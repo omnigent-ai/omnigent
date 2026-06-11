@@ -221,6 +221,14 @@ jobs:
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
         with:
           repository-url: https://test.pypi.org/legacy/
+          # TestPyPI is the retry-prone dry-run index and PyPI never allows a
+          # filename to be re-uploaded: without this, a re-run after a partial
+          # publish (e.g. one package's Trusted Publisher misconfigured)
+          # aborts on the first already-landed file and never reaches the
+          # packages that still need publishing. The real-PyPI step below
+          # deliberately omits it — a prod release must fail loud on any
+          # collision.
+          skip-existing: true
 
       - name: Publish to PyPI
         # Real PyPI only via a deliberate manual dispatch with
