@@ -3875,6 +3875,130 @@ async def test_accumulate_session_usage_unpriced_without_usage_model(
     assert "total_cost_usd" not in usage
 
 
+async def test_accumulate_session_usage_records_per_model_breakdown(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Relay turns are attributed per model; per-model costs sum to the flat total.
+
+    Two turns on two different models must each land in their own ``by_model``
+    bucket with their own tokens, and the sum of per-model costs must equal the
+    flat session ``total_cost_usd`` — the no-double-count invariant the UI
+    relies on. If the per-model cost were attributed to the wrong model or
+    double-counted, this sum would diverge from the flat total.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: (
+            ModelPricing(input_per_token=1e-6, output_per_token=2e-6)
+            if model in {"model-a", "model-b"}
+            else None
+        ),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+
+    sessions_routes._accumulate_session_usage(
+        {"usage": {"input_tokens": 1000, "output_tokens": 500, "model": "model-a"}},
+        session["id"],
+        store,
+    )
+    sessions_routes._accumulate_session_usage(
+        {"usage": {"input_tokens": 200, "output_tokens": 100, "model": "model-b"}},
+        session["id"],
+        store,
+    )
+
+    usage = _read_session_usage(db_uri, session["id"])
+    by_model = usage["by_model"]
+    # Each turn's tokens land in its own model bucket.
+    assert by_model["model-a"]["input_tokens"] == 1000
+    assert by_model["model-a"]["output_tokens"] == 500
+    assert by_model["model-b"]["input_tokens"] == 200
+    assert by_model["model-b"]["output_tokens"] == 100
+    # model-a: 1000*1e-6 + 500*2e-6 = 0.002 ; model-b: 200*1e-6 + 100*2e-6 = 0.0004.
+    assert by_model["model-a"]["total_cost_usd"] == pytest.approx(0.002)
+    assert by_model["model-b"]["total_cost_usd"] == pytest.approx(0.0004)
+    # Per-model costs sum to the flat total — proves no double-count / drop.
+    assert by_model["model-a"]["total_cost_usd"] + by_model["model-b"][
+        "total_cost_usd"
+    ] == pytest.approx(usage["total_cost_usd"])
+
+
+async def test_accumulate_session_usage_unpriced_model_has_tokens_no_cost(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unpriced relay model still records its tokens but no per-model cost key.
+
+    Mirrors the flat "priced ⟺ ``total_cost_usd`` key present" contract at the
+    per-model level: tokens are attributed even when the model isn't priceable
+    (so the token view is complete), but the model's bucket carries no cost key.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: None,  # nothing priceable
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    sessions_routes._accumulate_session_usage(
+        {"usage": {"input_tokens": 1000, "output_tokens": 500, "model": "free-model"}},
+        session["id"],
+        SqlAlchemyConversationStore(db_uri),
+    )
+
+    usage = _read_session_usage(db_uri, session["id"])
+    assert usage["by_model"]["free-model"]["input_tokens"] == 1000
+    assert usage["by_model"]["free-model"]["output_tokens"] == 500
+    assert "total_cost_usd" not in usage["by_model"]["free-model"]
+
+
+async def test_external_session_usage_records_per_model_breakdown(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A native cumulative usage POST attributes its buckets to the event's model.
+
+    Native harnesses report cumulative SESSION totals (SET semantics), so the
+    per-model bucket for the event's ``model`` mirrors the flat cumulative
+    buckets. Covers the native write path's per-model capture end-to-end
+    through the HTTP endpoint.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_session_usage",
+            "data": {
+                "cumulative_input_tokens": 1000,
+                "cumulative_output_tokens": 500,
+                "cumulative_cost_usd": 0.42,
+                "model": "native-model",
+            },
+        },
+    )
+    assert resp.status_code == 202, resp.text
+
+    usage = _read_session_usage(db_uri, session["id"])
+    bucket = usage["by_model"]["native-model"]
+    # No cache split here, so input_tokens == cumulative input; total folds
+    # input + output. Cost mirrors the flat (display) total.
+    assert bucket["input_tokens"] == 1000
+    assert bucket["output_tokens"] == 500
+    assert bucket["total_tokens"] == 1500
+    assert bucket["total_cost_usd"] == pytest.approx(0.42)
+
+
 async def test_external_session_usage_event_carries_priced_cost(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -3905,6 +4029,47 @@ async def test_external_session_usage_event_carries_priced_cost(
     assert resp.status_code == 202, resp.text
     assert [event["type"] for _, event in published] == ["session.usage"]
     assert published[0][1]["total_cost_usd"] == 0.42
+
+
+async def test_external_session_usage_event_carries_token_breakdown(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A native ``session.usage`` event carries the per-bucket token breakdown.
+
+    The web token-breakdown rows read these cumulative subtree counts off the
+    broadcast so they update live alongside the USD cost. The buckets are
+    persisted from the ``cumulative_*`` fields, then surfaced under their
+    canonical keys (``input_tokens`` etc.).
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_session_usage",
+            "data": {
+                "context_tokens": 1000,
+                "cumulative_input_tokens": 1000,
+                "cumulative_output_tokens": 500,
+                "cumulative_cost_usd": 0.42,
+                "model": "test-model",
+            },
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    assert [event["type"] for _, event in published] == ["session.usage"]
+    event = published[0][1]
+    # The per-model breakdown rides the broadcast, keyed by the event's model.
+    assert event["usage_by_model"]["test-model"]["input_tokens"] == 1000
+    assert event["usage_by_model"]["test-model"]["output_tokens"] == 500
 
 
 async def test_external_session_usage_unpriced_omits_cost(

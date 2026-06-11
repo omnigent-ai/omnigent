@@ -94,6 +94,23 @@ def test_blast_radius_gates_native_bash_tool() -> None:
     assert _result(evaluate(_tool_call("Bash", command="git status"), {})) == "ALLOW"
 
 
+def test_blast_radius_gates_pi_native_bash_tool() -> None:
+    """
+    blast_radius must also gate Pi's lowercase native ``bash`` tool.
+
+    Pi surfaces its in-process shell as ``bash`` (lowercase) with the same
+    string ``command`` key via the pi ``tool_call`` hook — distinct from the
+    Claude/Codex ``Bash`` casing. If this returns ALLOW, a pi worker's
+    ``git push --force`` bypasses the catastrophic-command gate entirely.
+    """
+    evaluate = blast_radius()
+    assert (
+        _result(evaluate(_tool_call("bash", command="git push --force origin main"), {})) == "DENY"
+    )
+    assert _result(evaluate(_tool_call("bash", command="git push origin main"), {})) == "ASK"
+    assert _result(evaluate(_tool_call("bash", command="git status"), {})) == "ALLOW"
+
+
 def test_blast_radius_ignores_non_shell_tools() -> None:
     """
     Non-shell tool calls pass through ALLOW — blast_radius only inspects
@@ -384,6 +401,10 @@ def test_worktree_guard_blocks_escapes(path: str, expected: str) -> None:
         # Claude native Edit also uses ``file_path``.
         ("Edit", "file_path", "main.py", "ALLOW"),
         ("Edit", "file_path", "~/.bashrc", "DENY"),
+        # Pi native write/edit (lowercase) use ``path`` (Omnigent convention).
+        ("write", "path", "src/app.py", "ALLOW"),
+        ("write", "path", "/etc/passwd", "DENY"),
+        ("edit", "path", "../escape.py", "DENY"),
     ],
     ids=[
         "Write-in-tree",
@@ -391,6 +412,9 @@ def test_worktree_guard_blocks_escapes(path: str, expected: str) -> None:
         "Write-escape",
         "Edit-in-tree",
         "Edit-home-escape",
+        "pi-write-in-tree",
+        "pi-write-absolute",
+        "pi-edit-escape",
     ],
 )
 def test_worktree_guard_gates_native_write_edit(

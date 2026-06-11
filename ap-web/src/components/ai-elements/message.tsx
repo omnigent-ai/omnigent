@@ -65,7 +65,10 @@ export const MessageContent = ({
 }: MessageContentProps) => (
   <div
     className={cn(
-      "is-user:dark flex w-fit min-w-0 max-w-full flex-col gap-2 overflow-hidden text-base tracking-[-0.01em]",
+      // 15px text / 24px line-height at the 16px desktop root, in rem so the
+      // mobile root-font-size bump (index.css) still scales both. User and
+      // assistant prose share this wrapper, so they stay in lockstep.
+      "is-user:dark flex w-fit min-w-0 max-w-full flex-col gap-2 overflow-hidden text-[0.9375rem] leading-6 tracking-[-0.01em]",
       "group-[.is-user]:ml-auto group-[.is-user]:rounded-2xl group-[.is-user]:bg-muted group-[.is-user]:px-4 group-[.is-user]:py-3 group-[.is-user]:text-foreground group-[.is-user]:ring-1 group-[.is-user]:ring-border/60",
       // Tighter than the user bubble's gap-2 so muted single-line tool
       // ("See N steps") / reasoning rows don't look orphaned between prose.

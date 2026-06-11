@@ -15,14 +15,14 @@ function renderBadge(state: SessionState) {
 afterEach(cleanup);
 
 describe("SessionStateBadge — per-state rendering", () => {
-  it("renders awaiting as a 'Need response' tag with a count-aware accessible label", () => {
+  it("renders awaiting as a 'Needs response' tag with a count-aware accessible label", () => {
     renderBadge({ kind: "awaiting", count: 3 });
     const badge = screen.getByTestId("session-state-badge");
     expect(badge).toHaveAttribute("data-state", "awaiting");
     expect(badge).toHaveAttribute("aria-label", "3 approval prompts waiting");
     // The approval indicator is a visible text tag (not an icon-only dot), so
-    // it reads as "Need response" at a glance in the row.
-    expect(badge).toHaveTextContent("Need response");
+    // it reads as "Needs response" at a glance in the row.
+    expect(badge).toHaveTextContent("Needs response");
   });
 
   it("uses singular wording when only one prompt is pending", () => {

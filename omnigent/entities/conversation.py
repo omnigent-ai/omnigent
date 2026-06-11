@@ -2,10 +2,22 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+# Attachment path markers the native executors prepend to prompt text
+# ("[Attached: /tmp/.../x.png]" from claude-native's _content_to_text,
+# "[Attached file: /tmp/...]" from codex-native's _file_block_to_input_item).
+# Those markers round-trip through the vendor transcript as user-message
+# text, so without filtering them a session started with an image is
+# titled by a temp-file path instead of what the user typed. Matched per
+# line by synthesize_conversation_title; keep in sync with
+# omnigent/inner/claude_native_executor.py and
+# omnigent/inner/codex_native_executor.py.
+_ATTACHMENT_MARKER_RE = re.compile(r"^\[Attached(?: file)?: .+\]$")
 
 # ── Conversation ──────────────────────────────────────
 
@@ -68,9 +80,15 @@ class Conversation:
         written yet.
     :param session_usage: Cumulative LLM token usage for the
         session. Shape: ``{"input_tokens": N, "output_tokens": M,
-        "total_tokens": T}``. Persisted as a JSON column and
-        loaded by the policy engine builder at workflow start.
-        Empty dict when no LLM calls have been recorded yet.
+        "total_tokens": T, "total_cost_usd": C}`` plus an optional
+        nested ``"by_model"`` sub-dict keyed by the raw harness model
+        id, each holding the same per-bucket token keys (and
+        ``total_cost_usd`` when that model's turns were priced), e.g.
+        ``{"by_model": {"claude-sonnet-4-6": {"input_tokens": N, ...}}}``.
+        Typed ``dict[str, Any]`` (not ``dict[str, float]``) to admit the
+        nested ``by_model`` object. Persisted as a JSON column and
+        loaded by the policy engine builder at workflow start. Empty
+        dict when no LLM calls have been recorded yet.
     :param reasoning_effort: Per-session reasoning-effort hint,
         e.g. ``"high"``. ``None`` means use the agent default.
         Set at session creation via ``POST /v1/sessions`` metadata
@@ -160,7 +178,7 @@ class Conversation:
     host_id: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
     session_state: dict[str, Any] = field(default_factory=dict)
-    session_usage: dict[str, float] = field(default_factory=dict)
+    session_usage: dict[str, Any] = field(default_factory=dict)
     reasoning_effort: str | None = None
     model_override: str | None = None
     cost_control_mode_override: str | None = None
@@ -225,6 +243,11 @@ def synthesize_conversation_title(
     """
     Derive a one-line conversation title from message content blocks.
 
+    Non-text blocks (``input_image``, ``input_file``) are skipped, and
+    lines matching the native executors' attachment path markers
+    (:data:`_ATTACHMENT_MARKER_RE`) are dropped so attachments never
+    leak temp-file paths into the title.
+
     :param content: Message content blocks, e.g.
         ``[{"type": "input_text", "text": "Hello"}]``.
     :param limit: Max chars before truncating with an ellipsis.
@@ -236,7 +259,12 @@ def synthesize_conversation_title(
         if block.get("type") == "input_text":
             text = block.get("text")
             if isinstance(text, str):
-                parts.append(text)
+                kept_lines = [
+                    line
+                    for line in text.splitlines()
+                    if not _ATTACHMENT_MARKER_RE.match(line.strip())
+                ]
+                parts.append("\n".join(kept_lines))
     collapsed = " ".join(" ".join(parts).split())
     if not collapsed:
         return None

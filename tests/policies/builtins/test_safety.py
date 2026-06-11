@@ -84,6 +84,49 @@ def test_ask_on_os_tools_asks_for_native_tools(
     assert expected_preview in result["reason"]
 
 
+# ── ask_on_os_tools: Pi native tools (lowercase) ──────────────────────────
+
+
+@pytest.mark.parametrize(
+    "tool,args,expected_preview",
+    [
+        ("bash", {"command": "rm -rf /"}, "rm -rf /"),
+        ("read", {"path": "/etc/passwd"}, "/etc/passwd"),
+        ("write", {"path": "/tmp/out.txt"}, "/tmp/out.txt"),
+        ("edit", {"path": "main.py"}, "main.py"),
+    ],
+    ids=["bash", "read", "write", "edit"],
+)
+def test_ask_on_os_tools_asks_for_pi_native_tools(
+    tool: str,
+    args: dict[str, str],
+    expected_preview: str,
+) -> None:
+    """Pi's lowercase native tools trigger ASK via the pi ``tool_call``
+    hook contract.
+
+    Pi names its in-process tools ``read`` / ``bash`` / ``write`` /
+    ``edit`` — distinct from the Claude/Codex casing covered above. The
+    pi executor routes these through the same TOOL_CALL verdict, so the
+    builtin must recognize the lowercase names; otherwise a polly pi
+    worker calling native ``read`` (enabled for skills) is silently
+    un-gated. If any returns ALLOW, the lowercase name isn't covered.
+
+    Asserts the preview too, proving pi's ``command`` / ``path`` arg keys
+    (which match the Omnigent convention, not Claude's ``file_path``)
+    resolve through the existing preview branches without a pi-specific
+    arg path.
+
+    :param tool: Pi native tool name, e.g. ``"bash"``.
+    :param args: Tool arguments dict.
+    :param expected_preview: Substring that must appear in the reason.
+    """
+    result = ask_on_os_tools(tc(tool, args))
+    assert result["result"] == "ASK"
+    assert tool in result["reason"]
+    assert expected_preview in result["reason"]
+
+
 def test_ask_on_os_tools_allows_non_os_tool() -> None:
     """A tool that is not a file/shell operation passes through.
 

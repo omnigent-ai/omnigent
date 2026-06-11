@@ -183,7 +183,7 @@ describe("Sidebar session list", () => {
     );
     expect(within(workingRow).queryByText("now")).toBeNull();
 
-    // Awaiting row: same rule for the "Need response" tag — any non-null
+    // Awaiting row: same rule for the "Needs response" tag — any non-null
     // session state replaces the timestamp, not just the working dot.
     const awaitingRow = screen.getByRole("link", { name: /conv_awaiting/ }).closest("li")!;
     expect(within(awaitingRow).getByTestId("session-state-badge")).toHaveAttribute(

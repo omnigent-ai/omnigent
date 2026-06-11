@@ -44,9 +44,32 @@ from pathlib import Path
 import filelock
 import httpx
 import pytest
-from playwright.sync_api import expect
+from playwright.sync_api import Page, expect
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def open_right_rail(page: Page) -> None:
+    """Expand the right "Workspace" rail if it is collapsed.
+
+    The rail now defaults closed per session (its open-state is remembered
+    per conversation), so a plain ``/c/{id}`` visit lands with it shut. File-
+    and terminal-centric tests that reach into the rail (changed-files panel,
+    Shells tab, inline file viewer) must open it first. Deep links that carry a
+    workspace signal (``?file=`` / ``?view=`` / ``?comment=``) open the rail on
+    their own, so those tests don't need this.
+
+    The toggle only renders once the rail has content (``hasRailContent``) and
+    on the desktop viewport these tests run at, so the generous timeout covers
+    the changed-files / terminals detection that gates the button.
+
+    :param page: Playwright page already navigated to a ``/c/{id}`` route.
+    :returns: None. Leaves the Workspace rail open.
+    """
+    toggle = page.get_by_role("button", name="Expand right panel")
+    toggle.click(timeout=60_000)
+    expect(page.get_by_role("complementary", name="Workspace")).to_be_visible()
+
 
 # Populated by ``live_server`` so test-scoped fixtures can access the
 # server PID and runner id without changing ``live_server``'s return

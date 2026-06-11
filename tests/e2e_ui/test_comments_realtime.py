@@ -35,6 +35,8 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests.e2e_ui.conftest import open_right_rail
+
 # ---------------------------------------------------------------------------
 # Test constants
 # ---------------------------------------------------------------------------
@@ -116,6 +118,9 @@ def _open_comments_panel(page: Page, base_url: str, session_id: str) -> None:
         the pre-seeded comment card rendered.
     """
     page.goto(f"{base_url}/c/{session_id}")
+    # The rail defaults closed per session; open it so the changed-files
+    # panel (and its file-open button) are reachable.
+    open_right_rail(page)
 
     # The PUT-seeded file surfaces in the changed-files panel (it polls
     # the workspace endpoint); the open button carries the filename as

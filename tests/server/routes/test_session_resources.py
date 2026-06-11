@@ -82,6 +82,30 @@ class _ConversationStore:
         """Return the conversation or None."""
         return self._conversations.get(conversation_id)
 
+    def list_conversations(
+        self,
+        *,
+        limit: int = 20,
+        after: str | None = None,
+        kind: str | None = None,
+        root_conversation_id: str | None = None,
+        **_kwargs: Any,
+    ) -> PagedList[Conversation]:
+        """Minimal list for policy-builder subtree walk.
+
+        :param limit: Max items per page.
+        :param after: Cursor for pagination.
+        :param kind: Conversation kind filter (ignored when ``None``).
+        :param root_conversation_id: Filter by root tree id.
+        :returns: A :class:`PagedList` of matching conversations.
+        """
+        convs = list(self._conversations.values())
+        if root_conversation_id is not None:
+            convs = [c for c in convs if c.root_conversation_id == root_conversation_id]
+        if kind is not None:
+            convs = [c for c in convs if c.kind == kind]
+        return PagedList(data=convs, has_more=False)
+
     def update_conversation(
         self,
         conversation_id: str,

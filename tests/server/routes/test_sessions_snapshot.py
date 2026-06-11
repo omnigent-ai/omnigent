@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from typing import Any
 
 import pytest
 
@@ -740,6 +741,8 @@ def _graph_conv(
     root: str,
     parent: str | None,
     cost: float | None,
+    tokens: dict[str, float] | None = None,
+    by_model: dict[str, dict[str, float]] | None = None,
 ) -> Conversation:
     """Build a spawn-tree conversation with optional priced ``session_usage``.
 
@@ -748,8 +751,18 @@ def _graph_conv(
     :param parent: Parent conversation id, or ``None`` for the tree root.
     :param cost: ``total_cost_usd`` to record, or ``None`` for an unpriced
         conversation (no cost key).
+    :param tokens: Per-bucket token counts to record alongside the cost, e.g.
+        ``{"input_tokens": 100, "output_tokens": 20}``. ``None`` records no
+        token buckets.
+    :param by_model: Nested per-model usage to record under ``by_model``, e.g.
+        ``{"claude-sonnet-4-6": {"input_tokens": 100, "total_cost_usd": 0.1}}``.
+        ``None`` records no per-model breakdown.
     """
-    usage: dict[str, float] = {} if cost is None else {"total_cost_usd": cost}
+    usage: dict[str, Any] = {} if cost is None else {"total_cost_usd": cost}
+    if tokens is not None:
+        usage.update(tokens)
+    if by_model is not None:
+        usage["by_model"] = by_model
     return Conversation(
         id=conv_id,
         created_at=1,
@@ -805,6 +818,105 @@ async def test_session_snapshot_cost_is_own_usage_for_childless_session() -> Non
     assert snapshot.total_cost_usd == 0.42
 
 
+@pytest.mark.asyncio
+async def test_session_snapshot_sums_by_model_over_subtree() -> None:
+    """The snapshot's ``usage_by_model`` sums token buckets across the subtree.
+
+    Mirrors the cost roll-up: each model's per-bucket counts on the parent's
+    snapshot must include the sub-agent's tokens, so the per-model breakdown
+    reflects the full spawn tree, not just the parent's own turns. When parent
+    and child share the same model, their buckets must be summed.
+    """
+    parent = _graph_conv(
+        "conv_parent",
+        root="conv_parent",
+        parent=None,
+        cost=1.0,
+        tokens={"input_tokens": 100, "output_tokens": 20},
+        by_model={"model-a": {"input_tokens": 100, "output_tokens": 20, "total_cost_usd": 1.0}},
+    )
+    child = _graph_conv(
+        "conv_child",
+        root="conv_parent",
+        parent="conv_parent",
+        cost=2.5,
+        tokens={"input_tokens": 400, "output_tokens": 80},
+        by_model={"model-a": {"input_tokens": 400, "output_tokens": 80, "total_cost_usd": 2.5}},
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={"conv_parent": parent, "conv_child": child},
+    )
+
+    snapshot = await _get_session_snapshot(conv_store, "conv_parent")  # type: ignore[arg-type]
+
+    # The per-model buckets must be parent + child summed.
+    assert snapshot.usage_by_model is not None
+    assert snapshot.usage_by_model["model-a"].input_tokens == 500
+    assert snapshot.usage_by_model["model-a"].output_tokens == 100
+    assert snapshot.usage_by_model["model-a"].total_cost_usd == 3.5
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_usage_by_model_none_when_unrecorded() -> None:
+    """An unpriced session with no per-model usage omits ``usage_by_model``.
+
+    ``None`` (no row rendered) rather than an empty dict — an empty dict
+    would imply models were tracked but none contributed.
+    """
+    solo = _graph_conv("conv_solo", root="conv_solo", parent=None, cost=None)
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={"conv_solo": solo},
+    )
+
+    snapshot = await _get_session_snapshot(conv_store, "conv_solo")  # type: ignore[arg-type]
+
+    assert snapshot.usage_by_model is None
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_usage_by_model_merges_differing_models() -> None:
+    """The snapshot's ``usage_by_model`` folds in a sub-agent on a different model.
+
+    A parent on ``model-a`` and a sub-agent on ``model-b`` must both appear in
+    the parent's per-model breakdown, summed over the subtree and typed as
+    :class:`ModelUsage`. Without the subtree merge a supervisor delegating to a
+    differently-modeled worker would hide that model's spend.
+    """
+    parent = _graph_conv(
+        "conv_parent",
+        root="conv_parent",
+        parent=None,
+        cost=0.10,
+        tokens={"input_tokens": 1000},
+        by_model={"model-a": {"input_tokens": 1000, "total_cost_usd": 0.10}},
+    )
+    child = _graph_conv(
+        "conv_child",
+        root="conv_parent",
+        parent="conv_parent",
+        cost=0.04,
+        tokens={"input_tokens": 150},
+        by_model={"model-b": {"input_tokens": 150, "total_cost_usd": 0.04}},
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={"conv_parent": parent, "conv_child": child},
+    )
+
+    snapshot = await _get_session_snapshot(conv_store, "conv_parent")  # type: ignore[arg-type]
+
+    assert snapshot.usage_by_model is not None
+    # Both models present (typed ModelUsage), each with its own attributed
+    # tokens/cost. A missing "model-b" would mean the sub-agent's model was
+    # dropped from the parent's per-model view.
+    assert snapshot.usage_by_model["model-a"].input_tokens == 1000
+    assert snapshot.usage_by_model["model-a"].total_cost_usd == 0.10
+    assert snapshot.usage_by_model["model-b"].input_tokens == 150
+    assert snapshot.usage_by_model["model-b"].total_cost_usd == 0.04
+
+
 def test_publish_subtree_cost_to_ancestors_publishes_each_ancestor_subtree(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -817,9 +929,30 @@ def test_publish_subtree_cost_to_ancestors_publishes_each_ancestor_subtree(
     parent=$6 ({parent, child}) and grandparent=$7 ({all three}), and must NOT
     publish to the originating child.
     """
-    g = _graph_conv("conv_g", root="conv_g", parent=None, cost=1.0)
-    p = _graph_conv("conv_p", root="conv_g", parent="conv_g", cost=2.0)
-    c = _graph_conv("conv_c", root="conv_g", parent="conv_p", cost=4.0)
+    g = _graph_conv(
+        "conv_g",
+        root="conv_g",
+        parent=None,
+        cost=1.0,
+        tokens={"input_tokens": 10},
+        by_model={"model-a": {"input_tokens": 10, "total_cost_usd": 1.0}},
+    )
+    p = _graph_conv(
+        "conv_p",
+        root="conv_g",
+        parent="conv_g",
+        cost=2.0,
+        tokens={"input_tokens": 20},
+        by_model={"model-a": {"input_tokens": 20, "total_cost_usd": 2.0}},
+    )
+    c = _graph_conv(
+        "conv_c",
+        root="conv_g",
+        parent="conv_p",
+        cost=4.0,
+        tokens={"input_tokens": 40},
+        by_model={"model-a": {"input_tokens": 40, "total_cost_usd": 4.0}},
+    )
     conv_store = _ConversationStore(
         [],
         conversations={"conv_g": g, "conv_p": p, "conv_c": c},
@@ -840,5 +973,8 @@ def test_publish_subtree_cost_to_ancestors_publishes_each_ancestor_subtree(
     assert by_conv["conv_p"]["total_cost_usd"] == 6.0
     # grandparent subtree = $1 + $2 + $4 (itself + both descendants).
     assert by_conv["conv_g"]["total_cost_usd"] == 7.0
+    # The per-model breakdown rolls up the same subtree alongside the cost.
+    assert by_conv["conv_p"]["usage_by_model"]["model-a"]["input_tokens"] == 60
+    assert by_conv["conv_g"]["usage_by_model"]["model-a"]["input_tokens"] == 70
     # The payload is a session.usage broadcast the web client renders as the badge.
     assert by_conv["conv_p"]["type"] == "session.usage"

@@ -85,7 +85,7 @@ def _to_conversation(
     session_state: dict[str, Any] = {}
     if row.session_state:
         session_state = json.loads(row.session_state)
-    session_usage: dict[str, float] = {}
+    session_usage: dict[str, Any] = {}
     if row.session_usage:
         session_usage = json.loads(row.session_usage)
     return Conversation(
@@ -896,7 +896,7 @@ class SqlAlchemyConversationStore(ConversationStore):
     def set_session_usage(
         self,
         conversation_id: str,
-        usage: dict[str, float],
+        usage: dict[str, Any],
     ) -> None:
         """
         Persist the cumulative LLM token usage for a conversation.
@@ -908,7 +908,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             e.g. ``"conv_abc123"``.
         :param usage: The complete usage dict to persist, e.g.
             ``{"input_tokens": 1500, "output_tokens": 350,
-            "total_tokens": 1850}``.
+            "total_tokens": 1850}``. May carry a nested ``"by_model"``
+            sub-dict (per-model token/cost buckets), hence ``Any``.
         """
         import json
 

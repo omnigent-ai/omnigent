@@ -613,10 +613,39 @@ _SUMMABLE_USAGE_KEYS = (
 )
 
 
+def _merge_by_model(
+    aggregate: dict[str, dict[str, float]],
+    per_conv: dict[str, Any],
+) -> None:
+    """
+    Deep-merge one conversation's ``by_model`` sub-dict into the subtree aggregate.
+
+    Unions model keys and sums each numeric per-bucket value (the token
+    counters and ``total_cost_usd``) within each model, so a parent's
+    per-model view folds in sub-agents that ran a different model. Mutates
+    ``aggregate`` in place.
+
+    :param aggregate: The running subtree ``by_model`` map being built, keyed
+        by raw harness model id, e.g.
+        ``{"claude-sonnet-4-6": {"input_tokens": 1200}}``.
+    :param per_conv: One conversation's ``session_usage["by_model"]`` dict.
+        Non-dict model buckets (malformed persisted data) are skipped.
+    """
+    for model, bucket in per_conv.items():
+        if not isinstance(bucket, dict):
+            continue
+        agg_bucket = aggregate.setdefault(model, {})
+        for key, value in bucket.items():
+            # Only sum genuine numerics; ``bool`` is an ``int`` subclass so
+            # exclude it explicitly to avoid summing a stray flag as 1.
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                agg_bucket[key] = agg_bucket.get(key, 0.0) + value
+
+
 def load_session_usage(
     conversation_id: str,
     conversation_store: ConversationStore,
-) -> dict[str, float]:
+) -> dict[str, Any]:
     """
     Load cumulative session usage for a conversation **plus all of its
     sub-agent descendants** (the subtree total).
@@ -643,17 +672,23 @@ def load_session_usage(
         ``output_tokens``, ``total_tokens``, ``total_cost_usd`` (the
         DISPLAY cost sum — statusLine ``S`` for claude-native), and
         ``policy_cost_usd`` (the ENFORCEMENT cost sum — see below; only
-        keys present in at least one conversation appear). Empty when the
-        conversation does not exist or no usage is recorded. Display
-        callers read ``total_cost_usd``; the policy seed
-        (:func:`_policy_usage_seed`) reads ``policy_cost_usd``.
+        keys present in at least one conversation appear). When any
+        conversation in the subtree recorded a per-model breakdown, a
+        nested ``by_model`` key maps each raw harness model id to its
+        own summed token/cost buckets (folding in sub-agents that ran a
+        different model). Empty when the conversation does not exist or
+        no usage is recorded. Display callers read ``total_cost_usd``;
+        the policy seed (:func:`_policy_usage_seed`) reads
+        ``policy_cost_usd`` (both unaffected by ``by_model``).
     """
     conv = conversation_store.get_conversation(conversation_id)
     if conv is None:
         return {}
     tree = _load_tree_conversations(conv.root_conversation_id, conversation_store)
     subtree_ids = _subtree_conversation_ids(tree, conversation_id)
-    totals: dict[str, float] = {}
+    totals: dict[str, Any] = {}
+    # Per-model breakdown summed across the subtree, parallel to the flat sums.
+    by_model_totals: dict[str, dict[str, float]] = {}
     # Enforcement cost total, accumulated alongside the display sums so the
     # policy seed can pick it without a second tree pass.
     policy_cost_total = 0.0
@@ -666,6 +701,12 @@ def load_session_usage(
             value = session_usage.get(key)
             if value is not None:
                 totals[key] = totals.get(key, 0.0) + value
+        # Per-model sub-dict (nested ``by_model`` key) is ignored by the flat
+        # ``_SUMMABLE_USAGE_KEYS`` loop above; merge it separately so the flat
+        # sum (used by policy gating) stays unchanged and backward-compatible.
+        per_conv_by_model = session_usage.get("by_model")
+        if isinstance(per_conv_by_model, dict):
+            _merge_by_model(by_model_totals, per_conv_by_model)
         # Enforcement cost: prefer this conversation's ``policy_cost_usd``
         # (claude-native's real-time figure incl. in-flight sub-agent spend),
         # else its displayed ``total_cost_usd`` (codex-native / relay don't
@@ -679,6 +720,8 @@ def load_session_usage(
             any_policy_cost = True
     if any_policy_cost:
         totals["policy_cost_usd"] = policy_cost_total
+    if by_model_totals:
+        totals["by_model"] = by_model_totals
     return totals
 
 
@@ -721,6 +764,9 @@ def _policy_usage_seed(
     if conv is None:
         return {}
     usage = load_session_usage(conv.root_conversation_id, conversation_store)
+    # ``by_model`` is a display-only breakdown; drop it so the engine's usage
+    # context carries only the flat numeric counters the gate reads.
+    usage.pop("by_model", None)
     policy_cost = usage.pop("policy_cost_usd", None)
     if policy_cost is not None:
         usage["total_cost_usd"] = policy_cost

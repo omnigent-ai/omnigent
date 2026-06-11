@@ -7,16 +7,20 @@
 
 import { useCallback, useEffect, useRef } from "react";
 import { useSyncExternalStore } from "react";
-import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
+import {
+  readSessionWorkspaceState,
+  writeSessionWorkspaceState,
+} from "@/lib/sessionWorkspaceState";
 
 const MIN_WIDTH_PX = 240;
 const MAX_WIDTH_RATIO = 0.6;
 
-// ~28 % of viewport, clamped [320, 460] — 480px was too wide on ≤1440px screens.
-const DEFAULT_RATIO = 0.28;
-const DEFAULT_MIN_PX = 320;
-const DEFAULT_MAX_PX = 460;
-const DEFAULT_SSR_PX = 380;
+// ~36 % of viewport, clamped [420, 600] — ~30 % wider than the prior default so
+// the first manual open lands at a comfortable working width.
+const DEFAULT_RATIO = 0.36;
+const DEFAULT_MIN_PX = 420;
+const DEFAULT_MAX_PX = 600;
+const DEFAULT_SSR_PX = 500;
 
 function defaultWidthPx(): number {
   if (typeof window === "undefined") return DEFAULT_SSR_PX;
@@ -39,13 +43,18 @@ function clamp(w: number, minPx = MIN_WIDTH_PX): number {
 // effective (viewport-clamped) width. Keeping the preference in
 // memory lets the resize handler re-derive the effective width from it —
 // restoring the larger choice when space returns — without touching disk.
-let preferredWidth: number | null = readPanelSizePreference("inlinePanelWidthPx");
-let storedWidth: number | null = preferredWidth;
+// Both start null: the active session's saved width is loaded once the hook
+// learns its conversationId (see loadSession), since the width is per-session.
+let currentSessionId: string | null = null;
+let preferredWidth: number | null = null;
+let storedWidth: number | null = null;
 const listeners = new Set<() => void>();
 
 function persistWidth(value: number | null) {
   preferredWidth = value;
-  writePanelSizePreference("inlinePanelWidthPx", value);
+  if (currentSessionId !== null && value !== null) {
+    writeSessionWorkspaceState(currentSessionId, { widthPx: value });
+  }
 }
 
 function setStoredWidthRaw(value: number | null, persist = false) {
@@ -69,10 +78,21 @@ function subscribe(cb: () => void): () => void {
   return () => listeners.delete(cb);
 }
 
+// Re-seed the module store from a session's saved width. Called when the
+// active conversation changes so each session restores its own width (and a
+// session with no saved width falls back to the viewport-derived default).
+function loadSession(sessionId: string | null): void {
+  if (sessionId === currentSessionId) return;
+  currentSessionId = sessionId;
+  preferredWidth = sessionId !== null ? readSessionWorkspaceState(sessionId).widthPx ?? null : null;
+  setStoredWidthRaw(preferredWidth);
+}
+
 /** Reset all module-level state. Only for use in tests. */
 export function resetWidthStoreForTesting(): void {
-  preferredWidth = readPanelSizePreference("inlinePanelWidthPx");
-  setStoredWidthRaw(preferredWidth);
+  currentSessionId = null;
+  preferredWidth = null;
+  setStoredWidthRaw(null);
 }
 
 function getSnapshot(): number | null {
@@ -95,13 +115,34 @@ function getServerSnapshot(): number | null {
  * Returns the current pixel width and handle props to spread onto the resize
  * handle element. Intended for desktop-only use — callers should not render
  * the handle on mobile.
+ *
+ * `sessionId` scopes the persisted width: each conversation remembers its own
+ * rail width. Pass `null` when there is no active conversation (the panel then
+ * uses the default width and resizes are not persisted).
  */
-export function useResizableInlinePanel(minWidthPx = MIN_WIDTH_PX) {
+export function useResizableInlinePanel(sessionId: string | null, minWidthPx = MIN_WIDTH_PX) {
   const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
-  const resolvedWidth = clamp(raw ?? defaultWidthPx(), minWidthPx);
+  // On a session switch the module store still holds the previous session's
+  // width until the effect below re-seeds it after commit. Derive this render's
+  // width straight from the incoming session's saved value so the panel doesn't
+  // flash the old width for a frame. Once the effect runs `currentSessionId`
+  // catches up and we fall back to the live store value (which the drag and
+  // keyboard handlers mutate in place).
+  let effectiveRaw = raw;
+  if (sessionId !== currentSessionId) {
+    effectiveRaw = sessionId !== null ? readSessionWorkspaceState(sessionId).widthPx ?? null : null;
+  }
+  const resolvedWidth = clamp(effectiveRaw ?? defaultWidthPx(), minWidthPx);
   const dragging = useRef(false);
   const minWidthRef = useRef(minWidthPx);
   minWidthRef.current = minWidthPx;
+
+  // Load the active session's saved width into the module store (and re-load
+  // when it changes) so the live store and the drag handlers operate on the
+  // right session.
+  useEffect(() => {
+    loadSession(sessionId);
+  }, [sessionId]);
 
   // Re-clamp on viewport resize so the panel can't overflow a shrunken window.
   // Re-derive the effective width from the persisted preference so widening the

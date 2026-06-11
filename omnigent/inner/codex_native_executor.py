@@ -356,5 +356,9 @@ def _file_block_to_input_item(block: dict[str, Any], bridge_dir: Path) -> dict[s
             _logger.warning("Failed to decode input_file data URI", exc_info=True)
     path = materialize_attachment(block, bridge_dir)
     if path is not None:
+        # Marker format is load-bearing: codex echoes this text item back
+        # in the mirrored user message, and title seeding strips lines
+        # matching _ATTACHMENT_MARKER_RE in
+        # omnigent/entities/conversation.py. Keep in sync.
         return {"type": "text", "text": f"[Attached file: {path}]"}
     return None

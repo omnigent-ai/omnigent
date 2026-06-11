@@ -1,4 +1,4 @@
-// Sidebar status indicator. Approval surfaces as a "Need response" tag so
+// Sidebar status indicator. Approval surfaces as a "Needs response" tag so
 // it reads at a glance; running/unseen stay as compact dots. Verbose copy
 // (incl. the approval count) lives in the tooltip.
 
@@ -29,7 +29,7 @@ function describe(state: SessionState): Visual {
         ariaLabel: tooltip,
         tooltip,
         render: () => (
-          <Badge className="border-transparent bg-warning/15 text-warning">Need response</Badge>
+          <Badge className="border-transparent bg-warning/15 text-warning">Needs response</Badge>
         ),
       };
     }
@@ -66,7 +66,7 @@ export function SessionStateBadge({ state }: SessionStateBadgeProps) {
           data-state={visual.kind}
           role="img"
           aria-label={visual.ariaLabel}
-          className="inline-flex min-h-3.5 shrink-0 items-center justify-center"
+          className="inline-flex h-5 shrink-0 items-center justify-center"
         >
           {visual.render()}
         </span>

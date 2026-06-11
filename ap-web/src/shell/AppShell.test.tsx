@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 import { MemoryRouter, Route, Routes, useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
 vi.mock("@/hooks/useConversations", () => ({
   useConversations: vi.fn(),
@@ -283,7 +284,15 @@ function SessionNavButton({ to }: { to: string }) {
   );
 }
 
-function renderShell(path: string) {
+function renderShell(path: string, { seedRightPanelOpen = true }: { seedRightPanelOpen?: boolean } = {}) {
+  // The rail is closed by default and its open-state is per-session. Most tests
+  // assert rail behavior, so by default seed the path's conversation open —
+  // reproducing the rail's pre-existing always-open behavior. Pass
+  // seedRightPanelOpen: false to exercise the real default-closed state.
+  if (seedRightPanelOpen) {
+    const id = path.match(/^\/c\/([^/?#]+)/)?.[1];
+    if (id) writeSessionWorkspaceState(id, { open: true });
+  }
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -370,6 +379,13 @@ beforeEach(() => {
   // choice carries across sessions. Clear it so a stored preference from one
   // test can't change another test's default scope.
   localStorage.clear();
+  // The right "Workspace" rail is closed by default and remembers its
+  // open-state per session. Most tests assert rail content and build their own
+  // router (or use renderShell) with conv_abc / conv_xyz, so seed those open
+  // here to reproduce the rail's pre-existing always-open behavior. Tests that
+  // exercise the real default-closed state use distinct conversation ids.
+  writeSessionWorkspaceState("conv_abc", { open: true });
+  writeSessionWorkspaceState("conv_xyz", { open: true });
   // The Tasks tab/drawer gates on chatStore.todos; reset so a populated
   // todo list from one test doesn't leak into the next.
   // Reset terminal-first startup signals so one test's terminalPending /
@@ -1573,6 +1589,91 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByRole("tab", { name: /Shells/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
   });
+
+  it("starts closed for a fresh session (no stored open-state)", () => {
+    // A brand-new session has no persisted open-state, so the rail stays
+    // closed — the card is unmounted and the header offers Expand, not
+    // Collapse. conv_fresh is not seeded open by the beforeEach.
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_fresh", permission_level: null }]);
+
+    renderShell("/c/conv_fresh", { seedRightPanelOpen: false });
+
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Expand right panel" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Collapse right panel" })).toBeNull();
+  });
+
+  it("persists the open-state per session across remounts", () => {
+    // Open the rail on a fresh session, then remount the same session: the
+    // persisted open-state restores the card without re-toggling.
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_persist", permission_level: null }]);
+
+    const first = renderShell("/c/conv_persist", { seedRightPanelOpen: false });
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    first.unmount();
+
+    // Remount the same conversation: the stored open-state (written by the
+    // toggle) brings the card back on its own.
+    renderShell("/c/conv_persist", { seedRightPanelOpen: false });
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
+  });
+
+  it("restores the selected rail tab per session", () => {
+    // Seed conv_tabmem open on the Agents tab; on mount the rail restores that
+    // tab as selected rather than falling back to Files.
+    writeSessionWorkspaceState("conv_tabmem", { open: true, rightRailTab: "subagents" });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_tabmem", permission_level: null }]);
+
+    renderShell("/c/conv_tabmem");
+
+    expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute(
+      "aria-selected",
+      "false",
+    );
+  });
+
+  it("restores the open file tabs per session (independent of the ?file= param)", () => {
+    // Seed conv_filemem with two open file tabs, none of which is in the URL.
+    // On mount the rail restores both tabs even though no ?file= is present.
+    writeSessionWorkspaceState("conv_filemem", {
+      open: true,
+      openFiles: ["a.ts", "b.ts"],
+      selectedFilePath: "b.ts",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_filemem", permission_level: null }]);
+
+    renderShell("/c/conv_filemem");
+
+    // Both remembered tabs render in the rail's file-tab strip (each tab div
+    // carries title={path}), and the persisted active file drives the viewer.
+    expect(screen.getByTitle("a.ts")).toBeInTheDocument();
+    expect(screen.getByTitle("b.ts")).toBeInTheDocument();
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "b.ts");
+  });
 });
 
 describe("Embedded REPL terminal rail inventory", () => {
@@ -1804,6 +1905,48 @@ describe("AppShell URL sync — file param", () => {
     expect(params).not.toContain("file=");
     expect(params).not.toContain("diff=");
     expect(params).not.toContain("comment=");
+  });
+
+  it("clears file/diff/comment/view params from the URL when the rail is collapsed", () => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+
+    // Deep-link into the workspace with every rail-pointing param. conv_abc is
+    // seeded open, so the rail mounts open with the params live.
+    renderShell("/c/conv_abc?file=README.md&diff=1&comment=c1&view=changed");
+
+    // Sanity: the rail is open and the params survived restore.
+    expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
+    expect(screen.getByTestId("url-params").textContent).toContain("file=README.md");
+    expect(screen.getByTestId("url-params").textContent).toContain("view=changed");
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+
+    // Collapsing hides the workspace, so every param that points into it is
+    // stripped: file/diff/comment by the toggle's clearFileViewerUrl, and
+    // view= by the scope-sync effect's rightPanelOpen gate. Failure means a
+    // reload would re-open the rail to a file/view the user just dismissed.
+    const afterCollapse = screen.getByTestId("url-params").textContent ?? "";
+    expect(afterCollapse).not.toContain("file=");
+    expect(afterCollapse).not.toContain("diff=");
+    expect(afterCollapse).not.toContain("comment=");
+    expect(afterCollapse).not.toContain("view=");
+
+    fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+
+    // Reopening rehydrates the URL from the remembered workspace state: the
+    // file (re-added by the toggle) and the Changed scope (re-added by the
+    // scope-sync effect). diff/comment were URL-only ephemerals, so they stay
+    // gone. Failure means a reopened rail is no longer reflected/shareable in
+    // the URL.
+    const afterReopen = screen.getByTestId("url-params").textContent ?? "";
+    expect(afterReopen).toContain("file=README.md");
+    expect(afterReopen).toContain("view=changed");
+    expect(afterReopen).not.toContain("diff=");
+    expect(afterReopen).not.toContain("comment=");
   });
 });
 

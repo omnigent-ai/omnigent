@@ -97,6 +97,10 @@ model and you're chatting in your terminal. It also launches a **local web UI**
 (`http://localhost:6767`, already signed in), so you can switch to the browser —
 or your phone (step 4) — any time.
 
+> [!NOTE]
+> The install puts two names for the same CLI on your PATH: `omnigent` and
+> the shorter `omni`. They're interchangeable.
+
 > [!TIP]
 > On first run, Omnigent picks up any model credentials already in your
 > environment — an `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, or a `claude` /
@@ -364,9 +368,10 @@ The **Docker deploy in [step 4](#4-deploy-a-server-and-use-it-from-your-phone)
 turns it on for you** — `OMNIGENT_AUTH_ENABLED` defaults to `1` there. With
 auth on, Omnigent uses built-in accounts; here's how teammates join:
 
-**Sign in.** Open the web UI (`http://localhost:8000` locally, or your host's
-URL) and sign in as `admin` — first run prints the password and saves it
-locally.
+**Sign in.** Open the web UI (`http://localhost:6767` locally, or your host's
+URL). On a fresh server it shows a create-admin form — pick your admin
+username and password there (headless deploys can pre-set it with
+`OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD`).
 
 **Invite teammates.** Open **Admin → Members → Invite** to create a single-use
 invite link — no email server needed. Send it over; your teammate opens it, sets
@@ -522,7 +527,7 @@ name: my_agent
 prompt: You are a helpful data analyst.
 
 executor:
-  harness: claude-sdk          # or: codex, openai-agents, native-claude, native-codex
+  harness: claude-sdk          # or: codex, openai-agents, claude-native, codex-native
 
 tools:
   # A local Python function (schema auto-generated from the signature)
@@ -549,10 +554,6 @@ sub-agents and verifies with an independent reviewer.
 See the [Agent YAML spec](docs/AGENT_YAML_SPEC.md) for the full schema.
 
 ---
-
-## Architecture
-
-> TODO
 
 ## Contributing
 

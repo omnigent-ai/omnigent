@@ -83,7 +83,7 @@ import {
 // fades out on hover/focus so the pin + kebab controls can take its place;
 // on mobile it sits left of the always-visible controls (right-[4.5rem]).
 const TIME_MARKER_SLOT_CLASS =
-  "-translate-y-1/2 pointer-events-none absolute top-1/2 right-[4.5rem] transition-opacity md:right-2 md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
+  "-translate-y-1/2 pointer-events-none absolute top-1/2 right-[4.5rem] flex h-5 items-center transition-opacity md:right-2 md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
 
 interface SidebarProps {
   open: boolean;
@@ -678,7 +678,7 @@ function ConversationRow({
   const hasUnseenMessages =
     !isActive &&
     isConversationUnseen(conversation.id, conversation.updated_at, conversation.status);
-  // Badge precedence: a pending approval ("Need response") outranks the
+  // Badge precedence: a pending approval ("Needs response") outranks the
   // unread dot — a session that's both unread and awaiting input should
   // surface the actionable approval tag. The row still renders bold (the
   // unread signal) via `hasUnseenMessages` below.
@@ -800,7 +800,7 @@ function ConversationRow({
           // swapped in on hover), so reserve room for both (pr-16). On
           // mobile there's no hover, so the marker, pin, and kebab are all
           // visible side by side — reserve pr-28 to clear the marker that
-          // sits left of them. The wide "Need response" tag replaces the
+          // sits left of them. The wide "Needs response" tag replaces the
           // timestamp in that slot, so reserve extra room for it
           // (pr-44 / md:pr-28). flex-col stacks the name row over the
           // git-branch subtitle row.
@@ -848,7 +848,7 @@ function ConversationRow({
           place. On mobile there is no hover, so it sits to the left of the
           always-visible pin + kebab (right-[4.5rem]) and stays put — they
           read side by side. When the session has a state badge (working dot,
-          "Need response", unseen dot), the badge takes this slot INSTEAD of
+          "Needs response", unseen dot), the badge takes this slot INSTEAD of
           the timestamp — the row shows one trailing marker, never both. */}
       {sessionState !== null ? (
         // pointer-events-none keeps clicks falling through to the row, so

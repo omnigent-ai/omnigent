@@ -805,13 +805,13 @@ describe("SubagentsPanel", () => {
     const { container } = renderPanel();
 
     const row = childRow(container, "c_await");
-    // The awaiting state renders the "Need response" tag (mirroring the
+    // The awaiting state renders the "Needs response" tag (mirroring the
     // sidebar) — if this reads "Working", the awaiting check isn't
     // outranking busy and the signal is hidden.
-    expect(row).toHaveTextContent(/Need response/);
+    expect(row).toHaveTextContent(/Needs response/);
     expect(within(row).getByTestId("subagent-status-dot")).toHaveAttribute(
       "aria-label",
-      "Need response",
+      "Needs response",
     );
     // The working RunningDot must NOT render for an awaiting child —
     // confirms the elicitation branch replaced the busy branch.

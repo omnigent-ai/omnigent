@@ -58,7 +58,7 @@ import type {
   ToolResult,
 } from "./events";
 import { NATIVE_TOOL_TYPES } from "./events";
-import type { ErrorInfo, Response } from "./types";
+import type { ErrorInfo, ModelUsage, Response } from "./types";
 
 /**
  * Out-param for `parseSseStream`: `sawDone` is set when the server's `[DONE]`
@@ -179,6 +179,55 @@ export function* parseEventLines(lines: Iterable<string>): Iterable<StreamEvent>
     const event = parseEvent(parsed.event, parsed.data);
     if (event !== null) yield event;
   }
+}
+
+/** Token/cost bucket keys on a `ModelUsage`, mapping wire (snake) to camel. */
+const MODEL_USAGE_FIELDS: ReadonlyArray<{ wire: string; camel: keyof ModelUsage }> = [
+  { wire: "input_tokens", camel: "inputTokens" },
+  { wire: "output_tokens", camel: "outputTokens" },
+  { wire: "total_tokens", camel: "totalTokens" },
+  { wire: "cache_read_input_tokens", camel: "cacheReadInputTokens" },
+  { wire: "cache_creation_input_tokens", camel: "cacheCreationInputTokens" },
+  { wire: "total_cost_usd", camel: "totalCostUsd" },
+];
+
+/**
+ * Parse the `usage_by_model` field of a `session.usage` event.
+ *
+ * Returns `undefined` when absent/null (the store keeps its cached map),
+ * a `Record<string, ModelUsage>` when valid, or `null` when malformed —
+ * which invalidates the whole event, matching the flat-field handling. The
+ * server sends the complete merged per-model map when it changes, so a valid
+ * value replaces the cached map wholesale. Each model's missing buckets
+ * become `null` (the `ModelUsage` "not recorded" sentinel). A non-numeric or
+ * negative bucket value, or a non-object entry, is treated as malformed.
+ *
+ * @param raw - The raw `usage_by_model` value off the event payload.
+ */
+function parseUsageByModel(raw: unknown): Record<string, ModelUsage> | undefined | null {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "object" || Array.isArray(raw)) return null;
+  const out: Record<string, ModelUsage> = {};
+  for (const [model, entry] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return null;
+    const src = entry as Record<string, unknown>;
+    const usage: ModelUsage = {
+      inputTokens: null,
+      outputTokens: null,
+      totalTokens: null,
+      cacheReadInputTokens: null,
+      cacheCreationInputTokens: null,
+      totalCostUsd: null,
+    };
+    for (const { wire, camel } of MODEL_USAGE_FIELDS) {
+      const value = src[wire];
+      if (value === undefined || value === null) continue;
+      if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return null;
+      usage[camel] = value;
+    }
+    out[model] = usage;
+  }
+  return out;
 }
 
 /**
@@ -403,7 +452,20 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       }
       totalCostUsd = rawCost;
     }
-    if (contextTokens === undefined && contextWindow === undefined && totalCostUsd === undefined) {
+    // Per-model breakdown (cumulative subtree map). The server sends the full
+    // merged map when it changes, so a present value replaces the cached map
+    // wholesale. Absent → undefined (keep cached); a malformed entry/bucket
+    // invalidates the whole event.
+    const usageByModel = parseUsageByModel(raw.usage_by_model);
+    if (usageByModel === null) {
+      return null;
+    }
+    if (
+      contextTokens === undefined &&
+      contextWindow === undefined &&
+      totalCostUsd === undefined &&
+      usageByModel === undefined
+    ) {
       return null;
     }
     return {
@@ -412,6 +474,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       ...(contextTokens !== undefined ? { contextTokens } : {}),
       ...(contextWindow !== undefined ? { contextWindow } : {}),
       ...(totalCostUsd !== undefined ? { totalCostUsd } : {}),
+      ...(usageByModel !== undefined ? { usageByModel } : {}),
     } satisfies SessionUsageEvent;
   }
   if (eventType === "session.model") {

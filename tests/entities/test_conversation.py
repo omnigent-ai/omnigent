@@ -85,13 +85,49 @@ def test_to_api_dict_exposes_interrupted_assistant_marker() -> None:
         ([{"type": "input_file", "file_id": "file_123"}], None),
         ([{"type": "input_text", "text": "   \n  "}], None),
         ([{"type": "input_text", "text": "a" * 100}], "a" * 59 + "…"),
+        # claude-native attachment marker (claude_native_executor
+        # prepends "[Attached: <path>]\n\n<text>") — the marker line is
+        # dropped so the title is the user's text, not a temp-file path.
+        (
+            [
+                {
+                    "type": "input_text",
+                    "text": (
+                        "[Attached: /tmp/omnigent/claude-native/0a1b/uploads/shot.png]"
+                        "\n\nfix this layout bug"
+                    ),
+                }
+            ],
+            "fix this layout bug",
+        ),
+        # codex-native binary-file marker ("[Attached file: <path>]")
+        # arrives as its own text block alongside the user's text.
+        (
+            [
+                {"type": "input_text", "text": "[Attached file: /tmp/omnigent/u/report.bin]"},
+                {"type": "input_text", "text": "summarize this"},
+            ],
+            "summarize this",
+        ),
+        # Image-only message: every line is a marker, so no title —
+        # the next user message seeds it instead of a temp-file path.
+        (
+            [{"type": "input_text", "text": "[Attached: /tmp/omnigent/u/img.png]"}],
+            None,
+        ),
+        # A marker mid-line is user prose, not an executor-emitted
+        # attachment line — it must survive into the title.
+        (
+            [{"type": "input_text", "text": "why does [Attached: x.png] render twice?"}],
+            "why does [Attached: x.png] render twice?",
+        ),
     ],
 )
 def test_synthesize_conversation_title(
     content: list[dict[str, object]],
     expected: str | None,
 ) -> None:
-    """Title synthesis collapses, joins, and truncates input text."""
+    """Title synthesis collapses, joins, truncates, and drops attachment markers."""
     assert synthesize_conversation_title(content) == expected
 
 

@@ -8653,6 +8653,21 @@ def create_runner_app(
                 # Turn sequencing gate (invariant I2: single active turn).
                 if conversation_id in _active_turns:
                     _native = _is_native_harness(conversation_id)
+                    # A turn parked on a human approval must not be steered
+                    # past its gate by an incoming message. The non-native
+                    # mid-turn injection forward below would do exactly that:
+                    # a parent agent's ``sys_session_send`` to a child blocked
+                    # on an elicitation would reach the parked turn as a steer
+                    # and let it advance — the parent jumping a human gate it
+                    # has no business resolving. While an approval is
+                    # outstanding we therefore buffer the message WITHOUT
+                    # forwarding it; it rides the post-turn continuation drain
+                    # after the human delivers a verdict (accept/decline/
+                    # timeout), so nothing is lost and only a real ``approval``
+                    # event advances the gate. Applies to human-sent messages
+                    # too — you can't jump the gate, but your message waits
+                    # rather than being dropped.
+                    _awaiting_approval = pending_approvals.has_pending(conversation_id)
                     # Stamp a correlation id so the buffered copy and the
                     # forwarded injection share an id. When the harness
                     # consumes the injection it echoes this id back in an
@@ -8661,13 +8676,16 @@ def create_runner_app(
                     # message is delivered exactly once and never also
                     # drives a continuation turn (RUNNER_MESSAGE_INGEST.md
                     # Part B). Native harnesses skip the forward entirely
-                    # (Part C), so they don't need a correlation id.
-                    if not _native:
+                    # (Part C), so they don't need a correlation id; neither
+                    # does a buffer-only park (no forward will be made).
+                    if not _native and not _awaiting_approval:
                         message_body["injection_id"] = f"inj_{uuid.uuid4().hex[:16]}"
                     _logger.info(
-                        "post_session_events: buffering message for active turn conv=%s native=%s",
+                        "post_session_events: buffering message for active turn conv=%s "
+                        "native=%s awaiting_approval=%s",
                         conversation_id,
                         _native,
+                        _awaiting_approval,
                     )
                     _session_message_buffers.setdefault(
                         conversation_id,
@@ -8687,7 +8705,11 @@ def create_runner_app(
                     # never typed or typed by a stray new turn. Native
                     # sessions deliver every message through the
                     # one-at-a-time continuation drain below instead.
-                    if not _native and process_manager is not None:
+                    #
+                    # SKIPPED while an approval is parked (``_awaiting_approval``):
+                    # forwarding would steer the gated turn past a human
+                    # approval (see the buffer-only rationale above).
+                    if not _native and not _awaiting_approval and process_manager is not None:
                         try:
                             _hc = await process_manager.get_client(conversation_id, "any")
                             _injection_resp = await _hc.post(

@@ -1058,6 +1058,85 @@
         "title": "MCPServerSummary",
         "type": "object"
       },
+      "ModelUsage": {
+        "description": "Cumulative token/cost usage attributed to a single LLM model.\n\nOne value in the ``usage_by_model`` map on :class:`SessionResponse` /\n:class:`SessionUsageEvent`, keyed by the raw harness-reported model id\n(e.g. ``\"claude-sonnet-4-6\"``, ``\"databricks-gpt-5-5\"``). Counts are\nsummed over the session's subtree (itself + sub-agent descendants), so a\nparent folds in sub-agents that ran a different model. Token buckets\nmirror the flat per-session breakdown.\n\n:param input_tokens: Cumulative non-cached input (prompt) tokens for this\n    model over the subtree, e.g. ``12000``. ``None`` when not recorded.\n:param output_tokens: Cumulative output (completion) tokens, e.g.\n    ``3400``. ``None`` when not recorded.\n:param total_tokens: Cumulative total tokens (counts cache buckets too,\n    as the harness reports), e.g. ``15400``. ``None`` when not recorded.\n:param cache_read_input_tokens: Cumulative tokens read from the prompt\n    cache, e.g. ``8000``. ``None`` when not recorded.\n:param cache_creation_input_tokens: Cumulative tokens written to the\n    prompt cache, e.g. ``2000``. ``None`` when not recorded.\n:param total_cost_usd: Cumulative USD spend attributed to this model,\n    e.g. ``0.42``. Present **only when this model's turns were priced**\n    (same \"priced \u27fa key present\" contract as the session total); ``None``\n    when the model is unpriced, so the sum of priced per-model costs\n    equals the session ``total_cost_usd``.",
+        "properties": {
+          "cache_creation_input_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Cache Creation Input Tokens"
+          },
+          "cache_read_input_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Cache Read Input Tokens"
+          },
+          "input_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Input Tokens"
+          },
+          "output_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Output Tokens"
+          },
+          "total_cost_usd": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Total Cost Usd"
+          },
+          "total_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Total Tokens"
+          }
+        },
+        "title": "ModelUsage",
+        "type": "object"
+      },
       "OutputFileDoneEvent": {
         "description": "A streamed file output completed materializing.\n\nEmitted by ``_emit_file_annotation_events`` in\n``omnigent/runtime/workflow.py`` once per file annotation in\nthe assistant's output. ``filename`` and ``content_type`` are\nonly populated when the originating annotation carried them.\n\n:param type: Always ``\"response.output_file.done\"``.\n:param file_id: Identifier of the materialized file,\n    e.g. ``\"file_abc123\"``.\n:param filename: Original filename if the annotation supplied\n    one, e.g. ``\"report.pdf\"``. ``None`` otherwise.\n:param content_type: MIME content type if the annotation\n    supplied one, e.g. ``\"application/pdf\"``. ``None``\n    otherwise.",
         "properties": {
@@ -2935,7 +3014,7 @@
         "type": "object"
       },
       "SessionUsageEvent": {
-        "description": "Token-usage update from a terminal-backed integration.\n\nEmitted after an ``external_session_usage`` POST from an\nout-of-AP runtime (e.g. the ``omnigent claude`` transcript\nforwarder). Either field may be absent; clients should leave\ncached values untouched for missing fields.\n\n:param type: Always ``\"session.usage\"``.\n:param conversation_id: Session identifier.\n:param context_tokens: ``input + cache_creation + cache_read``\n    from the latest assistant ``message.usage``. ``None`` on a\n    window-only broadcast.\n:param context_window: Resolved window in tokens (e.g. 200_000\n    normally, 1_000_000 with ``opus[1m]`` / ``sonnet[1m]``).\n    ``None`` on a tokens-only broadcast.\n:param total_cost_usd: Cumulative session spend in USD after this\n    update, e.g. ``0.42`` \u2014 the server-computed total the\n    cost-budget policy gates on. Present **only when the session\n    is priced**; omitted (``None``, stripped by ``exclude_none``)\n    when unpriced or on a broadcast that carries no cost change,\n    so the client keeps its prior value (the snapshot seeds the\n    initial \"\u2014\" for an unpriced session). Once a session is priced\n    the total only grows, so it never reverts to unpriced.\n\nCategory: **transient** (SSE-only). On reconnect, clients seed\nthe ring from the session snapshot's ``last_total_tokens`` and\n``context_window``, and the cost indicator from\n``total_cost_usd``.",
+        "description": "Token-usage update from a terminal-backed integration.\n\nEmitted after an ``external_session_usage`` POST from an\nout-of-AP runtime (e.g. the ``omnigent claude`` transcript\nforwarder). Either field may be absent; clients should leave\ncached values untouched for missing fields.\n\n:param type: Always ``\"session.usage\"``.\n:param conversation_id: Session identifier.\n:param context_tokens: ``input + cache_creation + cache_read``\n    from the latest assistant ``message.usage``. ``None`` on a\n    window-only broadcast.\n:param context_window: Resolved window in tokens (e.g. 200_000\n    normally, 1_000_000 with ``opus[1m]`` / ``sonnet[1m]``).\n    ``None`` on a tokens-only broadcast.\n:param total_cost_usd: Cumulative session spend in USD after this\n    update, e.g. ``0.42`` \u2014 the server-computed total the\n    cost-budget policy gates on. Present **only when the session\n    is priced**; omitted (``None``, stripped by ``exclude_none``)\n    when unpriced or on a broadcast that carries no cost change,\n    so the client keeps its prior value (the snapshot seeds the\n    initial \"\u2014\" for an unpriced session). Once a session is priced\n    the total only grows, so it never reverts to unpriced.\n:param usage_by_model: Per-model breakdown of the same subtree usage\n    after this update, keyed by raw harness model id, e.g.\n    ``{\"claude-sonnet-4-6\": ModelUsage(input_tokens=12000, ...)}``.\n    ``None`` (stripped by ``exclude_none``) on a broadcast that carries\n    no per-model change, so the client keeps its cached map.\n\nCategory: **transient** (SSE-only). On reconnect, clients seed\nthe ring from the session snapshot's ``last_total_tokens`` and\n``context_window``, the cost indicator from ``total_cost_usd``,\nand the per-model token breakdown from ``usage_by_model``.",
         "properties": {
           "context_tokens": {
             "anyOf": [
@@ -2993,6 +3072,21 @@
             "const": "session.usage",
             "title": "Type",
             "type": "string"
+          },
+          "usage_by_model": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/ModelUsage"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Usage By Model"
           }
         },
         "required": [

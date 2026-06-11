@@ -105,6 +105,16 @@ ToolExecutor: TypeAlias = Callable[  # type: ignore[explicit-any]
     Awaitable[dict[str, Any]] | dict[str, Any],
 ]
 
+# Native-tool policy gate wired by :class:`PiExecutor`. Invoked with a native
+# (non-bridged) tool name + argument dict; returns ``{"block": bool, "reason":
+# str}``. Pi's native tools (e.g. ``read``, enabled for skill loading) execute
+# inside the Pi process and never traverse the bridged ``/mcp`` path, so the
+# ``tool_call`` extension hook routes them here for a TOOL_CALL policy verdict.
+NativePolicyGate: TypeAlias = Callable[  # type: ignore[explicit-any]
+    [str, dict[str, Any]],
+    Awaitable[dict[str, Any]] | dict[str, Any],
+]
+
 # Plain JSON value — recursive union used by ``_check_blocked`` to walk
 # parsed Pi tool-result payloads.
 JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
@@ -131,6 +141,10 @@ class _ToolServer:
         self._server: asyncio.Server | None = None
         self.port: int = 0
         self._tool_executor: ToolExecutor | None = None
+        # Policy gate for native (non-bridged) Pi tool calls, set by
+        # :meth:`PiExecutor._ensure_tool_server`. ``None`` (single-process
+        # / test paths) means native tool calls are not gated.
+        self._policy_gate: NativePolicyGate | None = None
         # Per-server bearer token required on every request. Minted at
         # construction (never None) so auth is always enforced.
         self.token: str = secrets.token_urlsafe(32)
@@ -190,8 +204,15 @@ class _ToolServer:
                 if not isinstance(raw_req_id, str) or not isinstance(raw_tool_name, str):
                     continue
                 tool_args = request.get("args", {})
-                response = await self._execute(raw_tool_name, tool_args)
-                response["id"] = raw_req_id
+                if request.get("kind") == "policy_eval":
+                    # The ``tool_call`` extension hook asks for a TOOL_CALL
+                    # verdict on a native (non-bridged) tool — evaluate only,
+                    # never execute (Pi runs the tool itself on ALLOW).
+                    verdict = await self._evaluate_policy(raw_tool_name, tool_args)
+                    response = {"id": raw_req_id, "verdict": verdict}
+                else:
+                    response = await self._execute(raw_tool_name, tool_args)
+                    response["id"] = raw_req_id
                 out = json.dumps(response, separators=(",", ":")) + "\n"
                 writer.write(out.encode("utf-8"))
                 await writer.drain()
@@ -227,6 +248,37 @@ class _ToolServer:
             return {"result": resolved}
         except Exception as exc:  # noqa: BLE001 — tool errors are surfaced via the JSON response envelope
             return {"error": str(exc)}
+
+    async def _evaluate_policy(  # type: ignore[explicit-any]
+        self,
+        name: str,
+        args: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Evaluate a native (non-bridged) tool call against TOOL_CALL policy.
+
+        Routes through the :attr:`_policy_gate` wired by
+        :meth:`PiExecutor._ensure_tool_server`. Returns ``{"block": bool,
+        "reason": str}``.
+
+        Fail-open (allow) when no gate is wired or the gate raises: this
+        mirrors the runner/scaffold policy-evaluation contract, which also
+        defaults to ALLOW on a stalled or failed verdict so a transient
+        Omnigent outage can't wedge the agent mid-turn.
+        """
+        if self._policy_gate is None:
+            return {"block": False, "reason": ""}
+        try:
+            raw = self._policy_gate(name, args)
+            resolved = await raw if asyncio.iscoroutine(raw) or asyncio.isfuture(raw) else raw
+            if isinstance(resolved, dict):
+                return {
+                    "block": bool(resolved.get("block")),
+                    "reason": str(resolved.get("reason") or ""),
+                }
+            return {"block": False, "reason": ""}
+        except Exception as exc:  # noqa: BLE001 — fail-open; the verdict path must never wedge Pi
+            logger.warning("Pi native-tool policy eval failed for %r: %s", name, exc)
+            return {"block": False, "reason": ""}
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +365,7 @@ def _generate_extension_js(port: int, tool_schemas: list[ToolSpec], token: str) 
 const net = require("net");
 
 const TOOLS = {tools_json};
+const BRIDGED = new Set(TOOLS.map((t) => t.name));
 const PORT = {port};
 const TOKEN = {token_json};
 
@@ -368,7 +421,55 @@ function callTool(toolName, args) {{
   }});
 }}
 
+/**
+ * Ask the Omnigent tool server for a TOOL_CALL policy verdict on a native
+ * (non-bridged) Pi tool. Resolves to the verdict object {{ block, reason }}
+ * or null. Fail-open (null) on any transport error: a wedged native tool
+ * would break Pi worse than a missed gate, and bridged tools stay gated
+ * server-side regardless.
+ */
+function evalNativePolicy(toolName, args) {{
+  return new Promise((resolve) => {{
+    const client = net.createConnection({{ port: PORT, host: "127.0.0.1" }}, () => {{
+      const id = Math.random().toString(36).slice(2);
+      const frame = {{ id, token: TOKEN, kind: "policy_eval", tool: toolName, args }};
+      const req = JSON.stringify(frame) + "\\n";
+      let buf = "";
+      client.on("data", (chunk) => {{
+        buf += chunk.toString();
+        const nl = buf.indexOf("\\n");
+        if (nl !== -1) {{
+          client.end();
+          try {{
+            const resp = JSON.parse(buf.slice(0, nl));
+            resolve(resp && resp.verdict ? resp.verdict : null);
+          }} catch (e) {{
+            resolve(null);
+          }}
+        }}
+      }});
+      client.on("error", () => resolve(null));
+      client.write(req);
+    }});
+    client.on("error", () => resolve(null));
+  }});
+}}
+
 module.exports = function(pi) {{
+  // Gate native (non-bridged) tool calls through Omnigent policy. Pi's
+  // native tools (e.g. ``read``, enabled for skill loading) run in-process
+  // and never traverse the bridged /mcp path, so without this hook they
+  // escape all guardrails. Bridged tools ARE evaluated server-side at /mcp,
+  // so skip them here to avoid double-evaluation (and double ASK prompts).
+  pi.on("tool_call", async (event) => {{
+    if (!event || typeof event.toolName !== "string") return;
+    if (BRIDGED.has(event.toolName)) return;
+    const verdict = await evalNativePolicy(event.toolName, event.input || {{}});
+    if (verdict && verdict.block) {{
+      return {{ block: true, reason: verdict.reason || "blocked by Omnigent policy" }};
+    }}
+  }});
+
   for (const tool of TOOLS) {{
     // Pi passes tool.parameters directly to the LLM as JSON Schema, so we
     // can use the Omnigent schema as-is without TypeBox conversion.
@@ -1456,7 +1557,41 @@ class PiExecutor(Executor):
             self._tool_server = _ToolServer()
             await self._tool_server.start()
         self._tool_server._tool_executor = self._tool_executor
+        self._tool_server._policy_gate = self._gate_native_tool
         return self._tool_server.port
+
+    async def _gate_native_tool(  # type: ignore[explicit-any]
+        self,
+        name: str,
+        args: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Evaluate a native Pi tool call against Omnigent TOOL_CALL policy.
+
+        Bridges the tool server's :attr:`_ToolServer._policy_gate` to the
+        ``_policy_evaluator`` the harness scaffold installs on this executor
+        (the same round-trip the Claude SDK executor uses for LLM_REQUEST /
+        LLM_RESPONSE policies). Mirrors the claude-native / codex-native
+        PreToolUse hooks: the verdict is computed by the Omnigent server
+        against the session's full policy set (inherited parent session
+        policies + the agent spec's guardrails).
+
+        :param name: Native tool name, e.g. ``"read"`` or ``"bash"``.
+        :param args: The tool's argument dict.
+        :returns: ``{"block": bool, "reason": str}`` — block on DENY.
+            Allow when no evaluator is wired (single-process / test paths).
+            TOOL_CALL ASK is collapsed to ALLOW/DENY server-side before the
+            verdict returns, so only DENY blocks here.
+        """
+        # ``_policy_evaluator`` is installed best-effort by the harness
+        # scaffold's executor adapter; absent on single-process / pre-turn
+        # paths. Same fetch pattern as the Claude SDK executor.
+        evaluator = getattr(self, "_policy_evaluator", None)
+        if evaluator is None:
+            return {"block": False, "reason": ""}
+        verdict = await evaluator("PHASE_TOOL_CALL", {"name": name, "arguments": args})
+        if verdict.action == "POLICY_ACTION_DENY":
+            return {"block": True, "reason": verdict.reason or "blocked by policy"}
+        return {"block": False, "reason": ""}
 
     def _build_env_and_dir(
         self,
@@ -1551,11 +1686,15 @@ class PiExecutor(Executor):
             ]
             # Pi's ``formatSkillsForPrompt`` (system-prompt.js:33,112)
             # gates skill-index injection on ``selectedTools`` including
-            # ``"read"``. Pi's native ``read`` is a local filesystem
-            # read — no Databricks API call, no policy routing needed,
-            # sandbox-safe — so enabling it alongside the bridged MCP
-            # tools is harmless and lets the model actually see (and
-            # load) the skills we wired via ``--skill <path>``.
+            # ``"read"``. Pi's native ``read`` is a local filesystem read
+            # that runs in-process and never traverses the bridged /mcp
+            # path — so enabling it lets the model see (and load) the skills
+            # we wired via ``--skill <path>``. As a native tool it would
+            # otherwise escape all guardrails, so the generated extension's
+            # ``tool_call`` hook routes it (and any other native tool) through
+            # an Omnigent TOOL_CALL policy verdict; see
+            # :func:`_generate_extension_js` and
+            # :meth:`PiExecutor._gate_native_tool`.
             if self._skills_filter != "none":
                 tool_names.append("read")
             if tool_names:

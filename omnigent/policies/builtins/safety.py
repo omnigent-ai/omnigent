@@ -23,6 +23,15 @@ _SYS_OS_TOOLS = frozenset({"sys_os_read", "sys_os_write", "sys_os_edit", "sys_os
 # inside the CLI subprocess.
 _NATIVE_OS_TOOLS = frozenset({"Bash", "Read", "Write", "Edit", "Glob", "Grep"})
 
+# Pi native tool names (lowercase), surfaced via the pi ``tool_call``
+# extension hook (see ``omnigent.inner.pi_executor._gate_native_tool``).
+# Pi runs these in-process and routes them through the same TOOL_CALL
+# policy verdict — but under its own names, distinct from the
+# Claude/Codex-cased ``_NATIVE_OS_TOOLS``. Pi uses the same argument keys
+# as the Omnigent ``sys_os_*`` tools (``path`` / ``command``), so the
+# previews below resolve without a Pi-specific arg branch.
+_PI_NATIVE_OS_TOOLS = frozenset({"read", "bash", "write", "edit"})
+
 
 # ── Rate limiting ────────────────────────────────────────────────────────────
 
@@ -70,7 +79,7 @@ def max_tool_calls_per_session(limit: int = 100) -> PolicyCallable:
 def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
     """ASK for user approval before any file or shell tool call.
 
-    Covers three tool-name families:
+    Covers four tool-name families:
 
     - **Omnigent built-in OS tools** (``sys_os_read``,
       ``sys_os_write``, ``sys_os_edit``, ``sys_os_shell``).
@@ -79,6 +88,9 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
       ``PreToolUse`` hook contract.
     - **Codex native tools** — uses the same ``PreToolUse`` hook
       contract with the same tool names (e.g. ``Bash``).
+    - **Pi native tools** (``read``, ``bash``, ``write``, ``edit``)
+      — surfaced via the pi ``tool_call`` extension hook. Lowercase
+      and distinct from the Claude/Codex casing.
 
     Returns ASK so the user sees an approval prompt before the tool
     executes.
@@ -93,10 +105,10 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
     if not isinstance(data, dict):
         return _ALLOW
     tool = data.get("name", "")
-    if tool in _SYS_OS_TOOLS or tool in _NATIVE_OS_TOOLS:
+    if tool in _SYS_OS_TOOLS or tool in _NATIVE_OS_TOOLS or tool in _PI_NATIVE_OS_TOOLS:
         args = data.get("arguments", {})
         # Build a short preview of what the tool is doing.
-        if tool in ("sys_os_shell", "Bash"):
+        if tool in ("sys_os_shell", "Bash", "bash"):
             preview = args.get("command", "") if isinstance(args, dict) else ""
         elif tool in ("Grep", "Glob"):
             preview = args.get("pattern", "") if isinstance(args, dict) else ""

@@ -81,6 +81,7 @@ import {
 } from "@/hooks/useTerminals";
 import type {
   ContentBlock,
+  ModelUsage,
   PendingInput,
   SandboxStatus,
   Session,
@@ -324,6 +325,16 @@ export interface ChatState {
    * renders "—" rather than a misleading ``$0.00``.
    */
   sessionCostUsd: number | null;
+  /**
+   * Per-model usage breakdown over the active session's subtree (itself +
+   * sub-agents), keyed by raw harness model id. Seeded from the session
+   * snapshot on bind and replaced wholesale by ``session.usage`` SSE events
+   * that carry a per-model change (an event without it leaves the cached
+   * map untouched). ``null`` until per-model usage is recorded. The
+   * agent-info popover renders this directly; any aggregate view (total
+   * tokens, total cost) is derived from this map on the frontend.
+   */
+  sessionUsageByModel: Record<string, ModelUsage> | null;
   /**
    * Worktree branch checked out for the active session, surfaced in the
    * composer status line. Seeded from the session snapshot on bind
@@ -635,6 +646,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   contextWindow: null,
   tokensUsed: null,
   sessionCostUsd: null,
+  sessionUsageByModel: null,
   gitBranch: null,
   todos: [],
   skills: [],
@@ -792,11 +804,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           pendingUserMessages: s.pendingUserMessages.map((p) =>
             p.tempId === tempId ? { ...p, posted: true } : p,
           ),
-          pendingByConversation: removeFromPendingStash(
-            s.pendingByConversation,
-            sessionId,
-            tempId,
-          ),
+          pendingByConversation: removeFromPendingStash(s.pendingByConversation, sessionId, tempId),
         }));
       }
       // Note: native-terminal messages return a `pending_id`, but the
@@ -948,11 +956,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           pendingUserMessages: s.pendingUserMessages.map((p) =>
             p.tempId === tempId ? { ...p, posted: true } : p,
           ),
-          pendingByConversation: removeFromPendingStash(
-            s.pendingByConversation,
-            sessionId,
-            tempId,
-          ),
+          pendingByConversation: removeFromPendingStash(s.pendingByConversation, sessionId, tempId),
         }));
       }
       queryClient?.invalidateQueries({ queryKey: ["conversations"] });
@@ -1112,6 +1116,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         contextWindow: null,
         tokensUsed: null,
         sessionCostUsd: null,
+        sessionUsageByModel: null,
         gitBranch: null,
         todos: [],
         skills: [],
@@ -1137,10 +1142,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
     if (!sessionId) return;
     const targetSessionId =
       get().blocks.find(
-        (b): b is ElicitationBlock =>
-          b.type === "elicitation" && b.elicitationId === elicitationId,
-      )
-        ?.targetSessionId ?? sessionId;
+        (b): b is ElicitationBlock => b.type === "elicitation" && b.elicitationId === elicitationId,
+      )?.targetSessionId ?? sessionId;
     // Optimistically flip the matching elicitation block to
     // "responded" so the buttons disappear immediately. No server
     // event confirms the approval — the agent just resumes (or
@@ -1597,8 +1600,7 @@ async function bindStream(
     const items = page.items;
 
     // Sticky-pref handoff for CLI-created sessions with no override.
-    const isClaudeNativeSession =
-      session.labels?.["omnigent.wrapper"] === "claude-code-native-ui";
+    const isClaudeNativeSession = session.labels?.["omnigent.wrapper"] === "claude-code-native-ui";
     // Binding-derived fields (isNativeTerminalSession, bound agent,
     // model/skills metadata) — shared with the session.agent_changed
     // refresh path; see sessionBindingPatch.
@@ -1801,6 +1803,7 @@ async function bindStream(
         selectedModel: effectiveModel,
         tokensUsed: session.lastTotalTokens ?? null,
         sessionCostUsd: session.totalCostUsd ?? null,
+        sessionUsageByModel: session.usageByModel ?? null,
         todos: (session.todos ?? []) as Array<{
           content: string;
           status: "pending" | "in_progress" | "completed";
@@ -1925,6 +1928,7 @@ function reconnectStatusPatch(session: Session, s: ChatState): Partial<ChatState
   if (session.contextWindow != null) patch.contextWindow = session.contextWindow;
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
   if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
+  if (session.usageByModel != null) patch.sessionUsageByModel = session.usageByModel;
   if (
     (session.status === "idle" || session.status === "failed") &&
     s.activeResponse?.state === "streaming"
@@ -2138,7 +2142,9 @@ async function reconcileOnReconnect(id: string, set: Setter, get: Getter): Promi
   // while we fetch — those are at the new end of the transcript, not proof
   // the fetched window reaches back to the pre-gap one.
   const preGapIds = new Set(
-    get().blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
+    get()
+      .blocks.map((b) => b.ctx.itemId)
+      .filter((iid): iid is string => Boolean(iid)),
   );
   // Same pre-gap capture for elicitation cards: only cards rendered
   // before the snapshot fetch are eligible for its flips — see
@@ -3111,15 +3117,20 @@ export function handleSessionEvent(event: StreamEvent): void {
       // host-bound session; `failed` retains the reason so the page
       // explains why the sandbox never came up.
       useChatStore.setState({
-        sandboxStatus:
-          event.stage === "ready" ? null : { stage: event.stage, error: event.error },
+        sandboxStatus: event.stage === "ready" ? null : { stage: event.stage, error: event.error },
       });
       return;
     case "session_usage": {
       // Apply only fields that arrived; a window-only broadcast must
       // not clobber tokensUsed (and vice versa), and a cost-only
-      // broadcast (relay path) carries neither token field.
-      const patch: { tokensUsed?: number; contextWindow?: number; sessionCostUsd?: number } = {};
+      // broadcast (relay path) carries neither token field. The
+      // per-bucket breakdown fields follow the same merge rule.
+      const patch: {
+        tokensUsed?: number;
+        contextWindow?: number;
+        sessionCostUsd?: number;
+        sessionUsageByModel?: Record<string, ModelUsage>;
+      } = {};
       if (event.contextTokens !== undefined) {
         patch.tokensUsed = event.contextTokens;
       }
@@ -3128,6 +3139,9 @@ export function handleSessionEvent(event: StreamEvent): void {
       }
       if (event.totalCostUsd !== undefined) {
         patch.sessionCostUsd = event.totalCostUsd;
+      }
+      if (event.usageByModel !== undefined) {
+        patch.sessionUsageByModel = event.usageByModel;
       }
       if (Object.keys(patch).length > 0) {
         useChatStore.setState(patch);
@@ -3247,10 +3261,7 @@ export function handleSessionEvent(event: StreamEvent): void {
           };
         }
         if (event.status === "idle" || event.status === "failed") {
-          if (
-            event.responseId !== undefined &&
-            s.activeResponse?.responseId === event.responseId
-          ) {
+          if (event.responseId !== undefined && s.activeResponse?.responseId === event.responseId) {
             patch.status = "idle";
             if (s.activeResponse.state !== "cancelled") {
               patch.activeResponse = {
@@ -3376,7 +3387,12 @@ export function handleSessionEvent(event: StreamEvent): void {
               // promoted bubble keeps the same React key (no remount).
               blocks: [
                 ...s.blocks,
-                committedUserBlock(event.itemId, content, matched.tempId, event.createdBy ?? matched.author),
+                committedUserBlock(
+                  event.itemId,
+                  content,
+                  matched.tempId,
+                  event.createdBy ?? matched.author,
+                ),
               ],
             };
           }
@@ -3393,7 +3409,12 @@ export function handleSessionEvent(event: StreamEvent): void {
             // promoted bubble keeps the same React key (no remount/flink).
             blocks: [
               ...s.blocks,
-              committedUserBlock(event.itemId, content, head.tempId, event.createdBy ?? head.author),
+              committedUserBlock(
+                event.itemId,
+                content,
+                head.tempId,
+                event.createdBy ?? head.author,
+              ),
             ],
           };
         }
@@ -3705,10 +3726,7 @@ async function* tapSessionEvents(events: AsyncIterable<StreamEvent>): AsyncItera
  * needing a closure-scoped setter. Mirrors `finalizeActive` but
  * works from the module-scope `handleSessionEvent` boundary.
  */
-function finalizeCurrentActive(
-  state: ActiveResponse["state"],
-  responseIdOverride?: string,
-): void {
+function finalizeCurrentActive(state: ActiveResponse["state"], responseIdOverride?: string): void {
   useChatStore.setState((s) => {
     if (s.activeResponse === null && responseIdOverride === undefined) return {};
     const responseId = s.activeResponse?.responseId ?? responseIdOverride ?? "";

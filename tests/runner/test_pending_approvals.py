@@ -225,3 +225,134 @@ async def test_wait_for_user_approval_publishes_on_cancellation() -> None:
     # leave permanent stuck badges on their session.
     assert len(publishes) == 1
     assert publishes[0][1]["elicitation_id"] == "elicit_cancel"
+
+
+# ---------------------------------------------------------------------------
+# has_pending — session is "awaiting human approval"
+# ---------------------------------------------------------------------------
+#
+# ``has_pending(conversation_id)`` is read by the runner's message-ingest
+# path to decide whether an incoming message may be forwarded as a mid-turn
+# injection. While a session is parked on a human approval the forward is
+# suppressed so a parent agent's ``sys_session_send`` cannot steer the gated
+# turn past the gate. These tests pin the flag's lifecycle across every exit
+# path; a leaked or missing flag either wedges every later message to the
+# session (stuck "True") or reopens the gate-jump bug (premature "False").
+
+
+def _noop_publish(_conv_id: str, _event: dict[str, Any]) -> None:
+    """Publish sink for waits whose published events aren't under test."""
+
+
+@pytest.mark.asyncio
+async def test_has_pending_false_when_nothing_parked() -> None:
+    """A session with no parked approval is not awaiting one.
+
+    If this returned True spuriously, the ingest path would suppress
+    mid-turn injection for sessions that have no gate at all — silently
+    breaking normal steering.
+    """
+    assert pending_approvals.has_pending("conv_none") is False
+
+
+@pytest.mark.asyncio
+async def test_has_pending_true_while_parked_then_false_after_accept() -> None:
+    """The flag is set for the lifetime of a park and cleared on accept.
+
+    Proves the exact window the ingest guard depends on: True from the
+    moment the wait registers until the verdict resolves it, then False.
+    A flag that stayed True after resolution would wedge every subsequent
+    message to the session.
+    """
+    wait_task = asyncio.create_task(
+        pending_approvals.wait_for_user_approval(
+            elicitation_id="elicit_hp1",
+            conversation_id="conv_hp1",
+            publish_event=_noop_publish,
+            timeout_seconds=5.0,
+        )
+    )
+    # Let the wait register + bump the session counter before observing.
+    await asyncio.sleep(0.01)
+    assert pending_approvals.has_pending("conv_hp1") is True
+
+    pending_approvals.resolve("elicit_hp1", True)
+    assert await wait_task is True
+    # Cleared on the verdict path — the gate is resolved, so messages may
+    # flow (drive a continuation) again.
+    assert pending_approvals.has_pending("conv_hp1") is False
+
+
+@pytest.mark.asyncio
+async def test_has_pending_cleared_on_timeout() -> None:
+    """A timed-out park clears the flag (the finally decrement fires).
+
+    Without this, a session whose human walked away would reject all
+    further messages forever even though the gate has lapsed.
+    """
+    approved = await pending_approvals.wait_for_user_approval(
+        elicitation_id="elicit_hp_timeout",
+        conversation_id="conv_hp_timeout",
+        publish_event=_noop_publish,
+        timeout_seconds=0.05,
+    )
+    assert approved is False
+    assert pending_approvals.has_pending("conv_hp_timeout") is False
+
+
+@pytest.mark.asyncio
+async def test_has_pending_cleared_on_cancellation() -> None:
+    """Cancelling the wait task clears the flag via the finally decrement."""
+    task = asyncio.create_task(
+        pending_approvals.wait_for_user_approval(
+            elicitation_id="elicit_hp_cancel",
+            conversation_id="conv_hp_cancel",
+            publish_event=_noop_publish,
+            timeout_seconds=10.0,
+        )
+    )
+    await asyncio.sleep(0.01)
+    assert pending_approvals.has_pending("conv_hp_cancel") is True
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert pending_approvals.has_pending("conv_hp_cancel") is False
+
+
+@pytest.mark.asyncio
+async def test_has_pending_counts_concurrent_parks() -> None:
+    """Two approvals parked on one session: the flag tracks the count.
+
+    Parallel tool calls can each trip a checkpoint, so the session may
+    hold more than one parked approval. The flag must stay True until the
+    LAST one resolves — a naive boolean (cleared by the first verdict)
+    would reopen the gate while a sibling approval is still outstanding.
+    """
+    t1 = asyncio.create_task(
+        pending_approvals.wait_for_user_approval(
+            elicitation_id="elicit_multi_1",
+            conversation_id="conv_multi",
+            publish_event=_noop_publish,
+            timeout_seconds=5.0,
+        )
+    )
+    t2 = asyncio.create_task(
+        pending_approvals.wait_for_user_approval(
+            elicitation_id="elicit_multi_2",
+            conversation_id="conv_multi",
+            publish_event=_noop_publish,
+            timeout_seconds=5.0,
+        )
+    )
+    await asyncio.sleep(0.01)
+    assert pending_approvals.has_pending("conv_multi") is True
+
+    # Resolve the first — the session is still awaiting the second.
+    pending_approvals.resolve("elicit_multi_1", True)
+    assert await t1 is True
+    assert pending_approvals.has_pending("conv_multi") is True
+
+    # Resolve the second — now the gate is fully clear.
+    pending_approvals.resolve("elicit_multi_2", False)
+    assert await t2 is False
+    assert pending_approvals.has_pending("conv_multi") is False

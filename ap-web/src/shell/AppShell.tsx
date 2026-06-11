@@ -12,6 +12,10 @@ import {
 import { derivePermissionLevel } from "@/lib/permissionsApi";
 import { isMacElectronShell } from "@/lib/nativeBridge";
 import {
+  readSessionWorkspaceState,
+  writeSessionWorkspaceState,
+} from "@/lib/sessionWorkspaceState";
+import {
   Dialog,
   DialogContent,
   DialogDescription,
@@ -100,8 +104,13 @@ import type { RightRailTab } from "./railTabs";
  * more than one agent (the root has at least one child).
  */
 export function AppShell() {
+  // Read early: the conversationId scopes the per-session workspace state
+  // (rail open/width/tab/open files) used throughout this component.
+  const { conversationId } = useParams<{ conversationId: string }>();
   const [fileViewerCommentsOpen, setFileViewerCommentsOpen] = useState(false);
-  const [rightRailTab, setRightRailTab] = useState<RightRailTab>("files");
+  const [rightRailTab, setRightRailTab] = useState<RightRailTab>(
+    () => (conversationId ? readSessionWorkspaceState(conversationId).rightRailTab ?? "files" : "files"),
+  );
   // The comments panel only contributes to the min width when the rail is
   // actually showing the file viewer — on the Terminals tab the FileViewer
   // is unmounted, so the 720 floor would just waste horizontal space.
@@ -109,15 +118,23 @@ export function AppShell() {
   // width. The panel can be dragged wider, but this floor keeps it usable at
   // its default; widening past it is the user's choice via the inline handle.
   const inlinePanelMinWidth = rightRailTab === "files" && fileViewerCommentsOpen ? 720 : undefined;
-  const { panelWidth: inlinePanelWidth, handleProps: inlinePanelHandleProps } = useResizableInlinePanel(inlinePanelMinWidth);
+  const { panelWidth: inlinePanelWidth, handleProps: inlinePanelHandleProps } = useResizableInlinePanel(
+    conversationId ?? null,
+    inlinePanelMinWidth,
+  );
   const [searchParams, setSearchParams] = useSearchParams();
   const [sidebarOpen, setSidebarOpen] = useState(initialSidebarOpen);
-  const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
+  const [selectedFilePath, setSelectedFilePath] = useState<string | null>(
+    () => (conversationId ? readSessionWorkspaceState(conversationId).selectedFilePath ?? null : null),
+  );
   // Ordered list of open file tabs. ``selectedFilePath`` is the active tab
   // (null = a scope view, Changed/All, is active). Tabs persist when the user
   // switches to a scope view or another rail tab; only ``closeFile`` removes
-  // an entry.
-  const [openFiles, setOpenFiles] = useState<string[]>([]);
+  // an entry. Seeded from the per-session store; a ?file= URL param is merged
+  // in by the conversation-restore effect below.
+  const [openFiles, setOpenFiles] = useState<string[]>(
+    () => (conversationId ? readSessionWorkspaceState(conversationId).openFiles ?? [] : []),
+  );
   // false = full folder tree ("All"), true = changed-files-only flat list.
   // Surfaced as the Changed | All toggle inside the Files panel. Seeded from
   // the persisted, app-global preference (defaults to "All") so the choice
@@ -136,6 +153,13 @@ export function AppShell() {
     () => readFilesPanelPreferences().changedOnly,
   );
   const filesPanelScopePrefRef = useRef(filesPanelFlatView);
+  // Tracks which conversation the current rail tab / open-files state belongs
+  // to, so the persist effect targets the right session even before a switch's
+  // restore has re-rendered. Set by the conversation-restore effect.
+  const stateConvRef = useRef<string | null>(conversationId ?? null);
+  // Skips the first persist run so mount can't write default state over the
+  // values the restore effect is about to apply.
+  const workspacePersistHydrated = useRef(false);
   const [filesPanelShowHidden, setFilesPanelShowHidden] = useState(false);
   // Lifted so the Changes list order and the FileViewer prev/next order
   // share one source of truth (otherwise the "X/N" index won't match the
@@ -149,10 +173,13 @@ export function AppShell() {
   // on a phone they open as full-screen overlays from the session-menu FAB.
   const [subagentsPanelOpen, setSubagentsPanelOpen] = useState(false);
   const [todosPanelOpen, setTodosPanelOpen] = useState(false);
-  // The right "Workspace" rail (WorkspacePanel) is open by default — it's a
-  // floating card the user can collapse via the header's PanelRightIcon
-  // toggle, mirroring how the sidebar can be collapsed.
-  const [rightPanelOpen, setRightPanelOpen] = useState(true);
+  // The right "Workspace" rail (WorkspacePanel) is closed by default and
+  // remembers its open/closed state per session — a brand-new session starts
+  // closed; reopening a session restores how the user last left it. Toggled
+  // via the header's PanelRightIcon, mirroring the sidebar collapse.
+  const [rightPanelOpen, setRightPanelOpen] = useState(
+    () => (conversationId ? readSessionWorkspaceState(conversationId).open ?? false : false),
+  );
   const [shareOpen, setShareOpen] = useState(false);
   const [forkOpen, setForkOpen] = useState(false);
   // Truncation point for a "fork from here" opened from a message's
@@ -163,7 +190,6 @@ export function AppShell() {
   // Agent tools & policies dialog — the mobile counterpart of the desktop
   // AgentInfoButton popover, opened from the header's three-dot menu.
   const [agentInfoOpen, setAgentInfoOpen] = useState(false);
-  const { conversationId } = useParams<{ conversationId: string }>();
   // Single source of truth for "terminal view on" — toggle and rail
   // both route through setPanelInitialKey so they can't disagree.
   const panelOpen = panelInitialKey !== null;
@@ -443,28 +469,27 @@ export function AppShell() {
     [conversationId],
   );
 
-  // Close all panels when switching conversations, but restore the
-  // Chat/TUI toggle position from sessionStorage so the user lands back
-  // in the same view they last picked for this conversation.
-  // Also restore file-viewer state from URL search params so shared links
-  // open directly to the right file/tab.
+  // Restore the per-session workspace state when switching conversations:
+  // rail open-state, selected tab, and the open file tabs. The Chat/TUI toggle
+  // is restored from sessionStorage; the Files scope and the active file also
+  // honor URL search params so shared links open to the right view.
   useEffect(() => {
     setExecutionLogsKey(null);
     setFilesPanelOpen(false);
     setSubagentsPanelOpen(false);
     setTodosPanelOpen(false);
     setFilesPanelShowHidden(false);
-    // ``rightRailTab`` intentionally NOT reset on conversation switch
-    // — keeping the user's selection sticky across navigation feels
-    // more natural now that Subagents is the parent-children nav
-    // surface. ``openFileViewer`` still pulls the rail back to Files
-    // when a file is opened so the viewer is visible.
     if (!conversationId) {
+      setRightPanelOpen(false);
+      setRightRailTab("files");
       setSelectedFilePath(null);
       setOpenFiles([]);
       setPanelInitialKeyState(null);
+      stateConvRef.current = null;
       return;
     }
+    const persisted = readSessionWorkspaceState(conversationId);
+
     const stored = sessionStorage.getItem(
       `omnigent.ap-web.panel-key:${conversationId}`,
     );
@@ -476,51 +501,90 @@ export function AppShell() {
     // user's remembered choice (defaults to "All") so the scope stays sticky
     // across session switches.
     const viewParam = searchParams.get("view");
+    // ``nextTab`` stays null when there's no explicit signal to restore a tab
+    // (no ?view=, no persisted tab, no file to surface). In that case we leave
+    // ``rightRailTab`` untouched so the tab-fallback effect can still land on
+    // the first *available* tab — forcing "files" here would shadow it.
+    let nextTab: RightRailTab | null = null;
     if (viewParam === "changed") {
       setFilesPanelFlatView(true);
-      setRightRailTab("files");
+      nextTab = "files";
     } else if (viewParam === "explore") {
       setFilesPanelFlatView(false);
-      setRightRailTab("files");
+      nextTab = "files";
     } else {
       // Fall back to the remembered choice from the in-memory ref (not a
       // fresh localStorage read) so a swallowed write can't reset the scope.
       setFilesPanelFlatView(filesPanelScopePrefRef.current);
+      nextTab = persisted.rightRailTab ?? null;
     }
 
-    // Restore open file from URL (?file=<path>).
+    // Restore the open file tabs from the per-session store, then merge the
+    // URL ?file= param: a deep-link selects (and, if absent, opens) that file
+    // without discarding the other remembered tabs.
     const fileParam = searchParams.get("file");
-    const restoredFilePath = fileParam === null || fileParam === "" ? null : fileParam;
-    setSelectedFilePath(restoredFilePath);
-    // Seed the open tabs from the restored file. Only the active file is
-    // persisted in the URL, so a reload restores a single tab.
-    setOpenFiles(restoredFilePath ? [restoredFilePath] : []);
-    // A restored file must be visible in the rail. The Agents/Todos/
-    // Terminals tabs don't render the inline viewer, so pull the rail to
-    // Files when restoring a file (mirrors openFileViewer). Without this,
-    // a ?file= reload while parked on one of those tabs shadows the viewer.
-    if (restoredFilePath) {
-      setRightRailTab((prev) =>
-        prev === "terminals" || prev === "subagents" || prev === "todos"
-          ? "files"
-          : prev,
-      );
+    const urlFile = fileParam === null || fileParam === "" ? null : fileParam;
+    const persistedFiles = persisted.openFiles ?? [];
+    const nextOpenFiles =
+      urlFile && !persistedFiles.includes(urlFile) ? [...persistedFiles, urlFile] : persistedFiles;
+    const nextSelected = urlFile ?? persisted.selectedFilePath ?? null;
+    setOpenFiles(nextOpenFiles);
+    setSelectedFilePath(nextSelected);
+    // A selected file must be visible in the rail. The Agents/Todos/Terminals
+    // tabs don't render the inline viewer, so pull the rail to Files.
+    if (nextSelected && nextTab !== "files") {
+      nextTab = "files";
     }
+    if (nextTab !== null) setRightRailTab(nextTab);
+
+    // Restore the rail open-state for this session. A deep link / reload that
+    // carries a workspace signal — a file to open (?file=), a files-scope view
+    // (?view=changed|explore), or a comment to surface (?comment=) — reveals
+    // the rail even when this session was last left closed; otherwise the
+    // linked file/comment would render into a collapsed, invisible panel. This
+    // is transient: it doesn't rewrite the session's saved open-state.
+    const commentParam = searchParams.get("comment");
+    const hasWorkspaceUrlSignal =
+      urlFile !== null ||
+      viewParam === "changed" ||
+      viewParam === "explore" ||
+      (commentParam !== null && commentParam !== "");
+    setRightPanelOpen((persisted.open ?? false) || hasWorkspaceUrlSignal);
+
+    stateConvRef.current = conversationId;
   }, [conversationId]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Persist the per-session rail tab + open file tabs whenever they change.
+  // Keyed on the state (not conversationId) and targeted at the conversation
+  // the current state belongs to (stateConvRef, set by the restore effect) so
+  // a conversation switch can't write the outgoing session's state into the
+  // incoming one. The first run (mount) is skipped so it can't clobber the
+  // store with defaults before the restore effect's values are applied.
+  useEffect(() => {
+    if (!workspacePersistHydrated.current) {
+      workspacePersistHydrated.current = true;
+      return;
+    }
+    const id = stateConvRef.current;
+    if (!id) return;
+    writeSessionWorkspaceState(id, { rightRailTab, openFiles, selectedFilePath });
+  }, [rightRailTab, openFiles, selectedFilePath]);
+
   // Sync the Files-panel scope into the URL. The tree is the default, so we
-  // only write the param for "Changed only".
+  // only write the param for "Changed only" — and only while the rail is open,
+  // since the scope is meaningless (and shouldn't deep-link the rail back open)
+  // once the workspace is collapsed. Collapsing thus drops ?view= here.
   useEffect(() => {
     setSearchParams((prev) => {
       const next = new URLSearchParams(prev);
-      if (filesPanelFlatView) {
+      if (rightPanelOpen && filesPanelFlatView) {
         next.set("view", "changed");
       } else {
         next.delete("view");
       }
       return next;
     }, { replace: true });
-  }, [filesPanelFlatView]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [filesPanelFlatView, rightPanelOpen]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Manual scope changes (the Changed | All toggle) persist the choice so it
   // sticks across session switches and page refreshes. Update the in-memory
@@ -558,6 +622,13 @@ export function AppShell() {
     setRightRailTab((prev) =>
       prev === "terminals" || prev === "subagents" || prev === "todos" ? "files" : prev,
     );
+    // Reveal the rail so the viewer is actually visible — the rail now defaults
+    // closed per session, so opening a file (e.g. via a chat file-path link)
+    // while it's collapsed would otherwise route the file into an invisible
+    // panel. Persist open=true so the rail stays in sync with the open file on
+    // the next visit (mirroring the header toggle's persistence).
+    setRightPanelOpen(true);
+    if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
     // Set URL in the callback (not a useEffect) to avoid racing with
     // FileViewer's diff-sync effect which can clobber it on mount.
     setSearchParams((prev) => {
@@ -566,7 +637,7 @@ export function AppShell() {
       next.delete("comment"); // stale comment belongs to the previous file
       return next;
     }, { replace: true });
-  }, [setPanelInitialKey, terminalFirst, setSearchParams]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [setPanelInitialKey, terminalFirst, setSearchParams, conversationId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Strip the file-viewer URL params (file/diff/comment). Memoized on
   // ``setSearchParams`` so it always closes over react-router's *current*
@@ -899,7 +970,36 @@ export function AppShell() {
             showFilesPanel={showFilesPanel}
             hasRailContent={hasRailContent}
             rightPanelOpen={rightPanelOpen}
-            onToggleRightPanel={() => setRightPanelOpen((v) => !v)}
+            onToggleRightPanel={() => {
+              const next = !rightPanelOpen;
+              if (conversationId) writeSessionWorkspaceState(conversationId, { open: next });
+              if (next) {
+                // Reopening lands back on the file remembered in per-session
+                // state, so re-add ?file= to keep the URL shareable — mirroring
+                // how the scope-sync effect re-adds ?view= on reopen. diff and
+                // comment are URL-only ephemerals (not remembered), so they
+                // intentionally don't rehydrate. Imperative (not an effect) to
+                // avoid the FileViewer diff-sync race documented in that effect.
+                if (selectedFilePath) {
+                  setSearchParams(
+                    (prev) => {
+                      const params = new URLSearchParams(prev);
+                      params.set("file", selectedFilePath);
+                      return params;
+                    },
+                    { replace: true },
+                  );
+                }
+              } else {
+                // Collapsing the rail hides the workspace, so strip the deep-
+                // link params that point into it (file/diff/comment) — otherwise
+                // the URL advertises a file that isn't shown and a reload would
+                // re-open the rail. (?view= is dropped by the scope-sync effect,
+                // which is gated on rightPanelOpen.)
+                clearFileViewerUrl();
+              }
+              setRightPanelOpen(next);
+            }}
             mobileMenu={{
               fileViewerOpen,
               panelOpen,

@@ -24,6 +24,7 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
 // Match the AppShell.test.tsx mocks except DO NOT mock SubagentsPanel —
 // we want the real one so its <Link> renders.
@@ -97,6 +98,13 @@ import { useConversations } from "@/hooks/useConversations";
 afterEach(cleanup);
 
 beforeEach(() => {
+  // The right "Workspace" rail is closed by default and remembers its
+  // open-state per session; these tests assert rail content, so seed their
+  // conversations open to reproduce the rail's pre-existing always-open state.
+  // conv_child is the parent→child navigation target.
+  writeSessionWorkspaceState("conv_root", { open: true });
+  writeSessionWorkspaceState("conv_solo", { open: true });
+  writeSessionWorkspaceState("conv_child", { open: true });
   vi.mocked(useConversations).mockReset();
   vi.mocked(useConversations).mockReturnValue({
     data: {

@@ -753,3 +753,66 @@ def test_build_subagent_with_empty_usage_does_not_inflate_parent(
     assert engine.usage["output_tokens"] == 150
     assert engine.usage["total_tokens"] == 950
     assert engine.usage["total_cost_usd"] == pytest.approx(0.58)
+
+
+def test_load_session_usage_merges_by_model_across_subtree(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    The subtree per-model breakdown unions models and sums within each.
+
+    A parent's per-model view must fold in a sub-agent that ran a *different*
+    model (otherwise a supervisor delegating to a differently-modeled worker
+    would hide that spend), and must sum repeated occurrences of the *same*
+    model across conversations. The per-model costs must still total the flat
+    subtree ``total_cost_usd`` (no double-count / drop), and the display-only
+    ``by_model`` must not leak into the policy engine's usage seed.
+    """
+    from omnigent.runtime.policies.builder import load_session_usage
+
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id
+    )
+    # Parent ran model-a. Child ran a slice of model-a plus a different model-b.
+    conversation_store.set_session_usage(
+        parent.id,
+        {
+            "input_tokens": 1000,
+            "total_cost_usd": 0.10,
+            "by_model": {"model-a": {"input_tokens": 1000, "total_cost_usd": 0.10}},
+        },
+    )
+    conversation_store.set_session_usage(
+        child.id,
+        {
+            "input_tokens": 200,
+            "total_cost_usd": 0.05,
+            "by_model": {
+                "model-a": {"input_tokens": 50, "total_cost_usd": 0.01},
+                "model-b": {"input_tokens": 150, "total_cost_usd": 0.04},
+            },
+        },
+    )
+
+    usage = load_session_usage(parent.id, conversation_store)
+    by_model = usage["by_model"]
+    # model-a folds the parent (1000 / $0.10) and the child's slice (50 / $0.01).
+    assert by_model["model-a"]["input_tokens"] == 1050
+    assert by_model["model-a"]["total_cost_usd"] == pytest.approx(0.11)
+    # model-b ran only in the child, but the parent's view still folds it in.
+    assert by_model["model-b"]["input_tokens"] == 150
+    assert by_model["model-b"]["total_cost_usd"] == pytest.approx(0.04)
+    # Per-model costs sum to the flat subtree total (0.10 + 0.05) — the
+    # no-double-count invariant that lets the UI trust the breakdown.
+    per_model_cost_sum = sum(m["total_cost_usd"] for m in by_model.values())
+    assert per_model_cost_sum == pytest.approx(0.15)
+    assert usage["total_cost_usd"] == pytest.approx(0.15)
+
+    # by_model is display-only and must be stripped from the policy engine seed.
+    engine = build_policy_engine(
+        spec=AgentSpec(spec_version=1, name="parent"),
+        conversation_id=parent.id,
+        conversation_store=conversation_store,
+    )
+    assert "by_model" not in engine.usage

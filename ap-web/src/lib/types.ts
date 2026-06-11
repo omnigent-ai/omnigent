@@ -197,6 +197,22 @@ export interface NestedSessionItem {
  *
  * Mirrors `omnigent.server.schemas.SessionResponse`.
  */
+/**
+ * Cumulative token/cost usage attributed to a single LLM model — one value
+ * in `Session.usageByModel`. Counts are summed over the session subtree.
+ * Each field is `null` when that bucket was not recorded for the model;
+ * `totalCostUsd` is `null` when the model's turns were unpriced. Mirrors
+ * `omnigent.server.schemas.ModelUsage`.
+ */
+export interface ModelUsage {
+  inputTokens: number | null;
+  outputTokens: number | null;
+  totalTokens: number | null;
+  cacheReadInputTokens: number | null;
+  cacheCreationInputTokens: number | null;
+  totalCostUsd: number | null;
+}
+
 export interface Session {
   id: string;
   agentId: string;
@@ -280,6 +296,13 @@ export interface Session {
    * cost indicator render immediately on conversation resume.
    */
   totalCostUsd?: number | null;
+  /**
+   * Per-model breakdown of the same subtree usage, keyed by the raw harness
+   * model id (e.g. `"claude-sonnet-4-6"`). Each value is the model's token
+   * buckets + optional USD cost. `null`/absent when no per-model usage has
+   * been recorded. Lets the popover show which models a session spent on.
+   */
+  usageByModel?: Record<string, ModelUsage> | null;
   /**
    * Error details from the most recently failed task. Only present
    * when ``status === "failed"`` and the task stored an error.

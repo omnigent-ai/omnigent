@@ -240,6 +240,10 @@ def _content_to_text(content: Any, bridge_dir: Path) -> str:
             elif block_type in ("input_image", "input_file"):
                 path = materialize_attachment(block, bridge_dir)
                 if path is not None:
+                    # Marker format is load-bearing: the transcript mirrors
+                    # this text back as the durable user message, and title
+                    # seeding strips lines matching _ATTACHMENT_MARKER_RE in
+                    # omnigent/entities/conversation.py. Keep in sync.
                     attachment_lines.append(f"[Attached: {path}]")
         parts = attachment_lines + text_parts
         return "\n\n".join(parts)

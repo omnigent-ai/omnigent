@@ -15,6 +15,7 @@ import { isMessageItem } from "./conversationItems";
 import type { MessageContentBlock } from "./blocks";
 import { authenticatedFetch } from "./identity";
 import type {
+  ModelUsage,
   NestedSessionItem,
   SandboxStatus,
   Session,
@@ -64,6 +65,21 @@ export interface PostEventResponse {
 }
 
 /**
+ * Wire shape of `ModelUsage` from `omnigent/server/schemas.py` — one
+ * per-model entry in `usage_by_model`. Snake-case; converted to the
+ * camelCase `ModelUsage` type at the parse boundary. Every field is
+ * optional (absent when that bucket was not recorded for the model).
+ */
+interface ModelUsageWire {
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  total_tokens?: number | null;
+  cache_read_input_tokens?: number | null;
+  cache_creation_input_tokens?: number | null;
+  total_cost_usd?: number | null;
+}
+
+/**
  * Wire shape of `SessionResponse` from
  * `omnigent/server/schemas.py`. Snake-case; converted to the
  * camelCase `Session` type at the parse boundary.
@@ -108,6 +124,12 @@ interface SessionResponseWire {
   context_window?: number | null;
   last_total_tokens?: number | null;
   total_cost_usd?: number | null;
+  /**
+   * Per-model breakdown of the same subtree usage, keyed by the raw harness
+   * model id. Each value is a `ModelUsage` (the five token buckets + optional
+   * `total_cost_usd`). Absent/`null` when no per-model usage was recorded.
+   */
+  usage_by_model?: Record<string, ModelUsageWire> | null;
   last_task_error?: { code: string; message: string } | null;
   /**
    * Outstanding `response.elicitation_request` event dicts at the
@@ -124,7 +146,11 @@ interface SessionResponseWire {
    * client that posted then navigated away / rebound re-hydrates the
    * optimistic bubble. Empty for non-native sessions.
    */
-  pending_inputs?: Array<{ pending_id: string; content: MessageContentBlock[]; created_by?: string }>;
+  pending_inputs?: Array<{
+    pending_id: string;
+    content: MessageContentBlock[];
+    created_by?: string;
+  }>;
   /**
    * Numeric permission level (1=read, 2=edit, 3=manage, 4=owner) the
    * authenticated user holds on this session. Optional on the wire
@@ -189,6 +215,30 @@ interface SessionItemsResponseWire {
  */
 export const SESSION_HISTORY_PAGE_SIZE = 20;
 
+/**
+ * Convert the snake-case `usage_by_model` wire map into the camelCase
+ * `Record<string, ModelUsage>` the store/UI use, or `null` when absent.
+ * A `null`/absent value (or `null` token bucket) maps to `null` on the
+ * camelCase side so the UI omits that row.
+ */
+function usageByModelFromWire(
+  wire: Record<string, ModelUsageWire> | null | undefined,
+): Record<string, ModelUsage> | null {
+  if (wire == null) return null;
+  const out: Record<string, ModelUsage> = {};
+  for (const [model, usage] of Object.entries(wire)) {
+    out[model] = {
+      inputTokens: usage.input_tokens ?? null,
+      outputTokens: usage.output_tokens ?? null,
+      totalTokens: usage.total_tokens ?? null,
+      cacheReadInputTokens: usage.cache_read_input_tokens ?? null,
+      cacheCreationInputTokens: usage.cache_creation_input_tokens ?? null,
+      totalCostUsd: usage.total_cost_usd ?? null,
+    };
+  }
+  return out;
+}
+
 function sessionFromWire(wire: SessionResponseWire): Session {
   return {
     id: wire.id,
@@ -211,6 +261,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     contextWindow: wire.context_window,
     lastTotalTokens: wire.last_total_tokens,
     totalCostUsd: wire.total_cost_usd,
+    usageByModel: usageByModelFromWire(wire.usage_by_model),
     lastTaskError: wire.last_task_error,
     pendingElicitations: wire.pending_elicitations ?? [],
     pendingInputs: (wire.pending_inputs ?? []).map((p) => ({
@@ -680,17 +731,12 @@ function isUserPrompt(item: ConversationItem): boolean {
  * Returns the same `{ items, hasMore }` shape as `fetchSessionItemsPage`
  * so callers feed `oldestItemId` / `hasMoreHistory` from it unchanged.
  */
-export async function fetchInitialHistoryWindow(
-  sessionId: string,
-): Promise<SessionItemsPage> {
+export async function fetchInitialHistoryWindow(sessionId: string): Promise<SessionItemsPage> {
   let items: ConversationItem[] = [];
   let hasMore = true;
   for (let pages = 0; pages < MAX_INITIAL_PAGES; pages++) {
     const cursor = items[0]?.id;
-    const page = await fetchSessionItemsPage(
-      sessionId,
-      cursor ? { olderThan: cursor } : {},
-    );
+    const page = await fetchSessionItemsPage(sessionId, cursor ? { olderThan: cursor } : {});
     items = [...page.items, ...items]; // prepend the older page
     hasMore = page.hasMore;
     if (!hasMore) break; // reached the start of the conversation

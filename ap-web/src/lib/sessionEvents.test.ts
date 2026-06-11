@@ -890,6 +890,56 @@ describe("session.usage (FLAT envelope)", () => {
     });
     expect(out).toEqual([]);
   });
+
+  it("lifts usage_by_model into a per-model map with missing buckets as null", () => {
+    const out = parse("session.usage", {
+      type: "session.usage",
+      conversation_id: "conv_abc",
+      total_cost_usd: 0.42,
+      usage_by_model: {
+        "model-a": { input_tokens: 1000, output_tokens: 500, total_cost_usd: 0.4 },
+        "model-b": { input_tokens: 200 },
+      },
+    });
+    expect(out).toHaveLength(1);
+    const ev = out[0] as SessionUsageEvent;
+    expect(ev.usageByModel).toBeDefined();
+    // Present buckets are lifted; absent buckets become null (not omitted),
+    // so the UI can distinguish "not recorded" from a real zero.
+    expect(ev.usageByModel!["model-a"].inputTokens).toBe(1000);
+    expect(ev.usageByModel!["model-a"].outputTokens).toBe(500);
+    expect(ev.usageByModel!["model-a"].totalCostUsd).toBe(0.4);
+    expect(ev.usageByModel!["model-b"].inputTokens).toBe(200);
+    expect(ev.usageByModel!["model-b"].totalCostUsd).toBeNull();
+  });
+
+  it("accepts a usage_by_model-only broadcast (no flat fields)", () => {
+    const out = parse("session.usage", {
+      type: "session.usage",
+      conversation_id: "conv_abc",
+      usage_by_model: { "model-a": { input_tokens: 1000 } },
+    });
+    expect(out).toHaveLength(1);
+    expect((out[0] as SessionUsageEvent).usageByModel!["model-a"].inputTokens).toBe(1000);
+  });
+
+  it("rejects usage_by_model with a malformed (negative) bucket", () => {
+    const out = parse("session.usage", {
+      type: "session.usage",
+      conversation_id: "conv_abc",
+      usage_by_model: { "model-a": { input_tokens: -5 } },
+    });
+    expect(out).toEqual([]);
+  });
+
+  it("rejects usage_by_model whose entry is not an object", () => {
+    const out = parse("session.usage", {
+      type: "session.usage",
+      conversation_id: "conv_abc",
+      usage_by_model: { "model-a": 1000 },
+    });
+    expect(out).toEqual([]);
+  });
 });
 
 describe("session.todos (FLAT envelope)", () => {

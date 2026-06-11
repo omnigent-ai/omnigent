@@ -45,7 +45,9 @@ const AGENT_WITH_BOTH: Agent = {
     { name: "slack", transport: "http", description: "Slack MCP", url: "https://example/slack" },
     { name: "jira", transport: "stdio", command: "jira-mcp" },
   ],
-  policies: [{ name: "slack_policy", type: "function", on: ["tool_call"], description: "guard.slack" }],
+  policies: [
+    { name: "slack_policy", type: "function", on: ["tool_call"], description: "guard.slack" },
+  ],
 };
 
 describe("AgentInfoButton", () => {
@@ -133,5 +135,80 @@ describe("AgentInfoButton session cost row", () => {
     // The rest of the popover still renders (agent name proves it opened).
     expect(screen.getByText("databricks_coding_agent")).toBeInTheDocument();
     expect(screen.queryByTestId("agent-info-session-cost")).toBeNull();
+  });
+});
+
+describe("AgentInfoButton per-model usage breakdown", () => {
+  // The breakdown reads `sessionUsageByModel` from the store; reset between
+  // cases so they stay independent.
+  beforeEach(() => {
+    useChatStore.setState({ sessionUsageByModel: null });
+  });
+
+  it("renders per-model token buckets and cost for multiple models", () => {
+    useChatStore.setState({
+      sessionUsageByModel: {
+        "claude-sonnet-4-6": {
+          inputTokens: 12000,
+          outputTokens: 3000,
+          totalTokens: 15000,
+          cacheReadInputTokens: null,
+          cacheCreationInputTokens: null,
+          totalCostUsd: 0.42,
+        },
+        "databricks-gpt-5-5": {
+          inputTokens: 800,
+          outputTokens: 200,
+          totalTokens: 1000,
+          cacheReadInputTokens: null,
+          cacheCreationInputTokens: null,
+          totalCostUsd: null,
+        },
+      },
+    });
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_models");
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+
+    // Both model groups present, labeled by raw model id.
+    expect(screen.getByTestId("agent-info-usage-by-model")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-info-model-claude-sonnet-4-6")).toHaveTextContent(
+      "claude-sonnet-4-6",
+    );
+    // The dominant model (most total tokens) leads, and its compact values
+    // and cost render; the unpriced model shows tokens but no Cost row.
+    const gpt = screen.getByTestId("agent-info-model-databricks-gpt-5-5");
+    expect(gpt).toHaveTextContent("databricks-gpt-5-5");
+    expect(gpt).toHaveTextContent("1K");
+    expect(gpt).not.toHaveTextContent("Cost");
+  });
+
+  it("renders a single model when only one contributed", () => {
+    useChatStore.setState({
+      sessionUsageByModel: {
+        "claude-sonnet-4-6": {
+          inputTokens: 12400,
+          outputTokens: 250,
+          totalTokens: 1530000,
+          cacheReadInputTokens: 8000,
+          cacheCreationInputTokens: 2000,
+          totalCostUsd: 0.42,
+        },
+      },
+    });
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_models");
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+
+    expect(screen.getByTestId("agent-info-usage-by-model")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-info-model-claude-sonnet-4-6")).toHaveTextContent(
+      "claude-sonnet-4-6",
+    );
+  });
+
+  it("hides the breakdown section when no usage is recorded", () => {
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_models");
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+    // The popover still opens (agent name proves it), but no breakdown.
+    expect(screen.getByText("databricks_coding_agent")).toBeInTheDocument();
+    expect(screen.queryByTestId("agent-info-usage-by-model")).toBeNull();
   });
 });

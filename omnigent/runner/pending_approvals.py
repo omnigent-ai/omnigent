@@ -42,6 +42,33 @@ _DEFAULT_WAIT_SECONDS: float = 120.0
 # the session-event handler reads to set the result.
 _pending: dict[str, asyncio.Future[bool]] = {}
 
+# Per-session count of outstanding ASK verdicts (a session may have more
+# than one parked at once — e.g. parallel tool calls that each tripped a
+# checkpoint). Maintained by :func:`wait_for_user_approval` around its
+# park, since that's the single entry point that knows the conversation
+# id. Read by :func:`has_pending` so the runner's message-ingest path can
+# tell a session is awaiting a human approval and must NOT have that gate
+# perturbed by a mid-turn message injection (e.g. a parent agent's
+# ``sys_session_send`` to a blocked child — that message would otherwise
+# steer the parked turn past the human gate). See the ingest guard in
+# ``omnigent/runner/app.py``.
+_session_pending: dict[str, int] = {}
+
+
+def has_pending(conversation_id: str) -> bool:
+    """
+    Whether *conversation_id* currently has an outstanding ASK verdict.
+
+    ``True`` between :func:`wait_for_user_approval` parking and its exit
+    (verdict, decline, timeout, or cancellation). Lets callers treat a
+    session as "awaiting human approval" without threading the
+    elicitation id around.
+
+    :param conversation_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :returns: ``True`` when at least one approval is parked for the session.
+    """
+    return _session_pending.get(conversation_id, 0) > 0
+
 
 def register(elicitation_id: str) -> asyncio.Future[bool]:
     """
@@ -135,12 +162,21 @@ async def wait_for_user_approval(
     """
     effective_timeout = _DEFAULT_WAIT_SECONDS if timeout_seconds is None else timeout_seconds
     fut = register(elicitation_id)
+    # Mark the session as awaiting approval for the lifetime of this park
+    # so ``has_pending`` reports it. Decremented in ``finally`` on every
+    # exit path (verdict, timeout, cancellation) so the flag never leaks.
+    _session_pending[conversation_id] = _session_pending.get(conversation_id, 0) + 1
     try:
         approved = await asyncio.wait_for(fut, timeout=effective_timeout)
     except asyncio.TimeoutError:
         approved = False
     finally:
         cleanup(elicitation_id)
+        _remaining = _session_pending.get(conversation_id, 0) - 1
+        if _remaining > 0:
+            _session_pending[conversation_id] = _remaining
+        else:
+            _session_pending.pop(conversation_id, None)
         # Signal the Omnigent server's pending-elicitations index that
         # this prompt is done. Idempotent on the happy path (the
         # AP-side dispatch already cleared the entry); on timeout
@@ -162,3 +198,4 @@ def reset_for_tests() -> None:
     from one test silently change the behavior of the next.
     """
     _pending.clear()
+    _session_pending.clear()

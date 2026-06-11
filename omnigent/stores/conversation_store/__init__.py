@@ -664,7 +664,7 @@ class ConversationStore(ABC):
     def set_session_usage(
         self,
         conversation_id: str,
-        usage: dict[str, float],
+        usage: dict[str, Any],
     ) -> None:
         """
         Persist the cumulative LLM token usage for a conversation.
@@ -678,7 +678,8 @@ class ConversationStore(ABC):
             e.g. ``"conv_abc123"``.
         :param usage: The complete usage dict to persist, e.g.
             ``{"input_tokens": 1500, "output_tokens": 350,
-            "total_tokens": 1850}``.
+            "total_tokens": 1850}``. May carry a nested ``"by_model"``
+            sub-dict (per-model token/cost buckets), hence ``Any``.
         """
         ...
 

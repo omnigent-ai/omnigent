@@ -17,6 +17,7 @@ from playwright.sync_api import Page, expect
 from tests.e2e_ui.conftest import (
     _TERMINAL_PANEL_FILE,
     _TERMINAL_PANEL_FILE_CONTENT,
+    open_right_rail,
 )
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -65,6 +66,9 @@ def test_right_panel_terminals_and_file_viewer(
 
     try:
         page.goto(f"{base_url}/c/{session_id}")
+        # The rail defaults closed per session; open it so the Shells tab and
+        # Files panel below are reachable.
+        open_right_rail(page)
 
         composer = page.get_by_placeholder("Ask the agent anything…")
         expect(composer).to_be_visible()

@@ -84,6 +84,7 @@ describe("createSession", () => {
       lastTaskError: undefined,
       lastTotalTokens: undefined,
       totalCostUsd: undefined,
+      usageByModel: null,
       llmModel: undefined,
       modelOverride: undefined,
       reasoningEffort: undefined,

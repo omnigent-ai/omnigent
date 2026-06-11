@@ -26,6 +26,8 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests.e2e_ui.conftest import open_right_rail
+
 # ---------------------------------------------------------------------------
 # Test constants
 # ---------------------------------------------------------------------------
@@ -112,6 +114,9 @@ def test_markdown_rich_text_editor_add_comment(
     """
     base_url, session_id, file_path = seeded_markdown_session
     page.goto(f"{base_url}/c/{session_id}")
+    # The rail defaults closed per session; open it so the files panel is
+    # reachable.
+    open_right_rail(page)
 
     # Wait for the markdown file to appear in the files panel. The panel
     # polls the workspace changed-files endpoint; the PUT-seeded file shows
@@ -246,6 +251,9 @@ def test_heading_text_anchor_content_excludes_prefix(
     """
     base_url, session_id, file_path = seeded_markdown_session
     page.goto(f"{base_url}/c/{session_id}")
+    # The rail defaults closed per session; open it so the files panel is
+    # reachable.
+    open_right_rail(page)
 
     # The changed-file row renders two buttons carrying the filename: the
     # file-open button (visible text) and an icon-only Download button

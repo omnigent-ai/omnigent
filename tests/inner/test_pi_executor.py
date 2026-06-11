@@ -31,6 +31,7 @@ from omnigent.inner.pi_executor import (
     _ToolServer,
 )
 from omnigent.onboarding.databricks_config import DATABRICKS_CLAUDE_DEFAULT_MODEL
+from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
 
 
 def _run(coro):
@@ -409,6 +410,35 @@ class TestGenerateExtensionJs(unittest.TestCase):
         self.assertIn("9999", js)
         self.assertIn('const TOKEN = "tok-xyz";', js)
 
+    def test_registers_native_tool_call_policy_hook(self):
+        """The extension installs a ``tool_call`` hook that gates native tools.
+
+        Pi's native tools (e.g. ``read``, enabled for skill loading) run
+        in-process and bypass the bridged ``/mcp`` policy path. The hook
+        closes that gap: it must (1) register a ``tool_call`` listener, (2)
+        skip bridged tools (already gated server-side), and (3) send a
+        ``policy_eval`` frame and block on the verdict. If any piece is
+        missing the native tools run ungated.
+        """
+        schemas = [
+            {
+                "name": "sys_os_read",
+                "description": "bridged read",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ]
+        js = _generate_extension_js(12345, schemas, "tok")
+        # (1) A tool_call hook is registered.
+        self.assertIn('pi.on("tool_call"', js)
+        # (2) Bridged tools are skipped so they aren't double-evaluated
+        # (the bridged set is built from the registered tool names).
+        self.assertIn("const BRIDGED = new Set(TOOLS.map((t) => t.name));", js)
+        self.assertIn("BRIDGED.has(event.toolName)", js)
+        # (3) Native tools are evaluated via a policy_eval frame and the
+        # block verdict is honored.
+        self.assertIn('kind: "policy_eval"', js)
+        self.assertIn("block: true", js)
+
 
 # ---------------------------------------------------------------------------
 # _ToolServer tests
@@ -617,6 +647,188 @@ class TestToolServer(unittest.TestCase):
 
         _run(_test())
 
+    def test_policy_eval_frame_blocks_on_deny(self):
+        """A ``kind=policy_eval`` frame returns the gate's DENY verdict
+        without executing the tool.
+
+        This is the native-tool gate: Pi's ``tool_call`` hook asks for a
+        verdict on a tool it will run itself. The server must consult
+        ``_policy_gate`` (not ``_tool_executor``) and surface
+        ``{"block": True, ...}``. If the dispatch branch were missing, the
+        frame would fall through to ``_execute`` and the tool executor would
+        run — so we assert the executor never fired.
+        """
+
+        async def _test():
+            server = _ToolServer()
+            await server.start()
+
+            executed = False
+
+            async def executor(name, args):
+                nonlocal executed
+                executed = True
+                return {"ok": True}
+
+            async def gate(name, args):
+                # Echo the inputs back so the assertion proves the real
+                # tool name / args reached the gate, not a fixed stub.
+                return {"block": True, "reason": f"denied {name}:{args.get('path')}"}
+
+            server._tool_executor = executor
+            server._policy_gate = gate
+
+            reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+            request = (
+                json.dumps(
+                    {
+                        "id": "pe1",
+                        "token": server.token,
+                        "kind": "policy_eval",
+                        "tool": "read",
+                        "args": {"path": "/etc/secret"},
+                    }
+                )
+                + "\n"
+            )
+            writer.write(request.encode())
+            await writer.drain()
+
+            response_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+            response = json.loads(response_line)
+            self.assertEqual(response["id"], "pe1")
+            # DENY verdict surfaced verbatim from the gate, proving the
+            # tool name + args traversed to the gate intact.
+            self.assertEqual(
+                response["verdict"], {"block": True, "reason": "denied read:/etc/secret"}
+            )
+            # Verdict-only path: the tool must NOT have executed. If this
+            # is True, the policy_eval branch wrongly fell through to
+            # _execute and the native tool ran ungated despite a DENY.
+            self.assertFalse(executed, "tool executor ran on a policy_eval frame")
+
+            writer.close()
+            await server.stop()
+
+        _run(_test())
+
+    def test_policy_eval_frame_allows(self):
+        """An ALLOW gate yields ``{"block": False}`` so Pi runs the tool."""
+
+        async def _test():
+            server = _ToolServer()
+            await server.start()
+
+            async def gate(name, args):
+                return {"block": False, "reason": ""}
+
+            server._policy_gate = gate
+
+            reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+            request = (
+                json.dumps(
+                    {
+                        "id": "pe2",
+                        "token": server.token,
+                        "kind": "policy_eval",
+                        "tool": "read",
+                        "args": {"path": "/tmp/ok"},
+                    }
+                )
+                + "\n"
+            )
+            writer.write(request.encode())
+            await writer.drain()
+
+            response_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+            response = json.loads(response_line)
+            self.assertEqual(response["verdict"], {"block": False, "reason": ""})
+
+            writer.close()
+            await server.stop()
+
+        _run(_test())
+
+    def test_policy_eval_without_gate_fails_open(self):
+        """With no ``_policy_gate`` wired, the verdict is ALLOW (fail-open).
+
+        Single-process / test paths never install a gate. The native tool
+        must still run rather than wedge — so an unset gate yields
+        ``block=False`` rather than an error.
+        """
+
+        async def _test():
+            server = _ToolServer()
+            await server.start()
+            # Deliberately leave _policy_gate unset.
+
+            reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+            request = (
+                json.dumps(
+                    {
+                        "id": "pe3",
+                        "token": server.token,
+                        "kind": "policy_eval",
+                        "tool": "read",
+                        "args": {},
+                    }
+                )
+                + "\n"
+            )
+            writer.write(request.encode())
+            await writer.drain()
+
+            response_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+            response = json.loads(response_line)
+            self.assertEqual(response["verdict"], {"block": False, "reason": ""})
+
+            writer.close()
+            await server.stop()
+
+        _run(_test())
+
+    def test_policy_eval_gate_exception_fails_open(self):
+        """A gate that raises must not wedge Pi — the verdict is ALLOW.
+
+        Mirrors the runner/scaffold contract: a transient policy-evaluation
+        failure defaults to ALLOW. If this raised instead, every native tool
+        call would error out whenever the verdict round-trip hiccupped.
+        """
+
+        async def _test():
+            server = _ToolServer()
+            await server.start()
+
+            async def gate(name, args):
+                raise RuntimeError("verdict channel down")
+
+            server._policy_gate = gate
+
+            reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+            request = (
+                json.dumps(
+                    {
+                        "id": "pe4",
+                        "token": server.token,
+                        "kind": "policy_eval",
+                        "tool": "read",
+                        "args": {},
+                    }
+                )
+                + "\n"
+            )
+            writer.write(request.encode())
+            await writer.drain()
+
+            response_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+            response = json.loads(response_line)
+            self.assertEqual(response["verdict"], {"block": False, "reason": ""})
+
+            writer.close()
+            await server.stop()
+
+        _run(_test())
+
 
 # ---------------------------------------------------------------------------
 # _PiRpcSession tests
@@ -773,6 +985,82 @@ class TestPiExecutorConstructor(unittest.TestCase):
         with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
             executor = PiExecutor()
         self.assertIn("--no-tools", executor._extra_args)
+
+
+# ---------------------------------------------------------------------------
+# PiExecutor._gate_native_tool tests
+# ---------------------------------------------------------------------------
+
+
+class TestGateNativeTool(unittest.TestCase):
+    """``_gate_native_tool`` bridges the tool server to the scaffold's
+    ``_policy_evaluator`` and maps the proto verdict to ``{block, reason}``.
+
+    This is the security-critical mapping: a TOOL_CALL DENY from the
+    Omnigent policy engine must become ``block=True`` so Pi refuses the
+    native tool. ALLOW (and the no-evaluator path) must become
+    ``block=False`` so legitimate native tool use isn't broken.
+    """
+
+    @staticmethod
+    def _executor():
+        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+            return PiExecutor()
+
+    def test_deny_verdict_blocks_with_reason(self):
+        executor = self._executor()
+        seen: dict[str, object] = {}
+
+        async def fake_evaluator(phase, data):
+            seen["phase"] = phase
+            seen["data"] = data
+            return PolicyVerdictPayload(action="POLICY_ACTION_DENY", reason="no /etc reads")
+
+        executor._policy_evaluator = fake_evaluator
+
+        verdict = _run(executor._gate_native_tool("read", {"path": "/etc/secret"}))
+
+        # DENY → block, carrying the policy's human-readable reason so the
+        # model sees why. A False here means a denied native tool would run.
+        self.assertEqual(verdict, {"block": True, "reason": "no /etc reads"})
+        # The evaluator was invoked at the TOOL_CALL phase with the real
+        # tool name + args (not a fixed stub) — proving the native call's
+        # identity reaches the policy engine.
+        self.assertEqual(seen["phase"], "PHASE_TOOL_CALL")
+        self.assertEqual(seen["data"], {"name": "read", "arguments": {"path": "/etc/secret"}})
+
+    def test_allow_verdict_does_not_block(self):
+        executor = self._executor()
+
+        async def fake_evaluator(phase, data):
+            return PolicyVerdictPayload(action="POLICY_ACTION_ALLOW")
+
+        executor._policy_evaluator = fake_evaluator
+
+        verdict = _run(executor._gate_native_tool("read", {"path": "/tmp/ok"}))
+        # ALLOW must not block — otherwise every native tool call is broken.
+        self.assertEqual(verdict, {"block": False, "reason": ""})
+
+    def test_deny_without_reason_uses_fallback(self):
+        executor = self._executor()
+
+        async def fake_evaluator(phase, data):
+            return PolicyVerdictPayload(action="POLICY_ACTION_DENY", reason=None)
+
+        executor._policy_evaluator = fake_evaluator
+
+        verdict = _run(executor._gate_native_tool("bash", {"command": "ls"}))
+        # A DENY with no reason still blocks, with a non-empty fallback so
+        # the model never sees an empty refusal.
+        self.assertEqual(verdict["block"], True)
+        self.assertEqual(verdict["reason"], "blocked by policy")
+
+    def test_no_evaluator_allows(self):
+        executor = self._executor()
+        # No _policy_evaluator installed (single-process / pre-turn path).
+        verdict = _run(executor._gate_native_tool("read", {"path": "/x"}))
+        # Fail-open: without an evaluator wired the tool must still run.
+        self.assertEqual(verdict, {"block": False, "reason": ""})
 
 
 # ---------------------------------------------------------------------------

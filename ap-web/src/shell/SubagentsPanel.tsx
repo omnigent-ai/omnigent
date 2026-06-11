@@ -167,7 +167,7 @@ function childStatus(child: ChildSessionInfo): AgentStatus {
   // so checking ``busy`` first would hide the prompt behind a generic
   // "Working" pill — exactly the signal the user needs to act on.
   if (child.pending_elicitations_count > 0) {
-    return { activity: "awaiting", label: "Need response" };
+    return { activity: "awaiting", label: "Needs response" };
   }
   // ``busy`` is the authoritative live flag (queued or in_progress);
   // ``current_task_status`` may be "completed", "failed", "cancelled",
@@ -195,7 +195,7 @@ function sessionStatus(status: string | undefined): AgentStatus {
 }
 
 // Dot color per dot-rendered state. Working uses the animated RunningDot
-// and awaiting uses the "Need response" tag, so both are excluded here.
+// and awaiting uses the "Needs response" tag, so both are excluded here.
 // "done" is a quiet, expected outcome, so it reads as a muted dot rather
 // than a loud green one — only failures keep a saturated (red) tone to draw
 // the eye.
@@ -301,7 +301,7 @@ function brandChildIcon(child: ChildSessionInfo): AgentRowIcon | null {
  * @param status - The resolved activity + label to render.
  */
 function StatusIndicator({ activity, label }: AgentStatus) {
-  // Awaiting renders the exact same "Need response" tag as the sidebar
+  // Awaiting renders the exact same "Needs response" tag as the sidebar
   // (SessionStateBadge) so the approval affordance reads identically across
   // the app. The tag carries its own copy, so the row's separate label word
   // is omitted to avoid duplicating the text.
@@ -313,7 +313,7 @@ function StatusIndicator({ activity, label }: AgentStatus) {
         data-testid="subagent-status-dot"
         className="inline-flex shrink-0 items-center text-xs"
       >
-        <Badge className="border-transparent bg-warning/15 text-warning">Need response</Badge>
+        <Badge className="border-transparent bg-warning/15 text-warning">Needs response</Badge>
       </span>
     );
   }

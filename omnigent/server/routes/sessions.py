@@ -187,6 +187,7 @@ from omnigent.server.schemas import (
     ErrorEvent,
     GrantPermissionRequest,
     MCPServerSummary,
+    ModelUsage,
     OutputItemDoneEvent,
     OutputTextDeltaEvent,
     PaginatedList,
@@ -1834,16 +1835,23 @@ def _publish_subtree_cost_to_ancestors(
     :returns: None.
     """
     for ancestor_id in _ancestor_session_ids(conv_store, session_id):
-        subtree_cost = _priced_cost_for_display(load_session_usage(ancestor_id, conv_store))
-        if subtree_cost is None:
-            # Ancestor's subtree has no priced cost yet — leave its badge
-            # showing "—"/its snapshot value rather than emit $0.00.
+        ancestor_usage = load_session_usage(ancestor_id, conv_store)
+        subtree_cost = _priced_cost_for_display(ancestor_usage)
+        usage_by_model = _usage_by_model_for_display(ancestor_usage)
+        if subtree_cost is None and usage_by_model is None:
+            # Ancestor's subtree has no priced cost or token usage yet —
+            # leave its badge showing "—"/its snapshot value rather than
+            # emit $0.00.
             continue
-        event = SessionUsageEvent(
-            type="session.usage",
-            conversation_id=ancestor_id,
-            total_cost_usd=subtree_cost,
-        )
+        payload: dict[str, Any] = {
+            "type": "session.usage",
+            "conversation_id": ancestor_id,
+        }
+        if subtree_cost is not None:
+            payload["total_cost_usd"] = subtree_cost
+        if usage_by_model is not None:
+            payload["usage_by_model"] = usage_by_model
+        event = SessionUsageEvent(**payload)
         session_stream.publish(ancestor_id, event.model_dump(exclude_none=True))
 
 
@@ -1941,7 +1949,7 @@ def _build_session_response(
     runner_online: bool | None = None,
     host_online: bool | None = None,
     pending_elicitation_events: list[dict[str, Any]] | None = None,
-    subtree_usage: dict[str, float] | None = None,
+    subtree_usage: dict[str, Any] | None = None,
 ) -> SessionResponse:
     """
     Build a :class:`SessionResponse` from store-side entities.
@@ -2009,6 +2017,11 @@ def _build_session_response(
             "Session has no agent binding",
             code=ErrorCode.INTERNAL_ERROR,
         )
+    # Usage to display for this node: the SUBTREE total (this session + its
+    # sub-agents) when the caller computed it, else this conversation's own
+    # usage. Shared by the cost indicator and the per-model breakdown so
+    # both read the same numbers.
+    display_usage = subtree_usage if subtree_usage is not None else (conv.session_usage or {})
     return SessionResponse(
         id=conv.id,
         agent_id=conv.agent_id,
@@ -2038,9 +2051,10 @@ def _build_session_response(
         # it, so a parent's badge reflects its sub-agents' spend; falls
         # back to this conversation's own usage otherwise. A priced
         # cumulative total, or None (rendered "—") when never priced.
-        total_cost_usd=_priced_cost_for_display(
-            subtree_usage if subtree_usage is not None else (conv.session_usage or {})
-        ),
+        total_cost_usd=_priced_cost_for_display(display_usage),
+        # Per-model breakdown over the same subtree usage. None (omitted)
+        # when no per-model usage was recorded.
+        usage_by_model=_usage_by_model_for_display(display_usage),
         last_task_error=last_task_error,
         external_session_id=conv.external_session_id,
         terminal_launch_args=conv.terminal_launch_args,
@@ -2327,7 +2341,7 @@ def _record_daily_cost(
     conversation_store.add_daily_cost(owner, _utc_day(now_epoch()), delta_usd)
 
 
-def _priced_cost_for_display(usage: dict[str, float]) -> float | None:
+def _priced_cost_for_display(usage: dict[str, Any]) -> float | None:
     """
     Extract ``total_cost_usd`` for client display, or ``None`` when unpriced.
 
@@ -2348,6 +2362,106 @@ def _priced_cost_for_display(usage: dict[str, float]) -> float | None:
         # Defensive: a malformed persisted value must not break the
         # snapshot / SSE emit. Treat it as unpriced.
         return None
+
+
+def _model_usage_bucket(usage: dict[str, Any], model: str) -> dict[str, float]:
+    """
+    Get-or-create the per-model usage sub-bucket inside ``usage["by_model"]``.
+
+    The nested ``by_model`` map attributes token/cost usage to the specific
+    LLM that produced it, keyed on the raw harness-reported model id (faithful
+    and simplest — alias normalization is intentionally deferred). This mutates
+    ``usage`` in place, creating ``by_model`` and the per-model dict on first
+    use, and returns the model's bucket for the caller to increment / set.
+
+    :param usage: The conversation's mutable ``session_usage`` dict.
+    :param model: The raw harness model id, e.g. ``"claude-sonnet-4-6"`` or
+        ``"databricks-gpt-5-5"``.
+    :returns: The mutable per-model bucket, e.g. ``{"input_tokens": 1200}``.
+    """
+    by_model = usage.setdefault("by_model", {})
+    return by_model.setdefault(model, {})
+
+
+# Per-model token bucket keys (the five counters stored inside each
+# ``by_model[<model>]`` sub-dict). Used by :func:`_usage_by_model_for_display`
+# to coerce persisted values to ``int`` and by the native write path to copy
+# flat session counters into the per-model bucket.
+_MODEL_TOKEN_KEYS = (
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+)
+
+
+def _add_model_usage_delta(
+    bucket: dict[str, float],
+    token_deltas: dict[str, int],
+    cost_delta: float | None,
+) -> None:
+    """
+    Add one turn's per-model token/cost deltas into a model bucket (ADD).
+
+    Mirrors the flat-counter increments in :func:`_accumulate_session_usage`
+    so the per-model totals stay consistent with the flat totals: every flat
+    increment is matched by an increment to exactly one model bucket, so the
+    sum of per-model buckets equals the flat total. ``cost_delta`` is added
+    only when the turn was priced (``None`` otherwise), preserving the
+    "priced ⟺ ``total_cost_usd`` key present" contract at the per-model level.
+
+    :param bucket: The model's mutable bucket from :func:`_model_usage_bucket`.
+    :param token_deltas: This turn's per-bucket token counts to add, keyed by
+        the same names as :data:`_TOKEN_BREAKDOWN_KEYS`, e.g.
+        ``{"input_tokens": 1200, "output_tokens": 340, ...}``.
+    :param cost_delta: This turn's priced cost in USD to add, or ``None`` when
+        the turn was unpriced (the model's cost key stays absent).
+    """
+    for key, delta in token_deltas.items():
+        bucket[key] = bucket.get(key, 0) + delta
+    if cost_delta is not None:
+        bucket["total_cost_usd"] = bucket.get("total_cost_usd", 0.0) + cost_delta
+
+
+def _usage_by_model_for_display(usage: dict[str, Any]) -> dict[str, ModelUsage] | None:
+    """
+    Project the nested ``by_model`` usage map into typed :class:`ModelUsage`.
+
+    Companion to :func:`_token_breakdown_for_display` for the per-model view:
+    reads ``usage["by_model"]`` (the subtree-summed map from
+    :func:`load_session_usage`) and builds a ``{model_id: ModelUsage}`` dict
+    for the API. Token buckets are coerced to ``int`` and ``total_cost_usd``
+    to ``float``; an absent bucket stays ``None`` on the model (so a model
+    that was never priced has no cost), and malformed values are skipped.
+
+    :param usage: A subtree-summed usage dict, e.g.
+        ``{"input_tokens": 1500, "by_model": {"claude-sonnet-4-6":
+        {"input_tokens": 1500, "total_cost_usd": 0.42}}}``.
+    :returns: The per-model map, or ``None`` when no per-model usage is
+        present (so ``exclude_none`` omits the field entirely).
+    """
+    by_model = usage.get("by_model")
+    if not isinstance(by_model, dict) or not by_model:
+        return None
+    result: dict[str, ModelUsage] = {}
+    for model, bucket in by_model.items():
+        if not isinstance(bucket, dict):
+            continue
+        fields: dict[str, Any] = {}
+        for key in _MODEL_TOKEN_KEYS:
+            value = bucket.get(key)
+            if value is None:
+                continue
+            try:
+                fields[key] = int(value)
+            except (TypeError, ValueError):
+                continue
+        cost = _priced_cost_for_display(bucket)
+        if cost is not None:
+            fields["total_cost_usd"] = cost
+        result[model] = ModelUsage(**fields)
+    return result or None
 
 
 def _accumulate_session_usage(
@@ -2432,12 +2546,29 @@ def _accumulate_session_usage(
         from omnigent.llms.context_window import compute_llm_cost, fetch_model_pricing
 
         pricing = fetch_model_pricing(llm_model)
+        priced = pricing is not None
         if pricing is not None:
             # Cache-aware: usage_obj carries cache_read/cache_creation
             # token counts when the harness reports them; compute_llm_cost
             # prices them at their own (cheaper read / pricier write) rates.
             cost_delta = compute_llm_cost(usage_obj, pricing)
             current["total_cost_usd"] = current.get("total_cost_usd", 0.0) + cost_delta
+        # Per-model attribution (ADD). Tokens are attributed whenever the
+        # model is known — including unpriced turns — so the per-model token
+        # view is complete; cost is attributed only when this model's turn
+        # was priced (passing ``None`` otherwise keeps the model's cost key
+        # absent, matching the flat "priced ⟺ key present" contract).
+        _add_model_usage_delta(
+            _model_usage_bucket(current, llm_model),
+            {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": total_tokens,
+                "cache_read_input_tokens": cache_read_input_tokens,
+                "cache_creation_input_tokens": cache_creation_input_tokens,
+            },
+            cost_delta if priced else None,
+        )
 
     conversation_store.set_session_usage(session_id, current)
     # Per-user daily rollup (policy-gated; this is the per-turn delta).
@@ -2537,14 +2668,21 @@ def _persist_native_cumulative_usage(
             + int(current.get("output_tokens", 0))
         )
 
+    # Resolve the model only when tokens are present — both the token-pricing
+    # branch and the per-model attribution below need it, and both are gated on
+    # tokens. Resolving lazily avoids calling ``_resolve_llm_model`` (which
+    # touches the runtime agent cache) on a cost-only broadcast. Computed once
+    # out of the pricing-only branch so attribution works even on an unpriced
+    # turn. The raw harness model id wins; falls back to the agent spec's model.
+    has_tokens = cin is not None or cout is not None
+    model_name = (data.get("model") or _resolve_llm_model(conv)) if has_tokens else None
     if cost is not None:
         current["total_cost_usd"] = float(cost)
-    elif cin is not None or cout is not None:
-        model = data.get("model") or _resolve_llm_model(conv)
-        if isinstance(model, str) and model:
+    elif has_tokens:
+        if isinstance(model_name, str) and model_name:
             from omnigent.llms.context_window import compute_llm_cost, fetch_model_pricing
 
-            pricing = fetch_model_pricing(model)
+            pricing = fetch_model_pricing(model_name)
             if pricing is not None:
                 # SET (cumulative) — price the running token totals.
                 # ``current`` carries the cache-read split when the harness
@@ -2553,6 +2691,23 @@ def _persist_native_cumulative_usage(
                 # rate for cache tokens when the catalog omits a cache price
                 # (e.g. ``databricks-*`` entries today).
                 current["total_cost_usd"] = compute_llm_cost(current, pricing)
+
+    # Per-model attribution (SET). Native harnesses report cumulative SESSION
+    # totals, not per-model splits, so attribute the running cumulative buckets
+    # to the current model. For the usual single-model native session this
+    # makes the per-model view equal the flat totals; on a mid-session model
+    # switch the current model absorbs the cumulative (splitting deferred —
+    # keyed on the raw harness model id). Cost mirrors the flat
+    # ``total_cost_usd`` so the per-model cost key is present iff priced.
+    # ``model_name`` is only set when tokens are present, so this is skipped
+    # for cost-only broadcasts (nothing to attribute per-model).
+    if isinstance(model_name, str) and model_name:
+        bucket = _model_usage_bucket(current, model_name)
+        for key in _MODEL_TOKEN_KEYS:
+            if key in current:
+                bucket[key] = current[key]
+        if "total_cost_usd" in current:
+            bucket["total_cost_usd"] = current["total_cost_usd"]
 
     # Enforcement value (claude-native display/policy split). Stored
     # separately from the displayed ``total_cost_usd`` so the gate can read
@@ -2677,9 +2832,9 @@ async def _persist_external_session_usage(
     # hide in-flight sub-agent spend until the next child flush (the badge would
     # oscillate own ⇄ subtree). For a childless session the subtree is just
     # itself, so this equals own cost — one indexed tree query per flush.
-    subtree_cost = _priced_cost_for_display(
-        await asyncio.to_thread(load_session_usage, session_id, conversation_store)
-    )
+    subtree_usage = await asyncio.to_thread(load_session_usage, session_id, conversation_store)
+    subtree_cost = _priced_cost_for_display(subtree_usage)
+    usage_by_model = _usage_by_model_for_display(subtree_usage)
     # Only include fields that were sent; the client treats absent
     # fields as "no change" so a window-only update doesn't zero tokens.
     # ``total_cost_usd`` is included only when the subtree is priced
@@ -2695,6 +2850,8 @@ async def _persist_external_session_usage(
         event_payload["context_window"] = raw_window
     if subtree_cost is not None:
         event_payload["total_cost_usd"] = subtree_cost
+    if usage_by_model is not None:
+        event_payload["usage_by_model"] = usage_by_model
     event = SessionUsageEvent(**event_payload)
     session_stream.publish(session_id, event.model_dump(exclude_none=True))
     # This session's usage also moves its ANCESTORS' subtree cost (its spend
@@ -7499,8 +7656,18 @@ async def _flush_relay_text(
     text→function_call boundary (not only at ``response.completed``) keeps
     the persisted transcript interleaved — ``[text, tool, text, tool]`` —
     instead of collapsing a turn's narration into one block after its tool
-    calls (which renders tools-above-text + run-on text on reload). The
-    message is persist-only (live clients already rendered the deltas).
+    calls (which renders tools-above-text + run-on text on reload).
+
+    After a confirmed persist the item is also published to the live
+    stream as ``response.output_item.done`` (mirroring the native path's
+    :func:`_publish_external_conversation_item`). Live clients already
+    rendered the text from the deltas; the publish delivers the
+    store-assigned item id so they can stamp it onto the streamed block.
+    Without it the rendered block stays id-less and every reconnect's
+    itemId-keyed reconciliation splices the persisted copy in as a
+    duplicate. Clients dedupe the event itself by response id / content
+    equality (web ``blockStream.ts`` ``message_done``; the TUI's
+    ``_plan_output_item_render`` skips re-rendering when deltas streamed).
 
     The buffer and the in-flight replay are cleared ONLY after the append
     is confirmed: clearing first would let a reconnect during the persist
@@ -7544,7 +7711,7 @@ async def _flush_relay_text(
                 },
             ),
         )
-        await asyncio.to_thread(conversation_store.append, session_id, [item])
+        persisted = await asyncio.to_thread(conversation_store.append, session_id, [item])
     except Exception:
         # Keep text_acc + the in-flight buffer so the narration isn't lost:
         # it still replays on reconnect and is retried at the next flush.
@@ -7558,6 +7725,15 @@ async def _flush_relay_text(
     # stale replay together.
     text_acc.clear()
     inflight_text.reset_text(session_id)
+    # Publish the persisted item so live clients learn its store-assigned
+    # id and stamp it onto the already-rendered streamed text (see the
+    # docstring). Ordered before the boundary item / terminal event the
+    # caller publishes next, so the client's text section is still open.
+    done_event = OutputItemDoneEvent(
+        type="response.output_item.done",
+        item=persisted[0].to_api_dict(),
+    )
+    session_stream.publish(session_id, done_event.model_dump())
 
 
 async def _relay_runner_stream(
@@ -7854,44 +8030,51 @@ async def _relay_runner_stream(
                     # response so policy callables can read
                     # event["context"]["usage"]["total_cost_usd"].
                     if evt_type == "response.completed":
-                        _priced_cost = _accumulate_session_usage(
+                        # Persist the turn's usage (cost + token buckets) so
+                        # policy callables can read
+                        # event["context"]["usage"]["total_cost_usd"] and the
+                        # subtree roll-up below sees the new totals.
+                        _accumulate_session_usage(
                             event.get("response", {}),
                             session_id,
                             conversation_store,
                         )
-                        # Push the server-computed cost to the web client's
-                        # cost indicator, rolled up over the spawn subtree.
-                        # The session's own event carries its SUBTREE total
-                        # (this conversation + its sub-agents), and each
-                        # ancestor gets its own subtree total on its own
-                        # stream — so a supervisor's badge includes its
-                        # sub-agents and a parent updates live when a relay
-                        # sub-agent spends. Mirrors the native path
-                        # (_persist_external_session_usage); the roll-up was
-                        # wired for native only, but relay agents (e.g.
-                        # claude-sdk) need it too. Cost-only broadcast:
-                        # context_tokens/window already ride on the
-                        # response.completed event. Skipped when this turn
-                        # was unpriced (no subtree total changed), so the
-                        # snapshot's "—" stands. Threaded: store reads +
-                        # SSE fan-out.
-                        if _priced_cost is not None:
-                            _subtree_cost = _priced_cost_for_display(
-                                await asyncio.to_thread(
-                                    load_session_usage,
-                                    session_id,
-                                    conversation_store,
-                                )
-                            )
+                        # Push the server-computed cost AND token breakdown
+                        # to the web client's session indicator, rolled up
+                        # over the spawn subtree. The session's own event
+                        # carries its SUBTREE total (this conversation + its
+                        # sub-agents), and each ancestor gets its own subtree
+                        # total on its own stream — so a supervisor's badge
+                        # includes its sub-agents and a parent updates live
+                        # when a relay sub-agent spends. Mirrors the native
+                        # path (_persist_external_session_usage); the roll-up
+                        # was wired for native only, but relay agents (e.g.
+                        # claude-sdk) need it too. Cost is included only when
+                        # priced; the token breakdown rides along whenever any
+                        # bucket is recorded (so an unpriced session still
+                        # surfaces tokens). context_tokens/window already ride
+                        # on the response.completed event. Threaded: store
+                        # reads + SSE fan-out.
+                        _subtree_usage = await asyncio.to_thread(
+                            load_session_usage,
+                            session_id,
+                            conversation_store,
+                        )
+                        _subtree_cost = _priced_cost_for_display(_subtree_usage)
+                        _usage_by_model = _usage_by_model_for_display(_subtree_usage)
+                        if _subtree_cost is not None or _usage_by_model is not None:
+                            _usage_payload: dict[str, Any] = {
+                                "type": "session.usage",
+                                "conversation_id": session_id,
+                            }
                             if _subtree_cost is not None:
-                                session_stream.publish(
-                                    session_id,
-                                    SessionUsageEvent(
-                                        type="session.usage",
-                                        conversation_id=session_id,
-                                        total_cost_usd=_subtree_cost,
-                                    ).model_dump(exclude_none=True),
-                                )
+                                _usage_payload["total_cost_usd"] = _subtree_cost
+                            if _usage_by_model is not None:
+                                _usage_payload["usage_by_model"] = _usage_by_model
+                            session_stream.publish(
+                                session_id,
+                                SessionUsageEvent(**_usage_payload).model_dump(exclude_none=True),
+                            )
                             await asyncio.to_thread(
                                 _publish_subtree_cost_to_ancestors,
                                 conversation_store,

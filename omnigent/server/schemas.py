@@ -1325,6 +1325,42 @@ class SandboxStatus(BaseModel):
     error: str | None = None
 
 
+class ModelUsage(BaseModel):
+    """
+    Cumulative token/cost usage attributed to a single LLM model.
+
+    One value in the ``usage_by_model`` map on :class:`SessionResponse` /
+    :class:`SessionUsageEvent`, keyed by the raw harness-reported model id
+    (e.g. ``"claude-sonnet-4-6"``, ``"databricks-gpt-5-5"``). Counts are
+    summed over the session's subtree (itself + sub-agent descendants), so a
+    parent folds in sub-agents that ran a different model. Token buckets
+    mirror the flat per-session breakdown.
+
+    :param input_tokens: Cumulative non-cached input (prompt) tokens for this
+        model over the subtree, e.g. ``12000``. ``None`` when not recorded.
+    :param output_tokens: Cumulative output (completion) tokens, e.g.
+        ``3400``. ``None`` when not recorded.
+    :param total_tokens: Cumulative total tokens (counts cache buckets too,
+        as the harness reports), e.g. ``15400``. ``None`` when not recorded.
+    :param cache_read_input_tokens: Cumulative tokens read from the prompt
+        cache, e.g. ``8000``. ``None`` when not recorded.
+    :param cache_creation_input_tokens: Cumulative tokens written to the
+        prompt cache, e.g. ``2000``. ``None`` when not recorded.
+    :param total_cost_usd: Cumulative USD spend attributed to this model,
+        e.g. ``0.42``. Present **only when this model's turns were priced**
+        (same "priced ⟺ key present" contract as the session total); ``None``
+        when the model is unpriced, so the sum of priced per-model costs
+        equals the session ``total_cost_usd``.
+    """
+
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
+    total_cost_usd: float | None = None
+
+
 class SessionResponse(BaseModel):
     """
     API representation of a session.
@@ -1439,6 +1475,12 @@ class SessionResponse(BaseModel):
         the same total the cost-budget policy gates on. Lets clients
         seed their cost indicator on resume without waiting for the
         next ``session.usage`` SSE event.
+    :param usage_by_model: Per-model breakdown of the same subtree usage,
+        keyed by the raw harness model id, e.g.
+        ``{"claude-sonnet-4-6": ModelUsage(input_tokens=12000, ...)}``.
+        ``None`` when no per-model usage has been recorded (older sessions
+        recorded before this field existed, or before the first turn). Lets
+        the UI show which models a session spent its tokens / budget on.
     :param last_task_error: Error details from the most recently
         failed task. Only present when ``status == "failed"`` and
         the task stored an error. Lets clients display the failure
@@ -1549,6 +1591,7 @@ class SessionResponse(BaseModel):
     context_window: int | None = None
     last_total_tokens: int | None = None
     total_cost_usd: float | None = None
+    usage_by_model: dict[str, ModelUsage] | None = None
     last_task_error: dict[str, str] | None = None
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
@@ -2012,11 +2055,16 @@ class SessionUsageEvent(_SSEEventBase):
         so the client keeps its prior value (the snapshot seeds the
         initial "—" for an unpriced session). Once a session is priced
         the total only grows, so it never reverts to unpriced.
+    :param usage_by_model: Per-model breakdown of the same subtree usage
+        after this update, keyed by raw harness model id, e.g.
+        ``{"claude-sonnet-4-6": ModelUsage(input_tokens=12000, ...)}``.
+        ``None`` (stripped by ``exclude_none``) on a broadcast that carries
+        no per-model change, so the client keeps its cached map.
 
     Category: **transient** (SSE-only). On reconnect, clients seed
     the ring from the session snapshot's ``last_total_tokens`` and
-    ``context_window``, and the cost indicator from
-    ``total_cost_usd``.
+    ``context_window``, the cost indicator from ``total_cost_usd``,
+    and the per-model token breakdown from ``usage_by_model``.
     """
 
     type: Literal["session.usage"]
@@ -2024,6 +2072,7 @@ class SessionUsageEvent(_SSEEventBase):
     context_tokens: int | None = None
     context_window: int | None = None
     total_cost_usd: float | None = None
+    usage_by_model: dict[str, ModelUsage] | None = None
 
 
 class SessionModelEvent(_SSEEventBase):

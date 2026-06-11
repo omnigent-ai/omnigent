@@ -374,11 +374,13 @@ def blast_radius(
             factory params).
         :returns: ALLOW / ASK / DENY decision dict.
         """
-        # Match the Omnigent built-in OS shell and the Claude/Codex native
-        # Bash tool — the PreToolUse hook reports BOTH harnesses' shell tool as
-        # ``Bash`` with a string ``command`` (codex normalizes to this shape),
-        # so one match set covers both.
-        args = _tool_call(event, {"sys_os_shell", "Bash"})
+        # Match the Omnigent built-in OS shell, the Claude/Codex native
+        # Bash tool, and Pi's native lowercase ``bash``. The PreToolUse hook
+        # reports BOTH CLI harnesses' shell tool as ``Bash`` with a string
+        # ``command`` (codex normalizes to this shape); Pi's ``tool_call``
+        # hook reports ``bash`` with the same ``command`` key — so one match
+        # set covers all three.
+        args = _tool_call(event, {"sys_os_shell", "Bash", "bash"})
         if args is None:
             return _ALLOW
         command = args.get("command")
@@ -536,9 +538,12 @@ def worktree_guard(
     :returns: An evaluator ``fn(event, config)`` returning a V0 decision.
     """
 
-    # Match both Omnigent built-in OS write/edit and Claude/Codex
-    # native Write/Edit tools (surfaced via the PreToolUse hook).
-    _write_tools = {"sys_os_write", "sys_os_edit", "Write", "Edit"}
+    # Match Omnigent built-in OS write/edit, Claude/Codex native Write/Edit
+    # (surfaced via the PreToolUse hook), and Pi's native lowercase
+    # write/edit (surfaced via the pi ``tool_call`` hook). Pi uses the same
+    # ``path`` argument key as the Omnigent tools, so no Pi-specific arg
+    # branch is needed below.
+    _write_tools = {"sys_os_write", "sys_os_edit", "Write", "Edit", "write", "edit"}
 
     def _evaluate(event: _Json, config: _Json) -> _Json:  # noqa: ARG001
         """
@@ -570,9 +575,9 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
         "handler": "omnigent.inner.nessie.policies.blast_radius",
         "kind": "factory",
         "name": "Block Dangerous Shell Commands (force-push, rm -rf)",
-        "description": "Classifies shell commands (sys_os_shell and Claude/Codex native Bash) "
-        "as safe, risky (ASK), or catastrophic (DENY) to prevent destructive operations "
-        "like force-push or rm -rf /",
+        "description": "Classifies shell commands (sys_os_shell, Claude/Codex native Bash, "
+        "and Pi native bash) as safe, risky (ASK), or catastrophic (DENY) to prevent "
+        "destructive operations like force-push or rm -rf /",
     },
     {
         "handler": "omnigent.inner.nessie.policies.spawn_bounds",
@@ -592,7 +597,8 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
         "handler": "omnigent.inner.nessie.policies.worktree_guard",
         "kind": "factory",
         "name": "Restrict Writes to Git Worktree",
-        "description": "Blocks file writes (sys_os_write/edit and Claude/Codex native "
-        "Write/Edit) outside the worker's git worktree to prevent cross-branch contamination",
+        "description": "Blocks file writes (sys_os_write/edit, Claude/Codex native "
+        "Write/Edit, and Pi native write/edit) outside the worker's git worktree to "
+        "prevent cross-branch contamination",
     },
 ]
