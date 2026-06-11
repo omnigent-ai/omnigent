@@ -12,20 +12,16 @@ from omnigent.inner.mascots import (
 )
 
 
-def test_random_mascot_lines_returns_centered_happy_otto() -> None:
-    """The TUI mascot uses the selected centered Otto-like six-line art."""
+def test_random_mascot_lines_returns_compact_octopus() -> None:
+    """The TUI mascot uses the compact two-line octopus art."""
 
     lines = random_mascot_lines()
 
     assert lines == [
-        "      ╭────╮     ",
-        "   ╭──╯    ╰──╮  ",
-        "  ╭╯          ╰╮ ",
-        " ╭╯    ◕ᴗ◕     ╰╮",
-        " ╰╮            ╭╯",
-        "  ╰╯  ╰╯  ╰╯  ╰╯ ",
+        "( ◉ ‿ ◉ )",
+        " ~)|)|(~ ",
     ]
-    assert MASCOT_ART_COL_WIDTH == 17
+    assert MASCOT_ART_COL_WIDTH == 9
     assert all(len(line) == MASCOT_ART_COL_WIDTH for line in lines)
 
 

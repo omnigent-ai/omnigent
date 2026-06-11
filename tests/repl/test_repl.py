@@ -1401,14 +1401,14 @@ def test_startup_header_box_includes_folder_model_and_credential() -> None:
         folder="~/omnigent",
         description="Multi-agent coding orchestrator",
         model_label="claude-sonnet-4-6",
-        credential="🎟️ Subscription",
+        credential="Subscription",
         creds_line=None,
     )
     plain = re.sub(r"\x1b\[[0-9;]*m", "", _render_startup_banner_ansi("nessie", header=header))
     # Every header field appears in the rendered box.
     assert "Multi-agent coding orchestrator" in plain  # one-line summary row
     assert "claude-sonnet-4-6" in plain  # model row
-    assert "🎟️ Subscription" in plain  # credential row (glyph + shared label)
+    assert "Subscription" in plain  # credential row (glyphless — see _header_glyph)
     assert "~/omnigent" in plain  # working-folder row
     # No separate creds line was requested, so none is appended.
     assert "→" not in plain
@@ -1432,12 +1432,12 @@ def test_startup_header_appends_per_family_creds_line() -> None:
         folder="~/wd",
         description=None,
         model_label="claude-sonnet-4-6",
-        credential="🎟️ Subscription",
-        creds_line="Claude → 🎟️ Subscription   ·   Codex → 🎟️ Subscription",
+        credential="Subscription",
+        creds_line="Claude → Subscription   ·   Codex → Subscription",
     )
     plain = re.sub(r"\x1b\[[0-9;]*m", "", _render_startup_banner_ansi("nessie", header=header))
-    assert "Claude → 🎟️ Subscription" in plain
-    assert "Codex → 🎟️ Subscription" in plain
+    assert "Claude → Subscription" in plain
+    assert "Codex → Subscription" in plain
     # A personality-laden lead-in (with the agent name) precedes the creds line.
     lead = "Try asking nessie to spawn the following sub-agents!"
     assert lead in plain
@@ -1547,8 +1547,10 @@ def test_build_startup_header_subscription_credential(tmp_path, monkeypatch) -> 
     What this proves: the header's model + credential row is sourced from
     the real merged provider config for the launch harness — a Claude
     subscription default surfaces as the "Subscription" credential (with
-    no pinned model, since the CLI login picks it). A regression in the
-    config→header resolution would drop or mislabel the credential.
+    no pinned model, since the CLI login picks it), WITHOUT the 🎟️ kind
+    glyph (dropped from the header by design; CLI surfaces keep it). A
+    regression in the config→header resolution would drop or mislabel
+    the credential; a reappearing 🎟️ means _header_glyph was bypassed.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
@@ -1564,8 +1566,9 @@ def test_build_startup_header_subscription_credential(tmp_path, monkeypatch) -> 
     )
     header = _build_startup_header("claude-sdk", "A test agent.", ["anthropic"])
     assert header.credential is not None
-    assert "Subscription" in header.credential
-    assert "🎟" in header.credential
+    # Exact equality proves both the glyph suppression and that the
+    # empty-glyph join left no stray leading whitespace.
+    assert header.credential == "Subscription"
     # Single family → no per-family creds line (the box row already says it).
     assert header.creds_line is None
     # The description is summarized for the box.
@@ -1609,10 +1612,13 @@ def test_build_startup_header_creds_line_includes_pi_surface(tmp_path, monkeypat
         "pi", "Multi-agent coding orchestrator.", ["anthropic", "openai", "pi"]
     )
     assert header.creds_line is not None
-    # Each surface resolves its own effective credential.
-    assert "Claude → 🎟️ Subscription" in header.creds_line
-    assert "Codex → 🎟️ Subscription" in header.creds_line
+    # Each surface resolves its own effective credential. Subscriptions
+    # render glyphless in the header; other kinds keep their glyph (🧱).
+    assert "Claude → Subscription" in header.creds_line
+    assert "Codex → Subscription" in header.creds_line
     assert "Pi → 🧱 Databricks (my-ws)" in header.creds_line
+    # The ticket glyph never reaches the header creds line.
+    assert "🎟" not in header.creds_line
     # The box's launch-harness row follows the same pi resolution: the
     # explicit pi-scoped Databricks default, not the subscription.
     assert header.credential is not None

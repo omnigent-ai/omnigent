@@ -246,11 +246,13 @@ class _StartupHeader:
         e.g. ``"claude-sonnet-4-6"``; ``None`` when no model is pinned
         (a subscription / Databricks profile picks it at run time).
     :param credential: The launch harness's credential as glyph + label,
-        e.g. ``"🎟️ Subscription"``; ``None`` when none resolves (e.g. a
-        remote-URL target with no local harness).
+        e.g. ``"🧱 Databricks (my-ws)"`` — a subscription renders
+        glyphless as ``"Subscription"`` (see :func:`_header_glyph`);
+        ``None`` when none resolves (e.g. a remote-URL target with no
+        local harness).
     :param creds_line: The per-family creds disclosure shown beneath the
-        box for multi-vendor agents, e.g. ``"Claude → 🎟️ Subscription
-        ·   Codex → 🎟️ Subscription"``; ``None`` for single-family
+        box for multi-vendor agents, e.g. ``"Claude → Subscription
+        ·   Codex → Subscription"``; ``None`` for single-family
         agents (the box's credential row already says it).
     """
 
@@ -306,6 +308,24 @@ def _summarize_description(description: str | None) -> str | None:
     return first
 
 
+def _header_glyph(kind: str) -> str:
+    """Kind glyph for the startup header's credential labels.
+
+    The header drops the subscription ADMISSION TICKETS glyph — its red
+    rendering is too loud for the banner box — while every other kind
+    keeps its :func:`kind_glyph`. CLI surfaces (``omnigent setup``, the
+    ``/model`` readout) keep the ticket.
+
+    :param kind: The provider kind, e.g. ``"subscription"`` or ``"key"``.
+    :returns: The kind's glyph (e.g. ``"🔑"``), or ``""`` for the
+        subscription kind.
+    """
+    from omnigent.onboarding.configure_models import kind_glyph
+    from omnigent.onboarding.provider_config import SUBSCRIPTION_KIND
+
+    return "" if kind == SUBSCRIPTION_KIND else kind_glyph(kind)
+
+
 def _build_startup_header(
     harness: str | None,
     agent_description: str | None,
@@ -334,7 +354,6 @@ def _build_startup_header(
     from omnigent.onboarding.configure_models import (
         credential_label,
         family_label,
-        kind_glyph,
     )
     from omnigent.onboarding.detected import effective_config_with_detected
     from omnigent.onboarding.provider_config import (
@@ -352,7 +371,7 @@ def _build_startup_header(
         if cred is not None:
             model_label = cred.model
             cred_name = credential_label(cred.kind, cred.provider_name)
-            credential = f"{kind_glyph(cred.kind)} {cred_name}".strip()
+            credential = f"{_header_glyph(cred.kind)} {cred_name}".strip()
 
     creds_line: str | None = None
     families = used_families or []
@@ -372,7 +391,7 @@ def _build_startup_header(
                     profile=entry.profile,
                     display_name=entry.display_name,
                 )
-                label = f"{kind_glyph(entry.kind)} {cred_text}".strip()
+                label = f"{_header_glyph(entry.kind)} {cred_text}".strip()
             parts.append(f"{family_label(fam)} → {label}")
         creds_line = "   ·   ".join(parts)
 

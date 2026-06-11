@@ -40,6 +40,7 @@ import {
 } from "@/lib/browserNotifications";
 import { isNativeShell, setBadgeCount } from "@/lib/nativeBridge";
 import { fetchLastAssistantText } from "@/lib/lastAssistantText";
+import { markConversationSeen } from "@/hooks/useUnseenConversations";
 import { useIdleNotifications } from "./useIdleNotifications";
 
 const useConvMock = vi.mocked(useConversations);
@@ -107,6 +108,10 @@ beforeEach(() => {
   // "user looked away" case). Focus-specific tests override this.
   setWindowFocused(false);
   setConversations([]);
+  // The badge derivation reads the real last-seen baselines from
+  // localStorage (useUnseenConversations is intentionally NOT mocked);
+  // start each test with a clean slate.
+  window.localStorage.clear();
 });
 
 afterEach(() => {
@@ -267,40 +272,123 @@ describe("useIdleNotifications badge (native shell)", () => {
     isNativeMock.mockReturnValue(true);
   });
 
-  it("sets the badge to the count of unread sessions on a turn end", () => {
-    setWindowFocused(false);
-    setConversations([conv("a", "running")]);
-    const { rerender } = renderHook(() => useIdleNotifications());
-    setBadgeMock.mockClear();
+  /**
+   * Conversation with an unseen-activity baseline: the user last had it
+   * open at t=50 (persisted via the real `markConversationSeen`) and the
+   * session has activity at t=100 — exactly the state that lights the
+   * sidebar's unread dot.
+   */
+  function unseenConv(id: string, status: Conversation["status"] = "idle"): Conversation {
+    markConversationSeen(id, 50);
+    return { ...conv(id, status), updated_at: 100 };
+  }
 
-    setConversations([conv("a", "idle")]);
-    rerender();
+  it("counts already-unread sessions on the first data tick (no live transition)", () => {
+    // The session finished while the app was closed: its activity postdates
+    // the persisted last-seen baseline, but THIS window never observed the
+    // running -> idle transition. The badge must still count it — this is
+    // the core fix (the old transition-based badge read 0 here).
+    setConversations([unseenConv("a")]);
+    renderHook(() => useIdleNotifications());
 
-    // One unread session -> badge count 1. If 0, the unread set isn't being
-    // populated; if >1, ids are being double-counted.
     expect(setBadgeMock).toHaveBeenCalledWith(1);
   });
 
-  it("accumulates distinct unread sessions across polls", () => {
-    setWindowFocused(false);
-    setConversations([conv("a", "running"), conv("b", "running")]);
+  it("sends 0 on the first computation when nothing is unread", () => {
+    // The Electron main process keeps a per-window badge count that
+    // survives reloads. The first computation must send even when the
+    // count is 0, or a pre-reload badge sticks stale forever.
+    setConversations([conv("a", "idle")]);
+    renderHook(() => useIdleNotifications());
+
+    expect(setBadgeMock).toHaveBeenCalledWith(0);
+  });
+
+  it("sends nothing while the conversations query is still loading", () => {
+    useConvMock.mockReturnValue({ data: undefined } as ReturnType<typeof useConversations>);
     const { rerender } = renderHook(() => useIdleNotifications());
+    // No data yet -> no badge computation (a transient 0 would flicker a
+    // legitimate pre-reload badge before the list arrives).
+    expect(setBadgeMock).not.toHaveBeenCalled();
 
-    setConversations([conv("a", "idle"), conv("b", "running")]);
+    setConversations([unseenConv("a")]);
     rerender();
-    setConversations([conv("a", "idle"), conv("b", "idle")]);
-    rerender();
+    // First resolved fetch computes and sends the real count.
+    expect(setBadgeMock).toHaveBeenCalledWith(1);
+  });
 
-    // Two separate sessions finished across two polls -> badge reaches 2.
-    expect(setBadgeMock).toHaveBeenLastCalledWith(2);
+  it("counts sessions awaiting input (pending elicitations)", () => {
+    // Awaiting-input sessions badge even without an unseen baseline: the
+    // agent is blocked on the user, which the sidebar flags too.
+    setConversations([conv("a", "running", 1)]);
+    renderHook(() => useIdleNotifications());
+
+    expect(setBadgeMock).toHaveBeenCalledWith(1);
+  });
+
+  it("updates the badge when a watched session's turn ends", () => {
+    markConversationSeen("a", 50);
+    // Still running: updated_at past the baseline doesn't count yet
+    // (isConversationUnseen ignores running sessions).
+    setConversations([{ ...conv("a", "running"), updated_at: 100 }]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+    expect(setBadgeMock).toHaveBeenLastCalledWith(0);
+
+    setConversations([{ ...conv("a", "idle"), updated_at: 100 }]);
+    rerender();
+    // The turn ended -> the session is now unseen -> badge 1.
+    expect(setBadgeMock).toHaveBeenLastCalledWith(1);
+  });
+
+  it("does not resend an unchanged count", () => {
+    setConversations([unseenConv("a")]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+    expect(setBadgeMock).toHaveBeenCalledWith(1);
+    setBadgeMock.mockClear();
+
+    // Same unread state on the next tick (fresh data object, same content)
+    // -> the lastSent gate suppresses a redundant IPC send.
+    setConversations([unseenConv("a")]);
+    rerender();
+    expect(setBadgeMock).not.toHaveBeenCalled();
+  });
+
+  it("clears a session from the badge once it's marked seen", () => {
+    setConversations([unseenConv("a")]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+    expect(setBadgeMock).toHaveBeenLastCalledWith(1);
+
+    // The user viewed the session (ChatPage's useMarkConversationSeen
+    // advances the baseline past updated_at); the next data tick must drop
+    // it from the count.
+    markConversationSeen("a", 200);
+    setConversations([{ ...conv("a", "idle"), updated_at: 100 }]);
+    rerender();
+    expect(setBadgeMock).toHaveBeenLastCalledWith(0);
+  });
+
+  it("suppresses the actively-viewed session while the window is focused", () => {
+    setWindowFocused(true);
+    // 'a' is unseen by the baseline, but the user is looking right at it.
+    setConversations([unseenConv("a")]);
+    renderHook(() => useIdleNotifications("a"));
+
+    expect(setBadgeMock).toHaveBeenCalledWith(0);
+  });
+
+  it("counts the open session when the window is blurred", () => {
+    setWindowFocused(false);
+    setConversations([unseenConv("a")]);
+    renderHook(() => useIdleNotifications("a"));
+
+    // Viewing 'a' but blurred -> the user isn't looking, so it counts.
+    expect(setBadgeMock).toHaveBeenCalledWith(1);
   });
 
   it("clears the badge when the window regains focus on the open conversation", () => {
     setWindowFocused(false);
-    setConversations([conv("a", "running")]);
-    const { rerender } = renderHook(() => useIdleNotifications("a"));
-    setConversations([conv("a", "idle")]);
-    rerender();
+    setConversations([unseenConv("a")]);
+    renderHook(() => useIdleNotifications("a"));
     // Precondition: 'a' is unread (badge 1).
     expect(setBadgeMock).toHaveBeenLastCalledWith(1);
     setBadgeMock.mockClear();
@@ -317,10 +405,8 @@ describe("useIdleNotifications badge (native shell)", () => {
 
   it("keeps other unread sessions when focusing clears only the active one", () => {
     setWindowFocused(false);
-    setConversations([conv("a", "running"), conv("b", "running")]);
-    const { rerender } = renderHook(() => useIdleNotifications("a"));
-    setConversations([conv("a", "idle"), conv("b", "idle")]);
-    rerender();
+    setConversations([unseenConv("a"), unseenConv("b")]);
+    renderHook(() => useIdleNotifications("a"));
     // Both unread -> badge 2.
     expect(setBadgeMock).toHaveBeenLastCalledWith(2);
     setBadgeMock.mockClear();
@@ -330,7 +416,7 @@ describe("useIdleNotifications badge (native shell)", () => {
       window.dispatchEvent(new Event("focus"));
     });
 
-    // Focusing on 'a' clears only 'a'; 'b' remains unread -> badge 1.
+    // Focusing on 'a' suppresses only 'a'; 'b' remains unread -> badge 1.
     expect(setBadgeMock).toHaveBeenCalledWith(1);
   });
 });

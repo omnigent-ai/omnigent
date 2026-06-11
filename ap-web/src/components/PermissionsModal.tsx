@@ -172,7 +172,6 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
               <SelectContent>
                 <SelectItem value="1">Read</SelectItem>
                 <SelectItem value="2">Edit</SelectItem>
-                <SelectItem value="3">Manage</SelectItem>
               </SelectContent>
             </Select>
           </div>
@@ -407,14 +406,20 @@ function GrantRow({
   busy: boolean;
 }) {
   const isOwner = permission.level === 4;
+  // Manage is not grantable from the UI, so a pre-existing manage grant
+  // renders as a fixed label rather than a dropdown choice. Unlike the
+  // owner row it can still be revoked.
+  const isManage = permission.level === 3;
 
   return (
     <div className="flex items-center gap-2 rounded-md px-2 py-0.5 hover:bg-muted/50">
       <span className="flex-1 truncate text-sm" title={permission.user_id}>
         {permission.user_id}
       </span>
-      {isOwner ? (
-        <span className="flex h-8 w-28 items-center px-3 text-sm text-muted-foreground">Owner</span>
+      {isOwner || isManage ? (
+        <span className="flex h-8 w-28 items-center px-3 text-sm text-muted-foreground">
+          {isOwner ? "Owner" : "Manage"}
+        </span>
       ) : (
         <Select
           value={String(permission.level)}
@@ -430,7 +435,6 @@ function GrantRow({
           <SelectContent>
             <SelectItem value="1">Read</SelectItem>
             <SelectItem value="2">Edit</SelectItem>
-            <SelectItem value="3">Manage</SelectItem>
           </SelectContent>
         </Select>
       )}

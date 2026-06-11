@@ -42,12 +42,12 @@ def _display_width(text: str) -> int:
 
     :func:`rich.cells.cell_len` under-counts an emoji forced to its wide
     presentation by a trailing VARIATION SELECTOR-16 (U+FE0F) — e.g. the
-    subscription ``🎟️`` glyph — as a single cell, while modern terminals
+    cli-config ``⚙️`` glyph — as a single cell, while modern terminals
     render it as two. Adding one cell per VS16 makes the banner box border
     line up under such a glyph instead of drifting one column right.
 
-    :param text: The string to measure, e.g. ``"🎟️ Subscription"``.
-    :returns: The estimated terminal column width, e.g. ``15``.
+    :param text: The string to measure, e.g. ``"⚙️ my-gateway"``.
+    :returns: The estimated terminal column width, e.g. ``13``.
     """
     from rich.cells import cell_len
 
@@ -104,7 +104,7 @@ def startup_banner_strings(
         callers). Ignored when *info_lines* is provided.
     :param info_lines: Explicit dim info rows shown beneath the title,
         e.g. ``[BannerLine("multi-agent orchestrator", dim=True),
-        BannerLine("claude-sonnet-4-6 · 🎟️ Subscription", dim=True),
+        BannerLine("claude-sonnet-4-6 · Subscription", dim=True),
         BannerLine("~/omnigent", dim=True)]``. ``None`` falls
         back to the *hint_line* behavior.
     :param mascot_lines: Mascot art to show to the left of the

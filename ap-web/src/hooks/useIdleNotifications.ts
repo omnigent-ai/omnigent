@@ -1,19 +1,22 @@
 // Surfaces "a session needs your attention" as OS notifications and a
 // dock/taskbar badge. Rides the existing conversations poll (no new backend
-// signal): each refresh we diff the previous snapshot and react to two
-// "attention" transitions.
+// signal).
 //
-// Attention events (notify + badge):
+// Notifications fire on two "attention" TRANSITIONS, diffed against the
+// previous snapshot:
 //   * a turn finishing — status `running` -> `idle`/`failed`
 //   * a new elicitation — `pending_elicitations_count` increased (the agent
 //     is asking the user for input)
 //
-// The dock badge shows the number of UNREAD sessions at all times — sessions
-// that had an attention event the user hasn't looked at yet. A session is
-// "read" (removed from the badge) when the user is actively viewing it: the
-// window is focused AND it's the open conversation. Notifications follow the
-// same rule — anything that needs attention notifies, except the conversation
-// you're actively looking at.
+// The dock badge is NOT transition-based: it's recomputed from the full
+// conversation list every tick using the same persistent definition as the
+// sidebar — sessions with unseen activity (`isConversationUnseen`, backed by
+// the localStorage last-seen baseline) plus sessions awaiting input (pending
+// elicitations). That keeps it correct across reloads and counts sessions
+// that finished while the app was closed. A session is suppressed only while
+// the user is actively viewing it: the window is focused AND it's the open
+// conversation. Notifications follow the same rule — anything that needs
+// attention notifies, except the conversation you're actively looking at.
 //
 // Notifications are on by default — there's no settings toggle. In a plain
 // browser the Web Notifications API still requires a permission grant, so we
@@ -37,11 +40,12 @@ import { fetchLastAssistantText } from "@/lib/lastAssistantText";
 import {
   buildElicitationMap,
   buildStatusMap,
-  computeUnreadSet,
+  computeUnreadBadgeIds,
   type ConversationStatus,
   detectIdleTransitions,
   detectNewElicitations,
 } from "@/lib/idleTransitions";
+import { isConversationUnseen } from "@/hooks/useUnseenConversations";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
 
 const IDLE_BODY = "Agent finished and is ready for your input.";
@@ -83,10 +87,13 @@ function isWindowFocused(): boolean {
  * value, so sessions already idle at load never fire — only a fresh
  * transition observed by this client does.
  *
- * The badge reflects the number of unread sessions — those that had an
- * attention event (turn finished or new elicitation) the user hasn't viewed.
- * It updates on every change, regardless of window focus, and clears a
- * session the moment the user actively views it.
+ * The badge reflects the number of unread sessions — the same definition the
+ * sidebar uses: sessions with unseen activity since the user last had them
+ * open (`isConversationUnseen`) plus sessions awaiting input (pending
+ * elicitations). It's recomputed from the conversation list every tick (no
+ * accumulated state), so it survives reloads and counts sessions that
+ * finished while the app was closed. The actively-viewed session is cleared
+ * the moment the user views it.
  *
  * :param activeConversationId: The conversation currently open in the UI, or
  *   undefined on a non-chat route, e.g. ``"conv_abc123"``. Used to suppress
@@ -97,10 +104,18 @@ export function useIdleNotifications(activeConversationId?: string): void {
   const { data } = useConversations();
   const prevStatus = useRef<Map<string, ConversationStatus>>(new Map());
   const prevElicitations = useRef<Map<string, number>>(new Map());
-  // The set of unread session ids backing the badge. A ref (not state) because
-  // it drives an imperative OS call, not a render, and must persist across
-  // polls without re-triggering the effect.
-  const unread = useRef<Set<string>>(new Set());
+  // Last badge count actually sent to the shell. `null` (nothing sent yet)
+  // makes the FIRST computation send unconditionally — including 0 — so a
+  // badge left over in the Electron main process from before a reload (it
+  // keeps a per-window count that survives in-window navigations) is
+  // corrected instead of sticking stale.
+  const lastSentBadge = useRef<number | null>(null);
+  // Latest conversation list, so the focus listener (mounted once) can
+  // recompute the badge without re-subscribing on data changes. `null` until
+  // the first fetch resolves — the badge is never computed from a
+  // still-loading list, so a reload doesn't flash the stale count to 0
+  // before correcting it.
+  const latestConversations = useRef<Conversation[] | null>(null);
 
   useLazyPermissionRequest();
 
@@ -109,22 +124,54 @@ export function useIdleNotifications(activeConversationId?: string): void {
   const activeIdRef = useRef<string | undefined>(activeConversationId);
   activeIdRef.current = activeConversationId;
 
-  // Refocusing the window (or having it focused on the open conversation)
-  // marks that conversation read. Recompute the badge from the existing set
-  // with no new attention ids — `computeUnreadSet` clears the actively-viewed
-  // id. No-op in a plain browser (`setBadgeCount` is inert there).
+  // Send the badge count when it differs from the last one sent. No-op in a
+  // plain browser (`setBadgeCount` is inert outside the desktop shell).
+  const pushBadge = (count: number) => {
+    if (count === lastSentBadge.current) return;
+    lastSentBadge.current = count;
+    void setBadgeCount(count);
+  };
+
+  // Refocusing the window (focused on the open conversation) marks that
+  // conversation read: recompute from the latest list with windowFocused
+  // true, which drops the actively-viewed id from the count. The persistent
+  // last-seen baseline is advanced by ChatPage's `useMarkConversationSeen`,
+  // so the next data tick agrees with this immediate recompute.
   useEffect(() => {
     const onFocus = () => {
-      const next = computeUnreadSet(unread.current, [], activeIdRef.current, true);
-      unread.current = next;
-      void setBadgeCount(next.size);
+      if (latestConversations.current === null) return;
+      const next = computeUnreadBadgeIds(
+        latestConversations.current,
+        activeIdRef.current,
+        true,
+        isConversationUnseen,
+      );
+      pushBadge(next.size);
     };
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
+    // pushBadge only touches refs, so the once-mounted listener stays fresh.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
-    const conversations = data?.pages.flatMap((page) => page.data) ?? [];
+    // Still loading — don't compute a badge from an absent list (and don't
+    // bump lastSentBadge), so the first real computation below sends
+    // unconditionally.
+    if (data === undefined) return;
+    const conversations = data.pages.flatMap((page) => page.data);
+    latestConversations.current = conversations;
+
+    // Badge first, before the empty-list bail below: an empty list must
+    // still send 0 so a stale nonzero badge clears.
+    const unread = computeUnreadBadgeIds(
+      conversations,
+      activeConversationId,
+      isWindowFocused(),
+      isConversationUnseen,
+    );
+    pushBadge(unread.size);
+
     if (conversations.length === 0) return;
 
     const idle = detectIdleTransitions(prevStatus.current, conversations);
@@ -136,11 +183,7 @@ export function useIdleNotifications(activeConversationId?: string): void {
     const grantedOrNative = isNativeShell() || getNotificationPermission() === "granted";
 
     // A session is "actively viewed" — and thus suppressed — only when the
-    // window is focused AND it's the open conversation. De-dupe ids that both
-    // finished a turn and raised an elicitation in the same tick.
-    const attentionConvs = new Map<string, Conversation>();
-    for (const c of [...idle, ...newElicitations]) attentionConvs.set(c.id, c);
-
+    // window is focused AND it's the open conversation.
     if (grantedOrNative) {
       for (const conversation of idle) {
         if (windowFocused && conversation.id === activeConversationId) continue;
@@ -157,29 +200,7 @@ export function useIdleNotifications(activeConversationId?: string): void {
         notify(conversation, ELICITATION_BODY, navigate);
       }
     }
-
-    // Recompute the unread set from this tick's attention ids and push the
-    // badge. Done unconditionally (not gated on permission) so the badge
-    // tracks unread state even if web notifications were denied. No-op in a
-    // plain browser since `setBadgeCount` is inert outside the desktop shell.
-    const next = computeUnreadSet(
-      unread.current,
-      [...attentionConvs.keys()],
-      activeConversationId,
-      windowFocused,
-    );
-    if (!setsEqual(next, unread.current)) {
-      unread.current = next;
-      void setBadgeCount(next.size);
-    }
   }, [data, navigate, activeConversationId]);
-}
-
-/** True when two id sets contain exactly the same members. */
-function setsEqual(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
-  if (a.size !== b.size) return false;
-  for (const id of a) if (!b.has(id)) return false;
-  return true;
 }
 
 /** Show one notification for a session transition; click opens the chat. */

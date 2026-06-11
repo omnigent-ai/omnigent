@@ -75,39 +75,45 @@ export function detectNewElicitations(
 }
 
 /**
- * Pure reducer for the "unread sessions" set that drives the dock/taskbar
- * badge. Given the current set and this poll's observations, returns the
- * next set:
+ * Pure derivation of the "unread sessions" set that drives the dock/taskbar
+ * badge. Recomputed from the full conversation list every tick — no
+ * accumulated client-side state — so the badge matches what the sidebar
+ * flags as needing attention, including sessions that finished while this
+ * window wasn't open.
  *
- *   * Each \`attentionId\` (a session that just ended a turn or raised a new
- *     elicitation) is marked unread — UNLESS it's the conversation the user
- *     is actively viewing (the window is focused AND it's the active route).
- *     "Actively viewed" is the ONE suppression rule: if the window is
- *     blurred, even the open conversation counts as unread, because the user
- *     isn't looking at it.
- *   * The actively-viewed conversation is always cleared from the set, so
- *     opening (or refocusing on) a session marks it read.
+ * A session counts as unread when it is NOT actively viewed (the window is
+ * focused AND it's the open conversation — the one suppression rule; a
+ * blurred window means even the open conversation counts) AND either:
  *
- * Returns a NEW set; never mutates \`current\`.
+ *   * it has pending elicitations (the sidebar's "awaiting input" badge), or
+ *   * \`isUnseen\` says it has activity since the user last had it open (the
+ *     sidebar's unread dot — see \`isConversationUnseen\`).
  *
- * :param current: The existing unread-session id set.
- * :param attentionIds: Ids needing attention this tick, e.g. \`["conv_a"]\`.
+ * \`isUnseen\` is injected rather than imported so this module stays free of
+ * localStorage and directly unit-testable.
+ *
+ * :param conversations: The current conversation list.
  * :param activeId: The conversation currently open in the UI, or undefined
  *   when on a non-chat route, e.g. \`"conv_a"\`.
  * :param windowFocused: Whether the app window itself has focus.
- * :returns: The next unread-session id set.
+ * :param isUnseen: Predicate matching \`isConversationUnseen\`'s signature —
+ *   whether a session has unseen activity, given its id, \`updated_at\`, and
+ *   status.
+ * :returns: The unread-session id set; its size is the badge number.
  */
-export function computeUnreadSet(
-  current: ReadonlySet<string>,
-  attentionIds: string[],
+export function computeUnreadBadgeIds(
+  conversations: Conversation[],
   activeId: string | undefined,
   windowFocused: boolean,
+  isUnseen: (id: string, updatedAt: number, status: string | undefined) => boolean,
 ): Set<string> {
-  const next = new Set(current);
-  const isActivelyViewed = (id: string): boolean => windowFocused && id === activeId;
-  for (const id of attentionIds) {
-    if (!isActivelyViewed(id)) next.add(id);
+  const unread = new Set<string>();
+  for (const conversation of conversations) {
+    if (windowFocused && conversation.id === activeId) continue;
+    const awaiting = (conversation.pending_elicitations_count ?? 0) > 0;
+    if (awaiting || isUnseen(conversation.id, conversation.updated_at, conversation.status)) {
+      unread.add(conversation.id);
+    }
   }
-  if (activeId !== undefined && isActivelyViewed(activeId)) next.delete(activeId);
-  return next;
+  return unread;
 }

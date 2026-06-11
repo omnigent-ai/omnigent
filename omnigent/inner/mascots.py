@@ -20,12 +20,8 @@ class MascotPayload(TypedDict):
 
 
 MASCOT_ART_LINES: tuple[str, ...] = (
-    "      ╭────╮     ",
-    "   ╭──╯    ╰──╮  ",
-    "  ╭╯          ╰╮ ",
-    " ╭╯    ◕ᴗ◕     ╰╮",
-    " ╰╮            ╭╯",
-    "  ╰╯  ╰╯  ╰╯  ╰╯ ",
+    "( ◉ ‿ ◉ )",
+    " ~)|)|(~ ",
 )
 
 MASCOT_ART_COL_WIDTH = max(len(line) for line in MASCOT_ART_LINES)
@@ -53,7 +49,7 @@ def random_mascot_lines() -> list[str]:
     The function name is kept for compatibility with the old procedural
     mascot API, but the TUI now uses the single static Omnigent mascot.
 
-    :returns: Centered six-row mascot art.
+    :returns: Centered two-row mascot art.
     """
 
     return list(MASCOT_ART_LINES)

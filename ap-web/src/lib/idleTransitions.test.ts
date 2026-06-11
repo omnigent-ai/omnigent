@@ -3,7 +3,7 @@ import type { Conversation } from "@/hooks/useConversations";
 import {
   buildElicitationMap,
   buildStatusMap,
-  computeUnreadSet,
+  computeUnreadBadgeIds,
   detectIdleTransitions,
   detectNewElicitations,
   type ConversationStatus,
@@ -165,57 +165,99 @@ describe("buildElicitationMap", () => {
   });
 });
 
-describe("computeUnreadSet", () => {
-  it("adds an attention id when no conversation is active", () => {
-    const next = computeUnreadSet(new Set(), ["a"], undefined, true);
+describe("computeUnreadBadgeIds", () => {
+  /** Conversation with badge-relevant fields under test. */
+  function convB(
+    id: string,
+    opts: { status?: Conversation["status"]; pending?: number; updatedAt?: number } = {},
+  ): Conversation {
+    return {
+      ...conv(id, opts.status ?? "idle"),
+      updated_at: opts.updatedAt ?? 100,
+      pending_elicitations_count: opts.pending ?? 0,
+    };
+  }
+
+  /** Predicate marking exactly the given ids unseen (sidebar dot stand-in). */
+  function unseenIds(...ids: string[]): (id: string) => boolean {
+    const set = new Set(ids);
+    return (id: string) => set.has(id);
+  }
+
+  it("counts a session the unseen predicate flags", () => {
+    const next = computeUnreadBadgeIds([convB("a")], undefined, true, unseenIds("a"));
     expect([...next]).toEqual(["a"]);
   });
 
-  it("adds an attention id for a non-active conversation while focused", () => {
-    // Window focused but viewing 'b' -> 'a' is unread.
-    const next = computeUnreadSet(new Set(), ["a"], "b", true);
+  it("counts a session awaiting input even when not unseen", () => {
+    // Pending elicitation alone (sidebar "awaiting" badge) puts the session
+    // on the dock badge — the user owes it a response.
+    const next = computeUnreadBadgeIds([convB("a", { pending: 1 })], undefined, true, unseenIds());
     expect([...next]).toEqual(["a"]);
   });
 
-  it("suppresses an attention id only when actively viewed (focused + active)", () => {
-    // Focused AND viewing 'a' -> the user is looking at it, so not unread.
-    const next = computeUnreadSet(new Set(), ["a"], "a", true);
-    expect(next.has("a")).toBe(false);
+  it("excludes a seen session with no pending elicitations", () => {
+    // Neither unseen nor awaiting -> contributes nothing. A failure here
+    // means the badge would count every listed session.
+    const next = computeUnreadBadgeIds([convB("a")], undefined, true, unseenIds());
+    expect(next.size).toBe(0);
   });
 
-  it("marks the open conversation unread when the window is blurred", () => {
+  it("suppresses the actively-viewed session (focused + active)", () => {
+    // Focused AND viewing 'a' -> the user is looking at it, so not unread,
+    // even though the predicate flags it and it has a pending elicitation.
+    const next = computeUnreadBadgeIds([convB("a", { pending: 2 })], "a", true, unseenIds("a"));
+    expect(next.size).toBe(0);
+  });
+
+  it("counts the open session when the window is blurred", () => {
     // Active conversation is 'a' but the window is blurred -> the user isn't
-    // looking, so an attention event on 'a' still counts as unread. This is
-    // the core fix: badge tracks unread even with the window focused elsewhere.
-    const next = computeUnreadSet(new Set(), ["a"], "a", false);
-    expect(next.has("a")).toBe(true);
+    // looking, so 'a' still counts. Suppression requires focus AND active.
+    const next = computeUnreadBadgeIds([convB("a")], "a", false, unseenIds("a"));
+    expect([...next]).toEqual(["a"]);
   });
 
-  it("clears the actively-viewed conversation from an existing set", () => {
-    // 'a' was unread; the user focuses the window on 'a' (no new attention
-    // ids) -> 'a' is marked read and removed.
-    const next = computeUnreadSet(new Set(["a", "b"]), [], "a", true);
-    expect([...next].sort()).toEqual(["b"]);
+  it("counts a non-active unseen session while focused elsewhere", () => {
+    // Window focused but viewing 'b' -> 'a' is unread.
+    const next = computeUnreadBadgeIds([convB("a"), convB("b")], "b", true, unseenIds("a"));
+    expect([...next]).toEqual(["a"]);
   });
 
-  it("does not clear the active conversation when the window is blurred", () => {
-    // Refocus path requires focus; a blurred 'focus' can't happen, but guard
-    // the logic: blurred + active 'a' leaves 'a' in the set.
-    const next = computeUnreadSet(new Set(["a"]), [], "a", false);
-    expect(next.has("a")).toBe(true);
+  it("aggregates unseen and awaiting sessions in one set", () => {
+    // 'a' unseen, 'b' awaiting, 'c' both (counted once), 'd' neither,
+    // active 'e' suppressed. Size 3 proves de-dupe and suppression together.
+    const next = computeUnreadBadgeIds(
+      [
+        convB("a"),
+        convB("b", { pending: 1 }),
+        convB("c", { pending: 1 }),
+        convB("d"),
+        convB("e", { pending: 1 }),
+      ],
+      "e",
+      true,
+      unseenIds("a", "c", "e"),
+    );
+    expect([...next].sort()).toEqual(["a", "b", "c"]);
   });
 
-  it("does not mutate the input set", () => {
-    const current = new Set(["a"]);
-    computeUnreadSet(current, ["b"], undefined, true);
-    // Original must be untouched (returns a new set).
-    expect([...current]).toEqual(["a"]);
+  it("passes each session's id, updated_at, and status to the predicate", () => {
+    // The hook wires isConversationUnseen here; wrong arguments would make
+    // the localStorage lookup miss and the badge silently read 0.
+    const calls: Array<{ id: string; updatedAt: number; status: string | undefined }> = [];
+    computeUnreadBadgeIds(
+      [convB("a", { updatedAt: 42, status: "failed" })],
+      undefined,
+      true,
+      (id, updatedAt, status) => {
+        calls.push({ id, updatedAt, status });
+        return false;
+      },
+    );
+    expect(calls).toEqual([{ id: "a", updatedAt: 42, status: "failed" }]);
   });
 
-  it("simultaneously adds non-active ids and clears the active one", () => {
-    // Real-world tick: 'b' and 'c' finished while focused on 'a' -> add both,
-    // and 'a' (actively viewed) is cleared.
-    const next = computeUnreadSet(new Set(["a"]), ["b", "c"], "a", true);
-    expect([...next].sort()).toEqual(["b", "c"]);
+  it("returns an empty set for an empty list", () => {
+    expect(computeUnreadBadgeIds([], undefined, true, unseenIds("a")).size).toBe(0);
   });
 });

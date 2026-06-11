@@ -75,12 +75,25 @@ export function isConversationUnseen(
   return updatedAt > stored;
 }
 
+/** True when the app window currently has focus (SSR-safe default true). */
+function windowHasFocus(): boolean {
+  if (typeof document === "undefined") return true;
+  return typeof document.hasFocus === "function" ? document.hasFocus() : true;
+}
+
 /**
  * Marks the active conversation as seen on mount, on every poll
- * refresh (updatedAt change keeps the stored time fresh), and on
- * cleanup (navigation away). Wall-clock time is stored so any
- * server-side update that happened while the user was viewing is
- * captured, even if the conversations poll hadn't picked it up yet.
+ * refresh (updatedAt change keeps the stored time fresh), on the
+ * window regaining focus, and on cleanup (navigation away).
+ * Wall-clock time is stored so any server-side update that happened
+ * while the user was viewing is captured, even if the conversations
+ * poll hadn't picked it up yet.
+ *
+ * Every mark is gated on the window having focus: a thread open in a
+ * blurred window is NOT being read, so a turn finishing there must
+ * stay unseen (the dock badge counts it) until focus returns. The
+ * focus listener covers the return path — refocusing while the
+ * thread is open marks it seen at that moment.
  */
 export function useMarkConversationSeen(
   conversationId: string | undefined,
@@ -88,7 +101,17 @@ export function useMarkConversationSeen(
 ): void {
   useEffect(() => {
     if (!conversationId || updatedAt === undefined) return;
-    markConversationSeen(conversationId);
-    return () => markConversationSeen(conversationId);
+    const markIfFocused = () => {
+      if (windowHasFocus()) markConversationSeen(conversationId);
+    };
+    markIfFocused();
+    window.addEventListener("focus", markIfFocused);
+    return () => {
+      window.removeEventListener("focus", markIfFocused);
+      // Navigation away normally happens via user interaction (focused);
+      // an unmount in a blurred window (e.g. the session deleted from
+      // another client) must not silently mark the thread read.
+      markIfFocused();
+    };
   }, [conversationId, updatedAt]);
 }

@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { PermissionsModal } from "./PermissionsModal";
@@ -181,6 +181,45 @@ describe("PermissionsModal", () => {
     await waitFor(() => {
       expect(screen.getByText("'rice' needs manage permission")).toBeInTheDocument();
     });
+  });
+
+  // Regression guard: granting manage (level 3) is backend-only. No level
+  // dropdown in the modal may ever offer "Manage" — not the add-grant form
+  // and not the per-row level select, regardless of the viewer (owners and
+  // managers see the same modal).
+  it("never offers Manage in any level dropdown", async () => {
+    listMock.mockResolvedValue([
+      { user_id: "owner@example.com", conversation_id: "conv_abc", level: 4 },
+      { user_id: "mallory@example.com", conversation_id: "conv_abc", level: 3 },
+      { user_id: "bob@example.com", conversation_id: "conv_abc", level: 1 },
+    ]);
+
+    render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => expect(screen.getByText("mallory@example.com")).toBeInTheDocument());
+
+    // Exactly two dropdowns exist: bob's row + the add-grant form. If this
+    // count is 3, the pre-existing manage grant regressed from a fixed label
+    // back to an editable (and thus Manage-bearing) select.
+    const triggers = screen.getAllByRole("combobox");
+    expect(triggers).toHaveLength(2);
+    // The manage grant's level is still visible to the viewer as static text.
+    expect(screen.getByText("Manage")).toBeInTheDocument();
+
+    for (const trigger of triggers) {
+      trigger.focus();
+      fireEvent.keyDown(trigger, { key: "Enter" });
+      const listbox = await screen.findByRole("listbox");
+      // The full option list is exactly Read and Edit. A "Manage" entry here
+      // means the UI re-exposed grantable manage; any other extra entry means
+      // a new level was added without deciding whether it's grantable.
+      const options = within(listbox).getAllByRole("option");
+      expect(options.map((o) => o.textContent)).toEqual(["Read", "Edit"]);
+      fireEvent.keyDown(listbox, { key: "Escape" });
+      await waitFor(() => expect(screen.queryByRole("listbox")).not.toBeInTheDocument());
+    }
   });
 
   it("does not fetch permissions when closed", () => {

@@ -1,8 +1,10 @@
+import { act, cleanup, renderHook } from "@testing-library/react";
 import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
 import {
   isConversationUnseen,
   markConversationSeen,
   nowSeconds,
+  useMarkConversationSeen,
 } from "./useUnseenConversations";
 
 const STORAGE_KEY = "omnigent:last-seen-timestamps";
@@ -125,5 +127,91 @@ describe("isConversationUnseen", () => {
   it("handles non-object localStorage values gracefully", () => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify([1, 2, 3]));
     expect(isConversationUnseen("conv-1", 1000, "idle")).toBe(false);
+  });
+});
+
+describe("useMarkConversationSeen", () => {
+  /** Force the window-focus reading used by the hook (document.hasFocus). */
+  function setWindowFocused(focused: boolean): void {
+    vi.spyOn(document, "hasFocus").mockReturnValue(focused);
+  }
+
+  /** The stored last-seen baseline for an id, or undefined when absent. */
+  function storedBaseline(id: string): number | undefined {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? JSON.parse(raw)[id] : undefined;
+  }
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("marks the thread seen on mount when the window is focused", () => {
+    setWindowFocused(true);
+    vi.useFakeTimers({ now: 5_000_000 });
+    renderHook(() => useMarkConversationSeen("conv-1", 4_000));
+    expect(storedBaseline("conv-1")).toBe(5_000);
+  });
+
+  it("does NOT mark the thread seen while the window is blurred", () => {
+    // The thread is open but the app isn't focused — the user isn't
+    // reading it. Marking it seen here would silently drop the session
+    // from the dock badge the moment its turn finishes in the background.
+    setWindowFocused(false);
+    renderHook(() => useMarkConversationSeen("conv-1", 4_000));
+    expect(storedBaseline("conv-1")).toBeUndefined();
+  });
+
+  it("does not advance the baseline on updatedAt changes while blurred", () => {
+    setWindowFocused(true);
+    vi.useFakeTimers({ now: 1_000_000 });
+    const { rerender } = renderHook(({ updatedAt }) => useMarkConversationSeen("conv-1", updatedAt), {
+      initialProps: { updatedAt: 500 },
+    });
+    expect(storedBaseline("conv-1")).toBe(1_000);
+
+    // The agent finishes a turn (updated_at bumps) while the window is
+    // blurred: the baseline must stay at 1_000 so the session reads
+    // unseen — even though it's the open thread.
+    setWindowFocused(false);
+    vi.setSystemTime(3_000_000);
+    rerender({ updatedAt: 2_000 });
+    expect(storedBaseline("conv-1")).toBe(1_000);
+    expect(isConversationUnseen("conv-1", 2_000, "idle")).toBe(true);
+  });
+
+  it("marks the thread seen when the window regains focus", () => {
+    setWindowFocused(false);
+    vi.useFakeTimers({ now: 2_000_000 });
+    renderHook(() => useMarkConversationSeen("conv-1", 1_500));
+    expect(storedBaseline("conv-1")).toBeUndefined();
+
+    // The user comes back to the window with the thread still open —
+    // NOW they're reading it, so the baseline advances past updated_at.
+    setWindowFocused(true);
+    vi.setSystemTime(4_000_000);
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    expect(storedBaseline("conv-1")).toBe(4_000);
+    expect(isConversationUnseen("conv-1", 1_500, "idle")).toBe(false);
+  });
+
+  it("marks seen on unmount only when the window is focused", () => {
+    setWindowFocused(true);
+    vi.useFakeTimers({ now: 1_000_000 });
+    const focused = renderHook(() => useMarkConversationSeen("conv-1", 500));
+    vi.setSystemTime(2_000_000);
+    focused.unmount();
+    // Focused navigation away counts as having read up to now.
+    expect(storedBaseline("conv-1")).toBe(2_000);
+
+    // A blurred unmount (e.g. the session deleted from another client)
+    // must not advance the baseline — the user never saw the updates.
+    setWindowFocused(false);
+    vi.setSystemTime(3_000_000);
+    const blurred = renderHook(() => useMarkConversationSeen("conv-2", 500));
+    blurred.unmount();
+    expect(storedBaseline("conv-2")).toBeUndefined();
   });
 });
