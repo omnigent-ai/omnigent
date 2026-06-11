@@ -117,13 +117,16 @@ jobs:
       group: oss-regen-comment-${{ github.event.issue.number }}
       cancel-in-progress: false
     steps:
-      # PAT token so the push below re-triggers the PR's CI (a GITHUB_TOKEN push
-      # would not). Checks out the PR head branch so we can commit onto it.
+      # No token and no persisted credentials: the public repo needs no auth
+      # to fetch, and `uv lock` below can execute build backends the PR head
+      # chooses (sdists, [build-system] hooks in pyproject.toml) — nothing it
+      # runs should find OSS_REGEN_TOKEN on disk. The PAT enters only at the
+      # push step.
       - name: Checkout the PR branch
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: ${{ needs.authorize.outputs.head }}
-          token: ${{ secrets.OSS_REGEN_TOKEN }}
+          persist-credentials: false
 
       - name: Set up uv (clean public resolution, no proxy cache)
         uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4
@@ -143,10 +146,15 @@ jobs:
       # All ${{ }} values are passed via env: and referenced as "$VAR" rather
       # than interpolated into the script body — HEAD_REF is the PR author's
       # branch name (user-influenced), so this avoids expression injection.
+      # The PAT authenticates the push inline (scoped to this step, never
+      # written to .git/config) so the push re-triggers the PR's CI; Actions
+      # masks the secret in logs.
       - name: Commit and push to the PR branch
         id: push
         env:
           HEAD_REF: ${{ needs.authorize.outputs.head }}
+          OSS_REGEN_TOKEN: ${{ secrets.OSS_REGEN_TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -158,7 +166,7 @@ jobs:
           fi
           git add uv.lock ap-web/package-lock.json
           git commit -m "chore(oss): regenerate public lockfiles against public PyPI/npm"
-          git push origin "HEAD:$HEAD_REF"
+          git push "https://x-access-token:${OSS_REGEN_TOKEN}@github.com/${REPO}.git" "HEAD:$HEAD_REF"
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
       - name: Comment the result

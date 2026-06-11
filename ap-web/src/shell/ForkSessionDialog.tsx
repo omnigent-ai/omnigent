@@ -34,7 +34,7 @@ import { useHosts, type Host } from "@/hooks/useHosts";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
-import { forkSwitchPreservesHistory } from "@/lib/forkHarness";
+import { forkTargetCarriesHistory } from "@/lib/forkHarness";
 import { getCliServerUrl } from "@/lib/host";
 import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
 import { WorkspacePathField } from "./WorkspacePathField";
@@ -240,18 +240,16 @@ export function ForkSessionForm({
   //      fork-suffix-stripped name), since a UI session may bind the
   //      built-in directly, a same-named clone, or a "(fork …)" clone.
   //   2. targets that wouldn't preserve history: SDK targets replay the
-  //      Omnigent transcript and claude-native rebuilds its transcript
-  //      from the copied items (any source), but a CROSS-FAMILY switch
-  //      into codex-native is hidden until the rollout synthesizer tracks
-  //      Codex's session_meta schema (it would silently start fresh) —
-  //      see forkSwitchPreservesHistory. Unclassifiable harnesses
-  //      (harness=null) are hidden too.
+  //      Omnigent transcript and native targets rebuild their on-disk
+  //      transcript from the copied items (any source) — see
+  //      forkTargetCarriesHistory. Unclassifiable harnesses
+  //      (harness=null) are hidden.
   const switchableAgents = (agents ?? []).filter(
     (a) =>
       a.id !== sourceAgent?.id &&
       a.name !== sourceAgentName &&
       a.name !== sourceAgentBaseName &&
-      forkSwitchPreservesHistory(sourceAgent?.harness, a.harness),
+      forkTargetCarriesHistory(a.harness),
   );
 
   const switching = agentChoice !== SAME_AS_SOURCE;

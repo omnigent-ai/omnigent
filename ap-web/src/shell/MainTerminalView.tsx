@@ -35,9 +35,22 @@ interface MainTerminalViewProps {
    * unknown or closed key falls back the same way once terminals load.
    */
   initialTerminalKey?: string | null;
+  /**
+   * When true, attach every terminal (agent TUI and user shells)
+   * read-only — the viewer can watch but not type. Set for non-owners:
+   * a shared PTY's keystrokes carry no per-user identity, so only the
+   * owner may drive it (the server enforces this and refuses a
+   * non-owner write attach). Non-owners interact via the chat composer
+   * instead. Default false (owner / single-user).
+   */
+  readOnly?: boolean;
 }
 
-export function MainTerminalView({ conversationId, initialTerminalKey }: MainTerminalViewProps) {
+export function MainTerminalView({
+  conversationId,
+  initialTerminalKey,
+  readOnly = false,
+}: MainTerminalViewProps) {
   const { terminals } = useTerminals(conversationId);
   const terminalFirstCtx = useTerminalFirst();
   // The agent's own terminal (SDK REPL / native vendor pane) — the
@@ -137,6 +150,7 @@ export function MainTerminalView({ conversationId, initialTerminalKey }: MainTer
                   <TerminalView
                     sessionId={conversationId}
                     terminalId={activeTerminal.id}
+                    readOnly={readOnly}
                     onStateChange={(state) => {
                       setTerminalConnectionState(activeTerminal.id, state);
                     }}

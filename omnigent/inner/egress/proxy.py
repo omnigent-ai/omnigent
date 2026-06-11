@@ -46,6 +46,10 @@ logger = logging.getLogger(__name__)
 _CONNECT_RESPONSE = b"HTTP/1.1 200 Connection Established\r\n\r\n"
 _BUF_SIZE = 65536
 _HEADER_MAX = 65536
+# S6 (security): the smallest printable ASCII byte (SP). Any byte below
+# this is a control byte and is rejected in the inner request line — see
+# ``_handle_connect`` for the request-line-smuggling rationale.
+_MIN_PRINTABLE_BYTE = 0x20
 
 # S2 (security): CSP-internal endpoints that present as globally
 # routable IPs but actually reach inside the cloud tenant. These slip
@@ -395,6 +399,32 @@ class EgressProxy:
                 return
 
             inner_line = inner_first.decode("latin-1", errors="replace").strip()
+
+            # S6 (security): a sandboxed agent controls these
+            # MITM-decrypted bytes, so the policy parse and the bytes we
+            # forward upstream MUST NOT be able to diverge. The primary
+            # guard is re-serializing the forwarded request line from the
+            # parsed (method, path) below — that makes the upstream
+            # receive byte-for-byte what the policy authorized, no matter
+            # how ``str.split()`` tokenized the line. (``str.split()`` with
+            # no argument splits on *any* Unicode whitespace, which after
+            # the ``latin-1`` decode includes not just bare
+            # ``\r``/``\t``/``\v``/``\f`` but also NEL ``0x85`` and NBSP
+            # ``0xa0`` — so a control-byte filter alone would be
+            # insufficient.) As defense in depth we additionally reject
+            # any control byte (< SP) here, which gives a clean 403 for
+            # the classic bare-``\r``/``\t`` request-line smuggle instead
+            # of silently normalizing it.
+            if any(ord(ch) < _MIN_PRINTABLE_BYTE for ch in inner_line):
+                logger.warning(
+                    "REJECT-CONTROL-CHAR CONNECT %s — inner request line contains a control byte",
+                    host,
+                )
+                await self._send_forbidden(
+                    tls_writer, "inner request line contains forbidden character"
+                )
+                return
+
             inner_parts = inner_line.split()
             if len(inner_parts) < 2:
                 return
@@ -418,13 +448,21 @@ class EgressProxy:
             if content_length > 0:
                 body = await asyncio.wait_for(tls_reader.readexactly(content_length), timeout=30)
 
+            # Forward a request line re-serialized from the parsed
+            # method/path rather than the raw ``inner_first`` bytes, so
+            # the upstream always receives exactly the (method, path)
+            # the policy authorized. Mirrors the plain-HTTP path in
+            # ``_handle_http`` (``relative_line``); closes the
+            # policy-vs-forwarded byte differential.
+            inner_request_line = f"{inner_method} {inner_path} HTTP/1.1\r\n".encode("latin-1")
+
             await self._forward_https(
                 tls_writer,
                 host,
                 port,
                 inner_method,
                 inner_path,
-                inner_first,
+                inner_request_line,
                 inner_headers_raw,
                 body,
             )
@@ -467,7 +505,7 @@ class EgressProxy:
     ) -> None:
         """Open a real TLS connection to the target and relay."""
         try:
-            await self._assert_destination_allowed(host, port)
+            pinned_ip = await self._assert_destination_allowed(host, port)
         except PermissionError as exc:
             logger.warning("BLOCKED-DEST https://%s:%d - %s", host, port, exc)
             await self._send_forbidden(client_writer, str(exc))
@@ -476,10 +514,18 @@ class EgressProxy:
             ssl_ctx = ssl.create_default_context(cafile=str(self._upstream_ca_bundle))
         else:
             ssl_ctx = ssl.create_default_context()
+        # Connect to the IP pinned by the destination check (or the
+        # hostname when private-destination blocking is disabled and
+        # ``pinned_ip`` is None). Connecting to the pinned IP removes
+        # the second, independent DNS lookup that ``open_connection``
+        # would otherwise perform — the rebinding window this guard
+        # exists to close. ``server_hostname=host`` keeps TLS SNI and
+        # certificate verification bound to the original hostname.
+        connect_host = pinned_ip or host
         try:
             upstream_reader, upstream_writer = await asyncio.wait_for(
                 asyncio.open_connection(
-                    host,
+                    connect_host,
                     port,
                     ssl=ssl_ctx,
                     server_hostname=host,
@@ -591,7 +637,7 @@ class EgressProxy:
         logger.info("ALLOW %s http://%s%s", method, host, path)
 
         try:
-            await self._assert_destination_allowed(host, port)
+            pinned_ip = await self._assert_destination_allowed(host, port)
         except PermissionError as exc:
             logger.warning("BLOCKED-DEST http://%s%s - %s", host, path, exc)
             await self._send_forbidden(writer, str(exc))
@@ -605,9 +651,16 @@ class EgressProxy:
 
         relative_line = f"{method} {path} HTTP/1.1\r\n".encode("latin-1")
 
+        # Connect to the IP pinned by the destination check (or the
+        # hostname when blocking is disabled and ``pinned_ip`` is
+        # None) to avoid a second, independent DNS lookup — the
+        # rebinding window this guard exists to close. The original
+        # ``Host:`` header in ``headers_raw`` is forwarded unchanged,
+        # so virtual-host routing still works when connecting by IP.
+        connect_host = pinned_ip or host
         try:
             upstream_reader, upstream_writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port),
+                asyncio.open_connection(connect_host, port),
                 timeout=30,
             )
         except Exception as exc:  # noqa: BLE001 — upstream connect failure maps to 502
@@ -672,12 +725,15 @@ class EgressProxy:
                 result[key.decode("latin-1").strip().lower()] = val.decode("latin-1").strip()
         return result
 
-    async def _assert_destination_allowed(self, host: str, port: int) -> None:
+    async def _assert_destination_allowed(self, host: str, port: int) -> str | None:
         """
-        Resolve *host* and raise :exc:`PermissionError` if any
-        resolved address is non-globally-routable, multicast, or
-        matches a known CSP "trap" endpoint, when
+        Resolve *host*, validate every resolved address, and return a
+        single pinned IP the caller MUST connect to, when
         :attr:`_block_private_destinations` is set.
+
+        Raises :exc:`PermissionError` if any resolved address is
+        non-globally-routable, multicast, or matches a known CSP
+        "trap" endpoint.
 
         Uses ``ipaddress.ip_address(...).is_global`` rather than the
         narrower ``is_private`` flag so the check picks up CGNAT /
@@ -694,34 +750,46 @@ class EgressProxy:
         leak metadata and serve as cloud-host control planes, so
         they're refused regardless of ``is_global``.
 
-        Called *immediately before* opening the upstream socket in
-        both :meth:`_forward_https` and :meth:`_forward_http`. The
-        DNS lookup and the connect that follows can race (the name
-        could re-resolve), so callers should treat this as a
-        best-effort defense; the system resolver also caches for
-        most TTLs which makes a meaningful re-bind window narrow.
-        Combined with deny-by-default at the rule layer this is
-        still strictly better than no check.
+        **Fail closed + pin the IP (DNS-rebinding defense).** This
+        method resolves the host ONCE and returns the validated IP so
+        the caller connects to that exact address instead of letting
+        ``asyncio.open_connection`` perform an independent second
+        lookup. Without pinning, the check and the connect are two
+        separate resolutions (check-then-use / TOCTOU): an attacker
+        who controls DNS for an allowed/wildcard host could fail the
+        first lookup and return a private IP on the second, slipping
+        past the guard. A DNS resolution failure (``socket.gaierror``)
+        or an empty result therefore raises :exc:`PermissionError`
+        (fail closed) rather than allowing the connect to proceed.
 
+        :param host: Upstream hostname or IP literal to resolve and
+            validate, e.g. ``"api.example.com"`` or ``"203.0.113.7"``.
+        :param port: Upstream TCP port, e.g. ``443``. Passed to
+            ``getaddrinfo`` to select the service.
+        :returns: The validated IP string the caller must connect to
+            (e.g. ``"203.0.113.7"``) when blocking is enabled, or
+            ``None`` when :attr:`_block_private_destinations` is
+            ``False`` (caller connects to the hostname directly).
         :raises PermissionError: when blocking is enabled and the
-            host resolves to a non-public address.
+            host fails to resolve, resolves to no usable address, or
+            resolves to a non-public / multicast / cloud-trap address.
         """
         if not self._block_private_destinations:
-            return
+            return None
         try:
             infos = await asyncio.get_event_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
-        except socket.gaierror:
-            # DNS resolution failed entirely — let the subsequent
-            # connect attempt surface the error naturally (502 Bad
-            # Gateway with the gaierror as the cause). Blocking here
-            # would mask the real failure mode and would also break
-            # legitimate "host doesn't exist" handling that callers
-            # may want to observe and retry. Note: this is NOT a
-            # DNS-rebinding bypass — rebinding requires the host to
-            # resolve to SOMETHING (and to something different on
-            # the next lookup). A complete resolution failure can't
-            # smuggle a private IP.
-            return
+        except socket.gaierror as exc:
+            # Fail closed. A re-resolution at connect time is the
+            # rebinding channel this guard exists to close: if we
+            # returned here, the subsequent ``asyncio.open_connection``
+            # would resolve the name a second time and could land on a
+            # private IP that this lookup never saw. Refuse instead of
+            # deferring to the connect path.
+            raise PermissionError(
+                f"host {host!r} DNS resolution failed ({exc}) — blocked "
+                "because egress_allow_private_destinations is False"
+            ) from exc
+        pinned_ip: str | None = None
         for family, _type, _proto, _canon, sockaddr in infos:
             if family == socket.AF_INET:
                 ip_str = sockaddr[0]
@@ -755,6 +823,20 @@ class EgressProxy:
                         "because egress_allow_private_destinations "
                         "is False"
                     )
+            # First address that passed every check becomes the pinned
+            # connect target. We keep validating the rest so a list
+            # mixing public and private addresses still fails closed.
+            if pinned_ip is None:
+                pinned_ip = ip_str
+        if pinned_ip is None:
+            # getaddrinfo returned only address families we don't
+            # connect over (no AF_INET / AF_INET6 entry). Fail closed
+            # rather than fall through to a hostname re-resolution.
+            raise PermissionError(
+                f"host {host!r} resolved to no usable IPv4/IPv6 address "
+                "— blocked because egress_allow_private_destinations is False"
+            )
+        return pinned_ip
 
     @staticmethod
     def _parse_host_port(target: str, default_port: int = 443) -> tuple[str, int]:

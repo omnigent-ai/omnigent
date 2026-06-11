@@ -10,13 +10,13 @@
 //     else building one from the copied Omnigent items (a format-agnostic
 //     conversion, so the source harness doesn't matter).
 //
-// One exception: a CROSS-FAMILY switch into codex-native is hidden. The
-// Codex rollout synthesizer doesn't track Codex's session_meta schema yet
-// (codex ≥ 0.136 rejects the synthesized rollout as "does not start with
-// session metadata"), so the rebuild silently launches fresh. Offer it
-// again together with the version-aware synthesizer fix (see
-// tests/e2e/test_host_cross_family_fork_e2e.py module docstring).
-// Claude-native targets carry history from any source.
+// Native targets carry history from any source: the rollout synthesizer
+// writes the session_meta fields codex ≥ 0.133 requires (timestamp,
+// cli_version, model_provider) plus the event_msg mirrors codex rebuilds
+// visible turns from, so cross-family forks into codex-native rebuild the
+// rollout from the copied Omnigent items like claude-native always did
+// (see _codex_rollout_records_from_session_items in omnigent/codex_native.py
+// and tests/e2e/test_host_cross_family_fork_e2e.py).
 
 /** Provider family a harness consumes, or null when unknown. */
 export function harnessFamily(harness: string | null | undefined): "anthropic" | "openai" | null {
@@ -50,49 +50,29 @@ export function isNativeHarness(harness: string | null | undefined): boolean {
 }
 
 /**
- * Whether switching a fork from `sourceHarness` to `targetHarness` keeps
- * the source's conversation history (and so should be offered in the
- * picker).
+ * Whether forking/switching into `targetHarness` keeps the source's
+ * conversation history (and so should be offered in the picker).
  *
- * Returns true when:
- *   - the target is a known SDK harness (it replays the transcript as
- *     context), regardless of the source or its family;
- *   - the target is claude-native (the runner rebuilds the Claude
- *     transcript from the copied Omnigent items for any source); or
- *   - the target is codex-native AND the source is in the openai family
- *     (clone for a codex source, rebuild for an openai SDK source).
+ * True for every classifiable target — the source harness doesn't matter:
+ *   - an SDK target replays the transcript as context;
+ *   - a native target clones the source's native transcript when the
+ *     source is same-family native, else the runner rebuilds the target's
+ *     on-disk transcript from the copied Omnigent items (a format-agnostic
+ *     conversion; see the module comment).
  *
- * Returns false for a cross-family switch into codex-native (the Codex
- * rollout synthesizer doesn't track Codex's session_meta schema yet — the
- * rebuild would silently start fresh; see the module comment) and —
- * conservatively — for any target whose harness we can't classify.
+ * Returns false — conservatively — only for a target whose harness we
+ * can't classify.
  *
- * TODO(fork-switch): default false when the target harness is unknown
- * (`harnessFamily` returns null) — e.g. the catalog reports `harness: null`
- * because the server couldn't load the agent's bundle (see
- * `_to_agent_object` in `server/routes/builtin_agents.py`). We don't offer
- * a switch we can't verify preserves history. Revisit once the catalog
- * reliably reports a harness for every built-in, or to add an explicit
- * "may start fresh" affordance for unclassified harnesses.
+ * TODO(fork-switch): the false-for-unknown default exists because the
+ * catalog can report `harness: null` when the server couldn't load the
+ * agent's bundle (see `_to_agent_object` in
+ * `server/routes/builtin_agents.py`). We don't offer a switch we can't
+ * verify preserves history. Revisit once the catalog reliably reports a
+ * harness for every built-in, or to add an explicit "may start fresh"
+ * affordance for unclassified harnesses.
  *
- * @param sourceHarness - The source session's harness.
  * @param targetHarness - The harness the fork would switch to.
  */
-export function forkSwitchPreservesHistory(
-  sourceHarness: string | null | undefined,
-  targetHarness: string | null | undefined,
-): boolean {
-  const targetFamily = harnessFamily(targetHarness);
-  // Unknown/unsupported target harness → don't offer it (see TODO above).
-  if (targetFamily === null) return false;
-  // Known SDK target replays the transcript as context: history carries
-  // regardless of the source or its family (incl. native → SDK).
-  if (!isNativeHarness(targetHarness)) return true;
-  // Claude-native target: the runner rebuilds the Claude transcript from
-  // the copied Omnigent items, so any source carries.
-  if (targetFamily === "anthropic") return true;
-  // Codex-native target: only a same-family source carries until the
-  // rollout synthesizer tracks Codex's session_meta schema (see module
-  // comment).
-  return harnessFamily(sourceHarness) === targetFamily;
+export function forkTargetCarriesHistory(targetHarness: string | null | undefined): boolean {
+  return harnessFamily(targetHarness) !== null;
 }

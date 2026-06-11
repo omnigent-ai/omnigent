@@ -6,8 +6,21 @@ import type { TerminalFirstContextValue } from "./TerminalFirstContext";
 import { TerminalFirstContextProvider } from "./TerminalFirstContext";
 
 vi.mock("@/components/blocks/TerminalView", () => ({
-  TerminalView: ({ sessionId, terminalId }: { sessionId: string; terminalId: string }) => (
-    <div data-testid="terminal-view" data-session-id={sessionId} data-terminal-id={terminalId} />
+  TerminalView: ({
+    sessionId,
+    terminalId,
+    readOnly,
+  }: {
+    sessionId: string;
+    terminalId: string;
+    readOnly?: boolean;
+  }) => (
+    <div
+      data-testid="terminal-view"
+      data-session-id={sessionId}
+      data-terminal-id={terminalId}
+      data-read-only={String(readOnly ?? false)}
+    />
   ),
 }));
 
@@ -68,17 +81,23 @@ function renderView({
   terminals,
   isNativeWrapper = false,
   initialTerminalKey = null,
+  readOnly = false,
   setView,
 }: {
   terminals: TerminalInfo[];
   isNativeWrapper?: boolean;
   initialTerminalKey?: string | null;
+  readOnly?: boolean;
   setView?: (view: "chat" | "terminal") => void;
 }) {
   useTerminalsMock.mockReturnValue({ terminals, isLoading: false, error: null });
   return render(
     <TerminalFirstContextProvider value={makeCtx(isNativeWrapper, setView)}>
-      <MainTerminalView conversationId="conv_sdk" initialTerminalKey={initialTerminalKey} />
+      <MainTerminalView
+        conversationId="conv_sdk"
+        initialTerminalKey={initialTerminalKey}
+        readOnly={readOnly}
+      />
     </TerminalFirstContextProvider>,
   );
 }
@@ -103,6 +122,32 @@ describe("MainTerminalView — terminal-first SDK sessions", () => {
     // (creation belongs to the rail's Shells tab).
     expect(screen.queryByText("bash")).toBeNull();
     expect(screen.queryByTestId("new-shell-button")).toBeNull();
+  });
+
+  it("forwards readOnly to the terminal so non-owners attach view-only", () => {
+    // Owner (default): the agent terminal is interactive.
+    const { unmount } = renderView({ terminals: [REPL_TERMINAL] });
+    expect(screen.getByTestId("terminal-view")).toHaveAttribute("data-read-only", "false");
+    unmount();
+
+    // Non-owner: the same pane attaches read-only — they drive the
+    // agent via the composer, since a shared PTY can't attribute
+    // per-user keystrokes.
+    renderView({ terminals: [REPL_TERMINAL], readOnly: true });
+    expect(screen.getByTestId("terminal-view")).toHaveAttribute("data-read-only", "true");
+  });
+
+  it("forwards readOnly to a rail-opened shell too", () => {
+    // A user shell shares the owner-only rule: non-owners watch but
+    // can't type.
+    renderView({
+      terminals: [REPL_TERMINAL, BASH_SHELL],
+      initialTerminalKey: "terminal:terminal_bash_s1",
+      readOnly: true,
+    });
+    const view = screen.getByTestId("terminal-view");
+    expect(view).toHaveAttribute("data-terminal-id", "terminal_bash_s1");
+    expect(view).toHaveAttribute("data-read-only", "true");
   });
 
   it("renders a rail-opened shell chrome-free: shell header + close, no agent tab", () => {

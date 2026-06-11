@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "omnigent-client"
-version = "0.1.0"
+version = "0.1.0rc1"
 description = "Python client SDK for the omnigent server API"
 requires-python = ">=3.12"
 dependencies = [
@@ -12,8 +12,10 @@ dependencies = [
     # StreamEvent source of truth that the SDK validates SSE
     # envelopes against (see _sessions.py, _sse.py). Resolved via
     # the relative path below so the SDK can be installed
-    # editable alongside the root ``omnigent`` package.
-    "omnigent",
+    # editable alongside the root ``omnigent`` package. Version-locked
+    # (==) so a published SDK always pairs with the server release it
+    # shipped with (release-omnigent.yml verifies the pin).
+    "omnigent==0.1.0rc1",
     "httpx>=0.27",
     "pydantic>=2.0,<3",
 ]

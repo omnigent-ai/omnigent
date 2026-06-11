@@ -53,6 +53,14 @@ interface TerminalsPanelProps {
    * handle is rendered. Default: false (legacy push-panel behavior).
    */
   fluid?: boolean;
+  /**
+   * When true, attach terminals read-only — the viewer can watch but
+   * not type. Set for non-owners: a shared PTY's keystrokes carry no
+   * per-user identity, so only the owner may drive it (the server
+   * enforces this and refuses a non-owner write attach). Default false
+   * (owner / single-user).
+   */
+  readOnly?: boolean;
 }
 
 export function TerminalsPanel({
@@ -61,6 +69,7 @@ export function TerminalsPanel({
   initialTerminalKey,
   onClose,
   fluid = false,
+  readOnly = false,
 }: TerminalsPanelProps) {
   const [expanded, setExpanded] = useState(false);
   const ref = useRef<HTMLElement>(null);
@@ -220,6 +229,7 @@ export function TerminalsPanel({
               <TerminalView
                 sessionId={conversationId}
                 terminalId={activeTerminal.id}
+                readOnly={readOnly}
                 onStateChange={(state) => {
                   setTerminalConnectionState(activeTerminal.id, state);
                 }}

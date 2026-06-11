@@ -350,6 +350,7 @@ async def summarize_history(
     model: str,
     connection: dict[str, str] | None = None,
     runner_client: Any | None = None,  # httpx.AsyncClient | None
+    conversation_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Layer 2: call the LLM to summarise conversation messages.
@@ -373,6 +374,9 @@ async def summarize_history(
         runner. When set, the summarization LLM call is delegated to
         the runner's ``POST /v1/summarize`` endpoint. ``None`` falls
         back to *llm_client*.
+    :param conversation_id: Session/conversation identifier, e.g.
+        ``"conv_abc123"``. Forwarded to the runner so it can look up
+        the spec's auth credentials for the LLM call.
     :returns: A dict with ``"text"`` (the summary) and
         ``"token_count"`` (approximate token count).
     """
@@ -382,6 +386,7 @@ async def summarize_history(
             messages_to_summarize,
             model,
             connection,
+            conversation_id=conversation_id,
         )
     return await _summarize_history_uncached(
         messages_to_summarize,
@@ -425,6 +430,7 @@ async def _summarize_via_runner_uncached(
     messages_to_summarize: list[dict[str, Any]],
     model: str,
     connection: dict[str, str] | None = None,
+    conversation_id: str | None = None,
 ) -> dict[str, Any]:
     """
     POST to the runner's ``/v1/summarize`` endpoint and return the result.
@@ -437,6 +443,9 @@ async def _summarize_via_runner_uncached(
     :param model: LLM model string, e.g. ``"openai/gpt-4o"``.
     :param connection: Per-provider connection overrides forwarded to
         the runner verbatim. ``None`` omits the field.
+    :param conversation_id: Session/conversation identifier, e.g.
+        ``"conv_abc123"``. Sent in the payload so the runner can
+        look up the spec's auth credentials for the LLM call.
     :returns: Dict with ``"text"`` (summary) and ``"token_count"``
         (approximate tiktoken estimate) keys.
     :raises httpx.HTTPStatusError: On non-2xx responses from the runner.
@@ -444,6 +453,8 @@ async def _summarize_via_runner_uncached(
     payload: dict[str, Any] = {"messages": messages_to_summarize, "model": model}
     if connection:
         payload["connection"] = connection
+    if conversation_id is not None:
+        payload["session_id"] = conversation_id
     resp = await runner_client.post("/v1/summarize", json=payload, timeout=120.0)
     resp.raise_for_status()
     return resp.json()
@@ -626,6 +637,7 @@ async def compact(
         connection=connection,
         fail_on_error=fail_on_summary_error,
         runner_client=runner_client,
+        conversation_id=conversation_id,
     )
     if summary_metadata is not None:
         summary_messages = _summary_to_messages(summary_metadata)
@@ -735,6 +747,7 @@ async def _run_layer2(
     connection: dict[str, str] | None = None,
     fail_on_error: bool = False,
     runner_client: Any | None = None,  # httpx.AsyncClient | None
+    conversation_id: str | None = None,
 ) -> SummaryMetadata | None:
     """
     Attempt Layer 2 LLM summarisation.
@@ -760,6 +773,9 @@ async def _run_layer2(
         runner. When set, delegates the summarization LLM call to the
         runner's ``POST /v1/summarize`` endpoint. ``None`` uses
         *llm_client* directly.
+    :param conversation_id: Session/conversation identifier, e.g.
+        ``"conv_abc123"``. Forwarded to the runner so it can look up
+        the spec's auth credentials for the LLM call.
     :returns: :class:`SummaryMetadata` on success, ``None`` on failure.
     """
 
@@ -775,6 +791,8 @@ async def _run_layer2(
         summarize_kwargs: dict[str, Any] = {"connection": connection}
         if runner_client is not None:
             summarize_kwargs["runner_client"] = runner_client
+        if conversation_id is not None:
+            summarize_kwargs["conversation_id"] = conversation_id
         result = await summarize_history(
             to_summarize,
             llm_client,

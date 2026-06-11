@@ -1920,6 +1920,7 @@ async def compact_conversation_now(
         runner_client=_get_runner_client_for_compaction(conversation_id),
         force=True,
         fail_on_summary_error=True,
+        conversation_id=conversation_id,
     )
     if result.summary_metadata is None:
         raise OmnigentError(

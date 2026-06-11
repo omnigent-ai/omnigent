@@ -8484,6 +8484,8 @@ async def test_ensure_local_codex_resume_rollout_synthesizes_omnigent_history(
             external_session_id=thread_id,
             codex_home=codex_home,
             workspace=workspace.resolve(),
+            model_provider="omnigent_databricks",
+            codex_path=None,
         )
 
     assert rollout is not None
@@ -8498,12 +8500,20 @@ async def test_ensure_local_codex_resume_rollout_synthesizes_omnigent_history(
         "session_meta",
         "turn_context",
         "response_item",
+        "event_msg",
         "response_item",
         "response_item",
         "response_item",
+        "event_msg",
     ]
     assert records[0]["payload"]["id"] == thread_id
     assert records[0]["payload"]["cwd"] == str(workspace.resolve())
+    # codex >= 0.133 refuses to parse a rollout whose session_meta lacks
+    # timestamp/cli_version, and its thread-store backfill breaks resume
+    # when model_provider is absent (verified against codex 0.136.0).
+    assert records[0]["payload"]["timestamp"] == records[0]["timestamp"]
+    assert records[0]["payload"]["cli_version"] == "0.0.0"
+    assert records[0]["payload"]["model_provider"] == "omnigent_databricks"
     assert records[1]["payload"]["turn_id"] == "turn_1"
     assert records[1]["payload"]["cwd"] == str(workspace.resolve())
     assert records[2]["payload"] == {
@@ -8512,24 +8522,39 @@ async def test_ensure_local_codex_resume_rollout_synthesizes_omnigent_history(
         "content": [{"type": "input_text", "text": "open TODO.md"}],
         "id": "msg_user_1",
     }
+    # Visible-turn reconstruction reads event_msg mirrors, not
+    # response_item history: without them codex resumes an empty thread.
     assert records[3]["payload"] == {
+        "type": "user_message",
+        "message": "open TODO.md",
+        "images": [],
+        "local_images": [],
+        "text_elements": [],
+    }
+    assert records[4]["payload"] == {
         "type": "function_call",
         "name": "shell",
         "arguments": '{"command":"cat TODO.md"}',
         "call_id": "call_shell_1",
         "id": "fc_shell_1",
     }
-    assert records[4]["payload"] == {
+    assert records[5]["payload"] == {
         "type": "function_call_output",
         "call_id": "call_shell_1",
         "output": "contents",
         "id": "fco_shell_1",
     }
-    assert records[5]["payload"] == {
+    assert records[6]["payload"] == {
         "type": "message",
         "role": "assistant",
         "content": [{"type": "output_text", "text": "TODO.md says contents"}],
         "id": "msg_assistant_1",
+    }
+    assert records[7]["payload"] == {
+        "type": "agent_message",
+        "message": "TODO.md says contents",
+        "phase": "final_answer",
+        "memory_citation": None,
     }
     restored_payloads = [
         record["payload"] for record in records if record["type"] == "response_item"
@@ -8584,6 +8609,8 @@ async def test_ensure_local_codex_resume_rollout_preserves_existing_rollout(
             external_session_id=thread_id,
             codex_home=codex_home,
             workspace=(tmp_path / "workspace").resolve(),
+            model_provider="omnigent_databricks",
+            codex_path=None,
         )
 
     assert rollout == existing
@@ -8651,6 +8678,8 @@ async def test_ensure_local_codex_resume_rollout_rejects_malformed_tool_history(
                 external_session_id="019e96aa-0be2-7343-8d3b-6f914d60936b",
                 codex_home=tmp_path / "codex-home",
                 workspace=(tmp_path / "workspace").resolve(),
+                model_provider="omnigent_databricks",
+                codex_path=None,
             )
 
 
@@ -8687,6 +8716,8 @@ async def test_ensure_local_codex_resume_rollout_rejects_unsafe_thread_id(
                 external_session_id="../../etc/passwd",
                 codex_home=tmp_path / "codex-home",
                 workspace=(tmp_path / "workspace").resolve(),
+                model_provider="omnigent_databricks",
+                codex_path=None,
             )
 
 

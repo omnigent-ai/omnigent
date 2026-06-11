@@ -72,7 +72,7 @@ import type { SandboxStatus, Session, SessionStatus } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import type { MessageContentBlock } from "@/lib/blocks";
-import { derivePermissionLevel } from "@/lib/permissionsApi";
+import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
   type Bubble,
   type RenderItem,
@@ -1198,6 +1198,10 @@ function MainAgentSurface({
         <MainTerminalView
           conversationId={conversationId}
           initialTerminalKey={terminalFirst?.terminalViewKey}
+          // Non-owners attach read-only: a shared PTY can't attribute
+          // input per-user, so only the owner may type. They drive the
+          // agent via the composer instead. Server enforces this too.
+          readOnly={!isOwnerLevel(permissionLevel)}
         />
         <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
       </>

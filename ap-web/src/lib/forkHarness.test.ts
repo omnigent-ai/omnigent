@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { harnessFamily, isNativeHarness, forkSwitchPreservesHistory } from "./forkHarness";
+import { harnessFamily, isNativeHarness, forkTargetCarriesHistory } from "./forkHarness";
 
 describe("harnessFamily", () => {
   it.each([
@@ -41,59 +41,37 @@ describe("isNativeHarness", () => {
   });
 });
 
-describe("forkSwitchPreservesHistory", () => {
+describe("forkTargetCarriesHistory", () => {
   // SDK targets always carry history as context, regardless of source or
   // family — including native → SDK and cross-family. A false here would
   // wrongly hide a fully-supported switch from the picker.
-  it.each([
-    ["claude-native", "claude-sdk"], // native → same-family SDK
-    ["codex-native", "openai-agents"], // native → same-family SDK
-    ["claude-sdk", "codex"], // cross-family SDK → SDK (codex SDK)
-    ["openai-agents", "claude-sdk"], // cross-family → SDK
-  ])("SDK target %s ← %s preserves history", (source, target) => {
-    expect(forkSwitchPreservesHistory(source, target)).toBe(true);
-  });
+  it.each([["claude-sdk"], ["claude_sdk"], ["codex"], ["openai-agents"], ["agents_sdk"]])(
+    "SDK target %s carries history",
+    (target) => {
+      expect(forkTargetCarriesHistory(target)).toBe(true);
+    },
+  );
 
-  // claude-native target: the runner rebuilds the Claude transcript from
-  // the copied Omnigent items, so ANY source carries — same-family (clone
-  // or rebuild) and cross-family (rebuild) alike.
-  it.each([
-    ["claude-sdk", "claude-native"], // same-family SDK (rebuild)
-    ["claude-native", "claude-native"], // same-family native (clone)
-    ["openai-agents", "claude-native"], // cross-family SDK (rebuild)
-    ["codex-native", "claude-native"], // cross-family native (rebuild)
-  ])("claude-native target %s ← %s preserves history", (source, target) => {
-    expect(forkSwitchPreservesHistory(source, target)).toBe(true);
-  });
-
-  // codex-native target: same-family sources carry (clone for a codex
-  // source, rebuild for an openai SDK source — today's behavior).
-  it.each([
-    ["codex", "codex-native"], // codex SDK → native (rebuild)
-    ["openai-agents", "codex-native"], // SDK → native (rebuild)
-    ["codex-native", "codex-native"], // native → native (clone)
-  ])("same-family codex-native target %s ← %s preserves history", (source, target) => {
-    expect(forkSwitchPreservesHistory(source, target)).toBe(true);
-  });
-
-  // Cross-family into codex-native is hidden: the rollout synthesizer
-  // doesn't track Codex's session_meta schema yet (codex ≥ 0.136 rejects
-  // the synthesized rollout), so the rebuild would silently start fresh.
-  // A true here would surface a silently-fresh switch in the picker.
-  it.each([
-    ["claude-sdk", "codex-native"], // anthropic SDK → openai native
-    ["claude-native", "codex-native"], // anthropic native → openai native
-    ["mystery", "codex-native"], // unknown source can't match the family
-  ])("cross-family codex-native target %s ← %s loses history", (source, target) => {
-    expect(forkSwitchPreservesHistory(source, target)).toBe(false);
-  });
+  // Native targets carry from ANY source: the runner clones the source's
+  // native transcript when the source is same-family native, else rebuilds
+  // the target's on-disk transcript from the copied Omnigent items. The
+  // codex-native rebuild includes the session_meta fields codex ≥ 0.133
+  // requires plus the event_msg mirrors it rebuilds visible turns from
+  // (verified against codex 0.136.0), so cross-family forks into
+  // codex-native are offered like claude-native always was.
+  it.each([["claude-native"], ["native-claude"], ["codex-native"], ["native-codex"]])(
+    "native target %s carries history",
+    (target) => {
+      expect(forkTargetCarriesHistory(target)).toBe(true);
+    },
+  );
 
   it("does NOT offer a target whose harness is unknown (conservative; see TODO)", () => {
     // We can't classify an unrecognised harness (the catalog may report
     // harness=null when it couldn't load the agent's bundle), so we don't
     // offer a switch we can't verify preserves history.
-    expect(forkSwitchPreservesHistory("claude-sdk", "mystery")).toBe(false);
-    expect(forkSwitchPreservesHistory("claude-sdk", null)).toBe(false);
-    expect(forkSwitchPreservesHistory("claude-native", undefined)).toBe(false);
+    expect(forkTargetCarriesHistory("mystery")).toBe(false);
+    expect(forkTargetCarriesHistory(null)).toBe(false);
+    expect(forkTargetCarriesHistory(undefined)).toBe(false);
   });
 });

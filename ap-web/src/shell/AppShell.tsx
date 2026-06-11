@@ -9,7 +9,7 @@ import {
   readFilesPanelPreferences,
   writeFilesPanelPreferences,
 } from "@/lib/filesPanelPreferences";
-import { derivePermissionLevel } from "@/lib/permissionsApi";
+import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import { isMacElectronShell } from "@/lib/nativeBridge";
 import {
   readSessionWorkspaceState,
@@ -1090,6 +1090,9 @@ export function AppShell() {
           // No neighbor to resize against (chat is hidden, FilesPanel
           // owns its own width) — grow via flex-1.
           fluid={panelOpen}
+          // Non-owners attach read-only: a shared PTY can't attribute
+          // input per-user, so only the owner may type (server-enforced).
+          readOnly={!isOwnerLevel(permissionLevel)}
           onClose={() => setPanelInitialKey(null)}
         />
       )}

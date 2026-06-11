@@ -392,12 +392,12 @@ async def test_attach_terminal_rejects_missing_identity_before_runner_proxy() ->
     assert factory.calls == []
 
 
-async def test_attach_terminal_allows_edit_grant_for_interactive_proxy() -> None:
-    """Edit-level users may open an interactive terminal attach."""
+async def test_attach_terminal_allows_owner_for_interactive_proxy() -> None:
+    """The session owner may open an interactive (write) terminal attach."""
     conv_store = _StubConversationStore()
     conv_store.add("conv_alice")
     perm_store = _StubPermissionStore()
-    perm_store.add_grant("alice@example.com", "conv_alice", LEVEL_EDIT)
+    perm_store.add_grant("alice@example.com", "conv_alice", LEVEL_OWNER)
     app = FastAPI()
     app.include_router(
         create_terminal_attach_router(
@@ -423,6 +423,58 @@ async def test_attach_terminal_allows_edit_grant_for_interactive_proxy() -> None
         "/v1/sessions/conv_alice/resources/terminals/terminal_bash_s1/attach?read_only=false"
     ]
     assert b"whoami\n" in conn.received
+
+
+async def test_attach_terminal_edit_grant_denied_write_allowed_read_only() -> None:
+    """A non-owner edit collaborator cannot type but may observe.
+
+    A terminal is a single shared PTY whose keystrokes carry no
+    per-user identity, so input is acted on (and, for the agent's TUI,
+    persisted into history) as the owner. Holding *edit* on someone
+    else's session is therefore not enough to drive their terminal: an
+    interactive attach by Bob (edit on Alice's session) is refused
+    before the runner proxy is dialed, while a read-only attach is
+    allowed so Bob can still watch.
+    """
+    conv_store = _StubConversationStore()
+    conv_store.add("conv_alice")
+    perm_store = _StubPermissionStore()
+    perm_store.add_grant("alice@example.com", "conv_alice", LEVEL_OWNER)
+    perm_store.add_grant("bob@example.com", "conv_alice", LEVEL_EDIT)
+    app = FastAPI()
+    app.include_router(
+        create_terminal_attach_router(
+            auth_provider=UnifiedAuthProvider(source="header"),
+            permission_store=perm_store,  # type: ignore[arg-type]
+            conversation_store=conv_store,  # type: ignore[arg-type]
+        ),
+        prefix="/v1",
+    )
+
+    interactive_factory = _FakeRunnerWSFactory(_FakeRunnerWSConn())
+    set_runner_ws_factory(interactive_factory)
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with TestClient(app).websocket_connect(
+            "/v1/sessions/conv_alice/resources/terminals/terminal_bash_s1/attach",
+            headers={"X-Forwarded-Email": "bob@example.com"},
+        ):
+            pass
+    assert exc_info.value.code == 1008
+    assert interactive_factory.calls == []
+
+    readonly_conn = _FakeRunnerWSConn(outgoing=[b"output"])
+    readonly_factory = _FakeRunnerWSFactory(readonly_conn)
+    set_runner_ws_factory(readonly_factory)
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/conv_alice/resources/terminals/terminal_bash_s1/attach?read_only=true",
+        headers={"X-Forwarded-Email": "bob@example.com"},
+    ) as ws:
+        assert ws.receive_bytes() == b"output"
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_bytes()
+    assert readonly_factory.calls == [
+        "/v1/sessions/conv_alice/resources/terminals/terminal_bash_s1/attach?read_only=true"
+    ]
 
 
 async def test_attach_terminal_read_grant_only_allows_read_only_proxy() -> None:

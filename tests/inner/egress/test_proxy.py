@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from omnigent.inner.egress.ca import ensure_ca, ensure_ca_bundle
+from omnigent.inner.egress.certs import HostCertCache
 from omnigent.inner.egress.proxy import EgressProxy
 from omnigent.inner.egress.rules import parse_rules
 
@@ -116,12 +117,26 @@ async def test_proxy_blocks_disallowed_connect(
 @pytest.mark.asyncio
 async def test_proxy_allows_connect_to_permitted_host(
     ca_paths: tuple[Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """CONNECT to a permitted host returns 200 Connection Established."""
     cert_path, key_path, _ = ca_paths
     rules = parse_rules(["GET allowed.example.com/**"])
     proxy = EgressProxy(rules, cert_path, key_path)
     port = await proxy.start_tcp()
+
+    # Resolve the allowed upstream to a global IP so the (now
+    # fail-closed) destination check passes and the CONNECT reaches
+    # the 200 stage. 127.0.0.1 stays mapped to itself for the test
+    # client's own connection to the proxy.
+    loop = asyncio.get_event_loop()
+    monkeypatch.setattr(
+        loop,
+        "getaddrinfo",
+        _stub_getaddrinfo_resolving(
+            {"allowed.example.com": "93.184.216.34", "127.0.0.1": "127.0.0.1"}
+        ),
+    )
 
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
@@ -169,6 +184,27 @@ def _stub_getaddrinfo_to(ip: str) -> callable:
         else:
             sockaddr = (ip, port, 0, 0)
         return [(family, socket.SOCK_STREAM, 0, "", sockaddr)]
+
+    return _fake
+
+
+def _stub_getaddrinfo_resolving(host_to_ip: dict[str, str]) -> callable:
+    """Return a ``loop.getaddrinfo`` replacement that resolves the
+    hosts in *host_to_ip* to a single global ``AF_INET`` record and
+    raises ``socket.gaierror`` for any other host.
+
+    Used by CONNECT / HTTP forwarding tests that need a specific
+    upstream hostname to pass ``_assert_destination_allowed`` (which
+    now fails closed on DNS errors) so the test can reach the TLS /
+    relay stage it actually exercises. Unlisted hosts fail loudly
+    rather than silently resolving somewhere unexpected.
+    """
+
+    async def _fake(host: str, port: int, *, type: int = 0) -> list:
+        ip = host_to_ip.get(host)
+        if ip is None:
+            raise socket.gaierror(socket.EAI_NONAME, f"unstubbed host {host!r}")
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (ip, port))]
 
     return _fake
 
@@ -262,6 +298,9 @@ async def test_s2_assert_destination_skips_check_when_opt_in(
     is bypassed. The opt-in is global by design — see the
     ``egress_allow_private_destinations`` docstring in
     ``OSEnvSandboxSpec``.
+
+    Returns ``None`` (no pinned IP) so the caller falls back to
+    connecting by hostname.
     """
     cert_path, key_path, _ = ca_paths
     proxy = EgressProxy(
@@ -274,7 +313,173 @@ async def test_s2_assert_destination_skips_check_when_opt_in(
     loop = asyncio.get_event_loop()
     monkeypatch.setattr(loop, "getaddrinfo", _stub_getaddrinfo_to("168.63.129.16"))
 
-    await proxy._assert_destination_allowed("wire.example.com", 80)
+    pinned = await proxy._assert_destination_allowed("wire.example.com", 80)
+    # None signals "blocking disabled" so the connect path uses the
+    # hostname. A non-None return here would mean the opt-in stopped
+    # short-circuiting and started resolving/pinning anyway.
+    assert pinned is None
+
+
+@pytest.mark.asyncio
+async def test_s2_assert_destination_returns_pinned_ip_for_global(
+    ca_paths: tuple[Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A globally-routable host must return the exact validated IP so
+    the caller connects to that pinned address instead of re-resolving
+    the hostname (the DNS-rebinding window this method closes).
+
+    Regression guard: the pre-fix method returned ``None``, so the
+    connect path performed a second, independent ``getaddrinfo`` —
+    asserting the concrete IP comes back here proves the pin contract.
+    """
+    cert_path, key_path, _ = ca_paths
+    proxy = EgressProxy(parse_rules(["GET *.example.com/**"]), cert_path, key_path)
+
+    loop = asyncio.get_event_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", _stub_getaddrinfo_to("93.184.216.34"))
+
+    pinned = await proxy._assert_destination_allowed("example.com", 443)
+    # The returned IP must be the validated address, byte-for-byte —
+    # this is what the caller pins the TCP connection to. A None or a
+    # different value would mean the connect path re-resolves and the
+    # rebinding defense is defeated.
+    assert pinned == "93.184.216.34"
+
+
+@pytest.mark.asyncio
+async def test_s2_assert_destination_fails_closed_on_dns_error(
+    ca_paths: tuple[Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DNS resolution failure (``socket.gaierror``) MUST raise
+    :exc:`PermissionError` (fail closed), not return silently.
+
+    This is the core SEC-20576 fix: the pre-fix code caught
+    ``gaierror`` and returned (fail open), after which the connect
+    path re-resolved the hostname — letting an attacker who fails the
+    first lookup return a private IP on the second. Failing closed
+    here removes that bypass. If this test passes against code that
+    ``return``s on ``gaierror``, the fix has regressed.
+    """
+    cert_path, key_path, _ = ca_paths
+    proxy = EgressProxy(parse_rules(["GET *.rebind.test/**"]), cert_path, key_path)
+
+    async def _raise_gaierror(host: str, port: int, **kwargs: object) -> list:
+        raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+
+    loop = asyncio.get_event_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", _raise_gaierror)
+
+    with pytest.raises(PermissionError, match=r"DNS resolution failed"):
+        await proxy._assert_destination_allowed("attacker.rebind.test", 443)
+
+
+@pytest.mark.asyncio
+async def test_s2_dns_rebinding_fail_then_loopback_is_blocked_e2e(
+    ca_paths: tuple[Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end SEC-20576 regression through the public proxy.
+
+    Reproduces the ticket's PoC: the attacker-controlled host fails
+    the first DNS lookup and resolves to ``127.0.0.1`` on the next.
+    A real loopback HTTP server returns a marker body; the test
+    asserts the proxy returns ``403`` and the marker is NEVER seen,
+    and that the host was resolved exactly once (the connect path
+    did not re-resolve).
+
+    On the pre-fix (fail-open + re-resolve) code, the first lookup's
+    ``gaierror`` would be swallowed, the connect path would re-resolve
+    to ``127.0.0.1``, reach the loopback server, and the response would
+    carry the marker with a ``200`` status (and the lookup count would
+    be 2). This test fails loudly in that case.
+    """
+    marker = b"PRIVATE-DESTINATION-REACHED"
+
+    async def _serve_marker(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        """Minimal loopback HTTP origin that always answers with the
+        marker body, standing in for a private/internal service the
+        egress policy is meant to block.
+        """
+        await asyncio.wait_for(reader.readline(), timeout=5)
+        while True:
+            line = await asyncio.wait_for(reader.readline(), timeout=5)
+            if line in (b"\r\n", b"\n", b""):
+                break
+        writer.write(
+            b"HTTP/1.1 200 OK\r\nContent-Length: "
+            + str(len(marker)).encode()
+            + b"\r\nConnection: close\r\n\r\n"
+            + marker
+        )
+        await writer.drain()
+        writer.close()
+
+    marker_server = await asyncio.start_server(_serve_marker, "127.0.0.1", 0)
+    marker_port = marker_server.sockets[0].getsockname()[1]
+
+    cert_path, key_path, _ = ca_paths
+    proxy = EgressProxy(parse_rules(["GET *.rebind.test/**"]), cert_path, key_path)
+    proxy_port = await proxy.start_tcp()
+
+    loop = asyncio.get_event_loop()
+    real_getaddrinfo = loop.getaddrinfo
+    lookup_count = 0
+
+    async def _rebinding_getaddrinfo(host: str, port: int, **kwargs: object) -> list:
+        """Resolve the attacker host with a fail-then-loopback rebind;
+        defer every other host (e.g. the test client's own
+        ``127.0.0.1``) to the real resolver.
+        """
+        nonlocal lookup_count
+        if host == "attacker.rebind.test":
+            lookup_count += 1
+            if lookup_count == 1:
+                raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", port))
+            ]
+        return await real_getaddrinfo(host, port, **kwargs)
+
+    monkeypatch.setattr(loop, "getaddrinfo", _rebinding_getaddrinfo)
+
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
+        request = (
+            f"GET http://attacker.rebind.test:{marker_port}/x HTTP/1.1\r\n"
+            f"Host: attacker.rebind.test:{marker_port}\r\n\r\n"
+        ).encode()
+        writer.write(request)
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(4096), timeout=5)
+        writer.close()
+    finally:
+        await proxy.stop()
+        marker_server.close()
+        await marker_server.wait_closed()
+
+    # Blocked: the first lookup's gaierror fails closed, so the proxy
+    # never opens the upstream connection. A 200 here would mean the
+    # fail-open path resurfaced.
+    assert b"403 Forbidden" in response, (
+        f"Expected 403 (fail-closed on DNS error). Got: {response[:200]!r}. "
+        "A non-403 means _assert_destination_allowed no longer fails closed."
+    )
+    # The loopback origin must never be reached. The marker appearing
+    # is the literal SEC-20576 exploit succeeding.
+    assert marker not in response, (
+        "Private loopback destination was reached despite the block — "
+        "DNS-rebinding bypass has regressed."
+    )
+    # Exactly one resolution: the connect path did not perform a second,
+    # independent lookup. 2 would mean the host was re-resolved after the
+    # check (the TOCTOU window the pinning fix removes).
+    assert lookup_count == 1, (
+        f"Expected exactly 1 DNS resolution (fail-closed, no re-resolve), "
+        f"got {lookup_count}. 2 means the connect path re-resolved the "
+        f"hostname after the guard — the rebinding bypass is back."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -645,6 +850,15 @@ async def test_handle_connect_passes_protocol_to_start_tls_directly(
         raise ssl.SSLError("stubbed — short-circuit handshake")
 
     loop = asyncio.get_event_loop()
+    # Resolve the allowed upstream to a global IP so the fail-closed
+    # destination check passes and the handler reaches start_tls.
+    monkeypatch.setattr(
+        loop,
+        "getaddrinfo",
+        _stub_getaddrinfo_resolving(
+            {"allowed.example.com": "93.184.216.34", "127.0.0.1": "127.0.0.1"}
+        ),
+    )
     monkeypatch.setattr(loop, "start_tls", _fake_start_tls)
 
     try:
@@ -828,3 +1042,230 @@ async def test_s5_http_rejects_unsafe_host_before_dns(
         )
     finally:
         await proxy.stop()
+
+
+# ---------------------------------------------------------------------------
+# S6 — request-line smuggling on the CONNECT (MITM) path
+#
+# The CONNECT handler enforces its path/method allow-list against a
+# parse of the inner (MITM-decrypted) request line, but historically
+# forwarded the *raw* request-line bytes to the upstream verbatim. The
+# policy parse uses ``str.split()`` (no argument), which treats bare
+# ``\r``/``\t``/``\v``/``\f`` as whitespace. A sandboxed agent that
+# controls the inner HTTP bytes could embed a bare ``\r`` so the proxy
+# saw one (method, path) while a lenient upstream parsed a different,
+# smuggled request line — collapsing a fine-grained egress rule
+# (e.g. ``GET host/repos/myorg/**``) to "any method, any path" on an
+# already-allow-listed host. The fix rejects control bytes in the inner
+# request line AND re-serializes the forwarded request line from the
+# parsed (method, path) so the policy decision and the forwarded bytes
+# can never diverge. See SEC-20585.
+# ---------------------------------------------------------------------------
+
+
+def _resolve_to_loopback(ip: str = "127.0.0.1") -> callable:
+    """Return a ``loop.getaddrinfo`` replacement resolving any host to
+    *ip*, tolerant of the full ``family/type/proto/flags`` kwargs that
+    ``loop.create_connection`` passes (unlike ``_stub_getaddrinfo_to``,
+    which only accepts ``type``).
+    """
+
+    async def _fake(host: str, port: int, *_args: object, **_kwargs: object) -> list:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port))]
+
+    return _fake
+
+
+def _mitm_client_send_inner(
+    proxy_port: int,
+    connect_target: str,
+    server_hostname: str,
+    ca_bundle: Path,
+    inner_request: bytes,
+) -> bytes:
+    """Blocking helper (run via ``asyncio.to_thread``): open CONNECT to
+    the proxy, complete the inner MITM TLS handshake trusting
+    *ca_bundle*, send *inner_request*, and return the inner HTTP
+    response bytes.
+    """
+    raw = socket.create_connection(("127.0.0.1", proxy_port), timeout=10)
+    try:
+        connect = f"CONNECT {connect_target} HTTP/1.1\r\nHost: {server_hostname}\r\n\r\n"
+        raw.sendall(connect.encode("latin-1"))
+        # Drain the proxy's "200 Connection Established" header block.
+        established = b""
+        while b"\r\n\r\n" not in established:
+            chunk = raw.recv(4096)
+            if not chunk:
+                break
+            established += chunk
+
+        ctx = ssl.create_default_context(cafile=str(ca_bundle))
+        tls = ctx.wrap_socket(raw, server_hostname=server_hostname)
+        try:
+            tls.sendall(inner_request)
+            response = b""
+            while True:
+                chunk = tls.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+            return response
+        finally:
+            with contextlib.suppress(Exception):
+                tls.close()
+    finally:
+        with contextlib.suppress(Exception):
+            raw.close()
+
+
+@pytest.mark.asyncio
+async def test_s6_connect_rejects_control_byte_in_inner_request_line(
+    ca_paths: tuple[Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bare ``\\r`` in the inner request line is rejected with 403 and
+    is NEVER forwarded upstream (SEC-20585 proof-of-concept).
+
+    Without the fix the proxy parsed ``GET /repos/myorg/allowed`` (the
+    policy-allowed view) but forwarded the raw bytes
+    ``GET /repos/myorg/allowed\\rPUT\\r/repos/OTHERORG/secret HTTP/1.1``
+    verbatim, smuggling a ``PUT`` to a path the rule never authorized.
+    """
+    cert_path, key_path, bundle_path = ca_paths
+    host = "allowed.example.com"
+
+    # Recording TLS upstream — if the proxy ever forwarded the smuggled
+    # request, the request line would land here. We assert it does not.
+    received: list[bytes] = []
+
+    async def _upstream(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        line = await reader.readline()
+        received.append(line)
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+        with contextlib.suppress(Exception):
+            await writer.drain()
+        writer.close()
+
+    upstream_ctx = HostCertCache(cert_path, key_path).get_ssl_context(host)
+    upstream = await asyncio.start_server(_upstream, "127.0.0.1", 0, ssl=upstream_ctx)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+
+    proxy = EgressProxy(
+        parse_rules([f"GET {host}/repos/myorg/**"]),
+        cert_path,
+        key_path,
+        upstream_ca_bundle=bundle_path,
+        # The upstream listens on loopback; skip the private-destination
+        # block so we exercise the request-line path, not the dest check.
+        block_private_destinations=False,
+    )
+    proxy_port = await proxy.start_tcp()
+
+    loop = asyncio.get_event_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", _resolve_to_loopback())
+
+    smuggled = (
+        b"GET /repos/myorg/allowed\rPUT\r/repos/OTHERORG/secret HTTP/1.1\r\n"
+        b"Host: " + host.encode() + b"\r\n\r\n"
+    )
+
+    try:
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                _mitm_client_send_inner,
+                proxy_port,
+                f"{host}:{upstream_port}",
+                host,
+                bundle_path,
+                smuggled,
+            ),
+            timeout=15,
+        )
+
+        assert b"403 Forbidden" in response, (
+            f"Inner request line with a bare \\r MUST be rejected with "
+            f"403. Got: {response[:200]!r}"
+        )
+        assert received == [], (
+            f"Smuggled request line MUST NOT reach the upstream — the "
+            f"control byte has to be rejected before forwarding. "
+            f"Upstream received: {received!r}"
+        )
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_s6_connect_reserializes_request_line_to_upstream(
+    ca_paths: tuple[Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The forwarded request line is re-serialized from the parsed
+    (method, path), not echoed verbatim — so the upstream receives
+    exactly what the policy authorized.
+
+    We send a deliberately messy-but-benign request line (extra spaces,
+    HTTP/1.0) and assert the upstream sees the normalized
+    ``GET /repos/myorg/file HTTP/1.1`` line. This proves the proxy no
+    longer forwards ``inner_first`` verbatim, closing the
+    policy-vs-forwarded byte differential.
+    """
+    cert_path, key_path, bundle_path = ca_paths
+    host = "allowed.example.com"
+
+    received: list[bytes] = []
+
+    async def _upstream(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        line = await reader.readline()
+        received.append(line)
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+        with contextlib.suppress(Exception):
+            await writer.drain()
+        writer.close()
+
+    upstream_ctx = HostCertCache(cert_path, key_path).get_ssl_context(host)
+    upstream = await asyncio.start_server(_upstream, "127.0.0.1", 0, ssl=upstream_ctx)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+
+    proxy = EgressProxy(
+        parse_rules([f"GET {host}/repos/myorg/**"]),
+        cert_path,
+        key_path,
+        upstream_ca_bundle=bundle_path,
+        block_private_destinations=False,
+    )
+    proxy_port = await proxy.start_tcp()
+
+    loop = asyncio.get_event_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", _resolve_to_loopback())
+
+    messy = b"GET   /repos/myorg/file   HTTP/1.0\r\nHost: " + host.encode() + b"\r\n\r\n"
+
+    try:
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                _mitm_client_send_inner,
+                proxy_port,
+                f"{host}:{upstream_port}",
+                host,
+                bundle_path,
+                messy,
+            ),
+            timeout=15,
+        )
+
+        assert b"200 OK" in response, (
+            f"Benign allowed request should be forwarded and succeed. Got: {response[:200]!r}"
+        )
+        assert received == [b"GET /repos/myorg/file HTTP/1.1\r\n"], (
+            f"Upstream MUST receive the request line re-serialized from "
+            f"the parsed (method, path), not the verbatim inner bytes. "
+            f"Got: {received!r}"
+        )
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()

@@ -8,6 +8,30 @@ import type { Session } from "@/lib/types";
 import { authenticatedFetch } from "./identity";
 
 /**
+ * Numeric permission level of the session owner. Mirrors
+ * ``LEVEL_OWNER`` in ``omnigent/server/auth.py`` (READ=1, EDIT=2,
+ * MANAGE=3, OWNER=4).
+ */
+export const LEVEL_OWNER = 4;
+
+/**
+ * Return whether a permission level denotes the session owner.
+ *
+ * A ``null`` level means "unknown / single-user / still loading" and
+ * is treated permissively (owner), matching the rest of the UI's
+ * permissive-on-null stance (see ``derivePermissionLevel`` and
+ * ``useCanEdit``). Used to gate owner-only affordances such as
+ * typing into a session's shared terminal.
+ *
+ * :param level: The effective permission level, e.g. ``2`` for edit
+ *     access, or ``null`` when unresolved.
+ * :returns: ``true`` for the owner (level ``null`` or ``>= 4``).
+ */
+export function isOwnerLevel(level: number | null): boolean {
+  return level == null || level >= LEVEL_OWNER;
+}
+
+/**
  * Derive the effective permission level for the active conversation.
  *
  * Resolution order:

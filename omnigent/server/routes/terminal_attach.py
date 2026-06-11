@@ -54,6 +54,19 @@ silently at the server *and* the runner. The attach process itself
 runs ``tmux attach -r`` as defense-in-depth, even if a frame got
 past the application filter, tmux would refuse keystrokes from this
 client.
+
+Write attach is owner-only
+--------------------------
+
+A terminal is a single shared PTY driving one process that runs as the
+session owner. Raw keystroke bytes carry no per-user identity, so input
+typed by anyone other than the owner would be acted on — and, for the
+agent's TUI, persisted into conversation history — as if the owner typed
+it. To keep that attribution honest, an *interactive* (write) attach
+requires ``LEVEL_OWNER``; non-owners can only attach read-only and drive
+the agent through the chat composer, which carries the real sender's
+identity. This holds uniformly for the agent's own terminal and for
+user-launched shells, since both attach through this route.
 """
 
 from __future__ import annotations
@@ -71,7 +84,7 @@ from omnigent.runtime import (
     get_runner_ws_factory,
     get_terminal_registry,
 )
-from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider
+from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider
 from omnigent.server.routes._auth_helpers import require_access
 from omnigent.stores import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
@@ -106,8 +119,9 @@ def create_terminal_attach_router(
         WebSocket handshake. When ``None`` and permissions are disabled,
         attach behaves as before for single-user/local deployments.
     :param permission_store: Optional session permission store. When
-        provided, attach requires read access for read-only sessions and
-        edit access for interactive sessions.
+        provided, a read-only attach requires read access and an
+        interactive (write) attach requires owner access — only the
+        session owner may type into the shared PTY.
     :param conversation_store: Conversation store used by permission checks.
     :returns: An :class:`APIRouter` carrying the attach route.
     """
@@ -229,12 +243,37 @@ async def _authorize_terminal_attach(
     permission_store: PermissionStore | None,
     conversation_store: ConversationStore | None,
 ) -> None:
-    """Authorize a terminal-attach WebSocket before accepting it.
+    """
+    Authorize a terminal-attach WebSocket before accepting it.
 
-    Interactive attaches can write bytes to the PTY and therefore require edit
-    permission. Read-only attaches still expose terminal output, so read access
-    is the minimum. When permissions are disabled (``permission_store is None``),
-    preserve the existing single-user/dev behavior.
+    Interactive attaches write bytes to the shared PTY, which runs as the
+    session owner and (for the agent's TUI) persists input into history
+    under the owner's identity. Raw keystrokes carry no per-user
+    attribution, so an interactive attach requires ``LEVEL_OWNER`` — only
+    the owner can drive the terminal. Read-only attaches still expose
+    terminal output, so read access is the minimum; non-owners attach
+    read-only and send input through the chat composer (which carries the
+    real sender's identity). When permissions are disabled
+    (``permission_store is None``), preserve the existing
+    single-user/dev behavior.
+
+    :param websocket: The incoming FastAPI :class:`WebSocket`, used to
+        resolve the caller's identity via *auth_provider*.
+    :param session_id: Session/conversation identifier the attach
+        targets, e.g. ``"conv_abc123"``.
+    :param read_only: ``True`` for a view-only attach (requires
+        ``LEVEL_READ``); ``False`` for an interactive write attach
+        (requires ``LEVEL_OWNER``).
+    :param auth_provider: Provider used to resolve the caller's user id
+        from the WebSocket handshake. Required when *permission_store*
+        is set.
+    :param permission_store: Session permission store. ``None`` disables
+        all checks (single-user/dev mode).
+    :param conversation_store: Conversation store consulted by the
+        access check. Required when *permission_store* is set.
+    :raises WebSocketException: With ``WS_1008_POLICY_VIOLATION`` when
+        auth is misconfigured, the caller is unauthenticated, or the
+        caller lacks the required level for the requested mode.
     """
     if permission_store is None:
         return
@@ -251,7 +290,7 @@ async def _authorize_terminal_attach(
             reason="authentication required",
         )
 
-    required_level = LEVEL_READ if read_only else LEVEL_EDIT
+    required_level = LEVEL_READ if read_only else LEVEL_OWNER
     try:
         await require_access(
             user_id,

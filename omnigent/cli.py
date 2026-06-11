@@ -429,18 +429,19 @@ class _FirstRunPlan:
     agent: str | None
 
 
-def _bundled_polly_path() -> str:
-    """Return the filesystem path to the bundled ``polly`` example agent.
+def _bundled_example_path(name: str) -> str:
+    """Return the filesystem path to a bundled example agent directory.
 
-    Located via the packaged ``omnigent.resources.examples`` (a symlink to
-    ``examples/polly`` in a dev checkout, a real directory in an installed
+    Located via the packaged ``omnigent.resources.examples`` (symlinks to
+    ``examples/<name>`` in a dev checkout, real directories in an installed
     wheel), mirroring how the model catalog is located.
 
-    :returns: Absolute path string to the ``polly`` agent directory.
+    :param name: Bundled example directory name, e.g. ``"polly"``.
+    :returns: Absolute path string to the agent directory.
     """
     import importlib.resources
 
-    return str(importlib.resources.files("omnigent.resources.examples").joinpath("polly"))
+    return str(importlib.resources.files("omnigent.resources.examples").joinpath(name))
 
 
 def _pick_first_run_harness() -> _FirstRunPlan | None:
@@ -464,7 +465,7 @@ def _pick_first_run_harness() -> _FirstRunPlan | None:
 
     config = effective_config_with_detected(load_config())
     if default_provider_for_harness(config, "claude-sdk") is not None:
-        return _FirstRunPlan(harness="claude-sdk", agent=_bundled_polly_path())
+        return _FirstRunPlan(harness="claude-sdk", agent=_bundled_example_path("polly"))
     if default_provider_for_harness(config, "codex") is not None:
         return _FirstRunPlan(harness="codex", agent=None)
     if default_provider_for_harness(config, "pi") is not None:
@@ -1126,12 +1127,14 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "claude",
         "codex",
         "config",
+        "debby",
         "debug",
         "host",
         "lakebox",
         "login",
         "pane-picker",
         "pane-split",
+        "polly",
         "resume",
         "run",
         "sandbox",
@@ -3863,6 +3866,84 @@ def codex(
         prompt=prompt,
         auto_open_conversation=auto_open_conversation,
     )
+
+
+def _run_bundled_agent(name: str, run_args: tuple[str, ...]) -> None:
+    """Forward a bundled-agent subcommand to ``run`` on its packaged path.
+
+    Implements ``omnigent polly`` / ``omnigent debby``: resolves the bundled
+    example directory and re-dispatches through the ``run`` command's own
+    parser, so every ``run`` flag (``--server``, ``-p``, ``--resume``, ...)
+    works unchanged on the agent shorthands without duplicating ``run``'s
+    option declarations.
+
+    ``prog_name`` is pinned to ``"omnigent run"`` so context-derived output —
+    usage errors and the :func:`_build_resume_parts` replay prefix — renders
+    as the canonical ``omnigent run <path>`` form, which stays valid when
+    replayed.
+
+    :param name: Bundled example directory name, e.g. ``"polly"``.
+    :param run_args: Unparsed pass-through CLI args for ``run``,
+        e.g. ``("-p", "review the last commit")``.
+    """
+    # standalone_mode=False propagates ClickExceptions to main()'s handler
+    # (CLI diagnostics logging + setup hint) instead of exiting inline,
+    # matching the outer `cli(args=argv, standalone_mode=False)` dispatch.
+    run.main(
+        args=[_bundled_example_path(name), *run_args],
+        prog_name="omnigent run",
+        standalone_mode=False,
+    )
+
+
+@cli.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+@click.argument("run_args", nargs=-1, type=click.UNPROCESSED)
+def polly(run_args: tuple[str, ...]) -> None:
+    # Param docs live in comments — Click uses the docstring for --help.
+    # :param run_args: Pass-through args for ``run``.
+    """Launch polly, the bundled multi-agent coding orchestrator.
+
+    Shorthand for ``omnigent run`` on the packaged polly agent — the same
+    agent a bare ``omnigent`` launches when a Claude credential is
+    configured. All ``run`` options are accepted and forwarded.
+
+    \b
+    Examples:
+      omnigent polly
+      omnigent polly -p "review the last commit"
+      omnigent polly --server https://<app>.databricksapps.com
+    """
+    _run_bundled_agent("polly", run_args)
+
+
+@cli.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+@click.argument("run_args", nargs=-1, type=click.UNPROCESSED)
+def debby(run_args: tuple[str, ...]) -> None:
+    # Param docs live in comments — Click uses the docstring for --help.
+    # :param run_args: Pass-through args for ``run``.
+    """Launch debby, the bundled two-headed brainstorming agent.
+
+    Shorthand for ``omnigent run`` on the packaged debby agent. Debby fans
+    every question out to both a Claude and a GPT sub-agent, so a Claude
+    and an OpenAI provider must both be configured. All ``run`` options are
+    accepted and forwarded.
+
+    \b
+    Examples:
+      omnigent debby
+      omnigent debby -p "name ideas for a CLI that runs agents"
+    """
+    _run_bundled_agent("debby", run_args)
 
 
 @cli.command()

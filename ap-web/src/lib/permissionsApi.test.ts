@@ -10,8 +10,10 @@ import type { Conversation } from "@/hooks/useConversations";
 import type { Session } from "@/lib/types";
 import * as identity from "./identity";
 import {
+  LEVEL_OWNER,
   derivePermissionLevel,
   grantPermission,
+  isOwnerLevel,
   listPermissions,
   revokePermission,
 } from "./permissionsApi";
@@ -266,6 +268,27 @@ describe("derivePermissionLevel — resolution order", () => {
     // until the sidebar has settled; that would briefly disable the
     // composer on every load.
     expect(derivePermissionLevel(null, false, null, "conv_test", false)).toBeNull();
+  });
+});
+
+describe("isOwnerLevel — owner boundary", () => {
+  it("treats the owner level and above as owner", () => {
+    expect(isOwnerLevel(LEVEL_OWNER)).toBe(true);
+    expect(isOwnerLevel(LEVEL_OWNER + 1)).toBe(true);
+  });
+
+  it("treats read / edit / manage (below owner) as non-owner", () => {
+    // These are the collaborator levels that must NOT be allowed to
+    // type into the shared terminal — they attach read-only instead.
+    expect(isOwnerLevel(1)).toBe(false);
+    expect(isOwnerLevel(2)).toBe(false);
+    expect(isOwnerLevel(3)).toBe(false);
+  });
+
+  it("treats null (single-user / unresolved) permissively as owner", () => {
+    // Matches derivePermissionLevel/useCanEdit: a null level means
+    // permissions are off or still loading, so don't lock the owner out.
+    expect(isOwnerLevel(null)).toBe(true);
   });
 });
 

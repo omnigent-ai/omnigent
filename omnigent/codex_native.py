@@ -40,6 +40,7 @@ from omnigent.codex_native_app_server import (
     build_codex_native_server,
     build_codex_remote_args,
     client_for_transport,
+    codex_session_meta_model_provider,
     codex_terminal_env,
     preload_codex_thread_for_resume,
     resolve_native_codex_launch,
@@ -948,6 +949,12 @@ async def _prepare_codex_terminal(
         socket_path = socket_path_for_bridge_dir(bridge_dir)
         codex_home = codex_home_for_bridge_dir(bridge_dir)
         clear_bridge_state(bridge_dir)
+        # Route across all offerings: a configured provider (configure
+        # harness), the Databricks ucode profile, or Codex's own login —
+        # so `omnigent codex` honors the provider selection like the
+        # in-process codex harness. Resolved before any rollout synthesis
+        # so session_meta can name the provider the launch routes through.
+        _codex_launch = resolve_native_codex_launch(model=model)
         if thread_id is not None:
             await _ensure_local_codex_resume_rollout(
                 client,
@@ -955,6 +962,8 @@ async def _prepare_codex_terminal(
                 external_session_id=thread_id,
                 codex_home=codex_home,
                 workspace=Path.cwd().resolve(),
+                model_provider=codex_session_meta_model_provider(_codex_launch),
+                codex_path=command,
             )
         # Listen on a loopback WebSocket, mirroring the host-spawned
         # runner (``runner/app.py`` ``_auto_create_codex_terminal``).
@@ -965,11 +974,6 @@ async def _prepare_codex_terminal(
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _probe:
             _probe.bind(("127.0.0.1", 0))
             codex_ws_url = f"ws://127.0.0.1:{_probe.getsockname()[1]}"
-        # Route across all offerings: a configured provider (configure
-        # harness), the Databricks ucode profile, or Codex's own login —
-        # so `omnigent codex` honors the provider selection like the
-        # in-process codex harness.
-        _codex_launch = resolve_native_codex_launch(model=model)
         app_server = build_codex_native_server(
             socket_path=socket_path,
             codex_home=codex_home,
@@ -1589,6 +1593,8 @@ async def _ensure_local_codex_resume_rollout(
     external_session_id: str,
     codex_home: Path,
     workspace: Path,
+    model_provider: str,
+    codex_path: str | None,
 ) -> Path:
     """
     Ensure Codex has a local rollout JSONL for cold resume.
@@ -1611,6 +1617,17 @@ async def _ensure_local_codex_resume_rollout(
     :param workspace: Resolved directory Codex will run in, e.g.
         ``Path("/home/me/repo")``. Pass an already-resolved path so
         structural rollout cwd fields match the terminal cwd.
+    :param model_provider: Provider id this session's launch routes through,
+        e.g. ``"omnigent_databricks"`` (see
+        :func:`omnigent.codex_native_app_server.codex_session_meta_model_provider`).
+        Written into ``session_meta`` so codex's thread-store backfill can
+        resolve the provider when it indexes the rollout.
+    :param codex_path: Codex CLI executable used to stamp the real
+        ``cli_version`` into ``session_meta``, e.g. ``"/usr/local/bin/codex"``.
+        ``None`` (or an unparseable version probe) falls back to ``"0.0.0"`` —
+        codex >= 0.133 requires the field to be *present* to parse the
+        rollout, but treats the value as informational, so a flaky probe
+        must not cost the carried history.
     :returns: Path to the existing or written rollout.
     :raises click.ClickException: If Omnigent history cannot be fetched or the
         rollout cannot be written, or if the persisted Codex thread id is
@@ -1626,11 +1643,20 @@ async def _ensure_local_codex_resume_rollout(
         return existing
     target = _codex_resume_rollout_path(codex_home, external_session_id)
     items = await _fetch_all_session_items_for_codex_resume(client, session_id)
+    cli_version = None
+    if codex_path is not None:
+        from omnigent.inner.codex_executor import _codex_cli_version
+
+        version_tuple = await _codex_cli_version(codex_path)
+        if version_tuple is not None:
+            cli_version = ".".join(str(part) for part in version_tuple)
     records = _codex_rollout_records_from_session_items(
         items,
         session_id=session_id,
         external_session_id=external_session_id,
         cwd=workspace,
+        model_provider=model_provider,
+        cli_version=cli_version or "0.0.0",
     )
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     tmp = target.with_suffix(".jsonl.tmp")
@@ -1733,14 +1759,24 @@ def _codex_rollout_records_from_session_items(
     session_id: str,
     external_session_id: str,
     cwd: Path,
+    model_provider: str,
+    cli_version: str,
 ) -> list[dict[str, Any]]:
     """
     Convert Omnigent session items into Codex rollout JSONL records.
 
     The generated records follow Codex's rollout shape: one
     ``session_meta`` record, a ``turn_context`` before each Omnigent response
-    group, and Responses-style ``response_item`` payloads for user,
-    assistant, and tool history.
+    group, Responses-style ``response_item`` payloads for user, assistant,
+    and tool history, and an ``event_msg`` mirror after each user/assistant
+    message. All three session_meta extras and the event_msg mirrors are
+    load-bearing on codex >= 0.133 (verified against 0.136.0): a
+    ``session_meta`` without ``timestamp`` + ``cli_version`` fails rollout
+    parse ("does not start with session metadata"), an absent
+    ``model_provider`` breaks ``thread/resume`` config load once the
+    thread-store backfill indexes the rollout, and without ``event_msg``
+    records codex reconstructs zero visible turns — the resume "succeeds"
+    but the thread opens empty.
 
     :param items: Flat Omnigent item dicts in chronological order, e.g.
         ``{"type": "message", "role": "user", "content": [...]}``.
@@ -1750,6 +1786,10 @@ def _codex_rollout_records_from_session_items(
         ``"019e96aa-0be2-7343-8d3b-6f914d60936b"``.
     :param cwd: Working directory to write into structural rollout fields,
         e.g. ``Path("/home/me/repo")``.
+    :param model_provider: Provider id for ``session_meta.model_provider``,
+        e.g. ``"omnigent_databricks"``.
+    :param cli_version: Codex CLI version string for
+        ``session_meta.cli_version``, e.g. ``"0.136.0"``.
     :returns: Codex rollout record dictionaries.
     """
     timestamp = _codex_rollout_timestamp()
@@ -1759,8 +1799,11 @@ def _codex_rollout_records_from_session_items(
             "type": "session_meta",
             "payload": {
                 "id": external_session_id,
+                "timestamp": timestamp,
                 "cwd": str(cwd),
                 "originator": "omnigent",
+                "cli_version": cli_version,
+                "model_provider": model_provider,
             },
         }
     ]
@@ -1798,7 +1841,61 @@ def _codex_rollout_records_from_session_items(
                 "payload": payload,
             }
         )
+        event_msg = _codex_event_msg_record_for_message(payload, timestamp=timestamp)
+        if event_msg is not None:
+            records.append(event_msg)
     return records
+
+
+def _codex_event_msg_record_for_message(
+    payload: dict[str, Any],
+    *,
+    timestamp: str,
+) -> dict[str, Any] | None:
+    """
+    Build the ``event_msg`` mirror record for a message ``response_item``.
+
+    Codex reconstructs a resumed thread's *visible* turns from ``event_msg``
+    records (``user_message`` / ``agent_message``), not from the
+    ``response_item`` history that feeds the model context. A synthesized
+    rollout without these mirrors resumes "successfully" but renders an
+    empty thread (zero turns) on codex 0.136.0, so the carried history is
+    invisible in the TUI and web UI.
+
+    :param payload: A ``response_item`` payload already emitted into the
+        rollout, e.g. ``{"type": "message", "role": "user", "content": [...]}``.
+    :param timestamp: Rollout record timestamp, e.g.
+        ``"2026-06-12T08:00:00.000Z"``.
+    :returns: An ``event_msg`` record for user/assistant messages, or
+        ``None`` for tool-call payloads (codex shows those via dedicated
+        event types that are not needed for turn reconstruction).
+    """
+    if payload.get("type") != "message":
+        return None
+    text = " ".join(
+        block.get("text", "") for block in payload.get("content", []) if isinstance(block, dict)
+    ).strip()
+    if not text:
+        return None
+    role = payload.get("role")
+    if role == "user":
+        event_payload: dict[str, Any] = {
+            "type": "user_message",
+            "message": text,
+            "images": [],
+            "local_images": [],
+            "text_elements": [],
+        }
+    elif role == "assistant":
+        event_payload = {
+            "type": "agent_message",
+            "message": text,
+            "phase": "final_answer",
+            "memory_citation": None,
+        }
+    else:
+        return None
+    return {"timestamp": timestamp, "type": "event_msg", "payload": event_payload}
 
 
 def _interrupted_response_ids_from_session_items(items: list[dict[str, Any]]) -> set[str]:

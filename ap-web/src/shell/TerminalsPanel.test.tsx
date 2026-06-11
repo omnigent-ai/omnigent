@@ -4,8 +4,21 @@ import { type TerminalInfo, useTerminals } from "@/hooks/useTerminals";
 import { TerminalsPanel } from "./TerminalsPanel";
 
 vi.mock("@/components/blocks/TerminalView", () => ({
-  TerminalView: ({ sessionId, terminalId }: { sessionId: string; terminalId: string }) => (
-    <div data-testid="terminal-view" data-session-id={sessionId} data-terminal-id={terminalId} />
+  TerminalView: ({
+    sessionId,
+    terminalId,
+    readOnly,
+  }: {
+    sessionId: string;
+    terminalId: string;
+    readOnly?: boolean;
+  }) => (
+    <div
+      data-testid="terminal-view"
+      data-session-id={sessionId}
+      data-terminal-id={terminalId}
+      data-read-only={String(readOnly ?? false)}
+    />
   ),
 }));
 
@@ -44,12 +57,14 @@ function useTerminalList(terminals: TerminalInfo[]) {
 
 function renderPanel({
   initialTerminalKey = null,
+  readOnly = false,
   terminals = [
     makeTerminal("terminal_main", "main", "s1"),
     makeTerminal("terminal_worker", "worker", "s2"),
   ],
 }: {
   initialTerminalKey?: string | null;
+  readOnly?: boolean;
   terminals?: TerminalInfo[];
 } = {}) {
   useTerminalList(terminals);
@@ -58,6 +73,7 @@ function renderPanel({
       open
       conversationId="conv_terminal"
       initialTerminalKey={initialTerminalKey}
+      readOnly={readOnly}
       onClose={vi.fn()}
     />,
   );
@@ -136,6 +152,18 @@ describe("TerminalsPanel navigation", () => {
     });
 
     expect(screen.queryByTestId("terminal-view")).toBeNull();
+  });
+
+  it("forwards readOnly so non-owners attach shells view-only", () => {
+    renderPanel({ initialTerminalKey: "terminal:terminal_main", readOnly: true });
+
+    act(() => {
+      vi.advanceTimersByTime(180);
+    });
+
+    // A non-owner sees the shell but cannot type — the shared PTY runs
+    // as the owner, so keystrokes can't be attributed per-user.
+    expect(screen.getByTestId("terminal-view")).toHaveAttribute("data-read-only", "true");
   });
 
   it("defers mounting TerminalView until the panel is expanded", () => {

@@ -17,13 +17,14 @@ from unittest.mock import Mock
 import pytest
 import yaml
 from click import ClickException
-from click.testing import CliRunner
+from click.testing import CliRunner, Result
 
 from omnigent.cli import (
     _GLOBAL_CONFIG_KEYS,
     _adopt_ambient_credentials,
     _announce_auto_configured_credentials,
     _bundle,
+    _bundled_example_path,
     _dispatch_run,
     _ensure_sqlite_parent_dir,
     _expand_config_env_vars,
@@ -515,6 +516,94 @@ def test_codex_command_session_and_resume_mutually_exclusive(
 
     assert result.exit_code != 0
     assert "mutually exclusive" in result.output
+
+
+# ── bundled-agent shorthands (omnigent polly / omnigent debby) ──────────
+
+
+def _invoke_bundled_agent_command(
+    monkeypatch: pytest.MonkeyPatch, args: list[str]
+) -> tuple[Result, Mock]:
+    """Invoke a bundled-agent shorthand with ``run``'s dispatcher mocked.
+
+    Stubs ``_load_effective_config`` (no developer-machine config leakage)
+    and ``_dispatch_run`` (no server/daemon side effects), so the test
+    observes exactly what the forwarded ``run`` invocation would launch.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param args: Full CLI argv, e.g. ``["polly", "-p", "hi"]``.
+    :returns: The Click invocation result and the ``_dispatch_run`` mock.
+    """
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    dispatch = Mock()
+    monkeypatch.setattr("omnigent.cli._dispatch_run", dispatch)
+    result = CliRunner().invoke(cli, args)
+    return result, dispatch
+
+
+def test_polly_command_runs_bundled_polly_and_forwards_run_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``omnigent polly`` dispatches ``run`` on the packaged polly agent.
+
+    The shorthand must target the same bundled polly directory the bare
+    ``omnigent`` first-run plan uses, and pass-through ``run`` flags
+    (``-p``, ``--model``) must survive the forwarding unchanged.
+    """
+    result, dispatch = _invoke_bundled_agent_command(
+        monkeypatch, ["polly", "-p", "review the last commit", "--model", "m1"]
+    )
+
+    assert result.exit_code == 0, result.output
+    dispatch.assert_called_once()
+    kwargs = dispatch.call_args.kwargs
+    assert kwargs["target"] == _bundled_example_path("polly")
+    assert kwargs["prompt"] == "review the last commit"
+    assert kwargs["model"] == "m1"
+    # The resume replay prefix must be the canonical (re-runnable) run form,
+    # not "omnigent polly <path>" which would parse the path as a 2nd target.
+    assert kwargs["resume_parts"][:3] == ["omnigent", "run", _bundled_example_path("polly")]
+
+
+def test_debby_command_runs_bundled_debby(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``omnigent debby`` dispatches ``run`` on the packaged debby agent."""
+    result, dispatch = _invoke_bundled_agent_command(monkeypatch, ["debby"])
+
+    assert result.exit_code == 0, result.output
+    dispatch.assert_called_once()
+    assert dispatch.call_args.kwargs["target"] == _bundled_example_path("debby")
+
+
+def test_bundled_agent_command_rejects_extra_positional_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stray positional after the shorthand is a usage error, not a launch.
+
+    ``run`` takes a single AGENT positional which the shorthand already
+    supplies (the bundled path); a second one must fail loudly rather than
+    silently launching the wrong agent.
+    """
+    result, dispatch = _invoke_bundled_agent_command(monkeypatch, ["polly", "other_agent.yaml"])
+
+    assert result.exit_code != 0
+    dispatch.assert_not_called()
+
+
+def test_first_run_plan_and_polly_command_agree_on_bundled_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bare ``omnigent`` (Claude creds) and ``omnigent polly`` launch the SAME agent.
+
+    Pins the "same thing as bare ``omni``" contract: the first-run plan's
+    default agent and the polly shorthand resolve to one bundled directory.
+    """
+    monkeypatch.setattr(
+        "omnigent.onboarding.provider_config.default_provider_for_harness",
+        _fake_provider_for("claude-sdk"),
+    )
+    plan = _pick_first_run_harness()
+    assert plan is not None
+    assert plan.agent == _bundled_example_path("polly")
 
 
 def test_start_cli_runner_process_uses_token_bound_runner_id(

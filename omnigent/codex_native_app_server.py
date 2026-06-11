@@ -1113,6 +1113,40 @@ class NativeCodexLaunch:
     profile: str | None
 
 
+def codex_session_meta_model_provider(launch: NativeCodexLaunch) -> str:
+    """Return the provider id a launch routes through, for rollout synthesis.
+
+    Synthesized rollouts (fork carry-history, cross-machine cold resume) must
+    name the model provider in ``session_meta``: codex >= 0.133 backfills
+    rollouts written before app-server start into its thread-store sqlite,
+    and ``thread/resume`` of a backfilled row whose provider is empty or
+    unresolvable fails config load (``Model provider `` not found``),
+    silently dropping the carried history. The correct value is whatever
+    provider the launch itself routes through:
+
+    - a ``model_provider`` ``-c`` override (cli-config / key / gateway /
+      local providers) pins it explicitly — the override value is a TOML
+      basic string, which is also valid JSON;
+    - a Databricks profile launch carries no override here; the provider
+      table is generated at app-server start under the fixed
+      ``omnigent_databricks`` id (see ``_databricks_codex_config_overrides``);
+    - otherwise the launch defers to Codex's own login, the built-in
+      ``openai`` provider.
+
+    :param launch: Resolved native-Codex launch, e.g. one returned by
+        :func:`resolve_native_codex_launch`.
+    :returns: Provider id for ``session_meta.model_provider``, e.g.
+        ``"omnigent_databricks"``.
+    """
+    prefix = "model_provider="
+    for override in launch.config_overrides:
+        if override.startswith(prefix):
+            return json.loads(override.removeprefix(prefix))
+    if launch.profile is not None:
+        return "omnigent_databricks"
+    return "openai"
+
+
 def _codex_provider_launch(entry: ProviderEntry, model: str | None) -> NativeCodexLaunch | None:
     """Build a native-Codex launch that routes through a single provider entry.
 

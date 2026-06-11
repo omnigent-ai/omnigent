@@ -272,11 +272,14 @@ describe("ForkSessionDialog", () => {
     expect(navigateMock).not.toHaveBeenCalled();
   });
 
-  it("offers history-preserving targets and hides cross-family codex-native", () => {
-    // Source is claude-sdk (anthropic). SDK targets (any family) and
-    // claude-native carry history; codex-native is hidden for an
-    // anthropic source — the rollout synthesizer doesn't track Codex's
-    // session_meta schema yet, so the switch would silently start fresh.
+  it("offers history-preserving targets including cross-family codex-native", () => {
+    // Source is claude-sdk (anthropic). Every classifiable target carries
+    // history: SDK targets replay the transcript as context, and native
+    // targets (claude-native AND codex-native) rebuild their on-disk
+    // transcript from the copied Omnigent items — the codex rollout
+    // synthesizer writes the session_meta + event_msg records codex
+    // ≥ 0.133 needs (verified on 0.136.0), so cross-family codex-native
+    // is offered too.
     renderDialog();
     openAgentSelect();
 
@@ -286,10 +289,8 @@ describe("ForkSessionDialog", () => {
     expect(screen.getByTestId("fork-session-agent-option-ag_claude_native")).toBeInTheDocument();
     // SDK target of a different family still carries history as context.
     expect(screen.getByTestId("fork-session-agent-option-ag_openai")).toBeInTheDocument();
-    // Cross-family codex-native is hidden — would start fresh today.
-    expect(
-      screen.queryByTestId("fork-session-agent-option-ag_codex_native"),
-    ).not.toBeInTheDocument();
+    // Cross-family codex-native: rebuild-from-items carries history.
+    expect(screen.getByTestId("fork-session-agent-option-ag_codex_native")).toBeInTheDocument();
   });
 
   it("excludes the source's own agent so it doesn't duplicate 'Same as source'", () => {

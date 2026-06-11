@@ -8333,11 +8333,12 @@ async def _run_compact_locked(
         )
     task_id = f"compact_{int(time.time() * 1000)}"
     _publish_status(session_id, "running")
-    _publish_compaction_in_progress(session_id)
+    # compact() publishes its own in_progress / completed SSE events
+    # when conversation_id is set — don't double-publish here.
     from omnigent.runtime.workflow import compact_conversation_now
 
     try:
-        result = await compact_conversation_now(
+        await compact_conversation_now(
             task_id=task_id,
             conversation_id=session_id,
             spec=spec,
@@ -8354,7 +8355,6 @@ async def _run_compact_locked(
             f"Compaction failed while generating a summary: {detail}",
             code=ErrorCode.INTERNAL_ERROR,
         ) from exc
-    _publish_compaction_completed(session_id, result.total_tokens)
     _publish_status(session_id, "idle")
 
 

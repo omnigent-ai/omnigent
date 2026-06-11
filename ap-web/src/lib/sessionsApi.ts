@@ -454,7 +454,7 @@ export async function forkSession(
  * Unlike fork, this keeps the SAME session (transcript, comments, files,
  * workspace) and only rebinds the agent. The next turn runs on the new
  * harness; history carries per the same rule as a fork switch
- * (``forkSwitchPreservesHistory``). Model settings reset to the target's
+ * (``forkTargetCarriesHistory``). Model settings reset to the target's
  * defaults on a cross-family switch. Only built-in agents are bindable,
  * and only while the session is idle (a running turn → 409).
  *

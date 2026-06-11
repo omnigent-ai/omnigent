@@ -59,6 +59,7 @@ import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { useCommentInbox } from "@/hooks/useCommentInbox";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { isSessionStoppable } from "@/lib/sessionStop";
+import { isOwnerLevel } from "@/lib/permissionsApi";
 import { getSessionState } from "@/hooks/useSessionState";
 import { isConversationUnseen } from "@/hooks/useUnseenConversations";
 import { sumPendingApprovals } from "@/lib/inbox";
@@ -357,7 +358,7 @@ interface ConversationListProps {
 
 // permission_level null (no ACL row / legacy) or >= 4 both mean owner.
 function isOwnedByViewer(conversation: Conversation): boolean {
-  return conversation.permission_level === null || conversation.permission_level >= 4;
+  return isOwnerLevel(conversation.permission_level);
 }
 
 function ConversationList({

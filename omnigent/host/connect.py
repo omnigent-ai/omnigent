@@ -267,6 +267,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # …" for a key the CLI just saved to the file. Not a secret (a boolean
         # flag); safe to propagate.
         "OMNIGENT_DISABLE_KEYRING",
+        # Testing knob: override the context window size for compaction
+        # trigger threshold. Not a secret — a plain integer.
+        "AP_CONTEXT_WINDOW_OVERRIDE",
     }
 )
 # Locale family (``LC_ALL``, ``LC_CTYPE``, …) — allowed by prefix.

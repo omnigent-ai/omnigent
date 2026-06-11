@@ -599,6 +599,7 @@ async def _auto_create_codex_terminal(
         CodexAppServerClient,
         build_codex_native_server,
         build_codex_remote_args,
+        codex_session_meta_model_provider,
         codex_terminal_env,
         preload_codex_thread_for_resume,
         resolve_native_codex_launch,
@@ -620,6 +621,18 @@ async def _auto_create_codex_terminal(
     bridge_dir = prepare_bridge_dir(session_id)
     socket_path = socket_path_for_bridge_dir(bridge_dir)
     codex_home = codex_home_for_bridge_dir(bridge_dir)
+    # Route across all offerings: a configured provider (omnigent setup),
+    # a Databricks ucode profile from provider config, or Codex's own
+    # login — parity with the in-process codex harness and the CLI path.
+    # Resolved before the fork/cold-resume branches below so any rollout
+    # synthesis can stamp session_meta.model_provider with the provider
+    # this launch actually routes through.
+    default_model = launch_config.model_override or _codex_native_model_from_spec(agent_spec)
+    _codex_launch = resolve_native_codex_launch(model=default_model)
+    _session_meta_provider = codex_session_meta_model_provider(_codex_launch)
+    from omnigent.inner.codex_executor import _find_codex_cli
+
+    _codex_cli_path = _find_codex_cli()
     # Cancel any surviving forwarder first so its teardown closes the OLD app-server,
     # not the one registered below — and so it can't mirror alongside the new one.
     await _cancel_auto_forwarder_task(session_id)
@@ -725,6 +738,8 @@ async def _auto_create_codex_terminal(
                 external_session_id=target_thread_id,
                 codex_home=codex_home,
                 workspace=clone_workspace,
+                model_provider=_session_meta_provider,
+                codex_path=_codex_cli_path,
             )
         except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
             built_rollout = None
@@ -770,6 +785,8 @@ async def _auto_create_codex_terminal(
             external_session_id=launch_config.external_session_id,
             codex_home=codex_home,
             workspace=Path(workspace).resolve(),
+            model_provider=_session_meta_provider,
+            codex_path=_codex_cli_path,
         )
     # Link the bundle's skills into the per-bridge CODEX_HOME before the
     # app-server boots — Codex discovers ``$CODEX_HOME/skills/<name>/``
@@ -821,11 +838,6 @@ async def _auto_create_codex_terminal(
         {"Authorization": f"Bearer {_policy_auth_token}"} if _policy_auth_token else {}
     )
 
-    # Route across all offerings: a configured provider (omnigent setup),
-    # a Databricks ucode profile from provider config, or Codex's own
-    # login — parity with the in-process codex harness and the CLI path.
-    default_model = launch_config.model_override or _codex_native_model_from_spec(agent_spec)
-    _codex_launch = resolve_native_codex_launch(model=default_model)
     app_server = build_codex_native_server(
         socket_path=socket_path,
         codex_home=codex_home,
@@ -5484,20 +5496,8 @@ def create_runner_app(
             if spec and spec.executor.config.get("connection"):
                 connection = spec.executor.config["connection"]
 
-            if connection is None and model.startswith(("databricks/", "databricks-")):
-                _db_profile = (
-                    spec.executor.config.get("profile") if spec else None
-                ) or os.environ.get("DATABRICKS_CONFIG_PROFILE")
-                if _db_profile:
-                    from omnigent.runtime.credentials.databricks import (
-                        resolve_databricks_workspace,
-                    )
-
-                    _creds = resolve_databricks_workspace(_db_profile)
-                    connection = {
-                        "base_url": _creds.host.rstrip("/") + "/serving-endpoints",
-                        "api_key": _creds.token,
-                    }
+            if connection is None:
+                connection = _resolve_summarize_connection(conv, model)
 
             llm_client = _get_runner_llm_client()
             result: CompactionResult = await compact(
@@ -11181,6 +11181,175 @@ def create_runner_app(
             content={"error": {"code": -32601, "message": f"Method not found: {method!r}"}},
         )
 
+    def _resolve_summarize_connection(
+        session_id: str,
+        model: str,
+    ) -> dict[str, str] | None:
+        """
+        Resolve LLM connection for ``/v1/summarize`` from the session's spec.
+
+        Mirrors the harness auth resolution order so compaction
+        summarization uses the same credentials as normal agent turns:
+
+        1. :class:`ProviderAuth` — resolve named provider from
+           ``~/.omnigent/config.yaml``, extract ``api_key`` + ``base_url``
+           from the ``openai`` family.
+        2. :class:`DatabricksAuth` — resolve the named profile from
+           ``~/.databrickscfg`` into ``base_url`` + ``api_key``.
+        3. :class:`ApiKeyAuth` — inline ``api_key`` and optional
+           ``base_url``.
+        4. Global config ``auth:`` block (when spec declares no auth).
+        5. Legacy ``executor.config["profile"]`` or auto-Databricks
+           DEFAULT for ``databricks-*`` model prefixes.
+
+        :param session_id: Session/conversation identifier, e.g.
+            ``"conv_abc123"``.
+        :param model: LLM model string used to decide whether to
+            attempt Databricks profile resolution, e.g.
+            ``"databricks/databricks-gpt-5-5"``.
+        :returns: A connection dict with ``"base_url"`` and ``"api_key"``
+            keys, or ``None`` when no credentials could be resolved.
+        """
+        from omnigent.spec.types import ApiKeyAuth, DatabricksAuth, ProviderAuth
+
+        spec_entry = _session_spec_cache.get(session_id)
+        if spec_entry is None:
+            return None
+        spec = spec_entry.spec if hasattr(spec_entry, "spec") else spec_entry
+        if spec is None:
+            return None
+
+        auth = getattr(spec.executor, "auth", None)
+
+        # 1. ProviderAuth → resolve named provider, extract openai family.
+        if isinstance(auth, ProviderAuth):
+            return _resolve_provider_connection(auth.name, model)
+
+        # 2. DatabricksAuth → resolve profile from ~/.databrickscfg.
+        if isinstance(auth, DatabricksAuth):
+            return _resolve_databricks_connection(auth.profile, session_id)
+
+        # 3. ApiKeyAuth → inline key + optional base_url.
+        if isinstance(auth, ApiKeyAuth):
+            conn: dict[str, str] = {"api_key": auth.api_key}
+            if auth.base_url:
+                conn["base_url"] = auth.base_url
+            return conn
+
+        # 4. Global config auth (when spec declares no auth at all).
+        _spec_has_legacy_profile = bool(
+            spec.executor.profile or (spec.executor.config or {}).get("profile")
+        )
+        if auth is None and not _spec_has_legacy_profile:
+            from omnigent.runtime.workflow import _load_global_auth
+
+            global_auth = _load_global_auth()
+            if isinstance(global_auth, DatabricksAuth):
+                return _resolve_databricks_connection(global_auth.profile, session_id)
+            if isinstance(global_auth, ApiKeyAuth):
+                conn = {"api_key": global_auth.api_key}
+                if global_auth.base_url:
+                    conn["base_url"] = global_auth.base_url
+                return conn
+
+        # 5. Legacy fallback: executor.config.profile, executor.profile,
+        #    or auto-Databricks DEFAULT for databricks-* models.
+        if model.startswith(("databricks/", "databricks-")):
+            _db_profile = (
+                spec.executor.profile or (spec.executor.config or {}).get("profile") or "DEFAULT"
+            )
+            return _resolve_databricks_connection(_db_profile, session_id)
+
+        return None
+
+    def _resolve_provider_connection(
+        provider_name: str,
+        model: str = "",
+    ) -> dict[str, str] | None:
+        """
+        Resolve connection from a named provider's family.
+
+        Loads providers from ``~/.omnigent/config.yaml`` and extracts
+        ``api_key`` + ``base_url`` from the matching family entry.
+        Tries the ``anthropic`` family for ``anthropic/`` or
+        ``claude`` models, otherwise ``openai``. Returns ``None``
+        when the provider or a suitable family is not configured.
+
+        :param provider_name: Provider name from the ``providers:``
+            block, e.g. ``"litellm"`` or ``"openrouter"``.
+        :param model: LLM model string used to select the family,
+            e.g. ``"anthropic/claude-sonnet-4-20250514"``.
+        :returns: A connection dict, or ``None``.
+        """
+        try:
+            from omnigent.onboarding.detected import effective_config_with_detected
+            from omnigent.onboarding.provider_config import (
+                load_config,
+                load_providers,
+            )
+
+            config = load_config()
+            providers = load_providers(effective_config_with_detected(config))
+            entry = providers.get(provider_name)
+            if entry is None:
+                return None
+            # Databricks-kind providers route through profile resolution.
+            if entry.kind == "databricks" and entry.profile:
+                return _resolve_databricks_connection(entry.profile, provider_name)
+            # Pick the family matching the model prefix; fall back to
+            # whichever family the provider has.
+            _is_anthropic = model.startswith(("anthropic/", "claude"))
+            _preferred = "anthropic" if _is_anthropic else "openai"
+            _fallback = "openai" if _is_anthropic else "anthropic"
+            family = entry.family(_preferred) or entry.family(_fallback)
+            if family is None:
+                return None
+            conn: dict[str, str] = {}
+            if family.api_key:
+                conn["api_key"] = family.api_key
+            if family.base_url:
+                conn["base_url"] = family.base_url
+            return conn or None
+        except Exception:  # noqa: BLE001
+            _logger.warning(
+                "/v1/summarize: failed to resolve provider %r",
+                provider_name,
+                exc_info=True,
+            )
+            return None
+
+    def _resolve_databricks_connection(
+        profile: str,
+        context: str,
+    ) -> dict[str, str] | None:
+        """
+        Resolve Databricks credentials from a ``~/.databrickscfg`` profile.
+
+        :param profile: Databricks profile name, e.g. ``"oss"`` or
+            ``"DEFAULT"``.
+        :param context: Logging context (session_id or provider name).
+        :returns: A connection dict with ``"base_url"`` and ``"api_key"``,
+            or ``None`` on failure.
+        """
+        from omnigent.runtime.credentials.databricks import (
+            resolve_databricks_workspace,
+        )
+
+        try:
+            creds = resolve_databricks_workspace(profile)
+        except OSError:
+            _logger.warning(
+                "/v1/summarize: failed to resolve Databricks profile %r (context=%s)",
+                profile,
+                context,
+                exc_info=True,
+            )
+            return None
+        return {
+            "base_url": creds.host.rstrip("/") + "/serving-endpoints",
+            "api_key": creds.token,
+        }
+
     @app.post("/v1/summarize")
     async def summarize(request: Request) -> JSONResponse:
         """Summarize a message list using the runner's LLM credentials.
@@ -11209,18 +11378,19 @@ def create_runner_app(
                     }
                 },
             )
-        # Discard any connection forwarded from the Omnigent server for
-        # Databricks models — it contains credentials tied to the AP
-        # server's workspace, which may differ from the runner's.
-        # Pass connection=None so DatabricksAdapter auto-resolves from
-        # the runner's own DATABRICKS_CONFIG_PROFILE (propagated from
-        # the spec's executor.profile), giving fresh credentials for
-        # the runner's configured workspace.
-        connection: dict[str, str] | None = (
-            None
-            if (body.get("model") or "").startswith(("databricks/", "databricks-"))
-            else body.get("connection") or None
-        )
+        # Resolve LLM connection for the summarization call. Precedence:
+        # 1. Explicit connection in the payload (non-Databricks callers).
+        # 2. Spec auth from the session's cached spec (DatabricksAuth
+        #    profile or ApiKeyAuth).
+        # 3. Ambient env-var auth (DATABRICKS_CONFIG_PROFILE / DEFAULT).
+        connection: dict[str, str] | None = body.get("connection") or None
+        if connection is None:
+            session_id: str | None = body.get("session_id")
+            if session_id is not None:
+                connection = _resolve_summarize_connection(
+                    session_id,
+                    model,
+                )
         llm_client = _get_runner_llm_client()
         resp = await llm_client.responses.create(
             model=model,
