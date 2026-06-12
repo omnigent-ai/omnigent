@@ -159,6 +159,10 @@ async function enrichSessionAgent(scanned: ScannedSessionAgent): Promise<Availab
  * base name (fork/switch create per-session rows named
  * `"<builtin> (fork <id>)"`). What survives is genuinely custom —
  * ad-hoc uploaded agents that were previously invisible to the picker.
+ * Surviving custom agents are then collapsed by base name, keeping the
+ * newest session's row: a custom agent launched repeatedly from a local
+ * YAML mints a fresh agent_id per session, so by-id dedup alone would
+ * list one picker row per session (#3234).
  * Binding them needs no new server support: `POST /v1/sessions
  * {agent_id}` already authorizes session-scoped agents the caller can
  * read.
@@ -174,10 +178,16 @@ async function fetchAvailableAgents(): Promise<AvailableAgent[]> {
   ]);
   const builtinIds = new Set(builtins.map((a) => a.id));
   const builtinNames = new Set(builtins.map((a) => a.name));
-  const custom = scanned.filter(
-    (a) => !builtinIds.has(a.agentId) && !builtinNames.has(agentBaseName(a.agentName)),
-  );
-  const enriched = await Promise.all(custom.map(enrichSessionAgent));
+  // One row per custom base name, newest session first (scan order):
+  // same-named agent_ids are per-session mints of the same agent, and
+  // identical-name rows are indistinguishable in the picker anyway.
+  const customByName = new Map<string, ScannedSessionAgent>();
+  for (const agent of scanned) {
+    const base = agentBaseName(agent.agentName);
+    if (builtinIds.has(agent.agentId) || builtinNames.has(base)) continue;
+    if (!customByName.has(base)) customByName.set(base, agent);
+  }
+  const enriched = await Promise.all(Array.from(customByName.values()).map(enrichSessionAgent));
   // Built-ins first; custom agents follow in scan order (newest session
   // first). NewChatDialog's display-order sort is stable, so unranked
   // custom names keep this relative order.

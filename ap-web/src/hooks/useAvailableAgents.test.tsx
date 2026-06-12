@@ -303,6 +303,75 @@ describe("useAvailableAgents", () => {
     expect(enrichCalls).toEqual(["/v1/sessions/conv_3/agent"]);
   });
 
+  it("collapses same-named custom agents with distinct agent_ids to the newest session's row", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({ object: "list", data: [], has_more: false }),
+      [SCAN_URL]: mockResponse({
+        object: "list",
+        data: [
+          // Three sessions of the same custom agent, each with its own
+          // agent_id — a local-YAML agent mints a fresh row per launch
+          // (#3234). Scan order is newest-first, so conv_new wins.
+          { id: "conv_new", agent_id: "ag_run3", agent_name: "elise_working_agent" },
+          { id: "conv_mid", agent_id: "ag_run2", agent_name: "elise_working_agent" },
+          // A fork clone of the custom agent strips back to the same
+          // base name, so it collapses into the same row too.
+          {
+            id: "conv_old",
+            agent_id: "ag_run1",
+            agent_name: "elise_working_agent (fork conv_7)",
+          },
+          // A differently-named custom agent must NOT be collapsed —
+          // the dedup keys on base name, not on "is custom".
+          { id: "conv_doc", agent_id: "ag_doc", agent_name: "doc-writer" },
+        ],
+        has_more: false,
+      }),
+      // Only the newest session per name may be enriched. An enrich
+      // fetch for conv_mid/conv_old is unrouted and rejects loudly,
+      // failing the test if the by-name collapse regresses.
+      "/v1/sessions/conv_new/agent": mockResponse({
+        id: "ag_run3",
+        object: "agent",
+        name: "elise_working_agent",
+        description: "Elise's agent",
+        harness: "claude-sdk",
+      }),
+      "/v1/sessions/conv_doc/agent": mockResponse({
+        id: "ag_doc",
+        object: "agent",
+        name: "doc-writer",
+        description: null,
+        harness: "codex",
+      }),
+    });
+
+    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    // Exactly one elise row (the newest mint, ag_run3) plus doc-writer.
+    // Three elise rows would mean the by-name collapse regressed to
+    // by-id-only dedup; zero would mean customs were over-collapsed.
+    expect(result.current.data).toEqual([
+      {
+        id: "ag_run3",
+        name: "elise_working_agent",
+        display_name: "Elise_working_agent",
+        description: "Elise's agent",
+        harness: "claude-sdk",
+        skills: [],
+      },
+      {
+        id: "ag_doc",
+        name: "doc-writer",
+        display_name: "Doc-writer",
+        description: null,
+        harness: "codex",
+        skills: [],
+      },
+    ]);
+  });
+
   it("degrades to built-ins when the sessions scan fails", async () => {
     routeFetch({
       [BUILTINS_URL]: mockResponse({
