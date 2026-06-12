@@ -7,6 +7,9 @@ resolution-markers = [
     "python_full_version < '3.13'",
 ]
 
+[options]
+exclude-newer = "2026-06-05T18:41:08Z"
+
 [[package]]
 name = "aiofiles"
 version = "24.1.0"
