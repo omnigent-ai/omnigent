@@ -16,14 +16,15 @@
     {
       "layers" : [
         {
-          "fill-specializations" : [
-            {
-              "appearance" : "dark",
-              "value" : "automatic"
-            }
-          ],
-          "image-name" : "otto-transparent 2.png",
-          "name" : "otto-transparent 2"
+          "image-name" : "SVG Image.svg",
+          "name" : "SVG Image",
+          "position" : {
+            "scale" : 1.05,
+            "translation-in-points" : [
+              0,
+              0
+            ]
+          }
         }
       ],
       "position" : {
@@ -58,11 +59,6 @@
         {
           "image-name" : "SVG Image 6.svg",
           "name" : "SVG Image 6"
-        },
-        {
-          "hidden" : true,
-          "image-name" : "SVG Image 2.svg",
-          "name" : "SVG Image 2"
         }
       ],
       "shadow" : {

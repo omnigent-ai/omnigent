@@ -460,3 +460,178 @@ def test_workspace_url_with_path_probes_nothing(
 
     assert result == _WORKSPACE_API_URL
     assert probed == []
+
+
+def test_workspace_url_expands_when_mount_hidden_from_anonymous_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mount invisible to anonymous probes expands via a cached bearer.
+
+    Azure workspace edges answer the anonymous /api/2.0/omnigent probe
+    with a plain 404 — not the AWS proxy's 401-with-DatabricksRealm
+    challenge — so a mount that works for authenticated callers looks
+    absent and the user gets stranded on the bare workspace URL. With
+    a cached ``databricks auth login`` grant, the probe is retried
+    authenticated and the mount is adopted.
+    """
+    import omnigent.cli as cli_mod
+
+    fake = _FakeHttpx(
+        responses=[
+            # Root: the workspace web app shape that triggers expansion.
+            _response(404, headers={"server": "databricks"}),
+            # Mount, anonymous: hidden — plain 404, no realm challenge.
+            _response(404, headers={"server": "databricks"}),
+            # Mount, authenticated: omnigent answers.
+            _response(200, body={"user_id": "alice"}),
+        ]
+    )
+    monkeypatch.setattr(httpx, "get", fake.get)
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.databricks_sdk_installed",
+        lambda: True,
+    )
+    minted_for: list[str] = []
+
+    def _token(workspace_host: str) -> str:
+        minted_for.append(workspace_host)
+        return "tok-ws"
+
+    monkeypatch.setattr(cli_mod, "_databricks_workspace_token", _token)
+
+    result = cli_mod._workspace_api_server_url(_WORKSPACE)
+
+    assert result == _WORKSPACE_API_URL
+    # The bearer is minted for the workspace host (the bare URL) — that
+    # is what the Databricks OAuth token cache is keyed on, not the
+    # /api/2.0/omnigent candidate.
+    assert minted_for == [_WORKSPACE]
+    # Probe order: anonymous root, anonymous mount, authenticated mount.
+    # A missing third request means the authed retry never ran; a
+    # Bearer on either anonymous probe would present credentials to an
+    # endpoint not yet known to be Databricks-fronted.
+    assert [r["url"] for r in fake.requests] == [
+        f"{_WORKSPACE}/v1/me",
+        f"{_WORKSPACE_API_URL}/v1/me",
+        f"{_WORKSPACE_API_URL}/v1/me",
+    ]
+    assert [r["authorization"] for r in fake.requests] == [None, None, "Bearer tok-ws"]
+
+
+def test_workspace_url_hints_when_mount_dark_and_no_cached_grant(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Declining a workspace-shaped URL explains itself and the remedy.
+
+    Without a cached grant there is nothing to retry with, so the URL
+    is left as given — but a silent decline strands the user on a bare
+    workspace URL whose host tunnel can only 404, so the decline must
+    name the ``databricks auth login`` remedy.
+    """
+    import omnigent.cli as cli_mod
+
+    fake = _FakeHttpx(
+        responses=[
+            _response(404, headers={"server": "databricks"}),
+            _response(404, headers={"server": "databricks"}),
+        ]
+    )
+    monkeypatch.setattr(httpx, "get", fake.get)
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.databricks_sdk_installed",
+        lambda: True,
+    )
+    monkeypatch.setattr(cli_mod, "_databricks_workspace_token", lambda workspace_host: None)
+
+    result = cli_mod._workspace_api_server_url(_WORKSPACE)
+
+    assert result == _WORKSPACE
+    # No grant resolves → no authenticated retry: exactly the two
+    # anonymous probes ran. A third request here would mean a Bearer
+    # header was fabricated from nothing.
+    assert [r["authorization"] for r in fake.requests] == [None, None]
+    out = capsys.readouterr().out
+    # The hint must name the remedy, otherwise the user is back to
+    # debugging an opaque host-tunnel 404 on the bare workspace URL.
+    assert f"databricks auth login --host {_WORKSPACE}" in out
+
+
+def test_workspace_url_hints_when_authed_probe_also_misses(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A mount dark even to authenticated probes declines with a hint.
+
+    A 404 with valid credentials means omnigent is genuinely not
+    served on this workspace (or the grant is stale) — the URL is left
+    as given, and the message distinguishes this from the
+    never-logged-in case so the user doesn't loop on `auth login`.
+    """
+    import omnigent.cli as cli_mod
+
+    fake = _FakeHttpx(
+        responses=[
+            _response(404, headers={"server": "databricks"}),
+            _response(404, headers={"server": "databricks"}),
+            # Mount, authenticated: still 404 — not served here.
+            _response(404, headers={"server": "databricks"}),
+        ]
+    )
+    monkeypatch.setattr(httpx, "get", fake.get)
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.databricks_sdk_installed",
+        lambda: True,
+    )
+    monkeypatch.setattr(cli_mod, "_databricks_workspace_token", lambda workspace_host: "tok-ws")
+
+    result = cli_mod._workspace_api_server_url(_WORKSPACE)
+
+    assert result == _WORKSPACE
+    # The authed retry ran and presented the cached bearer; without it
+    # this test would be identical to the no-grant case.
+    assert [r["authorization"] for r in fake.requests] == [None, None, "Bearer tok-ws"]
+    out = capsys.readouterr().out
+    # The message must say credentials were already tried — pointing
+    # the user at `auth login` alone would send them in a circle.
+    assert "even with the cached workspace credentials" in out
+
+
+def test_workspace_url_skips_authed_probe_without_databricks_extra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No ``databricks`` extra → the token cache is never consulted.
+
+    ``_databricks_workspace_token`` imports the databricks-sdk-backed
+    auth resolver; calling it without the extra installed raises
+    ModuleNotFoundError. The ``databricks_sdk_installed()`` gate must
+    short-circuit first so plain OSS installs keep working.
+    """
+    import omnigent.cli as cli_mod
+
+    fake = _FakeHttpx(
+        responses=[
+            _response(404, headers={"server": "databricks"}),
+            _response(404, headers={"server": "databricks"}),
+        ]
+    )
+    monkeypatch.setattr(httpx, "get", fake.get)
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.databricks_sdk_installed",
+        lambda: False,
+    )
+
+    def _must_not_mint(workspace_host: str) -> str:
+        raise AssertionError(
+            "_databricks_workspace_token was called without the databricks "
+            "extra installed — the databricks_sdk_installed() gate in "
+            "_cached_workspace_bearer did not short-circuit."
+        )
+
+    monkeypatch.setattr(cli_mod, "_databricks_workspace_token", _must_not_mint)
+
+    result = cli_mod._workspace_api_server_url(_WORKSPACE)
+
+    assert result == _WORKSPACE
+    # Only the two anonymous probes — no token, no authed retry.
+    assert [r["authorization"] for r in fake.requests] == [None, None]

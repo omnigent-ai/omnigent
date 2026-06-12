@@ -60,7 +60,7 @@ export function conversationDisplayLabel(conversation: Conversation): string {
   if (conversation.title) return conversation.title;
   const label = nativeWrapperLabel(conversation);
   if (label !== null) return label;
-  return truncateConversationId(conversation.id);
+  return UNTITLED_CONVERSATION_LABEL;
 }
 
 export function filterConversations(
@@ -135,9 +135,4 @@ export function normalizePinnedConversationIds(
   }
 
   return normalized;
-}
-
-function truncateConversationId(id: string): string {
-  if (id.length <= 14) return id;
-  return `${id.slice(0, 13)}...`;
 }

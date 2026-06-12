@@ -1239,7 +1239,7 @@ def test_render_startup_banner_omits_keybinding_hints() -> None:
 def test_render_startup_banner_uses_mascot_accent_color() -> None:
     """
     The Omnigent mode banner box border is rendered in the Omnigent
-    octopus magenta-pink brand accent (truecolor RGB ``#F43BA6`` →
+    starfish magenta-pink brand accent (truecolor RGB ``#F43BA6`` →
     ``38;2;244;59;166``), matching the bottom toolbar, prompt
     marker, and tool-call glyphs.
 
@@ -1254,7 +1254,7 @@ def test_render_startup_banner_uses_mascot_accent_color() -> None:
     """
     ansi = _render_startup_banner_ansi("agent")
     # ``38;2;244;59;166`` is the SGR truecolor foreground encoding
-    # of #F43BA6 — the Omnigent octopus magenta-pink brand accent
+    # of #F43BA6 — the Omnigent starfish magenta-pink brand accent
     # (also ``TerminalHost.accent_color`` default). The banner
     # builder injects it for both the box border and the mascot art
     # on the Omnigent path.
@@ -1271,7 +1271,7 @@ def test_render_startup_banner_uses_mascot_accent_color() -> None:
 
 def test_run_banner_uses_magenta_mascot_color() -> None:
     """
-    The ``omnigent run`` banner renders in the octopus
+    The ``omnigent run`` banner renders in the starfish
     magenta-pink brand accent
     (``MASCOT_ART_COLOR = "#F43BA6"`` → ``38;2;244;59;166``).
     The default ``art_color`` and the explicit ``--omnigent`` override
@@ -1283,7 +1283,7 @@ def test_run_banner_uses_magenta_mascot_color() -> None:
     from omnigent.inner.mascots import MASCOT_ART_COLOR
 
     assert MASCOT_ART_COLOR == "#F43BA6", (
-        f"MASCOT_ART_COLOR must be the octopus magenta-pink brand "
+        f"MASCOT_ART_COLOR must be the starfish magenta-pink brand "
         f"accent (#F43BA6) for the ``omnigent run`` welcome "
         f"banner; got {MASCOT_ART_COLOR!r}."
     )
@@ -1309,7 +1309,7 @@ def test_render_startup_banner_fits_under_80_columns() -> None:
     If a future change reintroduces the hint text in the box, or
     an example agent name grows long enough on its own, the box
     overflows the terminal and prompt_toolkit re-flows the row,
-    producing the ``▝0‿0▘`` mascot drifting to a second line.
+    producing the starfish mascot drifting to a second line.
     ``databricks coding agent`` (the humanized form of the
     longest shipped example agent name) is the canonical
     regression input from the 2026-05-26 user report.

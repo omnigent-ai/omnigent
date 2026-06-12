@@ -1,4 +1,43 @@
-"""UI journey: two agents chat about The Hitchhiker's Guide across two rounds.
+r"""UI journey: two agents chat about The Hitchhiker's Guide across two rounds.
+
+::
+
+       o                                        .-----------------.
+      /|\   Arthur Dent                         |   ___________   |
+      / \   (top-level agent,                   |  |    42.    |  |  Deep Thought
+            session /c/<parent>)                |  |___________|  |  (deep_thought
+                                                |_________________|  sub-agent,
+                                                                     session /c/<child>)
+
+    PARENT TRANSCRIPT                           CHILD TRANSCRIPT
+    .--------------------------------.
+    | user                           |
+    |   Ask Deep Thought for the     |
+    |   Answer to the Ultimate       |
+    |   Question of Life, the        |
+    |   Universe, and Everything.    |
+    '--------------------------------'
+         |
+         |  sys_session_send                    .---------------------------.
+         +------------------------------------> | user (sent by Arthur)     |
+         |    (dispatch turn parks)             |   What is the Answer...?  |
+         |                                      '---------------------------'
+         |                                      .---------------------------.
+         |                                      | deep_thought              |
+         |         inbox auto-wake              |   The Answer is 42.       |
+         + <----------------------------------- |   Verification code:      |
+         v                                      |   vogon-<nonce>           |
+    .--------------------------------.          '---------------------------'
+    | arthur                         |
+    |   The Answer is 42.            |
+    |   Verification code:           |
+    |   vogon-<nonce>                |
+    '--------------------------------'
+
+    Round 2 repeats the shape ("what is the Ultimate Question?"), but MUST
+    continue the SAME child session: still exactly one Agents-rail row, and
+    the child transcript accumulates both replies (babelfish-<nonce> joins
+    vogon-<nonce>).
 
 The user asks Arthur (the session's top-level agent) to find out the Answer
 to the Ultimate Question of Life, the Universe, and Everything. Arthur's
@@ -112,16 +151,9 @@ def _expect_single_deep_thought_row(page: Page) -> str:
     :returns: The child session id from the row's
         ``data-child-session-id`` attribute.
     """
-    # The rail's open-state is remembered per conversation, so round 2's
-    # return to the parent lands with it already open. Wait for the
-    # header toggle in either state, then expand only when collapsed
-    # (open_right_rail clicks "Expand right panel" unconditionally and
-    # would time out against the "Collapse right panel" label).
-    expand = page.get_by_role("button", name="Expand right panel")
-    collapse = page.get_by_role("button", name="Collapse right panel")
-    expect(expand.or_(collapse).first).to_be_visible(timeout=60_000)
-    if expand.count() > 0:
-        open_right_rail(page)
+    # Idempotent: expands the rail when collapsed and is a no-op when
+    # round 2's return to the parent restores the remembered open state.
+    open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
     rail.get_by_role("tab", name=re.compile("^Agents")).click()
     rows = rail.locator(_SUBAGENT_ROW)

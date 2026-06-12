@@ -19,15 +19,28 @@ class MascotPayload(TypedDict):
     color: str
 
 
+# Otto the starfish — generated from the Otto brand PNG by the
+# manytools.org image-to-ASCII converter (29 cols, symbol-only charset),
+# with the white background stripped and margins trimmed.
 MASCOT_ART_LINES: tuple[str, ...] = (
-    "( ◉ ‿ ◉ )",
-    " ~)|)|(~ ",
+    "             #/##            ",
+    "            ##/###           ",
+    "           ###/(##           ",
+    "          ####/####       ###",
+    "#//#######################//#",
+    " ####//##    ###(    #//#### ",
+    "   ######    ###    #####    ",
+    "  ############ (#######      ",
+    " #  #& #################     ",
+    " #/#####//##########/###     ",
+    "     #///###     ####//##    ",
+    "      ##             ##      ",
 )
 
 MASCOT_ART_COL_WIDTH = max(len(line) for line in MASCOT_ART_LINES)
 
 # Truecolor hex: must stay in sync with the interactive welcome ``Panel`` border in
-# ``omnigent.cli``. Octopus magenta-pink — the Omnigent brand accent.
+# ``omnigent.cli``. Otto's starfish magenta-pink — the Omnigent brand accent.
 MASCOT_ART_COLOR = "#F43BA6"
 
 
@@ -49,7 +62,7 @@ def random_mascot_lines() -> list[str]:
     The function name is kept for compatibility with the old procedural
     mascot API, but the TUI now uses the single static Omnigent mascot.
 
-    :returns: Centered two-row mascot art.
+    :returns: The multi-row Otto-the-starfish mascot art.
     """
 
     return list(MASCOT_ART_LINES)
@@ -68,7 +81,7 @@ def mascot_payload_for_identity(agent_identity: str) -> MascotPayload:
     """
 
     digest = hashlib.sha256(agent_identity.encode("utf-8")).digest()
-    # Octopus magenta-pink range from hash bytes, centered on the brand
+    # Starfish magenta-pink range from hash bytes, centered on the brand
     # accent ``#F43BA6`` (244, 59, 166).
     r = 223 + (digest[8] % 33)
     g = 39 + (digest[9] % 40)

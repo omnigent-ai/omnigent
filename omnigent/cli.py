@@ -8279,6 +8279,40 @@ def debug_migrate_accounts_to_oidc(
         click.echo("\nDone. Flip OMNIGENT_AUTH_PROVIDER=oidc and restart.\n")
 
 
+def _workspace_mount_probe_matches(candidate: str, probe: httpx.Response) -> bool:
+    """Whether a ``/api/2.0/omnigent`` mount probe answered like omnigent.
+
+    :param candidate: The probed mount base URL, e.g.
+        ``"https://example.databricks.com/api/2.0/omnigent"``.
+    :param probe: The ``GET <candidate>/v1/me`` response.
+    :returns: ``True`` when the mount answered 200 (omnigent itself) or
+        with a Databricks-fronted shape (302 to ``/oidc/`` or 401 with
+        the ``DatabricksRealm`` challenge).
+    """
+    return probe.status_code == 200 or (
+        _databricks_workspace_login_target(candidate, probe) is not None
+    )
+
+
+def _cached_workspace_bearer(workspace_host: str) -> str | None:
+    """Best-effort bearer for *workspace_host* from the OAuth cache.
+
+    Unlike :func:`_databricks_workspace_token`, a missing ``databricks``
+    extra is not an error here — probe callers simply fall back to
+    unauthenticated behavior.
+
+    :param workspace_host: The workspace host, e.g.
+        ``"https://example.databricks.com"``.
+    :returns: A bearer token, or ``None`` when the ``databricks`` extra
+        is not installed or no cached grant resolves for the host.
+    """
+    from omnigent.onboarding.databricks_config import databricks_sdk_installed
+
+    if not databricks_sdk_installed():
+        return None
+    return _databricks_workspace_token(workspace_host)
+
+
 def _workspace_api_server_url(server: str) -> str:
     """Expand a bare Databricks workspace URL to its omnigent API base.
 
@@ -8291,6 +8325,14 @@ def _workspace_api_server_url(server: str) -> str:
     expanded URL is adopted. Detection is behavioral — no hostname
     patterns — and URLs that already carry a path are returned
     untouched without any probe.
+
+    Some workspace edges (Azure) answer the anonymous mount probe with
+    a plain 404 — not the AWS proxy's 401-with-``DatabricksRealm``
+    challenge — so a mount that works for authenticated callers is
+    invisible to the anonymous probe. When the host-keyed Databricks
+    OAuth cache holds a grant for the workspace (the user ran
+    ``databricks auth login``), the mount probe is retried with that
+    bearer before giving up.
 
     :param server: The user-supplied server URL, e.g.
         ``"https://example.databricks.com"``.
@@ -8327,11 +8369,44 @@ def _workspace_api_server_url(server: str) -> str:
         api_probe = _httpx.get(f"{candidate}/v1/me", timeout=10.0)
     except _httpx.HTTPError:
         return server
-    if api_probe.status_code == 200 or (
-        _databricks_workspace_login_target(candidate, api_probe) is not None
-    ):
+    if _workspace_mount_probe_matches(candidate, api_probe):
         click.echo(f"Using {candidate} (Databricks workspace-hosted omnigent).")
         return candidate
+    # The anonymous probe came back inconclusive (404 on Azure even
+    # when the mount exists). Retry it with a cached workspace bearer;
+    # either way, say what was decided — this branch is only reached
+    # for genuine workspace web hosts, where a silent decline strands
+    # the user on a bare URL that can only 404.
+    token = _cached_workspace_bearer(server)
+    if token is not None:
+        try:
+            authed_probe = _httpx.get(
+                f"{candidate}/v1/me",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10.0,
+            )
+        except _httpx.HTTPError:
+            authed_probe = None
+        if authed_probe is not None and _workspace_mount_probe_matches(candidate, authed_probe):
+            click.echo(f"Using {candidate} (Databricks workspace-hosted omnigent).")
+            return candidate
+        click.echo(
+            f"Note: {server} answers like a Databricks workspace, but "
+            f"{candidate} did not answer as an omnigent server even with "
+            f"the cached workspace credentials. Connecting to {server} as "
+            "given; if omnigent is hosted on this workspace, refresh the "
+            f"login with `databricks auth login --host {server}` or pass "
+            "the full mount URL."
+        )
+        return server
+    click.echo(
+        f"Note: {server} answers like a Databricks workspace, but "
+        f"{candidate} did not answer the anonymous probe "
+        f"(HTTP {api_probe.status_code}). Some edges hide the mount from "
+        "unauthenticated requests — if omnigent is hosted on this "
+        f"workspace, run `databricks auth login --host {server}` and "
+        "retry, or pass the full mount URL."
+    )
     return server
 
 

@@ -13,10 +13,11 @@
  * harness options or pill suffix at all.
  */
 export const BRAIN_HARNESS_LABELS: Record<string, string> = {
+  // Insertion order IS the fly-out's menu order.
   "claude-sdk": "Claude SDK",
+  "openai-agents": "OpenAI Agents SDK",
   codex: "Codex",
   pi: "Pi",
-  "openai-agents": "OpenAI Agents SDK",
 };
 
 /**

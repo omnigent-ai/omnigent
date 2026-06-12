@@ -414,7 +414,7 @@ def _render_startup_banner_ansi(
     Build the ANSI-styled startup banner shown when the REPL boots.
 
     Renders the mascot art + accent-bordered box, using the SDK's
-    octopus magenta-pink brand color (``#F43BA6``) so the box border,
+    starfish magenta-pink brand color (``#F43BA6``) so the box border,
     mascot, prompt marker, and bottom toolbar all read as one accent.
 
     When *header* is supplied, the box becomes a Claude-Code-style header:

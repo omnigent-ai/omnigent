@@ -236,7 +236,7 @@ const SETTLED_STATE: Record<AgentActivity, boolean> = {
  * role at a glance (Claude Code spawns many same-type "Explore" agents — the
  * icon distinguishes roles; the preview line below distinguishes instances).
  * Category icons are monochrome — the row applies the muted color; the
- * fallback is the full-color Otto (octopus) mascot.
+ * fallback is the full-color Otto (starfish) mascot.
  *
  * @param tool - The agent type, e.g. ``"Explore"`` or ``"researcher"``;
  *   ``null`` when the child carries no type.
