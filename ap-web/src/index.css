@@ -310,15 +310,19 @@
  * (e.g. FilesPanel inside the workspace panel, toolbars inside the
  * composer) is an interior fill, and re-decorating it with its own
  * border/shadow visually carves the parent card into pieces.
- * :not([aria-hidden="true"]) skips closed rails/drawers/sidebars: they
+ * :not([data-collapsed]) skips closed rails/drawers/sidebars: they
  * collapse to w-0 with their utility borders removed, but this rule's
  * border+shadow would still paint them as a thin glowing strip along the
- * screen edge. Closed panels mark themselves aria-hidden, which doubles
- * as the "visually collapsed" signal. (Not [inert]: this React version
- * drops the boolean inert attribute from the DOM, so it never matches.) */
-.dark :is(.bg-card, [class*="md:bg-card"]):not(:is(.bg-card, [class*="md:bg-card"]) :is(.bg-card, [class*="md:bg-card"])):not([aria-hidden="true"]) {
-  backdrop-filter: blur(32px) saturate(180%) !important;
+ * screen edge. Closed panels mark themselves data-collapsed. (NOT keyed on
+ * aria-hidden: Radix's modal a11y hiding sets aria-hidden="true" on open
+ * panels while a menu/dialog is up, and dropping this rule's 1px border
+ * then reflowed every sidebar row 2px wider. Not [inert] either: this
+ * React version drops the boolean inert attribute from the DOM.) */
+.dark :is(.bg-card, [class*="md:bg-card"]):not(:is(.bg-card, [class*="md:bg-card"]) :is(.bg-card, [class*="md:bg-card"])):not([data-collapsed]) {
+  /* -webkit- must come BEFORE the unprefixed property: LightningCSS (vite
+   * build) collapses the pair and keeps only the last declaration. */
   -webkit-backdrop-filter: blur(32px) saturate(180%) !important;
+  backdrop-filter: blur(32px) saturate(180%) !important;
   border: 1px solid rgba(255, 255, 255, 0.09);
   border-top-color: rgba(255, 255, 255, 0.14);
   background-image: linear-gradient(135deg, rgba(255, 255, 255, 0.04) 0%, rgba(255, 255, 255, 0) 60%);
@@ -339,8 +343,9 @@
 .dark [data-slot="popover-content"],
 .dark [role="menu"],
 .dark [data-radix-popper-content-wrapper] > * {
-  backdrop-filter: blur(24px) saturate(150%) !important;
+  /* -webkit- before unprefixed — see comment on the bg-card rule above. */
   -webkit-backdrop-filter: blur(24px) saturate(150%) !important;
+  backdrop-filter: blur(24px) saturate(150%) !important;
   border: 1px solid rgba(255, 255, 255, 0.08);
 }
 
@@ -369,11 +374,15 @@
   height: 2.25rem;
   -webkit-app-region: drag;
 }
-/* With the sidebar closed the chat header's left edge reaches the window
- * corner where the traffic lights float — drop it below them, mirroring
- * the sidebar's own top margin. */
+/* With the sidebar closed the chat header's left slot reaches the window
+ * corner where the traffic lights float — drop just that slot below them,
+ * mirroring the sidebar's own top margin. Applied to the slot, not the
+ * header bar, so the right action cluster (share, panel toggles) stays up
+ * in the title-bar strip. flex-start anchors the margin to the bar's top
+ * (the header centers its items, which would otherwise split the offset). */
 [data-electron-mac] .traffic-light-clearance {
-  padding-top: 2.25rem;
+  align-self: flex-start;
+  margin-top: 1rem;
 }
 /* Drag regions are geometric, not z-ordered: anything that overlaps the
  * strip (e.g. the mobile full-screen sidebar overlay) would lose clicks
@@ -420,6 +429,17 @@
   body {
     @apply bg-background text-foreground;
     }
+  /* The app shell is a fixed-viewport layout (h-dvh) with internal
+   * scrollers — the document itself must never scroll. Without this, any
+   * sub-pixel overflow (browser zoom rounding, floating overlays) gives the
+   * root a classic scrollbar on macOS "always show scrollbars" setups, and
+   * Radix's scroll-lock (body overflow:hidden on menu/dialog open) then
+   * removes it — widening the layout viewport and every fixed-position
+   * overlay with it. Scoped via :has so login/register/setup pages (outside
+   * the shell) keep default document scrolling. */
+  body:has(.app-shell) {
+    overflow: hidden;
+  }
   html {
     @apply font-sans;
     }
@@ -712,6 +732,61 @@
   color: var(--muted-foreground);
   margin: 0.75em 0;
 }
+/* GitHub-style alerts (> [!NOTE] etc., detected by TipTapGitHubAlert.ts):
+   colored border, icon + label header injected via pseudo-elements so the
+   ProseMirror document is untouched. */
+.tiptap-md-content .ProseMirror blockquote[data-alert-type] {
+  position: relative;
+  color: var(--foreground);
+  border-left-color: var(--md-alert-color);
+}
+.tiptap-md-content .ProseMirror blockquote[data-alert-type]::before {
+  content: attr(data-alert-label);
+  display: block;
+  padding-left: 24px;
+  margin-bottom: 0.25rem;
+  font-weight: 500;
+  line-height: 1.4;
+  color: var(--md-alert-color);
+}
+/* The icon: a mask over a colored box so it inherits --md-alert-color. */
+.tiptap-md-content .ProseMirror blockquote[data-alert-type]::after {
+  content: "";
+  position: absolute;
+  top: 0.2em;
+  left: 1em;
+  width: 16px;
+  height: 16px;
+  background-color: var(--md-alert-color);
+  mask: var(--md-alert-icon) no-repeat center / contain;
+  -webkit-mask: var(--md-alert-icon) no-repeat center / contain;
+}
+.tiptap-md-content .ProseMirror blockquote[data-alert-type="note"] {
+  --md-alert-color: #0969da;
+  --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8Zm8-6.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13ZM6.5 7.75A.75.75 0 0 1 7.25 7h1a.75.75 0 0 1 .75.75v2.75h.25a.75.75 0 0 1 0 1.5h-2a.75.75 0 0 1 0-1.5h.25v-2h-.25a.75.75 0 0 1-.75-.75ZM8 6a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z'/%3E%3C/svg%3E");
+}
+.tiptap-md-content .ProseMirror blockquote[data-alert-type="tip"] {
+  --md-alert-color: #1a7f37;
+  --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8 1.5c-2.363 0-4 1.69-4 3.75 0 .984.424 1.625.984 2.304l.214.253c.223.264.47.556.673.848.284.411.537.896.621 1.49a.75.75 0 0 1-1.484.211c-.04-.282-.163-.547-.37-.847a8.456 8.456 0 0 0-.542-.68c-.084-.1-.173-.205-.268-.32C3.201 7.75 2.5 6.766 2.5 5.25 2.5 2.31 4.863 0 8 0s5.5 2.31 5.5 5.25c0 1.516-.701 2.5-1.328 3.259-.095.115-.184.22-.268.319-.207.245-.383.453-.541.681-.208.3-.33.565-.37.847a.751.751 0 0 1-1.485-.212c.084-.593.337-1.078.621-1.489.203-.292.45-.584.673-.848.075-.088.147-.173.213-.253.561-.679.985-1.32.985-2.304 0-2.06-1.637-3.75-4-3.75ZM5.75 12h4.5a.75.75 0 0 1 0 1.5h-4.5a.75.75 0 0 1 0-1.5Zm.75 3.75a.75.75 0 0 1 .75-.75h1.5a.75.75 0 0 1 0 1.5h-1.5a.75.75 0 0 1-.75-.75Z'/%3E%3C/svg%3E");
+}
+.tiptap-md-content .ProseMirror blockquote[data-alert-type="important"] {
+  --md-alert-color: #8250df;
+  --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M0 1.75C0 .784.784 0 1.75 0h12.5C15.216 0 16 .784 16 1.75v9.5A1.75 1.75 0 0 1 14.25 13H8.06l-2.573 2.573A1.458 1.458 0 0 1 3 14.543V13H1.75A1.75 1.75 0 0 1 0 11.25Zm1.75-.25a.25.25 0 0 0-.25.25v9.5c0 .138.112.25.25.25h2a.75.75 0 0 1 .75.75v2.19l2.72-2.72a.749.749 0 0 1 .53-.22h6.5a.25.25 0 0 0 .25-.25v-9.5a.25.25 0 0 0-.25-.25Zm7 2.25v2.5a.75.75 0 0 1-1.5 0v-2.5a.75.75 0 0 1 1.5 0ZM9 9a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z'/%3E%3C/svg%3E");
+}
+.tiptap-md-content .ProseMirror blockquote[data-alert-type="warning"] {
+  --md-alert-color: #9a6700;
+  --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M6.457 1.047c.659-1.234 2.427-1.234 3.086 0l6.082 11.378A1.75 1.75 0 0 1 14.082 15H1.918a1.75 1.75 0 0 1-1.543-2.575Zm1.763.707a.25.25 0 0 0-.44 0L1.698 13.132a.25.25 0 0 0 .22.368h12.164a.25.25 0 0 0 .22-.368Zm.53 3.996v2.5a.75.75 0 0 1-1.5 0v-2.5a.75.75 0 0 1 1.5 0ZM9 11a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z'/%3E%3C/svg%3E");
+}
+.tiptap-md-content .ProseMirror blockquote[data-alert-type="caution"] {
+  --md-alert-color: #cf222e;
+  --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.47.22A.749.749 0 0 1 5 0h6c.199 0 .389.079.53.22l4.25 4.25c.141.14.22.331.22.53v6a.749.749 0 0 1-.22.53l-4.25 4.25a.749.749 0 0 1-.53.22H5a.749.749 0 0 1-.53-.22L.22 11.53A.749.749 0 0 1 0 11V5c0-.199.079-.389.22-.53Zm.84 1.28L1.5 5.31v5.38l3.81 3.81h5.38l3.81-3.81V5.31L10.69 1.5ZM8 4a.75.75 0 0 1 .75.75v3.5a.75.75 0 0 1-1.5 0v-3.5A.75.75 0 0 1 8 4Zm0 8a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z'/%3E%3C/svg%3E");
+}
+/* GitHub's dark-palette hues for the same five types. */
+.dark .tiptap-md-content .ProseMirror blockquote[data-alert-type="note"] { --md-alert-color: #4493f8; }
+.dark .tiptap-md-content .ProseMirror blockquote[data-alert-type="tip"] { --md-alert-color: #3fb950; }
+.dark .tiptap-md-content .ProseMirror blockquote[data-alert-type="important"] { --md-alert-color: #ab7df8; }
+.dark .tiptap-md-content .ProseMirror blockquote[data-alert-type="warning"] { --md-alert-color: #d29922; }
+.dark .tiptap-md-content .ProseMirror blockquote[data-alert-type="caution"] { --md-alert-color: #f85149; }
 .tiptap-md-content .ProseMirror code {
   font-family: var(--font-mono);
   font-size: 0.85em;
@@ -729,11 +804,32 @@
 .tiptap-md-content .ProseMirror pre code { background: none; padding: 0; }
 .tiptap-md-content .ProseMirror a { color: var(--primary); text-decoration: underline; }
 .tiptap-md-content .ProseMirror hr { border: none; border-top: 1px solid var(--border); margin: 1.5em 0; }
+/* Raw-HTML passthrough blocks (TipTapHtmlPassthrough.ts). Hidden blocks
+   (comments, bare wrapper tags) keep the bytes without visual presence;
+   summary blocks render as a dim disclosure line. */
+.tiptap-md-content .ProseMirror .md-html-passthrough-hidden { height: 0; overflow: hidden; margin: 0; }
+.tiptap-md-content .ProseMirror .md-html-passthrough-summary {
+  color: var(--muted-foreground);
+  font-weight: 500;
+  margin: 0.75em 0 0.25em;
+}
+/* GitHub-style images: never overflow the editor column. No `height: auto` —
+   it would override explicit height="" attributes from HTML <img> tags.
+   inline-block overrides Tailwind preflight's `img { display: block }` so
+   images flow within headings/paragraphs (logos, badges) like on GitHub. */
+.tiptap-md-content .ProseMirror img { max-width: 100%; display: inline-block; vertical-align: middle; }
+.tiptap-md-content .ProseMirror img.ProseMirror-selectednode { outline: 2px solid var(--primary); border-radius: 2px; }
 .tiptap-md-content .ProseMirror .tableWrapper { overflow-x: auto; }
-.tiptap-md-content .ProseMirror table { border-collapse: collapse; width: 100%; margin: 0.75em 0; table-layout: fixed; }
+/* GitHub-style tables: auto layout + max-content so columns size to their
+   content and the table hugs it (capped by the wrapper, which scrolls).
+   Column-resize still works — prosemirror-tables' <col> widths apply under
+   auto layout too, just less pixel-exact than with table-layout: fixed. */
+.tiptap-md-content .ProseMirror table { border-collapse: collapse; width: max-content; max-width: 100%; margin: 0.75em 0; }
 .tiptap-md-content .ProseMirror th,
-.tiptap-md-content .ProseMirror td { border: 1px solid var(--border); padding: 0.5em 0.75em; position: relative; }
-.tiptap-md-content .ProseMirror th { background: var(--muted); font-weight: 600; }
+.tiptap-md-content .ProseMirror td { border: 1px solid var(--border); padding: 6px 13px; position: relative; }
+.tiptap-md-content .ProseMirror th { font-weight: 600; }
+/* Zebra striping on even body rows (row 1 is the header), as on GitHub. */
+.tiptap-md-content .ProseMirror table tr:nth-child(odd):not(:first-child) { background: var(--muted); }
 /* Column resize handle injected by TipTap as a single element inside the
    hovered cell.  JS in TableBubbleMenu stretches top/height to the full
    table so it spans the entire column visually. */

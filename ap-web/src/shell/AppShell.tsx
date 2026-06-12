@@ -173,12 +173,15 @@ export function AppShell() {
   // on a phone they open as full-screen overlays from the session-menu FAB.
   const [subagentsPanelOpen, setSubagentsPanelOpen] = useState(false);
   const [todosPanelOpen, setTodosPanelOpen] = useState(false);
-  // The right "Workspace" rail (WorkspacePanel) is closed by default and
+  // The right "Workspace" rail (WorkspacePanel) is open by default and
   // remembers its open/closed state per session — a brand-new session starts
-  // closed; reopening a session restores how the user last left it. Toggled
-  // via the header's PanelRightIcon, mirroring the sidebar collapse.
+  // open; reopening a session restores how the user last left it. Toggled
+  // via the header's PanelRightIcon, mirroring the sidebar collapse. With no
+  // conversation the rail can't render, so the state stays false — leaving it
+  // true would let rail-gated side effects (the ?view= URL sync) fire on
+  // non-session routes like the home page.
   const [rightPanelOpen, setRightPanelOpen] = useState(
-    () => (conversationId ? readSessionWorkspaceState(conversationId).open ?? false : false),
+    () => (conversationId ? readSessionWorkspaceState(conversationId).open ?? true : false),
   );
   const [shareOpen, setShareOpen] = useState(false);
   const [forkOpen, setForkOpen] = useState(false);
@@ -480,6 +483,8 @@ export function AppShell() {
     setTodosPanelOpen(false);
     setFilesPanelShowHidden(false);
     if (!conversationId) {
+      // No session → no rail; false (not the open default) so rail-gated
+      // effects like the ?view= URL sync stay quiet on non-session routes.
       setRightPanelOpen(false);
       setRightRailTab("files");
       setSelectedFilePath(null);
@@ -549,7 +554,7 @@ export function AppShell() {
       viewParam === "changed" ||
       viewParam === "explore" ||
       (commentParam !== null && commentParam !== "");
-    setRightPanelOpen((persisted.open ?? false) || hasWorkspaceUrlSignal);
+    setRightPanelOpen((persisted.open ?? true) || hasWorkspaceUrlSignal);
 
     stateConvRef.current = conversationId;
   }, [conversationId]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -622,11 +627,12 @@ export function AppShell() {
     setRightRailTab((prev) =>
       prev === "terminals" || prev === "subagents" || prev === "todos" ? "files" : prev,
     );
-    // Reveal the rail so the viewer is actually visible — the rail now defaults
-    // closed per session, so opening a file (e.g. via a chat file-path link)
-    // while it's collapsed would otherwise route the file into an invisible
-    // panel. Persist open=true so the rail stays in sync with the open file on
-    // the next visit (mirroring the header toggle's persistence).
+    // Reveal the rail so the viewer is actually visible — the rail defaults
+    // open but a session the user collapsed restores collapsed, so opening a
+    // file (e.g. via a chat file-path link) there would otherwise route the
+    // file into an invisible panel. Persist open=true so the rail stays in
+    // sync with the open file on the next visit (mirroring the header
+    // toggle's persistence).
     setRightPanelOpen(true);
     if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
     // Set URL in the callback (not a useEffect) to avoid racing with
@@ -1029,7 +1035,7 @@ export function AppShell() {
           </main>
 
           {/* Right workspace card — gated on conversationId (panels have
-              no workspace to read without a session), default-closed,
+              no workspace to read without a session), default-open,
               hidden when any push panel takes the right side, *except* in
               terminal-first sessions where the terminal renders inline
               (not as a push panel) and the card should remain visible

@@ -112,6 +112,18 @@ class Conversation:
         ``PATCH /v1/sessions/{id}`` (the ap-web "Cost Optimized"
         toggle). Read by the cost-control advisor pipeline at turn
         start; mirrors the persistence shape of ``model_override``.
+    :param harness_override: Per-session harness override for the
+        bound agent's brain, e.g. ``"pi"`` or ``"openai-agents"``.
+        ``None`` means use the harness declared in the agent spec
+        (``executor.config.harness``). Set at session creation via
+        ``POST /v1/sessions`` (the new-chat harness picker) and
+        immutable thereafter — the runner spawns the harness on the
+        first turn, so a later switch would orphan the running
+        process. Only valid for ``executor.type: omnigent`` agents;
+        the create route validates against ``OMNIGENT_HARNESSES``.
+        Sub-agent sessions never inherit it (their own rows stay
+        ``None``), so e.g. polly's workers keep their declared
+        harnesses when the brain is overridden.
     :param sub_agent_name: For sub-agent sessions (``kind="sub_agent"``),
         the sub-agent type name within the parent's spec tree,
         e.g. ``"summarizer"``. The runner uses this to resolve the
@@ -182,6 +194,7 @@ class Conversation:
     reasoning_effort: str | None = None
     model_override: str | None = None
     cost_control_mode_override: str | None = None
+    harness_override: str | None = None
     sub_agent_name: str | None = None
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None

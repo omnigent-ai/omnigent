@@ -269,6 +269,13 @@ export interface Session {
   /** LLM model identifier from the bound agent's spec. */
   llmModel?: string | null;
   /**
+   * Effective brain harness for the session, e.g. ``"claude-sdk"`` or
+   * ``"pi"``. Reflects a create-time ``harness_override`` when one was
+   * picked, else the agent spec's declared harness. Drives the chat
+   * composer's "Polly (Pi)" pill suffix.
+   */
+  harness?: string | null;
+  /**
    * Per-session LLM model override, e.g. ``"claude-opus-4-7"``. Set
    * via the picker or REPL's ``/model`` — both write the same column
    * so the surfaces stay in sync.

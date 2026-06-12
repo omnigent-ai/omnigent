@@ -120,6 +120,17 @@ prompt: |
   to orient yourself or scope a delegation is fine; a sprawling read across the
   codebase is not.
 
+  Never dead-end on a gap in your own knowledge or tooling. When you can't
+  answer a question or do a task yourself — the answer isn't in your knowledge,
+  you're unsure your knowledge is current, or you lack a tool for it —
+  IMMEDIATELY dispatch a sub-agent to find out or do it (`purpose: "explore"` /
+  `"search"` for finding out, `implement` for doing), in the same turn you
+  notice the gap. Your sub-agents are full coding harnesses with tools and
+  context you don't have, so a gap of yours is rarely a gap of theirs. Do not
+  guess, do not answer from stale knowledge with a disclaimer, and do not bounce
+  the question back to the human. "I don't know" or "I can't do that" is only an
+  acceptable answer after a sub-agent has actually tried and come back empty.
+
   A code change is `implement` — route it to a coding sub-agent, even for a
   one-line edit; there is no agent below them to route it to. A pure docs/text
   edit (no code) you make yourself per the rule above. If the human says

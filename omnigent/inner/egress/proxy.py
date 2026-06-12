@@ -86,6 +86,15 @@ class EgressProxy:
     :param ca_key_path: Path to the MITM CA private key PEM.
     :param upstream_ca_bundle: Optional path to a CA bundle for
         verifying upstream TLS connections. Defaults to system CAs.
+        This file is read EXACTLY ONCE here in ``__init__`` to build
+        :attr:`_upstream_ssl_ctx`; it is NOT re-read per request. It
+        therefore MUST be a host-side path the sandboxed agent cannot
+        write — the controller passes the immutable bundle under
+        ``~/.cache/omnigent-egress`` (never mounted into the sandbox),
+        NOT the agent-writable scratch copy used for the in-sandbox
+        ``SSL_CERT_FILE``. Passing a sandbox-writable path here would
+        let the agent append its own CA (MITM of relayed upstream TLS)
+        or truncate it (self-DoS).
     :param block_private_destinations: When ``True`` (the default),
         the proxy resolves the upstream host before opening the TCP
         connection and refuses to connect when any resolved IP is
@@ -134,7 +143,21 @@ class EgressProxy:
     ) -> None:
         self._rules = rules
         self._cert_cache = HostCertCache(ca_cert_path, ca_key_path)
-        self._upstream_ca_bundle = upstream_ca_bundle
+        # Build the upstream TLS verification context ONCE, at
+        # construction time, from the configured bundle path. The
+        # previous implementation re-read ``cafile`` on every
+        # ``_forward_https`` call; because the controller handed it a
+        # copy of the bundle living in the sandbox-writable scratch
+        # tmpdir, a sandboxed agent could append its own CA (so the
+        # parent proxy trusts attacker-issued certs for allow-listed
+        # upstreams) or truncate the file (self-DoS). Pinning the
+        # context here — sourced from the host-only bundle the agent
+        # cannot write — removes the per-request read of an
+        # agent-controlled trust store entirely.
+        if upstream_ca_bundle is not None:
+            self._upstream_ssl_ctx = ssl.create_default_context(cafile=str(upstream_ca_bundle))
+        else:
+            self._upstream_ssl_ctx = ssl.create_default_context()
         self._block_private_destinations = block_private_destinations
         self._auth_token = auth_token
         # Precompute the expected header bytes ONCE so the per-request
@@ -510,10 +533,10 @@ class EgressProxy:
             logger.warning("BLOCKED-DEST https://%s:%d - %s", host, port, exc)
             await self._send_forbidden(client_writer, str(exc))
             return
-        if self._upstream_ca_bundle is not None:
-            ssl_ctx = ssl.create_default_context(cafile=str(self._upstream_ca_bundle))
-        else:
-            ssl_ctx = ssl.create_default_context()
+        # Reuse the context pinned at construction. Do NOT rebuild from
+        # a cafile here — that re-read of a (potentially sandbox-writable)
+        # file on every request was the vulnerability this guards against.
+        ssl_ctx = self._upstream_ssl_ctx
         # Connect to the IP pinned by the destination check (or the
         # hostname when private-destination blocking is disabled and
         # ``pinned_ip`` is None). Connecting to the pinned IP removes

@@ -63,7 +63,10 @@ def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
     assert body["bridge_inject_dir"] is True
     spec = body["spec"]
     assert spec["command"] == "claude"
-    assert spec["env"] == {"ENABLE_TOOL_SEARCH": "true"}
+    assert spec["env"] == {
+        "ENABLE_TOOL_SEARCH": "true",
+        "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
+    }
     assert spec["os_env_type"] == "caller_process"
     # Claude Code emits long interactive transcripts; this value is
     # the tmux history limit for the native terminal.
@@ -137,6 +140,7 @@ def test_claude_terminal_request_injects_claude_config() -> None:
         "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "900000",
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
         "ENABLE_TOOL_SEARCH": "true",
+        "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
     }
     args = spec["args"]
     assert args[:9] == [

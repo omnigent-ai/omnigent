@@ -1,4 +1,4 @@
-# Public-only: a maintainer comments `/regen` on a PR to regenerate the public
+# A maintainer comments `/regen` on a PR to regenerate the repo's
 # lockfiles (uv.lock + ap-web/package-lock.json) against public PyPI/npm and
 # commit them ONTO that PR's branch. Complements oss-regenerate-and-smoke.yml
 # (which opens a standalone rolling PR on manifest pushes / schedule); use this
@@ -137,6 +137,15 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "20"
+
+      # Resolve only distributions uploaded > 7 days ago, so a freshly
+      # regenerated lock never pins a release younger than a week (gives
+      # a window for a compromised/yanked upload to be caught). Inline
+      # rather than a local composite action: this job checks out the
+      # PR author's tree, where a `./.github/actions/...` reference may
+      # not exist; a `run:` step comes from the base-branch workflow.
+      - name: Pin uv resolution cutoff (exclude-newer)
+        run: echo "UV_EXCLUDE_NEWER=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
 
       - name: Regenerate lockfiles against public PyPI/npm
         run: |

@@ -549,6 +549,7 @@ class ConversationStore(ABC):
         _unset_model_override: bool = False,
         cost_control_mode_override: str | None = None,
         _unset_cost_control_mode_override: bool = False,
+        harness_override: str | None = None,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
     ) -> Conversation | None:
@@ -579,6 +580,11 @@ class ConversationStore(ABC):
         :param _unset_cost_control_mode_override: When ``True``, set
             ``cost_control_mode_override`` to ``None`` regardless of
             the ``cost_control_mode_override`` param value.
+        :param harness_override: Per-session brain-harness override,
+            e.g. ``"pi"``. ``None`` leaves unchanged. No ``_unset``
+            variant — the override is set once at session create and
+            immutable thereafter (the harness process is spawned on
+            the first turn).
         :param terminal_launch_args: Per-session native-terminal
             pass-through args, e.g.
             ``["--dangerously-skip-permissions"]``. ``None`` leaves

@@ -67,10 +67,14 @@ class EgressProxyHandle:
     :param socket_path: Absolute path to the Unix socket in the
         scratch tmpdir that the relay bridges TCP traffic to. Set
         in the policy as ``egress_socket_path``.
-    :param ca_bundle_path: Path to the MITM CA bundle inside the
+    :param ca_bundle_path: Path to the MITM CA bundle copy inside the
         scratch tmpdir. Set in ``SSL_CERT_FILE`` / etc. on the
         helper / terminal env so its TLS clients trust the proxy's
-        synthesized leaf certificates.
+        synthesized leaf certificates. This is the sandbox-writable
+        copy and is used ONLY for that in-sandbox client trust — it is
+        deliberately NOT the proxy's own upstream trust anchor (the
+        proxy pins the host-side bundle at construction; see
+        :func:`start_egress_proxy`).
     :param auth_token: Per-handle 256-bit Proxy-Authorization
         token. ``None`` when the caller asked for ``require_auth=
         False`` (terminal path); otherwise carried out of band to
@@ -149,7 +153,13 @@ def start_egress_proxy(
     bundle_path = ensure_ca_bundle(ca_cert_path)
 
     # Copy the CA bundle into the scratch tmpdir so it's visible
-    # inside the namespace (scratch is always bind-mounted rw).
+    # inside the namespace (scratch is always bind-mounted rw). This
+    # copy is used ONLY for the in-sandbox ``SSL_CERT_FILE`` / etc.
+    # env vars so the agent's TLS clients trust the proxy's MITM leaf
+    # certs. It is NOT the proxy's upstream trust anchor — the agent
+    # can write this file, so feeding it to the proxy would let the
+    # agent control which upstream certs the parent trusts. The proxy
+    # is given the host-only ``bundle_path`` instead (below).
     local_bundle = tmpdir / "ca-bundle.pem"
     shutil.copy2(bundle_path, local_bundle)
 
@@ -165,7 +175,14 @@ def start_egress_proxy(
         parsed_rules,
         ca_cert_path,
         ca_key_path,
-        upstream_ca_bundle=local_bundle,
+        # Pass the HOST-side immutable bundle
+        # (``~/.cache/omnigent-egress/ca-bundle.pem`` from
+        # ``ensure_ca_bundle`` — ``$HOME`` is never mounted into the
+        # sandbox), NOT ``local_bundle`` in the agent-writable scratch
+        # tmpdir. The proxy reads this once to build its upstream
+        # verification context; sourcing it from a sandbox-writable
+        # path would let the agent tamper with the parent's trust store.
+        upstream_ca_bundle=bundle_path,
         # S2 (security): when the spec didn't explicitly opt into
         # ``egress_allow_private_destinations``, refuse to connect
         # to RFC1918 / loopback / link-local / multicast / reserved

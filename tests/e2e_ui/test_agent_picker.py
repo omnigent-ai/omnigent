@@ -27,5 +27,6 @@ def test_agent_picker_shows_bound_agent(
 
     trigger = page.get_by_test_id("agent-picker-trigger")
     expect(trigger).to_be_visible()
-    expect(trigger).to_contain_text("hello_world")
+    # Agent slugs render capital-first in the picker (agentDisplayLabel).
+    expect(trigger).to_contain_text("Hello_world")
     expect(trigger).to_be_disabled()

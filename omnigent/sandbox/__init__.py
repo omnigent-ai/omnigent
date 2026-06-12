@@ -39,6 +39,7 @@ from omnigent.inner.sandbox import (
     with_additional_read_roots,
     with_additional_write_files,
     with_additional_write_roots,
+    with_denied_unix_sockets,
     with_spawn_env_allowlist,
 )
 
@@ -57,5 +58,6 @@ __all__ = [
     "with_additional_read_roots",
     "with_additional_write_files",
     "with_additional_write_roots",
+    "with_denied_unix_sockets",
     "with_spawn_env_allowlist",
 ]

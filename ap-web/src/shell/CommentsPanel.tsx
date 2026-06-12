@@ -3,6 +3,7 @@ import { CheckIcon, Link2Icon, WandSparklesIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useResizableCommentsPanel } from "@/hooks/useResizableCommentsPanel";
+import { getCurrentAuthorId } from "@/lib/identity";
 import { cn } from "@/lib/utils";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
@@ -47,8 +48,11 @@ export interface CommentsPanelProps {
   canAddress: boolean;
   addressPending: boolean;
   /**
-   * When false, the add-comment form and edit/delete buttons are hidden.
-   * Defaults to true (single-user mode or owner/editor access).
+   * When false, the add-comment form and all edit/delete buttons are hidden
+   * (read-only access). When true, the add-comment form is shown, but the
+   * per-comment edit/delete buttons appear only on the current user's own
+   * comments — see `canModify`. Defaults to true (single-user mode or
+   * owner/editor access).
    */
   canEdit?: boolean;
   /**
@@ -86,6 +90,15 @@ export function CommentsPanel({
   const [tab, setTab] = useState<Tab>("open");
   const addCommentTextareaRef = useRef<HTMLTextAreaElement>(null);
   const { width, containerRef, isDesktop, handleProps } = useResizableCommentsPanel();
+
+  // Editing or deleting a comment is author-only (the backend enforces this
+  // too; this just hides the affordances). A comment with no recorded author
+  // (legacy comments, or single-user/local mode where currentAuthorId is null)
+  // stays editable by any editor, matching the server's `created_by is None`
+  // fallback.
+  const currentAuthorId = getCurrentAuthorId();
+  const canModify = (c: Comment): boolean =>
+    canEdit && (c.created_by == null || c.created_by === currentAuthorId);
 
   useEffect(() => {
     setBody("");
@@ -229,8 +242,8 @@ export function CommentsPanel({
                   comment={c}
                   isSelected={activeSelection?.start_index === c.start_index && activeSelection?.end_index === c.end_index}
                   onClick={() => onClickComment(c)}
-                  onDelete={canEdit ? () => onDeleteComment(c.id) : undefined}
-                  onEdit={canEdit ? (newBody) => onEditComment(c.id, newBody) : undefined}
+                  onDelete={canModify(c) ? () => onDeleteComment(c.id) : undefined}
+                  onEdit={canModify(c) ? (newBody) => onEditComment(c.id, newBody) : undefined}
                   onCopyLink={onCopyCommentLink ? () => onCopyCommentLink(c.id) : undefined}
                 />
               ))}
@@ -244,7 +257,7 @@ export function CommentsPanel({
           ) : (
             <div className="space-y-2 p-3">
               {addressedComments.map((c) => (
-                <CommentCard key={c.id} comment={c} onDelete={canEdit ? () => onDeleteComment(c.id) : undefined} onCopyLink={onCopyCommentLink ? () => onCopyCommentLink(c.id) : undefined} />
+                <CommentCard key={c.id} comment={c} onDelete={canModify(c) ? () => onDeleteComment(c.id) : undefined} onCopyLink={onCopyCommentLink ? () => onCopyCommentLink(c.id) : undefined} />
               ))}
             </div>
           )

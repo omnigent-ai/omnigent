@@ -80,13 +80,13 @@ function mockConversations(convs: Conversation[]) {
   useConvMock.mockImplementation(() => result(convs));
 }
 
-function renderSidebar() {
+function renderSidebar(open = true) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
       <TooltipProvider>
         <MemoryRouter initialEntries={["/"]}>
-          <Sidebar open onClose={vi.fn()} />
+          <Sidebar open={open} onClose={vi.fn()} />
         </MemoryRouter>
       </TooltipProvider>
     </QueryClientProvider>,
@@ -122,6 +122,9 @@ describe("Sidebar session list", () => {
       conv("conv_archived", "Claude Code", { archived: true }),
     ]);
     renderSidebar();
+
+    // Archived starts collapsed by default; expand it to reach its rows.
+    fireEvent.click(screen.getByRole("button", { name: "Archived" }));
 
     // The archived row lands in its own "Archived" <section>, not Recent —
     // mixing it into Recent would defeat the grouping.
@@ -296,5 +299,51 @@ describe("Sidebar load-more vs collapsed Recent", () => {
     expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Recent" }));
     expect(screen.getByRole("button", { name: "Load more" })).toBeInTheDocument();
+  });
+});
+
+describe("Sidebar mobile overlay background", () => {
+  it("keeps the opaque bg-card-solid override for the mobile full-screen overlay", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    const aside = screen.getByRole("complementary", { name: "Conversations" });
+    // On mobile the sidebar is a fixed full-screen overlay ON TOP of the
+    // chat. Its desktop look uses the translucent glass --card (60% alpha
+    // in dark mode) + backdrop blur, but WebKit/Safari drops the blur as
+    // soon as a Radix popper (the row kebab menu) opens — and never
+    // repaints it — so the chat bled through the overlay. The fix pins an
+    // opaque background below the md breakpoint. If this assertion fails,
+    // the override was removed and the Safari mobile bleed-through is back.
+    expect(aside.className).toContain("max-md:bg-card-solid");
+    // Desktop keeps the glass treatment: base bg-card must stay alongside
+    // the mobile override (removing it would kill the desktop frosted look).
+    expect(aside.className).toMatch(/(^| )bg-card( |$)/);
+  });
+});
+
+describe("Sidebar collapsed marker", () => {
+  // The dark-mode glass rule in index.css keys its border/blur on
+  // :not([data-collapsed]) — NOT on aria-hidden, which Radix also toggles
+  // on the open sidebar while a modal menu is up (that coupling made every
+  // row reflow 2px wider when the session kebab menu opened). The panel
+  // must set data-collapsed exactly when closed; index.css.test.ts pins
+  // the selector side of this contract.
+  it("sets data-collapsed only while closed", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    // Closed panels are aria-hidden, which strips their accessible name —
+    // the role+name query can't reach them, so select by class instead.
+    const { container } = renderSidebar(false);
+    const aside = container.querySelector("aside.conversations-sidebar")!;
+    // Closed: marked collapsed so the glass rule skips the w-0 strip.
+    expect(aside).toHaveAttribute("data-collapsed");
+    cleanup();
+
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true);
+    const openAside = screen.getByRole("complementary", { name: "Conversations" });
+    // Open: the attribute must be ABSENT — rendering it as "false" would
+    // still match [data-collapsed] and strip the glass border while open.
+    expect(openAside).not.toHaveAttribute("data-collapsed");
   });
 });

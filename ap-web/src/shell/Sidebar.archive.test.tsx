@@ -135,11 +135,13 @@ describe("archive flow", () => {
   });
 
   it("unarchives an archived row by clearing the flag (no stop, no status row)", () => {
-    // An archived session renders in the bottom "Archived" section, so its
-    // kebab is reachable. Unarchiving is a quick flag flip — no runner stop
-    // and no "Archiving…" indicator, unlike the archive path above.
+    // An archived session renders in the bottom "Archived" section
+    // (collapsed by default — expand to reach the row's kebab).
+    // Unarchiving is a quick flag flip — no runner stop and no
+    // "Archiving…" indicator, unlike the archive path above.
     mockConversations([{ ...CONV, archived: true }]);
     renderSidebar();
+    fireEvent.click(screen.getByRole("button", { name: "Archived" }));
     clickArchive();
 
     expect(mocks.stop.mutate).not.toHaveBeenCalled();

@@ -1,6 +1,6 @@
 <div align="center">
 
-# <img src="docs/images/omnigent-logo.svg" alt="" height="38" valign="middle" /> Omnigent
+# <img src="https://raw.githubusercontent.com/omnigent-ai/omnigent/main/docs/images/omnigent-logo.svg" alt="" height="38" valign="middle" /> Omnigent
 
 ### A meta-harness for all your AI agents
 
@@ -8,14 +8,16 @@ Omnigent runs coding agents such as Claude Code, Codex, and Pi, and coordinates
 several of them as interchangeable workers under one orchestrator. You provide
 the models and the infrastructure, and Omnigent runs the agents on top.
 
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/omnigent-ai/omnigent/blob/main/LICENSE)
 ![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](#1-install)
+
+[omnigent.ai](https://omnigent.ai) · **[⬇️ Download the macOS desktop app](https://omnigent.ai/download/mac)**
 
 </div>
 
 <p align="center">
-  <img src="docs/images/omnigent-hero.png" alt="An Omnigent orchestrator and its sub-agents in one shared session" width="520" />
+  <img src="https://raw.githubusercontent.com/omnigent-ai/omnigent/main/docs/images/omnigent-hero.png" alt="An Omnigent orchestrator and its sub-agents in one shared session" width="520" />
 </p>
 
 ---
@@ -71,6 +73,12 @@ Omnigent needs **Python 3.12+**. Install the `omnigent` package:
 uv tool install omnigent        # or: pip install "omnigent"
 ```
 
+Or with [Homebrew](https://github.com/omnigent-ai/homebrew-tap):
+
+```bash
+brew install omnigent-ai/tap/omnigent
+```
+
 Or install straight from the repo:
 
 ```bash
@@ -102,7 +110,10 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
 
 `omnigent` picks a model with you and starts a session in your terminal. It
 also launches a local web UI at `http://localhost:6767` that shows the same
-session in the browser, or on a phone on your network (step 4).
+session in the browser, or on a phone on your network (step 4). The
+[desktop app](https://omnigent.ai/docs/interact/desktop) wraps that same UI
+in a native window and adds OS notifications and a dock badge —
+[download it for macOS](https://omnigent.ai/download/mac).
 
 > [!NOTE]
 > The install puts two names for the same CLI on your PATH: `omnigent` and
@@ -132,6 +143,10 @@ Two example agents ship with the repo, and they make good first sessions:
 ```bash
 omnigent run examples/polly/
 omnigent run examples/debby/
+
+# Run an orchestrator on a different harness (sub-agents keep their own):
+omnigent run examples/polly/ --harness pi
+omnigent run examples/debby/ --harness openai-agents
 ```
 
 **🐙 Polly** is a multi-agent coding orchestrator who writes no code herself.
@@ -195,7 +210,7 @@ the OpenAI-compatible `…/api/v1`.
 ### 4. Deploy a server (and use it from your phone📱)
 
 Run Omnigent on a server with a stable URL
-([`deploy/README.md`](deploy/README.md) is the full guide) and your sessions
+([`deploy/README.md`](https://github.com/omnigent-ai/omnigent/blob/main/deploy/README.md) is the full guide) and your sessions
 become reachable from anywhere, including your phone. The web UI is built for
 mobile, so you get the same chat, sub-agents, terminals, and files, in sync
 with your laptop.
@@ -205,7 +220,7 @@ server); Render deploys with one click; Fly.io, Railway, Hugging Face Spaces,
 and Modal are covered too. The server can also provision a cloud sandbox per
 session (*managed hosts*), so no laptop has to stay online. The full menu of
 targets, the database options, and the sandbox setup live in
-[`deploy/README.md`](deploy/README.md).
+[`deploy/README.md`](https://github.com/omnigent-ai/omnigent/blob/main/deploy/README.md).
 
 Once the server is up, sign in and register your laptop as a host:
 
@@ -269,7 +284,7 @@ and they're in. Signup is invite-only.
 > GitHub, Okta, Microsoft**)? Set `OMNIGENT_OIDC_ISSUER` plus a client ID
 > and secret on your deployed server and restart. The full walkthrough,
 > domain allowlists, and the proxy-only `header` auth mode are covered in
-> [`deploy/README.md#auth`](deploy/README.md#auth).
+> [`deploy/README.md#auth`](https://github.com/omnigent-ai/omnigent/blob/main/deploy/README.md#auth).
 
 ### 6. Govern your agents with policies
 
@@ -307,7 +322,7 @@ Policies stack across three levels, **server-wide** (admin), **per-agent**
 (developer), and **per-session** (you), with the stricter session rules
 checked first. Spend caps and access limits ship as builtins.
 
-See the [policy guide](docs/POLICIES.md) for the full catalog and trust model.
+See the [policy guide](https://github.com/omnigent-ai/omnigent/blob/main/docs/POLICIES.md) for the full catalog and trust model.
 
 ---
 
@@ -346,11 +361,11 @@ omnigent run path/to/my_agent.yaml
 ```
 
 The same file can declare sub-agents and reviewers. For a fuller example, see
-Polly at [`examples/polly/`](examples/polly/), and the
-[Agent YAML spec](docs/AGENT_YAML_SPEC.md) for the full schema.
+Polly at [`examples/polly/`](https://github.com/omnigent-ai/omnigent/tree/main/examples/polly/), and the
+[Agent YAML spec](https://github.com/omnigent-ai/omnigent/blob/main/docs/AGENT_YAML_SPEC.md) for the full schema.
 
 ---
 
 ## Contributing
 
-Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for how to set up your environment, run the checks, and open a pull request.
+Contributions are welcome. See [CONTRIBUTING.md](https://github.com/omnigent-ai/omnigent/blob/main/CONTRIBUTING.md) for how to set up your environment, run the checks, and open a pull request.

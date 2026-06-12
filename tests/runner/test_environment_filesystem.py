@@ -13,6 +13,7 @@ import pytest
 from fastapi import FastAPI
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
+from omnigent.entities.environment_filesystem import FilesystemPathNotFound
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import create_os_environment
 from omnigent.runner import create_runner_app
@@ -245,6 +246,173 @@ async def test_delete_directory_recursive(
     assert resp.status_code == 200
     assert resp.json()["deleted"] is True
     assert not (workspace / "src").exists()
+
+
+# ── shell-injection regression for stat/_stat_via_shell/_check_dir_empty ──
+
+
+@pytest.mark.asyncio
+async def test_delete_path_with_command_substitution_does_not_execute(
+    client: httpx.AsyncClient,
+    workspace: Path,
+) -> None:
+    """A DELETE path containing ``$(...)`` must not execute the substituted command.
+
+    Regression test: the DELETE handler reaches ``_stat_via_shell``
+    and ``_check_dir_empty``, which used to interpolate the caller-controlled
+    path into a double-quoted ``python3 -c`` script. The shell expanded
+    ``$(...)`` before python ran, giving arbitrary command execution.
+
+    The payload ``inj$(touch PWNED)x`` would, on the vulnerable code, run
+    ``touch PWNED`` in the workspace (cwd of the helper). With the path
+    embedded as a Python literal via ``json.dumps`` and the whole script
+    shell-quoted, the string is statted verbatim — no command runs.
+    """
+    import urllib.parse
+
+    # The marker the injected command would create if substitution fired.
+    marker = workspace / "PWNED"
+    assert not marker.exists(), "Precondition: marker must not exist before the request."
+
+    payload = "inj$(touch PWNED)x"
+    encoded = urllib.parse.quote(payload, safe="")
+    resp = await client.delete(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/{encoded}"
+    )
+
+    # The literal path does not exist, so the stat fails and the endpoint
+    # returns 404 — on BOTH old and new code the HTTP status is 404 (the
+    # substituted command produced empty output, leaving "injx"). The marker
+    # is the discriminator: it is created only if the injection executed.
+    assert resp.status_code == 404, (
+        f"Expected 404 for a non-existent literal path, got {resp.status_code}. Body: {resp.text}"
+    )
+    assert not marker.exists(), (
+        "Injected command executed: the 'PWNED' marker was created. The path "
+        "reached a shell-interpreted context (shell-injection regression)."
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_real_file_with_command_substitution_name(
+    client: httpx.AsyncClient,
+    workspace: Path,
+) -> None:
+    """A real file whose name literally contains ``$(...)`` can be deleted.
+
+    Usability guard for the shell-injection fix: embedding the path as a Python
+    literal must treat shell metacharacters as ordinary filename bytes, so a
+    legitimately (if unusually) named file is statted and removed correctly.
+
+    If the path were still shell-interpreted, ``$(whoami)`` would expand and
+    ``os.stat`` would receive a *different* string (``data<user>.txt``), the
+    stat would miss, and the real file would be left on disk — surfacing as a
+    404 and a surviving file. Asserting a successful delete of the real file
+    proves the verbatim path made it through.
+    """
+    import urllib.parse
+
+    weird_name = "data$(whoami).txt"
+    target = workspace / weird_name
+    target.write_text("payload-bytes")
+    assert target.exists(), "Precondition: the metacharacter-named file must exist."
+
+    encoded = urllib.parse.quote(weird_name, safe="")
+    resp = await client.delete(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/{encoded}"
+    )
+
+    assert resp.status_code == 200, (
+        f"Expected 200 deleting a real metacharacter-named file, got "
+        f"{resp.status_code}. A non-200 means the literal path was not used. "
+        f"Body: {resp.text}"
+    )
+    body = resp.json()
+    assert body["deleted"] is True, "The endpoint must report the file as deleted."
+    assert body["type"] == "file", "The metacharacter-named entry is a regular file."
+    # The verbatim-named file is gone — proves stat + rm both used the literal path.
+    assert not target.exists(), (
+        f"File {weird_name!r} still on disk after a reported delete; the rm "
+        "did not target the literal path."
+    )
+
+
+@pytest.mark.asyncio
+async def test_stat_path_with_command_substitution_does_not_execute(
+    workspace: Path,
+) -> None:
+    """``CallerProcessFilesystem.stat`` must not execute ``$(...)`` in the path.
+
+    ``stat`` shares the same shell-injection flaw but is not wired to a GET route, so it
+    is exercised here through its public method. A non-existent literal path
+    containing a command substitution must raise ``FilesystemPathNotFound``
+    without creating the marker the substituted command would produce.
+    """
+    from omnigent.runner.environment_filesystem import CallerProcessFilesystem
+
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+    assert os_env is not None
+    fs = CallerProcessFilesystem(os_env)
+
+    marker = workspace / "PWNED_STAT"
+    assert not marker.exists(), "Precondition: stat marker must not exist."
+
+    with pytest.raises(FilesystemPathNotFound):
+        await fs.stat("inj$(touch PWNED_STAT)x")
+
+    assert not marker.exists(), (
+        "stat executed the injected command: 'PWNED_STAT' marker was created "
+        "(shell-injection regression in stat())."
+    )
+
+
+@pytest.mark.asyncio
+async def test_stat_real_file_with_command_substitution_name(
+    workspace: Path,
+) -> None:
+    """``CallerProcessFilesystem.stat`` returns correct metadata for a file whose
+    name literally contains ``$(...)``.
+
+    Usability guard: the verbatim filename must be statted, returning a
+    file-type entry with the real byte size. A shell-interpreted path would
+    stat a different string and raise instead.
+    """
+    from omnigent.runner.environment_filesystem import CallerProcessFilesystem
+
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+    assert os_env is not None
+    fs = CallerProcessFilesystem(os_env)
+
+    weird_name = "report$(id).txt"
+    contents = "twelve bytes"
+    (workspace / weird_name).write_text(contents)
+
+    entry = await fs.stat(weird_name)
+
+    # type/name/bytes prove the literal path was statted, not a shell-expanded
+    # variant (which would have raised FilesystemPathNotFound instead).
+    assert entry.type == "file", f"Expected a file entry, got type={entry.type!r}."
+    assert entry.name == weird_name, (
+        f"Expected name {weird_name!r}, got {entry.name!r}; the path was not passed verbatim."
+    )
+    assert entry.bytes == len(contents.encode("utf-8")), (
+        f"Expected {len(contents.encode('utf-8'))} bytes, got {entry.bytes}; "
+        "stat read the wrong path."
+    )
 
 
 @pytest.mark.asyncio

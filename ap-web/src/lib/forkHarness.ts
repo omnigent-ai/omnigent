@@ -76,3 +76,16 @@ export function isNativeHarness(harness: string | null | undefined): boolean {
 export function forkTargetCarriesHistory(targetHarness: string | null | undefined): boolean {
   return harnessFamily(targetHarness) !== null;
 }
+
+/**
+ * Strip the `" (fork <id>)"` / `" (switch <id>)"` suffix the fork/switch
+ * routes append to an agent's name when cloning it, so a clone can be
+ * matched back to the agent it was cloned from by name.
+ *
+ * @param name - An agent name, e.g. `"claude-native-ui (fork conv_ab12)"`.
+ * @returns The base name, e.g. `"claude-native-ui"`. Names without a
+ *   clone suffix are returned unchanged.
+ */
+export function agentBaseName(name: string): string {
+  return name.replace(/ \((?:fork|switch) [^)]+\)$/, "");
+}

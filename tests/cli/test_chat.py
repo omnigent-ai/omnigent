@@ -42,6 +42,8 @@ from omnigent.chat import (
 )
 from omnigent.cli import _build_resume_parts
 from omnigent.inner.databricks_executor import DatabricksCredentials
+from omnigent.spec import load as load_spec
+from omnigent.spec import validate as validate_spec
 
 # ── _is_url ──────────────────────────────────────────
 
@@ -1531,6 +1533,160 @@ def test_apply_overrides_canonicalizes_claude_harness_alias() -> None:
     assert "model" not in executor
 
 
+def test_apply_overrides_writes_nested_config_harness_for_spec_version_bundle() -> None:
+    """
+    ``--harness`` on a ``spec_version`` bundle lands in
+    ``executor.config.harness`` — the ONLY harness location that
+    format's parser reads.
+
+    Regression guard for the polly no-op: ``omnigent run
+    examples/polly --harness pi`` used to write the flat
+    ``executor.harness`` key, which ``_parse_executor`` ignores for
+    spec_version specs — the brain silently stayed on claude-sdk.
+    """
+    raw: dict[str, object] = {
+        "spec_version": 1,
+        "name": "polly",
+        "prompt": "orchestrate",
+        "executor": {
+            "type": "omnigent",
+            "context_window": 1000000,
+            "config": {"harness": "claude-sdk", "profile": "my-profile"},
+        },
+    }
+
+    _apply_overrides_to_raw(raw, ChatOverrides(harness="pi"))
+
+    executor = raw["executor"]
+    assert isinstance(executor, dict)
+    config = executor["config"]
+    assert isinstance(config, dict)
+    assert config["harness"] == "pi", (
+        f"Expected the override to replace executor.config.harness; got "
+        f"{config.get('harness')!r}. If this is 'claude-sdk', the override "
+        f"went to the flat executor.harness key the bundle parser ignores — "
+        f"the silent no-op this fix removed."
+    )
+    # No dead flat key — the bundle parser would ignore it and a future
+    # reader would be misled about which value wins.
+    assert "harness" not in executor, (
+        f"Flat executor.harness {executor.get('harness')!r} should not be "
+        f"written for spec_version bundles."
+    )
+    # Sibling config keys survive the override.
+    assert config["profile"] == "my-profile"
+    # Declared harness suppresses the ad-hoc default-model fallback.
+    assert "model" not in executor
+
+
+def test_apply_overrides_flat_harness_creates_no_config_for_single_file_yaml() -> None:
+    """
+    Single-file omnigent YAMLs (no ``spec_version``) keep the flat
+    ``executor.harness`` write and gain no ``config`` block.
+
+    If a ``config`` key appears here, the spec-format detection in
+    ``_apply_harness_override_to_executor`` misfired — the inner
+    loader reads the flat key, and a stray ``config`` block would be
+    dead weight in the materialized YAML.
+    """
+    raw: dict[str, object] = {"name": "codex_agent", "prompt": "hi"}
+
+    _apply_overrides_to_raw(raw, ChatOverrides(harness="codex"))
+
+    executor = raw["executor"]
+    assert isinstance(executor, dict)
+    assert executor["harness"] == "codex"
+    assert "config" not in executor
+
+
+@pytest.mark.parametrize(
+    ("alias", "canonical"),
+    [
+        ("claude", "claude-sdk"),
+        ("openai-agents-sdk", "openai-agents"),
+        ("pi", "pi"),
+    ],
+)
+def test_apply_overrides_canonicalizes_alias_into_spec_version_config(
+    monkeypatch: pytest.MonkeyPatch,
+    alias: str,
+    canonical: str,
+) -> None:
+    """
+    Alias spellings canonicalize before landing in
+    ``executor.config.harness``, so the materialized bundle always
+    carries the canonical id the runtime registry dispatches on.
+
+    ``openai-agents-sdk`` is the spelling the project docs use for
+    the run examples; without the alias it fails ``--harness``
+    validation outright.
+    """
+    # Ambient OpenAI creds would trigger env-auth baking for the
+    # openai-agents case; deterministic tests must not depend on them.
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    raw: dict[str, object] = {
+        "spec_version": 1,
+        "name": "bundle",
+        "prompt": "hi",
+        "executor": {"type": "omnigent", "config": {"harness": "claude-sdk"}},
+    }
+
+    _apply_overrides_to_raw(raw, ChatOverrides(harness=alias))
+
+    executor = raw["executor"]
+    assert isinstance(executor, dict)
+    assert executor["config"]["harness"] == canonical, (
+        f"--harness {alias!r} must canonicalize to {canonical!r} in the "
+        f"materialized bundle; got {executor['config'].get('harness')!r}. "
+        f"A raw alias here would fail OMNIGENT_HARNESSES validation or "
+        f"miss the runtime dispatch registry."
+    )
+
+
+def test_apply_overrides_harness_and_model_together_for_spec_version_bundle() -> None:
+    """
+    ``--harness`` + ``--model`` on a bundle land in their respective
+    parser-read locations: nested ``config.harness`` and flat
+    ``executor.model``.
+
+    This is the polly-on-GPT invocation shape: ``omnigent run
+    examples/polly --harness openai-agents --model <gpt>``.
+    """
+    raw: dict[str, object] = {
+        "spec_version": 1,
+        "name": "polly",
+        "prompt": "orchestrate",
+        "executor": {"type": "omnigent", "config": {"harness": "claude-sdk"}},
+    }
+
+    _apply_overrides_to_raw(raw, ChatOverrides(harness="pi", model="databricks-claude-sonnet-4-6"))
+
+    executor = raw["executor"]
+    assert isinstance(executor, dict)
+    assert executor["config"]["harness"] == "pi"
+    # The bundle parser reads model from the FLAT executor.model key.
+    assert executor["model"] == "databricks-claude-sonnet-4-6"
+
+
+def test_apply_overrides_rejects_harness_for_non_omnigent_executor_type() -> None:
+    """
+    A spec_version bundle with a non-omnigent ``executor.type`` fails
+    loud on ``--harness`` instead of silently no-opping.
+
+    Those executor types have no ``config.harness``; writing one
+    would recreate the ignored-override bug in a new spot.
+    """
+    raw: dict[str, object] = {
+        "spec_version": 1,
+        "name": "sdk_agent",
+        "prompt": "hi",
+        "executor": {"type": "claude_sdk", "model": "claude-opus-4-8"},
+    }
+
+    with pytest.raises(click.ClickException, match="claude_sdk"):
+        _apply_overrides_to_raw(raw, ChatOverrides(harness="pi"))
+
+
 def test_apply_overrides_skips_default_when_yaml_declares_harness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1770,6 +1926,96 @@ def test_materialize_directory_bundle_with_override_keeps_nested_harness_unpinne
             f"{executor.get('model')!r}; expected none. A GPT model here "
             f"(databricks-gpt-5-4) is the regression that sent "
             f"anthropic/v1/messages to a GPT gateway endpoint."
+        )
+    finally:
+        _cleanup_materialized_override_bundle(materialized)
+
+
+@pytest.mark.parametrize("brain_harness", ["pi", "openai-agents"])
+@pytest.mark.parametrize(
+    ("bundle_name", "expected_workers"),
+    [
+        ("polly", {"claude_code": "claude-native", "codex": "codex-native", "pi": "pi"}),
+        ("debby", {"claude": "claude-sdk", "gpt": "openai-agents"}),
+    ],
+)
+def test_materialize_bundle_overrides_brain_harness(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    bundle_name: str,
+    expected_workers: dict[str, str],
+    brain_harness: str,
+) -> None:
+    """
+    A REAL bundled orchestrator (polly / debby), materialized with
+    ``--harness``, parses to a valid spec whose brain runs the requested
+    harness and whose sub-agents keep their own declared harnesses.
+
+    End-to-end through the production pipeline: ``copytree`` →
+    ``_apply_overrides_to_raw`` → ``yaml.safe_dump`` → ``omnigent.spec.load``
+    → ``validate``. This is the exact path ``omnigent run examples/polly
+    --harness pi`` (or ``examples/debby``) takes before the bundle reaches
+    a server.
+
+    What this proves: (1) the override reaches ``executor.config.harness``
+    where the bundle parser reads it — before the fix it landed on a flat
+    key and the brain silently stayed claude-sdk; (2) the rewritten spec
+    still validates (the harness is in OMNIGENT_HARNESSES); (3) the
+    override never leaks into the sub-agents, which would break
+    cross-vendor orchestration (polly's workers) and debby's claude-vs-gpt
+    debate pairing.
+
+    :param bundle_name: Packaged example bundle under
+        ``omnigent.resources.examples``, e.g. ``"polly"``.
+    :param expected_workers: Sub-agent name → declared harness mapping the
+        override must leave untouched.
+    :param brain_harness: The ``--harness`` value under test, e.g. ``"pi"``.
+    """
+    import importlib.resources
+
+    # Isolate from the developer's omnigent config and ambient creds so
+    # env-auth baking / model fallback can't make the result machine-dependent.
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OMNIGENT_MODEL", raising=False)
+
+    bundle_dir = Path(
+        str(importlib.resources.files("omnigent.resources.examples").joinpath(bundle_name))
+    )
+
+    materialized = _materialize_override_bundle(bundle_dir, ChatOverrides(harness=brain_harness))
+    try:
+        assert materialized != bundle_dir, (
+            "Expected --harness to force a rewritten bundle copy; got the "
+            "source dir back, meaning the override was dropped entirely."
+        )
+
+        spec = load_spec(materialized)
+        assert spec.executor.config.get("harness") == brain_harness, (
+            f"Parsed brain harness is {spec.executor.config.get('harness')!r}, "
+            f"expected {brain_harness!r}. If this is 'claude-sdk', the "
+            f"override was written to the flat executor.harness key the "
+            f"spec_version parser ignores — the {bundle_name} --harness no-op."
+        )
+        # The bundle stays model-unpinned: the overridden harness resolves
+        # its provider's default model, exactly like claude-sdk does today.
+        assert spec.executor.model is None
+        result = validate_spec(spec)
+        assert result.valid, (
+            f"Materialized {bundle_name} spec failed validation: "
+            f"{[(e.path, e.message) for e in result.errors]}. The override "
+            f"produced a bundle the server would reject at registration."
+        )
+        # Sub-agents keep their own declared harnesses — the brain override
+        # must not cascade into them.
+        worker_harnesses = {
+            sub.name: sub.executor.config.get("harness") for sub in spec.sub_agents
+        }
+        assert worker_harnesses == expected_workers, (
+            f"Sub-agent harnesses changed under a brain-only override: "
+            f"{worker_harnesses}. The override must rewrite only the "
+            f"top-level config.yaml, never agents/<name>/config.yaml."
         )
     finally:
         _cleanup_materialized_override_bundle(materialized)

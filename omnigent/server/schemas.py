@@ -1119,6 +1119,17 @@ class SessionCreateRequest(BaseModel):
         default) defers to the spec default. Set by the web UI's
         new-session "Cost Optimized" option; read by the cost-control
         advisor pipeline at turn start.
+    :param harness_override: Optional per-session brain-harness
+        override to persist at create time, e.g. ``"pi"`` or
+        ``"openai-agents"``. Set by the web UI's new-chat harness
+        picker; the runner uses it instead of the agent spec's
+        ``executor.config.harness`` when spawning the harness for
+        this session. Validated server-side: must canonicalize into
+        ``OMNIGENT_HARNESSES`` and the bound agent must be an
+        ``executor.type: omnigent`` spec. ``None`` (the default) uses
+        the spec's declared harness. Create-time only — there is no
+        PATCH path, since the harness process spawns on the first
+        turn.
     """
 
     agent_id: str
@@ -1134,6 +1145,7 @@ class SessionCreateRequest(BaseModel):
     terminal_launch_args: list[str] | None = None
     model_override: str | None = None
     cost_control_mode_override: str | None = None
+    harness_override: str | None = None
 
     @model_validator(mode="after")
     def _check_git_requires_host(self) -> SessionCreateRequest:

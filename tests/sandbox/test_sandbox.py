@@ -95,15 +95,21 @@ def test_bwrap_import_triggers_backend_registration() -> None:
     assert isinstance(backend, bwrap.BwrapSandboxBackend)
 
 
-def test_default_sandbox_for_platform_is_bwrap_on_linux() -> None:
+def test_default_sandbox_for_platform_is_bwrap_on_linux_regardless_of_binary() -> None:
     """
-    Linux platform default is ``linux_bwrap`` when the ``bwrap``
-    binary is on ``PATH``.
+    The Linux platform default is ``linux_bwrap`` and the choice does
+    **not** depend on whether the ``bwrap`` binary is installed on the
+    host doing the resolving.
 
-    Bwrap is the only Linux sandbox backend (mount/PID/UTS/IPC
-    namespaces + seccomp) and is the documented Linux default. The
-    user-facing contract is: install bubblewrap to get sandboxing,
-    otherwise fall back to ``none``.
+    This is the property that keeps spec parsing host-independent: the
+    default is materialized at parse time (loader / spec parser), so a
+    CI node or dev laptop without bubblewrap must still be able to load
+    a YAML whose ``sandbox:`` block omits ``type:``. The fail-loud
+    "no usable mechanism" check is deferred to the backend's runtime
+    ``resolve()`` (covered by
+    ``tests/inner/test_bwrap_sandbox.py::test_resolve_raises_when_bwrap_missing``).
+    We patch ``shutil.which`` to ``None`` to prove a missing binary
+    does not change the selected type.
     """
     import sys
     from unittest.mock import patch
@@ -112,24 +118,22 @@ def test_default_sandbox_for_platform_is_bwrap_on_linux() -> None:
 
     with (
         patch.object(sys, "platform", "linux"),
-        patch(
-            "omnigent.inner.sandbox.shutil.which",
-            return_value="/usr/bin/bwrap",
-        ),
+        patch("omnigent.inner.sandbox.shutil.which", return_value=None),
     ):
         spec = inner_sandbox._default_sandbox_for_platform()
     assert isinstance(spec, OSEnvSandboxSpec)
     assert spec.type == "linux_bwrap", (
-        f"Linux default sandbox should be 'linux_bwrap' when bwrap is on PATH; got {spec.type!r}."
+        "Linux default sandbox should be 'linux_bwrap' independent of "
+        f"bwrap availability; got {spec.type!r}."
     )
 
 
-def test_default_sandbox_for_platform_falls_back_when_bwrap_missing() -> None:
+def test_default_sandbox_for_platform_is_seatbelt_on_macos_regardless_of_binary() -> None:
     """
-    On Linux hosts where the ``bwrap`` binary is not installed (older
-    distros, FIPS-locked AMIs, container images without bubblewrap),
-    the default falls back to ``none`` instead of letting
-    ``resolve_sandbox`` raise. Symmetric with the macOS branch.
+    The macOS platform default is ``darwin_seatbelt`` and, like the
+    Linux branch, does not probe for ``sandbox-exec`` — selection is a
+    pure platform decision so parsing never depends on the resolving
+    host's PATH.
     """
     import sys
     from unittest.mock import patch
@@ -137,15 +141,32 @@ def test_default_sandbox_for_platform_falls_back_when_bwrap_missing() -> None:
     from omnigent.inner.datamodel import OSEnvSandboxSpec
 
     with (
-        patch.object(sys, "platform", "linux"),
-        patch(
-            "omnigent.inner.sandbox.shutil.which",
-            return_value=None,
-        ),
+        patch.object(sys, "platform", "darwin"),
+        patch("omnigent.inner.sandbox.shutil.which", return_value=None),
     ):
         spec = inner_sandbox._default_sandbox_for_platform()
     assert isinstance(spec, OSEnvSandboxSpec)
-    assert spec.type == "none", (
-        f"Expected 'none' fallback when bwrap is missing; got {spec.type!r}. "
-        f"Without this fallback, --os hard-fails on hosts without bubblewrap."
+    assert spec.type == "darwin_seatbelt", (
+        "macOS default sandbox should be 'darwin_seatbelt' independent of "
+        f"sandbox-exec availability; got {spec.type!r}."
     )
+
+
+def test_default_sandbox_for_platform_raises_on_unsupported_platform() -> None:
+    """
+    A platform with no sandbox backend at all (anything other than
+    Linux or macOS, e.g. Windows) fails loud: there is no backend to
+    defer the runtime check to, so the default selector itself raises.
+    The operator's explicit opt-out remains
+    ``os_env.sandbox.type='none'``.
+    """
+    import sys
+    from unittest.mock import patch
+
+    import pytest
+
+    with (
+        patch.object(sys, "platform", "win32"),
+        pytest.raises(OSError, match="No sandbox backend is available"),
+    ):
+        inner_sandbox._default_sandbox_for_platform()

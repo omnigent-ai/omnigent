@@ -214,7 +214,7 @@ interface WorkspacePanelProps {
  * reached via the header's session-menu FAB → full-screen drawers. The
  * card is drag-resizable via a handle on its left edge.
  *
- * Render gating (default-closed, hidden while a push panel owns the
+ * Render gating (default-open, hidden while a push panel owns the
  * right side) lives in AppShell — this component assumes it should
  * render when mounted.
  */

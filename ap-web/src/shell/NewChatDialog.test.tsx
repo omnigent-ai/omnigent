@@ -25,6 +25,7 @@ import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFile
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import type { Conversation } from "@/hooks/useConversations";
+import { setOmnigentHostConfig } from "@/lib/host";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 // Only authenticatedFetch is stubbed (the create POST under test);
@@ -455,12 +456,12 @@ describe("matchSkillInvocation", () => {
       name: "review-pr",
       args: "src/foo.ts",
     });
-    expect(
-      matchSkillInvocation("/review-pr https://github.com/org/repo/pull/123", SKILLS),
-    ).toEqual({
-      name: "review-pr",
-      args: "https://github.com/org/repo/pull/123",
-    });
+    expect(matchSkillInvocation("/review-pr https://github.com/org/repo/pull/123", SKILLS)).toEqual(
+      {
+        name: "review-pr",
+        args: "https://github.com/org/repo/pull/123",
+      },
+    );
   });
 });
 
@@ -491,6 +492,7 @@ function setupLandingMocks() {
   useHostFilesystemMock.mockReset();
   useDirectorySessionsMock.mockReset();
   useRunnerHealthMock.mockReset();
+  setOmnigentHostConfig({});
   localStorage.clear();
   // host_1's most-recent workspace seeds the field (so submit can enable
   // without manual picks). Tests that exercise the home fallback clear this.
@@ -651,31 +653,29 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-connect-host")).toBeTruthy();
   });
 
-  it("shows permission-mode options only when the claude-native agent is active", () => {
+  it("shows permission-mode options in the Advanced menu only for the claude-native agent", () => {
     renderLanding();
-    // a1 (Claude Code, claude-native) is the default agent → the picker
-    // surfaces the permission-mode flyout trigger, showing the current mode.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    const subTrigger = screen.getByTestId("new-chat-landing-permission-sub");
-    expect(subTrigger.textContent).toContain("Default");
-    // The radios live one level down — absent until the flyout opens.
+    // The radios live behind the footer tray's Advanced chip — absent
+    // until the menu opens.
     expect(screen.queryByTestId("new-chat-landing-permission-plan")).toBeNull();
-    // ArrowRight is radix's keyboard affordance for opening a submenu.
-    fireEvent.keyDown(subTrigger, { key: "ArrowRight" });
+    // a1 (Claude Code, claude-native) is the default agent → the footer
+    // tray surfaces the Advanced chip with the permission-mode radios.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
     const planOption = screen.getByTestId("new-chat-landing-permission-plan");
     expect(planOption.textContent).toContain("Plan");
     // The footer line explains the SELECTED mode until a row is hovered —
     // then it follows the hover, so every mode is explained without six
-    // two-line rows (which once made the flyout hit the viewport bottom).
+    // two-line rows.
     const detail = screen.getByTestId("new-chat-landing-permission-detail");
     expect(detail.textContent).toContain("Prompts before edits and commands");
     fireEvent.pointerEnter(planOption);
     expect(detail.textContent).toContain("Plans only; makes no edits");
-    // Switch to Codex (a2, not native) and reopen — the whole permission
-    // section is gone since --permission-mode only applies to the claude CLI.
-    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
+    // Switch to Codex (a2: not native, no overridable harness) — the whole
+    // Advanced chip is gone since --permission-mode only applies to the
+    // claude CLI and codex-native offers no harness override.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    expect(screen.queryByTestId("new-chat-landing-permission-sub")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
+    expect(screen.queryByTestId("new-chat-landing-advanced-chip")).toBeNull();
   });
 
   it("shows a conflict banner in the file browser for an occupied directory", async () => {
@@ -778,15 +778,29 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-sandbox-option")).toBeNull();
   });
 
+  it("shows a disabled sandbox row with host-provided tooltip content when managed sandboxes are unavailable", async () => {
+    setOmnigentHostConfig({
+      docsLinks: { newSandbox: "Managed sandboxes are disabled in this workspace." },
+    });
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    const disabledRow = screen.getByTestId("new-chat-landing-sandbox-option-disabled");
+    expect(disabledRow).toBeTruthy();
+    // Disabled helper row replaces the clickable sandbox option.
+    expect(screen.queryByTestId("new-chat-landing-sandbox-option")).toBeNull();
+    fireEvent.focus(screen.getByLabelText("Why New Sandbox is unavailable"));
+    await waitFor(() =>
+      expect(screen.getAllByText("Managed sandboxes are disabled in this workspace.").length).toBeGreaterThan(0),
+    );
+  });
+
   it("defaults to New Sandbox when the server supports managed sandboxes", async () => {
     // No clicks: the auto-select effect picks the FIRST menu option — the
     // sandbox — even though an online host (machine-1) exists. If this
     // regressed to host-first, the chip would read "machine-1".
     renderLanding({ managed_sandboxes_enabled: true });
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
-        "New Sandbox",
-      ),
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("New Sandbox"),
     );
     // Sandbox mode chrome comes with the default: repository chip in,
     // workspace/worktree chips out.
@@ -817,13 +831,9 @@ describe("NewChatLandingScreen", () => {
     mockHosts([]);
     renderLanding({ managed_sandboxes_enabled: true });
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
-        "New Sandbox",
-      ),
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("New Sandbox"),
     );
-    expect(screen.getByTestId("new-chat-landing-host-chip").textContent).not.toContain(
-      "No hosts",
-    );
+    expect(screen.getByTestId("new-chat-landing-host-chip").textContent).not.toContain("No hosts");
   });
 
   it("switching between a host and the sandbox swaps the workspace chrome", async () => {
@@ -831,9 +841,7 @@ describe("NewChatLandingScreen", () => {
     // Sandbox is the default; switch to the host first so the test
     // exercises both directions of the toggle.
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
-        "New Sandbox",
-      ),
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("New Sandbox"),
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     // The sandbox option is pinned FIRST in the menu, above the host list —
@@ -860,9 +868,7 @@ describe("NewChatLandingScreen", () => {
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
-        "New Sandbox",
-      ),
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("New Sandbox"),
     );
     expect(screen.queryByTestId("new-chat-landing-workspace-chip")).toBeNull();
     expect(screen.queryByTestId("new-chat-landing-branch-chip")).toBeNull();
@@ -979,6 +985,23 @@ describe("NewChatLandingScreen", () => {
     expect(body.host_type).toBe("managed");
     expect("host_id" in body).toBe(false);
     expect("git" in body).toBe(false);
+  });
+
+  it("shows host-provided git credentials tooltip content in the sandbox repo popover", async () => {
+    setOmnigentHostConfig({
+      docsLinks: { databricksGitCredentials: "Use Databricks Git credentials before cloning." },
+    });
+    renderLanding({ managed_sandboxes_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("New Sandbox"),
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    const helpButton = screen.getByLabelText("How to set up Databricks git credentials");
+    expect(helpButton).toBeTruthy();
+    fireEvent.focus(helpButton);
+    await waitFor(() =>
+      expect(screen.getAllByText("Use Databricks Git credentials before cloning.").length).toBeGreaterThan(0),
+    );
   });
 
   it("blocks submit on an invalid repository URL or a dangling branch", () => {
@@ -1229,43 +1252,6 @@ describe("NewChatLandingScreen skill pills", () => {
     // getAllBy: radix mounts the open tooltip twice (portal content + a
     // visually-hidden a11y copy) — both carry the description.
     expect(screen.getAllByText("Have both heads argue it out").length).toBeGreaterThan(0);
-  });
-});
-
-// Phones can't host the permission flyout — radix submenus only open
-// sideways and a ~390px viewport has no room beside the agent menu (the
-// panel clipped off-screen). Below `sm` the modes render inline instead.
-describe("NewChatLandingScreen permission modes on narrow screens", () => {
-  const originalInnerWidth = window.innerWidth;
-  beforeEach(() => {
-    setupLandingMocks();
-    Object.defineProperty(window, "innerWidth", {
-      value: 390, // iPhone 12 Pro — the reported breakage
-      configurable: true,
-      writable: true,
-    });
-  });
-  afterEach(() => {
-    Object.defineProperty(window, "innerWidth", {
-      value: originalInnerWidth,
-      configurable: true,
-      writable: true,
-    });
-    cleanup();
-    localStorage.clear();
-  });
-
-  it("renders the modes inline instead of a flyout", () => {
-    renderLanding();
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    // No subtrigger on phones — its flyout is what clipped off-screen.
-    expect(screen.queryByTestId("new-chat-landing-permission-sub")).toBeNull();
-    // The radios are directly in the menu, no submenu hop required, with
-    // the same detail footer explaining the selected mode.
-    expect(screen.getByTestId("new-chat-landing-permission-plan")).toBeTruthy();
-    expect(screen.getByTestId("new-chat-landing-permission-detail").textContent).toContain(
-      "Prompts before edits and commands",
-    );
   });
 });
 

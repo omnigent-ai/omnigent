@@ -387,10 +387,8 @@ def print_setup_hint() -> None:
     the model-configuration command. The dominant root cause for CLI
     failures in the wild is a missing or misconfigured model
     credential — a hint that nudges the user toward
-    ``omnigent setup --no-internal-beta`` keeps the recovery path obvious
-    without requiring per-call classification of "is this auth?".
-    (It deliberately does NOT say ``omnigent setup``, which is now
-    just an alias for the same picker — that would be circular.)
+    ``omnigent setup`` keeps the recovery path obvious without
+    requiring per-call classification of "is this auth?".
 
     Like :func:`log_cli_error_hint`, the line is written through
     to the original ``stderr`` so it survives any logging-driven
@@ -402,8 +400,7 @@ def print_setup_hint() -> None:
     dest = getattr(sys.stderr, "_original_stderr", sys.stderr)
     print(
         "If this looks like an auth or configuration problem, run "
-        "`omnigent setup --no-internal-beta` to set up a model credential "
-        "(for Databricks model serving, choose `+ Add a credential → Databricks`).",
+        "`omnigent setup` to configure a model credential.",
         file=dest,
     )
 

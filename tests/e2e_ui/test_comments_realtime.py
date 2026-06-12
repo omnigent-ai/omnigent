@@ -118,7 +118,7 @@ def _open_comments_panel(page: Page, base_url: str, session_id: str) -> None:
         the pre-seeded comment card rendered.
     """
     page.goto(f"{base_url}/c/{session_id}")
-    # The rail defaults closed per session; open it so the changed-files
+    # The rail defaults open but is remembered per session; ensure it is open so the changed-files
     # panel (and its file-open button) are reachable.
     open_right_rail(page)
 

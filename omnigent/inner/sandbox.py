@@ -109,6 +109,19 @@ class SandboxPolicy:
     :param egress_socket_path: Absolute path (inside the namespace) to
         the Unix socket connecting to the parent's egress proxy. The
         relay forwards all traffic through this socket.
+    :param deny_unix_socket_paths: Absolute paths to AF_UNIX (pathname)
+        sockets the helper must NOT be able to ``connect(2)`` to, even
+        when ``allow_network`` is true. Keeps a sandboxed pane from
+        reaching back to an unsandboxed control-plane server over a
+        socket that lives inside a bound write root (e.g. the managed
+        tmux control socket). The bwrap backend overlays
+        ``--bind-try /dev/null <path>`` so the path resolves to a
+        character device, not a socket, and the connect fails; the
+        seatbelt backend (whose default ``allow_network=true`` emits
+        ``(allow network*)``, which would otherwise permit the AF_UNIX
+        connect) emits an explicit last-match deny for each path.
+        ``None`` is treated identically to an empty list, e.g.
+        ``[Path("/tmp/omnigent-terminal-ab12/tmux.sock")]``.
 
     Historical note: a previous revision carried an
     ``egress_auth_token`` field shared between the parent (embedded
@@ -134,6 +147,7 @@ class SandboxPolicy:
     spawn_env_allowlist: list[str] | None = None
     egress_relay_port: int | None = None
     egress_socket_path: str | None = None
+    deny_unix_socket_paths: list[Path] | None = None
 
     def to_jsonable(self) -> dict[str, JsonValue]:
         result: dict[str, JsonValue] = {
@@ -158,6 +172,11 @@ class SandboxPolicy:
             ),
             "egress_relay_port": self.egress_relay_port,
             "egress_socket_path": self.egress_socket_path,
+            "deny_unix_socket_paths": (
+                [str(path) for path in self.deny_unix_socket_paths]
+                if self.deny_unix_socket_paths is not None
+                else None
+            ),
         }
         return result
 
@@ -202,6 +221,10 @@ class SandboxPolicy:
         egress_socket_path: str | None = (
             str(egress_socket_path_raw) if egress_socket_path_raw is not None else None
         )
+        deny_unix_socket_paths_data = data.get("deny_unix_socket_paths")
+        deny_unix_socket_paths: list[Path] | None = None
+        if isinstance(deny_unix_socket_paths_data, list):
+            deny_unix_socket_paths = [Path(str(path)) for path in deny_unix_socket_paths_data]
         return cls(
             backend_type=str(data.get("backend_type", "none")),
             active=bool(data.get("active", False)),
@@ -216,6 +239,7 @@ class SandboxPolicy:
             spawn_env_allowlist=spawn_env_allowlist,
             egress_relay_port=egress_relay_port,
             egress_socket_path=egress_socket_path,
+            deny_unix_socket_paths=deny_unix_socket_paths,
         )
 
 
@@ -355,6 +379,11 @@ def _clone_policy_with(
         spawn_env_allowlist=(
             list(policy.spawn_env_allowlist) if policy.spawn_env_allowlist is not None else None
         ),
+        deny_unix_socket_paths=(
+            list(policy.deny_unix_socket_paths)
+            if policy.deny_unix_socket_paths is not None
+            else None
+        ),
         # Egress fields are intentionally NOT preserved here — the
         # ``with_additional_*`` helpers run BEFORE the egress proxy
         # starts, so the source policy never carries egress fields.
@@ -439,6 +468,31 @@ def with_spawn_env_allowlist(
     if names is None:
         return policy
     return replace(policy, spawn_env_allowlist=sorted(set(names)))
+
+
+def with_denied_unix_sockets(
+    policy: SandboxPolicy,
+    sockets: Sequence[Path],
+) -> SandboxPolicy:
+    """
+    Return *policy* extended with AF_UNIX sockets the helper may not
+    ``connect(2)`` to.
+
+    See :attr:`SandboxPolicy.deny_unix_socket_paths`. Paths are resolved
+    (non-strict, sockets may not exist yet at policy-build time) and
+    de-duplicated. Called before the egress proxy is wired up, so the
+    egress relay fields are still unset and preserved as-is.
+
+    :param policy: The base policy to extend.
+    :param sockets: Absolute (or resolvable) AF_UNIX socket paths to deny.
+    :returns: A new :class:`SandboxPolicy` carrying the merged deny list.
+    """
+    denied = list(policy.deny_unix_socket_paths) if policy.deny_unix_socket_paths else []
+    for sock in sockets:
+        resolved = Path(sock).resolve(strict=False)
+        if all(existing != resolved for existing in denied):
+            denied.append(resolved)
+    return replace(policy, deny_unix_socket_paths=denied)
 
 
 def _prune_environ_to_spawn_allowlist(sandbox: SandboxPolicy) -> None:
@@ -691,46 +745,51 @@ def _ensure_builtin_backends() -> None:
 
 def _default_sandbox_for_platform() -> OSEnvSandboxSpec:
     """
-    Pick a sensible default sandbox for the host OS.
+    Pick the platform-preferred sandbox backend for the host OS.
 
-    - **Linux**: default to ``linux_bwrap`` when the ``bwrap`` binary
-      is on ``PATH`` (mount/PID/UTS/IPC namespaces + seccomp). Fall
-      through to ``none`` when ``bwrap`` is missing (older distros,
-      some FIPS-locked AMIs).
-    - **macOS**: default to ``darwin_seatbelt`` when the
-      ``sandbox-exec`` binary is on ``PATH`` (true on every stock
-      macOS install — it lives at ``/usr/bin/sandbox-exec``). Fall
-      through to ``none`` if missing.
-    - **Other platforms**: ``none``.
+    - **Linux**: ``linux_bwrap`` (mount/PID/UTS/IPC namespaces +
+      seccomp via the ``bwrap`` binary).
+    - **macOS**: ``darwin_seatbelt`` (SBPL via ``sandbox-exec``).
+
+    This is a pure *platform* decision — it does **not** probe for the
+    backend's binary. The default is resolved at spec **parse** time
+    (e.g. :func:`omnigent.inner.loader._parse_os_env_sandbox_spec`
+    and :func:`omnigent.spec.parser._parse_os_env_sandbox`) to fill
+    in an absent ``type:``; parsing a YAML must not depend on whether
+    the host that happens to be loading it has ``bwrap`` installed
+    (CI nodes, dev laptops, and the runtime host can all differ).
+
+    Fail-loud is preserved, but at the layer that actually matters:
+    when the chosen backend is resolved at **run** time and its binary
+    is missing, the backend raises (see
+    :meth:`omnigent.inner.bwrap_sandbox.BwrapSandboxBackend.resolve`,
+    which errors with an install hint when ``bwrap`` is not on
+    ``PATH``). So an agent that omitted ``sandbox.type`` on a host with
+    no usable mechanism still fails loudly rather than silently running
+    unsandboxed — it just fails when the sandbox is built, not when the
+    spec is parsed. The only explicit opt-out remains
+    ``os_env.sandbox.type='none'``.
 
     Spec-self-containment is preserved: a YAML that explicitly
     declares ``sandbox.type: linux_bwrap`` still routes to the bwrap
     backend and errors loudly on macOS (the author asked for it). The
     default only fires when ``sandbox:`` is omitted or when the YAML's
-    ``sandbox:`` block declares fields but not ``type:`` (see
-    :func:`omnigent.spec.parser._parse_os_env_sandbox`).
+    ``sandbox:`` block declares fields but not ``type:``.
 
-    :returns: :class:`OSEnvSandboxSpec` with an OS-appropriate
+    :returns: :class:`OSEnvSandboxSpec` with the OS-appropriate
         ``type``.
+    :raises OSError: When the host platform has no sandbox backend at
+        all (anything other than Linux or macOS). Set
+        ``os_env.sandbox.type='none'`` explicitly to run without one.
     """
     if sys.platform.startswith("linux"):
-        if shutil.which("bwrap") is not None:
-            return OSEnvSandboxSpec(type="linux_bwrap")
-        logger.warning(
-            "bwrap binary not found on this host; defaulting sandbox to "
-            "'none'. Install bubblewrap (e.g. `apt install bubblewrap`) "
-            "for sandboxing, or set sandbox.type explicitly in your YAML "
-            "to suppress this warning."
-        )
-    elif sys.platform == "darwin":
-        if shutil.which("sandbox-exec") is not None:
-            return OSEnvSandboxSpec(type="darwin_seatbelt")
-        logger.warning(
-            "sandbox-exec binary not found on PATH; defaulting macOS "
-            "sandbox to 'none'. Set sandbox.type explicitly in your "
-            "YAML to suppress this warning."
-        )
-    return OSEnvSandboxSpec(type="none")
+        return OSEnvSandboxSpec(type="linux_bwrap")
+    if sys.platform == "darwin":
+        return OSEnvSandboxSpec(type="darwin_seatbelt")
+    raise OSError(
+        f"No sandbox backend is available on platform {sys.platform!r}. "
+        "Set os_env.sandbox.type='none' explicitly to run without a sandbox."
+    )
 
 
 def _project_root() -> Path:

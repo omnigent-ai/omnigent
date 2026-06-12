@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { harnessFamily, isNativeHarness, forkTargetCarriesHistory } from "./forkHarness";
+import { agentBaseName, harnessFamily, isNativeHarness, forkTargetCarriesHistory } from "./forkHarness";
 
 describe("harnessFamily", () => {
   it.each([
@@ -73,5 +73,32 @@ describe("forkTargetCarriesHistory", () => {
     expect(forkTargetCarriesHistory("mystery")).toBe(false);
     expect(forkTargetCarriesHistory(null)).toBe(false);
     expect(forkTargetCarriesHistory(undefined)).toBe(false);
+  });
+});
+
+describe("agentBaseName", () => {
+  it("returns a plain name unchanged", () => {
+    expect(agentBaseName("claude-native-ui")).toBe("claude-native-ui");
+  });
+
+  it("strips a fork suffix", () => {
+    expect(agentBaseName("claude-native-ui (fork conv_ab12)")).toBe("claude-native-ui");
+  });
+
+  it("strips a switch suffix", () => {
+    expect(agentBaseName("nessie (switch conv_9f3c)")).toBe("nessie");
+  });
+
+  it("leaves interior or non-clone parentheses alone", () => {
+    // Only the exact trailing " (fork <id>)" / " (switch <id>)" shape is a
+    // clone marker — user-chosen names with parens must not be mangled.
+    expect(agentBaseName("my-agent (beta)")).toBe("my-agent (beta)");
+    expect(agentBaseName("agent (fork pun) helper")).toBe("agent (fork pun) helper");
+  });
+
+  it("strips only the outermost suffix when a clone was itself cloned", () => {
+    // Fork-of-a-fork names accumulate suffixes; one call removes one
+    // layer (callers compare against catalogs of single-layer names).
+    expect(agentBaseName("polly (fork conv_a) (switch conv_b)")).toBe("polly (fork conv_a)");
   });
 });

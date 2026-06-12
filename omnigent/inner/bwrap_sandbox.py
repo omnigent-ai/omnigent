@@ -398,6 +398,20 @@ class BwrapSandboxBackend(SandboxBackend):
             )
         )
 
+        # AF_UNIX control-socket masks. A denied socket
+        # (e.g. the managed tmux control socket) lives inside a bound
+        # write root — the instance ``private_dir`` — so the helper can
+        # otherwise reach it and ``connect(2)`` to the unsandboxed tmux
+        # server, whose ``run-shell`` would execute outside the sandbox.
+        # Overlay ``/dev/null`` onto each socket path so the helper sees
+        # a character device, not a socket, and ``connect`` fails. The
+        # host (which manages the server) keeps the real socket — the
+        # mask only exists inside the helper's mount namespace. Emitted
+        # AFTER the write-root binds so it is the last mount and wins
+        # (same deny-wins ordering as the dotfile mask above).
+        for sock in policy.deny_unix_socket_paths or []:
+            bwrap_args += ["--bind-try", "/dev/null", str(sock)]
+
         # Set $TMPDIR (and friends) to the first write_root that lives
         # under the system temp dir — the parent's
         # ``set_temp_env`` already pointed the host env at the same

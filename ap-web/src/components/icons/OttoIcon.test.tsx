@@ -12,10 +12,10 @@ describe("OttoIcon", () => {
     // freeze the eyes with no other signal.
     const eyes = container.querySelectorAll("svg > g.otto-eye");
     expect(eyes).toHaveLength(2);
-    // 4 paths per eye = sclera + iris + two highlights; losing one shifts the
+    // 3 paths per eye = sclera + pupil + highlight; losing one shifts the
     // group's fill-box bounds and the blink no longer collapses on center.
     for (const eye of eyes) {
-      expect(eye.querySelectorAll("path")).toHaveLength(4);
+      expect(eye.querySelectorAll("path")).toHaveLength(3);
     }
   });
 
@@ -26,7 +26,7 @@ describe("OttoIcon", () => {
     expect(svg).toHaveClass("otto-working");
     // The art's coordinate space; consumers size via className so a viewBox
     // change silently distorts the mascot everywhere.
-    expect(svg).toHaveAttribute("viewBox", "0 0 39 41");
+    expect(svg).toHaveAttribute("viewBox", "0 0 1024 1024");
     // Decorative in both render sites; the pin's aria-live region must only
     // ever announce the "Working…" text.
     expect(svg).toHaveAttribute("aria-hidden", "true");

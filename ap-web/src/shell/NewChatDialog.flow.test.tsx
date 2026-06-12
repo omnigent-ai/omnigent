@@ -172,6 +172,22 @@ describe("NewChatLandingScreen create flow", () => {
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
   });
 
+  it("keeps the seeded working directory when the already-selected host is re-picked", async () => {
+    renderLanding();
+    await waitForWorkspaceSeed();
+
+    // The first online host auto-selects, so the menu row the user is most
+    // likely to click is the one that's already active. Re-picking it must
+    // not clear the seeded directory: selectHost used to setWorkspace("")
+    // unconditionally, and on a same-host pick none of the seeding effect's
+    // inputs (host id, recents, derived home) change, so nothing ever
+    // re-filled the field — the chip dropped back to its empty placeholder.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: /corey-laptop/ }));
+
+    expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("foo");
+  });
+
   it("does not create a session when Enter is pressed with an empty message", async () => {
     // Host, agent and workspace all seed automatically, so the only thing
     // gating submit is a non-empty message. The Send button is disabled in
@@ -411,13 +427,16 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Open the agent picker (Radix opens on pointerdown), open the
-    // permission-mode flyout (ArrowRight = radix's submenu key), and pick a
-    // non-default mode. The create call proves the choice travels as a
-    // `--permission-mode <mode>` pair in terminal_launch_args.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.keyDown(screen.getByTestId("new-chat-landing-permission-sub"), { key: "ArrowRight" });
+    // Open the footer tray's Advanced menu (Radix opens on pointerdown) and
+    // pick a non-default mode. The create call proves the choice travels as
+    // a `--permission-mode <mode>` pair in terminal_launch_args.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-permission-bypassPermissions"));
+    // A non-default pick is suffixed onto the pill so the changed mode
+    // stays visible while the radios live in the Advanced menu.
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
+      "Claude Code (Bypass permissions)",
+    );
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -439,6 +458,9 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
+    // Untouched default mode → the pill reads as just the agent name, with
+    // no "(Default)" suffix.
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).not.toContain("(");
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -451,6 +473,91 @@ describe("NewChatLandingScreen create flow", () => {
     // "Default" → no flag persisted (undefined is dropped by JSON.stringify),
     // so the runner launches claude with its own default.
     expect(body.terminal_launch_args).toBeUndefined();
+  });
+
+  it("posts harness_override when a brain harness is picked from the Advanced menu", async () => {
+    // polly's spec declares claude-sdk; the Advanced menu offers the
+    // override set.
+    setAgents([
+      agent({ id: "ag_polly", name: "polly", display_name: "Polly", harness: "claude-sdk" }),
+    ]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    // Open the footer tray's Advanced menu and pick Pi.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-pi"));
+    // The composer pill reflects the pick before any session exists.
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Polly (Pi)");
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    // The pick must travel at create time — the harness spawns on the first
+    // turn, so there is no later surface to apply it.
+    expect(body.harness_override).toBe("pi");
+    expect(body.agent_id).toBe("ag_polly");
+  });
+
+  it("omits harness_override and shows the spec default when no harness is picked", async () => {
+    setAgents([
+      agent({ id: "ag_polly", name: "polly", display_name: "Polly", harness: "claude-sdk" }),
+    ]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    // With no explicit pick the pill shows just the agent name — the spec
+    // default is not suffixed (it lives in the Advanced menu's radios).
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Polly");
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).not.toContain(
+      "Claude SDK",
+    );
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    // Default kept → no override sent, so the session tracks the agent
+    // spec's declared harness even if the bundle updates later.
+    expect(body.harness_override).toBeUndefined();
+  });
+
+  it("re-picking the spec default clears a previous harness override", async () => {
+    setAgents([
+      agent({ id: "ag_polly", name: "polly", display_name: "Polly", harness: "claude-sdk" }),
+    ]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    // Pick Pi, then change mind back to the spec default (Claude SDK).
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-pi"));
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-claude-sdk"));
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    // Re-picking the default must CLEAR the override (not post it
+    // explicitly) so the session tracks the spec like an untouched one.
+    expect(body.harness_override).toBeUndefined();
   });
 
   // Skipped while the toggle is hidden behind the false-gate in NewChatDialog; un-skip when re-enabling.

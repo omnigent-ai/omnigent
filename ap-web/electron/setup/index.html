@@ -45,7 +45,7 @@
         padding: 0 16px;
       }
       .card { width: 100%; max-width: 24rem; }
-      .logo { display: block; margin: 0 auto 12px; height: 40px; }
+      .logo { display: block; margin: 0 auto 12px; height: 80px; }
       p.sub {
         margin: 0 0 24px;
         color: var(--muted-foreground);
@@ -144,7 +144,7 @@
       </picture>
       <p class="sub">Enter the URL of the Omnigents server. The desktop app loads its web UI directly.</p>
       <label for="url">Server URL</label>
-      <input id="url" type="text" placeholder="http://localhost:8000" autocomplete="off" spellcheck="false" />
+      <input id="url" type="text" placeholder="http://localhost:6767" autocomplete="off" spellcheck="false" />
       <button id="connect">Connect</button>
       <div class="err" id="err"></div>
       <div class="recents" id="recents" hidden>
@@ -191,10 +191,10 @@
         setup
           .getServerUrl()
           .then((saved) => {
-            input.value = saved || "http://localhost:8000";
+            input.value = saved || "http://localhost:6767";
           })
           .catch(() => {
-            input.value = "http://localhost:8000";
+            input.value = "http://localhost:6767";
           });
       }
 

@@ -133,6 +133,21 @@ jobs:
       - name: Install project + dev extras
         run: uv sync --extra all --extra dev
 
+      - name: Install bubblewrap
+        # The UI tests boot a real server and open terminals, which run
+        # under os_env. An agent/terminal that omits `os_env.sandbox.type`
+        # defaults to `linux_bwrap` on Linux and fails loud at runtime if
+        # `bwrap` is missing (rather than silently running unsandboxed), so
+        # the terminal never launches and the right-panel terminal assertion
+        # fails. Install `bubblewrap` like ci.yml / e2e.yml. The apparmor
+        # sysctl mirrors ci.yml: Ubuntu 24.04 blocks unprivileged user
+        # namespaces by default, which `bwrap`'s `unshare(CLONE_NEWUSER)`
+        # needs.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: Cache Playwright browsers
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
         with:

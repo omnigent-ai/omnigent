@@ -1,3 +1,5 @@
+import type { ReactNode } from "react";
+
 /**
  * Embed host integration seam.
  *
@@ -47,6 +49,13 @@ export interface OmnigentHostConfig {
    */
   resolveWebSocketUrl?: (path: string) => string;
   /**
+   * Turns a relative share-link path (basename already included, e.g.
+   * `<basename>/c/:id`) into the full absolute share URL — the host prepends
+   * its origin and adds any query params it needs. When omitted (standalone),
+   * ap-web prepends `window.location.origin` itself.
+   */
+  transformShareLink?: (relativePath: string) => string;
+  /**
    * Path suffix appended to the origin in CLI `--server` instructions shown
    * in the UI (e.g. `"/api/2.0/omnigent"`). When the host proxies the
    * Omnigent API behind a path prefix, CLI users need the full URL
@@ -54,6 +63,23 @@ export interface OmnigentHostConfig {
    * non-origin part.
    */
   cliServerUrlSuffix?: string;
+  /**
+   * Optional documentation links for embed-only UX hints.
+   *
+   * Standalone ap-web ignores these values. Embedded hosts can pass one object
+   * instead of adding many top-level props as docs surfaces grow.
+   */
+  docsLinks?: {
+    /**
+     * Full tooltip content shown for the disabled New Sandbox help icon.
+     */
+    newSandbox?: ReactNode;
+    /**
+     * Full tooltip content shown for the Databricks git-credentials help icon
+     * in the sandbox repository popover.
+     */
+    databricksGitCredentials?: ReactNode;
+  };
 }
 
 let _config: OmnigentHostConfig = {};
@@ -79,6 +105,14 @@ export function getOmnigentHostConfig(): OmnigentHostConfig {
  */
 export function getOmnigentUserSearch(): OmnigentHostConfig["searchUsers"] {
   return _config.searchUsers;
+}
+
+/**
+ * The host-provided share-link transform, or `undefined` when none is
+ * configured. Absence means the relative URL is used unchanged.
+ */
+export function getOmnigentTransformShareLink(): OmnigentHostConfig["transformShareLink"] {
+  return _config.transformShareLink;
 }
 
 /**

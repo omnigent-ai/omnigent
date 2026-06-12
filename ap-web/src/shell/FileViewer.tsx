@@ -965,6 +965,7 @@ function FileViewerBody({ open, conversationId, path, onClose, onNavigateTo, per
         open ? "md:border-border md:border-l" : "md:w-0 md:border-l-0",
       )}
       aria-hidden={!open}
+      data-collapsed={!open || undefined}
       inert={!open}
     >
       {/* Resize handle — desktop only (mobile is full-screen overlay) */}

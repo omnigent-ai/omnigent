@@ -529,7 +529,7 @@ def test_add_menu_options_ordering() -> None:
         "Anthropic — API key",
         "ChatGPT — subscription",
         "Claude — subscription (Pro/Max)",
-        "Gateway — custom base URL + key",
+        "Gateway — custom base URL + key (e.g. OpenRouter)",
         "OpenRouter — API key",
         "Databricks — workspace",
         "Other provider — API key",
@@ -541,7 +541,7 @@ def test_add_menu_options_ordering() -> None:
     assert codex == [
         "OpenAI — API key",
         "ChatGPT — subscription",
-        "Gateway — custom base URL + key",
+        "Gateway — custom base URL + key (e.g. OpenRouter)",
         "OpenRouter — API key",
         "Databricks — workspace",
         "Other provider — API key",
@@ -554,7 +554,7 @@ def test_add_menu_options_ordering() -> None:
     assert claude == [
         "Anthropic — API key",
         "Claude — subscription (Pro/Max)",
-        "Gateway — custom base URL + key",
+        "Gateway — custom base URL + key (e.g. OpenRouter)",
         "Databricks — workspace",
     ]
 

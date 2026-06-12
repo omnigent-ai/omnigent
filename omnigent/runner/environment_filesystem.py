@@ -610,16 +610,23 @@ class CallerProcessFilesystem:
 
         validated = _validate_path(path) if path else ""
         target = validated or "."
+        # Embed the path as a Python literal via json.dumps and shell-quote
+        # the entire script (matching list_dir/search_files). This keeps the
+        # caller-controlled path out of any shell-interpreted context: it never
+        # reaches the shell as bare text, so $(...), backticks, and $var in the
+        # path cannot be expanded.
+        _script = "\n".join(
+            [
+                "import os, json, stat as S",
+                f"p = {_json.dumps(target)}",
+                "s = os.stat(p)",
+                "print(json.dumps({'s': s.st_size, 'm': int(s.st_mtime),",
+                "    'd': S.S_ISDIR(s.st_mode), 'l': S.S_ISLNK(s.st_mode)}))",
+            ]
+        )
         result = await _run_os_env_async(
             self._os_env.shell,
-            f'python3 -c "'
-            f"import os,json,stat as S;p={_shell_quote(target)};"
-            f"s=os.stat(p);"
-            f"print(json.dumps({{"
-            f"'s':s.st_size,'m':int(s.st_mtime),"
-            f"'d':S.S_ISDIR(s.st_mode),"
-            f"'l':S.S_ISLNK(s.st_mode)"
-            f'}}))"',
+            f"python3 -c {_shell_quote(_script)}",
         )
         if "error" in result or result.get("exit_code", 1) != 0:
             raise FilesystemPathNotFound(f"Path {path!r} not found")
@@ -723,14 +730,20 @@ class CallerProcessFilesystem:
         """
         import json as _json
 
+        # Embed the path as a Python literal via json.dumps and shell-quote
+        # the entire script so the caller-controlled path is never interpreted
+        # by the shell; see stat() for the full rationale.
+        _script = "\n".join(
+            [
+                "import os, json, stat as S",
+                f"p = {_json.dumps(validated)}",
+                "s = os.stat(p)",
+                "print(json.dumps({'s': s.st_size, 'd': S.S_ISDIR(s.st_mode)}))",
+            ]
+        )
         result = await _run_os_env_async(
             self._os_env.shell,
-            f'python3 -c "'
-            f"import os,json,stat as S;p={_shell_quote(validated)};"
-            f"s=os.stat(p);"
-            f"print(json.dumps({{"
-            f"'s':s.st_size,'d':S.S_ISDIR(s.st_mode)"
-            f'}}))"',
+            f"python3 -c {_shell_quote(_script)}",
         )
         if "error" in result or result.get("exit_code", 1) != 0:
             raise FilesystemPathNotFound(f"Path {validated!r} not found")
@@ -748,9 +761,21 @@ class CallerProcessFilesystem:
         :param validated: Validated relative path.
         :returns: ``True`` if the directory has children.
         """
+        import json as _json
+
+        # Embed the path as a Python literal via json.dumps and shell-quote
+        # the entire script so the caller-controlled path is never interpreted
+        # by the shell; see stat() for the full rationale.
+        _script = "\n".join(
+            [
+                "import os",
+                f"p = {_json.dumps(validated)}",
+                "print(len(os.listdir(p)))",
+            ]
+        )
         check = await _run_os_env_async(
             self._os_env.shell,
-            f'python3 -c "import os;print(len(os.listdir({_shell_quote(validated)})))"',
+            f"python3 -c {_shell_quote(_script)}",
         )
         count = int(check.get("stdout", "0").strip() or "0")
         return count > 0

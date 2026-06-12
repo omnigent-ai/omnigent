@@ -1,11 +1,9 @@
 name: OSS Scorecard
 
-# OpenSSF Scorecard supply-chain posture scan. Public-only: the job is
-# gated to the OSS repo via `if: github.repository == 'omnigent-ai/omnigent'`,
-# so it is inert (skipped) in the managed source repo — no SARIF in its
-# Security tab, no secrets required there. Already public-safe
-# (ubuntu-latest, GITHUB_TOKEN only), so the export rewrite is a no-op and
-# it ships verbatim.
+# OpenSSF Scorecard supply-chain posture scan. The job is gated to this
+# repository via `if: github.repository == 'omnigent-ai/omnigent'`, so it
+# stays inert (skipped) in forks and mirrors — no SARIF in their Security
+# tabs, no secrets required there. ubuntu-latest, GITHUB_TOKEN only.
 #
 # Results upload as SARIF to the public repo's code-scanning / Security
 # tab. Token-only for now: the Branch-Protection check needs a PAT

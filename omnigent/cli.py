@@ -8080,8 +8080,8 @@ def setup(internal_beta: bool) -> None:
 
 # ─── sandbox group ────────────────────────────────────────────────
 # The provider-agnostic sandbox CLI lives in omnigent/cli_sandbox.py.
-# Provider launcher modules are build-dependent (the lakebox launcher is
-# excluded from the OSS export); hide the group when none are available.
+# Provider launcher modules are optional and may be absent from a given
+# distribution; hide the group when none are available.
 # `omnigent lakebox` is kept as an alias for `omnigent sandbox …
 # --provider lakebox`, registered only when the lakebox provider ships.
 if _sandbox_providers():

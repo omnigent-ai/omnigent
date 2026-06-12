@@ -244,7 +244,7 @@ export function useMonacoCommentLayer({
       // preventDefault on mousedown keeps the editor selection live so
       // handleAddComment can read it.
       onMouseDown={(e) => { e.preventDefault(); handleAddComment(); }}
-      className="fixed z-50 flex items-center gap-1.5 rounded-md border border-border bg-popover px-2.5 py-1 text-xs font-medium text-foreground shadow-md hover:bg-muted transition-colors"
+      className="fixed z-50 flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-xs font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
       style={{ left: buttonPos.left, top: buttonPos.top, transform: "translateY(-100%)" }}
     >
       <MessageSquarePlusIcon className="size-3.5" />

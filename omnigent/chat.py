@@ -61,6 +61,7 @@ from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.inner.databricks_executor import _DatabricksBearerAuth, _read_databrickscfg
 from omnigent.spec import load as load_spec
+from omnigent.spec._omnigent_compat import OMNIGENT_EXECUTOR_TYPE
 from omnigent.spec.parser import discover_host_skills
 from omnigent.spec.types import AgentSpec, SkillSpec
 
@@ -166,7 +167,10 @@ class ChatOverrides:
     source YAML is never mutated.
 
     :param harness: ``--harness`` value, e.g. ``"claude-sdk"``.
-        ``None`` leaves the YAML value unchanged.
+        ``None`` leaves the YAML value unchanged. Written to the flat
+        ``executor.harness`` key for single-file omnigent YAMLs and to
+        ``executor.config.harness`` for ``spec_version`` bundles (the
+        only location that format's parser reads).
     :param model: ``--model`` value, e.g.
         ``"databricks-claude-sonnet-4-6"``. ``None`` unchanged.
     :param system_prompt: ``--system-prompt`` value — overrides the
@@ -2883,7 +2887,8 @@ def _apply_overrides_to_raw(raw: _YamlMapping, overrides: ChatOverrides) -> None
     Mutate *raw* to reflect CLI overrides + the default-model fallback.
 
     Mirrors the legacy argparse CLI's ``_apply_overrides_to_yaml``
-    so behavior is unchanged post-unification.
+    so behavior is unchanged post-unification. The harness override is
+    format-aware — see :func:`_apply_harness_override_to_executor`.
 
     :param raw: Parsed YAML mapping (mutated in place).
     :param overrides: CLI overrides to bake into the ``executor``
@@ -2896,7 +2901,7 @@ def _apply_overrides_to_raw(raw: _YamlMapping, overrides: ChatOverrides) -> None
     if overrides.model is not None:
         executor_block["model"] = overrides.model
     if overrides.harness is not None:
-        executor_block["harness"] = canonicalize_harness(overrides.harness) or overrides.harness
+        _apply_harness_override_to_executor(raw, executor_block, overrides.harness)
     # When neither harness nor model is declared — after overrides —
     # inject the ad-hoc default. Gated on harness absence so a YAML
     # like ``claude_code_agent.yaml`` (declares harness, no model)
@@ -2915,6 +2920,48 @@ def _apply_overrides_to_raw(raw: _YamlMapping, overrides: ChatOverrides) -> None
     _inject_openai_env_auth_if_needed(raw)
     if overrides.system_prompt is not None:
         raw["prompt"] = overrides.system_prompt
+
+
+def _apply_harness_override_to_executor(
+    raw: _YamlMapping,
+    executor_block: _YamlMapping,
+    harness: str,
+) -> None:
+    """
+    Write the ``--harness`` override where the spec's format reads it.
+
+    Single-file omnigent YAMLs (``name`` + ``prompt``, no
+    ``spec_version``) read the flat ``executor.harness`` key.
+    ``spec_version`` bundles (e.g. ``examples/polly``) read ONLY
+    ``executor.config.harness`` — writing the flat key there is a
+    silent no-op, which made ``omnigent run examples/polly
+    --harness pi`` keep the claude-sdk brain.
+
+    :param raw: Parsed top-level YAML mapping (used to detect the
+        spec format via the ``spec_version`` discriminator).
+    :param executor_block: The ``executor:`` mapping inside *raw*
+        (mutated in place).
+    :param harness: The ``--harness`` value, e.g. ``"pi"``.
+    :raises click.ClickException: If a ``spec_version`` bundle
+        declares a non-omnigent ``executor.type`` — those executors
+        have no ``config.harness``, so the override cannot apply.
+    """
+    canonical = canonicalize_harness(harness) or harness
+    # "spec_version" is the format discriminator (see is_omnigent_yaml).
+    if "spec_version" not in raw:
+        executor_block["harness"] = canonical
+        return
+    etype = str(executor_block.get("type", OMNIGENT_EXECUTOR_TYPE))
+    if etype != OMNIGENT_EXECUTOR_TYPE:
+        raise click.ClickException(
+            f"--harness only applies to specs with executor.type "
+            f"{OMNIGENT_EXECUTOR_TYPE!r}; this spec declares executor.type {etype!r}."
+        )
+    config = executor_block.get("config")
+    if not isinstance(config, dict):
+        config = {}
+        executor_block["config"] = config
+    config["harness"] = canonical
 
 
 def _validate_agent_spec(agent_path: Path) -> None:

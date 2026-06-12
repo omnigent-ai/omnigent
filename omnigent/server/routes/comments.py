@@ -145,6 +145,43 @@ def create_comments_router(
         raise ValueError("conversation_store is required when permission_store is provided")
     router = APIRouter()
 
+    async def _require_comment_author(
+        user_id: str | None, comment_id: str, session_id: str
+    ) -> None:
+        """Enforce that the caller authored the comment they are mutating.
+
+        Used to gate the author-only operations — editing a comment's
+        ``body`` and deleting a comment — on top of the session-level
+        ``LEVEL_EDIT`` gate, which callers MUST run first. A session
+        collaborator with edit access can still mark *anyone's* comment
+        addressed (a shared review-workflow action), but cannot rewrite or
+        delete another user's comment.
+
+        Comments with no recorded author (``created_by is None`` — legacy
+        comments created before per-user attribution, or single-user mode)
+        remain editable/deletable by any editor, since there is no author to
+        protect. This helper is only invoked when permission enforcement is
+        active (``permission_store`` set), so single-user mode never reaches
+        it regardless.
+
+        The synchronous store read is dispatched to a worker thread to keep
+        the event loop unblocked, matching :func:`require_access`.
+
+        :param user_id: The authenticated caller, e.g. ``"bob@example.com"``.
+        :param comment_id: The comment being mutated, e.g. ``"a1b2c3d4-..."``.
+        :param session_id: The owning session, e.g. ``"conv_abc123"``.
+        :raises OmnigentError: 404 if the comment is not found in this
+            session; 403 if the caller is not the comment's author.
+        """
+        comment = await asyncio.to_thread(store.get, comment_id, session_id)
+        if comment is None:
+            raise OmnigentError("Comment not found", code=ErrorCode.NOT_FOUND)
+        if comment.created_by is not None and comment.created_by != user_id:
+            raise OmnigentError(
+                "Only the comment author can edit or delete this comment",
+                code=ErrorCode.FORBIDDEN,
+            )
+
     @router.post("/sessions/{session_id}/comments")
     async def add_comment(
         request: Request,
@@ -213,6 +250,10 @@ def create_comments_router(
         """Update a comment's status and/or body text.
 
         Requires ``LEVEL_EDIT`` on the session in multi-user mode.
+        Editing the ``body`` additionally requires the caller to be the
+        comment's author: rewriting another user's comment is forbidden,
+        while changing only the ``status`` (e.g. marking it ``"addressed"``)
+        stays open to any editor as a shared review-workflow action.
 
         :param request: The incoming request, used to extract the user identity.
         :param session_id: The owning session, e.g. ``"conv_abc123"``.
@@ -220,6 +261,7 @@ def create_comments_router(
         :param body: Fields to update; ``None`` fields are left unchanged.
         :returns: The updated serialized comment.
         :raises OmnigentError: 401/403/404 if the user lacks edit permission,
+             403 if a body edit is attempted on another user's comment,
             or 404 if the comment is not found.
         """
         user_id = get_user_id(request, auth_provider)
@@ -227,6 +269,11 @@ def create_comments_router(
             await require_access(
                 user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
             )
+            # Rewriting comment text is author-only; a status-only change is a
+            # shared review-workflow action that any editor (and the agent's
+            # update_comment tool) may perform.
+            if body.body is not None:
+                await _require_comment_author(user_id, comment_id, session_id)
         comment = store.update_comment(comment_id, session_id, status=body.status, body=body.body)
         if comment is None:
             raise OmnigentError("Comment not found", code=ErrorCode.NOT_FOUND)
@@ -240,20 +287,24 @@ def create_comments_router(
     ) -> dict[str, Any]:
         """Delete a comment.
 
-        Requires ``LEVEL_EDIT`` on the session in multi-user mode.
+        Requires ``LEVEL_EDIT`` on the session in multi-user mode, and
+        additionally that the caller is the comment's author — one
+        collaborator may not delete another user's comment.
 
         :param request: The incoming request, used to extract the user identity.
         :param session_id: The owning session, e.g. ``"conv_abc123"``.
         :param comment_id: The comment to delete, e.g. ``"a1b2c3d4-..."``.
         :returns: ``{"deleted": true}``.
         :raises OmnigentError: 401/403/404 if the user lacks edit permission,
-            or 404 if the comment is not found or does not belong to this session.
+            403 if the caller is not the comment's author, or 404 if the
+            comment is not found or does not belong to this session.
         """
         user_id = get_user_id(request, auth_provider)
         if permission_store is not None and conversation_store is not None:
             await require_access(
                 user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
             )
+            await _require_comment_author(user_id, comment_id, session_id)
         deleted = store.delete(comment_id, session_id)
         if deleted is None:
             raise OmnigentError("Comment not found", code=ErrorCode.NOT_FOUND)

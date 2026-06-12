@@ -9,8 +9,19 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Comment } from "@/hooks/useComments";
+import { getCurrentAuthorId } from "@/lib/identity";
 import type { ActiveSelection } from "./codeViewerHelpers";
 import { CommentsPanel } from "./CommentsPanel";
+
+// CommentsPanel reads the current user's identity (getCurrentAuthorId) to
+// decide whose comments expose Edit/Delete. Mock it so author-ownership tests
+// can pin "who am I". The default null mirrors single-user/local mode and an
+// unresolved identity, which is what the pre-existing (null-author) fixtures
+// below rely on — under that default every comment is treated as own.
+vi.mock("@/lib/identity", () => ({
+  getCurrentAuthorId: vi.fn<() => string | null>(() => null),
+}));
+const mockGetCurrentAuthorId = vi.mocked(getCurrentAuthorId);
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -200,6 +211,85 @@ describe("CommentsPanel read-only collaborator gating", () => {
     renderGated({ canEdit: false, comments: [makeComment("c1")] });
     expect(screen.getByText("Comment c1")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Copy link to comment" })).toBeInTheDocument();
+  });
+});
+
+// ── Author-only edit/delete gating (created_by vs current user) ─────────────
+//
+// Even with edit access (canEdit=true), a collaborator may only edit/delete
+// their OWN comments. The panel compares each comment's created_by against
+// getCurrentAuthorId and exposes Edit/Delete only on a match (the backend
+// enforces this independently; the UI just hides the affordances). Comments
+// with no recorded author (created_by null — legacy / single-user) stay
+// editable by any editor.
+
+/** A draft comment authored by `author`, otherwise identical to makeComment. */
+function makeAuthoredComment(id: string, author: string | null): Comment {
+  return { ...makeComment(id), created_by: author };
+}
+
+describe("CommentsPanel author-only edit/delete gating", () => {
+  afterEach(() => {
+    // Restore the default identity so later describe blocks (and any test
+    // order) see the null-author behavior their fixtures assume.
+    mockGetCurrentAuthorId.mockReturnValue(null);
+  });
+
+  it("shows Edit/Delete on the current user's own comment", () => {
+    mockGetCurrentAuthorId.mockReturnValue("alice@example.com");
+    renderGated({
+      canEdit: true,
+      comments: [makeAuthoredComment("c1", "alice@example.com")],
+    });
+    // Alice authored c1 → her own affordances appear. Failure means
+    // canModify rejected a self-authored comment (over-restriction).
+    expect(screen.getByRole("button", { name: "Edit" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Delete" })).toBeInTheDocument();
+  });
+
+  it("hides Edit/Delete on another user's comment even with edit access", () => {
+    mockGetCurrentAuthorId.mockReturnValue("bob@example.com");
+    renderGated({
+      canEdit: true,
+      comments: [makeAuthoredComment("c1", "alice@example.com")],
+    });
+    // Bob is an editor but did NOT author c1 → no mutation affordances.
+    // Failure here is the actual bug being fixed: an editor able to edit or
+    // delete another user's comment from the UI.
+    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
+    // Reading and copy-link stay available — gating is on mutation only.
+    expect(screen.getByText("Comment c1")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy link to comment" })).toBeInTheDocument();
+  });
+
+  it("shows Edit/Delete on an authorless (legacy/single-user) comment", () => {
+    mockGetCurrentAuthorId.mockReturnValue("bob@example.com");
+    renderGated({
+      canEdit: true,
+      comments: [makeAuthoredComment("c1", null)],
+    });
+    // created_by null → no author to protect, so any editor may modify,
+    // matching the backend's `created_by is None` fallback. Failure would
+    // mean legacy comments became uneditable after this change.
+    expect(screen.getByRole("button", { name: "Edit" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Delete" })).toBeInTheDocument();
+  });
+
+  it("renders own-vs-others affordances correctly in a mixed-author list", () => {
+    mockGetCurrentAuthorId.mockReturnValue("alice@example.com");
+    renderGated({
+      canEdit: true,
+      comments: [
+        makeAuthoredComment("c1", "alice@example.com"),
+        makeAuthoredComment("c2", "bob@example.com"),
+      ],
+    });
+    // Exactly one Edit and one Delete button — Alice's c1 only, not Bob's c2.
+    // A count of 2 would mean Bob's comment leaked mutation affordances; 0
+    // would mean Alice's own comment was wrongly suppressed.
+    expect(screen.getAllByRole("button", { name: "Edit" })).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: "Delete" })).toHaveLength(1);
   });
 });
 

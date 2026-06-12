@@ -4457,7 +4457,7 @@
     },
     "/v1/sessions": {
       "get": {
-        "description": "List sessions with cursor-based pagination.\n\nSessions are conversations with a non-``None`` ``agent_id``\n\u2014 i.e. those created via ``POST /v1/sessions``.\nConversations without an agent binding are excluded.\n\n:param limit: Maximum number of sessions to return\n    (1-1000, default 20).\n:param after: Cursor \u2014 return sessions after this\n    session ID in sort order, e.g. ``\"conv_abc123\"``.\n:param before: Cursor \u2014 return sessions before this\n    session ID.\n:param agent_id: When set, only return sessions bound\n    to this agent, e.g. ``\"ag_abc123\"``. ``None``\n    returns sessions across all agents.\n:param agent_name: When set, only return sessions whose\n    bound agent row has this name. This intentionally\n    includes session-scoped agents that share a name but\n    have distinct bundles. ``None`` disables the filter.\n:param order: Sort direction, ``\"desc\"`` (newest-first)\n    or ``\"asc\"`` (oldest-first).\n:param sort_by: Column to sort on, ``\"created_at\"`` or\n    ``\"updated_at\"``.\n:param search_query: Case-insensitive substring filter on\n    the session title or conversation content. ``None``\n    or empty string disables the filter. A session\n    matches if its title contains the query or any of\n    its conversation items' text does. Powers the\n    sidebar's session search.\n:param include_archived: When ``False`` (default), archived\n    sessions are omitted. When ``True``, archived sessions\n    are returned alongside active ones (the sidebar groups\n    them into an \"Archived\" section). Powers the sidebar's\n    \"Show archived\" toggle.\n:returns: A :class:`PaginatedList` of\n    :class:`SessionListItem`.",
+        "description": "List sessions with cursor-based pagination.\n\nSessions are conversations with a non-``None`` ``agent_id``\n\u2014 i.e. those created via ``POST /v1/sessions``.\nConversations without an agent binding are excluded.\n\n:param limit: Maximum number of sessions to return\n    (1-1000, default 20).\n:param after: Cursor \u2014 return sessions after this\n    session ID in sort order, e.g. ``\"conv_abc123\"``.\n:param before: Cursor \u2014 return sessions before this\n    session ID.\n:param agent_id: When set, only return sessions bound\n    to this agent, e.g. ``\"ag_abc123\"``. ``None``\n    returns sessions across all agents.\n:param agent_name: When set, only return sessions whose\n    bound agent row has this name. This intentionally\n    includes session-scoped agents that share a name but\n    have distinct bundles. ``None`` disables the filter.\n:param order: Sort direction, ``\"desc\"`` (newest-first)\n    or ``\"asc\"`` (oldest-first).\n:param sort_by: Column to sort on, ``\"created_at\"`` or\n    ``\"updated_at\"``.\n:param search_query: Case-insensitive substring filter on\n    the session title or conversation content. ``None``\n    or empty string disables the filter. A session\n    matches if its title contains the query or any of\n    its conversation items' text does. Powers the\n    sidebar's session search.\n:param include_archived: When ``False`` (default), archived\n    sessions are omitted. When ``True``, archived sessions\n    are returned alongside active ones (the sidebar groups\n    them into an \"Archived\" section). Powers the sidebar's\n    \"Show archived\" toggle.\n:param kind: Conversation kind to return. ``\"default\"``\n    (the default) returns only top-level user-initiated\n    sessions \u2014 the sidebar's view. ``\"sub_agent\"`` returns\n    only sub-agent child sessions. ``\"any\"`` returns both;\n    this lets the new-session agent picker discover agents\n    that are only bound to sub-agent sessions (e.g. ones\n    uploaded via ``sys_session_create``).\n:returns: A :class:`PaginatedList` of\n    :class:`SessionListItem`.",
         "operationId": "list_sessions_v1_sessions_get",
         "parameters": [
           {
@@ -4582,6 +4582,17 @@
               "default": false,
               "title": "Include Archived",
               "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "default": "default",
+              "pattern": "^(default|sub_agent|any)$",
+              "title": "Kind",
+              "type": "string"
             }
           }
         ],
@@ -5194,7 +5205,7 @@
     },
     "/v1/sessions/{session_id}/comments/{comment_id}": {
       "delete": {
-        "description": "Delete a comment.\n\nRequires ``LEVEL_EDIT`` on the session in multi-user mode.\n\n:param request: The incoming request, used to extract the user identity.\n:param session_id: The owning session, e.g. ``\"conv_abc123\"``.\n:param comment_id: The comment to delete, e.g. ``\"a1b2c3d4-...\"``.\n:returns: ``{\"deleted\": true}``.\n:raises OmnigentError: 401/403/404 if the user lacks edit permission,\n    or 404 if the comment is not found or does not belong to this session.",
+        "description": "Delete a comment.\n\nRequires ``LEVEL_EDIT`` on the session in multi-user mode, and\nadditionally that the caller is the comment's author \u2014 one\ncollaborator may not delete another user's comment.\n\n:param request: The incoming request, used to extract the user identity.\n:param session_id: The owning session, e.g. ``\"conv_abc123\"``.\n:param comment_id: The comment to delete, e.g. ``\"a1b2c3d4-...\"``.\n:returns: ``{\"deleted\": true}``.\n:raises OmnigentError: 401/403/404 if the user lacks edit permission,\n    403 if the caller is not the comment's author, or 404 if the\n    comment is not found or does not belong to this session.",
         "operationId": "delete_comment_v1_sessions__session_id__comments__comment_id__delete",
         "parameters": [
           {
@@ -5246,7 +5257,7 @@
         ]
       },
       "patch": {
-        "description": "Update a comment's status and/or body text.\n\nRequires ``LEVEL_EDIT`` on the session in multi-user mode.\n\n:param request: The incoming request, used to extract the user identity.\n:param session_id: The owning session, e.g. ``\"conv_abc123\"``.\n:param comment_id: The comment to update, e.g. ``\"a1b2c3d4-...\"``.\n:param body: Fields to update; ``None`` fields are left unchanged.\n:returns: The updated serialized comment.\n:raises OmnigentError: 401/403/404 if the user lacks edit permission,\n    or 404 if the comment is not found.",
+        "description": "Update a comment's status and/or body text.\n\nRequires ``LEVEL_EDIT`` on the session in multi-user mode.\nEditing the ``body`` additionally requires the caller to be the\ncomment's author: rewriting another user's comment is forbidden,\nwhile changing only the ``status`` (e.g. marking it ``\"addressed\"``)\nstays open to any editor as a shared review-workflow action.\n\n:param request: The incoming request, used to extract the user identity.\n:param session_id: The owning session, e.g. ``\"conv_abc123\"``.\n:param comment_id: The comment to update, e.g. ``\"a1b2c3d4-...\"``.\n:param body: Fields to update; ``None`` fields are left unchanged.\n:returns: The updated serialized comment.\n:raises OmnigentError: 401/403/404 if the user lacks edit permission,\n     403 if a body edit is attempted on another user's comment,\n    or 404 if the comment is not found.",
         "operationId": "update_comment_v1_sessions__session_id__comments__comment_id__patch",
         "parameters": [
           {

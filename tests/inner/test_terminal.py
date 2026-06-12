@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,7 +10,11 @@ from types import SimpleNamespace
 import pytest
 
 import omnigent.inner.terminal as terminal_mod
-from omnigent.inner.terminal import TerminalInstance
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
+from omnigent.inner.terminal import (
+    TerminalInstance,
+    create_terminal_instance,
+)
 from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
 
 
@@ -317,6 +322,16 @@ async def test_launch_strips_env_unset_keys_from_inherited_environment(
     # Force the unwanted var into the parent env so the test would
     # also catch a regression where ``env_unset`` is silently dropped.
     monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "ambient-host-profile")
+    # A benign ambient var that is NOT in env_unset — proves the strip
+    # is surgical rather than a wholesale wipe. (We can't use
+    # ``OMNIGENT_TMUX_SOCK`` for this any more: the sandbox hardening
+    # stopped ``launch`` from advertising the control-socket path to the pane.)
+    monkeypatch.setenv("OMNIGENT_BENIGN_SENTINEL", "keep-me")
+    # Seed an inherited OMNIGENT_TMUX_SOCK so the negative assertion
+    # below exercises ``launch``'s explicit ``env.pop`` of any ambient
+    # value — not merely the fact that launch stopped *setting* it
+    # (``launch`` strips both the self-set and any inherited value).
+    monkeypatch.setenv("OMNIGENT_TMUX_SOCK", "/leaked/from/parent.sock")
 
     instance = TerminalInstance(
         name="bash",
@@ -353,13 +368,18 @@ async def test_launch_strips_env_unset_keys_from_inherited_environment(
     )
 
     # Sanity check that ordinary env still flows through — the strip
-    # must be surgical, not a wholesale wipe. ``OMNIGENT_TMUX_SOCK``
-    # is set unconditionally by ``launch`` itself, so its presence
-    # proves the env construction ran and only the requested key
-    # was removed.
-    assert "OMNIGENT_TMUX_SOCK" in spawned_env, (
-        "OMNIGENT_TMUX_SOCK missing from tmux env — env_unset "
+    # must be surgical, not a wholesale wipe. The benign ambient var
+    # set above must survive since it is not in ``env_unset``.
+    assert spawned_env.get("OMNIGENT_BENIGN_SENTINEL") == "keep-me", (
+        "benign ambient var missing from tmux env — env_unset "
         "must remove only the listed keys, not the entire env."
+    )
+    # And the control-socket path must NOT be advertised to the pane
+    # the tmux server is unsandboxed, so a pane that knows
+    # the socket path could ``tmux -S <sock> run-shell`` out of the box.
+    assert "OMNIGENT_TMUX_SOCK" not in spawned_env, (
+        "OMNIGENT_TMUX_SOCK leaked into the tmux child env — the pane "
+        "must not be told the unsandboxed control socket's path."
     )
 
 
@@ -451,8 +471,8 @@ async def test_launch_strips_runner_binding_token_from_tmux_child(
     control-plane tunnel. The token is seeded into BOTH the parent env
     and the per-terminal ``env`` overrides, proving the strip runs after
     ``env.update(self.env)`` and so cannot be re-admitted by a spec
-    author. A benign override and the always-set ``OMNIGENT_TMUX_SOCK``
-    prove the strip is surgical, not a wholesale wipe.
+    author. A benign override proves the strip is surgical, not a
+    wholesale wipe.
 
     :param tmp_path: Temporary directory used for the fake tmux socket.
     :param monkeypatch: Seeds the binding token into the parent env.
@@ -524,9 +544,10 @@ async def test_launch_strips_runner_binding_token_from_tmux_child(
         "per-terminal env override was dropped — the strip must remove "
         "only the runner-auth secret, not the whole env."
     )
-    # Always set by launch() itself, so its presence proves env
-    # construction ran end-to-end.
-    assert "OMNIGENT_TMUX_SOCK" in spawned_env
+    # The control-socket path must not be advertised to the
+    # pane — the unsandboxed tmux server's run-shell would otherwise be
+    # one ``tmux -S <sock>`` away for the agent payload in the pane.
+    assert "OMNIGENT_TMUX_SOCK" not in spawned_env
 
 
 @pytest.mark.asyncio
@@ -805,3 +826,69 @@ def test_reap_orphaned_terminals_kills_server_for_dead_owner_socket(
     # kill-server targeted exactly this instance's socket; a missing
     # call means the tmux server (the real leak) survives dir removal.
     assert kill_calls == [["tmux", "-S", str(socket_path), "kill-server"]]
+
+
+@pytest.mark.skipif(
+    sys.platform not in ("linux", "darwin"),
+    reason="sandbox backends only resolve on Linux (bwrap) or macOS (seatbelt)",
+)
+def test_create_terminal_instance_denies_control_socket_but_keeps_private_dir_writable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A sandboxed terminal keeps its ``private_dir`` writable yet denies
+    the pane access to the tmux control socket inside it.
+
+    The socket must stay at ``private_dir/tmux.sock`` so the
+    orphan-reaper (which kills ``<instance-dir>/tmux.sock``) still
+    works, and ``private_dir`` must remain a write root so a forked
+    workspace is usable. The escape is closed instead by adding the
+    socket to ``deny_unix_socket_paths`` — bwrap masks it with
+    /dev/null and seatbelt emits a unix-socket deny. We assert all
+    three facts on the resolved policy at once because they are
+    co-dependent: dropping any one re-opens the escape or breaks
+    usability.
+    """
+    import shutil
+
+    # create_terminal_instance only guards on tmux availability (it does
+    # not launch tmux during construction), so faking the predicate lets
+    # this run in CI without tmux installed — same trick the reaper tests
+    # use — instead of an invisible-coverage-loss skip.
+    monkeypatch.setattr(terminal_mod, "_tmux_available", lambda: True)
+
+    backend_type = "linux_bwrap" if sys.platform == "linux" else "darwin_seatbelt"
+    spec = TerminalEnvSpec(
+        command="bash",
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=str(tmp_path),
+            sandbox=OSEnvSandboxSpec(type=backend_type),
+        ),
+    )
+
+    result = create_terminal_instance(name="bash", session_key="s1", spec=spec)
+    instance = result.instance
+    try:
+        assert instance.socket_path.parent == instance.private_dir, (
+            "socket must live inside private_dir so reap_orphaned_terminals "
+            "(which kills <instance-dir>/tmux.sock) can still reach it"
+        )
+        policy = instance.sandbox_policy
+        assert policy is not None and policy.active, "expected an active sandbox policy"
+
+        resolved_sock = instance.socket_path.resolve(strict=False)
+        resolved_private = instance.private_dir.resolve(strict=False)
+
+        assert policy.deny_unix_socket_paths is not None
+        assert resolved_sock in policy.deny_unix_socket_paths, (
+            "tmux control socket was not added to the sandbox deny list — "
+            "the pane could connect to the unsandboxed server and run-shell out"
+        )
+        assert resolved_private in policy.write_roots, (
+            "private_dir dropped from write roots — a forked workspace would "
+            "become read-only inside the pane"
+        )
+    finally:
+        shutil.rmtree(instance.private_dir, ignore_errors=True)

@@ -1,4 +1,4 @@
-# Public-only: build the `omnigent` release distributions — the core wheel
+# Build the `omnigent` release distributions — the core wheel
 # with the `ap-web` web UI bundled in, plus the `omnigent-client` and
 # `omnigent-ui-sdk` SDK wheels the core package depends on — run the
 # readiness gates, and publish all three to (Test)PyPI via OIDC Trusted
@@ -7,9 +7,9 @@
 # so every release publishes all three at the same version.
 #
 # SELF-CONTAINED: it publishes straight from THIS repo. Runs on
-# GitHub-hosted `ubuntu-latest`: it needs clean public PyPI/npm access, and
-# the managed dev machines + protected CI runners are proxy-bound (public
-# registries DNS-blocked).
+# GitHub-hosted `ubuntu-latest` specifically for clean, direct public
+# PyPI/npm access — releases must resolve against the public registries,
+# never a mirror or proxy.
 #
 # Release flow:
 #   1. Push a version tag (vX.Y.Z / vX.Y.ZrcN) -> builds + gates + publishes
@@ -71,7 +71,7 @@ concurrency:
 
 jobs:
   build-and-publish:
-    # Public-only: inert in the managed mirror, active only in the OSS repo.
+    # Gated to this repository; inert in forks and mirrors.
     if: github.repository == 'omnigent-ai/omnigent'
     runs-on: ubuntu-latest
     # Bound a hung run well under GitHub's 6-hour default (cold npm ci + FE

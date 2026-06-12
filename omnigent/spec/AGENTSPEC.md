@@ -253,7 +253,7 @@ at runtime by the server or runner for a tenant-uploaded
 (session-scoped) bundle. Expanding an uploaded spec's ``${VAR}`` against
 the server process env would let any tenant exfiltrate server-side
 secrets by referencing them in a header pointed at an attacker URL
-(SEC-20566 / W7-3). Only operator-authored template agents
+(W7-3). Only operator-authored template agents
 (`--agent`, built-ins; `Agent.session_id is None`) expand server-side.
 
 **Security note — SSRF risk:** The omnigent server makes outbound HTTP

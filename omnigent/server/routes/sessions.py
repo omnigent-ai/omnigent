@@ -2270,7 +2270,14 @@ def _resolve_harness(conv: Conversation | None) -> str | None:
     :returns: The canonical harness (e.g. ``"openai-agents"`` or
         ``"claude-sdk"``), or ``None`` when unavailable.
     """
-    if conv is None or conv.agent_id is None:
+    if conv is None:
+        return None
+    # A persisted per-session override (validated + canonicalized at
+    # create) wins over the spec's declared harness, so the snapshot
+    # reports what the runner actually spawns.
+    if conv.harness_override:
+        return conv.harness_override
+    if conv.agent_id is None:
         return None
     try:
         from omnigent.harness_aliases import canonicalize_harness
@@ -2290,6 +2297,60 @@ def _resolve_harness(conv: Conversation | None) -> str | None:
         return canonicalize_harness(harness) or harness
     except (KeyError, AttributeError, ValueError, ImportError, OSError):
         return None
+
+
+def _validated_harness_override(value: str | None, agent: Agent) -> str | None:
+    """
+    Validate + canonicalize a session-create ``harness_override``.
+
+    Mirrors the CLI's ``--harness`` rules (``_apply_harness_override_to_executor``
+    in ``omnigent/chat.py``): the canonical name must be a known bundle
+    harness, and the bound agent must be an ``executor.type: omnigent``
+    spec — other executor types have no ``config.harness``, so an
+    override there would be a silent no-op.
+
+    :param value: The raw override from the request body, e.g. ``"pi"``
+        or the ``"openai-agents-sdk"`` alias. ``None`` means no override.
+    :param agent: The bound agent row (already fetched by the caller).
+    :returns: The canonical harness id, or ``None`` when *value* is.
+    :raises OmnigentError: ``invalid_input`` for an unknown harness, a
+        non-omnigent executor type, or an unloadable agent bundle.
+    """
+    if value is None:
+        return None
+    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.runtime import get_agent_cache
+    from omnigent.spec._omnigent_compat import (
+        OMNIGENT_EXECUTOR_TYPE,
+        OMNIGENT_HARNESSES,
+    )
+
+    canonical = canonicalize_harness(value) or value
+    if canonical not in OMNIGENT_HARNESSES:
+        raise OmnigentError(
+            f"invalid harness_override: must be one of "
+            f"{sorted(OMNIGENT_HARNESSES)}, got {value!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    try:
+        loaded = get_agent_cache().load(
+            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+        )
+    except (KeyError, AttributeError, ValueError, ImportError, OSError) as exc:
+        raise OmnigentError(
+            f"harness_override requires a loadable agent spec; "
+            f"agent {agent.name!r} failed to load: {exc}",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+    executor_type = loaded.spec.executor.type
+    if executor_type != OMNIGENT_EXECUTOR_TYPE:
+        raise OmnigentError(
+            f"harness_override only applies to executor.type "
+            f"{OMNIGENT_EXECUTOR_TYPE!r} agents; agent {agent.name!r} "
+            f"declares executor.type {executor_type!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return canonical
 
 
 def _utc_day(epoch_seconds: int) -> str:
@@ -2937,13 +2998,18 @@ async def _persist_model_change_note(
     start an agent turn, unlike the message-post path) and published over
     SSE so connected clients render it live.
 
-    The caller gates this to **non-native** sessions and to real ``/model``
-    commands: claude-native / codex-native manage their model through the
-    in-TUI picker / launch flag and must not receive an injected AP-side
-    item, and ``silent`` bind-time auto-applies are skipped (see the
-    ``live_forward`` guard in ``update_session``). The note is a user-role
-    message, so the agent sees it in history on the next turn — consistent
-    with other ``[System: ...]`` markers (timer fired, sub-agent done).
+    The caller gates this to **non-native** sessions (those WITHOUT an
+    ``omnigent.wrapper`` native label, via ``_is_native_terminal_session``)
+    and to real ``/model`` commands: claude-native / codex-native manage
+    their model through the in-TUI picker / launch flag and must not receive
+    an injected AP-side item, and ``silent`` bind-time auto-applies are
+    skipped (see the ``live_forward`` guard in ``update_session``). The gate
+    keys on ``omnigent.wrapper`` rather than ``omnigent.ui == "terminal"``
+    because the latter is also set on chat-first SDK sessions that expose a
+    REPL terminal view (e.g. polly / debby), which DO want the note. The note
+    is a user-role message, so the agent sees it in history on the next turn —
+    consistent with other ``[System: ...]`` markers (timer fired, sub-agent
+    done).
 
     :param session_id: Session/conversation identifier, e.g.
         ``"conv_abc123"``.
@@ -6885,6 +6951,10 @@ async def _dispatch_skill_slash_command_to_runner(
     )
     if effective_runner_override is not None:
         runner_body["model_override"] = effective_runner_override
+    # Per-session brain-harness override — create-time only, so no
+    # per-event value exists; the persisted column is the source.
+    if conv.harness_override is not None:
+        runner_body["harness_override"] = conv.harness_override
 
     try:
         await runner_client.post(
@@ -7152,6 +7222,10 @@ async def _forward_event_to_runner(
     )
     if effective_runner_override is not None:
         runner_body["model_override"] = effective_runner_override
+    # Per-session brain-harness override — create-time only, so no
+    # per-event value exists; the persisted column is the source.
+    if conv.harness_override is not None:
+        runner_body["harness_override"] = conv.harness_override
 
     # The runner's sessions-native POST returns 202 immediately
     # and starts the turn as a background task. No streaming
@@ -7665,9 +7739,14 @@ async def _flush_relay_text(
     store-assigned item id so they can stamp it onto the streamed block.
     Without it the rendered block stays id-less and every reconnect's
     itemId-keyed reconciliation splices the persisted copy in as a
-    duplicate. Clients dedupe the event itself by response id / content
-    equality (web ``blockStream.ts`` ``message_done``; the TUI's
-    ``_plan_output_item_render`` skips re-rendering when deltas streamed).
+    duplicate. Clients must dedupe this event by CONTENT, not by
+    open-section state: at a mid-turn tool-call boundary the streamed
+    text has already been closed/committed client-side (by the
+    function_call item or interleaved reasoning) before this publish
+    arrives. The web stamps the id onto the matching streamed
+    ``text_done`` block in place (ap-web ``chatStore.ts``
+    ``pumpStreamEvents``); the TUI consumes a byte-equal committed
+    segment (``_repl.py`` ``_TurnProseTracker``).
 
     The buffer and the in-flight replay are cleared ONLY after the append
     is confirmed: clearing first would let a reconnect during the persist
@@ -7728,7 +7807,8 @@ async def _flush_relay_text(
     # Publish the persisted item so live clients learn its store-assigned
     # id and stamp it onto the already-rendered streamed text (see the
     # docstring). Ordered before the boundary item / terminal event the
-    # caller publishes next, so the client's text section is still open.
+    # caller publishes next; clients match it back to the streamed text
+    # by byte-equal content, not by open-section state.
     done_event = OutputItemDoneEvent(
         type="response.output_item.done",
         item=persisted[0].to_api_dict(),
@@ -10004,6 +10084,13 @@ async def _create_session_from_existing_agent(
         body.cost_control_mode_override
     )
 
+    # Validated against the loaded spec (known harness + omnigent
+    # executor type) before any row exists, mirroring the CLI's
+    # --harness fail-loud rules.
+    harness_override = await asyncio.to_thread(
+        _validated_harness_override, body.harness_override, agent
+    )
+
     # Inherit runner affinity from the parent session so the child
     # is assigned to the same runner (sub-agent co-location).
     inherited_runner_id: str | None = None
@@ -10123,7 +10210,11 @@ async def _create_session_from_existing_agent(
                 reason="create-rollback",
             )
         raise
-    if model_override is not None or cost_control_mode_override is not None:
+    if (
+        model_override is not None
+        or cost_control_mode_override is not None
+        or harness_override is not None
+    ):
         # ``create_conversation`` has no override params; reuse the
         # PATCH path's store write before the runner reads the snapshot
         # (the first turn / terminal launch happens only after this
@@ -10133,6 +10224,7 @@ async def _create_session_from_existing_agent(
             conv.id,
             model_override=model_override,
             cost_control_mode_override=cost_control_mode_override,
+            harness_override=harness_override,
         )
         if updated_conv is None:
             raise OmnigentError(
@@ -11908,6 +12000,7 @@ def create_sessions_router(
         sort_by: str = Query(default="created_at", pattern="^(created_at|updated_at)$"),
         search_query: str | None = Query(default=None),
         include_archived: bool = Query(default=False),
+        kind: str = Query(default="default", pattern="^(default|sub_agent|any)$"),
     ) -> PaginatedList:
         """
         List sessions with cursor-based pagination.
@@ -11944,6 +12037,13 @@ def create_sessions_router(
             are returned alongside active ones (the sidebar groups
             them into an "Archived" section). Powers the sidebar's
             "Show archived" toggle.
+        :param kind: Conversation kind to return. ``"default"``
+            (the default) returns only top-level user-initiated
+            sessions — the sidebar's view. ``"sub_agent"`` returns
+            only sub-agent child sessions. ``"any"`` returns both;
+            this lets the new-session agent picker discover agents
+            that are only bound to sub-agent sessions (e.g. ones
+            uploaded via ``sys_session_create``).
         :returns: A :class:`PaginatedList` of
             :class:`SessionListItem`.
         """
@@ -11969,7 +12069,10 @@ def create_sessions_router(
             agent_name=agent_name,
             accessible_by=user_id,
             has_agent_id=True,
-            kind="default",
+            # The store treats ``None`` as "no kind filter"; the API
+            # spells that ``kind=any`` to keep the param required-ish
+            # and pattern-validated.
+            kind=None if kind == "any" else kind,
             order=order,
             sort_by=sort_by,
             search_query=normalized_query,
@@ -12660,18 +12763,13 @@ def create_sessions_router(
                 runner_router,
                 {"type": "model_change", "model": updated.model_override},
             )
-            # Record the switch as a durable transcript note for in-process
-            # (non-native) sessions, where the web ``/model`` command lives.
-            # Native sessions are excluded: claude-native uses the picker and
-            # codex-native pins its model at launch, so an injected AP-side
-            # item there would be a stray/misleading record (see
-            # _persist_model_change_note). ``live_forward`` (== not silent)
-            # already excludes bind-time auto-applies, so only an explicit
-            # /model command lands a note.
-            is_native_terminal = (
-                updated.labels.get(_CLAUDE_NATIVE_UI_LABEL_KEY) == _CLAUDE_NATIVE_UI_LABEL_VALUE
-            )
-            if not is_native_terminal:
+            # Append a durable [System: model changed to X] note for sessions
+            # whose history Omnigent writes. Gate on the wrapper label (NOT
+            # omnigent.ui, which chat-first SDK terminal-view sessions like
+            # polly/debby also carry) — see _persist_model_change_note for the
+            # full rationale. live_forward (== not silent) already excludes
+            # bind-time auto-applies, so only an explicit /model lands a note.
+            if not _is_native_terminal_session(updated):
                 await _persist_model_change_note(
                     session_id,
                     updated.model_override,

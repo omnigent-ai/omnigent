@@ -210,6 +210,56 @@ async def test_list_sessions_pagination(
     assert page2["data"][0]["id"] != page1["data"][0]["id"]
 
 
+async def test_list_sessions_kind_filter(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    ``kind`` scopes the list: ``default`` (the default) hides
+    sub-agent children, ``sub_agent`` returns only them, and ``any``
+    returns both. ``any`` powers the new-session agent picker's
+    discovery of agents that are only bound to sub-agent sessions.
+    """
+    agent = await create_test_agent(client, name="kind-filter-agent")
+    parent = await _create_session(client, agent["id"], title="kind-parent")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = conv_store.create_conversation(
+        kind="sub_agent",
+        title="coder:kind-child",
+        parent_conversation_id=parent["id"],
+        agent_id=agent["id"],
+    )
+
+    # Omitting ``kind`` keeps the pre-param behavior: the sidebar's
+    # view lists only top-level sessions. The child appearing here
+    # would mean the default regressed to unfiltered.
+    resp = await client.get("/v1/sessions", params={"agent_id": agent["id"]})
+    assert resp.status_code == 200
+    default_ids = {s["id"] for s in resp.json()["data"]}
+    assert parent["id"] in default_ids
+    assert child.id not in default_ids
+
+    # kind=any returns the union, and the child row carries its agent
+    # binding — the field the picker harvests for discovery.
+    resp = await client.get("/v1/sessions", params={"agent_id": agent["id"], "kind": "any"})
+    assert resp.status_code == 200
+    any_rows = {s["id"]: s for s in resp.json()["data"]}
+    assert parent["id"] in any_rows
+    assert child.id in any_rows
+    assert any_rows[child.id]["agent_id"] == agent["id"]
+
+    # kind=sub_agent returns only the child for this agent.
+    resp = await client.get("/v1/sessions", params={"agent_id": agent["id"], "kind": "sub_agent"})
+    assert resp.status_code == 200
+    sub_ids = {s["id"] for s in resp.json()["data"]}
+    assert sub_ids == {child.id}
+
+    # Values outside default|sub_agent|any are rejected by the Query
+    # pattern, not silently passed through to the store.
+    resp = await client.get("/v1/sessions", params={"kind": "bogus"})
+    assert resp.status_code == 422
+
+
 async def test_list_sessions_includes_title_and_status(
     client: httpx.AsyncClient,
 ) -> None:
@@ -4696,10 +4746,15 @@ async def test_patch_model_override_skips_note_for_native_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    A native-terminal session (``omnigent.ui == "terminal"``) must NOT get
-    an injected note — claude-native uses the picker and codex-native pins
-    its model at launch, so an AP-side ``[System: ...]`` item would be a
-    stray/misleading record (and pollute the mirrored transcript).
+    A native-wrapper session (``omnigent.wrapper`` set, here alongside
+    ``omnigent.ui == "terminal"``) must NOT get an injected note —
+    claude-native uses the picker and codex-native pins its model at launch,
+    so an AP-side ``[System: ...]`` item would be a stray/misleading record
+    (and pollute the mirrored transcript). The gate keys on the wrapper
+    label, NOT ``omnigent.ui`` alone — see
+    ``test_patch_model_override_records_note_for_terminal_view_sdk_session``
+    for the chat-first SDK session that has ``omnigent.ui`` but no wrapper
+    and DOES get the note.
     """
     published: list[tuple[str, dict[str, Any]]] = []
     monkeypatch.setattr(
@@ -4729,8 +4784,60 @@ async def test_patch_model_override_skips_note_for_native_session(
         json={"model_override": "opus"},
     )
     assert patch.status_code == 200, patch.text
-    # Gate excludes native sessions — no transcript note.
+    # Gate excludes native-wrapper sessions — no transcript note.
     assert _model_change_notes(published) == []
+
+
+async def test_patch_model_override_records_note_for_terminal_view_sdk_session(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A chat-first SDK session that merely exposes a REPL terminal view
+    (``omnigent.ui == "terminal"`` but NO ``omnigent.wrapper``) DOES get the
+    note.
+
+    This is the polly / debby case: when such an agent is launched via
+    ``omnigent run``, the runner stamps ``omnigent.ui: terminal`` to enable
+    the web Chat/Terminal toggle (runner ``app.py``), but the brain is an
+    in-process claude-sdk agent whose history Omnigent writes — so a web
+    ``/model`` switch should land a durable ``[System: ...]`` note. Gating on
+    ``omnigent.ui`` (the pre-fix behavior) wrongly suppressed it; the gate
+    must key on the ``omnigent.wrapper`` native label instead.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+
+    async def _noop_forward(*_args: Any, **_kwargs: Any) -> None:
+        """Isolate the note logic from the live runner forward."""
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._forward_session_change_to_runner",
+        _noop_forward,
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        # Terminal VIEW only — no native wrapper. Mirrors a polly/debby
+        # session launched via `omnigent run`.
+        labels={"omnigent.ui": "terminal"},
+    )
+
+    patch = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"model_override": "databricks-claude-sonnet-4-6"},
+    )
+    assert patch.status_code == 200, patch.text
+    # Note IS recorded: ``omnigent.ui == "terminal"`` alone must not suppress
+    # it. An empty list here means the gate regressed to keying on
+    # ``omnigent.ui``, re-breaking the polly/debby web ``/model`` feedback.
+    assert _model_change_notes(published) == [
+        "[System: model changed to databricks-claude-sonnet-4-6]"
+    ]
 
 
 async def test_patch_model_override_silent_skips_note(

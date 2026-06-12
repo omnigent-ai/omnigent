@@ -7610,7 +7610,14 @@ def create_runner_app(
         spawn_env: dict[str, str] | None = None
         instructions: str | None = None
         if cached_spec is not None:
-            h = cached_spec.executor.config.get("harness") or cached_spec.executor.type
+            # The per-session harness override (validated at session
+            # create, forwarded by the Omnigent server in the message
+            # body) replaces the spec's declared brain harness.
+            h = (
+                msg_body.get("harness_override")
+                or cached_spec.executor.config.get("harness")
+                or cached_spec.executor.type
+            )
             harness_name = canonicalize_harness(h) or h
             spawn_env = _build_spawn_env_from_spec(
                 cached_spec,
@@ -7999,6 +8006,7 @@ def create_runner_app(
                     spec_resolver=spec_resolver,
                     session_id=conv_id,
                     model_override=body.get("model_override"),
+                    harness_override=body.get("harness_override"),
                 )
             except (httpx.HTTPError, RuntimeError) as exc:
                 return JSONResponse(
@@ -11587,6 +11595,7 @@ async def _resolve_harness_config(
     spec_resolver: SpecResolver | None,
     session_id: str | None = None,
     model_override: str | None = None,
+    harness_override: str | None = None,
 ) -> tuple[str, dict[str, str] | None]:
     """Resolve harness type + spawn-env from the agent spec.
 
@@ -11595,6 +11604,9 @@ async def _resolve_harness_config(
     :param session_id: Session/conversation id, threaded to the resolver.
     :param model_override: Per-session ``/model`` override, applied to the
         spawn-env model so it takes effect on the SDK harnesses.
+    :param harness_override: Per-session brain-harness override (validated
+        at session create, forwarded by the server in the message body),
+        e.g. ``"pi"``. Replaces the spec's ``executor.config.harness``.
     :returns: ``(harness, spawn_env)``; a default for unresolved specs.
     """
     if agent_id and spec_resolver:
@@ -11602,7 +11614,7 @@ async def _resolve_harness_config(
         spec = _unwrap_resolved_spec(spec_entry)
         workdir = _resolved_spec_workdir(spec_entry)
         if spec is not None:
-            harness = spec.executor.config.get("harness") or spec.executor.type
+            harness = harness_override or spec.executor.config.get("harness") or spec.executor.type
             harness = canonicalize_harness(harness) or harness
             spawn_env = _build_spawn_env_from_spec(
                 spec, harness, workdir=workdir, model_override=model_override

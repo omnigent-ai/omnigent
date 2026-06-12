@@ -3,9 +3,9 @@ Sandbox launchers: run Omnigent hosts in remote sandboxes.
 
 Public API for the ``omnigent sandbox`` CLI and anything else that
 bootstraps a sandbox-backed host. Providers are registered by name in
-:data:`_LAUNCHERS`; launcher modules may be absent from a build (the
-Databricks Lakebox launcher is excluded from the OSS export), in which
-case the provider simply isn't offered.
+:data:`_LAUNCHERS`; launcher modules may be absent from a given
+distribution (e.g. the Databricks Lakebox launcher), in which case the
+provider simply isn't offered.
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ __all__ = [
 
 # Provider name → "module:ClassName" of its SandboxLauncher. Modules are
 # imported lazily (some pull in optional SDKs) and may be absent from a
-# build entirely (lakebox is excluded from the OSS export).
+# distribution entirely (e.g. lakebox).
 _LAUNCHERS: dict[str, str] = {
     "lakebox": "omnigent.onboarding.sandboxes.lakebox:LakeboxLauncher",
     "modal": "omnigent.onboarding.sandboxes.modal:ModalSandboxLauncher",
@@ -109,8 +109,8 @@ def get_launcher(provider: str, *, workspace_host: str | None = None) -> Sandbox
         )
     if provider == "lakebox" and workspace_host is not None:
         # Imported here (not at module top) because the lakebox module
-        # is excluded from the OSS export; the availability check above
-        # guarantees it exists in this build.
+        # may be absent from a distribution; the availability check above
+        # guarantees it exists in this one.
         from omnigent.onboarding.sandboxes.lakebox import LakeboxLauncher
 
         return LakeboxLauncher(workspace_host=workspace_host)

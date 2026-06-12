@@ -667,6 +667,12 @@ minus `items` and snapshot-only fields.
 Supports cursor pagination and filters such as `search_query` and
 `include_archived`.
 
+The `kind` filter scopes which conversation kinds are listed:
+`default` (the default) returns only top-level user-initiated
+sessions, `sub_agent` returns only sub-agent child sessions, and
+`any` returns both. `any` powers the new-session agent picker's
+discovery of agents that are only bound to sub-agent sessions.
+
 When liveness is wired, each list item includes two orthogonal signals
 (matching `GET /health` for the same session id and the
 `WS /v1/sessions/updates` list item fields):

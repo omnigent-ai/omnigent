@@ -166,9 +166,20 @@ jobs:
         # in review, while `--ignore-scripts` still gates every other
         # package. `@openai/codex` has `scripts: null`, so no postinstall
         # to run there.
+        #
+        # bubblewrap: required by the `linux_bwrap` sandbox backend. An
+        # agent that omits `os_env.sandbox.type` defaults to `linux_bwrap`
+        # on Linux, and the backend fails loud at runtime if `bwrap` is
+        # not on PATH (rather than silently running unsandboxed). The e2e
+        # runner runs real agents with os_env, so it needs `bwrap` like
+        # every other workflow that exercises the sandbox (ci.yml,
+        # integration.yml, nightly.yml). The apparmor sysctl mirrors
+        # ci.yml: Ubuntu 24.04 blocks unprivileged user namespaces by
+        # default, which `bwrap`'s `unshare(CLONE_NEWUSER)` needs.
         working-directory: .github/ci-deps
         run: |
-          sudo apt-get install -y tmux
+          sudo apt-get install -y tmux bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           npm install --ignore-scripts
           node node_modules/@anthropic-ai/claude-code/install.cjs
           echo "${GITHUB_WORKSPACE}/.github/ci-deps/node_modules/.bin" >> "$GITHUB_PATH"

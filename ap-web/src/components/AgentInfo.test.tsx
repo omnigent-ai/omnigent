@@ -81,7 +81,7 @@ describe("AgentInfoButton", () => {
 
     // Name header plus every server and policy name proves the full
     // agent object flowed into the popover (not just structure).
-    expect(screen.getByText("databricks_coding_agent")).toBeInTheDocument();
+    expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
     expect(screen.getByText("Codes against Databricks.")).toBeInTheDocument();
     expect(screen.getByText("slack")).toBeInTheDocument();
     expect(screen.getByText("jira")).toBeInTheDocument();
@@ -95,7 +95,7 @@ describe("AgentInfoButton", () => {
       mcp_servers: [{ name: "tools", transport: "http" }],
     });
     fireEvent.click(screen.getByTestId("agent-info-trigger"));
-    expect(screen.getByText("claude")).toBeInTheDocument();
+    expect(screen.getByText("Claude")).toBeInTheDocument();
     expect(screen.queryByText("claude-native-ui")).toBeNull();
   });
 });
@@ -133,7 +133,7 @@ describe("AgentInfoButton session cost row", () => {
     renderButtonWithSession(AGENT_WITH_BOTH, "conv_cost");
     fireEvent.click(screen.getByTestId("agent-info-trigger"));
     // The rest of the popover still renders (agent name proves it opened).
-    expect(screen.getByText("databricks_coding_agent")).toBeInTheDocument();
+    expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
     expect(screen.queryByTestId("agent-info-session-cost")).toBeNull();
   });
 });
@@ -208,7 +208,7 @@ describe("AgentInfoButton per-model usage breakdown", () => {
     renderButtonWithSession(AGENT_WITH_BOTH, "conv_models");
     fireEvent.click(screen.getByTestId("agent-info-trigger"));
     // The popover still opens (agent name proves it), but no breakdown.
-    expect(screen.getByText("databricks_coding_agent")).toBeInTheDocument();
+    expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
     expect(screen.queryByTestId("agent-info-usage-by-model")).toBeNull();
   });
 });

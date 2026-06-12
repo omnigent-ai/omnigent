@@ -66,8 +66,8 @@ def test_right_panel_terminals_and_file_viewer(
 
     try:
         page.goto(f"{base_url}/c/{session_id}")
-        # The rail defaults closed per session; open it so the Shells tab and
-        # Files panel below are reachable.
+        # The rail defaults open but is remembered per session; ensure it is
+        # open so the Shells tab and Files panel below are reachable.
         open_right_rail(page)
 
         composer = page.get_by_placeholder("Ask the agent anything…")

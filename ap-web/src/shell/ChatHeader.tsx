@@ -172,11 +172,6 @@ export function ChatHeader({
         // conversation viewport fades its top edge instead (chat-scroll-fade
         // in index.css, applied in ChatPage).
         "absolute inset-x-0 top-0 z-30 flex h-14 items-center justify-between px-2 py-3",
-        // With the sidebar closed this header's left edge reaches the
-        // window corner, where the macOS Electron shell's traffic lights
-        // float — drop the header below them, matching the sidebar's own
-        // electron top margin. Inert outside the shell (see index.css).
-        !sidebarOpen && "traffic-light-clearance",
       )}
     >
       {/* Left slot: sidebar toggle (when sidebar is closed) and a
@@ -185,7 +180,11 @@ export function ChatHeader({
           sidebar row — on a phone the sidebar is collapsed and the
           nesting is invisible, so this affordance is the only way
           out of a child session without opening the sidebar. */}
-      <div className="flex items-center gap-1">
+      {/* With the sidebar closed this slot reaches the window corner,
+          where the macOS Electron shell's traffic lights float — drop
+          just this slot below them (the right action cluster stays up
+          in the title-bar strip). Inert outside the shell (index.css). */}
+      <div className={cn("flex items-center gap-1", !sidebarOpen && "traffic-light-clearance")}>
         {!sidebarOpen && (
           <Tooltip>
             <TooltipTrigger asChild>

@@ -65,7 +65,8 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { type Agent, useSessionAgent, useAgents } from "@/hooks/useAgents";
-import { AGENT_DISPLAY_NAMES } from "@/components/AgentInfo";
+import { agentDisplayLabel } from "@/components/AgentInfo";
+import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
 import { useConversations } from "@/hooks/useConversations";
 import { usePermissions } from "@/hooks/usePermissions";
 import type { SandboxStatus, Session, SessionStatus } from "@/lib/types";
@@ -3591,7 +3592,12 @@ function AgentPicker({
   // controls.
   const showAgents = !isClaudeNative && (agents?.length ?? 0) > 1;
   const rawAgentName = agents?.find((a) => a.id === selectedId)?.name ?? agents?.[0]?.name;
-  const agentDisplayName = AGENT_DISPLAY_NAMES[rawAgentName ?? ""] ?? rawAgentName;
+  const agentDisplayName = rawAgentName ? agentDisplayLabel(rawAgentName) : rawAgentName;
+  // Effective brain harness from the session snapshot (override-aware).
+  // Only the SDK brain harnesses get a pill suffix — native wrappers
+  // already use their own "Claude" branch below.
+  const sessionHarness = useChatStore((s) => s.sessionHarness);
+  const harnessLabel = sessionHarness ? (BRAIN_HARNESS_LABELS[sessionHarness] ?? null) : null;
 
   // Build the pill piece-by-piece so empty selections don't leave
   // stray separators.
@@ -3609,7 +3615,11 @@ function AgentPicker({
     // dropdown, so spelling them out here only costs horizontal space.
     triggerLabel = "Claude";
   } else {
-    const parts = [agentDisplayName, effortLabel].filter(
+    // The harness reads as part of the identity — "Polly (Pi)" — while
+    // effort stays a separate " · "-joined segment.
+    const nameWithHarness =
+      agentDisplayName && harnessLabel ? `${agentDisplayName} (${harnessLabel})` : agentDisplayName;
+    const parts = [nameWithHarness, effortLabel].filter(
       (p): p is string => p != null && p.length > 0,
     );
     triggerLabel = parts.join(" · ");
@@ -3650,7 +3660,7 @@ function AgentPicker({
                 )}
               >
                 <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-                  <span className="truncate">{AGENT_DISPLAY_NAMES[a.name] ?? a.name}</span>
+                  <span className="truncate">{agentDisplayLabel(a.name)}</span>
                   {a.description && (
                     <span className="truncate text-xs text-muted-foreground">{a.description}</span>
                   )}

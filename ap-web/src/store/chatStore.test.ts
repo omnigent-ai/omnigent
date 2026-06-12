@@ -4888,6 +4888,197 @@ describe("chatStore — pumpStreamEvents frame batching", () => {
     controller.abort();
   });
 
+  it("stamps a persisted message's id onto the streamed text in the buffer instead of duplicating it", async () => {
+    // Regression: the relay persists each streamed text segment at a
+    // tool-call boundary and publishes it as output_item.done(message)
+    // so clients learn its store-assigned id (#3146). The tool_call has
+    // already closed the streamed text id-less by then, so the
+    // reducer's open-section dedupe can't catch the event — the pump
+    // must match it back to the streamed text_done by content and stamp
+    // the id in place, not append a second copy.
+    useChatStore.setState({ conversationId: "conv_stamp", blocks: [] });
+    const sink = pushableStream();
+    const controller = new AbortController();
+    const manual = manualScheduler();
+    void pumpStreamEvents(
+      "conv_stamp",
+      sink.stream,
+      controller,
+      setState,
+      getState,
+      manual.scheduler,
+    );
+
+    const segment = "Got it — dispatching to all three vendors now.";
+    sink.push(sse("response.created", { id: "resp_s", status: "in_progress", output: [] }));
+    sink.push(sse("response.output_text.delta", { delta: segment }));
+    // claude-sdk tool call: the reducer closes the streamed text
+    // (id-less text_done) and yields the tool group.
+    sink.push(
+      sse("response.output_item.done", {
+        item: {
+          type: "function_call",
+          id: "fc_s",
+          call_id: "call_s",
+          name: "sys_session_send",
+          arguments: "{}",
+          response_id: "resp_s",
+        },
+      }),
+    );
+    // The relay's mid-turn flush publish: the persisted copy of the
+    // exact text that just streamed.
+    sink.push(
+      sse("response.output_item.done", {
+        item: {
+          id: "msg_seg1",
+          response_id: "resp_s",
+          type: "message",
+          status: "completed",
+          role: "assistant",
+          content: [{ type: "output_text", text: segment }],
+          model: "polly",
+        },
+      }),
+    );
+    await tick();
+    manual.fire();
+
+    const blocks = useChatStore.getState().blocks;
+    const dones = blocks.filter((b) => b.type === "text_done");
+    // Exactly one rendered copy of the segment. If 2, the mid-turn
+    // duplication regressed: the persisted copy appended next to the
+    // streamed one ("◆ agent + same text" after the tool call).
+    expect(dones).toHaveLength(1);
+    expect(dones[0]!.type === "text_done" && dones[0]!.fullText).toBe(segment);
+    // The streamed block now carries the persisted item's id, so
+    // reconnect reconciliation (itemId-keyed) won't splice the
+    // persisted copy in as a duplicate — the original #3146 hole.
+    expect(dones[0]!.ctx.itemId).toBe("msg_seg1");
+    // The text keeps its streamed position ABOVE the tool call; an
+    // appended copy would render below it.
+    const types = blocks.map((b) => b.type);
+    expect(types.indexOf("text_done")).toBeLessThan(types.indexOf("tool_group"));
+
+    controller.abort();
+  });
+
+  it("stamps the persisted message's id onto streamed text already committed to the store", async () => {
+    // Same scenario as above, but the frame flush fires BETWEEN the
+    // tool call and the persisted-message publish, so the id-less
+    // streamed text_done is already in state.blocks (not the frame
+    // buffer) when the message event arrives. The pump must stamp it
+    // in place via the store path.
+    useChatStore.setState({ conversationId: "conv_stamp2", blocks: [] });
+    const sink = pushableStream();
+    const controller = new AbortController();
+    const manual = manualScheduler();
+    void pumpStreamEvents(
+      "conv_stamp2",
+      sink.stream,
+      controller,
+      setState,
+      getState,
+      manual.scheduler,
+    );
+
+    const segment = "All three workers are live. Dispatching now.";
+    sink.push(sse("response.created", { id: "resp_s2", status: "in_progress", output: [] }));
+    sink.push(sse("response.output_text.delta", { delta: segment }));
+    sink.push(
+      sse("response.output_item.done", {
+        item: {
+          type: "function_call",
+          id: "fc_s2",
+          call_id: "call_s2",
+          name: "sys_os_shell",
+          arguments: "{}",
+          response_id: "resp_s2",
+        },
+      }),
+    );
+    await tick();
+    // Commit the buffered id-less text_done + tool_group to the store
+    // before the persisted-message event arrives.
+    manual.fire();
+    const committedAt = useChatStore
+      .getState()
+      .blocks.findIndex((b) => b.type === "text_done" && !b.ctx.itemId);
+    // Setup check: the streamed text committed id-less (the state the
+    // relay's publish must reconcile against).
+    expect(committedAt).toBeGreaterThanOrEqual(0);
+
+    sink.push(
+      sse("response.output_item.done", {
+        item: {
+          id: "msg_seg2",
+          response_id: "resp_s2",
+          type: "message",
+          status: "completed",
+          role: "assistant",
+          content: [{ type: "output_text", text: segment }],
+          model: "polly",
+        },
+      }),
+    );
+    await tick();
+    manual.fire();
+
+    const blocks = useChatStore.getState().blocks;
+    const dones = blocks.filter((b) => b.type === "text_done");
+    // One copy, stamped in place at its original index — not appended.
+    expect(dones).toHaveLength(1);
+    expect(dones[0]!.ctx.itemId).toBe("msg_seg2");
+    expect(blocks.findIndex((b) => b.type === "text_done")).toBe(committedAt);
+
+    controller.abort();
+  });
+
+  it("appends a persisted message whose text never streamed (non-streamed harness)", async () => {
+    // The stamp path must not swallow real content: a message item
+    // whose text has no streamed counterpart (no matching id-less
+    // text_done) is new content and must render.
+    useChatStore.setState({ conversationId: "conv_nostream", blocks: [] });
+    const sink = pushableStream();
+    const controller = new AbortController();
+    const manual = manualScheduler();
+    void pumpStreamEvents(
+      "conv_nostream",
+      sink.stream,
+      controller,
+      setState,
+      getState,
+      manual.scheduler,
+    );
+
+    sink.push(sse("response.created", { id: "resp_ns", status: "in_progress", output: [] }));
+    sink.push(
+      sse("response.output_item.done", {
+        item: {
+          id: "msg_ns",
+          response_id: "resp_ns",
+          type: "message",
+          status: "completed",
+          role: "assistant",
+          content: [{ type: "output_text", text: "Non-streamed reply." }],
+          model: "polly",
+        },
+      }),
+    );
+    await tick();
+    manual.fire();
+
+    const dones = useChatStore.getState().blocks.filter((b) => b.type === "text_done");
+    // The message rendered (no streamed copy existed to stamp). If 0,
+    // the stamp branch wrongly consumed a message with no streamed
+    // counterpart and dropped real content.
+    expect(dones).toHaveLength(1);
+    expect(dones[0]!.type === "text_done" && dones[0]!.fullText).toBe("Non-streamed reply.");
+    expect(dones[0]!.ctx.itemId).toBe("msg_ns");
+
+    controller.abort();
+  });
+
   it("drops a buffered block whose item a snapshot merge committed before the flush", async () => {
     useChatStore.setState({ conversationId: "conv_bufdup", blocks: [] });
     const sink = pushableStream();

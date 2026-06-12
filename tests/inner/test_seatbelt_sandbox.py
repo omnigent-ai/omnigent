@@ -35,7 +35,7 @@ from unittest.mock import patch
 import pytest
 
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.sandbox import SandboxPolicy
+from omnigent.inner.sandbox import SandboxPolicy, with_denied_unix_sockets
 from omnigent.inner.seatbelt_sandbox import (
     _DEFAULT_CWD_ALLOW_HIDDEN,
     _DEFAULT_READ_SUBPATHS,
@@ -587,6 +587,54 @@ def test_profile_network_section_for_allow_network_false_no_egress(
     assert "(allow network-bind" not in profile
     assert "(allow network-outbound" not in profile
     assert "(allow network-inbound" not in profile
+
+
+def test_profile_denies_unix_control_socket_after_allow_network(
+    tmp_path: Path,
+) -> None:
+    """
+    A denied AF_UNIX socket emits a ``(deny network-outbound (remote
+    unix-socket (path-literal <realpath>)))`` rule, and it lands AFTER
+    the broad ``(allow network*)``.
+
+    SBPL is last-match-wins, so with ``allow_network=True`` the broad
+    allow would otherwise let the pane ``connect(2)`` to the tmux
+    control socket. The deny must come last to win. We assert the rule
+    text uses the canonical realpath (the kernel canonicalises before
+    matching, e.g. ``/var`` → ``/private/var``) and that its line index
+    is greater than the allow's.
+    """
+    sock = tmp_path / "inst" / "tmux.sock"
+    policy = _make_policy(tmp_path, allow_network=True)
+    policy = with_denied_unix_sockets(policy, [sock])
+
+    profile = _build_profile(policy, tmp_path.resolve(strict=False))
+    lines = profile.splitlines()
+
+    canonical = str(Path(sock).resolve(strict=False))
+    deny_rule = f'(deny network-outbound (remote unix-socket (path-literal "{canonical}")))'
+    assert deny_rule in lines, f"missing socket deny rule; profile was:\n{profile}"
+    assert "(allow network*)" in lines
+    assert lines.index(deny_rule) > lines.index("(allow network*)"), (
+        "socket deny rule must follow (allow network*) — SBPL last-match-wins, "
+        "so a deny emitted before the broad allow would be overridden and the "
+        "tmux control socket would stay reachable."
+    )
+
+
+def test_profile_no_unix_socket_deny_when_list_empty(tmp_path: Path) -> None:
+    """
+    With no ``deny_unix_socket_paths`` the profile emits no
+    ``unix-socket`` deny rule — the containment is opt-in and must not
+    appear for ordinary sandboxes (a stray deny could break a
+    legitimate egress unix-socket allow).
+    """
+    policy = _make_policy(tmp_path, allow_network=True)
+    assert policy.deny_unix_socket_paths is None
+
+    profile = _build_profile(policy, tmp_path.resolve(strict=False))
+
+    assert "(deny network-outbound (remote unix-socket" not in profile
 
 
 def test_profile_network_section_for_active_egress_emits_narrow_allows(

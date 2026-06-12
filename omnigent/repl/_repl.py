@@ -15,7 +15,7 @@ import os
 import pathlib
 import sys
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol, TextIO
 
 from omnigent_client import (
@@ -2356,6 +2356,105 @@ def _plan_output_item_render(
     return _OutputItemRenderPlan(flush_inflight_text=False, render_item=False)
 
 
+@dataclass
+class _TurnProseTracker:
+    """
+    Streamed assistant prose bookkeeping for duplicate-item detection.
+
+    The relay persists each streamed text segment at a tool-call
+    boundary and publishes the persisted item as
+    ``response.output_item.done`` so clients learn its store-assigned id
+    (``_flush_relay_text`` in ``omnigent/server/routes/sessions.py``).
+    By the time that event reaches the REPL, the tool-call item that
+    triggered the flush has already committed the in-flight prose — the
+    delta-based skip (``saw_text_deltas``) sees nothing in flight and
+    would re-render the whole segment as a fresh "◆ agent + text" block.
+
+    This tracker remembers the turn's streamed prose per committed
+    segment so an assistant ``message`` item can be matched back (by
+    byte-equal text) to prose the user already watched stream, and
+    suppressed. Matching consumes the entry — multiset semantics, so a
+    turn that legitimately produces two identical segments still gets
+    its second copy matched by the second published item, and a
+    genuinely non-streamed assistant message (no matching entry) still
+    renders.
+
+    :param segment_parts: Delta strings of the current (uncommitted)
+        text segment in arrival order, e.g. ``["Got it — ", "done."]``.
+    :param committed_texts: Joined text of each segment committed this
+        turn, e.g. ``["Got it — done."]``.
+    """
+
+    segment_parts: list[str] = field(default_factory=list)
+    committed_texts: list[str] = field(default_factory=list)
+
+    def on_delta(self, delta: str) -> None:
+        """
+        Accumulate one streamed text delta into the current segment.
+
+        :param delta: The ``response.output_text.delta`` text,
+            e.g. ``"Got it — "``.
+        """
+        self.segment_parts.append(delta)
+
+    def commit_segment(self) -> None:
+        """
+        Move the current segment into the committed list.
+
+        Called when in-flight prose is committed at a content-block
+        boundary (tool call, assistant ``message`` item). No-op when no
+        deltas streamed since the last commit.
+        """
+        if self.segment_parts:
+            self.committed_texts.append("".join(self.segment_parts))
+            self.segment_parts.clear()
+
+    def reset_turn(self) -> None:
+        """
+        Drop all bookkeeping at a turn boundary.
+
+        A new turn's prose must not be matched against (or suppressed
+        by) the previous turn's segments.
+        """
+        self.segment_parts.clear()
+        self.committed_texts.clear()
+
+    def consume_match(self, item: dict[str, object]) -> bool:
+        """
+        Match an assistant ``message`` item against committed prose.
+
+        Joins the item's ``output_text`` content blocks and looks for a
+        byte-equal committed segment. A match means the item is the
+        relay's persisted copy of prose that already streamed, so
+        rendering it would duplicate the segment. The matched entry is
+        consumed.
+
+        :param item: The ``output_item.done`` item dict, e.g.
+            ``{"type": "message", "role": "assistant", "content":
+            [{"type": "output_text", "text": "Got it — done."}]}``.
+        :returns: ``True`` when the item's text matched (and consumed) a
+            committed streamed segment; ``False`` when the item carries
+            no output text or nothing matched.
+        """
+        content = item.get("content")
+        if not isinstance(content, list):
+            return False
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "output_text":
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        if not parts:
+            return False
+        joined = "".join(parts)
+        try:
+            self.committed_texts.remove(joined)
+        except ValueError:
+            return False
+        return True
+
+
 def _render_failed_status_error(
     fmt: RichBlockFormatter,
     host: TerminalHost,
@@ -2626,6 +2725,11 @@ async def run_repl(
     # in output_item.done (type=message, role=assistant) after the
     # same prose already streamed as deltas.
     _saw_text_deltas = False
+    # Streamed-prose bookkeeping for the relay's persisted-segment
+    # publishes: matches an assistant ``message`` output item back to
+    # prose that already streamed this turn so it isn't re-rendered as
+    # a duplicate "◆ agent + text" block. See :class:`_TurnProseTracker`.
+    _prose_tracker = _TurnProseTracker()
     # Tracks whether the most-recent ResponseCompleted event carried
     # provider-reported usage. Reset to False at each "running" status
     # (new turn begins) so the idle-event local-estimate fallback fires
@@ -2666,6 +2770,11 @@ async def run_repl(
         flush_items = list(fmt.format_message_done())
         for it in flush_items:
             host.output(it)
+        # Remember the committed segment's text so the relay's
+        # persisted-item publish for it (an assistant ``message``
+        # output_item.done arriving after a tool call reset
+        # ``_saw_text_deltas``) is recognized as already rendered.
+        _prose_tracker.commit_segment()
         _saw_text_deltas = False
         return flush_items
 
@@ -2741,6 +2850,10 @@ async def run_repl(
                 from omnigent_client import BlockContext, ResponseStartBlock
 
                 _saw_text_deltas = False
+                # New turn: drop the prior turn's streamed-segment
+                # bookkeeping so its prose can't suppress a later,
+                # legitimately identical assistant message.
+                _prose_tracker.reset_turn()
                 _context_ring_state[0] = False  # reset: new turn, provider usage unknown yet
                 host.start_timer()
                 # Local name distinct from run_repl's `agent_name` param:
@@ -2885,6 +2998,7 @@ async def run_repl(
             from omnigent_client import TextChunk
 
             _saw_text_deltas = True
+            _prose_tracker.on_delta(sdk_ev.delta)
             items_out = list(fmt.format_text_chunk(TextChunk(text=sdk_ev.delta)))
             if tape_entry is not None:
                 _event_tape.update_format(tape_entry, items_out)  # type: ignore[union-attr]
@@ -3016,7 +3130,24 @@ async def run_repl(
                         _event_tape.update_format(tape_entry, [])  # type: ignore[union-attr]
                         _maybe_log_tape_entry(tape_entry)
                     return
-                plan = _plan_output_item_render(item_type, item.get("role"), _saw_text_deltas)
+                # An assistant message whose prose is no longer in flight
+                # may still be a duplicate: the relay publishes each
+                # persisted text segment as an output_item.done AFTER the
+                # tool-call boundary already committed the streamed prose
+                # (resetting ``_saw_text_deltas``). Matching the item's
+                # text against the turn's committed segments catches that
+                # — see :class:`_TurnProseTracker`.
+                _streamed_match = (
+                    item_type == "message"
+                    and item.get("role") == "assistant"
+                    and not _saw_text_deltas
+                    and _prose_tracker.consume_match(item)
+                )
+                plan = _plan_output_item_render(
+                    item_type,
+                    item.get("role"),
+                    _saw_text_deltas or _streamed_match,
+                )
                 should_render = plan.render_item
                 # When ``True``, the message-boundary flush below already
                 # recorded the tape entry; the trailing ``elif`` must
@@ -3027,6 +3158,16 @@ async def run_repl(
                     # message; commit the trailing tail at the boundary
                     # instead of re-rendering the full item.
                     flush_items = _flush_inflight_assistant_text()
+                    # The flush just recorded this segment's text; this
+                    # item IS that segment's persisted copy, so consume
+                    # the entry — a stale one could wrongly suppress a
+                    # later identical (non-streamed) message this turn.
+                    # Skipped when ``_streamed_match`` already consumed
+                    # its entry above (the flush was then a no-op, and a
+                    # second consume could eat a different identical
+                    # segment's entry).
+                    if not _streamed_match:
+                        _prose_tracker.consume_match(item)
                     if tape_entry is not None:
                         _event_tape.update_format(tape_entry, flush_items)  # type: ignore[union-attr]
                         if flush_items:

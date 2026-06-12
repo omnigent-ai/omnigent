@@ -1,4 +1,4 @@
-"""Bounds and blast-radius policies for the nessie coding orchestrator.
+"""Bounds and blast-radius policies for the coding orchestrator.
 
 Each public function is a :class:`FunctionPolicy` *factory*: it takes the
 YAML ``factory_params`` as keyword arguments and returns an evaluator
@@ -346,7 +346,7 @@ def _push_severity(argv: list[str]) -> str | None:
 def blast_radius(
     *,
     gate_pushes: bool = True,
-    deny_reason: str = "Blocked by nessie blast-radius policy.",
+    deny_reason: str = "Blocked by the blast-radius policy.",
 ) -> Callable[[_Json, _Json], _Json]:
     """
     Factory: gate high-blast-radius shell commands by reversibility.
@@ -415,8 +415,8 @@ def spawn_bounds(
 
     Counts the *dispatch_tools* tool calls within a single orchestrator turn
     and DENIES once *max_dispatches_per_turn* is exceeded, forcing fan-out in
-    bounded waves rather than an unbounded fleet. nessie dispatches every
-    worker through a sub-agent send (``sys_session_send``), so that is the
+    bounded waves rather than an unbounded fleet. The orchestrator dispatches
+    every worker through a sub-agent send (``sys_session_send``), so that is the
     default counted tool. The counter resets each turn via the ``reset_turn``
     hook the runner calls (``omnigent/runner/policy.py``). This is the v1
     concurrency bound; true cross-turn live-concurrency accounting is a v1.x
@@ -478,7 +478,7 @@ def headless_subagent_purpose_guard(
     """
     Factory: require every ``sys_session_send`` to declare its ``args.purpose``.
 
-    nessie delegates all work through sub-agents, so each dispatch must be
+    The orchestrator delegates all work through sub-agents, so each dispatch must be
     tagged with an explicit ``args.purpose`` drawn from *allowed_purposes*.
     The policy fails loud on an unmarked or out-of-set purpose, keeping
     dispatches intentional rather than letting the model spawn a sub-agent

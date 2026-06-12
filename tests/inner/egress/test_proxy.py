@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import socket
 import ssl
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -355,7 +356,7 @@ async def test_s2_assert_destination_fails_closed_on_dns_error(
     """A DNS resolution failure (``socket.gaierror``) MUST raise
     :exc:`PermissionError` (fail closed), not return silently.
 
-    This is the core SEC-20576 fix: the pre-fix code caught
+    This is the core DNS-rebinding fix: the pre-fix code caught
     ``gaierror`` and returned (fail open), after which the connect
     path re-resolved the hostname — letting an attacker who fails the
     first lookup return a private IP on the second. Failing closed
@@ -380,9 +381,9 @@ async def test_s2_dns_rebinding_fail_then_loopback_is_blocked_e2e(
     ca_paths: tuple[Path, Path, Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """End-to-end SEC-20576 regression through the public proxy.
+    """End-to-end DNS-rebinding regression through the public proxy.
 
-    Reproduces the ticket's PoC: the attacker-controlled host fails
+    Reproduces the attack PoC: the attacker-controlled host fails
     the first DNS lookup and resolves to ``127.0.0.1`` on the next.
     A real loopback HTTP server returns a marker body; the test
     asserts the proxy returns ``403`` and the marker is NEVER seen,
@@ -467,7 +468,7 @@ async def test_s2_dns_rebinding_fail_then_loopback_is_blocked_e2e(
         "A non-403 means _assert_destination_allowed no longer fails closed."
     )
     # The loopback origin must never be reached. The marker appearing
-    # is the literal SEC-20576 exploit succeeding.
+    # is the literal DNS-rebinding exploit succeeding.
     assert marker not in response, (
         "Private loopback destination was reached despite the block — "
         "DNS-rebinding bypass has regressed."
@@ -1059,7 +1060,7 @@ async def test_s5_http_rejects_unsafe_host_before_dns(
 # already-allow-listed host. The fix rejects control bytes in the inner
 # request line AND re-serializes the forwarded request line from the
 # parsed (method, path) so the policy decision and the forwarded bytes
-# can never diverge. See SEC-20585.
+# can never diverge.
 # ---------------------------------------------------------------------------
 
 
@@ -1125,7 +1126,7 @@ async def test_s6_connect_rejects_control_byte_in_inner_request_line(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A bare ``\\r`` in the inner request line is rejected with 403 and
-    is NEVER forwarded upstream (SEC-20585 proof-of-concept).
+    is NEVER forwarded upstream (request-smuggling proof-of-concept).
 
     Without the fix the proxy parsed ``GET /repos/myorg/allowed`` (the
     policy-allowed view) but forwarded the raw bytes
@@ -1269,3 +1270,179 @@ async def test_s6_connect_reserializes_request_line_to_upstream(
         await proxy.stop()
         upstream.close()
         await upstream.wait_closed()
+
+
+# ---------------------------------------------------------------------------
+# Upstream trust anchor pinned at construction, not re-read per request
+#
+# The proxy's upstream TLS verification context MUST be built once in
+# ``__init__`` from the configured CA bundle and reused for every
+# request. The vulnerable implementation called
+# ``ssl.create_default_context(cafile=str(self._upstream_ca_bundle))``
+# inside ``_forward_https`` on EVERY request. Because the controller
+# handed it a copy of the bundle living in the sandbox-writable scratch
+# tmpdir, a sandboxed agent could append its own CA (so the parent
+# trusts attacker-issued certs for allow-listed upstreams) or truncate
+# the file (self-DoS) and the change would take effect on the next
+# forward. The fix sources the context from the host-only bundle and
+# pins it at construction.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _TunnelProbeOutcome:
+    """Result of a single HTTPS-over-CONNECT request through the proxy.
+
+    Captures either the inner HTTP status the proxy returned over the
+    established TLS tunnel, or the client-side exception that ended the
+    request before any status arrived (a torn tunnel).
+
+    :param status: The inner HTTP status code the proxy returned over
+        the MITM tunnel, e.g. ``502``. ``None`` when the tunnel was
+        torn before a response line was read.
+    :param error: ``"<ExcType>: <msg>"`` for the client-side exception
+        that ended the request, e.g.
+        ``"RemoteDisconnected: Remote end closed connection ..."``.
+        ``None`` on a clean response.
+    """
+
+    status: int | None
+    error: str | None
+
+
+def _tunnel_get_through_proxy(
+    proxy_port: int, ca_bundle_pem: str, host: str
+) -> _TunnelProbeOutcome:
+    """Issue ``GET https://<host>/`` through the MITM proxy and report
+    the inner status (or the tearing exception).
+
+    Runs the blocking ``http.client`` tunnel client so it can be driven
+    from an async test via :func:`asyncio.to_thread` without touching
+    the proxy's event loop. The client trusts the MITM CA via *in-memory*
+    PEM (``cadata``) rather than a file path, so the test can delete the
+    proxy's configured bundle without disturbing the client's own trust.
+
+    :param proxy_port: Loopback TCP port the :class:`EgressProxy` is
+        listening on (from ``start_tcp``).
+    :param ca_bundle_pem: The MITM CA bundle as PEM text, used to build
+        the client's trust store so the inner TLS handshake against the
+        proxy's synthesized leaf cert succeeds.
+    :param host: The CONNECT target / inner ``Host`` (a DNS name so the
+        MITM leaf's DNS SAN matches), e.g. ``"allowed.test"``.
+    :returns: A :class:`_TunnelProbeOutcome` describing what the client
+        observed.
+    """
+    import http.client
+
+    ctx = ssl.create_default_context(cadata=ca_bundle_pem)
+    conn = http.client.HTTPSConnection("127.0.0.1", proxy_port, context=ctx, timeout=10)
+    try:
+        conn.set_tunnel(host, 443)
+        conn.request("GET", "/", headers={"Host": host, "Connection": "close"})
+        resp = conn.getresponse()
+        return _TunnelProbeOutcome(status=resp.status, error=None)
+    except Exception as exc:
+        # The test deliberately captures any client-side exception (e.g.
+        # RemoteDisconnected from a torn tunnel) as the regression signal.
+        return _TunnelProbeOutcome(status=None, error=f"{type(exc).__name__}: {exc}")
+    finally:
+        with contextlib.suppress(Exception):
+            conn.close()
+
+
+@pytest.mark.asyncio
+async def test_upstream_ca_pinned_at_construction_not_reread_per_request(
+    ca_paths: tuple[Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The upstream verification context is built ONCE at construction;
+    mutating/removing the configured CA bundle file afterward does NOT
+    affect request handling.
+
+    This is the regression guard for the upstream-CA-bundle re-read
+    vulnerability. The probe completes a real MITM TLS tunnel to an
+    allow-listed host and sends an inner GET. DNS
+    for that host is stubbed to fail, so the proxy reaches the upstream
+    connect and returns ``502`` — proving ``_forward_https`` ran all the
+    way to the upstream open (which requires the upstream SSL context to
+    have been built successfully).
+
+    We then DELETE the bundle file the proxy was constructed with and
+    repeat the request. With the fix, the proxy reuses the context it
+    pinned in ``__init__`` and still returns ``502``. With the
+    vulnerable code (``ssl.create_default_context(cafile=...)`` on every
+    request), the now-missing file raises ``FileNotFoundError`` inside
+    ``_forward_https``, the handler aborts, and the client sees a torn
+    tunnel (no inner status) — so this test would fail. Deleting the
+    file stands in for the agent mutating the sandbox-writable copy the
+    vulnerable controller passed in: if the proxy re-reads it per
+    request, the agent's change takes effect.
+    """
+    cert_path, key_path, bundle_path = ca_paths
+    upstream_host = "allowed.test"
+    proxy = EgressProxy(
+        parse_rules([f"GET {upstream_host}/**"]),
+        cert_path,
+        key_path,
+        # The configured bundle — the proxy must read this exactly once,
+        # here, and never again. The test deletes it mid-flight below.
+        upstream_ca_bundle=bundle_path,
+        # Skip the private-destination guard so the destination check
+        # doesn't resolve DNS itself (it fails closed on a DNS error).
+        # We want the request to reach the upstream open_connection and
+        # fail THERE, yielding a 502 we can observe over the tunnel.
+        block_private_destinations=False,
+    )
+    port = await proxy.start_tcp()
+
+    # Stub DNS so the upstream open_connection fails deterministically
+    # (offline, no real network) and the proxy returns 502 instead of
+    # dialing a real host. Loopback still resolves so the test client
+    # can reach the proxy's listener.
+    loop = asyncio.get_event_loop()
+    real_getaddrinfo = loop.getaddrinfo
+
+    async def _stub_getaddrinfo(host: str, port: int, **kwargs: object) -> list:
+        if host in ("127.0.0.1", "localhost", "::1"):
+            return await real_getaddrinfo(host, port, **kwargs)  # type: ignore[arg-type]
+        raise socket.gaierror(socket.EAI_NONAME, f"stubbed NXDOMAIN for {host}")
+
+    monkeypatch.setattr(loop, "getaddrinfo", _stub_getaddrinfo)
+
+    # Read the MITM CA into memory once so the client's trust survives
+    # the file deletion that simulates the attacker's mutation.
+    ca_bundle_pem = bundle_path.read_text()
+
+    try:
+        # Baseline: with the bundle present, the proxy builds the
+        # upstream context, attempts the (stubbed-to-fail) upstream
+        # connect, and returns 502 over the tunnel. 502 here proves
+        # _forward_https reached the upstream-open stage.
+        before = await asyncio.to_thread(
+            _tunnel_get_through_proxy, port, ca_bundle_pem, upstream_host
+        )
+        assert before.status == 502, (
+            f"Baseline request did not reach the upstream-connect stage. "
+            f"Expected inner status 502 (upstream DNS stubbed to fail), got "
+            f"status={before.status!r} error={before.error!r}. If this isn't "
+            f"502 the test setup is wrong, not the fix."
+        )
+
+        # Attacker action stand-in: the file the proxy was told to use as
+        # its upstream trust anchor is mutated/removed. A pinned context
+        # is immune; a per-request cafile read is not.
+        bundle_path.unlink()
+
+        after = await asyncio.to_thread(
+            _tunnel_get_through_proxy, port, ca_bundle_pem, upstream_host
+        )
+        assert after.status == 502, (
+            f"After deleting the configured CA bundle, the proxy failed to "
+            f"serve the request (got status={after.status!r} error={after.error!r}). "
+            f"This means _forward_https re-read the now-missing cafile per "
+            f"request (FileNotFoundError tore the tunnel) instead of reusing "
+            f"the context pinned in __init__ — regression: the upstream trust "
+            f"anchor is sourced from a mutable, per-request file read."
+        )
+    finally:
+        await proxy.stop()

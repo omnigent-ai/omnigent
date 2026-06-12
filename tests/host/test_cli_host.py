@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import patch
 
+import psutil
 import pytest
 from click.testing import CliRunner
 
@@ -471,3 +476,73 @@ def test_ensure_host_daemon_skips_if_alive(
 
     # No process should have been spawned.
     assert spawn_count == 0, "Should not spawn a daemon when one is already alive"
+
+
+def test_host_stop_treats_zombie_daemon_as_dead(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Verify ``host stop`` succeeds when the recorded daemon pid is a zombie.
+
+    A daemon process that dies while its parent never reaps it stays in
+    the process table as a zombie. Zombies cannot be signalled, so a
+    liveness check that treats them as alive makes ``host stop`` (even
+    with ``--force``) fail forever with "did not exit" and blocks every
+    subsequent ``host`` start with "already running".
+    """
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+
+    zombie_pid = os.fork()
+    if zombie_pid == 0:
+        os._exit(0)
+    # Wait for the child to exit WITHOUT reaping it, so it stays in the
+    # process table as a zombie. os.waitid(..., WNOWAIT) would block until
+    # exactly that state but is unavailable on macOS Python builds, so poll
+    # the process status with a deadline — the child runs no code, so the
+    # transition happens within microseconds.
+    deadline = time.monotonic() + 30.0
+    while psutil.Process(zombie_pid).status() != psutil.STATUS_ZOMBIE:
+        if time.monotonic() > deadline:
+            pytest.fail("forked child never became a zombie — test setup is broken")
+    try:
+        daemons_dir = tmp_path / "daemons"
+        daemons_dir.mkdir()
+        # The file name must match _daemon_record_path's derivation
+        # (sha256 of the target, truncated) or stop's record cleanup
+        # would unlink a different path than the one written here.
+        record_path = daemons_dir / (hashlib.sha256(b"local").hexdigest()[:16] + ".json")
+        record_path.write_text(
+            json.dumps(
+                {
+                    "pid": zombie_pid,
+                    "target": "local",
+                    "mode": "local",
+                    "server_url": None,
+                    "log_path": None,
+                    "started_at": 1781200000,
+                    "host_id": "host_zombie_test",
+                    "resolved_server_url": None,
+                    "config_sig": None,
+                }
+            )
+        )
+
+        runner = CliRunner()
+        # --daemon-only skips the session-stop HTTP calls; the daemon
+        # process termination path is what the zombie bug breaks.
+        result = runner.invoke(cli, ["host", "stop", "--all", "--daemon-only"])
+    finally:
+        # Reap the zombie so it doesn't outlive the test.
+        os.waitpid(zombie_pid, 0)
+
+    # Exit code 0 proves the zombie was treated as dead. A nonzero exit
+    # ("Daemon ... did not exit; retry with --force.") means the
+    # liveness check saw the unkillable zombie as a live daemon.
+    assert result.exit_code == 0, f"host stop failed for a zombie daemon pid: {result.output}"
+    # The stale registry record must be deleted, otherwise the next
+    # ``host`` start still sees a conflicting "running" daemon.
+    assert not record_path.exists(), (
+        "stale daemon record survived stop — a subsequent host start "
+        "would be blocked by an 'already running' conflict"
+    )

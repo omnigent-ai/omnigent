@@ -1020,6 +1020,28 @@ def _build_profile(
     else:
         lines.append(";; allow_network=false — covered by (deny default); no allow rules emitted")
 
+    # ----------------------------------------------------------------
+    # AF_UNIX control-socket denials.
+    #
+    # Even when the host network is shared (``allow_network=true`` emits
+    # the broad ``(allow network*)`` above), specific pathname AF_UNIX
+    # sockets must stay unreachable so a sandboxed pane cannot
+    # ``connect(2)`` to an unsandboxed control-plane server (e.g. the
+    # managed tmux control socket, whose ``run-shell`` would execute
+    # outside the sandbox). Emitted LAST so the per-socket deny is the
+    # final matching rule (SBPL is last-match-wins), overriding the
+    # broad ``(allow network*)``. The path must be the realpath — the
+    # kernel canonicalises (e.g. ``/var`` → ``/private/var``) before
+    # matching, and an un-canonicalised rule silently fails to match.
+    if policy.deny_unix_socket_paths:
+        lines.append("")
+        lines.append(";; AF_UNIX control-socket denials (last-match-wins)")
+        for sock in policy.deny_unix_socket_paths:
+            canonical = str(Path(sock).resolve(strict=False))
+            lines.append(
+                f"(deny network-outbound (remote unix-socket (path-literal {_quote(canonical)})))"
+            )
+
     return "\n".join(lines) + "\n"
 
 

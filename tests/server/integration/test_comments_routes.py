@@ -530,3 +530,208 @@ async def test_comment_api_serializes_updated_at(
     # stale updated_at means the session fingerprint misses edits.
     assert patched["updated_at"] == 2_000 * us
     assert patched["created_at"] == 1_000
+
+
+# ── Author-only edit/delete (one editor may not rewrite another's comment) ─────
+
+
+async def test_body_edit_is_author_only_status_change_is_shared(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A second editor may resolve another user's comment but not rewrite it.
+
+    Alice and Bob both have ``LEVEL_EDIT`` on the session. Alice authors a
+    comment. Bob — a legitimate editor — must NOT be able to edit the
+    comment's *body* (403, and the stored text is untouched), but he MUST
+    still be able to flip its *status* (the shared review-workflow action
+    the agent and "Address All" also perform). Alice retains full edit
+    rights over her own comment.
+
+    This is the core of the fix: session-level edit access alone no longer
+    authorizes rewriting another user's words. If the body PATCH returns
+    200, the author gate is missing; if the status PATCH returns 403, the
+    gate over-reached into the shared workflow path.
+
+    :param auth_client: HTTP client backed by the auth-enabled app.
+    :param db_uri: Per-test SQLite URI used to seed both edit grants.
+    """
+    session_id = _seed_session_with_grants(
+        db_uri,
+        {"alice@example.com": LEVEL_EDIT, "bob@example.com": LEVEL_EDIT},
+    )
+    comment = await _add_comment(
+        auth_client,
+        session_id,
+        user="alice@example.com",
+        path="src/app.py",
+        body="Alice's note",
+        start_index=0,
+        end_index=5,
+    )
+
+    # Bob cannot rewrite the body of Alice's comment.
+    bob_body_patch = await auth_client.patch(
+        f"/v1/sessions/{session_id}/comments/{comment['id']}",
+        json={"body": "Bob overwrote this"},
+        headers={"X-Forwarded-Email": "bob@example.com"},
+    )
+    assert bob_body_patch.status_code == 403, (
+        f"Expected 403 for a non-author editing another user's comment body, "
+        f"got {bob_body_patch.status_code}. The author gate on body edits is missing."
+    )
+
+    # Decisive: the rejected edit did not mutate the stored body. A 403 that
+    # still wrote the row would mean the gate ran after the store mutation.
+    after_reject = await auth_client.get(
+        f"/v1/sessions/{session_id}/comments",
+        headers={"X-Forwarded-Email": "alice@example.com"},
+    )
+    after_reject.raise_for_status()
+    assert after_reject.json()[0]["body"] == "Alice's note", (
+        "Bob's forbidden body edit still changed the stored text — the author "
+        "check must run before store.update_comment."
+    )
+
+    # Bob CAN mark Alice's comment addressed — status changes stay shared.
+    bob_status_patch = await auth_client.patch(
+        f"/v1/sessions/{session_id}/comments/{comment['id']}",
+        json={"status": "addressed"},
+        headers={"X-Forwarded-Email": "bob@example.com"},
+    )
+    assert bob_status_patch.status_code == 200, (
+        f"Expected 200 for an editor marking another user's comment addressed, "
+        f"got {bob_status_patch.status_code}. The author gate must not apply to "
+        "status-only changes (the agent and 'Address All' rely on this)."
+    )
+    assert bob_status_patch.json()["status"] == "addressed"
+
+    # Alice retains full edit rights over her own comment's body.
+    alice_body_patch = await auth_client.patch(
+        f"/v1/sessions/{session_id}/comments/{comment['id']}",
+        json={"body": "Alice revised her own note"},
+        headers={"X-Forwarded-Email": "alice@example.com"},
+    )
+    assert alice_body_patch.status_code == 200, (
+        f"Author could not edit her own comment body: {alice_body_patch.status_code} "
+        f"{alice_body_patch.text}"
+    )
+    assert alice_body_patch.json()["body"] == "Alice revised her own note"
+
+
+async def test_delete_is_author_only(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A second editor cannot delete another user's comment; the author can.
+
+    Alice and Bob both have ``LEVEL_EDIT``. Bob's attempt to delete Alice's
+    comment must 403 and leave the comment in place; Alice's own delete must
+    succeed and remove it.
+
+    :param auth_client: HTTP client backed by the auth-enabled app.
+    :param db_uri: Per-test SQLite URI used to seed both edit grants.
+    """
+    session_id = _seed_session_with_grants(
+        db_uri,
+        {"alice@example.com": LEVEL_EDIT, "bob@example.com": LEVEL_EDIT},
+    )
+    comment = await _add_comment(
+        auth_client,
+        session_id,
+        user="alice@example.com",
+        path="src/app.py",
+        body="Alice's note",
+        start_index=0,
+        end_index=5,
+    )
+
+    bob_delete = await auth_client.delete(
+        f"/v1/sessions/{session_id}/comments/{comment['id']}",
+        headers={"X-Forwarded-Email": "bob@example.com"},
+    )
+    assert bob_delete.status_code == 403, (
+        f"Expected 403 for a non-author deleting another user's comment, got "
+        f"{bob_delete.status_code}. The author gate on delete is missing."
+    )
+
+    # The comment must survive Bob's forbidden delete.
+    still_there = await auth_client.get(
+        f"/v1/sessions/{session_id}/comments",
+        headers={"X-Forwarded-Email": "alice@example.com"},
+    )
+    still_there.raise_for_status()
+    assert len(still_there.json()) == 1, (
+        "Bob's forbidden delete removed the comment anyway — the author check "
+        "must run before store.delete."
+    )
+
+    # Alice deletes her own comment successfully.
+    alice_delete = await auth_client.delete(
+        f"/v1/sessions/{session_id}/comments/{comment['id']}",
+        headers={"X-Forwarded-Email": "alice@example.com"},
+    )
+    assert alice_delete.status_code == 200, (
+        f"Author could not delete her own comment: {alice_delete.status_code} {alice_delete.text}"
+    )
+    gone = await auth_client.get(
+        f"/v1/sessions/{session_id}/comments",
+        headers={"X-Forwarded-Email": "alice@example.com"},
+    )
+    gone.raise_for_status()
+    assert gone.json() == [], "Author's own delete did not remove the comment."
+
+
+async def test_authorless_comment_editable_by_any_editor(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A comment with no recorded author stays editable/deletable by any editor.
+
+    Legacy comments (created before per-user attribution) and single-user
+    comments have ``created_by is None``. There is no author to protect, so
+    the author gate must fall through and allow any ``LEVEL_EDIT`` collaborator
+    to edit and delete them — otherwise the fix would strand legacy data as
+    permanently uneditable.
+
+    The authorless comment is seeded directly through the store (the POST
+    route always stamps the requesting user, so it cannot produce a
+    ``created_by``-less row).
+
+    :param auth_client: HTTP client backed by the auth-enabled app.
+    :param db_uri: Per-test SQLite URI, used both to seed the grant and to
+        insert the authorless comment via the real comment store.
+    """
+    session_id = _seed_session_with_grants(db_uri, {"bob@example.com": LEVEL_EDIT})
+
+    # Seed a legacy/authorless comment straight into the store.
+    comment = SqlAlchemyCommentStore(db_uri).add(
+        conversation_id=session_id,
+        path="src/legacy.py",
+        body="Legacy note",
+        start_index=0,
+        end_index=4,
+        created_by=None,
+    )
+
+    # Bob (an editor, not the author — there is none) can edit the body.
+    bob_edit = await auth_client.patch(
+        f"/v1/sessions/{session_id}/comments/{comment.id}",
+        json={"body": "Bob updated the legacy note"},
+        headers={"X-Forwarded-Email": "bob@example.com"},
+    )
+    assert bob_edit.status_code == 200, (
+        f"An editor could not edit an authorless comment: {bob_edit.status_code} "
+        f"{bob_edit.text}. The created_by-None fallback is not allowing edits."
+    )
+    assert bob_edit.json()["body"] == "Bob updated the legacy note"
+
+    # And delete it.
+    bob_delete = await auth_client.delete(
+        f"/v1/sessions/{session_id}/comments/{comment.id}",
+        headers={"X-Forwarded-Email": "bob@example.com"},
+    )
+    assert bob_delete.status_code == 200, (
+        f"An editor could not delete an authorless comment: {bob_delete.status_code} "
+        f"{bob_delete.text}."
+    )

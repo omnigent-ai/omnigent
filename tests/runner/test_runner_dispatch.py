@@ -48,7 +48,11 @@ import pytest
 from fastapi import FastAPI
 
 from omnigent.runner import create_runner_app
-from omnigent.runner.app import _build_spawn_env_from_spec, _forward_harness_response
+from omnigent.runner.app import (
+    _build_spawn_env_from_spec,
+    _forward_harness_response,
+    _resolve_harness_config,
+)
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
@@ -1353,6 +1357,67 @@ def test_build_spawn_env_applies_model_override(
     assert base["HARNESS_CLAUDE_SDK_MODEL"] != "claude-sonnet-4-6"
     # … and the override wins, landing in the model env var the SDK reads.
     assert overridden["HARNESS_CLAUDE_SDK_MODEL"] == "claude-sonnet-4-6"
+
+
+@pytest.mark.asyncio
+async def test_resolve_harness_config_applies_harness_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A per-session ``harness_override`` replaces the spec's brain harness.
+
+    The web UI's new-chat picker persists the override on the session and
+    the server forwards it in the message body; the runner must spawn THAT
+    harness (with its spawn-env shape), not the spec's declared one — else
+    the snapshot would claim "pi" while claude-sdk actually runs.
+
+    :param tmp_path: Pytest temp dir for an isolated provider config.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n"
+        "  anthropic:\n"
+        "    kind: key\n"
+        "    default: true\n"
+        "    anthropic:\n"
+        "      base_url: https://api.anthropic.com\n"
+        "      api_key: $ANTHROPIC_API_KEY\n"
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="x",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+
+    async def _resolver(_agent_id: str, _session_id: str | None) -> AgentSpec:
+        return spec
+
+    # Baseline: no override resolves the spec's declared harness.
+    harness, spawn_env = await _resolve_harness_config(
+        agent_id="ag_x", spec_resolver=_resolver, session_id="conv_x"
+    )
+    assert harness == "claude-sdk"
+    assert spawn_env is not None and "HARNESS_CLAUDE_SDK_MODEL" in spawn_env
+
+    # Override: the harness AND its spawn-env shape follow the override.
+    harness, spawn_env = await _resolve_harness_config(
+        agent_id="ag_x",
+        spec_resolver=_resolver,
+        session_id="conv_x",
+        harness_override="pi",
+    )
+    assert harness == "pi", (
+        f"harness_override='pi' resolved to {harness!r} — the override "
+        f"was ignored and the spec's declared harness won."
+    )
+    # The spawn env must be built FOR the overridden harness (pi env keys),
+    # not the spec's claude-sdk shape — a claude env here means the harness
+    # name and env were resolved inconsistently.
+    assert spawn_env is not None and "HARNESS_PI_MODEL" in spawn_env, (
+        f"Expected a pi spawn-env; got keys {sorted(spawn_env or {})!r}"
+    )
 
 
 @pytest.mark.asyncio

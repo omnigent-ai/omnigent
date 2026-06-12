@@ -15,10 +15,10 @@ _DATABRICKSCFG_PATH = Path.home() / ".databrickscfg"
 # `databricks` extra (the add-provider menu, `setup --internal-beta`).
 # Matches the README's canonical `uv tool install` path. Dev clones use
 # `uv sync --extra databricks` instead, but the tool install is the path
-# end users actually took. The repo URL sits on its own line because
-# dev/oss/oss_export.py rewrites it to the (shorter) public slug on
-# export; inlined into the hint string, the rewritten line becomes
-# joinable and public ruff-format flags the shipped file.
+# end users actually took. The repo URL sits on its own line: the slug
+# differs per distribution, and inlining it into the hint string would
+# make the line's width — and therefore its ruff formatting — depend on
+# which slug a checkout carries.
 _SOURCE_REPO_URL = "https://github.com/omnigent-ai/omnigent.git"
 DATABRICKS_EXTRA_INSTALL_HINT = (
     f'uv tool install --force "omnigent[databricks] @ git+{_SOURCE_REPO_URL}"'

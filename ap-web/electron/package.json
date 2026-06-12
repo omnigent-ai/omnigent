@@ -25,6 +25,7 @@
     "directories": {
       "output": "dist"
     },
+    "afterPack": "build/afterPack.js",
     "files": [
       "src/**/*",
       "setup/**/*",
@@ -40,7 +41,8 @@
       "entitlements": "signing/entitlements.mac.plist",
       "entitlementsInherit": "signing/entitlements.mac.inherit.plist",
       "extendInfo": {
-        "NSMicrophoneUsageDescription": "Omnigent uses the microphone for voice dictation in the message composer."
+        "NSMicrophoneUsageDescription": "Omnigent uses the microphone for voice dictation in the message composer.",
+        "CFBundleIconName": "AppIcon"
       },
       "gatekeeperAssess": false,
       "notarize": false,

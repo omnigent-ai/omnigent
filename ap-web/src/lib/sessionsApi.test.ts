@@ -86,6 +86,7 @@ describe("createSession", () => {
       totalCostUsd: undefined,
       usageByModel: null,
       llmModel: undefined,
+      harness: null,
       modelOverride: undefined,
       reasoningEffort: undefined,
       pendingElicitations: [],

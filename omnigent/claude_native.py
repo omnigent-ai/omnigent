@@ -116,6 +116,12 @@ _CLAUDE_CODE_NESTED_SESSION_ENV = "CLAUDECODE"
 _CLAUDE_CODE_API_KEY_HELPER_TTL_ENV = "CLAUDE_CODE_API_KEY_HELPER_TTL_MS"
 _CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV = "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"
 _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
+# Claude Code's agent view (the session list opened by `claude agents`, the
+# left-arrow shortcut on an empty prompt, or /background) lets the user hop to
+# other sessions inside the TUI.  Omnigent owns session switching in its own
+# UI, so a wrapped terminal must stay pinned to the one session the UI thinks
+# it is showing.
+_CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV = "CLAUDE_CODE_DISABLE_AGENT_VIEW"
 # Claude Code env vars that pin each model-tier alias to a provider-specific
 # model ID.  When set, the /model picker shows these IDs as options rather
 # than normalising to canonical Anthropic names (which the Databricks gateway
@@ -271,7 +277,8 @@ def build_native_claude_terminal_env(
     Build env overrides for a native Claude Code terminal process.
 
     Forces MCP Tool Search on so Claude defers MCP tool schemas and
-    loads them on demand.
+    loads them on demand, and disables Claude Code's agent view so the
+    terminal stays pinned to the session the Omnigent UI is showing.
 
     :param claude_config: Optional provider/ucode launch config, e.g.
         one carrying ``{"ANTHROPIC_BASE_URL": "https://example.com"}``.
@@ -281,10 +288,12 @@ def build_native_claude_terminal_env(
     """
     terminal_env = {
         _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV: "true",
+        _CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV: "1",
     }
     if claude_config is not None:
         terminal_env.update(claude_config.env)
         terminal_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "true"
+        terminal_env[_CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV] = "1"
     return terminal_env
 
 

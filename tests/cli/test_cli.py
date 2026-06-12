@@ -2168,6 +2168,29 @@ def test_run_with_agent_unsupported_harness_fails_before_dispatch(
     run_chat.assert_not_called()
 
 
+def test_run_with_agent_accepts_openai_agents_sdk_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--harness openai-agents-sdk`` passes validation and dispatches.
+
+    This is the spelling the project docs use in run examples; before
+    the alias existed, ``_validate_harness`` rejected it as unsupported.
+    """
+    monkeypatch.setattr("omnigent.cli._load_global_config", dict)
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(
+        cli,
+        ["run", "tests/resources/examples/hello_world.yaml", "--harness", "openai-agents-sdk"],
+    )
+
+    assert result.exit_code == 0, result.output
+    # Dispatch happened — the alias cleared validation. The canonical
+    # rewrite happens later, at override materialization.
+    run_chat.assert_called_once()
+
+
 @pytest.mark.parametrize("flag", ["--omnigent", "--no-sessions-api"])
 def test_removed_runner_flow_flags_are_rejected(flag: str) -> None:
     """Removed runner-flow escape hatches are no longer accepted by click."""

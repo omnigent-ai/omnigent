@@ -41,7 +41,7 @@ _SCHEMA: dict[str, Any] = {
 }
 
 
-def _safe_resolve(path: str, workspace: Path) -> Path:
+def safe_resolve(path: str, workspace: Path) -> Path:
     """
     Resolve a relative path against the workspace with traversal protection.
 
@@ -114,7 +114,7 @@ class UploadFileTool(Tool):
             return "Error: no workspace available"
 
         try:
-            resolved = _safe_resolve(rel_path, ctx.workspace)
+            resolved = safe_resolve(rel_path, ctx.workspace)
         except ValueError as exc:
             return f"Error: {exc}"
 

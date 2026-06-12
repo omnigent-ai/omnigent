@@ -393,6 +393,10 @@ function registerLocalhostAccess() {
  */
 function applyDockIcon() {
   if (process.platform !== "darwin" || !app.dock) return;
+  // Packaged builds get the bundle icon (Assets.car / icon.icns), which has
+  // the standard margins and dynamic-icon support; overriding it with the
+  // full-bleed PNG would render oversized in the Dock.
+  if (app.isPackaged) return;
   const img = nativeImage.createFromPath(ICON_PNG);
   if (!img.isEmpty()) app.dock.setIcon(img);
 }
@@ -1274,7 +1278,22 @@ function buildMenu() {
       },
     ],
   });
-  template.push({ role: "viewMenu" });
+  // Same items as `role: "viewMenu"`, hand-rolled so Toggle Developer
+  // Tools (and its accelerator) can be dropped from release builds.
+  template.push({
+    label: "View",
+    submenu: [
+      { role: "reload" },
+      { role: "forceReload" },
+      ...(app.isPackaged ? [] : [{ role: "toggleDevTools" }]),
+      { type: "separator" },
+      { role: "resetZoom" },
+      { role: "zoomIn" },
+      { role: "zoomOut" },
+      { type: "separator" },
+      { role: "togglefullscreen" },
+    ],
+  });
   template.push({ role: "windowMenu" });
 
   const menu = Menu.buildFromTemplate(template);

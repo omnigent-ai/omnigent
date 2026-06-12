@@ -926,10 +926,14 @@ def default_provider_for_harness(config: dict[str, object], harness: str) -> Pro
     default. The ``pi`` harness (and any unmapped harness) consumes both
     families: an explicit :data:`PI_SURFACE` default wins; otherwise it
     falls back to the ``anthropic`` then ``openai`` family default,
-    skipping ``subscription`` defaults — their credential is a
-    claude/codex CLI login that an unmapped harness does not wrap and
-    cannot read (routing pi to one spawns it authless:
-    ``configure_agent_harness_with_provider`` no-ops on subscription).
+    skipping ``subscription`` and ``cli-config`` defaults — their
+    credential lives in the claude/codex CLI (a login, or a provider
+    table pinned in the CLI's own config file) that an unmapped harness
+    does not wrap and cannot read. Routing pi to one fails:
+    ``configure_agent_harness_with_provider`` no-ops on subscription
+    (spawning pi authless) and raises on cli-config for any harness
+    but codex. This mirrors :func:`provider_families`, which never
+    reports the :data:`PI_SURFACE` scope for either kind.
 
     :param config: The parsed config mapping (``providers:`` block).
     :param harness: The canonical harness name, e.g. ``"claude-sdk"`` or
@@ -947,12 +951,13 @@ def default_provider_for_harness(config: dict[str, object], harness: str) -> Pro
     if explicit is not None:
         return explicit
     # Fall back across both surfaces — prefer anthropic's default, and skip
-    # subscriptions (unusable outside their own CLI).
+    # the CLI-bound kinds (unusable outside their own CLI).
     for fam in _VALID_FAMILIES:
         provider = get_default_provider(config, fam)
-        # Subscription logins live in the claude/codex CLI, which an
-        # unmapped harness doesn't wrap — fall through to the next family.
-        if provider is not None and provider.kind != SUBSCRIPTION_KIND:
+        # Subscription logins and cli-config provider pins live in the
+        # claude/codex CLI's own files, which an unmapped harness doesn't
+        # wrap — fall through to the next family.
+        if provider is not None and provider.kind not in (SUBSCRIPTION_KIND, CLI_CONFIG_KIND):
             return provider
     return None
 

@@ -1,7 +1,6 @@
-# Public counterpart to the internal publish-images.yml (which is
-# EXCLUDE'd from export: self-hosted runner + JFrog OIDC). Builds the server
-# image and pushes it to ghcr.io/omnigent-ai/omnigent-server, the image every
-# deploy template references. ubuntu-latest, GHCR via GITHUB_TOKEN, no JFrog.
+# Builds the server image and pushes it to ghcr.io/omnigent-ai/omnigent-server,
+# the image every deploy template references. ubuntu-latest, GHCR via
+# GITHUB_TOKEN.
 #
 # Also builds + pushes the Omnigent host image (the `host` target of the
 # same Dockerfile) as ghcr.io/omnigent-ai/omnigent-host with the identical
@@ -50,7 +49,7 @@ jobs:
     permissions:
       contents: read
       packages: write # push the image to GHCR via GITHUB_TOKEN
-    # Inert in the managed mirror, active only in the OSS repo.
+    # Gated to this repository; inert in forks and mirrors.
     if: github.repository == 'omnigent-ai/omnigent'
     runs-on: ubuntu-latest
     timeout-minutes: 30

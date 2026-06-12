@@ -22,13 +22,24 @@ import {
 } from "@/components/ui/dialog";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { capitalizeAgentName } from "@/lib/agentLabels";
 import { useChatStore } from "@/store/chatStore";
 
 /** Trigger-pill display aliases for native agents. */
 export const AGENT_DISPLAY_NAMES: Record<string, string> = {
-  "claude-native-ui": "claude",
-  "codex-native-ui": "codex",
+  "claude-native-ui": "Claude",
+  "codex-native-ui": "Codex",
 };
+
+/**
+ * Display label for an agent name: the wrapper alias when mapped, else
+ * the name capital-first (server agent names are lowercase slugs, e.g.
+ * ``"polly"`` → ``"Polly"``). Keeps the chat surfaces consistent with
+ * the new-chat picker's capitalization.
+ */
+export function agentDisplayLabel(name: string): string {
+  return AGENT_DISPLAY_NAMES[name] ?? capitalizeAgentName(name);
+}
 
 /** Compact pill row listing MCP servers attached to an agent. */
 export function McpServerList({ servers }: { servers: McpServerSummary[] }) {
@@ -588,7 +599,7 @@ export function agentHasInfo(agent: Agent | undefined, sessionId?: string | null
  */
 export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
   const servers = agent?.mcp_servers ?? [];
-  const displayName = agent ? (AGENT_DISPLAY_NAMES[agent.name] ?? agent.name) : null;
+  const displayName = agent ? agentDisplayLabel(agent.name) : null;
   // Cumulative session spend, live from the store (seeded on bind, updated
   // by SSE ``session_usage``). ``null`` when the session is unpriced (no
   // turn priced yet) — omit the row rather than show "$0.00" / "—".

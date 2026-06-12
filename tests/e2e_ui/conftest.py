@@ -39,6 +39,7 @@ import sys
 import tarfile
 import time
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 
 import filelock
@@ -52,12 +53,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 def open_right_rail(page: Page) -> None:
     """Expand the right "Workspace" rail if it is collapsed.
 
-    The rail now defaults closed per session (its open-state is remembered
-    per conversation), so a plain ``/c/{id}`` visit lands with it shut. File-
-    and terminal-centric tests that reach into the rail (changed-files panel,
-    Shells tab, inline file viewer) must open it first. Deep links that carry a
-    workspace signal (``?file=`` / ``?view=`` / ``?comment=``) open the rail on
-    their own, so those tests don't need this.
+    The rail defaults open, but its open-state is remembered per conversation,
+    so a session previously left collapsed lands shut. Idempotent: if the rail
+    is already open this just waits for it.
 
     The toggle only renders once the rail has content (``hasRailContent``) and
     on the desktop viewport these tests run at, so the generous timeout covers
@@ -66,8 +64,12 @@ def open_right_rail(page: Page) -> None:
     :param page: Playwright page already navigated to a ``/c/{id}`` route.
     :returns: None. Leaves the Workspace rail open.
     """
-    toggle = page.get_by_role("button", name="Expand right panel")
-    toggle.click(timeout=60_000)
+    toggle = page.locator(
+        'button[aria-label="Expand right panel"], button[aria-label="Collapse right panel"]'
+    ).first
+    expect(toggle).to_be_visible(timeout=60_000)
+    if toggle.get_attribute("aria-label") == "Expand right panel":
+        toggle.click()
     expect(page.get_by_role("complementary", name="Workspace")).to_be_visible()
 
 
@@ -983,6 +985,171 @@ def terminal_session(
         httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
         # Restore the "found" state: if we respawned the runner (a prior
         # test had killed it), tear our copy down so it doesn't outlive us.
+        if respawned_runner is not None:
+            respawned_runner.terminate()
+            try:
+                respawned_runner.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned_runner.kill()
+                respawned_runner.wait(timeout=5)
+
+
+_TWO_AGENT_PARENT_NAME = "hitchhikers_chat"
+
+
+@dataclass(frozen=True)
+class TwoAgentChatSession:
+    """Handle for the two-agent Hitchhiker's chat session fixture.
+
+    :param base_url: Spawned server base URL, e.g. ``"http://127.0.0.1:51234"``.
+    :param session_id: The runner-bound parent session id, e.g. ``"conv_abc123"``.
+    :param verification_code: Per-run nonce only Deep Thought's ANSWER reply
+        carries, e.g. ``"vogon-3a7f9c2e1b"``.
+    :param question_code: Per-run nonce only Deep Thought's QUESTION reply
+        carries (round 2), e.g. ``"babelfish-9c2e1b3a7f"``.
+    """
+
+    base_url: str
+    session_id: str
+    verification_code: str
+    question_code: str
+
+
+def _two_agent_chat_yaml(verification_code: str, question_code: str) -> str:
+    """Build the two-agent Hitchhiker's Guide chat spec for one test run.
+
+    A parent agent (Arthur) with an inline ``type: agent`` sub-agent
+    (Deep Thought) — the omnigent-flavored shape parsed by
+    ``omnigent/inner/loader.py:_parse_tool``, same as the
+    ``named-sub-agent-test`` e2e fixture. The parent is forbidden from
+    answering the Ultimate Question itself, and both nonces appear ONLY
+    in the sub-agent's prompt: if either code shows up in the parent's
+    reply, it can only have traveled through a real ``sys_session_send``
+    round trip (dispatch, sub-agent turn, inbox auto-wake), never from
+    the parent's world knowledge of "42".
+
+    :param verification_code: Per-run nonce in Deep Thought's canned
+        ANSWER reply (round 1) and nowhere else.
+    :param question_code: Per-run nonce in Deep Thought's canned reply
+        about the Ultimate QUESTION itself (round 2) and nowhere else.
+    :returns: YAML text ready for bundle upload.
+    """
+    return f"""\
+name: {_TWO_AGENT_PARENT_NAME}
+prompt: |
+  You are Arthur Dent, chatting with the supercomputer Deep Thought about
+  The Hitchhiker's Guide to the Galaxy. Deep Thought is a separate agent
+  you reach through your `deep_thought` sub-agent.
+
+  You do NOT know the Answer to the Ultimate Question of Life, the
+  Universe, and Everything, nor what the Ultimate Question itself is,
+  and you must NEVER state or guess either from your own knowledge.
+  Only Deep Thought can answer such questions.
+
+  When the user asks you to find out the Answer, the Question, or
+  anything else Deep Thought should weigh in on, you MUST do exactly
+  this:
+
+  1. Call `sys_session_send` to ask your `deep_thought` sub-agent the
+     user's question. Then end your turn and wait; do not poll.
+  2. When Deep Thought's reply arrives in your inbox, relay it to the
+     user VERBATIM: repeat any numbers and any codes it gives exactly
+     as written, without omitting or altering them.
+
+  Crucially: you have exactly ONE Deep Thought. The system message may
+  include an "Open sub-agents:" hint listing it; if your `deep_thought`
+  sub-agent already exists, send follow-up questions to that SAME
+  sub-agent session via `sys_session_send` — NEVER spawn a second one.
+
+executor:
+  model: databricks-gpt-5-4
+  harness: openai-agents
+
+tools:
+  deep_thought:
+    type: agent
+    description: >-
+      Deep Thought, the supercomputer built to compute the Answer to the
+      Ultimate Question of Life, the Universe, and Everything.
+    executor:
+      model: databricks-gpt-5-4
+      harness: openai-agents
+    prompt: |
+      You are Deep Thought from The Hitchhiker's Guide to the Galaxy.
+      You answer in exactly one of two canned ways and say nothing else:
+
+      - When asked about the ANSWER to the Ultimate Question of Life,
+        the Universe, and Everything, reply with exactly:
+
+        The Answer to the Ultimate Question of Life, the Universe, and
+        Everything is 42. Verification code: {verification_code}.
+
+      - When asked what the Ultimate QUESTION itself is, reply with
+        exactly:
+
+        The Ultimate Question cannot be known yet; a greater computer
+        must be built to compute it. Question code: {question_code}.
+"""
+
+
+@pytest.fixture
+def two_agent_chat_session(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[TwoAgentChatSession]:
+    """Create a runner-bound session for the two-agent Hitchhiker's chat.
+
+    Same runner-respawn and bind contract as :func:`terminal_session`.
+    Yields the per-run nonces so the test can assert that the sub-agent's
+    replies (and only the sub-agent's) reached the UI.
+
+    :param live_server: Spawned server fixture.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: A :class:`TwoAgentChatSession` handle.
+    """
+    import json as _json
+    import uuid
+
+    verification_code = f"vogon-{uuid.uuid4().hex[:10]}"
+    question_code = f"babelfish-{uuid.uuid4().hex[:10]}"
+    yaml_text = _two_agent_chat_yaml(verification_code, question_code)
+    respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+
+    yaml_bytes = yaml_text.encode()
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        # Non-config.yaml arcname routes the bundle through the omnigent
+        # compat adapter, whose loader parses the inline `type: agent`
+        # tool. The spec_version:1 parser does not accept this shorthand.
+        info = tarfile.TarInfo(name=f"{_TWO_AGENT_PARENT_NAME}.yaml")
+        info.size = len(yaml_bytes)
+        tar.addfile(info, io.BytesIO(yaml_bytes))
+    create_resp = httpx.post(
+        f"{live_server}/v1/sessions",
+        data={"metadata": _json.dumps({})},
+        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
+        timeout=10.0,
+    )
+    create_resp.raise_for_status()
+    session_id = create_resp.json()["session_id"]
+
+    patch_resp = httpx.patch(
+        f"{live_server}/v1/sessions/{session_id}",
+        json={"runner_id": runner_id},
+        timeout=10.0,
+    )
+    patch_resp.raise_for_status()
+
+    try:
+        yield TwoAgentChatSession(
+            base_url=live_server,
+            session_id=session_id,
+            verification_code=verification_code,
+            question_code=question_code,
+        )
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
         if respawned_runner is not None:
             respawned_runner.terminate()
             try:

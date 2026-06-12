@@ -44,18 +44,18 @@ class _GenerateBuildInfo(build_py):
     def _bundle_examples(self) -> None:
         """Copy bundled example agents into the wheel as real directories.
 
-        ``omnigent/resources/examples/{polly,debby}`` are symlinks into the
-        top-level ``examples/`` tree in a dev checkout (and the OSS export
-        prunes those symlinks entirely), so setuptools' ``package-data`` never
-        materializes them into the built wheel — a directory symlink is not
-        walked. A plain ``pip install`` / ``uv tool install`` then ships a
+        ``omnigent/resources/examples/{polly,debby}`` may exist as symlinks
+        into the top-level ``examples/`` tree (or not at all) depending on
+        the checkout, and setuptools' ``package-data`` never materializes
+        symlinks into the built wheel — a directory symlink is not walked.
+        A plain ``pip install`` / ``uv tool install`` would then ship a
         package whose ``omnigent.resources.examples`` has no ``polly`` /
         ``debby`` subdir, and bare ``omnigent`` (first-run default → polly)
         dies with "Agent path not found".
 
         Fix: after ``build_py`` has populated ``build_lib``, copy the real
-        example trees from the top-level ``examples/`` dir (present in both the
-        internal repo and the OSS export) into
+        example trees from the top-level ``examples/`` dir (present in every
+        checkout) into
         ``build_lib/omnigent/resources/examples/<name>`` so every wheel is
         self-contained. This honors the contract documented in cli.py's
         ``_bundled_polly_path``: a symlink in a checkout, a real directory in

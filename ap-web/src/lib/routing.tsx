@@ -45,6 +45,13 @@ export interface RoutingApi {
   useLocation: typeof useRRLocation;
   Link: typeof RRLink;
   Outlet: typeof RROutlet;
+  /**
+   * Rebase an app-absolute path (`/c/:id`) the same way `navigate()`/`<Link>`
+   * targets are rebased. Identity in standalone; prepends `basename` in the
+   * embed. Used to build absolute URLs (e.g. a shareable link) that must land
+   * under the host mount path.
+   */
+  rebasePath: (path: string) => string;
 }
 
 /** Default implementation: plain react-router-dom. */
@@ -55,19 +62,29 @@ export const reactRouterRouting: RoutingApi = {
   useLocation: useRRLocation,
   Link: RRLink,
   Outlet: RROutlet,
+  rebasePath: (path) => path,
 };
 
 /**
- * Prepend `basename` to an absolute path-only `to` value. ap-web only ever
- * navigates/links to absolute string paths ("/", "/c/:id"); object/relative
- * `to` values are passed through unchanged.
+ * Prepend `basename` to an absolute path. Relative paths (no leading `/`) are
+ * passed through unchanged, as are paths already under the basename.
+ */
+function rebasePath(path: string, basename: string): string {
+  if (!path.startsWith("/")) return path;
+  // Avoid double-prefixing if already under the basename.
+  if (path === basename || path.startsWith(`${basename}/`)) return path;
+  return `${basename}${path}`;
+}
+
+/**
+ * Prepend `basename` to an absolute `to` value. Handles both forms ap-web uses:
+ * a string path ("/", "/c/:id") and the object form ({ pathname, search, hash })
+ * — the latter is rebased on its `pathname` while `search`/`hash` pass through.
+ * Relative `to` values (no leading `/`) are left unchanged.
  */
 function rebaseTo(to: To, basename: string): To {
-  if (typeof to === "string" && to.startsWith("/")) {
-    // Avoid double-prefixing if already under the basename.
-    if (to === basename || to.startsWith(`${basename}/`)) return to;
-    return `${basename}${to}`;
-  }
+  if (typeof to === "string") return rebasePath(to, basename);
+  if (to.pathname) return { ...to, pathname: rebasePath(to.pathname, basename) };
   return to;
 }
 
@@ -96,6 +113,7 @@ export function basenamedRouting(basename: string, base: RoutingApi = reactRoute
       const Impl = base.Link;
       return <Impl ref={ref} {...props} to={rebaseTo(props.to, basename)} />;
     }),
+    rebasePath: (path) => rebasePath(path, basename),
   };
 }
 
@@ -127,6 +145,12 @@ export const useSearchParams: typeof useRRSearchParams = (defaultInit) =>
   useRouting().useSearchParams(defaultInit);
 
 export const useLocation: typeof useRRLocation = () => useRouting().useLocation();
+
+/**
+ * The active `rebasePath` primitive. Identity standalone; prepends `basename`
+ * in the embed. Use to construct absolute URLs that respect the mount path.
+ */
+export const useRebasePath = (): ((path: string) => string) => useRouting().rebasePath;
 
 export const Link = forwardRef<HTMLAnchorElement, ComponentPropsWithoutRef<typeof RRLink>>(
   (props, ref) => {

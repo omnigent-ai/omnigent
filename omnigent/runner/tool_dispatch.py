@@ -87,7 +87,7 @@ from omnigent.tools.builtins.sys_terminal import (
     SysTerminalSendTool,
 )
 from omnigent.tools.builtins.update_comment import UpdateCommentTool
-from omnigent.tools.builtins.upload_file import UploadFileTool
+from omnigent.tools.builtins.upload_file import UploadFileTool, safe_resolve
 
 _logger = logging.getLogger(__name__)
 
@@ -3360,6 +3360,8 @@ async def execute_tool(
                 args,
                 server_client,
                 conversation_id=conversation_id,
+                agent_spec=agent_spec,
+                runner_workspace=runner_workspace,
             )
         elif tool_name in _TERMINAL_TOOLS:
             output = await _execute_terminal_tool(
@@ -4015,6 +4017,8 @@ async def _execute_file_tool(
     server_client: httpx.AsyncClient | None,
     *,
     conversation_id: str | None,
+    agent_spec: Any | None = None,
+    runner_workspace: Path | None = None,
 ) -> str:
     """
     Execute a file tool by calling session-scoped server file APIs.
@@ -4024,6 +4028,14 @@ async def _execute_file_tool(
     :param server_client: HTTP client for the Omnigent server.
     :param conversation_id: Owning session/conversation id,
         e.g. ``"conv_abc123"``.
+    :param agent_spec: Agent spec resolved for the current turn, used
+        (with ``runner_workspace``) to derive the workspace root that
+        an ``upload_file`` path is resolved against. ``None`` falls back
+        to the per-conversation default workspace.
+    :param runner_workspace: Authoritative runtime cwd for the runner,
+        sourced from ``OMNIGENT_RUNNER_WORKSPACE``. Combined with
+        ``agent_spec`` to compute the workspace containment boundary
+        for ``upload_file``.
     :returns: Tool result string.
     """
     if server_client is None:
@@ -4033,10 +4045,26 @@ async def _execute_file_tool(
     files_path = f"/v1/sessions/{conversation_id}/resources/files"
 
     if tool_name == UploadFileTool.name():
-        path = args.get("path", "")
-        filename = args.get("filename") or path.split("/")[-1]
+        path = args.get("path")
+        if not path:
+            return "Error: sys_upload_file failed: empty path"
+        # Resolve the agent-supplied path against the session workspace
+        # (the same cwd the sys_os_* tools operate in) and reject any
+        # path that escapes it. The read happens in the un-sandboxed
+        # runner process, so without this containment an agent could
+        # exfiltrate arbitrary host files. Mirrors the
+        # builtin UploadFileTool's safe_resolve / sys_agent_download
+        # containment checks.
+        workspace = Path(
+            _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace).cwd
+        )
         try:
-            with open(path, "rb") as f:
+            resolved = safe_resolve(path, workspace)
+        except ValueError as exc:
+            return f"Error: sys_upload_file failed: {exc}"
+        filename = resolved.name
+        try:
+            with open(resolved, "rb") as f:
                 content = f.read()
             resp = await server_client.post(
                 files_path,

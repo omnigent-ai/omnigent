@@ -19,7 +19,7 @@ import {
   InboxIcon,
   Loader2Icon,
   MoreHorizontalIcon,
-  PanelLeftIcon,
+  PanelRightOpenIcon,
   PencilIcon,
   PinIcon,
   PinOffIcon,
@@ -207,6 +207,12 @@ export function Sidebar({ open, onClose }: SidebarProps) {
         // Mobile (default): fixed full-screen overlay, slide via
         // translate-x. Stays edge-to-edge — the floating-card
         // treatment below is desktop-only.
+        // bg-card-solid (opaque): the overlay sits on top of the chat, and
+        // WebKit drops the glass rule's backdrop-filter once a Radix popper
+        // opens (and never repaints it), letting the chat bleed through the
+        // 60%-alpha glass --card. Desktop keeps the translucent bg-card —
+        // there the sidebar pushes content aside, so nothing sits behind it.
+        "max-md:bg-card-solid",
         "fixed inset-0 z-50",
         open ? "translate-x-0" : "-translate-x-full",
         // Desktop: a floating card. Detached from the window edges by a
@@ -223,6 +229,7 @@ export function Sidebar({ open, onClose }: SidebarProps) {
       // Hide from the accessibility tree when closed so screen readers
       // don't see the empty-state contents while focus is elsewhere.
       aria-hidden={!open}
+      data-collapsed={!open || undefined}
       // Match the keyboard-focus story: when closed, the sidebar's
       // children shouldn't receive tabs.
       inert={!open}
@@ -261,7 +268,10 @@ export function Sidebar({ open, onClose }: SidebarProps) {
                 onClick={onClose}
                 className="rounded-full"
               >
-                <PanelLeftIcon className="size-4" />
+                {/* panel-right-open while the sidebar IS open — this button
+                    only renders in the open state (ChatHeader's PanelLeftIcon
+                    covers the collapsed state). */}
+                <PanelRightOpenIcon className="size-4" />
               </Button>
             </TooltipTrigger>
             {/* Bottom placement keeps the tooltip clear of the macOS
@@ -327,7 +337,11 @@ export function Sidebar({ open, onClose }: SidebarProps) {
         </div>
       </div>
 
-      <nav className="flex-1 overflow-y-auto px-3 pb-3">
+      {/* [scrollbar-gutter:stable]: with macOS classic (space-taking)
+          scrollbars, the list's scrollbar appearing/disappearing (e.g. while
+          a Radix menu locks scrolling) resizes every row — titles gain/lose
+          a character. Reserving the gutter keeps row width constant. */}
+      <nav className="flex-1 overflow-y-auto px-3 pb-3 [scrollbar-gutter:stable]">
         <ConversationList
           conversationsQuery={conversationsQuery}
           onRowClick={onNavClick}
@@ -585,12 +599,17 @@ function ConversationSection({
             type="button"
             aria-expanded={!collapsed}
             onClick={() => onToggleCollapsed(title)}
-            className="group flex w-full items-center gap-1 rounded-md px-2 py-1 text-left text-xs font-semibold uppercase tracking-[0.08em] text-muted-foreground transition-colors hover:text-foreground"
+            className="group flex w-full items-center gap-1 rounded-md px-2 py-1 text-left text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
           >
             {title}
-            {/* Chevron trails the label (Codex/Cursor-style). */}
+            {/* Chevron trails the label (Codex/Cursor-style). Hidden until
+                hover when expanded; always visible when collapsed so the
+                hidden content stays discoverable. */}
             <ChevronRightIcon
-              className={cn("size-3.5 shrink-0 transition-transform", !collapsed && "rotate-90")}
+              className={cn(
+                "size-3.5 shrink-0 transition-transform",
+                !collapsed && "rotate-90 opacity-0 group-hover:opacity-100",
+              )}
             />
           </button>
         </h2>
@@ -805,7 +824,7 @@ function ConversationRow({
           // timestamp in that slot, so reserve extra room for it
           // (pr-44 / md:pr-28). flex-col stacks the name row over the
           // git-branch subtitle row.
-          "relative flex w-full flex-col gap-0.5 rounded-md px-2 py-2 text-left text-sm hover:bg-muted",
+          "relative flex w-full flex-col gap-0.5 rounded-md px-4 py-2 text-left text-sm hover:bg-muted",
           sessionState?.kind === "awaiting" ? "pr-44 md:pr-28" : "pr-28 md:pr-16",
           isActive && "bg-muted font-semibold",
         )}
@@ -1297,7 +1316,9 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
   }
 
   return (
-    <div className="flex items-center gap-1 rounded-md bg-muted px-1 py-0.5">
+    // pl-3 + the input's px-1 line the text up with the row's px-4 title;
+    // py-1 around the size-7 buttons matches the 36px single-line row height.
+    <div className="flex items-center gap-1 rounded-md bg-muted py-1 pr-1 pl-3">
       <input
         ref={inputRef}
         type="text"
@@ -1377,18 +1398,22 @@ function writePinnedConversationIds(ids: string[]) {
   }
 }
 
+// Archived starts collapsed until the user touches any section header —
+// once they do, the stored array (even an empty one) is the preference.
+const DEFAULT_COLLAPSED_SIDEBAR_SECTIONS = ["Archived"];
+
 function readCollapsedSidebarSections(): string[] {
-  if (typeof window === "undefined") return [];
+  if (typeof window === "undefined") return DEFAULT_COLLAPSED_SIDEBAR_SECTIONS;
   try {
     const raw = window.localStorage.getItem(COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY);
-    if (!raw) return [];
+    if (!raw) return DEFAULT_COLLAPSED_SIDEBAR_SECTIONS;
     const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
+    if (!Array.isArray(parsed)) return DEFAULT_COLLAPSED_SIDEBAR_SECTIONS;
     return parsed.filter((value): value is string => typeof value === "string");
   } catch {
-    // Same contract as pins: corrupt storage means "nothing collapsed",
+    // Same contract as pins: corrupt storage means "back to defaults",
     // never a broken sidebar.
-    return [];
+    return DEFAULT_COLLAPSED_SIDEBAR_SECTIONS;
   }
 }
 

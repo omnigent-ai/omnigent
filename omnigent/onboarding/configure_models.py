@@ -427,8 +427,8 @@ def add_menu_options() -> list[AddOption]:
         ),
         # Cross-vendor extras, alphabetical (Gateway before OpenRouter).
         _opt(
-            "Gateway — custom base URL + key",
-            "An OpenAI/Anthropic-compatible proxy: LiteLLM, Ollama, vLLM, …",
+            "Gateway — custom base URL + key (e.g. OpenRouter)",
+            "An OpenAI/Anthropic-compatible proxy: LiteLLM, Ollama, OpenRouter, vLLM, …",
             GATEWAY_KIND,
         ),
         _opt(

@@ -4,7 +4,32 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.harness_aliases import is_native_harness
+from omnigent.harness_aliases import canonicalize_harness, is_native_harness
+
+
+@pytest.mark.parametrize(
+    "alias,canonical",
+    [
+        ("claude", "claude-sdk"),
+        # Docs / runtime-dispatch spelling of the openai-agents harness;
+        # specs and OMNIGENT_HARNESSES use "openai-agents".
+        ("openai-agents-sdk", "openai-agents"),
+        # Canonical names pass through unchanged.
+        ("openai-agents", "openai-agents"),
+        ("pi", "pi"),
+        # Unknown names return unchanged so callers keep their own errors.
+        ("bogus", "bogus"),
+        (None, None),
+    ],
+)
+def test_canonicalize_harness(alias: str | None, canonical: str | None) -> None:
+    """Alias spellings map to canonical ids; everything else passes through.
+
+    A missing ``openai-agents-sdk`` mapping breaks the documented
+    ``omnigent run ... --harness openai-agents-sdk`` invocation at
+    ``_validate_harness``.
+    """
+    assert canonicalize_harness(alias) == canonical
 
 
 @pytest.mark.parametrize(

@@ -34,9 +34,15 @@ import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { EmbeddedProvider } from "./lib/embedded";
 import { type OmnigentHostConfig, setEmbedRoot, setOmnigentHostConfig } from "./lib/host";
 import { resolveIdentity } from "./lib/identity";
-import { type RoutingApi, RoutingProvider, basenamedRouting, reactRouterRouting } from "./lib/routing";
+import {
+  type RoutingApi,
+  RoutingProvider,
+  basenamedRouting,
+  reactRouterRouting,
+} from "./lib/routing";
 import { initChatStore } from "./store/chatStore";
 import "./index.css";
+import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
 
 export type { OmnigentHostConfig } from "./lib/host";
 export type { RoutingApi } from "./lib/routing";
@@ -193,9 +199,11 @@ function OmnigentProviders({
             <TooltipProvider>
               <RoutingProvider value={routing}>
                 <EmbedCapabilitiesProvider>
-                  <RunnerHealthProvider>
-                    <App basename={basename} />
-                  </RunnerHealthProvider>
+                  <SessionUpdatesProvider>
+                    <RunnerHealthProvider>
+                      <App basename={basename} />
+                    </RunnerHealthProvider>
+                  </SessionUpdatesProvider>
                 </EmbedCapabilitiesProvider>
               </RoutingProvider>
             </TooltipProvider>
@@ -218,7 +226,12 @@ function OmnigentProviders({
  *   - NAVIGATION/links: `navigate()`/`<Link to>` absolute targets are rebased
  *     under `basename` via `basenamedRouting` (the routing IoC).
  */
-export function OmnigentApp({ basename, routing, isDarkMode, ...hostConfig }: OmnigentAppProps = {}) {
+export function OmnigentApp({
+  basename,
+  routing,
+  isDarkMode,
+  ...hostConfig
+}: OmnigentAppProps = {}) {
   // Install transport config ONCE per mount (not on every render). Setting it in
   // the render body re-ran on every (re)render, and concurrent/Suspense renders
   // could re-invoke with empty props — clobbering the good config with `{}`.

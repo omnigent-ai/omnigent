@@ -1,13 +1,12 @@
-# Public-only: regenerate the OSS lockfiles against PUBLIC PyPI/npm, then
-# validate the Docker build + a CLI smoke. The managed dev machines and the
-# protected CI runners are proxy-bound (public PyPI/npm are DNS-blocked), so
-# this MUST run on GitHub-hosted `ubuntu-latest`, which has clean public
-# network access (proven on the canary: 37 packages resolved from pypi.org).
+# Regenerate the repo's lockfiles against PUBLIC PyPI/npm, then validate
+# the Docker build + a CLI smoke. Runs on GitHub-hosted `ubuntu-latest`
+# specifically so resolution sees the public registries directly — the
+# lockfiles must record public sources, never a mirror or proxy.
 #
-# Why this exists: the public source-export manifest deliberately omits
-# lockfiles, and the Dockerfile `COPY`s `ap-web/package-lock.json`, so a
-# fresh export is not Docker-buildable until the public lockfiles are
-# (re)generated here.
+# Why this exists: sync PRs land manifest changes without lockfile updates
+# (lockfiles are regenerated, not synced), and the Dockerfile `COPY`s
+# `ap-web/package-lock.json`, so the tree is not Docker-buildable until
+# the lockfiles are (re)generated here.
 #
 # Actions are SHA-pinned (with a trailing version comment) per the repo
 # convention and the SecOps day-1 requirement; the pins match the SHAs
@@ -47,8 +46,7 @@ jobs:
     permissions:
       contents: write # push the regen branch
       pull-requests: write # open / update the regen PR
-    # Public-only: inert in the managed mirror, active only in the OSS repo.
-    # (Repo name is interim — rename-gated on final branding.)
+    # Gated to this repository; inert in forks and mirrors.
     if: github.repository == 'omnigent-ai/omnigent'
     runs-on: ubuntu-latest
     # Bound a hung run well under GitHub's 6-hour default. The canary runs in
@@ -70,6 +68,12 @@ jobs:
           node-version: "20"
 
       # 1. Regenerate uv.lock from pyproject against public PyPI.
+      # Resolve only distributions uploaded > 7 days ago, so the lock
+      # never pins a release younger than a week (gives a window for a
+      # compromised/yanked upload to surface before we pin it).
+      - name: Pin uv resolution cutoff (exclude-newer)
+        run: echo "UV_EXCLUDE_NEWER=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
       - name: Regenerate uv.lock
         run: uv lock
 

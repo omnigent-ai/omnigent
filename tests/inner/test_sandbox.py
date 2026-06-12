@@ -232,6 +232,55 @@ def test_sandbox_policy_round_trips_spawn_env_allowlist() -> None:
     assert SandboxPolicy.from_jsonable(_noop_policy().to_jsonable()).spawn_env_allowlist is None
 
 
+def test_sandbox_policy_round_trips_deny_unix_socket_paths() -> None:
+    """``deny_unix_socket_paths`` survives the launcher wire encoding.
+
+    The seatbelt backend reads this list from the *decoded* policy to
+    emit its ``(deny network-outbound (remote unix-socket ...))`` rules.
+    If the field dropped out of ``to_jsonable`` / ``from_jsonable`` it
+    would decode as ``None``, the deny rule would never be emitted, and
+    the sandboxed pane could reach the unsandboxed tmux control socket.
+    """
+    from pathlib import Path
+
+    policy = _noop_policy()
+    policy.deny_unix_socket_paths = [Path("/tmp/inst/tmux.sock")]
+
+    decoded = SandboxPolicy.from_jsonable(policy.to_jsonable())
+
+    assert decoded.deny_unix_socket_paths == [Path("/tmp/inst/tmux.sock")]
+    # Old payloads (no key) and unset policies decode to None — "no
+    # deny", not an empty-but-present list.
+    assert SandboxPolicy.from_jsonable(_noop_policy().to_jsonable()).deny_unix_socket_paths is None
+
+
+def test_with_denied_unix_sockets_resolves_dedupes_and_is_pure() -> None:
+    """``with_denied_unix_sockets`` resolves + de-duplicates the socket
+    paths and never mutates the input policy.
+
+    The terminal calls this once per instance with the single tmux
+    socket, but the helper must be safe to chain (it sits next to the
+    other ``with_*`` policy builders) — so we assert it returns a fresh
+    policy and leaves the source untouched, and that a repeated path
+    collapses to one entry (a duplicate /dev/null mask is harmless but
+    a duplicate seatbelt deny line is noise).
+    """
+    from pathlib import Path
+
+    from omnigent.inner.sandbox import with_denied_unix_sockets
+
+    policy = _noop_policy()
+    sock = Path("/tmp/inst/tmux.sock")
+
+    augmented = with_denied_unix_sockets(policy, [sock, sock])
+
+    assert augmented.deny_unix_socket_paths == [sock.resolve(strict=False)]
+    # Source policy is not mutated — builders are chained off a shared
+    # base policy.
+    assert policy.deny_unix_socket_paths is None
+    assert augmented is not policy
+
+
 def test_with_spawn_env_allowlist_sets_sorted_deduped_copy() -> None:
     """``with_spawn_env_allowlist`` normalizes names and never mutates
     the input policy; ``None`` means "didn't opt in" and returns the

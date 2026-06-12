@@ -58,6 +58,7 @@ export function MobilePanelDrawer({ open, title, onClose, children, testId }: Mo
         open ? "translate-x-0" : "translate-x-full",
       )}
       aria-hidden={!open}
+      data-collapsed={!open || undefined}
       inert={!open}
     >
       <header className="flex shrink-0 items-center justify-between border-border border-b px-4 py-2">

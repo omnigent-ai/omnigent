@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "omnigent"
-version = "0.1.0rc2"
+version = "0.1.0rc3"
 description = "Omnigent: declarative agent authoring and runtime framework"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -25,8 +25,8 @@ dependencies = [
     # one version, so a published `omnigent==X` must resolve the SDK wheels
     # built alongside it (release-omnigent.yml verifies these pins match the
     # release tag). Local/editable installs still resolve via tool.uv.sources.
-    "omnigent-client==0.1.0rc2",
-    "omnigent-ui-sdk==0.1.0rc2",
+    "omnigent-client==0.1.0rc3",
+    "omnigent-ui-sdk==0.1.0rc3",
     # Merged from omnigent + omnigent.
     "pyyaml>=6.0,<7",
     "openai>=1.0,<3",
@@ -37,6 +37,9 @@ dependencies = [
     "uvicorn[standard]>=0.30,<1",
     "httpx>=0.27,<1",
     "ftfy>=6.0",
+    # Portable zombie-aware PID liveness checks for the host daemon
+    # lifecycle (omnigent/host/local_server.py).
+    "psutil>=5.9,<8",
     # CEL (Common Expression Language) for inline policy evaluation.
     # Non-Turing-complete, side-effect-free, guaranteed to terminate.
     "cel-expr-python>=0.1",
@@ -164,8 +167,8 @@ dev = [
     "pre-commit>=3.5",
     "types-PyYAML>=6.0",
     "filelock>=3.0",
-    # gitwildmatch glob matching for the dev/oss/oss_export.py manifest.
-    # Declared explicitly rather than relied on transitively (via mypy).
+    # gitwildmatch glob matching for repo tooling manifests. Declared
+    # explicitly rather than relied on transitively (via mypy).
     "pathspec>=0.12",
 ]
 
@@ -316,12 +319,11 @@ ignore = [
 
 [tool.ruff.lint.isort]
 # Classify first-party imports by NAME, not by file existence. Ruff's
-# default detection resolves each module against the filesystem, and the
-# OSS export prunes some omnigent submodules (e.g.
-# omnigent.onboarding.internal_beta) — without this pin, their imports in
-# shipped tests get reclassified as third-party in the public repo, and
-# the public Lint job demands an import order the internal repo can never
-# ship. A no-op internally, where every omnigent.* module resolves.
+# default detection resolves each module against the filesystem, so an
+# import of an optional submodule absent from a given checkout (e.g.
+# omnigent.onboarding.internal_beta) would be reclassified as third-party
+# there, demanding a different import order per checkout. Pinning the
+# package name keeps one canonical order everywhere.
 known-first-party = ["omnigent"]
 
 [tool.ruff.lint.per-file-ignores]

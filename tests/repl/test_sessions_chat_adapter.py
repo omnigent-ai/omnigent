@@ -36,7 +36,11 @@ from omnigent_client._events import (
     TextDelta,
 )
 
-from omnigent.repl._repl import _plan_output_item_render, _server_event_to_sdk_event
+from omnigent.repl._repl import (
+    _plan_output_item_render,
+    _server_event_to_sdk_event,
+    _TurnProseTracker,
+)
 from omnigent.server.schemas import (
     CancelledEvent,
     CompletedEvent,
@@ -385,6 +389,154 @@ def test_plan_output_item_render(
         f"whose prose already streamed would duplicate it; skipping a tool "
         f"call would drop it from the transcript."
     )
+
+
+def _assistant_message_item(text: str) -> dict[str, object]:
+    """
+    Build an assistant ``message`` output item with one text block.
+
+    Shape matches what the relay's ``_flush_relay_text`` publishes after
+    persisting a streamed text segment (``response.output_item.done``).
+
+    :param text: The message's output text, e.g. ``"Got it — done."``.
+    :returns: The ``item`` dict of the ``output_item.done`` event.
+    """
+    return {
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": text}],
+    }
+
+
+def test_prose_tracker_suppresses_persisted_segment_copy() -> None:
+    """The relay's persisted copy of a streamed segment is matched once.
+
+    Regression for the mid-turn duplication bug: the relay flushes a
+    streamed text segment at a tool-call boundary and publishes the
+    persisted item as ``output_item.done``. By then the tool-call item
+    already committed the in-flight prose, so the delta-based skip
+    can't catch the item — the content match must.
+    """
+    tracker = _TurnProseTracker()
+    tracker.on_delta("Got it — ")
+    tracker.on_delta("dispatching.")
+    # Tool-call boundary commits the in-flight prose (mirrors
+    # _flush_inflight_assistant_text resetting _saw_text_deltas).
+    tracker.commit_segment()
+
+    # The persisted copy byte-matches the streamed segment: it must be
+    # consumed (suppressed). A False here re-renders the whole segment
+    # as a duplicate "◆ agent + text" block — the reported bug.
+    assert tracker.consume_match(_assistant_message_item("Got it — dispatching.")) is True
+    # The entry is consumed: an identical item later in the turn has no
+    # streamed counterpart left and must render (it is real content).
+    assert tracker.consume_match(_assistant_message_item("Got it — dispatching.")) is False
+
+
+def test_prose_tracker_does_not_match_unstreamed_text() -> None:
+    """A non-streamed assistant message must not be suppressed.
+
+    If the item's text differs from every committed segment, the
+    message never streamed as deltas (e.g. a non-streaming harness)
+    and skipping it would drop real content from the transcript.
+    """
+    tracker = _TurnProseTracker()
+    tracker.on_delta("Streamed prose.")
+    tracker.commit_segment()
+
+    assert tracker.consume_match(_assistant_message_item("Different text.")) is False
+    # The streamed segment's entry is untouched by the failed match.
+    assert tracker.consume_match(_assistant_message_item("Streamed prose.")) is True
+
+
+def test_prose_tracker_multiset_handles_identical_segments() -> None:
+    """Two identical streamed segments suppress exactly two items.
+
+    Multiset semantics: a turn that legitimately narrates the same text
+    twice (two flushed segments) gets two persisted-item publishes; each
+    must match its own entry, and a third identical item must render.
+    """
+    tracker = _TurnProseTracker()
+    tracker.on_delta("Done.")
+    tracker.commit_segment()
+    tracker.on_delta("Done.")
+    tracker.commit_segment()
+
+    assert tracker.consume_match(_assistant_message_item("Done.")) is True
+    assert tracker.consume_match(_assistant_message_item("Done.")) is True
+    # Both entries consumed — a third identical message is new content.
+    assert tracker.consume_match(_assistant_message_item("Done.")) is False
+
+
+def test_prose_tracker_reset_turn_drops_prior_turn_prose() -> None:
+    """A new turn must not suppress messages with last turn's text."""
+    tracker = _TurnProseTracker()
+    tracker.on_delta("Same words.")
+    tracker.commit_segment()
+    tracker.reset_turn()
+
+    # Post-reset, the prior turn's segment is gone: an assistant message
+    # with identical text this turn is genuinely new and must render.
+    assert tracker.consume_match(_assistant_message_item("Same words.")) is False
+
+
+def test_prose_tracker_ignores_items_without_output_text() -> None:
+    """Items with no ``output_text`` content never match anything."""
+    tracker = _TurnProseTracker()
+    tracker.on_delta("prose")
+    tracker.commit_segment()
+
+    # No content list at all.
+    assert tracker.consume_match({"type": "message", "role": "assistant"}) is False
+    # Content present but no output_text blocks (e.g. refusal-only).
+    assert (
+        tracker.consume_match(
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "refusal", "refusal": "no"}],
+            }
+        )
+        is False
+    )
+    # The streamed entry survives both non-matches.
+    assert tracker.consume_match(_assistant_message_item("prose")) is True
+
+
+def test_prose_tracker_joins_multi_block_item_content() -> None:
+    """An item with several ``output_text`` blocks matches by joined text.
+
+    Mirrors the server-side join in ``_flush_relay_text`` /
+    ``_committed_message_text``: content blocks concatenate in order.
+    """
+    tracker = _TurnProseTracker()
+    tracker.on_delta("part one ")
+    tracker.on_delta("part two")
+    tracker.commit_segment()
+
+    item = {
+        "type": "message",
+        "role": "assistant",
+        "content": [
+            {"type": "output_text", "text": "part one "},
+            {"type": "output_text", "text": "part two"},
+        ],
+    }
+    assert tracker.consume_match(item) is True
+
+
+def test_prose_tracker_uncommitted_segment_does_not_match() -> None:
+    """Only COMMITTED segments are candidates for suppression.
+
+    While prose is still in flight, ``_saw_text_deltas`` is True and the
+    delta-based skip handles the item; the tracker must not also match
+    (the call-site short-circuits, but the tracker's own contract is
+    that uncommitted parts are not yet a segment).
+    """
+    tracker = _TurnProseTracker()
+    tracker.on_delta("in flight")
+
+    assert tracker.consume_match(_assistant_message_item("in flight")) is False
 
 
 def test_client_task_cancel_event_passes_through() -> None:

@@ -105,6 +105,7 @@ def _to_conversation(
         reasoning_effort=row.reasoning_effort,
         model_override=row.model_override,
         cost_control_mode_override=row.cost_control_mode_override,
+        harness_override=row.harness_override,
         sub_agent_name=row.sub_agent_name,
         external_session_id=row.external_session_id,
         # NULL → None; a stored JSON array (e.g. ``"[]"`` or
@@ -1655,6 +1656,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         _unset_model_override: bool = False,
         cost_control_mode_override: str | None = None,
         _unset_cost_control_mode_override: bool = False,
+        harness_override: str | None = None,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
     ) -> Conversation | None:
@@ -1676,6 +1678,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             switch, ``"on"`` or ``"off"``. ``None`` leaves unchanged.
         :param _unset_cost_control_mode_override: When ``True``, clear
             ``cost_control_mode_override`` to ``None``.
+        :param harness_override: Per-session brain-harness override,
+            e.g. ``"pi"``. ``None`` leaves unchanged; set once at
+            session create, no ``_unset`` variant.
         :param terminal_launch_args: Per-session native-terminal
             pass-through args, e.g.
             ``["--dangerously-skip-permissions"]``. ``None`` leaves
@@ -1715,6 +1720,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 changed = True
             elif cost_control_mode_override is not None:
                 row.cost_control_mode_override = cost_control_mode_override
+                changed = True
+            if harness_override is not None:
+                row.harness_override = harness_override
                 changed = True
             if terminal_launch_args is not None:
                 row.terminal_launch_args = json.dumps(terminal_launch_args)
@@ -2186,6 +2194,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 agent_id=agent_id if agent_id is not None else source.agent_id,
                 reasoning_effort=source.reasoning_effort if copy_model_settings else None,
                 model_override=source.model_override if copy_model_settings else None,
+                # The brain-harness override is family-bound like the model,
+                # so it follows the same copy gate.
+                harness_override=source.harness_override if copy_model_settings else None,
                 # Raw column-to-column copy of the JSON text; the
                 # fork should launch with the same native args.
                 terminal_launch_args=source.terminal_launch_args,
@@ -2393,6 +2404,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             if not copy_model_settings:
                 row.model_override = None
                 row.reasoning_effort = None
+            # The harness override belonged to the OLD agent's brain; the
+            # new agent runs on its own spec-declared harness.
+            row.harness_override = None
             # The native runtime session belongs to the OLD harness. Clearing
             # it makes the next turn cold-start the NEW harness, which rebuilds
             # the native transcript from this session's own AP items when

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 HARNESS_ALIASES: dict[str, str] = {
     "claude": "claude-sdk",
+    # The SDK package / runtime dispatch spelling; specs use "openai-agents".
+    "openai-agents-sdk": "openai-agents",
 }
 
 # Canonical native-CLI harness spellings. These are the only harnesses that

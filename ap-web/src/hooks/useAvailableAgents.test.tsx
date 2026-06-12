@@ -5,12 +5,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useAvailableAgents } from "./useAvailableAgents";
 
-// The hook reads the built-in agent list from GET /v1/agents (a
-// PaginatedList envelope) and maps each row into the AvailableAgent
-// shape the new-session picker renders. `authenticatedFetch` passes
-// through to the global `fetch` when no user id is set (the default
-// in jsdom), so stubbing `fetch` exercises the real fetch + mapping
-// path rather than a hand-rolled stand-in.
+// The hook unions the built-in agent list from GET /v1/agents with
+// custom agents discovered on the caller's sessions via
+// GET /v1/sessions?limit=100&kind=any (enriched per-agent through
+// GET /v1/sessions/{id}/agent). `authenticatedFetch` passes through to
+// the global `fetch` when no user id is set (the default in jsdom), so
+// stubbing `fetch` exercises the real fetch + mapping path rather than
+// a hand-rolled stand-in. The two top-level fetches run in parallel
+// (Promise.all), so the stub is keyed by URL, not by call order.
 function mockResponse(
   body: unknown,
   init?: { ok?: boolean; status?: number },
@@ -24,6 +26,24 @@ function mockResponse(
 }
 
 const fetchMock = vi.fn();
+
+const BUILTINS_URL = "/v1/agents";
+const SCAN_URL = "/v1/sessions?limit=100&kind=any";
+
+/**
+ * Stub the global fetch with per-URL responses. Unrouted URLs reject
+ * loudly so an unexpected request fails the test instead of hanging
+ * TanStack's retry loop.
+ */
+function routeFetch(routes: Record<string, Response>) {
+  fetchMock.mockImplementation((url: string) => {
+    const route = routes[url];
+    if (!route) {
+      return Promise.reject(new Error(`unrouted fetch in test: ${url}`));
+    }
+    return Promise.resolve(route);
+  });
+}
 
 function wrapper({ children }: { children: ReactNode }) {
   // retry off so the no-network/error case resolves on the first
@@ -46,6 +66,8 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+const EMPTY_SCAN = mockResponse({ object: "list", data: [], has_more: false });
+
 describe("useAvailableAgents", () => {
   it("does not fetch while disabled", async () => {
     const { result } = renderHook(() => useAvailableAgents({ enabled: false }), { wrapper });
@@ -55,25 +77,27 @@ describe("useAvailableAgents", () => {
     expect(result.current.fetchStatus).toBe("idle");
   });
 
-  it("fetches the built-in agent list from /v1/agents", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockResponse({ object: "list", data: [], has_more: false }),
-    );
+  it("fetches built-ins from /v1/agents and scans /v1/sessions?kind=any", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({ object: "list", data: [], has_more: false }),
+      [SCAN_URL]: EMPTY_SCAN,
+    });
 
     const { result } = renderHook(() => useAvailableAgents(), { wrapper });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
-    // Pins the source endpoint. If this drifts back to the retired
-    // /api/agents route (or any session-scoped list), the picker would
-    // surface conversation-bound agents that aren't launchable as new
-    // sessions.
-    const [url] = fetchMock.mock.calls[0] as [string];
-    expect(url).toBe("/v1/agents");
+    // Pins both source endpoints. /v1/agents drifting back to the
+    // retired /api/agents route would break against current servers;
+    // the scan dropping kind=any would silently stop discovering
+    // agents bound only to sub-agent sessions.
+    const urls = fetchMock.mock.calls.map((c) => c[0] as string);
+    expect(urls).toContain(BUILTINS_URL);
+    expect(urls).toContain(SCAN_URL);
   });
 
   it("maps rows into AvailableAgent and applies the claude-native, nessie, and debby display names", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockResponse({
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
         object: "list",
         data: [
           {
@@ -104,7 +128,8 @@ describe("useAvailableAgents", () => {
         ],
         has_more: false,
       }),
-    );
+      [SCAN_URL]: EMPTY_SCAN,
+    });
 
     const { result } = renderHook(() => useAvailableAgents(), { wrapper });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
@@ -147,7 +172,7 @@ describe("useAvailableAgents", () => {
       {
         id: "ag_yaml",
         name: "databricks_coding_agent",
-        display_name: "databricks_coding_agent",
+        display_name: "Databricks_coding_agent",
         description: "A coding agent",
         harness: "codex",
         skills: [],
@@ -156,8 +181,8 @@ describe("useAvailableAgents", () => {
   });
 
   it("defaults a missing harness to null", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockResponse({
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
         object: "list",
         // `harness` omitted — the server leaves it off when the agent's
         // spec couldn't be loaded. It must normalise to null so the card
@@ -165,7 +190,8 @@ describe("useAvailableAgents", () => {
         data: [{ id: "ag_x", name: "x" }],
         has_more: false,
       }),
-    );
+      [SCAN_URL]: EMPTY_SCAN,
+    });
 
     const { result } = renderHook(() => useAvailableAgents(), { wrapper });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
@@ -174,8 +200,8 @@ describe("useAvailableAgents", () => {
   });
 
   it("defaults a missing description to null", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockResponse({
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
         object: "list",
         // `description` omitted entirely (not just null) — the picker
         // renders the description conditionally, so undefined must be
@@ -183,7 +209,8 @@ describe("useAvailableAgents", () => {
         data: [{ id: "ag_x", name: "x" }],
         has_more: false,
       }),
-    );
+      [SCAN_URL]: EMPTY_SCAN,
+    });
 
     const { result } = renderHook(() => useAvailableAgents(), { wrapper });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
@@ -191,15 +218,135 @@ describe("useAvailableAgents", () => {
     expect(result.current.data?.[0].description).toBeNull();
   });
 
-  it("surfaces an error when the request fails", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockResponse({ detail: "nope" }, { ok: false, status: 500 }),
-    );
+  it("surfaces an error when the built-in request fails", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({ detail: "nope" }, { ok: false, status: 500 }),
+      [SCAN_URL]: EMPTY_SCAN,
+    });
 
     const { result } = renderHook(() => useAvailableAgents(), { wrapper });
     await waitFor(() => expect(result.current.isError).toBe(true));
 
     expect(result.current.error).toBeInstanceOf(Error);
     expect((result.current.error as Error).message).toContain("500");
+  });
+
+  it("discovers custom session-bound agents and drops built-in shadows", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [{ id: "ag_native", name: "claude-native-ui", harness: "claude-native" }],
+        has_more: false,
+      }),
+      [SCAN_URL]: mockResponse({
+        object: "list",
+        data: [
+          // Binds the built-in's own agent row — dropped by id.
+          { id: "conv_1", agent_id: "ag_native", agent_name: "claude-native-ui" },
+          // A fork clone of the built-in — distinct id, but the clone
+          // suffix strips back to a built-in name, so dropped by name.
+          {
+            id: "conv_2",
+            agent_id: "ag_clone",
+            agent_name: "claude-native-ui (fork conv_9)",
+          },
+          // Genuinely custom agent; survives and is enriched below.
+          { id: "conv_3", agent_id: "ag_doc", agent_name: "doc-writer" },
+          // Same custom agent on an older session — deduped by id, and
+          // the enrich fetch must use the newest session (conv_3).
+          { id: "conv_4", agent_id: "ag_doc", agent_name: "doc-writer" },
+          // Orphaned row (agent deleted) — skipped.
+          { id: "conv_5", agent_id: "ag_gone", agent_name: null },
+        ],
+        has_more: false,
+      }),
+      "/v1/sessions/conv_3/agent": mockResponse({
+        id: "ag_doc",
+        object: "agent",
+        name: "doc-writer",
+        description: "Documentation specialist",
+        harness: "claude-sdk",
+        skills: [{ name: "humanizer", description: "Remove AI writing patterns" }],
+      }),
+    });
+
+    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    // One built-in + one custom. ag_clone or ag_native appearing twice
+    // means shadow-dropping regressed; ag_doc missing means kind=any
+    // discovery broke; two ag_doc rows mean the by-id dedup broke.
+    expect(result.current.data).toEqual([
+      {
+        id: "ag_native",
+        name: "claude-native-ui",
+        display_name: "Claude Code",
+        description: null,
+        harness: "claude-native",
+        skills: [],
+      },
+      {
+        id: "ag_doc",
+        name: "doc-writer",
+        display_name: "Doc-writer",
+        description: "Documentation specialist",
+        harness: "claude-sdk",
+        skills: [{ name: "humanizer", description: "Remove AI writing patterns" }],
+      },
+    ]);
+    // The enrich fetch ran once, against the newest session the agent
+    // was seen on — not the older duplicate (conv_4) and not the
+    // shadowed rows (which must not be enriched at all).
+    const enrichCalls = fetchMock.mock.calls
+      .map((c) => c[0] as string)
+      .filter((u) => u.endsWith("/agent"));
+    expect(enrichCalls).toEqual(["/v1/sessions/conv_3/agent"]);
+  });
+
+  it("degrades to built-ins when the sessions scan fails", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [{ id: "ag_native", name: "claude-native-ui" }],
+        has_more: false,
+      }),
+      // Transient 5xx on the scan — built-in availability must not be
+      // hostage to the discovery extension, so the hook still succeeds.
+      [SCAN_URL]: mockResponse({ detail: "boom" }, { ok: false, status: 503 }),
+    });
+
+    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data?.map((a) => a.id)).toEqual(["ag_native"]);
+  });
+
+  it("lists a custom agent with scan fields when its enrich fetch fails", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({ object: "list", data: [], has_more: false }),
+      [SCAN_URL]: mockResponse({
+        object: "list",
+        data: [{ id: "conv_3", agent_id: "ag_doc", agent_name: "doc-writer" }],
+        has_more: false,
+      }),
+      // The agent's bundle can't be loaded (or the fetch 500s) — the
+      // agent must still be listed from scan fields, mirroring the
+      // server's own spec-load degradation, just without harness/skills.
+      "/v1/sessions/conv_3/agent": mockResponse({ detail: "boom" }, { ok: false, status: 500 }),
+    });
+
+    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data).toEqual([
+      {
+        id: "ag_doc",
+        name: "doc-writer",
+        display_name: "Doc-writer",
+        description: null,
+        harness: null,
+        skills: [],
+      },
+    ]);
   });
 });

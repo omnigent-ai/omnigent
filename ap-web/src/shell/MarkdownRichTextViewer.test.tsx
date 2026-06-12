@@ -24,15 +24,19 @@ vi.mock("@tiptap/react", () => ({
 vi.mock("@tiptap/markdown", () => ({
   Markdown: { configure: vi.fn().mockReturnValue({}) },
 }));
-vi.mock("@tiptap/starter-kit", () => ({ default: {} }));
+vi.mock("@tiptap/starter-kit", () => ({ default: { configure: vi.fn().mockReturnValue({}) } }));
 vi.mock("@tiptap/extension-table", () => ({
   Table: { configure: vi.fn().mockReturnValue({}) },
   TableRow: {},
   TableCell: {},
   TableHeader: {},
 }));
-vi.mock("@tiptap/extension-link", () => ({
-  default: { configure: vi.fn().mockReturnValue({}) },
+vi.mock("./TipTapGitHubAlert", () => ({ GitHubAlertBlockquote: {} }));
+vi.mock("./TipTapHtmlPassthrough", () => ({ HtmlPassthrough: {} }));
+vi.mock("./tiptapMarkdownPatches", () => ({ installMarkdownSerializerPatch: vi.fn() }));
+vi.mock("./TipTapWorkspaceImage", () => ({
+  createWorkspaceImageExtension: vi.fn().mockReturnValue({}),
+  ImageAwareLink: { configure: vi.fn().mockReturnValue({}) },
 }));
 vi.mock("./TipTapCommentExtension", () => ({
   createCommentDecorationExtension: vi.fn().mockReturnValue({}),

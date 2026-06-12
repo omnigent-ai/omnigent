@@ -118,6 +118,8 @@ interface SessionResponseWire {
   queued_items?: SessionEventInput[];
   reasoning_effort?: string | null;
   llm_model?: string | null;
+  /** Effective brain harness (override-aware), e.g. ``"claude-sdk"``. */
+  harness?: string | null;
   model_override?: string | null;
   /** Per-session cost-control switch; `null`/absent = spec default. */
   cost_control_mode_override?: "on" | "off" | null;
@@ -256,6 +258,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     queuedItems: wire.queued_items,
     reasoningEffort: wire.reasoning_effort,
     llmModel: wire.llm_model,
+    harness: wire.harness ?? null,
     modelOverride: wire.model_override,
     costControlModeOverride: wire.cost_control_mode_override,
     contextWindow: wire.context_window,

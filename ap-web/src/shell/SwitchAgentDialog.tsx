@@ -19,7 +19,7 @@ import { Button } from "@/components/ui/button";
 import { switchSessionAgent } from "@/lib/sessionsApi";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useSessionAgent } from "@/hooks/useAgents";
-import { forkTargetCarriesHistory, harnessFamily } from "@/lib/forkHarness";
+import { agentBaseName, forkTargetCarriesHistory, harnessFamily } from "@/lib/forkHarness";
 
 // "" means no target chosen yet. It must be empty (not a sentinel like
 // "__none__"): Radix only renders the trigger placeholder when the controlled
@@ -72,7 +72,7 @@ export function SwitchAgentDialog({
   // the fork/switch routes append when cloning, so a clone of a built-in
   // still matches that built-in by name and is excluded below.
   const currentAgentName = currentAgent?.name ?? null;
-  const currentAgentBaseName = currentAgentName?.replace(/ \((?:fork|switch) [^)]+\)$/, "") ?? null;
+  const currentAgentBaseName = currentAgentName ? agentBaseName(currentAgentName) : null;
 
   // Friendly label for the currently-bound agent, shown as the trigger's
   // default (greyed) so the box isn't blank and the user sees what they're on.

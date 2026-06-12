@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import click
+import psutil
 
 _LOCAL_SERVER_READY_TIMEOUT_SECONDS = 45.0
 
@@ -108,14 +109,24 @@ def server_config_signature() -> str:
 def _pid_alive(pid: int) -> bool:
     """Check whether a process with the given PID is running.
 
+    A zombie (exited but not yet reaped) process still exists in the
+    process table but has already terminated and can never be signalled,
+    so it is reported as dead here. Otherwise a daemon whose parent never
+    reaps it blocks ``host`` startup with "already running" and makes
+    ``host stop --force`` fail forever.
+
     :param pid: Process ID to check.
-    :returns: ``True`` if the process exists.
+    :returns: ``True`` if the process exists and is not a zombie.
     """
     try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
+        return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        # Includes psutil.ZombieProcess (a NoSuchProcess subclass), raised
+        # on platforms where a zombie's status cannot be queried at all.
         return False
+    except psutil.AccessDenied:
+        # The process exists but belongs to another user.
+        return True
 
 
 def _read_local_server_pid_file() -> tuple[int, int] | None:

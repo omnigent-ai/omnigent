@@ -152,6 +152,7 @@ export function TerminalsPanel({
         open ? "md:border-border md:border-l" : "md:w-0 md:border-l-0",
       )}
       aria-hidden={!open}
+      data-collapsed={!open || undefined}
     >
       {/* Resize handle — desktop only. Suppressed in fluid mode. */}
       {isDesktop && !fluid && (

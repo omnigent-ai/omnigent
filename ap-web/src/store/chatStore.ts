@@ -305,6 +305,12 @@ export interface ChatState {
    */
   llmModel: string | null;
   /**
+   * Effective brain harness for the active session (override-aware),
+   * e.g. ``"claude-sdk"`` or ``"pi"``. Populated from the session
+   * snapshot on bind; drives the composer pill's harness suffix.
+   */
+  sessionHarness: string | null;
+  /**
    * Context window size in tokens for the active session's model,
    * as looked up server-side. ``null`` before bind or when the
    * model is not in litellm's registry.
@@ -643,6 +649,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   oldestItemId: null,
   flashItemId: null,
   llmModel: null,
+  sessionHarness: null,
   contextWindow: null,
   tokensUsed: null,
   sessionCostUsd: null,
@@ -1109,6 +1116,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         loadingMoreHistory: false,
         oldestItemId: null,
         llmModel: null,
+        sessionHarness: null,
         // ``selectedEffort`` / ``selectedModel`` are sticky user picks —
         // not reset here so a CLI-created new chat inherits them.
         // The cost switch IS session-scoped, so it resets with the session.
@@ -1476,6 +1484,7 @@ function sessionBindingPatch(
   | "boundAgentId"
   | "boundAgentName"
   | "llmModel"
+  | "sessionHarness"
   | "costControlModeOverride"
   | "contextWindow"
   | "gitBranch"
@@ -1489,6 +1498,7 @@ function sessionBindingPatch(
     boundAgentId: session.agentId,
     boundAgentName: session.agentName,
     llmModel: session.llmModel ?? null,
+    sessionHarness: session.harness ?? null,
     costControlModeOverride: session.costControlModeOverride ?? null,
     contextWindow: session.contextWindow ?? null,
     gitBranch: session.gitBranch ?? null,
@@ -2766,6 +2776,50 @@ export async function pumpStreamEvents(
           revivePendingElicitationBlock(set, eid);
           continue;
         }
+      }
+
+      if (block.type === "text_done" && block.ctx.itemId && !isLiveProvisionalBlock(block)) {
+        // A persisted assistant message whose text already streamed
+        // id-less this response. The relay publishes each flushed text
+        // segment as `output_item.done` so clients learn its
+        // store-assigned id (see `_flush_relay_text`), but by the time
+        // it arrives a tool call / reasoning section has usually closed
+        // the streamed text — the reducer's open-section dedupe can't
+        // catch it and emits this block as a fresh copy. Stamp the id
+        // onto the already-streamed `text_done` IN PLACE instead of
+        // appending: the live view keeps one copy in its streamed
+        // position (above the tool call), and reconnect reconciliation
+        // (itemId-keyed) sees the persisted item as already rendered.
+        // FIFO (findIndex): the relay flushes segments in order, so the
+        // first unstamped match is the one this item persisted.
+        const itemId = block.ctx.itemId;
+        const matchesStreamed = (b: AnyBlock): b is TextDone =>
+          b.type === "text_done" &&
+          !b.ctx.itemId &&
+          b.ctx.responseId === block.ctx.responseId &&
+          b.fullText === block.fullText;
+        const bufferAt = buffer.findIndex(matchesStreamed);
+        if (bufferAt !== -1) {
+          const streamed = buffer[bufferAt] as TextDone;
+          buffer[bufferAt] = { ...streamed, ctx: { ...streamed.ctx, itemId } };
+          continue;
+        }
+        if (get().blocks.some(matchesStreamed)) {
+          // Commit buffered blocks first so the stamp lands on the same
+          // ordering the user is looking at.
+          flush();
+          set((s) => {
+            const at = s.blocks.findIndex(matchesStreamed);
+            if (at === -1) return {};
+            const streamed = s.blocks[at]!;
+            const next = s.blocks.slice();
+            next[at] = { ...streamed, ctx: { ...streamed.ctx, itemId } };
+            return { blocks: next };
+          });
+          continue;
+        }
+        // No streamed copy to stamp (e.g. a non-streamed message):
+        // fall through and append as a normal block.
       }
 
       if (block.type === "text_done" && get().isNativeTerminalSession) {

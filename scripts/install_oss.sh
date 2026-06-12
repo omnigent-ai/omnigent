@@ -241,9 +241,8 @@ check_platform() {
 }
 
 # Hard prerequisites: without these the package cannot be installed at all.
-# Unlike the internal bootstrap (which only checks-and-fails), the OSS flow
-# OFFERS to install the ones with a trusted one-line installer. No SSH check,
-# no Databricks CLI, no package-registry proxies — those are internal-only.
+# The installer OFFERS to install each one with a trusted one-line installer
+# rather than just checking-and-failing. git and uv are all it takes.
 check_prerequisites() {
   ensure_git
   ensure_uv

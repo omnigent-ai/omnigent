@@ -1,12 +1,9 @@
-# Public-safe pre-commit config. Ships AS .pre-commit-config.yaml via the
-# oss_export RENAME map. Runs ruff (format + check) and standard file-hygiene
-# hooks. The internal config's custom dev/lint/* hooks, the openapi-json and
-# uv-lock hooks, and mypy are intentionally omitted — they depend on tooling
-# under dev/ and scripts/ that is not shipped to the public repo.
+# Pre-commit hooks for this repository: ruff (format + check) plus standard
+# file-hygiene checks. Heavier validation (typing, lockfile freshness,
+# OpenAPI drift) runs in CI rather than as commit-time hooks.
 #
-# The built web-UI bundle is committed to the public repo (vendored, minified
-# JS/CSS) — never lint or "fix" it. Internally it's gitignored so the hooks
-# never see it; this exclude is public-only.
+# A built web-UI bundle may be committed at this path (vendored, minified
+# JS/CSS) — never lint or "fix" it.
 exclude: ^omnigent/server/static/web-ui/
 repos:
   - repo: local

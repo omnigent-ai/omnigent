@@ -33,7 +33,8 @@ import {
   useRevokePermission,
 } from "@/hooks/usePermissions";
 import { useUserSearch } from "@/hooks/useUserSearch";
-import { getOmnigentUserSearch } from "@/lib/host";
+import { getOmnigentTransformShareLink, getOmnigentUserSearch } from "@/lib/host";
+import { useRebasePath } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 
 const PUBLIC_USER = "__public__";
@@ -367,8 +368,20 @@ function AddUserCombobox({ value, onChange }: AddUserFieldProps) {
   );
 }
 
+/**
+ * The basename-rebased session path turned into an absolute URL. In the embed
+ * the host transform returns the full URL (origin included); standalone has no
+ * transform, so we prepend the origin ourselves.
+ */
+function getShareableLink(sessionId: string, rebasePath: (path: string) => string): string {
+  const path = rebasePath(`/c/${sessionId}`);
+  const transform = getOmnigentTransformShareLink();
+  return transform ? transform(path) : `${window.location.origin}${path}`;
+}
+
 function CopyLinkButton({ sessionId }: { sessionId: string }) {
   const [copied, setCopied] = useState(false);
+  const rebasePath = useRebasePath();
 
   useEffect(() => {
     if (!copied) return;
@@ -377,14 +390,14 @@ function CopyLinkButton({ sessionId }: { sessionId: string }) {
   }, [copied]);
 
   const handleCopy = useCallback(() => {
-    const url = `${window.location.origin}/c/${sessionId}`;
+    const url = getShareableLink(sessionId, rebasePath);
     navigator.clipboard.writeText(url).then(
       () => setCopied(true),
       (err) => {
         console.warn("Failed to copy link to clipboard", err);
       },
     );
-  }, [sessionId]);
+  }, [sessionId, rebasePath]);
 
   return (
     <Button variant="ghost" size="sm" onClick={handleCopy} className="gap-1.5 text-primary">

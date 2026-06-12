@@ -26,7 +26,6 @@ import {
   TableCell,
   TableHeader,
 } from "@tiptap/extension-table";
-import Link from "@tiptap/extension-link";
 import { Markdown } from "@tiptap/markdown";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
@@ -41,6 +40,14 @@ import {
   createCommentDecorationExtension,
   type CommentDecorationState,
 } from "./TipTapCommentExtension";
+import { createWorkspaceImageExtension, ImageAwareLink } from "./TipTapWorkspaceImage";
+import { GitHubAlertBlockquote } from "./TipTapGitHubAlert";
+import { HtmlPassthrough } from "./TipTapHtmlPassthrough";
+import { installMarkdownSerializerPatch } from "./tiptapMarkdownPatches";
+
+// Minimal-escaping serialiser override (see tiptapMarkdownPatches.ts) —
+// installed once at module load, before any editor instance is created.
+installMarkdownSerializerPatch();
 
 // ---------------------------------------------------------------------------
 // MarkdownRichTextViewer — outer shell manages the editor key for remounting
@@ -100,7 +107,11 @@ export function MarkdownRichTextViewer({
 
   return (
     <MarkdownRichTextViewerInner
-      key={editorKey}
+      // conversationId is part of the key: FileViewer is not keyed by session
+      // at its mount sites, so a session switch with the same file open must
+      // remount the editor — extensions close over conversationId/path and a
+      // stale closure would fetch workspace images from the previous session.
+      key={`${conversationId}:${editorKey}`}
       content={content}
       conversationId={conversationId}
       path={path}
@@ -242,16 +253,24 @@ function MarkdownRichTextViewerInner({
   // Extensions are created once per component mount.
   const extensions = useMemo(
     () => [
-      StarterKit,
+      // link/blockquote: false — StarterKit bundles its own versions whose
+      // markdown handlers would shadow the GitHub-flavored replacements
+      // below (duplicate extension names: first wins).
+      StarterKit.configure({ link: false, blockquote: false }),
       Table.configure({ resizable: true }),
       TableRow,
       TableCell,
       TableHeader,
-      Link.configure({ openOnClick: false, autolink: false }),
+      ImageAwareLink.configure({ openOnClick: false, autolink: false }),
+      GitHubAlertBlockquote,
+      HtmlPassthrough,
       Markdown,
+      createWorkspaceImageExtension(conversationId, path),
       createCommentDecorationExtension(commentStateRef),
     ],
-    // commentStateRef is stable; extensions must not change after mount.
+    // commentStateRef is stable and a path change remounts this component
+    // (editorKey), so the closed-over conversationId/path can't go stale;
+    // extensions must not change after mount.
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [],
   );

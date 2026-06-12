@@ -44,7 +44,7 @@ from omnigent.inner.bwrap_sandbox import (
     _bwrap_extra_seccomp_rules,
 )
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.sandbox import SandboxPolicy
+from omnigent.inner.sandbox import SandboxPolicy, with_denied_unix_sockets
 
 BWRAP_AVAILABLE = shutil.which("bwrap") is not None
 
@@ -480,6 +480,96 @@ def test_wrap_launcher_argv_cwd_read_only_by_default(tmp_path: Path) -> None:
     bind_verbs = [argv[i - 1] for i in cwd_indices if argv[i - 1] in {"--bind", "--ro-bind"}]
     assert "--ro-bind" in bind_verbs
     assert "--bind" not in bind_verbs
+
+
+def test_wrap_launcher_argv_masks_denied_unix_socket_after_write_root(
+    tmp_path: Path,
+) -> None:
+    """
+    A denied AF_UNIX socket inside a writable root is masked with a
+    ``--bind-try /dev/null <socket>`` overlay emitted AFTER that
+    root's bind.
+
+    The tmux control socket lives in the instance ``private_dir``,
+    which is a write root so the forked workspace stays writable.
+    bwrap mounts are last-wins, so the /dev/null mask must come after
+    the ``--bind`` of the enclosing root or the writable bind would
+    shadow it and the pane could ``connect(2)`` to the unsandboxed
+    tmux server. We assert both that the exact mask triple is present
+    and that it follows the root's bind index.
+    """
+    backend = _make_backend()
+    private_dir = (tmp_path / "instance").resolve(strict=False)
+    private_dir.mkdir()
+    socket_path = private_dir / "tmux.sock"
+    policy = _make_policy(tmp_path, write_roots=[private_dir])
+    policy = with_denied_unix_sockets(policy, [socket_path])
+
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+
+    mask_idx = _index_of_triple(argv, "--bind-try", "/dev/null", str(socket_path))
+    assert mask_idx is not None, (
+        f"Expected a `--bind-try /dev/null {socket_path}` mask for the "
+        f"denied socket; got argv tail {argv[-20:]}"
+    )
+    # The write-root bind of private_dir must precede the mask, else
+    # the writable bind would layer on top and re-expose the socket.
+    root_bind_indices = [
+        i
+        for i in range(len(argv) - 2)
+        if argv[i] in {"--bind", "--bind-try"} and argv[i + 1] == str(private_dir)
+    ]
+    assert root_bind_indices, "private_dir was never bound as a write root"
+    assert min(root_bind_indices) < mask_idx, (
+        "The /dev/null socket mask was emitted BEFORE the private_dir "
+        "write-root bind; bwrap last-wins would let the writable bind "
+        "re-expose the tmux socket to the pane."
+    )
+
+
+def test_wrap_launcher_argv_no_socket_mask_when_deny_list_empty(
+    tmp_path: Path,
+) -> None:
+    """
+    With no ``deny_unix_socket_paths`` the builder emits no
+    ``--bind-try /dev/null`` socket mask — the feature is opt-in and
+    must not perturb the argv for terminals that don't manage a tmux
+    control socket.
+    """
+    backend = _make_backend()
+    policy = _make_policy(tmp_path, write_roots=[tmp_path.resolve(strict=False)])
+    assert policy.deny_unix_socket_paths is None
+
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+
+    # The only /dev/null binds present (if any) come from the dotfile
+    # mask; none should target a path we didn't ask to deny. Since this
+    # tmp_path has no dotfiles, there should be no /dev/null bind at all.
+    devnull_targets = [
+        argv[i + 2]
+        for i in range(len(argv) - 2)
+        if argv[i] == "--bind-try" and argv[i + 1] == "/dev/null"
+    ]
+    assert devnull_targets == [], (
+        f"Unexpected /dev/null masks with an empty deny list: {devnull_targets}"
+    )
+
+
+def _index_of_triple(argv: list[str], a: str, b: str, c: str) -> int | None:
+    """
+    Return the index of the first ``[a, b, c]`` contiguous triple in
+    ``argv``, or ``None`` if absent.
+
+    :param argv: The argument vector to scan.
+    :param a: First token of the triple.
+    :param b: Second token.
+    :param c: Third token.
+    :returns: Index of ``a`` in the matching triple, or ``None``.
+    """
+    for i in range(len(argv) - 2):
+        if argv[i] == a and argv[i + 1] == b and argv[i + 2] == c:
+            return i
+    return None
 
 
 def test_wrap_launcher_argv_chdir_overrides_only_entry_directory(

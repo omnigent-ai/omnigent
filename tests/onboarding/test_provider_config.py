@@ -130,6 +130,37 @@ def test_default_provider_for_pi_none_when_only_subscriptions() -> None:
     assert default_provider_for_harness(config, "pi") is None
 
 
+def test_default_provider_for_pi_skips_cli_config_defaults() -> None:
+    """For the unmapped ``pi`` harness, a cli-config default is skipped.
+
+    A cli-config entry pins a provider table in ~/.codex/config.toml (e.g.
+    isaac's Databricks AI Gateway); only the codex harness bridges that file,
+    and ``configure_agent_harness_with_provider`` raises for any other
+    harness. A regression here makes the resolver hand pi the codex-only
+    gateway: the REPL startup header then shows "Pi → ⚙️ Databricks AI
+    Gateway" while ``setup`` (which filters via ``provider_families``)
+    correctly shows pi as credential-less, and an actual pi spawn fails.
+    """
+    config = {
+        "providers": {
+            "codex-databricks": {
+                "kind": "cli-config",
+                "default": True,
+                "cli": "codex",
+                "model_provider": "databricks",
+            },
+        }
+    }
+    # With only the codex-pinned gateway configured, pi must resolve no
+    # default — the gateway's credential lives in codex's config.toml,
+    # which pi cannot read. A non-None result means the fallback regressed
+    # to accepting cli-config and the header/setup readouts diverge again.
+    assert default_provider_for_harness(config, "pi") is None
+    # The codex harness itself still takes the cli-config default — it is
+    # exactly the CLI whose config.toml carries the provider table.
+    assert default_provider_for_harness(config, "codex").name == "codex-databricks"
+
+
 # ── the pi default scope ──────────────────────────────────────────────
 
 

@@ -284,15 +284,7 @@ function SessionNavButton({ to }: { to: string }) {
   );
 }
 
-function renderShell(path: string, { seedRightPanelOpen = true }: { seedRightPanelOpen?: boolean } = {}) {
-  // The rail is closed by default and its open-state is per-session. Most tests
-  // assert rail behavior, so by default seed the path's conversation open —
-  // reproducing the rail's pre-existing always-open behavior. Pass
-  // seedRightPanelOpen: false to exercise the real default-closed state.
-  if (seedRightPanelOpen) {
-    const id = path.match(/^\/c\/([^/?#]+)/)?.[1];
-    if (id) writeSessionWorkspaceState(id, { open: true });
-  }
+function renderShell(path: string) {
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -379,13 +371,6 @@ beforeEach(() => {
   // choice carries across sessions. Clear it so a stored preference from one
   // test can't change another test's default scope.
   localStorage.clear();
-  // The right "Workspace" rail is closed by default and remembers its
-  // open-state per session. Most tests assert rail content and build their own
-  // router (or use renderShell) with conv_abc / conv_xyz, so seed those open
-  // here to reproduce the rail's pre-existing always-open behavior. Tests that
-  // exercise the real default-closed state use distinct conversation ids.
-  writeSessionWorkspaceState("conv_abc", { open: true });
-  writeSessionWorkspaceState("conv_xyz", { open: true });
   // The Tasks tab/drawer gates on chatStore.todos; reset so a populated
   // todo list from one test doesn't leak into the next.
   // Reset terminal-first startup signals so one test's terminalPending /
@@ -1590,44 +1575,44 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
   });
 
-  it("starts closed for a fresh session (no stored open-state)", () => {
-    // A brand-new session has no persisted open-state, so the rail stays
-    // closed — the card is unmounted and the header offers Expand, not
-    // Collapse. conv_fresh is not seeded open by the beforeEach.
+  it("starts open for a fresh session (no stored open-state)", () => {
+    // A brand-new session has no persisted open-state, so the rail opens by
+    // default — the card is mounted and the header offers Collapse, not
+    // Expand.
     useEnvironmentMock.mockReturnValue({
       data: { available: false, root: null, home: null },
       isLoading: false,
     } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
     mockConversations([{ id: "conv_fresh", permission_level: null }]);
 
-    renderShell("/c/conv_fresh", { seedRightPanelOpen: false });
+    renderShell("/c/conv_fresh");
 
-    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
-    expect(screen.getByRole("button", { name: "Expand right panel" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Collapse right panel" })).toBeNull();
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Expand right panel" })).toBeNull();
   });
 
   it("persists the open-state per session across remounts", () => {
-    // Open the rail on a fresh session, then remount the same session: the
-    // persisted open-state restores the card without re-toggling.
+    // Collapse the rail on a fresh session, then remount the same session:
+    // the persisted closed-state wins over the open default.
     useEnvironmentMock.mockReturnValue({
       data: { available: false, root: null, home: null },
       isLoading: false,
     } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
     mockConversations([{ id: "conv_persist", permission_level: null }]);
 
-    const first = renderShell("/c/conv_persist", { seedRightPanelOpen: false });
-    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
-
-    fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+    const first = renderShell("/c/conv_persist");
     expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
     first.unmount();
 
-    // Remount the same conversation: the stored open-state (written by the
-    // toggle) brings the card back on its own.
-    renderShell("/c/conv_persist", { seedRightPanelOpen: false });
-    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
+    // Remount the same conversation: the stored closed-state (written by the
+    // toggle) keeps the card hidden despite the open default.
+    renderShell("/c/conv_persist");
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Expand right panel" })).toBeInTheDocument();
   });
 
   it("restores the selected rail tab per session", () => {

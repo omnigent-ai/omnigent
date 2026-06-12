@@ -37,6 +37,7 @@ from .sandbox import (
     create_private_tmpdir,
     resolve_sandbox,
     with_additional_write_roots,
+    with_denied_unix_sockets,
 )
 
 # Heterogeneous JSON-shaped result returned by :meth:`TerminalInstance.send`
@@ -813,9 +814,14 @@ class TerminalInstance:
             return
         effective_cwd = str(cwd or self.private_dir)
 
-        # Set OMNIGENT_TMUX_SOCK so the process knows its own socket path.
+        # Do NOT advertise the tmux control socket path to the
+        # pane. The tmux server runs unsandboxed, so exposing its socket
+        # let pane code run ``tmux -S <sock> run-shell '...'`` to execute
+        # commands outside the sandbox. The host-side control plane
+        # addresses the socket via ``self.socket_path`` directly and never
+        # needs the env var; any inherited value is stripped below too.
         env = dict(os.environ)
-        env["OMNIGENT_TMUX_SOCK"] = str(self.socket_path)
+        env.pop("OMNIGENT_TMUX_SOCK", None)
         # Apply per-terminal env overrides (takes precedence over inherited env).
         env.update(self.env)
         # Strip vars the caller asked us not to leak into the terminal —
@@ -1580,8 +1586,18 @@ def create_terminal_instance(
         if sandbox_spec.type != "none":
             sandbox = resolve_sandbox(effective_os_env_spec, cwd)
             if sandbox.active:
-                # Add the private dir to write roots (for the tmux socket).
+                # Add the private dir to write roots so a forked working
+                # tree (``private_dir/root``) and the instance dir stay
+                # writable inside the pane.
                 sandbox = with_additional_write_roots(sandbox, [private_dir])
+                # The tmux control socket lives inside that
+                # now-writable ``private_dir``. Deny the sandboxed pane
+                # from reaching it so it cannot ``tmux -S <sock> run-shell``
+                # against the unsandboxed server. bwrap overlays /dev/null
+                # onto the socket path; seatbelt emits a network-outbound
+                # unix-socket deny (its default allow_network=true would
+                # otherwise permit the connect).
+                sandbox = with_denied_unix_sockets(sandbox, [socket_path])
         # Plumb the egress allow-list from the OSEnvSandboxSpec
         # onto the instance so :meth:`launch` can start a
         # parent-side MITM proxy. SandboxPolicy itself only carries

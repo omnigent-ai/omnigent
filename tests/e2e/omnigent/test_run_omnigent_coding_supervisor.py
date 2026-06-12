@@ -290,9 +290,9 @@ _CODEX_SPAWN_TIMEOUT_SEC = 240
 # collision); ``omnigent/`` is the package dir the supervisor
 # operates on; ``pyproject.toml`` is a universal Python-project
 # anchor. Any LLM paraphrasing would still mention at least one
-# of them by name in a "list files" response. The anchors must exist
-# in BOTH repo shapes — the managed repo and the OSS export (which
-# prunes internal root docs like AGENTS.md, the previous anchor).
+# of them by name in a "list files" response. The anchors must exist in
+# every checkout this suite runs against — root-level docs vary between
+# distributions (AGENTS.md, the previous anchor, is not universal).
 _EXPECTED_ROOT_ENTRIES = ("openapi.json", "omnigent", "pyproject.toml")
 
 
