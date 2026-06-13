@@ -46,10 +46,11 @@ from omnigent._wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE as _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
 )
 from omnigent._wrapper_labels import (
-    CODEX_NATIVE_WRAPPER_VALUE as _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
-)
-from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY as _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
+)
+from omnigent.native_coding_agents import (
+    CODEX_NATIVE_CODING_AGENT,
+    native_coding_agent_for_wrapper_label,
 )
 
 # Client-side persistent launch state. The picker reads this per row
@@ -184,16 +185,12 @@ def _runtime_badge(row: _ConversationRow) -> str:
         without raising.
     """
     labels = getattr(row, "labels", None)
-    if (
-        isinstance(labels, dict)
-        and labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) == _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE
-    ):
-        return "[claude]"
-    if (
-        isinstance(labels, dict)
-        and labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) == _CODEX_NATIVE_WRAPPER_LABEL_VALUE
-    ):
-        return "[codex]"
+    if isinstance(labels, dict):
+        native_agent = native_coding_agent_for_wrapper_label(
+            labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+        )
+        if native_agent is not None:
+            return f"[{native_agent.key}]"
     return "[chat]"
 
 
@@ -1417,7 +1414,7 @@ def _launch_state_for_row(row: _ConversationRow) -> Any | None:
     wrapper = labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
     if wrapper == _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE:
         return _read_claude_launch_state(row.id)
-    if wrapper == _CODEX_NATIVE_WRAPPER_LABEL_VALUE:
+    if wrapper == CODEX_NATIVE_CODING_AGENT.wrapper_label:
         return _read_codex_launch_state(row.id)
     return None
 

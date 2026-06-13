@@ -1134,6 +1134,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "login",
         "pane-picker",
         "pane-split",
+        "pi",
         "polly",
         "resume",
         "run",
@@ -3864,6 +3865,87 @@ def codex(
         codex_args=codex_args,
         model=model,
         prompt=prompt,
+        auto_open_conversation=auto_open_conversation,
+    )
+
+
+@cli.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+@click.option(
+    "--server",
+    default=None,
+    help=(
+        "Remote omnigent URL. Ensures the host daemon, asks the "
+        "daemon-spawned runner to launch Pi, and attaches this TTY. "
+        'Pass --server "" to auto-spawn a persistent local server in the '
+        "background and use that instead of a remote one."
+    ),
+)
+@click.option(
+    "-r",
+    "--resume",
+    "resume",
+    is_flag=False,
+    flag_value=_RESUME_PICKER_SENTINEL,
+    default=None,
+    help=(
+        "Resume a prior Omnigent conversation. With a conversation id "
+        "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
+        "opens an interactive picker scoped to pi-native sessions."
+    ),
+)
+@click.option(
+    "--session",
+    "session_id",
+    metavar="SESSION_ID",
+    default=None,
+    hidden=True,
+    help="Deprecated alias for ``--resume <id>``; kept for one release.",
+)
+@click.argument("pi_args", nargs=-1, type=click.UNPROCESSED)
+def pi(
+    server: str | None,
+    resume: str | None,
+    session_id: str | None,
+    pi_args: tuple[str, ...],
+) -> None:
+    """Launch Pi TUI in an Omnigent terminal.
+
+    \b
+    Examples:
+      omnigent pi
+      omnigent pi --resume conv_abc123
+      omnigent pi --resume                    # interactive picker
+      omnigent pi --model local-deepseek/deepseek-v4-flash
+    """
+    choice = _split_resume_value(resume)
+    if session_id is not None and (choice.picker or choice.conversation_id is not None):
+        raise click.UsageError(
+            "--session and --resume are mutually exclusive; "
+            "prefer --resume (--session is deprecated).",
+        )
+
+    from omnigent.pi_native import run_pi_native
+
+    cfg = _load_effective_config()
+    if server is None:
+        server = cfg.get("server")
+    auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
+
+    server = _ensure_backend(server)
+    resolved_session_id = (
+        choice.conversation_id if choice.conversation_id is not None else session_id
+    )
+
+    run_pi_native(
+        server=server,
+        session_id=resolved_session_id,
+        resume_picker=choice.picker,
+        pi_args=pi_args,
         auto_open_conversation=auto_open_conversation,
     )
 

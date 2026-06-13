@@ -8,18 +8,26 @@ from __future__ import annotations
 
 HARNESS_ALIASES: dict[str, str] = {
     "claude": "claude-sdk",
+    "native-pi": "pi-native",
     # The SDK package / runtime dispatch spelling; specs use "openai-agents".
     "openai-agents-sdk": "openai-agents",
 }
 
-# Canonical native-CLI harness spellings. These are the only harnesses that
-# own an on-disk runtime transcript (Claude Code's project JSONL / Codex's
-# rollout); a fork into one carries history only via a transcript rebuild
-# (same-format clone on the same-family diagonal, or build-from-AP-items for
-# an SDK source). ``AgentSpec.harness_kind`` returns these canonical
-# spellings for native agents, so no executor-type aliasing is needed here.
+# Canonical native-CLI harness spellings. These harnesses type messages into
+# a resident terminal process and mirror their transcript back to Omnigent, so
+# the runner must not replay Omnigent history or treat a completed queue call
+# as a full in-process model turn. ``AgentSpec.harness_kind`` returns these
+# canonical spellings for native agents, so no executor-type aliasing is needed
+# here.
 NATIVE_HARNESSES: frozenset[str] = frozenset(
-    {"claude-native", "native-claude", "codex-native", "native-codex"}
+    {
+        "claude-native",
+        "native-claude",
+        "codex-native",
+        "native-codex",
+        "pi-native",
+        "native-pi",
+    }
 )
 
 
@@ -42,12 +50,9 @@ def is_claude_sdk_harness_name(harness: str | None) -> bool:
 def is_native_harness(harness: str | None) -> bool:
     """Return whether *harness* is a native CLI harness.
 
-    Native harnesses (Claude Code, Codex) boot from their own on-disk
-    runtime transcript and ignore the Omnigent transcript, so a fork into
-    one needs a transcript rebuild to carry history. Accepts the canonical
-    native spellings that :attr:`AgentSpec.harness_kind` returns
-    (``"claude-native"`` / ``"codex-native"`` and the reversed
-    ``"native-claude"`` / ``"native-codex"`` forms).
+    Native harnesses boot a vendor TUI in a terminal and route user messages
+    into that running process. Accepts the canonical native spellings that
+    :attr:`AgentSpec.harness_kind` returns plus their reversed aliases.
 
     :param harness: A harness id, e.g. ``"codex-native"`` or ``"claude_sdk"``;
         ``None`` returns ``False``.

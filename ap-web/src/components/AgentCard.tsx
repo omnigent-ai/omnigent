@@ -5,6 +5,7 @@ import { NessieIcon } from "@/components/icons/NessieIcon";
 import { PiIcon } from "@/components/icons/PiIcon";
 import type { ComponentType, SVGProps } from "react";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
+import { nativeCodingAgentForAvailableAgent } from "@/lib/nativeCodingAgents";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 
 /**
@@ -20,6 +21,10 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
  */
 function iconForAgent(agent: AvailableAgent): ComponentType<SVGProps<SVGSVGElement>> {
   if (agent.name === "nessie") return NessieIcon;
+  const nativeAgent = nativeCodingAgentForAvailableAgent(agent);
+  if (nativeAgent?.iconKind === "claude") return ClaudeIcon;
+  if (nativeAgent?.iconKind === "codex") return CodexIcon;
+  if (nativeAgent?.iconKind === "pi") return PiIcon;
   // A null harness (spec couldn't load) flows through to the bot fallback.
   if (agent.harness?.includes("codex")) return CodexIcon;
   if (agent.harness?.includes("claude")) return ClaudeIcon;

@@ -933,11 +933,12 @@ describe("chatStore — switchTo", () => {
 
   // The session.status handler keys off isNativeTerminalSession to decide
   // whether to clear the optimistic bubble on idle (see that handler's
-  // test). It must be true for BOTH native wrappers and false otherwise,
+  // test). It must be true for every registered native wrapper and false otherwise,
   // or the host-restart "bubble disappears" fix mis-fires.
   it.each([
     ["claude-code-native-ui", true],
     ["codex-native-ui", true],
+    ["pi-native-ui", true],
     ["some-other-wrapper", false],
     [null, false],
   ])("switchTo derives isNativeTerminalSession from wrapper=%s", async (wrapper, expected) => {

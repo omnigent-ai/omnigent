@@ -210,6 +210,7 @@ include = ["omnigent*"]
 "omnigent.db" = ["alembic.ini"]
 "omnigent.db.migrations" = ["script.py.mako"]
 "omnigent.resources.examples" = ["*.yaml", "*.sh", "debby/**/*", "polly/**/*"]
+"omnigent.resources.pi_native" = ["*.js"]
 # include UI assets in build
 "omnigent.server" = ["static/web-ui/**/*"]
 

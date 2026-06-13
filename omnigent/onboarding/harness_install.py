@@ -132,7 +132,7 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
 # :data:`_HARNESS_INSTALL` family key. Only the CLI-backed harnesses appear
 # here — the ones that cannot launch without a binary on ``PATH``:
 # ``claude-native`` wraps the ``claude`` CLI, ``codex-native`` the ``codex``
-# CLI, and ``pi`` the ``pi`` CLI.
+# CLI, and ``pi`` / ``pi-native`` the ``pi`` CLI.
 # SDK-based harnesses run in-process and are deliberately absent, so they
 # resolve to "no CLI required": ``claude-sdk``, ``codex``, ``openai-agents-sdk``,
 # ``databricks_supervisor``, and ``cursor`` (which drives the ``cursor-sdk``
@@ -141,6 +141,7 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "claude-native": ANTHROPIC_FAMILY,
     "codex-native": OPENAI_FAMILY,
     PI_KEY: PI_KEY,
+    "pi-native": PI_KEY,
 }
 
 

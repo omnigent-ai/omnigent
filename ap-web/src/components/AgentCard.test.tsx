@@ -47,6 +47,7 @@ describe("AgentCard icon selection", () => {
     { name: "design-reviewer", harness: "codex", expected: "codex" },
     { name: "codex-native-ui", harness: "codex-native", expected: "codex" },
     { name: "claude-native-ui", harness: "claude-native", expected: "claude" },
+    { name: "pi-native-ui", harness: "pi-native", expected: "pi" },
     { name: "x", harness: "claude-sdk", expected: "claude" },
     { name: "pi", harness: "pi", expected: "pi" },
     // The pi match is exact: a harness merely containing "pi" stays generic.

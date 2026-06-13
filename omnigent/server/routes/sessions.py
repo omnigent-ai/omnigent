@@ -88,6 +88,15 @@ from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
 from omnigent.model_override import validate_model_override
+from omnigent.native_coding_agents import (
+    CLAUDE_NATIVE_CODING_AGENT,
+    CODEX_NATIVE_CODING_AGENT,
+    NativeCodingAgent,
+    native_coding_agent_for_agent_name,
+    native_coding_agent_for_harness,
+    native_coding_agent_for_terminal_name,
+    native_coding_agent_for_wrapper_label,
+)
 from omnigent.policies.types import (
     ElicitationRequest,
     EvaluationContext,
@@ -420,7 +429,7 @@ _EXTERNAL_SESSION_TODOS_TYPE: str = "external_session_todos"
 # runner for tmux injection, and rendered transcript items must come
 # back through ``external_conversation_item`` only.
 _CLAUDE_NATIVE_WRAPPER_LABEL_KEY = "omnigent.wrapper"
-_CLAUDE_NATIVE_WRAPPER_LABEL_VALUE = "claude-code-native-ui"
+_CLAUDE_NATIVE_WRAPPER_LABEL_VALUE = CLAUDE_NATIVE_CODING_AGENT.wrapper_label
 # Marks a session as terminal-first in the Web UI (AppShell renders the
 # Claude Code terminal pane via TerminalFirstContext). Stamped alongside
 # the wrapper label so a claude-native session — created fresh by the
@@ -429,11 +438,11 @@ _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE = "claude-code-native-ui"
 _CLAUDE_NATIVE_UI_LABEL_KEY = "omnigent.ui"
 _CLAUDE_NATIVE_UI_LABEL_VALUE = "terminal"
 
-_CLAUDE_NATIVE_HARNESS = "claude-native"
-_CLAUDE_NATIVE_MODEL = "claude-native-ui"
-_CODEX_NATIVE_WRAPPER_LABEL_VALUE = "codex-native-ui"
-_CODEX_NATIVE_HARNESS = "codex-native"
-_CODEX_NATIVE_MODEL = "codex-native-ui"
+_CLAUDE_NATIVE_HARNESS = CLAUDE_NATIVE_CODING_AGENT.harness
+_CLAUDE_NATIVE_MODEL = CLAUDE_NATIVE_CODING_AGENT.agent_name
+_CODEX_NATIVE_WRAPPER_LABEL_VALUE = CODEX_NATIVE_CODING_AGENT.wrapper_label
+_CODEX_NATIVE_HARNESS = CODEX_NATIVE_CODING_AGENT.harness
+_CODEX_NATIVE_MODEL = CODEX_NATIVE_CODING_AGENT.agent_name
 _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S = 30.0
 _NATIVE_TERMINAL_START_FAILED_CODE = "native_terminal_start_failed"
 _NATIVE_TERMINAL_ENSURE_FAILED_CODE = "native_terminal_ensure_failed"
@@ -5730,10 +5739,8 @@ def _is_native_terminal_session(conv: Conversation) -> bool:
     :returns: ``True`` for wrappers whose transcript forwarder is the
         single writer for conversation history.
     """
-    return conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) in {
-        _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
-        _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
-    }
+    wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+    return native_coding_agent_for_wrapper_label(wrapper) is not None
 
 
 def _native_terminal_runtime(conv: Conversation) -> tuple[str, str, str]:
@@ -5745,10 +5752,9 @@ def _native_terminal_runtime(conv: Conversation) -> tuple[str, str, str]:
     :raises OmnigentError: If the wrapper label is unsupported.
     """
     wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
-    if wrapper == _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE:
-        return "Claude", _CLAUDE_NATIVE_MODEL, _CLAUDE_NATIVE_HARNESS
-    if wrapper == _CODEX_NATIVE_WRAPPER_LABEL_VALUE:
-        return "Codex", _CODEX_NATIVE_MODEL, _CODEX_NATIVE_HARNESS
+    native_agent = native_coding_agent_for_wrapper_label(wrapper)
+    if native_agent is not None:
+        return native_agent.display_name, native_agent.agent_name, native_agent.harness
     raise OmnigentError(
         "Unsupported native terminal session",
         code=ErrorCode.INVALID_INPUT,
@@ -5764,10 +5770,9 @@ def _native_terminal_name_for_harness(harness: str) -> str:
     :raises OmnigentError: If *harness* is not a supported native
         terminal harness.
     """
-    if harness == _CLAUDE_NATIVE_HARNESS:
-        return "claude"
-    if harness == _CODEX_NATIVE_HARNESS:
-        return "codex"
+    native_agent = native_coding_agent_for_harness(harness)
+    if native_agent is not None:
+        return native_agent.terminal_name
     raise OmnigentError(
         "Unsupported native terminal session",
         code=ErrorCode.INVALID_INPUT,
@@ -8540,6 +8545,24 @@ def _agent_is_native(agent: Agent) -> bool:
     return is_native_harness(spec.executor.harness_kind)
 
 
+def _native_coding_agent_for_agent(agent: Agent) -> NativeCodingAgent | None:
+    """
+    Return native coding-agent metadata for an agent's harness.
+
+    :param agent: The agent whose bundle should be inspected.
+    :returns: Registry metadata for the native TUI harness, or ``None``.
+    """
+    try:
+        spec = (
+            get_agent_cache()
+            .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
+            .spec
+        )
+    except Exception:  # noqa: BLE001 — unloadable bundle → non-native presentation
+        return None
+    return native_coding_agent_for_harness(spec.executor.harness_kind)
+
+
 def _presentation_labels_for_agent(agent: Agent) -> dict[str, str]:
     """Return the Web UI presentation labels for an agent's harness.
 
@@ -8554,24 +8577,8 @@ def _presentation_labels_for_agent(agent: Agent) -> dict[str, str]:
     :returns: ``{ui: terminal, wrapper: <value>}`` for a native agent, or
         ``{}`` for an SDK agent / undeterminable family (chat mode).
     """
-    from omnigent._wrapper_labels import (
-        CLAUDE_NATIVE_WRAPPER_VALUE,
-        CODEX_NATIVE_WRAPPER_VALUE,
-        UI_MODE_LABEL_KEY,
-        UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY,
-    )
-
-    if not _agent_is_native(agent):
-        return {}
-    family = _agent_provider_family(agent)
-    wrapper = {
-        "anthropic": CLAUDE_NATIVE_WRAPPER_VALUE,
-        "openai": CODEX_NATIVE_WRAPPER_VALUE,
-    }.get(family or "")
-    if wrapper is None:
-        return {}
-    return {UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE, WRAPPER_LABEL_KEY: wrapper}
+    native_agent = _native_coding_agent_for_agent(agent)
+    return native_agent.presentation_labels if native_agent is not None else {}
 
 
 async def _register_policy_elicitation(
@@ -9925,14 +9932,10 @@ def _native_subagent_wrapper_labels_from_spec(sub_spec: AgentSpec) -> dict[str, 
         sub-agent, or ``{}`` when the sub-agent is not native.
     """
     harness = _spec_harness(sub_spec)
-    if harness == _CLAUDE_NATIVE_HARNESS:
+    native_agent = native_coding_agent_for_harness(harness)
+    if native_agent is not None:
         return {
-            _CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
-            _CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE,
-        }
-    if harness == _CODEX_NATIVE_HARNESS:
-        return {
-            _CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+            _CLAUDE_NATIVE_WRAPPER_LABEL_KEY: native_agent.wrapper_label,
             _CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE,
         }
     return {}
@@ -10291,23 +10294,16 @@ async def _create_session_from_existing_agent(
                 code=ErrorCode.INTERNAL_ERROR,
             )
         conv = updated_conv
-    # Set wrapper label at creation time if the agent is a native
-    # terminal wrapper (claude-native or codex-native), so all messages
+    # Set wrapper labels at creation time if the agent is a native
+    # terminal wrapper, so all messages
     # (including early ones sent before the runner connects) take
     # the native path and avoid double-persistence with the
     # transcript forwarder.
-    if agent.name == "claude-native-ui":
-        _cn_labels = dict(body.labels) if body.labels else {}
-        _cn_labels[_CLAUDE_NATIVE_WRAPPER_LABEL_KEY] = _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE
-        # Terminal-first rendering label, so an added Claude Code child
-        # shows the terminal pane even though the dialog sends no labels.
-        _cn_labels[_CLAUDE_NATIVE_UI_LABEL_KEY] = _CLAUDE_NATIVE_UI_LABEL_VALUE
-        await asyncio.to_thread(conversation_store.set_labels, conv.id, _cn_labels)
-        conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
-    elif agent.name == "codex-native-ui":
-        _cx_labels = dict(body.labels) if body.labels else {}
-        _cx_labels[_CLAUDE_NATIVE_WRAPPER_LABEL_KEY] = _CODEX_NATIVE_WRAPPER_LABEL_VALUE
-        await asyncio.to_thread(conversation_store.set_labels, conv.id, _cx_labels)
+    native_agent = native_coding_agent_for_agent_name(agent.name)
+    if native_agent is not None:
+        _native_labels = dict(body.labels) if body.labels else {}
+        _native_labels.update(native_agent.presentation_labels)
+        await asyncio.to_thread(conversation_store.set_labels, conv.id, _native_labels)
         conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
     elif (
         body.sub_agent_name
@@ -14361,10 +14357,10 @@ def create_sessions_router(
         they launch undeclared names via the runner's
         synthesize-from-body path and predate the gate. The markers
         are client-controlled, so the exemption is narrowed to the
-        exact shape those wrappers send — ``terminal`` of ``"claude"``
-        or ``"codex"`` with ``session_key`` ``"main"`` — anything else
-        carrying a marker still goes through the declared-name gate
-        (it would otherwise be an arbitrary-terminal bypass).
+        exact shape those wrappers send — a registered native terminal
+        name with ``session_key`` ``"main"`` — anything else carrying a
+        marker still goes through the declared-name gate (it would
+        otherwise be an arbitrary-terminal bypass).
 
         :param session_id: Session/conversation identifier.
         :param request: JSON body with ``terminal`` and
@@ -14378,7 +14374,7 @@ def create_sessions_router(
         body = await request.json()
         is_native_bootstrap = (
             bool(body.get("ensure_native_terminal") or body.get("bridge_inject_dir"))
-            and body.get("terminal") in ("claude", "codex")
+            and native_coding_agent_for_terminal_name(body.get("terminal")) is not None
             and body.get("session_key") == "main"
         )
         if not is_native_bootstrap:
