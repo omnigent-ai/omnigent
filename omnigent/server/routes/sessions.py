@@ -41,6 +41,7 @@ import httpx
 from fastapi import (
     APIRouter,
     BackgroundTasks,
+    Depends,
     File,
     HTTPException,
     Query,
@@ -174,6 +175,10 @@ from omnigent.server.routes._auth_helpers import (
     require_user as _require_user,
 )
 from omnigent.server.routes._codex_elicitation import parse_codex_elicitation_request
+from omnigent.server.routes._content_type import (
+    require_json_content_type,
+    require_json_or_multipart_content_type,
+)
 from omnigent.server.routes._host_worktree import CreatedWorktree
 from omnigent.server.schemas import (
     AgentObject,
@@ -11521,6 +11526,10 @@ def create_sessions_router(
         "/sessions",
         status_code=201,
         response_model=None,
+        # CSRF hardening: this route dispatches on Content-Type (JSON vs
+        # multipart bundled-create), so reject text/plain and other simple
+        # types up front while still allowing both legitimate body shapes.
+        dependencies=[Depends(require_json_or_multipart_content_type)],
     )
     async def create_session(
         request: Request,
@@ -13212,6 +13221,9 @@ def create_sessions_router(
     @router.post(
         "/sessions/{session_id}/hooks/permission-request",
         response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
     )
     async def claude_permission_request_hook(
         request: Request,
@@ -13484,6 +13496,9 @@ def create_sessions_router(
         # Returns EvaluationResponse JSON; no Pydantic model since the
         # proto-style schema is validated manually.
         response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
     )
     async def evaluate_policy(
         request: Request,
@@ -13673,6 +13688,9 @@ def create_sessions_router(
     @router.post(
         "/sessions/{session_id}/hooks/codex-elicitation-request",
         response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
     )
     async def codex_elicitation_request_hook(
         request: Request,
@@ -14268,6 +14286,9 @@ def create_sessions_router(
     @router.post(
         "/sessions/{session_id}/resources/terminals",
         response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
     )
     async def create_session_terminal(
         session_id: str,
@@ -14368,6 +14389,9 @@ def create_sessions_router(
     @router.post(
         "/sessions/{session_id}/resources/terminals/{terminal_id}/transfer",
         response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
     )
     async def transfer_session_terminal(
         request: Request,
@@ -15054,6 +15078,9 @@ def create_sessions_router(
     @router.post(
         "/sessions/{session_id}/resources/environments/{environment_id}/shell",
         response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
     )
     async def run_environment_shell(
         session_id: str,
@@ -16990,6 +17017,10 @@ def create_sessions_router(
     @router.post(
         "/sessions/{session_id}/mcp",
         response_model=None,  # Returns a raw Response with application/json
+        # CSRF hardening: the MCP Streamable HTTP contract already mandates
+        # an application/json request body; enforce it so a cross-site
+        # text/plain request can't drive JSON-RPC against this proxy.
+        dependencies=[Depends(require_json_content_type)],
     )
     async def mcp_proxy(
         session_id: str,
