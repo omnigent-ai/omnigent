@@ -13,26 +13,21 @@
 # already used by sibling workflows in this repo.
 name: OSS regenerate lockfiles + smoke
 
+# Manual-only by design: a maintainer dispatches it when lockfiles need a
+# refresh (typically after a sync lands manifest changes). Automatic
+# triggers (manifest-path pushes, a weekly sweep) used to open rolling
+# regen PRs at unpredictable moments — including mid-release — so timing
+# stays in human hands; `/regen` on a PR covers the PR-scoped case.
 on:
   workflow_dispatch: {}
-  # Re-lock only when dependency manifests move (the bot commits lockfiles,
-  # which are NOT in these paths, so this never self-triggers a loop).
-  push:
-    branches: [main]
-    paths:
-      - "pyproject.toml"
-      - "ap-web/package.json"
-  # Weekly freshness sweep.
-  schedule:
-    - cron: "0 6 * * 1"
 
 # Read-only at the top level (Scorecard Token-Permissions); the write
 # scopes live on the job(s) below.
 permissions:
   contents: read
 
-# Serialize runs on the same ref so a manifest push and a manual dispatch
-# (or a weekly sweep) don't both force-push the regen branch at once.
+# Serialize runs on the same ref so two overlapping dispatches don't both
+# force-push the regen branch at once.
 # cancel-in-progress is false (not true): a queued run starts AFTER the
 # prior one finishes, so it checks out the just-updated main, regenerates
 # identical lockfiles, and exits clean on "nothing to commit" — instead of

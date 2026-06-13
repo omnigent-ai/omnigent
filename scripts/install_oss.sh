@@ -1,42 +1,30 @@
 #!/bin/sh
 
-# Omnigent OSS bootstrap installer.
+# Omnigent installer.
 #
-# The external counterpart to ``scripts/install.sh`` (which is the
-# Databricks internal-beta bootstrap). This script installs the same
-# toolchain an external user actually needs and deliberately drops every
-# Databricks-internal piece:
+# Installs the published `omnigent` wheel from PyPI with uv, wires up PATH,
+# and points you at first-run. The wheel bundles the prebuilt web UI, so the
+# default install needs no Node/npm and runs no build.
 #
-#   ported over      uv + git (offer to install if missing), a public git
-#                    install, PATH wiring, Python >= 3.12, Node >= 22 + npm +
-#                    tmux checks (tmux: offer to install)
-#   dropped          the internal PyPI / npm proxies, the SSH access check
-#                    to the private repo, the demo `databricks` CLI + lakebox,
-#                    `ucode`, the three Databricks OAuth profiles
-#   excluded         the trailing `omnigent setup` question — first-run
-#                    `omnigent run` owns model-credential + harness setup
+# Options:
+#   --version X   install a specific PyPI release (default: latest)
+#   --repo URL    install from a git checkout instead (builds from source;
+#                 requires Node 22+/npm) — for development
+#   --non-interactive, --verbose
 #
-# Pattern: same structure/helpers as the internal `install.sh`. The internal
-# script only checks-and-fails on uv/git/npm; here we additionally OFFER to
-# install the deps that have a trusted one-line installer (uv, git, tmux).
-# Node/npm are check-and-fail: we never install them (distro Node is often
-# older than the required 22.10, so pointing at the official installer is
-# safer than a package-manager guess), but a missing/too-old Node or a
-# missing npm aborts the run — `uv tool install` builds the web UI with npm
-# and would hard-fail later with a noisier error anyway. The GA `databricks`
-# CLI is an optional end-of-run hint since only the Databricks model
-# provider needs it.
-#
-# Harness CLIs (claude / codex / pi) are intentionally NOT installed here:
-# `omnigent run` / `omnigent configure harness` offer to `npm install`
-# the harness you actually pick, so we only verify Node/npm/tmux are present.
+# uv and git (only with --repo) are required; the installer offers to install
+# them if missing. Node/npm are needed by the Claude/Codex/Pi harnesses and
+# tmux by their terminal launchers — missing ones are warnings, not errors,
+# unless building from source.
 
 set -eu
 
-# Public repository to install from. Override with --repo.
-# TODO(oss-release): point this at the public mirror once the repo name
-# is final; for now it is overridable so the script is usable today.
-REPO_URL="https://github.com/omnigent-ai/omnigent.git"
+# Published PyPI package, the default install. --version pins a release.
+PACKAGE_NAME="omnigent"
+VERSION=
+# Set by --repo to install from a git checkout instead (development; builds
+# the web UI from source). Empty => install the published wheel from PyPI.
+REPO_URL=
 PYTHON_VERSION="3.12"
 INSTALL_URL=
 NON_INTERACTIVE=false
@@ -67,7 +55,7 @@ init_style() {
 }
 
 usage() {
-  printf 'Usage: install_oss.sh [--non-interactive] [--verbose] [--repo URL]\n'
+  printf 'Usage: install_oss.sh [--non-interactive] [--verbose] [--version X] [--repo URL]\n'
 }
 
 step() {
@@ -168,6 +156,14 @@ parse_args() {
         REPO_URL="$2"
         shift
         ;;
+      --version)
+        if [ "$#" -lt 2 ]; then
+          usage >&2
+          exit 1
+        fi
+        VERSION="$2"
+        shift
+        ;;
       *)
         usage >&2
         exit 1
@@ -180,7 +176,9 @@ parse_args() {
 normalize_repo_url() {
   case "$REPO_URL" in
     "")
-      fail "--repo requires a non-empty URL."
+      # No --repo: install the published wheel from PyPI (the default).
+      INSTALL_URL=
+      return
       ;;
     git+ssh://* | git+https://* | git+http://*)
       INSTALL_URL="$REPO_URL"
@@ -201,7 +199,17 @@ normalize_repo_url() {
       ;;
   esac
 
+  if [ -n "$VERSION" ]; then
+    fail "--version pins a PyPI release and cannot be combined with --repo (a git source install)."
+  fi
   verbose "Repository install URL: $INSTALL_URL"
+}
+
+# True only for a from-source git install (--repo): that path builds the web
+# UI with npm, so Node/npm are hard requirements. A default PyPI install pulls
+# the prebuilt wheel and needs neither.
+building_from_source() {
+  [ -n "$INSTALL_URL" ]
 }
 
 prompt_yes_no() {
@@ -240,11 +248,14 @@ check_platform() {
   esac
 }
 
-# Hard prerequisites: without these the package cannot be installed at all.
-# The installer OFFERS to install each one with a trusted one-line installer
-# rather than just checking-and-failing. git and uv are all it takes.
+# Hard prerequisites. uv is always required (it performs the install). git is
+# only needed for a from-source `--repo` install — a PyPI wheel install never
+# touches git — so we check it only in that mode. The installer OFFERS to
+# install each with a trusted one-line installer rather than just failing.
 check_prerequisites() {
-  ensure_git
+  if building_from_source; then
+    ensure_git
+  fi
   ensure_uv
 }
 
@@ -268,9 +279,8 @@ ensure_git() {
   fail "git is required. Install it, then rerun this installer."
 }
 
-# uv is the one true hard dependency with a trusted official one-liner, so we
-# offer to run it. On decline / non-interactive / failure we fall back to a
-# fail-with-hint (we cannot install the package without uv).
+# uv performs the install, so it's required; offer the official one-liner,
+# and fall back to a fail-with-hint on decline/non-interactive/failure.
 ensure_uv() {
   if command -v uv >/dev/null 2>&1; then
     step "uv is available"
@@ -301,39 +311,42 @@ ensure_uv() {
 
 # ── Harness toolchain ────────────────────────────────────────────────
 #
-# Node and npm are HARD requirements: `uv tool install` builds the web UI
-# with npm at install time (setup.py aborts the build without it), and the
-# Claude / Codex / Pi harness CLIs are npm packages installed on demand by
-# `omnigent run`. Failing here, before the slow install, gives a clearer
-# error than the same failure surfacing mid-`uv tool install`. tmux stays a
-# soft check (offer to install): only the terminal-harness launchers need it.
+# Node 22+/npm power the Claude/Codex/Pi harnesses; the default PyPI install
+# and the bare web UI don't need them, so a missing one is a warning here.
+# With --repo (source build) npm is required up front, so it becomes an error.
 
-# Node >= 22.10: the bundled claude/codex/pi CLIs ship an `undici` that calls
-# worker_threads.markAsUncloneable (added in 22.10). Probe the symbol directly
-# rather than parse a version string, matching the runtime's Node check.
+# Report a missing prereq: fatal when building from source, otherwise a warning.
+require_or_warn() {
+  if building_from_source; then
+    fail "$1"
+  fi
+  warn "$1"
+}
+
+# Node >= 22.10: the Claude/Codex/Pi CLIs need worker_threads.markAsUncloneable
+# (added in 22.10). Probe the symbol rather than parse a version string.
 check_node() {
   if ! command -v node >/dev/null 2>&1; then
-    fail "node not found on PATH — Omnigent needs Node.js 22 LTS or newer (a 22.10+ API is required) to build the web UI and run the Claude/Codex/Pi harnesses. Install it (https://docs.npmjs.com/downloading-and-installing-node-js-and-npm), then rerun this installer."
+    require_or_warn "node not found — Node.js 22+ is needed for the Claude/Codex/Pi harnesses (https://nodejs.org)."
+    return
   fi
   if node -e "process.exit(typeof require('node:worker_threads').markAsUncloneable === 'function' ? 0 : 1)" >/dev/null 2>&1; then
     step "Node.js is new enough for the harness CLIs"
   else
-    fail "Node.js is too old — Omnigent needs Node.js 22 LTS or newer (a 22.10+ API is required) for the web UI build and the bundled harness CLIs. Upgrade it (https://docs.npmjs.com/downloading-and-installing-node-js-and-npm), then rerun this installer."
+    require_or_warn "Node.js is older than 22.10 — the Claude/Codex/Pi harnesses need 22 LTS or newer (https://nodejs.org)."
   fi
 }
 
 check_npm() {
   if command -v npm >/dev/null 2>&1; then
-    step "npm is available (builds the web UI; installs harness CLIs on first run)"
+    step "npm is available (installs the Claude/Codex/Pi harness CLIs on first run)"
   else
-    fail "npm not found on PATH — Omnigent needs it to build the web UI at install time and to install the Claude/Codex/Pi CLIs. Install it (https://docs.npmjs.com/downloading-and-installing-node-js-and-npm), then rerun this installer."
+    require_or_warn "npm not found — needed to install the Claude/Codex/Pi harness CLIs (https://nodejs.org)."
   fi
 }
 
-# tmux: `omnigent claude` / `omnigent codex` launch the agent through a
-# local tmux terminal and refuse to start without it. This was a real
-# stumbling block for OSS users (cryptic "tmux was not found" at launch), so
-# we surface it up front and offer to install it.
+# `omnigent claude` / `omnigent codex` launch through a local tmux terminal
+# and won't start without it, so surface it up front and offer to install it.
 # Emit the package-manager command that installs $1 on this Linux box, or
 # nothing when no known package manager is present. Shared by the tmux and
 # git install offers.
@@ -384,17 +397,23 @@ check_tmux() {
 }
 
 install_omnigent() {
-  step "Installing Omnigent (Python $PYTHON_VERSION)"
-  # --force so re-running the installer actually RE-installs: `uv tool install`
-  # is a no-op when the tool is already present (the version is static even
-  # when git main has moved), so without it "rerun to upgrade" silently does
-  # nothing. --force re-clones latest main, re-resolves deps, and rebuilds the
-  # web UI (built at install time by setup.py, no longer committed).
-  # -q keeps uv quiet — in particular it suppresses uv's "Installed N
-  # executables: omni, omnigent" summary. The package ships two console-script
-  # entry points, but the single command we point users at is `omnigent`;
-  # `omni` is a short alias, not something to advertise at install time.
-  run_with_spinner "uv tool install" uv tool install --force -q --python "$PYTHON_VERSION" "$INSTALL_URL"
+  # Default: the published PyPI wheel (`omnigent`, optionally `omnigent==X`).
+  # The wheel ships the prebuilt web UI, so there is no npm/Node step and no
+  # source build — the fast, reliable path. `--repo` switches INSTALL_URL to a
+  # git ref, which builds from source (and needs npm, checked above).
+  if building_from_source; then
+    target="$INSTALL_URL"
+    step "Installing Omnigent from source (Python $PYTHON_VERSION)"
+  elif [ -n "$VERSION" ]; then
+    target="${PACKAGE_NAME}==${VERSION}"
+    step "Installing Omnigent $VERSION (Python $PYTHON_VERSION)"
+  else
+    target="$PACKAGE_NAME"
+    step "Installing Omnigent (Python $PYTHON_VERSION)"
+  fi
+  # --force so re-running upgrades instead of no-op'ing; -q hides uv's
+  # "Installed N executables" summary (the package also ships an `omni` alias).
+  run_with_spinner "uv tool install" uv tool install --force -q --python "$PYTHON_VERSION" "$target"
 }
 
 uv_tool_bin_dir() {
@@ -490,11 +509,8 @@ verify_omnigent() {
   "$cli_path" --help >/dev/null
   step "Verified $cli_path"
 
-  # `omni` is installed alongside `omnigent` as a console-script entry point
-  # (see [project.scripts] in pyproject.toml), so `uv tool install` materializes
-  # both. We don't advertise it, but do a silent check so a packaging regression
-  # that drops it surfaces here as a warning rather than as a puzzled user
-  # report later.
+  # `omni` is a shorthand alias installed alongside `omnigent`; check it so a
+  # packaging regression that drops it surfaces here rather than later.
   for alias_cmd in omni; do
     if [ ! -x "$bin_dir/$alias_cmd" ] && ! command -v "$alias_cmd" >/dev/null 2>&1; then
       warn "the $alias_cmd alias was not installed (expected a console-script entry point alongside omnigent)."
@@ -502,9 +518,8 @@ verify_omnigent() {
   done
 }
 
-# Note: there is deliberately no `omnigent setup` step here. On OSS, a bare
-# `omnigent` (first run) configures a model credential and offers to install
-# the harness CLI you pick — there is no Databricks profile flow to run.
+# No setup step here by design: the first `omnigent` run configures a model
+# credential and offers to install the harness CLI you pick.
 print_next_steps() {
   bin_dir="$1"
   command_prefix=

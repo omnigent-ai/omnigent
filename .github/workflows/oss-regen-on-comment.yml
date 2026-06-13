@@ -1,8 +1,9 @@
 # A maintainer comments `/regen` on a PR to regenerate the repo's
 # lockfiles (uv.lock + ap-web/package-lock.json) against public PyPI/npm and
 # commit them ONTO that PR's branch. Complements oss-regenerate-and-smoke.yml
-# (which opens a standalone rolling PR on manifest pushes / schedule); use this
-# when the PR itself moved a dependency and you want the lock fixed in place.
+# (which opens a standalone rolling PR when a maintainer dispatches it); use
+# this when the PR itself moved a dependency and you want the lock fixed in
+# place.
 #
 # Validation is deliberately left to the PR's own CI: the push is made with a
 # PAT (secrets.OSS_REGEN_TOKEN), NOT GITHUB_TOKEN, so it re-fires the PR's full
