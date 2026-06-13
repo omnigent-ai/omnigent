@@ -49,6 +49,7 @@ from omnigent.server.routes.sessions import (
     set_server_runner_router,
 )
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
+from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
     AgentStore,
     ArtifactStore,
@@ -925,6 +926,11 @@ def create_app(
     app.state.server_metrics = server_metrics
     app.state.server_metrics_otel = server_metrics_otel
     app.add_middleware(_WebSocketMetricsMiddleware, metrics=server_metrics)
+    # CSWSH guard: reject cross-origin WebSocket handshakes before any
+    # route accepts them. Added after the metrics middleware so it is the
+    # outermost WS middleware — a forbidden origin is closed without even
+    # reaching the metrics counter (which only counts on accept anyway).
+    app.add_middleware(WebSocketOriginMiddleware)
     # Give the tool-policy ASK gate (which forwards the native-terminal
     # approval popup from a parked-gate background task, off any
     # request/route closure) the runner router so it can reach the bound

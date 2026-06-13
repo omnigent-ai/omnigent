@@ -24,7 +24,10 @@ from urllib.parse import quote, urlsplit, urlunsplit
 
 from websockets.exceptions import InvalidURI, WebSocketException
 
-from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+from omnigent.runner.identity import (
+    OMNIGENT_INTERNAL_WS_ORIGIN,
+    RUNNER_TUNNEL_TOKEN_HEADER,
+)
 from omnigent.runner.transports.ws_tunnel.frames import (
     HelloFrame,
     PingFrame,
@@ -518,7 +521,11 @@ async def _serve_tunnel_once(
 
     dispatch_tasks: dict[str, asyncio.Task[None]] = {}
     ws_channels: dict[str, _RunnerWSChannel] = {}
-    headers: dict[str, str] = {}
+    # Identify as a first-party client so the server's WebSocket origin
+    # guard (CSWSH protection) allows the handshake — this runner is not a
+    # browser and would otherwise rely on the permissive missing-origin
+    # branch.
+    headers: dict[str, str] = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
     if auth_token:
         headers["Authorization"] = f"Bearer {auth_token}"
     if tunnel_token:

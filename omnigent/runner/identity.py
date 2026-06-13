@@ -19,6 +19,15 @@ RUNNER_ADOPT_SIGNAL = signal.SIGUSR1
 RUNNER_WORKSPACE_ENV_VAR = "OMNIGENT_RUNNER_WORKSPACE"
 RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR = "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN"
 RUNNER_TUNNEL_TOKEN_HEADER = "X-Omnigent-Runner-Tunnel-Token"
+# Sentinel ``Origin`` header that the project's own non-browser WebSocket
+# clients (runner -> server tunnel, host/daemon -> server tunnel,
+# terminal-attach) set on their handshakes so the server's CSWSH origin
+# guard allows them. Lives here, alongside the tunnel token header,
+# because it is part of the same client/server handshake contract and the
+# server imports it from this module (server -> runner, not the reverse).
+# The non-HTTP scheme is deliberate: a browser computes ``Origin`` from
+# the page URL and can never emit this value.
+OMNIGENT_INTERNAL_WS_ORIGIN = "omnigent://internal"
 # "1" enables per-session workspace isolation so each session
 # gets its own subdirectory. Set by shared-host servers; single-user
 # CLI flows leave it unset (agent sees the project root directly).
