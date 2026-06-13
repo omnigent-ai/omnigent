@@ -67,13 +67,11 @@ jobs:
         with:
           node-version: "20"
 
-      # 1. Regenerate uv.lock from pyproject against public PyPI.
-      # Resolve only distributions uploaded > 7 days ago, so the lock
-      # never pins a release younger than a week (gives a window for a
-      # compromised/yanked upload to surface before we pin it).
-      - name: Pin uv resolution cutoff (exclude-newer)
-        run: echo "UV_EXCLUDE_NEWER=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
-
+      # 1. Regenerate uv.lock from pyproject against public PyPI. The
+      # 7-day dependency cooldown comes from the repo's uv.toml
+      # (`exclude-newer = "P7D"`), recorded in the lock as a relative
+      # span — an env-var cutoff here would instead stamp an absolute
+      # date into the lock and break later `uv sync --locked` runs.
       - name: Regenerate uv.lock
         run: uv lock
 

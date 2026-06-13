@@ -138,15 +138,13 @@ jobs:
         with:
           node-version: "20"
 
-      # Resolve only distributions uploaded > 7 days ago, so a freshly
-      # regenerated lock never pins a release younger than a week (gives
-      # a window for a compromised/yanked upload to be caught). Inline
-      # rather than a local composite action: this job checks out the
-      # PR author's tree, where a `./.github/actions/...` reference may
-      # not exist; a `run:` step comes from the base-branch workflow.
-      - name: Pin uv resolution cutoff (exclude-newer)
-        run: echo "UV_EXCLUDE_NEWER=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
-
+      # The 7-day dependency cooldown comes from the repo's uv.toml
+      # (`exclude-newer = "P7D"`), which uv records in the lock as a
+      # relative span — so `uv sync --locked` stays consistent without
+      # this workflow injecting a cutoff. (An env-var UV_EXCLUDE_NEWER
+      # here would override the config with an absolute date and stamp
+      # it into the lock, breaking every later `uv sync --locked` that
+      # runs without the same env.)
       - name: Regenerate lockfiles against public PyPI/npm
         run: |
           uv lock
