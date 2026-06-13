@@ -1,0 +1,13 @@
+# Fail loudly on a uv too old to honor the cooldown below: relative
+# `exclude-newer` durations parse from 0.11, and the lockfile sentinel
+# handling that keeps `uv sync --locked` stable landed in 0.11.8.
+required-version = ">=0.11.8"
+
+# Dependency cooldown: never resolve a distribution uploaded within the
+# last 7 days, so a compromised or yanked release has a window to surface
+# before it gets pinned. uv records the relative span in uv.lock (as
+# `exclude-newer-span`) rather than a fixed date, so the pinned versions
+# stay reproducible and `uv sync --locked` keeps passing; the cooldown is
+# only re-applied when a resolution actually runs (`uv lock`, `--upgrade`,
+# `--refresh`, or a dependency change).
+exclude-newer = "P7D"
