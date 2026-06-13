@@ -8,8 +8,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
-exclude-newer-span = "P7D"
+exclude-newer = "2026-06-06T00:21:27Z"
 
 [[package]]
 name = "aiofiles"
@@ -2432,7 +2431,7 @@ wheels = [
 
 [[package]]
 name = "omnigent"
-version = "0.1.0rc4"
+version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },
@@ -2588,7 +2587,7 @@ provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "vertex", "m
 
 [[package]]
 name = "omnigent-client"
-version = "0.1.0rc4"
+version = "0.1.0"
 source = { editable = "sdks/python-client" }
 dependencies = [
     { name = "httpx" },
@@ -2605,7 +2604,7 @@ requires-dist = [
 
 [[package]]
 name = "omnigent-ui-sdk"
-version = "0.1.0rc4"
+version = "0.1.0"
 source = { editable = "sdks/ui" }
 dependencies = [
     { name = "omnigent-client" },
@@ -2616,7 +2615,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "omnigent-client", specifier = "==0.1.0rc4" },
+    { name = "omnigent-client", specifier = "==0.1.0" },
     { name = "prompt-toolkit", specifier = ">=3" },
     { name = "pyyaml", specifier = ">=6.0,<7" },
     { name = "rich", specifier = ">=13" },
