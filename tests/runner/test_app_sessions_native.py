@@ -811,6 +811,71 @@ async def test_create_session_threads_resolved_bundle_dir_to_codex_spawn_env(
     assert env["HARNESS_CODEX_SKILLS_FILTER"] == '["codex_e2e_xyz_greet_a3f9c2"]'
 
 
+@pytest.mark.asyncio
+async def test_create_session_threads_workspace_to_pi_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pi pre-spawn receives the session workspace, not the bundle dir."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
+    session_id = "conv_pi_worktree"
+    runner_workspace = tmp_path / "runner-workspace"
+    runner_workspace.mkdir()
+    bundle_dir = tmp_path / "runner-specs" / "ag_pi-v1"
+    bundle_dir.mkdir(parents=True)
+    worktree = tmp_path / "repo-worktrees" / "feature-x"
+    worktree.mkdir(parents=True)
+    spec = AgentSpec(
+        spec_version=1,
+        name="pi-worktree-agent",
+        skills_filter="none",
+        executor=ExecutorSpec(config={"harness": "pi"}),
+    )
+    harness_client = _ScriptedHarnessClient([])
+    pm = _FakeProcessManager(harness_client)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> ResolvedSpec:
+        del agent_id, session_id
+        return ResolvedSpec(spec=spec, workdir=bundle_dir)
+
+    class _SessionWorkspaceClient(NullServerClient):
+        async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+            del kwargs
+            if url == f"/v1/sessions/{session_id}":
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": session_id,
+                        "agent_id": "ag_pi",
+                        "created_at": 1.0,
+                        "workspace": str(worktree),
+                    },
+                    request=httpx.Request("GET", url),
+                )
+            return await super().get(url)
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=_SessionWorkspaceClient(),  # type: ignore[arg-type]
+        runner_workspace=runner_workspace,
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "ag_pi"},
+        )
+
+    assert resp.status_code == 201
+    assert pm.get_client_calls
+    conversation_id, harness, env = pm.get_client_calls[-1]
+    assert conversation_id == session_id
+    assert harness == "pi"
+    assert env is not None
+    assert env["HARNESS_PI_CWD"] == str(worktree.resolve())
+    assert env["HARNESS_PI_BUNDLE_DIR"] == str(bundle_dir)
+
+
 @pytest.mark.parametrize(
     ("session_json", "expected"),
     [

@@ -1156,6 +1156,7 @@ def _build_codex_spawn_env(
 def _build_pi_spawn_env(
     spec: AgentSpec,
     *,
+    cwd: Path | None = None,
     workdir: Path | None = None,
 ) -> dict[str, str]:
     """
@@ -1168,6 +1169,8 @@ def _build_pi_spawn_env(
     pattern from §Step 5a.
 
     :param spec: The agent spec.
+    :param cwd: Runtime working directory for the Pi CLI. This is the
+        session workspace, not the agent bundle workdir.
     :param workdir: The bundle's on-disk path (extracted by the
         agent cache). Threaded through as ``HARNESS_PI_BUNDLE_DIR``
         so the harness wrap's executor can source bundled skills
@@ -1210,6 +1213,8 @@ def _build_pi_spawn_env(
     env["HARNESS_PI_SKILLS_FILTER"] = json.dumps(spec.skills_filter)
     if spec.name:
         env["HARNESS_PI_AGENT_NAME"] = spec.name
+    if cwd is not None:
+        env["HARNESS_PI_CWD"] = str(cwd)
     if workdir is not None:
         env["HARNESS_PI_BUNDLE_DIR"] = str(workdir)
     os_env_payload = _serialize_os_env(spec.os_env)
