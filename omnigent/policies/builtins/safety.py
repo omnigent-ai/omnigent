@@ -246,8 +246,12 @@ def block_skills(blocked: list[str]) -> PolicyCallable:
             data = event.get("data")
             text = data if isinstance(data, str) else ""
             if text.startswith("/"):
-                # Extract the command name: first token after "/"
-                command = text[1:].split(None, 1)[0] if len(text) > 1 else ""
+                # Extract the command name: first token after "/".
+                # ``split(None, ...)`` drops empty tokens, so a bare "/"
+                # or a slash followed only by whitespace ("/   ") yields
+                # an empty list — guard against IndexError.
+                tokens = text[1:].split(None, 1)
+                command = tokens[0] if tokens else ""
                 if command.lower() in blocked_lower:
                     return {
                         "result": "DENY",
