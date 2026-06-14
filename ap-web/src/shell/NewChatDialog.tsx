@@ -1008,12 +1008,10 @@ export function NewChatLandingScreen() {
           : matchSkillInvocation(initialPrompt, agent?.skills ?? []),
         files,
       });
-      // Record the prompt in the shared composer history so the user can
-      // recall it with ArrowUp in the freshly-opened chat (e.g. to retry
-      // after a failed send). The chat composer's usePromptHistory re-reads
-      // localStorage on mount, so it picks this up on navigate. Use the
-      // sanitized text so recall matches exactly what was sent.
-      appendPromptHistoryEntry(initialPrompt);
+      // Scope the recall entry to the new session id so ArrowUp surfaces it in
+      // the freshly-opened chat (whose composer reads the same per-conversation
+      // key). Sanitized text so recall reproduces exactly what was sent.
+      appendPromptHistoryEntry(initialPrompt, data.id);
       navigate(`/c/${data.id}`);
     } catch {
       setCreateError("Couldn't reach the server. Check your connection and try again.");

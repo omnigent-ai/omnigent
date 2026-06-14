@@ -2780,7 +2780,10 @@ export function Composer({
   // Auto-grow the textarea from 1 row up to 10 rows, then let it scroll.
   useAutoGrowTextarea(textareaRef, value);
 
-  const { appendEntry, recallPrevious, recallNext, resetCursor } = usePromptHistory();
+  // Scope recall to the active conversation so ArrowUp surfaces only this
+  // chat's prompts, not the last thing typed in any other chat.
+  const { appendEntry, recallPrevious, recallNext, resetCursor } =
+    usePromptHistory(conversationId);
   // Set just before recall sets `value`; cleared when the resulting onChange
   // fires. Lets onChange distinguish "user typed" (reset cursor) from
   // "recall replaced the value" (keep cursor).
