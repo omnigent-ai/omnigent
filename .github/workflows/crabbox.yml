@@ -1,0 +1,148 @@
+name: Crabbox
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - ".crabbox.yaml"
+      - ".github/workflows/crabbox.yml"
+      - ".github/workflows/crabbox-hydrate.yml"
+      - "docs/CRABBOX.md"
+      - "scripts/crabbox/**"
+  push:
+    branches:
+      - main
+    paths:
+      - ".crabbox.yaml"
+      - ".github/workflows/crabbox.yml"
+      - ".github/workflows/crabbox-hydrate.yml"
+      - "docs/CRABBOX.md"
+      - "scripts/crabbox/**"
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "Crabbox job to run."
+        required: true
+        default: e2e
+        type: choice
+        options:
+          - lint
+          - pytest
+          - e2e
+          - e2e-ui
+          - release-smoke
+          - pr-gates
+      live:
+        description: "Actually lease a box and run the selected job. False only validates dry-runs."
+        required: true
+        default: false
+        type: boolean
+      github_runner:
+        description: "Use Crabbox GitHub-runner hydration for the live run."
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crabbox-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CRABBOX_VERSION: v0.31.0
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  validate:
+    name: Crabbox config
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Crabbox
+        run: |
+          set -euo pipefail
+          version="${CRABBOX_VERSION#v}"
+          archive="crabbox_${version}_linux_amd64.tar.gz"
+          tmp="$(mktemp -d)"
+          gh release download "$CRABBOX_VERSION" \
+            -R openclaw/crabbox \
+            -p "$archive" \
+            -p checksums.txt \
+            -D "$tmp"
+          (cd "$tmp" && grep "  $archive\$" checksums.txt | sha256sum -c -)
+          tar -xzf "$tmp/$archive" -C "$tmp"
+          sudo install -m 0755 "$tmp/crabbox" /usr/local/bin/crabbox
+          crabbox --version
+
+      - name: List configured jobs
+        run: crabbox job list
+
+      - name: Dry-run configured jobs
+        run: |
+          set -euo pipefail
+          for job in lint pytest e2e e2e-ui release-smoke pr-gates; do
+            echo "::group::crabbox job run --dry-run $job"
+            crabbox job run --dry-run "$job"
+            echo "::endgroup::"
+          done
+
+      - name: Check Crabbox scripts parse
+        run: bash -n scripts/crabbox/*.sh
+
+  run:
+    name: Crabbox live run
+    needs: validate
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.live }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Crabbox
+        run: |
+          set -euo pipefail
+          version="${CRABBOX_VERSION#v}"
+          archive="crabbox_${version}_linux_amd64.tar.gz"
+          tmp="$(mktemp -d)"
+          gh release download "$CRABBOX_VERSION" \
+            -R openclaw/crabbox \
+            -p "$archive" \
+            -p checksums.txt \
+            -D "$tmp"
+          (cd "$tmp" && grep "  $archive\$" checksums.txt | sha256sum -c -)
+          tar -xzf "$tmp/$archive" -C "$tmp"
+          sudo install -m 0755 "$tmp/crabbox" /usr/local/bin/crabbox
+          crabbox --version
+
+      - name: Configure Crabbox broker
+        env:
+          CRABBOX_BROKER_URL: ${{ secrets.CRABBOX_BROKER_URL }}
+          CRABBOX_TOKEN: ${{ secrets.CRABBOX_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CRABBOX_BROKER_URL:-}" ] || [ -z "${CRABBOX_TOKEN:-}" ]; then
+            echo "::notice::CRABBOX_BROKER_URL/CRABBOX_TOKEN not configured; using existing runner Crabbox config"
+            exit 0
+          fi
+          printf '%s' "$CRABBOX_TOKEN" | crabbox config set-broker \
+            -url "$CRABBOX_BROKER_URL" \
+            -token-stdin
+
+      - name: Run selected Crabbox job
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ "${{ inputs.github_runner }}" = "true" ]; then
+            args+=(--github-runner)
+          fi
+          crabbox job run "${args[@]}" "${{ inputs.job }}"

@@ -1,0 +1,154 @@
+profile: omnigent-ci
+target: linux
+architecture: amd64
+class: beast
+market: spot
+ttl: 4h
+idleTimeout: 60m
+
+sync:
+  gitSeed: true
+  fingerprint: true
+  timeout: 20m
+  warnFiles: 50000
+  warnBytes: 5368709120
+  failFiles: 150000
+  failBytes: 21474836480
+  exclude:
+    - .crabbox
+    - .mypy_cache
+    - .pytest_cache
+    - .ruff_cache
+    - .venv
+    - ap-web/dist
+    - ap-web/node_modules
+    - coverage.xml
+    - dist
+    - htmlcov
+    - node_modules
+    - test-results
+
+env:
+  allow:
+    - ANTHROPIC_API_KEY
+    - CI
+    - CODEX
+    - CRABBOX_*
+    - DATABRICKS_BEARER
+    - DATABRICKS_TOKEN
+    - GATEWAY_BASE_URL
+    - LLM_API_KEY
+    - OMNIGENT_*
+    - OPENAI_API_KEY
+    - OPENAI_BASE_URL
+    - PYTEST_*
+    - UV_INDEX_URL
+    - PIP_INDEX_URL
+
+jobs:
+  lint:
+    hydrate:
+      actions: true
+      waitTimeout: 35m
+      keepAliveMinutes: 180
+    actions:
+      workflow: .github/workflows/crabbox-hydrate.yml
+      job: hydrate
+    shell: true
+    command: scripts/crabbox/lint.sh
+    label: omnigent lint
+    artifactGlobs:
+      - artifacts/crabbox/**
+    stop: auto
+
+  pytest:
+    hydrate:
+      actions: true
+      waitTimeout: 35m
+      keepAliveMinutes: 180
+    actions:
+      workflow: .github/workflows/crabbox-hydrate.yml
+      job: hydrate
+    shell: true
+    command: scripts/crabbox/pytest.sh
+    label: omnigent pytest
+    junit:
+      - artifacts/crabbox/pytest.xml
+    artifactGlobs:
+      - artifacts/crabbox/**
+    stop: auto
+
+  e2e:
+    hydrate:
+      actions: true
+      waitTimeout: 40m
+      keepAliveMinutes: 240
+    actions:
+      workflow: .github/workflows/crabbox-hydrate.yml
+      job: hydrate
+    shell: true
+    command: scripts/crabbox/e2e.sh
+    label: omnigent e2e
+    junit:
+      - artifacts/crabbox/e2e/junit.xml
+    artifactGlobs:
+      - artifacts/crabbox/**
+    stop: auto
+
+  e2e-ui:
+    hydrate:
+      actions: true
+      waitTimeout: 40m
+      keepAliveMinutes: 240
+    actions:
+      workflow: .github/workflows/crabbox-hydrate.yml
+      job: hydrate
+    shell: true
+    command: scripts/crabbox/e2e-ui.sh
+    label: omnigent e2e-ui
+    junit:
+      - artifacts/crabbox/e2e-ui/junit.xml
+    artifactGlobs:
+      - artifacts/crabbox/**
+      - test-results/**
+      - playwright-report/**
+    stop: auto
+
+  release-smoke:
+    hydrate:
+      actions: true
+      waitTimeout: 40m
+      keepAliveMinutes: 240
+    actions:
+      workflow: .github/workflows/crabbox-hydrate.yml
+      job: hydrate
+    shell: true
+    command: scripts/crabbox/release-smoke.sh
+    label: omnigent release-smoke
+    artifactGlobs:
+      - artifacts/crabbox/**
+      - dist/**
+    requiredArtifacts:
+      - artifacts/crabbox/release-smoke/omnigent-version.txt
+    stop: auto
+
+  pr-gates:
+    hydrate:
+      actions: true
+      waitTimeout: 40m
+      keepAliveMinutes: 240
+    actions:
+      workflow: .github/workflows/crabbox-hydrate.yml
+      job: hydrate
+    shell: true
+    command: scripts/crabbox/pr-gates.sh
+    label: omnigent pr-gates
+    junit:
+      - artifacts/crabbox/pytest.xml
+      - artifacts/crabbox/e2e/junit.xml
+      - artifacts/crabbox/e2e-ui/junit.xml
+    artifactGlobs:
+      - artifacts/crabbox/**
+      - test-results/**
+      - playwright-report/**
+    stop: auto

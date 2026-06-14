@@ -1,0 +1,51 @@
+# Crabbox Remote Validation
+
+Omnigent has repo-local Crabbox jobs for running the same high-cost
+validation loops on an OpenClaw Crabbox lease that GitHub Actions runs on
+hosted runners.
+
+Crabbox is documented at <https://crabbox.sh/>. The Omnigent integration is
+kept in:
+
+- `.crabbox.yaml` for job definitions and sync/env policy
+- `scripts/crabbox/` for the commands each job executes
+- `.github/workflows/crabbox-hydrate.yml` for lease hydration
+- `.github/workflows/crabbox.yml` for config validation and manual live runs
+
+## Jobs
+
+```bash
+crabbox job list
+crabbox job run --dry-run e2e
+crabbox job run e2e
+```
+
+Available jobs:
+
+- `lint`: pre-commit plus `ap-web` type-checking
+- `pytest`: the non-live pytest suite, matching the default pytest excludes
+- `e2e`: live Databricks-backed E2E tests under `tests/e2e/`
+- `e2e-ui`: Playwright UI E2E tests under `tests/e2e_ui/`
+- `release-smoke`: build distributions and smoke-install the wheels
+- `pr-gates`: lint, pytest, e2e, and e2e-ui in sequence
+
+Live E2E jobs require `LLM_API_KEY` and `GATEWAY_BASE_URL`. Crabbox only
+forwards variables named in `.crabbox.yaml`, so keep new secrets out of the
+repo and add only their names to `env.allow` when a job needs them.
+
+## GitHub Actions
+
+The `Crabbox` workflow runs on PRs that touch the Crabbox integration and
+validates every configured job with `crabbox job run --dry-run`. Maintainers
+can manually dispatch the same workflow with `live=true` to lease a box and
+run one job from GitHub Actions.
+
+Repository secrets used by the live workflow:
+
+- `CRABBOX_BROKER_URL`
+- `CRABBOX_TOKEN`
+- `LLM_API_KEY`
+- `GATEWAY_BASE_URL`
+
+If the broker secrets are omitted, the workflow uses whatever provider and
+credentials the runner already has configured.
