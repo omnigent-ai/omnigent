@@ -11,6 +11,14 @@ configuration in issues, tests, examples, or logs.
 This is a Python package with an optional frontend under `ap-web/`. Use
 [`uv`](https://docs.astral.sh/uv/) for local development:
 
+Install local prerequisites first:
+
+- [`uv`](https://docs.astral.sh/uv/getting-started/installation/) for Python
+  environments and dependency management.
+- `tmux`, required for native Claude/Codex terminals launched by the local host
+  (`brew install tmux` on macOS, or `apt install tmux` on Debian/Ubuntu).
+- Node.js 22 LTS or newer with `npm` when working on `ap-web/`.
+
 ```bash
 git clone https://github.com/omnigent-ai/omnigent.git
 cd omnigent
@@ -34,6 +42,33 @@ When touching `ap-web/`:
 ```bash
 cd ap-web && npm install && npm run lint && npm run build
 ```
+
+## Running locally
+
+To try your changes, start a local server, register your machine as a host,
+and run the frontend dev server. Use three separate terminals:
+
+```bash
+# Terminal 1: local server on :6767
+omnigent server
+
+# Terminal 2: register your machine as a host
+omnigent host --server http://localhost:6767
+
+# Terminal 3: frontend dev server
+cd ap-web
+npm run dev
+```
+
+Open the Vite URL from the frontend dev server, usually
+`http://localhost:5173/`. The host registration is what lets the web UI browse
+your filesystem and start new sessions on your machine — without it, the web UI
+is read/continue-only.
+
+`omni` is an alias for `omnigent`, so `omni host --server ...` works too.
+The host URL can also be passed positionally (`omnigent host
+http://localhost:6767`). See the [README](README.md) for more on hosts,
+harnesses, and credentials.
 
 ## Pull requests
 
