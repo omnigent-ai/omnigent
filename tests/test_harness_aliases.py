@@ -17,6 +17,8 @@ from omnigent.harness_aliases import canonicalize_harness, is_native_harness
         # Canonical names pass through unchanged.
         ("openai-agents", "openai-agents"),
         ("pi", "pi"),
+        # Canonical cursor id passes through unchanged (no alias).
+        ("cursor", "cursor"),
         # Unknown names return unchanged so callers keep their own errors.
         ("bogus", "bogus"),
         (None, None),
@@ -51,6 +53,8 @@ def test_canonicalize_harness(alias: str | None, canonical: str | None) -> None:
         ("codex", False),
         # The "claude" shorthand canonicalizes to claude-sdk (not native).
         ("claude", False),
+        # cursor is a headless ACP harness, not a native CLI bridge.
+        ("cursor", False),
         ("some-unknown-harness", False),
         (None, False),
     ],

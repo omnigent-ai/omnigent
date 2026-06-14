@@ -4026,6 +4026,7 @@ def resume(
 # into a materialized copy of the spec before the server starts.
 _HARNESS_CHOICES_HELP = (
     "'claude' (alias for 'claude-sdk'), 'claude-sdk', 'codex', "
+    "'cursor', "
     "'openai-agents', 'open-responses', or 'pi'"
 )
 _HARNESS_HELP = f"Harness to use for a local agent: {_HARNESS_CHOICES_HELP}."
@@ -4054,6 +4055,9 @@ _DEFAULT_HARNESS_PROMPTS = {
     ),
     "codex": (
         "You are Codex, running through Omnigent. Help the user with software engineering tasks."
+    ),
+    "cursor": (
+        "You are Cursor, running through Omnigent. Help the user with software engineering tasks."
     ),
 }
 _DEFAULT_HARNESS_PROMPT = "You are a helpful coding agent running through Omnigent."

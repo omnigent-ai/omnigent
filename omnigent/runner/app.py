@@ -11658,6 +11658,7 @@ _HARNESS_MODEL_ENV_KEY: dict[str, str] = {
     "codex": "HARNESS_CODEX_MODEL",
     "pi": "HARNESS_PI_MODEL",
     "openai-agents": "HARNESS_OPENAI_AGENTS_MODEL",
+    "cursor": "HARNESS_CURSOR_MODEL",
 }
 
 
@@ -11687,6 +11688,7 @@ def _build_spawn_env_from_spec(
         from omnigent.runtime.workflow import (
             _build_claude_sdk_spawn_env,
             _build_codex_spawn_env,
+            _build_cursor_spawn_env,
             _build_openai_agents_sdk_spawn_env,
             _build_pi_spawn_env,
         )
@@ -11699,6 +11701,8 @@ def _build_spawn_env_from_spec(
             env = _build_pi_spawn_env(spec, workdir=workdir)
         elif harness == "openai-agents":
             env = _build_openai_agents_sdk_spawn_env(spec)
+        elif harness == "cursor":
+            env = _build_cursor_spawn_env(spec, workdir=workdir)
         else:
             # claude-native / codex-native / unknown — no spawn-env.
             return None

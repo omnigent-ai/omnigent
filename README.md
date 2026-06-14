@@ -4,7 +4,7 @@
 
 ### A meta-harness for all your AI agents
 
-Omnigent provides a common layer over Claude Code, Codex, Pi, and the agents you write yourself: swap or combine harnesses without rewriting, keep them in check with policies and sandboxing, and collaborate in real time on the same live session, from any device.
+Omnigent provides a common layer over Claude Code, Codex, Cursor, Pi, and the agents you write yourself: swap or combine harnesses without rewriting, keep them in check with policies and sandboxing, and collaborate in real time on the same live session, from any device.
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/omnigent-ai/omnigent/blob/main/LICENSE)
 ![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)
@@ -145,6 +145,7 @@ omnigent run examples/debby/
 # Run an orchestrator on a different harness (sub-agents keep their own):
 omnigent run examples/polly/ --harness pi
 omnigent run examples/debby/ --harness openai-agents
+omnigent run examples/polly/ --harness cursor  # Cursor CLI (needs cursor-agent + CURSOR_API_KEY)
 ```
 
 **🐙 Polly** is a multi-agent coding orchestrator who writes no code herself.
@@ -336,7 +337,7 @@ name: my_agent
 prompt: You are a helpful data analyst.
 
 executor:
-  harness: claude-sdk          # or: codex, codex-native, claude-native, openai-agents, pi
+  harness: claude-sdk          # or: codex, codex-native, claude-native, cursor, openai-agents, pi
 
 tools:
   # A local Python function (schema auto-generated from the signature)
