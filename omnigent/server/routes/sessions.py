@@ -317,7 +317,7 @@ _EXTERNAL_ELICITATION_RESOLVED_TYPE: str = "external_elicitation_resolved"
 # session.status event observed outside the Omnigent task runtime
 # (e.g. ``omnigent claude`` mirroring Claude Code's Stop hook into
 # the session stream so the web UI's idle/running indicator updates).
-# Payload shape: ``{"status": "idle" | "running" | "waiting" | "failed"}``.
+# Payload shape: ``{"status": "idle" | "launching" | "running" | "waiting" | "failed"}``.
 _EXTERNAL_SESSION_STATUS_TYPE: str = "external_session_status"
 _EXTERNAL_SESSION_STATUS_VALUES: frozenset[str] = frozenset(
     {"idle", "running", "waiting", "failed"}
@@ -11298,7 +11298,7 @@ async def _handle_mcp_tools_call(
                 "method": "tools/call",
                 "params": {"name": namespaced_name, "arguments": arguments},
             },
-            # ``sys_session_send`` returns a running handle immediately; this
+            # ``sys_session_send`` returns a launch handle immediately; this
             # timeout now protects ordinary runner proxy hangs.
             timeout=MCP_PROXY_FORWARD_TIMEOUT_S,
         )

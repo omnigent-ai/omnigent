@@ -821,6 +821,7 @@ describe("SubagentsPanel", () => {
   it("shows the status word only for notable states, not quiet ones", () => {
     mockChildTree({
       conv_parent: [
+        childInfo({ id: "c_launch", tool: "researcher", current_task_status: "launching" }),
         childInfo({ id: "c_work", tool: "researcher", busy: true }),
         childInfo({ id: "c_done", tool: "researcher", current_task_status: "completed" }),
         childInfo({ id: "c_idle", tool: "researcher" }),
@@ -832,6 +833,10 @@ describe("SubagentsPanel", () => {
 
     // The unexpected "cancelled" terminal state keeps its word so it stands out.
     expect(childRow(container, "c_cancel")).toHaveTextContent(/cancelled/);
+    // Launching is not yet real work, so it shows its word and does not reuse
+    // the active running dot.
+    expect(childRow(container, "c_launch")).toHaveTextContent(/Launching/);
+    expect(childRow(container, "c_launch").querySelector('[data-testid="running-dot"]')).toBeNull();
     // Quiet states render no word — the label lives in the tooltip. Working is
     // quiet too: the pulsing pink dot already reads as "active".
     expect(childRow(container, "c_work")).not.toHaveTextContent(/Working/);

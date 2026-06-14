@@ -2645,6 +2645,7 @@ async def test_sys_session_send_reuses_existing_child_session(
 
     create_posts = 0
     event_posts: list[dict[str, Any]] = []
+    published: list[dict[str, Any]] = []
 
     monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
     monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
@@ -2695,6 +2696,7 @@ async def test_sys_session_send_reuses_existing_child_session(
                 conversation_id="conv_parent",
                 agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="claude")]),
                 session_inbox=session_inbox,
+                publish_event=_capturing_publish_event(published),
             )
         finally:
             runner_app.unregister_subagent_work("conv_existing")
@@ -2703,9 +2705,12 @@ async def test_sys_session_send_reuses_existing_child_session(
     payload = json.loads(output)
     assert create_posts == 0, "continuation must not create a duplicate child session"
     assert payload["conversation_id"] == "conv_existing"
-    assert payload["status"] == "running"
+    assert payload["status"] == "launching"
     assert "continued ok" not in payload["message"]
     assert event_posts[0]["data"]["content"][0]["text"] == "continue"
+    assert published[-1]["type"] == "session.child_session.updated"
+    assert published[-1]["child"]["current_task_status"] == "launching"
+    assert published[-1]["child"]["busy"] is False
 
 
 def _spec_with_subagent_harness(harness: str) -> SimpleNamespace:
@@ -3723,7 +3728,7 @@ async def test_sys_session_send_completion_drains_from_parent_inbox(
                 session_inbox=session_inbox,
             )
             payload = json.loads(output)
-            assert payload["status"] == "running"
+            assert payload["status"] == "launching"
             assert "CHILD_MARKER" not in payload["message"]
 
             runner_app.mark_subagent_work_terminal(
@@ -4230,7 +4235,7 @@ async def test_sys_read_inbox_applies_subagent_tool_result_policy(
     """
     ``sys_read_inbox`` evaluates delayed sub-agent output as TOOL_RESULT.
 
-    ``sys_session_send`` returns a running handle immediately, so the
+    ``sys_session_send`` returns a launching handle immediately, so the
     child output arrives after the original tool call. The delayed
     output must still pass through Omnigent policy evaluation before the LLM
     sees it in the inbox drain.
@@ -4668,6 +4673,7 @@ def test_session_status_to_task_status_maps_known_values() -> None:
     """
     from omnigent.runner.app import _session_status_to_task_status
 
+    assert _session_status_to_task_status("launching") == "launching"
     assert _session_status_to_task_status("running") == "in_progress"
     assert _session_status_to_task_status("waiting") == "in_progress"
     assert _session_status_to_task_status("idle") == "completed"
@@ -6350,7 +6356,7 @@ async def test_sys_session_send_session_id_posts_to_direct_child(
     assert event_posts[0]["data"]["content"][0]["text"] == "continue please"
     handle = json.loads(output)
     assert handle["conversation_id"] == "conv_child"
-    assert handle["status"] == "running"
+    assert handle["status"] == "launching"
 
 
 @pytest.mark.asyncio
