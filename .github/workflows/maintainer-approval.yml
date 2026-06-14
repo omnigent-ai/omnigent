@@ -1,75 +1,61 @@
 name: Maintainer Approval
 
-# Posts a `Maintainer Approval` commit status on the PR head SHA.
-# That status is a required check in branch protection (added to the
-# contexts list by .github/scripts/apply-main-branch-protection.sh).
+# Gates merge on a maintainer's approval. The job *is* the required
+# check: it exits non-zero until a maintainer has approved, and GitHub
+# reports that pass/fail as the `Maintainer Approval` status check
+# automatically. We do NOT post a commit status, so no `statuses: write`
+# token is needed.
 #
-# State is success when either:
-#   - the PR author is listed in .github/MAINTAINER on main, OR
-#   - some maintainer's latest non-COMMENTED review on this PR is
-#     APPROVED.
-# Otherwise the state is pending with a "waiting for maintainer
-# approval" description -- branch protection treats pending as not
-# satisfied, so the PR cannot merge.
+# Why this matters for fork PRs: a fork's `pull_request` /
+# `pull_request_review` token is forced read-only regardless of the
+# `permissions:` block, so the old `gh api .../statuses` POST always
+# 403'd on contributor PRs. Making the check the job result sidesteps
+# the API write entirely.
 #
-# Why we read .github/MAINTAINER from main's tip and not the PR head
-# SHA: otherwise a PR editing MAINTAINER to add its author could
-# self-grant the gate. The same property is documented in
-# merge-ready.yml's force-merge eligibility step.
+# Trigger is `pull_request_target`, so the workflow always runs from the
+# base branch (main) with the base repo's token, even for fork PRs:
+#   - it is not held behind the "approve fork-PR workflows" gate, so it
+#     reports immediately on open instead of sitting in action_required;
+#   - the PR-head copy of this file never runs, so a malicious PR cannot
+#     edit the check to weaken it.
+# This is safe because the job checks out nothing and runs no PR code --
+# it only reads .github/MAINTAINER from main and queries the API.
 #
-# Fork-PR token note: the status is posted through the GitHub API,
-# which needs `statuses: write`. A fork PR's `pull_request` token is
-# forced read-only regardless of the `permissions:` block, so the POST
-# would 403 for any contributor PR from a fork. The step below detects
-# that case and skips the POST (rather than erroring): with no status
-# reported, branch protection leaves the required `Maintainer Approval`
-# check unsatisfied -- which is exactly the gate we want -- until a
-# maintainer reviews. The `pull_request_review` event runs in the base
-# repo with a writable token even for forks, so it posts the result
-# then. (We deliberately do not use a base-context PR trigger that runs
-# with secrets on fork code: the public CI leak gate forbids it.)
+# `pull_request_target` does not fire on reviews, so an approval does
+# not re-run this check by itself. maintainer-approval-rerun.yml +
+# maintainer-approval-rerun-run.yml re-run this workflow when a
+# maintainer submits an approving review, flipping the check green.
 #
-# Defense-in-depth note: a malicious PR could edit *this* workflow to
-# drop `?ref=main`. On its own `pull_request_review` and `pull_request`
-# events the modified workflow would run from the PR branch, which
-# could let the PR self-grant the status. The remaining defense is
-# `required_pull_request_reviews` in branch protection -- a real
-# maintainer still has to click Merge, and every change arrives through
-# a PR (no direct push to main).
+# Why read .github/MAINTAINER from main's tip (not the PR head): a PR
+# that adds its own author to MAINTAINER must not be able to self-grant.
 
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, reopened, synchronize, ready_for_review]
-  pull_request_review:
-    types: [submitted, edited, dismissed]
 
-# Read-only at the top level (Scorecard Token-Permissions); the write
-# scopes live on the job below.
 permissions:
   contents: read
 
 concurrency:
+  # Do not cancel in-progress runs: a superseded run cancelled mid-flight
+  # leaves the check red, and queued re-evaluation is cheap.
   group: maintainer-approval-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
-  evaluate:
-    name: evaluate
+  approve:
+    name: Maintainer Approval
     permissions:
       contents: read
       pull-requests: read
-      statuses: write   # post the Maintainer Approval status
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
-      - name: Evaluate maintainer approval
+      - name: Require maintainer approval
         env:
           GH_TOKEN: ${{ github.token }}
           REPO:     ${{ github.repository }}
           PR:       ${{ github.event.pull_request.number }}
-          SHA:      ${{ github.event.pull_request.head.sha }}
-          EVENT:    ${{ github.event_name }}
-          IS_FORK:  ${{ github.event.pull_request.head.repo.fork }}
         run: |
           # --- Load maintainers from .github/MAINTAINER at main's tip ---
           set +e
@@ -77,81 +63,47 @@ jobs:
           RC=$?
           set -e
           if [[ $RC -ne 0 || -z "$CONTENT_B64" ]]; then
-            STATE=pending
-            DESC=".github/MAINTAINER not found on main"
-          else
-            CONTENT=$(echo "$CONTENT_B64" | base64 -d)
-            # Strip comments and blanks; flatten to a space-separated list.
-            # `grep -v` exits 1 with no matches; wrap so the pipeline
-            # stays 0 under pipefail and we reach the empty-list branch.
-            MAINTAINERS=$(echo "$CONTENT" | sed -E 's/#.*$//' | tr -s '[:space:]' '\n' | { grep -v '^$' || true; } | tr '\n' ' ')
-            MAINTAINERS_LC=$(echo "$MAINTAINERS" | tr '[:upper:]' '[:lower:]')
+            echo "::error::.github/MAINTAINER not found on main"
+            exit 1
+          fi
 
-            if [[ -z "${MAINTAINERS_LC// /}" ]]; then
-              STATE=pending
-              DESC=".github/MAINTAINER on main has no entries"
-            else
-              AUTHOR=$(gh pr view "$PR" --repo "$REPO" --json author --jq '.author.login')
-              AUTHOR_LC=$(echo "$AUTHOR" | tr '[:upper:]' '[:lower:]')
+          CONTENT=$(echo "$CONTENT_B64" | base64 -d)
+          # Strip comments and blanks; flatten to a space-separated list.
+          # `grep -v` exits 1 with no matches; wrap so the pipeline stays
+          # 0 under pipefail and we reach the empty-list branch.
+          MAINTAINERS=$(echo "$CONTENT" | sed -E 's/#.*$//' | tr -s '[:space:]' '\n' | { grep -v '^$' || true; } | tr '\n' ' ')
+          MAINTAINERS_LC=$(echo "$MAINTAINERS" | tr '[:upper:]' '[:lower:]')
+          if [[ -z "${MAINTAINERS_LC// /}" ]]; then
+            echo "::error::.github/MAINTAINER on main has no entries"
+            exit 1
+          fi
 
-              STATE=""
-              DESC=""
+          AUTHOR=$(gh pr view "$PR" --repo "$REPO" --json author --jq '.author.login')
+          AUTHOR_LC=$(echo "$AUTHOR" | tr '[:upper:]' '[:lower:]')
 
-              # Case 1: author is a maintainer.
-              for m in $MAINTAINERS_LC; do
-                if [[ "$m" == "$AUTHOR_LC" ]]; then
-                  STATE=success
-                  DESC="Author @$AUTHOR is a maintainer"
-                  break
-                fi
-              done
-
-              # Case 2: latest non-COMMENTED review state of some
-              # maintainer is APPROVED. Matches GitHub's UI semantics
-              # (COMMENTED doesn't supersede APPROVED; CHANGES_REQUESTED
-              # and DISMISSED do).
-              if [[ -z "$STATE" ]]; then
-                APPROVERS=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
-                  --jq '[.[] | select(.state != "COMMENTED")] | group_by(.user.login) | map(max_by(.submitted_at)) | .[] | select(.state == "APPROVED") | .user.login')
-                for u in $APPROVERS; do
-                  u_lc=$(echo "$u" | tr '[:upper:]' '[:lower:]')
-                  for m in $MAINTAINERS_LC; do
-                    if [[ "$m" == "$u_lc" ]]; then
-                      STATE=success
-                      DESC="Approved by maintainer @$u"
-                      break 2
-                    fi
-                  done
-                done
-              fi
-
-              # Case 3: nothing yet -- pending.
-              if [[ -z "$STATE" ]]; then
-                STATE=pending
-                DESC="Awaiting approval from a maintainer"
-              fi
+          # Case 1: author is a maintainer.
+          for m in $MAINTAINERS_LC; do
+            if [[ "$m" == "$AUTHOR_LC" ]]; then
+              echo "Author @$AUTHOR is a maintainer."
+              exit 0
             fi
-          fi
+          done
 
-          # GitHub commit-status descriptions max out at 140 chars.
-          if [[ ${#DESC} -gt 140 ]]; then
-            DESC="${DESC:0:137}..."
-          fi
+          # Case 2: latest non-COMMENTED review state of some maintainer
+          # is APPROVED. Matches GitHub's UI semantics (COMMENTED does
+          # not supersede APPROVED; CHANGES_REQUESTED and DISMISSED do).
+          APPROVERS=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
+            --jq '[.[] | select(.state != "COMMENTED")] | group_by(.user.login) | map(max_by(.submitted_at)) | .[] | select(.state == "APPROVED") | .user.login')
+          for u in $APPROVERS; do
+            u_lc=$(echo "$u" | tr '[:upper:]' '[:lower:]')
+            for m in $MAINTAINERS_LC; do
+              if [[ "$m" == "$u_lc" ]]; then
+                echo "Approved by maintainer @$u."
+                exit 0
+              fi
+            done
+          done
 
-          # A fork PR's pull_request token is read-only, so the status
-          # POST would 403. Skip it on that event/fork combination -- the
-          # required check stays unreported (which blocks merge, the
-          # intended gate) until a maintainer reviews, at which point the
-          # writable pull_request_review token posts the result.
-          if [[ "$EVENT" == "pull_request" && "$IS_FORK" == "true" ]]; then
-            echo "Fork PR on pull_request event: token is read-only, " \
-              "skipping status POST. Awaiting maintainer review " \
-              "(would post Maintainer Approval=$STATE: $DESC)."
-            exit 0
-          fi
-
-          gh api "repos/$REPO/statuses/$SHA" \
-            -f state="$STATE" \
-            -f context="Maintainer Approval" \
-            -f description="$DESC" >/dev/null
-          echo "Posted Maintainer Approval=$STATE on $SHA ($DESC)"
+          # Case 3: nothing yet -- fail the check so merge stays blocked.
+          echo "::error::Awaiting approval from a maintainer (one of: $MAINTAINERS)."
+          exit 1

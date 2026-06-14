@@ -93,6 +93,10 @@ WORKDIR /build
 # Manifests + SDK path-deps first so the install layer caches across
 # pure source edits.
 COPY pyproject.toml setup.py ./
+# License + third-party attribution travel into the published images (the host
+# and runtime targets COPY /build below), since the image redistributes the
+# dependency bytes baked in by the install step.
+COPY LICENSE NOTICE ./
 COPY sdks/ ./sdks/
 COPY omnigent/ ./omnigent/
 # The built-in polly agent's packaged bundle (omnigent/resources/examples/

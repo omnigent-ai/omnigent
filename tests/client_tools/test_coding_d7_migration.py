@@ -230,3 +230,28 @@ def test_grep_smoke() -> None:
     """``Grep`` smoke-test against this file's known content."""
     out = Grep(pattern="def test_grep_smoke", path=__file__)
     assert __file__ in out, f"Grep should find this test file; got {out!r}"
+
+
+def test_grep_invalid_regex_returns_error() -> None:
+    """``Grep`` with an invalid regex returns an error string, not a crash.
+
+    Both rg and grep exit with code 2 on a bad pattern; the tool must
+    surface that rather than silently returning "No matches found."
+    """
+    out = Grep(pattern="[invalid", path=__file__)
+    assert "Search failed" in out, f"Expected error for invalid regex; got {out!r}"
+
+
+def test_edit_write_error_returns_error_string() -> None:
+    """``Edit`` returns an error string (not raise) when write_text raises OSError."""
+    from unittest.mock import patch
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as tmp:
+        tmp.write("hello world")
+        path = tmp.name
+    try:
+        with patch.object(Path, "write_text", side_effect=OSError("disk full")):
+            result = Edit(file_path=path, old_string="hello", new_string="goodbye")
+        assert "Error writing" in result, f"Expected write-error message; got {result!r}"
+    finally:
+        Path(path).unlink()

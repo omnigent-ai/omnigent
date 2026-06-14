@@ -25,6 +25,9 @@ name: E2E Tests
 on:
   schedule:
     - cron: "0 9 * * *"
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore: ['ap-web/**']
   workflow_dispatch:
     inputs:
       branch:
@@ -83,6 +86,11 @@ jobs:
     # we trip rate limits, drop ``-n`` to 1 first; only fall back to
     # ``max-parallel`` reduction if QPS still hurts.
     name: E2E Tests (shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
+    # Public-only: skip draft PRs and fork PRs (forks can't read the
+    # LLM_API_KEY / GATEWAY_BASE_URL secrets); see _E2E_GUARD_IF_BLOCK.
+    if: ${{ !github.event.pull_request.draft
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
     strategy:
       # One red shard shouldn't cancel siblings; we want every shard's

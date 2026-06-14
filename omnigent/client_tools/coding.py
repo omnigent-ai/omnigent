@@ -148,7 +148,10 @@ def Edit(
         if replace_all
         else text.replace(old_string, new_string, 1)
     )
-    target.write_text(result)
+    try:
+        target.write_text(result)
+    except OSError as exc:
+        return _truncate(f"Error writing {target}: {exc}")
     replacements = count if replace_all else 1
     return _truncate(f"Replaced {replacements} occurrence(s) in {target}")
 
@@ -203,7 +206,7 @@ def Grep(
             ``count`` (match counts).
     """
     search_path = path if path is not None else "."
-    cmd = ["rg", pattern, search_path, "--no-heading"]
+    cmd = ["rg", "-e", pattern, search_path, "--no-heading"]
     if glob is not None:
         cmd.extend(["--glob", glob])
     mode = output_mode if output_mode is not None else "files_with_matches"
@@ -218,17 +221,25 @@ def Grep(
             text=True,
             timeout=30,
         )
-        return _truncate(result.stdout.strip() or "No matches found.")
+    except subprocess.TimeoutExpired:
+        return _truncate("Search timed out after 30s")
     except FileNotFoundError:
         # ripgrep not installed — fall back to grep.
-        grep_cmd = ["grep", "-r", pattern, search_path]
-        result = subprocess.run(
-            grep_cmd,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        return _truncate(result.stdout.strip() or "No matches found.")
+        grep_cmd = ["grep", "-r", "-e", pattern, search_path]
+        try:
+            result = subprocess.run(
+                grep_cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except FileNotFoundError:
+            return _truncate("Search failed: neither ripgrep nor grep is available.")
+        except subprocess.TimeoutExpired:
+            return _truncate("Search timed out after 30s")
+    if result.returncode > 1:
+        return _truncate(f"Search failed (exit {result.returncode}): {result.stderr.strip()}")
+    return _truncate(result.stdout.strip() or "No matches found.")
 
 
 @tool(strict=False)

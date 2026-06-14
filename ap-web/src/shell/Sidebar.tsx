@@ -65,6 +65,7 @@ import { isConversationUnseen } from "@/hooks/useUnseenConversations";
 import { sumPendingApprovals } from "@/lib/inbox";
 import { cn } from "@/lib/utils";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
+import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import { ThemeModeMenu } from "@/components/theme/ThemeModeMenu";
 import { AccountMenu } from "./AccountMenu";
@@ -444,6 +445,20 @@ function ConversationList({
       return next;
     });
   }, []);
+
+  // Visible rows in render order (collapsed sections excluded) for the Cmd+↑/↓
+  // session hotkey. Titles must match the <ConversationSection> props below.
+  const orderedConversationIds = useMemo(() => {
+    const visible = (title: string, list: readonly Conversation[]) =>
+      collapsedSections.includes(title) ? [] : list;
+    return [
+      ...visible("Pinned", sections.pinned),
+      ...visible("Recent", sections.sessions),
+      ...visible("Shared with me", sections.shared),
+      ...visible("Archived", sections.archived),
+    ].map((c) => c.id);
+  }, [sections, collapsedSections]);
+  useSessionSwitchHotkey(orderedConversationIds, activeId);
 
   // Only normalize pinned ids once all pages are loaded; a pin that
   // lives on an unloaded page should not be dropped prematurely

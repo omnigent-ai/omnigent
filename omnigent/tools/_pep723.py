@@ -11,12 +11,21 @@ Extracts dependency declarations from Python tool files that use the
 When dependencies are found, the tool subprocess is invoked via
 ``uv run --with dep1 --with dep2 -- python _runner.py`` so that
 deps are auto-resolved and cached by uv.
+
+Per PEP 723 the metadata block's content is a TOML document, so it is
+recovered by stripping the comment prefix from each line and parsed with
+``tomllib``. This correctly handles arbitrary field ordering, multi-line
+arrays, single/double quoting, and dependency specifiers that contain
+``[extras]`` (e.g. ``uvicorn[standard]``) -- none of which an ad-hoc regex
+over the raw lines handles reliably.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+
+import tomllib
 
 
 @dataclass(frozen=True)
@@ -35,61 +44,60 @@ class InlineMetadata:
 _BLOCK_START_RE = re.compile(r"^#\s*///\s*script\s*$")
 # Matches the closing marker: ``# ///``
 _BLOCK_END_RE = re.compile(r"^#\s*///\s*$")
-# Matches a dependencies line: ``# dependencies = [...]``
-_DEPS_RE = re.compile(
-    r"^#\s*dependencies\s*=\s*\[([^\]]*)\]",
-)
 
 
 def parse_inline_metadata(source: str) -> InlineMetadata | None:
     """
     Extract PEP 723 inline script metadata from Python source.
 
-    Scans for a ``# /// script`` ... ``# ///`` block and extracts
-    the ``dependencies`` list. Returns ``None`` if no metadata
-    block is found or if the block contains no dependencies.
+    Scans for a ``# /// script`` ... ``# ///`` block, recovers the embedded
+    TOML document, and reads its ``dependencies`` array. Returns ``None`` if
+    no metadata block is found, the block is not valid TOML, or it declares
+    no dependencies.
 
     :param source: The full source text of a Python file.
     :returns: Parsed metadata with dependencies, or ``None``.
     """
-    lines = source.splitlines()
-    in_block = False
-    block_lines: list[str] = []
-
-    for line in lines:
-        if not in_block:
-            if _BLOCK_START_RE.match(line):
-                in_block = True
-            continue
-        if _BLOCK_END_RE.match(line):
-            break
-        block_lines.append(line)
-
-    if not block_lines:
+    toml_text = _extract_block_toml(source)
+    if toml_text is None:
         return None
 
-    # Join block lines and search for dependencies = [...]
-    block_text = "\n".join(block_lines)
-    match = _DEPS_RE.search(block_text)
-    if match is None:
+    try:
+        metadata = tomllib.loads(toml_text)
+    except tomllib.TOMLDecodeError:
         return None
 
-    raw_deps = match.group(1)
-    deps = _parse_dep_list(raw_deps)
+    deps = metadata.get("dependencies")
+    if not isinstance(deps, list) or not all(isinstance(dep, str) for dep in deps):
+        return None
     if not deps:
         return None
     return InlineMetadata(dependencies=deps)
 
 
-def _parse_dep_list(raw: str) -> list[str]:
+def _extract_block_toml(source: str) -> str | None:
     """
-    Parse a comma-separated list of quoted dependency specifiers.
+    Recover the TOML document embedded in a ``# /// script`` block.
 
-    Handles both single and double quotes, strips whitespace.
-    Example input: ``'"requests>=2.28", "beautifulsoup4"'``
+    Per PEP 723 the metadata content is each block line with its comment
+    prefix removed: drop a leading ``# `` (hash + space) when present,
+    otherwise drop a leading ``#``. Only a block terminated by ``# ///`` is
+    recognized, matching the spec's reference implementation.
 
-    :param raw: The raw string between ``[`` and ``]``.
-    :returns: List of dependency specifier strings.
+    :param source: The full source text of a Python file.
+    :returns: The block's TOML text, or ``None`` if no terminated block
+        is present.
     """
-    # Extract all quoted strings (single or double)
-    return [m.group(1) or m.group(2) for m in re.finditer(r'"([^"]*?)"|\'([^\']*?)\'', raw)]
+    in_block = False
+    content_lines: list[str] = []
+
+    for line in source.splitlines():
+        if not in_block:
+            if _BLOCK_START_RE.match(line):
+                in_block = True
+            continue
+        if _BLOCK_END_RE.match(line):
+            return "\n".join(content_lines)
+        content_lines.append(line[2:] if line.startswith("# ") else line[1:])
+
+    return None

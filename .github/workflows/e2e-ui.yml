@@ -18,6 +18,8 @@ name: E2E UI Tests
 #                       ref.
 
 on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   schedule:
     - cron: "0 9 * * *"
   workflow_dispatch:
@@ -73,7 +75,11 @@ jobs:
     # Skip on draft PRs; the `ready_for_review` trigger re-fires the
     # workflow when the draft is converted, so the check won't strand
     # pending on the eventual ready-for-review state.
-    if: ${{ !github.event.pull_request.draft }}
+    # Public-only: also skip fork PRs — they can't read the LLM_API_KEY /
+    # GATEWAY_BASE_URL secrets; see _E2E_GUARD_IF_BLOCK.
+    if: ${{ !github.event.pull_request.draft
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:

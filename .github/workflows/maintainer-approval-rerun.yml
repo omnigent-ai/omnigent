@@ -1,0 +1,45 @@
+name: Maintainer Approval Rerun
+
+# Bridges a maintainer's approving review to a re-run of the Maintainer
+# Approval check. `pull_request_target` does not fire on reviews, so
+# something has to re-trigger the check when an approval lands.
+#
+# A fork PR's `pull_request_review` token is read-only AND the run is
+# held behind the fork-approval gate, so it cannot re-run a workflow
+# itself. This job therefore only records the PR number as an artifact;
+# the privileged re-run happens in maintainer-approval-rerun-run.yml,
+# which runs from the base repo on `workflow_run`.
+# See https://securitylab.github.com/research/github-actions-preventing-pwn-requests/
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maintainer-approval-rerun-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  record:
+    # Only approvals can flip the check green; skip everything else.
+    if: github.event.review.state == 'approved'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Record PR number
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          mkdir -p pr
+          echo "$PR_NUMBER" > pr/pr_number
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: maintainer-approval-pr-number
+          path: pr/
+          retention-days: 1
+          if-no-files-found: error
