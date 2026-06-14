@@ -19,13 +19,14 @@ name: E2E Tests
 #                       parallel; leans heavily on
 #                       ``tests/known_failures.yaml`` quarantines
 #                       (~290 entries today) tracked under #532.
-#   push (main)         Post-merge verification run, matches the
-#                       pattern in ci.yml / nightly.yml.
 
 on:
   schedule:
     - cron: "0 9 * * *"
-  pull_request:
+  # pull_request_target (not pull_request) so fork PRs run in the base-repo
+  # context with secrets, gated by the fork-e2e environment below. Same-repo
+  # and internal PRs run ungated (empty environment).
+  pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
     paths-ignore: ['ap-web/**']
   workflow_dispatch:
@@ -86,11 +87,11 @@ jobs:
     # we trip rate limits, drop ``-n`` to 1 first; only fall back to
     # ``max-parallel`` reduction if QPS still hurts.
     name: E2E Tests (shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
-    # Public-only: skip draft PRs and fork PRs (forks can't read the
-    # LLM_API_KEY / GATEWAY_BASE_URL secrets); see _E2E_GUARD_IF_BLOCK.
-    if: ${{ !github.event.pull_request.draft
-      && (github.event_name != 'pull_request'
-          || github.event.pull_request.head.repo.full_name == github.repository) }}
+    # Fork PRs gate behind the fork-e2e environment (maintainer approval) before
+    # any fork code/secret runs; same-repo and internal PRs get an empty
+    # environment, i.e. no gate. Draft PRs skip.
+    environment: ${{ github.event.pull_request.head.repo.fork && 'fork-e2e' || '' }}
+    if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     strategy:
       # One red shard shouldn't cancel siblings; we want every shard's
@@ -116,7 +117,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
-          ref: ${{ github.event.inputs.branch || github.ref }}
+          # Test the merge result: refs/pull/N/merge is the PR head merged into
+          # the base by GitHub. It is absent when the PR conflicts, so a
+          # conflicted PR fails checkout here by design (resolve conflicts
+          # first). Fork code still runs only after the env gate above. Non-PR
+          # events fall back to the dispatch branch / ref.
+          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.event.inputs.branch || github.ref }}
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
