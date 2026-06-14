@@ -317,7 +317,10 @@ _EXTERNAL_ELICITATION_RESOLVED_TYPE: str = "external_elicitation_resolved"
 # session.status event observed outside the Omnigent task runtime
 # (e.g. ``omnigent claude`` mirroring Claude Code's Stop hook into
 # the session stream so the web UI's idle/running indicator updates).
-# Payload shape: ``{"status": "idle" | "launching" | "running" | "waiting" | "failed"}``.
+# Payload shape: ``{"status": "idle" | "running" | "waiting" | "failed"}``.
+# ``launching`` is runner-local sub-agent bookkeeping (it rides in a child's
+# ``current_task_status``, never as an external session status) and is
+# intentionally absent from ``_EXTERNAL_SESSION_STATUS_VALUES`` below.
 _EXTERNAL_SESSION_STATUS_TYPE: str = "external_session_status"
 _EXTERNAL_SESSION_STATUS_VALUES: frozenset[str] = frozenset(
     {"idle", "running", "waiting", "failed"}

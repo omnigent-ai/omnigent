@@ -5213,7 +5213,7 @@ async def test_external_session_status_running_fans_out_child_busy_to_parent() -
             resp = await client.post(
                 f"/v1/sessions/{child_id}/events",
                 json={"type": "external_session_status", "data": {"status": "running"}},
-        )
+            )
         assert resp.status_code == 204, resp.text
         entry = runner_app.get_subagent_work(child_id)
         assert entry is not None

@@ -5131,7 +5131,12 @@ async def _cancel_subagent_task(
     entry = _runner_app.get_subagent_work(str(task_id))
     if entry is None or entry.parent_session_id != conversation_id:
         return f"Error: no in-flight task with task_id {task_id}"
-    if entry.status != "running":
+    # A dispatched child sits in ``launching`` until its runtime emits a real
+    # busy edge (see ``mark_subagent_work_started``). Cancellation must still
+    # route to the child during that window — otherwise cancelling a slow-to-
+    # start sub-agent would silently no-op and leave it running. Only terminal
+    # states (``completed`` / ``failed`` / ``cancelled``) short-circuit here.
+    if entry.status not in ("launching", "running", "waiting"):
         return json.dumps(
             {
                 "cancelled": entry.status == "cancelled",
