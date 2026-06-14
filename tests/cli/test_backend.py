@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,8 @@ from omnigent.cli import (
     _discover_local_server_url,
     _ensure_backend,
     _ensure_host_daemon,
+    _resolve_attach_server,
+    _resolve_host_server,
 )
 from omnigent.cli import (
     cli as cli_group,
@@ -1425,3 +1428,168 @@ def test_ensure_backend_databricks_preflight_skips_when_authenticated(
 
     assert login_calls == []
     assert result == "https://myapp-1234.aws.databricksapps.com"
+
+
+# ── Workspace-URL expansion for attach / resume / host ──────────────
+#
+# ``run`` / ``claude`` / ``codex`` expand a bare Databricks workspace URL to
+# its ``/api/2.0/omnigent`` mount via ``_ensure_backend`` (covered above);
+# ``attach``, ``resume``, and the ``host`` subcommands resolve ``--server``
+# on their own paths and must route through the same expansion. The
+# expansion itself probes the network and is tested in
+# ``test_login_databricks.py`` — here we stub it to a recognizable
+# transform and assert each resolver actually calls it.
+
+
+def _expand_marker(server: str) -> str:
+    """Stand in for ``_workspace_api_server_url`` with a visible transform.
+
+    :param server: The URL the resolver hands to the expansion.
+    :returns: ``server`` with the API mount appended, so a test can tell
+        an expanded result apart from a passed-through one.
+    """
+    return f"{server.rstrip('/')}/api/2.0/omnigent"
+
+
+def _recording_expander(seen: list[str]) -> Callable[[str], str]:
+    """Build a ``_workspace_api_server_url`` stub that records its input.
+
+    :param seen: List the stub appends each received URL to, so a test
+        can assert the resolver expanded the bare URL (not a pre-pathed one).
+    :returns: Callable that records ``server`` then returns its expansion.
+    """
+
+    def _expand(server: str) -> str:
+        seen.append(server)
+        return _expand_marker(server)
+
+    return _expand
+
+
+def test_resolve_attach_server_expands_explicit_workspace_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit ``--server`` workspace URL is expanded to its API mount.
+
+    Regression: ``attach`` returned the bare URL, so ``/v1/sessions/{id}``
+    hit the workspace web app and 404'd instead of the omnigent API.
+    """
+    seen: list[str] = []
+    monkeypatch.setattr(cli, "_workspace_api_server_url", _recording_expander(seen))
+
+    result = _resolve_attach_server("https://ws.example.net/", configured_server=None)
+
+    assert result == "https://ws.example.net/api/2.0/omnigent"
+    assert seen == ["https://ws.example.net"]
+
+
+def test_resolve_attach_server_expands_configured_workspace_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The configured ``server`` default is expanded just like ``--server``."""
+    monkeypatch.setattr(cli, "_workspace_api_server_url", _expand_marker)
+
+    result = _resolve_attach_server(None, configured_server="https://ws.example.net")
+
+    assert result == "https://ws.example.net/api/2.0/omnigent"
+
+
+def test_resolve_attach_server_local_fallback_not_expanded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The local-server fallback returns a concrete URL without expansion.
+
+    The background server already publishes a loopback URL; routing it
+    through the network probe would be pointless work.
+    """
+    monkeypatch.setattr(
+        cli,
+        "_workspace_api_server_url",
+        lambda s: pytest.fail("local fallback must not be expanded"),
+    )
+    monkeypatch.setattr(cli, "local_server_url_if_healthy", lambda: "http://127.0.0.1:8123/")
+
+    assert _resolve_attach_server(None, configured_server=None) == "http://127.0.0.1:8123"
+
+
+def test_resolve_host_server_expands_explicit_workspace_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``host`` subcommands expand a bare ``--server`` workspace URL.
+
+    The daemon is registered under the expanded ``/api/2.0/omnigent`` URL,
+    so the registry lookup must expand too or it never matches a daemon
+    that ``run`` / ``host`` started.
+    """
+    seen: list[str] = []
+    monkeypatch.setattr(cli, "_workspace_api_server_url", _recording_expander(seen))
+
+    result = _resolve_host_server("https://ws.example.net/")
+
+    assert result == "https://ws.example.net/api/2.0/omnigent"
+    assert seen == ["https://ws.example.net"]
+
+
+def test_resolve_host_server_reads_config_and_expands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no ``--server``, the configured default is read and expanded."""
+    monkeypatch.setattr(
+        cli, "_load_effective_config", lambda: {"server": "https://ws.example.net"}
+    )
+    monkeypatch.setattr(cli, "_workspace_api_server_url", _expand_marker)
+
+    assert _resolve_host_server(None) == "https://ws.example.net/api/2.0/omnigent"
+
+
+def test_resolve_host_server_none_stays_local(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No CLI value and no configured default stays local (``None``)."""
+    monkeypatch.setattr(cli, "_load_effective_config", dict)
+    monkeypatch.setattr(
+        cli, "_workspace_api_server_url", lambda s: pytest.fail("nothing to expand")
+    )
+
+    assert _resolve_host_server(None) is None
+
+
+def test_resume_command_expands_server_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``omnigent resume <id> --server <workspace>`` expands before dispatch.
+
+    Regression: ``resume`` forwarded the bare URL, so its remote picker
+    and wrapper-label lookups 404'd against the workspace web app.
+    """
+    monkeypatch.setattr(cli, "_workspace_api_server_url", _expand_marker)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        "omnigent.resume_dispatch.run_resume",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    result = CliRunner().invoke(
+        cli_group, ["resume", "conv_abc123", "--server", "https://ws.example.net"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured == {
+        "target": "conv_abc123",
+        "server": "https://ws.example.net/api/2.0/omnigent",
+    }
+
+
+def test_resume_command_without_server_skips_expansion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without ``--server``, resume forwards ``None`` and never probes."""
+    monkeypatch.setattr(
+        cli, "_workspace_api_server_url", lambda s: pytest.fail("nothing to expand")
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        "omnigent.resume_dispatch.run_resume",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    result = CliRunner().invoke(cli_group, ["resume", "conv_abc123"])
+
+    assert result.exit_code == 0, result.output
+    assert captured == {"target": "conv_abc123", "server": None}
