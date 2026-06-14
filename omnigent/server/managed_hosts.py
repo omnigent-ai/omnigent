@@ -107,8 +107,10 @@ _logger = logging.getLogger(__name__)
 # session today. (Deployments that construct ManagedSandboxConfig
 # directly are not constrained by either set — their launcher factory
 # IS the support.)
-SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset({"lakebox", "modal", "daytona"})
-PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset({"modal", "daytona"})
+SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
+    {"lakebox", "modal", "daytona", "cwsandbox"}
+)
+PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset({"modal", "daytona", "cwsandbox"})
 
 # How long a managed launch waits for the sandboxed host to register
 # before declaring failure. The image is pre-baked (no pip install at
@@ -134,6 +136,12 @@ MODAL_MANAGED_TOKEN_TTL_S = 25 * 3600
 # session past 7 days going through the dead-host relaunch path) mints
 # a fresh token.
 DAYTONA_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
+
+# The cwsandbox launch-token TTL is NOT a constant: CW Sandbox's lifetime is
+# operator-overridable (OMNIGENT_CWSANDBOX_MAX_LIFETIME_S), so the TTL is
+# derived from the resolved lifetime at parse time via
+# cwsandbox.managed_token_ttl_s() — always above the cap, so a live sandbox
+# can re-authenticate its tunnel across reconnects while a leaked token can't.
 
 # Where the in-sandbox host process logs — named in launch-failure
 # errors so an operator knows where to look inside the sandbox.
@@ -569,6 +577,15 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             _parse_daytona_image(raw), _parse_daytona_env(raw)
         )
         token_ttl_s = DAYTONA_MANAGED_TOKEN_TTL_S
+    elif provider == "cwsandbox":
+        from omnigent.onboarding.sandboxes.cwsandbox import managed_token_ttl_s
+
+        launcher_factory = _cwsandbox_launcher_factory(
+            _parse_cwsandbox_image(raw), _parse_cwsandbox_env(raw)
+        )
+        # Derived from OMNIGENT_CWSANDBOX_MAX_LIFETIME_S so the token always
+        # outlives the (operator-overridable) sandbox lifetime.
+        token_ttl_s = managed_token_ttl_s()
     else:
         launcher_factory = _unsupported_launcher_factory(provider)
         # Never consulted (the factory rejects before any token is
@@ -755,6 +772,58 @@ def _parse_daytona_env(raw: dict[str, object]) -> list[str] | None:
             "server config 'sandbox.daytona.env' must be a list of server "
             "environment variable NAMES to inject, e.g. ['OPENAI_API_KEY', "
             "'GIT_TOKEN']"
+        )
+    return [name.strip() for name in env]
+
+
+def _cwsandbox_launcher_factory(
+    image: str | None,
+    env: list[str] | None,
+) -> Callable[[], SandboxLauncher]:
+    """Build the launcher factory for the YAML ``provider: cwsandbox`` path."""
+
+    def _build() -> SandboxLauncher:
+        from omnigent.onboarding.sandboxes.cwsandbox import CWSandboxLauncher
+
+        return CWSandboxLauncher(image=image, env=env)
+
+    return _build
+
+
+def _parse_cwsandbox_image(raw: dict[str, object]) -> str | None:
+    """Extract and validate ``sandbox.cwsandbox.image`` (optional)."""
+    section = raw.get("cwsandbox")
+    if section is None:
+        return None
+    if not isinstance(section, dict):
+        raise ValueError("server config 'sandbox.cwsandbox' must be a mapping")
+    image = section.get("image")
+    if image is None:
+        return None
+    if not isinstance(image, str) or not image.strip():
+        raise ValueError(
+            "server config 'sandbox.cwsandbox.image' must be a registry image "
+            "reference with omnigent pre-installed (omit it to use the official image)"
+        )
+    return image.strip()
+
+
+def _parse_cwsandbox_env(raw: dict[str, object]) -> list[str] | None:
+    """Extract and validate ``sandbox.cwsandbox.env`` — server env var NAMES (optional)."""
+    section = raw.get("cwsandbox")
+    if section is None:
+        return None
+    if not isinstance(section, dict):
+        raise ValueError("server config 'sandbox.cwsandbox' must be a mapping")
+    env = section.get("env")
+    if env is None:
+        return None
+    if not isinstance(env, list) or not all(
+        isinstance(name, str) and name.strip() for name in env
+    ):
+        raise ValueError(
+            "server config 'sandbox.cwsandbox.env' must be a list of server "
+            "environment variable NAMES to inject, e.g. ['ANTHROPIC_API_KEY', 'GIT_TOKEN']"
         )
     return [name.strip() for name in env]
 
