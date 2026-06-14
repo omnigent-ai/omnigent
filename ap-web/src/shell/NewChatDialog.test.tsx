@@ -1277,4 +1277,29 @@ describe("NewChatLandingScreen attachments", () => {
     fireEvent.click(screen.getByRole("button", { name: "Remove notes.txt" }));
     expect(screen.queryByText("notes.txt")).toBeNull();
   });
+
+  it("attaches files dropped onto the composer and surfaces a drop overlay", () => {
+    renderLanding();
+    const composer = screen.getByTestId("new-chat-landing-composer");
+    // Dragging over the composer lifts the drop-target overlay.
+    fireEvent.dragOver(composer, { dataTransfer: { files: [] } });
+    expect(screen.getByText("Drop files here")).toBeTruthy();
+    // Dropping a file attaches it (chip proves it reached state) and clears
+    // the overlay.
+    const file = new File(["hello"], "dropped.txt", { type: "text/plain" });
+    fireEvent.drop(composer, { dataTransfer: { files: [file] } });
+    expect(screen.getByText("dropped.txt")).toBeTruthy();
+    expect(screen.queryByText("Drop files here")).toBeNull();
+  });
+
+  it("clears the drop overlay when the drag leaves the composer", () => {
+    renderLanding();
+    const composer = screen.getByTestId("new-chat-landing-composer");
+    fireEvent.dragEnter(composer, { dataTransfer: { files: [] } });
+    expect(screen.getByText("Drop files here")).toBeTruthy();
+    // relatedTarget defaults to null (outside the composer), so the active
+    // state clears rather than sticking when moving between child elements.
+    fireEvent.dragLeave(composer, { dataTransfer: { files: [] } });
+    expect(screen.queryByText("Drop files here")).toBeNull();
+  });
 });

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type DragEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "@/lib/routing";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -43,6 +43,7 @@ import { getCliServerUrl } from "@/lib/host";
 import { getOmnigentHostConfig } from "@/lib/host";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
 import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
+import { cn } from "@/lib/utils";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
@@ -611,6 +612,39 @@ export function NewChatLandingScreen() {
   const addFiles = (incoming: File[]) => setFiles((prev) => [...prev, ...incoming]);
   const removeFile = (index: number) => setFiles((prev) => prev.filter((_, i) => i !== index));
 
+  // Drag-and-drop onto the composer — same behavior as the in-session
+  // composer (drop files anywhere on the box; an inset ring + overlay
+  // signal the drop target).
+  const [isDragActive, setIsDragActive] = useState(false);
+
+  const handleDrop = (e: DragEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragActive(false);
+    const dropped = Array.from(e.dataTransfer.files);
+    if (dropped.length > 0) addFiles(dropped);
+  };
+
+  const handleDragOver = (e: DragEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragActive(true);
+  };
+
+  const handleDragEnter = (e: DragEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragActive(true);
+  };
+
+  const handleDragLeave = (e: DragEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    // Only clear the active state when the pointer leaves the container
+    // itself, not when it moves between child elements inside it.
+    if (e.currentTarget.contains(e.relatedTarget as Node)) return;
+    setIsDragActive(false);
+  };
+
   // Gates the sandbox host option: only servers whose sandbox
   // config can actually serve a managed launch advertise it. "loading"
   // fails closed (option hidden) until the boot probe resolves.
@@ -1056,16 +1090,29 @@ export function NewChatLandingScreen() {
               e.preventDefault();
               void handleCreate();
             }}
+            onDrop={handleDrop}
+            onDragOver={handleDragOver}
+            onDragEnter={handleDragEnter}
+            onDragLeave={handleDragLeave}
             // Two visual states only (no hover): resting --border, and
             // --foreground while the textarea itself has focus (has-[]
             // scopes it so focusing footer buttons doesn't trigger it).
             // dark:bg-card-solid: the footer tray below tucks its top
             // edge behind this card (-mt-9), and the dark glass --card
             // is 60% alpha — the tucked strip ghosts through a
-            // translucent card. Mirrors the chat composer card.
-            className="relative z-10 flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid shadow-[0_12px_20px_-20px_rgba(0,0,0,0.14),0_20px_28px_-28px_rgba(0,0,0,0.1)] transition-[border-color,box-shadow] duration-150 has-[textarea:focus]:border-foreground"
+            // translucent card. Mirrors the chat composer card. Drag-over
+            // lifts an inset ring (overlay below).
+            className={cn(
+              "relative z-10 flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid shadow-[0_12px_20px_-20px_rgba(0,0,0,0.14),0_20px_28px_-28px_rgba(0,0,0,0.1)] transition-[border-color,box-shadow] duration-150 has-[textarea:focus]:border-foreground",
+              isDragActive && "ring-2 ring-ring ring-inset",
+            )}
             data-testid="new-chat-landing-composer"
           >
+            {isDragActive && (
+              <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-card/80">
+                <span className="text-sm font-medium text-ring">Drop files here</span>
+              </div>
+            )}
             {/* Skill suggestions — floats above the composer box. */}
             {slashMenuOpen && (
               <SlashCommandMenu
