@@ -1821,6 +1821,24 @@ def _daemon_tunnel_recovers(
     return False
 
 
+def _daemon_host_identity_changed(record: _HostDaemonRecord) -> bool:
+    """
+    Return whether a daemon record belongs to a different current host id.
+
+    A live daemon can outlast edits to ``~/.omnigent/config.yaml``. Reusing
+    that process leaves commands polling for the new host id while the daemon
+    is still connected as the old host id, which can never succeed.
+
+    :param record: Daemon record being considered for reuse.
+    :returns: ``True`` when the record has a host id and the current config
+        either has a different id or no id.
+    """
+    if record.host_id is None:
+        return False
+    current_host_id = _load_existing_host_id()
+    return record.host_id != current_host_id
+
+
 def _terminate_host_unit(record: _HostDaemonRecord, *, reason: str) -> None:
     """
     Tear down a daemon and, in local mode, the Omnigent server it owns.
@@ -1893,6 +1911,11 @@ def _reuse_existing_daemon_record(target: str) -> _DaemonReuseDecision:
         _delete_daemon_record(existing)
         return _DaemonReuseDecision(reuse=False, config_changed=False)
 
+    background = existing.log_path is not None
+    if background and _daemon_host_identity_changed(existing):
+        _terminate_host_unit(existing, reason="host identity changed")
+        return _DaemonReuseDecision(reuse=False, config_changed=False)
+
     if target != _LOCAL_DAEMON_MARKER:
         # Remote / explicit ``--server`` mode: the daemon connects to a server
         # we don't own and can't restart, so the config-signature / heal /
@@ -1902,7 +1925,6 @@ def _reuse_existing_daemon_record(target: str) -> _DaemonReuseDecision:
         # reused as-is.
         return _DaemonReuseDecision(reuse=True, config_changed=False)
 
-    background = existing.log_path is not None
     if not background:
         # Foreground host / legacy host.pid: keep prior behavior — a
         # live PID is reused as-is (don't kill the user's interactive

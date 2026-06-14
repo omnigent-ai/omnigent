@@ -39,6 +39,12 @@ from omnigent.cli import (
 from omnigent.host.local_server import LocalServerStartup
 
 
+@pytest.fixture(autouse=True)
+def _stable_current_host_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep daemon-reuse tests independent of the developer's real config."""
+    monkeypatch.setattr(cli, "_load_existing_host_id", lambda: "host_abc")
+
+
 class _Proc:
     """Subprocess stub returned by a patched ``Popen``.
 
@@ -341,6 +347,42 @@ def test_ensure_host_daemon_reuses_healthy_background_daemon(
 
     assert "args" not in captured  # reused, not respawned
     assert torn_down == []  # healthy daemon not torn down
+
+
+def test_ensure_host_daemon_respawns_on_host_identity_change(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A background daemon with a stale host id is torn down + respawned.
+
+    The native terminal path waits for the current config's host id to come
+    online. If daemon reuse keeps a process connected as an older host id, that
+    wait can only time out.
+    """
+    captured: dict[str, object] = {}
+    _patch_daemon_spawn(monkeypatch, tmp_path, captured)
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="local",
+        mode="local",
+        server_url=None,
+        log_path=str(tmp_path / "daemon.log"),
+        started_at=1_000_000,
+        host_id="host_old",
+        config_sig=cli.server_config_signature(),
+        resolved_server_url="http://127.0.0.1:8123",
+    )
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli, "_load_existing_host_id", lambda: "host_new")
+    torn_down: list[str] = []
+    monkeypatch.setattr(
+        cli, "_terminate_host_unit", lambda record, *, reason: torn_down.append(reason)
+    )
+
+    _ensure_host_daemon(None)
+
+    assert len(torn_down) == 1 and "identity" in torn_down[0]
+    assert "args" in captured
 
 
 def test_ensure_host_daemon_respawns_on_config_drift(
