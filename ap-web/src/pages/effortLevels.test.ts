@@ -9,11 +9,23 @@ describe("effortLevelsForConv", () => {
   });
 
   it("returns the default 3-level set for non-claude-native conversations", () => {
-    // Non-CN harnesses (claude-sdk, codex, openai-agents, ...) keep the
+    // Non-native harnesses (claude-sdk, codex, openai-agents, ...) keep the
     // existing low/medium/high options — we only changed CN, not the
     // shared default.
     const conv = { labels: {} };
     expect(effortLevelsForConv(conv)).toEqual(["low", "medium", "high"]);
+  });
+
+  it("returns the Codex-native effort set for codex-native conversations", () => {
+    const conv = { labels: { "omnigent.wrapper": "codex-native-ui" } };
+    expect(effortLevelsForConv(conv)).toEqual([
+      "none",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+    ]);
   });
 
   it("returns the default set when conv is null or labels are missing", () => {
@@ -31,6 +43,11 @@ describe("effortLevelsForConv", () => {
 describe("shouldShowModelPicker", () => {
   it("returns true for claude-code-native-ui wrapper", () => {
     const conv = { labels: { "omnigent.wrapper": "claude-code-native-ui" } };
+    expect(shouldShowModelPicker(conv)).toBe(true);
+  });
+
+  it("returns true for codex-native-ui wrapper", () => {
+    const conv = { labels: { "omnigent.wrapper": "codex-native-ui" } };
     expect(shouldShowModelPicker(conv)).toBe(true);
   });
 
@@ -67,10 +84,11 @@ describe("shouldShowEffortPicker", () => {
     ).toBe(true);
   });
 
-  it("returns false for codex-native wrapper sessions", () => {
-    // Codex-native has no standalone `/effort` command.
+  it("returns true for codex-native wrapper sessions", () => {
+    // Codex-native uses Codex app-server `thread/settings/update`, not a
+    // terminal slash command, but the UI control is now meaningful.
     expect(shouldShowEffortPicker({ labels: { "omnigent.wrapper": "codex-native-ui" } })).toBe(
-      false,
+      true,
     );
     expect(
       shouldShowEffortPicker({
@@ -79,7 +97,7 @@ describe("shouldShowEffortPicker", () => {
           "omnigent.wrapper": "codex-native-ui",
         },
       }),
-    ).toBe(false);
+    ).toBe(true);
   });
 
   it("returns false for custom agents and missing labels", () => {

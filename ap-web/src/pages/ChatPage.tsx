@@ -84,6 +84,7 @@ import {
 } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
+import { CODEX_NATIVE_MODELS } from "@/lib/codexNativeModels";
 import {
   consumePendingInitialPrompt,
   type PendingInitialPrompt,
@@ -826,6 +827,7 @@ export function ChatPage() {
   const capabilitySource = {
     labels: activeSession ? (activeSession.labels ?? {}) : (activeConv?.labels ?? {}),
   };
+  const modelPickerKind = modelPickerKindForConv(capabilitySource);
 
   // When inside a session, only show the bound agent — the session is
   // tied 1:1 to its runner and can't be reassigned. Show all agents on
@@ -873,7 +875,8 @@ export function ChatPage() {
       readOnlyReason={readOnlyReason}
       effortLevels={effortLevelsForConv(capabilitySource)}
       showEffort={shouldShowEffortPicker(capabilitySource)}
-      showModels={shouldShowModelPicker(capabilitySource)}
+      showModels={modelPickerKind !== null}
+      modelPickerKind={modelPickerKind}
       costRoutingVerdict={costRoutingVerdict}
       costRoutingEligible={costRoutingEligible}
       subAgentLabel={subAgentLabel}
@@ -1094,6 +1097,8 @@ interface MainAgentSurfaceProps {
   showEffort: boolean;
   /** Whether the picker dropdown should include a Models section. */
   showModels: boolean;
+  /** Native model picker family, when present. */
+  modelPickerKind: NativeModelPickerKind | null;
   /** Latest advisor verdict for the cost-routing pill; null when none. */
   costRoutingVerdict: CostRoutingVerdict | null;
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child). */
@@ -1164,6 +1169,7 @@ function MainAgentSurface({
   effortLevels,
   showEffort,
   showModels,
+  modelPickerKind,
   costRoutingVerdict,
   costRoutingEligible,
   subAgentLabel,
@@ -1417,6 +1423,7 @@ function MainAgentSurface({
         effortLevels={effortLevels}
         showEffort={showEffort}
         showModels={showModels}
+        modelPickerKind={modelPickerKind}
         isTerminalFirst={isTerminalFirst}
         isNativeWrapper={isNativeWrapper}
         reconnectHint={liveness.kind === "runner_asleep"}
@@ -2476,6 +2483,8 @@ interface ComposerProps {
   showEffort: boolean;
   /** Whether the picker dropdown should include a Models section. */
   showModels: boolean;
+  /** Native model picker family, when present. */
+  modelPickerKind: NativeModelPickerKind | null;
   /**
    * Terminal-first session (Chat/Terminal pill present). Presentation
    * only: tightens the composer's bottom padding to `pb-1.5` so it sits
@@ -2485,11 +2494,9 @@ interface ComposerProps {
   isTerminalFirst?: boolean;
   /**
    * Native-CLI wrapper session (claude-native / codex-native). Drops the
-   * `/model` slash command unless the session also has the model picker
-   * (`showModels`, claude-native — the runner propagates the override
-   * live). Codex-native pins its model at launch, so the command would
-   * be a misleading no-op there. Terminal-first SDK sessions (embedded
-   * Omnigent REPL terminal) keep it.
+   * `/model` slash command unless the session also has a model picker
+   * (`showModels`); terminal-first SDK sessions (embedded Omnigent REPL
+   * terminal) keep it.
    */
   isNativeWrapper?: boolean;
   /**
@@ -2627,10 +2634,67 @@ function ContextRing({ contextWindow, tokensUsed }: { contextWindow: number; tok
   );
 }
 
+function formatModelPart(part: string): string {
+  const lower = part.toLowerCase();
+  if (lower === "gpt") return "GPT";
+  if (lower === "xhigh") return "xHigh";
+  return part.charAt(0).toUpperCase() + part.slice(1);
+}
+
+/**
+ * Human-readable compact model label for the composer status tray.
+ *
+ * @param model - Model override or bound agent model id.
+ * @returns A compact display label, or ``null`` when no model is known.
+ */
+export function formatStatusModelLabel(model: string | null): string | null {
+  const raw = model?.trim();
+  if (!raw) return null;
+  const lower = raw.toLowerCase();
+  const known = [...CLAUDE_NATIVE_MODELS, ...CODEX_NATIVE_MODELS].find((m) => m.id === lower);
+  if (known) return known.label;
+
+  const leaf = raw.split("/").at(-1) ?? raw;
+  const withoutProvider = leaf
+    .replace(/^databricks[-_]/i, "")
+    .replace(/^anthropic[-_]/i, "")
+    .replace(/^openai[-_]/i, "")
+    .replace(/^claude[-_]/i, "Claude-");
+  const parts = withoutProvider.split(/[-_]+/).filter(Boolean);
+  if (parts.length === 0) return raw;
+  if (parts[0]?.toLowerCase() === "gpt") {
+    return `GPT-${parts.slice(1).join(".")}`;
+  }
+  return parts.map(formatModelPart).join(" ");
+}
+
+/** Format effort for compact status labels (``"xhigh"`` → ``"xHigh"``). */
+function formatStatusEffortLabel(effort: string | null): string | null {
+  if (!effort) return null;
+  return effort.toLowerCase() === "xhigh" ? "xHigh" : formatEffortLabel(effort);
+}
+
+/**
+ * Compose the current model and effort for the composer status tray.
+ *
+ * @param model - Model override or bound model id.
+ * @param effort - Current reasoning effort override, if any.
+ * @returns Compact label such as ``"GPT-5.5 xHigh"``.
+ */
+export function formatModelEffortStatusLabel(
+  model: string | null,
+  effort: string | null,
+): string | null {
+  const modelLabel = formatStatusModelLabel(model);
+  const effortLabel = formatStatusEffortLabel(effort);
+  const parts = [modelLabel, effortLabel].filter((p): p is string => p != null && p.length > 0);
+  return parts.length > 0 ? parts.join(" ") : null;
+}
+
 /**
  * Status-line tray tucked behind the composer card: the worktree branch
  * on the left (truncated to an ellipsis so the tray never wraps), the
- * context ring on the right. Shares the card's background so the two
+ * model/effort + context ring on the right. Shares the card's background so the two
  * read as one rounded shape: the card keeps its full rounded-2xl and
  * paints on top (it's position:relative), while this in-flow sibling is
  * pulled up behind it so a rounded shelf peeks out below the card's
@@ -2643,16 +2707,22 @@ function ComposerStatusLine() {
   const conversationId = useChatStore((s) => s.conversationId);
   const contextWindow = useChatStore((s) => s.contextWindow);
   const tokensUsed = useChatStore((s) => s.tokensUsed);
+  const selectedEffort = useChatStore((s) => s.selectedEffort);
+  const selectedModel = useChatStore((s) => s.selectedModel);
+  const llmModel = useChatStore((s) => s.llmModel);
   // Seeded from the session snapshot on bind (chatStore.sessionBindingPatch),
   // alongside contextWindow — so the branch reads from the same store as
   // the other status-line values rather than a separate fetch.
   const gitBranch = useChatStore((s) => s.gitBranch);
 
   const showBranch = !!conversationId && !!gitBranch;
+  const modelEffortLabel = conversationId
+    ? formatModelEffortStatusLabel(selectedModel ?? llmModel, selectedEffort)
+    : null;
   // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
   const showRing =
     !!conversationId && contextWindow != null && contextWindow > 0 && tokensUsed != null;
-  if (!showBranch && !showRing) return null;
+  if (!showBranch && !showRing && modelEffortLabel === null) return null;
 
   return (
     <div
@@ -2683,8 +2753,17 @@ function ComposerStatusLine() {
           </>
         )}
       </span>
-      {/* Right: context ring, never shrinks. */}
-      <div className="flex shrink-0 items-center gap-3">
+      {/* Right: model/effort and context ring, never shrinks. */}
+      <div className="flex min-w-0 shrink-0 items-center gap-3">
+        {modelEffortLabel && (
+          <span
+            data-testid="composer-model-effort"
+            className="max-w-36 truncate text-xs text-muted-foreground sm:max-w-52"
+            title={modelEffortLabel}
+          >
+            {modelEffortLabel}
+          </span>
+        )}
         {showRing && <ContextRing contextWindow={contextWindow} tokensUsed={tokensUsed} />}
       </div>
     </div>
@@ -2785,6 +2864,7 @@ export function Composer({
   effortLevels,
   showEffort,
   showModels,
+  modelPickerKind,
   isTerminalFirst = false,
   isNativeWrapper = false,
   reconnectHint = false,
@@ -2885,13 +2965,9 @@ export function Composer({
   // entries alongside the built-ins.
   const skills = useChatStore((s) => s.skills);
   // ``/model`` writes ``conv.model_override`` (the same column the REPL's
-  // ``/model`` and the claude-native picker write). In-process harnesses
-  // re-resolve it each turn; claude-native (``showModels``) propagates it
-  // live — the runner injects ``/model <name>`` into the pane and
-  // auto-confirms the TUI's "Switch model?" dialog. Sent as plaintext
-  // instead, that dialog would block the pane with nothing web-side to
-  // answer it. Only codex-native (model pinned at launch) drops the
-  // command.
+  // ``/model`` and native pickers write). In-process harnesses re-resolve
+  // it each turn; native wrappers expose it only when they have a picker
+  // path that the runner can propagate without blocking the vendor TUI.
   const showModel = !isNativeWrapper || showModels;
   const slashCommands = useMemo(
     () => buildSlashCommandMap(skills, showEffort, showModel),
@@ -3563,7 +3639,7 @@ export function Composer({
               onSelect={onSelectAgent}
               effortLevels={effortLevels}
               showEffort={showEffort}
-              showModels={showModels}
+              modelPickerKind={modelPickerKind}
               disabled={isReadOnly}
               openNonce={pickerOpenNonce}
             />
@@ -3763,6 +3839,9 @@ const EFFORT_LEVELS = ["low", "medium", "high"] as const;
 
 /** Anthropic-side efforts for claude-native sessions (matches ANTHROPIC_EFFORTS in reasoning_effort.py). */
 const CLAUDE_NATIVE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+const CODEX_NATIVE_EFFORT_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh"] as const;
+
+type NativeModelPickerKind = "claude" | "codex";
 
 type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
 
@@ -3797,23 +3876,40 @@ export function readOnlyReasonForSessionLabels(
 export function effortLevelsForConv(
   conv: { labels?: Record<string, string | null> | null } | null | undefined,
 ): readonly string[] {
-  if (conv?.labels?.["omnigent.wrapper"] === "claude-code-native-ui") {
-    return CLAUDE_NATIVE_EFFORT_LEVELS;
+  switch (conv?.labels?.["omnigent.wrapper"]) {
+    case "claude-code-native-ui":
+      return CLAUDE_NATIVE_EFFORT_LEVELS;
+    case "codex-native-ui":
+      return CODEX_NATIVE_EFFORT_LEVELS;
+    default:
+      return EFFORT_LEVELS;
   }
-  return EFFORT_LEVELS;
 }
 
 /**
- * Should the model picker be visible for *conv*?
+ * Which native model picker should be visible for *conv*?
  *
  * Gated on the wrapper label, not `omnigent.ui === "terminal"`:
- * other terminal-first wrappers may not be Anthropic (see
+ * other terminal-first wrappers may not be Claude/Codex-native (see
  * `TerminalFirstContext.tsx`).
  */
+export function modelPickerKindForConv(
+  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+): NativeModelPickerKind | null {
+  switch (conv?.labels?.["omnigent.wrapper"]) {
+    case "claude-code-native-ui":
+      return "claude";
+    case "codex-native-ui":
+      return "codex";
+    default:
+      return null;
+  }
+}
+
 export function shouldShowModelPicker(
   conv: { labels?: Record<string, string | null> | null } | null | undefined,
 ): boolean {
-  return conv?.labels?.["omnigent.wrapper"] === "claude-code-native-ui";
+  return modelPickerKindForConv(conv) !== null;
 }
 
 /**
@@ -3847,8 +3943,8 @@ interface AgentPickerProps {
   effortLevels: readonly string[];
   /** Show the Effort section and selected effort. */
   showEffort: boolean;
-  /** When true, render the Models section between agents and effort. */
-  showModels: boolean;
+  /** Native model picker family, when present. */
+  modelPickerKind: NativeModelPickerKind | null;
   /**
    * Disables the picker trigger. The picker is purely a write
    * surface (selecting an agent / model / effort changes how the
@@ -3876,7 +3972,7 @@ function AgentPicker({
   onSelect,
   effortLevels,
   showEffort,
-  showModels,
+  modelPickerKind,
   disabled = false,
   openNonce = 0,
 }: AgentPickerProps) {
@@ -3894,13 +3990,19 @@ function AgentPicker({
   const selectedModel = useChatStore((s) => s.selectedModel);
   const llmModel = useChatStore((s) => s.llmModel);
 
-  const isClaudeNative = showModels;
+  const modelOptions =
+    modelPickerKind === "claude"
+      ? CLAUDE_NATIVE_MODELS
+      : modelPickerKind === "codex"
+        ? CODEX_NATIVE_MODELS
+        : [];
+  const isNativeModelPicker = modelPickerKind !== null;
   // Only offer the agent list when there's an actual choice. Inside a
   // session the picker is scoped to the single bound agent (the runner is
   // tied 1:1 to it and can't be reassigned), so a one-row "Agents" section
   // is pure noise — drop it and let the dropdown be just the effort/model
   // controls.
-  const showAgents = !isClaudeNative && (agents?.length ?? 0) > 1;
+  const showAgents = !isNativeModelPicker && (agents?.length ?? 0) > 1;
   const rawAgentName = agents?.find((a) => a.id === selectedId)?.name ?? agents?.[0]?.name;
   const agentDisplayName = rawAgentName ? agentDisplayLabel(rawAgentName) : rawAgentName;
   // Effective brain harness from the session snapshot (override-aware).
@@ -3912,18 +4014,20 @@ function AgentPicker({
   // Build the pill piece-by-piece so empty selections don't leave
   // stray separators.
   const effortLabel = showEffort && selectedEffort ? formatEffortLabel(selectedEffort) : null;
-  const hasPickerActions = showAgents || showModels || showEffort;
+  const hasPickerActions = showAgents || modelOptions.length > 0 || showEffort;
 
   let triggerLabel: string;
   if (isLoading) {
     triggerLabel = "Loading…";
   } else if (!hasAgents) {
     triggerLabel = "No agents";
-  } else if (isClaudeNative) {
-    // claude-native sessions are always the bound Claude agent. Show just
-    // "Claude" in the pill — the model and effort are still selectable in the
+  } else if (modelPickerKind === "claude") {
+    // Native sessions are always scoped to the bound vendor agent. Show just
+    // the vendor name in the pill — model and effort remain selectable in the
     // dropdown, so spelling them out here only costs horizontal space.
     triggerLabel = "Claude";
+  } else if (modelPickerKind === "codex") {
+    triggerLabel = "Codex";
   } else {
     // The harness reads as part of the identity — "Polly (Pi)" — while
     // effort stays a separate " · "-joined segment.
@@ -3977,11 +4081,11 @@ function AgentPicker({
             ))}
           </>
         )}
-        {showModels && (
+        {modelOptions.length > 0 && (
           <>
-            {!isClaudeNative && <DropdownMenuSeparator className="my-1" />}
+            {!isNativeModelPicker && <DropdownMenuSeparator className="my-1" />}
             <PickerSectionHeader>Models</PickerSectionHeader>
-            {CLAUDE_NATIVE_MODELS.map((m) => {
+            {modelOptions.map((m) => {
               const isExplicit = selectedModel === m.id;
               const isImplicit =
                 selectedModel === null && isModelImplicitlySelected(m.id, llmModel);
@@ -4013,7 +4117,9 @@ function AgentPicker({
             dropdown doesn't open with a stray divider at the top. */}
         {showEffort && (
           <>
-            {(showAgents || showModels) && <DropdownMenuSeparator className="my-1" />}
+            {(showAgents || modelOptions.length > 0) && (
+              <DropdownMenuSeparator className="my-1" />
+            )}
             <PickerSectionHeader>Effort</PickerSectionHeader>
             {effortLevels.map((level) => (
               <DropdownMenuItem

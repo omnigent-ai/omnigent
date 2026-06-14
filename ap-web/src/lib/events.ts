@@ -452,6 +452,20 @@ export interface SessionModelEvent {
 }
 
 /**
+ * `session.reasoning_effort` — active thinking-level switch from a native
+ * terminal session.
+ *
+ * Emitted by the Omnigent server when a terminal forwarder observes an effort
+ * change made inside the terminal UI. Carries `null` when the terminal cleared
+ * back to its model default.
+ */
+export interface SessionReasoningEffortEvent {
+  type: "session_reasoning_effort";
+  conversationId: string;
+  reasoningEffort: string | null;
+}
+
+/**
  * `session.agent_changed` — the session's bound agent was switched in
  * place (switch-agent route).
  *
@@ -738,6 +752,7 @@ export type StreamEvent =
   | SessionStatusEvent
   | SessionUsageEvent
   | SessionModelEvent
+  | SessionReasoningEffortEvent
   | SessionAgentChangedEvent
   | SessionTodosEvent
   | SessionTerminalPendingEvent

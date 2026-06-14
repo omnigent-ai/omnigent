@@ -4644,6 +4644,154 @@ async def test_post_external_model_change_does_not_forward_to_runner(
     )
 
 
+async def test_post_external_reasoning_effort_change_publishes_session_effort(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``external_reasoning_effort_change`` persists effort and posts SSE.
+
+    This is the Codex TUI-side thinking-level path. The route must update
+    ``conversation.reasoning_effort`` for reload/cost resolution and publish a
+    typed live event so the web picker follows the terminal immediately.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_reasoning_effort_change",
+            "data": {"reasoning_effort": "medium"},
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert resp.json() == {"queued": False}
+    assert [event["type"] for _, event in published] == ["session.reasoning_effort"]
+    assert published[0][1]["conversation_id"] == session["id"]
+    assert published[0][1]["reasoning_effort"] == "medium"
+    # Persisted snapshot proves this was not just a transient SSE update.
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["reasoning_effort"] == "medium"
+
+
+async def test_post_external_reasoning_effort_change_clears_effort(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``external_reasoning_effort_change`` with null clears stale effort.
+
+    Codex reports ``effort: null`` when the session is back on its default
+    thinking level. If the route treated null as "omitted", a previous explicit
+    ``reasoning_effort`` would survive incorrectly.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    seed = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"reasoning_effort": "high", "silent": True},
+    )
+    assert seed.status_code == 200, seed.text
+    published.clear()
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_reasoning_effort_change",
+            "data": {"reasoning_effort": None},
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert [event["type"] for _, event in published] == ["session.reasoning_effort"]
+    assert published[0][1]["reasoning_effort"] is None
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    # Null from Codex must clear the stored override, not leave "high" behind.
+    assert snapshot["reasoning_effort"] is None
+
+
+async def test_post_external_reasoning_effort_change_rejects_invalid_effort(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Unsupported terminal-observed effort values fail loud.
+
+    This prevents a malformed Codex event from persisting a value the session
+    PATCH path and frontend picker do not understand.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_reasoning_effort_change",
+            "data": {"reasoning_effort": "turbo"},
+        },
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "invalid reasoning_effort" in resp.text
+
+
+async def test_post_external_codex_collaboration_mode_change_persists_label(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Codex collaboration mode mirrors into the session labels.
+
+    The app-server mode is the only "Plan vs Default" state Codex exposes.
+    Persisting it as a label lets session snapshots report the current Codex
+    mode without adding a Codex-specific conversation column.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_codex_collaboration_mode_change",
+            "data": {"mode": "plan"},
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["labels"]["omnigent.codex_native.collaboration_mode"] == "plan"
+
+
+async def test_post_external_codex_collaboration_mode_change_rejects_unknown_mode(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Unknown Codex collaboration mode kinds fail instead of becoming labels."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_codex_collaboration_mode_change",
+            "data": {"mode": "review"},
+        },
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "external_codex_collaboration_mode_change" in resp.text
+
+
 def _model_change_notes(published: list[tuple[str, dict[str, Any]]]) -> list[str]:
     """
     Extract ``[System: ...]`` model-change note texts from published events.

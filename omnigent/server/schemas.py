@@ -2122,6 +2122,30 @@ class SessionModelEvent(_SSEEventBase):
     model: str
 
 
+class SessionReasoningEffortEvent(_SSEEventBase):
+    """
+    Active reasoning-effort update from a terminal-backed integration.
+
+    Emitted after an ``external_reasoning_effort_change`` POST from a native
+    terminal forwarder when the user changes the thinking level inside the
+    terminal UI. Lets the web effort picker reflect a TUI-side switch without
+    a reload.
+
+    :param type: Always ``"session.reasoning_effort"``.
+    :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
+    :param reasoning_effort: Reasoning effort now active for the session, e.g.
+        ``"medium"``, or ``None`` when Codex cleared to its default.
+
+    Category: **transient** (SSE-only). The server also writes
+    ``reasoning_effort`` on the conversation, so on reconnect clients restore
+    the selection from the session snapshot rather than from a replayed event.
+    """
+
+    type: Literal["session.reasoning_effort"]
+    conversation_id: str
+    reasoning_effort: str | None = None
+
+
 class SessionAgentChangedEvent(_SSEEventBase):
     """
     Bound-agent change on a live session.
@@ -3323,6 +3347,7 @@ ServerStreamEvent = Annotated[
     SessionStatusEvent
     | SessionUsageEvent
     | SessionModelEvent
+    | SessionReasoningEffortEvent
     | SessionAgentChangedEvent
     | SessionTodosEvent
     | SessionTerminalPendingEvent

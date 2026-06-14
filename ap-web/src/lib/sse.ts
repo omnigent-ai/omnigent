@@ -45,6 +45,7 @@ import type {
   SessionTerminalActivityEvent,
   SessionStatusEvent,
   SessionModelEvent,
+  SessionReasoningEffortEvent,
   SessionAgentChangedEvent,
   SessionTodosEvent,
   SessionSandboxStatusEvent,
@@ -487,6 +488,17 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     const model = data.model;
     if (typeof model !== "string" || !model) return null;
     return { type: "session_model", conversationId, model } satisfies SessionModelEvent;
+  }
+  if (eventType === "session.reasoning_effort") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const reasoningEffort = data.reasoning_effort;
+    if (reasoningEffort !== null && typeof reasoningEffort !== "string") return null;
+    return {
+      type: "session_reasoning_effort",
+      conversationId,
+      reasoningEffort,
+    } satisfies SessionReasoningEffortEvent;
   }
   if (eventType === "session.agent_changed") {
     const conversationId = data.conversation_id;

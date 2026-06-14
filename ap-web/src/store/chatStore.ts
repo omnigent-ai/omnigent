@@ -92,6 +92,7 @@ import { uploadFile } from "@/lib/filesApi";
 import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { isClaudeNativeModel } from "@/lib/claudeNativeModels";
+import { isCodexNativeModel } from "@/lib/codexNativeModels";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { isNativeWrapper } from "@/lib/nativeCodingAgents";
 
@@ -1321,6 +1322,41 @@ export const useChatStore = create<ChatState>((set, get) => ({
 type Setter = (partial: Partial<ChatState> | ((state: ChatState) => Partial<ChatState>)) => void;
 type Getter = () => ChatState;
 
+type NativeModelFamily = "claude" | "codex";
+
+/**
+ * Resolve the native model family from a session wrapper label.
+ *
+ * :param session: Session snapshot from the API.
+ * :returns: ``"claude"`` / ``"codex"`` for native wrappers, else ``null``.
+ */
+function nativeModelFamilyForSession(session: Pick<Session, "labels">): NativeModelFamily | null {
+  switch (session.labels?.["omnigent.wrapper"]) {
+    case "claude-code-native-ui":
+      return "claude";
+    case "codex-native-ui":
+      return "codex";
+    default:
+      return null;
+  }
+}
+
+/**
+ * Whether a sticky model id can be applied to a native session family.
+ *
+ * :param family: Native model family from :func:`nativeModelFamilyForSession`.
+ * :param model: Sticky model id / alias.
+ * :returns: True only when the model is compatible with that native family.
+ */
+function isNativeModelCompatible(family: NativeModelFamily, model: string): boolean {
+  switch (family) {
+    case "claude":
+      return isClaudeNativeModel(model);
+    case "codex":
+      return isCodexNativeModel(model);
+  }
+}
+
 /**
  * Ensure the store has a bound session with a live SSE stream, creating
  * one if there is no conversation yet. Returns the session id. Shared by
@@ -1362,7 +1398,7 @@ async function ensureBoundSession(
     // missed). Bind the stream FIRST, then post the first message.
     const session = await createSession(agentId, []);
     sessionId = session.id;
-    // Claude-native runners read reasoning_effort during bind.
+    // Native runners read reasoning_effort during bind.
     const preBindEffort = get().selectedEffort;
     if (preBindEffort != null && supportsEffortControl(session)) {
       await updateSession(sessionId, {
@@ -1629,7 +1665,7 @@ async function bindStream(
     const items = page.items;
 
     // Sticky-pref handoff for CLI-created sessions with no override.
-    const isClaudeNativeSession = session.labels?.["omnigent.wrapper"] === "claude-code-native-ui";
+    const nativeModelFamily = nativeModelFamilyForSession(session);
     // Binding-derived fields (isNativeTerminalSession, bound agent,
     // model/skills metadata) — shared with the session.agent_changed
     // refresh path; see sessionBindingPatch.
@@ -1643,32 +1679,23 @@ async function bindStream(
     const effectiveEffort = canApplyEffort
       ? (session.reasoningEffort ?? stickyEffort ?? null)
       : stickyEffort;
-    // Non-CN: don't auto-apply the model, but keep the sticky pick so
-    // navigating back to a CN session restores it.
-    const effectiveModel = isClaudeNativeSession
+    // Non-native: don't auto-apply the model, but keep the sticky pick so
+    // navigating back to a native session restores it.
+    const effectiveModel = nativeModelFamily !== null
       ? (session.modelOverride ?? stickyModel)
       : stickyModel;
-    // Whether the claude-native handoff below is about to persist the
-    // sticky model as this session's override. Only hand over a
-    // Claude-compatible model: `selectedModel` is a single global pick
-    // shared across harnesses, so it can hold a foreign default (e.g. a
-    // Codex session sitting on `gpt-5.4`). Applying that here would
-    // persist model_override=gpt-5.4 and launch Claude Code with
-    // `--model gpt-5.4`, which it cannot run. When the sticky pick isn't
-    // a Claude model we skip the handoff and let the session fall back to
-    // the agent's own Claude default.
-    const willApplyStickyModel =
-      !isSubAgentSession &&
-      isClaudeNativeSession &&
-      session.modelOverride == null &&
-      stickyModel != null &&
-      isClaudeNativeModel(stickyModel);
     // The session's REAL effective override: the server's stored value,
-    // plus the sticky model the handoff is about to apply. Unlike
+    // plus the sticky model the native handoff is about to apply. Unlike
     // `effectiveModel`/`selectedModel` (which hold the unapplied sticky
-    // pick for non-CN sessions), this is the session truth the `/model`
+    // pick for non-native sessions), this is the session truth the `/model`
     // readout shows, so a non-applied sticky pick is never mislabeled as
     // an active "(override)".
+    const willApplyStickyModel =
+      !isSubAgentSession &&
+      nativeModelFamily !== null &&
+      session.modelOverride == null &&
+      stickyModel != null &&
+      isNativeModelCompatible(nativeModelFamily, stickyModel);
     const effectiveSessionOverride =
       session.modelOverride ?? (willApplyStickyModel ? stickyModel : null);
     if (
@@ -1677,8 +1704,7 @@ async function bindStream(
       session.reasoningEffort == null &&
       stickyEffort != null
     ) {
-      const silent = !isClaudeNativeSession;
-      updateSession(id, { reasoningEffort: stickyEffort, silent }).catch((err: unknown) => {
+      updateSession(id, { reasoningEffort: stickyEffort }).catch((err: unknown) => {
         console.warn(`Failed to apply sticky effort=${stickyEffort} to session ${id}:`, err);
       });
     }
@@ -3245,6 +3271,12 @@ export function handleSessionEvent(event: StreamEvent): void {
         selectedModel: event.model,
         sessionModelOverride: event.model,
       });
+      return;
+    case "session_reasoning_effort":
+      // A thinking-level switch made inside a native terminal. Reflect it
+      // in the picker for the open session; the server persisted
+      // reasoning_effort, so reload restores the same value.
+      useChatStore.setState({ selectedEffort: event.reasoningEffort });
       return;
     case "session_presence":
       // Full-state replacement — every presence event carries the

@@ -7380,7 +7380,7 @@ class _EventRecordingServerClient(NullServerClient):
 
 class _RecordingCodexAppServerClient:
     """
-    Test double for Codex app-server JSON-RPC interrupts.
+    Test double for Codex app-server JSON-RPC controls.
 
     :param transport: Transport passed to
         :func:`omnigent.codex_native_app_server.client_for_transport`, e.g.
@@ -7423,6 +7423,126 @@ class _RecordingCodexAppServerClient:
         :returns: None.
         """
         self.closed = True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event_payload,expected_params",
+    [
+        (
+            {"type": "model_change", "model": "gpt-5.4"},
+            {"threadId": "thread_codex", "model": "gpt-5.4"},
+        ),
+        (
+            {"type": "effort_change", "effort": "xhigh"},
+            {"threadId": "thread_codex", "effort": "xhigh"},
+        ),
+    ],
+    ids=["model_change", "effort_change"],
+)
+async def test_events_codex_native_settings_change_uses_thread_settings_update(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    event_payload: dict[str, Any],
+    expected_params: dict[str, Any],
+) -> None:
+    """
+    Codex-native model / effort updates call ``thread/settings/update``.
+
+    The web UI persists model and effort through Omnigent's normal session
+    PATCH path. The runner must translate the forwarded control event into
+    Codex app-server's structured settings RPC, not type into the terminal or
+    204 as a no-op. The update is a next-turn setting: it is valid even when
+    no active turn id is recorded.
+    """
+    from omnigent import codex_native_app_server
+    from omnigent.spec.types import ExecutorSpec
+
+    conv_id = "conv_codex_native_settings"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:43210",
+            thread_id="thread_codex",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=None,
+        ),
+    )
+
+    fake_client = _RecordingCodexAppServerClient(
+        transport="ws://127.0.0.1:43210",
+        client_name="omnigent-codex-native-runner",
+    )
+
+    def _fake_client_for_transport(
+        transport: str,
+        *,
+        client_name: str = "omnigent",
+    ) -> _RecordingCodexAppServerClient:
+        """
+        Return the fake Codex app-server client for the recorded bridge state.
+
+        :param transport: App-server transport from bridge state, e.g.
+            ``"ws://127.0.0.1:43210"``.
+        :param client_name: Client name supplied by the runner, e.g.
+            ``"omnigent-codex-native-runner"``.
+        :returns: Fake client that records JSON-RPC calls.
+        """
+        assert transport == fake_client.transport
+        assert client_name == fake_client.client_name
+        return fake_client
+
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "client_for_transport",
+        _fake_client_for_transport,
+    )
+
+    codex_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the codex-native spec for any agent_id."""
+        del agent_id, session_id
+        return codex_native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json=event_payload,
+        )
+
+    assert resp.status_code == 204, (
+        f"codex-native {event_payload['type']} must return 204; "
+        f"got {resp.status_code}: {resp.text}"
+    )
+    assert fake_client.connected
+    assert fake_client.closed
+    assert fake_client.requests == [
+        ("thread/settings/update", expected_params),
+    ], (
+        f"codex-native {event_payload['type']} must call thread/settings/update "
+        f"with next-turn settings; got {fake_client.requests!r}."
+    )
 
 
 @pytest.mark.asyncio

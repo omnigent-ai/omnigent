@@ -1,4 +1,4 @@
-// Pin the wire envelopes for the four `session.*` SSE events.
+// Pin the wire envelopes for `session.*` SSE events.
 //
 // Each event in `omnigent/server/schemas.py` uses either a FLAT
 // envelope (`{type, ...fields}`) or a NESTED envelope (`{type, data:
@@ -18,6 +18,7 @@ import type {
   SessionInterruptedEvent,
   SessionModelEvent,
   SessionPresenceEvent,
+  SessionReasoningEffortEvent,
   SessionResourceCreatedEvent,
   SessionResourceDeletedEvent,
   SessionSandboxStatusEvent,
@@ -1181,6 +1182,34 @@ describe("session.model (FLAT envelope)", () => {
 
   it("rejects missing conversation_id", () => {
     expect(parse("session.model", { model: "opus" })).toEqual([]);
+  });
+});
+
+describe("session.reasoning_effort (FLAT envelope)", () => {
+  it("lifts conversation_id and effort", () => {
+    const events = parse("session.reasoning_effort", {
+      conversation_id: "conv_abc",
+      reasoning_effort: "medium",
+    });
+    expect(events).toHaveLength(1);
+    const ev = events[0] as SessionReasoningEffortEvent;
+    expect(ev.type).toBe("session_reasoning_effort");
+    expect(ev.conversationId).toBe("conv_abc");
+    expect(ev.reasoningEffort).toBe("medium");
+  });
+
+  it("lifts null effort clears", () => {
+    const events = parse("session.reasoning_effort", {
+      conversation_id: "conv_abc",
+      reasoning_effort: null,
+    });
+    expect(events).toHaveLength(1);
+    const ev = events[0] as SessionReasoningEffortEvent;
+    expect(ev.reasoningEffort).toBeNull();
+  });
+
+  it("rejects missing effort", () => {
+    expect(parse("session.reasoning_effort", { conversation_id: "conv_abc" })).toEqual([]);
   });
 });
 

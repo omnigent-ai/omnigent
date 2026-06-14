@@ -907,6 +907,18 @@ Request body matches `SessionEventInput`:
                                   omitted when unpriced. The same value is seeded
                                   on the session snapshot as `total_cost_usd`
                                   (`null` when unpriced).
+      - "external_reasoning_effort_change"
+                                — internal terminal-observed thinking-level
+                                  update from a native forwarder. Persists
+                                  `reasoning_effort` and publishes a
+                                  `session.reasoning_effort` event. Payload:
+                                  `{reasoning_effort: string | null}`; `null`
+                                  clears to the model default.
+      - "external_codex_collaboration_mode_change"
+                                — internal Codex app-server collaboration-mode
+                                  update. Persists the mode kind as label
+                                  `omnigent.codex_native.collaboration_mode`.
+                                  Payload: `{mode: "default" | "plan"}`.
       - "external_compaction_status"
                                 — internal terminal-observed compaction
                                   edge from the claude-native forwarder
@@ -1137,6 +1149,7 @@ stream and surface queue/interrupt semantics.
 | Event | Pydantic class | Wire shape (illustrative) |
 |---|---|---|
 | `session.status` | `SessionStatusEvent` | `{type, conversation_id, status: "running" \| "waiting" \| "idle" \| "failed"}` |
+| `session.reasoning_effort` | `SessionReasoningEffortEvent` | `{type, conversation_id, reasoning_effort: string \| null}` |
 | `session.input.consumed` | `SessionInputConsumedEvent` | `{type, data: {queued_item_id, type, data, position}}` (nested envelope) |
 | `session.interrupted` | `SessionInterruptedEvent` | `{type, data: {requested_at, queued_item_id?: null}}` (nested envelope) |
 | `session.created` | `SessionCreatedEvent` | `{type, conversation_id: <parent>, child_conversation_id, agent_id, ...}` — emitted on the PARENT session's stream when a sub-agent is spawned. |

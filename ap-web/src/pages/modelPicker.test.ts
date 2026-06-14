@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
+import { CODEX_NATIVE_MODELS, isCodexNativeModel } from "@/lib/codexNativeModels";
 import { isModelImplicitlySelected } from "./ChatPage";
 
 describe("CLAUDE_NATIVE_MODELS", () => {
@@ -20,6 +21,24 @@ describe("CLAUDE_NATIVE_MODELS", () => {
 
   it("labels each alias by tier", () => {
     expect(CLAUDE_NATIVE_MODELS.map((m) => m.label)).toEqual(["Opus", "Sonnet", "Haiku"]);
+  });
+});
+
+describe("CODEX_NATIVE_MODELS", () => {
+  it("offers Codex subscription-tier model ids", () => {
+    expect(CODEX_NATIVE_MODELS.map((m) => m.id)).toEqual([
+      "gpt-5.5",
+      "gpt-5.4",
+      "gpt-5.4-mini",
+    ]);
+  });
+
+  it("accepts Codex-compatible sticky model ids but rejects Claude aliases", () => {
+    expect(isCodexNativeModel("gpt-5.4")).toBe(true);
+    expect(isCodexNativeModel("databricks-gpt-5-5")).toBe(true);
+    expect(isCodexNativeModel("gpt-5.1-codex")).toBe(true);
+    expect(isCodexNativeModel("opus")).toBe(false);
+    expect(isCodexNativeModel("claude-opus-4-8")).toBe(false);
   });
 });
 

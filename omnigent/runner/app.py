@@ -6496,6 +6496,56 @@ def create_runner_app(
         _wake_parent_after_native_interrupt(conv_id)
         return Response(status_code=204)
 
+    async def _codex_native_bridge_state_for_session(
+        conv_id: str,
+        *,
+        action: str,
+    ) -> Any | None:
+        """
+        Read the recorded Codex app-server bridge state for a session.
+
+        Codex-native controls (interrupt, model, effort) target the
+        app-server socket recorded by the forwarder. ``--resume`` sessions
+        can have a bridge id distinct from the Omnigent session id, so the
+        lookup first resolves ``omnigent.codex_native.bridge_id`` from
+        session labels and falls back to ``conv_id`` for legacy states.
+
+        :param conv_id: Session/conversation identifier, e.g.
+            ``"conv_abc123"``.
+        :param action: Human-readable control action for logs, e.g.
+            ``"interrupt"``.
+        :returns: Bridge state for this session, or ``None`` when no matching
+            state is currently recorded.
+        """
+        from omnigent.codex_native_bridge import (
+            CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
+            bridge_dir_for_bridge_id,
+            read_bridge_state,
+        )
+
+        labels = await _session_labels_for_runner_spawn(
+            server_client=server_client,
+            session_id=conv_id,
+        )
+        bridge_id = labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or conv_id
+        state = read_bridge_state(bridge_dir_for_bridge_id(bridge_id))
+        if state is None:
+            _logger.warning(
+                "Codex-native %s skipped for %s: no bridge state.",
+                action,
+                conv_id,
+            )
+            return None
+        if state.session_id != conv_id:
+            _logger.warning(
+                "Codex-native %s skipped for %s: bridge belongs to %s.",
+                action,
+                conv_id,
+                state.session_id,
+            )
+            return None
+        return state
+
     async def _handle_codex_native_interrupt(conv_id: str) -> Response:
         """
         Stop a codex-native turn via Codex app-server ``turn/interrupt``.
@@ -6522,27 +6572,9 @@ def create_runner_app(
             503 when Codex rejects the active-turn interrupt.
         """
         from omnigent.codex_native_app_server import client_for_transport
-        from omnigent.codex_native_bridge import (
-            CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
-            bridge_dir_for_bridge_id,
-            read_bridge_state,
-        )
 
-        labels = await _session_labels_for_runner_spawn(
-            server_client=server_client,
-            session_id=conv_id,
-        )
-        bridge_id = labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or conv_id
-        state = read_bridge_state(bridge_dir_for_bridge_id(bridge_id))
+        state = await _codex_native_bridge_state_for_session(conv_id, action="interrupt")
         if state is None:
-            _logger.warning("Codex-native interrupt skipped for %s: no bridge state.", conv_id)
-            return Response(status_code=204)
-        if state.session_id != conv_id:
-            _logger.warning(
-                "Codex-native interrupt skipped for %s: bridge belongs to %s.",
-                conv_id,
-                state.session_id,
-            )
             return Response(status_code=204)
         if state.active_turn_id is None:
             _logger.info("Codex-native interrupt skipped for %s: no active turn.", conv_id)
@@ -6580,6 +6612,70 @@ def create_runner_app(
             with contextlib.suppress(Exception):
                 await codex_client.close()
         _wake_parent_after_native_interrupt(conv_id)
+        return Response(status_code=204)
+
+    async def _handle_codex_native_settings_update(
+        conv_id: str,
+        settings: dict[str, Any],
+    ) -> Response:
+        """
+        Queue Codex app-server next-turn settings for a loaded thread.
+
+        Codex app-server exposes ``thread/settings/update`` for partial
+        updates to a loaded thread's future-turn settings. This is the
+        codex-native counterpart to the Claude-native slash-command
+        injection path: model/effort changes persisted by Omnigent are
+        forwarded into Codex's own control plane instead of being typed into
+        the terminal.
+
+        :param conv_id: Session/conversation identifier, e.g.
+            ``"conv_abc123"``.
+        :param settings: Flat Codex app-server settings fields to update,
+            excluding ``threadId``; e.g. ``{"model": "gpt-5.4"}``.
+        :returns: 204 when no bridge is loaded or the update lands; 503 when
+            Codex rejects the settings update.
+        """
+        from omnigent.codex_native_app_server import client_for_transport
+
+        if not settings:
+            return Response(status_code=204)
+        state = await _codex_native_bridge_state_for_session(conv_id, action="settings update")
+        if state is None:
+            return Response(status_code=204)
+
+        codex_client = client_for_transport(
+            state.socket_path,
+            client_name="omnigent-codex-native-runner",
+        )
+        try:
+            await codex_client.connect()
+            await codex_client.request(
+                "thread/settings/update",
+                {
+                    "threadId": state.thread_id,
+                    **settings,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - surface app-server settings failures.
+            _logger.warning(
+                "Codex-native thread/settings/update failed for session=%s thread=%s settings=%s",
+                conv_id,
+                state.thread_id,
+                sorted(settings),
+                exc_info=True,
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "codex_native_settings_update_failed",
+                    "detail": _client_safe_error_detail(
+                        exc, context="codex-native settings update"
+                    ),
+                },
+            )
+        finally:
+            with contextlib.suppress(Exception):
+                await codex_client.close()
         return Response(status_code=204)
 
     async def _handle_pi_native_interrupt(conv_id: str) -> Response:
@@ -9723,11 +9819,13 @@ def create_runner_app(
         if body_type == "effort_change":
             # Omnigent server forwards the persisted reasoning_effort here
             # so harnesses that can't re-read it from store at turn
-            # boundaries can propagate it live. Today only claude-
-            # native has a live-injection path; other harnesses pick
-            # up the persisted value on the next turn and need no
+            # boundaries can propagate it live. Claude-native injects a
+            # slash command into its terminal; codex-native queues a
+            # Codex app-server next-turn settings update. Other harnesses
+            # pick up the persisted value on the next turn and need no
             # runtime side effect, so they 204 here.
-            if _session_harness_name(conversation_id) == "claude-native":
+            harness = _session_harness_name(conversation_id)
+            if harness in ("claude-native", "codex-native"):
                 effort = body.get("effort") if isinstance(body, dict) else None
                 if effort is not None and not isinstance(effort, str):
                     return JSONResponse(
@@ -9736,6 +9834,13 @@ def create_runner_app(
                             "error": "invalid_input",
                             "detail": "Body 'effort' must be a string or null",
                         },
+                    )
+                if harness == "codex-native":
+                    if effort is None:
+                        return Response(status_code=204)
+                    return await _handle_codex_native_settings_update(
+                        conversation_id,
+                        {"effort": effort},
                     )
                 return await _handle_claude_native_effort_change(
                     conversation_id,
@@ -9746,14 +9851,12 @@ def create_runner_app(
         if body_type == "model_change":
             # Omnigent server forwards the persisted model_override here so
             # harnesses that can't re-read it from store at turn
-            # boundaries can propagate it live. Only claude-native has a
-            # live-injection path (typing ``/model`` into its tmux pane).
-            # codex-native has no usable programmatic model switch in the
-            # shipped codex (no settings RPC; ``/model`` is a multi-step
-            # TUI selector), so codex model changes are made in the
-            # terminal — see the cost-policy deny message. Other harnesses
+            # boundaries can propagate it live. Claude-native types
+            # ``/model`` into its tmux pane; codex-native queues a
+            # Codex app-server next-turn settings update. Other harnesses
             # pick up the persisted value on the next turn and 204 here.
-            if _session_harness_name(conversation_id) == "claude-native":
+            harness = _session_harness_name(conversation_id)
+            if harness in ("claude-native", "codex-native"):
                 model = body.get("model") if isinstance(body, dict) else None
                 if model is not None and not isinstance(model, str):
                     return JSONResponse(
@@ -9762,6 +9865,13 @@ def create_runner_app(
                             "error": "invalid_input",
                             "detail": "Body 'model' must be a string or null",
                         },
+                    )
+                if harness == "codex-native":
+                    if model is None or not model.strip():
+                        return Response(status_code=204)
+                    return await _handle_codex_native_settings_update(
+                        conversation_id,
+                        {"model": model.strip()},
                     )
                 return await _handle_claude_native_model_change(
                     conversation_id,

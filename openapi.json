@@ -1830,6 +1830,7 @@
             "session.interrupted": "#/components/schemas/SessionInterruptedEvent",
             "session.model": "#/components/schemas/SessionModelEvent",
             "session.presence": "#/components/schemas/SessionPresenceEvent",
+            "session.reasoning_effort": "#/components/schemas/SessionReasoningEffortEvent",
             "session.resource.created": "#/components/schemas/SessionResourceCreatedEvent",
             "session.resource.deleted": "#/components/schemas/SessionResourceDeletedEvent",
             "session.sandbox_status": "#/components/schemas/SessionSandboxStatusEvent",
@@ -1855,6 +1856,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionModelEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionReasoningEffortEvent"
           },
           {
             "$ref": "#/components/schemas/SessionAgentChangedEvent"
@@ -2547,6 +2551,50 @@
           "viewers"
         ],
         "title": "SessionPresenceEvent",
+        "type": "object"
+      },
+      "SessionReasoningEffortEvent": {
+        "description": "Active reasoning-effort update from a terminal-backed integration.\n\nEmitted after an ``external_reasoning_effort_change`` POST from a native\nterminal forwarder when the user changes the thinking level inside the\nterminal UI. Lets the web effort picker reflect a TUI-side switch without\na reload.\n\n:param type: Always ``\"session.reasoning_effort\"``.\n:param conversation_id: Session identifier, e.g. ``\"conv_abc123\"``.\n:param reasoning_effort: Reasoning effort now active for the session, e.g.\n    ``\"medium\"``, or ``None`` when Codex cleared to its default.\n\nCategory: **transient** (SSE-only). The server also writes\n``reasoning_effort`` on the conversation, so on reconnect clients restore\nthe selection from the session snapshot rather than from a replayed event.",
+        "properties": {
+          "conversation_id": {
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reasoning Effort"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.reasoning_effort",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id"
+        ],
+        "title": "SessionReasoningEffortEvent",
         "type": "object"
       },
       "SessionResourceCreatedEvent": {
@@ -5432,7 +5480,7 @@
     },
     "/v1/sessions/{session_id}/events": {
       "post": {
-        "description": "Submit a session event (input message, tool output,\napproval, or interrupt).\n\nDispatches on ``body.type``:\n\n- ``\"interrupt\"`` cancels any active task and publishes a\n  ``session.interrupted`` event. Bypasses item persistence.\n- ``\"approval\"`` resolves an outstanding elicitation\n  in-band (see :func:`_dispatch_approval`).\n- ``\"external_assistant_message\"`` appends and streams an\n  assistant message observed outside the Omnigent task runtime,\n  without starting or steering a task.\n- ``\"external_conversation_item\"`` appends and streams a\n  completed item observed outside the Omnigent task runtime,\n  without starting or steering a task.\n- ``\"external_output_text_delta\"`` publishes a transient\n  ``response.output_text.delta`` event observed outside the\n  Omnigent task runtime, without persisting an item or starting /\n  steering a task.\n- ``\"external_session_interrupted\"`` publishes a\n  ``session.interrupted`` event observed outside the Omnigent task\n  runtime, without persisting an item or starting / steering a\n  task.\n- ``\"external_elicitation_resolved\"`` marks a native\n  harness-originated elicitation as resolved elsewhere so\n  subscribed clients clear the pending approval card.\n- ``\"external_session_status\"`` publishes a terminal-observed\n  ``session.status`` edge without persisting an item or\n  starting/steering a task.\n- ``\"external_model_change\"`` persists a terminal-observed\n  model switch to ``model_override`` and publishes a\n  ``session.model`` SSE event so the web picker reflects it.\n- ``\"stop_session\"`` terminates the live session without\n  deleting the conversation (owner-only). Forwarded\n  harness-agnostically to the runner, which hard-kills the\n  external process for harnesses that have one (claude-native\n  kills its tmux pane) and 204s otherwise. Stop is non-sticky:\n  it writes no persistent marker, so the next message\n  auto-relaunches the session on its (still-online) host via\n  the normal message-dispatch relaunch path.\n- ``\"message\"`` on an ``omnigent claude`` terminal session\n  is forwarded to the bound runner for tmux injection only;\n  the accepted prompt is persisted later when Claude records\n  it in the terminal transcript.\n- Any other (item-typed) event is persisted into\n  ``conversation_items`` via the legacy create-or-steer path\n  (legacy persist path): if an active\n  task is present, the item is delivered into its inbox;\n  otherwise a new task is created and started. In both\n  cases ``session.input.consumed`` fires with the persisted\n  item's id.\n\n:param session_id: Session/conversation identifier.\n:param body: The validated :class:`SessionEventInput`.\n:returns: ``{\"queued\": True, \"item_id\": \"...\"}`` for\n    item-typed events, where ``item_id`` is the persisted\n    conversation item id also emitted by\n    ``session.input.consumed``; ``{\"queued\": False}`` for\n    control and internal transient events.\n:raises OmnigentError: 404 if no session exists.",
+        "description": "Submit a session event (input message, tool output,\napproval, or interrupt).\n\nDispatches on ``body.type``:\n\n- ``\"interrupt\"`` cancels any active task and publishes a\n  ``session.interrupted`` event. Bypasses item persistence.\n- ``\"approval\"`` resolves an outstanding elicitation\n  in-band (see :func:`_dispatch_approval`).\n- ``\"external_assistant_message\"`` appends and streams an\n  assistant message observed outside the Omnigent task runtime,\n  without starting or steering a task.\n- ``\"external_conversation_item\"`` appends and streams a\n  completed item observed outside the Omnigent task runtime,\n  without starting or steering a task.\n- ``\"external_output_text_delta\"`` publishes a transient\n  ``response.output_text.delta`` event observed outside the\n  Omnigent task runtime, without persisting an item or starting /\n  steering a task.\n- ``\"external_session_interrupted\"`` publishes a\n  ``session.interrupted`` event observed outside the Omnigent task\n  runtime, without persisting an item or starting / steering a\n  task.\n- ``\"external_elicitation_resolved\"`` marks a native\n  harness-originated elicitation as resolved elsewhere so\n  subscribed clients clear the pending approval card.\n- ``\"external_session_status\"`` publishes a terminal-observed\n  ``session.status`` edge without persisting an item or\n  starting/steering a task.\n- ``\"external_model_change\"`` persists a terminal-observed\n  model switch to ``model_override`` and publishes a\n  ``session.model`` SSE event so the web picker reflects it.\n- ``\"external_reasoning_effort_change\"`` persists a terminal-observed\n  thinking-level switch to ``reasoning_effort`` and publishes a\n  ``session.reasoning_effort`` SSE event so the web picker reflects it.\n- ``\"external_codex_collaboration_mode_change\"`` persists the\n  Codex app-server collaboration mode kind as an internal session label\n  (``omnigent.codex_native.collaboration_mode``).\n- ``\"stop_session\"`` terminates the live session without\n  deleting the conversation (owner-only). Forwarded\n  harness-agnostically to the runner, which hard-kills the\n  external process for harnesses that have one (claude-native\n  kills its tmux pane) and 204s otherwise. Stop is non-sticky:\n  it writes no persistent marker, so the next message\n  auto-relaunches the session on its (still-online) host via\n  the normal message-dispatch relaunch path.\n- ``\"message\"`` on an ``omnigent claude`` terminal session\n  is forwarded to the bound runner for tmux injection only;\n  the accepted prompt is persisted later when Claude records\n  it in the terminal transcript.\n- Any other (item-typed) event is persisted into\n  ``conversation_items`` via the legacy create-or-steer path\n  (legacy persist path): if an active\n  task is present, the item is delivered into its inbox;\n  otherwise a new task is created and started. In both\n  cases ``session.input.consumed`` fires with the persisted\n  item's id.\n\n:param session_id: Session/conversation identifier.\n:param body: The validated :class:`SessionEventInput`.\n:returns: ``{\"queued\": True, \"item_id\": \"...\"}`` for\n    item-typed events, where ``item_id`` is the persisted\n    conversation item id also emitted by\n    ``session.input.consumed``; ``{\"queued\": False}`` for\n    control and internal transient events.\n:raises OmnigentError: 404 if no session exists.",
         "operationId": "post_event_v1_sessions__session_id__events_post",
         "parameters": [
           {

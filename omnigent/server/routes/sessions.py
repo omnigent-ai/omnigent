@@ -223,6 +223,7 @@ from omnigent.server.schemas import (
     SessionLabelsResponse,
     SessionListItem,
     SessionModelEvent,
+    SessionReasoningEffortEvent,
     SessionResourceListPage,
     SessionResourceObject,
     SessionResourcePaginatedList,
@@ -369,6 +370,11 @@ _EXTERNAL_SESSION_USAGE_TYPE: str = "external_session_usage"
 # on the conversation and publishes a ``session.model`` SSE event so the
 # web model picker reflects the switch. Payload: ``{"model": "opus"}``.
 _EXTERNAL_MODEL_CHANGE_TYPE: str = "external_model_change"
+# Active reasoning-effort switch observed inside a native terminal. Persists
+# ``reasoning_effort`` on the conversation and publishes a
+# ``session.reasoning_effort`` SSE event so the web effort picker reflects the
+# switch. Payload: ``{"reasoning_effort": "medium"}``; JSON ``null`` clears.
+_EXTERNAL_REASONING_EFFORT_CHANGE_TYPE: str = "external_reasoning_effort_change"
 
 # Subagent-start signal from the claude-native forwarder. Claude Code
 # spawns sub-agents internally (Task tool) and writes their transcripts
@@ -412,6 +418,11 @@ _CODEX_NATIVE_SUBAGENT_TOOL_CALL_ID_LABEL_KEY = "omnigent.codex_native.collab_to
 _CODEX_NATIVE_SUBAGENT_PROMPT_LABEL_KEY = "omnigent.codex_native.prompt"
 _CODEX_NATIVE_SUBAGENT_NICKNAME_LABEL_KEY = "omnigent.codex_native.agent_nickname"
 _CODEX_NATIVE_SUBAGENT_ROLE_LABEL_KEY = "omnigent.codex_native.agent_role"
+# Current Codex collaboration mode kind (``"plan"`` or ``"default"``)
+# mirrored from app-server ``thread/settings/updated``.
+_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY = "omnigent.codex_native.collaboration_mode"
+_EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE: str = "external_codex_collaboration_mode_change"
+_CODEX_NATIVE_COLLABORATION_MODES: frozenset[str] = frozenset({"default", "plan"})
 # Display name fallback when neither nickname nor role is available.
 _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK = "Codex"
 # Labels read by ``_get_session_snapshot`` to seed the ap-web ring on
@@ -605,9 +616,11 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_SESSION_USAGE_TYPE,
     _EXTERNAL_COMPACTION_STATUS_TYPE,
     _EXTERNAL_MODEL_CHANGE_TYPE,
+    _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
     _EXTERNAL_SESSION_TODOS_TYPE,
     _EXTERNAL_SUBAGENT_START_TYPE,
     _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
+    _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
 }
 
 # Validates every dict that crosses the AP→client SSE boundary on
@@ -3024,6 +3037,119 @@ async def _persist_external_model_change(
         model=model,
     )
     session_stream.publish(session_id, event.model_dump())
+
+
+def _validate_external_reasoning_effort(body: SessionEventInput) -> str | None:
+    """
+    Validate a terminal-observed reasoning-effort payload.
+
+    :param body: External effort-change event body. ``data.reasoning_effort``
+        must be present and either ``None`` or a supported effort string, e.g.
+        ``"medium"``.
+    :returns: Normalized effort string, or ``None`` when the terminal cleared
+        to its default effort.
+    :raises OmnigentError: If the payload is missing or unsupported.
+    """
+    if "reasoning_effort" not in body.data:
+        raise OmnigentError(
+            "external_reasoning_effort_change requires data.reasoning_effort",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    raw_effort = body.data["reasoning_effort"]
+    if raw_effort is None:
+        return None
+    if not isinstance(raw_effort, str) or not raw_effort.strip():
+        raise OmnigentError(
+            "external_reasoning_effort_change requires data.reasoning_effort "
+            "to be a non-empty string or null",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    effort = raw_effort.strip()
+    try:
+        return validate_effort(effort, "session metadata", EFFORT_VALUES)
+    except ValueError as exc:
+        raise OmnigentError(
+            f"invalid reasoning_effort: {exc}",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+
+
+async def _persist_external_reasoning_effort_change(
+    session_id: str,
+    conv: Conversation,
+    body: SessionEventInput,
+    conversation_store: ConversationStore,
+) -> None:
+    """
+    Persist and broadcast a reasoning-effort switch made inside the terminal.
+
+    Mirrors a native-terminal thinking-level change onto the Omnigent session.
+    Unlike the public PATCH path, this deliberately does NOT forward an
+    ``effort_change`` back to the runner: the terminal is already on that
+    effort, so re-injecting it would loop.
+
+    :param session_id: Session/conversation identifier, e.g.
+        ``"conv_abc123"``.
+    :param conv: Conversation row for ``session_id`` at the route boundary.
+    :param body: External effort-change event body.
+    :param conversation_store: Store used to update ``reasoning_effort``.
+    :returns: None.
+    """
+    effort = _validate_external_reasoning_effort(body)
+    if conv.reasoning_effort == effort:
+        return
+    await asyncio.to_thread(
+        conversation_store.update_conversation,
+        session_id,
+        reasoning_effort=effort,
+        _unset_reasoning_effort=effort is None,
+    )
+    event = SessionReasoningEffortEvent(
+        type="session.reasoning_effort",
+        conversation_id=session_id,
+        reasoning_effort=effort,
+    )
+    session_stream.publish(session_id, event.model_dump())
+
+
+async def _persist_external_codex_collaboration_mode_change(
+    session_id: str,
+    conv: Conversation,
+    body: SessionEventInput,
+    conversation_store: ConversationStore,
+) -> None:
+    """
+    Persist Codex's collaboration mode kind as an internal session label.
+
+    :param session_id: Session/conversation identifier, e.g.
+        ``"conv_abc123"``.
+    :param conv: Conversation row for ``session_id`` at the route boundary.
+    :param body: External Codex mode-change event body. ``data.mode`` must be
+        ``"default"`` or ``"plan"``.
+    :param conversation_store: Store used to upsert the mode label.
+    :returns: None.
+    :raises OmnigentError: If ``data.mode`` is missing or unsupported.
+    """
+    raw_mode = body.data.get("mode")
+    if not isinstance(raw_mode, str) or not raw_mode.strip():
+        raise OmnigentError(
+            "external_codex_collaboration_mode_change requires data.mode to be a non-empty string",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    mode = raw_mode.strip()
+    if mode not in _CODEX_NATIVE_COLLABORATION_MODES:
+        raise OmnigentError(
+            "external_codex_collaboration_mode_change requires data.mode in "
+            f"{sorted(_CODEX_NATIVE_COLLABORATION_MODES)}; got {mode!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if conv.labels.get(_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY) == mode:
+        return
+    await asyncio.to_thread(
+        conversation_store.set_labels,
+        session_id,
+        {_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY: mode},
+    )
 
 
 async def _persist_model_change_note(
@@ -15528,6 +15654,12 @@ def create_sessions_router(
         - ``"external_model_change"`` persists a terminal-observed
           model switch to ``model_override`` and publishes a
           ``session.model`` SSE event so the web picker reflects it.
+        - ``"external_reasoning_effort_change"`` persists a terminal-observed
+          thinking-level switch to ``reasoning_effort`` and publishes a
+          ``session.reasoning_effort`` SSE event so the web picker reflects it.
+        - ``"external_codex_collaboration_mode_change"`` persists the
+          Codex app-server collaboration mode kind as an internal session label
+          (``omnigent.codex_native.collaboration_mode``).
         - ``"stop_session"`` terminates the live session without
           deleting the conversation (owner-only). Forwarded
           harness-agnostically to the runner, which hard-kills the
@@ -15602,9 +15734,11 @@ def create_sessions_router(
             _EXTERNAL_SESSION_USAGE_TYPE,
             _EXTERNAL_COMPACTION_STATUS_TYPE,
             _EXTERNAL_MODEL_CHANGE_TYPE,
+            _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
             _EXTERNAL_SESSION_TODOS_TYPE,
             _EXTERNAL_SUBAGENT_START_TYPE,
             _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
+            _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
         ):
             try:
                 parse_item_data(body.type, {"type": body.type, **body.data})
@@ -16033,6 +16167,22 @@ def create_sessions_router(
             return {"queued": False}
         if body.type == _EXTERNAL_MODEL_CHANGE_TYPE:
             await _persist_external_model_change(
+                session_id,
+                conv,
+                body,
+                conversation_store,
+            )
+            return {"queued": False}
+        if body.type == _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE:
+            await _persist_external_reasoning_effort_change(
+                session_id,
+                conv,
+                body,
+                conversation_store,
+            )
+            return {"queued": False}
+        if body.type == _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE:
+            await _persist_external_codex_collaboration_mode_change(
                 session_id,
                 conv,
                 body,

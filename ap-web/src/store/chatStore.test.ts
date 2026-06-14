@@ -3320,6 +3320,30 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     });
   });
 
+  describe("session.reasoning_effort", () => {
+    it("reflects a TUI-side effort switch in selectedEffort", () => {
+      // A thinking-level change inside a native terminal arrives as
+      // session.reasoning_effort; the effort picker must follow it.
+      useChatStore.setState({ selectedEffort: "high" });
+      handleSessionEvent({
+        type: "session_reasoning_effort",
+        conversationId: "conv_abc",
+        reasoningEffort: "medium",
+      });
+      expect(useChatStore.getState().selectedEffort).toBe("medium");
+    });
+
+    it("reflects a terminal effort clear in selectedEffort", () => {
+      useChatStore.setState({ selectedEffort: "medium" });
+      handleSessionEvent({
+        type: "session_reasoning_effort",
+        conversationId: "conv_abc",
+        reasoningEffort: null,
+      });
+      expect(useChatStore.getState().selectedEffort).toBeNull();
+    });
+  });
+
   describe("session.input.consumed", () => {
     it("promotes the oldest pending user message into blocks (FIFO, plain append)", () => {
       const existingAssistant: AnyBlock = {
@@ -4593,9 +4617,9 @@ describe("chatStore — elicitation_resolved", () => {
 });
 
 // Sticky-pref handoff: a sessions's snapshot trumps the store; an
-// empty snapshot picks up the user's last pick (claude-native only
-// for model). PATCH fires as a side effect so the next turn uses
-// the override server-side.
+// empty snapshot picks up the user's last compatible native pick.
+// PATCH fires as a side effect so the next turn uses the override
+// server-side.
 describe("chatStore — bindStream sticky-pref handoff", () => {
   interface SnapshotOverrides {
     labels?: Record<string, string>;
@@ -4663,6 +4687,29 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     expect(state.selectedEffort).toBe("high");
   });
 
+  it("PATCHes sticky model and effort onto a codex-native session with no overrides", async () => {
+    seedSession("conv_codex", []);
+    withSnapshot("conv_codex", { labels: { "omnigent.wrapper": "codex-native-ui" } });
+
+    useChatStore.setState({
+      selectedEffort: "xhigh",
+      selectedModel: "gpt-5.4",
+    });
+    await useChatStore.getState().switchTo("conv_codex");
+
+    const patches = patchCallsFor("conv_codex");
+    expect(patches).toEqual(
+      expect.arrayContaining([
+        { model_override: "gpt-5.4", silent: true },
+        { reasoning_effort: "xhigh" },
+      ]),
+    );
+
+    const state = useChatStore.getState();
+    expect(state.selectedModel).toBe("gpt-5.4");
+    expect(state.selectedEffort).toBe("xhigh");
+  });
+
   it("does NOT apply sticky effort or model to a sub-agent (child) session", async () => {
     // Observer sticky prefs must not overwrite child sessions.
     seedSession("conv_child", []);
@@ -4701,6 +4748,19 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     await useChatStore.getState().switchTo("conv_cn_gpt");
 
     const patches = patchCallsFor("conv_cn_gpt");
+    expect(patches.some((p) => "model_override" in p)).toBe(false);
+  });
+
+  it("does NOT PATCH a non-Codex sticky model onto a codex-native session", async () => {
+    // Same guard in the opposite direction: a Claude alias from the global
+    // picker must not be handed to Codex app-server as its next-turn model.
+    seedSession("conv_codex_claude", []);
+    withSnapshot("conv_codex_claude", { labels: { "omnigent.wrapper": "codex-native-ui" } });
+
+    useChatStore.setState({ selectedEffort: null, selectedModel: "opus" });
+    await useChatStore.getState().switchTo("conv_codex_claude");
+
+    const patches = patchCallsFor("conv_codex_claude");
     expect(patches.some((p) => "model_override" in p)).toBe(false);
   });
 
@@ -4762,6 +4822,18 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     await useChatStore.getState().setEffort("high");
 
     expect(patchCallsFor("conv_supported")).toEqual([{ reasoning_effort: "high" }]);
+    expect(useChatStore.getState().selectedEffort).toBe("high");
+  });
+
+  it("PATCHes effort on an active codex-native session", async () => {
+    seedSession("conv_codex_supported", []);
+    withSnapshot("conv_codex_supported", { labels: { "omnigent.wrapper": "codex-native-ui" } });
+    await useChatStore.getState().switchTo("conv_codex_supported");
+    fetchMock.mockClear();
+
+    await useChatStore.getState().setEffort("high");
+
+    expect(patchCallsFor("conv_codex_supported")).toEqual([{ reasoning_effort: "high" }]);
     expect(useChatStore.getState().selectedEffort).toBe("high");
   });
 

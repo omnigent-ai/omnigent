@@ -194,6 +194,148 @@ async def test_sync_after_resume_posts_spawn_model() -> None:
     assert state.posted_model == "gpt-5.4-mini"
 
 
+def test_thread_settings_updated_records_effort_and_collaboration_mode() -> None:
+    """
+    ``thread/settings/updated`` records Codex's live thinking settings.
+
+    App-server sends the public ``ThreadSettings`` shape with ``effort`` and
+    ``collaborationMode``. If this parser regresses, the later sync helpers have
+    no state to mirror, so Omnigent would keep stale ``reasoning_effort`` and
+    mode metadata even though Codex changed them.
+    """
+    state = fwd._CodexForwarderState()
+
+    state.note_thread_settings_updated(
+        {
+            "threadSettings": {
+                "model": "gpt-5.4-codex",
+                "effort": "medium",
+                "collaborationMode": {
+                    "mode": "plan",
+                    "settings": {
+                        "model": "gpt-5.4-codex",
+                        "reasoning_effort": "medium",
+                        "developer_instructions": None,
+                    },
+                },
+            }
+        }
+    )
+
+    assert state.model == "gpt-5.4-codex"
+    assert state.effort == "medium"
+    assert state.collaboration_mode == "plan"
+
+
+@pytest.mark.asyncio
+async def test_sync_reasoning_effort_change_posts_and_dedupes() -> None:
+    """
+    Codex effort changes mirror to Omnigent exactly once per observed value.
+
+    The first sync must POST ``external_reasoning_effort_change`` so the server
+    persists ``conversation.reasoning_effort``. The second sync with the same
+    value must not re-post; otherwise every repeated settings notification would
+    churn the session stream.
+    """
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState(effort="medium")
+
+    await fwd._sync_reasoning_effort_change(
+        client,
+        session_id="conv_x",
+        forwarder_state=state,
+    )
+    await fwd._sync_reasoning_effort_change(
+        client,
+        session_id="conv_x",
+        forwarder_state=state,
+    )
+
+    # One post proves the new effort reached AP; no second post proves the
+    # dedupe baseline advanced after a successful mirror.
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_reasoning_effort_change",
+                "data": {"reasoning_effort": "medium"},
+            },
+        )
+    ]
+    assert state.posted_effort == "medium"
+    assert state.posted_effort_known is True
+
+
+@pytest.mark.asyncio
+async def test_sync_reasoning_effort_change_posts_clear() -> None:
+    """
+    Codex clearing effort mirrors JSON null to Omnigent.
+
+    ``None`` is a meaningful observed value (model/default effort), so the
+    forwarder must still post it after a prior explicit effort. If this returned
+    early on falsey ``None``, Omnigent would keep a stale explicit effort.
+    """
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState(
+        effort=None,
+        posted_effort="high",
+        posted_effort_known=True,
+    )
+
+    await fwd._sync_reasoning_effort_change(
+        client,
+        session_id="conv_x",
+        forwarder_state=state,
+    )
+
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_reasoning_effort_change",
+                "data": {"reasoning_effort": None},
+            },
+        )
+    ]
+    assert state.posted_effort is None
+    assert state.posted_effort_known is True
+
+
+@pytest.mark.asyncio
+async def test_sync_codex_collaboration_mode_change_posts_and_dedupes() -> None:
+    """
+    Codex collaboration mode changes mirror to Omnigent labels once.
+
+    The ``mode`` value is the durable "Plan vs Default" signal we can get from
+    app-server. Missing this POST would leave the session snapshot without the
+    current Codex mode.
+    """
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState(collaboration_mode="plan")
+
+    await fwd._sync_codex_collaboration_mode_change(
+        client,
+        session_id="conv_x",
+        forwarder_state=state,
+    )
+    await fwd._sync_codex_collaboration_mode_change(
+        client,
+        session_id="conv_x",
+        forwarder_state=state,
+    )
+
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_codex_collaboration_mode_change",
+                "data": {"mode": "plan"},
+            },
+        )
+    ]
+    assert state.posted_collaboration_mode == "plan"
+
+
 @pytest.mark.parametrize(
     "content,expected",
     [

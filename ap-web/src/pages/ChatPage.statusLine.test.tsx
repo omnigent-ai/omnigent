@@ -2,14 +2,14 @@ import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useChatStore } from "@/store/chatStore";
-import { Composer } from "./ChatPage";
+import { Composer, formatModelEffortStatusLabel } from "./ChatPage";
 
 // Pins the visibility rules for the status-line tray under the composer:
-// it shows the worktree branch (truncated so the tray never wraps) and the
-// context ring, and must not render at all when neither has data — no dead
-// shelf attached to the composer. Session cost was moved OUT of this tray
-// into the header agent-info popover, so a priced cost must NOT resurrect
-// the tray or appear here.
+// it shows the worktree branch (truncated so the tray never wraps), current
+// model/effort, and the context ring. It must not render at all when none
+// has data — no dead shelf attached to the composer. Session cost was moved
+// OUT of this tray into the header agent-info popover, so a priced cost must
+// NOT resurrect the tray or appear here.
 
 /** Minimal ComposerProps for an interactive (writable, idle) composer. */
 function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) {
@@ -31,6 +31,7 @@ function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) 
     effortLevels: ["low", "medium", "high"] as const,
     showEffort: true,
     showModels: false,
+    modelPickerKind: null,
     ...overrides,
   };
 }
@@ -57,6 +58,9 @@ describe("Composer status line (branch + context ring)", () => {
       tokensUsed: null,
       sessionCostUsd: null,
       gitBranch: null,
+      llmModel: null,
+      selectedModel: null,
+      selectedEffort: null,
     });
   });
 
@@ -89,6 +93,34 @@ describe("Composer status line (branch + context ring)", () => {
     // 25k of 100k → 25% used; a wrong value means the ring wired the
     // wrong store fields through its props.
     expect(screen.getByLabelText("25% of context used")).toBeInTheDocument();
+  });
+
+  it("shows model and effort immediately left of the context ring", () => {
+    useChatStore.setState({
+      selectedModel: "gpt-5.5",
+      selectedEffort: "xhigh",
+      contextWindow: 100_000,
+      tokensUsed: 25_000,
+    });
+    renderComposer();
+
+    const modelEffort = screen.getByTestId("composer-model-effort");
+    const ring = screen.getByLabelText("25% of context used");
+    expect(modelEffort).toHaveTextContent("GPT-5.5 xHigh");
+    expect(modelEffort.compareDocumentPosition(ring) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+  });
+
+  it("falls back to the bound model when there is no model override", () => {
+    useChatStore.setState({
+      llmModel: "databricks-gpt-5-5",
+      selectedEffort: "medium",
+    });
+    renderComposer();
+
+    expect(screen.getByTestId("composer-model-effort")).toHaveTextContent("GPT-5.5 Medium");
+    expect(screen.queryByLabelText(/context used/)).toBeNull();
   });
 
   it("draws the ring arc as what's used, not what's left", () => {
@@ -154,5 +186,20 @@ describe("Composer status line (branch + context ring)", () => {
     renderComposer();
     expect(statusLine()).not.toBeNull();
     expect(screen.queryByTestId("composer-git-branch")).toBeNull();
+  });
+});
+
+describe("formatModelEffortStatusLabel", () => {
+  it("compacts Codex model ids and xhigh effort", () => {
+    expect(formatModelEffortStatusLabel("gpt-5.5", "xhigh")).toBe("GPT-5.5 xHigh");
+    expect(formatModelEffortStatusLabel("databricks-gpt-5-5", "xhigh")).toBe(
+      "GPT-5.5 xHigh",
+    );
+  });
+
+  it("omits missing pieces", () => {
+    expect(formatModelEffortStatusLabel("opus", null)).toBe("Opus");
+    expect(formatModelEffortStatusLabel(null, "low")).toBe("Low");
+    expect(formatModelEffortStatusLabel(null, null)).toBeNull();
   });
 });
