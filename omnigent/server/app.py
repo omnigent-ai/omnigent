@@ -1297,14 +1297,14 @@ def create_app(
         # managed_sandboxes_enabled gates the web UI's sandbox
         # option on the new-session screen: true only when a `sandbox:`
         # config is wired AND its provider can actually serve a managed
-        # launch (staged providers like daytona/lakebox parse but
-        # reject at launch — they must not advertise the option).
+        # launch (staged providers parse but reject at launch — they
+        # must not advertise the option).
         managed_sandboxes_enabled = (
             sandbox_config is not None and sandbox_config.managed_launch_supported
         )
         # sandbox_provider names the backing provider (e.g. "modal",
-        # "lakebox") so the web UI can label the option per provider
-        # ("Modal Sandbox" / "Databricks Sandbox") instead of the
+        # "islo") so the web UI can label the option per provider
+        # ("Modal Sandbox" / "Islo Sandbox") instead of the
         # generic "New Sandbox". Only surfaced when the option is
         # actually offered; None when no provider is named (embedding
         # configs may leave it unset) so the UI keeps the generic label.
