@@ -52,15 +52,29 @@ class _FakeStreamReader:
     """Simulates asyncio.StreamReader with pre-loaded lines."""
 
     def __init__(self, lines: list[bytes]):
-        self._lines = list(lines)
-        self._index = 0
+        self._buffer = bytearray(b"".join(lines))
 
     async def readline(self) -> bytes:
-        if self._index < len(self._lines):
-            line = self._lines[self._index]
-            self._index += 1
+        if not self._buffer:
+            return b""
+        newline_index = self._buffer.find(b"\n")
+        if newline_index >= 0:
+            end = newline_index + 1
+            line = bytes(self._buffer[:end])
+            del self._buffer[:end]
             return line
-        return b""
+        line = bytes(self._buffer)
+        self._buffer.clear()
+        return line
+
+    async def read(self, n: int = -1) -> bytes:
+        if not self._buffer:
+            return b""
+        if n is None or n < 0 or n > len(self._buffer):
+            n = len(self._buffer)
+        chunk = bytes(self._buffer[:n])
+        del self._buffer[:n]
+        return chunk
 
     def __aiter__(self):
         return self
@@ -836,6 +850,35 @@ class TestToolServer(unittest.TestCase):
 
 
 class TestPiRpcSession(unittest.TestCase):
+    def test_reader_accepts_single_stdout_line_larger_than_default_stream_limit(self):
+        async def _test():
+            rpc = _PiRpcSession()
+            stream = asyncio.StreamReader()
+            payload = "x" * (70 * 1024)
+            event = {
+                "type": "tool_execution_end",
+                "toolName": "large_result",
+                "isError": False,
+                "result": {"content": payload},
+            }
+            stream.feed_data((json.dumps(event) + "\n").encode())
+            stream.feed_eof()
+            rpc.process = MagicMock()
+            rpc.process.stdout = stream
+            rpc._line_queue = asyncio.Queue()
+
+            await rpc._reader()
+
+            line = await rpc.read_line(timeout=0.1)
+            self.assertIsNotNone(line)
+            parsed = json.loads(line)
+            self.assertEqual(parsed["type"], "tool_execution_end")
+            self.assertEqual(parsed["toolName"], "large_result")
+            self.assertEqual(parsed["result"]["content"], payload)
+            self.assertIsNone(await rpc.read_line(timeout=0.1))
+
+        _run(_test())
+
     def test_send_command(self):
         async def _test():
             rpc = _PiRpcSession()

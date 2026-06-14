@@ -657,13 +657,13 @@ async def test_context_overflow_anthropic_sum_pattern(
             retry=retry_config,
         )
 
-    # In Anthropic's "a + b > limit" pattern:
-    # group(1)=actual (197202), group(2)=max (200000).
+    # In Anthropic's "a + b > limit" pattern the full request size is
+    # a + b (197202 + 21333 = 218535), not just a (the prompt alone).
     assert exc_info.value.max_context_tokens == 200000, (
         f"Expected max_context_tokens=200000, got {exc_info.value.max_context_tokens}."
     )
-    assert exc_info.value.actual_tokens == 197202, (
-        f"Expected actual_tokens=197202, got {exc_info.value.actual_tokens}."
+    assert exc_info.value.actual_tokens == 218535, (
+        f"Expected actual_tokens=218535 (197202+21333), got {exc_info.value.actual_tokens}."
     )
 
 

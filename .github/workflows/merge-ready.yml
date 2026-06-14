@@ -89,7 +89,10 @@ jobs:
       ) ||
       (
         github.event_name == 'workflow_run' &&
-        github.event.workflow_run.event == 'pull_request'
+        (
+          github.event.workflow_run.event == 'pull_request' ||
+          github.event.workflow_run.event == 'pull_request_target'
+        )
       ) ||
       (
         github.event_name == 'issue_comment' &&
@@ -125,6 +128,13 @@ jobs:
           else
             PR=$(echo "$WF_PRS" | jq -r '.[0].number // empty')
             SHA="${{ github.event.workflow_run.head_sha }}"
+            if [[ -z "$PR" ]]; then
+              # Fork-PR upstream runs leave workflow_run.pull_requests empty
+              # (GitHub omits cross-repo PR refs), so resolve the open PR from
+              # the head SHA. SHA is a commit hash from the event (no injection).
+              PR=$(gh api "repos/$REPO/commits/$SHA/pulls" \
+                --jq 'map(select(.state == "open")) | .[0].number // empty' 2>/dev/null || true)
+            fi
             if [[ -z "$PR" ]]; then
               echo "::notice::Skipped: workflow_run has no associated PR (push to main, etc)"
               echo "skip=true" >> "$GITHUB_OUTPUT"
