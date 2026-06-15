@@ -475,14 +475,6 @@ free credits. Rates: [islo.dev](https://islo.dev).
 - **"managed host did not come online within 120s."** Check that
   `server_url` is publicly reachable from Islo's cloud, then inspect the
   in-sandbox host log: `~/.omnigent/logs/host-runner/*.log`.
-- **UI stuck on "Provisioning sandbox…" but a refresh shows the reply.**
-  The host and runner are connected — the browser just isn't receiving live
-  updates. The Web UI streams session state over SSE
-  (`/v1/sessions/{id}/stream`), and some dev tunnels (cloudflared / ngrok
-  quick tunnels) buffer streaming responses. Use an ingress that doesn't
-  buffer SSE, or point your browser directly at the server — `server_url`
-  only needs to be reachable from Islo's cloud for the sandbox dial-back,
-  not from your browser.
 - **Agent has no credentials.** Verify the injected var names match the
   forwarded set above (or are named in `OMNIGENT_RUNNER_ENV_PASSTHROUGH`),
   and that each name was actually set in the launching environment.
