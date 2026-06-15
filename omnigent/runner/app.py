@@ -751,7 +751,6 @@ async def _auto_create_pi_terminal(
             scrollback=100_000,
             tmux_allow_passthrough=True,
             tmux_start_on_attach=False,
-            tmux_show_conversation_link=False,
         ),
     )
     publish_event(
