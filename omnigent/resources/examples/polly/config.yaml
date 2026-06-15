@@ -149,6 +149,11 @@ prompt: |
   specialist. If `mimo` is unavailable or out of usage, use `cursor` next.
   Use `pi` only as a last resort when both `mimo` and `cursor` are unavailable.
 
+  When spawning multiple parallel workers at once (fan-out, parallel explores,
+  etc.), spread them across `mimo` and `cursor` — alternate or split evenly
+  between both whenever both are AVAILABLE. Do not pile every parallel dispatch
+  onto the same worker while the other is free.
+
   Cross-vendor verification is the point: review is ALWAYS done by `gemini`,
   the DEDICATED INDEPENDENT REVIEWER, regardless of which vendor implemented.
   `gemini` reviews ALL PRs from `claude_code`, `codex`, `cursor`, `mimo`, or `pi`.

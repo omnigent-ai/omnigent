@@ -14,7 +14,7 @@ dependency).
    Record the worktree path + branch in the registry
    (`.polly/registry.json`).
 2. Dispatch one implementation sub-agent per task, scoped to its worktree:
-   `sys_session_send(agent="claude_code"|"codex", title="<task_slug>",
+   `sys_session_send(agent="cursor"|"mimo"|"claude_code"|"codex", title="<task_slug>",
    args={purpose: "implement", input: "<task + acceptance contract +
    worktree path>"})`. Use a short task-based title such as `auth-refactor` or
    `fix-sse-error`, never the raw vendor name. State the scope and that it must
@@ -38,6 +38,9 @@ dependency).
    disposable. Don't remove a worktree that still has open fix-tasks.
 
 ## Notes
+- When dispatching multiple tasks in parallel, spread workers across `mimo` and
+  `cursor` — alternate or split evenly when both are AVAILABLE rather than
+  sending every task to the same agent.
 - Respect the per-turn dispatch cap (enforced by policy). More tasks than the
   cap → dispatch in waves (let the running batch finish before dispatching more).
 - The human can open any sub-agent in the UI's Subagents panel and read its
