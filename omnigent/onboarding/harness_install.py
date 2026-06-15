@@ -35,8 +35,10 @@ when the credentials file is absent — see ``ambient._claude_login_detected``.)
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
@@ -293,7 +295,26 @@ def harness_login(key: str) -> bool:
     if harness_cli_logged_in(key):
         return True
     try:
-        subprocess.run([spec.binary, *spec.login_args], check=False, timeout=600)
+        # Open /dev/tty explicitly so the child process sees a real TTY even
+        # when the parent's stdio is piped (e.g. launched via `uv tool run`).
+        # The Claude CLI checks isatty() and skips opening the browser when it
+        # returns false, which causes a "timed out" login on Fedora/Wayland and
+        # similar setups where sudo credentials aren't cached.
+        tty_fd = None
+        kwargs: dict = {"check": False, "timeout": 600}
+        if not sys.stdin.isatty():
+            try:
+                tty_fd = os.open("/dev/tty", os.O_RDWR)
+                kwargs["stdin"] = tty_fd
+                kwargs["stdout"] = tty_fd
+                kwargs["stderr"] = tty_fd
+            except OSError:
+                pass
+        try:
+            subprocess.run([spec.binary, *spec.login_args], **kwargs)
+        finally:
+            if tty_fd is not None:
+                os.close(tty_fd)
     except (OSError, subprocess.TimeoutExpired):
         return False
     return harness_cli_logged_in(key)
