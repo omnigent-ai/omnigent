@@ -1,0 +1,117 @@
+---
+# Omnigent server — the meta-harness hub.
+#
+# Deploys the SERVER ONLY. Per the OSS entrypoint the server runs in
+# "external-runners-only" mode: it accepts runner WebSocket connections at
+# /v1/runner/tunnel and NEVER spawns harness subprocesses itself — so this pod
+# is unprivileged. Agents run in RUNNERS launched elsewhere: a laptop
+# (`omnigent run agent.yaml --server https://omnigent.example.com`), a managed
+# sandbox (Modal/Daytona), or the on-cluster host daemon in ../host/.
+#
+# - Image is linux/amd64-only -> amd64 nodeSelector. GHCR package is public
+#   (no imagePullSecret).
+# - Alembic migrations run automatically in the entrypoint (no migration Job).
+# - AUTH: setting OMNIGENT_OIDC_ISSUER with OMNIGENT_AUTH_ENABLED=1 selects OIDC
+#   mode; the server runs its own /auth/login + /auth/callback. Works with any
+#   OIDC IdP (Authentik, Keycloak, Auth0, Okta, ...). GOTCHA: Omnigent rejects
+#   logins where email_verified != true — make your IdP assert it.
+#   For a no-auth dev/test bring-up, set OMNIGENT_AUTH_ENABLED=0 and drop the
+#   OMNIGENT_OIDC_* / OMNIGENT_DOMAIN env below.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: omnigent
+  namespace: omnigent
+  labels:
+    app: omnigent
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate            # single writer to the artifact PVC
+  selector:
+    matchLabels:
+      app: omnigent
+  template:
+    metadata:
+      labels:
+        app: omnigent
+    spec:
+      securityContext:
+        # Group-own the artifact volume so the server can write it even if the
+        # storage backend squashes root. Drop if your storage perms don't need it.
+        fsGroup: 1000
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      containers:
+        - name: omnigent
+          image: ghcr.io/omnigent-ai/omnigent-server:v0.1.0
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: omnigent-secrets
+                  key: database-url
+            - name: ARTIFACT_DIR
+              value: /data/artifacts
+            - name: HOST
+              value: "0.0.0.0"
+            - name: PORT
+              value: "8000"
+            # ---- auth (OIDC). For no-auth dev: set to "0" and delete the rest. ----
+            - name: OMNIGENT_AUTH_ENABLED
+              value: "1"
+            - name: OMNIGENT_CONFIG
+              value: /etc/omnigent/config.yaml
+            # Browser-facing host. The server derives the OIDC redirect URI
+            # https://<domain>/auth/callback (must match your IdP client's
+            # allowed redirect URIs) and the cookie scope.
+            - name: OMNIGENT_DOMAIN
+              value: omnigent.example.com
+            # Your IdP issuer; the server appends /.well-known/openid-configuration.
+            - name: OMNIGENT_OIDC_ISSUER
+              value: https://YOUR_IDP/application/o/omnigent/
+            - name: OMNIGENT_OIDC_CLIENT_ID
+              value: YOUR_OIDC_CLIENT_ID
+            - name: OMNIGENT_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: omnigent-secrets
+                  key: oidc-client-secret
+            - name: OMNIGENT_OIDC_COOKIE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: omnigent-secrets
+                  key: oidc-cookie-secret
+            # A connecting HOST authenticates with the session JWT from
+            # `omnigent login`; the default 8h expiry breaks a long-lived host
+            # on reconnect. Raise it for unattended hosts (720 = 30d).
+            - name: OMNIGENT_OIDC_SESSION_TTL_HOURS
+              value: "720"
+          ports:
+            - name: http
+              containerPort: 8000
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: config
+              mountPath: /etc/omnigent
+              readOnly: true
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: "1", memory: 1Gi }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: omnigent-artifacts
+        - name: config
+          configMap:
+            name: omnigent-config

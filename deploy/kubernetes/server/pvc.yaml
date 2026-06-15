@@ -1,0 +1,17 @@
+---
+# Artifact storage for the server (mounted at /data, ARTIFACT_DIR=/data/artifacts).
+# The Deployment is single-writer (strategy: Recreate), so RWO is fine. Set
+# storageClassName to one your cluster provides (omit to use the default class).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: omnigent-artifacts
+  namespace: omnigent
+  labels:
+    app: omnigent
+spec:
+  accessModes: ["ReadWriteOnce"]
+  # storageClassName: your-storage-class
+  resources:
+    requests:
+      storage: 10Gi
