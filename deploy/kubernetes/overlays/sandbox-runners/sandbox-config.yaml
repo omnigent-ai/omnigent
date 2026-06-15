@@ -1,0 +1,59 @@
+---
+# config.yaml for the server, supplying the `sandbox:` section that turns on the
+# kubernetes sandbox provider. The base deployment configures the server purely
+# through env vars (the omnigent-config ConfigMap); the managed-sandbox backend,
+# however, is read from the config FILE that `OMNIGENT_CONFIG` points at
+# (parse_sandbox_config(cfg.get("sandbox")) in omnigent/cli.py). This overlay's
+# deployment-patch.yaml mounts this ConfigMap at /etc/omnigent and sets
+# OMNIGENT_CONFIG=/etc/omnigent/config.yaml.
+#
+# Only the `sandbox:` section is needed here — auth and the rest stay in the
+# env-based omnigent-config ConfigMap (the two layers are independent).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: omnigent-sandbox-config
+  # Mounted by the server Pod, so this ConfigMap lives in the SERVER namespace.
+  namespace: omnigent
+  labels:
+    app.kubernetes.io/name: omnigent
+    app.kubernetes.io/component: server
+data:
+  config.yaml: |
+    sandbox:
+      provider: kubernetes
+      # Public/in-cluster URL the runner Pod's `omnigent host` dials back to.
+      # In-cluster service DNS is simplest (no ingress hop); http upgrades to ws
+      # for the tunnel. Use your external ingress URL instead if runner Pods
+      # must reach the server through it.
+      # In-cluster `service.namespace.svc.cluster.local` DNS form; the base
+      # Service listens on port 80 (targetPort http=8000), so no port suffix.
+      # (The Service is in `omnigent`; runner Pods in `omnigent-sandboxes` reach
+      # it across namespaces via this fully-qualified cluster DNS name.)
+      server_url: http://omnigent.omnigent.svc.cluster.local
+      kubernetes:
+        # Namespace the runner Pods are created in — the DEDICATED runner
+        # namespace (separate from the server's `omnigent`), where the server SA
+        # holds its scoped pods + pods/exec rights. secret_name / service_account
+        # below resolve in THIS namespace.
+        namespace: omnigent-sandboxes
+        # K8s Secret whose keys are projected into every runner Pod via envFrom
+        # (the harness LLM/git credentials). See runner-credentials.yaml.
+        secret_name: omnigent-creds
+        # ServiceAccount the runner Pods run as (deliberately powerless).
+        service_account: omnigent-runner
+        # Optional: override the runner image (defaults to the official prebaked
+        # host image ghcr.io/omnigent-ai/omnigent-host:latest — amd64-only).
+        # image: ghcr.io/your-org/omnigent-host:latest
+        # Optional: extra node selector labels, merged with the always-present
+        # kubernetes.io/arch: amd64 (the host image has no aarch64 wheel).
+        #
+        # IMPORTANT — runner-node kernel compatibility: the agent harness
+        # (Claude Code / Codex) runs on Bun, whose JS engine (JSC) garbage
+        # collector can segfault at startup ("embedder failed to suspend
+        # thread ... Segmentation fault") on some newer Linux kernels (observed
+        # on 7.0.0 / Ubuntu 26.04) — independent of the seccomp profile. If agent
+        # turns fail with that crash, label the nodes on a known-good kernel and
+        # pin runner Pods to them here. See the overlay README "Troubleshooting".
+        # node_selector:
+        #   omnigent.ai/runner-ready: "true"   # label your known-good nodes

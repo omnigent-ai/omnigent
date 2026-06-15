@@ -195,6 +195,9 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.commands: list[str] = []
         self.host_starts: list[HostStartInvocation] = []
         self.terminated: list[str] = []
+        # How many times close() was called — the managed launch/relaunch
+        # paths must release the launcher in a finally (round-3 FIX-A).
+        self.close_count = 0
 
     def prepare(self) -> None:
         """Record the preflight call (no real SDK/credential check)."""
@@ -257,6 +260,11 @@ class FakeSandboxLauncher(SandboxLauncher):
     def terminate(self, sandbox_id: str) -> None:
         """Record the termination."""
         self.terminated.append(sandbox_id)
+
+    def close(self) -> None:
+        """Record the close (the launch/relaunch ``finally`` releases the
+        launcher's pool)."""
+        self.close_count += 1
 
 
 def _parse_host_start(command: str) -> HostStartInvocation:

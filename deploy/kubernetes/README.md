@@ -209,6 +209,34 @@ omnigent host  --server https://omnigent.example.com # register this machine
 The host then appears in the web UI when you start a new chat. See the
 [main README](../../README.md) for the full host/auth reference.
 
+## Or let the cluster be the compute (on-demand runner Pods) — optional
+
+Instead of registering a long-lived external host, the server can spawn a
+**runner Pod on demand** per session and delete it when the session ends — the
+same managed launch-token model as the Modal/Daytona sandbox providers, but on
+your own cluster. This is the `kubernetes` sandbox provider.
+
+The [`overlays/sandbox-runners/`](overlays/sandbox-runners/README.md) overlay
+adds, on top of the base deploy, the `sandbox: provider: kubernetes` config and a
+**two-namespace least-blast-radius** RBAC split: the runner Pods (and their
+harness-credentials Secret + powerless SA) live in a dedicated
+`omnigent-sandboxes` namespace, and the server SA's `pods` + `pods/exec` rights
+are scoped — via a cross-namespace RoleBinding — to that namespace only, so a
+compromised server can't touch the server/DB Pods or Secrets in `omnigent`.
+
+```bash
+# edit overlays/sandbox-runners/{runner-credentials,sandbox-config}.yaml and the
+# `images:` override in kustomization.yaml (REPLACE_ME) first
+kubectl kustomize deploy/kubernetes/overlays/sandbox-runners/ | kubectl apply -f -
+```
+
+Requires amd64 nodes (the host image is amd64-only) and — importantly — a server
+image **built with the `kubernetes` extra** (`docker build --build-arg
+OMNIGENT_EXTRAS=kubernetes`; the base image lacks it and every launch would
+fail). Supports `claude-sdk` + `codex` agents. See the
+[overlay README](overlays/sandbox-runners/README.md) for requirements, the
+two-namespace design, how it works, and troubleshooting.
+
 ## Use your own IdP instead (OIDC) — optional
 
 Optional. The default `accounts` provider (username + password) works out of the

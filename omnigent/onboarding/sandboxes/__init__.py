@@ -62,6 +62,9 @@ _LAUNCHERS: dict[str, str] = {
     # `omnigent[cwsandbox]` extra), imported lazily like modal/daytona.
     "cwsandbox": "omnigent.onboarding.sandboxes.cwsandbox:CWSandboxLauncher",
     "islo": "omnigent.onboarding.sandboxes.islo:IsloSandboxLauncher",
+    # On-demand Kubernetes Pod via the official kubernetes client (the
+    # `omnigent[kubernetes]` extra), imported lazily like modal/daytona.
+    "kubernetes": "omnigent.onboarding.sandboxes.kubernetes:KubernetesSandboxLauncher",
 }
 
 

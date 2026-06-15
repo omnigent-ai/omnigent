@@ -75,6 +75,14 @@ deploy/
 ├── islo/              ← Islo sandbox-provider guide (gateway credential
 │   └── README.md         injection); NOT a server deploy target.
 │
+├── kubernetes/        ← Kustomize tree: deploy the server to a cluster, plus
+│   ├── base/             the `sandbox-runners` overlay that ALSO turns the
+│   ├── overlays/         cluster into on-demand agent compute (runner Pods).
+│   │   ├── postgres/         · postgres / openshift server overlays
+│   │   ├── openshift/
+│   │   └── sandbox-runners/  · kubernetes sandbox provider (runner Pods)
+│   └── README.md
+│
 └── docker/            ← common Docker image + compose stack
     ├── Dockerfile         multi-stage slim image (node web build → python builder → runtime)
     ├── docker-compose.yaml   omnigent + postgres for any Docker host
@@ -95,7 +103,9 @@ deploy/
 | Deploy to Modal (durable artifact Volume) | Modal | [`modal/README.md`](modal/README.md): `modal deploy`, BYO Neon Postgres |
 | Stand up a quick demo (no DB to provision) | HF Spaces | [`hf-spaces/README.md`](hf-spaces/README.md): Docker Space, SQLite |
 | Share a server running on your **laptop**: demo it to teammates, or let remote runners & cloud sandboxes connect back to it (nothing to deploy) | Cloudflare quick tunnel | `cloudflared tunnel --url http://localhost:6767` |
-| Cloud Run / Kubernetes / other | Docker image | [`docker/README.md`](docker/README.md), then point your platform at the image |
+| Deploy to Kubernetes (Kustomize) | Kustomize tree | [`kubernetes/README.md`](kubernetes/README.md): `kubectl apply -k deploy/kubernetes/overlays/<overlay>` |
+| Run agents **in the cluster itself** (on-demand runner Pods) | `sandbox-runners` overlay | [`kubernetes/overlays/sandbox-runners/README.md`](kubernetes/overlays/sandbox-runners/README.md): the kubernetes sandbox provider |
+| Cloud Run / other container platform | Docker image | [`docker/README.md`](docker/README.md), then point your platform at the image |
 
 All deploy paths share the same image (`docker/Dockerfile`): a slim Python
 container running the FastAPI / WebSocket coordinator, with Postgres or

@@ -1,0 +1,30 @@
+---
+# Patch the base server Deployment so the kubernetes sandbox provider works:
+#   1. Run as the `omnigent-server` ServiceAccount (bound by rolebinding.yaml to
+#      the pods + pods/exec Role in role.yaml) so the launcher can manage Pods.
+#   2. Mount the sandbox config.yaml and point OMNIGENT_CONFIG at it so the
+#      server parses the `sandbox: provider: kubernetes` section.
+#
+# NOTE: the server image must include the `kubernetes` extra
+# (`pip install 'omnigent[kubernetes]'`) for the provider to import the client.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: omnigent
+spec:
+  template:
+    spec:
+      serviceAccountName: omnigent-server
+      containers:
+        - name: omnigent
+          env:
+            - name: OMNIGENT_CONFIG
+              value: /etc/omnigent/config.yaml
+          volumeMounts:
+            - name: sandbox-config
+              mountPath: /etc/omnigent
+              readOnly: true
+      volumes:
+        - name: sandbox-config
+          configMap:
+            name: omnigent-sandbox-config

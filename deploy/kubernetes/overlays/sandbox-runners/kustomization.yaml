@@ -1,0 +1,35 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# On-demand runner-Pod sandbox provider, layered on the base server deploy.
+# Adds the RBAC + config the kubernetes sandbox launcher needs; the base
+# Deployment/Service/Ingress/PVC are unchanged except for the patch below.
+#
+# NO overlay-wide `namespace:` (tri-model FIX-1): a global namespace would force
+# every resource into one namespace. Instead, the base resources keep `omnigent`
+# (set by ../../base/kustomization.yaml) and each overlay-added resource sets its
+# own metadata.namespace explicitly — server resources in `omnigent`, runner
+# resources (namespace/SA/Role/RoleBinding/Secret) in `omnigent-sandboxes`. This
+# is the two-namespace least-blast-radius split.
+
+resources:
+  - ../../base
+  - serviceaccount-server.yaml # SA in omnigent (server runs as this)
+  - namespace-sandboxes.yaml # the dedicated omnigent-sandboxes namespace
+  - serviceaccount-runner.yaml # runner SA in omnigent-sandboxes
+  - role.yaml # Role in omnigent-sandboxes (scoped Pod rights)
+  - rolebinding.yaml # cross-ns binding: server SA → runner-ns Role
+  - sandbox-config.yaml # server config (omnigent); points at runner ns
+  - runner-credentials.yaml # harness creds Secret in omnigent-sandboxes
+
+# The base server image lacks the `kubernetes` extra, so _ensure_sdk() would
+# fail every launch (tri-model FIX-5). Override it with a server image BUILT
+# WITH the extra — i.e. `docker build --build-arg OMNIGENT_EXTRAS=kubernetes`
+# (see deploy/docker). REPLACE the registry below with your built image.
+images:
+  - name: ghcr.io/omnigent-ai/omnigent-server
+    newName: ghcr.io/REPLACE_ME/omnigent-server
+    newTag: kubernetes
+
+patches:
+  - path: deployment-patch.yaml

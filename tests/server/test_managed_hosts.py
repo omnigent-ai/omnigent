@@ -570,6 +570,29 @@ async def test_launch_success_registers_host_and_returns_workspace(db_uri: str) 
     assert resolved.host_id == result.host_id
     # Nothing was torn down on the success path.
     assert fake.terminated == []
+    # round-3 FIX-A: the launcher is closed (its connection pool released)
+    # even on the SUCCESS path — the leak the existing terminate-close tests
+    # missed, since terminate builds a different launcher.
+    assert fake.close_count == 1
+
+
+async def test_launch_closes_launcher_on_failure(db_uri: str) -> None:
+    """
+    round-3 FIX-A: the launcher is also closed on the FAILURE path (the
+    close is in launch_managed_host's finally), so a failed launch can't
+    leak the pool either.
+    """
+    host_store = HostStore(db_uri)
+    fake = FakeSandboxLauncher(fail_on_host_start=True)
+
+    with pytest.raises(HTTPException):
+        await launch_managed_host(
+            config=_injected_config(fake),
+            owner=_OWNER,
+            host_store=host_store,
+        )
+
+    assert fake.close_count == 1
 
 
 async def test_launch_with_injected_custom_launcher(db_uri: str) -> None:

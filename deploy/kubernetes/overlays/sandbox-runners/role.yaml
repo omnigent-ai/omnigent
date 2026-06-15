@@ -1,0 +1,44 @@
+---
+# Namespaced Role granting the server exactly what the launcher calls — nothing
+# more (no list/watch, no pods/log). Lives in the DEDICATED runner namespace
+# `omnigent-sandboxes` (tri-model FIX-1) and is bound to the omnigent-server SA
+# (in `omnigent`) via the cross-namespace rolebinding.yaml. Because the grant is
+# a namespaced Role here, it can ONLY ever touch Pods in `omnigent-sandboxes`,
+# never the server/DB Pods or Secrets in `omnigent`.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: omnigent-sandbox-manager
+  namespace: omnigent-sandboxes
+  labels:
+    app.kubernetes.io/name: omnigent
+    app.kubernetes.io/component: server
+rules:
+  # Manage the lifecycle of runner Pods, scoped to exactly what the launcher
+  # calls: provision() creates them, the pod-ready wait reads them
+  # (read_namespaced_pod is a `get`), and terminate() deletes them. The
+  # launcher never lists or watches Pods, so those verbs are omitted.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "get", "delete"]
+  # REQUIRED. The provider does not bake `omnigent host` into the Pod's
+  # entrypoint — the Pod just boots `sleep infinity`. Once the container is
+  # ready, the server execs `omnigent host` into it (pods/exec), which dials
+  # back over the managed launch-token tunnel. Without this the server can
+  # create Pods but never start a host in them, and every managed session hangs.
+  # The launcher uses the GET-based exec client (connect_get_namespaced_pod_exec)
+  # and the Role grants BOTH get and create so exec works regardless of how the
+  # apiserver maps the exec subresource (kubectl POSTs → create; some setups
+  # authorize the GET-based client as get). Do NOT narrow to a single verb
+  # without testing on your cluster — a wrong narrowing 403s every exec and
+  # hangs every managed session. Verified live with both verbs granted.
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["get", "create"]
+  # Surface scheduler/kubelet events (FailedScheduling, Failed pull, …) in the
+  # provider's error messages when a Pod won't become ready. (No pods/log rule:
+  # the launcher never reads logs via the API — operators debug a stuck host
+  # with their own kubeconfig + `kubectl exec <pod> -- cat /tmp/omnigent-host.log`.)
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list"]

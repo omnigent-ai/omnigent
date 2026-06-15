@@ -392,6 +392,28 @@ class SandboxLauncher(ABC):
         """
         raise self._capability_error("install shipped wheels")
 
+    def close(self) -> None:
+        """
+        Release any process-level resources the launcher holds (HTTP
+        connection pools, API clients, …).
+
+        Optional lifecycle hook: the default is a no-op, so providers that
+        hold nothing per-instance inherit it harmlessly. Providers that
+        build a pooled client (e.g. the Kubernetes launcher's urllib3
+        ``ApiClient``) override it to close that pool. Callers that build a
+        launcher for a single managed operation (launch / relaunch /
+        teardown) should call this in a ``finally`` so the pool is released
+        on BOTH the success and the failure path.
+
+        Idempotent and best-effort: safe to call more than once, and
+        implementations must not raise (a close error must never mask the
+        operation's real result).
+        """
+        # Default: nothing to release. Providers holding a pooled client
+        # override this (the explicit return keeps it a deliberate no-op
+        # hook, not an unimplemented abstract method).
+        return
+
     def _capability_error(self, action: str) -> SandboxCapabilityError:
         """
         Build the error for an optional primitive this provider lacks.

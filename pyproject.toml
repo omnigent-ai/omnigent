@@ -105,6 +105,11 @@ daytona = ["daytona>=0.180,<1"]
 # server-managed `sandbox.provider: cwsandbox`).
 # Same lazy-import posture as above. Pre-1.0 SDK: pin minor.
 cwsandbox = ["cwsandbox>=0.26,<1"]
+# Kubernetes sandbox launcher (server-managed `sandbox.provider:
+# kubernetes`). The launcher module ships in the base package and imports
+# the official client lazily, so only users of the provider need this
+# extra. Pin the major (latest stable 36.0.2).
+kubernetes = ["kubernetes>=36,<37"]
 # MLflow tracing is opt-in: tracing is disabled by default and the
 # server degrades gracefully when mlflow is absent, so the (heavy) mlflow
 # dependency only installs for users who want it (`omnigent[tracing]`).
@@ -458,6 +463,12 @@ ignore_missing_imports = true
 # posture as modal above.
 [[tool.mypy.overrides]]
 module = "cwsandbox.*"
+ignore_missing_imports = true
+
+# kubernetes is an optional dep (the `kubernetes` extra); same lazy-import
+# posture as modal above.
+[[tool.mypy.overrides]]
+module = "kubernetes.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

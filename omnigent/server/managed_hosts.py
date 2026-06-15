@@ -32,7 +32,7 @@ stores into ``create_app``):
    ``<data_dir>/config.yaml``)::
 
        sandbox:
-         provider: modal          # lakebox | modal | daytona | islo
+         provider: modal          # lakebox | modal | daytona | islo | kubernetes
          server_url: https://omnigent.example.com
          modal:                   # optional block
            image: docker.io/me/omnigent-host:latest  # default: official image
@@ -54,6 +54,17 @@ stores into ``create_app``):
            vcpus: 2
            memory_mb: 4096
            disk_gb: 20
+         kubernetes:              # optional block (provider: kubernetes)
+           image: ghcr.io/me/omnigent-host:latest  # default: official image
+           namespace: omnigent-sandboxes     # runner-Pod namespace
+                                             # (default; the dedicated ns
+                                             # the overlay grants rights in)
+           secret_name: omnigent-creds       # K8s Secret projected into
+                                             # every Pod via envFrom
+                                             # (harness LLM keys, GIT_TOKEN)
+           service_account: omnigent-runner  # ServiceAccount Pods run as
+           node_selector:                    # extra node selector labels
+             disktype: ssd                   # merged with arch=amd64
 
    The image defaults to the official prebaked host image
    (``ghcr.io/omnigent-ai/omnigent-host:latest``; see
@@ -65,9 +76,13 @@ stores into ``create_app``):
    launcher reads ``DAYTONA_API_KEY`` (plus optional
    ``DAYTONA_API_URL`` / ``DAYTONA_TARGET``), and the Islo launcher
    reads ``ISLO_API_KEY`` (plus optional ``ISLO_BASE_URL``) from the
-   server process environment. ``modal``, ``daytona``, and ``islo``
-   have managed-launch support; ``lakebox`` parses but rejects at
-   launch.
+   server process environment. The Kubernetes launcher authenticates
+   from the server pod's in-cluster ServiceAccount (or a kubeconfig out
+   of cluster), so it needs no API key in this file either; harness
+   credentials ride a pre-created Secret named by
+   ``sandbox.kubernetes.secret_name``. ``modal``, ``daytona``,
+   ``islo``, and ``kubernetes`` have managed-launch support; ``lakebox``
+   parses but rejects at launch.
 
 2. **Direct construction** (embedding deployments): build
    :class:`ManagedSandboxConfig` with a custom
@@ -121,10 +136,10 @@ _logger = logging.getLogger(__name__)
 # ManagedSandboxConfig directly are not constrained by either set —
 # their launcher factory IS the support.)
 SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
-    {"lakebox", "modal", "daytona", "cwsandbox", "islo"}
+    {"lakebox", "modal", "daytona", "cwsandbox", "islo", "kubernetes"}
 )
 PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
-    {"modal", "daytona", "cwsandbox", "islo"}
+    {"modal", "daytona", "cwsandbox", "islo", "kubernetes"}
 )
 
 # How long a managed launch waits for the sandboxed host to register
@@ -156,6 +171,14 @@ DAYTONA_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 # deleted by managed-session teardown; use the same 7-day policy bound
 # as Daytona for long-lived hosts and stale-token cleanup.
 ISLO_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
+
+# Launch-token lifetime for the YAML kubernetes path. Sandbox Pods have
+# no platform lifetime cap (they run until managed teardown deletes
+# them), so the bound is policy, not platform: the same 7-day policy
+# bound as Daytona/Islo keeps a long-lived Pod re-authenticating its
+# tunnel across reconnects while still expiring tokens of sandboxes
+# nobody deleted. A relaunch mints a fresh token + expiry.
+KUBERNETES_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 
 # The cwsandbox launch-token TTL is NOT a constant: CW Sandbox's lifetime is
 # operator-overridable (OMNIGENT_CWSANDBOX_MAX_LIFETIME_S), so the TTL is
@@ -618,6 +641,18 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             disk_gb=_parse_provider_positive_int(raw, "islo", "disk_gb"),
         )
         token_ttl_s = ISLO_MANAGED_TOKEN_TTL_S
+    elif provider == "kubernetes":
+        launcher_factory = _kubernetes_launcher_factory(
+            image=_parse_provider_image(raw, "kubernetes"),
+            env=_parse_provider_env(raw, "kubernetes"),
+            namespace=_parse_provider_string(raw, "kubernetes", "namespace"),
+            secret_name=_parse_provider_string(raw, "kubernetes", "secret_name"),
+            service_account=_parse_provider_string(raw, "kubernetes", "service_account"),
+            node_selector=_parse_provider_str_mapping(raw, "kubernetes", "node_selector"),
+            kubeconfig=_parse_provider_string(raw, "kubernetes", "kubeconfig"),
+            in_cluster=_parse_provider_bool(raw, "kubernetes", "in_cluster"),
+        )
+        token_ttl_s = KUBERNETES_MANAGED_TOKEN_TTL_S
     else:
         launcher_factory = _unsupported_launcher_factory(provider)
         # Never consulted (the factory rejects before any token is
@@ -912,6 +947,66 @@ def _islo_launcher_factory(
     return _build
 
 
+def _kubernetes_launcher_factory(
+    *,
+    image: str | None,
+    env: list[str] | None,
+    namespace: str | None,
+    secret_name: str | None,
+    service_account: str | None,
+    node_selector: dict[str, str] | None,
+    kubeconfig: str | None,
+    in_cluster: bool | None,
+) -> Callable[[], SandboxLauncher]:
+    """
+    Build the launcher factory for the YAML ``provider: kubernetes`` path.
+
+    :param image: Registry image reference with omnigent pre-installed,
+        e.g. ``"ghcr.io/me/omnigent-host:latest"``, or ``None`` to use
+        the official prebaked host image (env-overridable; see
+        :class:`omnigent.onboarding.sandboxes.kubernetes.KubernetesSandboxLauncher`).
+    :param env: Names of server-process environment variables injected
+        into every sandbox Pod as literal ``env``, e.g.
+        ``["OPENAI_API_KEY", "GIT_TOKEN"]``, or ``None`` to resolve from
+        the launcher's env-var fallback / inject nothing. Prefer
+        *secret_name* for actual credentials.
+    :param namespace: Namespace to create Pods in, or ``None`` to resolve
+        from the launcher's env-var fallback / default.
+    :param secret_name: Pre-created Kubernetes Secret projected into every
+        Pod via ``envFrom`` (harness LLM credentials), or ``None`` to
+        resolve from the launcher's env-var fallback / attach no Secret.
+    :param service_account: ServiceAccount the Pods run as, or ``None`` to
+        resolve from the launcher's env-var fallback / default.
+    :param node_selector: Extra node selector labels merged with the
+        mandatory ``kubernetes.io/arch: amd64`` constraint, or ``None``
+        for none.
+    :param kubeconfig: Explicit kubeconfig path for the out-of-cluster
+        config fallback, or ``None`` to resolve from the launcher's
+        env-var fallback / the ambient kubeconfig.
+    :param in_cluster: Force the cluster-config source — ``True`` for
+        in-cluster ServiceAccount only, ``False`` for kubeconfig only, or
+        ``None`` to try in-cluster then fall back to kubeconfig.
+    :returns: A factory producing parameterized Kubernetes launchers.
+    """
+
+    def _build() -> SandboxLauncher:
+        """Construct the Kubernetes launcher (lazy SDK import inside)."""
+        from omnigent.onboarding.sandboxes.kubernetes import KubernetesSandboxLauncher
+
+        return KubernetesSandboxLauncher(
+            image=image,
+            env=env,
+            namespace=namespace,
+            secret_name=secret_name,
+            service_account=service_account,
+            node_selector=node_selector,
+            kubeconfig=kubeconfig,
+            in_cluster=in_cluster,
+        )
+
+    return _build
+
+
 def _parse_provider_section(raw: dict[str, object], provider: str) -> dict[str, object] | None:
     """
     Extract a provider-specific optional config block.
@@ -1028,6 +1123,61 @@ def _parse_provider_positive_int(raw: dict[str, object], provider: str, key: str
     return value
 
 
+def _parse_provider_bool(raw: dict[str, object], provider: str, key: str) -> bool | None:
+    """
+    Extract and validate an optional boolean provider field.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :param provider: Provider block name, e.g. ``"kubernetes"``.
+    :param key: Field name under the provider block, e.g. ``"in_cluster"``.
+    :returns: The boolean, or ``None`` when omitted.
+    :raises ValueError: When the field is present but is not a real
+        boolean (a YAML ``"true"`` string or an int are rejected — a
+        silently-coerced flag would change the cluster-config source).
+    """
+    section = _parse_provider_section(raw, provider)
+    if section is None:
+        return None
+    value = section.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise ValueError(f"server config 'sandbox.{provider}.{key}' must be a boolean")
+    return value
+
+
+def _parse_provider_str_mapping(
+    raw: dict[str, object], provider: str, key: str
+) -> dict[str, str] | None:
+    """
+    Extract and validate an optional provider string→string mapping field.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :param provider: Provider block name, e.g. ``"kubernetes"``.
+    :param key: Field name under the provider block, e.g.
+        ``"node_selector"``.
+    :returns: The validated mapping, or ``None`` when omitted.
+    :raises ValueError: When the provider block or field is present but
+        not a mapping, or any key/value is not a non-empty string.
+    """
+    section = _parse_provider_section(raw, provider)
+    if section is None:
+        return None
+    value = section.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, dict) or not all(
+        isinstance(k, str) and k.strip() and isinstance(v, str) and v.strip()
+        for k, v in value.items()
+    ):
+        raise ValueError(
+            f"server config 'sandbox.{provider}.{key}' must be a mapping of "
+            "non-empty string keys to non-empty string values, e.g. "
+            "{'disktype': 'ssd'}"
+        )
+    return {k.strip(): v.strip() for k, v in value.items()}
+
+
 async def launch_managed_host(
     *,
     config: ManagedSandboxConfig,
@@ -1080,26 +1230,32 @@ async def launch_managed_host(
     # table PK, so embed the host_id's leading hex for uniqueness
     # across a user's managed sandboxes.
     host_name = f"managed-{host_id[len('host_') : len('host_') + 8]}"
+    # try/finally so the launcher's connection pool is released on BOTH the
+    # success and the failure path (round-3 FIX-A): a successful launch
+    # discards this launcher, and terminate later builds a different one.
     try:
-        await asyncio.to_thread(launcher.prepare)
-        sandbox_id = await asyncio.to_thread(launcher.provision, host_name)
-    except click.ClickException as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"managed sandbox launch failed: {exc.message}",
-        ) from exc
-    workspace = await _arm_and_start_host(
-        launcher=launcher,
-        config=config,
-        host_store=host_store,
-        host_id=host_id,
-        host_name=host_name,
-        owner=owner,
-        sandbox_id=sandbox_id,
-        repo=repo,
-        on_stage=on_stage,
-    )
-    return ManagedHostLaunch(host_id=host_id, workspace=workspace)
+        try:
+            await asyncio.to_thread(launcher.prepare)
+            sandbox_id = await asyncio.to_thread(launcher.provision, host_name)
+        except click.ClickException as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"managed sandbox launch failed: {exc.message}",
+            ) from exc
+        workspace = await _arm_and_start_host(
+            launcher=launcher,
+            config=config,
+            host_store=host_store,
+            host_id=host_id,
+            host_name=host_name,
+            owner=owner,
+            sandbox_id=sandbox_id,
+            repo=repo,
+            on_stage=on_stage,
+        )
+        return ManagedHostLaunch(host_id=host_id, workspace=workspace)
+    finally:
+        await asyncio.to_thread(launcher.close)
 
 
 async def relaunch_managed_host(
@@ -1152,31 +1308,38 @@ async def relaunch_managed_host(
                 "was launched with is no longer configured on this server"
             ),
         )
-    # The old generation is normally already dead (that is why we are
-    # here), but terminate defensively so a transient tunnel outage
-    # can never leave two live sandboxes claiming one host identity.
-    await _terminate_sandbox_best_effort(launcher, host)
+    # try/finally so the launcher's connection pool is released on BOTH the
+    # success and the failure path (round-3 FIX-A): the same launcher is
+    # reused for the defensive terminate AND the fresh provision, then
+    # discarded on success.
     try:
-        await asyncio.to_thread(launcher.prepare)
-        sandbox_id = await asyncio.to_thread(launcher.provision, host.name)
-    except click.ClickException as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"managed sandbox relaunch failed: {exc.message}",
-        ) from exc
-    workspace = await _arm_and_start_host(
-        launcher=launcher,
-        config=config,
-        host_store=host_store,
-        host_id=host.host_id,
-        host_name=host.name,
-        owner=host.owner,
-        sandbox_id=sandbox_id,
-        repo=repo,
-        on_stage=on_stage,
-        keep_host_on_failure=True,
-    )
-    return ManagedHostLaunch(host_id=host.host_id, workspace=workspace)
+        # The old generation is normally already dead (that is why we are
+        # here), but terminate defensively so a transient tunnel outage
+        # can never leave two live sandboxes claiming one host identity.
+        await _terminate_sandbox_best_effort(launcher, host)
+        try:
+            await asyncio.to_thread(launcher.prepare)
+            sandbox_id = await asyncio.to_thread(launcher.provision, host.name)
+        except click.ClickException as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"managed sandbox relaunch failed: {exc.message}",
+            ) from exc
+        workspace = await _arm_and_start_host(
+            launcher=launcher,
+            config=config,
+            host_store=host_store,
+            host_id=host.host_id,
+            host_name=host.name,
+            owner=host.owner,
+            sandbox_id=sandbox_id,
+            repo=repo,
+            on_stage=on_stage,
+            keep_host_on_failure=True,
+        )
+        return ManagedHostLaunch(host_id=host.host_id, workspace=workspace)
+    finally:
+        await asyncio.to_thread(launcher.close)
 
 
 async def _arm_and_start_host(
