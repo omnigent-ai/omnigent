@@ -1,0 +1,22 @@
+# CODEOWNERS is a placeholder. Maintainers, please replace the
+# default owner below with your routing convention. GitHub uses
+# the LAST matching line wins, so order matters.
+#
+# Recommended grouping based on the repo layout the README describes:
+#
+#   omnigent/runner/**           -> the runner / harness team
+#   omnigent/server/**           -> the server / API team
+#   omnigent/runtime/harnesses/  -> per-harness owners (claude, codex, pi, ...)
+#   omnigent/llms/**             -> LLM client team
+#   omnigent/cli.py              -> the CLI / DX team
+#   sdks/python-client/**        -> SDK team
+#   sdks/ui/**                   -> UI SDK team
+#   ap-web/**                    -> frontend team
+#   deploy/**                    -> infra / deploy
+#   docs/**                      -> docs / DX
+#   .github/workflows/**         -> CI / build
+#
+# Until that's filled in, fall back to a single owner so no PR routes
+# to nobody.
+
+* @omnigent-ai/maintainers

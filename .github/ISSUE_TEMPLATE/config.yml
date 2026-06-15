@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security disclosure
+    url: https://github.com/omnigent-ai/omnigent/security/advisories/new
+    about: Report a security vulnerability privately via GitHub Security Advisories.
+  - name: Discussions
+    url: https://github.com/omnigent-ai/omnigent/discussions
+    about: Open-ended conversations, "how do I" questions, or feedback that does not fit the bug / feature / question templates.
