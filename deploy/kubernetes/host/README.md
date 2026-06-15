@@ -29,14 +29,11 @@ seeds its tokens from the mounted Secret and execs `omnigent host` directly.
 - **`tmux` is present.** Omnigent's terminal / "new shell" feature
   (`omnigent/inner/terminal.py`) hard-fails `RuntimeError: tmux is not installed
   or not on PATH` without it; the image bakes it in.
-- **`IS_SANDBOX=1` is baked in**, so the native harnesses skip their own
-  in-sandbox sandboxing. Claude Code refuses `--dangerously-skip-permissions`
-  under root unless `IS_SANDBOX` is set (and sandbox containers run as root), and
-  it short-circuits the `bwrap` wrap. So you do **not** need `bubblewrap` in the
-  pod. (Without `IS_SANDBOX`, the `claude-native` / `codex-native` harnesses try
-  to wrap the CLI in a bwrap sandbox and fail at
-  `omnigent/inner/bwrap_sandbox.py`:
-  `linux_bwrap sandbox requires the 'bwrap' binary on PATH`.)
+- **`IS_SANDBOX=1` is baked in.** Claude Code refuses
+  `--dangerously-skip-permissions` as root unless `IS_SANDBOX` is set, and the
+  flag makes the `claude` / `codex` CLIs run without wrapping *themselves* in
+  `bwrap`. So **`claude-sdk` and `codex` agents need no `bubblewrap` in the
+  pod**. (This does *not* extend to terminal/`native-ui` agents — see Caveats.)
 
 ## Activate
 
@@ -90,6 +87,19 @@ volume).
 - **amd64 only** — `omnigent==0.1.0` depends on `cel-expr-python`, which has no
   aarch64-linux wheel, so arm64 nodes can't run the host. (The prebaked host
   image is `linux/amd64` for the same reason.)
-- **`git`/`gh` for agents** is optional: mount an SSH key + `gh` token in the
-  Secret (the image's git credential helper picks up `GIT_TOKEN`/`GIT_USERNAME`
-  for HTTPS). Omit them for anonymous clones of public repos. See `host.yaml`.
+- **Terminal / `native-ui` agents don't run in an unprivileged pod.**
+  `claude-sdk` and `codex` agents work; `claude-native-ui` / `codex-native-ui`
+  open an interactive shell via Omnigent's terminal feature
+  (`omnigent/inner/terminal.py`), whose sandbox defaults to `linux_bwrap`
+  **regardless of `IS_SANDBOX`** (that flag only relaxes the harness CLI, not the
+  terminal). `bwrap` isn't baked into the image, and even with it present, bwrap
+  needs unprivileged user namespaces — denied in an unprivileged pod. So those
+  agents fail (`omnigent/inner/bwrap_sandbox.py`:
+  `linux_bwrap sandbox requires the 'bwrap' binary on PATH`). Use `claude-sdk` /
+  `codex` agents, or grant the pod the needed privilege (CAP_SYS_ADMIN / a userns
+  policy) or set the agent's server-side `os_env.sandbox.type=none`.
+- **`git` for agents is HTTPS-only** (the image bakes no ssh client). Add a `gh`
+  token to the Secret; the baked credential helper picks up
+  `GIT_TOKEN`/`GIT_USERNAME` for HTTPS, and `host.yaml` rewrites `git@github.com:`
+  SSH remotes to HTTPS so they're covered too. Omit it for anonymous clones of
+  public repos. See `host.yaml`.

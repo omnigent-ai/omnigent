@@ -1,12 +1,22 @@
 # On-cluster `omnigent host` daemon — the K8s agent-compute stopgap (#39).
 #
-# A stock node:22 pod runtime-bootstraps a dev toolchain + the omnigent/claude/
-# codex CLIs onto its PVC, seeds tokens from the omnigent-host Secret, and runs
-# `omnigent host`, which dials the server (outbound only) and spawns runners
-# locally. Replicate this (Deployment + PVC) per node you want as compute; set
-# a distinct metadata.name + spec.hostname + nodeSelector for each.
+# Runs the OFFICIAL prebaked host image `ghcr.io/omnigent-ai/omnigent-host:latest`
+# (CI-built from the `host` target of ../../docker/Dockerfile; linux/amd64). It
+# bakes the omnigent install + git + tmux + the claude/codex/pi CLIs and sets
+# IS_SANDBOX=1 — so there is NO runtime bootstrap: the pod seeds its tokens from
+# the mounted Secret and execs `omnigent host`, which dials the server (outbound
+# only) and spawns runners locally on the node.
 #
-# amd64 only (omnigent 0.1.0 -> cel-expr-python has no aarch64-linux wheel).
+# Replicate this (Deployment + PVC) per node you want as compute; give each a
+# distinct metadata.name + spec.hostname + nodeSelector.
+#
+# amd64 only — the image is linux/amd64 (omnigent 0.1.0 -> cel-expr-python has no
+# aarch64-linux wheel).
+#
+# AGENT CLASSES: `claude-sdk` / `codex` agents (no interactive terminal) run here.
+# Terminal "native-ui" agents (`claude-native-ui` / `codex-native-ui`) do NOT —
+# they need a bwrap sandbox the unprivileged pod can't provide. See README.md
+# ("Caveats").
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -38,72 +48,62 @@ spec:
         kubernetes.io/arch: amd64
         # kubernetes.io/hostname: <pin to a specific node>
       securityContext:
+        # The image is built to run as root (WORKDIR /root). We run it
+        # UNPRIVILEGED and point HOME at the writable PVC instead (see the
+        # `cd "$HOME"` note in the command). fsGroup lets the pod own the volume
+        # even if the storage backend squashes root.
         runAsUser: 1000
         runAsGroup: 1000
         fsGroup: 1000
         fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: host
-          image: node:22-bookworm
+          image: ghcr.io/omnigent-ai/omnigent-host:latest
           env:
             - { name: HOME, value: /data }
             - { name: OMNIGENT_SERVER, value: https://omnigent.example.com }
             - { name: GIT_USER_NAME, value: "Omnigent Agent" }
             - { name: GIT_USER_EMAIL, value: "agent@example.com" }
-            # Harness auth via env (cleaner than mounting ~/.claude). Optional.
+            # github (and any HTTPS git host): the image's baked credential helper
+            # sends GIT_TOKEN as the password. Optional.
+            - { name: GIT_USERNAME, value: "x-access-token" }
+            - name: GIT_TOKEN
+              valueFrom: { secretKeyRef: { name: omnigent-host, key: gh-token, optional: true } }
+            # Harness auth via env (cleaner than mounting ~/.claude). Provide at
+            # least one. Optional secret keys -> host boots without them.
             - name: CLAUDE_CODE_OAUTH_TOKEN
               valueFrom: { secretKeyRef: { name: omnigent-host, key: claude-oauth-token, optional: true } }
-          command: ["/bin/bash", "-c"]
+            - name: CODEX_ACCESS_TOKEN
+              valueFrom: { secretKeyRef: { name: omnigent-host, key: codex-access-token, optional: true } }
+          command: ["bash", "-lc"]
           args:
             - |
               set -euo pipefail
-              export MAMBA_ROOT_PREFIX=/data/.mamba
-              export PATH="/data/.toolchain/bin:/data/.local/bin:/data/.npm-global/bin:$PATH"
-
-              # --- agentic-dev toolchain on the PVC (no root; persisted + sentinel-gated) ---
-              # tmux is REQUIRED (omnigent terminal feature); bubblewrap for native-claude
-              # sandboxing; plus ffmpeg + language servers for real agent work.
-              command -v micromamba >/dev/null 2>&1 || { mkdir -p /tmp/mm && curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xj -C /tmp/mm bin/micromamba && install -m 755 /tmp/mm/bin/micromamba /data/.local/bin/micromamba && rm -rf /tmp/mm; }
-              [ -x /data/.toolchain/bin/tmux ] || micromamba create -y -q -p /data/.toolchain -c conda-forge tmux ffmpeg ripgrep fd-find jq git git-delta bat gh openssh less unzip gopls rust-analyzer bubblewrap
-              [ -x /data/.toolchain/bin/bwrap ] || micromamba install -y -q -p /data/.toolchain -c conda-forge bubblewrap
-              npm config set prefix /data/.npm-global
-              [ -f /data/.npm-global/.lsp-installed ] || { npm install -g typescript typescript-language-server bash-language-server yaml-language-server vscode-langservers-extracted pyright prettier eslint && touch /data/.npm-global/.lsp-installed; }
-
-              # --- omnigent + harness CLIs ---
-              command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/data/.local/bin sh
-              command -v omnigent >/dev/null 2>&1 || uv tool install "omnigent==0.1.0"
-              command -v claude   >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code
-              command -v codex    >/dev/null 2>&1 || npm install -g @openai/codex
-              command -v ruff     >/dev/null 2>&1 || uv tool install ruff || true
-
-              # --- tokens (the whole Secret is mounted at /secrets) ---
-              mkdir -p /data/.omnigent && install -m 600 /secrets/auth_tokens.json /data/.omnigent/auth_tokens.json
-              mkdir -p /data/.codex && { [ -f /data/.codex/auth.json ] || { [ -s /secrets/codex_auth.json ] && install -m 600 /secrets/codex_auth.json /data/.codex/auth.json; }; } || true
-
-              # --- optional git/gh auth for agents (graceful: skipped if keys absent) ---
-              git config --global user.name "${GIT_USER_NAME}"
+              echo "omnigent host ($(hostname)) -> $OMNIGENT_SERVER | uid=$(id -u) omnigent=$(command -v omnigent) tmux=$(tmux -V 2>/dev/null || echo NONE)"
+              # --- seed the omnigent login session into HOME (=/data); the image's
+              #     /root is root-owned, so we keep all state on the writable PVC ---
+              mkdir -p "$HOME/.omnigent"
+              install -m 600 /secrets/auth_tokens.json "$HOME/.omnigent/auth_tokens.json"
+              # --- git config for agents (HTTPS; the image bakes no ssh client) ---
+              git config --global user.name  "${GIT_USER_NAME}"
               git config --global user.email "${GIT_USER_EMAIL}"
               git config --global --add safe.directory '*'
-              if [ -s /secrets/ssh-key ]; then
-                mkdir -p /data/.ssh && chmod 700 /data/.ssh
-                install -m 600 /secrets/ssh-key /data/.ssh/id_ed25519
-                printf 'Host github.com\n  User git\n  IdentityFile /data/.ssh/id_ed25519\n  StrictHostKeyChecking accept-new\n' > /data/.ssh/config
-                chmod 600 /data/.ssh/config
-                # conda-forge ssh doesn't auto-read ~/.ssh/config -> point git's ssh at it
-                git config --global core.sshCommand 'ssh -F /data/.ssh/config -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new'
-              fi
-              # gh token -> github over HTTPS; route github SSH remotes to HTTPS so a
-              # separate github SSH key isn't needed.
-              [ -s /secrets/gh-token ] && { gh auth login --with-token < /secrets/gh-token && gh auth setup-git && git config --global url."https://github.com/".insteadOf "git@github.com:" && git config --global --add url."https://github.com/".insteadOf "ssh://git@github.com/"; } || true
-
-              echo "omnigent host -> $OMNIGENT_SERVER  tmux=$(tmux -V 2>/dev/null || echo NONE) bwrap=$(command -v bwrap >/dev/null && echo yes || echo no)"
+              # Rewrite github SSH remotes -> HTTPS so GIT_TOKEN covers them (no ssh
+              # key needed). A self-hosted forge over HTTPS works the same way: add a
+              # scoped `~/.git-credentials` entry + a matching `insteadOf` for its host.
+              git config --global url."https://github.com/".insteadOf "git@github.com:"
+              git config --global --add url."https://github.com/".insteadOf "ssh://git@github.com/"
+              # THE uid-1000 FIX: omnigent stats <cwd>/.omnigent/config.yaml; the image
+              # WORKDIR is /root (root-owned) -> EACCES as uid 1000 -> CrashLoop. cd
+              # into HOME (writable) first so the probe reads $HOME/.omnigent.
+              cd "$HOME"
               exec omnigent host --server "$OMNIGENT_SERVER"
           volumeMounts:
             - { name: data, mountPath: /data }
             - { name: secrets, mountPath: /secrets, readOnly: true }
-            # Mount your code/workspaces here so agents have real repos to work in,
-            # e.g. an NFS PVC of your projects at /data/projects (runner workspace
-            # dirs must already exist on the host).
+            # Mount your code/workspaces so agents have real repos to work in
+            # (runner workspace dirs must already exist on the host), e.g. an NFS
+            # PVC of your projects at /data/projects:
             # - { name: projects, mountPath: /data/projects }
           resources:
             requests: { cpu: 200m, memory: 512Mi }
