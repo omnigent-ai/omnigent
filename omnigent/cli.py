@@ -1146,7 +1146,6 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
 )
 
 
-
 def main() -> None:
     """
     Console-script entry point for ``omnigent``.

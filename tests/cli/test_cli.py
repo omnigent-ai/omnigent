@@ -3582,7 +3582,6 @@ def test_bare_omnigent_tty_dispatches_to_run(
     monkeypatch.setattr(sys, "argv", ["omnigent"])
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
 
-
     dispatched: dict[str, list[str]] = {}
 
     def fake_cli(*, args: list[str], standalone_mode: bool = True) -> None:
@@ -3601,7 +3600,6 @@ def test_bare_omnigent_rejects_positional_server_url(
 ) -> None:
     """Top-level server URLs must use ``run --server`` explicitly."""
     from omnigent.cli import main
-
 
     monkeypatch.setattr(sys, "argv", ["omnigent", "http://localhost:8000"])
 
@@ -3626,7 +3624,6 @@ def test_unknown_command_reports_no_such_command(
     that previously swallowed every non-subcommand invocation.
     """
     from omnigent.cli import main
-
 
     monkeypatch.setattr(sys, "argv", ["omnigent", "blah"])
 
