@@ -1130,6 +1130,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "debby",
         "debug",
         "host",
+        "import",
         "lakebox",
         "login",
         "pane-picker",
@@ -8655,6 +8656,183 @@ def _databricks_workspace_token(workspace_host: str) -> str | None:
         return auth.current_token()
     except (DatabricksAuthError, ValueError):
         return None
+
+
+def _resolve_import_agent_id(base_url: str) -> str:
+    """Pick an agent to bind an imported (history-only) session to.
+
+    Queries ``GET /v1/agents`` and returns the first agent's id. There is no
+    server-side "default" marker, so when several agents exist the first
+    (the server's default ordering) is used and the user is told how to
+    override it.
+
+    :param base_url: Resolved Omnigent server base URL.
+    :returns: A durable agent id, e.g. ``"ag_abc123"``.
+    :raises click.ClickException: When agents cannot be listed or none exist.
+    """
+    result = _host_http_json(base_url=base_url, method="GET", path="/v1/agents")
+    if result.status_code != 200 or not isinstance(result.body, dict):
+        raise click.ClickException(
+            f"Could not list agents to bind the import "
+            f"({result.status_code}): {_host_error_text(result.body)}. "
+            f"Pass --agent <agent_id>."
+        )
+    data = result.body.get("data")
+    ids: list[str] = []
+    for entry in data if isinstance(data, list) else []:
+        if isinstance(entry, dict):
+            entry_id = entry.get("id")
+            if isinstance(entry_id, str):
+                ids.append(entry_id)
+    if not ids:
+        raise click.ClickException(
+            "No agents are registered on the server. Pass --agent <agent_id>."
+        )
+    if len(ids) > 1:
+        click.echo(
+            f"Multiple agents available; binding the imported session to {ids[0]!r}. "
+            f"Use --agent to choose another.",
+            err=True,
+        )
+    return ids[0]
+
+
+@cli.command("import")
+@click.argument("transcript", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--source",
+    type=click.Choice(["auto", "claude", "codex"]),
+    default="auto",
+    show_default=True,
+    help="Transcript format. 'auto' detects Claude vs Codex from the file.",
+)
+@click.option(
+    "--server",
+    default=None,
+    help=(
+        "Omnigent server to import into. Defaults to the 'server' in your "
+        "config, then a running local server."
+    ),
+)
+@click.option(
+    "--agent",
+    "agent_id",
+    default=None,
+    help="Durable agent id to bind the imported session to (default: the server's first agent).",
+)
+@click.option(
+    "--title",
+    default=None,
+    help="Session title (default: synthesized from the first message).",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Parse and summarize the transcript without creating a session.",
+)
+def import_(
+    transcript: Path,
+    source: str,
+    server: str | None,
+    agent_id: str | None,
+    title: str | None,
+    dry_run: bool,
+) -> None:
+    # Click uses the docstring as --help text — keep param docs in comments
+    # so they don't leak into CLI output.
+    #
+    # :param transcript: Path to a Claude or Codex ``.jsonl`` transcript.
+    # :param source: ``auto`` / ``claude`` / ``codex``.
+    # :param server: Target server URL, or None to resolve from config/local.
+    # :param agent_id: Agent to bind, or None to pick the server's first.
+    # :param title: Session title, or None to synthesize from the transcript.
+    # :param dry_run: When set, parse and summarize without importing.
+    """Import an existing Claude Code or Codex chat into an Omnigent server.
+
+    Parses a finished local transcript and creates a new history-only session
+    seeded with its messages and tool calls, viewable (and resumable) in the
+    web UI.
+
+    \b
+    Examples:
+      omnigent import ~/.claude/projects/-home-me-repo/<session-id>.jsonl
+      omnigent import ./rollout-<ts>-<thread-id>.jsonl --source codex
+      omnigent import chat.jsonl --server https://example.com --dry-run
+    """
+    from omnigent.transcript_import import (
+        TranscriptImportError,
+        parse_transcript_file,
+        to_initial_items,
+    )
+
+    try:
+        parsed = parse_transcript_file(transcript, source=source)
+    except TranscriptImportError as err:
+        raise click.ClickException(str(err)) from err
+
+    final_title = title or parsed.title or f"Imported {parsed.source} chat"
+    click.echo(
+        f"Parsed {parsed.source} transcript: {parsed.message_count} messages, "
+        f"{parsed.tool_call_count} tool calls, {parsed.tool_output_count} tool outputs.",
+        err=True,
+    )
+    if dry_run:
+        click.echo(
+            f"Dry run — would create session titled {final_title!r}. Nothing imported.",
+            err=True,
+        )
+        return
+
+    resolved_server = _resolve_host_server(server)
+    if resolved_server is None:
+        resolved_server = local_server_url_if_healthy()
+    if resolved_server is None:
+        raise click.ClickException(
+            "No server specified. Pass --server <url>, set 'server' in your "
+            "config, or start one with `omnigent server start`."
+        )
+    base_url = resolved_server.rstrip("/")
+
+    resolved_agent_id = agent_id or _resolve_import_agent_id(base_url)
+
+    # The transcript items are JSON-shaped dicts typed with ``object`` values;
+    # cast to the strict request alias at this boundary (httpx serializes any
+    # JSON-able payload). Mirrors the decode-side cast in ``_host_http_json``.
+    body = {
+        "agent_id": resolved_agent_id,
+        "title": final_title,
+        "initial_items": to_initial_items(parsed.items),
+        "labels": {"imported_from": parsed.source},
+    }
+    result = _host_http_json(
+        base_url=base_url,
+        method="POST",
+        path="/v1/sessions",
+        json_body=cast(_HostJsonObject, body),
+        timeout_s=60.0,
+    )
+    if result.status_code not in (200, 201) or not isinstance(result.body, dict):
+        raise click.ClickException(
+            f"Import failed ({result.status_code}): {_host_error_text(result.body)}"
+        )
+    session_id = result.body.get("id")
+    if not isinstance(session_id, str):
+        raise click.ClickException(
+            f"Import succeeded but the server returned no session id: {result.body!r}"
+        )
+
+    from omnigent.conversation_browser import conversation_url
+
+    # Human-facing lines go to stderr; stdout carries only the bare session id
+    # so `SID=$(omnigent import ...)` captures just the id.
+    click.echo(
+        f"Imported {parsed.message_count} messages and "
+        f"{parsed.tool_call_count} tool calls into session {session_id}.",
+        err=True,
+    )
+    click.echo(session_id)
+    click.echo(f"Web UI: {conversation_url(base_url, session_id)}", err=True)
 
 
 @cli.command("login")
