@@ -5,17 +5,6 @@ export interface NativeModelPickerOption {
   label: string;
 }
 
-function unique(values: readonly string[]): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const value of values) {
-    if (seen.has(value)) continue;
-    seen.add(value);
-    out.push(value);
-  }
-  return out;
-}
-
 /**
  * Convert Codex ``model/list`` options into picker rows.
  *
@@ -75,5 +64,5 @@ export function codexEffortLevelsForModel(
     options.find((option) => option.isDefault) ??
     options[0] ??
     null;
-  return selected ? unique(selected.supportedReasoningEfforts) : [];
+  return selected ? Array.from(new Set(selected.supportedReasoningEfforts)) : [];
 }
