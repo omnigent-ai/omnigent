@@ -17,6 +17,7 @@ import {
   CircleStopIcon,
   GitBranchIcon,
   InboxIcon,
+  ListFilterIcon,
   Loader2Icon,
   MoreHorizontalIcon,
   PanelRightOpenIcon,
@@ -131,6 +132,7 @@ function useActiveNavItem(): { isNewChatPage: boolean; isInboxPage: boolean } {
 export function Sidebar({ open, onClose }: SidebarProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("");
+  const [pendingApprovalsOnly, setPendingApprovalsOnly] = useState(false);
   const [pinnedConversationIds, setPinnedConversationIds] = useState(readPinnedConversationIds);
 
   // Debounce search input so we don't fire a server request on every
@@ -325,16 +327,29 @@ export function Sidebar({ open, onClose }: SidebarProps) {
             )}
           </Link>
         </Button>
-        <div className="relative mt-3">
-          <SearchIcon className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2.5 size-3.5 text-muted-foreground" />
-          <input
-            type="search"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            aria-label="Search sessions"
-            placeholder="Search sessions"
-            className="min-h-8 w-full rounded-full border border-input pr-3 pl-8 text-sm transition placeholder:text-muted-foreground focus-visible:outline-1"
-          />
+        <div className="mt-3 flex items-center gap-2">
+          <div className="relative flex-1">
+            <SearchIcon className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2.5 size-3.5 text-muted-foreground" />
+            <input
+              type="search"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              aria-label="Search sessions"
+              placeholder="Search sessions"
+              className="min-h-8 w-full rounded-full border border-input pr-3 pl-8 text-sm transition placeholder:text-muted-foreground focus-visible:outline-1"
+            />
+          </div>
+          <Button
+            type="button"
+            variant={pendingApprovalsOnly ? "secondary" : "ghost"}
+            size="icon"
+            aria-pressed={pendingApprovalsOnly}
+            aria-label="Show only sessions with pending approvals"
+            title="Show only sessions with pending approvals"
+            onClick={() => setPendingApprovalsOnly((v) => !v)}
+          >
+            <ListFilterIcon className="size-4" />
+          </Button>
         </div>
       </div>
 
@@ -347,6 +362,7 @@ export function Sidebar({ open, onClose }: SidebarProps) {
           conversationsQuery={conversationsQuery}
           onRowClick={onNavClick}
           searchQuery={debouncedSearchQuery}
+          pendingApprovalsOnly={pendingApprovalsOnly}
           pinnedConversationIds={pinnedConversationIds}
           onPinnedConversationIdsChange={setPinnedConversationIds}
           onTogglePinned={togglePinnedConversation}
@@ -366,6 +382,7 @@ interface ConversationListProps {
   conversationsQuery: ReturnType<typeof useConversations>;
   onRowClick: (e: MouseEvent<HTMLAnchorElement>) => void;
   searchQuery: string;
+  pendingApprovalsOnly: boolean;
   pinnedConversationIds: string[];
   onPinnedConversationIdsChange: (ids: string[]) => void;
   onTogglePinned: (conversationId: string) => void;
@@ -380,16 +397,20 @@ function ConversationList({
   conversationsQuery,
   onRowClick,
   searchQuery,
+  pendingApprovalsOnly,
   pinnedConversationIds,
   onPinnedConversationIdsChange,
   onTogglePinned,
 }: ConversationListProps) {
   // All loaded conversations from the single paginated list (for pinned
-  // backfill, normalization, and the flat session list).
-  const allConversations = useMemo(
-    () => conversationsQuery.data?.pages.flatMap((page) => page.data) ?? [],
-    [conversationsQuery.data],
-  );
+  // backfill, normalization, and the flat session list). When the
+  // "pending approvals only" filter is on, keep just the rows that have
+  // at least one outstanding approval prompt.
+  const allConversations = useMemo(() => {
+    const rows = conversationsQuery.data?.pages.flatMap((page) => page.data) ?? [];
+    if (!pendingApprovalsOnly) return rows;
+    return rows.filter((c) => (c.pending_elicitations_count ?? 0) > 0);
+  }, [conversationsQuery.data, pendingApprovalsOnly]);
 
   // Backfill pinned sessions that aren't in the loaded set.
   const loadedIds = useMemo(() => new Set(allConversations.map((c) => c.id)), [allConversations]);
