@@ -45,6 +45,12 @@ from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
 # first-run ``run`` flow falls back to it, so it has install metadata too.
 PI_KEY = "pi"
 
+# Cursor authenticates against its own backend via ``cursor-agent login`` (or
+# ``CURSOR_API_KEY``) — it has no provider/gateway credential, and its CLI ships
+# via a curl installer + self-update rather than npm, so it carries an
+# ``install_hint`` instead of a ``package``.
+CURSOR_KEY = "cursor"
+
 
 @dataclass(frozen=True)
 class HarnessInstallSpec:
@@ -54,7 +60,8 @@ class HarnessInstallSpec:
     :param binary: The CLI executable name looked up on ``PATH``, e.g.
         ``"claude"``.
     :param package: The npm package that provides the binary, e.g.
-        ``"@anthropic-ai/claude-code"``.
+        ``"@anthropic-ai/claude-code"``; ``None`` for a CLI not installed via
+        npm (use *install_hint* instead).
     :param login_args: Argv (after *binary*) for the harness's own interactive
         subscription login, e.g. ``("auth", "login", "--claudeai")`` for Claude
         or ``("login",)`` for Codex; ``None`` when the harness has no login
@@ -65,14 +72,22 @@ class HarnessInstallSpec:
         in?" status command, e.g. ``("auth", "status")`` (Claude, prints JSON
         with a ``loggedIn`` field) / ``("login", "status")`` (Codex, exits 0
         when logged in); ``None`` when the harness has no status command.
+    :param install_hint: Shell command shown to the user to install the CLI
+        when it has no npm *package* (e.g. cursor-agent's curl installer);
+        ``None`` for npm-installable harnesses.
+    :param login_status_key: The boolean field in the status command's JSON
+        output that reports login state, e.g. ``"isAuthenticated"`` for
+        cursor-agent. ``None`` falls back to ``"loggedIn"``, then the exit code.
     """
 
     display: str
     binary: str
-    package: str
+    package: str | None
     login_args: tuple[str, ...] | None = None
     logout_args: tuple[str, ...] | None = None
     status_args: tuple[str, ...] | None = None
+    install_hint: str | None = None
+    login_status_key: str | None = None
 
 
 # Keyed by harness family (Claude=anthropic, Codex=openai) plus the pi
@@ -98,6 +113,16 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         status_args=("login", "status"),
     ),
     PI_KEY: HarnessInstallSpec("Pi", "pi", "@earendil-works/pi-coding-agent"),
+    CURSOR_KEY: HarnessInstallSpec(
+        "Cursor",
+        "cursor-agent",
+        package=None,
+        login_args=("login",),
+        logout_args=("logout",),
+        status_args=("status", "--format", "json"),
+        install_hint="curl https://cursor.com/install -fsS | bash",
+        login_status_key="isAuthenticated",
+    ),
 }
 
 
@@ -106,13 +131,15 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
 # :data:`_HARNESS_INSTALL` family key. Only the CLI-backed harnesses appear
 # here — the ones that cannot launch without a binary on ``PATH``:
 # ``claude-native`` wraps the ``claude`` CLI, ``codex-native`` the ``codex``
-# CLI, and ``pi`` the ``pi`` CLI. SDK-based harnesses (``claude-sdk``,
-# ``codex``, ``openai-agents-sdk``, ``databricks_supervisor``) run in-process
-# and are deliberately absent, so they resolve to "no CLI required".
+# CLI, ``pi`` the ``pi`` CLI, and ``cursor`` the ``cursor-agent`` CLI.
+# SDK-based harnesses (``claude-sdk``, ``codex``, ``openai-agents-sdk``,
+# ``databricks_supervisor``) run in-process and are deliberately absent, so
+# they resolve to "no CLI required".
 _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "claude-native": ANTHROPIC_FAMILY,
     "codex-native": OPENAI_FAMILY,
     PI_KEY: PI_KEY,
+    CURSOR_KEY: CURSOR_KEY,
 }
 
 
@@ -191,8 +218,13 @@ def harness_install_command(key: str) -> list[str]:
         ``["npm", "install", "-g", "@anthropic-ai/claude-code"]``.
     :raises KeyError: If *key* has no install spec (caller should gate on
         :func:`harness_install_spec`).
+    :raises ValueError: If *key* has a spec but no npm ``package`` (a CLI
+        installed out-of-band, e.g. cursor-agent); show its ``install_hint``.
     """
-    return ["npm", "install", "-g", _HARNESS_INSTALL[key].package]
+    package = _HARNESS_INSTALL[key].package
+    if package is None:
+        raise ValueError(f"{key!r} has no npm package; show its install_hint instead")
+    return ["npm", "install", "-g", package]
 
 
 def install_harness_cli(key: str) -> bool:
@@ -208,6 +240,11 @@ def install_harness_cli(key: str) -> bool:
         present), ``False`` if npm is missing or the install failed.
     :raises KeyError: If *key* has no install spec.
     """
+    spec = _HARNESS_INSTALL.get(key)
+    if spec is not None and spec.package is None:
+        # Non-npm CLI (e.g. cursor-agent ships via a curl installer); there is
+        # no auto-install path, so the caller shows its ``install_hint``.
+        return False
     if shutil.which("npm") is None:
         return False
     cmd = harness_install_command(key)
@@ -262,8 +299,9 @@ def harness_cli_logged_in(key: str) -> bool:
         payload = json.loads(result.stdout)
     except (json.JSONDecodeError, ValueError):
         return result.returncode == 0
-    if isinstance(payload, dict) and "loggedIn" in payload:
-        return bool(payload["loggedIn"])
+    status_key = spec.login_status_key or "loggedIn"
+    if isinstance(payload, dict) and status_key in payload:
+        return bool(payload[status_key])
     return result.returncode == 0
 
 

@@ -25,7 +25,7 @@ that would actually work.
 from __future__ import annotations
 
 from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
-from omnigent.onboarding.harness_install import PI_KEY, harness_cli_installed
+from omnigent.onboarding.harness_install import CURSOR_KEY, PI_KEY, harness_cli_installed
 from omnigent.onboarding.provider_config import (
     _EXECUTOR_TYPE_HARNESS_ALIASES,
     _HARNESS_FAMILY,
@@ -88,6 +88,11 @@ def harness_is_configured(harness: str) -> bool:
     canonical = _canonical_harness(harness)
     if canonical in _SDK_HARNESSES:
         return True
+    if canonical == CURSOR_KEY:
+        # Cursor wraps the ``cursor-agent`` CLI but authenticates against its
+        # own backend; the daemon can only verify the binary is on PATH (login
+        # state needs a subprocess), so gate on install like the other CLIs.
+        return harness_cli_installed(CURSOR_KEY)
     if canonical not in _HARNESS_FAMILY and canonical != PI_SURFACE:
         # Unknown harness — the daemon has no install metadata for it, so
         # it can't assess readiness. Fail open (custom/newer harnesses,
@@ -113,4 +118,5 @@ def configured_harness_map() -> dict[str, bool]:
     spellings.update(_EXECUTOR_TYPE_HARNESS_ALIASES)
     spellings.update(HARNESS_ALIASES)
     spellings.add(PI_SURFACE)
+    spellings.add(CURSOR_KEY)
     return {spelling: harness_is_configured(spelling) for spelling in spellings}

@@ -7649,6 +7649,56 @@ def _manage_harness_providers(family: str) -> None:
             status = _manage_credential(row.provider, family)
 
 
+def _manage_cursor_harness() -> None:
+    """Run the level-2 loop for Cursor: install hint, then sign in / out.
+
+    Cursor authenticates against its own backend via ``cursor-agent login``
+    (or ``CURSOR_API_KEY``), so it has no provider/gateway credential to
+    manage — this drives the CLI's own auth instead of the provider menu. An
+    uninstalled CLI shows the manual install command (cursor-agent ships via a
+    curl installer, not npm) and returns; otherwise the loop toggles sign-in /
+    sign-out, confirming each via the CLI's own status.
+
+    :returns: None.
+    """
+    from omnigent.onboarding.harness_install import (
+        CURSOR_KEY,
+        harness_cli_installed,
+        harness_cli_logged_in,
+        harness_install_spec,
+        harness_login,
+        harness_logout,
+    )
+    from omnigent.onboarding.interactive import console, select
+
+    if not harness_cli_installed(CURSOR_KEY):
+        spec = harness_install_spec(CURSOR_KEY)
+        hint = spec.install_hint if spec is not None else None
+        console.print(
+            "  Cursor's CLI (`cursor-agent`) isn't installed. Install it with:\n"
+            f"    [bold]{hint}[/bold]\n"
+            "  then re-open setup to sign in (or set CURSOR_API_KEY)."
+        )
+        return
+
+    status: str | None = None
+    while True:
+        logged_in = harness_cli_logged_in(CURSOR_KEY)
+        action = "Sign out (cursor-agent logout)" if logged_in else "Sign in (cursor-agent login)"
+        idx = select(
+            "Cursor — " + ("signed in" if logged_in else "not signed in"),
+            [action, "← Back"],
+            clear_on_exit=True,
+            status=status,
+        )
+        if idx < 0 or idx == 1:  # Esc / q / Back
+            return
+        if logged_in:
+            status = "Signed out" if harness_logout(CURSOR_KEY) else "Sign-out did not complete"
+        else:
+            status = "✓ Signed in" if harness_login(CURSOR_KEY) else "Sign-in did not complete"
+
+
 def _manage_credential(provider: str, family: str) -> str | None:
     """Run the level-3 loop for one credential: make default / remove.
 
@@ -7928,7 +7978,11 @@ def _run_configure_harnesses_interactive() -> None:
         performs while navigating.
     """
     from omnigent.onboarding.configure_models import family_label
-    from omnigent.onboarding.harness_install import harness_cli_installed
+    from omnigent.onboarding.harness_install import (
+        CURSOR_KEY,
+        harness_cli_installed,
+        harness_cli_logged_in,
+    )
     from omnigent.onboarding.interactive import select
     from omnigent.onboarding.provider_config import (
         ANTHROPIC_FAMILY,
@@ -8004,6 +8058,24 @@ def _run_configure_harnesses_interactive() -> None:
                 options.append(f"  {sub_line}")
                 selectable.append(False)  # a sub-line — cursor skips it
                 row_target.append(None)
+        # Cursor: a login-only harness (its own backend via ``cursor-agent
+        # login`` / ``CURSOR_API_KEY``), so it has no provider credential to
+        # configure — readiness is "CLI installed + signed in", and its
+        # drill-in drives cursor-agent's own auth, not the provider menu.
+        cursor_installed = harness_cli_installed(CURSOR_KEY)
+        cursor_ready = cursor_installed and harness_cli_logged_in(CURSOR_KEY)
+        options.append(f"{'  ' if cursor_ready else '[red]✗[/] '}Cursor")
+        selectable.append(True)
+        row_target.append(CURSOR_KEY)
+        if not cursor_installed:
+            cursor_sub = "[dim]not installed yet — open to install[/]"
+        elif cursor_ready:
+            cursor_sub = "[green]✓[/] signed in via cursor-agent"
+        else:
+            cursor_sub = "[dim]not signed in — open to log in[/]"
+        options.append(f"  {cursor_sub}")
+        selectable.append(False)
+        row_target.append(None)
         options.append("Quit")
         selectable.append(True)
         row_target.append(_QUIT)
@@ -8016,7 +8088,9 @@ def _run_configure_harnesses_interactive() -> None:
         if idx < 0:  # Esc / q — exit
             return
         target = row_target[idx]
-        if target in families:
+        if target == CURSOR_KEY:
+            _manage_cursor_harness()
+        elif target in families:
             _manage_harness_providers(target)
         else:  # Quit row (or, defensively, a non-family row)
             return

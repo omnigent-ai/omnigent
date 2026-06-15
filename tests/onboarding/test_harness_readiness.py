@@ -61,7 +61,7 @@ def test_sdk_and_unknown_harnesses_are_never_gated(
 # CLI-wrapping harnesses are gated on their binary being on PATH.
 @pytest.mark.parametrize(
     "harness",
-    ["claude-native", "native-claude", "codex", "codex-native", "native-codex", "pi"],
+    ["claude-native", "native-claude", "codex", "codex-native", "native-codex", "pi", "cursor"],
 )
 def test_cli_harness_configured_only_when_binary_installed(
     monkeypatch: pytest.MonkeyPatch, harness: str
@@ -105,6 +105,7 @@ def test_configured_harness_map_covers_all_spellings(
         "agents_sdk",
         "claude",
         "pi",
+        "cursor",
     }
     assert set(result) == expected_keys
 
@@ -133,7 +134,15 @@ def test_configured_harness_map_gates_only_cli_harnesses(
     ):
         assert result[sdk] is True, f"{sdk} should never be gated"
     # CLI-wrapping spellings — gated, so False when the binary is absent.
-    for cli in ("claude-native", "native-claude", "codex", "codex-native", "native-codex", "pi"):
+    for cli in (
+        "claude-native",
+        "native-claude",
+        "codex",
+        "codex-native",
+        "native-codex",
+        "pi",
+        "cursor",
+    ):
         assert result[cli] is False, f"{cli} should be gated on its CLI binary"
 
 
