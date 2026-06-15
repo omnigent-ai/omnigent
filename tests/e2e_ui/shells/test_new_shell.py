@@ -33,23 +33,15 @@ independent session.
 
 from __future__ import annotations
 
+import contextlib
 import re
 import time
 import uuid
-from pathlib import Path
 
 import httpx
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import open_right_rail
-
-# The ``zsh`` terminal (and the session's ``default`` environment
-# filesystem) is rooted at the repo checkout — the runner inherits the
-# pytest process cwd, so a shell ``pwd`` prints this path and a file
-# written here reads back through the filesystem API by its bare name.
-# This file sits one level deeper than ``conftest.py`` (``shells/`` vs
-# ``e2e_ui/``), so the checkout root is ``parents[3]``, not ``parents[2]``.
-_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 # Tab key prefix for a user-created ``zsh`` shell: ``createTerminal``
 # mints a ``u-<rand>`` session key, yielding the resource id
@@ -126,17 +118,17 @@ def test_new_shell_runs_typed_command(page: Page, terminal_session: tuple[str, s
 
     xterm's WebGL canvas keeps the rendered output out of the DOM, so we
     can't assert on the on-screen text. Instead the typed ``pwd`` is
-    redirected to a marker file at the shell's cwd — which is the repo
-    checkout, the same root the session's ``default`` environment
-    filesystem serves — and we read it back through the filesystem API: a
-    non-empty absolute path proves the keystrokes reached the PTY and the
-    command ran.
+    redirected to a marker file at the shell's working directory and read
+    back through the filesystem API by the same relative name: the shell's
+    cwd and the session's ``default`` environment filesystem share one root
+    (both resolve the agent spec's ``os_env.cwd: .``), so the bare name
+    matches regardless of where that root lands — unlike an absolute path,
+    which differs between a local checkout and the CI workspace. A
+    non-empty absolute path in the file proves the keystrokes reached the
+    PTY and the command ran.
     """
     base_url, session_id = terminal_session
     marker = f"shell_pwd_{uuid.uuid4().hex[:8]}.txt"
-    # Absolute redirect target at the filesystem-API root, so the read-back
-    # by bare name resolves to the same file regardless of the shell's cwd.
-    abs_target = _REPO_ROOT / marker
 
     try:
         page.goto(f"{base_url}/c/{session_id}")
@@ -150,17 +142,19 @@ def test_new_shell_runs_typed_command(page: Page, terminal_session: tuple[str, s
 
         # Focus xterm's hidden input (a plain container click doesn't
         # reliably focus the WebGL canvas in headless Chromium), then type a
-        # pwd that persists its output to a file the API can read back. The
-        # brief wait lets the attached shell finish drawing its first prompt
-        # so the keystrokes aren't swallowed mid-redraw.
+        # pwd that persists its output to a marker file. No pre-type wait is
+        # needed: bash is already running in the tmux pane before we attach,
+        # and the PTY buffers input, so keystrokes sent right after the WS
+        # reaches ``connected`` are read once the shell is ready.
         textarea = terminal_view.locator("textarea.xterm-helper-textarea")
         textarea.focus()
-        page.wait_for_timeout(1000)
-        page.keyboard.type(f'pwd > "{abs_target}"')
+        page.keyboard.type(f"pwd > {marker}")
         page.keyboard.press("Enter")
 
-        # Poll the file endpoint until the redirected pwd output lands.
-        deadline = time.monotonic() + 20.0
+        # Poll the file endpoint until the redirected pwd output lands. The
+        # loop exits as soon as the file appears (≈1-2s), so the ceiling
+        # only bounds a genuine failure.
+        deadline = time.monotonic() + 15.0
         content = ""
         while time.monotonic() < deadline:
             try:
@@ -171,8 +165,17 @@ def test_new_shell_runs_typed_command(page: Page, terminal_session: tuple[str, s
                 break
             time.sleep(0.5)
 
+        # A non-empty body is the signal: the shell ran the command and
+        # produced output. It is pwd, so the output is an absolute path.
         assert content.strip().startswith("/"), (
             f"shell never wrote pwd output to {marker}; last server content: {content!r}"
         )
     finally:
-        abs_target.unlink(missing_ok=True)
+        # Best-effort: the marker lands at the session filesystem root.
+        # Delete it through the API; any transport error is harmless.
+        with contextlib.suppress(httpx.HTTPError):
+            httpx.delete(
+                f"{base_url}/v1/sessions/{session_id}"
+                f"/resources/environments/default/filesystem/{marker}",
+                timeout=10.0,
+            )
