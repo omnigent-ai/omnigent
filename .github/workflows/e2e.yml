@@ -11,25 +11,27 @@ name: E2E Tests
 #   workflow_dispatch   manual run. Inputs: `branch` to target a
 #                       non-main ref; `parallelism` to override the
 #                       pytest `-n` worker count (default 8).
-#   pull_request        PR-gate entry point. The four shard check
-#                       names are listed in merge-ready.yml's
-#                       REQUIRED array so merge is blocked until
-#                       all four go green. Full suite runs ~3-4
-#                       minutes wall-clock with all four shards in
-#                       parallel; leans heavily on
-#                       ``tests/known_failures.yaml`` quarantines
-#                       (~290 entries today) tracked under #532.
+#   pull_request        PR-gate entry point for SAME-REPO PRs (secrets
+#                       flow). FORK PRs skip the job here (no secrets on
+#                       fork pull_request runs) and instead run via the
+#                       fork-e2e/** push below, after fork-e2e-mirror.yml
+#                       mirrors an approved / returning-contributor PR.
+#                       The four shard check names are in merge-ready.yml's
+#                       REQUIRED array so merge is blocked until all four
+#                       go green. Leans heavily on
+#                       ``tests/known_failures.yaml`` quarantines (#532).
+#   push (fork-e2e/**)  The e2e run for mirrored fork PRs -- a trusted
+#                       base-repo branch, so secrets flow.
 
 on:
   schedule:
     - cron: "0 9 * * *"
-  # pull_request_target (not pull_request) so fork PRs run in the base-repo
-  # context with the test-gateway secrets. Ungated by design: those creds are
-  # rate-limited + revocable, so auto-run on fork PRs is an accepted risk (no
-  # environment -> no approval prompt, no per-shard deployment records).
-  # leak-scan-allow: pull_request_target
-  pull_request_target:
+  pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore: ['ap-web/**']
+  push:
+    branches:
+      - 'fork-e2e/**'
     paths-ignore: ['ap-web/**']
   workflow_dispatch:
     inputs:
@@ -89,9 +91,13 @@ jobs:
     # we trip rate limits, drop ``-n`` to 1 first; only fall back to
     # ``max-parallel`` reduction if QPS still hurts.
     name: E2E Tests (shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
-    # Draft PRs skip. Fork PRs run ungated -- see the leak-scan-allow note on
-    # the pull_request_target trigger above.
-    if: ${{ !github.event.pull_request.draft }}
+    # Skip draft PRs, and skip FORK pull_request events: forks get no secrets
+    # on `pull_request`, so they run via the fork-e2e/** push that
+    # fork-e2e-mirror.yml creates after approval (a `push` event is not a
+    # 'pull_request', so it always passes this guard).
+    if: ${{ !github.event.pull_request.draft
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
     strategy:
       # One red shard shouldn't cancel siblings; we want every shard's
@@ -117,11 +123,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
-          # Test the merge result: refs/pull/N/merge is the PR head merged into
-          # the base by GitHub. It is absent when the PR conflicts, so a
-          # conflicted PR fails checkout here by design (resolve conflicts
-          # first). Fork code still runs only after the env gate above. Non-PR
-          # events fall back to the dispatch branch / ref.
+          # Same-repo PRs: test the merge result. refs/pull/N/merge is the PR
+          # head merged into the base by GitHub; it is absent when the PR
+          # conflicts, so a conflicted PR fails checkout here by design
+          # (resolve conflicts first). Push events (the mirrored fork-e2e/**
+          # branches) and dispatch fall back to the branch / ref -- for
+          # fork-e2e/** that is the contributor's head commit on a trusted
+          # base-repo branch.
           ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.event.inputs.branch || github.ref }}
 
       - name: Set up Python

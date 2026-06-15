@@ -71,14 +71,14 @@ jobs:
     # workflow_run completions, or `/merge` comments. Other label
     # adds no longer skip-run here.
     #
-    # workflow_run is filtered to PR-originated runs. Post-merge
-    # runs on `main` (workflow_run.event == 'push') and nightlies
-    # / manual dispatches (schedule / workflow_dispatch) have no
-    # PR to post a status on -- the context-resolution step below
-    # would skip them anyway, but we'd still spend ~15 s spinning
-    # up a runner. Filter at the job-`if:` level so push:main
-    # completions of the watched workflows don't spawn wasteful
-    # merge-ready runs per merge.
+    # workflow_run is filtered to PR-originated runs: the watched
+    # workflows' `pull_request` completions, plus the fork-e2e run
+    # which arrives as a `push` on a `fork-e2e/**` branch (the e2e
+    # suite for a mirrored fork PR -- see fork-e2e-mirror.yml). The
+    # context-resolution step below maps that branch's head SHA back
+    # to its PR. Post-merge runs on `main` (push), nightlies, and
+    # manual dispatches have no PR to post on, so they're excluded
+    # here to avoid spinning up a wasteful runner per merge.
     if: >-
       (
         github.event_name == 'pull_request' &&
@@ -91,7 +91,10 @@ jobs:
         github.event_name == 'workflow_run' &&
         (
           github.event.workflow_run.event == 'pull_request' ||
-          github.event.workflow_run.event == 'pull_request_target'
+          (
+            github.event.workflow_run.event == 'push' &&
+            startsWith(github.event.workflow_run.head_branch, 'fork-e2e/')
+          )
         )
       ) ||
       (
