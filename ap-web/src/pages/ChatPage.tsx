@@ -2657,18 +2657,14 @@ function ContextRing({ contextWindow, tokensUsed }: { contextWindow: number; tok
   );
 }
 
-function formatModelPart(part: string): string {
-  const lower = part.toLowerCase();
-  if (lower === "gpt") return "GPT";
-  if (lower === "xhigh") return "xHigh";
-  return part.charAt(0).toUpperCase() + part.slice(1);
-}
-
 /**
- * Human-readable compact model label for the composer status tray.
+ * Model label for the composer status tray.
  *
  * @param model - Model override or bound agent model id.
- * @returns A compact display label, or ``null`` when no model is known.
+ * @param codexModelOptions - Codex-returned model metadata, when available.
+ * @returns Codex's display label for known Codex models, a local Claude alias
+ *   label for Claude native tiers, the raw model id otherwise, or ``null``
+ *   when no model is known.
  */
 export function formatStatusModelLabel(
   model: string | null,
@@ -2678,22 +2674,10 @@ export function formatStatusModelLabel(
   if (!raw) return null;
   const lower = raw.toLowerCase();
   const codexOption = findCodexModelOption(codexModelOptions, raw);
-  if (codexOption) return codexOption.displayName;
+  if (codexOption) return codexOption.displayName || codexOption.id;
   const known = CLAUDE_NATIVE_MODELS.find((m) => m.id === lower);
   if (known) return known.label;
-
-  const leaf = raw.split("/").at(-1) ?? raw;
-  const withoutProvider = leaf
-    .replace(/^databricks[-_]/i, "")
-    .replace(/^anthropic[-_]/i, "")
-    .replace(/^openai[-_]/i, "")
-    .replace(/^claude[-_]/i, "Claude-");
-  const parts = withoutProvider.split(/[-_]+/).filter(Boolean);
-  if (parts.length === 0) return raw;
-  if (parts[0]?.toLowerCase() === "gpt") {
-    return `GPT-${parts.slice(1).join(".")}`;
-  }
-  return parts.map(formatModelPart).join(" ");
+  return raw;
 }
 
 /** Format effort for compact status labels (``"xhigh"`` → ``"xHigh"``). */
@@ -2707,7 +2691,7 @@ function formatStatusEffortLabel(effort: string | null): string | null {
  *
  * @param model - Model override or bound model id.
  * @param effort - Current reasoning effort override, if any.
- * @returns Compact label such as ``"GPT-5.5 xHigh"``.
+ * @returns Compact label such as ``"gpt-5.5 xHigh"``.
  */
 export function formatModelEffortStatusLabel(
   model: string | null,

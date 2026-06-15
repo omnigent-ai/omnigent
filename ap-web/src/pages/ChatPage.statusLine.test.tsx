@@ -62,6 +62,7 @@ describe("Composer status line (branch + context ring)", () => {
       llmModel: null,
       selectedModel: null,
       selectedEffort: null,
+      codexModelOptions: [],
     });
   });
 
@@ -102,12 +103,22 @@ describe("Composer status line (branch + context ring)", () => {
       selectedEffort: "xhigh",
       contextWindow: 100_000,
       tokensUsed: 25_000,
+      codexModelOptions: [
+        {
+          id: "gpt-5.5",
+          model: "databricks-gpt-5-5",
+          displayName: "Codex GPT 5.5 Preview",
+          defaultReasoningEffort: "high",
+          supportedReasoningEfforts: ["low", "medium", "high", "xhigh"],
+          isDefault: true,
+        },
+      ],
     });
     renderComposer();
 
     const modelEffort = screen.getByTestId("composer-model-effort");
     const ring = screen.getByLabelText("25% of context used");
-    expect(modelEffort).toHaveTextContent("GPT-5.5 xHigh");
+    expect(modelEffort).toHaveTextContent("Codex GPT 5.5 Preview xHigh");
     expect(modelEffort.compareDocumentPosition(ring) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING,
     );
@@ -120,7 +131,9 @@ describe("Composer status line (branch + context ring)", () => {
     });
     renderComposer();
 
-    expect(screen.getByTestId("composer-model-effort")).toHaveTextContent("GPT-5.5 Medium");
+    expect(screen.getByTestId("composer-model-effort")).toHaveTextContent(
+      "databricks-gpt-5-5 Medium",
+    );
     expect(screen.queryByLabelText(/context used/)).toBeNull();
   });
 
@@ -191,10 +204,25 @@ describe("Composer status line (branch + context ring)", () => {
 });
 
 describe("formatModelEffortStatusLabel", () => {
-  it("compacts Codex model ids and xhigh effort", () => {
-    expect(formatModelEffortStatusLabel("gpt-5.5", "xhigh")).toBe("GPT-5.5 xHigh");
+  it("uses Codex display names exactly as returned in model metadata", () => {
+    expect(
+      formatModelEffortStatusLabel("gpt-5.5", "xhigh", [
+        {
+          id: "gpt-5.5",
+          model: "databricks-gpt-5-5",
+          displayName: "codex says GPT-5.5",
+          defaultReasoningEffort: "high",
+          supportedReasoningEfforts: ["low", "medium", "high", "xhigh"],
+          isDefault: true,
+        },
+      ]),
+    ).toBe("codex says GPT-5.5 xHigh");
+  });
+
+  it("leaves unknown model ids raw", () => {
+    expect(formatModelEffortStatusLabel("gpt-5.5", "xhigh")).toBe("gpt-5.5 xHigh");
     expect(formatModelEffortStatusLabel("databricks-gpt-5-5", "xhigh")).toBe(
-      "GPT-5.5 xHigh",
+      "databricks-gpt-5-5 xHigh",
     );
   });
 
