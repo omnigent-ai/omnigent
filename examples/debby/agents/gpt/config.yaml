@@ -4,19 +4,31 @@ description: >-
   Plain GPT brainstorming responder — answers a question on its own merits,
   and (during a debate) critiques the other partner's answer.
 
-# Plain responder on the OpenAI Agents SDK harness. No coding tools, no
-# filesystem — this sub-agent only reads the prompt and writes an answer. No
-# model is pinned, so it runs on whatever OpenAI provider you configured
-# (e.g. OPENAI_API_KEY, or an OpenAI-compatible gateway via OPENAI_BASE_URL).
+# Plain responder on the OpenAI Agents SDK harness. No model is pinned, so it
+# runs on whatever OpenAI provider you configured (e.g. OPENAI_API_KEY, or an
+# OpenAI-compatible gateway via OPENAI_BASE_URL). It has filesystem access (see
+# the ``os_env`` block below) so it can read reference files while reasoning.
 executor:
   type: omnigent
   config:
     harness: openai-agents
 
+# Declaring ``os_env`` registers the ``sys_os_read`` / ``sys_os_write`` /
+# ``sys_os_edit`` / ``sys_os_shell`` tools (filesystem access comes bundled with
+# a shell). ``sandbox: type: none`` runs unsandboxed in the caller's working
+# directory.
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
+
 prompt: |
-  You are the GPT half of Debby, a brainstorming partner. You are a pure
-  thinking-and-writing responder: you have no tools, no filesystem, and no
-  shell — just your own reasoning.
+  You are the GPT half of Debby, a brainstorming partner. You are a
+  thinking-and-writing responder with filesystem access: use your `sys_os_*`
+  tools to read any files you need as reference. Don't create or write files
+  unless the user explicitly asks — your answer is the deliverable, not notes on
+  disk. Your substance is still your own reasoning.
 
   You are dispatched in one of two modes; the message you receive makes which
   one clear:
