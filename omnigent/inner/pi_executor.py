@@ -1186,7 +1186,7 @@ def _extract_pi_turn_usage(
     that :class:`TurnComplete` consumes, so pi sub-agent cost is priced
     the same way as ``claude-sdk`` and ``codex`` turns.
 
-    Pi (``@mariozechner/pi-coding-agent``) forwards assistant messages
+    Pi (``@earendil-works/pi-coding-agent``) forwards assistant messages
     whose ``usage`` dict carries ``input`` / ``output`` / ``cacheRead`` /
     ``cacheWrite`` / ``totalTokens`` token counts, and the message itself
     carries the resolved ``model``. This translates those into omnigent's
