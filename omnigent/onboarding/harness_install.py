@@ -296,10 +296,11 @@ def harness_login(key: str) -> bool:
         return True
     try:
         # Open /dev/tty explicitly so the child process sees a real TTY even
-        # when the parent's stdio is piped (e.g. launched via `uv tool run`).
-        # The Claude CLI checks isatty() and skips opening the browser when it
-        # returns false, which causes a "timed out" login on Fedora/Wayland and
-        # similar setups where sudo credentials aren't cached.
+        # when the parent's stdio is piped (e.g. launched via `uv tool run` or
+        # another wrapper). The Claude CLI checks isatty() and skips opening the
+        # browser when it returns false, which strands the login until it times
+        # out. Fall back to inherited stdio when /dev/tty can't be opened (a
+        # headless run with no controlling terminal).
         tty_fd = None
         kwargs: dict = {"check": False, "timeout": 600}
         if not sys.stdin.isatty():

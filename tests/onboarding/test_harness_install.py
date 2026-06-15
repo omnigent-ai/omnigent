@@ -191,6 +191,9 @@ def test_harness_login_runs_cli_login_then_verifies(
     reflects the post-login verdict.
     """
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+    # Pin stdin to a TTY so this test stays focused on argv and never touches a
+    # real /dev/tty — the non-TTY branch is exercised separately below.
+    monkeypatch.setattr(hi.sys.stdin, "isatty", lambda: True)
     calls: list[list[str]] = []
     state = {"logged_in": False}
     monkeypatch.setattr(
@@ -198,7 +201,7 @@ def test_harness_login_runs_cli_login_then_verifies(
         lambda k: state["logged_in"],
     )
 
-    def _run(argv: list[str], *, check: bool = False, timeout: float | None = None):
+    def _run(argv: list[str], **kwargs: object):
         calls.append(argv)
         state["logged_in"] = True  # the user completed the interactive login
         return subprocess.CompletedProcess(args=argv, returncode=0)
@@ -206,6 +209,81 @@ def test_harness_login_runs_cli_login_then_verifies(
     monkeypatch.setattr(hi.subprocess, "run", _run)
     assert hi.harness_login(key) is True
     assert calls == [expected_argv]
+
+
+def test_harness_login_wires_dev_tty_when_stdin_not_a_tty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No TTY on stdin → open /dev/tty, pass it as the child's std* fds, then close it.
+
+    When the parent's stdio is piped (e.g. launched via ``uv tool run``) the
+    harness CLI sees ``isatty() == False`` and refuses to open the browser,
+    stranding the login. The fix opens ``/dev/tty`` and hands it to the child as
+    stdin/stdout/stderr so it sees a real terminal. Asserts that wiring happens
+    and that the fd is released even on the success path (``finally``).
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(hi.sys.stdin, "isatty", lambda: False)
+    state = {"logged_in": False}
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_logged_in",
+        lambda k: state["logged_in"],
+    )
+
+    sentinel_fd = 4242
+    monkeypatch.setattr(hi.os, "open", lambda path, flags: sentinel_fd)
+    closed: list[int] = []
+    monkeypatch.setattr(hi.os, "close", lambda fd: closed.append(fd))
+
+    seen: dict = {}
+
+    def _run(argv: list[str], **kwargs: object):
+        seen["kwargs"] = kwargs
+        state["logged_in"] = True
+        return subprocess.CompletedProcess(args=argv, returncode=0)
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.harness_login(ANTHROPIC_FAMILY) is True
+    assert seen["kwargs"]["stdin"] == sentinel_fd
+    assert seen["kwargs"]["stdout"] == sentinel_fd
+    assert seen["kwargs"]["stderr"] == sentinel_fd
+    assert closed == [sentinel_fd]  # fd released after the login returns
+
+
+def test_harness_login_falls_back_when_dev_tty_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No controlling terminal → swallow the OSError and inherit parent stdio.
+
+    Headless / CI runs have no ``/dev/tty``; the login must still proceed with
+    the parent's inherited stdio rather than crash, and must not pass any
+    std* fds to the child.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(hi.sys.stdin, "isatty", lambda: False)
+    state = {"logged_in": False}
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_logged_in",
+        lambda k: state["logged_in"],
+    )
+
+    def _no_tty(path: str, flags: int) -> int:
+        raise OSError("no controlling terminal")
+
+    monkeypatch.setattr(hi.os, "open", _no_tty)
+
+    seen: dict = {}
+
+    def _run(argv: list[str], **kwargs: object):
+        seen["kwargs"] = kwargs
+        state["logged_in"] = True
+        return subprocess.CompletedProcess(args=argv, returncode=0)
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.harness_login(ANTHROPIC_FAMILY) is True
+    assert "stdin" not in seen["kwargs"]
+    assert "stdout" not in seen["kwargs"]
+    assert "stderr" not in seen["kwargs"]
 
 
 def test_harness_login_false_when_login_not_completed(monkeypatch: pytest.MonkeyPatch) -> None:
