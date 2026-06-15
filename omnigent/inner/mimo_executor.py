@@ -19,7 +19,6 @@ import shutil
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from .cursor_acp import AcpClient, AcpError
 from .cursor_executor import _build_cursor_prompt, _update_to_event
