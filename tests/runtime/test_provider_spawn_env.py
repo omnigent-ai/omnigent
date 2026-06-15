@@ -29,6 +29,7 @@ from omnigent.runtime.workflow import (
     _build_claude_sdk_spawn_env,
     _build_codex_spawn_env,
     _build_openai_agents_sdk_spawn_env,
+    _build_opencode_spawn_env,
     _build_pi_spawn_env,
 )
 from omnigent.spec.types import (
@@ -304,6 +305,68 @@ def test_openai_agents_uses_openai_global_default(config_home: Path) -> None:
     assert env["HARNESS_OPENAI_AGENTS_MODEL"] == "gpt-default-model"
     # No DATABRICKS enable flag for this harness (executor takes key directly).
     assert "HARNESS_OPENAI_AGENTS_DATABRICKS" not in env
+
+
+def test_opencode_uses_anthropic_global_default(config_home: Path) -> None:
+    """A ``default: true`` anthropic provider routes the opencode harness.
+
+    Locks in the gateway env-var shape OpenCode's executor reads —
+    ``HARNESS_OPENCODE_GATEWAY_PROVIDER`` / ``BASE_URL`` / ``API_KEY``
+    — and confirms the default provider id is ``"anthropic"`` to match
+    OpenCode's most common gateway shape (Anthropic-compatible).
+    Failure means the opencode dispatch branch in
+    :func:`_apply_provider_to_opencode` is not firing on the default
+    family, or the env-var names regressed.
+    """
+    _write_config(config_home, _anthropic_default_config())
+    spec = _make_spec(harness="opencode")
+
+    env = _build_opencode_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_OPENCODE_GATEWAY_PROVIDER"] == "anthropic"
+    assert env["HARNESS_OPENCODE_GATEWAY_BASE_URL"] == "https://anthropic.example.com/v1"
+    # Static key → flows directly into the gateway override (no auth-command
+    # surface in OpenCode's config schema). A regression that emitted a
+    # ``printf %s ...`` here would land a non-resolvable shell command inside
+    # OPENCODE_CONFIG_CONTENT.apiKey.
+    assert env["HARNESS_OPENCODE_GATEWAY_API_KEY"] == "sk-ant-secret"
+    # No spec model → the family's models.default supplies the model.
+    assert env["HARNESS_OPENCODE_MODEL"] == "claude-default-model"
+
+
+def test_opencode_uses_openai_family_when_anthropic_absent(
+    config_home: Path,
+) -> None:
+    """When only an openai family is configured, opencode picks it.
+
+    The dispatch in :func:`_apply_provider_to_opencode` iterates in
+    ``anthropic → openai`` order; this test exercises the fallback.
+    Failure means the dispatch hard-coded ``anthropic`` and a fresh
+    machine with only an OpenAI key would crash at spec load.
+    """
+    _write_config(config_home, _openai_default_config())
+    spec = _make_spec(harness="opencode")
+
+    env = _build_opencode_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_OPENCODE_GATEWAY_PROVIDER"] == "openai"
+    assert env["HARNESS_OPENCODE_GATEWAY_BASE_URL"] == "https://openai.example.com/v1"
+    assert env["HARNESS_OPENCODE_GATEWAY_API_KEY"] == "sk-oai-secret"
+
+
+def test_opencode_workdir_threads_through_as_cwd(config_home: Path, tmp_path: Path) -> None:
+    """``workdir`` flows into ``HARNESS_OPENCODE_CWD``.
+
+    The OpenCode executor passes this to ``opencode run --dir`` so
+    file ops resolve relative to the agent bundle. A drop here would
+    silently run every turn in the runner's own cwd.
+    """
+    _write_config(config_home, _anthropic_default_config())
+    spec = _make_spec(harness="opencode")
+
+    env = _build_opencode_spawn_env(spec, workdir=tmp_path)
+
+    assert env["HARNESS_OPENCODE_CWD"] == str(tmp_path)
 
 
 def test_pi_uses_anthropic_global_default(config_home: Path) -> None:

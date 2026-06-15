@@ -16,6 +16,7 @@ from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
         (ANTHROPIC_FAMILY, "claude", "@anthropic-ai/claude-code"),
         (OPENAI_FAMILY, "codex", "@openai/codex"),
         (hi.PI_KEY, "pi", "@earendil-works/pi-coding-agent"),
+        (hi.OPENCODE_KEY, "opencode", "opencode-ai"),
     ],
 )
 def test_install_spec_and_command(key: str, binary: str, package: str) -> None:
@@ -44,6 +45,7 @@ def test_unknown_key_has_no_spec_and_is_not_installed() -> None:
         ("claude-native", "claude"),
         ("codex-native", "codex"),
         ("pi", "pi"),
+        ("opencode", "opencode"),
     ],
 )
 def test_required_cli_for_cli_backed_harness(harness: str, binary: str) -> None:

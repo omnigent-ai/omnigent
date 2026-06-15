@@ -616,3 +616,201 @@ def test_close_session_drops_cached_session_id() -> None:
         return "k" not in executor._session_ids
 
     assert asyncio.run(_run()) is True
+
+
+# ── _build_opencode_config_content: gateway + MCP synthesis ─────────
+
+
+def test_build_config_content_returns_none_when_nothing_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No env vars → ``None`` → executor passes through to opencode's
+    own config discovery without injecting ``OPENCODE_CONFIG_CONTENT``.
+    """
+    for env_var in (
+        "HARNESS_OPENCODE_GATEWAY_PROVIDER",
+        "HARNESS_OPENCODE_GATEWAY_BASE_URL",
+        "HARNESS_OPENCODE_GATEWAY_API_KEY",
+        "HARNESS_OPENCODE_MCP_SERVERS",
+    ):
+        monkeypatch.delenv(env_var, raising=False)
+    assert opencode_executor._build_opencode_config_content() is None
+
+
+def test_build_config_content_synthesises_provider_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gateway env vars produce a ``provider.<id>.options`` override.
+
+    Locks in the shape OpenCode's ``resolveSDK`` reads from
+    ``packages/opencode/src/provider/provider.ts``: ``baseURL`` +
+    ``apiKey`` under ``options``.
+    """
+    monkeypatch.setenv("HARNESS_OPENCODE_GATEWAY_PROVIDER", "anthropic")
+    monkeypatch.setenv("HARNESS_OPENCODE_GATEWAY_BASE_URL", "https://example.com/api")
+    monkeypatch.setenv("HARNESS_OPENCODE_GATEWAY_API_KEY", "tok-123")
+    monkeypatch.delenv("HARNESS_OPENCODE_MCP_SERVERS", raising=False)
+
+    payload = opencode_executor._build_opencode_config_content()
+
+    assert payload == {
+        "provider": {
+            "anthropic": {
+                "options": {
+                    "baseURL": "https://example.com/api",
+                    "apiKey": "tok-123",
+                }
+            }
+        }
+    }
+
+
+def test_build_config_content_defaults_provider_to_anthropic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No explicit ``HARNESS_OPENCODE_GATEWAY_PROVIDER`` → ``"anthropic"``.
+
+    The default matches Databricks AI gateway / most operator setups;
+    a regression that changed it to ``"openai"`` would silently route
+    every Databricks-gateway run at the wrong wire.
+    """
+    monkeypatch.delenv("HARNESS_OPENCODE_GATEWAY_PROVIDER", raising=False)
+    monkeypatch.setenv("HARNESS_OPENCODE_GATEWAY_BASE_URL", "https://x/")
+    monkeypatch.setenv("HARNESS_OPENCODE_GATEWAY_API_KEY", "k")
+    monkeypatch.delenv("HARNESS_OPENCODE_MCP_SERVERS", raising=False)
+
+    payload = opencode_executor._build_opencode_config_content()
+
+    assert payload is not None
+    assert "anthropic" in payload["provider"]
+
+
+def test_build_config_content_decodes_mcp_servers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``HARNESS_OPENCODE_MCP_SERVERS`` decodes into ``payload["mcp"]``.
+
+    OpenCode's ``Config.layer`` merges this into the user's global
+    config (per ``packages/opencode/src/config/config.ts``), so this
+    is the per-invocation hook for registering an Omnigent MCP
+    endpoint without mutating ``~/.config/opencode/config.json``.
+    """
+    monkeypatch.delenv("HARNESS_OPENCODE_GATEWAY_BASE_URL", raising=False)
+    monkeypatch.delenv("HARNESS_OPENCODE_GATEWAY_API_KEY", raising=False)
+    servers = {
+        "omnigent": {
+            "type": "remote",
+            "url": "http://127.0.0.1:9999/mcp",
+            "headers": {"Authorization": "Bearer abc"},
+        },
+        "user-mcp": {"enabled": False},
+    }
+    monkeypatch.setenv("HARNESS_OPENCODE_MCP_SERVERS", json.dumps(servers))
+
+    payload = opencode_executor._build_opencode_config_content()
+
+    assert payload == {"mcp": servers}
+
+
+def test_resolve_mcp_servers_env_rejects_malformed_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed value in the env var RAISES — it's a producer-side bug."""
+    monkeypatch.setenv("HARNESS_OPENCODE_MCP_SERVERS", "{not-json")
+    with pytest.raises(ValueError) as excinfo:
+        opencode_executor._resolve_mcp_servers_env()
+    assert "HARNESS_OPENCODE_MCP_SERVERS" in str(excinfo.value)
+
+
+def test_resolve_mcp_servers_env_rejects_wrong_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-object JSON value RAISES with a clear type error."""
+    monkeypatch.setenv("HARNESS_OPENCODE_MCP_SERVERS", "[1, 2]")
+    with pytest.raises(ValueError) as excinfo:
+        opencode_executor._resolve_mcp_servers_env()
+    assert "object" in str(excinfo.value)
+
+
+def test_build_spawn_env_injects_config_content_and_disables_project_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a payload is synthesised, the spawn-env also sets
+    ``OPENCODE_DISABLE_PROJECT_CONFIG=1`` so a user-project
+    ``opencode.json`` cannot silently re-introduce a provider /
+    MCP entry the operator wanted suppressed.
+    """
+    monkeypatch.setenv("HARNESS_OPENCODE_GATEWAY_BASE_URL", "https://x/")
+    monkeypatch.setenv("HARNESS_OPENCODE_GATEWAY_API_KEY", "k")
+    monkeypatch.delenv("HARNESS_OPENCODE_MCP_SERVERS", raising=False)
+    executor = opencode_executor.OpenCodeExecutor()
+
+    env = executor._build_spawn_env()
+
+    assert "OPENCODE_CONFIG_CONTENT" in env
+    assert env["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
+    decoded = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+    assert decoded["provider"]["anthropic"]["options"]["apiKey"] == "k"
+
+
+def test_build_spawn_env_pass_through_when_nothing_to_inject(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No gateway / MCP env vars → spawn-env doesn't synthesise
+    ``OPENCODE_CONFIG_CONTENT`` or set the disable flag, so a user
+    who runs opencode outside Omnigent gets identical behavior.
+    """
+    for env_var in (
+        "HARNESS_OPENCODE_GATEWAY_PROVIDER",
+        "HARNESS_OPENCODE_GATEWAY_BASE_URL",
+        "HARNESS_OPENCODE_GATEWAY_API_KEY",
+        "HARNESS_OPENCODE_MCP_SERVERS",
+        "OPENCODE_CONFIG_CONTENT",
+        "OPENCODE_DISABLE_PROJECT_CONFIG",
+    ):
+        monkeypatch.delenv(env_var, raising=False)
+    executor = opencode_executor.OpenCodeExecutor()
+
+    env = executor._build_spawn_env()
+
+    assert "OPENCODE_CONFIG_CONTENT" not in env
+    assert "OPENCODE_DISABLE_PROJECT_CONFIG" not in env
+
+
+# ── run_turn: tools-without-MCP-bridge warning ─────────────────────
+
+
+def test_run_turn_warns_once_when_tools_without_mcp_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Spec tools with no MCP bridge → one-time warning, not per-turn spam.
+
+    A warning every turn would drown CI logs once an operator ships
+    a spec with even a single tool declared. The executor flips a
+    one-shot guard on first emit.
+    """
+    monkeypatch.setenv("HARNESS_OPENCODE_PATH", "/fake/opencode")
+    monkeypatch.delenv("HARNESS_OPENCODE_MCP_SERVERS", raising=False)
+
+    async def _fake_subprocess(*_: str, **__: object) -> _FakeProcess:
+        return _FakeProcess([b""], return_code=0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_subprocess)
+    executor = opencode_executor.OpenCodeExecutor()
+
+    async def _drive() -> None:
+        for _ in range(3):
+            async for _event in executor.run_turn(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[{"name": "sql_query", "description": "x", "parameters": {}}],
+                system_prompt="",
+                config=None,
+            ):
+                pass
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(_drive())
+
+    warnings = [rec for rec in caplog.records if "spec tool" in rec.getMessage().lower()]
+    assert len(warnings) == 1, f"expected exactly one warning, got {len(warnings)}"

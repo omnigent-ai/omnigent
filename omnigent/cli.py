@@ -470,6 +470,15 @@ def _pick_first_run_harness() -> _FirstRunPlan | None:
         return _FirstRunPlan(harness="codex", agent=None)
     if default_provider_for_harness(config, "pi") is not None:
         return _FirstRunPlan(harness="pi", agent=None)
+    # OpenCode is multi-provider and stores its auth via ``opencode auth
+    # login`` rather than the ambient-detected provider config, so
+    # ``default_provider_for_harness`` can't gate it. Fall back to
+    # "binary installed" as the readiness proxy: the executor will fail
+    # loud at the first turn if no provider is actually configured.
+    from omnigent.onboarding.harness_install import OPENCODE_KEY, harness_cli_installed
+
+    if harness_cli_installed(OPENCODE_KEY):
+        return _FirstRunPlan(harness="opencode", agent=None)
     return None
 
 
@@ -3950,6 +3959,45 @@ def polly(run_args: tuple[str, ...]) -> None:
     }
 )
 @click.argument("run_args", nargs=-1, type=click.UNPROCESSED)
+def opencode(run_args: tuple[str, ...]) -> None:
+    # Param docs live in comments — Click uses the docstring for --help.
+    # :param run_args: Pass-through args for ``run``.
+    """Launch the OpenCode harness through Omnigent.
+
+    Shorthand for ``omnigent run --harness opencode``. OpenCode
+    (https://opencode.ai) is a multi-provider coding agent; Omnigent
+    drives it via ``opencode run --format json`` per turn and routes the
+    structured event stream into the standard REPL. All ``run`` options
+    are accepted and forwarded.
+
+    Unlike ``omnigent claude`` / ``omnigent codex``, this does **not**
+    launch the native TUI in a tmux pane — it runs OpenCode headlessly
+    behind the standard Omnigent REPL. ``omnigent auth login`` /
+    ``opencode auth login`` configures provider credentials.
+
+    \b
+    Examples:
+      omnigent opencode
+      omnigent opencode -p "summarise the README"
+      omnigent opencode -m anthropic/claude-sonnet-4-5
+    """
+    # standalone_mode=False mirrors :func:`_run_bundled_agent` so
+    # ClickExceptions propagate to ``main`` (CLI diagnostics + setup
+    # hint) instead of exiting inline.
+    run.main(
+        args=["--harness", "opencode", *run_args],
+        prog_name="omnigent run",
+        standalone_mode=False,
+    )
+
+
+@cli.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+@click.argument("run_args", nargs=-1, type=click.UNPROCESSED)
 def debby(run_args: tuple[str, ...]) -> None:
     # Param docs live in comments — Click uses the docstring for --help.
     # :param run_args: Pass-through args for ``run``.
@@ -4055,6 +4103,10 @@ _DEFAULT_HARNESS_PROMPTS = {
     ),
     "codex": (
         "You are Codex, running through Omnigent. Help the user with software engineering tasks."
+    ),
+    "opencode": (
+        "You are OpenCode, running through Omnigent. "
+        "Help the user with software engineering tasks."
     ),
 }
 _DEFAULT_HARNESS_PROMPT = "You are a helpful coding agent running through Omnigent."

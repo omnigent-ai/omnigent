@@ -45,6 +45,12 @@ from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
 # first-run ``run`` flow falls back to it, so it has install metadata too.
 PI_KEY = "pi"
 
+# Like Pi, OpenCode (https://opencode.ai) is a CLI-backed harness that doesn't
+# fit either the Anthropic or OpenAI family — it's multi-provider, configured
+# per-invocation via ``OPENCODE_CONFIG_CONTENT``. Treated as its own install
+# key so the binary and login plumbing have a place to land.
+OPENCODE_KEY = "opencode"
+
 
 @dataclass(frozen=True)
 class HarnessInstallSpec:
@@ -98,6 +104,22 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         status_args=("login", "status"),
     ),
     PI_KEY: HarnessInstallSpec("Pi", "pi", "@earendil-works/pi-coding-agent"),
+    # OpenCode ships an ``opencode`` binary via the ``opencode-ai`` npm
+    # package (or via ``curl -fsSL https://opencode.ai/install | bash``
+    # for the non-npm path). ``opencode auth login`` is the interactive
+    # provider login. ``status_args`` is intentionally ``None``: the
+    # closest probe (``opencode auth list``) exits ``0`` even when no
+    # providers are configured, so an exit-code reading would falsely
+    # report "logged in". With ``None`` the login path runs every time
+    # the operator asks for it (interactive, so they can cancel if
+    # already authenticated).
+    OPENCODE_KEY: HarnessInstallSpec(
+        "OpenCode",
+        "opencode",
+        "opencode-ai",
+        login_args=("auth", "login"),
+        logout_args=("auth", "logout"),
+    ),
 }
 
 
@@ -113,6 +135,11 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "claude-native": ANTHROPIC_FAMILY,
     "codex-native": OPENAI_FAMILY,
     PI_KEY: PI_KEY,
+    # OpenCode is multi-provider but still binary-gated: it cannot launch
+    # without the ``opencode`` CLI on ``PATH``. Listed here so
+    # ``required_cli_for_harness`` returns its install spec and
+    # ``missing_harness_cli`` fails loud before a subagent spawn.
+    OPENCODE_KEY: OPENCODE_KEY,
 }
 
 

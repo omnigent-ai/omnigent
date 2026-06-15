@@ -25,12 +25,22 @@ that would actually work.
 from __future__ import annotations
 
 from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
-from omnigent.onboarding.harness_install import PI_KEY, harness_cli_installed
+from omnigent.onboarding.harness_install import (
+    OPENCODE_KEY,
+    PI_KEY,
+    harness_cli_installed,
+)
 from omnigent.onboarding.provider_config import (
     _EXECUTOR_TYPE_HARNESS_ALIASES,
     _HARNESS_FAMILY,
     PI_SURFACE,
 )
+
+# Surface name for OpenCode in the readiness map. Mirrors :data:`PI_SURFACE`
+# — both are CLI-backed harnesses without a single provider family, so they
+# carry their own surface keys rather than living under
+# :data:`_HARNESS_FAMILY`.
+OPENCODE_SURFACE = "opencode"
 
 # In-process SDK harnesses: no CLI binary, credentials resolved at runtime
 # from ambient/spec sources the daemon can't see. Never gated. Includes both
@@ -61,10 +71,15 @@ def _install_key(canonical: str) -> str:
     """Return the install-spec key whose CLI binary *canonical* requires.
 
     :param canonical: A canonical CLI-wrapping harness id keyed in
-        ``_HARNESS_FAMILY`` (e.g. ``"codex-native"``), or ``"pi"``.
+        ``_HARNESS_FAMILY`` (e.g. ``"codex-native"``), ``"pi"``, or
+        ``"opencode"``.
     :returns: ``"anthropic"`` / ``"openai"`` for the claude/codex CLIs,
-        or :data:`~omnigent.onboarding.harness_install.PI_KEY` for pi.
+        :data:`~omnigent.onboarding.harness_install.PI_KEY` for pi,
+        :data:`~omnigent.onboarding.harness_install.OPENCODE_KEY` for
+        opencode.
     """
+    if canonical == OPENCODE_SURFACE:
+        return OPENCODE_KEY
     return _HARNESS_FAMILY.get(canonical) or PI_KEY
 
 
@@ -88,7 +103,11 @@ def harness_is_configured(harness: str) -> bool:
     canonical = _canonical_harness(harness)
     if canonical in _SDK_HARNESSES:
         return True
-    if canonical not in _HARNESS_FAMILY and canonical != PI_SURFACE:
+    if (
+        canonical not in _HARNESS_FAMILY
+        and canonical != PI_SURFACE
+        and canonical != OPENCODE_SURFACE
+    ):
         # Unknown harness — the daemon has no install metadata for it, so
         # it can't assess readiness. Fail open (custom/newer harnesses,
         # version skew).
@@ -113,4 +132,5 @@ def configured_harness_map() -> dict[str, bool]:
     spellings.update(_EXECUTOR_TYPE_HARNESS_ALIASES)
     spellings.update(HARNESS_ALIASES)
     spellings.add(PI_SURFACE)
+    spellings.add(OPENCODE_SURFACE)
     return {spelling: harness_is_configured(spelling) for spelling in spellings}

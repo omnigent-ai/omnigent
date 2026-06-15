@@ -69,6 +69,35 @@ _ENV_VARIANT = "HARNESS_OPENCODE_VARIANT"
 _ENV_THINKING = "HARNESS_OPENCODE_THINKING"
 _ENV_SKIP_PERMISSIONS = "HARNESS_OPENCODE_DANGEROUSLY_SKIP_PERMISSIONS"
 
+# Gateway-routing env vars — when set, the executor synthesises an
+# ``OPENCODE_CONFIG_CONTENT`` JSON payload that overrides the chosen
+# provider's ``baseURL`` / ``apiKey`` per ``packages/opencode/src/
+# config/config.ts`` (the ``Flag.OPENCODE_CONFIG_CONTENT`` merge path).
+# This keeps gateway routing per-invocation and out of the user's
+# global ``~/.config/opencode/config.json``.
+_ENV_GATEWAY_PROVIDER = "HARNESS_OPENCODE_GATEWAY_PROVIDER"
+_ENV_GATEWAY_BASE_URL = "HARNESS_OPENCODE_GATEWAY_BASE_URL"
+_ENV_GATEWAY_API_KEY = "HARNESS_OPENCODE_GATEWAY_API_KEY"
+
+# MCP-bridge env var: a JSON object of ``{server_name: ConfigMCPV1.Info}``
+# entries merged into ``OPENCODE_CONFIG_CONTENT``'s ``mcp`` map per
+# ``packages/opencode/src/config/config.ts`` so OpenCode connects to
+# Omnigent's tool dispatch endpoint as an MCP server. v0 reads this
+# raw rather than synthesising it inside the executor — the producer
+# (workflow.py / the harness wrap) decides whether and how to start
+# the MCP endpoint and writes the URL here.
+_ENV_MCP_SERVERS = "HARNESS_OPENCODE_MCP_SERVERS"
+
+# Set together with ``OPENCODE_CONFIG_CONTENT``: tells OpenCode to
+# skip walking the cwd for ``opencode.json`` so user-project config
+# never silently overrides the per-session settings the executor
+# generated. The global ``~/.config/opencode/`` is still merged
+# (OpenCode has no flag to suppress it), so producers that need a
+# truly isolated config should also write a temp global config dir
+# via ``OPENCODE_CONFIG_DIR`` before spawning the harness subprocess.
+_OPENCODE_CONFIG_CONTENT_ENV = "OPENCODE_CONFIG_CONTENT"
+_OPENCODE_DISABLE_PROJECT_CONFIG_ENV = "OPENCODE_DISABLE_PROJECT_CONFIG"
+
 # OpenCode emits one JSON object per line on stdout when invoked
 # with ``--format json``. Per packages/opencode/src/cli/cmd/run.ts
 # the event envelope is::
@@ -319,6 +348,92 @@ def _translate_event(
     return []
 
 
+def _resolve_mcp_servers_env() -> dict[str, Any]:
+    """Decode ``HARNESS_OPENCODE_MCP_SERVERS`` into the OpenCode MCP map.
+
+    The env var is a JSON object whose entries match OpenCode's
+    ``ConfigMCPV1.Info`` shape — typically::
+
+        {
+          "omnigent": {
+            "type":    "remote",
+            "url":     "http://127.0.0.1:<port>/mcp",
+            "headers": {"Authorization": "Bearer ..."}
+          }
+        }
+
+    Producers that want to suppress a user's globally-registered MCP
+    server (because it would leak into orchestrator-driven turns) can
+    include an entry like ``{"<server>": {"enabled": false}}`` —
+    OpenCode's ``Config.layer`` merge preserves disabled entries.
+
+    A malformed value RAISES rather than silently dropping, since the
+    env var is written by the parent omnigent process and a bad value
+    is a producer-side bug.
+
+    :returns: The decoded map, or empty when the env var is unset.
+    :raises ValueError: When the env var is set but isn't a JSON
+        object.
+    """
+    raw = os.environ.get(_ENV_MCP_SERVERS, "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"{_ENV_MCP_SERVERS} is set but is not valid JSON ({exc}). "
+            "Producers writing this env var must emit a JSON object."
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            f"{_ENV_MCP_SERVERS} decoded to {type(parsed).__name__}; "
+            "expected a JSON object keyed by MCP server name."
+        )
+    return parsed
+
+
+def _build_opencode_config_content() -> dict[str, Any] | None:
+    """Synthesise the ``OPENCODE_CONFIG_CONTENT`` payload, if any.
+
+    Combines the gateway-routing env vars and the MCP-bridge env var
+    into one JSON-serialisable dict matching OpenCode's
+    ``ConfigV1.Info`` schema. Returns ``None`` when nothing is
+    configured — callers pass through without setting the env var so
+    OpenCode's normal config-discovery path runs unchanged.
+
+    Gateway override (per
+    ``packages/opencode/src/provider/provider.ts`` ``resolveSDK``)
+    flows through ``provider.<id>.options.baseURL`` and
+    ``provider.<id>.options.apiKey``. ``HARNESS_OPENCODE_GATEWAY_PROVIDER``
+    chooses the provider id; the default ``"anthropic"`` matches the
+    most common gateway shape (Databricks AI gateway →
+    Anthropic-compatible endpoint).
+    """
+    base_url = os.environ.get(_ENV_GATEWAY_BASE_URL, "").strip()
+    api_key = os.environ.get(_ENV_GATEWAY_API_KEY, "").strip()
+    mcp_servers = _resolve_mcp_servers_env()
+
+    if not base_url and not api_key and not mcp_servers:
+        return None
+
+    payload: dict[str, Any] = {}
+
+    if base_url or api_key:
+        provider_id = os.environ.get(_ENV_GATEWAY_PROVIDER, "").strip() or "anthropic"
+        options: dict[str, Any] = {}
+        if base_url:
+            options["baseURL"] = base_url
+        if api_key:
+            options["apiKey"] = api_key
+        payload["provider"] = {provider_id: {"options": options}}
+
+    if mcp_servers:
+        payload["mcp"] = mcp_servers
+
+    return payload
+
+
 class OpenCodeExecutor(Executor):
     """Drive the OpenCode CLI as a per-turn subprocess.
 
@@ -344,12 +459,40 @@ class OpenCodeExecutor(Executor):
         skip_raw = os.environ.get(_ENV_SKIP_PERMISSIONS)
         self._skip_permissions = True if skip_raw is None else _parse_truthy(skip_raw)
         self._session_ids: dict[str, str] = {}
+        # One-time guard for the "spec tools declared but no MCP
+        # bridge wired" warning — see run_turn.
+        self._warned_no_mcp_bridge = False
 
     def _resolve_binary(self) -> str:
         """Locate ``opencode`` lazily and cache the path."""
         if self._binary is None:
             self._binary = _resolve_opencode_binary()
         return self._binary
+
+    def _build_spawn_env(self) -> dict[str, str]:
+        """Return the env mapping for the per-turn ``opencode run`` subprocess.
+
+        Inherits the harness subprocess's environment so user PATH /
+        XDG vars / shell config stay accessible, then layers in the
+        gateway / MCP overrides that the producer wrote into the
+        ``HARNESS_OPENCODE_GATEWAY_*`` and ``HARNESS_OPENCODE_MCP_*``
+        env vars. The resulting ``OPENCODE_CONFIG_CONTENT`` is merged
+        on top of the user's global config by ``Config.layer`` in
+        OpenCode itself — so this is non-destructive for the
+        operator's ``~/.config/opencode/config.json``.
+
+        ``OPENCODE_DISABLE_PROJECT_CONFIG=1`` is set unconditionally
+        when we generate a config override so a user-project
+        ``opencode.json`` cannot silently re-introduce the
+        provider/MCP entries the producer wanted suppressed.
+        """
+        env = dict(os.environ)
+        payload = _build_opencode_config_content()
+        if payload is None:
+            return env
+        env[_OPENCODE_CONFIG_CONTENT_ENV] = json.dumps(payload, separators=(",", ":"))
+        env[_OPENCODE_DISABLE_PROJECT_CONFIG_ENV] = "1"
+        return env
 
     def _session_key_for(self, messages: list[Message]) -> str | None:
         """Pull the Omnigent session_key off the inbound messages, if present.
@@ -377,13 +520,34 @@ class OpenCodeExecutor(Executor):
     ) -> AsyncIterator[ExecutorEvent]:
         """Run one OpenCode turn.
 
-        ``tools`` and ``system_prompt`` are accepted for ABI
-        compatibility but ignored — OpenCode loads tools and
-        instructions from its own configuration. Wiring spec
-        tools through ``dynamicTools`` is a follow-up once the
-        per-turn event stream lands.
+        ``system_prompt`` is accepted for ABI compatibility but
+        ignored — OpenCode loads instructions from its own
+        configuration (``opencode auth`` + ``opencode.json``).
+
+        ``tools`` is forwarded by the adapter but **not yet bridged
+        into the OpenCode subprocess** in this build. The producer
+        side (workflow.py spawn-env builder) can populate
+        ``HARNESS_OPENCODE_MCP_SERVERS`` to register an Omnigent
+        MCP endpoint that exposes spec tools — that env var is
+        consumed by :func:`_build_opencode_config_content` and
+        flows into ``OPENCODE_CONFIG_CONTENT.mcp``. The in-process
+        FastMCP server that would serve that endpoint is intentionally
+        out of scope for v1 (it needs careful lifecycle and
+        :attr:`_tool_executor` callback plumbing); when ``tools`` is
+        non-empty and no MCP server has been wired we log a one-time
+        warning so the user knows their spec tools aren't reaching
+        OpenCode.
         """
-        del tools, system_prompt
+        del system_prompt
+        if tools and not os.environ.get(_ENV_MCP_SERVERS) and not self._warned_no_mcp_bridge:
+            logger.warning(
+                "opencode harness: %d spec tool(s) declared but no Omnigent "
+                "MCP server is registered (HARNESS_OPENCODE_MCP_SERVERS is "
+                "unset). Tools will not be exposed to OpenCode. Set the env "
+                "var to an Omnigent-served MCP endpoint to bridge them.",
+                len(tools),
+            )
+            self._warned_no_mcp_bridge = True
         binary = self._resolve_binary()
         omnigent_session_key = self._session_key_for(messages)
         opencode_session_id = (
@@ -424,12 +588,15 @@ class OpenCodeExecutor(Executor):
             self._cwd or "<inherited>",
         )
 
+        spawn_env = self._build_spawn_env()
+
         try:
             process = await asyncio.create_subprocess_exec(
                 *argv,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self._cwd or None,
+                env=spawn_env,
             )
         except FileNotFoundError as exc:
             yield ExecutorError(

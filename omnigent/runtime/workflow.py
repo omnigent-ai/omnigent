@@ -139,7 +139,7 @@ _logger = logging.getLogger(__name__)
 # (hyphen), e.g. ``"claude_sdk"`` → ``"claude-sdk"`` used by ``_HARNESS_MODULES``.
 
 
-AgentHarnessType = Literal["claude-sdk", "codex", "pi", "openai-agents-sdk"]
+AgentHarnessType = Literal["claude-sdk", "codex", "pi", "openai-agents-sdk", "opencode"]
 
 
 @dataclass(frozen=True)
@@ -406,6 +406,12 @@ _HARNESS_DATABRICKS_PROFILE: dict[AgentHarnessType, str] = {
     "codex": "HARNESS_CODEX_DATABRICKS_PROFILE",
     "pi": "HARNESS_PI_DATABRICKS_PROFILE",
     "openai-agents-sdk": "HARNESS_OPENAI_AGENTS_DATABRICKS_PROFILE",
+    # OpenCode reads no profile directly; it consumes the gateway base
+    # URL + token resolved from this profile via
+    # :func:`_apply_provider_to_opencode_databricks`. Keeping the entry
+    # lets callers that iterate the dict (e.g. the legacy reset paths)
+    # see opencode without crashing.
+    "opencode": "HARNESS_OPENCODE_DATABRICKS_PROFILE",
 }
 
 
@@ -555,6 +561,13 @@ def configure_agent_harness_with_provider(
         # Databricks AI gateway is one producer of that transport), record
         # the Databricks profile (Databricks-specific, used by the executor
         # for token refresh), then delegate gateway enrichment to ucode.
+        if harness_type == "opencode":
+            # OpenCode does not consume ucode's gateway-state map (it
+            # routes through OPENCODE_CONFIG_CONTENT instead). Resolve
+            # the Databricks workspace directly and write the two
+            # env vars the opencode executor reads.
+            _apply_databricks_profile_to_opencode(env, entry.profile)
+            return
         profile = entry.profile
         flag = _HARNESS_GATEWAY_FLAG.get(harness_type)
         if flag is not None:
@@ -567,6 +580,9 @@ def configure_agent_harness_with_provider(
     # Inline-family kinds: key / gateway / local.
     if harness_type == "pi":
         _apply_provider_to_pi(env, entry)
+        return
+    if harness_type == "opencode":
+        _apply_provider_to_opencode(env, entry)
         return
     family_name = _PROVIDER_HARNESS_FAMILY[harness_type]
     family = entry.family(family_name)
@@ -676,6 +692,158 @@ def _apply_provider_family(
         # Codex defaults to the Responses wire API; OpenRouter-style
         # chat-only gateways set wire_api: chat. See codex_harness.py.
         env["HARNESS_CODEX_WIRE_API"] = family.wire_api or RESPONSES_WIRE_API
+
+
+def _apply_databricks_profile_to_opencode(env: dict[str, str], profile: str | None) -> None:
+    """Resolve a Databricks profile and write opencode's gateway env vars.
+
+    OpenCode's config schema has no ``gateway`` flag and no dynamic
+    auth-command surface. To route it through the Databricks AI
+    gateway we resolve the workspace host + token here, then bake
+    them into ``HARNESS_OPENCODE_GATEWAY_BASE_URL`` +
+    ``HARNESS_OPENCODE_GATEWAY_API_KEY`` so the executor's
+    ``OPENCODE_CONFIG_CONTENT`` synthesis picks them up.
+
+    The Anthropic-compatible Databricks gateway endpoint is the
+    default: it matches OpenCode's default provider (``"anthropic"``)
+    and keeps the executor's gateway-provider env var unchanged.
+
+    :param env: Mutable spawn-env dict.
+    :param profile: Optional ``~/.databrickscfg`` profile name;
+        ``None`` falls back to the resolver's default (env vars then
+        DEFAULT profile).
+    :raises OmnigentError: When the profile cannot be resolved.
+    """
+    from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
+
+    try:
+        creds = resolve_databricks_workspace(profile)
+    except OSError as exc:
+        raise OmnigentError(
+            f"opencode (Databricks profile {profile!r}) could not resolve workspace "
+            f"credentials: {exc}. Run 'databricks auth login --host <workspace>' or "
+            "set DATABRICKS_HOST + DATABRICKS_TOKEN.",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+    env["HARNESS_OPENCODE_GATEWAY_PROVIDER"] = "anthropic"
+    env["HARNESS_OPENCODE_GATEWAY_BASE_URL"] = f"{creds.host}/serving-endpoints"
+    env["HARNESS_OPENCODE_GATEWAY_API_KEY"] = creds.token
+    if profile:
+        env["HARNESS_OPENCODE_DATABRICKS_PROFILE"] = profile
+
+
+def _apply_provider_to_opencode(env: dict[str, str], entry: ProviderEntry) -> None:
+    """Apply a provider entry to the opencode harness's gateway env vars.
+
+    OpenCode is multi-provider. Rather than picking one family for it
+    here, this looks for the first family the entry actually provides
+    in the order ``anthropic`` → ``openai`` (matching ``pi``'s family
+    preference) and writes the resulting base URL + key into
+    ``HARNESS_OPENCODE_GATEWAY_*`` env vars. The executor synthesises
+    these into an ``OPENCODE_CONFIG_CONTENT`` payload at spawn time
+    per ``packages/opencode/src/config/config.ts`` so the override is
+    per-invocation and non-destructive for the user's global
+    ``~/.config/opencode/config.json``.
+
+    Mirrors the inline-family dispatch in
+    :func:`_apply_provider_to_openai_agents` — the executor takes the
+    base URL + API key directly, with no separate ``GATEWAY`` enable
+    flag.
+
+    :param env: Mutable spawn-env dict, modified in place.
+    :param entry: The resolved provider entry; must declare at least
+        one of the supported families.
+    :raises OmnigentError: If the provider declares neither an
+        ``anthropic`` nor an ``openai`` family.
+    """
+    family: FamilyConfig | None = None
+    provider_id: str | None = None
+    for family_name, opencode_provider_id in (
+        (ANTHROPIC_FAMILY, "anthropic"),
+        (OPENAI_FAMILY, "openai"),
+    ):
+        candidate = entry.family(family_name)
+        if candidate is not None:
+            family = candidate
+            provider_id = opencode_provider_id
+            break
+    if family is None or provider_id is None:
+        raise OmnigentError(
+            f"provider {entry.name!r} has no 'anthropic' or 'openai' family — "
+            "the 'opencode' harness needs one of them to route through its "
+            "OPENCODE_CONFIG_CONTENT provider override. Add an "
+            "'anthropic:' or 'openai:' family block to that provider in "
+            "~/.omnigent/config.yaml.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    env["HARNESS_OPENCODE_GATEWAY_PROVIDER"] = provider_id
+    env["HARNESS_OPENCODE_GATEWAY_BASE_URL"] = family.base_url
+    if family.api_key:
+        env["HARNESS_OPENCODE_GATEWAY_API_KEY"] = family.api_key
+    else:
+        # OpenCode's config schema accepts a literal apiKey only —
+        # there's no dynamic auth-command surface. Resolve the
+        # shell command once now via ``_provider_auth_command`` so
+        # the operator gets a clear "credential needed" error here
+        # rather than a 401 from the gateway later. The materialised
+        # token is non-refreshing for the life of the subprocess —
+        # documented limitation; long-running sessions on rotating
+        # credentials should prefer a static ``api_key`` provider.
+        env["HARNESS_OPENCODE_GATEWAY_API_KEY"] = _materialise_one_shot_token(
+            _provider_auth_command(family)
+        )
+    # Per-spec model precedence: spec model > provider default.
+    if "HARNESS_OPENCODE_MODEL" not in env and family.default_model:
+        env["HARNESS_OPENCODE_MODEL"] = family.default_model
+
+
+def _materialise_one_shot_token(auth_command: str) -> str:
+    """Run *auth_command* in a shell and return its stdout, trimmed.
+
+    Used by the opencode dispatch path: OpenCode's config schema has
+    no dynamic auth-command surface — it wants a literal
+    ``options.apiKey``. So when the provider names an ``auth_command``
+    rather than a static ``api_key``, we run it once here to
+    materialise the token at spawn time.
+
+    Documented limitation: the token does not refresh for the life of
+    the subprocess. For a long-running session on rotating
+    credentials, prefer a static ``api_key`` provider.
+
+    :param auth_command: A shell command that prints the bearer token
+        to stdout, e.g. ``"printf %s $TOKEN"`` or
+        ``"databricks tokens get -o table"``.
+    :returns: The token stdout, with surrounding whitespace stripped.
+    :raises OmnigentError: If the command exits non-zero or prints
+        an empty token.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            auth_command,
+            shell=True,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise OmnigentError(
+            f"opencode auth-command failed to run: {exc}. "
+            "Use a 'api_key' provider for opencode, or fix the "
+            "auth-command so it returns a token within 60s.",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+    token = result.stdout.strip()
+    if result.returncode != 0 or not token:
+        stderr_excerpt = (result.stderr or "").strip()[:512]
+        raise OmnigentError(
+            f"opencode auth-command exited with code {result.returncode} "
+            f"and produced no token. Stderr: {stderr_excerpt!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return token
 
 
 def _apply_provider_to_openai_agents(env: dict[str, str], family: FamilyConfig) -> None:
@@ -1388,6 +1556,83 @@ def _build_openai_agents_sdk_spawn_env(spec: AgentSpec) -> dict[str, str]:
         ucode_profile,
         harness_type="openai-agents-sdk",
     )
+    return env
+
+
+def _build_opencode_spawn_env(
+    spec: AgentSpec,
+    *,
+    workdir: Path | None = None,
+) -> dict[str, str]:
+    """Build the env-var dict the opencode harness wrap reads.
+
+    Maps spec.executor fields → the ``HARNESS_OPENCODE_*`` env vars
+    defined in :mod:`omnigent.inner.opencode_harness`.
+
+    Compared with the SDK-wrapping builders, this one is short
+    because OpenCode's executor is configured by a single
+    ``OPENCODE_CONFIG_CONTENT`` JSON payload synthesised at spawn
+    time from the gateway env vars — no per-family base-URL maps,
+    no separate ``WIRE_API`` knob.
+
+    Auth resolution (highest first):
+
+    1. ``executor.auth: {type: provider, name: X}`` *or* the per-family
+       global default — routes through
+       :func:`_apply_provider_to_opencode`.
+    2. ``executor.auth: {type: databricks, profile: P}`` *or* legacy
+       ``executor.profile`` / ``config["profile"]`` — resolves the
+       workspace creds via :func:`_apply_databricks_profile_to_opencode`.
+    3. Nothing configured — OpenCode uses its own
+       ``opencode auth login`` credentials.
+
+    :param spec: The agent spec.
+    :param workdir: The bundle's on-disk path. Threaded through as
+        ``HARNESS_OPENCODE_CWD`` when set, so the executor's
+        ``--dir`` flag points at the bundle and not the
+        Omnigent-runner's cwd.
+    :returns: A dict of env-var overrides.
+    """
+    env: dict[str, str] = {}
+    model = _resolve_spec_model(spec)
+    if model is not None:
+        env["HARNESS_OPENCODE_MODEL"] = model
+    if workdir is not None:
+        env["HARNESS_OPENCODE_CWD"] = str(workdir)
+
+    provider = _resolve_provider_for_build(spec, harness_type="opencode")
+    if provider is not None:
+        configure_agent_harness_with_provider(env, provider, harness_type="opencode")
+        return env
+
+    spec_auth = spec.executor.auth
+    auth: ApiKeyAuth | DatabricksAuth | None = (
+        spec_auth if isinstance(spec_auth, (ApiKeyAuth, DatabricksAuth)) else None
+    )
+    _spec_has_legacy_profile = bool(spec.executor.profile or spec.executor.config.get("profile"))
+    if auth is None and not _spec_has_legacy_profile:
+        auth = _load_global_auth()
+
+    if isinstance(auth, ApiKeyAuth):
+        # Static key → bake into the gateway override directly. The
+        # provider id stays at the executor's default ("anthropic")
+        # unless the user also set HARNESS_OPENCODE_GATEWAY_PROVIDER
+        # in their shell.
+        env["HARNESS_OPENCODE_GATEWAY_API_KEY"] = auth.api_key
+        if auth.base_url:
+            env["HARNESS_OPENCODE_GATEWAY_BASE_URL"] = auth.base_url
+        return env
+    if isinstance(auth, DatabricksAuth):
+        _apply_databricks_profile_to_opencode(env, auth.profile or None)
+        return env
+
+    # Legacy ``executor.profile`` / ``executor.config["profile"]``:
+    # treat as a Databricks profile, matching the other harnesses'
+    # legacy paths.
+    legacy_profile = spec.executor.config.get("profile") or spec.executor.profile or None
+    if legacy_profile:
+        _apply_databricks_profile_to_opencode(env, str(legacy_profile))
+
     return env
 
 

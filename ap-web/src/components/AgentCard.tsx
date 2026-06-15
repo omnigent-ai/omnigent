@@ -25,6 +25,10 @@ function iconForAgent(agent: AvailableAgent): ComponentType<SVGProps<SVGSVGEleme
   if (agent.harness?.includes("claude")) return ClaudeIcon;
   // Exact match — a substring check would false-match e.g. "openapi".
   if (agent.harness === "pi") return PiIcon;
+  // ``opencode`` is multi-provider and ships no first-party glyph in
+  // this repo yet; it falls through to the generic ``BotIcon``. Add
+  // a dedicated ``OpenCodeIcon`` here once one lands under
+  // ``components/icons/``.
   return BotIcon;
 }
 
