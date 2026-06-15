@@ -348,6 +348,28 @@ jobs:
           retention-days: 3
           if-no-files-found: ignore
 
+      - name: Dump ~/.claude state on failure (TEMP)
+        # The native-claude transcript + config live under ~/.claude (a hidden
+        # dir the absolute-path artifact glob missed). Copy them under /tmp so
+        # the server-logs upload captures the Claude transcript (API errors) and
+        # ~/.claude.json (first-run gate state). REVERT with the rest.
+        if: failure()
+        run: |
+          mkdir -p /tmp/claude-home-dump
+          cp -r "$HOME/.claude/projects" /tmp/claude-home-dump/ 2>/dev/null || true
+          cp "$HOME/.claude.json" /tmp/claude-home-dump/claude.json 2>/dev/null || true
+          # Redact the bearer token from the copied config before upload.
+          if [ -f /tmp/claude-home-dump/claude.json ]; then
+            python3 - <<'PY' || true
+          import json, pathlib, re
+          p = pathlib.Path("/tmp/claude-home-dump/claude.json")
+          txt = p.read_text()
+          # Scrub any apiKeyHelper printf token and obvious bearer-looking values.
+          txt = re.sub(r'(printf %s )\S+', r'\1<REDACTED>', txt)
+          p.write_text(txt)
+          PY
+          fi
+
       - name: Upload server logs on failure
         id: upload_server_logs
         if: failure()
@@ -369,7 +391,8 @@ jobs:
             /tmp/pytest-of-runner/**/e2e_ui_server*/server.log
             /tmp/pytest-of-runner/**/e2e_ui_server*/runner.log
             /tmp/omnigent-*/claude-native/**
-            /home/runner/.claude/projects/**/*.jsonl
+            /tmp/claude-home-dump/**
+            /tmp/claude-tui-*.png
           retention-days: 3
           if-no-files-found: ignore
 
