@@ -119,7 +119,7 @@ def test_resize_height_affects_viewport_ceiling(
 
     # Small terminal: 10 rows → ceiling = 10 - 5 = 5.
     monkeypatch.setattr("omnigent_ui_sdk.terminal._host._term_height", lambda: 10)
-    ceiling_small = 10 - _BOTTOM_RESERVED_ROWS
+    ceiling_small = max(1, 10 - _BOTTOM_RESERVED_ROWS)
 
     # Stream many lines.
     for i in range(20):
@@ -169,13 +169,14 @@ def test_resize_mid_stream_changes_ceiling(
     _noop_stdout(monkeypatch)
 
     # Start with a tall terminal: ceiling = 20 - 5 = 15.
-    height = 20
+    height = 25
     monkeypatch.setattr("omnigent_ui_sdk.terminal._host._term_height", lambda: height)
+    ceiling_start = max(1, height - _BOTTOM_RESERVED_ROWS)
     for i in range(10):
         host.output(StreamingText(text=f"line {i}\n"))
 
     # 10 lines streamed — still under the ceiling of 15.
-    assert host._streamed_line_count == 10
+    assert host._streamed_line_count == min(10, ceiling_start)
 
     # Shrink terminal mid-stream to 8 rows → ceiling = 8 - 5 = 3.
     # The streamed count is already 10, which is way above the new
@@ -285,7 +286,7 @@ def test_resize_live_region_cap_changes_with_height(
     host_small = TerminalHost(model_name="test")
     monkeypatch.setattr("omnigent_ui_sdk.terminal._host._term_height", lambda: 15)
     host_small.output(StreamLive(renderable=Text(long_text)))
-    ceiling_small = 15 - _BOTTOM_RESERVED_ROWS
+    ceiling_small = max(1, 15 - _BOTTOM_RESERVED_ROWS)
 
     assert host_small._live_line_count <= ceiling_small, (
         f"Expected _live_line_count <= {ceiling_small} at height 15, "
@@ -297,11 +298,11 @@ def test_resize_live_region_cap_changes_with_height(
 
     # Tall terminal: ceiling = 40 - 5 = 35.
     host_tall = TerminalHost(model_name="test")
-    monkeypatch.setattr("omnigent_ui_sdk.terminal._host._term_height", lambda: 40)
+    monkeypatch.setattr("omnigent_ui_sdk.terminal._host._term_height", lambda: 50)
     host_tall.output(StreamLive(renderable=Text(long_text)))
 
     # 30 lines fits within ceiling 35 — should be uncapped.
     assert host_tall._live_line_count == 30, (
-        f"Expected _live_line_count == 30 (all lines fit within ceiling 35), "
+        f"Expected _live_line_count == 30 (all lines fit within the tall ceiling), "
         f"got {host_tall._live_line_count}."
     )

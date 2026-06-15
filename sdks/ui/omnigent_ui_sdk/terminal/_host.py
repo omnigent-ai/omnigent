@@ -621,15 +621,14 @@ def _prompt_input_max_rows() -> int:
 
 
 # Rows the host doesn't get to use for scrollable output: prompt-toolkit's
-# pinned input area + bottom toolbar + a one-row safety margin. The
+# pinned input area, bottom toolbar, and safety margin for tight PTYs. The
 # cursor-up + erase replace path needs the streamed line count to fit
 # UNDER this ceiling — anything beyond can't be reached because the
 # scrolled-off rows live in the terminal's scrollback buffer, not the
-# active viewport. Empirically tuned: prompt-toolkit's default layout
-# reserves ~3 rows for the input line + toolbar; we add 2 more so a
-# slightly-too-large response degrades gracefully (skip the replace)
-# instead of partial-clearing into the duplicate-render bug.
-_BOTTOM_RESERVED_ROWS: int = 5
+# active viewport. Keep the reserve conservative: long responses still
+# render in full via StreamReplace, while printing too many live rows can
+# leave duplicate raw text in scrollback.
+_BOTTOM_RESERVED_ROWS: int = 11
 
 
 # Idempotency guard for the CSI-u escape-sequence registrations
@@ -2635,7 +2634,7 @@ class TerminalHost:
                 # ``_print_text_line`` — see ``_should_stream_more``
                 # for why printing past the ceiling causes the
                 # scrollback-duplicate-render bug.
-                if not self._should_stream_more():
+                if not self._should_stream_more(1):
                     continue
                 print(linkify_ansi(f"{self.text_indent}{line}"), flush=True)
                 self._streamed_line_count += 1
@@ -2682,9 +2681,9 @@ class TerminalHost:
         ``replace_streamed_text``'s cursor-up reaches every printed
         line — preventing the scrollback-duplicate render.
         """
-        if not self._should_stream_more():
-            return
         if not text.strip():
+            if not self._should_stream_more(1):
+                return
             print(flush=True)
             self._streamed_line_count += 1
             return
@@ -2697,10 +2696,13 @@ class TerminalHost:
             initial_indent=indent,
             subsequent_indent=indent,
         )
-        self._streamed_line_count += wrapped.count("\n") + 1
+        wrapped_line_count = wrapped.count("\n") + 1
+        if not self._should_stream_more(wrapped_line_count):
+            return
+        self._streamed_line_count += wrapped_line_count
         print(linkify_ansi(wrapped), flush=True)
 
-    def _should_stream_more(self) -> bool:
+    def _should_stream_more(self, pending_lines: int = 1) -> bool:
         """
         Whether the streaming path may print another line.
 
@@ -2724,12 +2726,14 @@ class TerminalHost:
         ``_paragraph_buffer`` holds the full text — no content is
         lost from the gating.
 
+        :param pending_lines: Number of terminal rows the pending
+            print would add.
         :returns: ``True`` if there's still room in the viewport for
-            another streamed line; ``False`` once the line count has
-            hit the ceiling.
+            the pending streamed rows; ``False`` once the line count
+            would exceed the ceiling.
         """
         ceiling = max(1, _term_height() - _BOTTOM_RESERVED_ROWS)
-        return self._streamed_line_count < ceiling
+        return self._streamed_line_count + pending_lines <= ceiling
 
     def clear_streamed_text(self) -> None:
         """Clear the previously streamed text lines using ANSI escapes.

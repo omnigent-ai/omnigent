@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -810,6 +811,16 @@ def _parse_optional_int(value: str | None) -> int | None:
         return None
 
 
+def _claude_temp_namespace() -> str:
+    """Return a stable per-user namespace for Claude CLI temp files."""
+
+    getuid = getattr(os, "getuid", None)
+    if getuid is not None:
+        return str(getuid())
+    user_key = os.environ.get("USERNAME") or os.environ.get("USER") or str(pathlib.Path.home())
+    return "win-" + hashlib.sha256(user_key.encode("utf-8", "surrogatepass")).hexdigest()[:12]
+
+
 def _claude_internal_write_roots() -> list[pathlib.Path]:
     """Writable roots the Claude CLI needs for its own local session state."""
 
@@ -819,7 +830,7 @@ def _claude_internal_write_roots() -> list[pathlib.Path]:
         pathlib.Path.home() / ".claude" / "session-env",
         pathlib.Path.home() / ".claude" / "sessions",
         pathlib.Path.home() / ".npm" / "_logs",
-        pathlib.Path(tempfile.gettempdir()) / f"claude-{os.getuid()}",
+        pathlib.Path(tempfile.gettempdir()) / f"claude-{_claude_temp_namespace()}",
     ]
     for root in roots:
         root.mkdir(parents=True, exist_ok=True)
