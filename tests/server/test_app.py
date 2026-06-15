@@ -519,6 +519,42 @@ def test_ensure_default_polly_agent_seeds_card(seed_stores: _SeedStores) -> None
     assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
 
 
+def test_ensure_default_polly_codex_agent_clones_polly_with_codex_brain(
+    seed_stores: _SeedStores,
+) -> None:
+    """
+    Seeding registers a separate polly clone whose root orchestrator uses Codex.
+
+    The clone must keep polly's bundle structure while changing only the launch
+    identity and top-level harness; otherwise the Web UI card would either be a
+    duplicate polly row or would not actually run the requested Codex brain.
+    """
+    server_app._ensure_default_polly_codex_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+
+    seeded = seed_stores.agent_store.get_by_name(server_app._POLLY_CODEX_AGENT_NAME)
+    assert seeded is not None, "polly-codex was not registered"
+    assert seeded.name == "polly-codex"
+    assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
+
+    spec = seed_stores.agent_cache.load(seeded.id, seeded.bundle_location).spec
+    assert spec.name == "polly-codex"
+    assert spec.executor.config["harness"] == "codex"
+    assert spec.executor.config["model"] == "gpt-5.5"
+    assert spec.executor.config["reasoning_effort"] == "low"
+    assert sorted(spec.tools.agents) == [
+        "claude_code",
+        "codex",
+        "cursor",
+        "gemini",
+        "mimo",
+        "pi",
+    ]
+
+
 def test_ensure_default_polly_agent_is_idempotent(seed_stores: _SeedStores) -> None:
     """
     A second seed call is a no-op — it must not register a duplicate.

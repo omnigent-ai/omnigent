@@ -71,8 +71,11 @@ _WEB_UI_GZIP_MINIMUM_SIZE = 1024
 _CLAUDE_NATIVE_AGENT_NAME = "claude-native-ui"
 _CODEX_NATIVE_AGENT_NAME = "codex-native-ui"
 _CURSOR_NATIVE_AGENT_NAME = "cursor-native-ui"
+_MIMO_NATIVE_AGENT_NAME = "mimo-native-ui"
+_GEMINI_NATIVE_AGENT_NAME = "gemini-native-ui"
 _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
+_POLLY_CODEX_AGENT_NAME = "polly-codex"
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
 # polly's and debby's multi-file bundles are packaged under
 # omnigent.resources.examples (see pyproject package-data), so they resolve
@@ -345,8 +348,11 @@ def _ensure_default_agents(
     _ensure_default_claude_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_codex_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_cursor_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_mimo_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_gemini_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_debby_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_polly_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_polly_codex_agent(agent_store, artifact_store, agent_cache)
     _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
 
 
@@ -472,10 +478,11 @@ def _build_codex_native_bundle() -> bytes:
     import tempfile
 
     from omnigent.codex_native import _materialize_codex_agent_spec
+    from omnigent.inner.codex_executor import _OPENAI_CODEX_DEFAULT_MODEL
     from omnigent.spec import materialize_bundle
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        spec_path = _materialize_codex_agent_spec(Path(tmpdir), model=None)
+        spec_path = _materialize_codex_agent_spec(Path(tmpdir), model=_OPENAI_CODEX_DEFAULT_MODEL)
         bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
         return _tar_gz_dir(bundle_dir)
 
@@ -546,6 +553,97 @@ def _ensure_default_cursor_agent(
         agent_cache,
         name=_CURSOR_NATIVE_AGENT_NAME,
         bundle_bytes=_build_cursor_native_bundle(),
+    )
+
+
+def _build_cli_native_bundle(*, name: str, harness: str, prompt: str) -> bytes:
+    """
+    Build a gzipped tarball for a simple CLI-harness built-in agent.
+
+    Mimo and Gemini use the same ACP-style headless harness shape as
+    Cursor but do not need a dedicated CLI wrapper module: the Web UI only
+    needs a built-in agent row whose spec declares the appropriate harness.
+
+    :param name: Built-in agent name, e.g. ``"mimo-native-ui"``.
+    :param harness: Harness id, e.g. ``"mimo"``.
+    :param prompt: System prompt for the generated agent spec.
+    :returns: Gzipped tarball bytes suitable for the artifact store.
+    """
+    import tempfile
+
+    import yaml
+
+    from omnigent.spec import materialize_bundle
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        yaml_path = tmp / f"{name}.yaml"
+        raw = {
+            "name": name,
+            "prompt": prompt,
+            "executor": {"harness": harness},
+            "os_env": {
+                "type": "caller_process",
+                "cwd": ".",
+                "sandbox": {"type": "none"},
+            },
+        }
+        yaml_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+        bundle_dir = materialize_bundle(yaml_path, tmp / "bundle")
+        return _tar_gz_dir(bundle_dir)
+
+
+def _ensure_default_mimo_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """
+    Register or refresh the mimo-native-ui agent.
+
+    Called during server lifespan startup so the Web UI can offer Mimo as a
+    built-in top-level agent, not only as a polly sub-agent or harness override.
+    """
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=_MIMO_NATIVE_AGENT_NAME,
+        bundle_bytes=_build_cli_native_bundle(
+            name=_MIMO_NATIVE_AGENT_NAME,
+            harness="mimo",
+            prompt=(
+                "You are a helpful AI assistant powered by Mimo. "
+                "Assist the user with their tasks."
+            ),
+        ),
+    )
+
+
+def _ensure_default_gemini_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """
+    Register or refresh the gemini-native-ui agent.
+
+    Called during server lifespan startup so the Web UI can offer Gemini as a
+    built-in top-level agent, not only as a polly sub-agent or harness override.
+    """
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=_GEMINI_NATIVE_AGENT_NAME,
+        bundle_bytes=_build_cli_native_bundle(
+            name=_GEMINI_NATIVE_AGENT_NAME,
+            harness="gemini",
+            prompt=(
+                "You are a helpful AI assistant powered by Gemini. "
+                "Assist the user with their tasks."
+            ),
+        ),
     )
 
 
@@ -625,6 +723,51 @@ def _build_polly_bundle() -> bytes:
         return _tar_gz_dir(bundle_dir)
 
 
+def _build_polly_codex_bundle() -> bytes:
+    """
+    Build a Codex-orchestrated clone of the packaged ``examples/polly`` bundle.
+
+    The clone keeps polly's sub-agent roster, skills, terminals, spawn flag, and
+    guardrails, but changes the root agent identity and orchestrator harness to
+    ``codex``. Building it at seed time avoids duplicating the whole bundle in
+    package data while keeping refresh/content-hash behavior identical to polly.
+
+    :returns: Gzipped tarball bytes suitable for the artifact store.
+    """
+    import shutil
+    import tempfile
+
+    import yaml
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        source = tmp / "source"
+        shutil.copytree(_POLLY_BUNDLE_SOURCE, source)
+        config_path = source / "config.yaml"
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        raw["name"] = _POLLY_CODEX_AGENT_NAME
+        raw["description"] = (
+            "Codex-orchestrated clone of polly. Delegates coding work to the "
+            "same Claude Code / Codex / Cursor / Mimo / Gemini / Pi sub-agents, "
+            "but runs the top-level orchestrator brain on the Codex harness."
+        )
+        executor = raw.setdefault("executor", {})
+        executor["type"] = "omnigent"
+        config = executor.setdefault("config", {})
+        config["harness"] = "codex"
+        config.setdefault("model", "gpt-5.5")
+        config.setdefault("reasoning_effort", "low")
+        prompt = raw.get("prompt")
+        if isinstance(prompt, str):
+            raw["prompt"] = prompt.replace(
+                "You are polly,",
+                "You are polly-codex, the Codex-orchestrated clone of polly,",
+                1,
+            )
+        config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+        return _tar_gz_dir(source)
+
+
 def _ensure_default_polly_agent(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
@@ -661,6 +804,33 @@ def _ensure_default_polly_agent(
         agent_cache,
         name=_POLLY_AGENT_NAME,
         bundle_bytes=_build_polly_bundle(),
+    )
+
+
+def _ensure_default_polly_codex_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """
+    Register the Codex-orchestrated polly clone if the polly bundle ships here.
+
+    This gives the Web UI a separate launchable card for users who want polly's
+    delegation workflow but prefer the top-level orchestrator to run on Codex.
+    """
+    if not (_POLLY_BUNDLE_SOURCE / "config.yaml").is_file():
+        _logger.debug(
+            "polly bundle not found at %s; skipping polly-codex seed",
+            _POLLY_BUNDLE_SOURCE,
+        )
+        return
+
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=_POLLY_CODEX_AGENT_NAME,
+        bundle_bytes=_build_polly_codex_bundle(),
     )
 
 
