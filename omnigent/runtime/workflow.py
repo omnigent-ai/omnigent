@@ -1224,18 +1224,43 @@ def _build_cursor_spawn_env(
     workdir: Path | None = None,
 ) -> dict[str, str]:
     """
-    Build the env-var dict the Cursor harness wrap reads.
+    Build the env-var dict the cursor harness wrap reads.
 
-    Cursor Agent CLI owns its provider/auth configuration; Omnigent
-    supplies model, cwd/sandbox, and display metadata.
+    Maps spec.executor fields → the ``HARNESS_CURSOR_*`` env vars defined
+    in ``omnigent/inner/cursor_harness.py``. Unlike the gateway-backed
+    builders (claude-sdk / codex / pi / openai-agents), there is NO gateway or
+    Databricks-profile resolution: cursor-agent talks only to Cursor's own
+    backend (``CURSOR_API_KEY`` / ``cursor-agent login``) and has no custom API
+    base-URL override, so it never routes through the Databricks AI gateway.
+
+    Auth: an explicit ``executor.auth: {type: api_key, api_key: ...}`` is
+    forwarded as ``HARNESS_CURSOR_API_KEY`` (cursor-agent reads it as
+    ``CURSOR_API_KEY``). With no api-key auth the harness falls back to an
+    inherited ``CURSOR_API_KEY`` or an existing ``cursor-agent login`` — a
+    ``DatabricksAuth`` profile does not apply to cursor and is ignored.
+
+    :param spec: The agent spec.
+    :param workdir: The bundle's on-disk path, threaded as
+        ``HARNESS_CURSOR_BUNDLE_DIR``.
+    :returns: A dict of env-var overrides for
+        :meth:`HarnessProcessManager.get_client(env=...)`.
     """
-    del workdir
     env: dict[str, str] = {}
     model = _resolve_spec_model(spec)
     if model is not None:
         env["HARNESS_CURSOR_MODEL"] = model
+    # Only an explicit api-key auth maps to cursor's CURSOR_API_KEY; Databricks
+    # / provider auth has no cursor equivalent and is left for cursor's own
+    # login / inherited CURSOR_API_KEY to satisfy.
+    if isinstance(spec.executor.auth, ApiKeyAuth):
+        env["HARNESS_CURSOR_API_KEY"] = spec.executor.auth.api_key
+    # Always set so the wrap doesn't fall back to ``"all"`` and override an
+    # explicit ``skills: none`` from the spec (parity with the peer builders).
+    env["HARNESS_CURSOR_SKILLS_FILTER"] = json.dumps(spec.skills_filter)
     if spec.name:
         env["HARNESS_CURSOR_AGENT_NAME"] = spec.name
+    if workdir is not None:
+        env["HARNESS_CURSOR_BUNDLE_DIR"] = str(workdir)
     os_env_payload = _serialize_os_env(spec.os_env)
     if os_env_payload is not None:
         env["HARNESS_CURSOR_OS_ENV"] = os_env_payload

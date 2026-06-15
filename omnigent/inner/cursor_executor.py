@@ -9,6 +9,7 @@ import os
 import shutil
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
@@ -29,6 +30,28 @@ from .executor import (
 logger = logging.getLogger(__name__)
 
 _STREAM_READ_CHUNK_SIZE = 4096
+
+# Prefix-matched env var names allowed into the cursor-agent subprocess. Only
+# known-safe categories pass: Cursor's own config knobs, proxy/TLS settings,
+# Node.js runtime knobs (cursor-agent bundles a Node runtime), and locale.
+# Credential families (``DATABRICKS_*``, ``AWS_*``, provider API keys, ...)
+# deliberately do NOT match — mirrors :data:`pi_executor._PI_ENV_ALLOW_PREFIXES`.
+_CURSOR_ENV_ALLOW_PREFIXES: tuple[str, ...] = (
+    "CURSOR_",
+    "HTTP_",
+    "HTTPS_",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "SSL_",
+    "NODE_",
+    "XDG_",
+    "LANG",
+    "LC_",
+)
+
+# databricks-* model ids are gateway-routed; cursor talks only to Cursor's
+# own backend and has no gateway, so such ids are silently dropped.
+_DATABRICKS_MODEL_PREFIX = "databricks-"
 
 
 async def _create_subprocess_exec(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
@@ -168,7 +191,10 @@ class CursorExecutor(Executor):
         os_env: OSEnvSpec | None = None,
         model: str | None = None,
         cursor_path: str | None = None,
+        api_key: str | None = None,
+        bundle_dir: Path | None = None,  # noqa: ARG002 — reserved for future use
         agent_name: str | None = None,
+        skills_filter: str | list[str] = "all",
     ) -> None:
         resolved_cursor = cursor_path or _find_cursor_cli()
         if not resolved_cursor:
@@ -181,9 +207,13 @@ class CursorExecutor(Executor):
         self._model = model
         self._agent_name = agent_name
         self._os_env_spec = os_env
+        self._skills_filter = skills_filter
         self._env = _clean_cursor_env(
             os_env.sandbox.env_passthrough if os_env is not None and os_env.sandbox else None
         )
+        # Inject API key if provided
+        if api_key:
+            self._env["CURSOR_API_KEY"] = api_key
         sandboxed = _try_sandbox_cursor(
             self._cursor_path,
             os_env,
@@ -197,9 +227,16 @@ class CursorExecutor(Executor):
         return True
 
     def _resolve_model(self, config: ExecutorConfig | None) -> str | None:
+        resolved_model: str | None
         if config is not None and config.model:
-            return config.model
-        return self._model
+            resolved_model = config.model
+        else:
+            resolved_model = self._model
+        # Drop databricks-* model ids since cursor has no gateway
+        if resolved_model and resolved_model.startswith(_DATABRICKS_MODEL_PREFIX):
+            resolved_model = resolved_model[len(_DATABRICKS_MODEL_PREFIX) :]
+            logger.debug("CursorExecutor: dropped databricks- prefix, using %s", resolved_model)
+        return resolved_model
 
     async def run_turn(
         self,
@@ -240,7 +277,9 @@ class CursorExecutor(Executor):
             env=self._env,
         )
 
-        stderr_task = asyncio.create_task(process.stderr.read() if process.stderr else _empty_bytes())
+        stderr_task = asyncio.create_task(
+            process.stderr.read() if process.stderr else _empty_bytes()
+        )
         response_text = ""
         streamed_any = False
         usage: dict[str, Any] | None = None
@@ -287,10 +326,10 @@ class CursorExecutor(Executor):
                         else:
                             response_text = text
                 elif event_type == "text":
-                    text = event.get("text") or event.get("delta")
-                    if isinstance(text, str) and text:
-                        yield TextChunk(text=text)
-                        response_text += text
+                    text_delta = event.get("text") or event.get("delta")
+                    if isinstance(text_delta, str) and text_delta:
+                        yield TextChunk(text=text_delta)
+                        response_text += text_delta
                         streamed_any = True
                 elif event_type == "result":
                     result_text = event.get("result")
