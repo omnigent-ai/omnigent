@@ -5,14 +5,6 @@ export interface NativeModelPickerOption {
   label: string;
 }
 
-function normalizeModelId(model: string): string {
-  return model
-    .trim()
-    .toLowerCase()
-    .replace(/^(databricks|openai|anthropic|claude)[-_/]+/, "")
-    .replace(/[._/]+/g, "-");
-}
-
 function unique(values: readonly string[]): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
@@ -37,7 +29,7 @@ export function codexModelPickerOptions(
 }
 
 /**
- * Find the Codex option matching a model id reported by either Omnigent or Codex.
+ * Find the Codex option matching a raw Codex model id.
  *
  * @param options - Codex model options from the session snapshot.
  * @param model - Candidate model id, e.g. ``"gpt-5.5"``.
@@ -49,17 +41,7 @@ export function findCodexModelOption(
 ): CodexModelOption | null {
   const raw = model?.trim();
   if (!raw) return null;
-  const lower = raw.toLowerCase();
-  const normalized = normalizeModelId(raw);
-  return (
-    options.find((option) => {
-      const ids = [option.id, option.model].map((value) => value.toLowerCase());
-      return (
-        ids.includes(lower) ||
-        ids.map(normalizeModelId).includes(normalized)
-      );
-    }) ?? null
-  );
+  return options.find((option) => option.id === raw) ?? null;
 }
 
 /**

@@ -57,12 +57,11 @@ describe("Codex model-list helpers", () => {
     ]);
   });
 
-  it("matches picker ids and provider model ids from the Codex catalog", () => {
+  it("matches only raw Codex picker ids from the Codex catalog", () => {
     expect(findCodexModelOption(CODEX_MODEL_OPTIONS, "gpt-5.5")?.id).toBe("gpt-5.5");
-    expect(findCodexModelOption(CODEX_MODEL_OPTIONS, "databricks-gpt-5-5")?.id).toBe(
-      "gpt-5.5",
-    );
+    expect(findCodexModelOption(CODEX_MODEL_OPTIONS, "databricks-gpt-5-5")).toBeNull();
     expect(isCodexNativeModel(CODEX_MODEL_OPTIONS, "gpt-5.4-mini")).toBe(true);
+    expect(isCodexNativeModel(CODEX_MODEL_OPTIONS, "databricks-gpt-5-4-mini")).toBe(false);
     expect(isCodexNativeModel(CODEX_MODEL_OPTIONS, "opus")).toBe(false);
   });
 
