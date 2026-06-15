@@ -2866,7 +2866,7 @@ def test_run_turn_bridge_extension_carries_live_server_token(monkeypatch) -> Non
 # ---------------------------------------------------------------------------
 # Pi token-usage → TurnComplete.usage tests
 #
-# pi (``@mariozechner/pi-coding-agent``) forwards assistant messages whose
+# pi (``@earendil-works/pi-coding-agent``) forwards assistant messages whose
 # ``usage`` object carries ``input`` / ``output`` / ``cacheRead`` /
 # ``cacheWrite`` / ``totalTokens`` token counts (plus a ``cost`` breakdown),
 # and the message itself carries the resolved ``model``. The executor maps

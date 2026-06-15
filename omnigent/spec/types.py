@@ -345,10 +345,10 @@ class _PiRetryAdapter:
         before subprocess spawn.
 
         Schema audited from
-        ``@mariozechner/pi-coding-agent@0.68.1/docs/settings.md``
-        (the package now ships as ``@earendil-works/pi-coding-agent``
-        — github.com/earendil-works/pi — with the same settings
-        schema). Pi natively implements exponential backoff with
+        ``@earendil-works/pi-coding-agent/docs/settings.md``
+        (github.com/earendil-works/pi — the maintained successor to the
+        deprecated ``@mariozechner/pi-coding-agent@0.68.1``, with the same
+        settings schema). Pi natively implements exponential backoff with
         jitter and ``Retry-After`` honoring; we configure the budget
         and shape.
 
