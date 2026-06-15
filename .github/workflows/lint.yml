@@ -57,6 +57,14 @@ jobs:
         with:
           python-version-file: ".python-version"
 
+      # Must run BEFORE any `uv` command: `uv sync` / `uv run` re-resolve
+      # the working tree against CI's own index (pypi.org) and would
+      # rewrite a committed proxy URL to canonical, masking it from the
+      # pre-commit hook below. This checks the committed file as-is
+      # (stdlib only, no venv needed).
+      - name: Check uv.lock uses the public PyPI index
+        run: python scripts/normalize_uv_lock_registry.py --check uv.lock
+
       - name: Set up uv
         uses: astral-sh/setup-uv@8d55fbecc275b1c35dbe060458839f8d30439ccf  # v3
         with:
