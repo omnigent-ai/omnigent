@@ -31,21 +31,31 @@
           --ring: #e8ecf0;
         }
       }
-      * { box-sizing: border-box; }
+      * {
+        box-sizing: border-box;
+      }
       body {
         margin: 0;
         min-height: 100vh;
         display: flex;
         align-items: center;
         justify-content: center;
-        font-family: ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji",
-          "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+        font-family:
+          ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji",
+          "Segoe UI Symbol", "Noto Color Emoji";
         background: var(--background);
         color: var(--foreground);
         padding: 0 16px;
       }
-      .card { width: 100%; max-width: 24rem; }
-      .logo { display: block; margin: 0 auto 12px; height: 80px; }
+      .card {
+        width: 100%;
+        max-width: 24rem;
+      }
+      .logo {
+        display: block;
+        margin: 0 auto 12px;
+        height: 80px;
+      }
       p.sub {
         margin: 0 0 24px;
         color: var(--muted-foreground);
@@ -70,7 +80,9 @@
         color: var(--foreground);
         outline: none;
       }
-      input::placeholder { color: var(--muted-foreground); }
+      input::placeholder {
+        color: var(--muted-foreground);
+      }
       input:focus-visible {
         border-color: var(--ring);
         box-shadow: 0 0 0 3px color-mix(in srgb, var(--ring) 50%, transparent);
@@ -82,7 +94,10 @@
         border-radius: var(--radius-lg);
         cursor: pointer;
       }
-      button:disabled { opacity: 0.5; cursor: default; }
+      button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
       #connect {
         margin-top: 16px;
         padding: 9px 12px;
@@ -94,7 +109,9 @@
       #connect:hover:not(:disabled) {
         background: color-mix(in srgb, var(--primary) 90%, transparent);
       }
-      .recents { margin-top: 24px; }
+      .recents {
+        margin-top: 24px;
+      }
       .recents-title {
         margin: 0 0 8px;
         font-size: 13px;
@@ -142,9 +159,17 @@
         <source srcset="assets/omnigents-logo-reverse.svg" media="(prefers-color-scheme: dark)" />
         <img class="logo" src="assets/omnigents-logo.svg" alt="Omnigents" />
       </picture>
-      <p class="sub">Enter the URL of the Omnigents server. The desktop app loads its web UI directly.</p>
+      <p class="sub">
+        Enter the URL of the Omnigents server. The desktop app loads its web UI directly.
+      </p>
       <label for="url">Server URL</label>
-      <input id="url" type="text" placeholder="http://localhost:6767" autocomplete="off" spellcheck="false" />
+      <input
+        id="url"
+        type="text"
+        placeholder="http://localhost:6767"
+        autocomplete="off"
+        spellcheck="false"
+      />
       <button id="connect">Connect</button>
       <div class="err" id="err"></div>
       <div class="recents" id="recents" hidden>

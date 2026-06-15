@@ -160,6 +160,7 @@ def test_build_codex_native_server_profile_error_names_profile(
         "omnigent.codex_native_app_server._read_databrickscfg",
         lambda _profile: None,
     )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / "missing-databrickscfg"))
 
     with pytest.raises(OSError, match="profile 'oss'"):
         build_codex_native_server(
@@ -172,6 +173,57 @@ def test_build_codex_native_server_profile_error_names_profile(
             ap_server_url=None,
             ap_auth_headers={},
         )
+
+
+def test_build_codex_native_server_uses_profile_host_without_static_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Native Codex accepts Databricks CLI OAuth profiles without static tokens.
+
+    A default Omnigent install may not include ``databricks-sdk`` in the
+    runner process. In that case ``_read_databrickscfg`` cannot mint a bearer
+    at startup, but the profile's host is still enough: Codex gets an
+    ``auth.command`` that runs ``databricks auth token --profile`` at request
+    time.
+    """
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server._find_codex_cli",
+        lambda: sys.executable,
+    )
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server._read_databrickscfg",
+        lambda _profile: None,
+    )
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "[oss]",
+                "host = https://example.cloud.databricks.com",
+                "auth_type = databricks-cli",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+
+    app_server = build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path,
+        model=None,
+        profile="oss",
+        bridge_dir=tmp_path / "bridge",
+        ap_server_url=None,
+        ap_auth_headers={},
+    )
+
+    overrides = "\n".join(app_server.config_overrides)
+    assert "https://example.cloud.databricks.com/ai-gateway/codex/v1" in overrides
+    assert 'databricks auth token --profile \\"oss\\"' in overrides
 
 
 def _test_app_server(

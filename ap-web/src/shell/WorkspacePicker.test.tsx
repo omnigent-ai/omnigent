@@ -17,10 +17,7 @@ import {
   parentOf,
   WorkspacePicker,
 } from "./WorkspacePicker";
-import {
-  useHostFilesystem,
-  type HostFilesystemEntry,
-} from "@/hooks/useHostFilesystem";
+import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
 
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: vi.fn(),
@@ -78,9 +75,7 @@ describe("parentOf", () => {
 
 describe("normalizeTypedPath", () => {
   it("returns the path unchanged for a clean absolute path", () => {
-    expect(normalizeTypedPath("/Users/corey/projects")).toBe(
-      "/Users/corey/projects",
-    );
+    expect(normalizeTypedPath("/Users/corey/projects")).toBe("/Users/corey/projects");
   });
 
   it("trims whitespace", () => {
@@ -92,9 +87,7 @@ describe("normalizeTypedPath", () => {
   it("collapses runs of slashes", () => {
     // A typo like "/Users//corey" should still navigate to the
     // intended directory rather than failing the listing.
-    expect(normalizeTypedPath("/Users//corey///foo")).toBe(
-      "/Users/corey/foo",
-    );
+    expect(normalizeTypedPath("/Users//corey///foo")).toBe("/Users/corey/foo");
   });
 
   it("strips a trailing slash", () => {
@@ -138,28 +131,20 @@ describe("normalizeTypedPath", () => {
     // The user from the bug report typed "~/omnigent"
     // and nothing happened. Now the picker expands it
     // client-side using the resolved home dir.
-    expect(
-      normalizeTypedPath("~/omnigent", "/Users/corey"),
-    ).toBe("/Users/corey/omnigent");
+    expect(normalizeTypedPath("~/omnigent", "/Users/corey")).toBe("/Users/corey/omnigent");
   });
 
   it("expands a bare tilde to the resolved home", () => {
-    expect(normalizeTypedPath("~", "/Users/corey")).toBe(
-      "/Users/corey",
-    );
+    expect(normalizeTypedPath("~", "/Users/corey")).toBe("/Users/corey");
   });
 
   it("collapses extra slashes after tilde expansion", () => {
     // ~//foo → home + "/" + "/foo" → run-of-slashes collapse.
-    expect(
-      normalizeTypedPath("~//projects", "/Users/corey"),
-    ).toBe("/Users/corey/projects");
+    expect(normalizeTypedPath("~//projects", "/Users/corey")).toBe("/Users/corey/projects");
   });
 
   it("strips a trailing slash after tilde expansion", () => {
-    expect(
-      normalizeTypedPath("~/projects/", "/Users/corey"),
-    ).toBe("/Users/corey/projects");
+    expect(normalizeTypedPath("~/projects/", "/Users/corey")).toBe("/Users/corey/projects");
   });
 
   it("does not support ~user form", () => {
@@ -248,9 +233,7 @@ describe("WorkspacePicker path bar", () => {
     useHostFilesystemMock.mockImplementation(() => result(listing));
 
     const { rerender } = render(<WorkspacePicker hostId="host_1" />);
-    const input = screen.getByTestId(
-      "workspace-picker-path-input",
-    ) as HTMLInputElement;
+    const input = screen.getByTestId("workspace-picker-path-input") as HTMLInputElement;
     fireEvent.change(input, { target: { value: "/Users/serena.ruan/Doc" } });
 
     // Home listing arrives — resolvedHome derives, currentAbsolute flips.
@@ -282,9 +265,7 @@ describe("WorkspacePicker path bar", () => {
     );
 
     render(<WorkspacePicker hostId="host_1" />);
-    const input = screen.getByTestId(
-      "workspace-picker-path-input",
-    ) as HTMLInputElement;
+    const input = screen.getByTestId("workspace-picker-path-input") as HTMLInputElement;
     fireEvent.click(screen.getByTestId("workspace-picker-entry-projects"));
     expect(input.value).toBe("/Users/serena.ruan/projects");
   });
@@ -304,13 +285,7 @@ describe("WorkspacePicker path bar", () => {
       }),
     );
     const onSelect = vi.fn();
-    render(
-      <WorkspacePicker
-        hostId="host_1"
-        initialPath="~/projects"
-        onSelect={onSelect}
-      />,
-    );
+    render(<WorkspacePicker hostId="host_1" initialPath="~/projects" onSelect={onSelect} />);
     fireEvent.click(screen.getByTestId("workspace-picker-select"));
     expect(onSelect).toHaveBeenCalledWith("/Users/corey/projects");
   });

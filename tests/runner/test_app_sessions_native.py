@@ -5198,6 +5198,15 @@ async def test_external_session_status_running_fans_out_child_busy_to_parent() -
         tool="codex",
         session_name="impl",
     )
+    runner_app.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="codex",
+        title="impl",
+    )
+    entry = runner_app.get_subagent_work(child_id)
+    assert entry is not None
+    assert entry.status == "launching"
 
     try:
         async with _runner_client(app) as client:
@@ -5206,9 +5215,13 @@ async def test_external_session_status_running_fans_out_child_busy_to_parent() -
                 json={"type": "external_session_status", "data": {"status": "running"}},
             )
         assert resp.status_code == 204, resp.text
+        entry = runner_app.get_subagent_work(child_id)
+        assert entry is not None
+        assert entry.status == "running"
 
         events = _drain_session_event_queue(runner_app._session_event_queues_ref.get(parent_id))
     finally:
+        runner_app.unregister_subagent_work(child_id)
         runner_app.unregister_child_session(child_id)
         runner_app._session_event_queues_ref.pop(parent_id, None)
         runner_app._session_event_queues_ref.pop(child_id, None)

@@ -146,7 +146,7 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
 // ``busy`` + ``current_task_status``). Drives the dot tone, whether the
 // label word shows, and whether the row is de-emphasized. ``awaiting`` =
 // parked on an approval / input prompt and needs the user's attention.
-type AgentActivity = "working" | "awaiting" | "done" | "failed" | "idle" | "other";
+type AgentActivity = "launching" | "working" | "awaiting" | "done" | "failed" | "idle" | "other";
 
 interface AgentStatus {
   activity: AgentActivity;
@@ -170,8 +170,11 @@ function childStatus(child: ChildSessionInfo): AgentStatus {
     return { activity: "awaiting", label: "Needs response" };
   }
   // ``busy`` is the authoritative live flag (queued or in_progress);
-  // ``current_task_status`` may be "completed", "failed", "cancelled",
-  // or null when no task has run yet.
+  // ``current_task_status`` may be "launching", "completed", "failed",
+  // "cancelled", or null when no task has run yet.
+  if (child.current_task_status === "launching") {
+    return { activity: "launching", label: "Launching" };
+  }
   if (child.busy) return { activity: "working", label: "Working" };
   if (child.current_task_status === "completed") return { activity: "done", label: "Done" };
   if (child.current_task_status === "failed") return { activity: "failed", label: "Failed" };
@@ -189,6 +192,7 @@ function childStatus(child: ChildSessionInfo): AgentStatus {
  * @returns The collapsed activity + its label.
  */
 function sessionStatus(status: string | undefined): AgentStatus {
+  if (status === "launching") return { activity: "launching", label: "Launching" };
   if (status === "running") return { activity: "working", label: "Working" };
   if (status === "failed") return { activity: "failed", label: "Failed" };
   return { activity: "idle", label: "Idle" };
@@ -203,6 +207,7 @@ const DOT_TONE: Record<Exclude<AgentActivity, "working" | "awaiting">, string> =
   done: "bg-muted-foreground/55",
   failed: "bg-destructive",
   idle: "bg-muted-foreground/55",
+  launching: "bg-muted-foreground/70",
   other: "bg-muted-foreground/55",
 };
 
@@ -211,6 +216,7 @@ const DOT_TONE: Record<Exclude<AgentActivity, "working" | "awaiting">, string> =
 // "active", so the redundant "Working" label is dropped. The eye still lands on
 // agents that need input or are in trouble, which keep their word.
 const QUIET_STATE: Record<AgentActivity, boolean> = {
+  launching: false,
   working: true,
   awaiting: false,
   failed: false,
@@ -223,6 +229,7 @@ const QUIET_STATE: Record<AgentActivity, boolean> = {
 // Kept separate from QUIET_STATE: ``working`` is quiet (no label word) but must
 // NOT be dimmed — an actively-working agent should stay full-strength.
 const SETTLED_STATE: Record<AgentActivity, boolean> = {
+  launching: false,
   working: false,
   awaiting: false,
   failed: false,

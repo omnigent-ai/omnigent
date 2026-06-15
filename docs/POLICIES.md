@@ -224,13 +224,13 @@ Scans user messages and LLM prompts for PII patterns (SSN, credit card, email, p
 
 #### `cost_budget`
 
-Gates a session on cumulative LLM spend, at the tool-call phase. ASKs the first time spend crosses each soft warning threshold. At the hard limit it acts as a **downgrade gate**, not a hard stop: it DENYs tool calls only while the session is on an expensive model -- telling the user to switch to a cheaper one with `/model` -- and allows them again once the session has switched.
+Gates a session on cumulative LLM spend, at the **request** phase (before the LLM turn, so text-only turns are budgeted too) and the **tool-call** phase. ASKs the first time spend crosses each soft warning threshold. At the hard limit it acts as a **downgrade gate**, not a hard stop: it DENYs (the whole turn on `request`, or each tool call on `tool_call`) only while the session is on an expensive model -- telling the user to switch to a cheaper one with `/model` -- and allows them again once the session has switched.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `max_cost_usd` | number | (required) | Hard spend limit in USD. Once reached, tool calls are blocked while the session is on an expensive model. |
+| `max_cost_usd` | number | (required) | Hard spend limit in USD. Once reached, the turn / tool calls are blocked while the session is on an expensive model. |
 | `ask_thresholds_usd` | number[] | `null` | Soft warning checkpoints that ASK the first time spend crosses each (each must be < `max_cost_usd`) |
-| `expensive_models` | string[] | Opus + GPT-5.5 | Case-insensitive substring tokens for the model tiers blocked once over budget (e.g. `"opus"` matches any Opus deployment). `[]` disables the hard limit, leaving only the soft thresholds. |
+| `expensive_models` | string[] | Fable + Opus + GPT-5 (excl. `-mini`/`-nano`) | Case-insensitive substring tokens for the model tiers blocked once over budget (e.g. `"opus"` matches any Opus deployment). The default's broad `gpt-5` token matches the whole GPT-5 family except the cheap `-mini`/`-nano` variants; an explicit list is matched literally with no exclusions. `[]` disables the hard limit, leaving only the soft thresholds. |
 
 ```yaml
 budget:
@@ -239,7 +239,7 @@ budget:
   factory_params:
     max_cost_usd: 5.00
     ask_thresholds_usd: [1.00, 3.00]
-    expensive_models: ["opus", "gpt-5.5"]
+    expensive_models: ["opus", "gpt-5"]
 ```
 
 #### `user_daily_cost_budget`
@@ -248,9 +248,9 @@ Same ASK / downgrade-gate behavior as `cost_budget`, but the budget is the **ses
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `max_cost_usd` | number | (required) | Hard daily limit in USD. Once the owner's spend for the day reaches it, tool calls are blocked while on an expensive model. |
+| `max_cost_usd` | number | (required) | Hard daily limit in USD. Once the owner's spend for the day reaches it, the turn / tool calls are blocked while on an expensive model. |
 | `ask_thresholds_usd` | number[] | `null` | Soft daily warning checkpoints that ASK the first time the owner's daily spend crosses each (each must be < `max_cost_usd`) |
-| `expensive_models` | string[] | Opus + GPT-5.5 | Case-insensitive substring tokens for the model tiers blocked once over the daily budget. `[]` disables the hard limit, leaving only the soft thresholds. |
+| `expensive_models` | string[] | Fable + Opus + GPT-5 (excl. `-mini`/`-nano`) | Case-insensitive substring tokens for the model tiers blocked once over the daily budget. An explicit list is matched literally with no exclusions. `[]` disables the hard limit, leaving only the soft thresholds. |
 
 ```yaml
 # server_config.yaml -- a per-user daily cap applied to every session

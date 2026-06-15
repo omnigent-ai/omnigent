@@ -179,14 +179,15 @@ export function TerminalsPanel({
       {/* Split content.
           Mobile: flex-col — list on top, xterm below.
           Desktop: flex-row — list on left, xterm on right. */}
-      <div ref={splitRef as React.RefObject<HTMLDivElement>} className="flex min-h-0 flex-1 flex-col md:flex-row overflow-hidden">
+      <div
+        ref={splitRef as React.RefObject<HTMLDivElement>}
+        className="flex min-h-0 flex-1 flex-col md:flex-row overflow-hidden"
+      >
         {/* List panel */}
         <div
           className={cn(
             "relative flex shrink-0 flex-col overflow-y-auto py-1",
-            activeTerminal
-              ? "border-b border-border md:border-b-0 md:border-r"
-              : "flex-1",
+            activeTerminal ? "border-b border-border md:border-b-0 md:border-r" : "flex-1",
           )}
           // Width only meaningful on desktop (horizontal split).
           style={activeTerminal && isDesktop ? { width: listWidth } : undefined}
@@ -212,9 +213,7 @@ export function TerminalsPanel({
                 onClick={() => setActiveKey(isActive ? null : key)}
               >
                 <TerminalIcon className="size-3.5 shrink-0 text-muted-foreground" />
-                {t.session && (
-                  <span className="shrink-0 text-xs font-medium">{t.session}</span>
-                )}
+                {t.session && <span className="shrink-0 text-xs font-medium">{t.session}</span>}
                 <span className="truncate text-xs text-muted-foreground/70">{t.name}</span>
                 <span className="flex-1" />
                 <TerminalStatusBadge status={getStatus(t)} />

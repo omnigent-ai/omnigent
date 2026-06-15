@@ -27,10 +27,7 @@ export interface FileDiffResponse {
   after: string | null;
 }
 
-async function fetchFileDiff(
-  conversationId: string,
-  path: string,
-): Promise<FileDiffResponse> {
+async function fetchFileDiff(conversationId: string, path: string): Promise<FileDiffResponse> {
   // Encode each path segment individually so slashes remain structural.
   const encodedPath = path.split("/").map(encodeURIComponent).join("/");
   const url =
@@ -49,23 +46,15 @@ async function fetchFileDiff(
  * - the runner is offline
  * - the file does not appear in the session's changed-files list
  */
-export function useFileDiff(
-  conversationId: string | undefined,
-  path: string | null,
-) {
+export function useFileDiff(conversationId: string | undefined, path: string | null) {
   const runnerOnline = useSessionRunnerOnline(conversationId);
   const changedFiles = useWorkspaceChangedFiles(conversationId);
-  const isInChangedFiles =
-    (changedFiles.data?.data.some((f) => f.path === path) ?? false);
+  const isInChangedFiles = changedFiles.data?.data.some((f) => f.path === path) ?? false;
 
   return useQuery({
     queryKey: ["file-diff", conversationId, path],
     queryFn: () => fetchFileDiff(conversationId!, path!),
-    enabled:
-      !!conversationId &&
-      !!path &&
-      runnerOnline !== false &&
-      isInChangedFiles,
+    enabled: !!conversationId && !!path && runnerOnline !== false && isInChangedFiles,
     staleTime: 5_000,
   });
 }

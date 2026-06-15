@@ -20,12 +20,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangleIcon, Check, Copy, MessageSquareOffIcon } from "lucide-react";
 import { useEditor, EditorContent } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
-import {
-  Table,
-  TableRow,
-  TableCell,
-  TableHeader,
-} from "@tiptap/extension-table";
+import { Table, TableRow, TableCell, TableHeader } from "@tiptap/extension-table";
 import { Markdown } from "@tiptap/markdown";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
@@ -94,7 +89,16 @@ export function MarkdownRichTextViewer({
   // preserved because the editor DOM is never torn down.
   const setContentRef = useRef<((content: string) => void) | null>(null);
 
-  const { editorKey, isDirty, setDirty, hasExternalUpdate, discardAndApplyExternal, dismissExternalUpdate, markSaved, reconcileServerContent } = useMarkdownEditorSync({
+  const {
+    editorKey,
+    isDirty,
+    setDirty,
+    hasExternalUpdate,
+    discardAndApplyExternal,
+    dismissExternalUpdate,
+    markSaved,
+    reconcileServerContent,
+  } = useMarkdownEditorSync({
     content,
     path,
     isSettled,
@@ -181,7 +185,12 @@ function MarkdownRichTextViewerInner({
 }: InnerProps) {
   const [isCopied, setIsCopied] = useState(false);
   const copyTimeoutRef = useRef<number>(0);
-  useEffect(() => () => { window.clearTimeout(copyTimeoutRef.current); }, []);
+  useEffect(
+    () => () => {
+      window.clearTimeout(copyTimeoutRef.current);
+    },
+    [],
+  );
   const scrollContainerRef = useRef<HTMLDivElement>(null);
 
   const handleCopyContent = useCallback(() => {
@@ -191,10 +200,7 @@ function MarkdownRichTextViewerInner({
       .then(() => {
         setIsCopied(true);
         window.clearTimeout(copyTimeoutRef.current);
-        copyTimeoutRef.current = window.setTimeout(
-          () => setIsCopied(false),
-          2000,
-        );
+        copyTimeoutRef.current = window.setTimeout(() => setIsCopied(false), 2000);
       })
       .catch(() => {
         // ignore clipboard errors
@@ -203,7 +209,9 @@ function MarkdownRichTextViewerInner({
 
   // Stable ref to the raw server content for comment offset mapping.
   const contentRef = useRef(content);
-  useEffect(() => { contentRef.current = content; }, [content]);
+  useEffect(() => {
+    contentRef.current = content;
+  }, [content]);
 
   // Baseline used to detect actual edits vs TipTap normalisation.
   const baselineRef = useRef<string | null>(null);
@@ -312,7 +320,9 @@ function MarkdownRichTextViewerInner({
     if (!editor) return;
     // Schedule only on focused (user) edits; a pre-focus normalisation update
     // re-baselines in onUpdate above and must not trigger a write.
-    const onUpdate = () => { if (editor.isFocused) autoSave.schedule(); };
+    const onUpdate = () => {
+      if (editor.isFocused) autoSave.schedule();
+    };
     const onBlur = () => autoSave.flush();
     editor.on("update", onUpdate);
     editor.on("blur", onBlur);
@@ -397,11 +407,7 @@ function MarkdownRichTextViewerInner({
             onClick={handleCopyContent}
             className="absolute top-3 right-3 z-10 flex items-center gap-1 rounded px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
           >
-            {isCopied ? (
-              <Check className="size-3.5" />
-            ) : (
-              <Copy className="size-3.5" />
-            )}
+            {isCopied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
             {isCopied ? "Copied!" : "Copy"}
           </button>
         )}
@@ -442,7 +448,8 @@ function MarkdownRichTextViewerInner({
       {canEdit && isDirty && !hasExternalUpdate && !saveDisabled && (
         <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-1.5 border-t border-border bg-muted/50 px-4 py-1.5 text-xs text-muted-foreground backdrop-blur-sm">
           <MessageSquareOffIcon className="size-3.5 shrink-0" />
-          {writeFile.isPending ? "Saving…" : "Unsaved changes —"} commenting is available once saved.
+          {writeFile.isPending ? "Saving…" : "Unsaved changes —"} commenting is available once
+          saved.
         </div>
       )}
       <MarkdownCommentPlugin

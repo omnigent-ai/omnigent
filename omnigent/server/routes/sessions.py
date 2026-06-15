@@ -41,6 +41,7 @@ import httpx
 from fastapi import (
     APIRouter,
     BackgroundTasks,
+    Depends,
     File,
     HTTPException,
     Query,
@@ -174,6 +175,10 @@ from omnigent.server.routes._auth_helpers import (
     require_user as _require_user,
 )
 from omnigent.server.routes._codex_elicitation import parse_codex_elicitation_request
+from omnigent.server.routes._content_type import (
+    require_json_content_type,
+    require_json_or_multipart_content_type,
+)
 from omnigent.server.routes._host_worktree import CreatedWorktree
 from omnigent.server.schemas import (
     AgentObject,
@@ -318,6 +323,9 @@ _EXTERNAL_ELICITATION_RESOLVED_TYPE: str = "external_elicitation_resolved"
 # (e.g. ``omnigent claude`` mirroring Claude Code's Stop hook into
 # the session stream so the web UI's idle/running indicator updates).
 # Payload shape: ``{"status": "idle" | "running" | "waiting" | "failed"}``.
+# ``launching`` is runner-local sub-agent bookkeeping (it rides in a child's
+# ``current_task_status``, never as an external session status) and is
+# intentionally absent from ``_EXTERNAL_SESSION_STATUS_VALUES`` below.
 _EXTERNAL_SESSION_STATUS_TYPE: str = "external_session_status"
 _EXTERNAL_SESSION_STATUS_VALUES: frozenset[str] = frozenset(
     {"idle", "running", "waiting", "failed"}
@@ -884,6 +892,28 @@ async def _poll_request_disconnect(request: Request) -> None:
         message = await request.receive()
         if message["type"] == "http.disconnect":
             return
+
+
+def _attachment_disposition(filename: str) -> str:
+    """Build a safe ``Content-Disposition: attachment`` header value.
+
+    The filename is user-controlled, so it cannot be interpolated
+    into the header verbatim — a quote or newline would let the
+    uploader inject header content or break parsing. We emit an
+    ASCII-only ``filename`` fallback (with quotes/backslashes/control
+    characters stripped) plus an RFC 5987 ``filename*`` parameter that
+    percent-encodes the full UTF-8 name for modern browsers.
+
+    :param filename: The stored, user-supplied filename.
+    :returns: A ``Content-Disposition`` header value forcing download.
+    """
+    # ASCII fallback: drop anything outside printable ASCII and the
+    # characters that are structurally significant in the header.
+    ascii_name = "".join(ch for ch in filename if 0x20 <= ord(ch) < 0x7F and ch not in '"\\')
+    if not ascii_name:
+        ascii_name = "download"
+    encoded = urllib.parse.quote(filename, safe="")
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded}"
 
 
 def _stored_file_to_resource(
@@ -11298,7 +11328,7 @@ async def _handle_mcp_tools_call(
                 "method": "tools/call",
                 "params": {"name": namespaced_name, "arguments": arguments},
             },
-            # ``sys_session_send`` returns a running handle immediately; this
+            # ``sys_session_send`` returns a launch handle immediately; this
             # timeout now protects ordinary runner proxy hangs.
             timeout=MCP_PROXY_FORWARD_TIMEOUT_S,
         )
@@ -11518,6 +11548,10 @@ def create_sessions_router(
         "/sessions",
         status_code=201,
         response_model=None,
+        # CSRF hardening: this route dispatches on Content-Type (JSON vs
+        # multipart bundled-create), so reject text/plain and other simple
+        # types up front while still allowing both legitimate body shapes.
+        dependencies=[Depends(require_json_or_multipart_content_type)],
     )
     async def create_session(
         request: Request,
@@ -13209,6 +13243,9 @@ def create_sessions_router(
     @router.post(
         "/sessions/{session_id}/hooks/permission-request",
         response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
     )
     async def claude_permission_request_hook(
         request: Request,
@@ -13481,6 +13518,9 @@ def create_sessions_router(
         # Returns EvaluationResponse JSON; no Pydantic model since the
         # proto-style schema is validated manually.
         response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
     )
     async def evaluate_policy(
         request: Request,
@@ -13670,6 +13710,9 @@ def create_sessions_router(
     @router.post(
         "/sessions/{session_id}/hooks/codex-elicitation-request",
         response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
     )
     async def codex_elicitation_request_hook(
         request: Request,
@@ -14265,6 +14308,9 @@ def create_sessions_router(
     @router.post(
         "/sessions/{session_id}/resources/terminals",
         response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
     )
     async def create_session_terminal(
         session_id: str,
@@ -14365,6 +14411,9 @@ def create_sessions_router(
     @router.post(
         "/sessions/{session_id}/resources/terminals/{terminal_id}/transfer",
         response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
     )
     async def transfer_session_terminal(
         request: Request,
@@ -14653,7 +14702,22 @@ def create_sessions_router(
             )
         content = artifact_store.get(stored.id)
         media_type = mimetypes.guess_type(stored.filename)[0] or "application/octet-stream"
-        return Response(content=content, media_type=media_type)
+        # The filename and bytes are fully user-controlled. Serving the
+        # content inline lets a browser navigating directly to this URL
+        # render an uploaded ``evil.html`` as ``text/html`` and execute
+        # its script in the server's own origin (stored XSS — acute on
+        # the OSS/local server, which has no CSRF/apiproxy boundary).
+        # Force a download with ``Content-Disposition: attachment`` and
+        # disable MIME sniffing so the response cannot be reinterpreted
+        # as an active type.
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={
+                "Content-Disposition": _attachment_disposition(stored.filename),
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     @router.delete(
         "/sessions/{session_id}/resources/files/{file_id}",
@@ -15051,6 +15115,9 @@ def create_sessions_router(
     @router.post(
         "/sessions/{session_id}/resources/environments/{environment_id}/shell",
         response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
     )
     async def run_environment_shell(
         session_id: str,
@@ -16987,6 +17054,10 @@ def create_sessions_router(
     @router.post(
         "/sessions/{session_id}/mcp",
         response_model=None,  # Returns a raw Response with application/json
+        # CSRF hardening: the MCP Streamable HTTP contract already mandates
+        # an application/json request body; enforce it so a cross-site
+        # text/plain request can't drive JSON-RPC against this proxy.
+        dependencies=[Depends(require_json_content_type)],
     )
     async def mcp_proxy(
         session_id: str,

@@ -20,6 +20,13 @@ repos:
         entry: .venv/bin/python -m ruff check --fix --force-exclude
         types: [python]
 
+      - id: ap-web-prettier
+        name: ap-web prettier
+        language: system
+        entry: npm --prefix ap-web exec -- prettier --write
+        files: ^ap-web/.*\.(css|html|js|jsx|json|md|mdx|ts|tsx|yaml|yml)$
+        exclude: ^omnigent/server/static/web-ui/assets/
+
   # ── File hygiene ────────────────────────────────────────────────
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0

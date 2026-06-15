@@ -397,14 +397,15 @@ export interface ClientTaskCancel {
 /**
  * `session.status` — session lifecycle transition.
  *
- * `waiting` arrives when the parent agent loop parks on
- * background tools / sub-agents. The session snapshot's `status`
- * never reports `waiting`; it is live-only.
+ * `launching` means a task/session exists but has not emitted a concrete
+ * harness-start signal. `waiting` arrives when the parent agent loop parks
+ * on background tools / sub-agents. The session snapshot's `status` never
+ * reports `waiting`; it is live-only.
  */
 export interface SessionStatusEvent {
   type: "session_status";
   conversationId: string;
-  status: "idle" | "running" | "waiting" | "failed";
+  status: "idle" | "launching" | "running" | "waiting" | "failed";
   responseId?: string;
 }
 

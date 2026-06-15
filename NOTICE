@@ -45,6 +45,18 @@ Copyright 2016 Google LLC.
 opentelemetry-instrumentation-openai-agents-v2 - https://pypi.org/project/opentelemetry-instrumentation-openai-agents-v2/
 Copyright The OpenTelemetry Authors.
 
+cel-expr-python - https://github.com/cel-expr/cel-python/
+Copyright The Cel Expr Python Authors.
+
+modal - https://pypi.org/project/modal/
+Copyright Modal Labs 2022.
+
+daytona - https://pypi.org/project/daytona/
+Copyright 2024 Daytona.
+
+opentelemetry-distro - https://pypi.org/project/opentelemetry-distro/
+Copyright The OpenTelemetry Authors.
+
 ________________
 
 This Software contains code from the following open source projects, licensed under the MIT license (https://opensource.org/license/mit):
@@ -94,6 +106,9 @@ Copyright (c) 2015-2022 José Padilla.
 argon2-cffi - https://pypi.org/project/argon2-cffi/
 Copyright (c) 2015 Hynek Schlawack and the argon2-cffi contributors.
 
+tomlkit - https://pypi.org/project/tomlkit/
+Copyright (c) 2018 Sébastien Eustace.
+
 ________________
 
 This Software contains code from the following open source projects, licensed under the BSD-3 license (https://opensource.org/license/bsd-3-clause):
@@ -112,6 +127,9 @@ Copyright © 2019, Encode OSS Ltd. All rights reserved.
 
 click - https://pypi.org/project/click/
 Copyright 2014 Pallets.
+
+psutil - https://pypi.org/project/psutil/
+Copyright (c) 2009, Jay Loden, Dave Daeschler, Giampaolo Rodola. All rights reserved.
 
 ________________
 

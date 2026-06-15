@@ -3071,7 +3071,8 @@ class _SubagentWorkEntry:
     :param wrapper_label: Optional terminal wrapper label from the
         child session, e.g. ``"codex-native-ui"`` for codex-native
         native sub-agents.
-    :param status: Current work status, e.g. ``"running"``.
+    :param status: Current work status, e.g. ``"launching"`` or
+        ``"running"``.
     :param output: Terminal child output or error text. ``None``
         while the work is still running.
     :param created_at: Unix timestamp when the dispatch was registered.
@@ -3087,7 +3088,7 @@ class _SubagentWorkEntry:
     agent: str
     title: str
     wrapper_label: str | None = None
-    status: str = "running"
+    status: str = "launching"
     output: str | None = None
     created_at: float = dataclasses.field(default_factory=time.time)
     completed_at: float | None = None
@@ -3175,6 +3176,25 @@ def get_subagent_work(child_session_id: str) -> _SubagentWorkEntry | None:
     :returns: The work entry, or ``None`` if the child is not tracked.
     """
     return _subagent_work_by_child.get(child_session_id)
+
+
+def mark_subagent_work_started(child_session_id: str) -> _SubagentWorkEntry | None:
+    """
+    Promote a sub-agent dispatch from launch bookkeeping to real execution.
+
+    ``sys_session_send`` creates the child session and registers work before
+    the child harness has proven it started. The first child
+    ``session.status:running`` / ``waiting`` edge is that proof.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :returns: The updated work entry, or ``None`` if the child is untracked.
+    """
+    entry = _subagent_work_by_child.get(child_session_id)
+    if entry is None:
+        return None
+    if entry.status == "launching":
+        entry.status = "running"
+    return entry
 
 
 def unregister_subagent_work(
@@ -3609,9 +3629,12 @@ def _session_status_to_task_status(status: object) -> str | None:
     keeps the child rail's status text roughly in sync as ``busy`` flips.
 
     :param status: A ``session.status`` value, e.g. ``"running"``.
-    :returns: ``"in_progress"`` / ``"completed"`` / ``"failed"``, or
-        ``None`` for an unrecognized status (caller omits the field).
+    :returns: ``"launching"`` / ``"in_progress"`` / ``"completed"`` /
+        ``"failed"``, or ``None`` for an unrecognized status (caller
+        omits the field).
     """
+    if status == "launching":
+        return "launching"
     if status in ("running", "waiting"):
         return "in_progress"
     if status == "idle":
@@ -4063,6 +4086,8 @@ def create_runner_app(
         :param allow_history_preview_fallback: Whether to read runner history.
         :returns: Update event, or ``None`` when busy/task status did not change.
         """
+        if status in ("running", "waiting"):
+            mark_subagent_work_started(session_id)
         busy = status in ("running", "waiting")
         task_status = _session_status_to_task_status(status)
         if meta.last_busy == busy and meta.last_task_status == task_status:

@@ -39,15 +39,10 @@ export interface Comment {
 // every session with comments — sharing this key keeps its cache and
 // the SessionUpdatesProvider fingerprint invalidation in sync.
 export function commentsQueryKey(sessionId: string, path?: string) {
-  return path
-    ? ["comments", sessionId, path]
-    : ["comments", sessionId];
+  return path ? ["comments", sessionId, path] : ["comments", sessionId];
 }
 
-export async function fetchComments(
-  sessionId: string,
-  path?: string,
-): Promise<Comment[]> {
+export async function fetchComments(sessionId: string, path?: string): Promise<Comment[]> {
   const url = path
     ? `/v1/sessions/${encodeURIComponent(sessionId)}/comments?path=${encodeURIComponent(path)}`
     : `/v1/sessions/${encodeURIComponent(sessionId)}/comments`;
@@ -130,11 +125,7 @@ export function useDeleteComment(sessionId: string) {
 export function useUpdateComment(sessionId: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (payload: {
-      commentId: string;
-      status?: string;
-      body?: string;
-    }) => {
+    mutationFn: async (payload: { commentId: string; status?: string; body?: string }) => {
       const { commentId, ...fields } = payload;
       const res = await authenticatedFetch(
         `/v1/sessions/${encodeURIComponent(sessionId)}/comments/${encodeURIComponent(commentId)}`,
@@ -168,10 +159,7 @@ export function useUpdateComment(sessionId: string) {
 export function useSendCommentsToAgent(sessionId: string, agentId: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (payload: {
-      comment_ids: string[];
-      instruction?: string;
-    }) => {
+    mutationFn: async (payload: { comment_ids: string[]; instruction?: string }) => {
       const res = await authenticatedFetch(
         `/v1/sessions/${encodeURIComponent(sessionId)}/comments/send`,
         {

@@ -41,9 +41,9 @@ Omnigent lets you:
   conversation to continue on their own.
 
 - **☁️ Run agents in cloud sandboxes.** No laptop required: run sessions in
-  disposable [Modal](https://modal.com) or [Daytona](https://www.daytona.io)
-  sandboxes, launched from the CLI or provisioned by the server per session
-  (*managed hosts*). More providers coming soon.
+  disposable [Modal](https://modal.com), [Daytona](https://www.daytona.io), or
+  [Islo](https://islo.dev) sandboxes, launched from the CLI or provisioned by
+  the server per session (*managed hosts*).
 
 - **🛡️ Govern your agents.** Create
   [policies](#6-govern-your-agents-with-policies) to pause for your approval

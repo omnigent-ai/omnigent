@@ -580,6 +580,7 @@ _PI_ENV_ALLOW_EXACT: frozenset[str] = frozenset(
         "TZ",
     }
 )
+_STREAM_READ_CHUNK_SIZE = 65536
 
 
 def _build_models_json(
@@ -817,7 +818,7 @@ class _PiRpcSession:
         """Background task: read lines from Pi stdout and enqueue them."""
         assert self.process is not None and self.process.stdout is not None
         try:
-            async for raw_line in self.process.stdout:
+            async for raw_line in self._iter_stream_lines(self.process.stdout):
                 line = raw_line.decode("utf-8", errors="replace").rstrip("\n\r")
                 if line:
                     self._line_queue.put_nowait(line)
@@ -833,7 +834,7 @@ class _PiRpcSession:
         if self.process is None or self.process.stderr is None:
             return
         try:
-            async for raw_line in self.process.stderr:
+            async for raw_line in self._iter_stream_lines(self.process.stderr):
                 text = raw_line.decode("utf-8", errors="replace").rstrip("\n\r")
                 if text:
                     logger.debug("pi stderr: %s", text)
@@ -841,6 +842,29 @@ class _PiRpcSession:
                         self._stderr_lines.append(text)
         except (asyncio.CancelledError, Exception):  # noqa: BLE001 — stderr drainer is best-effort; never crashes
             pass
+
+    @staticmethod
+    async def _iter_stream_chunks(stream: asyncio.StreamReader) -> AsyncIterator[bytes]:
+        while True:
+            chunk = await stream.read(_STREAM_READ_CHUNK_SIZE)
+            if not chunk:
+                break
+            yield chunk
+
+    @staticmethod
+    async def _iter_stream_lines(stream: asyncio.StreamReader) -> AsyncIterator[bytes]:
+        buffer = bytearray()
+        async for chunk in _PiRpcSession._iter_stream_chunks(stream):
+            buffer.extend(chunk)
+            while True:
+                newline_index = buffer.find(b"\n")
+                if newline_index < 0:
+                    break
+                line = bytes(buffer[: newline_index + 1])
+                del buffer[: newline_index + 1]
+                yield line
+        if buffer:
+            yield bytes(buffer)
 
     async def send_command(self, command: CodexEvent) -> None:
         """Send a JSONL command to Pi's stdin."""

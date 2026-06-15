@@ -112,10 +112,7 @@ describe("useHosts", () => {
     // field-absent hosts both survive. If host_sandbox appears, the
     // sandbox filter regressed; if host_legacy disappears, the filter
     // broke old-server compatibility.
-    expect(result.current.data?.map((h) => h.host_id)).toEqual([
-      "host_laptop",
-      "host_legacy",
-    ]);
+    expect(result.current.data?.map((h) => h.host_id)).toEqual(["host_laptop", "host_legacy"]);
   });
 
   it("surfaces an error when the request fails", async () => {

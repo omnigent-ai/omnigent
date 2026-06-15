@@ -58,6 +58,7 @@ _LAUNCHERS: dict[str, str] = {
     "lakebox": "omnigent.onboarding.sandboxes.lakebox:LakeboxLauncher",
     "modal": "omnigent.onboarding.sandboxes.modal:ModalSandboxLauncher",
     "daytona": "omnigent.onboarding.sandboxes.daytona:DaytonaSandboxLauncher",
+    "islo": "omnigent.onboarding.sandboxes.islo:IsloSandboxLauncher",
 }
 
 

@@ -71,14 +71,14 @@ jobs:
     # workflow_run completions, or `/merge` comments. Other label
     # adds no longer skip-run here.
     #
-    # workflow_run is filtered to PR-originated runs. Post-merge
-    # runs on `main` (workflow_run.event == 'push') and nightlies
-    # / manual dispatches (schedule / workflow_dispatch) have no
-    # PR to post a status on -- the context-resolution step below
-    # would skip them anyway, but we'd still spend ~15 s spinning
-    # up a runner. Filter at the job-`if:` level so push:main
-    # completions of the watched workflows don't spawn wasteful
-    # merge-ready runs per merge.
+    # workflow_run is filtered to PR-originated runs: the watched
+    # workflows' `pull_request` completions, plus the fork-e2e run
+    # which arrives as a `push` on a `fork-e2e/**` branch (the e2e
+    # suite for a mirrored fork PR -- see fork-e2e-mirror.yml). The
+    # context-resolution step below maps that branch's head SHA back
+    # to its PR. Post-merge runs on `main` (push), nightlies, and
+    # manual dispatches have no PR to post on, so they're excluded
+    # here to avoid spinning up a wasteful runner per merge.
     if: >-
       (
         github.event_name == 'pull_request' &&
@@ -89,7 +89,13 @@ jobs:
       ) ||
       (
         github.event_name == 'workflow_run' &&
-        github.event.workflow_run.event == 'pull_request'
+        (
+          github.event.workflow_run.event == 'pull_request' ||
+          (
+            github.event.workflow_run.event == 'push' &&
+            startsWith(github.event.workflow_run.head_branch, 'fork-e2e/')
+          )
+        )
       ) ||
       (
         github.event_name == 'issue_comment' &&
@@ -125,6 +131,13 @@ jobs:
           else
             PR=$(echo "$WF_PRS" | jq -r '.[0].number // empty')
             SHA="${{ github.event.workflow_run.head_sha }}"
+            if [[ -z "$PR" ]]; then
+              # Fork-PR upstream runs leave workflow_run.pull_requests empty
+              # (GitHub omits cross-repo PR refs), so resolve the open PR from
+              # the head SHA. SHA is a commit hash from the event (no injection).
+              PR=$(gh api "repos/$REPO/commits/$SHA/pulls" \
+                --jq 'map(select(.state == "open")) | .[0].number // empty' 2>/dev/null || true)
+            fi
             if [[ -z "$PR" ]]; then
               echo "::notice::Skipped: workflow_run has no associated PR (push to main, etc)"
               echo "skip=true" >> "$GITHUB_OUTPUT"

@@ -1,0 +1,17 @@
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: omnigent
+  labels:
+    app: omnigent
+spec:
+  host: omnigent.apps.example.com
+  to:
+    kind: Service
+    name: omnigent
+    weight: 100
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

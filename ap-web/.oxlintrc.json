@@ -22,12 +22,26 @@
         "paths": [
           {
             "name": "react-router-dom",
-            "importNames": ["useNavigate", "useParams", "useSearchParams", "useLocation", "Link", "Outlet"],
+            "importNames": [
+              "useNavigate",
+              "useParams",
+              "useSearchParams",
+              "useLocation",
+              "Link",
+              "Outlet"
+            ],
             "message": "Import routing primitives (useNavigate/useParams/useSearchParams/useLocation/Link/Outlet) from @/lib/routing — the routing IoC seam the embed overrides. Route/Routes/BrowserRouter/MemoryRouter are structural and may stay on react-router-dom."
           },
           {
             "name": "react-router",
-            "importNames": ["useNavigate", "useParams", "useSearchParams", "useLocation", "Link", "Outlet"],
+            "importNames": [
+              "useNavigate",
+              "useParams",
+              "useSearchParams",
+              "useLocation",
+              "Link",
+              "Outlet"
+            ],
             "message": "Import routing primitives (useNavigate/useParams/useSearchParams/useLocation/Link/Outlet) from @/lib/routing — the routing IoC seam the embed overrides."
           }
         ]
@@ -53,12 +67,13 @@
         "no-restricted-globals": "off",
         "no-restricted-imports": "off"
       }
+    },
+    {
+      "files": ["electron/**"],
+      "rules": {
+        "no-restricted-globals": "off"
+      }
     }
   ],
-  "ignorePatterns": [
-    "dist",
-    "node_modules",
-    "src/components/ui",
-    "src/components/ai-elements"
-  ]
+  "ignorePatterns": ["dist", "node_modules", "src/components/ui", "src/components/ai-elements"]
 }

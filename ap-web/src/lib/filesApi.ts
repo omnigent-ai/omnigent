@@ -13,10 +13,13 @@ export async function uploadFile(sessionId: string, file: File): Promise<Uploade
   // with name="" which the server rejects. Use "image.png" as the fallback
   // so the upload succeeds regardless of how the file was obtained.
   form.append("file", file, file.name || "image.png");
-  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/resources/files`, {
-    method: "POST",
-    body: form,
-  });
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files`,
+    {
+      method: "POST",
+      body: form,
+    },
+  );
   if (!res.ok) throw new Error(`upload failed: ${res.status} ${res.statusText}`);
   const resource = (await res.json()) as {
     id: string;

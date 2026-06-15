@@ -54,7 +54,13 @@ interface Result {
   reconcileServerContent: (serverContent: string) => boolean;
 }
 
-export function useMarkdownEditorSync({ content, path, isSettled, onDirtyChange, setContentRef }: Options): Result {
+export function useMarkdownEditorSync({
+  content,
+  path,
+  isSettled,
+  onDirtyChange,
+  setContentRef,
+}: Options): Result {
   const [editorKey, setEditorKey] = useState(0);
   const [isDirty, setIsDirty] = useState(false);
   const [hasExternalUpdate, setHasExternalUpdate] = useState(false);
@@ -78,10 +84,13 @@ export function useMarkdownEditorSync({ content, path, isSettled, onDirtyChange,
   // True when a path change is waiting for the new file's query to settle.
   const pendingRemountRef = useRef(false);
 
-  const setDirty = useCallback((value: boolean) => {
-    setIsDirty(value);
-    onDirtyChange?.(value);
-  }, [onDirtyChange]);
+  const setDirty = useCallback(
+    (value: boolean) => {
+      setIsDirty(value);
+      onDirtyChange?.(value);
+    },
+    [onDirtyChange],
+  );
 
   // Path change → reset state and mark a pending remount.
   // Don't remount immediately: content may still be "" while the new file loads.
@@ -176,27 +185,39 @@ export function useMarkdownEditorSync({ content, path, isSettled, onDirtyChange,
 
   // Imperative counterpart to the content-change effect, for content fetched
   // outside the query (the pre-write conflict check). See the Result doc.
-  const reconcileServerContent = useCallback((serverContent: string): boolean => {
-    // Already known (last-seen server state or our own save) — nothing to do.
-    if (serverContent === prevContentRef.current || serverContent === lastSavedRef.current) {
+  const reconcileServerContent = useCallback(
+    (serverContent: string): boolean => {
+      // Already known (last-seen server state or our own save) — nothing to do.
+      if (serverContent === prevContentRef.current || serverContent === lastSavedRef.current) {
+        return false;
+      }
+      // Adopt as the latest known server state — this also lets a later "Keep
+      // mine" overwrite through, while a *newer* external edit re-raises.
+      prevContentRef.current = serverContent;
+      if (isDirtyRef.current) {
+        pendingContentRef.current = serverContent;
+        setHasExternalUpdate(true);
+        return true;
+      }
+      // Clean editor: adopt the content (nothing to conflict with).
+      if (setContentRef?.current) {
+        setContentRef.current(serverContent);
+      } else {
+        setEditorKey((k) => k + 1);
+      }
       return false;
-    }
-    // Adopt as the latest known server state — this also lets a later "Keep
-    // mine" overwrite through, while a *newer* external edit re-raises.
-    prevContentRef.current = serverContent;
-    if (isDirtyRef.current) {
-      pendingContentRef.current = serverContent;
-      setHasExternalUpdate(true);
-      return true;
-    }
-    // Clean editor: adopt the content (nothing to conflict with).
-    if (setContentRef?.current) {
-      setContentRef.current(serverContent);
-    } else {
-      setEditorKey((k) => k + 1);
-    }
-    return false;
-  }, [setContentRef]);
+    },
+    [setContentRef],
+  );
 
-  return { editorKey, isDirty, setDirty, hasExternalUpdate, discardAndApplyExternal, dismissExternalUpdate, markSaved, reconcileServerContent };
+  return {
+    editorKey,
+    isDirty,
+    setDirty,
+    hasExternalUpdate,
+    discardAndApplyExternal,
+    dismissExternalUpdate,
+    markSaved,
+    reconcileServerContent,
+  };
 }

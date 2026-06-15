@@ -47,7 +47,13 @@ interface MobilePanelDrawerProps {
  * @param children - The panel body, mounted only while open.
  * @param testId - Optional ``data-testid`` for the root element.
  */
-export function MobilePanelDrawer({ open, title, onClose, children, testId }: MobilePanelDrawerProps) {
+export function MobilePanelDrawer({
+  open,
+  title,
+  onClose,
+  children,
+  testId,
+}: MobilePanelDrawerProps) {
   return (
     <aside
       data-testid={testId}

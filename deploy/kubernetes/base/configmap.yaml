@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: omnigent-config
+  labels:
+    app: omnigent
+data:
+  HOST: "0.0.0.0"
+  PORT: "8000"
+  ARTIFACT_DIR: "/data/artifacts"
+  OMNIGENT_ADMIN_CREDENTIALS_PATH: "/data/admin-credentials"
+  OMNIGENT_AUTH_ENABLED: "1"
+  OMNIGENT_AUTH_PROVIDER: "accounts"
+  OMNIGENT_ACCOUNTS_AUTO_OPEN: "0"

@@ -121,20 +121,13 @@ export function LoginPage() {
     <div className="flex min-h-screen items-center justify-center bg-background px-4">
       <div className="w-full max-w-sm space-y-6">
         <div className="space-y-1 text-center">
-          <h1 className="text-2xl font-semibold tracking-tight">
-            Sign in
-          </h1>
-          <p className="text-sm text-muted-foreground">
-            Welcome to Omnigent.
-          </p>
+          <h1 className="text-2xl font-semibold tracking-tight">Sign in</h1>
+          <p className="text-sm text-muted-foreground">Welcome to Omnigent.</p>
         </div>
 
         <form onSubmit={onSubmit} className="space-y-4">
           <div className="space-y-1.5">
-            <label
-              htmlFor="login-username"
-              className="text-sm font-medium leading-none"
-            >
+            <label htmlFor="login-username" className="text-sm font-medium leading-none">
               Username
             </label>
             <Input
@@ -147,17 +140,13 @@ export function LoginPage() {
               required
             />
             <p className="text-xs text-muted-foreground">
-              On a fresh install your username is your machine login (the
-              output of <code className="font-mono">whoami</code>), unless an
-              admin set a different one.
+              On a fresh install your username is your machine login (the output of{" "}
+              <code className="font-mono">whoami</code>), unless an admin set a different one.
             </p>
           </div>
 
           <div className="space-y-1.5">
-            <label
-              htmlFor="login-password"
-              className="text-sm font-medium leading-none"
-            >
+            <label htmlFor="login-password" className="text-sm font-medium leading-none">
               Password
             </label>
             <Input
@@ -180,18 +169,14 @@ export function LoginPage() {
             </div>
           )}
 
-          <Button
-            type="submit"
-            className="w-full"
-            disabled={submitting || password.length === 0}
-          >
+          <Button type="submit" className="w-full" disabled={submitting || password.length === 0}>
             {submitting ? "Signing in…" : "Sign in"}
           </Button>
         </form>
 
         <p className="text-center text-xs text-muted-foreground">
-          On a fresh install the initial admin password was printed to
-          the server's stderr and saved to{" "}
+          On a fresh install the initial admin password was printed to the server's stderr and saved
+          to{" "}
           <code className="rounded bg-muted px-1 py-0.5 font-mono">
             ~/.omnigent/admin-credentials
           </code>

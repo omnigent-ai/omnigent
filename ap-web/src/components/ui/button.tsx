@@ -1,8 +1,8 @@
-import * as React from "react"
-import { cva, type VariantProps } from "class-variance-authority"
-import { Slot } from "radix-ui"
+import * as React from "react";
+import { cva, type VariantProps } from "class-variance-authority";
+import { Slot } from "radix-ui";
 
-import { cn } from "@/lib/utils"
+import { cn } from "@/lib/utils";
 
 // The pressed-state nudge uses the `transform` property (not translate-y-px)
 // so it composes with `translate`-based positioning: a caller centering the
@@ -42,8 +42,8 @@ const buttonVariants = cva(
       variant: "default",
       size: "default",
     },
-  }
-)
+  },
+);
 
 // forwardRef is required for React 18: Radix primitives that wrap Button via
 // `asChild` (e.g. DropdownMenuTrigger) attach a ref to measure the trigger and
@@ -53,13 +53,13 @@ const Button = React.forwardRef<
   HTMLButtonElement,
   React.ComponentProps<"button"> &
     VariantProps<typeof buttonVariants> & {
-      asChild?: boolean
+      asChild?: boolean;
     }
 >(function Button(
   { className, variant = "default", size = "default", asChild = false, ...props },
-  ref
+  ref,
 ) {
-  const Comp = asChild ? Slot.Root : "button"
+  const Comp = asChild ? Slot.Root : "button";
 
   return (
     <Comp
@@ -70,7 +70,7 @@ const Button = React.forwardRef<
       className={cn(buttonVariants({ variant, size, className }))}
       {...props}
     />
-  )
-})
+  );
+});
 
-export { Button, buttonVariants }
+export { Button, buttonVariants };

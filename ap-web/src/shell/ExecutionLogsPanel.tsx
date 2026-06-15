@@ -127,8 +127,7 @@ export function ExecutionLogsPanel({
   }, [open]);
 
   const entries = buildLogEntries(conversationId, children);
-  const activeEntry =
-    entries.find((e) => e.key === activeKey) ?? entries[0] ?? null;
+  const activeEntry = entries.find((e) => e.key === activeKey) ?? entries[0] ?? null;
 
   return (
     <aside
@@ -203,10 +202,7 @@ export function ExecutionLogsPanel({
  * Build the entry list: "main" pinned first, then every child session
  * in the order returned by the child_sessions endpoint.
  */
-function buildLogEntries(
-  conversationId: string,
-  children: ChildSessionInfo[],
-): LogEntry[] {
+function buildLogEntries(conversationId: string, children: ChildSessionInfo[]): LogEntry[] {
   const main: LogEntry = {
     key: executionLogTabKey(MAIN_EXECUTION_LOG_KEY),
     sessionId: conversationId,
@@ -257,9 +253,7 @@ function SessionItemsList({ sessionId }: { sessionId: string }) {
     return <div className="text-muted-foreground text-xs">Loading…</div>;
   }
   if (error) {
-    return (
-      <div className="text-destructive text-xs">Failed to load items: {error.message}</div>
-    );
+    return <div className="text-destructive text-xs">Failed to load items: {error.message}</div>;
   }
   if (items.length === 0) {
     return <div className="text-muted-foreground text-xs">No items</div>;
@@ -303,9 +297,7 @@ function SessionItemEntry({ item, index }: { item: RawSessionItem; index: number
           <ChevronRightIcon className="size-3 shrink-0 text-muted-foreground" />
         )}
         <span className="shrink-0 text-muted-foreground">#{index}</span>
-        {!isExpanded && (
-          <span className="truncate text-foreground">{collapsed}</span>
-        )}
+        {!isExpanded && <span className="truncate text-foreground">{collapsed}</span>}
       </button>
       {isExpanded && (
         <pre className="whitespace-pre-wrap break-words border-t border-border px-2 py-1.5 text-foreground">

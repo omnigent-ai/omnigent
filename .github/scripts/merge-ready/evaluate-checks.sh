@@ -7,9 +7,11 @@
 #   - conclusion=success, OR
 #   - conclusion=skipped AND name is in ALLOW_SKIP, OR
 #   - the check is missing AND name is in ALLOW_SKIP AND its owning
-#     workflow either never ran for this SHA (path-ignored) or its
+#     workflow either never ran for this SHA (path-ignored), or its
 #     newest run succeeded (the absent check was conditionally excluded
-#     from that run's job matrix — see workflow_run_outcome).
+#     from that run's job matrix), or its newest run was skipped (the
+#     whole workflow was gated off, e.g. a fork/draft PR) — see
+#     workflow_run_outcome.
 #
 # A missing ALLOW_SKIP check is NOT green only while its workflow's
 # newest run is still in flight / cancelled / failed: the check could
@@ -17,7 +19,8 @@
 # from mere absence let PR #2218 merge while an E2E shard was cancelled
 # and re-running. Trusting a *succeeded* run keeps path-filtered jobs
 # (e.g. CI's dynamically-selected Pytest shards on a docs/deploy-only
-# PR) from blocking the gate.
+# PR) from blocking the gate; trusting a *skipped* run keeps fork/draft
+# PRs — whose entire e2e workflow is gated off — from wedging it.
 #
 # Env in: GH_TOKEN, REPO, SHA
 # Out:    failed=<markdown bullet list of failed names> on $GITHUB_OUTPUT
@@ -46,6 +49,10 @@ WORKFLOW_RUNS=$(gh api "repos/$REPO/actions/runs?head_sha=$SHA&per_page=100" --p
 #               absent was conditionally excluded from that run's job
 #               matrix (e.g. CI dynamically path-filters its Pytest
 #               shards); the green workflow vouches the job wasn't needed.
+#   "skipped" — newest run completed with conclusion=skipped: every job's
+#               `if:` was false, so the run did no work (e2e fork guard on
+#               a fork PR, e2e-ui `!draft` on a draft PR). A definitive
+#               skip, not a transient, so absent ALLOW_SKIP checks pass.
 #   "other"   — in progress, queued, cancelled, or failed. An absent
 #               check may still be pending or was lost, so the gate must
 #               wait rather than treat the gap as a skip (the #2218 race,
@@ -63,6 +70,8 @@ workflow_run_outcome() {
   concl=$(printf '%s' "$row" | cut -f3)
   if [[ "$status" == "completed" && "$concl" == "success" ]]; then
     echo "success"
+  elif [[ "$status" == "completed" && "$concl" == "skipped" ]]; then
+    echo "skipped"
   else
     echo "other"
   fi
@@ -83,9 +92,10 @@ for n in "${REQUIRED[@]}"; do
         FAIL=1
         continue
       fi
-      # outcome is "none" (workflow path-skipped) or "success" (job
-      # conditionally excluded from a green run) — both legitimate.
-      echo "OK      : $n  (skipped: path-ignored workflow or conditionally-excluded job)"
+      # outcome is "none" (workflow path-skipped), "success" (job
+      # conditionally excluded from a green run), or "skipped" (whole
+      # workflow gated off, e.g. fork/draft PR) — all legitimate.
+      echo "OK      : $n  (skipped: path-ignored, conditionally-excluded, or fork/draft-gated)"
       continue
     fi
     echo "MISSING : $n"
