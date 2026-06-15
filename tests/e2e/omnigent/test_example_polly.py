@@ -71,8 +71,9 @@ def test_coding_subagents(polly_spec: AgentSpec) -> None:
     The bundle has five coding sub-agents: ``claude_code`` (Claude Code,
     claude-native) and ``codex`` (Codex, codex-native) on the native terminal
     harnesses, ``cursor`` / ``mimo`` on their ACP CLI harnesses, plus ``pi``
-    (Pi, pi) as the headless multi-model worker. All implement, review, and explore. The native harnesses
-    make claude_code / codex render terminal-first (Chat / Terminal pill) so
+    (Pi, pi) as the headless multi-model worker. All implement, review, and
+    explore. The native harnesses make claude_code / codex render
+    terminal-first (Chat / Terminal pill) so
     the human can watch or take over.
 
     A missing/renamed agent means no implementers, and same-vendor harnesses
@@ -287,7 +288,8 @@ def test_investigation_skill_delegates_read_only_work() -> None:
     assert "Use for any read-only task: investigation, debugging, audit" in compact
     assert (
         "Dispatch each task to `claude_code`, `codex`, `cursor`, `mimo`, or `pi`: "
-        '`sys_session_send(agent="claude_code"|"codex"|"cursor"|"mimo"|"pi", title="explore-<task_slug>", '
+        '`sys_session_send(agent="claude_code"|"codex"|"cursor"|"mimo"|"pi", '
+        'title="explore-<task_slug>", '
         'args={purpose: "explore", input: "<question + exact scope + evidence requested>"})`'
     ) in compact
     # The audited skill (#3074) made task-based titles mandatory at dispatch.
