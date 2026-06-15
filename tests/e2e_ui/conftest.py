@@ -205,6 +205,55 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "instead of rebuilding. Fails if no build is present."
         ),
     )
+    # Round-robin shard split for the e2e-ui CI matrix. We roll our own
+    # (rather than pull in pytest-shard / pytest-split) so the partition
+    # is a dependency-free strided slice -- see pytest_collection_modifyitems
+    # below for why striding beats hash-bucketing for wall-clock balance.
+    parser.addoption(
+        "--splits",
+        type=int,
+        default=None,
+        help="Total number of shards to split the UI suite into (CI matrix).",
+    )
+    parser.addoption(
+        "--group",
+        type=int,
+        default=None,
+        help="1-indexed shard this run executes (requires --splits).",
+    )
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(
+    config: pytest.Config,
+    items: list[pytest.Item],
+) -> None:
+    """Round-robin the collected UI tests across the CI shard matrix.
+
+    pytest-shard hash-buckets node IDs, which is blind to per-test
+    wall-clock and left one shard at ~5min while siblings finished in
+    ~2min. A *strided* slice -- ``items[group-1::splits]`` -- deals tests
+    out like cards instead, so a heavy file (whose cases collect
+    adjacently) scatters one-per-shard rather than landing in a single
+    bucket. That averages cost across shards without maintaining a
+    durations file.
+
+    No-op unless both ``--splits`` and ``--group`` are passed, so local
+    runs and the non-sharded suites are unaffected. ``trylast`` lets the
+    repo-wide known-failures marking in ``tests/conftest.py`` tag items
+    first; markers travel with the items the slice keeps.
+    """
+    splits = config.getoption("--splits")
+    group = config.getoption("--group")
+    if splits is None and group is None:
+        return
+    if splits is None or group is None:
+        raise pytest.UsageError("--splits and --group must be passed together")
+    if splits < 1:
+        raise pytest.UsageError("--splits must be >= 1")
+    if not 1 <= group <= splits:
+        raise pytest.UsageError(f"--group must be between 1 and {splits}")
+    items[:] = items[group - 1 :: splits]
 
 
 def _register_agent_yaml(
@@ -624,7 +673,10 @@ def live_server(
 
 
 @pytest.fixture
-def seeded_session(live_server: str) -> Iterator[tuple[str, str]]:
+def seeded_session(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
     """Create a session bound to ``live_server``'s runner and yield its id.
 
     The web UI no longer lets users start a new chat from inside the
@@ -636,13 +688,21 @@ def seeded_session(live_server: str) -> Iterator[tuple[str, str]]:
     session bound to that agent, then ``PATCH``-binds it to the
     spawned runner so ``POST /v1/responses`` can dispatch.
 
+    Respawns the shared runner first if a prior test in the shard killed
+    it (``test_stale_stream``); otherwise the runner-bind ``PATCH`` would
+    400 on an offline runner. Any runner this respawns is torn down with
+    the fixture. This keeps the fixture order-independent, so sharding
+    and test reordering can place the runner-killing test anywhere.
+
     :param live_server: Spawned server fixture — its
         ``OMNIGENT_RUNNER_ID`` and pre-registered agent are reused.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
     :returns: ``(base_url, session_id)``. Tests typically navigate to
         ``f"{base_url}/c/{session_id}"``.
     """
     import json as _json
 
+    respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
     # Create a session with the hello_world bundle inline. The server
     # pre-registered the agent via --agent, but since /api/agents is
@@ -668,6 +728,15 @@ def seeded_session(live_server: str) -> Iterator[tuple[str, str]]:
         yield (live_server, session_id)
     finally:
         httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        # Restore the "found" state: if we respawned the runner (a prior
+        # test had killed it), tear our copy down so it doesn't outlive us.
+        if respawned_runner is not None:
+            respawned_runner.terminate()
+            try:
+                respawned_runner.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned_runner.kill()
+                respawned_runner.wait(timeout=5)
 
 
 def _create_runner_bound_session(base_url: str, runner_id: str) -> str:

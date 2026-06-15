@@ -6,7 +6,15 @@
  * manage-level (3) permission on the session.
  */
 
-import { type FormEvent, type KeyboardEvent, useCallback, useEffect, useId, useRef, useState } from "react";
+import {
+  type FormEvent,
+  type KeyboardEvent,
+  useCallback,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+} from "react";
 import { CheckIcon, LinkIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {

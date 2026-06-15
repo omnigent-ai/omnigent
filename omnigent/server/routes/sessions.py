@@ -41,6 +41,7 @@ import httpx
 from fastapi import (
     APIRouter,
     BackgroundTasks,
+    Depends,
     File,
     HTTPException,
     Query,
@@ -174,6 +175,10 @@ from omnigent.server.routes._auth_helpers import (
     require_user as _require_user,
 )
 from omnigent.server.routes._codex_elicitation import parse_codex_elicitation_request
+from omnigent.server.routes._content_type import (
+    require_json_content_type,
+    require_json_or_multipart_content_type,
+)
 from omnigent.server.routes._host_worktree import CreatedWorktree
 from omnigent.server.schemas import (
     AgentObject,
@@ -887,6 +892,28 @@ async def _poll_request_disconnect(request: Request) -> None:
         message = await request.receive()
         if message["type"] == "http.disconnect":
             return
+
+
+def _attachment_disposition(filename: str) -> str:
+    """Build a safe ``Content-Disposition: attachment`` header value.
+
+    The filename is user-controlled, so it cannot be interpolated
+    into the header verbatim — a quote or newline would let the
+    uploader inject header content or break parsing. We emit an
+    ASCII-only ``filename`` fallback (with quotes/backslashes/control
+    characters stripped) plus an RFC 5987 ``filename*`` parameter that
+    percent-encodes the full UTF-8 name for modern browsers.
+
+    :param filename: The stored, user-supplied filename.
+    :returns: A ``Content-Disposition`` header value forcing download.
+    """
+    # ASCII fallback: drop anything outside printable ASCII and the
+    # characters that are structurally significant in the header.
+    ascii_name = "".join(ch for ch in filename if 0x20 <= ord(ch) < 0x7F and ch not in '"\\')
+    if not ascii_name:
+        ascii_name = "download"
+    encoded = urllib.parse.quote(filename, safe="")
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded}"
 
 
 def _stored_file_to_resource(
@@ -3408,21 +3435,26 @@ async def _hold_native_ask_gate(
     conversation_store: ConversationStore,
 ) -> bool:
     """
-    Hold a native-harness tool call until a human resolves the ASK.
+    Hold a server-side ASK gate until a human resolves it.
 
-    URL-based elicitation for native harnesses. Publishes a
-    ``response.elicitation_request`` (the web UI / REPL render the
-    approve card) and parks a server-side Future via
+    Publishes a ``response.elicitation_request`` (the web UI / REPL
+    render the approve card) and parks a server-side Future via
     :func:`_publish_and_wait_for_harness_elicitation`, exactly as the
     ``PermissionRequest`` hook does. The human approves through the
     elicitation's resolve URL; this collapses the verdict to a single
     boolean the caller maps to ALLOW / DENY.
 
+    Used for any phase whose ASK must be resolved on the server rather
+    than by a runner-side ``wait_for_user_approval`` park:
+    :attr:`Phase.TOOL_CALL` (the native ``PreToolUse`` hook gate) and
+    :attr:`Phase.REQUEST` (the user-message input gate, which has no
+    runner in the loop yet — see :func:`_evaluate_input_policy`).
+
     Unlike the old ASK→``defer`` path, the gate lives on the server,
     so a permissive native ``permission_mode`` (``acceptEdits`` /
-    ``bypassPermissions``) cannot skip it — the tool call stays
-    blocked until a real human verdict. Timeout / disconnect fail
-    closed (return ``False`` → DENY).
+    ``bypassPermissions``) cannot skip it — the action stays blocked
+    until a real human verdict. Timeout / disconnect fail closed
+    (return ``False`` → DENY).
 
     On approve, the ASK-accumulated ``set_labels`` / ``state_updates``
     are applied (POLICIES.md §7.2: side effects land only on approve);
@@ -3431,10 +3463,12 @@ async def _hold_native_ask_gate(
     :param request: FastAPI request, for upstream-disconnect detection
         inside the parking helper.
     :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
-    :param phase: Enforcement phase — :attr:`Phase.TOOL_CALL` here
-        (the only phase a native PreToolUse hook can block).
-    :param data: The proto event ``data``; for a tool call,
-        ``{"name": "Bash", "arguments": {"command": "ls"}}``.
+    :param phase: Enforcement phase being gated, e.g.
+        :attr:`Phase.TOOL_CALL` or :attr:`Phase.REQUEST`.
+    :param data: The proto event ``data`` — for a tool call,
+        ``{"name": "Bash", "arguments": {"command": "ls"}}``; for a
+        request, the user ``message`` body
+        (``{"role": "user", "content": [...]}``).
     :param engine: The policy engine, used to resolve the per-policy
         ``ask_timeout`` and to apply approved side effects.
     :param result: The composed ASK :class:`PolicyResult` — carries
@@ -8936,6 +8970,7 @@ def _extract_user_text_from_event(body: SessionEventInput) -> str:
 
 
 async def _evaluate_input_policy(
+    request: Request,
     session_id: str,
     conv: Conversation,
     body: SessionEventInput,
@@ -8946,26 +8981,36 @@ async def _evaluate_input_policy(
     actor: dict[str, str] | None = None,
 ) -> dict[str, Any] | None:
     """
-    Evaluate a user message against INPUT phase policy rules.
+    Evaluate a user message against REQUEST (input) phase policy rules.
 
-    Pure evaluation — does NOT persist the event. Returns
-    ``None`` on ALLOW (caller should persist via the active
-    path). Returns a verdict dict on DENY or ASK (caller
-    should NOT forward to runner).
+    Does not persist the event. On ALLOW returns ``None`` (caller
+    forwards the message). On DENY returns a verdict dict (caller does
+    NOT forward). On ASK this function **parks for human approval**
+    before returning: unlike the ``tool_call`` phase — where the runner
+    parks via ``wait_for_user_approval`` — the REQUEST phase has no
+    runner in the loop yet (the message hasn't been forwarded), so the
+    approval gate must live here. It reuses :func:`_hold_native_ask_gate`
+    (the same server-side park the native ``tool_call`` gate uses):
+    accept collapses to ALLOW (``None``, forward the message), while
+    decline / timeout collapses to a DENY verdict (fail-closed).
 
+    :param request: The active FastAPI request, threaded to
+        :func:`_hold_native_ask_gate` for upstream-disconnect detection
+        while parked on an ASK.
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
     :param conv: The session's :class:`Conversation` entity.
     :param body: The validated ``message`` event.
     :param conversation_store: Store for label state.
     :param agent_store: Store for agent spec lookups.
-    :param runner_router: Unused, kept for signature
+    :param _runner_router: Unused, kept for signature
         consistency.
     :param actor: Authenticated principal, e.g.
         ``{"run_as": "alice@example.com"}``. ``None`` when
         identity is unknown.
-    :returns: ``None`` on ALLOW (fall through to persist
-        path). Verdict dict on DENY/ASK.
+    :returns: ``None`` on ALLOW or an approved ASK (fall through to the
+        forward path). A verdict dict ``{"verdict": "deny", "reason":
+        ...}`` on DENY or a declined / timed-out ASK.
     """
 
     user_text = _extract_user_text_from_event(body)
@@ -9009,18 +9054,29 @@ async def _evaluate_input_policy(
             "reason": result.reason or "Denied by policy",
         }
 
-    # ASK — publish elicitation event.
-    elicitation_id = await _register_policy_elicitation(
+    # ASK — park server-side for human approval. The REQUEST phase has no
+    # runner-side approval round-trip (the message has not been forwarded to
+    # a runner yet, so nothing would park on a "pending" verdict — it would
+    # collapse to a silent deny). Hold the gate here exactly like the native
+    # tool_call path: _hold_native_ask_gate publishes the approval card,
+    # awaits the human verdict on a server-side Future, and applies the
+    # deciding policy's writes only on accept (POLICIES.md §7.2). Accept ->
+    # ALLOW (fall through to forward the message); decline / timeout ->
+    # DENY (fail-closed).
+    approved = await _hold_native_ask_gate(
+        request,
         session_id=session_id,
+        phase=Phase.REQUEST,
+        data=body.data,
+        engine=engine,
         result=result,
-        arguments_preview=user_text[:1024],
         conversation_store=conversation_store,
     )
+    if approved:
+        return None
     return {
-        "verdict": "pending",
-        "elicitation_id": elicitation_id,
-        # Spec-resolved approval window; the runner's park honors it.
-        "ask_timeout": resolve_ask_timeout(engine, result),
+        "verdict": "deny",
+        "reason": result.reason or "Denied by policy",
     }
 
 
@@ -11521,6 +11577,10 @@ def create_sessions_router(
         "/sessions",
         status_code=201,
         response_model=None,
+        # CSRF hardening: this route dispatches on Content-Type (JSON vs
+        # multipart bundled-create), so reject text/plain and other simple
+        # types up front while still allowing both legitimate body shapes.
+        dependencies=[Depends(require_json_or_multipart_content_type)],
     )
     async def create_session(
         request: Request,
@@ -13212,6 +13272,9 @@ def create_sessions_router(
     @router.post(
         "/sessions/{session_id}/hooks/permission-request",
         response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
     )
     async def claude_permission_request_hook(
         request: Request,
@@ -13484,6 +13547,9 @@ def create_sessions_router(
         # Returns EvaluationResponse JSON; no Pydantic model since the
         # proto-style schema is validated manually.
         response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
     )
     async def evaluate_policy(
         request: Request,
@@ -13673,6 +13739,9 @@ def create_sessions_router(
     @router.post(
         "/sessions/{session_id}/hooks/codex-elicitation-request",
         response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
     )
     async def codex_elicitation_request_hook(
         request: Request,
@@ -14268,6 +14337,9 @@ def create_sessions_router(
     @router.post(
         "/sessions/{session_id}/resources/terminals",
         response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
     )
     async def create_session_terminal(
         session_id: str,
@@ -14368,6 +14440,9 @@ def create_sessions_router(
     @router.post(
         "/sessions/{session_id}/resources/terminals/{terminal_id}/transfer",
         response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
     )
     async def transfer_session_terminal(
         request: Request,
@@ -14656,7 +14731,22 @@ def create_sessions_router(
             )
         content = artifact_store.get(stored.id)
         media_type = mimetypes.guess_type(stored.filename)[0] or "application/octet-stream"
-        return Response(content=content, media_type=media_type)
+        # The filename and bytes are fully user-controlled. Serving the
+        # content inline lets a browser navigating directly to this URL
+        # render an uploaded ``evil.html`` as ``text/html`` and execute
+        # its script in the server's own origin (stored XSS — acute on
+        # the OSS/local server, which has no CSRF/apiproxy boundary).
+        # Force a download with ``Content-Disposition: attachment`` and
+        # disable MIME sniffing so the response cannot be reinterpreted
+        # as an active type.
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={
+                "Content-Disposition": _attachment_disposition(stored.filename),
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     @router.delete(
         "/sessions/{session_id}/resources/files/{file_id}",
@@ -15054,6 +15144,9 @@ def create_sessions_router(
     @router.post(
         "/sessions/{session_id}/resources/environments/{environment_id}/shell",
         response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
     )
     async def run_environment_shell(
         session_id: str,
@@ -15395,6 +15488,7 @@ def create_sessions_router(
         ):
             try:
                 _input_verdict = await _evaluate_input_policy(
+                    request,
                     session_id,
                     conv,
                     body,
@@ -15440,6 +15534,7 @@ def create_sessions_router(
                 return {"queued": False, "denied": True, "reason": reason}
         elif body.type == _SLASH_COMMAND_TYPE and conv.agent_id is not None:
             _input_verdict = await _evaluate_input_policy(
+                request,
                 session_id,
                 conv,
                 _build_skill_slash_command_policy_body(body),
@@ -16990,6 +17085,10 @@ def create_sessions_router(
     @router.post(
         "/sessions/{session_id}/mcp",
         response_model=None,  # Returns a raw Response with application/json
+        # CSRF hardening: the MCP Streamable HTTP contract already mandates
+        # an application/json request body; enforce it so a cross-site
+        # text/plain request can't drive JSON-RPC against this proxy.
+        dependencies=[Depends(require_json_content_type)],
     )
     async def mcp_proxy(
         session_id: str,

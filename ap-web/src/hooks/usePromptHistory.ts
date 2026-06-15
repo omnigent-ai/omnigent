@@ -2,18 +2,35 @@
 //
 // Mirrors the terminal REPL's up-arrow history (prompt-toolkit's FileHistory
 // against ~/.omnigent_history). Web-side, history persists across tabs and
-// reloads via a single localStorage key; the recall cursor is in-memory only,
-// matching shell semantics where each new login starts at the bottom.
+// reloads via localStorage; the recall cursor is in-memory only, matching
+// shell semantics where each new login starts at the bottom.
+//
+// History is scoped per conversation: each chat keeps its own recall stack
+// under a conversation-specific key, so ArrowUp in one chat never surfaces a
+// prompt typed in another. A surface with no bound conversation falls back to
+// the bare legacy key.
 
 import { useCallback, useEffect, useRef } from "react";
 
-const STORAGE_KEY = "omnigent:prompt-history";
+const STORAGE_PREFIX = "omnigent:prompt-history";
 const MAX_ENTRIES = 100;
 
-function readHistory(): string[] {
+/**
+ * Resolve the localStorage key for a given history scope.
+ *
+ * @param scope The conversation id the history belongs to, e.g.
+ *   ``"conv_abc123"``. When `null`/`undefined` (no bound conversation), returns
+ *   the bare legacy key so unscoped surfaces share one stack.
+ * @returns The localStorage key, e.g. ``"omnigent:prompt-history:conv_abc123"``.
+ */
+function scopedKey(scope: string | null | undefined): string {
+  return scope ? `${STORAGE_PREFIX}:${scope}` : STORAGE_PREFIX;
+}
+
+function readHistory(key: string): string[] {
   if (typeof window === "undefined") return [];
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
+    const raw = window.localStorage.getItem(key);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
@@ -23,10 +40,10 @@ function readHistory(): string[] {
   }
 }
 
-function writeHistory(entries: string[]): void {
+function writeHistory(key: string, entries: string[]): void {
   if (typeof window === "undefined") return;
   try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(entries));
+    window.localStorage.setItem(key, JSON.stringify(entries));
   } catch {
     // Quota exceeded or storage disabled — non-fatal; recall just stops
     // persisting until the next successful write.
@@ -34,30 +51,35 @@ function writeHistory(entries: string[]): void {
 }
 
 /**
- * Append `text` to the persisted prompt history (localStorage), trimming
- * first and skipping empty / consecutive-duplicate entries (matching shell
- * ``HISTCONTROL=ignoredups``). Caps at {@link MAX_ENTRIES} with FIFO
+ * Append `text` to the persisted prompt history for `scope` (localStorage),
+ * trimming first and skipping empty / consecutive-duplicate entries (matching
+ * shell ``HISTCONTROL=ignoredups``). Caps at {@link MAX_ENTRIES} with FIFO
  * eviction.
  *
  * Standalone (not part of the hook) so non-composer surfaces can contribute
- * to the same history — notably the home-page landing composer, whose first
- * message should be recallable with ArrowUp in the freshly-opened chat (the
- * chat composer's `usePromptHistory` re-reads localStorage on mount).
+ * to a conversation's history — notably the home-page landing composer, which
+ * already knows the new session id and writes under it so the first message is
+ * recallable with ArrowUp in the freshly-opened chat (the chat composer's
+ * `usePromptHistory` reads that same scoped key on mount).
  *
+ * @param text The prompt text to record, e.g. ``"read the README"``.
+ * @param scope The conversation id to scope the entry to, e.g.
+ *   ``"conv_abc123"``; `null`/omitted writes to the shared legacy key.
  * @returns The new persisted history (unchanged on a skipped duplicate), or
  *   `null` when `text` was empty/whitespace and nothing was written.
  */
-export function appendPromptHistoryEntry(text: string): string[] | null {
+export function appendPromptHistoryEntry(text: string, scope?: string | null): string[] | null {
   const trimmed = text.trim();
   if (!trimmed) return null;
-  const history = readHistory();
+  const key = scopedKey(scope);
+  const history = readHistory(key);
   // Collapse consecutive duplicates against the persisted tail, so the same
   // prompt sent from the landing composer and then again in-chat isn't stored
   // twice.
   if (history.length > 0 && history[history.length - 1] === trimmed) return history;
   const next = [...history, trimmed];
   const capped = next.length > MAX_ENTRIES ? next.slice(-MAX_ENTRIES) : next;
-  writeHistory(capped);
+  writeHistory(key, capped);
   return capped;
 }
 
@@ -88,24 +110,34 @@ export interface PromptHistory {
 }
 
 /**
- * Imperative recall API. The hook does not trigger re-renders — callers
- * read history values from the returned methods inside event handlers
- * (keydown, submit) and apply them to whatever input state they own.
+ * Imperative recall API, scoped to a single conversation. The hook does not
+ * trigger re-renders — callers read history values from the returned methods
+ * inside event handlers (keydown, submit) and apply them to whatever input
+ * state they own.
  *
  * Cursor convention: 0 = newest, increasing = older. When `cursor` is
  * `null`, no recall is in progress and `draft` is undefined.
+ *
+ * @param scope The conversation id whose history to recall, e.g.
+ *   ``"conv_abc123"``. Changing it re-hydrates from that conversation's key and
+ *   drops any in-progress recall, so ArrowUp never surfaces another chat's
+ *   prompts. `null`/omitted uses the shared legacy key (no bound conversation).
  */
-export function usePromptHistory(): PromptHistory {
+export function usePromptHistory(scope?: string | null): PromptHistory {
   const historyRef = useRef<string[]>([]);
   const cursorRef = useRef<number | null>(null);
   const draftRef = useRef<string | null>(null);
+  // Live scope for the stable appendEntry callback (avoids recreating it per switch).
+  const scopeRef = useRef(scope);
+  scopeRef.current = scope;
 
-  // Hydrate on mount. Synchronous read — localStorage is fast and we want
-  // the first ArrowUp to find existing entries even if it fires before a
-  // re-render.
+  // Re-read the active conversation's stack on mount and each switch; reset the
+  // cursor so the previous chat's in-progress recall can't bleed in.
   useEffect(() => {
-    historyRef.current = readHistory();
-  }, []);
+    historyRef.current = readHistory(scopedKey(scope));
+    cursorRef.current = null;
+    draftRef.current = null;
+  }, [scope]);
 
   const resetCursor = useCallback(() => {
     cursorRef.current = null;
@@ -117,7 +149,7 @@ export function usePromptHistory(): PromptHistory {
       // Persist via the shared module helper (trims, dedupes, caps), then
       // sync our in-memory ref to the returned history so recall sees the new
       // entry without a re-read. `null` means nothing was written (empty text).
-      const capped = appendPromptHistoryEntry(text);
+      const capped = appendPromptHistoryEntry(text, scopeRef.current);
       if (capped !== null) historyRef.current = capped;
       resetCursor();
     },

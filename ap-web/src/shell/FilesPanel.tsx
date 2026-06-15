@@ -88,8 +88,8 @@ function HiddenFilesToggle({
   const tooltipLabel = showHidden
     ? "Hide hidden files"
     : hasHidden
-    ? `${hiddenCount} file${hiddenCount === 1 ? "" : "s"} in hidden directories. Click to show.`
-    : "Show hidden files";
+      ? `${hiddenCount} file${hiddenCount === 1 ? "" : "s"} in hidden directories. Click to show.`
+      : "Show hidden files";
   const iconSize = size === "4" ? "size-4" : "size-3.5";
   return (
     <TooltipProvider>
@@ -106,9 +106,7 @@ function HiddenFilesToggle({
             )}
             onClick={onToggle}
           >
-            {showHidden
-              ? <EyeOffIcon className={iconSize} />
-              : <EyeIcon className={iconSize} />}
+            {showHidden ? <EyeOffIcon className={iconSize} /> : <EyeIcon className={iconSize} />}
           </button>
         </TooltipTrigger>
         <TooltipContent side="bottom">{tooltipLabel}</TooltipContent>
@@ -147,10 +145,7 @@ function SortSelector({
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-40">
-        <DropdownMenuRadioGroup
-          value={sort}
-          onValueChange={(v) => onChange(v as ChangedSort)}
-        >
+        <DropdownMenuRadioGroup value={sort} onValueChange={(v) => onChange(v as ChangedSort)}>
           {SORT_OPTIONS.map(({ value, label, Icon }) => (
             <DropdownMenuRadioItem key={value} value={value}>
               <Icon className="size-3.5" />
@@ -188,11 +183,7 @@ function FileScopeSwitch({
     "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground";
   const idlePill = "text-muted-foreground hover:text-foreground";
   return (
-    <div
-      role="radiogroup"
-      aria-label="File scope"
-      className="flex shrink-0 items-center gap-1"
-    >
+    <div role="radiogroup" aria-label="File scope" className="flex shrink-0 items-center gap-1">
       <button
         type="button"
         role="radio"
@@ -272,7 +263,17 @@ function SearchFilterInput({
  * Uploaded/attached files are rendered inline in the message thread and are
  * intentionally not listed here.
  */
-export function FilesPanel({ onFileSelect, flatView, onFlatViewChange, showHidden, onShowHiddenChange, sort: changedSort, onSortChange, onClose, frameless }: FilesPanelProps) {
+export function FilesPanel({
+  onFileSelect,
+  flatView,
+  onFlatViewChange,
+  showHidden,
+  onShowHiddenChange,
+  sort: changedSort,
+  onSortChange,
+  onClose,
+  frameless,
+}: FilesPanelProps) {
   const { conversationId } = useParams<{ conversationId: string }>();
   // The runner went offline (e.g. its host restarted): `sessionStatus`
   // is "failed", set by `_on_runner_disconnect` server-side when the
@@ -312,8 +313,8 @@ export function FilesPanel({ onFileSelect, flatView, onFlatViewChange, showHidde
   });
   const workingDir = envQuery.data?.root ?? null;
   const changedCount = changedQuery.data?.data.length ?? 0;
-  const hiddenFilesCount = (changedQuery.data?.data ?? []).filter(
-    (f) => f.path.split("/").some((seg) => seg.startsWith(".")),
+  const hiddenFilesCount = (changedQuery.data?.data ?? []).filter((f) =>
+    f.path.split("/").some((seg) => seg.startsWith(".")),
   ).length;
 
   useEffect(() => {
@@ -349,8 +350,7 @@ export function FilesPanel({ onFileSelect, flatView, onFlatViewChange, showHidde
     },
   );
   // Highlight the filters toggle when include/exclude carry a value.
-  const treeFiltersActive =
-    treeInclude.trim().length > 0 || treeExclude.trim().length > 0;
+  const treeFiltersActive = treeInclude.trim().length > 0 || treeExclude.trim().length > 0;
 
   return (
     <div
@@ -366,7 +366,12 @@ export function FilesPanel({ onFileSelect, flatView, onFlatViewChange, showHidde
             <span className="shrink-0 font-medium text-sm">Working folder</span>
             {workingDir && <WorkingDirLabel dir={workingDir} />}
             <div className="ml-auto flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
-              <HiddenFilesToggle showHidden={showHidden} onToggle={() => onShowHiddenChange(!showHidden)} size="4" hiddenCount={hiddenFilesCount} />
+              <HiddenFilesToggle
+                showHidden={showHidden}
+                onToggle={() => onShowHiddenChange(!showHidden)}
+                size="4"
+                hiddenCount={hiddenFilesCount}
+              />
               {onClose && (
                 <button
                   type="button"
@@ -398,7 +403,12 @@ export function FilesPanel({ onFileSelect, flatView, onFlatViewChange, showHidde
             </button>
             {!collapsed && (
               <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
-                <HiddenFilesToggle showHidden={showHidden} onToggle={() => onShowHiddenChange(!showHidden)} size="3.5" hiddenCount={hiddenFilesCount} />
+                <HiddenFilesToggle
+                  showHidden={showHidden}
+                  onToggle={() => onShowHiddenChange(!showHidden)}
+                  size="3.5"
+                  hiddenCount={hiddenFilesCount}
+                />
               </div>
             )}
           </>

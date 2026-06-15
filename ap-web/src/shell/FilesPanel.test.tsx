@@ -43,7 +43,10 @@ function file(path: string, bytes = 10): WorkspaceFile {
   };
 }
 
-function changedFile(path: string, status: WorkspaceChangedFile["status"] = "modified"): WorkspaceChangedFile {
+function changedFile(
+  path: string,
+  status: WorkspaceChangedFile["status"] = "modified",
+): WorkspaceChangedFile {
   return {
     bytes: 10,
     modified_at: null,
@@ -131,7 +134,7 @@ function renderPanel({
       <Routes>
         <Route
           path="/c/:conversationId"
-          element={(
+          element={
             <FilesPanel
               sort="recent"
               onSortChange={vi.fn()}
@@ -142,7 +145,7 @@ function renderPanel({
               onShowHiddenChange={vi.fn()}
               onClose={onClose}
             />
-          )}
+          }
         />
       </Routes>
     </MemoryRouter>,
@@ -250,7 +253,7 @@ describe("FilesPanel scope switch (Changed | All) visibility", () => {
         <Routes>
           <Route
             path="/c/:conversationId"
-            element={(
+            element={
               <FilesPanel
                 sort="recent"
                 onSortChange={vi.fn()}
@@ -261,14 +264,17 @@ describe("FilesPanel scope switch (Changed | All) visibility", () => {
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
-            )}
+            }
           />
         </Routes>
       </MemoryRouter>,
     );
 
     // Both segments present; All is selected (flatView=false), Changed is not.
-    expect(screen.getByRole("radio", { name: /^changed$/i })).toHaveAttribute("aria-checked", "false");
+    expect(screen.getByRole("radio", { name: /^changed$/i })).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
     expect(screen.getByRole("radio", { name: /^all$/i })).toHaveAttribute("aria-checked", "true");
   });
 
@@ -296,7 +302,7 @@ describe("FilesPanel scope switch (Changed | All) visibility", () => {
         <Routes>
           <Route
             path="/c/:conversationId"
-            element={(
+            element={
               <FilesPanel
                 sort="recent"
                 onSortChange={vi.fn()}
@@ -307,7 +313,7 @@ describe("FilesPanel scope switch (Changed | All) visibility", () => {
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
-            )}
+            }
           />
         </Routes>
       </MemoryRouter>,
@@ -332,7 +338,7 @@ describe("FilesPanel changed files search", () => {
         <Routes>
           <Route
             path="/c/:conversationId"
-            element={(
+            element={
               <FilesPanel
                 sort="recent"
                 onSortChange={vi.fn()}
@@ -342,7 +348,7 @@ describe("FilesPanel changed files search", () => {
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
-            )}
+            }
           />
         </Routes>
       </MemoryRouter>,
@@ -356,10 +362,7 @@ describe("FilesPanel changed files search", () => {
       conversationId: "conv_search_filter",
       flatView: true,
       files: [file("src/components/Button.tsx"), file("docs/Guide.md")],
-      changedFiles: [
-        changedFile("src/components/Button.tsx"),
-        changedFile("docs/Guide.md"),
-      ],
+      changedFiles: [changedFile("src/components/Button.tsx"), changedFile("docs/Guide.md")],
     });
 
     fireEvent.change(screen.getByRole("searchbox", { name: "Search changed files" }), {
@@ -397,7 +400,7 @@ describe("FilesPanel changed files search", () => {
         <Routes>
           <Route
             path="/c/:conversationId"
-            element={(
+            element={
               <FilesPanel
                 sort="recent"
                 onSortChange={vi.fn()}
@@ -407,7 +410,7 @@ describe("FilesPanel changed files search", () => {
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
-            )}
+            }
           />
         </Routes>
       </MemoryRouter>,
@@ -419,7 +422,7 @@ describe("FilesPanel changed files search", () => {
         <Routes>
           <Route
             path="/c/:conversationId"
-            element={(
+            element={
               <FilesPanel
                 sort="recent"
                 onSortChange={vi.fn()}
@@ -429,7 +432,7 @@ describe("FilesPanel changed files search", () => {
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
-            )}
+            }
           />
         </Routes>
       </MemoryRouter>,
@@ -444,10 +447,7 @@ describe("FilesPanel changed files search", () => {
       conversationId: "conv_search_path",
       flatView: true,
       files: [file("src/components/Button.tsx"), file("docs/Guide.md")],
-      changedFiles: [
-        changedFile("src/components/Button.tsx"),
-        changedFile("docs/Guide.md"),
-      ],
+      changedFiles: [changedFile("src/components/Button.tsx"), changedFile("docs/Guide.md")],
     });
 
     fireEvent.change(screen.getByRole("searchbox", { name: "Search changed files" }), {
@@ -478,10 +478,7 @@ describe("FilesPanel changed files search", () => {
   });
 
   it("preserves inline folder expansion state when opening the drawer", () => {
-    const files = [
-      file("docs/Guide.md"),
-      file("src/App.tsx"),
-    ];
+    const files = [file("docs/Guide.md"), file("src/App.tsx")];
     useAllFilesMock.mockReturnValue(allFilesResult(files));
     useChangedFilesMock.mockReturnValue(changedFilesResult());
     useDirectoryMock.mockReturnValue(directoryResult());
@@ -496,7 +493,7 @@ describe("FilesPanel changed files search", () => {
           <Routes>
             <Route
               path="/c/:conversationId"
-              element={(
+              element={
                 <>
                   <FilesPanelDrawer
                     sort="recent"
@@ -511,7 +508,9 @@ describe("FilesPanel changed files search", () => {
                   />
                   {!drawerOpen && (
                     <>
-                      <button type="button" onClick={() => setDrawerOpen(true)}>open drawer</button>
+                      <button type="button" onClick={() => setDrawerOpen(true)}>
+                        open drawer
+                      </button>
                       <FilesPanel
                         sort="recent"
                         onSortChange={vi.fn()}
@@ -524,7 +523,7 @@ describe("FilesPanel changed files search", () => {
                     </>
                   )}
                 </>
-              )}
+              }
             />
           </Routes>
         </MemoryRouter>
@@ -563,7 +562,7 @@ describe("FilesPanel changed files search", () => {
           <Routes>
             <Route
               path="/c/:conversationId"
-              element={(
+              element={
                 <>
                   <FilesPanelDrawer
                     sort="recent"
@@ -578,7 +577,9 @@ describe("FilesPanel changed files search", () => {
                   />
                   {!drawerOpen && (
                     <>
-                      <button type="button" onClick={() => setDrawerOpen(true)}>open drawer</button>
+                      <button type="button" onClick={() => setDrawerOpen(true)}>
+                        open drawer
+                      </button>
                       <FilesPanel
                         sort="recent"
                         onSortChange={vi.fn()}
@@ -591,7 +592,7 @@ describe("FilesPanel changed files search", () => {
                     </>
                   )}
                 </>
-              )}
+              }
             />
           </Routes>
         </MemoryRouter>
@@ -613,7 +614,9 @@ describe("FilesPanel changed files search", () => {
 
   it("keeps hidden search results hidden until the hidden-file toggle is enabled", () => {
     useAllFilesMock.mockReturnValue(allFilesResult([file(".env"), file("src/App.tsx")]));
-    useChangedFilesMock.mockReturnValue(changedFilesResult([changedFile(".env"), changedFile("src/App.tsx")]));
+    useChangedFilesMock.mockReturnValue(
+      changedFilesResult([changedFile(".env"), changedFile("src/App.tsx")]),
+    );
     useDirectoryMock.mockReturnValue(directoryResult());
     useEnvironmentMock.mockReturnValue(environmentResult());
     useSearchMock.mockReturnValue(searchResult());
@@ -625,7 +628,7 @@ describe("FilesPanel changed files search", () => {
           <Routes>
             <Route
               path="/c/:conversationId"
-              element={(
+              element={
                 <FilesPanel
                   sort="recent"
                   onSortChange={vi.fn()}
@@ -635,7 +638,7 @@ describe("FilesPanel changed files search", () => {
                   showHidden={showHidden}
                   onShowHiddenChange={setShowHidden}
                 />
-              )}
+              }
             />
           </Routes>
         </MemoryRouter>
@@ -678,7 +681,7 @@ describe("FilesPanel tree (Explore) search", () => {
         <Routes>
           <Route
             path="/c/:conversationId"
-            element={(
+            element={
               <FilesPanel
                 sort="recent"
                 onSortChange={vi.fn()}
@@ -688,7 +691,7 @@ describe("FilesPanel tree (Explore) search", () => {
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
-            )}
+            }
           />
         </Routes>
       </MemoryRouter>,
@@ -716,7 +719,9 @@ describe("FilesPanel tree (Explore) search", () => {
     expect(screen.queryByText("abc/test.md")).toBeNull();
 
     // Advance past the 300 ms debounce
-    act(() => { vi.advanceTimersByTime(300); });
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
 
     // Both search result paths must be visible; the tree's top-level node
     // ("src") would still be in the DOM as a folder button so we only assert
@@ -737,13 +742,17 @@ describe("FilesPanel tree (Explore) search", () => {
     const searchBox = screen.getByRole("searchbox", { name: "Search all files" });
 
     fireEvent.change(searchBox, { target: { value: "test" } });
-    act(() => { vi.advanceTimersByTime(300); });
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
     // Search mode is active — the flat result is visible
     expect(screen.getByText((t) => t.includes("abc/test.md"))).toBeInTheDocument();
 
     // Clear the query
     fireEvent.change(searchBox, { target: { value: "" } });
-    act(() => { vi.advanceTimersByTime(300); });
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
 
     // Tree is back — the top-level src/ folder button is visible again
     expect(screen.getByRole("button", { name: /src\//i })).toBeInTheDocument();
@@ -834,7 +843,9 @@ describe("FilesPanel tree (Explore) search", () => {
     fireEvent.change(screen.getByRole("searchbox", { name: "Search all files" }), {
       target: { value: "zzznotfound" },
     });
-    act(() => { vi.advanceTimersByTime(300); });
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
 
     expect(screen.getByText('No files match "zzznotfound"')).toBeInTheDocument();
   });
@@ -859,7 +870,7 @@ describe("FilesPanel tree (Explore) search", () => {
         <Routes>
           <Route
             path="/c/:conversationId"
-            element={(
+            element={
               <FilesPanel
                 sort="recent"
                 onSortChange={vi.fn()}
@@ -869,7 +880,7 @@ describe("FilesPanel tree (Explore) search", () => {
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
-            )}
+            }
           />
         </Routes>
       </MemoryRouter>,
@@ -881,7 +892,7 @@ describe("FilesPanel tree (Explore) search", () => {
         <Routes>
           <Route
             path="/c/:conversationId"
-            element={(
+            element={
               <FilesPanel
                 sort="recent"
                 onSortChange={vi.fn()}
@@ -891,7 +902,7 @@ describe("FilesPanel tree (Explore) search", () => {
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
-            )}
+            }
           />
         </Routes>
       </MemoryRouter>,
@@ -916,7 +927,9 @@ describe("FilesPanel tree (Explore) search", () => {
     fireEvent.change(screen.getByRole("searchbox", { name: "Search all files" }), {
       target: { value: "env" },
     });
-    act(() => { vi.advanceTimersByTime(300); });
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
 
     // .env is a dotfile — must be hidden when showHidden=false
     expect(screen.queryByText((t) => t.includes(".env"))).toBeNull();
@@ -967,18 +980,20 @@ describe("FilesPanel tree (Explore) search", () => {
 
     // Before the debounce fires, debouncedTreeSearch is still "" — the hook
     // must not yet have been called with "wired".
-    expect(
-      useSearchMock.mock.calls.some(([, q]) => q === "wired"),
-    ).toBe(false);
+    expect(useSearchMock.mock.calls.some(([, q]) => q === "wired")).toBe(false);
 
     // Advance past the 300ms debounce threshold
-    act(() => { vi.advanceTimersByTime(300); });
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
 
     // debouncedTreeSearch has now updated to "wired" — FilesPanel re-renders
     // and calls useWorkspaceFileSearch with the debounced value.  This
     // confirms the hook is wired to debouncedTreeSearch, not the raw input.
     expect(
-      useSearchMock.mock.calls.some(([convId, q]) => convId === "conv_tree_search_wiring" && q === "wired"),
+      useSearchMock.mock.calls.some(
+        ([convId, q]) => convId === "conv_tree_search_wiring" && q === "wired",
+      ),
     ).toBe(true);
   });
 
@@ -1015,7 +1030,9 @@ describe("FilesPanel tree (Explore) search", () => {
     fireEvent.change(screen.getByRole("textbox", { name: "files to include" }), {
       target: { value: "*.py" },
     });
-    act(() => { vi.advanceTimersByTime(300); });
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
 
     // Both the text query (2nd arg) and the include glob (3rd arg) reach the
     // hook; a missing include wiring would leave the 3rd arg "".
@@ -1043,7 +1060,9 @@ describe("FilesPanel tree (Explore) search", () => {
     fireEvent.change(screen.getByRole("textbox", { name: "files to exclude" }), {
       target: { value: "**/node_modules" },
     });
-    act(() => { vi.advanceTimersByTime(300); });
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
 
     // Both the text query (2nd arg) and the exclude glob (4th arg) reach the
     // hook; a missing exclude wiring would leave the 4th arg "".
@@ -1070,7 +1089,9 @@ describe("FilesPanel tree (Explore) search", () => {
       target: { value: "**/node_modules" },
     });
     expect(screen.getByRole("textbox", { name: "files to include" })).toHaveValue("*.ts");
-    expect(screen.getByRole("textbox", { name: "files to exclude" })).toHaveValue("**/node_modules");
+    expect(screen.getByRole("textbox", { name: "files to exclude" })).toHaveValue(
+      "**/node_modules",
+    );
 
     // Switch to Changed (flat) view — the useEffect resets the glob filters.
     rerender(
@@ -1078,7 +1099,7 @@ describe("FilesPanel tree (Explore) search", () => {
         <Routes>
           <Route
             path="/c/:conversationId"
-            element={(
+            element={
               <FilesPanel
                 sort="recent"
                 onSortChange={vi.fn()}
@@ -1088,7 +1109,7 @@ describe("FilesPanel tree (Explore) search", () => {
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
-            )}
+            }
           />
         </Routes>
       </MemoryRouter>,
@@ -1101,7 +1122,7 @@ describe("FilesPanel tree (Explore) search", () => {
         <Routes>
           <Route
             path="/c/:conversationId"
-            element={(
+            element={
               <FilesPanel
                 sort="recent"
                 onSortChange={vi.fn()}
@@ -1111,7 +1132,7 @@ describe("FilesPanel tree (Explore) search", () => {
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
-            )}
+            }
           />
         </Routes>
       </MemoryRouter>,

@@ -84,9 +84,7 @@ export function InboxPage() {
   }, [hasNextPage, isFetchingNextPage, fetchNextPage]);
 
   const allRows = (conversationsQuery.data?.pages ?? []).flatMap((page) => page.data);
-  const rows = allRows.filter(
-    (c) => !c.archived && (c.pending_elicitations_count ?? 0) > 0,
-  );
+  const rows = allRows.filter((c) => !c.archived && (c.pending_elicitations_count ?? 0) > 0);
 
   // Unseen file comments across sessions — the hook filters to rows
   // that report comments and mounts one comments query per such row.
@@ -166,8 +164,7 @@ export function InboxPage() {
         {(items.length > 0 || commentInbox.items.length > 0) && (
           <span className="text-sm text-muted-foreground">
             {[
-              items.length > 0 &&
-                (items.length === 1 ? "1 approval" : `${items.length} approvals`),
+              items.length > 0 && (items.length === 1 ? "1 approval" : `${items.length} approvals`),
               commentInbox.items.length > 0 &&
                 (commentInbox.items.length === 1
                   ? "1 comment"
@@ -218,8 +215,7 @@ export function InboxPage() {
             <InboxIcon className="size-8 text-muted-foreground/50" />
             <p className="text-sm font-medium">Nothing waiting on you</p>
             <p className="text-xs text-muted-foreground">
-              When an agent needs your input or someone comments on a file, it
-              will show up here.
+              When an agent needs your input or someone comments on a file, it will show up here.
             </p>
           </div>
         )}

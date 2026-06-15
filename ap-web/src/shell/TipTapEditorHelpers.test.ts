@@ -190,7 +190,7 @@ describe("computeSelectionData", () => {
   it("falls back to proportional indices when anchor_content is not in rawContent verbatim", () => {
     // Simulate a multi-line selection where the doc joins with "\n" but
     // rawContent uses a different representation.
-    const docText = "first\nsecond";   // doc has "\n" as separator
+    const docText = "first\nsecond"; // doc has "\n" as separator
     const rawContent = "first\r\nsecond"; // raw file has "\r\n" (different)
     const doc = makeDoc(docText);
     // Select "first\nsecond" — the "\n" form won't be found in rawContent.

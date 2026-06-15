@@ -64,9 +64,7 @@ interface BatchHealthResponse {
 export function useRunnerHealth(
   sessions: RunnerHealthInput[] | undefined,
 ): Map<string, SessionLiveness> {
-  const [statusMap, setStatusMap] = useState<Map<string, SessionLiveness>>(
-    new Map(),
-  );
+  const [statusMap, setStatusMap] = useState<Map<string, SessionLiveness>>(new Map());
 
   useEffect(() => {
     if (!sessions || sessions.length === 0) {

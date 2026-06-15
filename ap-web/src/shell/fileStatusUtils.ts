@@ -2,17 +2,23 @@ import type { WorkspaceChangedFile } from "@/hooks/useWorkspaceChangedFiles";
 
 export function gitStatusLetter(status: WorkspaceChangedFile["status"]): string {
   switch (status) {
-    case "created": return "A";
-    case "deleted": return "D";
-    case "modified": return "M";
+    case "created":
+      return "A";
+    case "deleted":
+      return "D";
+    case "modified":
+      return "M";
   }
 }
 
 export function gitStatusLabel(status: WorkspaceChangedFile["status"]): string {
   switch (status) {
-    case "created": return "Added";
-    case "deleted": return "Deleted";
-    case "modified": return "Modified";
+    case "created":
+      return "Added";
+    case "deleted":
+      return "Deleted";
+    case "modified":
+      return "Modified";
   }
 }
 

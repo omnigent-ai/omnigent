@@ -72,6 +72,9 @@ deploy/
 │   ├── src/index.js      server deploy target. See its README.md.
 │   └── README.md
 │
+├── islo/              ← Islo sandbox-provider guide (gateway credential
+│   └── README.md         injection); NOT a server deploy target.
+│
 └── docker/            ← common Docker image + compose stack
     ├── Dockerfile         multi-stage slim image (node web build → python builder → runtime)
     ├── docker-compose.yaml   omnigent + postgres for any Docker host
@@ -192,22 +195,23 @@ omnigent run path/to/agent.yaml --server https://your-host
 
 Don't want a laptop to be the host? Run the host in a cloud sandbox instead.
 
-**From the CLI (Modal or Daytona).** Install the extra
-(`pip install 'omnigent[modal]'` or `'omnigent[daytona]'`), authenticate
-(`modal token new`, or set `DAYTONA_API_KEY`), then:
+**From the CLI (Modal, Daytona, or Islo).** Install the provider extra when
+needed (`pip install 'omnigent[modal]'` or `'omnigent[daytona]'`; Islo uses the
+built-in HTTP client), authenticate (`modal token new`, `DAYTONA_API_KEY`, or
+`ISLO_API_KEY`), then:
 
 ```bash
-omnigent sandbox create --provider modal     # or --provider daytona
+omnigent sandbox create --provider modal     # or --provider daytona / islo
 omnigent sandbox connect --provider modal --sandbox-id <id> --server https://your-host
 ```
 
 > [!NOTE]
 > Modal caps sandbox lifetime at 24 hours. Re-run `create` + `connect` to
-> roll the host onto a fresh sandbox. Daytona has no lifetime cap, but
-> free-tier orgs restrict egress to an allowlist; see
+> roll the host onto a fresh sandbox. Daytona and Islo have no Omnigent-imposed
+> lifetime cap; Daytona free-tier orgs restrict egress to an allowlist; see
 > [`daytona/README.md`](daytona/README.md) for the relay workaround.
 
-**Server-managed (Modal or Daytona).** With *managed hosts*, creating a
+**Server-managed (Modal, Daytona, or Islo).** With *managed hosts*, creating a
 session with `"host_type": "managed"` (e.g.
 `POST /v1/sessions {"agent_id": ..., "host_type": "managed"}`) makes the
 server provision a sandbox, start a host in it, and run the session there.
@@ -223,6 +227,8 @@ sandbox:
 
 Modal credentials come from the server's environment (`MODAL_TOKEN_ID` /
 `MODAL_TOKEN_SECRET`, or a mounted `~/.modal.toml`), not the config file.
+Daytona reads `DAYTONA_API_KEY`; Islo reads `ISLO_API_KEY` (and optional
+`ISLO_BASE_URL`) from the server environment.
 Each sandbox authenticates back with a server-minted, per-launch token, so
 no user credentials ever enter the sandbox.
 
@@ -252,7 +258,8 @@ sandbox:
 For private registries, set `OMNIGENT_MODAL_REGISTRY_SECRET` on the server
 to the name of a Modal secret holding `REGISTRY_USERNAME` /
 `REGISTRY_PASSWORD`; for CLI-launched sandboxes, `OMNIGENT_MODAL_HOST_IMAGE`
-(or `OMNIGENT_DAYTONA_HOST_IMAGE`) overrides the image ref.
+(or `OMNIGENT_DAYTONA_HOST_IMAGE` / `OMNIGENT_ISLO_HOST_IMAGE`) overrides the
+image ref.
 
 **LLM credentials for managed sessions.** A fresh sandbox has no API keys.
 Park your provider credentials in a [Modal secret](https://modal.com/secrets)
@@ -275,6 +282,18 @@ sandbox:
     secrets: [omnigent-llm]
 ```
 
+For Daytona and Islo, list server environment variable names under
+`sandbox.daytona.env` or `sandbox.islo.env`; the launcher copies the current
+server env values into each sandbox:
+
+```yaml
+sandbox:
+  provider: islo
+  server_url: https://your-host
+  islo:
+    env: [OPENAI_API_KEY, GIT_TOKEN]
+```
+
 Using a **Claude subscription** instead of an API key? Run
 `claude setup-token` on your own machine and store the resulting long-lived
 token as `CLAUDE_CODE_OAUTH_TOKEN` in the secret. A **ChatGPT
@@ -292,7 +311,9 @@ fetch/push.
 
 The full Modal guide (CLI sandboxes, custom images, LLM and git credentials,
 troubleshooting) lives at [`modal/README.md`](modal/README.md); the Daytona
-guide lives at [`daytona/README.md`](daytona/README.md).
+guide lives at [`daytona/README.md`](daytona/README.md); the Islo guide
+(including its gateway credential-injection model) lives at
+[`islo/README.md`](islo/README.md).
 
 ## Auth
 

@@ -43,9 +43,7 @@ describe("useWriteFileContent", () => {
 
     expect(fetchMock).toHaveBeenCalledOnce();
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe(
-      "/v1/sessions/sess_1/resources/environments/default/filesystem/src/notes.md",
-    );
+    expect(url).toBe("/v1/sessions/sess_1/resources/environments/default/filesystem/src/notes.md");
     expect(init.method).toBe("PUT");
     expect(JSON.parse(init.body as string)).toEqual({ content: "# Hello", encoding: "utf-8" });
   });

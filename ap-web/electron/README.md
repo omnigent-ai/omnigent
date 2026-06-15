@@ -8,18 +8,18 @@ adds native niceties:
   API) when an agent finishes a turn (`running` → `idle`/`failed`), raises a
   new elicitation (asks for input), or a runner disconnects (`online` →
   `offline`). A notification fires for any such event **except** the one
-  conversation you're actively viewing (window focused *and* that chat
+  conversation you're actively viewing (window focused _and_ that chat
   open). Sessions already settled at launch don't fire; only fresh
   transitions this client observes do. On a turn-end the notification body
   shows the **first few lines of the agent's final message** when they can be
   fetched (one best-effort `GET /items` call), falling back to a generic
   "Agent finished and is ready for your input."
 - **A foreground attention cue.** macOS (and Windows) suppress the notification
-  *banner* for the **frontmost** app — the notification still lands in
+  _banner_ for the **frontmost** app — the notification still lands in
   Notification Center, but no toast pops, which reads as "notifications only
   work when the app is in the background." Because the web layer already only
-  notifies for sessions you are *not* actively viewing, the shell adds an
-  OS-level cue the frontmost app *can* show: it **bounces the macOS dock icon**
+  notifies for sessions you are _not_ actively viewing, the shell adds an
+  OS-level cue the frontmost app _can_ show: it **bounces the macOS dock icon**
   (or flashes the taskbar frame on Windows/Linux) so an unopened session's
   turn-end is noticeable even with Omnigent in front.
 - **Multiple windows** (**Server → New Window**, `Cmd/Ctrl+N`). Each window is
@@ -46,7 +46,7 @@ adds native niceties:
 - **Microphone permission for voice dictation.** The composer's dictation
   button uses the Web Speech API plus a `getUserMedia` audio stream (the mic
   level meter). Both go through Chromium's permission layer, which in Electron
-  asks the *embedder* (us) rather than showing Chrome's prompt — with no
+  asks the _embedder_ (us) rather than showing Chrome's prompt — with no
   handler wired, Chromium denies by default, so `recognition.start()` fails
   instantly with `not-allowed` and the button appears dead. The main process
   now wires `setPermissionRequestHandler` / `setPermissionCheckHandler` to
@@ -57,7 +57,7 @@ adds native niceties:
   `NSMicrophoneUsageDescription`).
 
   > **Caveat — Web Speech may still not transcribe in Electron.** Granting the
-  > mic clears the *permission* gate, but `SpeechRecognition` also depends on
+  > mic clears the _permission_ gate, but `SpeechRecognition` also depends on
   > Google's cloud speech backend keyed to official Google Chrome builds, which
   > Electron's bundled Chromium does **not** ship. So recognition can still
   > fail (typically a `network` error) even with the mic allowed. The web app
@@ -140,11 +140,11 @@ dismisses.
   scheme from this server". Beyond that, each window is
   **pinned to the one server origin the user explicitly connected it to**,
   and that pin — not navigation — is the trust boundary:
-  - Navigation is deliberately *not* restricted: servers may sit behind
+  - Navigation is deliberately _not_ restricted: servers may sit behind
     auth that redirects through external identity providers, so a window
     can legitimately visit foreign origins mid-login.
   - Instead, every privileged IPC handler verifies its sender frame.
-    `notify` / `setBadgeCount` only work when both the calling frame *and*
+    `notify` / `setBadgeCount` only work when both the calling frame _and_
     the window's top-level page are on the pinned origin (so a pinned-origin
     iframe embedded in a hostile page gets nothing); the setup bridge
     (`omnigentSetup`) only works for the bundled setup page itself, so a
@@ -158,7 +158,7 @@ dismisses.
 
 - **Node** 22.x + npm (already used by `ap-web`).
 - Electron ships its own Chromium/Node, so no system webview libs are needed
-  on Linux for *running* the built app, though packaging tools may pull a few
+  on Linux for _running_ the built app, though packaging tools may pull a few
   build deps.
 
 ## Run it (development)
@@ -200,16 +200,16 @@ microphone for dictation). Signing is driven entirely by what credentials
 are present — there are no code changes between a dev build and a release
 build:
 
-| Credentials present | Result |
-|---|---|
-| none | ad-hoc–signed app; runs locally, other Macs see a Gatekeeper warning |
-| Developer ID cert | signed app; downloads still warn until notarized |
-| Developer ID cert + Apple notarization creds (`build:mac:release`) | signed + notarized; installs cleanly everywhere |
+| Credentials present                                                | Result                                                               |
+| ------------------------------------------------------------------ | -------------------------------------------------------------------- |
+| none                                                               | ad-hoc–signed app; runs locally, other Macs see a Gatekeeper warning |
+| Developer ID cert                                                  | signed app; downloads still warn until notarized                     |
+| Developer ID cert + Apple notarization creds (`build:mac:release`) | signed + notarized; installs cleanly everywhere                      |
 
 ### 1. Get a signing certificate
 
 You need a **Developer ID Application** certificate from an Apple Developer
-Program account (the kind used for distribution *outside* the App Store).
+Program account (the kind used for distribution _outside_ the App Store).
 Create it at <https://developer.apple.com/account/resources/certificates>
 (or via Xcode → Settings → Accounts → Manage Certificates), then either:
 
@@ -284,7 +284,7 @@ Then enter `http://localhost:8000` in the setup page.
 
 External security keys (e.g. a YubiKey) work out of the box: Chromium's
 content layer speaks CTAP to the key directly. That's also why the flow is
-*invisible* — the passkey sheet you see in Chrome/Safari is browser chrome,
+_invisible_ — the passkey sheet you see in Chrome/Safari is browser chrome,
 which Electron doesn't ship. Touching the key completes the ceremony with no
 UI.
 
@@ -300,7 +300,7 @@ saved passkeys match. Three pieces must agree before this activates:
    `signing/entitlements.mac.plist`.
 3. An **embedded Developer ID provisioning profile**
    (`signing/omnigent.provisionprofile`, wired via `provisioningProfile`
-   in `package.json`). `keychain-access-groups` is a *restricted*
+   in `package.json`). `keychain-access-groups` is a _restricted_
    entitlement: a Developer ID signature alone doesn't authorize it, and
    AMFI SIGKILLs the app at launch ("Launchd job spawn failed", POSIX
    error 163). Create the profile in the Apple Developer portal: an App ID
@@ -336,8 +336,8 @@ Trusted pages may call services on the user's own machine
 (`http://localhost:<port>`, `127.0.0.1`, `[::1]`) even when those
 services don't send CORS headers — authentication flows use this to
 reach local auth helpers/token brokers. The shell injects the CORS (and
-preflight) response headers itself, scoped to requests *from* a trusted
-page origin *to* a loopback host; see `src/localhost_cors.js`. Trusted
+preflight) response headers itself, scoped to requests _from_ a trusted
+page origin _to_ a loopback host; see `src/localhost_cors.js`. Trusted
 means:
 
 - a window's **pinned server origin**, or
@@ -353,7 +353,7 @@ Anything else stays blocked by normal CORS, and a localhost service that
 sends its own `Access-Control-Allow-Origin` keeps enforcing its own
 policy untouched.
 
-If a page needs localhost while *not* being the visible top-level page,
+If a page needs localhost while _not_ being the visible top-level page,
 hand-add its origin to `settings.json`:
 
 ```json
@@ -366,7 +366,7 @@ hand-add its origin to `settings.json`:
 ## Multiple servers
 
 One server URL is saved as the default, but extra windows can be opened
-against *different* servers via **Server → New Window on Different
+against _different_ servers via **Server → New Window on Different
 Server…**. It opens a setup page in **per-window** mode: the URL you connect
 applies to that window only and is never saved, so the default server is
 untouched and the extra connection ends when the window closes. These

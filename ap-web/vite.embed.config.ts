@@ -128,7 +128,8 @@ function resolveExternalCjsRequire(externals: readonly string[]): Plugin {
   // The helper assignment opens with `<var> = /* @__PURE__ */ ((<arg>) =>` and
   // the IIFE body closes with `})` after the throw. We locate the opener by
   // scanning back from the marker, and the closer by scanning forward.
-  const HELPER_OPENER = /([A-Za-z_$][\w$]*)\s*=\s*\/\* @__PURE__ \*\/\s*\(\([A-Za-z_$][\w$]*\)\s*=>\s*typeof require[^]*$/;
+  const HELPER_OPENER =
+    /([A-Za-z_$][\w$]*)\s*=\s*\/\* @__PURE__ \*\/\s*\(\([A-Za-z_$][\w$]*\)\s*=>\s*typeof require[^]*$/;
 
   /**
    * Locate rolldown's `__require` helper assignment around the error marker.
@@ -170,8 +171,12 @@ function resolveExternalCjsRequire(externals: readonly string[]): Plugin {
       if (!helper) return null;
       patchedCount++;
 
-      const imports = externals.map((spec) => `import * as ${importName(spec)} from ${JSON.stringify(spec)};`).join("\n");
-      const table = externals.map((spec) => `${JSON.stringify(spec)}: ${importName(spec)}`).join(", ");
+      const imports = externals
+        .map((spec) => `import * as ${importName(spec)} from ${JSON.stringify(spec)};`)
+        .join("\n");
+      const table = externals
+        .map((spec) => `${JSON.stringify(spec)}: ${importName(spec)}`)
+        .join(", ");
 
       // Replace the helper with a function that resolves our externals from the
       // injected ESM namespaces (rspack dedupes those to the host's single React
@@ -185,7 +190,8 @@ function resolveExternalCjsRequire(externals: readonly string[]): Plugin {
         `\tthrow Error("Calling \`require\` for \\"" + id + "\\" in an environment that doesn't expose the \`require\` function.");\n` +
         `}`;
 
-      const next = imports + "\n" + code.slice(0, helper.start) + replacement + code.slice(helper.end);
+      const next =
+        imports + "\n" + code.slice(0, helper.start) + replacement + code.slice(helper.end);
       return { code: next, map: null };
     },
     generateBundle() {
@@ -222,7 +228,13 @@ function scopeOmnigentCss(): Plugin {
 // rspack resolves these specifiers to its own copies, so the embed shares the
 // host's single React + react-router instance. Kept as bare strings (no shims,
 // no globals) — rspack does the resolution at its build time.
-const SHARED_EXTERNALS = ["react", "react-dom", "react/jsx-runtime", "react-router", "react-router-dom"];
+const SHARED_EXTERNALS = [
+  "react",
+  "react-dom",
+  "react/jsx-runtime",
+  "react-router",
+  "react-router-dom",
+];
 
 export default defineConfig({
   // `base: "./"` makes Vite reference the emitted Monaco worker via a RELATIVE
@@ -233,7 +245,12 @@ export default defineConfig({
   // content-hash on its own CDN (see the `@omnigent/embed` wiring in
   // app.rsbuild.config.ts). rspack owns the FINAL hashed worker name.
   base: "./",
-  plugins: [react(), tailwindcss(), scopeOmnigentCss(), resolveExternalCjsRequire(SHARED_EXTERNALS)],
+  plugins: [
+    react(),
+    tailwindcss(),
+    scopeOmnigentCss(),
+    resolveExternalCjsRequire(SHARED_EXTERNALS),
+  ],
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),

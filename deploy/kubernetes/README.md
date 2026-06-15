@@ -146,6 +146,33 @@ with its own 10 Gi PVC. Good for dev/testing clusters.
    kubectl kustomize deploy/kubernetes/overlays/postgres/ | kubectl apply -f -
    ```
 
+## Deploy on Red Hat OpenShift
+
+The `overlays/openshift/` overlay replaces the Ingress with an OpenShift Route
+(edge TLS, managed by the platform) and adds a `restricted-v2`-compatible
+SecurityContext. No ingress controller or cert-manager add-ons needed.
+
+1. **Edit the secret** in `base/secret.yaml` (same as the external-database
+   path above).
+
+2. **Set your route hostname** — replace `omnigent.apps.example.com` in
+   `overlays/openshift/route.yaml` with your cluster's apps domain.
+
+3. **Apply:**
+
+   ```bash
+   kubectl kustomize deploy/kubernetes/overlays/openshift/ | oc apply -f -
+   ```
+
+For in-cluster Postgres on OpenShift, use `overlays/openshift-postgres/`
+instead — it combines the Postgres StatefulSet, OpenShift Route, and restricted
+security contexts:
+
+```bash
+# edit overlays/openshift-postgres/secret-patch.yaml with real passwords first
+kubectl kustomize deploy/kubernetes/overlays/openshift-postgres/ | oc apply -f -
+```
+
 ## Verify the deployment
 
 Check the rollout and reach the server without a public domain:

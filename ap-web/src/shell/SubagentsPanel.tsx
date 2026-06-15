@@ -146,14 +146,7 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
 // ``busy`` + ``current_task_status``). Drives the dot tone, whether the
 // label word shows, and whether the row is de-emphasized. ``awaiting`` =
 // parked on an approval / input prompt and needs the user's attention.
-type AgentActivity =
-  | "launching"
-  | "working"
-  | "awaiting"
-  | "done"
-  | "failed"
-  | "idle"
-  | "other";
+type AgentActivity = "launching" | "working" | "awaiting" | "done" | "failed" | "idle" | "other";
 
 interface AgentStatus {
   activity: AgentActivity;

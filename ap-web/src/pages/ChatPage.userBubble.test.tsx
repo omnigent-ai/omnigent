@@ -105,9 +105,7 @@ describe("AssistantBubble lifecycle rendering", () => {
   it("shows an interrupted indicator for cancelled assistant bubbles", () => {
     renderBubble(assistantBubble("cancelled"));
 
-    expect(screen.getByTestId("assistant-interrupted-indicator")).toHaveTextContent(
-      "Interrupted",
-    );
+    expect(screen.getByTestId("assistant-interrupted-indicator")).toHaveTextContent("Interrupted");
   });
 
   it("does not show an interrupted indicator for completed assistant bubbles", () => {
