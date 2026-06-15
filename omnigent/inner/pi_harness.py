@@ -34,8 +34,10 @@ Env vars read at startup:
   URLs keyed by model family, e.g.
   ``{"claude": "https://example.databricks.com/ai-gateway/anthropic"}``.
 - ``HARNESS_PI_CWD``: working directory the executor launches
-  the Pi CLI in. ``None`` falls back to the subprocess's
-  inherited cwd.
+  the Pi CLI in. When unset, falls back to
+  ``OMNIGENT_RUNNER_WORKSPACE`` — the session workspace the
+  native harnesses already honor — and finally to the
+  subprocess's inherited cwd.
 - ``HARNESS_PI_PATH``: absolute path to a ``pi`` CLI binary.
   ``None`` searches ``PATH``.
 - ``HARNESS_PI_OS_ENV``: JSON-encoded :class:`OSEnvSpec`
@@ -74,6 +76,7 @@ from fastapi import FastAPI
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import Executor
 from omnigent.inner.pi_executor import PiExecutor
+from omnigent.runner.identity import RUNNER_WORKSPACE_ENV_VAR
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
 _logger = logging.getLogger(__name__)
@@ -212,7 +215,7 @@ def _build_pi_executor() -> Executor:
     agent_name_raw = os.environ.get(_ENV_AGENT_NAME, "").strip()
     agent_name = agent_name_raw or None
     return PiExecutor(
-        cwd=os.environ.get(_ENV_CWD),
+        cwd=os.environ.get(_ENV_CWD) or os.environ.get(RUNNER_WORKSPACE_ENV_VAR),
         os_env=_resolve_os_env(),
         model=os.environ.get(_ENV_MODEL),
         pi_path=os.environ.get(_ENV_PI_PATH),
