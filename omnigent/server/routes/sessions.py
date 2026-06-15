@@ -745,6 +745,7 @@ _runner_skills_inflight: dict[str, asyncio.Task[None]] = {}
 # (``model/list``) off the hot path, same shape as runner skills.
 _codex_model_options_cache: dict[str, list[CodexModelOption]] = {}
 _codex_model_options_inflight: dict[str, asyncio.Task[None]] = {}
+_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S = (0.25, 0.5, 1.0, 2.0, 2.0)
 
 
 @dataclass
@@ -4770,6 +4771,38 @@ def _publish_codex_model_options(session_id: str) -> None:
     session_stream.publish(session_id, event.model_dump())
 
 
+def _invalidate_runner_backed_snapshot_state(
+    session_id: str,
+    *,
+    cancel_inflight: bool,
+) -> None:
+    """
+    Drop runner-derived session snapshot overlays for one session.
+
+    These fields are discovered from the bound runner (skills and the
+    codex-native ``model/list`` catalog), so browser reloads can ask the
+    next snapshot to refresh them from the live session instead of serving
+    stale AP-process memory. Runner teardown additionally cancels any
+    in-flight fetch so a dead runner cannot land a late stale value.
+
+    :param session_id: Session/conversation identifier,
+        e.g. ``"conv_abc123"``.
+    :param cancel_inflight: Whether to cancel currently-running fetches.
+        Use ``True`` when a runner disconnects; use ``False`` for browser
+        refreshes so concurrent page-load callers do not cancel each other.
+    """
+    _runner_skills_cache.pop(session_id, None)
+    if cancel_inflight:
+        inflight = _runner_skills_inflight.pop(session_id, None)
+        if inflight is not None:
+            inflight.cancel()
+    _codex_model_options_cache.pop(session_id, None)
+    if cancel_inflight:
+        codex_inflight = _codex_model_options_inflight.pop(session_id, None)
+        if codex_inflight is not None:
+            codex_inflight.cancel()
+
+
 def _publish_changed_files_invalidated(session_id: str, environment_id: str = "default") -> None:
     """
     Publish a coarse filesystem-change invalidation to the live stream.
@@ -8424,17 +8457,10 @@ async def _relay_runner_stream(
         # mid-turn, or a rebind cancellation) can't strand it forever.
         # Normal turn-ends already clear via record_publish.
         inflight_text.discard(session_id)
-        # Relay ended (runner dropped/rebound): re-discover skills next time.
-        # Cancel any in-flight fetch so it can't land stale skills from the
-        # dead runner into the cache after this pop.
-        _runner_skills_cache.pop(session_id, None)
-        inflight = _runner_skills_inflight.pop(session_id, None)
-        if inflight is not None:
-            inflight.cancel()
-        _codex_model_options_cache.pop(session_id, None)
-        codex_inflight = _codex_model_options_inflight.pop(session_id, None)
-        if codex_inflight is not None:
-            codex_inflight.cancel()
+        # Relay ended (runner dropped/rebound): re-discover runner-backed
+        # snapshot overlays next time. Cancel in-flight fetches so they can't
+        # land stale values from the dead runner after this pop.
+        _invalidate_runner_backed_snapshot_state(session_id, cancel_inflight=True)
 
 
 def _ensure_runner_relay(
@@ -12155,6 +12181,7 @@ def create_sessions_router(
         session_id: str,
         include_items: bool = Query(default=True),
         include_liveness: bool = Query(default=True),
+        refresh_state: bool = Query(default=False),
     ) -> SessionResponse:
         """
         Return a session snapshot: identity, status, and committed
@@ -12175,6 +12202,11 @@ def create_sessions_router(
             as ``None``. The web chat surface passes ``False`` because
             it sources liveness from the ``/health`` poll and the WS
             stream, not the snapshot.
+        :param refresh_state: When ``True``, refresh runner-derived
+            snapshot overlays from the live session instead of serving
+            stale AP-process caches. Browser reload/bind requests use
+            this to recover from fixed bugs without restarting the AP
+            server.
         :returns: The matching :class:`SessionResponse`.
         :raises OmnigentError: 404 if no session exists.
         """
@@ -12198,6 +12230,7 @@ def create_sessions_router(
             liveness_lookup=liveness_lookup if include_liveness else None,
             include_items=include_items,
             runner_exit_reports=runner_exit_reports,
+            refresh_state=refresh_state,
         )
 
     @router.get(
@@ -17594,23 +17627,37 @@ async def _load_codex_model_options(
     :param runner_client: HTTP client pointed at the bound runner.
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
     """
-    try:
-        resp = await runner_client.get(
-            f"/v1/sessions/{session_id}/codex-model-options",
-            timeout=5.0,
-        )
-    except httpx.HTTPError:
-        _logger.debug("Runner Codex model-options query failed for %s", session_id)
+    path = f"/v1/sessions/{session_id}/codex-model-options"
+    for attempt in range(len(_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S) + 1):
+        try:
+            resp = await runner_client.get(path, timeout=5.0)
+        except httpx.HTTPError:
+            _logger.debug("Runner Codex model-options query failed for %s", session_id)
+            return
+        if resp.status_code != 200:
+            # 503 means Codex's app-server bridge is still booting. Keep the
+            # background single-flight alive so the web picker fills without a
+            # second manual refresh.
+            if resp.status_code == 503 and attempt < len(_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S):
+                await asyncio.sleep(_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S[attempt])
+                continue
+            return
+        try:
+            options = _codex_model_options_from_wire(resp.json().get("models", []))
+        except (ValueError, KeyError, TypeError, ValidationError):
+            _logger.debug("Runner Codex model-options payload malformed for %s", session_id)
+            return
+        if not options:
+            # Older runners returned 200 + [] for the same not-ready window.
+            # Do not cache that empty catalog; retry, then leave the cache
+            # cold so a later snapshot can try again.
+            if attempt < len(_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S):
+                await asyncio.sleep(_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S[attempt])
+                continue
+            return
+        _codex_model_options_cache[session_id] = options
+        _publish_codex_model_options(session_id)
         return
-    if resp.status_code != 200:
-        return
-    try:
-        options = _codex_model_options_from_wire(resp.json().get("models", []))
-    except (ValueError, KeyError, TypeError, ValidationError):
-        _logger.debug("Runner Codex model-options payload malformed for %s", session_id)
-        return
-    _codex_model_options_cache[session_id] = options
-    _publish_codex_model_options(session_id)
 
 
 async def _get_session_snapshot(
@@ -17623,6 +17670,7 @@ async def _get_session_snapshot(
     liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None = None,
     include_items: bool = True,
     runner_exit_reports: RunnerExitReports | None = None,
+    refresh_state: bool = False,
 ) -> SessionResponse:
     """
     Read a full session snapshot from the store.
@@ -17657,6 +17705,10 @@ async def _get_session_snapshot(
         through ``GET /sessions/{id}/items`` (the web chat surface)
         pass ``False`` — the items read is the most expensive step of
         the snapshot build and its result would be discarded.
+    :param refresh_state: When ``True``, clear runner-backed snapshot
+        overlays for this session before building the response. Browser
+        reloads use this so a refresh re-reads current live-session
+        capabilities instead of serving stale AP-process caches.
     :returns: The fully populated :class:`SessionResponse`.
     :raises OmnigentError: 404 if no session exists, 500 if the
         underlying conversation has no agent binding
@@ -17670,6 +17722,8 @@ async def _get_session_snapshot(
             "Session not found",
             code=ErrorCode.NOT_FOUND,
         )
+    if refresh_state:
+        _invalidate_runner_backed_snapshot_state(session_id, cancel_inflight=False)
     # Return the most recent committed items while preserving the
     # SessionResponse contract that ``items`` is chronological. The
     # store's default page is the oldest 100 (``order="asc"``), which

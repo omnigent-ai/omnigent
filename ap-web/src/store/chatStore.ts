@@ -486,6 +486,15 @@ export interface ChatState {
    * there is no active conversation.
    */
   compact: () => Promise<void>;
+  /**
+   * Refetch runner-backed session state for the active conversation.
+   *
+   * Used when a native runner comes online after being unreachable: the
+   * runner-owned fields (skills, Codex model catalog, terminal/session
+   * metadata) may have changed while the browser only had a stale cached
+   * snapshot. No-ops for inactive or missing conversations.
+   */
+  refreshSessionState: (conversationId?: string) => Promise<void>;
 }
 
 let queryClient: QueryClient | null = null;
@@ -1230,6 +1239,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
     await postEvent(conversationId, { type: "compact", data: {} });
   },
 
+  refreshSessionState: async (conversationId) => {
+    const id = conversationId ?? get().conversationId;
+    if (!id) return;
+    await refetchRunnerBackedSessionState(id, {
+      refreshState: true,
+      applyBindingPatch: true,
+    });
+  },
+
   setEffort: async (effort) => {
     set({ selectedEffort: effort });
     savePickerPref(PICKER_PREF_EFFORT_KEY, effort);
@@ -1670,7 +1688,7 @@ async function bindStream(
     const [session, page] = await Promise.all([
       queryClient.fetchQuery({
         queryKey: ["session", id],
-        queryFn: () => getSessionSlim(id),
+        queryFn: () => getSessionSlim(id, { refreshState: true }),
         staleTime: 0,
         retry: false,
       }),
@@ -3091,40 +3109,66 @@ function committedUserBlock(
   };
 }
 
+interface RefetchRunnerBackedSessionStateOptions {
+  /** Force the AP server to re-read runner-backed caches before returning. */
+  refreshState?: boolean;
+  /** Apply the broader binding metadata patch in addition to capabilities. */
+  applyBindingPatch?: boolean;
+}
+
 /**
- * Refetch runner-backed session capabilities and apply them to the store.
+ * Refetch runner-backed session state and apply it to the store.
  *
  * Skills and codex-native model options are runner-owned. When a session
  * binds before those background fetches land, the snapshot carries empty
  * lists. The server later sends a bare nudge; refetching the snapshot is
  * how the store pulls the cache-warmed fields without clobbering live chat
- * state.
+ * state. Runner-online refreshes can also ask the server to pierce stale
+ * caches and then re-apply binding metadata that is safe to update out of
+ * band (agent labels, harness, terminal-pending, sandbox state).
  *
  * Best-effort and race-guarded: a failed fetch (runner dropped again
- * mid-flight) leaves existing capabilities in place, and a result for a
+ * mid-flight) leaves existing state in place, and a result for a
  * conversation the user has since switched away from is dropped.
  *
- * :param conversationId: The session whose runner just came online,
- *     e.g. ``"conv_abc123"``.
+ * :param conversationId: The session to refetch, e.g. ``"conv_abc123"``.
+ * :param options: Whether to force a runner-backed refresh and apply the
+ *     broader binding patch.
  */
-async function refetchSessionCapabilities(conversationId: string): Promise<void> {
+async function refetchRunnerBackedSessionState(
+  conversationId: string,
+  options: RefetchRunnerBackedSessionStateOptions = {},
+): Promise<void> {
   if (useChatStore.getState().conversationId !== conversationId) return;
   let session: Session;
   try {
-    session = await getSessionSlim(conversationId);
+    if (queryClient !== null) {
+      session = await queryClient.fetchQuery({
+        queryKey: ["session", conversationId],
+        queryFn: () => getSessionSlim(conversationId, { refreshState: options.refreshState }),
+        staleTime: 0,
+        retry: false,
+      });
+    } else {
+      session = await getSessionSlim(conversationId, { refreshState: options.refreshState });
+    }
   } catch {
     // The runner may have dropped again before the fetch landed. Keep
-    // the existing skills list rather than wiping it on a transient error.
+    // the existing state rather than wiping it on a transient error.
     return;
   }
   // Re-check after the await — the user may have switched conversations
   // while the request was in flight; applying now would leak another
   // session's capabilities into the open composer.
   if (useChatStore.getState().conversationId !== conversationId) return;
-  useChatStore.setState({
-    skills: session.skills ?? [],
-    codexModelOptions: session.codexModelOptions ?? [],
-  });
+  useChatStore.setState(
+    options.applyBindingPatch === true
+      ? sessionBindingPatch(session)
+      : {
+          skills: session.skills ?? [],
+          codexModelOptions: session.codexModelOptions ?? [],
+        },
+  );
 }
 
 /**
@@ -3657,14 +3701,14 @@ export function handleSessionEvent(event: StreamEvent): void {
       // path, so the bind-time snapshot served an empty list; this is
       // the first moment the slash-command menu can be filled. Refetch
       // the now-warm snapshot and apply its `skills`. Fire and forget —
-      // refetchSessionCapabilities self-guards against a stale apply.
-      void refetchSessionCapabilities(event.conversationId);
+      // refetchRunnerBackedSessionState self-guards against a stale apply.
+      void refetchRunnerBackedSessionState(event.conversationId);
       return;
     case "session_codex_model_options":
       // Codex app-server `model/list` just resolved. Refetch the
       // cache-warmed snapshot and apply `codexModelOptions`; the picker
       // derives both model rows and effort levels from that catalog.
-      void refetchSessionCapabilities(event.conversationId);
+      void refetchRunnerBackedSessionState(event.conversationId);
       return;
     case "tool_result":
       // Tool results are not a reliable correlation signal for

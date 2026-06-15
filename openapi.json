@@ -4776,7 +4776,7 @@
         ]
       },
       "get": {
-        "description": "Return a session snapshot: identity, status, and committed\nitems.\n\n:param request: The incoming FastAPI request (for auth).\n:param response: The FastAPI response (for cache headers).\n:param session_id: Session/conversation identifier,\n    e.g. ``\"conv_abc123\"``.\n:param include_items: When ``False``, skip the committed-items\n    read and return ``items=[]``. The web chat surface passes\n    ``False`` because it hydrates the transcript via the\n    paginated ``GET /sessions/{id}/items`` endpoint in parallel\n    and never reads the snapshot's copy; the items read is the\n    single most expensive step of the snapshot build.\n:param include_liveness: When ``False``, skip the runner/host\n    liveness lookup and return ``runner_online``/``host_online``\n    as ``None``. The web chat surface passes ``False`` because\n    it sources liveness from the ``/health`` poll and the WS\n    stream, not the snapshot.\n:returns: The matching :class:`SessionResponse`.\n:raises OmnigentError: 404 if no session exists.",
+        "description": "Return a session snapshot: identity, status, and committed\nitems.\n\n:param request: The incoming FastAPI request (for auth).\n:param response: The FastAPI response (for cache headers).\n:param session_id: Session/conversation identifier,\n    e.g. ``\"conv_abc123\"``.\n:param include_items: When ``False``, skip the committed-items\n    read and return ``items=[]``. The web chat surface passes\n    ``False`` because it hydrates the transcript via the\n    paginated ``GET /sessions/{id}/items`` endpoint in parallel\n    and never reads the snapshot's copy; the items read is the\n    single most expensive step of the snapshot build.\n:param include_liveness: When ``False``, skip the runner/host\n    liveness lookup and return ``runner_online``/``host_online``\n    as ``None``. The web chat surface passes ``False`` because\n    it sources liveness from the ``/health`` poll and the WS\n    stream, not the snapshot.\n:param refresh_state: When ``True``, refresh runner-derived\n    snapshot overlays from the live session instead of serving\n    stale AP-process caches. Browser reload/bind requests use\n    this to recover from fixed bugs without restarting the AP\n    server.\n:returns: The matching :class:`SessionResponse`.\n:raises OmnigentError: 404 if no session exists.",
         "operationId": "get_session_v1_sessions__session_id__get",
         "parameters": [
           {
@@ -4805,6 +4805,16 @@
             "schema": {
               "default": true,
               "title": "Include Liveness",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "refresh_state",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Refresh State",
               "type": "boolean"
             }
           }

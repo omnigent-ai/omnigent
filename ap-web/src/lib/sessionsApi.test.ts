@@ -529,6 +529,25 @@ describe("getSession", () => {
     expect(session.items).toEqual([]);
   });
 
+  it("getSessionSlim can request a runner-backed state refresh", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_abc",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+        items: [],
+      }),
+    );
+
+    await getSessionSlim("conv_abc", { refreshState: true });
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/v1/sessions/conv_abc?include_items=false&include_liveness=false&refresh_state=true",
+    );
+  });
+
   it("maps permission_level from the wire to permissionLevel", async () => {
     // Regression for the bug where SessionResponseWire was missing
     // permission_level — the field was on the wire but dropped at the

@@ -97,6 +97,7 @@ import {
 } from "@/store/chatStore";
 import { useSession } from "@/hooks/useSession";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { useRefreshSessionStateOnRunnerOnline } from "@/hooks/useSessionOnlineRefresh";
 import {
   type SessionLiveness,
   livenessRowFromSession,
@@ -493,6 +494,7 @@ export function ChatPage() {
   // RunnerHealthProvider). `undefined` = not yet polled — the indicator
   // stays hidden until the first poll for this session resolves.
   const runnerOnline = useSessionRunnerOnline(urlConvId);
+  useRefreshSessionStateOnRunnerOnline(urlConvId, runnerOnline);
   // OR'd into "Working…" so cross-client turns surface a shimmer.
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const loadingConversation = useChatStore((s) => s.loadingConversation);
