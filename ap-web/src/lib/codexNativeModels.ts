@@ -1,35 +1,97 @@
-/**
- * Codex-native model picker options. Keep this list aligned with the
- * subscription-tier model catalog Omnigent exposes for Codex-backed agents.
- *
- * Lives in a leaf module (no React / store imports) so both the picker UI
- * (`ChatPage`) and the store (`chatStore`) can read it without a circular
- * import.
- */
-export const CODEX_NATIVE_MODELS = [
-  // Ordered by capability tier, most powerful first.
-  { id: "gpt-5.5", label: "GPT-5.5" },
-  { id: "gpt-5.4", label: "GPT-5.4" },
-  { id: "gpt-5.4-mini", label: "GPT-5.4 mini" },
-] as const;
+import type { CodexModelOption } from "./types";
+
+export interface NativeModelPickerOption {
+  id: string;
+  label: string;
+}
+
+function normalizeModelId(model: string): string {
+  return model
+    .trim()
+    .toLowerCase()
+    .replace(/^(databricks|openai|anthropic|claude)[-_/]+/, "")
+    .replace(/[._/]+/g, "-");
+}
+
+function unique(values: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const value of values) {
+    if (seen.has(value)) continue;
+    seen.add(value);
+    out.push(value);
+  }
+  return out;
+}
 
 /**
- * Is `model` something a Codex-native session can actually run?
+ * Convert Codex ``model/list`` options into picker rows.
  *
- * Accepts the advertised picker ids plus the common OpenAI/Codex naming
- * families Omnigent can receive from gateway-backed model ids. Rejects
- * Claude aliases so cross-harness sticky picks are not applied to Codex.
- *
- * @param model - A model id / alias, or null/undefined.
- * @returns True only for a Codex-compatible model.
+ * @param options - Codex model options from the session snapshot.
+ * @returns Picker rows using Codex's own id and display label.
  */
-export function isCodexNativeModel(model: string | null | undefined): boolean {
-  if (model == null) return false;
-  const id = model.toLowerCase();
+export function codexModelPickerOptions(
+  options: readonly CodexModelOption[],
+): NativeModelPickerOption[] {
+  return options.map((m) => ({ id: m.id, label: m.displayName || m.id }));
+}
+
+/**
+ * Find the Codex option matching a model id reported by either Omnigent or Codex.
+ *
+ * @param options - Codex model options from the session snapshot.
+ * @param model - Candidate model id, e.g. ``"gpt-5.5"``.
+ * @returns The matching option, or ``null`` when unknown.
+ */
+export function findCodexModelOption(
+  options: readonly CodexModelOption[],
+  model: string | null | undefined,
+): CodexModelOption | null {
+  const raw = model?.trim();
+  if (!raw) return null;
+  const lower = raw.toLowerCase();
+  const normalized = normalizeModelId(raw);
   return (
-    CODEX_NATIVE_MODELS.some((m) => m.id === id) ||
-    id.startsWith("gpt-") ||
-    id.startsWith("databricks-gpt-") ||
-    id.includes("codex")
+    options.find((option) => {
+      const ids = [option.id, option.model].map((value) => value.toLowerCase());
+      return (
+        ids.includes(lower) ||
+        ids.map(normalizeModelId).includes(normalized)
+      );
+    }) ?? null
   );
+}
+
+/**
+ * Whether a sticky model id is one Codex advertised for this session.
+ *
+ * @param options - Codex model options from the session snapshot.
+ * @param model - Candidate model id.
+ * @returns True only when the candidate matches a Codex-returned option.
+ */
+export function isCodexNativeModel(
+  options: readonly CodexModelOption[],
+  model: string | null | undefined,
+): boolean {
+  return findCodexModelOption(options, model) !== null;
+}
+
+/**
+ * Effort levels for the currently selected Codex model.
+ *
+ * @param options - Codex model options from the session snapshot.
+ * @param currentModel - Active override or bound model id.
+ * @returns Model-specific effort values from Codex ``model/list``.
+ */
+export function codexEffortLevelsForModel(
+  options: readonly CodexModelOption[],
+  currentModel: string | null | undefined,
+): readonly string[] {
+  if (options.length === 0) return [];
+  const selected =
+    findCodexModelOption(options, currentModel) ??
+    options.find((option) => option.isDefault) ??
+    options[0] ??
+    null;
+  return selected ? unique(selected.supportedReasoningEfforts) : [];
 }

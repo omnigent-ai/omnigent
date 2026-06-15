@@ -1,6 +1,26 @@
 import { describe, expect, it } from "vitest";
+import type { CodexModelOption } from "@/lib/types";
 
 import { effortLevelsForConv, shouldShowEffortPicker, shouldShowModelPicker } from "./ChatPage";
+
+const CODEX_MODEL_OPTIONS: CodexModelOption[] = [
+  {
+    id: "gpt-5.5",
+    model: "databricks-gpt-5-5",
+    displayName: "GPT-5.5",
+    defaultReasoningEffort: "high",
+    supportedReasoningEfforts: ["low", "medium", "high", "xhigh"],
+    isDefault: true,
+  },
+  {
+    id: "gpt-5.4-mini",
+    model: "databricks-gpt-5-4-mini",
+    displayName: "GPT-5.4 mini",
+    defaultReasoningEffort: "medium",
+    supportedReasoningEfforts: ["minimal", "low", "medium"],
+    isDefault: false,
+  },
+];
 
 describe("effortLevelsForConv", () => {
   it("returns the Claude-native effort set for claude-native conversations", () => {
@@ -16,16 +36,18 @@ describe("effortLevelsForConv", () => {
     expect(effortLevelsForConv(conv)).toEqual(["low", "medium", "high"]);
   });
 
-  it("returns the Codex-native effort set for codex-native conversations", () => {
+  it("returns Codex-native efforts from the selected Codex model option", () => {
     const conv = { labels: { "omnigent.wrapper": "codex-native-ui" } };
-    expect(effortLevelsForConv(conv)).toEqual([
-      "none",
+    expect(effortLevelsForConv(conv, CODEX_MODEL_OPTIONS, "gpt-5.4-mini")).toEqual([
       "minimal",
       "low",
       "medium",
-      "high",
-      "xhigh",
     ]);
+  });
+
+  it("returns an empty Codex-native effort set until Codex options load", () => {
+    const conv = { labels: { "omnigent.wrapper": "codex-native-ui" } };
+    expect(effortLevelsForConv(conv, [], null)).toEqual([]);
   });
 
   it("returns the default set when conv is null or labels are missing", () => {

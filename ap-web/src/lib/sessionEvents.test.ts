@@ -13,6 +13,7 @@ import type {
   SessionAgentChangedEvent,
   SessionChangedFilesInvalidatedEvent,
   SessionChildSessionUpdatedEvent,
+  SessionCodexModelOptionsEvent,
   SessionCreatedEvent,
   SessionInputConsumedEvent,
   SessionInterruptedEvent,
@@ -1435,6 +1436,26 @@ describe("session.skills (FLAT envelope)", () => {
     const out = parse("session.skills", {
       type: "session.skills",
       conversation_id: "",
+    });
+    expect(out).toEqual([]);
+  });
+});
+
+describe("session.codex_model_options (FLAT envelope)", () => {
+  it("lifts conversation_id into the bare nudge", () => {
+    const out = parse("session.codex_model_options", {
+      type: "session.codex_model_options",
+      conversation_id: "conv_abc",
+    });
+    expect(out).toHaveLength(1);
+    const ev = out[0] as SessionCodexModelOptionsEvent;
+    expect(ev.type).toBe("session_codex_model_options");
+    expect(ev.conversationId).toBe("conv_abc");
+  });
+
+  it("rejects missing conversation_id", () => {
+    const out = parse("session.codex_model_options", {
+      type: "session.codex_model_options",
     });
     expect(out).toEqual([]);
   });

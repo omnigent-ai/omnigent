@@ -192,6 +192,7 @@ from omnigent.server.routes._host_worktree import CreatedWorktree
 from omnigent.server.schemas import (
     AgentObject,
     ChildSessionSummary,
+    CodexModelOption,
     ConversationDeleted,
     CreatedSessionResponse,
     ElicitationRequestEvent,
@@ -210,6 +211,7 @@ from omnigent.server.schemas import (
     SandboxStatus,
     ServerStreamEvent,
     SessionAgentChangedEvent,
+    SessionCodexModelOptionsEvent,
     SessionCreatedEvent,
     SessionCreateMetadata,
     SessionCreateRequest,
@@ -743,6 +745,11 @@ _session_sandbox_status_cache: dict[str, SandboxStatus] = {}
 # poll can't pin the runner's event loop and wedge a turn.
 _runner_skills_cache: dict[str, list[SkillSummary]] = {}
 _runner_skills_inflight: dict[str, asyncio.Task[None]] = {}
+# Per-session codex-native model catalog cache + in-flight fetch.
+# The snapshot warms this from the bound runner's live Codex app-server
+# (``model/list``) off the hot path, same shape as runner skills.
+_codex_model_options_cache: dict[str, list[CodexModelOption]] = {}
+_codex_model_options_inflight: dict[str, asyncio.Task[None]] = {}
 
 
 @dataclass
@@ -2007,6 +2014,7 @@ def _build_session_response(
     host_online: bool | None = None,
     pending_elicitation_events: list[dict[str, Any]] | None = None,
     subtree_usage: dict[str, Any] | None = None,
+    codex_model_options: list[CodexModelOption] | None = None,
 ) -> SessionResponse:
     """
     Build a :class:`SessionResponse` from store-side entities.
@@ -2066,6 +2074,9 @@ def _build_session_response(
         ``None`` falls back to this conversation's own ``session_usage``
         (correct for childless sessions). Passed by the snapshot path;
         other callers omit it.
+    :param codex_model_options: Codex app-server ``model/list`` options
+        for this session, e.g. ``[CodexModelOption(id="gpt-5.5", ...)]``.
+        ``None`` is treated as ``[]``.
     :returns: The :class:`SessionResponse` for the API.
     :raises OmnigentError: If ``conv.agent_id`` is ``None``.
     """
@@ -2139,6 +2150,7 @@ def _build_session_response(
         # non-claude-native sessions or before the first poll tick.
         todos=_session_todos_cache.get(conv.id, []),
         skills=skills or [],
+        codex_model_options=codex_model_options or [],
         # Replay terminal spin-up state so a client connecting while the
         # runner is still creating a terminal-first session's terminal
         # sees the Terminal-pill spinner. Populated by the runner SSE
@@ -4802,6 +4814,24 @@ def _publish_runner_skills(session_id: str) -> None:
     """
     event = SessionSkillsEvent(
         type="session.skills",
+        conversation_id=session_id,
+    )
+    session_stream.publish(session_id, event.model_dump())
+
+
+def _publish_codex_model_options(session_id: str) -> None:
+    """
+    Publish a typed :class:`SessionCodexModelOptionsEvent` to the live stream.
+
+    Fired when the background Codex ``model/list`` fetch populates the
+    per-session model-options cache. Connected clients re-read the session
+    snapshot and apply its cache-backed ``codex_model_options`` field.
+
+    :param session_id: Session/conversation identifier,
+        e.g. ``"conv_abc123"``.
+    """
+    event = SessionCodexModelOptionsEvent(
+        type="session.codex_model_options",
         conversation_id=session_id,
     )
     session_stream.publish(session_id, event.model_dump())
@@ -8480,6 +8510,10 @@ async def _relay_runner_stream(
         inflight = _runner_skills_inflight.pop(session_id, None)
         if inflight is not None:
             inflight.cancel()
+        _codex_model_options_cache.pop(session_id, None)
+        codex_inflight = _codex_model_options_inflight.pop(session_id, None)
+        if codex_inflight is not None:
+            codex_inflight.cancel()
 
 
 def _ensure_runner_relay(
@@ -17571,6 +17605,106 @@ async def _load_runner_skills(
     _publish_runner_skills(session_id)
 
 
+def _codex_model_options_from_wire(raw_models: Any) -> list[CodexModelOption]:
+    """
+    Parse runner-returned Codex ``model/list`` data into API objects.
+
+    :param raw_models: JSON value from the runner's
+        ``{"models": [...]}`` response, e.g. a list of Codex model dicts.
+    :returns: Validated model options for the session snapshot.
+    :raises ValueError: If the payload is not the expected list/dict
+        shape.
+    """
+    if not isinstance(raw_models, list):
+        raise ValueError("Codex model options payload must be a list")
+    options: list[CodexModelOption] = []
+    for raw_model in raw_models:
+        if not isinstance(raw_model, dict):
+            raise ValueError("Codex model option must be an object")
+        supported_raw = raw_model.get("supported_reasoning_efforts")
+        if not isinstance(supported_raw, list) or not all(
+            isinstance(value, str) and value for value in supported_raw
+        ):
+            raise ValueError("Codex supported_reasoning_efforts must be strings")
+        options.append(
+            CodexModelOption(
+                id=raw_model["id"],
+                model=raw_model["model"],
+                display_name=raw_model["display_name"],
+                default_reasoning_effort=raw_model["default_reasoning_effort"],
+                supported_reasoning_efforts=supported_raw,
+                is_default=bool(raw_model.get("is_default", False)),
+            )
+        )
+    return options
+
+
+async def _fetch_codex_model_options(
+    runner_client: httpx.AsyncClient | None,
+    session_id: str,
+    conv: Conversation,
+) -> list[CodexModelOption]:
+    """
+    Fetch cached Codex model options for a codex-native session.
+
+    The bound runner owns this query because only it can reach the live
+    Codex app-server socket. Like skills, this stays off the snapshot hot
+    path: the first snapshot kicks a background fetch and returns ``[]``;
+    subsequent snapshots serve the cache.
+
+    :param runner_client: HTTP client pointed at the bound runner, or
+        ``None`` when no runner is bound.
+    :param session_id: Session/conversation identifier,
+        e.g. ``"conv_abc123"``.
+    :param conv: Conversation row whose labels identify the wrapper.
+    :returns: Cached Codex options, or ``[]`` when not codex-native or not
+        yet available.
+    """
+    if conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) != _CODEX_NATIVE_WRAPPER_LABEL_VALUE:
+        return []
+    if runner_client is None:
+        return []
+    cached = _codex_model_options_cache.get(session_id)
+    if cached is not None:
+        return cached
+    if session_id not in _codex_model_options_inflight:
+        task = asyncio.create_task(_load_codex_model_options(runner_client, session_id))
+        _codex_model_options_inflight[session_id] = task
+        task.add_done_callback(
+            lambda _t, sid=session_id: _codex_model_options_inflight.pop(sid, None)
+        )
+    return []
+
+
+async def _load_codex_model_options(
+    runner_client: httpx.AsyncClient,
+    session_id: str,
+) -> None:
+    """
+    Background single-flight fetch of a session's Codex model catalog.
+
+    :param runner_client: HTTP client pointed at the bound runner.
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
+    """
+    try:
+        resp = await runner_client.get(
+            f"/v1/sessions/{session_id}/codex-model-options",
+            timeout=5.0,
+        )
+    except httpx.HTTPError:
+        _logger.debug("Runner Codex model-options query failed for %s", session_id)
+        return
+    if resp.status_code != 200:
+        return
+    try:
+        options = _codex_model_options_from_wire(resp.json().get("models", []))
+    except (ValueError, KeyError, TypeError, ValidationError):
+        _logger.debug("Runner Codex model-options payload malformed for %s", session_id)
+        return
+    _codex_model_options_cache[session_id] = options
+    _publish_codex_model_options(session_id)
+
+
 async def _get_session_snapshot(
     conv_store: ConversationStore,
     session_id: str,
@@ -17767,6 +17901,11 @@ async def _get_session_snapshot(
     # server only overlays the result; best-effort, empty when no runner
     # is bound or it can't be reached.
     skills = await _fetch_runner_skills(runner_client, session_id)
+    # Codex model options are also runner-owned: they come from the
+    # session's live Codex app-server ``model/list`` response. Best-effort
+    # and cache-backed like skills so a snapshot poll cannot wedge the
+    # runner while a turn is active.
+    codex_model_options = await _fetch_codex_model_options(runner_client, session_id, conv)
     # Dynamic override from the forwarder (real Claude Code window).
     # Only present after the first statusLine tick; before that the
     # spec default applies.
@@ -17804,6 +17943,7 @@ async def _get_session_snapshot(
         last_task_error=last_task_error,
         agent_name=agent_name,
         skills=skills,
+        codex_model_options=codex_model_options,
         runner_online=runner_online,
         host_online=host_online,
         pending_elicitation_events=await asyncio.to_thread(

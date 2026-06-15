@@ -69,7 +69,7 @@ import { agentDisplayLabel } from "@/components/AgentInfo";
 import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
 import { useConversations } from "@/hooks/useConversations";
 import { usePermissions } from "@/hooks/usePermissions";
-import type { SandboxStatus, Session, SessionStatus } from "@/lib/types";
+import type { CodexModelOption, SandboxStatus, Session, SessionStatus } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import type { MessageContentBlock } from "@/lib/blocks";
@@ -84,7 +84,11 @@ import {
 } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
-import { CODEX_NATIVE_MODELS } from "@/lib/codexNativeModels";
+import {
+  codexEffortLevelsForModel,
+  codexModelPickerOptions,
+  findCodexModelOption,
+} from "@/lib/codexNativeModels";
 import {
   consumePendingInitialPrompt,
   type PendingInitialPrompt,
@@ -828,6 +832,15 @@ export function ChatPage() {
     labels: activeSession ? (activeSession.labels ?? {}) : (activeConv?.labels ?? {}),
   };
   const modelPickerKind = modelPickerKindForConv(capabilitySource);
+  const codexModelOptions = useChatStore((s) => s.codexModelOptions);
+  const selectedModel = useChatStore((s) => s.selectedModel);
+  const llmModel = useChatStore((s) => s.llmModel);
+  const effortLevels = effortLevelsForConv(
+    capabilitySource,
+    codexModelOptions,
+    selectedModel ?? llmModel,
+  );
+  const showEffort = shouldShowEffortPicker(capabilitySource) && effortLevels.length > 0;
 
   // When inside a session, only show the bound agent — the session is
   // tied 1:1 to its runner and can't be reassigned. Show all agents on
@@ -873,10 +886,11 @@ export function ChatPage() {
       loadingMoreHistory={loadingMoreHistory}
       permissionLevel={permissionLevel}
       readOnlyReason={readOnlyReason}
-      effortLevels={effortLevelsForConv(capabilitySource)}
-      showEffort={shouldShowEffortPicker(capabilitySource)}
+      effortLevels={effortLevels}
+      showEffort={showEffort}
       showModels={modelPickerKind !== null}
       modelPickerKind={modelPickerKind}
+      codexModelOptions={codexModelOptions}
       costRoutingVerdict={costRoutingVerdict}
       costRoutingEligible={costRoutingEligible}
       subAgentLabel={subAgentLabel}
@@ -1099,6 +1113,8 @@ interface MainAgentSurfaceProps {
   showModels: boolean;
   /** Native model picker family, when present. */
   modelPickerKind: NativeModelPickerKind | null;
+  /** Codex app-server model options for codex-native sessions. */
+  codexModelOptions: readonly CodexModelOption[];
   /** Latest advisor verdict for the cost-routing pill; null when none. */
   costRoutingVerdict: CostRoutingVerdict | null;
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child). */
@@ -1170,6 +1186,7 @@ function MainAgentSurface({
   showEffort,
   showModels,
   modelPickerKind,
+  codexModelOptions,
   costRoutingVerdict,
   costRoutingEligible,
   subAgentLabel,
@@ -1424,6 +1441,7 @@ function MainAgentSurface({
         showEffort={showEffort}
         showModels={showModels}
         modelPickerKind={modelPickerKind}
+        codexModelOptions={codexModelOptions}
         isTerminalFirst={isTerminalFirst}
         isNativeWrapper={isNativeWrapper}
         reconnectHint={liveness.kind === "runner_asleep"}
@@ -2485,6 +2503,8 @@ interface ComposerProps {
   showModels: boolean;
   /** Native model picker family, when present. */
   modelPickerKind: NativeModelPickerKind | null;
+  /** Codex app-server model options for codex-native sessions. */
+  codexModelOptions: readonly CodexModelOption[];
   /**
    * Terminal-first session (Chat/Terminal pill present). Presentation
    * only: tightens the composer's bottom padding to `pb-1.5` so it sits
@@ -2647,11 +2667,16 @@ function formatModelPart(part: string): string {
  * @param model - Model override or bound agent model id.
  * @returns A compact display label, or ``null`` when no model is known.
  */
-export function formatStatusModelLabel(model: string | null): string | null {
+export function formatStatusModelLabel(
+  model: string | null,
+  codexModelOptions: readonly CodexModelOption[] = [],
+): string | null {
   const raw = model?.trim();
   if (!raw) return null;
   const lower = raw.toLowerCase();
-  const known = [...CLAUDE_NATIVE_MODELS, ...CODEX_NATIVE_MODELS].find((m) => m.id === lower);
+  const codexOption = findCodexModelOption(codexModelOptions, raw);
+  if (codexOption) return codexOption.displayName;
+  const known = CLAUDE_NATIVE_MODELS.find((m) => m.id === lower);
   if (known) return known.label;
 
   const leaf = raw.split("/").at(-1) ?? raw;
@@ -2684,8 +2709,9 @@ function formatStatusEffortLabel(effort: string | null): string | null {
 export function formatModelEffortStatusLabel(
   model: string | null,
   effort: string | null,
+  codexModelOptions: readonly CodexModelOption[] = [],
 ): string | null {
-  const modelLabel = formatStatusModelLabel(model);
+  const modelLabel = formatStatusModelLabel(model, codexModelOptions);
   const effortLabel = formatStatusEffortLabel(effort);
   const parts = [modelLabel, effortLabel].filter((p): p is string => p != null && p.length > 0);
   return parts.length > 0 ? parts.join(" ") : null;
@@ -2710,6 +2736,7 @@ function ComposerStatusLine() {
   const selectedEffort = useChatStore((s) => s.selectedEffort);
   const selectedModel = useChatStore((s) => s.selectedModel);
   const llmModel = useChatStore((s) => s.llmModel);
+  const codexModelOptions = useChatStore((s) => s.codexModelOptions);
   // Seeded from the session snapshot on bind (chatStore.sessionBindingPatch),
   // alongside contextWindow — so the branch reads from the same store as
   // the other status-line values rather than a separate fetch.
@@ -2717,7 +2744,7 @@ function ComposerStatusLine() {
 
   const showBranch = !!conversationId && !!gitBranch;
   const modelEffortLabel = conversationId
-    ? formatModelEffortStatusLabel(selectedModel ?? llmModel, selectedEffort)
+    ? formatModelEffortStatusLabel(selectedModel ?? llmModel, selectedEffort, codexModelOptions)
     : null;
   // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
   const showRing =
@@ -2865,6 +2892,7 @@ export function Composer({
   showEffort,
   showModels,
   modelPickerKind,
+  codexModelOptions,
   isTerminalFirst = false,
   isNativeWrapper = false,
   reconnectHint = false,
@@ -3640,6 +3668,7 @@ export function Composer({
               effortLevels={effortLevels}
               showEffort={showEffort}
               modelPickerKind={modelPickerKind}
+              codexModelOptions={codexModelOptions}
               disabled={isReadOnly}
               openNonce={pickerOpenNonce}
             />
@@ -3839,7 +3868,6 @@ const EFFORT_LEVELS = ["low", "medium", "high"] as const;
 
 /** Anthropic-side efforts for claude-native sessions (matches ANTHROPIC_EFFORTS in reasoning_effort.py). */
 const CLAUDE_NATIVE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
-const CODEX_NATIVE_EFFORT_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh"] as const;
 
 type NativeModelPickerKind = "claude" | "codex";
 
@@ -3875,12 +3903,14 @@ export function readOnlyReasonForSessionLabels(
 
 export function effortLevelsForConv(
   conv: { labels?: Record<string, string | null> | null } | null | undefined,
+  codexModelOptions: readonly CodexModelOption[] = [],
+  currentModel: string | null = null,
 ): readonly string[] {
   switch (conv?.labels?.["omnigent.wrapper"]) {
     case "claude-code-native-ui":
       return CLAUDE_NATIVE_EFFORT_LEVELS;
     case "codex-native-ui":
-      return CODEX_NATIVE_EFFORT_LEVELS;
+      return codexEffortLevelsForModel(codexModelOptions, currentModel);
     default:
       return EFFORT_LEVELS;
   }
@@ -3945,6 +3975,8 @@ interface AgentPickerProps {
   showEffort: boolean;
   /** Native model picker family, when present. */
   modelPickerKind: NativeModelPickerKind | null;
+  /** Codex app-server model options for codex-native sessions. */
+  codexModelOptions: readonly CodexModelOption[];
   /**
    * Disables the picker trigger. The picker is purely a write
    * surface (selecting an agent / model / effort changes how the
@@ -3973,6 +4005,7 @@ function AgentPicker({
   effortLevels,
   showEffort,
   modelPickerKind,
+  codexModelOptions,
   disabled = false,
   openNonce = 0,
 }: AgentPickerProps) {
@@ -3994,7 +4027,7 @@ function AgentPicker({
     modelPickerKind === "claude"
       ? CLAUDE_NATIVE_MODELS
       : modelPickerKind === "codex"
-        ? CODEX_NATIVE_MODELS
+        ? codexModelPickerOptions(codexModelOptions)
         : [];
   const isNativeModelPicker = modelPickerKind !== null;
   // Only offer the agent list when there's an actual choice. Inside a
@@ -4088,7 +4121,10 @@ function AgentPicker({
             {modelOptions.map((m) => {
               const isExplicit = selectedModel === m.id;
               const isImplicit =
-                selectedModel === null && isModelImplicitlySelected(m.id, llmModel);
+                selectedModel === null &&
+                (modelPickerKind === "codex"
+                  ? findCodexModelOption(codexModelOptions, llmModel)?.id === m.id
+                  : isModelImplicitlySelected(m.id, llmModel));
               const isActive = isExplicit || isImplicit;
               return (
                 <DropdownMenuItem

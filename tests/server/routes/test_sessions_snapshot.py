@@ -29,6 +29,19 @@ async def _drain_runner_skills(session_id: str) -> None:
         await asyncio.sleep(0)
 
 
+async def _drain_codex_model_options(session_id: str) -> None:
+    """Pump the loop until the background Codex model-options fetch lands.
+
+    Codex model options are eventual-consistent like skills: the first
+    snapshot returns ``[]`` and starts the runner query; a later snapshot
+    serves the cache.
+    """
+    for _ in range(100):
+        if session_id in _sessions_mod._codex_model_options_cache:
+            return
+        await asyncio.sleep(0)
+
+
 class _ConversationStore:
     """Minimal store that records ``list_items`` calls.
 
@@ -538,6 +551,106 @@ async def test_session_snapshot_includes_skills_from_runner(
     assert "/v1/sessions/conv_skills/skills" in fake_client.get_calls
     assert [s.name for s in snapshot.skills] == ["triage-issues", "mlflow-bug"]
     assert snapshot.skills[0].description == "Triage issues."
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_includes_codex_model_options_from_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Codex-native model and effort controls use Codex's live ``model/list``.
+
+    The session snapshot first returns no options and kicks a background
+    runner fetch. Once the fetch lands, the next snapshot exposes Codex's
+    returned model ids, display names, and model-specific efforts. If this
+    regresses to a hardcoded frontend list, this runner path would not be
+    called and the snapshot would stay empty.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    _mod._session_status_cache.clear()
+    _mod._runner_skills_cache.clear()
+    _mod._runner_skills_inflight.clear()
+    _mod._codex_model_options_cache.clear()
+    _mod._codex_model_options_inflight.clear()
+
+    class _FakeResponse:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.status_code = 200
+            self._payload = payload
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    class _FakeRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
+            self.get_calls.append(url)
+            if url.endswith("/skills"):
+                return _FakeResponse({"skills": []})
+            if url.endswith("/codex-model-options"):
+                return _FakeResponse(
+                    {
+                        "models": [
+                            {
+                                "id": "gpt-5.5",
+                                "model": "databricks-gpt-5-5",
+                                "display_name": "GPT-5.5",
+                                "default_reasoning_effort": "high",
+                                "supported_reasoning_efforts": [
+                                    "low",
+                                    "medium",
+                                    "high",
+                                    "xhigh",
+                                ],
+                                "is_default": True,
+                            }
+                        ]
+                    }
+                )
+            return _FakeResponse({"status": "idle"})
+
+    fake_client = _FakeRunnerClient()
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: fake_client)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    conv = Conversation(
+        id="conv_codex_options",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_codex_options",
+        agent_id="ag_test",
+        labels={
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={"conv_codex_options": conv},
+    )
+
+    first = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_codex_options",
+    )
+    assert first.codex_model_options == []
+    await _drain_codex_model_options("conv_codex_options")
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_codex_options",
+    )
+
+    assert "/v1/sessions/conv_codex_options/codex-model-options" in fake_client.get_calls
+    assert [m.id for m in snapshot.codex_model_options] == ["gpt-5.5"]
+    assert snapshot.codex_model_options[0].display_name == "GPT-5.5"
+    assert snapshot.codex_model_options[0].supported_reasoning_efforts == [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+    ]
 
 
 @pytest.mark.asyncio

@@ -4626,6 +4626,7 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     reasoning_effort?: string | null;
     model_override?: string | null;
     parent_session_id?: string | null;
+    codex_model_options?: Array<Record<string, unknown>>;
   }
 
   /** Override the snapshot GET so a test can inject labels + overrides. */
@@ -4643,6 +4644,7 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
           reasoning_effort: overrides.reasoning_effort ?? null,
           model_override: overrides.model_override ?? null,
           parent_session_id: overrides.parent_session_id ?? null,
+          codex_model_options: overrides.codex_model_options ?? [],
         });
       }
       return defaultFetchHandler(input, init);
@@ -4689,7 +4691,19 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
 
   it("PATCHes sticky model and effort onto a codex-native session with no overrides", async () => {
     seedSession("conv_codex", []);
-    withSnapshot("conv_codex", { labels: { "omnigent.wrapper": "codex-native-ui" } });
+    withSnapshot("conv_codex", {
+      labels: { "omnigent.wrapper": "codex-native-ui" },
+      codex_model_options: [
+        {
+          id: "gpt-5.4",
+          model: "databricks-gpt-5-4",
+          display_name: "GPT-5.4",
+          default_reasoning_effort: "high",
+          supported_reasoning_efforts: ["low", "medium", "high", "xhigh"],
+          is_default: false,
+        },
+      ],
+    });
 
     useChatStore.setState({
       selectedEffort: "xhigh",

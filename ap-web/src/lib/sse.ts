@@ -33,6 +33,7 @@ import type {
   RetryEvent,
   SessionChangedFilesInvalidatedEvent,
   SessionChildSessionUpdatedEvent,
+  SessionCodexModelOptionsEvent,
   SessionCreatedEvent,
   SessionInputConsumedEvent,
   SessionInterruptedEvent,
@@ -690,6 +691,14 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       type: "session_skills",
       conversationId,
     } satisfies SessionSkillsEvent;
+  }
+  if (eventType === "session.codex_model_options") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    return {
+      type: "session_codex_model_options",
+      conversationId,
+    } satisfies SessionCodexModelOptionsEvent;
   }
   if (eventType === "session.presence") {
     const conversationId = data.conversation_id;

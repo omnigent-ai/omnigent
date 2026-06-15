@@ -697,6 +697,16 @@ export interface SessionSkillsEvent {
   conversationId: string;
 }
 
+/**
+ * `session.codex_model_options` — the Codex app-server model catalog just
+ * resolved for a session. Consumers refetch the session snapshot and apply
+ * its now-populated `codexModelOptions`.
+ */
+export interface SessionCodexModelOptionsEvent {
+  type: "session_codex_model_options";
+  conversationId: string;
+}
+
 /** One user currently viewing the session (holding its stream open). */
 export interface SessionViewer {
   /** Authenticated identity, e.g. `"alice@example.com"`. */
@@ -766,4 +776,5 @@ export type StreamEvent =
   | SessionChangedFilesInvalidatedEvent
   | SessionTerminalActivityEvent
   | SessionSkillsEvent
+  | SessionCodexModelOptionsEvent
   | SessionPresenceEvent;

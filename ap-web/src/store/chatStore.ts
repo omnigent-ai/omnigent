@@ -81,6 +81,7 @@ import {
 } from "@/hooks/useTerminals";
 import type {
   ContentBlock,
+  CodexModelOption,
   ModelUsage,
   PendingInput,
   SandboxStatus,
@@ -380,6 +381,12 @@ export interface ChatState {
    */
   skills: SkillSummary[];
   /**
+   * Codex app-server model options for the active codex-native session.
+   * Populated from the session snapshot and updated when the server's
+   * background Codex ``model/list`` fetch lands.
+   */
+  codexModelOptions: CodexModelOption[];
+  /**
    * True while the runner is auto-creating the terminal for a
    * terminal-first session (claude-native / codex-native). Seeded from
    * the session snapshot's `terminal_pending` field on bind and
@@ -671,6 +678,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   gitBranch: null,
   todos: [],
   skills: [],
+  codexModelOptions: [],
   terminalPending: false,
   viewers: [],
   sandboxStatus: null,
@@ -1144,6 +1152,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         gitBranch: null,
         todos: [],
         skills: [],
+        codexModelOptions: [],
         terminalPending: false,
         viewers: [],
         sandboxStatus: null,
@@ -1348,12 +1357,16 @@ function nativeModelFamilyForSession(session: Pick<Session, "labels">): NativeMo
  * :param model: Sticky model id / alias.
  * :returns: True only when the model is compatible with that native family.
  */
-function isNativeModelCompatible(family: NativeModelFamily, model: string): boolean {
+function isNativeModelCompatible(
+  family: NativeModelFamily,
+  model: string,
+  session: Session,
+): boolean {
   switch (family) {
     case "claude":
       return isClaudeNativeModel(model);
     case "codex":
-      return isCodexNativeModel(model);
+      return isCodexNativeModel(session.codexModelOptions ?? [], model);
   }
 }
 
@@ -1543,6 +1556,7 @@ function sessionBindingPatch(
   | "contextWindow"
   | "gitBranch"
   | "skills"
+  | "codexModelOptions"
   | "terminalPending"
   | "sandboxStatus"
 > {
@@ -1558,6 +1572,7 @@ function sessionBindingPatch(
     contextWindow: session.contextWindow ?? null,
     gitBranch: session.gitBranch ?? null,
     skills: session.skills ?? [],
+    codexModelOptions: session.codexModelOptions ?? [],
     terminalPending: session.terminalPending ?? false,
     sandboxStatus: session.sandboxStatus ?? null,
   };
@@ -1681,9 +1696,14 @@ async function bindStream(
       : stickyEffort;
     // Non-native: don't auto-apply the model, but keep the sticky pick so
     // navigating back to a native session restores it.
-    const effectiveModel = nativeModelFamily !== null
-      ? (session.modelOverride ?? stickyModel)
-      : stickyModel;
+    const compatibleStickyModel =
+      nativeModelFamily !== null && stickyModel != null
+        ? isNativeModelCompatible(nativeModelFamily, stickyModel, session)
+          ? stickyModel
+          : null
+        : stickyModel;
+    const effectiveModel =
+      nativeModelFamily !== null ? (session.modelOverride ?? compatibleStickyModel) : stickyModel;
     // The session's REAL effective override: the server's stored value,
     // plus the sticky model the native handoff is about to apply. Unlike
     // `effectiveModel`/`selectedModel` (which hold the unapplied sticky
@@ -1694,10 +1714,9 @@ async function bindStream(
       !isSubAgentSession &&
       nativeModelFamily !== null &&
       session.modelOverride == null &&
-      stickyModel != null &&
-      isNativeModelCompatible(nativeModelFamily, stickyModel);
+      compatibleStickyModel != null;
     const effectiveSessionOverride =
-      session.modelOverride ?? (willApplyStickyModel ? stickyModel : null);
+      session.modelOverride ?? (willApplyStickyModel ? compatibleStickyModel : null);
     if (
       !isSubAgentSession &&
       canApplyEffort &&
@@ -1709,9 +1728,11 @@ async function bindStream(
       });
     }
     if (willApplyStickyModel) {
-      updateSession(id, { modelOverride: stickyModel, silent: true }).catch((err: unknown) => {
-        console.warn(`Failed to apply sticky model=${stickyModel} to session ${id}:`, err);
-      });
+      updateSession(id, { modelOverride: compatibleStickyModel, silent: true }).catch(
+        (err: unknown) => {
+          console.warn(`Failed to apply sticky model=${compatibleStickyModel} to session ${id}:`, err);
+        },
+      );
     }
 
     const snapshotBlocks = itemsToBlocks(items);
@@ -3071,27 +3092,22 @@ function committedUserBlock(
 }
 
 /**
- * Refetch a session's skills from its (now-reachable) runner and apply
- * them to the store so the composer's slash-command menu reflects the
- * runner-discovered skills the moment the runner's WS tunnel comes
- * online.
+ * Refetch runner-backed session capabilities and apply them to the store.
  *
- * Skills are runner-owned — discovered against the runner's filesystem,
- * not the server's. When a session binds before its runner is reachable,
- * the server's best-effort skill fetch fails closed and the snapshot
- * carries an empty list, leaving the menu blank until a manual reload.
- * The session snapshot re-queries the bound runner on every read, so
- * refetching it is the way to pull a fresh list; we apply only `skills`
- * because the rest of the snapshot would clobber live chat state.
+ * Skills and codex-native model options are runner-owned. When a session
+ * binds before those background fetches land, the snapshot carries empty
+ * lists. The server later sends a bare nudge; refetching the snapshot is
+ * how the store pulls the cache-warmed fields without clobbering live chat
+ * state.
  *
  * Best-effort and race-guarded: a failed fetch (runner dropped again
- * mid-flight) leaves the existing list in place, and a result for a
+ * mid-flight) leaves existing capabilities in place, and a result for a
  * conversation the user has since switched away from is dropped.
  *
  * :param conversationId: The session whose runner just came online,
  *     e.g. ``"conv_abc123"``.
  */
-async function refetchSkills(conversationId: string): Promise<void> {
+async function refetchSessionCapabilities(conversationId: string): Promise<void> {
   if (useChatStore.getState().conversationId !== conversationId) return;
   let session: Session;
   try {
@@ -3103,9 +3119,12 @@ async function refetchSkills(conversationId: string): Promise<void> {
   }
   // Re-check after the await — the user may have switched conversations
   // while the request was in flight; applying now would leak another
-  // session's skills into the open composer.
+  // session's capabilities into the open composer.
   if (useChatStore.getState().conversationId !== conversationId) return;
-  useChatStore.setState({ skills: session.skills ?? [] });
+  useChatStore.setState({
+    skills: session.skills ?? [],
+    codexModelOptions: session.codexModelOptions ?? [],
+  });
 }
 
 /**
@@ -3638,8 +3657,14 @@ export function handleSessionEvent(event: StreamEvent): void {
       // path, so the bind-time snapshot served an empty list; this is
       // the first moment the slash-command menu can be filled. Refetch
       // the now-warm snapshot and apply its `skills`. Fire and forget —
-      // refetchSkills self-guards against a stale apply.
-      void refetchSkills(event.conversationId);
+      // refetchSessionCapabilities self-guards against a stale apply.
+      void refetchSessionCapabilities(event.conversationId);
+      return;
+    case "session_codex_model_options":
+      // Codex app-server `model/list` just resolved. Refetch the
+      // cache-warmed snapshot and apply `codexModelOptions`; the picker
+      // derives both model rows and effort levels from that catalog.
+      void refetchSessionCapabilities(event.conversationId);
       return;
     case "tool_result":
       // Tool results are not a reliable correlation signal for

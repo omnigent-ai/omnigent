@@ -1380,6 +1380,35 @@ class ModelUsage(BaseModel):
     total_cost_usd: float | None = None
 
 
+class CodexModelOption(BaseModel):
+    """
+    Codex app-server model option exposed on a session snapshot.
+
+    Mirrors the fields the Web UI needs from Codex ``model/list`` while
+    keeping the public API snake_case like the rest of
+    :class:`SessionResponse`.
+
+    :param id: Codex picker id to pass back to
+        ``thread/settings/update``, e.g. ``"gpt-5.5"``.
+    :param model: Provider-facing model id Codex will run, e.g.
+        ``"gpt-5.5"`` or ``"databricks-gpt-5-5"``.
+    :param display_name: Codex display label, e.g. ``"GPT-5.5"``.
+    :param default_reasoning_effort: Codex default effort for this
+        model, e.g. ``"medium"``.
+    :param supported_reasoning_efforts: Effort values Codex advertises
+        for this model, e.g. ``["minimal", "low", "medium", "high"]``.
+    :param is_default: Whether Codex marks this model as the default
+        option in its catalog.
+    """
+
+    id: str
+    model: str
+    display_name: str
+    default_reasoning_effort: str
+    supported_reasoning_efforts: list[str] = Field(default_factory=list)
+    is_default: bool = False
+
+
 class SessionResponse(BaseModel):
     """
     API representation of a session.
@@ -1567,6 +1596,10 @@ class SessionResponse(BaseModel):
         runner at startup. Empty list when the agent spec
         cannot be loaded, or when bundled + host discovery
         yields nothing.
+    :param codex_model_options: Codex app-server ``model/list`` options
+        for codex-native sessions, including each model's supported
+        reasoning efforts. Empty for non-codex-native sessions or while
+        the bound runner / Codex app-server cannot answer yet.
     :param terminal_pending: ``True`` while the runner is auto-creating
         a terminal-first session's terminal (claude-native /
         codex-native), so the Web UI shows a spinner on the Terminal
@@ -1628,6 +1661,7 @@ class SessionResponse(BaseModel):
     archived: bool = False
     todos: list[dict[str, Any]] = Field(default_factory=list)
     skills: list[SkillSummary] = Field(default_factory=list)
+    codex_model_options: list[CodexModelOption] = Field(default_factory=list)
     terminal_pending: bool = False
     sandbox_status: SandboxStatus | None = None
 
@@ -2307,6 +2341,32 @@ class SessionSkillsEvent(_SSEEventBase):
     """
 
     type: Literal["session.skills"]
+    conversation_id: str
+
+
+class SessionCodexModelOptionsEvent(_SSEEventBase):
+    """
+    Signal that a codex-native session's model catalog has resolved.
+
+    Codex model options are fetched from the bound runner's live
+    Codex app-server via ``model/list`` and cached on the session
+    snapshot. The initial snapshot can return an empty list while
+    this background fetch is in flight; this event tells connected
+    clients to re-read the snapshot and apply its now-populated
+    ``codex_model_options``.
+
+    Carries no payload beyond the conversation id. The snapshot's
+    ``codex_model_options`` field remains the source of truth.
+
+    :param type: Always ``"session.codex_model_options"``.
+    :param conversation_id: Session identifier,
+        e.g. ``"conv_abc123"``.
+
+    Category: **transient** (SSE-only). On reconnect, clients seed
+    Codex model / effort controls from the session snapshot.
+    """
+
+    type: Literal["session.codex_model_options"]
     conversation_id: str
 
 
@@ -3353,6 +3413,7 @@ ServerStreamEvent = Annotated[
     | SessionTerminalPendingEvent
     | SessionSandboxStatusEvent
     | SessionSkillsEvent
+    | SessionCodexModelOptionsEvent
     | SessionInputConsumedEvent
     | SessionInterruptedEvent
     | SessionCreatedEvent

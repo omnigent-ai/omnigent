@@ -15,6 +15,7 @@ import { isMessageItem } from "./conversationItems";
 import type { MessageContentBlock } from "./blocks";
 import { authenticatedFetch } from "./identity";
 import type {
+  CodexModelOption,
   ModelUsage,
   NestedSessionItem,
   SandboxStatus,
@@ -77,6 +78,19 @@ interface ModelUsageWire {
   cache_read_input_tokens?: number | null;
   cache_creation_input_tokens?: number | null;
   total_cost_usd?: number | null;
+}
+
+/**
+ * Wire shape of ``CodexModelOption`` from
+ * ``omnigent.server.schemas.CodexModelOption``.
+ */
+interface CodexModelOptionWire {
+  id: string;
+  model: string;
+  display_name: string;
+  default_reasoning_effort: string;
+  supported_reasoning_efforts: string[];
+  is_default?: boolean | null;
 }
 
 /**
@@ -184,6 +198,7 @@ interface SessionResponseWire {
    * description. Surfaced in the web composer's slash-command menu.
    */
   skills?: SkillSummary[];
+  codex_model_options?: CodexModelOptionWire[];
   /**
    * True while the runner is auto-creating a terminal-first session's
    * terminal. Drives the Terminal-pill spinner; absent on older
@@ -241,6 +256,20 @@ function usageByModelFromWire(
   return out;
 }
 
+function codexModelOptionsFromWire(
+  wire: CodexModelOptionWire[] | null | undefined,
+): CodexModelOption[] {
+  if (wire == null) return [];
+  return wire.map((m) => ({
+    id: m.id,
+    model: m.model,
+    displayName: m.display_name,
+    defaultReasoningEffort: m.default_reasoning_effort,
+    supportedReasoningEfforts: m.supported_reasoning_efforts,
+    isDefault: m.is_default ?? false,
+  }));
+}
+
 function sessionFromWire(wire: SessionResponseWire): Session {
   return {
     id: wire.id,
@@ -277,6 +306,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     subAgentName: wire.sub_agent_name ?? null,
     todos: wire.todos ?? [],
     skills: wire.skills ?? [],
+    codexModelOptions: codexModelOptionsFromWire(wire.codex_model_options),
     terminalPending: wire.terminal_pending ?? false,
     sandboxStatus: wire.sandbox_status ?? null,
   };

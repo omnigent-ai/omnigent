@@ -1,8 +1,33 @@
 import { describe, expect, it } from "vitest";
 
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
-import { CODEX_NATIVE_MODELS, isCodexNativeModel } from "@/lib/codexNativeModels";
+import {
+  codexEffortLevelsForModel,
+  codexModelPickerOptions,
+  findCodexModelOption,
+  isCodexNativeModel,
+} from "@/lib/codexNativeModels";
+import type { CodexModelOption } from "@/lib/types";
 import { isModelImplicitlySelected } from "./ChatPage";
+
+const CODEX_MODEL_OPTIONS: CodexModelOption[] = [
+  {
+    id: "gpt-5.5",
+    model: "databricks-gpt-5-5",
+    displayName: "GPT-5.5",
+    defaultReasoningEffort: "high",
+    supportedReasoningEfforts: ["low", "medium", "high", "xhigh"],
+    isDefault: true,
+  },
+  {
+    id: "gpt-5.4-mini",
+    model: "databricks-gpt-5-4-mini",
+    displayName: "GPT-5.4 mini",
+    defaultReasoningEffort: "medium",
+    supportedReasoningEfforts: ["minimal", "low", "medium"],
+    isDefault: false,
+  },
+];
 
 describe("CLAUDE_NATIVE_MODELS", () => {
   it("offers Claude Code tier aliases, not pinned version IDs", () => {
@@ -24,21 +49,35 @@ describe("CLAUDE_NATIVE_MODELS", () => {
   });
 });
 
-describe("CODEX_NATIVE_MODELS", () => {
-  it("offers Codex subscription-tier model ids", () => {
-    expect(CODEX_NATIVE_MODELS.map((m) => m.id)).toEqual([
-      "gpt-5.5",
-      "gpt-5.4",
-      "gpt-5.4-mini",
+describe("Codex model-list helpers", () => {
+  it("builds picker rows from Codex-returned options", () => {
+    expect(codexModelPickerOptions(CODEX_MODEL_OPTIONS)).toEqual([
+      { id: "gpt-5.5", label: "GPT-5.5" },
+      { id: "gpt-5.4-mini", label: "GPT-5.4 mini" },
     ]);
   });
 
-  it("accepts Codex-compatible sticky model ids but rejects Claude aliases", () => {
-    expect(isCodexNativeModel("gpt-5.4")).toBe(true);
-    expect(isCodexNativeModel("databricks-gpt-5-5")).toBe(true);
-    expect(isCodexNativeModel("gpt-5.1-codex")).toBe(true);
-    expect(isCodexNativeModel("opus")).toBe(false);
-    expect(isCodexNativeModel("claude-opus-4-8")).toBe(false);
+  it("matches picker ids and provider model ids from the Codex catalog", () => {
+    expect(findCodexModelOption(CODEX_MODEL_OPTIONS, "gpt-5.5")?.id).toBe("gpt-5.5");
+    expect(findCodexModelOption(CODEX_MODEL_OPTIONS, "databricks-gpt-5-5")?.id).toBe(
+      "gpt-5.5",
+    );
+    expect(isCodexNativeModel(CODEX_MODEL_OPTIONS, "gpt-5.4-mini")).toBe(true);
+    expect(isCodexNativeModel(CODEX_MODEL_OPTIONS, "opus")).toBe(false);
+  });
+
+  it("derives effort levels from the matched Codex model", () => {
+    expect(codexEffortLevelsForModel(CODEX_MODEL_OPTIONS, "gpt-5.4-mini")).toEqual([
+      "minimal",
+      "low",
+      "medium",
+    ]);
+    expect(codexEffortLevelsForModel(CODEX_MODEL_OPTIONS, null)).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+    ]);
   });
 });
 

@@ -1824,6 +1824,7 @@
             "session.agent_changed": "#/components/schemas/SessionAgentChangedEvent",
             "session.changed_files.invalidated": "#/components/schemas/SessionChangedFilesInvalidatedEvent",
             "session.child_session.updated": "#/components/schemas/SessionChildSessionUpdatedEvent",
+            "session.codex_model_options": "#/components/schemas/SessionCodexModelOptionsEvent",
             "session.created": "#/components/schemas/SessionCreatedEvent",
             "session.heartbeat": "#/components/schemas/SessionHeartbeatEvent",
             "session.input.consumed": "#/components/schemas/SessionInputConsumedEvent",
@@ -1874,6 +1875,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionSkillsEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionCodexModelOptionsEvent"
           },
           {
             "$ref": "#/components/schemas/SessionInputConsumedEvent"
@@ -2105,6 +2109,38 @@
           "child"
         ],
         "title": "SessionChildSessionUpdatedEvent",
+        "type": "object"
+      },
+      "SessionCodexModelOptionsEvent": {
+        "description": "Signal that a codex-native session's model catalog has resolved.\n\nCodex model options are fetched from the bound runner's live\nCodex app-server via ``model/list`` and cached on the session\nsnapshot. The initial snapshot can return an empty list while\nthis background fetch is in flight; this event tells connected\nclients to re-read the snapshot and apply its now-populated\n``codex_model_options``.\n\nCarries no payload beyond the conversation id. The snapshot's\n``codex_model_options`` field remains the source of truth.\n\n:param type: Always ``\"session.codex_model_options\"``.\n:param conversation_id: Session identifier,\n    e.g. ``\"conv_abc123\"``.\n\nCategory: **transient** (SSE-only). On reconnect, clients seed\nCodex model / effort controls from the session snapshot.",
+        "properties": {
+          "conversation_id": {
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.codex_model_options",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id"
+        ],
+        "title": "SessionCodexModelOptionsEvent",
         "type": "object"
       },
       "SessionCreatedEvent": {

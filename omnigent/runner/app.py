@@ -6678,6 +6678,93 @@ def create_runner_app(
                 await codex_client.close()
         return Response(status_code=204)
 
+    def _codex_model_option_from_app_server_model(raw_model: dict[str, Any]) -> dict[str, Any]:
+        """
+        Convert one Codex ``model/list`` model into the runner wire shape.
+
+        :param raw_model: Codex app-server model object, e.g.
+            ``{"id": "gpt-5.5", "displayName": "GPT-5.5"}``.
+        :returns: Snake-case model option consumed by the AP server.
+        :raises ValueError: If required Codex fields are missing or malformed.
+        """
+        supported_raw = raw_model.get("supportedReasoningEfforts")
+        if not isinstance(supported_raw, list):
+            raise ValueError("Codex model missing supportedReasoningEfforts")
+        supported: list[str] = []
+        for item in supported_raw:
+            if not isinstance(item, dict):
+                raise ValueError("Codex reasoning effort option must be an object")
+            effort = item.get("reasoningEffort")
+            if not isinstance(effort, str) or not effort:
+                raise ValueError("Codex reasoning effort option missing reasoningEffort")
+            supported.append(effort)
+        required = {
+            "id": raw_model.get("id"),
+            "model": raw_model.get("model"),
+            "display_name": raw_model.get("displayName"),
+            "default_reasoning_effort": raw_model.get("defaultReasoningEffort"),
+        }
+        if not all(isinstance(value, str) and value for value in required.values()):
+            raise ValueError("Codex model missing required string fields")
+        return {
+            **required,
+            "supported_reasoning_efforts": supported,
+            "is_default": bool(raw_model.get("isDefault", False)),
+        }
+
+    async def _codex_native_model_options(conv_id: str) -> list[dict[str, Any]]:
+        """
+        Query Codex app-server ``model/list`` for a loaded codex-native session.
+
+        :param conv_id: Session/conversation identifier, e.g.
+            ``"conv_abc123"``.
+        :returns: Model options in the AP server's snake-case wire shape.
+        :raises RuntimeError: If the app-server call fails.
+        :raises ValueError: If Codex returns a malformed payload.
+        """
+        from omnigent.codex_native_app_server import client_for_transport
+
+        state = await _codex_native_bridge_state_for_session(
+            conv_id,
+            action="model options",
+        )
+        if state is None:
+            return []
+
+        codex_client = client_for_transport(
+            state.socket_path,
+            client_name="omnigent-codex-native-runner",
+        )
+        options: list[dict[str, Any]] = []
+        try:
+            await codex_client.connect()
+            cursor: str | None = None
+            while True:
+                params: dict[str, Any] = {"includeHidden": False}
+                if cursor is not None:
+                    params["cursor"] = cursor
+                response = await codex_client.request("model/list", params)
+                result = response.get("result")
+                if not isinstance(result, dict):
+                    raise ValueError("Codex model/list result must be an object")
+                data = result.get("data")
+                if not isinstance(data, list):
+                    raise ValueError("Codex model/list data must be a list")
+                for raw_model in data:
+                    if not isinstance(raw_model, dict):
+                        raise ValueError("Codex model/list item must be an object")
+                    options.append(_codex_model_option_from_app_server_model(raw_model))
+                next_cursor = result.get("nextCursor")
+                if next_cursor is None:
+                    break
+                if not isinstance(next_cursor, str) or not next_cursor:
+                    raise ValueError("Codex model/list nextCursor must be a string or null")
+                cursor = next_cursor
+        finally:
+            with contextlib.suppress(Exception):
+                await codex_client.close()
+        return options
+
     async def _handle_pi_native_interrupt(conv_id: str) -> Response:
         """
         Stop a pi-native turn by asking the resident Pi extension to abort.
@@ -11512,6 +11599,43 @@ def create_runner_app(
             status_code=200,
             content={"skills": [{"name": s.name, "description": s.description} for s in skills]},
         )
+
+    @app.get("/v1/sessions/{session_id}/codex-model-options")
+    async def get_session_codex_model_options(session_id: str) -> JSONResponse:
+        """
+        Return Codex app-server model options for a codex-native session.
+
+        The AP server uses this to populate Web UI model and effort controls
+        from Codex's actual ``model/list`` response rather than a copied
+        catalog. Non-codex-native sessions return an empty list.
+
+        :param session_id: Session/conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :returns: JSON ``{"models": [...]}``, where each model contains
+            ``id``, ``model``, ``display_name``,
+            ``default_reasoning_effort``, ``supported_reasoning_efforts``,
+            and ``is_default``.
+        """
+        if _session_harness_name(session_id) != "codex-native":
+            return JSONResponse(status_code=200, content={"models": []})
+        try:
+            return JSONResponse(
+                status_code=200,
+                content={"models": await _codex_native_model_options(session_id)},
+            )
+        except Exception as exc:  # noqa: BLE001 - surface Codex app-server failures to AP.
+            _logger.warning(
+                "Codex-native model/list failed for session=%s",
+                session_id,
+                exc_info=True,
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "codex_native_model_options_failed",
+                    "detail": _client_safe_error_detail(exc, context="codex-native model options"),
+                },
+            )
 
     @app.post("/v1/sessions/{session_id}/skills/resolve")
     async def resolve_session_skill(session_id: str, request: Request) -> JSONResponse:

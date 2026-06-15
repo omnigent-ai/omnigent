@@ -32,6 +32,7 @@ function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) 
     showEffort: true,
     showModels: false,
     modelPickerKind: null,
+    codexModelOptions: [],
     ...overrides,
   };
 }
