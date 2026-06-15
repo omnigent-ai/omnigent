@@ -375,7 +375,7 @@ def _materialize_codex_agent_spec(
     :returns: Path to the generated YAML spec.
     """
     yaml_path = tmpdir / "codex-native-ui.yaml"
-    executor: dict[str, str] = {"harness": "codex-native"}
+    executor: dict[str, str | bool] = {"harness": "codex-native", "yolo": True}
     if model is not None:
         executor["model"] = model
     raw: dict[str, Any] = {

@@ -17,6 +17,7 @@ from omnigent.harness_aliases import canonicalize_harness, is_native_harness
         # Canonical names pass through unchanged.
         ("openai-agents", "openai-agents"),
         ("pi", "pi"),
+        ("mimo", "mimo"),
         # Unknown names return unchanged so callers keep their own errors.
         ("bogus", "bogus"),
         (None, None),

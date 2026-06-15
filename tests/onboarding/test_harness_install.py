@@ -31,6 +31,17 @@ def test_install_spec_and_command(key: str, binary: str, package: str) -> None:
     assert hi.harness_install_command(key) == ["npm", "install", "-g", package]
 
 
+def test_mimo_install_spec_is_binary_only() -> None:
+    """Mimo is CLI-backed, but Omnigent does not know a supported npm package."""
+    spec = hi.harness_install_spec(hi.MIMO_KEY)
+    assert spec is not None
+    assert spec.display == "Mimo"
+    assert spec.binary == "mimo"
+    assert spec.package is None
+    with pytest.raises(KeyError):
+        hi.harness_install_command(hi.MIMO_KEY)
+
+
 def test_unknown_key_has_no_spec_and_is_not_installed() -> None:
     """A family with no dedicated CLI (e.g. a gateway-only family) → None / False,
     never a crash."""
@@ -44,10 +55,11 @@ def test_unknown_key_has_no_spec_and_is_not_installed() -> None:
         ("claude-native", "claude"),
         ("codex-native", "codex"),
         ("pi", "pi"),
+        ("mimo", "mimo"),
     ],
 )
 def test_required_cli_for_cli_backed_harness(harness: str, binary: str) -> None:
-    """The three CLI-backed harnesses map to the binary their launch needs.
+    """CLI-backed harnesses map to the binary their launch needs.
 
     Drift here (a wrong/missing mapping) would let sub-agent dispatch skip
     the preflight for a harness that actually needs a CLI, reintroducing the
@@ -128,6 +140,19 @@ def test_install_harness_cli_requires_npm(monkeypatch: pytest.MonkeyPatch) -> No
 
     monkeypatch.setattr(hi.subprocess, "run", _explode)
     assert hi.install_harness_cli(ANTHROPIC_FAMILY) is False
+
+
+def test_install_harness_cli_without_package_returns_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A binary-only harness does not attempt a guessed npm install."""
+    monkeypatch.setattr(hi.shutil, "which", lambda name: "/usr/bin/npm")
+
+    def _explode(*a: object, **k: object) -> None:
+        raise AssertionError("subprocess.run reached despite missing install package")
+
+    monkeypatch.setattr(hi.subprocess, "run", _explode)
+    assert hi.install_harness_cli(hi.MIMO_KEY) is False
 
 
 def test_install_harness_cli_runs_npm_then_rechecks(monkeypatch: pytest.MonkeyPatch) -> None:

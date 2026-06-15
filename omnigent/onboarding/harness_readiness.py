@@ -25,7 +25,7 @@ that would actually work.
 from __future__ import annotations
 
 from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
-from omnigent.onboarding.harness_install import PI_KEY, harness_cli_installed
+from omnigent.onboarding.harness_install import MIMO_KEY, PI_KEY, harness_cli_installed
 from omnigent.onboarding.provider_config import (
     _EXECUTOR_TYPE_HARNESS_ALIASES,
     _HARNESS_FAMILY,
@@ -61,18 +61,22 @@ def _install_key(canonical: str) -> str:
     """Return the install-spec key whose CLI binary *canonical* requires.
 
     :param canonical: A canonical CLI-wrapping harness id keyed in
-        ``_HARNESS_FAMILY`` (e.g. ``"codex-native"``), or ``"pi"``.
+        ``_HARNESS_FAMILY`` (e.g. ``"codex-native"``), ``"pi"``, or
+        ``"mimo"``.
     :returns: ``"anthropic"`` / ``"openai"`` for the claude/codex CLIs,
-        or :data:`~omnigent.onboarding.harness_install.PI_KEY` for pi.
+        :data:`~omnigent.onboarding.harness_install.PI_KEY` for pi, or
+        :data:`~omnigent.onboarding.harness_install.MIMO_KEY` for mimo.
     """
+    if canonical == MIMO_KEY:
+        return MIMO_KEY
     return _HARNESS_FAMILY.get(canonical) or PI_KEY
 
 
 def harness_is_configured(harness: str) -> bool:
     """Return whether *harness* can be launched on this machine.
 
-    Only CLI-wrapping harnesses are assessed (native Claude/Codex and
-    ``pi``): they cannot run without their binary on ``PATH``, and that
+    Only CLI-wrapping harnesses are assessed (native Claude/Codex, ``pi``,
+    and ``mimo``): they cannot run without their binary on ``PATH``, and that
     is the one thing the daemon can check reliably and locally. SDK
     harnesses and unknown harnesses always return ``True`` — their
     readiness depends on runtime/ambient credentials the daemon can't
@@ -80,7 +84,7 @@ def harness_is_configured(harness: str) -> bool:
     working launches.
 
     :param harness: A harness id, e.g. ``"claude-native"``, ``"codex"``,
-        ``"openai-agents"``, ``"agents_sdk"``, or ``"pi"``.
+        ``"openai-agents"``, ``"agents_sdk"``, ``"pi"``, or ``"mimo"``.
     :returns: ``True`` when launchable (CLI installed, or a harness the
         daemon doesn't gate); ``False`` only when a CLI-wrapping
         harness's binary is missing from ``PATH``.
@@ -88,7 +92,7 @@ def harness_is_configured(harness: str) -> bool:
     canonical = _canonical_harness(harness)
     if canonical in _SDK_HARNESSES:
         return True
-    if canonical not in _HARNESS_FAMILY and canonical != PI_SURFACE:
+    if canonical not in _HARNESS_FAMILY and canonical not in {PI_SURFACE, MIMO_KEY}:
         # Unknown harness — the daemon has no install metadata for it, so
         # it can't assess readiness. Fail open (custom/newer harnesses,
         # version skew).
@@ -107,10 +111,12 @@ def configured_harness_map() -> dict[str, bool]:
 
     :returns: Mapping of harness spelling to readiness, e.g.
         ``{"claude-native": False, "codex-native": False,
-        "claude-sdk": True, "openai-agents": True, "pi": True}``.
+        "claude-sdk": True, "openai-agents": True, "pi": True,
+        "mimo": False}``.
     """
     spellings: set[str] = set(_HARNESS_FAMILY)
     spellings.update(_EXECUTOR_TYPE_HARNESS_ALIASES)
     spellings.update(HARNESS_ALIASES)
     spellings.add(PI_SURFACE)
+    spellings.add(MIMO_KEY)
     return {spelling: harness_is_configured(spelling) for spelling in spellings}

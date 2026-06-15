@@ -41,9 +41,10 @@ from dataclasses import dataclass
 
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
 
-# Pi is not a configure-menu family (the menu is Claude + Codex), but the
-# first-run ``run`` flow falls back to it, so it has install metadata too.
+# Pi and Mimo are not configure-menu families (the menu is Claude + Codex), but
+# the first-run ``run`` flow can launch them, so they have CLI metadata too.
 PI_KEY = "pi"
+MIMO_KEY = "mimo"
 
 
 @dataclass(frozen=True)
@@ -54,7 +55,8 @@ class HarnessInstallSpec:
     :param binary: The CLI executable name looked up on ``PATH``, e.g.
         ``"claude"``.
     :param package: The npm package that provides the binary, e.g.
-        ``"@anthropic-ai/claude-code"``.
+        ``"@anthropic-ai/claude-code"``. ``None`` when the harness is
+        CLI-backed but Omnigent does not know a supported npm install target.
     :param login_args: Argv (after *binary*) for the harness's own interactive
         subscription login, e.g. ``("auth", "login", "--claudeai")`` for Claude
         or ``("login",)`` for Codex; ``None`` when the harness has no login
@@ -69,7 +71,7 @@ class HarnessInstallSpec:
 
     display: str
     binary: str
-    package: str
+    package: str | None
     login_args: tuple[str, ...] | None = None
     logout_args: tuple[str, ...] | None = None
     status_args: tuple[str, ...] | None = None
@@ -98,6 +100,7 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         status_args=("login", "status"),
     ),
     PI_KEY: HarnessInstallSpec("Pi", "pi", "@earendil-works/pi-coding-agent"),
+    MIMO_KEY: HarnessInstallSpec("Mimo", "mimo", None),
 }
 
 
@@ -106,13 +109,14 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
 # :data:`_HARNESS_INSTALL` family key. Only the CLI-backed harnesses appear
 # here — the ones that cannot launch without a binary on ``PATH``:
 # ``claude-native`` wraps the ``claude`` CLI, ``codex-native`` the ``codex``
-# CLI, and ``pi`` the ``pi`` CLI. SDK-based harnesses (``claude-sdk``,
+# CLI, ``pi`` the ``pi`` CLI, and ``mimo`` the ``mimo`` CLI. SDK-based harnesses (``claude-sdk``,
 # ``codex``, ``openai-agents-sdk``, ``databricks_supervisor``) run in-process
 # and are deliberately absent, so they resolve to "no CLI required".
 _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "claude-native": ANTHROPIC_FAMILY,
     "codex-native": OPENAI_FAMILY,
     PI_KEY: PI_KEY,
+    MIMO_KEY: MIMO_KEY,
 }
 
 
@@ -157,8 +161,8 @@ def missing_harness_cli(harness: str) -> HarnessInstallSpec | None:
 def harness_install_spec(key: str) -> HarnessInstallSpec | None:
     """Return the install spec for a family/harness key, or ``None``.
 
-    :param key: A harness family (``"anthropic"`` / ``"openai"``) or
-        :data:`PI_KEY` (``"pi"``).
+    :param key: A harness family (``"anthropic"`` / ``"openai"``),
+        :data:`PI_KEY` (``"pi"``), or :data:`MIMO_KEY` (``"mimo"``).
     :returns: The :class:`HarnessInstallSpec`, or ``None`` for an unknown key
         (e.g. a gateway-only family with no dedicated CLI).
     """
@@ -172,8 +176,8 @@ def harness_cli_installed(key: str) -> bool:
     ucode and the npm install-prompt UX — even though the SDK-based
     ``claude-sdk`` harness can run without the ``claude`` CLI.
 
-    :param key: A harness family (``"anthropic"`` / ``"openai"``) or
-        :data:`PI_KEY`.
+    :param key: A harness family (``"anthropic"`` / ``"openai"``),
+        :data:`PI_KEY`, or :data:`MIMO_KEY`.
     :returns: ``True`` when the CLI is on ``PATH``; ``False`` when it isn't or
         the key has no associated CLI.
     """
@@ -189,10 +193,14 @@ def harness_install_command(key: str) -> list[str]:
     :param key: A harness family or :data:`PI_KEY`.
     :returns: The install command, e.g.
         ``["npm", "install", "-g", "@anthropic-ai/claude-code"]``.
-    :raises KeyError: If *key* has no install spec (caller should gate on
-        :func:`harness_install_spec`).
+    :raises KeyError: If *key* has no install spec or no supported npm package
+        (caller should gate on :func:`harness_install_spec` and inspect
+        ``package`` when it needs to show an npm command).
     """
-    return ["npm", "install", "-g", _HARNESS_INSTALL[key].package]
+    package = _HARNESS_INSTALL[key].package
+    if package is None:
+        raise KeyError(key)
+    return ["npm", "install", "-g", package]
 
 
 def install_harness_cli(key: str) -> bool:
@@ -206,11 +214,15 @@ def install_harness_cli(key: str) -> bool:
     :returns: ``True`` when the CLI is on ``PATH`` after the install attempt
         (including the no-op case where npm reports success but the binary is
         present), ``False`` if npm is missing or the install failed.
-    :raises KeyError: If *key* has no install spec.
+    :raises KeyError: If *key* has no install spec. Returns ``False`` when the
+        spec is binary-only and has no supported npm package.
     """
     if shutil.which("npm") is None:
         return False
-    cmd = harness_install_command(key)
+    try:
+        cmd = harness_install_command(key)
+    except KeyError:
+        return False
     try:
         subprocess.run(cmd, check=False, timeout=300)
     except (OSError, subprocess.TimeoutExpired):

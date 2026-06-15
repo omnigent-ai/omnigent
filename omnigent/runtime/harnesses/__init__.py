@@ -43,6 +43,8 @@ _HARNESS_MODULES: dict[str, str] = {
     "codex-native": "omnigent.inner.codex_native_harness",
     # Cursor Agent CLI harness wrap. See omnigent/inner/cursor_harness.py.
     "cursor": "omnigent.inner.cursor_harness",
+    # Mimo Code CLI harness wrap. See omnigent/inner/mimo_harness.py.
+    "mimo": "omnigent.inner.mimo_harness",
     # Step 4c: codex harness wrap. See
     # omnigent/inner/codex_harness.py.
     "codex": "omnigent.inner.codex_harness",
