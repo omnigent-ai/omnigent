@@ -106,8 +106,7 @@ def _polly_spec_dir(tmp_path: Path, *, mode: str) -> Path:
     Copy the polly bundle into *tmp_path* with the advisor mode overridden.
 
     Lets the optimize test run against a spec variant without mutating the
-    shipped example; the agents/ subdir is copied so sub-agents still resolve
-    (polly declares claude_code / codex / pi).
+    shipped example; the agents/ subdir is copied so sub-agents still resolve.
 
     :param tmp_path: Per-test temp dir.
     :param mode: The ``cost_optimize.mode`` to write, ``"advise"`` or

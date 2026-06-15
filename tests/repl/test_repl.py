@@ -1625,6 +1625,24 @@ def test_build_startup_header_creds_line_includes_pi_surface(tmp_path, monkeypat
     assert "Databricks" in header.credential
 
 
+def test_build_startup_header_creds_line_includes_cli_owned_surfaces(
+    tmp_path, monkeypatch
+) -> None:
+    """Cursor and Mimo show in the startup sub-agent roster as CLI-owned surfaces."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text("providers: {}\n")
+
+    header = _build_startup_header(
+        "claude-sdk", "Multi-agent coding orchestrator.", ["cursor", "mimo"]
+    )
+
+    assert header.creds_line is not None
+    assert "Cursor → cursor-agent login" in header.creds_line
+    assert "Mimo → Mimo CLI config" in header.creds_line
+
+
 # ── Ctrl+O overlay: paginated conversation_items fetch ──────
 
 

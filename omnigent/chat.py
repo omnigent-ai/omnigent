@@ -3455,7 +3455,12 @@ def _spec_used_families(agent_yaml: Path | None) -> list[str]:
     else:
         return []
     try:
-        from omnigent.onboarding.provider_config import PI_SURFACE, harness_family
+        from omnigent.onboarding.provider_config import (
+            CURSOR_SURFACE,
+            MIMO_SURFACE,
+            PI_SURFACE,
+            harness_family,
+        )
         from omnigent.spec import parse
 
         spec = parse(root, expand_env=False)
@@ -3477,6 +3482,14 @@ def _spec_used_families(agent_yaml: Path | None) -> list[str]:
             # surface's effective credential (explicit pi default, else
             # the cross-family fallback).
             families.add(PI_SURFACE)
+        elif harness == CURSOR_SURFACE:
+            # Cursor is CLI-owned (cursor-agent login / CURSOR_API_KEY), so it
+            # is not an OpenAI-family default even though it may run OpenAI
+            # models. Keep it as its own display surface.
+            families.add(CURSOR_SURFACE)
+        elif harness == MIMO_SURFACE:
+            # Mimo likewise owns its provider setup inside the CLI.
+            families.add(MIMO_SURFACE)
         for child in node.sub_agents:
             _walk(child)
 

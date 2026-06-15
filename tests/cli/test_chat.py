@@ -1935,7 +1935,16 @@ def test_materialize_directory_bundle_with_override_keeps_nested_harness_unpinne
 @pytest.mark.parametrize(
     ("bundle_name", "expected_workers"),
     [
-        ("polly", {"claude_code": "claude-native", "codex": "codex-native", "pi": "pi"}),
+        (
+            "polly",
+            {
+                "claude_code": "claude-native",
+                "codex": "codex-native",
+                "cursor": "cursor",
+                "mimo": "mimo",
+                "pi": "pi",
+            },
+        ),
         ("debby", {"claude": "claude-sdk", "gpt": "openai-agents"}),
     ],
 )
@@ -2798,6 +2807,8 @@ def test_spec_used_families_multi_vendor_directory_agent(tmp_path) -> None:
     """
     root = tmp_path / "orchestrator"
     (root / "agents" / "worker").mkdir(parents=True)
+    (root / "agents" / "cursor_worker").mkdir(parents=True)
+    (root / "agents" / "mimo_worker").mkdir(parents=True)
     (root / "config.yaml").write_text(
         "spec_version: 1\n"
         "name: orchestrator\n"
@@ -2809,6 +2820,8 @@ def test_spec_used_families_multi_vendor_directory_agent(tmp_path) -> None:
         "tools:\n"
         "  agents:\n"
         "    - worker\n"
+        "    - cursor_worker\n"
+        "    - mimo_worker\n"
     )
     (root / "agents" / "worker" / "config.yaml").write_text(
         "spec_version: 1\n"
@@ -2819,12 +2832,35 @@ def test_spec_used_families_multi_vendor_directory_agent(tmp_path) -> None:
         "  config:\n"
         "    harness: codex-native\n"
     )
+    (root / "agents" / "cursor_worker" / "config.yaml").write_text(
+        "spec_version: 1\n"
+        "name: cursor_worker\n"
+        "prompt: work\n"
+        "executor:\n"
+        "  type: omnigent\n"
+        "  config:\n"
+        "    harness: cursor\n"
+    )
+    (root / "agents" / "mimo_worker" / "config.yaml").write_text(
+        "spec_version: 1\n"
+        "name: mimo_worker\n"
+        "prompt: work\n"
+        "executor:\n"
+        "  type: omnigent\n"
+        "  config:\n"
+        "    harness: mimo\n"
+    )
 
     # Both the orchestrator (anthropic) and its sub-agent (openai) count,
     # whether the caller passes the config.yaml or the directory itself
     # (the latter is what `omnigent run <dir>` threads through).
-    assert _spec_used_families(root / "config.yaml") == ["anthropic", "openai"]
-    assert _spec_used_families(root) == ["anthropic", "openai"]
+    assert _spec_used_families(root / "config.yaml") == [
+        "anthropic",
+        "cursor",
+        "mimo",
+        "openai",
+    ]
+    assert _spec_used_families(root) == ["anthropic", "cursor", "mimo", "openai"]
 
 
 def test_spec_used_families_degrades_gracefully() -> None:

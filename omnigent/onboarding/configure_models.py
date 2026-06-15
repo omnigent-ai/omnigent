@@ -35,10 +35,12 @@ from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
     CHAT_WIRE_API,
     CLI_CONFIG_KIND,
+    CURSOR_SURFACE,
     DATABRICKS_KIND,
     GATEWAY_KIND,
     KEY_KIND,
     LOCAL_KIND,
+    MIMO_SURFACE,
     OPENAI_FAMILY,
     PI_SURFACE,
     SUBSCRIPTION_KIND,
@@ -88,6 +90,8 @@ _FAMILY_LABEL: dict[str, str] = {
     ANTHROPIC_FAMILY: "Claude",
     OPENAI_FAMILY: "Codex",
     PI_SURFACE: "Pi",
+    CURSOR_SURFACE: "Cursor",
+    MIMO_SURFACE: "Mimo",
 }
 
 # The concrete harness ids each surface powers, shown as a dim annotation
@@ -97,6 +101,8 @@ _FAMILY_HARNESS_IDS: dict[str, str] = {
     ANTHROPIC_FAMILY: "claude-sdk, native-claude",
     OPENAI_FAMILY: "codex, native-codex, openai-agents",
     PI_SURFACE: "pi",
+    CURSOR_SURFACE: "cursor",
+    MIMO_SURFACE: "mimo",
 }
 
 

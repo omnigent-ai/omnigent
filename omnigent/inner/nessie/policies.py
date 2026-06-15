@@ -471,8 +471,8 @@ def headless_subagent_purpose_guard(
         "Every sys_session_send must declare what kind of work it is. Set "
         "args.purpose to one of `implement` (write product code — any code "
         "change, however small), `review` (judge a diff against its contract), "
-        "or `explore` / `search` (read-only investigation). All sub-agents "
-        "(`claude_code`, `codex`, `pi`) accept all of these."
+        "or `explore` / `search` (read-only investigation). All coding "
+        "sub-agents accept all of these."
     ),
 ) -> Callable[[_Json], _Json]:
     """

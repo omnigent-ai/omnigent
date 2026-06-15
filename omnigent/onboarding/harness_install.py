@@ -39,11 +39,12 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 
-from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
+from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, CURSOR_SURFACE, OPENAI_FAMILY
 
 # Pi and Mimo are not configure-menu families (the menu is Claude + Codex), but
 # the first-run ``run`` flow can launch them, so they have CLI metadata too.
 PI_KEY = "pi"
+CURSOR_KEY = CURSOR_SURFACE
 MIMO_KEY = "mimo"
 
 
@@ -100,6 +101,7 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         status_args=("login", "status"),
     ),
     PI_KEY: HarnessInstallSpec("Pi", "pi", "@earendil-works/pi-coding-agent"),
+    CURSOR_KEY: HarnessInstallSpec("Cursor", "cursor-agent", None),
     MIMO_KEY: HarnessInstallSpec("Mimo", "mimo", None),
 }
 
@@ -109,13 +111,15 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
 # :data:`_HARNESS_INSTALL` family key. Only the CLI-backed harnesses appear
 # here — the ones that cannot launch without a binary on ``PATH``:
 # ``claude-native`` wraps the ``claude`` CLI, ``codex-native`` the ``codex``
-# CLI, ``pi`` the ``pi`` CLI, and ``mimo`` the ``mimo`` CLI. SDK-based harnesses (``claude-sdk``,
+# CLI, ``pi`` the ``pi`` CLI, ``cursor`` the ``cursor-agent`` CLI, and
+# ``mimo`` the ``mimo`` CLI. SDK-based harnesses (``claude-sdk``,
 # ``codex``, ``openai-agents-sdk``, ``databricks_supervisor``) run in-process
 # and are deliberately absent, so they resolve to "no CLI required".
 _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "claude-native": ANTHROPIC_FAMILY,
     "codex-native": OPENAI_FAMILY,
     PI_KEY: PI_KEY,
+    CURSOR_KEY: CURSOR_KEY,
     MIMO_KEY: MIMO_KEY,
 }
 

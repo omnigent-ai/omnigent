@@ -42,6 +42,17 @@ def test_mimo_install_spec_is_binary_only() -> None:
         hi.harness_install_command(hi.MIMO_KEY)
 
 
+def test_cursor_install_spec_is_binary_only() -> None:
+    """Cursor is CLI-backed, but Omnigent does not know a supported npm package."""
+    spec = hi.harness_install_spec(hi.CURSOR_KEY)
+    assert spec is not None
+    assert spec.display == "Cursor"
+    assert spec.binary == "cursor-agent"
+    assert spec.package is None
+    with pytest.raises(KeyError):
+        hi.harness_install_command(hi.CURSOR_KEY)
+
+
 def test_unknown_key_has_no_spec_and_is_not_installed() -> None:
     """A family with no dedicated CLI (e.g. a gateway-only family) → None / False,
     never a crash."""
@@ -55,6 +66,7 @@ def test_unknown_key_has_no_spec_and_is_not_installed() -> None:
         ("claude-native", "claude"),
         ("codex-native", "codex"),
         ("pi", "pi"),
+        ("cursor", "cursor-agent"),
         ("mimo", "mimo"),
     ],
 )

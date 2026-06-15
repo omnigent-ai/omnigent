@@ -357,6 +357,8 @@ def _build_startup_header(
     )
     from omnigent.onboarding.detected import effective_config_with_detected
     from omnigent.onboarding.provider_config import (
+        CURSOR_SURFACE,
+        MIMO_SURFACE,
         describe_active_credential,
         load_config,
         surface_default_provider,
@@ -382,7 +384,11 @@ def _build_startup_header(
             # what the pi harness would actually route through (explicit
             # pi scope, else the cross-family fallback).
             entry = surface_default_provider(config, fam)
-            if entry is None:
+            if fam == CURSOR_SURFACE:
+                label = "cursor-agent login"
+            elif fam == MIMO_SURFACE:
+                label = "Mimo CLI config"
+            elif entry is None:
                 label = "not configured"
             else:
                 cred_text = credential_label(

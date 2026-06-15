@@ -4026,7 +4026,7 @@ def resume(
 # into a materialized copy of the spec before the server starts.
 _HARNESS_CHOICES_HELP = (
     "'claude' (alias for 'claude-sdk'), 'claude-sdk', 'codex', 'cursor', "
-    "'openai-agents', 'open-responses', or 'pi'"
+    "'mimo', 'openai-agents', 'open-responses', or 'pi'"
 )
 _HARNESS_HELP = f"Harness to use for a local agent: {_HARNESS_CHOICES_HELP}."
 _RUN_HARNESS_HELP = (

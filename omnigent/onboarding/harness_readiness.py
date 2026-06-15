@@ -25,7 +25,12 @@ that would actually work.
 from __future__ import annotations
 
 from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
-from omnigent.onboarding.harness_install import MIMO_KEY, PI_KEY, harness_cli_installed
+from omnigent.onboarding.harness_install import (
+    CURSOR_KEY,
+    MIMO_KEY,
+    PI_KEY,
+    harness_cli_installed,
+)
 from omnigent.onboarding.provider_config import (
     _EXECUTOR_TYPE_HARNESS_ALIASES,
     _HARNESS_FAMILY,
@@ -65,8 +70,11 @@ def _install_key(canonical: str) -> str:
         ``"mimo"``.
     :returns: ``"anthropic"`` / ``"openai"`` for the claude/codex CLIs,
         :data:`~omnigent.onboarding.harness_install.PI_KEY` for pi, or
-        :data:`~omnigent.onboarding.harness_install.MIMO_KEY` for mimo.
+        :data:`~omnigent.onboarding.harness_install.CURSOR_KEY` for cursor,
+        or :data:`~omnigent.onboarding.harness_install.MIMO_KEY` for mimo.
     """
+    if canonical == CURSOR_KEY:
+        return CURSOR_KEY
     if canonical == MIMO_KEY:
         return MIMO_KEY
     return _HARNESS_FAMILY.get(canonical) or PI_KEY
@@ -76,8 +84,8 @@ def harness_is_configured(harness: str) -> bool:
     """Return whether *harness* can be launched on this machine.
 
     Only CLI-wrapping harnesses are assessed (native Claude/Codex, ``pi``,
-    and ``mimo``): they cannot run without their binary on ``PATH``, and that
-    is the one thing the daemon can check reliably and locally. SDK
+    ``cursor``, and ``mimo``): they cannot run without their binary on
+    ``PATH``, and that is the one thing the daemon can check reliably and locally. SDK
     harnesses and unknown harnesses always return ``True`` — their
     readiness depends on runtime/ambient credentials the daemon can't
     enumerate, so blocking them would risk false negatives that break
@@ -92,7 +100,7 @@ def harness_is_configured(harness: str) -> bool:
     canonical = _canonical_harness(harness)
     if canonical in _SDK_HARNESSES:
         return True
-    if canonical not in _HARNESS_FAMILY and canonical not in {PI_SURFACE, MIMO_KEY}:
+    if canonical not in _HARNESS_FAMILY and canonical not in {PI_SURFACE, CURSOR_KEY, MIMO_KEY}:
         # Unknown harness — the daemon has no install metadata for it, so
         # it can't assess readiness. Fail open (custom/newer harnesses,
         # version skew).
@@ -118,5 +126,6 @@ def configured_harness_map() -> dict[str, bool]:
     spellings.update(_EXECUTOR_TYPE_HARNESS_ALIASES)
     spellings.update(HARNESS_ALIASES)
     spellings.add(PI_SURFACE)
+    spellings.add(CURSOR_KEY)
     spellings.add(MIMO_KEY)
     return {spelling: harness_is_configured(spelling) for spelling in spellings}
