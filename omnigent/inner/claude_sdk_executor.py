@@ -1648,13 +1648,18 @@ class ClaudeSDKExecutor(Executor):
             ``"mcp__github__issue_write"``.
         :param tool_input: Arguments dict for the tool call.
         :returns: :class:`claude_agent_sdk.PermissionResultDeny` when a
-            policy denies the call (the server collapses TOOL_CALL ASK to a
-            hard ALLOW/DENY, so only the hard verdict reaches us), or
-            ``None`` when the call should be allowed to proceed (no policy
-            evaluator wired, an ``mcp__omnigent__*`` tool already gated on
-            the dispatch path, or an ALLOW / no-match verdict). Returning
-            ``None`` lets the caller fall through to its remaining gate
-            logic (elicitation) without forcing an allow.
+            policy denies the call. ``POLICY_ACTION_ASK`` is normally
+            collapsed to a hard ALLOW/DENY by the server-side
+            ``/policies/evaluate`` route. If a raw ASK reaches this callback
+            (for example from a read-only evaluation path), this hook runs the
+            existing Omnigent elicitation handler before returning
+            :class:`claude_agent_sdk.PermissionResultAllow` or DENY; without
+            a handler it fails closed. Returns ``None`` when the call should
+            be allowed to proceed (no policy evaluator wired, an
+            ``mcp__omnigent__*`` tool already gated on the dispatch path, or
+            an ALLOW / no-match verdict). Returning ``None`` lets the caller
+            fall through to its remaining gate logic (elicitation) without
+            forcing an allow.
         """
         _policy_eval = getattr(self, "_policy_evaluator", None)
         if _policy_eval is None:
@@ -1667,15 +1672,37 @@ class ClaudeSDKExecutor(Executor):
             "PHASE_TOOL_CALL",
             {"name": tool_name, "arguments": tool_input},
         )
-        if _verdict.action == "POLICY_ACTION_DENY":
+        _action = getattr(_verdict, "action", None)
+        if _action in ("POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED"):
+            # ALLOW / no-match — fall through (caller decides whether to also
+            # run the human-consent elicitation gate).
+            return None
+        if _action == "POLICY_ACTION_ASK":
+            from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+
+            reason = _verdict.reason or "Approval required by Omnigent TOOL_CALL policy"
+            if self._elicitation_handler is None:
+                logger.warning(
+                    "TOOL_CALL policy ASK had no elicitation handler; denying tool=%s reason=%s",
+                    tool_name,
+                    reason,
+                )
+                return PermissionResultDeny(message=reason)
+            logger.info("TOOL_CALL policy requested approval tool=%s reason=%s", tool_name, reason)
+            if await self._elicitation_handler(tool_name, tool_input):
+                return PermissionResultAllow()
+            return PermissionResultDeny(message=reason)
+        if _action == "POLICY_ACTION_DENY":
             from claude_agent_sdk import PermissionResultDeny
 
             reason = _verdict.reason or "Denied by Omnigent TOOL_CALL policy"
             logger.info("TOOL_CALL policy denied tool=%s reason=%s", tool_name, reason)
             return PermissionResultDeny(message=reason)
-        # ALLOW / no-match — fall through (caller decides whether to also
-        # run the human-consent elicitation gate).
-        return None
+        from claude_agent_sdk import PermissionResultDeny
+
+        reason = f"Unexpected Omnigent TOOL_CALL policy verdict: {_action!r}"
+        logger.warning("TOOL_CALL policy failed closed tool=%s reason=%s", tool_name, reason)
+        return PermissionResultDeny(message=reason)
 
     async def _can_use_tool_gate(
         self,

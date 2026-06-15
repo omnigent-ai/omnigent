@@ -3078,6 +3078,113 @@ class TestToolCallPolicyGate(unittest.TestCase):
 
         _run(_t())
 
+    def test_ask_verdict_prompts_even_under_bypass(self):
+        """A raw ASK verdict is supported by routing to Omnigent
+        elicitation, even under bypassPermissions."""
+        from claude_agent_sdk import PermissionResultAllow
+
+        async def _t():
+            executor = self._make_executor(permission_mode="bypassPermissions")
+            executor._policy_evaluator = AsyncMock(
+                return_value=self._verdict("POLICY_ACTION_ASK", reason="approval required")
+            )
+            elicit = AsyncMock(return_value=True)
+            executor._elicitation_handler = elicit
+
+            result = await executor._can_use_tool_gate(
+                "mcp__github__issue_write",
+                {"title": "bug"},
+                self._perm_ctx(),
+            )
+
+            self.assertIsInstance(result, PermissionResultAllow)
+            elicit.assert_awaited_once_with("mcp__github__issue_write", {"title": "bug"})
+
+        _run(_t())
+
+    def test_ask_verdict_denies_when_user_declines(self):
+        """A declined raw ASK blocks execution with the policy reason."""
+        from claude_agent_sdk import PermissionResultDeny
+
+        async def _t():
+            executor = self._make_executor(permission_mode="bypassPermissions")
+            executor._policy_evaluator = AsyncMock(
+                return_value=self._verdict("POLICY_ACTION_ASK", reason="approval required")
+            )
+            executor._elicitation_handler = AsyncMock(return_value=False)
+
+            result = await executor._can_use_tool_gate(
+                "mcp__github__issue_write",
+                {"title": "bug"},
+                self._perm_ctx(),
+            )
+
+            self.assertIsInstance(result, PermissionResultDeny)
+            self.assertEqual(result.message, "approval required")
+
+        _run(_t())
+
+    def test_ask_verdict_without_elicitation_handler_fails_closed(self):
+        """If raw ASK reaches the callback but no handler is available,
+        the tool must not run."""
+        from claude_agent_sdk import PermissionResultDeny
+
+        async def _t():
+            executor = self._make_executor(permission_mode="bypassPermissions")
+            executor._policy_evaluator = AsyncMock(
+                return_value=self._verdict("POLICY_ACTION_ASK", reason="approval required")
+            )
+
+            result = await executor._can_use_tool_gate(
+                "mcp__github__issue_write",
+                {"title": "bug"},
+                self._perm_ctx(),
+            )
+
+            self.assertIsInstance(result, PermissionResultDeny)
+            self.assertEqual(result.message, "approval required")
+
+        _run(_t())
+
+    def test_unspecified_verdict_falls_through(self):
+        """UNSPECIFIED is a proto no-op verdict and should behave like no match."""
+        from claude_agent_sdk import PermissionResultAllow
+
+        async def _t():
+            executor = self._make_executor(permission_mode="bypassPermissions")
+            executor._policy_evaluator = AsyncMock(
+                return_value=self._verdict("POLICY_ACTION_UNSPECIFIED")
+            )
+
+            result = await executor._can_use_tool_gate(
+                "mcp__github__issue_read",
+                {"number": 1},
+                self._perm_ctx(),
+            )
+
+            self.assertIsInstance(result, PermissionResultAllow)
+
+        _run(_t())
+
+    def test_unexpected_verdict_fails_closed(self):
+        """Unknown policy actions should not silently allow a tool call."""
+        from claude_agent_sdk import PermissionResultDeny
+
+        async def _t():
+            executor = self._make_executor(permission_mode="bypassPermissions")
+            executor._policy_evaluator = AsyncMock(return_value=self._verdict("BOGUS"))
+
+            result = await executor._can_use_tool_gate(
+                "mcp__github__issue_write",
+                {"title": "bug"},
+                self._perm_ctx(),
+            )
+
+            self.assertIsInstance(result, PermissionResultDeny)
+            self.assertIn("Unexpected Omnigent TOOL_CALL policy verdict", result.message)
+
+        _run(_t())
+
     def test_allow_verdict_no_human_prompt_under_bypass(self):
         """ALLOW under bypassPermissions allows the call with no human
         prompt, preserving bypass ergonomics."""
