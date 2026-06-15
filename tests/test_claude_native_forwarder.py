@@ -5315,3 +5315,65 @@ async def test_forward_session_cost_posts_status_when_no_subagents(
     ]
     assert dedupe.posted_cost == pytest.approx(0.25)
     assert dedupe.posted_policy_cost == pytest.approx(0.25)
+
+
+def test_parse_json_response_returns_value_on_valid_json() -> None:
+    """
+    A normal JSON body parses through ``_parse_json_response`` unchanged.
+
+    :returns: None.
+    """
+    resp = httpx.Response(200, json={"id": "conv_abc123"})
+    assert forwarder._parse_json_response(resp, context="session snapshot") == {
+        "id": "conv_abc123"
+    }
+
+
+def test_parse_json_response_raises_diagnosable_error_on_html_body() -> None:
+    """
+    An HTML body (e.g. an expired Databricks Apps OAuth login page served
+    with a 200) raises a ``RuntimeError`` naming the content type and a
+    body snippet, not an opaque ``json.JSONDecodeError``. The original
+    parser error is preserved as ``__cause__`` for debugging.
+
+    :returns: None.
+    """
+    resp = httpx.Response(
+        200,
+        html="<!DOCTYPE html><html><body>Sign in to continue</body></html>",
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        forwarder._parse_json_response(resp, context="session 'conv_abc123' snapshot")
+    message = str(excinfo.value)
+    assert "session 'conv_abc123' snapshot" in message
+    assert "text/html" in message
+    assert "<!DOCTYPE html>" in message
+    assert isinstance(excinfo.value.__cause__, ValueError)
+
+
+@pytest.mark.asyncio
+async def test_fetch_session_snapshot_raises_diagnosable_error_on_html_body() -> None:
+    """
+    ``_fetch_session_snapshot`` surfaces a clear error when the Sessions
+    API returns a 200 HTML body instead of JSON — the failure mode behind
+    Claude Code's "Unrecognized token '<'" crash when an auth/proxy page is
+    served in place of the API response. Without the guard this raised a
+    bare ``json.JSONDecodeError`` that the forwarder supervisor turned into
+    a silent restart loop.
+
+    :returns: None.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            html="<!DOCTYPE html><html><body>Sign in to continue</body></html>",
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        with pytest.raises(RuntimeError) as excinfo:
+            await forwarder._fetch_session_snapshot(client, "conv_abc123")
+    message = str(excinfo.value)
+    assert "conv_abc123" in message
+    assert "text/html" in message

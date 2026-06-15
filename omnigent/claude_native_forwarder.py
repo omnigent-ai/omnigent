@@ -803,6 +803,40 @@ async def _write_subagent_forward_state_async(
     await asyncio.to_thread(_write_subagent_forward_state, bridge_dir, state)
 
 
+def _parse_json_response(resp: httpx.Response, *, context: str) -> Any:
+    """
+    Parse an Omnigent JSON response, failing loudly on a non-JSON body.
+
+    The forwarder calls ``resp.json()`` on Sessions API responses after
+    ``resp.raise_for_status()``. That guards non-2xx statuses but not a
+    2xx body that simply is not JSON: an auth or proxy layer in front of
+    the server — most commonly an expired Databricks Apps OAuth session —
+    can serve an HTML login or error page with a 200 status. A bare
+    ``resp.json()`` then raises an opaque ``json.JSONDecodeError``
+    ("Expecting value: line 1 column 1 (char 0)") with no hint that the
+    body was HTML, and the forwarder supervisor turns that into a silent
+    restart loop. This wrapper re-raises with the response content type
+    and a body snippet so the cause is obvious in logs.
+
+    :param resp: HTTP response whose body is expected to be JSON.
+    :param context: Short request description for the error message,
+        e.g. ``"session conv_abc123 snapshot"``.
+    :returns: The parsed JSON value (object, array, or scalar).
+    :raises RuntimeError: If the response body is not valid JSON.
+    """
+    try:
+        return resp.json()
+    except ValueError as exc:
+        content_type = resp.headers.get("content-type") or "<unknown>"
+        snippet = " ".join(resp.text[:200].split())
+        raise RuntimeError(
+            f"{context} returned a non-JSON body (content-type "
+            f"{content_type!r}); an auth or proxy page was likely served "
+            f"instead of the API response (e.g. an expired login session). "
+            f"Body starts with: {snippet!r}"
+        ) from exc
+
+
 async def _post_external_subagent_start(
     client: httpx.AsyncClient,
     *,
@@ -833,6 +867,7 @@ async def _post_external_subagent_start(
     :raises KeyError: If the server response is missing
         ``child_session_id`` — indicates a server/forwarder version
         mismatch and is unrecoverable for this sub-agent.
+    :raises RuntimeError: If the server response body is not JSON.
     """
     resp = await client.post(
         f"/v1/sessions/{parent_session_id}/events",
@@ -847,7 +882,7 @@ async def _post_external_subagent_start(
         },
     )
     resp.raise_for_status()
-    body = resp.json()
+    body = _parse_json_response(resp, context=f"sub-agent start for {parent_session_id!r}")
     return body["child_session_id"]
 
 
@@ -1708,7 +1743,7 @@ async def _create_clear_replacement_session(
         },
     )
     create_resp.raise_for_status()
-    created = create_resp.json()
+    created = _parse_json_response(create_resp, context="clear-replacement session create")
     new_session_id = created.get("id")
     if not isinstance(new_session_id, str) or not new_session_id:
         raise RuntimeError("clear replacement session response did not include id")
@@ -1828,7 +1863,7 @@ async def _create_fork_replacement_session(
         json={},
     )
     fork_resp.raise_for_status()
-    forked = fork_resp.json()
+    forked = _parse_json_response(fork_resp, context=f"fork of session {old_session_id!r}")
     new_session_id = forked.get("id")
     if not isinstance(new_session_id, str) or not new_session_id:
         raise RuntimeError("fork replacement session response did not include id")
@@ -1942,7 +1977,7 @@ async def _fetch_session_snapshot(
     """
     resp = await client.get(f"/v1/sessions/{url_component(session_id)}")
     resp.raise_for_status()
-    payload = resp.json()
+    payload = _parse_json_response(resp, context=f"session {session_id!r} snapshot")
     if not isinstance(payload, dict):
         raise RuntimeError(f"session {session_id!r} snapshot was not an object")
     return payload
