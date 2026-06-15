@@ -83,7 +83,7 @@ def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
     def _worker() -> None:
         try:
             asyncio.run(coro)
-        except BaseException as exc:  # noqa: BLE001 — re-raised on caller thread
+        except BaseException as exc:
             captured["error"] = exc
 
     thread = threading.Thread(target=_worker)
@@ -209,9 +209,7 @@ async def _register_common_routes(
         await route.fulfill(status=200, content_type="application/json", body=_hosts_body())
 
     async def handle_agents(route: Route) -> None:
-        await route.fulfill(
-            status=200, content_type="application/json", body=resolved_agents_body
-        )
+        await route.fulfill(status=200, content_type="application/json", body=resolved_agents_body)
 
     async def handle_events(route: Route) -> None:
         # Swallow the auto-sent initial prompt so no real LLM turn runs.
