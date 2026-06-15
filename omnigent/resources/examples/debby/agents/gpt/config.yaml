@@ -4,14 +4,23 @@ description: >-
   Plain GPT brainstorming responder — answers a question on its own merits,
   and (during a debate) critiques the other partner's answer.
 
-# Plain responder on the OpenAI Agents SDK harness. No coding tools, no
-# filesystem — this sub-agent only reads the prompt and writes an answer. No
-# model is pinned, so it runs on whatever OpenAI provider you configured
-# (e.g. OPENAI_API_KEY, or an OpenAI-compatible gateway via OPENAI_BASE_URL).
+# Plain GPT responder on the Codex harness. No coding tools, no filesystem —
+# this sub-agent only reads the prompt and writes an answer. The codex harness
+# is GPT-only and uses OpenAI's native auth (a ChatGPT/Codex login or
+# OPENAI_API_KEY), so the GPT head always routes to OpenAI. No model is pinned,
+# so it resolves your configured OpenAI/Codex provider's default GPT model.
+#
+# Why codex rather than openai-agents: the openai-agents harness treats an
+# unpinned model as a Databricks model (see
+# omnigent/inner/openai_agents_sdk_executor.py — `is_databricks_model =
+# model is None`) and, with no OPENAI_API_KEY/OPENAI_BASE_URL in the
+# environment, silently falls back to ambient Databricks credentials — routing
+# Debby's "GPT" head through the Databricks gateway instead of OpenAI. The
+# codex harness has no such unpinned-model Databricks fallback.
 executor:
   type: omnigent
   config:
-    harness: openai-agents
+    harness: codex
 
 prompt: |
   You are the GPT half of Debby, a brainstorming partner. You are a pure

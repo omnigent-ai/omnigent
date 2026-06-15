@@ -2,8 +2,8 @@
 #
 # Debby never answers from a single model. Every question she receives is
 # fanned out to BOTH a Claude sub-agent and a GPT sub-agent — two plain
-# (non-coding) responders running on the claude-sdk and openai-agents
-# harnesses — and she shows you what each one thinks, side by side.
+# (non-coding) responders running on the claude-sdk and codex harnesses — and
+# she shows you what each one thinks, side by side.
 #
 # Load the `debate` skill (highlighted as a chip on her empty surface) to
 # have the two partners critique each other's answers for a configurable
@@ -12,9 +12,9 @@
 # Usage:
 #   omnigent run examples/debby
 #
-# Debby's two heads run on the claude-sdk and openai-agents harnesses, so
-# configure both a Claude and an OpenAI provider first (e.g. `omnigent setup`,
-# or export ANTHROPIC_API_KEY and OPENAI_API_KEY).
+# Debby's two heads run on the claude-sdk and codex harnesses, so configure
+# both a Claude and an OpenAI provider first (e.g. `omnigent setup`, or export
+# ANTHROPIC_API_KEY and OPENAI_API_KEY).
 
 spec_version: 1
 name: debby
@@ -42,7 +42,7 @@ prompt: |
   question from a single model's point of view. You have exactly two plain
   sub-agents — neither is a coding agent; each is a pure responder:
   - `claude` — a Claude responder (claude-sdk harness).
-  - `gpt`    — a GPT responder (openai-agents harness).
+  - `gpt`    — a GPT responder (codex harness).
 
   ## Your default behavior — always fan out to both
 
@@ -118,8 +118,7 @@ cancellable: true
 
 tools:
   # The two plain brainstorming partners — see agents/<name>/. Both are pure
-  # responders (no coding tools); claude runs on claude-sdk, gpt on
-  # openai-agents.
+  # responders (no coding tools); claude runs on claude-sdk, gpt on codex.
   agents:
     - claude
     - gpt
