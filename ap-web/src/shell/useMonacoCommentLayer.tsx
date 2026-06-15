@@ -24,7 +24,9 @@ import { getEmbedRoot } from "@/lib/host";
 // returns the same type, so both surfaces share this layer.
 export type CodeEditorInstance = Parameters<OnMount>[0];
 type TextModel = NonNullable<ReturnType<CodeEditorInstance["getModel"]>>;
-type ModelDeltaDecoration = NonNullable<Parameters<CodeEditorInstance["createDecorationsCollection"]>[0]>[number];
+type ModelDeltaDecoration = NonNullable<
+  Parameters<CodeEditorInstance["createDecorationsCollection"]>[0]
+>[number];
 type DecorationsCollection = ReturnType<CodeEditorInstance["createDecorationsCollection"]>;
 
 /**
@@ -45,7 +47,12 @@ export function buildCommentDecorations(
   const rangeOf = (start: number, end: number) => {
     const s = model.getPositionAt(start);
     const e = model.getPositionAt(end);
-    return { startLineNumber: s.lineNumber, startColumn: s.column, endLineNumber: e.lineNumber, endColumn: e.column };
+    return {
+      startLineNumber: s.lineNumber,
+      startColumn: s.column,
+      endLineNumber: e.lineNumber,
+      endColumn: e.column,
+    };
   };
   const decorations: ModelDeltaDecoration[] = comments.map((c) => {
     const isActive =
@@ -62,7 +69,10 @@ export function buildCommentDecorations(
   if (
     activeSelection != null &&
     activeSelection.end_index > activeSelection.start_index &&
-    !comments.some((c) => c.start_index === activeSelection.start_index && c.end_index === activeSelection.end_index)
+    !comments.some(
+      (c) =>
+        c.start_index === activeSelection.start_index && c.end_index === activeSelection.end_index,
+    )
   ) {
     decorations.push({
       range: rangeOf(activeSelection.start_index, activeSelection.end_index),
@@ -126,7 +136,11 @@ export function useMonacoCommentLayer({
     const ed = editorRef.current;
     const model = ed?.getModel();
     if (!ed || !model) return;
-    const decorations = buildCommentDecorations(model, commentsRef.current, activeSelectionRef.current);
+    const decorations = buildCommentDecorations(
+      model,
+      commentsRef.current,
+      activeSelectionRef.current,
+    );
     if (decorationsRef.current) decorationsRef.current.set(decorations);
     else decorationsRef.current = ed.createDecorationsCollection(decorations);
   }, [editorRef]);
@@ -135,13 +149,22 @@ export function useMonacoCommentLayer({
   // selection. Hidden unless a comment may be started (canComment).
   const updateCommentButton = useCallback(() => {
     const ed = editorRef.current;
-    if (!ed || !canCommentRef.current) { setButtonPos(null); return; }
+    if (!ed || !canCommentRef.current) {
+      setButtonPos(null);
+      return;
+    }
     const sel = ed.getSelection();
     const model = ed.getModel();
-    if (!sel || !model || sel.isEmpty() || !model.getValueInRange(sel).trim()) { setButtonPos(null); return; }
+    if (!sel || !model || sel.isEmpty() || !model.getValueInRange(sel).trim()) {
+      setButtonPos(null);
+      return;
+    }
     const visible = ed.getScrolledVisiblePosition(sel.getStartPosition());
     const node = ed.getDomNode();
-    if (!visible || !node) { setButtonPos(null); return; }
+    if (!visible || !node) {
+      setButtonPos(null);
+      return;
+    }
     const rect = node.getBoundingClientRect();
     setButtonPos({ left: rect.left + visible.left, top: rect.top + visible.top });
   }, [editorRef]);
@@ -168,7 +191,9 @@ export function useMonacoCommentLayer({
         const pos = e.target.position;
         if (pos) {
           const offset = model.getOffsetAt(pos);
-          const clicked = commentsRef.current.find((c) => c.start_index <= offset && offset < c.end_index);
+          const clicked = commentsRef.current.find(
+            (c) => c.start_index <= offset && offset < c.end_index,
+          );
           if (clicked) {
             onSetActiveSelectionRef.current({
               start_index: clicked.start_index,
@@ -184,7 +209,9 @@ export function useMonacoCommentLayer({
         onSetActiveSelectionRef.current(null);
       }),
     ];
-    return () => { for (const d of disposables) d.dispose(); };
+    return () => {
+      for (const d of disposables) d.dispose();
+    };
   }, [mounted, editorRef, updateCommentButton]);
 
   // (Re)apply decorations when comments / active selection change.
@@ -201,7 +228,10 @@ export function useMonacoCommentLayer({
     const s = model.getPositionAt(activeSelection.start_index);
     const e = model.getPositionAt(activeSelection.end_index);
     ed.revealRangeInCenterIfOutsideViewport({
-      startLineNumber: s.lineNumber, startColumn: s.column, endLineNumber: e.lineNumber, endColumn: e.column,
+      startLineNumber: s.lineNumber,
+      startColumn: s.column,
+      endLineNumber: e.lineNumber,
+      endColumn: e.column,
     });
   }, [mounted, editorRef, activeSelection]);
 
@@ -213,7 +243,12 @@ export function useMonacoCommentLayer({
   }, [canComment]);
 
   // Drop the decorations collection on unmount.
-  useEffect(() => () => { decorationsRef.current?.clear(); }, []);
+  useEffect(
+    () => () => {
+      decorationsRef.current?.clear();
+    },
+    [],
+  );
 
   // Create a comment from the current selection.
   const handleAddComment = useCallback(() => {
@@ -223,7 +258,10 @@ export function useMonacoCommentLayer({
     // Re-check: commenting may have become unavailable (permission / dirty /
     // truncation) between the button appearing and this click — don't anchor a
     // comment to offsets that no longer match the saved server content.
-    if (!canCommentRef.current) { setButtonPos(null); return; }
+    if (!canCommentRef.current) {
+      setButtonPos(null);
+      return;
+    }
     const sel = ed.getSelection();
     if (!sel || sel.isEmpty()) return;
     onSetActiveSelectionRef.current({
@@ -243,7 +281,10 @@ export function useMonacoCommentLayer({
       type="button"
       // preventDefault on mousedown keeps the editor selection live so
       // handleAddComment can read it.
-      onMouseDown={(e) => { e.preventDefault(); handleAddComment(); }}
+      onMouseDown={(e) => {
+        e.preventDefault();
+        handleAddComment();
+      }}
       className="fixed z-50 flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-xs font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
       style={{ left: buttonPos.left, top: buttonPos.top, transform: "translateY(-100%)" }}
     >

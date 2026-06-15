@@ -3,11 +3,7 @@
 // the "Thought for N seconds" timer via wall clock; we just thread
 // through `isStreaming` and the accumulated text.
 
-import {
-  Reasoning,
-  ReasoningContent,
-  ReasoningTrigger,
-} from "@/components/ai-elements/reasoning";
+import { Reasoning, ReasoningContent, ReasoningTrigger } from "@/components/ai-elements/reasoning";
 
 interface ReasoningViewProps {
   text: string;

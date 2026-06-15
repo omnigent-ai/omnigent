@@ -205,6 +205,55 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "instead of rebuilding. Fails if no build is present."
         ),
     )
+    # Round-robin shard split for the e2e-ui CI matrix. We roll our own
+    # (rather than pull in pytest-shard / pytest-split) so the partition
+    # is a dependency-free strided slice -- see pytest_collection_modifyitems
+    # below for why striding beats hash-bucketing for wall-clock balance.
+    parser.addoption(
+        "--splits",
+        type=int,
+        default=None,
+        help="Total number of shards to split the UI suite into (CI matrix).",
+    )
+    parser.addoption(
+        "--group",
+        type=int,
+        default=None,
+        help="1-indexed shard this run executes (requires --splits).",
+    )
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(
+    config: pytest.Config,
+    items: list[pytest.Item],
+) -> None:
+    """Round-robin the collected UI tests across the CI shard matrix.
+
+    pytest-shard hash-buckets node IDs, which is blind to per-test
+    wall-clock and left one shard at ~5min while siblings finished in
+    ~2min. A *strided* slice -- ``items[group-1::splits]`` -- deals tests
+    out like cards instead, so a heavy file (whose cases collect
+    adjacently) scatters one-per-shard rather than landing in a single
+    bucket. That averages cost across shards without maintaining a
+    durations file.
+
+    No-op unless both ``--splits`` and ``--group`` are passed, so local
+    runs and the non-sharded suites are unaffected. ``trylast`` lets the
+    repo-wide known-failures marking in ``tests/conftest.py`` tag items
+    first; markers travel with the items the slice keeps.
+    """
+    splits = config.getoption("--splits")
+    group = config.getoption("--group")
+    if splits is None and group is None:
+        return
+    if splits is None or group is None:
+        raise pytest.UsageError("--splits and --group must be passed together")
+    if splits < 1:
+        raise pytest.UsageError("--splits must be >= 1")
+    if not 1 <= group <= splits:
+        raise pytest.UsageError(f"--group must be between 1 and {splits}")
+    items[:] = items[group - 1 :: splits]
 
 
 def _register_agent_yaml(
@@ -624,7 +673,10 @@ def live_server(
 
 
 @pytest.fixture
-def seeded_session(live_server: str) -> Iterator[tuple[str, str]]:
+def seeded_session(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
     """Create a session bound to ``live_server``'s runner and yield its id.
 
     The web UI no longer lets users start a new chat from inside the
@@ -636,13 +688,21 @@ def seeded_session(live_server: str) -> Iterator[tuple[str, str]]:
     session bound to that agent, then ``PATCH``-binds it to the
     spawned runner so ``POST /v1/responses`` can dispatch.
 
+    Respawns the shared runner first if a prior test in the shard killed
+    it (``test_stale_stream``); otherwise the runner-bind ``PATCH`` would
+    400 on an offline runner. Any runner this respawns is torn down with
+    the fixture. This keeps the fixture order-independent, so sharding
+    and test reordering can place the runner-killing test anywhere.
+
     :param live_server: Spawned server fixture — its
         ``OMNIGENT_RUNNER_ID`` and pre-registered agent are reused.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
     :returns: ``(base_url, session_id)``. Tests typically navigate to
         ``f"{base_url}/c/{session_id}"``.
     """
     import json as _json
 
+    respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
     # Create a session with the hello_world bundle inline. The server
     # pre-registered the agent via --agent, but since /api/agents is
@@ -668,6 +728,15 @@ def seeded_session(live_server: str) -> Iterator[tuple[str, str]]:
         yield (live_server, session_id)
     finally:
         httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        # Restore the "found" state: if we respawned the runner (a prior
+        # test had killed it), tear our copy down so it doesn't outlive us.
+        if respawned_runner is not None:
+            respawned_runner.terminate()
+            try:
+                respawned_runner.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned_runner.kill()
+                respawned_runner.wait(timeout=5)
 
 
 def _create_runner_bound_session(base_url: str, runner_id: str) -> str:
@@ -1200,3 +1269,110 @@ def server_pid(live_server: str) -> int:
     :returns: OS process id.
     """
     return int(_server_state["pid"])
+
+
+# ---------------------------------------------------------------------------
+# Per-agent chat sessions (message render-parity suite, and reusable beyond it)
+#
+# ``custom_agent_session`` yields ``(base_url, session_id)`` for a session bound
+# to the shared ``live_server`` runner, ready to chat at ``/c/<session_id>``. It
+# registers a plain ``openai-agents`` agent (the ``echo_probe`` spec below) —
+# the same harness family as ``hello_world`` — fresh, so it stands in for "spin
+# up a different agent" without the multi-provider sprawl of the packaged
+# ``polly`` / ``debby`` examples.
+#
+# Native CLI built-ins (``claude-native-ui`` / ``codex-native-ui``) are not
+# wired up here yet: driving the real vendor TUI in a PTY needs CI-side setup
+# (gateway auth + Claude Code first-run state) owned by the native-harness CI
+# enablement work. Add those fixtures back alongside that effort.
+# ---------------------------------------------------------------------------
+
+# A precise-echo agent on the openai-agents harness (same provider family as
+# hello_world, so it authenticates against the same gateway in CI). spec_version
+# 1 + executor.config.harness routes through the strict parser; arcname
+# config.yaml keeps it on that path.
+_CUSTOM_AGENT_NAME = "echo_probe"
+_CUSTOM_AGENT_YAML = f"""\
+spec_version: 1
+name: {_CUSTOM_AGENT_NAME}
+prompt: |
+  You are a precise echo assistant. The user sends a turn that ends with an
+  instruction to reply with one exact token. Reply with that token verbatim
+  and nothing else — no preamble, no quotes, no trailing punctuation.
+
+executor:
+  model: databricks-gpt-5-4
+  config:
+    harness: openai-agents
+"""
+
+
+def _bind_session_runner(base_url: str, session_id: str, runner_id: str) -> None:
+    """PATCH *session_id* onto *runner_id* so ``POST /v1/responses`` dispatches.
+
+    :param base_url: Spawned server base URL, e.g. ``"http://127.0.0.1:51234"``.
+    :param session_id: The session/conversation id to bind.
+    :param runner_id: The token-bound runner id the session dispatches to.
+    """
+    patch = httpx.patch(
+        f"{base_url}/v1/sessions/{session_id}",
+        json={"runner_id": runner_id},
+        timeout=10.0,
+    )
+    patch.raise_for_status()
+
+
+def _create_bundled_session(base_url: str, runner_id: str, yaml_text: str) -> str:
+    """Register a session-scoped agent from *yaml_text* and bind its session.
+
+    The multipart ``POST /v1/sessions`` both registers the agent and creates
+    the session it is scoped to, returning that ``session_id`` directly — so
+    no separate create call is needed.
+
+    :param base_url: Spawned server base URL.
+    :param runner_id: The token-bound runner id to bind.
+    :param yaml_text: The agent spec body.
+    :returns: The new session/conversation id.
+    """
+    import json as _json
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        data = yaml_text.encode()
+        info = tarfile.TarInfo("config.yaml")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+
+    create = httpx.post(
+        f"{base_url}/v1/sessions",
+        data={"metadata": _json.dumps({})},
+        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
+        timeout=30.0,
+    )
+    create.raise_for_status()
+    session_id = str(create.json()["session_id"])
+    _bind_session_runner(base_url, session_id, runner_id)
+    return session_id
+
+
+@pytest.fixture
+def custom_agent_session(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A runner-bound session on the custom ``echo_probe`` agent.
+
+    :param live_server: Spawned server fixture; its runner is reused.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``.
+    """
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    session_id = _create_bundled_session(live_server, runner_id, _CUSTOM_AGENT_YAML)
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
+            respawned.wait(timeout=5)

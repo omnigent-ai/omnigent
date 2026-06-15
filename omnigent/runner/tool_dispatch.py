@@ -615,6 +615,43 @@ def _session_wrapper_label(session_payload: dict[str, Any]) -> str | None:
     return wrapper if isinstance(wrapper, str) and wrapper else None
 
 
+def _publish_child_launching_update(
+    *,
+    parent_session_id: str,
+    child_session_id: str,
+    title: str,
+    tool: str,
+    session_name: str,
+    publish_event: Callable[[str, dict[str, Any]], None] | None,
+) -> None:
+    """
+    Publish the honest pre-start child state to the parent stream.
+
+    The child session exists at this point, but no child runtime has emitted
+    a busy edge yet. Surfacing ``launching`` prevents the UI/orchestrator from
+    mistaking session bookkeeping for a running worker.
+    """
+    event = {
+        "type": "session.child_session.updated",
+        "conversation_id": parent_session_id,
+        "child_session_id": child_session_id,
+        "child": {
+            "id": child_session_id,
+            "title": title,
+            "tool": tool,
+            "session_name": session_name,
+            "busy": False,
+            "current_task_status": "launching",
+        },
+    }
+    if publish_event is not None:
+        publish_event(parent_session_id, event)
+        return
+    from omnigent.runtime import session_stream
+
+    session_stream.publish(parent_session_id, event)
+
+
 async def _list_child_sessions(
     *,
     server_client: httpx.AsyncClient,
@@ -852,10 +889,11 @@ async def _execute_subagent_tool(
     Dispatch a sub-agent tool call (``sys_session_send``).
 
     Creates or reuses a child session on the server, registers a
-    runner-local work entry, posts the child message, and returns a
-    running handle immediately. The child turn runs on the same
-    runner. When it completes, runner turn-end bookkeeping pushes a
-    completion payload into the parent's ``sys_read_inbox`` queue.
+    runner-local launch entry, posts the child message, and returns a
+    launching handle immediately. The child work becomes ``running`` only
+    after the child runtime emits a real busy status. When it completes,
+    runner turn-end bookkeeping pushes a completion payload into the
+    parent's ``sys_read_inbox`` queue.
 
     :param args: Parsed arguments from the LLM. Expected keys:
         ``agent`` (sub-agent name, e.g. ``"researcher"``),
@@ -917,6 +955,7 @@ async def _execute_subagent_tool(
             message,
             server_client=server_client,
             conversation_id=conversation_id,
+            publish_event=publish_event,
         )
 
     # Named mode: (agent, title) spawn-or-continue.
@@ -977,10 +1016,14 @@ async def _execute_subagent_tool(
             )
         child_wrapper_label = _session_wrapper_label(existing)
         existing_work = _runner_app.get_subagent_work(child_session_id)
-        if existing_work is not None and existing_work.status == "running":
+        if existing_work is not None and existing_work.status in (
+            "launching",
+            "running",
+            "waiting",
+        ):
             return (
                 f"Error: sub-agent {sub_agent_name!r} title {session_name!r} "
-                "already has a running turn; wait for completion before sending again"
+                "already has a launching or running turn; wait for completion before sending again"
             )
         if existing.get("busy") is True:
             return (
@@ -1103,6 +1146,14 @@ async def _execute_subagent_tool(
         title=session_name,
         wrapper_label=child_wrapper_label,
     )
+    _publish_child_launching_update(
+        parent_session_id=conversation_id,
+        child_session_id=child_session_id,
+        title=f"{sub_agent_name}:{session_name}",
+        tool=str(sub_agent_name),
+        session_name=session_name,
+        publish_event=publish_event,
+    )
 
     # Send the user message as a separate event so the server's
     # post_event forwards it to the runner and starts the child
@@ -1140,10 +1191,10 @@ async def _execute_subagent_tool(
             "kind": "sub_agent",
             "agent": sub_agent_name,
             "title": session_name,
-            "status": "running",
+            "status": "launching",
             "message": (
                 f"[System: sub-agent {sub_agent_name} title {session_name!r} "
-                f"started as task {child_session_id}. Result will appear in "
+                f"launching as task {child_session_id}. Result will appear in "
                 "your inbox; call sys_read_inbox to check or sys_cancel_task "
                 "to interrupt it.]"
             ),
@@ -1157,6 +1208,7 @@ async def _send_to_existing_session(
     *,
     server_client: httpx.AsyncClient,
     conversation_id: str,
+    publish_event: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> str:
     """
     Post a message to an existing direct-child session, return a handle.
@@ -1215,9 +1267,9 @@ async def _send_to_existing_session(
     parsed = _parse_session_title(snap_data.get("title"))
     agent_label = parsed.agent or "agent"
     existing_work = _runner_app.get_subagent_work(target_session_id)
-    if existing_work is not None and existing_work.status == "running":
+    if existing_work is not None and existing_work.status in ("launching", "running", "waiting"):
         return (
-            f"Error: session {target_session_id!r} already has a running turn; "
+            f"Error: session {target_session_id!r} already has a launching or running turn; "
             "wait for completion before sending again"
         )
     if snap_data.get("busy") is True:
@@ -1238,6 +1290,14 @@ async def _send_to_existing_session(
         agent=agent_label,
         title=parsed.title or "",
         wrapper_label=_session_wrapper_label(snap_data),
+    )
+    _publish_child_launching_update(
+        parent_session_id=conversation_id,
+        child_session_id=target_session_id,
+        title=snap_data.get("title") or "",
+        tool=agent_label,
+        session_name=parsed.title or "",
+        publish_event=publish_event,
     )
 
     try:
@@ -1271,10 +1331,10 @@ async def _send_to_existing_session(
             "kind": "sub_agent",
             "agent": agent_label,
             "title": parsed.title,
-            "status": "running",
+            "status": "launching",
             "message": (
                 f"[System: sub-agent {agent_label} title {parsed.title!r} "
-                f"resumed as task {target_session_id}. Result will appear in "
+                f"launching as task {target_session_id}. Result will appear in "
                 "your inbox; call sys_read_inbox to check or sys_cancel_task "
                 "to interrupt it.]"
             ),
@@ -5071,7 +5131,12 @@ async def _cancel_subagent_task(
     entry = _runner_app.get_subagent_work(str(task_id))
     if entry is None or entry.parent_session_id != conversation_id:
         return f"Error: no in-flight task with task_id {task_id}"
-    if entry.status != "running":
+    # A dispatched child sits in ``launching`` until its runtime emits a real
+    # busy edge (see ``mark_subagent_work_started``). Cancellation must still
+    # route to the child during that window — otherwise cancelling a slow-to-
+    # start sub-agent would silently no-op and leave it running. Only terminal
+    # states (``completed`` / ``failed`` / ``cancelled``) short-circuit here.
+    if entry.status not in ("launching", "running", "waiting"):
         return json.dumps(
             {
                 "cancelled": entry.status == "cancelled",

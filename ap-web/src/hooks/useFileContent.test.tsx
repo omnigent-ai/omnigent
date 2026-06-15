@@ -12,7 +12,12 @@ vi.mock("@/store/chatStore", () => ({
 
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
-import { downloadWorkspaceFile, fileContentToBlob, triggerBrowserDownload, useFileContent } from "./useFileContent";
+import {
+  downloadWorkspaceFile,
+  fileContentToBlob,
+  triggerBrowserDownload,
+  useFileContent,
+} from "./useFileContent";
 import type { FileContentResponse } from "./useFileContent";
 
 const onlineMock = vi.mocked(useSessionRunnerOnline);
@@ -207,7 +212,10 @@ describe("downloadWorkspaceFile", () => {
     const origCreateElement = document.createElement.bind(document);
     vi.spyOn(document, "createElement").mockImplementation((tag: string) => {
       const el = origCreateElement(tag);
-      if (tag === "a") vi.spyOn(el as HTMLAnchorElement, "click").mockImplementation(() => { clickedLinks.push((el as HTMLAnchorElement).download); });
+      if (tag === "a")
+        vi.spyOn(el as HTMLAnchorElement, "click").mockImplementation(() => {
+          clickedLinks.push((el as HTMLAnchorElement).download);
+        });
       return el;
     });
     vi.stubGlobal("URL", { createObjectURL: vi.fn(() => "blob:x"), revokeObjectURL: vi.fn() });

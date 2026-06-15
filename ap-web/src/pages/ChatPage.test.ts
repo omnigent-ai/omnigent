@@ -95,11 +95,7 @@ describe("Composer structural read-only reasons", () => {
 describe("Terminal-first surface selection", () => {
   it("keeps Terminal view selected even when the runner is offline", () => {
     expect(
-      shouldShowTerminalSurface(
-        "conv_stopped",
-        { isTerminalFirst: true, view: "terminal" },
-        false,
-      ),
+      shouldShowTerminalSurface("conv_stopped", { isTerminalFirst: true, view: "terminal" }, false),
     ).toBe(true);
   });
 
@@ -455,9 +451,9 @@ describe("shouldShowWorkingIndicator", () => {
   it("suppresses Working when a compaction loading bubble owns the active slot", () => {
     // Compaction loading already renders the busy state, so the standalone
     // Working indicator would be duplicate progress UI.
-    expect(shouldShowWorkingIndicator(true, [{ kind: "compaction_loading", itemId: "cmp_1" }])).toBe(
-      false,
-    );
+    expect(
+      shouldShowWorkingIndicator(true, [{ kind: "compaction_loading", itemId: "cmp_1" }]),
+    ).toBe(false);
   });
 });
 
@@ -740,7 +736,10 @@ describe("dispatchInitialPrompt", () => {
     const send = vi.fn().mockResolvedValue(undefined);
     const sendSlashCommand = vi.fn().mockResolvedValue(undefined);
     dispatchInitialPrompt(
-      { text: "/review-pr 123 focus on auth", skill: { name: "review-pr", args: "123 focus on auth" } },
+      {
+        text: "/review-pr 123 focus on auth",
+        skill: { name: "review-pr", args: "123 focus on auth" },
+      },
       "ag_abc123",
       send,
       sendSlashCommand,
@@ -757,7 +756,12 @@ describe("dispatchInitialPrompt", () => {
   it("posts plain text (no matched skill) as a regular message", () => {
     const send = vi.fn().mockResolvedValue(undefined);
     const sendSlashCommand = vi.fn().mockResolvedValue(undefined);
-    dispatchInitialPrompt({ text: "read the README", skill: null }, "ag_abc123", send, sendSlashCommand);
+    dispatchInitialPrompt(
+      { text: "read the README", skill: null },
+      "ag_abc123",
+      send,
+      sendSlashCommand,
+    );
     // Full text verbatim, no files. This is also the path for native
     // terminal sessions and unknown "/typo" commands (skill stays null).
     expect(send).toHaveBeenCalledWith("read the README", "ag_abc123", []);

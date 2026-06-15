@@ -7,6 +7,7 @@ provider that speaks the OpenAI Chat Completions API format.
 
 from __future__ import annotations
 
+import codecs
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -535,6 +536,11 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
         """
         current_event: str | None = None
         buf = ""
+        # Decode incrementally: httpx yields arbitrary byte chunks, so a
+        # multi-byte UTF-8 character can be split across a chunk boundary.
+        # An incremental decoder buffers the partial sequence until the rest
+        # arrives, instead of emitting U+FFFD replacement chars per chunk.
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
         async with (
             httpx.AsyncClient(timeout=timeout) as client,
             client.stream(
@@ -553,7 +559,7 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
                 )
             resp.raise_for_status()
             async for chunk in resp.aiter_bytes():
-                buf += chunk.decode("utf-8", errors="replace")
+                buf += decoder.decode(chunk)
                 while "\n" in buf:
                     line, buf = buf.split("\n", 1)
                     line = line.rstrip("\r")

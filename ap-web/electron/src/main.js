@@ -201,9 +201,7 @@ function registerWebAuthn() {
     // Label each account by whatever name fields the credential carries;
     // the index-based fallback is display-only (the answer is always the
     // credentialId, never the label).
-    const labels = accounts.map(
-      (a, i) => a.userName || a.userDisplayName || `Account ${i + 1}`,
-    );
+    const labels = accounts.map((a, i) => a.userName || a.userDisplayName || `Account ${i + 1}`);
     void dialog
       .showMessageBox(win, {
         type: "question",
@@ -622,6 +620,99 @@ function normalizeUrl(raw) {
   return url.toString();
 }
 
+/**
+ * Path under a Databricks workspace where the Omnigent web UI is mounted. A
+ * bare workspace URL serves the workspace's own web app at the root, so a user
+ * who pastes just the workspace host (e.g.
+ * ``https://<ws>.azuredatabricks.net``) lands on a 404 unless this suffix is
+ * appended.
+ *
+ * NOTE: the Python CLI records the same UI mount as ``/ml/omnigent``
+ * (singular) in ``omnigent/conversation_browser.py`` (WORKSPACE_UI_PATH); the
+ * plural here is the path that actually resolves on the live workspace. The
+ * two should be reconciled — see also that file's WORKSPACE_API_PATH.
+ */
+const WORKSPACE_UI_PATH = "/ml/omnigents";
+
+/**
+ * CSS that hides the Databricks workspace navigation chrome around a
+ * workspace-hosted Omnigent SPA.
+ *
+ * On a workspace the SPA is mounted as a workspace *page*, so Databricks wraps
+ * it in its top-nav shell (the dark bar with the workspace switcher). In a
+ * dedicated desktop window that chrome is just noise. We promote Omnigent's
+ * own root — ``.omnigent-app``, the wrapper ap-web's embed entry sets
+ * (``ap-web/src/embed.tsx``) — to a full-viewport overlay so it paints over
+ * the workspace bar. Keying on Omnigent's wrapper (defined in THIS repo)
+ * rather than the monolith-owned, unstable workspace nav markup keeps this
+ * from silently breaking when Databricks reshuffles its chrome; on a
+ * standalone (non-embed) build there is no ``.omnigent-app``, so the rule is
+ * a harmless no-op.
+ */
+const WORKSPACE_CHROME_HIDE_CSS = `
+  .omnigent-app {
+    position: fixed !important;
+    inset: 0 !important;
+    z-index: 2147483647 !important;
+  }
+`;
+
+/**
+ * Probe timeout for Databricks workspace detection. Deliberately short: a slow
+ * or unreachable host must not stall the connect flow — on timeout we fall
+ * back to loading the URL exactly as entered.
+ */
+const WORKSPACE_PROBE_TIMEOUT_MS = 8000;
+
+/**
+ * Expand a bare Databricks workspace URL to its Omnigent web-UI mount.
+ *
+ * Mirrors the omni CLI's behavioral detection
+ * (``omnigent/cli.py:_workspace_api_server_url``): rather than match
+ * hostnames, probe the URL and adopt the mount only when the host answers
+ * like a Databricks workspace — a response carrying the ``server: databricks``
+ * header. URLs that already carry a path, or aren't https, are returned
+ * untouched WITHOUT a probe, so a user who pastes the full ``…/ml/omnigents``
+ * URL (or connects to any non-workspace server) is never second-guessed.
+ *
+ * The CLI appends the API mount because it's an API client; the desktop shell
+ * loads the web UI, so it appends the SPA mount instead.
+ *
+ * @param {string} normalized A normalized http(s) URL from {@link normalizeUrl}.
+ * @returns {Promise<string>} The workspace UI URL when expansion applies, else
+ *   the input unchanged.
+ */
+async function expandDatabricksWorkspaceUrl(normalized) {
+  let url;
+  try {
+    url = new URL(normalized);
+  } catch {
+    return normalized;
+  }
+  // Only bare https roots are candidates: a non-root path means the user
+  // already pointed at a specific mount, and Databricks workspaces are
+  // https-only.
+  if (url.protocol !== "https:" || (url.pathname !== "/" && url.pathname !== "")) {
+    return normalized;
+  }
+  let probe;
+  try {
+    probe = await fetch(`${url.origin}/`, {
+      method: "HEAD",
+      redirect: "manual",
+      signal: AbortSignal.timeout(WORKSPACE_PROBE_TIMEOUT_MS),
+    });
+  } catch {
+    // Unreachable / DNS / TLS / timeout: connect to the URL as given and let
+    // the did-fail-load fallback surface any real failure.
+    return normalized;
+  }
+  if ((probe.headers.get("server") ?? "").toLowerCase() !== "databricks") {
+    return normalized;
+  }
+  return `${url.origin}${WORKSPACE_UI_PATH}`;
+}
+
 // ---------------------------------------------------------------------------
 // Window + navigation
 // ---------------------------------------------------------------------------
@@ -784,8 +875,7 @@ function createWindow(targetUrl, opts = {}) {
   // ephemeral windows start on the setup page so the user can enter the
   // alternate server, and normal windows fall back to the saved server.
   const candidate =
-    explicit ??
-    (ephemeral ? null : typeof saved === "string" && saved.length > 0 ? saved : null);
+    explicit ?? (ephemeral ? null : typeof saved === "string" && saved.length > 0 ? saved : null);
   // A candidate that doesn't parse (hand-edited/corrupt settings.json) is
   // treated as "no server configured" rather than crashing window creation.
   const destinationOrigin = candidate ? originOf(candidate) : null;
@@ -858,6 +948,24 @@ function createWindow(targetUrl, opts = {}) {
     },
   );
 
+  // Databricks workspace-hosted Omnigent renders inside the workspace's
+  // top-nav chrome (the SPA is a workspace page). On a dedicated desktop
+  // window, hide it by overlaying Omnigent's own root — see
+  // WORKSPACE_CHROME_HIDE_CSS. Re-applied on every full load (a server switch
+  // is a fresh document); the SPA's own client-side routing keeps the same
+  // document, so the injected stylesheet persists across in-app navigation.
+  win.webContents.on("did-finish-load", () => {
+    let pathname = "";
+    try {
+      pathname = new URL(win.webContents.getURL()).pathname;
+    } catch {
+      return;
+    }
+    if (pathname.startsWith(WORKSPACE_UI_PATH)) {
+      void win.webContents.insertCSS(WORKSPACE_CHROME_HIDE_CSS);
+    }
+  });
+
   win.on("closed", () => {
     windows.delete(win);
     updateBadge(); // drop this window's contribution from the app-wide badge
@@ -902,8 +1010,7 @@ function attachContextMenu(win) {
       }
       template.push({
         label: "Add to Dictionary",
-        click: () =>
-          win.webContents.session.addWordToSpellCheckerDictionary(params.misspelledWord),
+        click: () => win.webContents.session.addWordToSpellCheckerDictionary(params.misspelledWord),
       });
       template.push({ type: "separator" });
     }
@@ -1360,12 +1467,15 @@ function registerIpc() {
   // Setup page → persist URL and navigate the SENDING window to it. We target
   // the window that owns the setup page (via its webContents) rather than a
   // global, so connecting from one window doesn't hijack another.
-  ipcMain.handle("omnigent:set-server-url", (event, url) => {
+  ipcMain.handle("omnigent:set-server-url", async (event, url) => {
     if (!isSetupPageSender(event)) {
       // A server page must never be able to re-point which server is saved.
       throw new Error("set-server-url is only available to the setup page");
     }
     const normalized = normalizeUrl(url); // throws → rejects → setup page shows error
+    // Bare Databricks workspace URLs serve a 404 at the root; expand them to
+    // the Omnigent UI mount so the user can paste just the workspace host.
+    const target = await expandDatabricksWorkspaceUrl(normalized);
     const win = BrowserWindow.fromWebContents(event.sender) ?? activeWindow();
     // Multi-server windows connect without touching the saved server —
     // the connection lives and dies with the window.
@@ -1374,22 +1484,22 @@ function registerIpc() {
       const settings = loadSettings();
       // The saved default persists immediately even if this load fails:
       // the failure fallback keeps it pre-filled so Connect retries it.
-      settings.server_url = normalized;
+      settings.server_url = target;
       saveSettings(settings);
     }
     if (win) {
       // The user explicitly chose this server — it becomes the window's
       // trusted origin for privileged IPC and permission grants.
-      pinWindow(win, new URL(normalized).origin);
+      pinWindow(win, new URL(target).origin);
       win
-        .loadURL(normalized)
+        .loadURL(target)
         .then(() => {
           // Only a server that actually responded earns a recents slot —
           // a typo'd or unreachable URL must not show up in the
           // quick-pick list on the setup page.
           if (ephemeral) return;
           const settings = loadSettings();
-          rememberRecentServer(settings, normalized);
+          rememberRecentServer(settings, target);
           saveSettings(settings);
         })
         .catch(() => {
@@ -1612,7 +1722,6 @@ if (!gotLock) {
     registerIpc();
     buildMenu();
     createWindow();
-
 
     app.on("activate", () => {
       // macOS: re-create the window when the dock icon is clicked and none open.

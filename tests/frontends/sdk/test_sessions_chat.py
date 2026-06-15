@@ -38,13 +38,20 @@ from omnigent_client._sessions_chat import (
     SessionsChat,
     SessionToolCallInfo,
 )
+from omnigent_client._tool_handler import StreamHooks
 from omnigent_client._types import File
 
 from omnigent.server.schemas import (
     CompletedEvent,
+    CreatedEvent,
+    ElicitationRequestEvent,
+    ElicitationRequestParams,
     OutputFileDoneEvent,
     OutputItemDoneEvent,
     OutputTextDeltaEvent,
+    ReasoningStartedEvent,
+    ReasoningSummaryTextDeltaEvent,
+    ReasoningTextDeltaEvent,
     ResponseObject,
     ServerStreamEvent,
     SessionHeartbeatEvent,
@@ -72,6 +79,21 @@ class _PostEventCall:
 
     session_id: str
     event: dict[str, Any]
+
+
+@dataclass
+class _ResolveElicitationCall:
+    """
+    Single recorded ``resolve_elicitation`` call.
+
+    :param session_id: Session id passed to ``resolve_elicitation``.
+    :param elicitation_id: Elicitation id passed in the URL path.
+    :param result: MCP-shape result body.
+    """
+
+    session_id: str
+    elicitation_id: str
+    result: dict[str, Any]
 
 
 @dataclass
@@ -112,6 +134,7 @@ class _FakeNamespace(SessionsNamespace):
         self._stream_scripts = stream_scripts
         self._session_obj = session_obj
         self.post_event_calls: list[_PostEventCall] = []
+        self.resolve_elicitation_calls: list[_ResolveElicitationCall] = []
         self.interrupt_calls: list[str] = []
         self.create_calls: list[tuple[bytes, str]] = []
         self.get_calls: list[str] = []
@@ -140,6 +163,21 @@ class _FakeNamespace(SessionsNamespace):
         self.post_event_calls.append(
             _PostEventCall(session_id=session_id, event=event),
         )
+
+    async def resolve_elicitation(  # type: ignore[override]
+        self,
+        session_id: str,
+        elicitation_id: str,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.resolve_elicitation_calls.append(
+            _ResolveElicitationCall(
+                session_id=session_id,
+                elicitation_id=elicitation_id,
+                result=result,
+            )
+        )
+        return {"queued": False}
 
     async def interrupt(self, session_id: str) -> None:  # type: ignore[override]
         self.interrupt_calls.append(session_id)
@@ -393,6 +431,24 @@ def _completed_event(
     )
 
 
+def _created_event(response_id: str = "resp_1") -> CreatedEvent:
+    """
+    Build a real :class:`CreatedEvent` for lifecycle hook tests.
+
+    :param response_id: Response id, e.g. ``"resp_1"``.
+    :returns: A typed :class:`CreatedEvent`.
+    """
+    return CreatedEvent(
+        type="response.created",
+        response=ResponseObject(
+            id=response_id,
+            status="in_progress",
+            model="test-model",
+            created_at=1700000000,
+        ),
+    )
+
+
 # ── send() ────────────────────────────────────────────────────────────
 
 
@@ -439,6 +495,192 @@ async def test_send_posts_message_event_and_yields_events_until_terminal() -> No
     # If 4 events leak through, the turn-boundary check regressed
     # and downstream consumers will see two turns merged.
     assert yielded == [delta1, delta2, completed]
+
+
+@pytest.mark.asyncio
+async def test_send_fires_stream_hooks_for_sessions_events() -> None:
+    """
+    SessionsChat must expose the same lifecycle hooks as legacy Session.
+
+    Regression for the sessions-first SDK path: callers could pass hooks
+    to ``client.session(...)`` but not to ``client.sessions_chat(...)``,
+    and no hooks fired while iterating sessions-native events.
+    """
+    session = _make_session()
+    message_content = [{"type": "output_text", "text": "done"}]
+    calls: list[tuple[Any, ...]] = []
+
+    def on_response_start(ctx: Any) -> None:
+        calls.append(("response_start", ctx.response.id, ctx.response.status))
+
+    async def on_reasoning_start(ctx: Any) -> None:
+        del ctx
+        calls.append(("reasoning_start",))
+
+    def on_reasoning_end(ctx: Any) -> None:
+        calls.append(("reasoning_end", ctx.reasoning_text, ctx.summary_text))
+
+    def on_message_start(ctx: Any) -> None:
+        calls.append(("message_start", ctx.response_id))
+
+    def on_message_end(ctx: Any) -> None:
+        calls.append(("message_end", ctx.content))
+
+    def on_tool_call_start(ctx: Any) -> None:
+        calls.append(
+            (
+                "tool_start",
+                ctx.name,
+                ctx.arguments,
+                ctx.call_id,
+                ctx.executed_by,
+            )
+        )
+
+    def on_tool_call_end(ctx: Any) -> None:
+        calls.append(("tool_end", ctx.call_id, ctx.output))
+
+    def on_file_output(ctx: Any) -> None:
+        calls.append(("file", ctx.file_id, ctx.filename, ctx.content_type))
+
+    def on_response_end(ctx: Any) -> None:
+        calls.append(("response_end", ctx.response.id, ctx.status))
+
+    hooks = StreamHooks(
+        on_response_start=on_response_start,
+        on_reasoning_start=on_reasoning_start,
+        on_reasoning_end=on_reasoning_end,
+        on_message_start=on_message_start,
+        on_message_end=on_message_end,
+        on_tool_call_start=on_tool_call_start,
+        on_tool_call_end=on_tool_call_end,
+        on_file_output=on_file_output,
+        on_response_end=on_response_end,
+    )
+    events: list[ServerStreamEvent] = [
+        _created_event(),
+        ReasoningStartedEvent(type="response.reasoning.started"),
+        ReasoningTextDeltaEvent(type="response.reasoning_text.delta", delta="thinking"),
+        ReasoningSummaryTextDeltaEvent(
+            type="response.reasoning_summary_text.delta",
+            delta="summary",
+        ),
+        OutputTextDeltaEvent(type="response.output_text.delta", delta="hi"),
+        OutputItemDoneEvent(
+            type="response.output_item.done",
+            item={
+                "id": "fc_1",
+                "type": "function_call",
+                "status": "completed",
+                "name": "lookup",
+                "arguments": '{"q": "x"}',
+                "call_id": "call_1",
+            },
+        ),
+        OutputItemDoneEvent(
+            type="response.output_item.done",
+            item={
+                "id": "fco_1",
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "tool output",
+            },
+        ),
+        OutputFileDoneEvent(
+            type="response.output_file.done",
+            file_id="file_xyz",
+            filename="report.pdf",
+            content_type="application/pdf",
+        ),
+        OutputItemDoneEvent(
+            type="response.output_item.done",
+            item={
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "content": message_content,
+            },
+        ),
+        _completed_event(),
+    ]
+    ns = _FakeNamespace(
+        stream_scripts=[_StreamScript(events=events)],
+        session_obj=session,
+    )
+    chat = SessionsChat(
+        namespace=ns,
+        files_uploader=None,
+        files_getter=None,
+        session=session,
+        hooks=hooks,
+    )
+
+    yielded = [event async for event in chat.send("hi")]
+
+    assert yielded == events
+    assert calls == [
+        ("response_start", "resp_1", "in_progress"),
+        ("reasoning_start",),
+        ("reasoning_end", "thinking", "summary"),
+        ("message_start", "resp_1"),
+        ("tool_start", "lookup", {"q": "x"}, "call_1", "server"),
+        ("tool_end", "call_1", "tool output"),
+        ("file", "file_xyz", "report.pdf", "application/pdf"),
+        ("message_end", message_content),
+        ("response_end", "resp_1", "completed"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_send_routes_elicitation_hook_to_resolve_endpoint() -> None:
+    """
+    Elicitation hooks must resolve the sessions-native approval request.
+
+    Without this, an SDK user who registers ``on_elicitation_request``
+    through the sessions chat helper sees the prompt but the parked
+    workflow never receives the approval verdict.
+    """
+    session = _make_session()
+    calls: list[tuple[str, str, str]] = []
+
+    async def on_elicitation_request(ctx: Any) -> bool:
+        calls.append((ctx.elicitation_id, ctx.message, ctx.response_id))
+        return True
+
+    request = ElicitationRequestEvent(
+        type="response.elicitation_request",
+        elicitation_id="elicit_1",
+        params=ElicitationRequestParams(
+            message="Approve this?",
+            requestedSchema={"type": "object"},
+            phase="pre_tool_use",
+            policy_name="approval",
+            content_preview="tool call",
+            target_session_id="conv_child",
+        ),
+    )
+    ns = _FakeNamespace(
+        stream_scripts=[_StreamScript(events=[_created_event(), request, _completed_event()])],
+        session_obj=session,
+    )
+    chat = SessionsChat(
+        namespace=ns,
+        files_uploader=None,
+        files_getter=None,
+        session=session,
+        hooks=StreamHooks(on_elicitation_request=on_elicitation_request),
+    )
+
+    [event async for event in chat.send("hi")]
+
+    assert calls == [("elicit_1", "Approve this?", "resp_1")]
+    assert ns.resolve_elicitation_calls == [
+        _ResolveElicitationCall(
+            session_id="conv_child",
+            elicitation_id="elicit_1",
+            result={"action": "accept"},
+        )
+    ]
 
 
 @pytest.mark.asyncio
@@ -997,6 +1239,7 @@ async def test_create_factory_creates_session_and_wires_helpers() -> None:
     ns = _FakeNamespace(stream_scripts=[], session_obj=session)
     uploader = _FakeUploader()
     getter = _FakeGetter()
+    hooks = StreamHooks()
 
     chat = await SessionsChat.create(
         namespace=ns,
@@ -1004,12 +1247,14 @@ async def test_create_factory_creates_session_and_wires_helpers() -> None:
         filename="agent.tar.gz",
         files_uploader=uploader,
         files_getter=getter,
+        hooks=hooks,
     )
 
     # Created exactly one session with the uploaded bundle bytes.
     assert ns.create_calls == [(b"bundle-bytes", "agent.tar.gz")]
     assert chat.session_id == "conv_abc"
     assert chat.agent_id == "ag_abc"
+    assert chat._hooks is hooks
 
 
 # ── tool_callables validation + dispatch ──────────────────────────────
@@ -1278,6 +1523,7 @@ async def test_send_dispatches_action_required_calls_callable_and_posts_output()
     )
 
     invocations: list[SessionToolCallInfo] = []
+    hook_calls: list[tuple[Any, ...]] = []
 
     async def _callable(info: SessionToolCallInfo) -> str:
         invocations.append(info)
@@ -1302,6 +1548,20 @@ async def test_send_dispatches_action_required_calls_callable_and_posts_output()
         session=session,
         tool_callables={"open_in_editor": _callable},
         agent_tools_getter=getter,
+        hooks=StreamHooks(
+            on_tool_call_start=lambda ctx: hook_calls.append(
+                (
+                    "start",
+                    ctx.name,
+                    ctx.arguments,
+                    ctx.call_id,
+                    ctx.executed_by,
+                )
+            ),
+            on_tool_call_end=lambda ctx: hook_calls.append(
+                ("end", ctx.name, ctx.call_id, ctx.output)
+            ),
+        ),
     )
 
     yielded = [event async for event in chat.send("please")]
@@ -1343,6 +1603,10 @@ async def test_send_dispatches_action_required_calls_callable_and_posts_output()
         "type": "function_call_output",
         "data": {"call_id": "call_xyz", "output": "did the thing"},
     }
+    assert hook_calls == [
+        ("start", "open_in_editor", {"path": "foo.py"}, "call_xyz", "client"),
+        ("end", "open_in_editor", "call_xyz", "did the thing"),
+    ]
 
 
 @pytest.mark.asyncio

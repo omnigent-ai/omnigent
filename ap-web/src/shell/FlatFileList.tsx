@@ -72,8 +72,8 @@ function FileListItem({
               isDeleted
                 ? "bg-destructive/10 text-destructive"
                 : file.status === "created"
-                ? "bg-green-500/10 text-green-600 dark:text-green-400"
-                : "bg-amber-500/10 text-amber-600 dark:text-amber-400",
+                  ? "bg-green-500/10 text-green-600 dark:text-green-400"
+                  : "bg-amber-500/10 text-amber-600 dark:text-amber-400",
             )}
             title={gitStatusLabel(file.status)}
           >
@@ -90,7 +90,9 @@ function FileListItem({
             <bdi>{file.path}</bdi>
           </span>
           {file.bytes !== null && !isDeleted && (
-            <span className="shrink-0 text-muted-foreground text-[10px]">{formatBytes(file.bytes)}</span>
+            <span className="shrink-0 text-muted-foreground text-[10px]">
+              {formatBytes(file.bytes)}
+            </span>
           )}
         </button>
         {!isDeleted && conversationId && (
@@ -156,35 +158,49 @@ export function FlatFileList({
     return <p className="px-2 py-1 text-muted-foreground text-xs">No workspace changes yet</p>;
   }
   const normalizedSearchQuery = normalizeSearchQuery(searchQuery);
-  const visibleFiles = files.filter((f) => showHidden || !f.path.split("/").some((seg) => seg.startsWith(".")));
+  const visibleFiles = files.filter(
+    (f) => showHidden || !f.path.split("/").some((seg) => seg.startsWith(".")),
+  );
   const sorted = visibleFiles
-    .filter((f) => (
-      normalizedSearchQuery.length === 0
-      || f.name.toLowerCase().includes(normalizedSearchQuery)
-      || f.path.toLowerCase().includes(normalizedSearchQuery)
-    ))
+    .filter(
+      (f) =>
+        normalizedSearchQuery.length === 0 ||
+        f.name.toLowerCase().includes(normalizedSearchQuery) ||
+        f.path.toLowerCase().includes(normalizedSearchQuery),
+    )
     .sort(compareChangedFiles(sort));
   const hiddenCount = files.length - visibleFiles.length;
   if (visibleFiles.length === 0) {
     return (
       <p className="px-2 py-1 text-muted-foreground text-xs">
         All changes are in hidden files.{" "}
-
-        <button type="button" className="cursor-pointer underline hover:text-foreground" onClick={onShowHidden}>
+        <button
+          type="button"
+          className="cursor-pointer underline hover:text-foreground"
+          onClick={onShowHidden}
+        >
           Click to show
         </button>
       </p>
     );
   }
   if (sorted.length === 0) {
-    return <p className="px-2 py-1 text-muted-foreground text-xs">No changed files match "{searchQuery.trim()}"</p>;
+    return (
+      <p className="px-2 py-1 text-muted-foreground text-xs">
+        No changed files match "{searchQuery.trim()}"
+      </p>
+    );
   }
   return (
     <>
       {hiddenCount > 0 && (
         <p className="px-2 py-1 text-muted-foreground text-xs">
           {hiddenCount} file{hiddenCount === 1 ? "" : "s"} hidden.{" "}
-          <button type="button" className="cursor-pointer underline hover:text-foreground" onClick={onShowHidden}>
+          <button
+            type="button"
+            className="cursor-pointer underline hover:text-foreground"
+            onClick={onShowHidden}
+          >
             Click to show
           </button>
         </p>

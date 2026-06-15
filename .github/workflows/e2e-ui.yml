@@ -11,8 +11,12 @@ name: E2E UI Tests
 #
 # Triggers:
 #   pull_request        opened / synchronize / reopened /
-#                       ready_for_review. Draft PRs are skipped.
-#   push (main)         post-merge run on the default branch.
+#                       ready_for_review. SAME-REPO PRs only; draft
+#                       PRs and fork PRs skip the job (forks run via
+#                       the fork-e2e/** push after approval, mirrored
+#                       by fork-e2e-mirror.yml).
+#   push (fork-e2e/**)  the UI suite for mirrored fork PRs -- a trusted
+#                       base-repo branch, so secrets flow.
 #   schedule            09:00 UTC daily, alongside nightly.yml.
 #   workflow_dispatch   manual run. Input `branch` selects a non-main
 #                       ref.
@@ -20,6 +24,9 @@ name: E2E UI Tests
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches:
+      - 'fork-e2e/**'
   schedule:
     - cron: "0 9 * * *"
   workflow_dispatch:
@@ -70,16 +77,43 @@ env:
   TERM: xterm-256color
 
 jobs:
+  # Compute the shard matrix once. A skipped run (draft, or a fork's
+  # pull_request) yields an EMPTY matrix -> zero shard jobs -> no skipped
+  # check-runs with an unexpanded ${{ matrix.* }} name. Shared with e2e.yml
+  # via .github/scripts/ci/e2e-shard-matrix.sh (only NUM_SHARDS differs).
+  setup:
+    name: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Check out CI scripts
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          # Triggering ref (not pinned to main): the script must exist on the
+          # running ref, and it is not a security gate -- it only shards tests
+          # and can't expose secrets (fork pull_request has none), so the PR's
+          # own copy is fine.
+          sparse-checkout: .github/scripts/ci
+          persist-credentials: false
+      - name: Compute shard matrix
+        id: matrix
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+          NUM_SHARDS: "3"
+        run: bash .github/scripts/ci/e2e-shard-matrix.sh
+
   e2e-ui:
     name: E2E UI Tests (shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
-    # Skip on draft PRs; the `ready_for_review` trigger re-fires the
-    # workflow when the draft is converted, so the check won't strand
-    # pending on the eventual ready-for-review state.
-    # Public-only: also skip fork PRs — they can't read the LLM_API_KEY /
-    # GATEWAY_BASE_URL secrets; see _E2E_GUARD_IF_BLOCK.
-    if: ${{ !github.event.pull_request.draft
-      && (github.event_name != 'pull_request'
-          || github.event.pull_request.head.repo.full_name == github.repository) }}
+    # Draft PRs and fork pull_request events resolve to an EMPTY matrix in
+    # `setup` (forks can't read the LLM_API_KEY / GATEWAY_BASE_URL secrets on a
+    # pull_request; they run via the fork-e2e/** mirror push instead), so this
+    # job produces zero shard runs for them -- and thus no skipped placeholder
+    # check. The `ready_for_review` trigger re-fires when a draft is converted.
+    needs: setup
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -88,22 +122,10 @@ jobs:
       # localized to one chunk.
       fail-fast: false
       max-parallel: 3
-      matrix:
-        # 3 shards: pytest-shard splits test node IDs deterministically,
-        # so the same test always lands in the same shard across runs.
-        # Each shard pays the full setup cost (uv sync + npm build +
-        # Playwright install, all cached), so more shards buy less once
-        # per-shard test time approaches setup time. Bump the count if
-        # shard runtime creeps up again. The shard check names are
-        # listed in .github/scripts/merge-ready/required.sh -- keep the
-        # two in sync when changing the count.
-        include:
-          - shard_id: 0
-            num_shards: 3
-          - shard_id: 1
-            num_shards: 3
-          - shard_id: 2
-            num_shards: 3
+      # Shards from `setup`; [] when the run is skipped. Shard check names are
+      # in .github/scripts/merge-ready/required.sh -- keep in sync with the
+      # NUM_SHARDS in this workflow's setup job when changing the count.
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
 
     steps:
       - name: Checkout
@@ -216,14 +238,19 @@ jobs:
           if [[ "$NIGHTLY_FULL" != "true" ]]; then
             EXTRA_ARGS+=(-m "not nightly")
           fi
-          # --shard-id/--num-shards (pytest-shard) split the test node
-          # IDs deterministically across the matrix entries; same set
-          # of tests overall, just chunked.
+          # --splits/--group partition the suite across the matrix entries
+          # via a round-robin strided slice (see pytest_collection_modifyitems
+          # in tests/e2e_ui/conftest.py). Unlike pytest-shard's hash-bucketing
+          # -- which was blind to runtime and left one shard ~5min while
+          # others ran ~2min -- striding scatters each heavy file's cases
+          # one-per-shard, evening out wall-clock with no extra dependency
+          # and no durations file to maintain. --group is 1-indexed, so we
+          # map the 0-indexed matrix shard_id with +1.
           uv run pytest tests/e2e_ui \
             -v --tb=long --showlocals --log-level=INFO -r a \
             --ui-skip-build \
-            --shard-id="$SHARD_ID" \
-            --num-shards="$NUM_SHARDS" \
+            --splits="$NUM_SHARDS" \
+            --group="$((SHARD_ID + 1))" \
             --tracing=retain-on-failure \
             --screenshot=only-on-failure \
             --video=retain-on-failure \

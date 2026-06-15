@@ -288,7 +288,7 @@ describe("addColumnBefore", () => {
     // New empty column is at index 1; original col 1 (H2) shifted to index 2.
     const headerCells = rowText(rows(editor)[0]);
     expect(headerCells[0]).toBe("H1"); // unchanged
-    expect(headerCells[1]).toBe("");   // new empty column
+    expect(headerCells[1]).toBe(""); // new empty column
     expect(headerCells[2]).toBe("H2"); // original col 1 shifted right
     expect(headerCells[3]).toBe("H3"); // original col 2 shifted right
   });
@@ -457,7 +457,10 @@ describe("multi-table isolation", () => {
     let tableText = "";
     for (let d = $pos.depth; d > 0; d--) {
       const node = $pos.node(d);
-      if (node.type.name === "table") { tableText = node.textContent; break; }
+      if (node.type.name === "table") {
+        tableText = node.textContent;
+        break;
+      }
     }
     // The table we landed in must contain T2H1 — it must NOT contain T1H1.
     expect(tableText).toContain("T2H1");
@@ -621,7 +624,7 @@ describe("colIndexAtX", () => {
   //   col 1: left=100 right=200
   //   col 2: left=200 right=300
   const cellRects = [
-    { left: 0,   right: 100, cellIndex: 0 },
+    { left: 0, right: 100, cellIndex: 0 },
     { left: 100, right: 200, cellIndex: 1 },
     { left: 200, right: 300, cellIndex: 2 },
   ];
@@ -664,7 +667,7 @@ describe("colIndexAtX", () => {
     // After a column move the cellIndex values can differ from their array
     // position.  The function must return the cellIndex, not the array index.
     const sparse = [
-      { left: 0,   right: 100, cellIndex: 2 },
+      { left: 0, right: 100, cellIndex: 2 },
       { left: 100, right: 200, cellIndex: 0 },
     ];
     expect(colIndexAtX(sparse, 50)).toBe(2);

@@ -98,29 +98,25 @@ describe("PermissionsModal share-safety", () => {
   // STRICT XFAIL: no share-safety warning is rendered today. When the
   // Share flow learns to warn for a no-sandbox environment, `it.fails` turns
   // red — delete the marker and keep the assertion.
-  it.fails(
-    "warns when sharing a session whose primary environment is not sandboxed",
-    async () => {
-      // The modal mounts via the same permissions path the other tests cover,
-      // so the only operation that can fail here is the warning lookup — it
-      // fails today because no warning element exists, not because the modal
-      // failed to render.
-      listMock.mockResolvedValue([
-        { user_id: "owner@example.com", conversation_id: "conv_unsafe", level: 4 },
-      ]);
+  it.fails("warns when sharing a session whose primary environment is not sandboxed", async () => {
+    // The modal mounts via the same permissions path the other tests cover,
+    // so the only operation that can fail here is the warning lookup — it
+    // fails today because no warning element exists, not because the modal
+    // failed to render.
+    listMock.mockResolvedValue([
+      { user_id: "owner@example.com", conversation_id: "conv_unsafe", level: 4 },
+    ]);
 
-      render(
-        <PermissionsModal sessionId="conv_unsafe" open={true} onOpenChange={() => {}} />,
-        { wrapper: createWrapper() },
-      );
+    render(<PermissionsModal sessionId="conv_unsafe" open={true} onOpenChange={() => {}} />, {
+      wrapper: createWrapper(),
+    });
 
-      // waitFor (not a synchronous query) so a future implementation that
-      // renders the warning only after its async environment fetch resolves
-      // still satisfies the contract; today it exhausts the timeout because no
-      // matching element ever appears.
-      await waitFor(() => {
-        expect(screen.getByText(SAFETY_WARNING_RE)).toBeInTheDocument();
-      });
-    },
-  );
+    // waitFor (not a synchronous query) so a future implementation that
+    // renders the warning only after its async environment fetch resolves
+    // still satisfies the contract; today it exhausts the timeout because no
+    // matching element ever appears.
+    await waitFor(() => {
+      expect(screen.getByText(SAFETY_WARNING_RE)).toBeInTheDocument();
+    });
+  });
 });

@@ -200,7 +200,6 @@ describe("createTerminal", () => {
   });
 });
 
-
 describe("terminalsReconcileInterval", () => {
   // The spinner is `terminalPending && !terminalsAvailable`. This decides
   // when the terminals query re-polls to recover a missed

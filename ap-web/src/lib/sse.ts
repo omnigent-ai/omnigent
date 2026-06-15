@@ -408,7 +408,11 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     if (
       typeof conversationId === "string" &&
       conversationId &&
-      (status === "idle" || status === "running" || status === "waiting" || status === "failed")
+      (status === "idle" ||
+        status === "launching" ||
+        status === "running" ||
+        status === "waiting" ||
+        status === "failed")
     ) {
       const responseId = typeof data.response_id === "string" ? data.response_id : undefined;
       return {

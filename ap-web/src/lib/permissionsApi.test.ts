@@ -98,9 +98,7 @@ describe("grantPermission", () => {
     [2, "edit"],
     [3, "manage"],
   ])("forwards level %i (%s) verbatim", async (level) => {
-    fetchMock.mockResolvedValueOnce(
-      mockResponse({ user_id: "u", conversation_id: "c", level }),
-    );
+    fetchMock.mockResolvedValueOnce(mockResponse({ user_id: "u", conversation_id: "c", level }));
     await grantPermission("c", "u", level);
     const init = fetchMock.mock.calls[0][1] as RequestInit;
     expect(JSON.parse(init.body as string).level).toBe(level);
@@ -134,9 +132,7 @@ describe("grantPermission", () => {
   });
 
   it("url-encodes the session id", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockResponse({ user_id: "u", conversation_id: "x", level: 1 }),
-    );
+    fetchMock.mockResolvedValueOnce(mockResponse({ user_id: "u", conversation_id: "x", level: 1 }));
     await grantPermission("conv with space", "u", 1);
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/conv%20with%20space/permissions");
   });
@@ -294,9 +290,7 @@ describe("isOwnerLevel — owner boundary", () => {
 
 describe("authenticatedFetch integration", () => {
   it("all API functions route through authenticatedFetch, not raw fetch", async () => {
-    const spy = vi.spyOn(identity, "authenticatedFetch").mockResolvedValue(
-      mockResponse([]),
-    );
+    const spy = vi.spyOn(identity, "authenticatedFetch").mockResolvedValue(mockResponse([]));
 
     await listPermissions("conv_abc");
     expect(spy).toHaveBeenCalledTimes(1);

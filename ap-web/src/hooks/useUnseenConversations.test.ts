@@ -165,9 +165,12 @@ describe("useMarkConversationSeen", () => {
   it("does not advance the baseline on updatedAt changes while blurred", () => {
     setWindowFocused(true);
     vi.useFakeTimers({ now: 1_000_000 });
-    const { rerender } = renderHook(({ updatedAt }) => useMarkConversationSeen("conv-1", updatedAt), {
-      initialProps: { updatedAt: 500 },
-    });
+    const { rerender } = renderHook(
+      ({ updatedAt }) => useMarkConversationSeen("conv-1", updatedAt),
+      {
+        initialProps: { updatedAt: 500 },
+      },
+    );
     expect(storedBaseline("conv-1")).toBe(1_000);
 
     // The agent finishes a turn (updated_at bumps) while the window is

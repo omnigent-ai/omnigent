@@ -1991,8 +1991,8 @@ class SessionStatusEvent(_SSEEventBase):
     Session lifecycle status transition.
 
     Emitted by the runtime / session route handler at every
-    transition between ``running`` / ``waiting`` / ``idle`` /
-    ``failed``. Wire shape is
+    transition between ``launching`` / ``running`` / ``waiting`` /
+    ``idle`` / ``failed``. Wire shape is
     FLAT (not enveloped): ``{"type": "session.status",
     "conversation_id": "...", "status": "...",
     "sequence_number": null}``.
@@ -2013,9 +2013,10 @@ class SessionStatusEvent(_SSEEventBase):
     :param type: Always ``"session.status"``.
     :param conversation_id: The conversation/session identifier
         whose status changed, e.g. ``"conv_abc123"``.
-    :param status: New session status. ``"idle"`` (no loop
-        running), ``"running"`` (loop executing), ``"waiting"``
-        (parent turn parked on the async-work drain), or
+    :param status: New session status. ``"launching"`` (session or
+        child task created, but no concrete harness start observed),
+        ``"idle"`` (no loop running), ``"running"`` (loop executing),
+        ``"waiting"`` (parent turn parked on the async-work drain), or
         ``"failed"`` (terminal failure).
     :param response_id: Optional active response id for terminal-backed
         integrations, e.g. ``"codex_turn_abc123"``. Clients use it to
@@ -2037,7 +2038,7 @@ class SessionStatusEvent(_SSEEventBase):
 
     type: Literal["session.status"]
     conversation_id: str
-    status: Literal["idle", "running", "waiting", "failed"]
+    status: Literal["idle", "launching", "running", "waiting", "failed"]
     response_id: str | None = None
     error: ErrorDetail | None = None
 

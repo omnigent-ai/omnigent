@@ -58,6 +58,10 @@ jobs:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: npm ci --legacy-peer-deps
 
+      - name: Check formatting
+        working-directory: ap-web
+        run: npm run format:check
+
       - name: Run tests
         working-directory: ap-web
         run: npm test

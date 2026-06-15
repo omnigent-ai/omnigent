@@ -38,8 +38,15 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   useTerminals: vi.fn(() => ({ terminals: [], isLoading: false, error: null })),
 }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
-  useWorkspaceEnvironment: vi.fn(() => ({ data: { available: true, root: null }, isLoading: false })),
-  useWorkspaceChangedFiles: vi.fn(() => ({ data: { data: [] }, isSuccess: true, isLoading: false })),
+  useWorkspaceEnvironment: vi.fn(() => ({
+    data: { available: true, root: null },
+    isLoading: false,
+  })),
+  useWorkspaceChangedFiles: vi.fn(() => ({
+    data: { data: [] },
+    isSuccess: true,
+    isLoading: false,
+  })),
 }));
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   // Keep the real module — childSessionsQueryKey, MAX_TREE_DEPTH, and
@@ -103,22 +110,26 @@ beforeEach(() => {
   vi.mocked(useConversations).mockReset();
   vi.mocked(useConversations).mockReturnValue({
     data: {
-      pages: [{
-        data: [{
-          id: "conv_root",
-          object: "conversation" as const,
-          title: null,
-          created_at: 0,
-          updated_at: 0,
-          labels: {},
-          permission_level: null,
-          host_id: null,
-          runner_id: null,
-        }],
-        first_id: null,
-        last_id: null,
-        has_more: false,
-      }],
+      pages: [
+        {
+          data: [
+            {
+              id: "conv_root",
+              object: "conversation" as const,
+              title: null,
+              created_at: 0,
+              updated_at: 0,
+              labels: {},
+              permission_level: null,
+              host_id: null,
+              runner_id: null,
+            },
+          ],
+          first_id: null,
+          last_id: null,
+          has_more: false,
+        },
+      ],
       pageParams: [undefined],
     },
   } as never);
@@ -142,16 +153,18 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
     vi.mocked(useChildSessions).mockImplementation((id) => {
       if (id === "conv_root") {
         return {
-          children: [{
-            id: "conv_child",
-            title: null,
-            tool: "researcher",
-            session_name: null,
-            current_task_status: null,
-            busy: false,
-            last_message_preview: null,
-            pending_elicitations_count: 0,
-          }],
+          children: [
+            {
+              id: "conv_child",
+              title: null,
+              tool: "researcher",
+              session_name: null,
+              current_task_status: null,
+              busy: false,
+              last_message_preview: null,
+              pending_elicitations_count: 0,
+            },
+          ],
           isLoading: false,
           error: null,
         };
@@ -164,11 +177,21 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
       if (id === "conv_root") {
         return {
           session: {
-            id: "conv_root", agentId: "ag", agentName: null, runnerId: null,
-            status: "idle", createdAt: 0, title: null, labels: {}, items: [],
-            pendingElicitations: [], permissionLevel: 4, parentSessionId: null,
+            id: "conv_root",
+            agentId: "ag",
+            agentName: null,
+            runnerId: null,
+            status: "idle",
+            createdAt: 0,
+            title: null,
+            labels: {},
+            items: [],
+            pendingElicitations: [],
+            permissionLevel: 4,
+            parentSessionId: null,
           },
-          isLoading: false, error: null,
+          isLoading: false,
+          error: null,
         } as never;
       }
       // Simulate the real-world race: when the user navigates to a
@@ -258,11 +281,21 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
     });
     vi.mocked(useSession).mockReturnValue({
       session: {
-        id: "conv_solo", agentId: "ag", agentName: null, runnerId: null,
-        status: "idle", createdAt: 0, title: null, labels: {}, items: [],
-        pendingElicitations: [], permissionLevel: 4, parentSessionId: null,
+        id: "conv_solo",
+        agentId: "ag",
+        agentName: null,
+        runnerId: null,
+        status: "idle",
+        createdAt: 0,
+        title: null,
+        labels: {},
+        items: [],
+        pendingElicitations: [],
+        permissionLevel: 4,
+        parentSessionId: null,
       },
-      isLoading: false, error: null,
+      isLoading: false,
+      error: null,
     } as never);
 
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -284,9 +317,6 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
     // the default selection.
     const agentsTab = screen.getByRole("tab", { name: /Agents\s*1/i });
     expect(agentsTab).toHaveAttribute("aria-selected", "false");
-    expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
+    expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute("aria-selected", "true");
   });
 });

@@ -222,9 +222,7 @@ class SessionUpdatesSocket {
    */
   private handleWatchdogExpiry(): void {
     if (!this.started || this.ws === null) return;
-    console.warn(
-      `[session-updates] no frame in ${HEARTBEAT_WATCHDOG_MS} ms; reconnecting`,
-    );
+    console.warn(`[session-updates] no frame in ${HEARTBEAT_WATCHDOG_MS} ms; reconnecting`);
     // close() drives onclose → setConnected(false) → scheduleReconnect.
     this.ws.close();
   }

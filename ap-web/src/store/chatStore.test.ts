@@ -444,8 +444,14 @@ describe("chatStore — switchTo", () => {
     // source of truth; the stale pending copy is dropped.
     seedSession("conv_native", [userMessage("resp1", "the initial prompt")]);
     seedPendingInputs("conv_native", [
-      { pending_id: "pending_stale", content: [{ type: "input_text", text: "the initial prompt" }] },
-      { pending_id: "pending_live", content: [{ type: "input_text", text: "a genuinely queued msg" }] },
+      {
+        pending_id: "pending_stale",
+        content: [{ type: "input_text", text: "the initial prompt" }],
+      },
+      {
+        pending_id: "pending_live",
+        content: [{ type: "input_text", text: "a genuinely queued msg" }],
+      },
     ]);
 
     await useChatStore.getState().switchTo("conv_native");
@@ -464,7 +470,10 @@ describe("chatStore — switchTo", () => {
     // double up with the reformatted committed copy.
     seedSession("conv_native", [userMessage("resp1", "[Attached: a.png]\n\nthe initial prompt")]);
     seedPendingInputs("conv_native", [
-      { pending_id: "pending_stale", content: [{ type: "input_text", text: "the initial prompt" }] },
+      {
+        pending_id: "pending_stale",
+        content: [{ type: "input_text", text: "the initial prompt" }],
+      },
     ]);
 
     await useChatStore.getState().switchTo("conv_native");
@@ -602,7 +611,10 @@ describe("chatStore — switchTo", () => {
     await useChatStore.getState().switchTo("conv_other");
 
     // While away, the new "hello" committed — history now has two copies.
-    seedSession("conv_native", [userMessage("resp_old", "hello"), userMessage("resp_new", "hello")]);
+    seedSession("conv_native", [
+      userMessage("resp_old", "hello"),
+      userMessage("resp_new", "hello"),
+    ]);
     await useChatStore.getState().switchTo("conv_native");
 
     expect(useChatStore.getState().pendingUserMessages).toEqual([]);
@@ -963,7 +975,8 @@ describe("chatStore — switchTo", () => {
     await useChatStore.getState().switchTo("conv_abc");
 
     const sessionFetches = fetchMock.mock.calls.filter(
-      ([u, init]) => String(u).split("?")[0] === "/v1/sessions/conv_abc" && (init?.method ?? "GET") === "GET",
+      ([u, init]) =>
+        String(u).split("?")[0] === "/v1/sessions/conv_abc" && (init?.method ?? "GET") === "GET",
     );
     // One GET proves bindStream refetched instead of trusting the
     // pre-populated React Query session cache.
@@ -1998,9 +2011,7 @@ describe("chatStore — sendSlashCommand", () => {
     expect(useChatStore.getState().status).toBe("streaming");
     const pending = useChatStore.getState().pendingUserMessages;
     expect(pending).toHaveLength(1);
-    expect(pending[0]!.content).toEqual([
-      { type: "input_text", text: "/grill-me review this" },
-    ]);
+    expect(pending[0]!.content).toEqual([{ type: "input_text", text: "/grill-me review this" }]);
 
     resolvePost();
     await p;
@@ -5620,12 +5631,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     // The gap items belong to the ACTIVE turn and are NEWER than its
     // already-rendered blocks, so they land after t1 — the pre-fix splice
     // put them before the turn's first block, i.e. above u1/t1.
-    expect(state.blocks.map((b) => b.ctx.itemId)).toEqual([
-      u1.id,
-      t1.id,
-      t2.id,
-      t3.id,
-    ]);
+    expect(state.blocks.map((b) => b.ctx.itemId)).toEqual([u1.id, t1.id, t2.id, t3.id]);
     // The turn ended during the gap (snapshot status "idle"): the spinner
     // recovery still applies on this path.
     expect(state.activeResponse?.state).toBe("completed");
@@ -5981,12 +5987,7 @@ describe("chatStore — live delta streaming (claude-native)", () => {
   }
 
   /** One `response.output_text.delta` frame carrying native streaming ids. */
-  function nativeDelta(
-    messageId: string,
-    index: number,
-    delta: string,
-    final: boolean,
-  ): string {
+  function nativeDelta(messageId: string, index: number, delta: string, final: boolean): string {
     return sse("response.output_text.delta", { delta, message_id: messageId, index, final });
   }
 
@@ -6025,7 +6026,14 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     const sink = pushableStream();
     const controller = new AbortController();
     const manual = manualScheduler();
-    void pumpStreamEvents(conversationId, sink.stream, controller, setState, getState, manual.scheduler);
+    void pumpStreamEvents(
+      conversationId,
+      sink.stream,
+      controller,
+      setState,
+      getState,
+      manual.scheduler,
+    );
     return { sink, controller, manual };
   }
 
@@ -6040,7 +6048,11 @@ describe("chatStore — live delta streaming (claude-native)", () => {
   }
 
   it("streams into a provisional block in `blocks`, not a separate lane", async () => {
-    useChatStore.setState({ conversationId: "conv_live", blocks: [], isNativeTerminalSession: true });
+    useChatStore.setState({
+      conversationId: "conv_live",
+      blocks: [],
+      isNativeTerminalSession: true,
+    });
     const { sink, controller } = startPump("conv_live");
 
     sink.push(sse("response.created", { id: "resp_l", status: "in_progress", output: [] }));
@@ -6062,7 +6074,11 @@ describe("chatStore — live delta streaming (claude-native)", () => {
   });
 
   it("replaces the provisional in place with the authoritative item", async () => {
-    useChatStore.setState({ conversationId: "conv_live2", blocks: [], isNativeTerminalSession: true });
+    useChatStore.setState({
+      conversationId: "conv_live2",
+      blocks: [],
+      isNativeTerminalSession: true,
+    });
     const { sink, controller } = startPump("conv_live2");
 
     sink.push(sse("response.created", { id: "resp_l", status: "in_progress", output: [] }));
@@ -6155,7 +6171,11 @@ describe("chatStore — live delta streaming (claude-native)", () => {
   it("keeps streamed text ABOVE an elicitation that arrives mid-stream", async () => {
     // The user-reported bug: text streams, then a tool-permission card
     // arrives and must render BELOW the text that preceded it (not above).
-    useChatStore.setState({ conversationId: "conv_live3", blocks: [], isNativeTerminalSession: true });
+    useChatStore.setState({
+      conversationId: "conv_live3",
+      blocks: [],
+      isNativeTerminalSession: true,
+    });
     const { sink, controller } = startPump("conv_live3");
 
     sink.push(sse("response.created", { id: "resp_l", status: "in_progress", output: [] }));
@@ -6190,7 +6210,11 @@ describe("chatStore — live delta streaming (claude-native)", () => {
   });
 
   it("replaces each message's preview in place across a multi-message turn", async () => {
-    useChatStore.setState({ conversationId: "conv_live4", blocks: [], isNativeTerminalSession: true });
+    useChatStore.setState({
+      conversationId: "conv_live4",
+      blocks: [],
+      isNativeTerminalSession: true,
+    });
     const { sink, controller } = startPump("conv_live4");
 
     sink.push(sse("response.created", { id: "resp_l", status: "in_progress", output: [] }));
@@ -6217,7 +6241,11 @@ describe("chatStore — live delta streaming (claude-native)", () => {
   });
 
   it("drops an unfinalized provisional on response_end (interrupt / drop)", async () => {
-    useChatStore.setState({ conversationId: "conv_live5", blocks: [], isNativeTerminalSession: true });
+    useChatStore.setState({
+      conversationId: "conv_live5",
+      blocks: [],
+      isNativeTerminalSession: true,
+    });
     const { sink, controller } = startPump("conv_live5");
 
     sink.push(sse("response.created", { id: "resp_l", status: "in_progress", output: [] }));
@@ -6239,7 +6267,11 @@ describe("chatStore — live delta streaming (claude-native)", () => {
   });
 
   it("appends in-order chunks and ignores a duplicate index", async () => {
-    useChatStore.setState({ conversationId: "conv_live6", blocks: [], isNativeTerminalSession: true });
+    useChatStore.setState({
+      conversationId: "conv_live6",
+      blocks: [],
+      isNativeTerminalSession: true,
+    });
     const { sink, controller } = startPump("conv_live6");
 
     sink.push(sse("response.created", { id: "resp_l", status: "in_progress", output: [] }));
@@ -6260,7 +6292,11 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     // deltas file moments before the transcript flushed). Replaying it
     // would re-create the finalized message's preview as a duplicate,
     // stale bubble that also sits below any later elicitation card.
-    useChatStore.setState({ conversationId: "conv_live7", blocks: [], isNativeTerminalSession: true });
+    useChatStore.setState({
+      conversationId: "conv_live7",
+      blocks: [],
+      isNativeTerminalSession: true,
+    });
     const { sink, controller } = startPump("conv_live7");
 
     sink.push(sse("response.created", { id: "resp_l", status: "in_progress", output: [] }));
@@ -6278,9 +6314,7 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     // It is dropped: no re-created provisional (which would duplicate the
     // committed text and linger below later cards).
     expect(provisional()).toBeUndefined();
-    const dones = useChatStore
-      .getState()
-      .blocks.filter((b) => b.type === "text_done");
+    const dones = useChatStore.getState().blocks.filter((b) => b.type === "text_done");
     expect(dones).toHaveLength(1);
 
     controller.abort();
@@ -6305,7 +6339,9 @@ describe("chatStore — setCostControlMode", () => {
     // and a reload would silently lose the user's choice.
     const patchCall = fetchMock.mock.calls.find(([u, init]) => {
       const url = typeof u === "string" ? u : (u as URL | Request).toString();
-      return url === "/v1/sessions/conv_cc" && (init as RequestInit | undefined)?.method === "PATCH";
+      return (
+        url === "/v1/sessions/conv_cc" && (init as RequestInit | undefined)?.method === "PATCH"
+      );
     });
     expect(patchCall).toBeDefined();
     const body = JSON.parse((patchCall![1] as RequestInit).body as string);
@@ -6535,9 +6571,7 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
 
     // The prompt fires during the gap: its SSE event went into the dead
     // socket, so it exists only in the snapshot's pending list.
-    seedPendingElicitations("conv_gapfire", [
-      pendingElicitationRaw("elic_gap", "Approve gap op?"),
-    ]);
+    seedPendingElicitations("conv_gapfire", [pendingElicitationRaw("elic_gap", "Approve gap op?")]);
     sinks[0]!.error();
     await drainAsync();
     expect(sinks).toHaveLength(2);

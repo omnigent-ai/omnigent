@@ -10,7 +10,8 @@
  */
 export const CLAUDE_NATIVE_MODELS = [
   // Ordered by capability tier, most powerful first.
-  { id: "fable", label: "Fable" },
+  // Fable temporarily withheld while Anthropic has Fable access disabled.
+  // { id: "fable", label: "Fable" },
   { id: "opus", label: "Opus" },
   { id: "sonnet", label: "Sonnet" },
   { id: "haiku", label: "Haiku" },
@@ -20,10 +21,12 @@ export const CLAUDE_NATIVE_MODELS = [
  * Is `model` something a Claude Code (claude-native) session can actually
  * run — i.e. a Claude model rather than a foreign harness's id?
  *
- * Accepts the version-agnostic aliases (`fable` / `opus` / `sonnet` /
- * `haiku`) and any fully-qualified Anthropic id (anything containing
- * `claude`, e.g. `claude-fable-5`, `anthropic/claude-opus-4-8`,
- * `databricks-claude-sonnet-4-6`). Rejects everything else — notably the
+ * Accepts the version-agnostic aliases (`opus` / `sonnet` / `haiku`) and
+ * any fully-qualified Anthropic id (anything containing `claude`, e.g.
+ * `claude-fable-5`, `anthropic/claude-opus-4-8`,
+ * `databricks-claude-sonnet-4-6`). The bare `fable` alias no longer
+ * matches while Fable is withheld, but pinned `claude-fable-5` sessions
+ * still pass via the `claude` branch. Rejects everything else — notably the
  * Codex / OpenAI defaults (`gpt-5.4`, `gpt-5.4-mini`, …) that leak into the
  * cross-harness global picker selection.
  *

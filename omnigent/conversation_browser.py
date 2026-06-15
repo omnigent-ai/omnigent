@@ -13,7 +13,7 @@ from collections.abc import Callable
 # server (API) base onto the UI mount so browser links land on the SPA
 # instead of the JSON API.
 WORKSPACE_API_PATH = "/api/2.0/omnigent"
-WORKSPACE_UI_PATH = "/ml/omnigent"
+WORKSPACE_UI_PATH = "/omnigent"
 
 
 def conversation_url(base_url: str, conversation_id: str) -> str:
@@ -23,7 +23,7 @@ def conversation_url(base_url: str, conversation_id: str) -> str:
     For Databricks workspace-hosted servers
     (``https://<ws>/api/2.0/omnigent``) the web UI lives on the
     workspace SPA mount, so the link becomes
-    ``https://<ws>/ml/omnigent/c/<id>`` — with the ``?o=<org>``
+    ``https://<ws>/omnigent/c/<id>`` — with the ``?o=<org>``
     workspace selector appended when ``omnigent login`` recorded the
     org id.
 
