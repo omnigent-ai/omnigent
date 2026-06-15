@@ -548,8 +548,18 @@ def live_server(
     proc = subprocess.Popen(
         [
             sys.executable,
-            "-m",
-            "omnigent",
+            # Equivalent of the unit tests' ``monkeypatch.setattr(presence,
+            # "_LEAVE_GRACE_S", ...)``, but applied INSIDE this spawned
+            # interpreter — a monkeypatch in the test process can't reach a
+            # subprocess. ``-c`` patches the module global before the CLI
+            # runs; the presence route reads it live at call time, so the
+            # presence-leave assertion in test_collab_realtime clears in ~1s
+            # instead of the prod 15s dwell (which only exists to absorb the
+            # ingress' ~5-min stream recycle a test server never hits).
+            # Mirrors ``python -m omnigent`` (omnigent/__main__.py).
+            "-c",
+            "import omnigent.server.presence as _p; _p._LEAVE_GRACE_S = 1.0; "
+            "from omnigent.cli import main; main()",
             "server",
             "--host",
             "127.0.0.1",
