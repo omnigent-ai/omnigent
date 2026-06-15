@@ -85,18 +85,28 @@ if [[ "$touches_ui" != "true" ]]; then
 fi
 
 # --- 2. LLM judge: behavior change without adequate e2e_ui coverage? ------
-# Build a bounded diff blob: only ap-web/** and tests/e2e_ui/** patches, each
-# truncated, so the prompt stays small and on-topic.
+# Build a bounded diff blob: only ap-web/** and tests/e2e_ui/** patches. Each
+# file's patch is truncated to MAX_PATCH_LINES so one huge file can't crowd out
+# the others, keeping the prompt representative across many-file PRs. A final
+# head -c is an overall backstop for PRs with very many files.
 MAX_PATCH_LINES=400
 DIFF_BLOB=$(gh api "repos/$REPO/pulls/$PR/files" --paginate \
-  --jq '.[] | select(.filename | startswith("ap-web/") or startswith("tests/e2e_ui/")) | "=== \(.status) \(.filename) ===\n\(.patch // "(no textual patch -- binary or too large)")"' \
+  --argjson max "$MAX_PATCH_LINES" \
+  --jq '.[]
+    | select(.filename | startswith("ap-web/") or startswith("tests/e2e_ui/"))
+    | (.patch // "(no textual patch -- binary or too large)") as $p
+    | ($p | split("\n")) as $lines
+    | (if ($lines | length) > $max
+         then (($lines[:$max] | join("\n")) + "\n... (patch truncated at \($max) lines)")
+         else $p end) as $trunc
+    | "=== \(.status) \(.filename) ===\n\($trunc)"' \
   | head -c 60000)
 
 PR_TITLE=$(gh pr view "$PR" --repo "$REPO" --json title --jq '.title')
 
 SYSTEM_PROMPT='You are a CI gate that decides whether a pull request needs a browser end-to-end UI test.
 
-The repo keeps Playwright UI tests under tests/e2e_ui/ (grouped by area: chat, sessions, comments, collaboration, files, agent_switch, mobile, start_session). Frontend code lives under ap-web/.
+The repo keeps Playwright UI tests under tests/e2e_ui/ (grouped by area: chat, sessions, comments, collaboration, files, agent_switch, mobile, start_session, fork_session). Frontend code lives under ap-web/.
 
 You are given the PR title and the diff of its ap-web/** and tests/e2e_ui/** files. Decide:
 - needs_test = false  when EITHER the ap-web change is NOT a user-facing behavior change (pure refactor, rename, type-only change, dependency bump, styling/formatting, comments, copy tweak with no flow change, or test-only/build-only edit), OR the PR already adds/updates a tests/e2e_ui/** test that meaningfully exercises the changed behavior.
