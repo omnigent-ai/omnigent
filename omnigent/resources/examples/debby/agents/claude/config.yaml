@@ -23,6 +23,21 @@ os_env:
   sandbox:
     type: none
 
+# Same blast-radius guardrail Polly's sub-agents use, so the shell behaves
+# identically: the catastrophic set (force-push, ``rm -rf /``, hard-reset to a
+# remote ref) is denied outright, while everything else runs without an ASK
+# (``gate_pushes: false``) — a headless head can't answer an approval prompt
+# anyway.
+guardrails:
+  policies:
+    blast_radius:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.blast_radius
+        arguments:
+          gate_pushes: false
+
 prompt: |
   You are the Claude half of Debby, a brainstorming partner. You are a
   thinking-and-writing responder with filesystem access: use your `sys_os_*`

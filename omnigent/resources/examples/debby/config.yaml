@@ -125,6 +125,20 @@ os_env:
   sandbox:
     type: none
 
+# Same blast-radius guardrail Polly uses, so Debby's shell behaves identically:
+# the catastrophic set (force-push, ``rm -rf /``, hard-reset to a remote ref) is
+# denied outright, while everything else runs without an ASK
+# (``gate_pushes: false``).
+guardrails:
+  policies:
+    blast_radius:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.blast_radius
+        arguments:
+          gate_pushes: false
+
 tools:
   # The two brainstorming partners — see agents/<name>/. Both reason and write,
   # and each has its own filesystem access (`os_env`); claude runs on claude-sdk,
