@@ -2,11 +2,13 @@
 # Non-secret Omnigent server settings (the same YAML `omnigent server -c` reads;
 # the entrypoint loads it via OMNIGENT_CONFIG). The IdP gates *authentication*;
 # this gates *authorization*:
-#   admins          — promoted to operator on login, keyed by the OIDC email
-#                     claim. Additive (removing an entry never demotes). Make
-#                     sure these match your IdP's email claim.
-#   allowed_domains — non-admin logins must match one of these. Drop it to allow
-#                     any authenticated user.
+#   admins          — promoted to operator on login. Additive (removing an entry
+#                     never demotes). In OIDC mode keyed by the email claim
+#                     (match your IdP's claim); in accounts mode keyed by the
+#                     account username — so list usernames, not emails, there.
+#   allowed_domains — OIDC-ONLY email-domain gate: non-admin OIDC logins must
+#                     match one of these. NOT enforced in accounts mode. Drop it
+#                     to allow any authenticated user.
 apiVersion: v1
 kind: ConfigMap
 metadata:

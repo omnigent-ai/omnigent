@@ -6,7 +6,8 @@ A reference deployment for running Omnigent on a Kubernetes cluster, in two part
   This is straightforward: per the OSS entrypoint the server runs in
   *external-runners-only* mode (it accepts runner connections at
   `/v1/runner/tunnel` and never spawns harness subprocesses itself), so the pod
-  is **unprivileged**.
+  needs **no special privileges** — an ordinary container (no `privileged`, no
+  `CAP_SYS_ADMIN`, no host access), unlike the host daemon below.
 - **`host/`** — a **stopgap** that runs the `omnigent host` daemon as a
   `Deployment` *on the cluster*, so cluster nodes become agent compute. See the
   gap below.
@@ -39,7 +40,7 @@ native Kubernetes provider would replace.
 ## Architecture
 
 ```
-  Browser ──HTTP──▶ omnigent server (Deployment, unprivileged)
+  Browser ──HTTP──▶ omnigent server (Deployment, ordinary container)
                        │   external-runners-only
                        │   accepts host/runner WS at /v1/runner/tunnel ◀──┐
                        ├─ Postgres (DATABASE_URL)                         │  outbound only
@@ -53,26 +54,38 @@ native Kubernetes provider would replace.
 ## Quickstart
 
 Default auth is the built-in **`accounts`** provider (multi-user,
-username/password, no external IdP; first boot auto-creates an admin — password
-in the pod logs). Prefer your own IdP? See the opt-in OIDC block in
-`server/deployment.yaml`.
+username/password, no external IdP). Omnigent **never auto-generates** an admin
+password: for a headless deploy set `OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD` in
+the Secret; otherwise create the first admin via the one-time web setup form on
+first visit (`/v1/info` reports `needs_setup` until then). Prefer your own IdP?
+See the opt-in OIDC block in `server/deployment.yaml`.
 
 ```bash
 # 1. Server
 kubectl apply -f server/namespace.yaml
-# edit server/secret.example.yaml (database-url + accounts-cookie-secret) -> apply as a real Secret
-kubectl apply -f server/secret.example.yaml      # or your sealed-secrets/SOPS/ESO equivalent
-kubectl apply -f server/configmap.yaml
+
+# Build the Secret from real values (do NOT apply the example as-is — it's
+# placeholders). See server/secret.example.yaml, or use sealed-secrets/SOPS/ESO.
+kubectl -n omnigent create secret generic omnigent-secrets \
+  --from-literal=database-url='postgresql://user:pass@host:5432/omnigent' \
+  --from-literal=accounts-cookie-secret="$(openssl rand -hex 32)"
+  # + --from-literal=accounts-admin-password='...'  for a headless first admin
+
+kubectl apply -f server/configmap.yaml           # edit admins/allowed_domains first
 kubectl apply -f server/pvc.yaml
 kubectl apply -f server/deployment.yaml
 kubectl apply -f server/service.yaml
 kubectl apply -f server/ingress.example.yaml     # adapt to your ingress controller
 
-# first-boot admin password (accounts mode):
-kubectl -n omnigent logs deploy/omnigent | grep -A4 "Created initial admin"
+# First admin (accounts mode): sign in with the accounts-admin-password you set
+# above. If you didn't set one, open the URL and use the one-time web setup form.
 
-# 2. (optional, stopgap) agent compute on the cluster — see host/README.md
-kubectl apply -f host/secret.example.yaml        # the host's session + harness tokens
+# 2. (optional, stopgap) agent compute on the cluster — see host/README.md.
+# Build the host Secret from real files (auth_tokens.json MUST come via
+# --from-file — a hand-written entry without expires_at reads as expired):
+kubectl -n omnigent create secret generic omnigent-host \
+  --from-file=auth_tokens.json="$HOME/.omnigent/auth_tokens.json" \
+  --from-literal=claude-oauth-token="$(claude setup-token)"
 kubectl apply -f host/host.yaml
 ```
 
@@ -86,9 +99,9 @@ kubectl apply -f host/host.yaml
   `postgresql://` → `postgresql+psycopg://`.
 - **Auth (default = accounts):** set `OMNIGENT_AUTH_ENABLED=1` +
   `OMNIGENT_ACCOUNTS_COOKIE_SECRET` + `OMNIGENT_ACCOUNTS_BASE_URL` (the public
-  URL). First boot creates an admin with a random password (in the logs + on the
-  PVC at `/data/admin-credentials`); pin it with
-  `OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD` for headless deploys.
+  URL). Omnigent never auto-generates an admin password: set
+  `OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD` (from the Secret) for a headless first
+  admin, or create it via the one-time web setup form on first visit.
 - **OIDC (opt-in):** Omnigent rejects logins where `email_verified != true`.
   Some IdPs (e.g. Authentik's default OpenID `email` scope mapping) emit
   `email_verified: false` — make your IdP assert `true`.

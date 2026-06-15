@@ -87,7 +87,7 @@ spec:
               # --- git config for agents (HTTPS; the image bakes no ssh client) ---
               git config --global user.name  "${GIT_USER_NAME}"
               git config --global user.email "${GIT_USER_EMAIL}"
-              git config --global --add safe.directory '*'
+              git config --global --replace-all safe.directory '*'   # idempotent across restarts
               # Rewrite github SSH remotes -> HTTPS so GIT_TOKEN covers them (no ssh
               # key needed). A self-hosted forge over HTTPS works the same way: add a
               # scoped `~/.git-credentials` entry + a matching `insteadOf` for its host.

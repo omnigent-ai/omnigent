@@ -90,9 +90,10 @@ volume).
 - **Terminal / `native-ui` agents don't run in an unprivileged pod.**
   `claude-sdk` and `codex` agents work; `claude-native-ui` / `codex-native-ui`
   open an interactive shell via Omnigent's terminal feature
-  (`omnigent/inner/terminal.py`), whose sandbox defaults to `linux_bwrap`
-  **regardless of `IS_SANDBOX`** (that flag only relaxes the harness CLI, not the
-  terminal). `bwrap` isn't baked into the image, and even with it present, bwrap
+  (`omnigent/inner/terminal.py`), which for native-ui agents runs under a
+  `linux_bwrap` sandbox **regardless of `IS_SANDBOX`** (that flag only relaxes
+  the harness CLI, not the terminal). `bwrap` isn't baked into the image, and
+  even with it present, bwrap
   needs unprivileged user namespaces — denied in an unprivileged pod. So those
   agents fail (`omnigent/inner/bwrap_sandbox.py`:
   `linux_bwrap sandbox requires the 'bwrap' binary on PATH`). Use `claude-sdk` /

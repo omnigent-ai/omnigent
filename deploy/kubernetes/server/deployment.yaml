@@ -4,7 +4,10 @@
 # Deploys the SERVER ONLY. Per the OSS entrypoint the server runs in
 # "external-runners-only" mode: it accepts runner WebSocket connections at
 # /v1/runner/tunnel and NEVER spawns harness subprocesses itself — so this pod
-# is unprivileged. Agents run in RUNNERS launched elsewhere: a laptop
+# needs no special privileges (an ordinary container: no privileged, no
+# CAP_SYS_ADMIN, no host access). It does run as root by default (the image sets
+# no USER); the securityContext below drops caps + blocks privilege escalation.
+# Agents run in RUNNERS launched elsewhere: a laptop
 # (`omnigent run agent.yaml --server https://omnigent.example.com`), a managed
 # sandbox (Modal/Daytona), or the on-cluster host daemon in ../host/.
 #
@@ -13,12 +16,12 @@
 # - Alembic migrations run automatically in the entrypoint (no migration Job).
 # - AUTH (default = built-in `accounts`): with OMNIGENT_AUTH_ENABLED=1 and no
 #   OMNIGENT_OIDC_ISSUER set, the server selects its built-in multi-user
-#   `accounts` provider — username/password, no external IdP, first boot
-#   auto-creates an admin (random password in the pod logs + on the artifact
-#   PVC at /data/admin-credentials), and the admin invites teammates from the
-#   web UI. This matches the deploy default everywhere else (see deploy/README.md
-#   "Auth"). To pin the admin password for a headless bring-up, set
-#   OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD.
+#   `accounts` provider — username/password, no external IdP. Omnigent NEVER
+#   auto-generates an admin password: set OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD
+#   (below) to create the first admin headlessly, or create it via the one-time
+#   web setup form on first visit (/v1/info reports needs_setup until then); the
+#   admin then invites teammates from the web UI. Matches the deploy default
+#   everywhere else (see deploy/README.md "Auth").
 #   Prefer your own IdP? See the "opt-in: OIDC instead of accounts" block below.
 #   For a no-auth dev/test bring-up, set OMNIGENT_AUTH_ENABLED=0 (single shared
 #   "local" user — local dev only, never a network-exposed deploy).
@@ -45,11 +48,20 @@ spec:
         # Group-own the artifact volume so the server can write it even if the
         # storage backend squashes root. Drop if your storage perms don't need it.
         fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+        # To run fully non-root, add: runAsNonRoot: true / runAsUser: 1000
+        # (confirm the image writes only to /data — fsGroup-owned — and the DB).
       nodeSelector:
         kubernetes.io/arch: amd64
       containers:
         - name: omnigent
           image: ghcr.io/omnigent-ai/omnigent-server:v0.1.0
+          securityContext:
+            # A web server needs no Linux capabilities or privilege escalation.
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           env:
             - name: DATABASE_URL
               valueFrom:
@@ -84,10 +96,10 @@ spec:
             # URL (behind your Ingress/LB), NOT the in-cluster Service address.
             - name: OMNIGENT_ACCOUNTS_BASE_URL
               value: "https://omnigent.example.com"
-            # Optional: pin the first-boot admin password for a headless deploy
-            # where you can't read the pod logs. Otherwise a random password is
-            # generated and printed to the logs + written to
-            # /data/admin-credentials on the artifact PVC.
+            # Creates the first admin headlessly. Omnigent never auto-generates a
+            # password — without this (and with no TTY) first boot reports
+            # needs_setup and waits for the one-time web setup form. Set this to
+            # provision the admin non-interactively.
             # - name: OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD
             #   valueFrom:
             #     secretKeyRef: { name: omnigent-secrets, key: accounts-admin-password }

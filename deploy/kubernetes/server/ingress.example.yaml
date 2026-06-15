@@ -1,8 +1,9 @@
 ---
 # Generic Ingress (networking.k8s.io/v1). Adapt to your ingress controller and
-# TLS setup. The host must match OMNIGENT_DOMAIN in the Deployment so the OIDC
-# redirect URI lines up. WebSockets (the live session stream + /v1/runner/tunnel)
-# ride normal HTTP upgrade — most controllers pass them through by default.
+# TLS setup. The host must match the server's public URL — OMNIGENT_ACCOUNTS_BASE_URL
+# in accounts mode (the default), or OMNIGENT_DOMAIN / the OIDC redirect URI if you
+# opt into OIDC. WebSockets (the live session stream + /v1/runner/tunnel) ride
+# normal HTTP upgrade — most controllers pass them through by default.
 #
 # Using a controller CRD instead (Traefik IngressRoute, Contour HTTPProxy, ...)?
 # Route host omnigent.example.com -> service omnigent:8000 there instead.

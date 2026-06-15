@@ -9,8 +9,9 @@ The manifests here deploy the Omnigent **server** — the FastAPI / WebSocket
 coordinator from the shared `deploy/docker/Dockerfile` (`omnigent-server`
 image) — as a plain `Deployment`. The server runs "external-runner only": it
 accepts runner connections at `/v1/runner/tunnel` and never executes agent
-harnesses itself, so the pod is **unprivileged**. Runners live elsewhere — a
-laptop, a managed sandbox (Modal/Daytona), or the on-cluster `host/` stopgap.
+harnesses itself, so the pod needs **no special privileges** (an ordinary
+container). Runners live elsewhere — a laptop, a managed sandbox
+(Modal/Daytona), or the on-cluster `host/` stopgap.
 
 Auth defaults to the built-in **`accounts`** provider (multi-user
 username/password, first-boot admin, no external IdP), matching the deploy
@@ -28,17 +29,22 @@ becomes agent compute.
 ```bash
 cd deploy/kubernetes
 kubectl apply -f server/namespace.yaml
-# edit server/secret.example.yaml (database-url + accounts-cookie-secret), then:
-kubectl apply -f server/secret.example.yaml      # or sealed-secrets / SOPS / ESO
+# Build the Secret (don't apply the example as-is — it's placeholders). See
+# server/secret.example.yaml, or use sealed-secrets / SOPS / ESO:
+kubectl -n omnigent create secret generic omnigent-secrets \
+  --from-literal=database-url='postgresql://user:pass@host:5432/omnigent' \
+  --from-literal=accounts-cookie-secret="$(openssl rand -hex 32)"
 kubectl apply -f server/configmap.yaml server/pvc.yaml \
                server/deployment.yaml server/service.yaml \
                server/ingress.example.yaml       # adapt the Ingress to your controller
 kubectl -n omnigent rollout status deploy/omnigent
-kubectl -n omnigent logs deploy/omnigent | grep -A4 "Created initial admin"   # admin password
+# First admin: set accounts-admin-password in the Secret, or use the one-time web
+# setup form on first visit (omnigent never auto-generates a password).
 ```
 
 Server answers on the Service (`omnigent:8000`) and at your Ingress host
-(`OMNIGENT_ACCOUNTS_BASE_URL`). Sign in with the admin password from the logs.
+(`OMNIGENT_ACCOUNTS_BASE_URL`). Sign in as the admin you set via
+`accounts-admin-password` (or created in the web setup form).
 
 ## Files
 
@@ -47,7 +53,7 @@ Server answers on the Service (`omnigent:8000`) and at your Ingress host
 | `server/namespace.yaml` | The `omnigent` Namespace. Apply first. |
 | `server/deployment.yaml` | The server `Deployment`. amd64 nodeSelector (image is linux/amd64-only), accounts auth env by default (OIDC block commented in-line), `DATABASE_URL` from the Secret, `/health` readiness+liveness probes, artifact PVC at `/data`, config ConfigMap at `/etc/omnigent`. The single source for which env vars the server reads — mirrors `deploy/docker/.env.example`. |
 | `server/secret.example.yaml` | EXAMPLE Secret template (`omnigent-secrets`): `database-url` + `accounts-cookie-secret` (default), `oidc-client-secret` / `oidc-cookie-secret` (opt-in, commented). DO NOT commit real values — manage with sealed-secrets/SOPS/ESO/Vault. |
-| `server/configmap.yaml` | Non-secret server config (`config.yaml`: `admins`, `allowed_domains`) — the same YAML `omnigent server -c` reads, loaded via `OMNIGENT_CONFIG`. Gates *authorization* (the IdP/accounts flow gates *authentication*). |
+| `server/configmap.yaml` | Non-secret server config (`config.yaml`: `admins`, `allowed_domains`) — the same YAML `omnigent server -c` reads, loaded via `OMNIGENT_CONFIG`. `admins` promotes operators; `allowed_domains` is an **OIDC-only** email gate (accounts mode keys admins by username and doesn't enforce it). |
 | `server/service.yaml` | ClusterIP `Service` → port 8000. |
 | `server/ingress.example.yaml` | Generic `networking.k8s.io/v1` Ingress (host → `omnigent:8000`, TLS). Adapt to your controller (or use a controller CRD: Traefik IngressRoute, Contour HTTPProxy, …). Host must match `OMNIGENT_ACCOUNTS_BASE_URL` (and the OIDC redirect URI if you opt into OIDC). |
 | `server/pvc.yaml` | `ReadWriteOnce` PVC for the artifact store at `/data`. Set your `storageClassName`. |
@@ -76,7 +82,7 @@ kubectl delete -f server/ -f host/        # then: kubectl delete pvc -n omnigent
 | Pod `Pending`, never schedules | No amd64 node, or the PVC can't bind | `kubectl -n omnigent describe pod -l app=omnigent` — look for the nodeSelector or `FailedScheduling`/`unbound PersistentVolumeClaim` event; set a real `storageClassName` in `pvc.yaml`. |
 | `CrashLoopBackOff` at startup, accounts error | Missing/short cookie secret or bad base URL | Logs show `OMNIGENT_ACCOUNTS_COOKIE_SECRET must be …` (needs 64 hex chars — `openssl rand -hex 32`) or `OMNIGENT_ACCOUNTS_BASE_URL must start with http:// or https://`. |
 | `CrashLoopBackOff`, `psycopg.OperationalError` | `DATABASE_URL` wrong/unreachable | `kubectl -n omnigent get secret omnigent-secrets -o jsonpath='{.data.database-url}' | base64 -d` and verify the Postgres host/creds; first boot over a remote DB is slow (migrations). |
-| Can't find the admin password | Random password only printed once | `kubectl -n omnigent logs deploy/omnigent | grep -A4 "Created initial admin"`, or read `/data/admin-credentials` on the PVC; pre-seed with `OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD`. |
+| No admin / can't sign in (accounts mode) | accounts mode never auto-generates a password | Set `OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD` (Secret key `accounts-admin-password`) for a headless admin, or open the URL and use the one-time web setup form (`/v1/info` reports `needs_setup`). |
 | OIDC login bounces / "email present but email_verified is not true" | IdP asserts `email_verified: false` | Make the IdP emit `email_verified: true` (e.g. override Authentik's default `email` scope mapping). |
 | Web UI loads but new chats hang forever | Expected — runners are external | Launch a runner (`omnigent run … --server <url>`) or bring up `host/`. |
 | On-cluster host never connects | `auth_tokens.json` missing `expires_at` (treated as expired) | `--from-file` the real `~/.omnigent/auth_tokens.json`; don't hand-write a `{"token": …}`-only body. See `host/secret.example.yaml`. |
