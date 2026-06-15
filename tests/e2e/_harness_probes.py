@@ -142,6 +142,18 @@ HARNESS_PROBES: list[HarnessProbe] = [
         # ``openai-agents`` needs a gateway-reachable model.
         cli_binary=None,
     ),
+    HarnessProbe(
+        harness="cursor",
+        # Cursor speaks the OpenAI Responses API via the Databricks
+        # gateway; the GPT model is the natural fit per CLAUDE.md
+        # (``databricks-gpt-5-4-mini`` is the OpenAI-style
+        # Databricks model). Registry key is ``cursor`` to match
+        # the Omnigent YAML ``executor.harness`` spelling.
+        model=resolve_model("databricks-gpt-5-4-mini", key="probe:cursor"),
+        env_prefix="HARNESS_CURSOR_",
+        marker="CURSOR_E2E_OK",
+        cli_binary="cursor-agent",
+    ),
 ]
 
 
