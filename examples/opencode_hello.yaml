@@ -1,0 +1,48 @@
+name: opencode-hello
+description: >-
+  Smallest possible OpenCode agent — single-file launcher YAML that hands
+  every turn to the OpenCode CLI (https://opencode.ai) running headlessly
+  behind the standard Omnigent REPL. Useful as a sanity check that the
+  harness wires up end-to-end on a fresh machine, and as a starting
+  point for a real OpenCode-backed agent.
+
+# Single-file launcher shape — matches what ``omnigent run --harness
+# opencode`` generates internally (see ``_materialize_harness_launcher_file``
+# in omnigent/cli.py). For multi-agent bundles, prefer the directory
+# layout under ``examples/polly/`` / ``examples/debby/``.
+executor:
+  harness: opencode
+  # Override per-invocation via ``-m openai/gpt-5`` or ``/model`` in
+  # the REPL. With no model pinned, OpenCode picks its configured
+  # default for the chosen provider.
+  model: anthropic/claude-sonnet-4-5
+
+prompt: |
+  You are OpenCode, running headlessly inside Omnigent. Help the user
+  with software engineering tasks — read files, edit code, run tests,
+  and explain your reasoning. Keep responses concise and prefer
+  showing the user diffs / commands over describing them in prose.
+
+# OpenCode is a multi-provider coding agent. Credentials live inside
+# OpenCode's own ``opencode auth login`` flow, NOT in Omnigent's
+# provider config — so this spec declares no ``executor.auth`` block.
+#
+# To route through a gateway (Databricks AI gateway / vendor-neutral
+# proxy) instead, either set ``HARNESS_OPENCODE_GATEWAY_BASE_URL`` +
+# ``HARNESS_OPENCODE_GATEWAY_API_KEY`` in the shell, or declare a
+# ``executor.auth: {type: databricks, profile: …}`` block and let
+# Omnigent resolve the workspace.
+#
+# OpenCode owns its own file/shell tools (bash, edit, read, …) and
+# runs them inside its own loop. The harness therefore advertises
+# ``handles_tools_internally=True`` and does NOT need an ``os_env``
+# block to inject the ``sys_os_*`` tools — adding one would just
+# duplicate every operation against Omnigent's dispatch path.
+
+# Try it:
+#   omnigent run examples/opencode_hello.yaml
+#   omnigent run examples/opencode_hello.yaml -p "summarise the README"
+#   omnigent run examples/opencode_hello.yaml -m openai/gpt-5
+#
+# Or as a shortcut for any opencode-harness run:
+#   omnigent opencode -p "list the files in the current directory"
