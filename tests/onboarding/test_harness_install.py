@@ -53,6 +53,47 @@ def test_cursor_install_spec_is_binary_only() -> None:
         hi.harness_install_command(hi.CURSOR_KEY)
 
 
+def test_gemini_install_spec_has_npm_package() -> None:
+    """Gemini is CLI-backed and Omnigent knows its npm package.
+
+    Unlike cursor / mimo, the Gemini CLI ships as ``@google/gemini-cli`` so
+    ``omnigent setup`` can offer to npm-install it from the harness menu.
+    A drift in display/binary/package would either install the wrong thing
+    or check the wrong PATH entry.
+    """
+    spec = hi.harness_install_spec(hi.GEMINI_KEY)
+    assert spec is not None
+    assert spec.display == "Gemini"
+    assert spec.binary == "gemini"
+    assert spec.package == "@google/gemini-cli"
+    assert hi.harness_install_command(hi.GEMINI_KEY) == [
+        "npm",
+        "install",
+        "-g",
+        "@google/gemini-cli",
+    ]
+
+
+def test_gemini_has_no_login_status_logout_args() -> None:
+    """Gemini ships no first-class auth subcommands today.
+
+    The CLI authenticates interactively on first launch (Google account /
+    ``GEMINI_API_KEY`` env var); there's no ``gemini auth login`` analog of
+    the Claude / Codex flows. Until one lands, ``configure harnesses`` must
+    not try to drive a non-existent login command.
+    """
+    spec = hi.harness_install_spec(hi.GEMINI_KEY)
+    assert spec is not None
+    assert spec.login_args is None
+    assert spec.logout_args is None
+    assert spec.status_args is None
+    # The high-level wrappers gate on these args being set, so they must
+    # short-circuit to False without spawning anything.
+    assert hi.harness_login(hi.GEMINI_KEY) is False
+    assert hi.harness_logout(hi.GEMINI_KEY) is False
+    assert hi.harness_cli_logged_in(hi.GEMINI_KEY) is False
+
+
 def test_unknown_key_has_no_spec_and_is_not_installed() -> None:
     """A family with no dedicated CLI (e.g. a gateway-only family) → None / False,
     never a crash."""
@@ -68,6 +109,7 @@ def test_unknown_key_has_no_spec_and_is_not_installed() -> None:
         ("pi", "pi"),
         ("cursor", "cursor-agent"),
         ("mimo", "mimo"),
+        ("gemini", "gemini"),
     ],
 )
 def test_required_cli_for_cli_backed_harness(harness: str, binary: str) -> None:

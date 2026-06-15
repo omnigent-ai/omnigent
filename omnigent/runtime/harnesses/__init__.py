@@ -45,6 +45,10 @@ _HARNESS_MODULES: dict[str, str] = {
     "cursor": "omnigent.inner.cursor_harness",
     # Mimo Code CLI harness wrap. See omnigent/inner/mimo_harness.py.
     "mimo": "omnigent.inner.mimo_harness",
+    # Gemini CLI harness wrap. See omnigent/inner/gemini_harness.py. Like
+    # cursor / mimo it drives an ACP session, but via the ``--acp`` flag
+    # rather than an ``acp`` subcommand, and is pinned to a single model.
+    "gemini": "omnigent.inner.gemini_harness",
     # Step 4c: codex harness wrap. See
     # omnigent/inner/codex_harness.py.
     "codex": "omnigent.inner.codex_harness",

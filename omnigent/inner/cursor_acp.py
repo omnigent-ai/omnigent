@@ -23,7 +23,7 @@ import contextlib
 import json
 import logging
 from asyncio import Future, Queue, Task
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from typing import Any, TypeAlias
 
 from ._subprocess_lifecycle import close_subprocess_transport
@@ -73,19 +73,25 @@ class AcpClient:
         env: dict[str, str],
         cwd: str | None,
         extra_args: list[str] | None = None,
+        subcommand: Sequence[str] = ("acp",),
     ) -> None:
         """
         :param cursor_path: Path to spawn — the ``cursor-agent`` binary.
         :param env: The COMPLETE subprocess environment (allowlisted by the
             caller; never the full ``os.environ``).
         :param cwd: Working directory for the ACP server, or ``None`` to inherit.
-        :param extra_args: Extra CLI args appended to ``cursor-agent acp`` (e.g.
-            ``["--sandbox", "enabled"]``). ``None`` appends nothing.
+        :param extra_args: Extra CLI args appended after the ACP subcommand
+            (e.g. ``["--sandbox", "enabled"]``). ``None`` appends nothing.
+        :param subcommand: How the CLI is told to enter ACP server mode. Most
+            ACP CLIs use an ``acp`` subcommand (the default ``("acp",)``);
+            some, like the Gemini CLI, use a ``--acp`` flag instead — pass
+            ``("--acp",)`` in that case.
         """
         self._cursor_path = cursor_path
         self._env = env
         self._cwd = cwd
         self._extra_args = list(extra_args or [])
+        self._subcommand = list(subcommand)
         self._proc: asyncio.subprocess.Process | None = None
         self._reader_task: Task[None] | None = None
         self._stderr_task: Task[None] | None = None
@@ -105,11 +111,14 @@ class AcpClient:
         :raises AcpError: If the process fails to start or initialize.
         """
         logger.debug(
-            "AcpClient: spawning %s acp %s", self._cursor_path, " ".join(self._extra_args)
+            "AcpClient: spawning %s %s %s",
+            self._cursor_path,
+            " ".join(self._subcommand),
+            " ".join(self._extra_args),
         )
         self._proc = await _create_subprocess_exec(
             self._cursor_path,
-            "acp",
+            *self._subcommand,
             *self._extra_args,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,

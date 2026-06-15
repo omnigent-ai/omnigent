@@ -39,13 +39,20 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 
-from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, CURSOR_SURFACE, OPENAI_FAMILY
+from omnigent.onboarding.provider_config import (
+    ANTHROPIC_FAMILY,
+    CURSOR_SURFACE,
+    GEMINI_SURFACE,
+    OPENAI_FAMILY,
+)
 
-# Pi and Mimo are not configure-menu families (the menu is Claude + Codex), but
-# the first-run ``run`` flow can launch them, so they have CLI metadata too.
+# Pi, Mimo, Cursor, and Gemini are not configure-menu families (the menu is
+# Claude + Codex), but the first-run ``run`` flow can launch them, so they have
+# CLI metadata too.
 PI_KEY = "pi"
 CURSOR_KEY = CURSOR_SURFACE
 MIMO_KEY = "mimo"
+GEMINI_KEY = GEMINI_SURFACE
 
 
 @dataclass(frozen=True)
@@ -103,6 +110,7 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
     PI_KEY: HarnessInstallSpec("Pi", "pi", "@earendil-works/pi-coding-agent"),
     CURSOR_KEY: HarnessInstallSpec("Cursor", "cursor-agent", None),
     MIMO_KEY: HarnessInstallSpec("Mimo", "mimo", None),
+    GEMINI_KEY: HarnessInstallSpec("Gemini", "gemini", "@google/gemini-cli"),
 }
 
 
@@ -111,16 +119,18 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
 # :data:`_HARNESS_INSTALL` family key. Only the CLI-backed harnesses appear
 # here — the ones that cannot launch without a binary on ``PATH``:
 # ``claude-native`` wraps the ``claude`` CLI, ``codex-native`` the ``codex``
-# CLI, ``pi`` the ``pi`` CLI, ``cursor`` the ``cursor-agent`` CLI, and
-# ``mimo`` the ``mimo`` CLI. SDK-based harnesses (``claude-sdk``,
-# ``codex``, ``openai-agents-sdk``, ``databricks_supervisor``) run in-process
-# and are deliberately absent, so they resolve to "no CLI required".
+# CLI, ``pi`` the ``pi`` CLI, ``cursor`` the ``cursor-agent`` CLI, ``mimo``
+# the ``mimo`` CLI, and ``gemini`` the ``gemini`` CLI. SDK-based harnesses
+# (``claude-sdk``, ``codex``, ``openai-agents-sdk``, ``databricks_supervisor``)
+# run in-process and are deliberately absent, so they resolve to "no CLI
+# required".
 _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "claude-native": ANTHROPIC_FAMILY,
     "codex-native": OPENAI_FAMILY,
     PI_KEY: PI_KEY,
     CURSOR_KEY: CURSOR_KEY,
     MIMO_KEY: MIMO_KEY,
+    GEMINI_KEY: GEMINI_KEY,
 }
 
 
@@ -166,7 +176,8 @@ def harness_install_spec(key: str) -> HarnessInstallSpec | None:
     """Return the install spec for a family/harness key, or ``None``.
 
     :param key: A harness family (``"anthropic"`` / ``"openai"``),
-        :data:`PI_KEY` (``"pi"``), or :data:`MIMO_KEY` (``"mimo"``).
+        :data:`PI_KEY` (``"pi"``), :data:`MIMO_KEY` (``"mimo"``), or
+        :data:`GEMINI_KEY` (``"gemini"``).
     :returns: The :class:`HarnessInstallSpec`, or ``None`` for an unknown key
         (e.g. a gateway-only family with no dedicated CLI).
     """
@@ -181,7 +192,7 @@ def harness_cli_installed(key: str) -> bool:
     ``claude-sdk`` harness can run without the ``claude`` CLI.
 
     :param key: A harness family (``"anthropic"`` / ``"openai"``),
-        :data:`PI_KEY`, or :data:`MIMO_KEY`.
+        :data:`PI_KEY`, :data:`MIMO_KEY`, or :data:`GEMINI_KEY`.
     :returns: ``True`` when the CLI is on ``PATH``; ``False`` when it isn't or
         the key has no associated CLI.
     """

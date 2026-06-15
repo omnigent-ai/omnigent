@@ -27,6 +27,7 @@ from __future__ import annotations
 from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
 from omnigent.onboarding.harness_install import (
     CURSOR_KEY,
+    GEMINI_KEY,
     MIMO_KEY,
     PI_KEY,
     harness_cli_installed,
@@ -66,17 +67,20 @@ def _install_key(canonical: str) -> str:
     """Return the install-spec key whose CLI binary *canonical* requires.
 
     :param canonical: A canonical CLI-wrapping harness id keyed in
-        ``_HARNESS_FAMILY`` (e.g. ``"codex-native"``), ``"pi"``, or
-        ``"mimo"``.
+        ``_HARNESS_FAMILY`` (e.g. ``"codex-native"``), ``"pi"``, ``"mimo"``,
+        ``"cursor"``, or ``"gemini"``.
     :returns: ``"anthropic"`` / ``"openai"`` for the claude/codex CLIs,
-        :data:`~omnigent.onboarding.harness_install.PI_KEY` for pi, or
+        :data:`~omnigent.onboarding.harness_install.PI_KEY` for pi,
         :data:`~omnigent.onboarding.harness_install.CURSOR_KEY` for cursor,
-        or :data:`~omnigent.onboarding.harness_install.MIMO_KEY` for mimo.
+        :data:`~omnigent.onboarding.harness_install.MIMO_KEY` for mimo, or
+        :data:`~omnigent.onboarding.harness_install.GEMINI_KEY` for gemini.
     """
     if canonical == CURSOR_KEY:
         return CURSOR_KEY
     if canonical == MIMO_KEY:
         return MIMO_KEY
+    if canonical == GEMINI_KEY:
+        return GEMINI_KEY
     return _HARNESS_FAMILY.get(canonical) or PI_KEY
 
 
@@ -84,15 +88,16 @@ def harness_is_configured(harness: str) -> bool:
     """Return whether *harness* can be launched on this machine.
 
     Only CLI-wrapping harnesses are assessed (native Claude/Codex, ``pi``,
-    ``cursor``, and ``mimo``): they cannot run without their binary on
-    ``PATH``, and that is the one thing the daemon can check reliably and locally. SDK
-    harnesses and unknown harnesses always return ``True`` — their
-    readiness depends on runtime/ambient credentials the daemon can't
-    enumerate, so blocking them would risk false negatives that break
-    working launches.
+    ``cursor``, ``mimo``, and ``gemini``): they cannot run without their
+    binary on ``PATH``, and that is the one thing the daemon can check
+    reliably and locally. SDK harnesses and unknown harnesses always return
+    ``True`` — their readiness depends on runtime/ambient credentials the
+    daemon can't enumerate, so blocking them would risk false negatives that
+    break working launches.
 
     :param harness: A harness id, e.g. ``"claude-native"``, ``"codex"``,
-        ``"openai-agents"``, ``"agents_sdk"``, ``"pi"``, or ``"mimo"``.
+        ``"openai-agents"``, ``"agents_sdk"``, ``"pi"``, ``"mimo"``, or
+        ``"gemini"``.
     :returns: ``True`` when launchable (CLI installed, or a harness the
         daemon doesn't gate); ``False`` only when a CLI-wrapping
         harness's binary is missing from ``PATH``.
@@ -100,7 +105,12 @@ def harness_is_configured(harness: str) -> bool:
     canonical = _canonical_harness(harness)
     if canonical in _SDK_HARNESSES:
         return True
-    if canonical not in _HARNESS_FAMILY and canonical not in {PI_SURFACE, CURSOR_KEY, MIMO_KEY}:
+    if canonical not in _HARNESS_FAMILY and canonical not in {
+        PI_SURFACE,
+        CURSOR_KEY,
+        MIMO_KEY,
+        GEMINI_KEY,
+    }:
         # Unknown harness — the daemon has no install metadata for it, so
         # it can't assess readiness. Fail open (custom/newer harnesses,
         # version skew).
@@ -120,7 +130,7 @@ def configured_harness_map() -> dict[str, bool]:
     :returns: Mapping of harness spelling to readiness, e.g.
         ``{"claude-native": False, "codex-native": False,
         "claude-sdk": True, "openai-agents": True, "pi": True,
-        "mimo": False}``.
+        "mimo": False, "gemini": False}``.
     """
     spellings: set[str] = set(_HARNESS_FAMILY)
     spellings.update(_EXECUTOR_TYPE_HARNESS_ALIASES)
@@ -128,4 +138,5 @@ def configured_harness_map() -> dict[str, bool]:
     spellings.add(PI_SURFACE)
     spellings.add(CURSOR_KEY)
     spellings.add(MIMO_KEY)
+    spellings.add(GEMINI_KEY)
     return {spelling: harness_is_configured(spelling) for spelling in spellings}
