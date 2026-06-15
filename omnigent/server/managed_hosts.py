@@ -120,9 +120,7 @@ _logger = logging.getLogger(__name__)
 # managed session today. (Deployments that construct
 # ManagedSandboxConfig directly are not constrained by either set —
 # their launcher factory IS the support.)
-SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
-    {"lakebox", "modal", "daytona", "islo"}
-)
+SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset({"lakebox", "modal", "daytona", "islo"})
 PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset({"modal", "daytona", "islo"})
 
 # How long a managed launch waits for the sandboxed host to register
@@ -955,9 +953,7 @@ def _parse_provider_positive_int(raw: dict[str, object], provider: str, key: str
     if value is None:
         return None
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-        raise ValueError(
-            f"server config 'sandbox.{provider}.{key}' must be a positive integer"
-        )
+        raise ValueError(f"server config 'sandbox.{provider}.{key}' must be a positive integer")
     return value
 
 
