@@ -49,12 +49,25 @@ resolved from the YAML file's directory.
 
 ```yaml
 executor:
-  harness: claude-sdk        # claude-sdk, openai-agents, codex, etc.
+  harness: claude-sdk        # claude-sdk, openai-agents, codex, opencode, etc.
   model: databricks-claude-opus-4-7
   auth:
     type: databricks
     profile: oss             # Databricks profile for model routing
 ```
+
+Supported `harness` values:
+
+| Harness | Notes |
+|---|---|
+| `claude-sdk` | Claude Agent SDK (default). Reads `ANTHROPIC_API_KEY` or routes through a configured provider. |
+| `claude-native` | Native Claude Code TUI launched in a tmux pane (`omnigent claude`). |
+| `codex` | OpenAI Codex SDK. |
+| `codex-native` | Native Codex TUI launched in a tmux pane (`omnigent codex`). |
+| `openai-agents` | OpenAI Agents SDK. |
+| `pi` | Pi multi-model CLI agent. |
+| `opencode` | [OpenCode](https://opencode.ai) CLI driven headlessly via `opencode run --format json` (`omnigent opencode`). Multi-provider; credentials live in `opencode auth login`. Gateway routing via `HARNESS_OPENCODE_GATEWAY_*` env vars or `executor.auth: {type: databricks, profile: …}`. |
+| `databricks_supervisor` | Databricks Agent Bricks Supervisor API. |
 
 Set the Databricks profile under `executor.auth`. The older top-level
 `executor.profile` shorthand is legacy and should not be used in new specs.

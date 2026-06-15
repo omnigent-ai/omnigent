@@ -4,7 +4,7 @@
 
 ### A meta-harness for all your AI agents
 
-Omnigent provides a common layer over Claude Code, Codex, Pi, and the agents you write yourself: swap or combine harnesses without rewriting, keep them in check with policies and sandboxing, and collaborate in real time on the same live session, from any device.
+Omnigent provides a common layer over Claude Code, Codex, OpenCode, Pi, and the agents you write yourself: swap or combine harnesses without rewriting, keep them in check with policies and sandboxing, and collaborate in real time on the same live session, from any device.
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/omnigent-ai/omnigent/blob/main/LICENSE)
 ![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)
@@ -28,10 +28,10 @@ Omnigent lets you:
   follow you: start in your terminal, continue in the browser, pick it up on
   your phone. Messages, sub-agents, terminals, and files stay in sync.
 
-- **🤖 Supervise multiple agents.** Use Claude Code, Codex, Pi, and custom
-  agents (defined in YAML) together in the same session. Ask one agent to
-  review another's work, or split a task across agents that are each good at
-  different things.
+- **🤖 Supervise multiple agents.** Use Claude Code, Codex, OpenCode, Pi, and
+  custom agents (defined in YAML) together in the same session. Ask one agent
+  to review another's work, or split a task across agents that are each good
+  at different things.
 
 - **🔌 Use any model.** A first-party API key, a Claude/ChatGPT subscription,
   or any compatible gateway. All first-class.
@@ -131,6 +131,7 @@ Or launch a specific agent runtime, or your own agent:
 ```bash
 omnigent claude                      # Claude Code, in a session your team can join
 omnigent codex                       # Codex
+omnigent opencode                    # OpenCode (https://opencode.ai), headless
 omnigent run path/to/agent.yaml      # your own agent (see "Write your own agent")
 ```
 
@@ -336,7 +337,7 @@ name: my_agent
 prompt: You are a helpful data analyst.
 
 executor:
-  harness: claude-sdk          # or: codex, codex-native, claude-native, openai-agents, pi
+  harness: claude-sdk          # or: codex, codex-native, claude-native, openai-agents, pi, opencode
 
 tools:
   # A local Python function (schema auto-generated from the signature)
