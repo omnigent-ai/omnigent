@@ -13,6 +13,7 @@ Requirements:
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
 import shutil
@@ -35,6 +36,19 @@ from .executor import (
 )
 
 logger = logging.getLogger(__name__)
+
+# The only model Mimo can run without provider auth: its bundled router. With
+# no model configured, ``mimo acp`` falls back to whatever its catalog lists
+# first (e.g. ``google/gemini-3-pro-image-preview``), which needs a Google API
+# key and otherwise fails mid-stream with ``AI_LoadAPIKeyError`` — the turn
+# silently ends with no output. Default the *primary* agent to this instead.
+_DEFAULT_MIMO_MODEL = "mimo/mimo-auto"
+
+# Env var that injects an inline JSON config into ``mimo acp``. The config's
+# ``model`` field is what selects the primary ("build") agent's model — the
+# ACP ``session/new`` ``model`` parameter only sets the auxiliary title
+# subagent, NOT the agent that answers the prompt.
+_ENV_CONFIG_CONTENT = "MIMOCODE_CONFIG_CONTENT"
 
 _MIMO_ENV_ALLOW_PREFIXES: tuple[str, ...] = (
     "MIMO_",
@@ -159,6 +173,31 @@ class MimoExecutor(Executor):
         cfg = config or ExecutorConfig()
         return cfg.model or self._model_override
 
+    def _env_with_model(self, model: str | None) -> dict[str, str]:
+        """Copy the subprocess env, forcing Mimo's primary-agent model.
+
+        Mimo's primary ("build") agent reads its model from the inline config's
+        ``model`` field, not from the ACP ``session/new`` parameter, so we set
+        it via ``MIMOCODE_CONFIG_CONTENT``. An explicit *model* (from the spec
+        or dispatch) wins; otherwise we honor a ``model`` already present in a
+        caller-supplied config and fall back to ``mimo/mimo-auto`` — the only
+        model that runs without provider auth.
+        """
+        env = dict(self._env)
+        config: dict[str, object] = {}
+        existing = env.get(_ENV_CONFIG_CONTENT, "").strip()
+        if existing:
+            with contextlib.suppress(json.JSONDecodeError):
+                parsed = json.loads(existing)
+                if isinstance(parsed, dict):
+                    config = parsed
+        if model:
+            config["model"] = model
+        else:
+            config.setdefault("model", _DEFAULT_MIMO_MODEL)
+        env[_ENV_CONFIG_CONTENT] = json.dumps(config)
+        return env
+
     async def _close_state(self, state: _MimoSessionState) -> None:
         if state.client is not None:
             await state.client.close()
@@ -193,7 +232,7 @@ class MimoExecutor(Executor):
         cwd = self._cwd or os.getcwd()
         client = AcpClient(
             self._mimo_path,
-            env=self._env,
+            env=self._env_with_model(model),
             cwd=cwd,
             extra_args=["--cwd", cwd],
         )
