@@ -24,6 +24,8 @@ if TYPE_CHECKING:
 
 from omnigent.codex_native_bridge import write_policy_hook_config
 from omnigent.inner.codex_executor import (
+    _CODEX_DEFAULT_REASONING_EFFORT,
+    _OPENAI_CODEX_DEFAULT_MODEL,
     _clean_codex_env,
     _codex_cli_version,
     _codex_home_config_source_from_env,
@@ -45,6 +47,9 @@ _CONNECT_RETRY_DELAY_SECONDS = 0.05
 _CONNECT_TIMEOUT_SECONDS = 10.0
 _STDERR_CHUNK_LIMIT = 65536
 _DATABRICKS_CODEX_DEFAULT_MODEL = "databricks-gpt-5-5"
+_CODEX_DEFAULT_REASONING_CONFIG = (
+    f"model_reasoning_effort={json.dumps(_CODEX_DEFAULT_REASONING_EFFORT)}"
+)
 _UDS_WEBSOCKET_HANDSHAKE_URI = "ws://localhost/rpc"
 _MAX_WEBSOCKET_MESSAGE_SIZE_BYTES = 128 << 20
 # hooks.json filename written into the private CODEX_HOME registering the
@@ -1031,7 +1036,7 @@ def build_codex_native_server(
     :param socket_path: Unix socket path for the app-server.
     :param codex_home: Private per-session ``CODEX_HOME`` path.
     :param cwd: Working directory for Codex, e.g. the user's repo.
-    :param model: Optional Codex model id, e.g. ``"gpt-5.4-mini"``.
+    :param model: Optional Codex model id, e.g. ``"gpt-5.5"``.
     :param profile: Optional Databricks CLI profile, e.g.
         ``"<your-profile>"``.
     :param bridge_dir: Native Codex bridge directory; the policy hook is
@@ -1057,7 +1062,7 @@ def build_codex_native_server(
     if not resolved_codex:
         raise ImportError("Native Codex requires the 'codex' CLI on PATH.")
     env = _clean_codex_env()
-    config_overrides: list[str] = []
+    config_overrides: list[str] = [_CODEX_DEFAULT_REASONING_CONFIG]
     if profile is not None:
         creds = _read_databrickscfg(profile)
         host = creds.host if creds is not None else _read_databrickscfg_host(profile)
@@ -1103,7 +1108,8 @@ class NativeCodexLaunch:
     :param config_overrides: Codex ``-c`` overrides that route through a
         generic provider (``model_provider`` + base_url + auth + wire);
         empty for the Databricks-profile and CLI-login paths.
-    :param model: Model id to pin, or ``None`` to keep Codex's default.
+    :param model: Model id to pin, or ``None`` when the caller has not yet
+        resolved a provider-specific default.
     :param profile: Databricks profile for the ucode path, or ``None`` (a
         generic provider routes via *config_overrides*; CLI login uses
         neither).
@@ -1174,8 +1180,8 @@ def _codex_provider_launch(entry: ProviderEntry, model: str | None) -> NativeCod
     :param entry: The provider entry to route through, e.g. a ``key`` entry for
         ``openai`` or a ``databricks`` entry.
     :param model: An explicit/session model override that wins over the
-        provider's default model, e.g. ``"gpt-5.5"``; ``None`` keeps the
-        provider's default.
+        provider's default model, e.g. ``"gpt-5.5"``; ``None`` selects the
+        provider/Codex default.
     :returns: A routable :class:`NativeCodexLaunch`, or ``None`` when *entry*
         cannot route without Codex's own login.
     """
@@ -1190,14 +1196,18 @@ def _codex_provider_launch(entry: ProviderEntry, model: str | None) -> NativeCod
     )
 
     if entry.kind == DATABRICKS_KIND:
-        return NativeCodexLaunch(config_overrides=[], model=model, profile=entry.profile)
+        return NativeCodexLaunch(
+            config_overrides=[],
+            model=model or _DATABRICKS_CODEX_DEFAULT_MODEL,
+            profile=entry.profile,
+        )
     if entry.kind == CLI_CONFIG_KIND:
         # Pin the config.toml-defined provider by name; its table (and
         # credential) ride along via the bridged config.toml. json.dumps
         # yields a valid TOML basic string for the -c override value.
         return NativeCodexLaunch(
             config_overrides=[f"model_provider={json.dumps(entry.model_provider)}"],
-            model=model,
+            model=model or _OPENAI_CODEX_DEFAULT_MODEL,
             profile=None,
         )
     if entry.kind not in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND):
@@ -1315,13 +1325,14 @@ def _resolve_subscription_launch(
     # (``_populate_codex_home_config``) so this "is Codex logged in?" check reads
     # the exact auth.json the launched Codex process will use.
     real_codex_home = _codex_home_config_source_from_env()
+    pinned = model or _OPENAI_CODEX_DEFAULT_MODEL
     if codex_auth_has_credential(real_codex_home / "auth.json"):
         _logger.info(
             "native-codex routing: Codex CLI login (subscription provider %r; Codex is logged in)",
             entry.name,
         )
         return NativeCodexLaunch(
-            config_overrides=subscription_overrides, model=model, profile=None
+            config_overrides=subscription_overrides, model=pinned, profile=None
         )
     fallback = _first_routable_codex_provider(explicit, exclude=entry.name, model=model)
     if fallback is not None:
@@ -1331,7 +1342,7 @@ def _resolve_subscription_launch(
         "Codex login and no alternative provider is configured)",
         entry.name,
     )
-    return NativeCodexLaunch(config_overrides=subscription_overrides, model=model, profile=None)
+    return NativeCodexLaunch(config_overrides=subscription_overrides, model=pinned, profile=None)
 
 
 def resolve_native_codex_launch(*, model: str | None) -> NativeCodexLaunch:
@@ -1390,9 +1401,15 @@ def resolve_native_codex_launch(*, model: str | None) -> NativeCodexLaunch:
         # (parity with _resolve_provider_for_build).
         global_auth = _load_global_auth()
         if isinstance(global_auth, DatabricksAuth):
-            return NativeCodexLaunch(config_overrides=[], model=model, profile=global_auth.profile)
+            return NativeCodexLaunch(
+                config_overrides=[],
+                model=model or _DATABRICKS_CODEX_DEFAULT_MODEL,
+                profile=global_auth.profile,
+            )
         if global_auth is not None:
-            return NativeCodexLaunch(config_overrides=[], model=model, profile=None)
+            return NativeCodexLaunch(
+                config_overrides=[], model=model or _OPENAI_CODEX_DEFAULT_MODEL, profile=None
+            )
         entry = default_provider_for_harness(effective_config_with_detected(explicit), "codex")
 
     if entry is None:
@@ -1401,7 +1418,11 @@ def resolve_native_codex_launch(*, model: str | None) -> NativeCodexLaunch:
             "harness, no Databricks profile). Run `omnigent setup --no-internal-beta` to route "
             "through a provider."
         )
-        return NativeCodexLaunch(config_overrides=no_provider_overrides, model=model, profile=None)
+        return NativeCodexLaunch(
+            config_overrides=no_provider_overrides,
+            model=model or _OPENAI_CODEX_DEFAULT_MODEL,
+            profile=None,
+        )
     if entry.kind == SUBSCRIPTION_KIND:
         return _resolve_subscription_launch(entry, model, explicit)
 
@@ -1419,7 +1440,11 @@ def resolve_native_codex_launch(*, model: str | None) -> NativeCodexLaunch:
         "credential — falling back to Codex's own login.",
         entry.name,
     )
-    return NativeCodexLaunch(config_overrides=no_provider_overrides, model=model, profile=None)
+    return NativeCodexLaunch(
+        config_overrides=no_provider_overrides,
+        model=model or _OPENAI_CODEX_DEFAULT_MODEL,
+        profile=None,
+    )
 
 
 def client_for_transport(

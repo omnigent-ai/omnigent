@@ -191,6 +191,7 @@ def test_resolve_native_codex_launch_subscription_logged_in_uses_cli_login(
     # Exactly the openai pin — no base_url/auth overrides (the login carries auth).
     assert launch.config_overrides == ['model_provider="openai"']
     assert launch.profile is None
+    assert launch.model == "gpt-5.5"
 
 
 def test_resolve_native_codex_launch_subscription_ignores_private_inherited_home(
@@ -233,6 +234,7 @@ def test_resolve_native_codex_launch_subscription_ignores_private_inherited_home
     # key-provider overrides were synthesized despite the private CODEX_HOME.
     assert launch.config_overrides == ['model_provider="openai"']
     assert launch.profile is None
+    assert launch.model == "gpt-5.5"
 
 
 def test_resolve_native_codex_launch_subscription_no_login_falls_through_to_key(
@@ -296,6 +298,7 @@ def test_resolve_native_codex_launch_subscription_no_login_no_alternative_uses_l
     launch = resolve_native_codex_launch(model=None)
     assert launch.config_overrides == ['model_provider="openai"']
     assert launch.profile is None
+    assert launch.model == "gpt-5.5"
 
 
 def test_resolve_native_codex_launch_databricks_provider_uses_profile(_isolated: Path) -> None:
@@ -309,6 +312,7 @@ def test_resolve_native_codex_launch_databricks_provider_uses_profile(_isolated:
     assert launch.config_overrides == []
     # Routes via the Databricks profile path, not provider overrides.
     assert launch.profile == "oss"
+    assert launch.model == "databricks-gpt-5-5"
 
 
 def test_resolve_native_codex_launch_global_auth_when_no_provider(_isolated: Path) -> None:
@@ -353,7 +357,7 @@ def test_resolve_native_codex_launch_cli_config_default_pins_provider(
 
     The provider table + credential live in ~/.codex/config.toml (bridged
     into the session CODEX_HOME), so the launch must carry exactly the pin —
-    no synthesized base_url/auth overrides, no profile, no forced model.
+    no synthesized base_url/auth overrides, no profile, with the Codex default model pinned.
     Failure on the pin means an adopted isaac-style provider launches the
     native terminal on codex's built-in (unauthenticated) path; extra
     overrides mean we fabricated a transport over the config.toml one.
@@ -375,7 +379,7 @@ def test_resolve_native_codex_launch_cli_config_default_pins_provider(
 
     assert launch.config_overrides == ['model_provider="Databricks"']
     assert launch.profile is None
-    assert launch.model is None
+    assert launch.model == "gpt-5.5"
 
 
 _DISMISSIBLE_CODEX_CONFIG = """
@@ -414,6 +418,7 @@ def test_resolve_native_codex_launch_dismissed_config_provider_pins_openai(
 
     assert launch.config_overrides == ['model_provider="openai"']
     assert launch.profile is None
+    assert launch.model == "gpt-5.5"
 
 
 def test_resolve_native_codex_launch_undismissed_config_provider_routes_via_pin(
@@ -436,3 +441,4 @@ def test_resolve_native_codex_launch_undismissed_config_provider_routes_via_pin(
 
     assert launch.config_overrides == ['model_provider="Databricks"']
     assert launch.profile is None
+    assert launch.model == "gpt-5.5"

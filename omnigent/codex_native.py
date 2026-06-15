@@ -66,6 +66,7 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.inner.codex_executor import _OPENAI_CODEX_DEFAULT_MODEL
 from omnigent.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
 )
@@ -216,7 +217,7 @@ def run_codex_native(
     :param codex_args: Raw Codex CLI args to pass before ``resume``.
     :param resume_picker: ``True`` runs the Codex-native picker.
     :param command: Codex executable, e.g. ``"codex"``.
-    :param model: Optional model id, e.g. ``"gpt-5.4-mini"``.
+    :param model: Optional model id, e.g. ``"gpt-5.5"``.
     :param prompt: Optional first prompt to send after launch.
     :param auto_open_conversation: When ``True``, open the
         browser conversation URL after the session is prepared.
@@ -371,13 +372,15 @@ def _materialize_codex_agent_spec(
     Write the terminal-first agent spec used by ``omnigent codex``.
 
     :param tmpdir: Temporary directory for the generated YAML file.
-    :param model: Optional model id, e.g. ``"gpt-5.4-mini"``.
+    :param model: Optional model id, e.g. ``"gpt-5.5"``.
     :returns: Path to the generated YAML spec.
     """
     yaml_path = tmpdir / "codex-native-ui.yaml"
-    executor: dict[str, str | bool] = {"harness": "codex-native", "yolo": True}
-    if model is not None:
-        executor["model"] = model
+    executor: dict[str, str | bool] = {
+        "harness": "codex-native",
+        "yolo": True,
+        "model": model or _OPENAI_CODEX_DEFAULT_MODEL,
+    }
     raw: dict[str, Any] = {
         "name": _AGENT_NAME,
         "prompt": (
@@ -657,7 +660,7 @@ async def _prepare_codex_terminal_via_daemon(
     :param codex_args: User pass-through Codex args, e.g.
         ``("--config", "approval_policy=on-request")``.
     :param model: Optional model override for this launch, e.g.
-        ``"gpt-5.4-mini"``.
+        ``"gpt-5.5"``.
     :param host_id: Local host daemon id, e.g. ``"host_abc123"``.
     :param workspace: Absolute workspace path for the runner cwd, e.g.
         ``"/Users/me/repo"``.

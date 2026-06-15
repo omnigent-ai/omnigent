@@ -222,6 +222,7 @@ def test_build_codex_native_server_uses_profile_host_without_static_token(
     )
 
     overrides = "\n".join(app_server.config_overrides)
+    assert 'model_reasoning_effort="low"' in overrides
     assert "https://example.cloud.databricks.com/ai-gateway/codex/v1" in overrides
     assert 'databricks auth token --profile \\"oss\\"' in overrides
 

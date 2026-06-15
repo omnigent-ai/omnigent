@@ -95,7 +95,8 @@ _TURN_COMPLETED_DRAIN_SECONDS = 1.0
 _CODEX_VERSION_PROBE_TIMEOUT_SECONDS = 5.0
 _STDERR_CHUNK_LIMIT = 65536
 _STREAM_READ_CHUNK_SIZE = 65536
-_OPENAI_CODEX_DEFAULT_MODEL = "gpt-5.4-mini"
+_OPENAI_CODEX_DEFAULT_MODEL = "gpt-5.5"
+_CODEX_DEFAULT_REASONING_EFFORT = "low"
 # Databricks-specific default model for the Databricks-profile-derivation
 # gateway path (no gateway base URL supplied directly). The neutral
 # generic-provider gateway path never uses this — it requires the Omnigent producer
@@ -2260,8 +2261,11 @@ class CodexExecutor(Executor):
             _tool_signature(tools),
         )
         try:
+            raw_reasoning_effort = cfg.extra.get("reasoning_effort")
             reasoning_effort = validate_effort(
-                cfg.extra.get("reasoning_effort"), "codex", CODEX_EFFORTS
+                raw_reasoning_effort or _CODEX_DEFAULT_REASONING_EFFORT,
+                "codex",
+                CODEX_EFFORTS,
             )
         except ValueError as exc:
             yield ExecutorError(message=str(exc), retryable=False)
