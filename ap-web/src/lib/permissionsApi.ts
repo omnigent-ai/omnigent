@@ -90,11 +90,14 @@ export async function grantPermission(
   userId: string,
   level: number,
 ): Promise<Permission> {
-  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/permissions`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ user_id: userId, level }),
-  });
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/permissions`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId, level }),
+    },
+  );
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new Error(body?.error?.message ?? `${res.status} ${res.statusText}`);
@@ -102,10 +105,7 @@ export async function grantPermission(
   return (await res.json()) as Permission;
 }
 
-export async function revokePermission(
-  sessionId: string,
-  userId: string,
-): Promise<void> {
+export async function revokePermission(sessionId: string, userId: string): Promise<void> {
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}/permissions/${encodeURIComponent(userId)}`,
     { method: "DELETE" },

@@ -4032,16 +4032,23 @@ def _websocket_connect(attach_url: str, *, headers: dict[str, str]) -> Any:
     """
     import websockets
 
+    from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+
+    # Identify as a first-party client so the server's WebSocket origin
+    # guard (CSWSH protection) allows the handshake — this attach client
+    # is not a browser. Set on a copy so the caller's dict (which also
+    # carries auth headers and may be reused) is not mutated here.
+    handshake_headers = {**headers, "Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
     try:
         return websockets.connect(
             attach_url,
-            additional_headers=headers,
+            additional_headers=handshake_headers,
             close_timeout=_CLAUDE_ATTACH_WS_CLOSE_TIMEOUT_S,
         )
     except TypeError:
         return websockets.connect(
             attach_url,
-            extra_headers=headers,
+            extra_headers=handshake_headers,
             close_timeout=_CLAUDE_ATTACH_WS_CLOSE_TIMEOUT_S,
         )
 

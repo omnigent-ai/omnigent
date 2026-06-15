@@ -11,20 +11,15 @@ describe("CLAUDE_NATIVE_MODELS", () => {
     // the installed version supports, so the list never drifts. Guard
     // against a regression back to version-numbered IDs.
     const ids = CLAUDE_NATIVE_MODELS.map((m) => m.id);
-    // Capability order, most powerful first: Fable is the tier above Opus.
-    expect(ids).toEqual(["fable", "opus", "sonnet", "haiku"]);
+    // Capability order, most powerful first. Fable is temporarily withheld.
+    expect(ids).toEqual(["opus", "sonnet", "haiku"]);
     for (const id of ids) {
       expect(id).not.toMatch(/\d/); // an alias carries no version digits
     }
   });
 
   it("labels each alias by tier", () => {
-    expect(CLAUDE_NATIVE_MODELS.map((m) => m.label)).toEqual([
-      "Fable",
-      "Opus",
-      "Sonnet",
-      "Haiku",
-    ]);
+    expect(CLAUDE_NATIVE_MODELS.map((m) => m.label)).toEqual(["Opus", "Sonnet", "Haiku"]);
   });
 });
 

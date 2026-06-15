@@ -4,7 +4,10 @@
 import type { CSSProperties } from "react";
 import type { ThemedToken } from "shiki";
 
-interface TextSegment { text: string; isMatch: boolean; }
+interface TextSegment {
+  text: string;
+  isMatch: boolean;
+}
 
 function splitAtMatches(text: string, query: string): TextSegment[] {
   const lower = text.toLowerCase();
@@ -35,11 +38,11 @@ function buildTokenStyle(token: ThemedToken): CSSProperties {
   return {
     color: token.color,
     // oxlint-disable-next-line eslint(no-bitwise)
-    fontStyle: token.fontStyle && (token.fontStyle & SHIKI_ITALIC) ? "italic" : undefined,
+    fontStyle: token.fontStyle && token.fontStyle & SHIKI_ITALIC ? "italic" : undefined,
     // oxlint-disable-next-line eslint(no-bitwise)
-    fontWeight: token.fontStyle && (token.fontStyle & SHIKI_BOLD) ? "bold" : undefined,
+    fontWeight: token.fontStyle && token.fontStyle & SHIKI_BOLD ? "bold" : undefined,
     // oxlint-disable-next-line eslint(no-bitwise)
-    textDecoration: token.fontStyle && (token.fontStyle & SHIKI_UNDERLINE) ? "underline" : undefined,
+    textDecoration: token.fontStyle && token.fontStyle & SHIKI_UNDERLINE ? "underline" : undefined,
     ...(token.htmlStyle as CSSProperties),
   };
 }
@@ -82,7 +85,7 @@ export function renderLineTokens(
             </mark>
           ) : (
             seg.text
-          )
+          ),
         )}
       </span>
     );

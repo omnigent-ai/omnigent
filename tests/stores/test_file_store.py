@@ -152,3 +152,52 @@ def test_delete_all_for_session(
     other_page = file_store.list(session_id="conv_other")
     assert file_store.get(other_page.data[0].id, session_id="conv_other") is not None
     assert file_store.get(global_f.id) is not None
+
+
+# ── include_unscoped ──────────────────────────────────────────────
+
+
+def test_list_include_unscoped_returns_session_and_global_files(
+    file_store: SqlAlchemyFileStore,
+) -> None:
+    """list with include_unscoped=True includes global (session_id=NULL) files."""
+    file_store.create("session.txt", 10, session_id="conv_x")
+    file_store.create("global.txt", 20)
+    file_store.create("other.txt", 30, session_id="conv_y")
+
+    page = file_store.list(session_id="conv_x", include_unscoped=True)
+    filenames = {f.filename for f in page.data}
+    assert "session.txt" in filenames
+    assert "global.txt" in filenames
+    assert "other.txt" not in filenames
+
+
+def test_list_include_unscoped_false_excludes_global_files(
+    file_store: SqlAlchemyFileStore,
+) -> None:
+    """list with include_unscoped=False (default) excludes global files."""
+    file_store.create("session.txt", 10, session_id="conv_x")
+    file_store.create("global.txt", 20)
+
+    page = file_store.list(session_id="conv_x", include_unscoped=False)
+    filenames = {f.filename for f in page.data}
+    assert "session.txt" in filenames
+    assert "global.txt" not in filenames
+
+
+# ── list edge cases ───────────────────────────────────────────────
+
+
+def test_list_empty(file_store: SqlAlchemyFileStore) -> None:
+    """list on an empty store returns empty PagedList."""
+    page = file_store.list()
+    assert page.data == []
+    assert page.first_id is None
+    assert page.last_id is None
+    assert page.has_more is False
+
+
+def test_delete_nonexistent_returns_false(file_store: SqlAlchemyFileStore) -> None:
+    """delete returns False for an ID that was never created."""
+    result = file_store.delete("file_never_existed")
+    assert result is False

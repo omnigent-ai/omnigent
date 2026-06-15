@@ -204,9 +204,7 @@ export type ChangePasswordResult = { ok: true } | { ok: false; error: string };
  * :param body: ``{old_password, new_password}``.
  * :returns: ``{ok: true}`` or ``{ok: false, error}``.
  */
-export async function changePassword(
-  body: ChangePasswordRequest,
-): Promise<ChangePasswordResult> {
+export async function changePassword(body: ChangePasswordRequest): Promise<ChangePasswordResult> {
   let res: Response;
   try {
     res = await fetch("/auth/users/me/password", {
@@ -382,9 +380,7 @@ export async function listUsers(): Promise<AccountListEntry[] | null> {
  *     rights. Defaults false; the modal flips it via a checkbox.
  * :returns: The new token + the URL to share, or a typed failure.
  */
-export async function createInvite(
-  isAdmin: boolean,
-): Promise<InviteCreated | AdminFailure> {
+export async function createInvite(isAdmin: boolean): Promise<InviteCreated | AdminFailure> {
   return _admin<InviteCreated>(
     () =>
       fetch("/auth/invite", {
@@ -416,9 +412,7 @@ export async function createInvite(
  * surface as 400 with explanatory ``error`` strings, propagated
  * through :type:`AdminFailure`.
  */
-export async function deleteUser(
-  userId: string,
-): Promise<{ ok: true } | AdminFailure> {
+export async function deleteUser(userId: string): Promise<{ ok: true } | AdminFailure> {
   let res: Response;
   try {
     res = await fetch(`/auth/users/${encodeURIComponent(userId)}`, {
@@ -444,9 +438,7 @@ export async function deleteUser(
  * Returns the freshly generated plaintext exactly once. The admin
  * is responsible for DM-ing it to the user out-of-band.
  */
-export async function resetUserPassword(
-  userId: string,
-): Promise<PasswordReset | AdminFailure> {
+export async function resetUserPassword(userId: string): Promise<PasswordReset | AdminFailure> {
   return _admin<PasswordReset>(
     () =>
       fetch(`/auth/users/${encodeURIComponent(userId)}/reset`, {

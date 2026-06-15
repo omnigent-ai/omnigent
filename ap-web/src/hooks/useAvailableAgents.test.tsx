@@ -13,10 +13,7 @@ import { useAvailableAgents } from "./useAvailableAgents";
 // stubbing `fetch` exercises the real fetch + mapping path rather than
 // a hand-rolled stand-in. The two top-level fetches run in parallel
 // (Promise.all), so the stub is keyed by URL, not by call order.
-function mockResponse(
-  body: unknown,
-  init?: { ok?: boolean; status?: number },
-): Response {
+function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): Response {
   return {
     ok: init?.ok ?? true,
     status: init?.status ?? 200,
@@ -51,9 +48,7 @@ function wrapper({ children }: { children: ReactNode }) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
-  return (
-    <QueryClientProvider client={client}>{children}</QueryClientProvider>
-  );
+  return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
 }
 
 beforeEach(() => {

@@ -23,13 +23,9 @@ afterEach(() => {
 
 describe("MessageResponse", () => {
   it("blocks external image markdown and renders a placeholder", async () => {
-    render(
-      <MessageResponse>{"![leak](https://attacker.example/pixel.png)"}</MessageResponse>,
-    );
+    render(<MessageResponse>{"![leak](https://attacker.example/pixel.png)"}</MessageResponse>);
 
-    expect(
-      document.querySelector('img[src^="https://attacker.example"]'),
-    ).toBeNull();
+    expect(document.querySelector('img[src^="https://attacker.example"]')).toBeNull();
     expect(await screen.findByText("[Image blocked: leak]")).toBeTruthy();
   });
 });
@@ -64,7 +60,7 @@ describe("MessageResponse code-block copy", () => {
     });
 
     render(
-      <MessageResponse>{"```ts\nconst value = 1;\nconsole.log(value);\n```"}</MessageResponse>
+      <MessageResponse>{"```ts\nconst value = 1;\nconsole.log(value);\n```"}</MessageResponse>,
     );
 
     fireEvent.click(await screen.findByRole("button", { name: "Copy Code" }));

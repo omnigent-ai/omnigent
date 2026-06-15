@@ -53,6 +53,11 @@ artifacts/
 # Playwright test run output (screenshots, traces, videos).
 test-results/
 
+# ap-web SPA build output, emitted into the server's static dir by
+# `npm run build` / the e2e_ui test fixture. Regenerated on demand;
+# never committed.
+omnigent/server/static/web-ui/
+
 # macOS Finder metadata — never useful to commit.
 .DS_Store
 **/.DS_Store

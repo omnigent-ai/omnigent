@@ -1146,23 +1146,6 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
 )
 
 
-def _should_skip_update_check(argv: list[str]) -> bool:
-    """Decide whether the update check should be skipped for *argv*.
-
-    Skipped for help / version requests and internal subcommands
-    (``pane-split``, ``pane-picker``) that are invoked by the TUI,
-    not by the user directly.
-
-    :param argv: CLI arguments without the program name, e.g.
-        ``["run", "agent.yaml"]``.
-    :returns: ``True`` when the update check should be suppressed.
-    """
-    if not argv:
-        return True
-    first = argv[0]
-    return first in {"--help", "-h", "--version", "version", "pane-split", "pane-picker"}
-
-
 def main() -> None:
     """
     Console-script entry point for ``omnigent``.
@@ -1193,11 +1176,6 @@ def main() -> None:
     _migrate_legacy_state_dir()
 
     argv = sys.argv[1:]
-
-    if not _should_skip_update_check(argv):
-        from omnigent.update_check import maybe_show_update_notice
-
-        maybe_show_update_notice()
 
     # Bare ``omnigent`` with no args behaves like ``omnigent run`` on an
     # interactive terminal: ``run`` resolves the configured default agent /
@@ -4013,7 +3991,8 @@ def resume(
 
     run_resume(
         target=target,
-        server=server,
+        # A bare Databricks workspace URL means its /api/2.0/omnigent mount.
+        server=_workspace_api_server_url(server) if server else server,
     )
 
 
@@ -4532,7 +4511,8 @@ def _resolve_attach_server(server: str | None, configured_server: str | None) ->
     """
     chosen = server if server is not None else configured_server
     if chosen:
-        return chosen.rstrip("/")
+        # A bare Databricks workspace URL means its /api/2.0/omnigent mount.
+        return _workspace_api_server_url(chosen.rstrip("/"))
     local = local_server_url_if_healthy()
     return local.rstrip("/") if local else None
 
@@ -5069,7 +5049,8 @@ def _resolve_host_server(server: str | None) -> str | None:
     if server is None:
         configured = _load_effective_config().get("server")
         server = str(configured) if configured else None
-    return server.rstrip("/") if server else None
+    # A bare Databricks workspace URL means its /api/2.0/omnigent mount.
+    return _workspace_api_server_url(server.rstrip("/")) if server else None
 
 
 def _daemon_base_url(record: _HostDaemonRecord) -> str | None:

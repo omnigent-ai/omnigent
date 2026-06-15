@@ -33,9 +33,7 @@ const SETTLE_MS = 200;
 
 beforeEach(() => {
   vi.useFakeTimers();
-  scrollSpy = vi
-    .spyOn(Element.prototype, "scrollIntoView")
-    .mockImplementation(() => {});
+  scrollSpy = vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(() => {});
   useChatStore.setState({ flashItemId: null });
 });
 

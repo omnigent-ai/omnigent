@@ -44,14 +44,19 @@ function makeFakeEditor(initial: string): FakeEditor {
   let value = initial;
   return {
     getValue: () => value,
-    setValue: (v) => { value = v; h.onChange?.(v, { isFlush: true }); },
+    setValue: (v) => {
+      value = v;
+      h.onChange?.(v, { isFlush: true });
+    },
     getModel: () => ({ setEOL: () => {} }),
     addCommand: () => {},
     onDidBlurEditorWidget: () => ({ dispose: () => {} }),
     saveViewState: () => null,
     restoreViewState: () => {},
     getAction: () => ({ run: () => {} }),
-    __set: (v) => { value = v; },
+    __set: (v) => {
+      value = v;
+    },
   };
 }
 
@@ -133,8 +138,12 @@ async function renderMounted(el: React.ReactElement) {
 // Drive an edit + fire the debounce so a save goes in flight (deferred write).
 async function editAndStartSave() {
   fakeEditor!.__set(EDITED);
-  await act(async () => { h.onChange?.(EDITED, {}); });
-  await act(async () => { vi.advanceTimersByTime(1000); });
+  await act(async () => {
+    h.onChange?.(EDITED, {});
+  });
+  await act(async () => {
+    vi.advanceTimersByTime(1000);
+  });
 }
 
 beforeEach(() => {
@@ -157,10 +166,15 @@ beforeEach(() => {
     reconcileServerContent,
   } as unknown as ReturnType<typeof syncHook.useMarkdownEditorSync>);
 
-  writePromise = new Promise<void>((r) => { resolveWrite = r; });
+  writePromise = new Promise<void>((r) => {
+    resolveWrite = r;
+  });
   mutateAsync = vi.fn().mockReturnValue(writePromise);
   vi.mocked(writeHook.useWriteFileContent).mockReturnValue({
-    isPending: false, isError: false, reset: vi.fn(), mutateAsync,
+    isPending: false,
+    isError: false,
+    reset: vi.fn(),
+    mutateAsync,
   } as unknown as ReturnType<typeof writeHook.useWriteFileContent>);
 
   vi.mocked(runnerHook.useSessionRunnerOnline).mockReturnValue(true);
@@ -180,9 +194,14 @@ describe("MonacoCodeEditor save-after-teardown guard", () => {
     expect(mutateAsync).toHaveBeenCalledWith({ path: PATH, content: EDITED });
     expect(markSaved).not.toHaveBeenCalled();
 
-    await act(async () => { unmount(); });
+    await act(async () => {
+      unmount();
+    });
     // Write lands after teardown.
-    await act(async () => { resolveWrite(); await writePromise; });
+    await act(async () => {
+      resolveWrite();
+      await writePromise;
+    });
 
     // The leak: a late markSaved()/dismissExternalUpdate() would mutate the
     // persistent sync hook (now tracking another file). The mountedRef guard
@@ -196,7 +215,10 @@ describe("MonacoCodeEditor save-after-teardown guard", () => {
     // genuinely calls markSaved/setDirty(false) when the editor is still alive.
     await renderMounted(makeEditor());
     await editAndStartSave();
-    await act(async () => { resolveWrite(); await writePromise; });
+    await act(async () => {
+      resolveWrite();
+      await writePromise;
+    });
 
     // Echo-dedupe marker recorded and editor forced clean — the normal save.
     expect(markSaved).toHaveBeenCalledWith(EDITED);
@@ -212,7 +234,10 @@ describe("MonacoCodeEditor save-after-teardown guard", () => {
     // render() isn't StrictMode by default, so this must be opted in explicitly.
     await renderMounted(<StrictMode>{makeEditor()}</StrictMode>);
     await editAndStartSave();
-    await act(async () => { resolveWrite(); await writePromise; });
+    await act(async () => {
+      resolveWrite();
+      await writePromise;
+    });
 
     // With a cleanup-only mountedRef these are skipped (the guard bails on the
     // still-mounted editor because the ref is stuck false post-remount).

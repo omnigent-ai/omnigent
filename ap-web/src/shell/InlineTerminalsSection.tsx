@@ -20,10 +20,7 @@ interface InlineTerminalsSectionProps {
   onExpand: (terminalKey: string) => void;
 }
 
-export function InlineTerminalsSection({
-  conversationId,
-  onExpand,
-}: InlineTerminalsSectionProps) {
+export function InlineTerminalsSection({ conversationId, onExpand }: InlineTerminalsSectionProps) {
   const { terminals: allTerminals } = useTerminals(conversationId);
   // Inventory view: the agent's own terminal (SDK REPL / native vendor
   // pane) backs the pill's Terminal view and must not appear as a
@@ -44,11 +41,7 @@ export function InlineTerminalsSection({
           shells the virtual row is the whole list — no centered
           empty-state copy. */}
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto py-1">
-        <NewTerminalButton
-          conversationId={conversationId}
-          onCreated={onExpand}
-          variant="row"
-        />
+        <NewTerminalButton conversationId={conversationId} onCreated={onExpand} variant="row" />
         {terminals.map((t) => (
           <button
             key={terminalTabKey(t)}
@@ -57,9 +50,7 @@ export function InlineTerminalsSection({
             onClick={() => onExpand(terminalTabKey(t))}
           >
             <TerminalIcon className="size-3.5 shrink-0 text-muted-foreground" />
-            {t.session && (
-              <span className="shrink-0 text-xs font-medium">{t.session}</span>
-            )}
+            {t.session && <span className="shrink-0 text-xs font-medium">{t.session}</span>}
             <span className="truncate text-xs text-muted-foreground/70">{t.name}</span>
             <span className="flex-1" />
             <TerminalStatusBadge status={getStatus(t)} />

@@ -183,6 +183,13 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.image: str | None = None
         self.secrets: list[str] | None = None
         self.env: list[str] | None = None
+        self.base_url: str | None = None
+        self.gateway_profile: str | None = None
+        self.snapshot_name: str | None = None
+        self.workdir: str | None = None
+        self.vcpus: int | None = None
+        self.memory_mb: int | None = None
+        self.disk_gb: int | None = None
         self.prepared = False
         self.provisioned_names: list[str] = []
         self.commands: list[str] = []
@@ -330,6 +337,51 @@ def install_fake_daytona_launcher(
         return fake
 
     monkeypatch.setattr(daytona_mod, "DaytonaSandboxLauncher", _ctor)
+
+
+def install_fake_islo_launcher(
+    monkeypatch: Any,  # pytest.MonkeyPatch — Any avoids importing pytest in a helpers module
+    fake: FakeSandboxLauncher,
+) -> None:
+    """
+    Substitute the fake for ``IsloSandboxLauncher`` at its public seam.
+
+    The managed flow constructs ``IsloSandboxLauncher(image=…, env=…,
+    base_url=…, gateway_profile=…, snapshot_name=…, workdir=…,
+    vcpus=…, memory_mb=…, disk_gb=…)``; the shim records those
+    constructor args on the fake and hands it back, so production code
+    runs unmodified against it.
+
+    :param monkeypatch: The test's ``pytest.MonkeyPatch``.
+    :param fake: The fake launcher to substitute.
+    """
+    import omnigent.onboarding.sandboxes.islo as islo_mod
+
+    def _ctor(
+        *,
+        image: str | None = None,
+        env: list[str] | None = None,
+        base_url: str | None = None,
+        gateway_profile: str | None = None,
+        snapshot_name: str | None = None,
+        workdir: str | None = None,
+        vcpus: int | None = None,
+        memory_mb: int | None = None,
+        disk_gb: int | None = None,
+    ) -> FakeSandboxLauncher:
+        """Stand-in constructor recording the construction wiring."""
+        fake.image = image
+        fake.env = env
+        fake.base_url = base_url
+        fake.gateway_profile = gateway_profile
+        fake.snapshot_name = snapshot_name
+        fake.workdir = workdir
+        fake.vcpus = vcpus
+        fake.memory_mb = memory_mb
+        fake.disk_gb = disk_gb
+        return fake
+
+    monkeypatch.setattr(islo_mod, "IsloSandboxLauncher", _ctor)
 
 
 async def wait_for_completion(

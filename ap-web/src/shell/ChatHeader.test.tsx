@@ -32,14 +32,12 @@ const mobileMenu = {
   onOpenMainExecutionLog: () => {},
 };
 
-function renderHeader(
-  props: {
-    sidebarOpen: boolean;
-    isChildSession?: boolean;
-    parentSessionId?: string;
-    boundAgent?: Agent;
-  },
-) {
+function renderHeader(props: {
+  sidebarOpen: boolean;
+  isChildSession?: boolean;
+  parentSessionId?: string;
+  boundAgent?: Agent;
+}) {
   return render(
     <MemoryRouter initialEntries={["/"]}>
       <TooltipProvider>

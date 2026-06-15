@@ -1,0 +1,24 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: omnigent
+
+resources:
+  - ../../base
+  - statefulset.yaml
+  - service.yaml
+  - route.yaml
+
+patches:
+  - path: deployment-patch.yaml
+  - path: secret-patch.yaml
+  - path: postgres-deployment-patch.yaml
+  - target:
+      kind: Ingress
+      name: omnigent
+    patch: |
+      $patch: delete
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: omnigent

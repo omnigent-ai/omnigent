@@ -28,11 +28,7 @@ import { cn } from "@/lib/utils";
 // Exported for use in tests.
 // ---------------------------------------------------------------------------
 
-export function freshCellPos(
-  editor: Editor,
-  rowIndex: number,
-  colIndex: number,
-): number | null {
+export function freshCellPos(editor: Editor, rowIndex: number, colIndex: number): number | null {
   const rows = editor.view.dom.querySelectorAll("tr");
   const row = rows[rowIndex] as HTMLTableRowElement | undefined;
   if (!row) return null;
@@ -49,10 +45,7 @@ export function freshCellPos(
 // ProseMirror helpers for moving rows / columns
 // ---------------------------------------------------------------------------
 
-function getTableContext(
-  editor: Editor,
-  rowIndex: number,
-): { node: PMNode; pos: number } | null {
+function getTableContext(editor: Editor, rowIndex: number): { node: PMNode; pos: number } | null {
   const pos = freshCellPos(editor, rowIndex, 0);
   if (pos === null) return null;
   const $pos = editor.state.doc.resolve(pos);
@@ -301,13 +294,26 @@ export function TableHandles({
 }) {
   const [rowHandle, setRowHandle] = useState<HandlePos | null>(null);
   const [colHandle, setColHandle] = useState<HandlePos | null>(null);
-  const [rowMenu, setRowMenu] = useState<{ anchorTop: number; anchorLeft: number; handle: HandlePos } | null>(null);
-  const [colMenu, setColMenu] = useState<{ anchorTop: number; anchorLeft: number; handle: HandlePos } | null>(null);
+  const [rowMenu, setRowMenu] = useState<{
+    anchorTop: number;
+    anchorLeft: number;
+    handle: HandlePos;
+  } | null>(null);
+  const [colMenu, setColMenu] = useState<{
+    anchorTop: number;
+    anchorLeft: number;
+    handle: HandlePos;
+  } | null>(null);
   // Selection overlays: full-border rectangle around the hovered/dragged row or column.
   const [rowSelRect, setRowSelRect] = useState<Rect | null>(null);
   const [colSelRect, setColSelRect] = useState<Rect | null>(null);
   // Right-click context menu — shown when right-clicking inside any table cell.
-  const [tableContextMenu, setTableContextMenu] = useState<{ x: number; y: number; rowIndex: number; colIndex: number } | null>(null);
+  const [tableContextMenu, setTableContextMenu] = useState<{
+    x: number;
+    y: number;
+    rowIndex: number;
+    colIndex: number;
+  } | null>(null);
   // Target overlay: shown over the row/column the drag is hovering over.
   const [dragTargetRect, setDragTargetRect] = useState<Rect | null>(null);
   // Ghost: semi-transparent copy of the source row/column that follows the cursor.
@@ -324,7 +330,12 @@ export function TableHandles({
   const dragCleanupRef = useRef<(() => void) | null>(null);
 
   // Cancel any in-progress drag when the component unmounts (e.g. route change).
-  useEffect(() => () => { dragCleanupRef.current?.(); }, []);
+  useEffect(
+    () => () => {
+      dragCleanupRef.current?.();
+    },
+    [],
+  );
 
   const scheduleHide = useCallback(() => {
     window.clearTimeout(hideTimer.current);
@@ -376,8 +387,18 @@ export function TableHandles({
           prev.colIndex === colIndex &&
           prev.top === rowRect.top &&
           prev.left === rowRect.left
-        ) return prev;
-        return { top: rowRect.top, left: rowRect.left, rowIndex, colIndex, cellWidth: cellRect.width, rowHeight: rowRect.height, rowWidth: rowRect.width, tableHeight: tableRect.height };
+        )
+          return prev;
+        return {
+          top: rowRect.top,
+          left: rowRect.left,
+          rowIndex,
+          colIndex,
+          cellWidth: cellRect.width,
+          rowHeight: rowRect.height,
+          rowWidth: rowRect.width,
+          tableHeight: tableRect.height,
+        };
       });
       setColHandle((prev) => {
         if (
@@ -385,8 +406,18 @@ export function TableHandles({
           prev.colIndex === colIndex &&
           prev.top === tableRect.top &&
           prev.left === cellRect.left
-        ) return prev;
-        return { top: tableRect.top, left: cellRect.left, rowIndex, colIndex, cellWidth: cellRect.width, rowHeight: rowRect.height, rowWidth: rowRect.width, tableHeight: tableRect.height };
+        )
+          return prev;
+        return {
+          top: tableRect.top,
+          left: cellRect.left,
+          rowIndex,
+          colIndex,
+          cellWidth: cellRect.width,
+          rowHeight: rowRect.height,
+          rowWidth: rowRect.width,
+          tableHeight: tableRect.height,
+        };
       });
       // Selection overlays are set only when the handle pill is hovered (see onMouseEnter below).
     };
@@ -450,19 +481,27 @@ export function TableHandles({
         const cell = handle.closest<HTMLElement>("td, th");
         const table = handle.closest<HTMLElement>("table");
         if (!cell || !table) return;
-        const topOffset =
-          cell.getBoundingClientRect().top - table.getBoundingClientRect().top;
+        const topOffset = cell.getBoundingClientRect().top - table.getBoundingClientRect().top;
         handle.style.top = `-${topOffset}px`;
         handle.style.height = `${table.offsetHeight}px`;
       });
     };
     const observer = new MutationObserver(fixResizeHandle);
     observer.observe(dom, { childList: true, subtree: true });
-    return () => { observer.disconnect(); cancelAnimationFrame(rafId); };
+    return () => {
+      observer.disconnect();
+      cancelAnimationFrame(rafId);
+    };
   }, [editor]);
 
-  const handleMouseEnter = () => { mouseInUI.current = true; cancelHide(); };
-  const handleMouseLeave = () => { mouseInUI.current = false; scheduleHide(); };
+  const handleMouseEnter = () => {
+    mouseInUI.current = true;
+    cancelHide();
+  };
+  const handleMouseLeave = () => {
+    mouseInUI.current = false;
+    scheduleHide();
+  };
 
   // -------------------------------------------------------------------------
   // Mousedown-based drag — avoids ProseMirror HTML5 DnD interference.
@@ -521,7 +560,9 @@ export function TableHandles({
         if (type === "row") {
           // Scope hit-testing to the source table's rows only — prevents the
           // ghost/indicator from jumping to rows in other tables.
-          const sourceRow = dom.querySelectorAll("tr")[tableRowIndex] as HTMLTableRowElement | undefined;
+          const sourceRow = dom.querySelectorAll("tr")[tableRowIndex] as
+            | HTMLTableRowElement
+            | undefined;
           const sourceTableEl = sourceRow?.closest("table");
           if (!sourceTableEl) return;
           const tableRows = Array.from(sourceTableEl.querySelectorAll("tr"));
@@ -556,7 +597,9 @@ export function TableHandles({
           });
         } else {
           // Look up target column by X band within the source table only.
-          const sourceRow = dom.querySelectorAll("tr")[tableRowIndex] as HTMLTableRowElement | undefined;
+          const sourceRow = dom.querySelectorAll("tr")[tableRowIndex] as
+            | HTMLTableRowElement
+            | undefined;
           const tableEl = sourceRow?.closest("table");
           const firstRow = tableEl?.querySelector("tr") as HTMLTableRowElement | null;
           if (!firstRow) return;
@@ -705,31 +748,49 @@ export function TableHandles({
   return (
     <>
       {/* Row selection overlay — full-border rectangle spanning the entire hovered row */}
-      {rowSelRect && createPortal(
-        <div
-          className="pointer-events-none fixed z-40 border-2 border-primary bg-primary/5"
-          style={{ top: rowSelRect.top, left: rowSelRect.left, width: rowSelRect.width, height: rowSelRect.height }}
-        />,
-        document.body,
-      )}
+      {rowSelRect &&
+        createPortal(
+          <div
+            className="pointer-events-none fixed z-40 border-2 border-primary bg-primary/5"
+            style={{
+              top: rowSelRect.top,
+              left: rowSelRect.left,
+              width: rowSelRect.width,
+              height: rowSelRect.height,
+            }}
+          />,
+          document.body,
+        )}
 
       {/* Column selection overlay — full-border rectangle spanning the entire hovered column */}
-      {colSelRect && createPortal(
-        <div
-          className="pointer-events-none fixed z-40 border-2 border-primary bg-primary/5"
-          style={{ top: colSelRect.top, left: colSelRect.left, width: colSelRect.width, height: colSelRect.height }}
-        />,
-        document.body,
-      )}
+      {colSelRect &&
+        createPortal(
+          <div
+            className="pointer-events-none fixed z-40 border-2 border-primary bg-primary/5"
+            style={{
+              top: colSelRect.top,
+              left: colSelRect.left,
+              width: colSelRect.width,
+              height: colSelRect.height,
+            }}
+          />,
+          document.body,
+        )}
 
       {/* Drag target overlay — shows where the dragged row/column will land */}
-      {dragTargetRect && createPortal(
-        <div
-          className="pointer-events-none fixed z-40 border-2 border-primary/60 bg-primary/10"
-          style={{ top: dragTargetRect.top, left: dragTargetRect.left, width: dragTargetRect.width, height: dragTargetRect.height }}
-        />,
-        document.body,
-      )}
+      {dragTargetRect &&
+        createPortal(
+          <div
+            className="pointer-events-none fixed z-40 border-2 border-primary/60 bg-primary/10"
+            style={{
+              top: dragTargetRect.top,
+              left: dragTargetRect.left,
+              width: dragTargetRect.width,
+              height: dragTargetRect.height,
+            }}
+          />,
+          document.body,
+        )}
 
       {/* Row handle — vertical pill with ⋮ to the left of the hovered row */}
       {rowHandle &&
@@ -754,7 +815,12 @@ export function TableHandles({
               mouseInUI.current = true;
               cancelHide();
               setColSelRect(null); // only one overlay active at a time
-              setRowSelRect({ top: rowHandle.top, left: rowHandle.left, width: rowHandle.rowWidth, height: rowHandle.rowHeight });
+              setRowSelRect({
+                top: rowHandle.top,
+                left: rowHandle.left,
+                width: rowHandle.rowWidth,
+                height: rowHandle.rowHeight,
+              });
             }}
             onMouseLeave={() => {
               mouseInUI.current = false;
@@ -762,11 +828,18 @@ export function TableHandles({
               scheduleHide();
             }}
             onMouseDown={(e) =>
-              startDrag(e, "row", rowHandle.rowIndex, rowHandle.rowIndex,
-                { top: rowHandle.top, left: rowHandle.left, width: rowHandle.rowWidth, height: rowHandle.rowHeight })
+              startDrag(e, "row", rowHandle.rowIndex, rowHandle.rowIndex, {
+                top: rowHandle.top,
+                left: rowHandle.left,
+                width: rowHandle.rowWidth,
+                height: rowHandle.rowHeight,
+              })
             }
             onClick={(e) => {
-              if (wasDragRef.current) { wasDragRef.current = false; return; }
+              if (wasDragRef.current) {
+                wasDragRef.current = false;
+                return;
+              }
               const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
               setRowMenu({ anchorTop: rect.bottom + 4, anchorLeft: rect.left, handle: rowHandle });
             }}
@@ -774,7 +847,11 @@ export function TableHandles({
               if (e.key === "Enter" || e.key === " ") {
                 e.preventDefault();
                 const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                setRowMenu({ anchorTop: rect.bottom + 4, anchorLeft: rect.left, handle: rowHandle });
+                setRowMenu({
+                  anchorTop: rect.bottom + 4,
+                  anchorLeft: rect.left,
+                  handle: rowHandle,
+                });
               }
             }}
           >
@@ -817,7 +894,12 @@ export function TableHandles({
               mouseInUI.current = true;
               cancelHide();
               setRowSelRect(null); // only one overlay active at a time
-              setColSelRect({ top: colHandle.top, left: colHandle.left, width: colHandle.cellWidth, height: colHandle.tableHeight });
+              setColSelRect({
+                top: colHandle.top,
+                left: colHandle.left,
+                width: colHandle.cellWidth,
+                height: colHandle.tableHeight,
+              });
             }}
             onMouseLeave={() => {
               mouseInUI.current = false;
@@ -825,11 +907,18 @@ export function TableHandles({
               scheduleHide();
             }}
             onMouseDown={(e) =>
-              startDrag(e, "col", colHandle.colIndex, colHandle.rowIndex,
-                { top: colHandle.top, left: colHandle.left, width: colHandle.cellWidth, height: colHandle.tableHeight })
+              startDrag(e, "col", colHandle.colIndex, colHandle.rowIndex, {
+                top: colHandle.top,
+                left: colHandle.left,
+                width: colHandle.cellWidth,
+                height: colHandle.tableHeight,
+              })
             }
             onClick={(e) => {
-              if (wasDragRef.current) { wasDragRef.current = false; return; }
+              if (wasDragRef.current) {
+                wasDragRef.current = false;
+                return;
+              }
               const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
               setColMenu({ anchorTop: rect.bottom + 4, anchorLeft: rect.left, handle: colHandle });
             }}
@@ -837,7 +926,11 @@ export function TableHandles({
               if (e.key === "Enter" || e.key === " ") {
                 e.preventDefault();
                 const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                setColMenu({ anchorTop: rect.bottom + 4, anchorLeft: rect.left, handle: colHandle });
+                setColMenu({
+                  anchorTop: rect.bottom + 4,
+                  anchorLeft: rect.left,
+                  handle: colHandle,
+                });
               }
             }}
           >
@@ -858,13 +951,19 @@ export function TableHandles({
       )}
 
       {/* Drag ghost — semi-transparent copy of the source row/column that follows the cursor */}
-      {dragGhostRect && createPortal(
-        <div
-          className="pointer-events-none fixed z-[9997] border-2 border-primary bg-primary/15 opacity-90"
-          style={{ top: dragGhostRect.top, left: dragGhostRect.left, width: dragGhostRect.width, height: dragGhostRect.height }}
-        />,
-        document.body,
-      )}
+      {dragGhostRect &&
+        createPortal(
+          <div
+            className="pointer-events-none fixed z-[9997] border-2 border-primary bg-primary/15 opacity-90"
+            style={{
+              top: dragGhostRect.top,
+              left: dragGhostRect.left,
+              width: dragGhostRect.width,
+              height: dragGhostRect.height,
+            }}
+          />,
+          document.body,
+        )}
 
       {/* Right-click context menu — shown when right-clicking inside a table cell */}
       {tableContextMenu && (

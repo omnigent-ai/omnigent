@@ -486,45 +486,6 @@ def test_check_failure_caches_zero(
 
 
 # ------------------------------------------------------------------
-# _should_skip_update_check (in cli.py)
-# ------------------------------------------------------------------
-
-
-def test_should_skip_help_flags() -> None:
-    """Skip for ``--help``, ``-h``, ``--version``, ``version``."""
-    from omnigent.cli import _should_skip_update_check
-
-    assert _should_skip_update_check(["--help"])
-    assert _should_skip_update_check(["-h"])
-    assert _should_skip_update_check(["--version"])
-    assert _should_skip_update_check(["version"])
-
-
-def test_should_skip_internal_subcommands() -> None:
-    """Skip for TUI-internal subcommands."""
-    from omnigent.cli import _should_skip_update_check
-
-    assert _should_skip_update_check(["pane-split"])
-    assert _should_skip_update_check(["pane-picker"])
-
-
-def test_should_skip_empty_argv() -> None:
-    """Skip when argv is empty (bare ``omnigent``)."""
-    from omnigent.cli import _should_skip_update_check
-
-    assert _should_skip_update_check([])
-
-
-def test_should_not_skip_run() -> None:
-    """Do NOT skip for normal subcommands like ``run``."""
-    from omnigent.cli import _should_skip_update_check
-
-    assert not _should_skip_update_check(["run", "agent.yaml"])
-    assert not _should_skip_update_check(["server"])
-    assert not _should_skip_update_check(["attach"])
-
-
-# ------------------------------------------------------------------
 # Installed-wheel path
 # ------------------------------------------------------------------
 

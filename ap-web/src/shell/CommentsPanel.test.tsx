@@ -311,8 +311,14 @@ describe("CommentsPanel author-only edit/delete gating", () => {
 function mockLayoutMetrics(scrollHeight: number, clientHeight: number): () => void {
   const origScroll = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollHeight");
   const origClient = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientHeight");
-  Object.defineProperty(HTMLElement.prototype, "scrollHeight", { configurable: true, value: scrollHeight });
-  Object.defineProperty(HTMLElement.prototype, "clientHeight", { configurable: true, value: clientHeight });
+  Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+    configurable: true,
+    value: scrollHeight,
+  });
+  Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+    configurable: true,
+    value: clientHeight,
+  });
   return () => {
     if (origScroll) Object.defineProperty(HTMLElement.prototype, "scrollHeight", origScroll);
     else delete (HTMLElement.prototype as { scrollHeight?: number }).scrollHeight;
@@ -321,7 +327,8 @@ function mockLayoutMetrics(scrollHeight: number, clientHeight: number): () => vo
   };
 }
 
-const LONG_BODY = "This is a long comment body that overflows the collapsed clamp and needs a toggle.";
+const LONG_BODY =
+  "This is a long comment body that overflows the collapsed clamp and needs a toggle.";
 
 function makeCommentWithBody(id: string, body: string): Comment {
   return { ...makeComment(id), body };

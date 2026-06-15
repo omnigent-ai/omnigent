@@ -71,15 +71,12 @@ describe("isBinaryPath", () => {
     expect(isBinaryPath(path)).toBe(true);
   });
 
-  it.each([
-    "app.py",
-    "index.ts",
-    "README.md",
-    "config.json",
-    "notes.txt",
-  ])("classifies %s as non-binary", (path) => {
-    expect(isBinaryPath(path)).toBe(false);
-  });
+  it.each(["app.py", "index.ts", "README.md", "config.json", "notes.txt"])(
+    "classifies %s as non-binary",
+    (path) => {
+      expect(isBinaryPath(path)).toBe(false);
+    },
+  );
 
   it("is case-insensitive on the extension", () => {
     expect(isBinaryPath("LOGO.PNG")).toBe(true);

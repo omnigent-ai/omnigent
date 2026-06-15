@@ -794,9 +794,10 @@ describe("buildBubbles — cross-bubble tool_result pairing", () => {
 
     const t2 = bubbles[2] as Extract<Bubble, { kind: "assistant" }>;
     expect(t2.responseId).toBe("resp_T2");
-    expect(
-      t2.items.map((item) => (item as Extract<RenderItem, { kind: "text" }>).text),
-    ).toEqual(["Synthesizing the review.", "Done."]);
+    expect(t2.items.map((item) => (item as Extract<RenderItem, { kind: "text" }>).text)).toEqual([
+      "Synthesizing the review.",
+      "Done.",
+    ]);
   });
 
   it("live output for a history-hydrated call renders after a fresh pump", () => {

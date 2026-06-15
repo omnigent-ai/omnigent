@@ -7,16 +7,8 @@
 //            output doesn't dominate the conversation view.
 
 import { ChevronRightIcon, SquareTerminalIcon } from "lucide-react";
-import {
-  CodeBlock,
-  CodeBlockHeader,
-  CodeBlockTitle,
-} from "@/components/ai-elements/code-block";
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from "@/components/ui/collapsible";
+import { CodeBlock, CodeBlockHeader, CodeBlockTitle } from "@/components/ai-elements/code-block";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 
 interface TerminalCommandCardProps {
   kind: "input" | "output";
@@ -25,12 +17,7 @@ interface TerminalCommandCardProps {
   stderr: string | null;
 }
 
-export function TerminalCommandCard({
-  kind,
-  input,
-  stdout,
-  stderr,
-}: TerminalCommandCardProps) {
+export function TerminalCommandCard({ kind, input, stdout, stderr }: TerminalCommandCardProps) {
   if (kind === "input") {
     return (
       <div
@@ -41,8 +28,7 @@ export function TerminalCommandCard({
         <span className="flex w-full items-center gap-1.5 py-0.5 text-left text-muted-foreground text-xs">
           <SquareTerminalIcon className="size-3 shrink-0 text-emerald-500 dark:text-emerald-400" />
           <span className="min-w-0 flex-1 truncate font-mono">
-            <span className="font-semibold text-foreground">$</span>{" "}
-            {input ?? ""}
+            <span className="font-semibold text-foreground">$</span> {input ?? ""}
           </span>
         </span>
       </div>

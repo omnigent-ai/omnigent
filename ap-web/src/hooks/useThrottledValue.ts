@@ -57,7 +57,12 @@ export function useThrottledValue<T>(value: T, intervalMs: number): T {
   }, [value, intervalMs, shown]);
 
   // Drop any pending flush on unmount; never setState after teardown.
-  useEffect(() => () => { window.clearTimeout(timerRef.current); }, []);
+  useEffect(
+    () => () => {
+      window.clearTimeout(timerRef.current);
+    },
+    [],
+  );
 
   return shown;
 }

@@ -25,7 +25,7 @@ from omnigent.server.routes.sessions import (
 )
 from omnigent.server.schemas import SessionEventInput
 from omnigent.spec import AgentSpec
-from omnigent.spec.types import PolicySpec
+from omnigent.spec.types import Phase, PolicySpec
 
 # ── Stub stores ──────────────────────────────────────────────
 
@@ -128,6 +128,25 @@ class _FakeBody:
     data: dict[str, Any]
 
 
+class _FakeRequest:
+    """Minimal stand-in for a FastAPI ``Request``.
+
+    ``_evaluate_input_policy`` only passes the request through to
+    ``_hold_native_ask_gate`` (for upstream-disconnect detection while
+    parked on an ASK). The ALLOW / DENY / skip tests never reach the
+    gate, and the ASK tests stub the gate out, so the request is never
+    actually introspected — this exists only to fill the positional
+    parameter with a real object rather than ``None``.
+    """
+
+    async def is_disconnected(self) -> bool:
+        """Report the client as connected.
+
+        :returns: Always ``False`` (test client never disconnects).
+        """
+        return False
+
+
 # ── Helpers ──────────────────────────────────────────────────
 
 
@@ -182,6 +201,7 @@ def _make_spec_no_guardrails() -> AgentSpec:
 
 _CACHE_PATCH = "omnigent.server.routes.sessions.get_agent_cache"
 _ENGINE_PATCH = "omnigent.server.routes.sessions.build_policy_engine"
+_HOLD_GATE_PATCH = "omnigent.server.routes.sessions._hold_native_ask_gate"
 _STREAM_PATCH = "omnigent.server.routes.sessions.session_stream"
 
 
@@ -462,6 +482,7 @@ async def test_input_allow_verdict():
         mock_engine.apply_label_writes = lambda x: None
 
         result = await _evaluate_input_policy(
+            _FakeRequest(),
             "sess_1",
             conv,
             body,
@@ -501,6 +522,7 @@ async def test_input_deny_verdict():
         mock_engine.apply_label_writes = lambda x: None
 
         result = await _evaluate_input_policy(
+            _FakeRequest(),
             "sess_1",
             conv,
             body,
@@ -564,6 +586,7 @@ async def test_skill_slash_command_policy_body_uses_typed_command_text():
         mock_engine.apply_label_writes = lambda x: None
 
         result = await _evaluate_input_policy(
+            _FakeRequest(),
             "sess_1",
             conv,
             policy_body,
@@ -595,6 +618,7 @@ async def test_input_no_guardrails_skips_policy():
     ):
         mock_cache.return_value.load.return_value = loaded
         result = await _evaluate_input_policy(
+            _FakeRequest(),
             "sess_1",
             conv,
             body,
@@ -620,6 +644,7 @@ async def test_input_empty_text_skips_policy():
     )
 
     result = await _evaluate_input_policy(
+        _FakeRequest(),
         "sess_1",
         conv,
         body,
@@ -629,6 +654,156 @@ async def test_input_empty_text_skips_policy():
     )
 
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_input_ask_approved_falls_through_to_allow():
+    """A REQUEST-phase ASK the user APPROVES collapses to ALLOW.
+
+    Regression guard for the request-phase approval round-trip. The
+    REQUEST phase has no runner-side park (the message has not been
+    forwarded yet), so the input path must hold the gate server-side
+    via ``_hold_native_ask_gate`` and, on accept, return ``None`` so the
+    /events handler forwards the message. Before the fix, an input ASK
+    returned a ``pending`` verdict that the handler collapsed to
+    ``[Denied by policy]`` — the approval card was published but nothing
+    waited on it.
+    """
+    conv_store = _FakeConversationStore()
+    agent_store = _FakeAgentStore(agent=_make_agent())
+    conv = conv_store.get_conversation("sess_1")
+    body = _make_user_message_body("delete the file /tmp/policy-demo.txt")
+
+    spec = _make_spec_with_guardrails()
+    loaded = LoadedAgent(spec=spec, workdir="/tmp/fake")
+    ask_result = PolicyResult(
+        action=PolicyAction.ASK,
+        reason="Deleting files requires approval",
+        deciding_policy="llm_prompt_classifier_policy",
+    )
+
+    async def _eval(_ctx: Any) -> PolicyResult:
+        return ask_result
+
+    held_phases: list[Phase] = []
+
+    async def _fake_hold(
+        _request: Any,
+        *,
+        session_id: str,
+        phase: Phase,
+        data: dict[str, Any],
+        engine: Any,
+        result: PolicyResult,
+        conversation_store: Any,
+    ) -> bool:
+        """Stand in for the server-side approval park; simulate approve.
+
+        Records the phase so the test can assert the ASK was routed
+        through the gate at the REQUEST phase (not the old pending path).
+
+        :returns: ``True`` — the user clicked Approve.
+        """
+        held_phases.append(phase)
+        return True
+
+    with (
+        patch(_CACHE_PATCH) as mock_cache,
+        patch(_ENGINE_PATCH) as mock_build,
+        patch(_HOLD_GATE_PATCH, new=_fake_hold),
+    ):
+        mock_cache.return_value.load.return_value = loaded
+        mock_engine = mock_build.return_value
+        mock_engine.evaluate = _eval
+        mock_engine.apply_label_writes = lambda x: None
+
+        result = await _evaluate_input_policy(
+            _FakeRequest(),
+            "sess_1",
+            conv,
+            body,
+            conv_store,
+            agent_store,
+            None,
+        )
+
+    # The ASK was routed through the server-side approval park, at the
+    # REQUEST phase. If this is empty, the input path skipped the gate
+    # (the regressed "pending"/silent-deny path); a non-REQUEST phase
+    # would mean the wrong gate fired.
+    assert held_phases == [Phase.REQUEST]
+    # Approve -> None -> the /events handler forwards the message. A dict
+    # here would mean the message was wrongly blocked despite approval.
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_input_ask_declined_denies():
+    """A REQUEST-phase ASK the user DECLINES (or times out) collapses to DENY.
+
+    The fail-closed half of the request-phase round-trip: when the
+    server-side park returns ``False`` (decline / cancel / timeout),
+    ``_evaluate_input_policy`` returns a deny verdict carrying the
+    deciding policy's reason so the /events handler refuses to forward
+    the message.
+    """
+    conv_store = _FakeConversationStore()
+    agent_store = _FakeAgentStore(agent=_make_agent())
+    conv = conv_store.get_conversation("sess_1")
+    body = _make_user_message_body("delete the file /tmp/policy-demo.txt")
+
+    spec = _make_spec_with_guardrails()
+    loaded = LoadedAgent(spec=spec, workdir="/tmp/fake")
+    ask_result = PolicyResult(
+        action=PolicyAction.ASK,
+        reason="Deleting files requires approval",
+        deciding_policy="llm_prompt_classifier_policy",
+    )
+
+    async def _eval(_ctx: Any) -> PolicyResult:
+        return ask_result
+
+    async def _fake_hold(
+        _request: Any,
+        *,
+        session_id: str,
+        phase: Phase,
+        data: dict[str, Any],
+        engine: Any,
+        result: PolicyResult,
+        conversation_store: Any,
+    ) -> bool:
+        """Stand in for the server-side approval park; simulate decline.
+
+        :returns: ``False`` — the user declined / the gate timed out.
+        """
+        return False
+
+    with (
+        patch(_CACHE_PATCH) as mock_cache,
+        patch(_ENGINE_PATCH) as mock_build,
+        patch(_HOLD_GATE_PATCH, new=_fake_hold),
+    ):
+        mock_cache.return_value.load.return_value = loaded
+        mock_engine = mock_build.return_value
+        mock_engine.evaluate = _eval
+        mock_engine.apply_label_writes = lambda x: None
+
+        result = await _evaluate_input_policy(
+            _FakeRequest(),
+            "sess_1",
+            conv,
+            body,
+            conv_store,
+            agent_store,
+            None,
+        )
+
+    # Decline -> deny verdict carrying the deciding policy's reason. A
+    # ``None`` here would mean a declined ASK silently let the message
+    # through (the dangerous direction).
+    assert result["verdict"] == "deny"
+    assert result["reason"] == "Deleting files requires approval"
 
 
 # ── OUTPUT policy tests (step 5.7) ──────────────────────────

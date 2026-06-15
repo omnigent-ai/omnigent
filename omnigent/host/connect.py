@@ -1283,8 +1283,14 @@ class HostProcess:
             managed-host token header or — only when a token could be
             minted — ``{"Authorization": "Bearer <token>"}``.
         """
-        headers: dict[str, str] = {}
         from omnigent.host.identity import HOST_TOKEN_ENV_VAR, MANAGED_HOST_TOKEN_HEADER
+        from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+
+        # Identify as a first-party client so the server's WebSocket origin
+        # guard (CSWSH protection) allows the handshake — the host process
+        # is not a browser. Seeded before either auth branch so it is sent
+        # on both the managed-token and Bearer paths.
+        headers: dict[str, str] = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
 
         managed_token = os.environ.get(HOST_TOKEN_ENV_VAR)
         if managed_token:

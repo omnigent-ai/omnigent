@@ -319,7 +319,7 @@ function reusablePrefix(
   // could change lifecycle/error without a block change — don't reuse.
   const activeId = activeResponse?.responseId;
   if (activeId !== undefined) {
-  for (const b of prefix) {
+    for (const b of prefix) {
       if (b.kind === "assistant" && b.responseId === activeId) return null;
     }
   }
@@ -461,11 +461,12 @@ function walkBubbles(
     if (groupBlocks.length > 0 && groupBlocks.every((bk) => bk.type === "tool_result")) {
       continue;
     }
-    const lifecycle = groupHasInterruptedText(groupBlocks) || interruptedResponses.has(groupResponseId)
-      ? "cancelled"
-      : activeResponse?.responseId === groupResponseId
-        ? activeResponse.state
-        : "completed";
+    const lifecycle =
+      groupHasInterruptedText(groupBlocks) || interruptedResponses.has(groupResponseId)
+        ? "cancelled"
+        : activeResponse?.responseId === groupResponseId
+          ? activeResponse.state
+          : "completed";
     const error = activeResponse?.responseId === groupResponseId ? activeResponse.error : null;
 
     const subIndex = subIndexByResp.get(groupResponseId) ?? 0;
