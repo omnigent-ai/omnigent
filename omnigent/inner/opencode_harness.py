@@ -36,6 +36,36 @@ Env vars read at startup:
   **Defaults to ``True``** because a headless meta-harness has
   nowhere to surface interactive permission prompts; set to
   ``"0"`` only when you've arranged for permission UI elsewhere.
+
+Gateway-routing env vars — synthesise an ``OPENCODE_CONFIG_CONTENT``
+provider override per ``packages/opencode/src/config/config.ts``.
+The override is layered on top of the user's global
+``~/.config/opencode/config.json`` (non-destructive); the executor
+also sets ``OPENCODE_DISABLE_PROJECT_CONFIG=1`` whenever any of
+these are non-empty, so a user-project ``opencode.json`` cannot
+silently re-introduce a provider/MCP entry the operator wanted
+suppressed.
+
+- ``HARNESS_OPENCODE_GATEWAY_PROVIDER``: provider id whose
+  ``options`` get overridden, e.g. ``"anthropic"`` (default) or
+  ``"openai"``. Unset → no override.
+- ``HARNESS_OPENCODE_GATEWAY_BASE_URL``: ``options.baseURL`` for the
+  chosen provider. Typical value: a Databricks AI gateway endpoint
+  like ``https://<workspace>.databricks.com/serving-endpoints/<id>``.
+- ``HARNESS_OPENCODE_GATEWAY_API_KEY``: ``options.apiKey`` for the
+  chosen provider. Required alongside ``BASE_URL`` for the
+  gateway-routing override to take effect.
+
+MCP-bridge env var:
+
+- ``HARNESS_OPENCODE_MCP_SERVERS``: JSON object of
+  ``{server_name: ConfigMCPV1.Info}`` entries merged into the
+  ``OPENCODE_CONFIG_CONTENT`` ``mcp`` map. Used by the workflow to
+  point OpenCode at an Omnigent-owned MCP endpoint so spec tools
+  round-trip through the standard dispatch path. Include
+  ``{"<server>": {"enabled": false}}`` entries to suppress any of
+  the user's globally-registered MCP servers that would otherwise
+  leak in.
 """
 
 from __future__ import annotations

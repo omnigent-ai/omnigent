@@ -75,7 +75,6 @@ CURSOR_KEY = "cursor"
 # Moonshot API key), not via the ambient provider config; like Cursor it ships
 # via a curl installer rather than npm, so it carries an ``install_hint``.
 KIMI_KEY = "kimi"
-
 # Kiro authenticates against its own backend and ships as a standalone native
 # installer, not an npm package managed by ``omni setup``.
 KIRO_KEY = "kiro"
@@ -338,6 +337,11 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     # returns its install spec and ``missing_harness_cli`` fails loud
     # before a subagent spawn.
     KIMI_KEY: KIMI_KEY,
+    # OpenCode is multi-provider but still binary-gated: it cannot launch
+    # without the ``opencode`` CLI on ``PATH``. Listed here so
+    # ``required_cli_for_harness`` returns its install spec and
+    # ``missing_harness_cli`` fails loud before a subagent spawn.
+    OPENCODE_KEY: OPENCODE_KEY,
     "cursor-native": CURSOR_KEY,
     "native-cursor": CURSOR_KEY,
     "kiro-native": KIRO_KEY,

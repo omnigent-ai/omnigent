@@ -115,6 +115,7 @@ _ProviderHarness: TypeAlias = Literal[
     "antigravity",
     "kimi",
     "qwen",
+    "opencode",
 ]
 
 # Harness spellings -> the workflow harness whose provider resolution they
@@ -152,6 +153,12 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, _ProviderHarness] = {
     "native-antigravity": "antigravity",
     "agy-native": "antigravity",
     "native-agy": "antigravity",
+    # OpenCode is multi-provider; it shares no resolution path with
+    # an existing harness. The identity entry keeps callers that
+    # iterate this map (e.g. ``list_models_for_worker``) finding the
+    # harness so they don't fall through to a noisy "unknown harness"
+    # branch.
+    "opencode": "opencode",
 }
 
 # cursor-agent always routes through its own stored login — there is no
