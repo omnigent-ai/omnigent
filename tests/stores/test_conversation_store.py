@@ -3864,3 +3864,103 @@ def test_add_daily_cost_stacks_after_ask_approved(
     # ask_approved untouched throughout.
     assert state["cost_usd"] == pytest.approx(2.5)
     assert state["ask_approved_usd"] == pytest.approx(2.0)
+
+
+# ── set_session_state ─────────────────────────────────────────────────────
+
+
+def test_set_session_state_persists(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """set_session_state writes a JSON-serializable dict to the conversation."""
+    conv = conversation_store.create_conversation()
+    state = {"cursor": 42, "flags": ["a", "b"]}
+    conversation_store.set_session_state(conv.id, state)
+
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.session_state == state
+
+
+def test_set_session_state_overwrites(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """set_session_state replaces the entire state dict."""
+    conv = conversation_store.create_conversation()
+    conversation_store.set_session_state(conv.id, {"v": 1})
+    conversation_store.set_session_state(conv.id, {"v": 2, "new_key": True})
+
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.session_state == {"v": 2, "new_key": True}
+
+
+def test_set_session_state_empty_dict(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """set_session_state with empty dict clears state."""
+    conv = conversation_store.create_conversation()
+    conversation_store.set_session_state(conv.id, {"old": True})
+    conversation_store.set_session_state(conv.id, {})
+
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.session_state == {}
+
+
+# ── set_session_usage ─────────────────────────────────────────────────────
+
+
+def test_set_session_usage_persists(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """set_session_usage writes token usage to the conversation."""
+    conv = conversation_store.create_conversation()
+    usage = {"input_tokens": 1500, "output_tokens": 350, "total_tokens": 1850}
+    conversation_store.set_session_usage(conv.id, usage)
+
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.session_usage == usage
+
+
+def test_set_session_usage_overwrites(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """set_session_usage replaces the entire usage dict."""
+    conv = conversation_store.create_conversation()
+    conversation_store.set_session_usage(conv.id, {"input_tokens": 100})
+    conversation_store.set_session_usage(conv.id, {"input_tokens": 200, "output_tokens": 50})
+
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.session_usage == {"input_tokens": 200, "output_tokens": 50}
+
+
+# ── list_conversations_by_host_id ─────────────────────────────────────────
+
+
+def test_list_conversations_by_host_id_returns_matching(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """list_conversations_by_host_id returns conversations bound to the host."""
+    _register_host(db_uri, "host_byhost")
+    conv = conversation_store.create_conversation(
+        host_id="host_byhost",
+        workspace="/tmp/ws",
+    )
+    conversation_store.create_conversation()  # no host_id
+
+    result = conversation_store.list_conversations_by_host_id("host_byhost")
+    assert len(result) == 1
+    assert result[0].id == conv.id
+
+
+def test_list_conversations_by_host_id_empty(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """list_conversations_by_host_id returns empty list when no match."""
+    conversation_store.create_conversation()
+    result = conversation_store.list_conversations_by_host_id("host_nonexistent")
+    assert result == []

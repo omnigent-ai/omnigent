@@ -390,3 +390,281 @@ def test_delete_wrong_session(
     )
     assert store.delete("pol_del_x", other_session_id) is False
     assert store.get("pol_del_x", session_id) is not None
+
+
+# ── Default (server-wide) policy methods ──────────────────────────────────────
+
+
+def test_create_default_returns_policy(store: SqlAlchemyPolicyStore) -> None:
+    """create_default inserts a server-wide policy with session_id=None."""
+    policy = store.create_default(
+        policy_id="dpol_1",
+        name="default_block",
+        type="python",
+        handler="mod.default_handler",
+    )
+    assert policy.id == "dpol_1"
+    assert policy.session_id is None
+    assert policy.name == "default_block"
+    assert policy.type == "python"
+    assert policy.handler == "mod.default_handler"
+    assert policy.enabled is True
+    assert policy.created_at > 0
+    assert policy.updated_at is None
+
+
+def test_create_default_with_factory_params(store: SqlAlchemyPolicyStore) -> None:
+    """create_default stores factory_params as JSON."""
+    policy = store.create_default(
+        policy_id="dpol_fp",
+        name="parameterized",
+        type="python",
+        handler="mod.func",
+        factory_params={"threshold": 0.5, "mode": "strict"},
+    )
+    assert policy.factory_params == {"threshold": 0.5, "mode": "strict"}
+
+
+def test_create_default_with_created_by(store: SqlAlchemyPolicyStore) -> None:
+    """create_default stores the created_by field."""
+    policy = store.create_default(
+        policy_id="dpol_cb",
+        name="audited",
+        type="python",
+        handler="mod.func",
+        created_by="admin@example.com",
+    )
+    assert policy.created_by == "admin@example.com"
+
+
+def test_create_default_duplicate_name_raises(store: SqlAlchemyPolicyStore) -> None:
+    """create_default with a duplicate name raises IntegrityError."""
+    store.create_default(
+        policy_id="dpol_dup1",
+        name="unique_default",
+        type="python",
+        handler="mod.func",
+    )
+    with pytest.raises(IntegrityError):
+        store.create_default(
+            policy_id="dpol_dup2",
+            name="unique_default",
+            type="python",
+            handler="mod.func2",
+        )
+
+
+def test_create_default_same_name_as_session_policy_ok(
+    store: SqlAlchemyPolicyStore,
+    session_id: str,
+) -> None:
+    """A default policy may share a name with a session-scoped policy."""
+    store.create(
+        policy_id="pol_session",
+        session_id=session_id,
+        name="shared_name",
+        type="python",
+        handler="mod.func",
+    )
+    default = store.create_default(
+        policy_id="dpol_shared",
+        name="shared_name",
+        type="python",
+        handler="mod.default_func",
+    )
+    assert default.session_id is None
+
+
+def test_get_default_returns_policy(store: SqlAlchemyPolicyStore) -> None:
+    """get_default fetches a default policy by ID."""
+    store.create_default(
+        policy_id="dpol_get",
+        name="fetchable",
+        type="python",
+        handler="mod.func",
+    )
+    fetched = store.get_default("dpol_get")
+    assert fetched is not None
+    assert fetched.id == "dpol_get"
+    assert fetched.name == "fetchable"
+
+
+def test_get_default_returns_none_for_missing(store: SqlAlchemyPolicyStore) -> None:
+    """get_default returns None when policy does not exist."""
+    assert store.get_default("dpol_missing") is None
+
+
+def test_get_default_returns_none_for_session_policy(
+    store: SqlAlchemyPolicyStore,
+    session_id: str,
+) -> None:
+    """get_default returns None for a session-scoped policy."""
+    store.create(
+        policy_id="pol_sess_only",
+        session_id=session_id,
+        name="session_only",
+        type="python",
+        handler="mod.func",
+    )
+    assert store.get_default("pol_sess_only") is None
+
+
+def test_list_defaults_returns_all_in_order(store: SqlAlchemyPolicyStore) -> None:
+    """list_defaults returns all default policies ordered by created_at ASC."""
+    store.create_default(policy_id="dpol_l1", name="first", type="python", handler="mod.a")
+    store.create_default(policy_id="dpol_l2", name="second", type="python", handler="mod.b")
+    defaults = store.list_defaults()
+    assert len(defaults) == 2
+    assert defaults[0].name == "first"
+    assert defaults[1].name == "second"
+
+
+def test_list_defaults_excludes_session_policies(
+    store: SqlAlchemyPolicyStore,
+    session_id: str,
+) -> None:
+    """list_defaults does not return session-scoped policies."""
+    store.create(
+        policy_id="pol_sess",
+        session_id=session_id,
+        name="session_pol",
+        type="python",
+        handler="mod.func",
+    )
+    store.create_default(
+        policy_id="dpol_only",
+        name="default_only",
+        type="python",
+        handler="mod.func",
+    )
+    defaults = store.list_defaults()
+    assert len(defaults) == 1
+    assert defaults[0].name == "default_only"
+
+
+def test_list_defaults_empty(store: SqlAlchemyPolicyStore) -> None:
+    """list_defaults returns empty list when no default policies exist."""
+    assert store.list_defaults() == []
+
+
+def test_update_default_changes_name(store: SqlAlchemyPolicyStore) -> None:
+    """update_default with name= changes the name and bumps updated_at."""
+    store.create_default(
+        policy_id="dpol_upd1",
+        name="old_name",
+        type="python",
+        handler="mod.func",
+    )
+    updated = store.update_default("dpol_upd1", name="new_name")
+    assert updated is not None
+    assert updated.name == "new_name"
+    assert updated.updated_at is not None
+
+
+def test_update_default_changes_handler(store: SqlAlchemyPolicyStore) -> None:
+    """update_default with handler= changes the handler."""
+    store.create_default(
+        policy_id="dpol_upd2",
+        name="handler_pol",
+        type="python",
+        handler="mod.old_func",
+    )
+    updated = store.update_default("dpol_upd2", handler="mod.new_func")
+    assert updated is not None
+    assert updated.handler == "mod.new_func"
+
+
+def test_update_default_changes_enabled(store: SqlAlchemyPolicyStore) -> None:
+    """update_default with enabled=False disables the policy."""
+    store.create_default(
+        policy_id="dpol_upd3",
+        name="toggle_default",
+        type="python",
+        handler="mod.func",
+    )
+    updated = store.update_default("dpol_upd3", enabled=False)
+    assert updated is not None
+    assert updated.enabled is False
+
+
+def test_update_default_noop_does_not_bump_timestamp(store: SqlAlchemyPolicyStore) -> None:
+    """update_default with no changes does not bump updated_at."""
+    store.create_default(
+        policy_id="dpol_noop",
+        name="noop_pol",
+        type="python",
+        handler="mod.func",
+    )
+    updated = store.update_default("dpol_noop")
+    assert updated is not None
+    assert updated.updated_at is None
+
+
+def test_update_default_returns_none_for_missing(store: SqlAlchemyPolicyStore) -> None:
+    """update_default returns None when policy does not exist."""
+    assert store.update_default("dpol_missing", name="x") is None
+
+
+def test_update_default_returns_none_for_session_policy(
+    store: SqlAlchemyPolicyStore,
+    session_id: str,
+) -> None:
+    """update_default returns None for a session-scoped policy."""
+    store.create(
+        policy_id="pol_not_default",
+        session_id=session_id,
+        name="not_default",
+        type="python",
+        handler="mod.func",
+    )
+    assert store.update_default("pol_not_default", name="new") is None
+
+
+def test_update_default_duplicate_name_raises(store: SqlAlchemyPolicyStore) -> None:
+    """update_default rejects a name that collides with another default."""
+    store.create_default(
+        policy_id="dpol_ren1",
+        name="name_a",
+        type="python",
+        handler="mod.func",
+    )
+    store.create_default(
+        policy_id="dpol_ren2",
+        name="name_b",
+        type="python",
+        handler="mod.func",
+    )
+    with pytest.raises(IntegrityError):
+        store.update_default("dpol_ren2", name="name_a")
+
+
+def test_delete_default_removes_policy(store: SqlAlchemyPolicyStore) -> None:
+    """delete_default removes the policy and returns True."""
+    store.create_default(
+        policy_id="dpol_del1",
+        name="to_delete",
+        type="python",
+        handler="mod.func",
+    )
+    assert store.delete_default("dpol_del1") is True
+    assert store.get_default("dpol_del1") is None
+
+
+def test_delete_default_idempotent(store: SqlAlchemyPolicyStore) -> None:
+    """delete_default on a missing policy returns False."""
+    assert store.delete_default("dpol_missing") is False
+
+
+def test_delete_default_rejects_session_policy(
+    store: SqlAlchemyPolicyStore,
+    session_id: str,
+) -> None:
+    """delete_default returns False for a session-scoped policy."""
+    store.create(
+        policy_id="pol_no_del",
+        session_id=session_id,
+        name="cant_delete_as_default",
+        type="python",
+        handler="mod.func",
+    )
+    assert store.delete_default("pol_no_del") is False
