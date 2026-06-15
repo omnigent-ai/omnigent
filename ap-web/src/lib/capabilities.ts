@@ -92,8 +92,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
         const data = (await res.json()) as Partial<ServerInfo>;
         _cached = {
           accounts_enabled: data.accounts_enabled === true,
-          login_url:
-            typeof data.login_url === "string" ? data.login_url : null,
+          login_url: typeof data.login_url === "string" ? data.login_url : null,
           needs_setup: data.needs_setup === true,
           databricks_features: data.databricks_features === true,
           managed_sandboxes_enabled: data.managed_sandboxes_enabled === true,
@@ -146,7 +145,6 @@ const _SANDBOX_PROVIDER_NAMES: Record<string, string> = {
 export function sandboxOptionLabel(provider: string | null): string {
   if (!provider) return "New Sandbox";
   const name =
-    _SANDBOX_PROVIDER_NAMES[provider] ??
-    provider.charAt(0).toUpperCase() + provider.slice(1);
+    _SANDBOX_PROVIDER_NAMES[provider] ?? provider.charAt(0).toUpperCase() + provider.slice(1);
   return `${name} Sandbox`;
 }

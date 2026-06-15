@@ -11,3 +11,10 @@ required-version = ">=0.11.8"
 # only re-applied when a resolution actually runs (`uv lock`, `--upgrade`,
 # `--refresh`, or a dependency change).
 exclude-newer = "P7D"
+
+# Per-package cooldown exemption: cwsandbox is a first-party CoreWeave SDK
+# pinned to an exact, tested version (the `cwsandbox` extra). Exempt just this
+# package from the P7D cooldown so the lock can pin 0.26.0 before the window
+# elapses; the global cooldown still applies to every other dependency. Drop
+# this once 0.26.0 (published 2026-06-11) has aged past P7D.
+exclude-newer-package = { cwsandbox = "2026-06-12T00:00:00Z" }

@@ -405,6 +405,19 @@ def test_block_skills_slash_command_bare_slash_allows() -> None:
     assert result["result"] == "ALLOW"
 
 
+@pytest.mark.parametrize("text", ["/ ", "/   ", "/\t"])
+def test_block_skills_slash_then_whitespace_allows(text: str) -> None:
+    """A slash followed only by whitespace passes through without crashing.
+
+    ``split(None, ...)`` drops empty tokens, so ``"/ ".split()`` is an
+    empty list. The command extraction must not index ``[0]`` blindly,
+    or evaluation raises ``IndexError`` and the request fails closed.
+    """
+    policy = block_skills(blocked=["git-stack"])
+    result = policy(_request_event(text))
+    assert result["result"] == "ALLOW"
+
+
 # ── ask_on_add_policy ──────────────────────────────────────────
 
 

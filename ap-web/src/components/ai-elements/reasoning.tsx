@@ -1,22 +1,10 @@
 "use client";
 
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from "@/components/ui/collapsible";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { cn } from "@/lib/utils";
 import { ChevronRightIcon, SparklesIcon } from "lucide-react";
 import type { ComponentProps, ReactNode } from "react";
-import {
-  createContext,
-  memo,
-  useCallback,
-  useContext,
-  useEffect,
-  useMemo,
-  useState,
-} from "react";
+import { createContext, memo, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { Streamdown } from "streamdown";
 
 import { Shimmer } from "./shimmer";
@@ -89,7 +77,7 @@ export const Reasoning = memo(
 
     const contextValue = useMemo(
       () => ({ duration, isOpen, isStreaming, setIsOpen: handleOpenChange, expandable }),
-      [duration, isOpen, isStreaming, handleOpenChange, expandable]
+      [duration, isOpen, isStreaming, handleOpenChange, expandable],
     );
 
     return (
@@ -107,12 +95,10 @@ export const Reasoning = memo(
         </Collapsible>
       </ReasoningContext.Provider>
     );
-  }
+  },
 );
 
-export type ReasoningTriggerProps = ComponentProps<
-  typeof CollapsibleTrigger
-> & {
+export type ReasoningTriggerProps = ComponentProps<typeof CollapsibleTrigger> & {
   getThinkingMessage?: (isStreaming: boolean, duration?: number) => ReactNode;
 };
 
@@ -145,14 +131,12 @@ export const ReasoningTrigger = memo(
     const label = (
       <>
         <SparklesIcon className="size-3.5 shrink-0" />
-        <span className="min-w-0 flex-1 truncate">
-          {getThinkingMessage(isStreaming, duration)}
-        </span>
+        <span className="min-w-0 flex-1 truncate">{getThinkingMessage(isStreaming, duration)}</span>
         {expandable && (
           <ChevronRightIcon
             className={cn(
               "size-3.5 shrink-0 transition-transform",
-              isOpen ? "rotate-90" : "rotate-0"
+              isOpen ? "rotate-90" : "rotate-0",
             )}
           />
         )}
@@ -167,7 +151,7 @@ export const ReasoningTrigger = memo(
         <div
           className={cn(
             "flex w-full items-center gap-1.5 py-0.5 text-left text-muted-foreground text-xs",
-            className
+            className,
           )}
         >
           {children ?? label}
@@ -179,53 +163,49 @@ export const ReasoningTrigger = memo(
       <CollapsibleTrigger
         className={cn(
           "flex w-full cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-xs transition-colors hover:text-foreground",
-          className
+          className,
         )}
         {...props}
       >
         {children ?? label}
       </CollapsibleTrigger>
     );
-  }
+  },
 );
 
-export type ReasoningContentProps = ComponentProps<
-  typeof CollapsibleContent
-> & {
+export type ReasoningContentProps = ComponentProps<typeof CollapsibleContent> & {
   children: string;
 };
 
-export const ReasoningContent = memo(
-  ({ className, children, ...props }: ReasoningContentProps) => {
-    const { expandable } = useReasoning();
+export const ReasoningContent = memo(({ className, children, ...props }: ReasoningContentProps) => {
+  const { expandable } = useReasoning();
 
-    // Non-expandable section has no content to reveal — render nothing so
-    // there's no empty collapsible region under the flat header.
-    if (!expandable) return null;
+  // Non-expandable section has no content to reveal — render nothing so
+  // there's no empty collapsible region under the flat header.
+  if (!expandable) return null;
 
-    return (
-      <CollapsibleContent
-        className={cn(
-          "mt-1 ml-2 border-l pl-3 py-1 text-xs",
-          "data-[state=closed]:fade-out-0 data-[state=closed]:slide-out-to-top-2 data-[state=open]:slide-in-from-top-2 text-muted-foreground outline-none data-[state=closed]:animate-out data-[state=open]:animate-in",
-          className
-        )}
-        {...props}
+  return (
+    <CollapsibleContent
+      className={cn(
+        "mt-1 ml-2 border-l pl-3 py-1 text-xs",
+        "data-[state=closed]:fade-out-0 data-[state=closed]:slide-out-to-top-2 data-[state=open]:slide-in-from-top-2 text-muted-foreground outline-none data-[state=closed]:animate-out data-[state=open]:animate-in",
+        className,
+      )}
+      {...props}
+    >
+      <Streamdown
+        plugins={STREAMDOWN_PLUGINS}
+        // Let links open on a plain click (and cmd/ctrl-click in a new tab)
+        // instead of Streamdown's default "Open external link?" modal.
+        linkSafety={CHAT_LINK_SAFETY}
+        // Block remote image fetches that can exfiltrate data through URLs.
+        rehypePlugins={SECURE_STREAMDOWN_REHYPE_PLUGINS}
       >
-        <Streamdown
-          plugins={STREAMDOWN_PLUGINS}
-          // Let links open on a plain click (and cmd/ctrl-click in a new tab)
-          // instead of Streamdown's default "Open external link?" modal.
-          linkSafety={CHAT_LINK_SAFETY}
-          // Block remote image fetches that can exfiltrate data through URLs.
-          rehypePlugins={SECURE_STREAMDOWN_REHYPE_PLUGINS}
-        >
-          {children}
-        </Streamdown>
-      </CollapsibleContent>
-    );
-  }
-);
+        {children}
+      </Streamdown>
+    </CollapsibleContent>
+  );
+});
 
 Reasoning.displayName = "Reasoning";
 ReasoningTrigger.displayName = "ReasoningTrigger";

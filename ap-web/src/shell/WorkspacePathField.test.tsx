@@ -13,10 +13,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { splitTypedPath, WorkspacePathField } from "./WorkspacePathField";
-import {
-  useHostFilesystem,
-  type HostFilesystemEntry,
-} from "@/hooks/useHostFilesystem";
+import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
 
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: vi.fn(),
@@ -118,7 +115,13 @@ describe("WorkspacePathField", () => {
     dir("projects", "/Users/corey/projects"),
     dir("downloads", "/Users/corey/downloads"),
     dir(".hidden", "/Users/corey/.hidden"),
-    { name: "readme.txt", path: "/Users/corey/readme.txt", type: "file", bytes: 10, modified_at: 0 },
+    {
+      name: "readme.txt",
+      path: "/Users/corey/readme.txt",
+      type: "file",
+      bytes: 10,
+      modified_at: 0,
+    },
   ];
 
   beforeEach(() => {
@@ -144,9 +147,7 @@ describe("WorkspacePathField", () => {
     );
     fireEvent.focus(screen.getByTestId("workspace-path-input"));
     expect(screen.getByTestId("workspace-path-dropdown")).toBeTruthy();
-    expect(screen.getByTestId("workspace-match-0").textContent).toContain(
-      "/Users/corey/projects",
-    );
+    expect(screen.getByTestId("workspace-match-0").textContent).toContain("/Users/corey/projects");
     // Files and dot-dirs are filtered out — a workspace must be a
     // visible directory.
     expect(screen.queryByText("/Users/corey/readme.txt")).toBeNull();

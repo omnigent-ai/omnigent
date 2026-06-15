@@ -408,13 +408,14 @@ function FileRowItem({
   conversationId: string | undefined;
 }) {
   const isDeleted = fileStatus === "deleted";
-  const fileColorClass = fileStatus === "created"
-    ? "text-green-500 dark:text-green-400"
-    : fileStatus === "modified"
-    ? "text-amber-500 dark:text-amber-400"
-    : isDeleted
-    ? "text-destructive"
-    : undefined;
+  const fileColorClass =
+    fileStatus === "created"
+      ? "text-green-500 dark:text-green-400"
+      : fileStatus === "modified"
+        ? "text-amber-500 dark:text-amber-400"
+        : isDeleted
+          ? "text-destructive"
+          : undefined;
   const { handlers, tooltip } = useCursorTooltip(path);
 
   return (
@@ -430,7 +431,9 @@ function FileRowItem({
           onClick={() => !isDeleted && onFileSelect(path)}
           disabled={isDeleted}
         >
-          <FileIcon className={cn("size-3.5 shrink-0", fileColorClass ?? "text-muted-foreground")} />
+          <FileIcon
+            className={cn("size-3.5 shrink-0", fileColorClass ?? "text-muted-foreground")}
+          />
           <span
             className={cn(
               "min-w-0 flex-1 truncate font-mono text-sm md:text-xs",
@@ -449,8 +452,8 @@ function FileRowItem({
                 isDeleted
                   ? "bg-destructive/10 text-destructive"
                   : fileStatus === "created"
-                  ? "bg-green-500/10 text-green-600 dark:text-green-400"
-                  : "bg-amber-500/10 text-amber-600 dark:text-amber-400",
+                    ? "bg-green-500/10 text-green-600 dark:text-green-400"
+                    : "bg-amber-500/10 text-amber-600 dark:text-amber-400",
               )}
               title={gitStatusLabel(fileStatus)}
             >
@@ -577,24 +580,28 @@ function TreeNodeRow({
   // Build the child node list: for lazy dirs use fetched data (converted
   // directly — no need to run buildTree since the API returns one level at a
   // time); otherwise use the statically known children.
-  const rawChildNodes: TreeNode[] = isLazyDir && lazyData
-    ? lazyData.map((file): TreeNode => {
-        if (file.type === "directory") {
-          return { type: "dir", name: file.name, path: file.path, children: [], lazy: true };
-        }
-        return { type: "file", name: file.name, file };
-      })
-    : node.children;
-  const childNodes = showHidden ? rawChildNodes : rawChildNodes.filter((n) => !n.name.startsWith("."));
+  const rawChildNodes: TreeNode[] =
+    isLazyDir && lazyData
+      ? lazyData.map((file): TreeNode => {
+          if (file.type === "directory") {
+            return { type: "dir", name: file.name, path: file.path, children: [], lazy: true };
+          }
+          return { type: "file", name: file.name, file };
+        })
+      : node.children;
+  const childNodes = showHidden
+    ? rawChildNodes
+    : rawChildNodes.filter((n) => !n.name.startsWith("."));
 
   const dirStatus = dirtyDirMap.get(node.path);
-  const dirDotClass = dirStatus === "created"
-    ? "text-green-500 dark:text-green-400"
-    : dirStatus === "modified"
-    ? "text-amber-500 dark:text-amber-400"
-    : dirStatus === "deleted"
-    ? "text-destructive"
-    : undefined;
+  const dirDotClass =
+    dirStatus === "created"
+      ? "text-green-500 dark:text-green-400"
+      : dirStatus === "modified"
+        ? "text-amber-500 dark:text-amber-400"
+        : dirStatus === "deleted"
+          ? "text-destructive"
+          : undefined;
 
   return (
     <li>
@@ -612,13 +619,19 @@ function TreeNodeRow({
             open && "rotate-90",
           )}
         />
-        <span className={cn(
-          "min-w-0 flex-1 truncate font-mono text-sm md:text-xs",
-          dirStatus === "created" && "font-semibold",
-          dirDotClass,
-        )}>{node.name}/</span>
+        <span
+          className={cn(
+            "min-w-0 flex-1 truncate font-mono text-sm md:text-xs",
+            dirStatus === "created" && "font-semibold",
+            dirDotClass,
+          )}
+        >
+          {node.name}/
+        </span>
         {dirStatus && (
-          <span className={cn("shrink-0 text-[8px] leading-none", dirDotClass)} aria-hidden>●</span>
+          <span className={cn("shrink-0 text-[8px] leading-none", dirDotClass)} aria-hidden>
+            ●
+          </span>
         )}
       </button>
       {open && (

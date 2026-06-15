@@ -16,9 +16,7 @@ import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
 import { findPmRangeForComment } from "./TipTapEditorHelpers";
 
-export const commentDecorationKey = new PluginKey<DecorationSet>(
-  "commentDecoration",
-);
+export const commentDecorationKey = new PluginKey<DecorationSet>("commentDecoration");
 
 export interface CommentDecorationState {
   comments: Comment[];
@@ -30,10 +28,7 @@ export interface CommentDecorationState {
   onClickComment: (comment: Comment) => void;
 }
 
-function buildDecorations(
-  doc: ProseMirrorNode,
-  state: CommentDecorationState,
-): DecorationSet {
+function buildDecorations(doc: ProseMirrorNode, state: CommentDecorationState): DecorationSet {
   const { comments, activeSelection, rawContent, pendingRange } = state;
   const decos: Decoration[] = [];
 
@@ -108,15 +103,11 @@ export function createCommentDecorationExtension(
             },
             handleDOMEvents: {
               click(_, event) {
-                const target = (event.target as Element).closest(
-                  "[data-comment-id]",
-                );
+                const target = (event.target as Element).closest("[data-comment-id]");
                 if (!target) return false;
                 const id = target.getAttribute("data-comment-id");
                 if (!id || !stateRef.current) return false;
-                const comment = stateRef.current.comments.find(
-                  (c) => c.id === id,
-                );
+                const comment = stateRef.current.comments.find((c) => c.id === id);
                 if (comment) {
                   stateRef.current.onClickComment(comment);
                   return true;

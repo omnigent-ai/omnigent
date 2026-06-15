@@ -54,7 +54,9 @@ const FORMATTERS: Record<string, ArgFormatter> = {
   },
   sys_session_get_history: (args) => {
     const id = asString(args.conversation_id);
-    return id === null ? verbOnly("Get session history") : { verb: "Get session history:", body: id };
+    return id === null
+      ? verbOnly("Get session history")
+      : { verb: "Get session history:", body: id };
   },
   sys_session_close: (args) => sessionTitle("Close child session:", args),
   sys_session_list: () => verbOnly("List child sessions"),
@@ -77,9 +79,7 @@ const FORMATTERS: Record<string, ArgFormatter> = {
   // Async dispatch + inbox.
   sys_call_async: (args) => {
     const tool = asString(args.tool);
-    return tool === null
-      ? verbOnly("Dispatch async")
-      : { verb: "Dispatch async:", body: tool };
+    return tool === null ? verbOnly("Dispatch async") : { verb: "Dispatch async:", body: tool };
   },
   sys_read_inbox: () => verbOnly("Read inbox"),
   list_tasks: () => verbOnly("List tasks"),

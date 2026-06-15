@@ -4013,7 +4013,8 @@ def resume(
 
     run_resume(
         target=target,
-        server=server,
+        # A bare Databricks workspace URL means its /api/2.0/omnigent mount.
+        server=_workspace_api_server_url(server) if server else server,
     )
 
 
@@ -4532,7 +4533,8 @@ def _resolve_attach_server(server: str | None, configured_server: str | None) ->
     """
     chosen = server if server is not None else configured_server
     if chosen:
-        return chosen.rstrip("/")
+        # A bare Databricks workspace URL means its /api/2.0/omnigent mount.
+        return _workspace_api_server_url(chosen.rstrip("/"))
     local = local_server_url_if_healthy()
     return local.rstrip("/") if local else None
 
@@ -5069,7 +5071,8 @@ def _resolve_host_server(server: str | None) -> str | None:
     if server is None:
         configured = _load_effective_config().get("server")
         server = str(configured) if configured else None
-    return server.rstrip("/") if server else None
+    # A bare Databricks workspace URL means its /api/2.0/omnigent mount.
+    return _workspace_api_server_url(server.rstrip("/")) if server else None
 
 
 def _daemon_base_url(record: _HostDaemonRecord) -> str | None:

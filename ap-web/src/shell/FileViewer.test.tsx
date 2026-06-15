@@ -76,7 +76,12 @@ vi.mock("@/hooks/useFileDiff", () => ({
 
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
   useWorkspaceChangedFiles: vi.fn(() => ({
-    data: { available: true, data: [{ path: "file1.py", bytes: 10, modified_at: null, name: "file1.py", status: "modified" }] },
+    data: {
+      available: true,
+      data: [
+        { path: "file1.py", bytes: 10, modified_at: null, name: "file1.py", status: "modified" },
+      ],
+    },
   })),
 }));
 
@@ -170,7 +175,14 @@ interface RenderProps {
  * real browser environment. A LocationDisplay sibling lets tests read
  * the current params after state changes.
  */
-function viewerTree({ open = false, path = "file1.py", initialSearch = "", onClose = vi.fn(), sort, onNavigateTo }: RenderProps = {}) {
+function viewerTree({
+  open = false,
+  path = "file1.py",
+  initialSearch = "",
+  onClose = vi.fn(),
+  sort,
+  onNavigateTo,
+}: RenderProps = {}) {
   const url = initialSearch ? `/?${initialSearch}` : "/";
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return (
@@ -226,7 +238,14 @@ function installContentWidth(width: number): void {
   }
   vi.stubGlobal("ResizeObserver", StubResizeObserver);
   vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
-    width, height: 0, top: 0, left: 0, right: width, bottom: 0, x: 0, y: 0,
+    width,
+    height: 0,
+    top: 0,
+    left: 0,
+    right: width,
+    bottom: 0,
+    x: 0,
+    y: 0,
     toJSON: () => ({}),
   } as DOMRect);
 }
@@ -379,7 +398,18 @@ describe("FileViewer prev/next navigation order", () => {
     } finally {
       // Restore the default single-file mock for later tests.
       vi.mocked(useWorkspaceChangedFiles).mockReturnValue({
-        data: { available: true, data: [{ path: "file1.py", bytes: 10, modified_at: null, name: "file1.py", status: "modified" }] },
+        data: {
+          available: true,
+          data: [
+            {
+              path: "file1.py",
+              bytes: 10,
+              modified_at: null,
+              name: "file1.py",
+              status: "modified",
+            },
+          ],
+        },
       } as ReturnType<typeof useWorkspaceChangedFiles>);
     }
   });
@@ -443,7 +473,9 @@ describe("FileViewer URL sync — diff param", () => {
       expect(screen.getByText("Loading diff…")).toBeInTheDocument();
     } finally {
       // Restore the default (payload present) so later tests render the diff.
-      vi.mocked(useFileDiff).mockReturnValue({ data: { before: "old", after: "new" } } as ReturnType<typeof useFileDiff>);
+      vi.mocked(useFileDiff).mockReturnValue({
+        data: { before: "old", after: "new" },
+      } as ReturnType<typeof useFileDiff>);
     }
   });
 });
@@ -563,14 +595,13 @@ describe("FileViewer copy-link button", () => {
     useCommentsMock.mockReturnValue(makeCommentsQuery([]));
     renderViewer({ open: true });
 
-    expect(
-      screen.getByRole("button", { name: "Copy link to file" }),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy link to file" })).toBeInTheDocument();
   });
 });
 
 function makeAnchoredComment(
-  overrides: Partial<Comment> & Pick<Comment, "id" | "start_index" | "end_index" | "anchor_content">,
+  overrides: Partial<Comment> &
+    Pick<Comment, "id" | "start_index" | "end_index" | "anchor_content">,
 ): Comment {
   return {
     conversation_id: "conv_1",
@@ -757,13 +788,7 @@ describe("FileViewer header close affordance", () => {
     render(
       <QueryClientProvider client={queryClient}>
         <MemoryRouter initialEntries={["/"]}>
-          <FileViewer
-            frameless
-            open
-            conversationId="conv_1"
-            path="file1.py"
-            onClose={vi.fn()}
-          />
+          <FileViewer frameless open conversationId="conv_1" path="file1.py" onClose={vi.fn()} />
         </MemoryRouter>
       </QueryClientProvider>,
     );
@@ -891,7 +916,12 @@ describe("FileViewer keyboard shortcut — Alt+← / Alt+→", () => {
 
   afterEach(() => {
     vi.mocked(useWorkspaceChangedFiles).mockReturnValue({
-      data: { available: true, data: [{ path: "file1.py", bytes: 10, modified_at: null, name: "file1.py", status: "modified" }] },
+      data: {
+        available: true,
+        data: [
+          { path: "file1.py", bytes: 10, modified_at: null, name: "file1.py", status: "modified" },
+        ],
+      },
     } as ReturnType<typeof useWorkspaceChangedFiles>);
   });
 

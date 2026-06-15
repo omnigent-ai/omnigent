@@ -1555,6 +1555,52 @@ async def test_download_session_file_content(
     )
     assert resp.status_code == 200
     assert resp.content == b"hello world"
+    # The content route must force a download and forbid MIME sniffing
+    # so a browser never renders user-uploaded bytes as an active type
+    # in the server's origin. A failure here means the stored-XSS
+    # hardening was dropped and the response is renderable inline again.
+    assert resp.headers["content-disposition"] == (
+        "attachment; filename=\"hello.txt\"; filename*=UTF-8''hello.txt"
+    )
+    assert resp.headers["x-content-type-options"] == "nosniff"
+
+
+@pytest.mark.asyncio
+async def test_download_session_file_html_is_attachment_not_inline(
+    file_client: httpx.AsyncClient,
+) -> None:
+    """An uploaded .html must be served as a download, not rendered inline.
+
+    Reproduces the stored-XSS vector: a user uploads ``evil.html``
+    with a ``<script>`` body. Without the hardening the route would
+    return ``Content-Type: text/html`` with no disposition, letting a
+    browser execute the script in the server origin. The disposition +
+    nosniff headers neutralize that.
+    """
+    upload = await file_client.post(
+        "/v1/sessions/conv_proxy/resources/files",
+        files={
+            "file": (
+                "evil.html",
+                b"<script>alert(document.domain)</script>",
+                "text/html",
+            ),
+        },
+    )
+    file_id = upload.json()["id"]
+
+    resp = await file_client.get(
+        f"/v1/sessions/conv_proxy/resources/files/{file_id}/content",
+    )
+    assert resp.status_code == 200
+    # The bytes are still served verbatim — we don't mangle content,
+    # we only change how the browser is told to handle them.
+    assert resp.content == b"<script>alert(document.domain)</script>"
+    # attachment => browser downloads instead of rendering the script.
+    assert resp.headers["content-disposition"].startswith("attachment;")
+    assert 'filename="evil.html"' in resp.headers["content-disposition"]
+    # nosniff => the browser won't second-guess the declared type.
+    assert resp.headers["x-content-type-options"] == "nosniff"
 
 
 @pytest.mark.asyncio

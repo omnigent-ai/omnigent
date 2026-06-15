@@ -59,7 +59,9 @@ import * as runnerHook from "@/hooks/RunnerHealthProvider";
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-function makeSyncResult(overrides: Partial<ReturnType<typeof syncHook.useMarkdownEditorSync>> = {}) {
+function makeSyncResult(
+  overrides: Partial<ReturnType<typeof syncHook.useMarkdownEditorSync>> = {},
+) {
   return {
     editorKey: 1,
     isDirty: false,
@@ -85,7 +87,9 @@ function setupReadOnlyHooks() {
   vi.mocked(runnerHook.useSessionRunnerOnline).mockReturnValue(undefined);
 }
 
-function setupEditHooks(syncOverrides: Partial<ReturnType<typeof syncHook.useMarkdownEditorSync>> = {}) {
+function setupEditHooks(
+  syncOverrides: Partial<ReturnType<typeof syncHook.useMarkdownEditorSync>> = {},
+) {
   vi.mocked(permissions.useCanEdit).mockReturnValue(true);
   vi.mocked(syncHook.useMarkdownEditorSync).mockReturnValue(makeSyncResult(syncOverrides));
   vi.mocked(writeHook.useWriteFileContent).mockReturnValue({
@@ -195,7 +199,10 @@ describe("MarkdownRichTextViewer dirty banners", () => {
     setupEditHooks({ isDirty: true, hasExternalUpdate: false });
     // Override the write hook to report an in-flight PUT.
     vi.mocked(writeHook.useWriteFileContent).mockReturnValue({
-      isPending: true, isError: false, reset: vi.fn(), mutateAsync: vi.fn(),
+      isPending: true,
+      isError: false,
+      reset: vi.fn(),
+      mutateAsync: vi.fn(),
     } as unknown as ReturnType<typeof writeHook.useWriteFileContent>);
     renderViewer("content");
     expect(screen.getByText(/Saving… commenting is available once saved/)).toBeDefined();

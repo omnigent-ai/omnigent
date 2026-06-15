@@ -43,9 +43,7 @@ export interface CommentInbox {
  *     callers can pass their list unfiltered.
  */
 export function useCommentInbox(rows: Conversation[]): CommentInbox {
-  const commentRows = rows.filter(
-    (row) => !row.archived && (row.comments_count ?? 0) > 0,
-  );
+  const commentRows = rows.filter((row) => !row.archived && (row.comments_count ?? 0) > 0);
   const queries = useQueries({
     queries: commentRows.map((row) => ({
       queryKey: commentsQueryKey(row.id),
