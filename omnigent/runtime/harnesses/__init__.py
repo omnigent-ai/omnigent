@@ -41,6 +41,8 @@ _HARNESS_MODULES: dict[str, str] = {
     "claude-native": "omnigent.inner.claude_native_harness",
     # Native Codex TUI terminal bridge used by ``omnigent codex``.
     "codex-native": "omnigent.inner.codex_native_harness",
+    # Cursor Agent CLI harness wrap. See omnigent/inner/cursor_harness.py.
+    "cursor": "omnigent.inner.cursor_harness",
     # Step 4c: codex harness wrap. See
     # omnigent/inner/codex_harness.py.
     "codex": "omnigent.inner.codex_harness",

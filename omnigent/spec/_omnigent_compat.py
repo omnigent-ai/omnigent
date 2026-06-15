@@ -78,6 +78,7 @@ OMNIGENT_HARNESSES = frozenset(
         "claude-sdk",
         "codex",
         "codex-native",
+        "cursor",
         "databricks_supervisor",
         "openai-agents",
         "open-responses",

@@ -1218,6 +1218,30 @@ def _build_pi_spawn_env(
     return env
 
 
+def _build_cursor_spawn_env(
+    spec: AgentSpec,
+    *,
+    workdir: Path | None = None,
+) -> dict[str, str]:
+    """
+    Build the env-var dict the Cursor harness wrap reads.
+
+    Cursor Agent CLI owns its provider/auth configuration; Omnigent
+    supplies model, cwd/sandbox, and display metadata.
+    """
+    del workdir
+    env: dict[str, str] = {}
+    model = _resolve_spec_model(spec)
+    if model is not None:
+        env["HARNESS_CURSOR_MODEL"] = model
+    if spec.name:
+        env["HARNESS_CURSOR_AGENT_NAME"] = spec.name
+    os_env_payload = _serialize_os_env(spec.os_env)
+    if os_env_payload is not None:
+        env["HARNESS_CURSOR_OS_ENV"] = os_env_payload
+    return env
+
+
 def _load_global_auth() -> ApiKeyAuth | DatabricksAuth | None:
     """
     Load the ``auth:`` block from ``~/.omnigent/config.yaml``.
