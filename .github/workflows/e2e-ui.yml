@@ -63,16 +63,8 @@ env:
   # expected the agent to fall back to ~/.databrickscfg, but the SDK's
   # default-profile lookup didn't resolve our OAuth M2M config in CI,
   # which is what was failing the LLM calls.
-  #
-  # ANTHROPIC_API_KEY / CODEX / CLAUDE_CODE stay scrubbed (matching
-  # e2e.yml): the native claude-native harness routes through the Databricks
-  # gateway's anthropic surface via the ~/.databrickscfg profile +
-  # DATABRICKS_BEARER written below, NOT a vendor API key. DATABRICKS_TOKEN
-  # is intentionally NOT scrubbed here (it was, before): the message
-  # render-parity suite's claude-native agent needs the Databricks profile to
-  # resolve, and an empty DATABRICKS_TOKEN in the env would shadow the profile
-  # and break that auth.
   ANTHROPIC_API_KEY: ""
+  DATABRICKS_TOKEN: ""
   CODEX: ""
   CLAUDE_CODE: ""
   # Match e2e.yml's proxy choice.
@@ -151,87 +143,23 @@ jobs:
       - name: Set LLM credentials
         run: echo "LLM_API_KEY=${{ secrets.LLM_API_KEY }}" >> "$GITHUB_ENV"
 
-      - name: Write gateway profile (~/.databrickscfg)
-        # The message render-parity suite spins up claude-native ("Claude
-        # Code") and codex-native ("Codex") sessions. Both resolve their
-        # model provider from the Databricks gateway profile (the gateway
-        # serves the OpenAI surface for codex AND the anthropic surface for
-        # claude-native), exactly like e2e.yml's native rows. The
-        # openai-agents hello_world agent the other UI tests use is
-        # unaffected — it authenticates via OPENAI_API_KEY / OPENAI_BASE_URL
-        # set in the "Run UI e2e tests" step.
-        env:
-          GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-        run: |
-          # Strip the /serving-endpoints suffix the conftest re-appends.
-          host="${GATEWAY_BASE_URL%/serving-endpoints}"
-          cat > "$HOME/.databrickscfg" <<EOF
-          [default]
-          host  = $host
-          token = $LLM_API_KEY
-          EOF
-          # PAT passthrough for the codex / claude-native auth commands.
-          echo "DATABRICKS_BEARER=$LLM_API_KEY" >> "$GITHUB_ENV"
-
-      - name: Pre-seed Claude Code first-run state (~/.claude.json)
-        # The claude-native render-parity test drives the real Claude Code TUI
-        # in a PTY. On a fresh CI $HOME, Claude's first-run theme picker + the
-        # workspace-trust dialog block the TUI before it renders its prompt, so
-        # the process exits ("[server exited]") and the turn never completes —
-        # the only thing that differs from a developer's machine, where
-        # ~/.claude.json already records onboarding + a trusted workspace. Seed
-        # "already onboarded" + trust the workspace (the runner's cwd = Claude's
-        # cwd = $GITHUB_WORKSPACE) to clear both gates, mirroring the native e2e
-        # suite's _seed_onboarded_claude_home. Auth is separate (the gateway
-        # profile above + the conftest's provider config). CI-only: a workflow
-        # step, so a dev's real ~/.claude.json is never touched.
-        run: |
-          cat > "$HOME/.claude.json" <<EOF
-          {
-            "hasCompletedOnboarding": true,
-            "theme": "dark",
-            "lastOnboardingVersion": "2.0.0",
-            "projects": {
-              "${GITHUB_WORKSPACE}": {
-                "hasTrustDialogAccepted": true,
-                "hasCompletedProjectOnboarding": true
-              }
-            }
-          }
-          EOF
-
       - name: Install project + dev extras
         run: uv sync --extra all --extra dev
 
-      - name: Install binary dependencies
-        # bubblewrap: the UI tests boot a real server and open terminals,
-        # which run under os_env. An agent/terminal that omits
-        # `os_env.sandbox.type` defaults to `linux_bwrap` on Linux and fails
-        # loud at runtime if `bwrap` is missing (rather than silently running
-        # unsandboxed). The apparmor sysctl mirrors ci.yml: Ubuntu 24.04
-        # blocks unprivileged user namespaces by default, which `bwrap`'s
-        # `unshare(CLONE_NEWUSER)` needs.
-        #
-        # tmux + claude/codex CLIs: the render-parity suite drives the
-        # claude-native / codex-native harnesses, which launch the vendor
-        # CLI in a tmux-backed terminal. `npm install` against
-        # `.github/ci-deps/package.json` pins the CLI versions;
-        # `--ignore-scripts` blocks arbitrary postinstall across every
-        # package. `@anthropic-ai/claude-code` ships a stub at
-        # `bin/claude.exe`; its `install.cjs` only does platform detection
-        # plus a same-tree copy of the native binary from
-        # `optionalDependencies` (no network, no external execution), so we
-        # run it explicitly while `--ignore-scripts` still gates the rest.
-        # `@openai/codex` has `scripts: null`. Mirrors e2e.yml exactly.
+      - name: Install bubblewrap
+        # The UI tests boot a real server and open terminals, which run
+        # under os_env. An agent/terminal that omits `os_env.sandbox.type`
+        # defaults to `linux_bwrap` on Linux and fails loud at runtime if
+        # `bwrap` is missing (rather than silently running unsandboxed), so
+        # the terminal never launches and the right-panel terminal assertion
+        # fails. Install `bubblewrap` like ci.yml / e2e.yml. The apparmor
+        # sysctl mirrors ci.yml: Ubuntu 24.04 blocks unprivileged user
+        # namespaces by default, which `bwrap`'s `unshare(CLONE_NEWUSER)`
+        # needs.
         run: |
           sudo apt-get update
-          sudo apt-get install -y tmux bubblewrap
+          sudo apt-get install -y bubblewrap
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          cd .github/ci-deps
-          npm install --ignore-scripts
-          node node_modules/@anthropic-ai/claude-code/install.cjs
-          echo "${GITHUB_WORKSPACE}/.github/ci-deps/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Cache Playwright browsers
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
@@ -339,18 +267,7 @@ jobs:
           # on GitHub-hosted runners. The previous glob targeted
           # ``e2e_ui_logs*``, which never matched, so the artifact was
           # always empty.
-          #
-          # The sibling runner subprocess writes ``runner.log`` next to it,
-          # and respawned / external runners under ``e2e_ui_*runner*/``. The
-          # native-CLI harness (claude/codex) routing decisions and the vendor
-          # CLI's own output land there, NOT in server.log (which only carries
-          # HTTP access lines), so capture all of them — a native-turn failure
-          # (e.g. a provider that resolves to no credential) is otherwise
-          # undiagnosable from the artifacts alone.
-          path: |
-            /tmp/pytest-of-runner/**/e2e_ui_server*/server.log
-            /tmp/pytest-of-runner/**/e2e_ui_server*/runner.log
-            /tmp/pytest-of-runner/**/e2e_ui_*runner*/runner.log
+          path: /tmp/pytest-of-runner/**/e2e_ui_server*/server.log
           retention-days: 3
           if-no-files-found: ignore
 

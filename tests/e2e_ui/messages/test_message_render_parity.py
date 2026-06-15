@@ -1,9 +1,8 @@
 r"""UI journey: messages render identically to the transcript, with no dupes.
 
-Across three agent shapes — a custom ``openai-agents`` agent ("echo_probe"),
-``claude-native-ui`` ("Claude Code"), and ``codex-native-ui`` ("Codex") — this
-drives five real chat turns through the web composer and asserts two
-properties that historically regressed on the native CLI harnesses:
+Drives a custom ``openai-agents`` agent ("echo_probe") through five real chat
+turns via the web composer and asserts two properties that historically
+regressed on the native forwarder:
 
 1. **Render parity with the TUI.** The terminal UI (``omnigent/chat.py``) and
    the web SPA both render from the SAME canonical transcript,
@@ -27,13 +26,8 @@ chatty, and they survive any harness that splits a turn across multiple
 assistant blocks (the count is over bubbles containing the token, not over
 bubbles).
 
-The native ``claude-native`` agent requires the ``claude`` CLI on PATH; CI
-installs it (.github/workflows/e2e-ui.yml). The shared fixtures skip only when
-the server never registered the built-in.
-
-Only the custom and claude-native cases run here today. codex-native is not yet
-covered — see the note above ``custom``/``claude_code`` near the end of the
-module for the gateway-routing gap.
+The native CLI harnesses (claude-native, codex-native) are not covered here yet
+— see the note after ``test_custom_agent_message_render_parity``.
 """
 
 from __future__ import annotations
@@ -51,10 +45,8 @@ _WORKING = '[data-testid="working-indicator"]'
 
 _TURNS = 5
 
-# A custom openai-agents turn is a single LLM call; a native CLI turn pays
-# cold-launch + a real claude/codex round trip, so it gets a far larger budget.
+# A custom openai-agents turn is a single LLM call.
 _CUSTOM_TURN_TIMEOUT_MS = 90_000
-_NATIVE_TURN_TIMEOUT_MS = 180_000
 
 
 def _send(page: Page, text: str) -> None:
@@ -85,35 +77,6 @@ def _ensure_chat_view(page: Page) -> None:
     chat_button = view_mode.get_by_role("button", name="Chat")
     expect(chat_button).to_be_visible(timeout=30_000)
     chat_button.click()
-
-
-def _reveal_terminal_view(page: Page) -> None:
-    """Best-effort switch to the Terminal view so the failure capture shows the CLI pane.
-
-    A native CLI turn that produces no chat output fails silently from the
-    Chat view's perspective — the real error (auth/model rejection, a crash)
-    is in the vendor CLI's terminal pane, which neither the server log nor a
-    Chat-view trace records. Flipping to the Terminal view before re-raising
-    lets Playwright's on-failure screenshot / video / trace capture that pane,
-    turning the black-box timeout into a diagnosable artifact.
-
-    Best-effort by design: it runs on an already-failing path, so any error
-    here (no toggle, pane not ready) is swallowed — it must never mask the
-    original assertion failure.
-
-    :param page: The Playwright page, on the session's chat surface.
-    """
-    try:
-        view_mode = page.get_by_role("group", name="View mode")
-        if view_mode.count() == 0:
-            return
-        terminal_button = view_mode.get_by_role("button", name="Terminal")
-        terminal_button.click(timeout=10_000)
-        # Give the PTY pane a moment to attach and paint before the harness
-        # grabs the on-failure screenshot.
-        page.wait_for_timeout(2_000)
-    except Exception:  # noqa: BLE001 — diagnostic only; never mask the real failure
-        pass
 
 
 def _turn_prompt(index: int, user_marker: str, assistant_token: str) -> str:
@@ -291,16 +254,10 @@ def _run_render_parity_journey(
 
         _send(page, _turn_prompt(index, user_marker, assistant_token))
         # The echoed token in an assistant bubble = the turn produced its
-        # reply; only producible from this turn's prompt. If it never lands
-        # (a native CLI turn that silently produced nothing), flip to the
-        # Terminal view first so the on-failure capture shows the CLI pane.
-        try:
-            expect(page.locator(_ASSISTANT, has_text=assistant_token).first).to_be_visible(
-                timeout=per_turn_timeout_ms
-            )
-        except AssertionError:
-            _reveal_terminal_view(page)
-            raise
+        # reply; only producible from this turn's prompt.
+        expect(page.locator(_ASSISTANT, has_text=assistant_token).first).to_be_visible(
+            timeout=per_turn_timeout_ms
+        )
         # Turn fully settled before the next send, so any transient live
         # preview has collapsed into the committed bubble (the dedup check
         # below would otherwise race a mid-stream double).
@@ -322,22 +279,9 @@ def test_custom_agent_message_render_parity(
     )
 
 
-@pytest.mark.timeout(600)
-def test_claude_code_message_render_parity(
-    page: Page,
-    claude_code_session: tuple[str, str],
-) -> None:
-    base_url, session_id = claude_code_session
-    _run_render_parity_journey(
-        page, base_url, session_id, per_turn_timeout_ms=_NATIVE_TURN_TIMEOUT_MS
-    )
-
-
-# NOTE: codex-native ("Codex") is intentionally NOT covered here yet. In the
-# e2e_ui server's provider setup (OPENAI_API_KEY is set for the openai-agents
-# agents), Codex resolves the ambient `openai` provider and routes to the
-# gateway's generic openai surface rather than the `databricks` profile path
-# that e2e.yml's native-codex rows use, so its turns come back empty. The
-# reusable `codex_session` fixture (with the workspace + model_override fixes)
-# stays in the shared conftest for when that routing is sorted; re-add a
-# `test_codex_message_render_parity` then.
+# NOTE: the native CLI harnesses (claude-native "Claude Code", codex-native
+# "Codex") are intentionally NOT covered here yet. Driving the real vendor TUI
+# in a PTY needs CI-side setup (gateway auth + Claude Code first-run state) that
+# is owned by the native-harness CI enablement work; until that lands, this
+# suite covers the render-parity / no-duplicate logic via the custom
+# openai-agents agent above.

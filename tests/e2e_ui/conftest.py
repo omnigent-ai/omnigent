@@ -274,74 +274,6 @@ def _find_free_port() -> int:
         return s.getsockname()[1]
 
 
-def _maybe_isolate_gateway_config(mp: pytest.MonkeyPatch, config_home: Path) -> bool:
-    """Point native-claude at a gateway provider config when CI gateway creds exist.
-
-    The packaged ``claude-native-ui`` built-in spec declares no auth, so the
-    native-claude harness resolves its model provider from
-    ``~/.omnigent/config.yaml`` (``resolve_native_claude_config`` →
-    ``default_provider_for_harness``). On a developer machine that resolves to a
-    logged-in ``claude`` CLI (a subscription login); CI has no such login AND
-    scrubs ``ANTHROPIC_API_KEY``, so without an explicit provider the harness
-    launches Claude Code with no credentials and the turn never produces output
-    — the render-parity suite then times out waiting for the first reply (the
-    failure this guards against).
-
-    When the gateway creds the workflow already exports for the openai-agents
-    agents are present (``OPENAI_BASE_URL`` + ``OPENAI_API_KEY``), write a
-    ``gateway`` provider that serves the Databricks anthropic surface
-    (``<host>/ai-gateway/anthropic`` — see
-    ``omnigent/inner/claude_sdk_executor.py``) and point ``OMNIGENT_CONFIG_HOME``
-    at it via *mp* (mirroring ``test_model_catalog._isolate_config``), so
-    native-claude routes through the same gateway. The token is referenced
-    lazily as ``env:OPENAI_API_KEY`` so it reaches the runner (which resolves
-    the config) without baking the secret into a file. Only the ``anthropic``
-    family is declared, so openai family resolution (openai-agents / codex) is
-    untouched.
-
-    ``OMNIGENT_CONFIG_HOME`` is set only on the in-process ``os.environ`` (which
-    the spawned server + runner copy), and *mp* restores it on teardown — a
-    developer's real ``~/.omnigent/config.yaml`` is never read or written.
-    Locally (no gateway creds) this is a no-op and the subscription-login path
-    is preserved.
-
-    :param mp: A session-scoped :class:`pytest.MonkeyPatch` whose ``undo`` the
-        caller invokes on teardown.
-    :param config_home: Directory to write ``config.yaml`` into.
-    :returns: ``True`` when a config was written + the env pointed at it,
-        ``False`` when gateway creds were absent (the local no-op path).
-    """
-    import yaml
-
-    openai_base = os.environ.get("OPENAI_BASE_URL")
-    token = os.environ.get("OPENAI_API_KEY")
-    if not openai_base or not token:
-        return False
-    # The Databricks anthropic surface lives at ``<host>/ai-gateway/anthropic``;
-    # ``host`` is the gateway base minus the openai ``/serving-endpoints`` suffix.
-    host = openai_base.rstrip("/")
-    suffix = "/serving-endpoints"
-    if host.endswith(suffix):
-        host = host[: -len(suffix)]
-    config = {
-        "providers": {
-            "e2e-gateway": {
-                "kind": "gateway",
-                "default": True,
-                "anthropic": {
-                    "base_url": f"{host}/ai-gateway/anthropic",
-                    "api_key_ref": "env:OPENAI_API_KEY",
-                    "models": {"default": "databricks-claude-opus-4-8"},
-                },
-            }
-        }
-    }
-    config_home.mkdir(parents=True, exist_ok=True)
-    (config_home / "config.yaml").write_text(yaml.safe_dump(config, sort_keys=False))
-    mp.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
-    return True
-
-
 @pytest.fixture(scope="session")
 def built_spa(request: pytest.FixtureRequest) -> None:
     """
@@ -550,18 +482,6 @@ def live_server(
 
     binding_token = _secrets.token_urlsafe(32)
     runner_id = token_bound_runner_id(binding_token)
-    # Provision a native-claude gateway provider (CI only) so the
-    # ``claude-native-ui`` built-in authenticates through the Databricks gateway
-    # instead of a (CI-absent) Claude CLI login. The helper points
-    # ``OMNIGENT_CONFIG_HOME`` at an isolated dir via this MonkeyPatch BEFORE the
-    # server/runner env dicts are built below (they copy ``os.environ``), so
-    # every spawned process — including any runner respawn — resolves the same
-    # config. A session-scoped ``pytest.MonkeyPatch`` (the function-scoped
-    # fixture can't be used here) restores the env on teardown. A developer's
-    # real ``~/.omnigent/config.yaml`` is never touched; no-op locally (no
-    # gateway creds), preserving the subscription-login path.
-    _config_mp = pytest.MonkeyPatch()
-    _maybe_isolate_gateway_config(_config_mp, server_tmp / "omnigent_config")
     # PYTHONPATH forces the subprocess to import omnigent from
     # the worktree, not whatever's pip-installed in .venv —
     # otherwise a branch with code changes would silently run
@@ -667,7 +587,6 @@ def live_server(
                 proc.kill()
                 proc.wait(timeout=5)
         log_handle.close()
-        _config_mp.undo()
         log_text = log_path.read_text() if log_path.exists() else ""
         raise RuntimeError(
             f"`omnigent server` did not become healthy within "
@@ -687,7 +606,6 @@ def live_server(
         yield base_url
     finally:
         _server_state.clear()
-        _config_mp.undo()
         if runner_proc.poll() is None:
             runner_proc.send_signal(signal.SIGTERM)
             try:
@@ -1307,38 +1225,18 @@ def server_pid(live_server: str) -> int:
 # ---------------------------------------------------------------------------
 # Per-agent chat sessions (message render-parity suite, and reusable beyond it)
 #
-# Each fixture below yields ``(base_url, session_id)`` for a session bound to
-# the shared ``live_server`` runner, ready to chat at ``/c/<session_id>``,
-# across three agent shapes whose transcript-rendering paths differ:
+# ``custom_agent_session`` yields ``(base_url, session_id)`` for a session bound
+# to the shared ``live_server`` runner, ready to chat at ``/c/<session_id>``. It
+# registers a plain ``openai-agents`` agent (the ``echo_probe`` spec below) —
+# the same harness family as ``hello_world`` — fresh, so it stands in for "spin
+# up a different agent" without the multi-provider sprawl of the packaged
+# ``polly`` / ``debby`` examples.
 #
-# * ``custom_agent_session`` — a plain ``openai-agents`` agent (the
-#   ``echo_probe`` spec below), the same harness family as ``hello_world``,
-#   registered fresh so it stands in for "spin up a different agent" without
-#   the multi-provider sprawl of the packaged ``polly`` / ``debby`` examples.
-# * ``claude_code_session`` — the auto-registered ``claude-native-ui`` built-in
-#   (the ``claude-native`` CLI harness, "Claude Code").
-# * ``codex_session`` — the auto-registered ``codex-native-ui`` built-in (the
-#   ``codex-native`` CLI harness, "Codex").
-#
-# The two native built-ins are registered by ``_ensure_default_agents`` at
-# server startup (omnigent/server/app.py), so they exist on any ``omnigent
-# server`` without extra wiring — the fixtures just create a session bound to
-# them by durable agent id and PATCH it onto the runner, the same bind the
-# ``seeded_session`` fixture does for the bundled agent.
+# Native CLI built-ins (``claude-native-ui`` / ``codex-native-ui``) are not
+# wired up here yet: driving the real vendor TUI in a PTY needs CI-side setup
+# (gateway auth + Claude Code first-run state) owned by the native-harness CI
+# enablement work. Add those fixtures back alongside that effort.
 # ---------------------------------------------------------------------------
-
-# Names the server auto-registers for the two native CLI harnesses
-# (omnigent/server/app.py: _ensure_default_claude_agent /
-# _ensure_default_codex_agent). The matching CLI binary must be on PATH for
-# the harness to launch — callers skip when it is absent.
-CLAUDE_NATIVE_AGENT_NAME = "claude-native-ui"
-CODEX_NATIVE_AGENT_NAME = "codex-native-ui"
-
-# Model pinned on codex-native sessions — matches omnigent's own codex default
-# (omnigent/codex_native_app_server.py ``_DATABRICKS_CODEX_DEFAULT_MODEL``) and
-# is served by the Databricks gateway used in CI. See ``model_override`` on
-# :func:`_create_native_session` for why pinning is required.
-_NATIVE_CODEX_MODEL = "databricks-gpt-5-5"
 
 # A precise-echo agent on the openai-agents harness (same provider family as
 # hello_world, so it authenticates against the same gateway in CI). spec_version
@@ -1373,80 +1271,6 @@ def _bind_session_runner(base_url: str, session_id: str, runner_id: str) -> None
         timeout=10.0,
     )
     patch.raise_for_status()
-
-
-def _find_builtin_agent_id(base_url: str, name: str) -> str | None:
-    """Return the durable id of a built-in agent by name, or ``None``.
-
-    :param base_url: Spawned server base URL.
-    :param name: Registered agent name, e.g. ``"claude-native-ui"``.
-    :returns: The ``"ag_..."`` id, or ``None`` when the server did not
-        register it (e.g. the harness's CLI is unavailable).
-    """
-    resp = httpx.get(f"{base_url}/v1/agents", timeout=10.0)
-    resp.raise_for_status()
-    for agent in resp.json().get("data", []):
-        if agent.get("name") == name:
-            return str(agent["id"])
-    return None
-
-
-def _create_native_session(
-    base_url: str,
-    runner_id: str,
-    agent_name: str,
-    *,
-    workspace: str | None = None,
-    model_override: str | None = None,
-) -> str:
-    """Create a runner-bound session against a native built-in agent.
-
-    Native built-ins have ``session_id IS NULL``, so the JSON create body
-    (``{"agent_id": ...}``) is accepted and returns a ``SessionResponse``
-    whose ``id`` is the new session — unlike the multipart bundle create
-    (used for session-scoped agents) which returns ``session_id``.
-
-    :param base_url: Spawned server base URL.
-    :param runner_id: The token-bound runner id to bind.
-    :param agent_name: The native built-in name, e.g. ``"codex-native-ui"``.
-    :param workspace: Optional absolute path stored as the session's
-        workspace. Required for ``codex-native``: the runner refuses to
-        auto-launch the Codex terminal without a session workspace or
-        ``OMNIGENT_RUNNER_WORKSPACE`` (omnigent/runner/app.py
-        ``_codex_session_workspace``). With ``host_id`` unset the server
-        stores the path verbatim (no os_env boundary validation), so it
-        must already exist. ``claude-native`` does not need it.
-    :param model_override: Optional model id pinned on the session, passed
-        to the native CLI as ``--model`` at terminal launch. Required for
-        ``codex-native`` here: when an ``OPENAI_API_KEY`` is present (the
-        e2e_ui server sets one for the openai-agents agents) Codex resolves
-        the generic ``openai`` provider with no default model and launches
-        against a model the gateway doesn't serve, so the turn completes
-        with no output. Pinning a gateway-served model makes Codex reach a
-        real endpoint regardless of which provider it resolves.
-    :returns: The new session/conversation id.
-    :raises pytest.skip.Exception: When the built-in is not registered.
-    """
-    agent_id = _find_builtin_agent_id(base_url, agent_name)
-    if agent_id is None:
-        pytest.skip(
-            f"{agent_name!r} is not registered on the server — its CLI harness "
-            "is likely unavailable in this environment."
-        )
-    body: dict[str, object] = {"agent_id": agent_id}
-    if workspace is not None:
-        body["workspace"] = workspace
-    if model_override is not None:
-        body["model_override"] = model_override
-    create = httpx.post(
-        f"{base_url}/v1/sessions",
-        json=body,
-        timeout=30.0,
-    )
-    create.raise_for_status()
-    session_id = str(create.json()["id"])
-    _bind_session_runner(base_url, session_id, runner_id)
-    return session_id
 
 
 def _create_bundled_session(base_url: str, runner_id: str, yaml_text: str) -> str:
@@ -1496,61 +1320,6 @@ def custom_agent_session(
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
     session_id = _create_bundled_session(live_server, runner_id, _CUSTOM_AGENT_YAML)
-    try:
-        yield (live_server, session_id)
-    finally:
-        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
-        if respawned is not None:
-            respawned.terminate()
-            respawned.wait(timeout=5)
-
-
-@pytest.fixture
-def claude_code_session(
-    live_server: str,
-    tmp_path_factory: pytest.TempPathFactory,
-) -> Iterator[tuple[str, str]]:
-    """A runner-bound session on the ``claude-native-ui`` ("Claude Code") agent.
-
-    :param live_server: Spawned server fixture; its runner is reused.
-    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
-    :returns: ``(base_url, session_id)``.
-    """
-    respawned = _ensure_runner_online(live_server, tmp_path_factory)
-    runner_id = str(_server_state["runner_id"])
-    session_id = _create_native_session(live_server, runner_id, CLAUDE_NATIVE_AGENT_NAME)
-    try:
-        yield (live_server, session_id)
-    finally:
-        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
-        if respawned is not None:
-            respawned.terminate()
-            respawned.wait(timeout=5)
-
-
-@pytest.fixture
-def codex_session(
-    live_server: str,
-    tmp_path_factory: pytest.TempPathFactory,
-) -> Iterator[tuple[str, str]]:
-    """A runner-bound session on the ``codex-native-ui`` ("Codex") agent.
-
-    :param live_server: Spawned server fixture; its runner is reused.
-    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
-    :returns: ``(base_url, session_id)``.
-    """
-    respawned = _ensure_runner_online(live_server, tmp_path_factory)
-    runner_id = str(_server_state["runner_id"])
-    # Codex refuses to auto-launch its terminal without a workspace; give it
-    # a real (empty) dir to run in. claude-native needs no such thing.
-    workspace = tmp_path_factory.mktemp("codex_workspace")
-    session_id = _create_native_session(
-        live_server,
-        runner_id,
-        CODEX_NATIVE_AGENT_NAME,
-        workspace=str(workspace),
-        model_override=_NATIVE_CODEX_MODEL,
-    )
     try:
         yield (live_server, session_id)
     finally:
