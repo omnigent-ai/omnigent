@@ -33,6 +33,9 @@ export function harnessFamily(harness: string | null | undefined): "anthropic" |
     case "openai-agents":
     case "openai-agents-sdk":
     case "agents_sdk":
+    case "cursor":
+    case "mimo":
+    case "gemini":
       return "openai";
     default:
       return null;

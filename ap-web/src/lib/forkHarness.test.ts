@@ -18,6 +18,9 @@ describe("harnessFamily", () => {
     ["openai-agents", "openai"],
     ["openai-agents-sdk", "openai"],
     ["agents_sdk", "openai"],
+    ["cursor", "openai"],
+    ["mimo", "openai"],
+    ["gemini", "openai"],
   ])("maps %s → %s", (harness, family) => {
     expect(harnessFamily(harness)).toBe(family);
   });
@@ -40,6 +43,9 @@ describe("isNativeHarness", () => {
     ["claude_sdk", false],
     ["openai-agents", false],
     ["codex", false],
+    ["cursor", false],
+    ["mimo", false],
+    ["gemini", false],
     [null, false],
   ])("classifies %s as native=%s", (harness, expected) => {
     expect(isNativeHarness(harness as string | null)).toBe(expected);
@@ -50,7 +56,16 @@ describe("forkTargetCarriesHistory", () => {
   // SDK targets always carry history as context, regardless of source or
   // family — including native → SDK and cross-family. A false here would
   // wrongly hide a fully-supported switch from the picker.
-  it.each([["claude-sdk"], ["claude_sdk"], ["codex"], ["openai-agents"], ["agents_sdk"]])(
+  it.each([
+    ["claude-sdk"],
+    ["claude_sdk"],
+    ["codex"],
+    ["openai-agents"],
+    ["agents_sdk"],
+    ["cursor"],
+    ["mimo"],
+    ["gemini"],
+  ])(
     "SDK target %s carries history",
     (target) => {
       expect(forkTargetCarriesHistory(target)).toBe(true);

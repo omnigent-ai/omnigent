@@ -18,6 +18,8 @@ export const BRAIN_HARNESS_LABELS: Record<string, string> = {
   "openai-agents": "OpenAI Agents SDK",
   codex: "Codex",
   cursor: "Cursor",
+  mimo: "Mimo",
+  gemini: "Gemini",
   pi: "Pi",
 };
 

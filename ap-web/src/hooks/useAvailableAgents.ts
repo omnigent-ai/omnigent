@@ -24,9 +24,12 @@ const DISPLAY_NAMES: Record<string, string> = {
   "claude-native-ui": "Claude Code",
   "codex-native-ui": "Codex",
   "cursor-native-ui": "Cursor",
+  "mimo-native-ui": "Mimo",
+  "gemini-native-ui": "Gemini",
   // nessie is no longer seeded, but older deployments retain their row.
   nessie: "Nessie",
   polly: "Polly",
+  "polly-codex": "Polly Codex",
   debby: "Debby",
 };
 

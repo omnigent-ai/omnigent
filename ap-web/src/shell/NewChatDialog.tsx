@@ -62,7 +62,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 // returns agents newest-registered first (agent_store.list sorts by
 // created_at desc), so pin the order users expect; any agent not listed
 // here falls after, in server order.
-const AGENT_DISPLAY_ORDER = ["Claude Code", "Codex", "Polly"];
+const AGENT_DISPLAY_ORDER = ["Claude Code", "Codex", "Polly", "Polly Codex"];
 
 // Hidden on the new-session picker only (superseded by polly; older
 // deployments still carry a seeded nessie row this filter keeps out).
@@ -72,13 +72,14 @@ const NEW_SESSION_HIDDEN_AGENTS = new Set(["nessie"]);
 // truncate badly in the dropdown; other dialogs keep the server values.
 const AGENT_PICKER_DESCRIPTIONS: Record<string, string> = {
   polly: "Multi-agent coding",
+  "polly-codex": "Multi-agent coding with Codex brain",
   debby: "Multi-agent debate",
 };
 
 // Agents whose bundled skills render as always-visible pills under the
 // landing composer. Deliberately an allowlist while the pattern proves
 // out — other agents keep the "/" menu as the only skill surface.
-const SKILL_PILL_AGENTS = new Set(["polly", "debby"]);
+const SKILL_PILL_AGENTS = new Set(["polly", "polly-codex", "debby"]);
 
 // Claude Code's `claude --permission-mode` choices (v2.1). Claude-native
 // sessions only. "default" is Claude's own default and sends no flag; any
