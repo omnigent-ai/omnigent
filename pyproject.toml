@@ -143,7 +143,9 @@ dev = [
     "pytest-cov>=5",
     "pytest-playwright>=0.5",
     # Hash-partition the test suite across N shards for the nightly
-    # matrix. Pinned to a known-stable older release.
+    # matrix. Pinned to a known-stable older release. Used by e2e.yml;
+    # the e2e-ui suite uses its own round-robin `--splits`/`--group`
+    # split (see tests/e2e_ui/conftest.py), so no extra dep there.
     "pytest-shard==0.1.2",
     # Per-test wallclock cap. Without this, a single hung test (e.g.
     # a pexpect REPL test waiting for a terminal pattern that never

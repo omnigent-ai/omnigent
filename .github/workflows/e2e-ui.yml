@@ -238,14 +238,19 @@ jobs:
           if [[ "$NIGHTLY_FULL" != "true" ]]; then
             EXTRA_ARGS+=(-m "not nightly")
           fi
-          # --shard-id/--num-shards (pytest-shard) split the test node
-          # IDs deterministically across the matrix entries; same set
-          # of tests overall, just chunked.
+          # --splits/--group partition the suite across the matrix entries
+          # via a round-robin strided slice (see pytest_collection_modifyitems
+          # in tests/e2e_ui/conftest.py). Unlike pytest-shard's hash-bucketing
+          # -- which was blind to runtime and left one shard ~5min while
+          # others ran ~2min -- striding scatters each heavy file's cases
+          # one-per-shard, evening out wall-clock with no extra dependency
+          # and no durations file to maintain. --group is 1-indexed, so we
+          # map the 0-indexed matrix shard_id with +1.
           uv run pytest tests/e2e_ui \
             -v --tb=long --showlocals --log-level=INFO -r a \
             --ui-skip-build \
-            --shard-id="$SHARD_ID" \
-            --num-shards="$NUM_SHARDS" \
+            --splits="$NUM_SHARDS" \
+            --group="$((SHARD_ID + 1))" \
             --tracing=retain-on-failure \
             --screenshot=only-on-failure \
             --video=retain-on-failure \

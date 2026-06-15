@@ -205,6 +205,55 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "instead of rebuilding. Fails if no build is present."
         ),
     )
+    # Round-robin shard split for the e2e-ui CI matrix. We roll our own
+    # (rather than pull in pytest-shard / pytest-split) so the partition
+    # is a dependency-free strided slice -- see pytest_collection_modifyitems
+    # below for why striding beats hash-bucketing for wall-clock balance.
+    parser.addoption(
+        "--splits",
+        type=int,
+        default=None,
+        help="Total number of shards to split the UI suite into (CI matrix).",
+    )
+    parser.addoption(
+        "--group",
+        type=int,
+        default=None,
+        help="1-indexed shard this run executes (requires --splits).",
+    )
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(
+    config: pytest.Config,
+    items: list[pytest.Item],
+) -> None:
+    """Round-robin the collected UI tests across the CI shard matrix.
+
+    pytest-shard hash-buckets node IDs, which is blind to per-test
+    wall-clock and left one shard at ~5min while siblings finished in
+    ~2min. A *strided* slice -- ``items[group-1::splits]`` -- deals tests
+    out like cards instead, so a heavy file (whose cases collect
+    adjacently) scatters one-per-shard rather than landing in a single
+    bucket. That averages cost across shards without maintaining a
+    durations file.
+
+    No-op unless both ``--splits`` and ``--group`` are passed, so local
+    runs and the non-sharded suites are unaffected. ``trylast`` lets the
+    repo-wide known-failures marking in ``tests/conftest.py`` tag items
+    first; markers travel with the items the slice keeps.
+    """
+    splits = config.getoption("--splits")
+    group = config.getoption("--group")
+    if splits is None and group is None:
+        return
+    if splits is None or group is None:
+        raise pytest.UsageError("--splits and --group must be passed together")
+    if splits < 1:
+        raise pytest.UsageError("--splits must be >= 1")
+    if not 1 <= group <= splits:
+        raise pytest.UsageError(f"--group must be between 1 and {splits}")
+    items[:] = items[group - 1 :: splits]
 
 
 def _register_agent_yaml(
