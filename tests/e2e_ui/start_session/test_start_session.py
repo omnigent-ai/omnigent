@@ -76,14 +76,14 @@ def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
     and re-raised on the calling thread so the test fails normally.
 
     :param coro: The coroutine to run to completion.
-    :raises BaseException: Whatever the coroutine raised, re-raised here.
+    :raises Exception: Whatever the coroutine raised, re-raised here.
     """
-    captured: dict[str, BaseException] = {}
+    captured: dict[str, Exception] = {}
 
     def _worker() -> None:
         try:
             asyncio.run(coro)
-        except BaseException as exc:
+        except Exception as exc:
             captured["error"] = exc
 
     thread = threading.Thread(target=_worker)
