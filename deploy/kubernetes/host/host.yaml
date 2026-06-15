@@ -91,7 +91,11 @@ spec:
               # Rewrite github SSH remotes -> HTTPS so GIT_TOKEN covers them (no ssh
               # key needed). A self-hosted forge over HTTPS works the same way: add a
               # scoped `~/.git-credentials` entry + a matching `insteadOf` for its host.
-              git config --global url."https://github.com/".insteadOf "git@github.com:"
+              # --unset-all first so this is idempotent across restarts on the persistent
+              # PVC — a non---add set over an existing multi-value insteadOf errors under
+              # set -e ("cannot overwrite multiple values with a single value") -> CrashLoop.
+              git config --global --unset-all url."https://github.com/".insteadOf 2>/dev/null || true
+              git config --global --add url."https://github.com/".insteadOf "git@github.com:"
               git config --global --add url."https://github.com/".insteadOf "ssh://git@github.com/"
               # THE uid-1000 FIX: omnigent stats <cwd>/.omnigent/config.yaml; the image
               # WORKDIR is /root (root-owned) -> EACCES as uid 1000 -> CrashLoop. cd
