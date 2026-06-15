@@ -3581,7 +3581,7 @@ def test_bare_omnigent_tty_dispatches_to_run(
 
     monkeypatch.setattr(sys, "argv", ["omnigent"])
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
-    monkeypatch.setattr("omnigent.update_check.maybe_show_update_notice", Mock())
+
 
     dispatched: dict[str, list[str]] = {}
 
@@ -3602,7 +3602,7 @@ def test_bare_omnigent_rejects_positional_server_url(
     """Top-level server URLs must use ``run --server`` explicitly."""
     from omnigent.cli import main
 
-    monkeypatch.setattr("omnigent.update_check.maybe_show_update_notice", Mock())
+
     monkeypatch.setattr(sys, "argv", ["omnigent", "http://localhost:8000"])
 
     with pytest.raises(SystemExit) as exc_info:
@@ -3627,7 +3627,7 @@ def test_unknown_command_reports_no_such_command(
     """
     from omnigent.cli import main
 
-    monkeypatch.setattr("omnigent.update_check.maybe_show_update_notice", Mock())
+
     monkeypatch.setattr(sys, "argv", ["omnigent", "blah"])
 
     with pytest.raises(SystemExit) as exc_info:
