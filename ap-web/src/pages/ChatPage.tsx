@@ -742,6 +742,10 @@ export function ChatPage() {
     document.title = showsWorking ? `● ${base}` : base;
   }, [activeConv?.title, showsWorking, urlConvId]);
 
+  const codexModelOptions = useChatStore((s) => s.codexModelOptions);
+  const selectedModel = useChatStore((s) => s.selectedModel);
+  const llmModel = useChatStore((s) => s.llmModel);
+
   // Loading + error gates for `/c/:id` hydration.
   if (urlConvId) {
     if (loadingConversation) return <HydratingPlaceholder />;
@@ -832,9 +836,6 @@ export function ChatPage() {
     labels: activeSession ? (activeSession.labels ?? {}) : (activeConv?.labels ?? {}),
   };
   const modelPickerKind = modelPickerKindForConv(capabilitySource);
-  const codexModelOptions = useChatStore((s) => s.codexModelOptions);
-  const selectedModel = useChatStore((s) => s.selectedModel);
-  const llmModel = useChatStore((s) => s.llmModel);
   const effortLevels = effortLevelsForConv(
     capabilitySource,
     codexModelOptions,
