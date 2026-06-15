@@ -9207,6 +9207,11 @@ def create_runner_app(
                 return await _handle_claude_native_interrupt(conversation_id)
             if _harness == "codex-native":
                 return await _handle_codex_native_interrupt(conversation_id)
+            if _harness == "pi-native":
+                # The pi-native turn lives in the Pi TUI process; the runner's
+                # harness task already returned, so the cancel floor has nothing
+                # to cancel. Queue an abort to the resident extension instead.
+                return await _handle_pi_native_interrupt(conversation_id)
             # In-process harness: mark interrupted, forward an interrupt to the
             # harness, and force-cancel the runner turn task so the turn ends
             # promptly even if the harness can't honor the interrupt in time.
@@ -9270,6 +9275,10 @@ def create_runner_app(
                 return await _handle_claude_native_stop(conversation_id)
             if _harness == "codex-native":
                 return await _handle_codex_native_interrupt(conversation_id)
+            if _harness == "pi-native":
+                # Pi has no separate session-kill; abort the active turn via the
+                # extension (mirrors codex-native reusing its interrupt handler).
+                return await _handle_pi_native_interrupt(conversation_id)
             await _cancel_inprocess_turn(conversation_id)
             return Response(status_code=204)
 

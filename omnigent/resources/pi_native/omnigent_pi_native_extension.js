@@ -188,12 +188,14 @@ function startInboxPoller(pi, config, handleInterrupt) {
         }
       }
       if (payload.type === "interrupt") {
-        const accepted =
-          typeof handleInterrupt === "function" ? handleInterrupt() : false;
-        if (!accepted) {
-          seen.delete(payload.id);
-          continue;
-        }
+        // An interrupt is point-in-time: make one delivery attempt, then
+        // always consume the file (below). If there is no live turn to abort
+        // right now, the interrupt is simply dropped — leaving the file would
+        // re-read it every tick forever and, once a later turn creates an
+        // abortable context, abort that unrelated turn. requestInterrupt arms
+        // the pendingInterrupt window when it does catch a running turn, so a
+        // turn starting just after this still gets aborted via replay.
+        if (typeof handleInterrupt === "function") handleInterrupt();
       }
       try {
         fs.unlinkSync(fullPath);

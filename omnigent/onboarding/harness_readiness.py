@@ -41,6 +41,13 @@ from omnigent.onboarding.provider_config import (
 # / ``agents_sdk``) and the ``claude`` alias normalize onto these first.
 _SDK_HARNESSES: frozenset[str] = frozenset({"claude-sdk", "openai-agents", "openai-agents-sdk"})
 
+# CLI-wrapping pi harnesses. Both the bare ``pi`` surface and the native
+# ``pi-native`` wrapper launch the same ``pi`` binary (``canonicalize_harness``
+# folds ``native-pi`` → ``pi-native``). Unlike claude/codex they have no
+# ``_HARNESS_FAMILY`` entry — pi uses the ``PI_SURFACE`` sentinel — so they must
+# be gated explicitly or they fail open like an unknown harness.
+_PI_HARNESSES: frozenset[str] = frozenset({PI_SURFACE, "pi-native"})
+
 
 def _canonical_harness(harness: str) -> str:
     """Normalize a harness id to its canonical spelling.
@@ -74,15 +81,16 @@ def harness_is_configured(harness: str) -> bool:
     """Return whether *harness* can be launched on this machine.
 
     Only CLI-wrapping harnesses are assessed (native Claude/Codex and
-    ``pi``): they cannot run without their binary on ``PATH``, and that
-    is the one thing the daemon can check reliably and locally. SDK
-    harnesses and unknown harnesses always return ``True`` — their
-    readiness depends on runtime/ambient credentials the daemon can't
-    enumerate, so blocking them would risk false negatives that break
-    working launches.
+    ``pi`` / ``pi-native``): they cannot run without their binary on
+    ``PATH``, and that is the one thing the daemon can check reliably and
+    locally. SDK harnesses and unknown harnesses always return ``True`` —
+    their readiness depends on runtime/ambient credentials the daemon
+    can't enumerate, so blocking them would risk false negatives that
+    break working launches.
 
     :param harness: A harness id, e.g. ``"claude-native"``, ``"codex"``,
-        ``"openai-agents"``, ``"agents_sdk"``, or ``"pi"``.
+        ``"openai-agents"``, ``"agents_sdk"``, ``"pi"``, or
+        ``"pi-native"``.
     :returns: ``True`` when launchable (CLI installed, or a harness the
         daemon doesn't gate); ``False`` only when a CLI-wrapping
         harness's binary is missing from ``PATH``.
@@ -103,7 +111,7 @@ def harness_is_configured(harness: str) -> bool:
         from omnigent.onboarding.cursor_auth import cursor_api_key_configured
 
         return cursor_api_key_configured() or bool(os.environ.get("CURSOR_API_KEY"))
-    if canonical not in _HARNESS_FAMILY and canonical != PI_SURFACE:
+    if canonical not in _HARNESS_FAMILY and canonical not in _PI_HARNESSES:
         # Unknown harness — the daemon has no install metadata for it, so
         # it can't assess readiness. Fail open (custom/newer harnesses,
         # version skew).
@@ -127,6 +135,6 @@ def configured_harness_map() -> dict[str, bool]:
     spellings: set[str] = set(_HARNESS_FAMILY)
     spellings.update(_EXECUTOR_TYPE_HARNESS_ALIASES)
     spellings.update(HARNESS_ALIASES)
-    spellings.add(PI_SURFACE)
+    spellings.update(_PI_HARNESSES)
     spellings.add(CURSOR_KEY)
     return {spelling: harness_is_configured(spelling) for spelling in spellings}

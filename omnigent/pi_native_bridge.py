@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import os
 import tempfile
@@ -11,6 +12,12 @@ import uuid
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
+
+# Per-process tiebreaker for inbox ordering. The extension delivers inbox
+# files in lexicographic filename order, so a high-resolution timestamp alone
+# can still tie when two payloads are queued within the same nanosecond; the
+# counter disambiguates them in enqueue order.
+_ENQUEUE_SEQUENCE = itertools.count()
 
 PI_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_PI_NATIVE_BRIDGE_DIR"
 PI_NATIVE_REQUEST_SESSION_ID_ENV_VAR = "HARNESS_PI_NATIVE_REQUEST_SESSION_ID"
@@ -133,8 +140,17 @@ def enqueue_interrupt(bridge_dir: Path) -> str:
 def _enqueue_payload(bridge_dir: Path, item_id: str, payload: dict[str, Any]) -> None:
     inbox = bridge_dir / _INBOX_DIR
     inbox.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{item_id}.", suffix=".tmp", dir=str(inbox))
-    final_path = inbox / f"{item_id}.json"
+    # Order-preserving filename. The extension polls ``inbox/*.json`` and
+    # delivers them in lexicographic order, but ``item_id`` is a random uuid
+    # with no time ordering — and an ``interrupt_`` id sorts before a ``msg_``
+    # id regardless of which was queued first. Prefix with a zero-padded
+    # nanosecond timestamp plus a per-process counter so the on-disk sort
+    # matches enqueue order. The payload's ``id`` (used by the extension for
+    # dedup) stays ``item_id``; only the filename carries the ordinal.
+    ordinal = f"{time.time_ns():020d}_{next(_ENQUEUE_SEQUENCE):08d}"
+    file_stem = f"{ordinal}_{item_id}"
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{file_stem}.", suffix=".tmp", dir=str(inbox))
+    final_path = inbox / f"{file_stem}.json"
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, sort_keys=True)
