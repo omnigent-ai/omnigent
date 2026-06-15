@@ -403,7 +403,7 @@ check_tmux() {
 # fail to start. macOS sandboxes with the built-in seatbelt backend and needs
 # nothing here, so this check is Linux-only.
 check_bubblewrap() {
-  [ "$(uname -s)" = Linux ] || return
+  [ "$(uname -s)" = Linux ] || return 0
 
   if command -v bwrap >/dev/null 2>&1; then
     step "bubblewrap (bwrap) is available"
