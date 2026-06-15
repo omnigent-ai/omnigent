@@ -6,11 +6,9 @@ name: E2E UI Required
 # test" policy at PR time, where the author still has the change's intent in
 # head.
 #
-# ROLLOUT: ENFORCE: "true" -- the policy verdict (UI change without a covering
-# test or effective waiver) FAILS the job. For the failure to actually block
-# the merge button, also mark `E2E UI Required` as a required status check in
-# branch protection for main. Set ENFORCE back to "false" to return to
-# observe-only (warn but pass) if needed.
+# The policy verdict (UI change without a covering test or effective waiver)
+# FAILS the job. For the failure to actually block the merge button, mark
+# `E2E UI Required` as a required status check in branch protection for main.
 #
 # Whether the change "needs a test" is decided by an LLM judge (see
 # check.sh case 2), NOT a deterministic file-presence check -- so refactors,
@@ -86,8 +84,4 @@ jobs:
           OPENAI_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
           OPENAI_API_KEY: ${{ secrets.LLM_API_KEY }}
           E2E_UI_JUDGE_MODEL: databricks-gpt-5-4
-          # Blocking: the policy verdict ("UI change without a covering test /
-          # effective waiver") FAILS the job. Set to "false" for observe-only
-          # (warn but pass). Infra/config errors block regardless.
-          ENFORCE: "true"
         run: bash .github/scripts/e2e-ui-required/check.sh

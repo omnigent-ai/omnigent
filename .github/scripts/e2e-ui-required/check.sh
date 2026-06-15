@@ -35,38 +35,15 @@
 # PR-head code. Called from a base-branch (pull_request_target) job, so a PR
 # cannot edit this script to weaken its own gate.
 #
-# Rollout: ENFORCE (default "false") controls only the POLICY verdict -- i.e.
-# "this PR changes UI behavior and has no covering test or effective waiver".
-# While ENFORCE != "true" that verdict is emitted as a warning and the job
-# still passes (observe-only), so the check can be wired up and watched before
-# it gates merges. Flip ENFORCE to "true" (one env value in the workflow) to
-# make the policy verdict blocking. Infra/config errors (gateway unreachable,
-# unparseable verdict, no maintainers configured) ALWAYS block regardless --
-# those are broken-setup signals, not judgment calls.
-#
 # Env in:  GH_TOKEN, REPO, PR, MAINTAINERS (space-separated, from
 #          merge-ready/load-maintainers.sh), OPENAI_BASE_URL, OPENAI_API_KEY,
-#          E2E_UI_JUDGE_MODEL, ENFORCE (default "false").
-# Exit:    0 = gate satisfied (or observe-only); 1 = blocked.
+#          E2E_UI_JUDGE_MODEL.
+# Exit:    0 = gate satisfied; 1 = blocked.
 
 set -euo pipefail
 
-ENFORCE="${ENFORCE:-false}"
-
-# Hard error: broken setup / infra. Always blocks.
 fail() { echo "::error::$1"; exit 1; }
 pass() { echo "$1"; exit 0; }
-
-# Policy verdict: the PR does not satisfy the e2e_ui requirement. Blocks only
-# when ENFORCE=true; otherwise warns and passes (observe-only rollout).
-block() {
-  if [[ "$ENFORCE" == "true" ]]; then
-    echo "::error::$1"; exit 1
-  fi
-  echo "::warning::[observe-only, not blocking] $1"
-  echo "ENFORCE != true -> reporting only; this would block once enforcement is on."
-  exit 0
-}
 
 # --- 1. Changed files (REST, paginated -- robust for large PRs) -----------
 FILES=$(gh api "repos/$REPO/pulls/$PR/files" --paginate \
@@ -168,7 +145,7 @@ echo "e2e_ui judge -> test required: $REASON"
 HAS_LABEL=$(gh api "repos/$REPO/pulls/$PR" \
   --jq '[.labels[].name] | index("skip-e2e-ui-test") != null')
 if [[ "$HAS_LABEL" != "true" ]]; then
-  block "This PR changes UI behavior (ap-web/**) without a tests/e2e_ui/** test that covers it: $REASON. Add a UI test, or have a maintainer apply the 'skip-e2e-ui-test' label after reviewing your local-run proof."
+  fail "This PR changes UI behavior (ap-web/**) without a tests/e2e_ui/** test that covers it: $REASON. Add a UI test, or have a maintainer apply the 'skip-e2e-ui-test' label after reviewing your local-run proof."
 fi
 
 # --- 4. Skip label is only effective if a maintainer is on the hook -------
@@ -199,4 +176,4 @@ for u in $APPROVERS; do
   done
 done
 
-block "'skip-e2e-ui-test' is set but not effective: author @$AUTHOR is not a maintainer and no maintainer has approved this PR yet. A maintainer must approve to honor the waiver."
+fail "'skip-e2e-ui-test' is set but not effective: author @$AUTHOR is not a maintainer and no maintainer has approved this PR yet. A maintainer must approve to honor the waiver."
