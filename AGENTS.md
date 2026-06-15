@@ -30,7 +30,7 @@ for a migration, reset, or replacement.
 
 - The authoritative local services are the user-systemd units
   `omnigent-server.service` and `omnigent-host.service`.
-- Their working tree is `/mnt/storage/omnigent-opencode-merge`. Keep the
+- Their working tree is `/mnt/storage/omnigent-working-branch`. Keep the
   server, host, runners, and new sessions on this checkout and its current
   branch.
 - Do not launch a manual `omnigent server` or `omnigent host` alongside the
