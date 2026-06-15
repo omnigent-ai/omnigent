@@ -87,6 +87,35 @@ def _ensure_chat_view(page: Page) -> None:
     chat_button.click()
 
 
+def _reveal_terminal_view(page: Page) -> None:
+    """Best-effort switch to the Terminal view so the failure capture shows the CLI pane.
+
+    A native CLI turn that produces no chat output fails silently from the
+    Chat view's perspective — the real error (auth/model rejection, a crash)
+    is in the vendor CLI's terminal pane, which neither the server log nor a
+    Chat-view trace records. Flipping to the Terminal view before re-raising
+    lets Playwright's on-failure screenshot / video / trace capture that pane,
+    turning the black-box timeout into a diagnosable artifact.
+
+    Best-effort by design: it runs on an already-failing path, so any error
+    here (no toggle, pane not ready) is swallowed — it must never mask the
+    original assertion failure.
+
+    :param page: The Playwright page, on the session's chat surface.
+    """
+    try:
+        view_mode = page.get_by_role("group", name="View mode")
+        if view_mode.count() == 0:
+            return
+        terminal_button = view_mode.get_by_role("button", name="Terminal")
+        terminal_button.click(timeout=10_000)
+        # Give the PTY pane a moment to attach and paint before the harness
+        # grabs the on-failure screenshot.
+        page.wait_for_timeout(2_000)
+    except Exception:  # noqa: BLE001 — diagnostic only; never mask the real failure
+        pass
+
+
 def _turn_prompt(index: int, user_marker: str, assistant_token: str) -> str:
     """Build turn *index*'s prompt: carry a marker, echo a token verbatim.
 
@@ -262,10 +291,16 @@ def _run_render_parity_journey(
 
         _send(page, _turn_prompt(index, user_marker, assistant_token))
         # The echoed token in an assistant bubble = the turn produced its
-        # reply; only producible from this turn's prompt.
-        expect(page.locator(_ASSISTANT, has_text=assistant_token).first).to_be_visible(
-            timeout=per_turn_timeout_ms
-        )
+        # reply; only producible from this turn's prompt. If it never lands
+        # (a native CLI turn that silently produced nothing), flip to the
+        # Terminal view first so the on-failure capture shows the CLI pane.
+        try:
+            expect(page.locator(_ASSISTANT, has_text=assistant_token).first).to_be_visible(
+                timeout=per_turn_timeout_ms
+            )
+        except AssertionError:
+            _reveal_terminal_view(page)
+            raise
         # Turn fully settled before the next send, so any transient live
         # preview has collapsed into the committed bubble (the dedup check
         # below would otherwise race a mid-stream double).
