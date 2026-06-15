@@ -11,8 +11,12 @@ name: E2E UI Tests
 #
 # Triggers:
 #   pull_request        opened / synchronize / reopened /
-#                       ready_for_review. Draft PRs are skipped.
-#   push (main)         post-merge run on the default branch.
+#                       ready_for_review. SAME-REPO PRs only; draft
+#                       PRs and fork PRs skip the job (forks run via
+#                       the fork-e2e/** push after approval, mirrored
+#                       by fork-e2e-mirror.yml).
+#   push (fork-e2e/**)  the UI suite for mirrored fork PRs -- a trusted
+#                       base-repo branch, so secrets flow.
 #   schedule            09:00 UTC daily, alongside nightly.yml.
 #   workflow_dispatch   manual run. Input `branch` selects a non-main
 #                       ref.
@@ -20,6 +24,9 @@ name: E2E UI Tests
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches:
+      - 'fork-e2e/**'
   schedule:
     - cron: "0 9 * * *"
   workflow_dispatch:
