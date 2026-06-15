@@ -171,7 +171,13 @@ class SubAgentInfo:
 
 @dataclass
 class SubAgentSpawnedCtx:
-    """Context for ``on_sub_agent_spawned``."""
+    """Context for ``on_sub_agent_spawned``.
+
+    .. note::
+       The ``on_sub_agent_spawned`` hook is reserved and not yet
+       fired by the client — see ``StreamHooks.on_sub_agent_spawned``
+       and omnigent-ai/omnigent#146.
+    """
 
     parent_response_id: str
     sub_agents: list[SubAgentInfo] = field(default_factory=list)
@@ -179,7 +185,13 @@ class SubAgentSpawnedCtx:
 
 @dataclass
 class SubAgentCompletedCtx:
-    """Context for ``on_sub_agent_completed``."""
+    """Context for ``on_sub_agent_completed``.
+
+    .. note::
+       The ``on_sub_agent_completed`` hook is reserved and not yet
+       fired by the client — see ``StreamHooks.on_sub_agent_completed``
+       and omnigent-ai/omnigent#146.
+    """
 
     response_id: str
     agent_name: str
@@ -302,6 +314,14 @@ class StreamHooks:
     on_transport_error: Callable[[TransportErrorCtx], Awaitable[bool] | bool] | None = None
 
     # Sub-agent lifecycle
+    #
+    # .. note::
+    #    Reserved — not yet fired. The client does not currently emit
+    #    discrete sub-agent spawn/complete events (sub-agents flow
+    #    through the tool-call tunnel without a dedicated lifecycle
+    #    event), so a registered callback is a no-op at runtime today.
+    #    Tracers should not rely on these for sub-agent latency/cost
+    #    attribution yet. Tracking: omnigent-ai/omnigent#146.
     on_sub_agent_spawned: Callable[[SubAgentSpawnedCtx], Awaitable[None] | None] | None = None
     on_sub_agent_completed: Callable[[SubAgentCompletedCtx], Awaitable[None] | None] | None = None
 
