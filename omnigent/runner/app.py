@@ -2444,11 +2444,17 @@ async def _evaluate_policy_via_omnigent(
     the verdict back to the harness as a ``policy_verdict`` inbound
     event.
 
-    On any failure (AP unreachable, malformed response), defaults to
-    ``POLICY_ACTION_ALLOW`` so a transient Omnigent outage does not block
-    the agent's LLM call — fail-open is appropriate here because the
-    Omnigent server's own enforcement sites (REQUEST, TOOL_CALL, etc.)
-    provide the authoritative blocking gate.
+    On failure (AP unreachable, non-200, malformed response) the default
+    verdict is phase-aware:
+
+    - ``PHASE_LLM_REQUEST`` / ``PHASE_LLM_RESPONSE`` fail OPEN
+      (``POLICY_ACTION_ALLOW``) so a transient Omnigent outage does not
+      hang the turn — these gates are advisory.
+    - ``PHASE_TOOL_CALL`` / ``PHASE_TOOL_RESULT`` fail CLOSED
+      (``POLICY_ACTION_DENY``). For connector-native MCP tools the harness
+      ``can_use_tool`` callback (which consumes this verdict) is the *only*
+      enforcement point — the call is never re-checked server-side — so a
+      policy that cannot be evaluated must not let the tool through.
 
     :param server_client: HTTP client pointed at the Omnigent server.
     :param harness_client: HTTP client pointed at the harness subprocess.
@@ -2460,9 +2466,18 @@ async def _evaluate_policy_via_omnigent(
         ``"PHASE_LLM_REQUEST"``.
     :param data: Event data dict for the policy engine.
     """
-    # Default verdict: allow. Used on error paths.
-    verdict_action = "POLICY_ACTION_ALLOW"
-    verdict_reason: str | None = None
+    # Default verdict on error / non-200 / timeout. Phase-aware: tool-call
+    # phases fail CLOSED (this round-trip is the authoritative gate for
+    # connector-native tools), advisory LLM phases fail OPEN so a transient
+    # outage never hangs the turn.
+    _fail_closed = phase in ("PHASE_TOOL_CALL", "PHASE_TOOL_RESULT")
+    _default_action = "POLICY_ACTION_DENY" if _fail_closed else "POLICY_ACTION_ALLOW"
+    verdict_action = _default_action
+    verdict_reason: str | None = (
+        f"Omnigent policy evaluation unavailable; failing closed for {phase}."
+        if _fail_closed
+        else None
+    )
     verdict_data: dict[str, Any] | None = None
 
     try:
@@ -2478,19 +2493,21 @@ async def _evaluate_policy_via_omnigent(
         )
         if ap_resp.status_code == 200:
             result = ap_resp.json()
-            verdict_action = result.get("result", "POLICY_ACTION_ALLOW")
+            verdict_action = result.get("result", _default_action)
             verdict_reason = result.get("reason")
             verdict_data = result.get("data")
         else:
             _logger.warning(
-                "AP policy evaluate returned %d for %s; defaulting to ALLOW",
+                "AP policy evaluate returned %d for %s; defaulting to %s",
                 ap_resp.status_code,
                 evaluation_id,
+                _default_action,
             )
-    except Exception:  # noqa: BLE001 — fail-open on Omnigent errors
+    except Exception:  # noqa: BLE001 — fail-open (LLM phases) / fail-closed (tool phases)
         _logger.warning(
-            "AP policy evaluate failed for %s; defaulting to ALLOW",
+            "AP policy evaluate failed for %s; defaulting to %s",
             evaluation_id,
+            _default_action,
             exc_info=True,
         )
 

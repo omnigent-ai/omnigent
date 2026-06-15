@@ -638,12 +638,25 @@ class TurnContext:
         try:
             return await asyncio.wait_for(future, timeout=_POLICY_EVAL_TIMEOUT_S)
         except asyncio.TimeoutError:
+            # Phase-aware default: advisory LLM phases fail OPEN so a missing
+            # verdict never hangs the turn, but TOOL_CALL / TOOL_RESULT is the
+            # authoritative gate for connector-native tools and fails CLOSED.
+            _fail_closed = phase in ("PHASE_TOOL_CALL", "PHASE_TOOL_RESULT")
+            _action = "POLICY_ACTION_DENY" if _fail_closed else "POLICY_ACTION_ALLOW"
             _logger.warning(
-                "Policy evaluation %s timed out after %ds; defaulting to ALLOW",
+                "Policy evaluation %s timed out after %ds; defaulting to %s",
                 evaluation_id,
                 _POLICY_EVAL_TIMEOUT_S,
+                _action,
             )
-            return PolicyVerdictPayload(action="POLICY_ACTION_ALLOW")
+            return PolicyVerdictPayload(
+                action=_action,
+                reason=(
+                    f"Policy evaluation timed out; failing closed for {phase}."
+                    if _fail_closed
+                    else None
+                ),
+            )
         finally:
             self._pending_policy_evaluations.pop(evaluation_id, None)
 
