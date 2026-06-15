@@ -3931,6 +3931,7 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       session_name: "auth",
       current_task_status: "in_progress",
       busy: true,
+      last_task_error: null,
       last_message_preview: "looking…",
       ...overrides,
     });
@@ -3952,6 +3953,7 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
           session_name: "auth",
           labels: {},
           current_task_status: "in_progress",
+          last_task_error: null,
           busy: true,
           last_message_preview: "looking…",
           // Insert path defaults the count to 0 when the delta omits it.
@@ -4043,6 +4045,80 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       expect(row?.last_message_preview).toBe("found the bug"); // updated
       expect(row?.busy).toBe(true); // preserved
       expect(row?.current_task_status).toBe("in_progress"); // preserved
+    });
+
+    it("merges a failed status delta with a durable error", () => {
+      client.setQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"), [
+        {
+          id: "conv_child1",
+          title: "researcher:auth",
+          tool: "researcher",
+          session_name: "auth",
+          current_task_status: "in_progress",
+          busy: true,
+          last_message_preview: "booting worker",
+          pending_elicitations_count: 0,
+        },
+      ]);
+      handleSessionEvent({
+        type: "session_child_session_updated",
+        conversationId: "conv_parent",
+        childSessionId: "conv_child1",
+        child: {
+          id: "conv_child1",
+          busy: false,
+          current_task_status: "failed",
+          last_task_error: {
+            code: "required_terminal_exited",
+            message: "Required terminal exited unexpectedly",
+          },
+        },
+      });
+      const row = client.getQueryData<ChildSessionInfo[]>(
+        childSessionsQueryKey("conv_parent"),
+      )?.[0];
+      expect(row?.busy).toBe(false);
+      expect(row?.current_task_status).toBe("failed");
+      expect(row?.last_task_error).toEqual({
+        code: "required_terminal_exited",
+        message: "Required terminal exited unexpectedly",
+      });
+    });
+
+    it("clears a stale child error when the runner sends an active status", () => {
+      client.setQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"), [
+        {
+          id: "conv_child1",
+          title: "researcher:auth",
+          tool: "researcher",
+          session_name: "auth",
+          current_task_status: "failed",
+          busy: false,
+          last_task_error: {
+            code: "required_terminal_exited",
+            message: "Required terminal exited unexpectedly",
+          },
+          last_message_preview: "boot failed",
+          pending_elicitations_count: 0,
+        },
+      ]);
+      handleSessionEvent({
+        type: "session_child_session_updated",
+        conversationId: "conv_parent",
+        childSessionId: "conv_child1",
+        child: {
+          id: "conv_child1",
+          busy: true,
+          current_task_status: "in_progress",
+          last_task_error: null,
+        },
+      });
+      const row = client.getQueryData<ChildSessionInfo[]>(
+        childSessionsQueryKey("conv_parent"),
+      )?.[0];
+      expect(row?.busy).toBe(true);
+      expect(row?.current_task_status).toBe("in_progress");
+      expect(row?.last_task_error).toBeNull();
     });
 
     it("initializes a cold child-sessions cache from a full delta", () => {

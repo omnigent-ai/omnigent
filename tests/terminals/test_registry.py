@@ -24,8 +24,9 @@ from unittest.mock import AsyncMock
 import pytest
 
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
-from omnigent.inner.terminal import TerminalInstance
+from omnigent.inner.terminal import TerminalCreateResult, TerminalInstance
 from omnigent.terminals import TerminalRegistry
+from omnigent.terminals import registry as registry_mod
 from omnigent.terminals.registry import TerminalListEntry, conversation_link_for_id
 
 # ── Pure bookkeeping (no tmux) ────────────────────────────────
@@ -156,6 +157,67 @@ async def test_shutdown_on_empty_registry_is_noop() -> None:
     reg = TerminalRegistry()
     await reg.shutdown()
     assert reg.active_conversation_ids() == []
+
+
+async def test_launch_replaces_stale_running_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``launch`` verifies a cached running entry before returning it."""
+
+    class _FlagTerminal(TerminalInstance):
+        """Terminal instance whose liveness is controlled by a flag."""
+
+        alive: bool = True
+        closed: bool = False
+
+        async def launch(self, *, cwd: Path | None = None) -> None:
+            del cwd
+            self.running = True
+
+        async def is_alive(self) -> bool:
+            if not self.alive:
+                self.running = False
+            return self.alive
+
+        async def close(self) -> None:
+            self.closed = True
+            self.running = False
+
+    reg = TerminalRegistry()
+    stale = _FlagTerminal(
+        name="shell",
+        session_key="s1",
+        socket_path=tmp_path / "stale.sock",
+        private_dir=tmp_path / "stale",
+        running=True,
+    )
+    stale.alive = False
+    created = _FlagTerminal(
+        name="shell",
+        session_key="s1",
+        socket_path=tmp_path / "created.sock",
+        private_dir=tmp_path / "created",
+        running=False,
+    )
+    reg._by_conversation["conv_x"] = {("shell", "s1"): stale}
+    reg._instance_locks[("conv_x", "shell", "s1")] = threading.Lock()
+
+    def _fake_create_terminal_instance(*_args: object, **_kwargs: object) -> TerminalCreateResult:
+        return TerminalCreateResult(instance=created, cwd=tmp_path)
+
+    monkeypatch.setattr(registry_mod, "create_terminal_instance", _fake_create_terminal_instance)
+
+    result = await reg.launch(
+        "conv_x",
+        "shell",
+        "s1",
+        TerminalEnvSpec(command="bash"),
+    )
+
+    assert result is created
+    assert stale.closed is True
+    assert reg.get("conv_x", "shell", "s1") is created
 
 
 def test_transfer_moves_terminal_without_closing_tmux(tmp_path: Path) -> None:

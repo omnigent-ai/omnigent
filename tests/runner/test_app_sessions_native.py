@@ -1001,7 +1001,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     class _FakeResourceRegistry:
         """Resource registry that records the launched terminal spec."""
 
-        async def launch_terminal(
+        async def launch_auxiliary_terminal(
             self,
             *,
             session_id: str,
@@ -1290,7 +1290,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
     class _FakeResourceRegistry:
         """Resource registry that records the launched terminal spec."""
 
-        async def launch_terminal(
+        async def launch_auxiliary_terminal(
             self,
             *,
             session_id: str,
@@ -1548,7 +1548,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
     class _FakeResourceRegistry:
         """Resource registry that records the launched terminal spec."""
 
-        async def launch_terminal(
+        async def launch_auxiliary_terminal(
             self,
             *,
             session_id: str,
@@ -1792,7 +1792,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
     class _FakeResourceRegistry:
         """Resource registry that records the launched terminal spec."""
 
-        async def launch_terminal(
+        async def launch_auxiliary_terminal(
             self,
             *,
             session_id: str,
@@ -1958,7 +1958,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     class _FakeResourceRegistry:
         """Resource registry returning a fixed terminal view."""
 
-        async def launch_terminal(
+        async def launch_auxiliary_terminal(
             self,
             *,
             session_id: str,
@@ -5238,6 +5238,7 @@ async def test_external_session_status_running_fans_out_child_busy_to_parent() -
                 "session_name": "impl",
                 "busy": True,
                 "current_task_status": "in_progress",
+                "last_task_error": None,
             },
         }
     ]
@@ -5309,6 +5310,7 @@ async def test_external_status_sequence_coalesces_duplicates_but_emits_task_stat
                 "session_name": "impl",
                 "busy": True,
                 "current_task_status": "in_progress",
+                "last_task_error": None,
             },
         },
         {
@@ -8088,6 +8090,147 @@ async def test_events_stop_session_closes_terminal_and_publishes_deleted(
 
 
 @pytest.mark.asyncio
+async def test_required_terminal_exit_publishes_deleted_and_failed(tmp_path: Path) -> None:
+    """
+    A required terminal disappearing fails the owning session.
+
+    This uses a generic ``worker`` terminal name to pin the lifecycle rule,
+    not a Claude-specific branch: if the terminal was registered as required,
+    the runner must publish both resource deletion and ``session.status:
+    failed`` when its watcher reports that tmux disappeared.
+
+    :param tmp_path: Temporary directory for fake terminal paths.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.app import _session_event_queues_ref
+    from tests.runner.helpers import make_test_terminal_instance
+
+    parent_id = f"conv_parent_required_exit_{uuid.uuid4().hex[:12]}"
+    conv_id = f"conv_required_exit_{uuid.uuid4().hex[:12]}"
+    parent_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("worker", "main", tmp_path)
+    instance.command = "worker-cli"
+    instance.args = ["--profile", "test"]
+    instance.launch_cwd = str(tmp_path)
+    instance._remember_pane_snapshot("startup failed\ncomplete setup first")
+    terminal_registry._by_conversation.setdefault(conv_id, {})[("worker", "main")] = instance
+    callbacks: dict[str, Any] = {}
+
+    def _capture_watcher(
+        on_idle: object | None = None,
+        *,
+        on_activity: object | None = None,
+        on_exit: object | None = None,
+        idle_threshold_s: float | None = None,
+        poll_interval_s: float | None = None,
+        replace: bool = False,
+    ) -> None:
+        del on_idle, on_activity, idle_threshold_s, poll_interval_s
+        callbacks["on_exit"] = on_exit
+        callbacks["replace"] = replace
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    pm._sessions.add(conv_id)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+    )
+    resource_registry = app.state.session_resource_registry
+    runner_app._session_inboxes_ref[parent_id] = parent_inbox
+    runner_app.register_child_session(
+        conv_id,
+        parent_session_id=parent_id,
+        title="worker:main",
+        tool="worker",
+        session_name="main",
+    )
+    runner_app.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=conv_id,
+        agent="worker",
+        title="main",
+    )
+
+    async def _collect_exit_events() -> list[dict[str, Any]]:
+        while True:
+            queue = _session_event_queues_ref.get(conv_id)
+            if queue is not None and queue.qsize() >= 2:
+                events: list[dict[str, Any]] = []
+                while not queue.empty():
+                    item = queue.get_nowait()
+                    if isinstance(item, dict):
+                        events.append(item)
+                return events
+            await asyncio.sleep(0)
+
+    try:
+        await resource_registry.observe_required_terminal(
+            conv_id,
+            "worker",
+            "main",
+            instance,
+        )
+        on_exit = callbacks.get("on_exit")
+        assert callable(on_exit)
+        on_exit()
+        queued_events = await asyncio.wait_for(_collect_exit_events(), timeout=1.0)
+        for _ in range(100):
+            if pm.released:
+                break
+            await asyncio.sleep(0)
+        parent_events = _drain_session_event_queue(_session_event_queues_ref.get(parent_id))
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+        _session_event_queues_ref.pop(parent_id, None)
+        runner_app.unregister_subagent_work(conv_id)
+        runner_app.unregister_child_session(conv_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    assert terminal_registry.get(conv_id, "worker", "main") is None
+    assert {
+        "type": "session.resource.deleted",
+        "resource_id": "terminal_worker_main",
+        "resource_type": "terminal",
+        "session_id": conv_id,
+    } in queued_events
+    failed_events = [
+        event
+        for event in queued_events
+        if event.get("type") == "session.status" and event.get("status") == "failed"
+    ]
+    assert len(failed_events) == 1, f"expected one failed status, got {queued_events!r}"
+    assert failed_events[0]["error"]["code"] == "required_terminal_exited"
+    assert "Required terminal exited unexpectedly" in failed_events[0]["error"]["message"]
+    assert parent_events == [
+        {
+            "type": "session.child_session.updated",
+            "conversation_id": parent_id,
+            "child_session_id": conv_id,
+            "child": {
+                "id": conv_id,
+                "title": "worker:main",
+                "tool": "worker",
+                "session_name": "main",
+                "busy": False,
+                "current_task_status": "failed",
+                "last_task_error": failed_events[0]["error"],
+            },
+        }
+    ]
+    assert pm.released == [conv_id]
+    inbox_item = parent_inbox.get_nowait()
+    assert inbox_item["status"] == "failed"
+    assert "Required terminal exited unexpectedly" in inbox_item["output"]
+    assert "command: worker-cli (2 args; argv omitted" in inbox_item["output"]
+    assert f"cwd: {tmp_path}" in inbox_item["output"]
+    assert "startup failed\ncomplete setup first" in inbox_item["output"]
+    assert "Suggested next checks" not in inbox_item["output"]
+
+
+@pytest.mark.asyncio
 async def test_events_effort_change_on_native_session_types_slash_command(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -9369,7 +9512,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
         # None, so the test doesn't need a real terminal instance.
         terminal_registry = None
 
-        async def launch_terminal(
+        async def launch_required_terminal(
             self,
             *,
             session_id: str,
@@ -9457,7 +9600,7 @@ async def test_auto_create_claude_terminal_passes_session_effort(
 
         terminal_registry = None
 
-        async def launch_terminal(
+        async def launch_required_terminal(
             self,
             *,
             session_id: str,
@@ -9568,7 +9711,7 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
 
         terminal_registry = None
 
-        async def launch_terminal(
+        async def launch_required_terminal(
             self,
             *,
             session_id: str,
@@ -9729,7 +9872,7 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
 
         terminal_registry = None
 
-        async def launch_terminal(
+        async def launch_required_terminal(
             self,
             *,
             session_id: str,
@@ -9852,7 +9995,7 @@ async def test_auto_create_claude_terminal_emits_resource_created_event(
         # ``_publish_tmux_target_for_bridge`` early-returns when this is None.
         terminal_registry = None
 
-        async def launch_terminal(
+        async def launch_required_terminal(
             self,
             *,
             session_id: str,
@@ -10075,7 +10218,7 @@ async def test_auto_create_claude_terminal_resets_stale_bridge_id_label(
 
         terminal_registry = None
 
-        async def launch_terminal(
+        async def launch_required_terminal(
             self,
             *,
             session_id: str,
@@ -10409,7 +10552,7 @@ class _EnsureTerminalCase:
     :param expect_auto_create: Whether the request must route to
         ``_auto_create_claude_terminal`` (the ensure path).
     :param expect_launch: Whether the request must route to the generic
-        ``launch_terminal`` path instead.
+        terminal launch path instead.
     :param expect_name: ``name`` of the resource the route must return —
         identifies which collaborator produced the response.
     """
@@ -10469,15 +10612,15 @@ async def test_create_session_terminal_ensure_routes_claude_native(
     no ``spec`` and no ``bridge_inject_dir`` must go to the full native
     ``_auto_create_claude_terminal`` (or return the live terminal if one
     exists), while a request carrying ``spec``/``bridge_inject_dir`` (the
-    fresh-launch wrapper path) must still use the generic ``launch_terminal``.
+    fresh-launch wrapper path) must still use the generic terminal launch.
 
     The three collaborators are stubbed so the routing decision is the only
     thing under test; each returns a distinctly-named real
     :class:`SessionResourceView`, so the response ``name`` proves which path
     handled the request. Remove the ensure branch and the auto-create cases
-    fall through to ``launch_terminal`` (wrong name, ``launched`` recorded);
-    drop the ``not spec`` guard and the explicit-spec case wrongly
-    auto-creates — either way this test fails.
+    fall through to the generic terminal launch path (wrong name,
+    ``launched`` recorded); drop the ``not spec`` guard and the explicit-spec
+    case wrongly auto-creates — either way this test fails.
 
     :param case: The parametrized routing scenario.
     :param monkeypatch: Pytest monkeypatch fixture.
@@ -10511,7 +10654,7 @@ async def test_create_session_terminal_ensure_routes_claude_native(
             )
         return None
 
-    async def _stub_launch_terminal(
+    async def _stub_launch_auxiliary_terminal(
         self: object, *, session_id: str, terminal_name: str, session_key: str, **_kwargs: object
     ) -> SessionResourceView:
         """Record the generic-launch call and return a tagged terminal view."""
@@ -10526,7 +10669,11 @@ async def test_create_session_terminal_ensure_routes_claude_native(
 
     monkeypatch.setattr("omnigent.runner.app._auto_create_claude_terminal", _stub_auto_create)
     monkeypatch.setattr(SessionResourceRegistry, "get_terminal_resource", _stub_get_terminal)
-    monkeypatch.setattr(SessionResourceRegistry, "launch_terminal", _stub_launch_terminal)
+    monkeypatch.setattr(
+        SessionResourceRegistry,
+        "launch_auxiliary_terminal",
+        _stub_launch_auxiliary_terminal,
+    )
 
     app = create_runner_app(
         process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
@@ -10821,7 +10968,7 @@ async def test_create_session_terminal_ensure_routes_codex_native(
         close_calls.append(f"{session_id}:{terminal_id}")
         return True
 
-    async def _stub_launch_terminal(
+    async def _stub_launch_auxiliary_terminal(
         self: object,
         *,
         session_id: str,
@@ -10857,7 +11004,11 @@ async def test_create_session_terminal_ensure_routes_codex_native(
         _stub_terminal_resource_role,
     )
     monkeypatch.setattr(SessionResourceRegistry, "close_terminal", _stub_close_terminal)
-    monkeypatch.setattr(SessionResourceRegistry, "launch_terminal", _stub_launch_terminal)
+    monkeypatch.setattr(
+        SessionResourceRegistry,
+        "launch_auxiliary_terminal",
+        _stub_launch_auxiliary_terminal,
+    )
 
     app = create_runner_app(
         process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
@@ -10984,7 +11135,7 @@ async def test_auto_create_repl_terminal_launches_attach_and_stamps_label(
     class _FakeResourceRegistry:
         """Resource registry that records the launched REPL terminal spec."""
 
-        async def launch_terminal(
+        async def launch_auxiliary_terminal(
             self,
             *,
             session_id: str,
@@ -12223,7 +12374,7 @@ async def test_auto_create_claude_terminal_recreate_cancels_prior_forwarder(
 
         terminal_registry = None
 
-        async def launch_terminal(
+        async def launch_required_terminal(
             self,
             *,
             session_id: str,
@@ -12425,7 +12576,7 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
     class _FakeResourceRegistry:
         """Returns a terminal resource view without launching tmux."""
 
-        async def launch_terminal(
+        async def launch_auxiliary_terminal(
             self,
             *,
             session_id: str,
