@@ -29,8 +29,7 @@ def _materialize_cursor_agent_spec(
     raw: dict[str, Any] = {
         "name": _AGENT_NAME,
         "prompt": (
-            "You are a helpful AI assistant powered by Cursor. "
-            "Assist the user with their tasks."
+            "You are a helpful AI assistant powered by Cursor. Assist the user with their tasks."
         ),
         "executor": executor,
         "os_env": {
