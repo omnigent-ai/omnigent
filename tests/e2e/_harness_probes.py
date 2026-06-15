@@ -144,12 +144,10 @@ HARNESS_PROBES: list[HarnessProbe] = [
     ),
     HarnessProbe(
         harness="cursor",
-        # Cursor speaks the OpenAI Responses API via the Databricks
-        # gateway; the GPT model is the natural fit per CLAUDE.md
-        # (``databricks-gpt-5-4-mini`` is the OpenAI-style
-        # Databricks model). Registry key is ``cursor`` to match
-        # the Omnigent YAML ``executor.harness`` spelling.
-        model=resolve_model("databricks-gpt-5-4-mini", key="probe:cursor"),
+        # Cursor Agent CLI uses Composer 2.5 Fast as its default
+        # model. Registry key is ``cursor`` to match the Omnigent
+        # YAML ``executor.harness`` spelling.
+        model=resolve_model("composer-2.5-fast", key="probe:cursor"),
         env_prefix="HARNESS_CURSOR_",
         marker="CURSOR_E2E_OK",
         cli_binary="cursor-agent",
