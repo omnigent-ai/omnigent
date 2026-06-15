@@ -60,11 +60,11 @@ def test_post_tool_use_maps_to_phase_tool_result() -> None:
 
 
 @pytest.mark.parametrize("hook_event", ["PreToolUse", "PostToolUse"])
-def test_mcp_tools_are_skipped(hook_event: str) -> None:
+def test_omnigent_mcp_tools_are_skipped(hook_event: str) -> None:
     """
-    MCP tools (``mcp__*``) return None and are never sent to /policies/evaluate.
+    Omnigent MCP tools return None and are never sent to /policies/evaluate.
 
-    MCP tool calls are already policy-checked by the relay path
+    Omnigent MCP tool calls are already policy-checked by the relay path
     (ProxyMcpManager → Omnigent /mcp endpoint → _evaluate_tool_call_policy).
     If this guard regressed, every MCP tool call would be evaluated
     twice — once via the relay, once via this hook.
@@ -75,6 +75,41 @@ def test_mcp_tools_are_skipped(hook_event: str) -> None:
     )
     # None signals the caller to skip the POST entirely.
     assert result is None
+
+
+@pytest.mark.parametrize(
+    "hook_event,expected_type",
+    [("PreToolUse", "PHASE_TOOL_CALL"), ("PostToolUse", "PHASE_TOOL_RESULT")],
+)
+def test_connector_native_mcp_tools_are_evaluated(hook_event: str, expected_type: str) -> None:
+    """
+    Connector-native MCP tools must not be skipped by the native pre-call hook.
+
+    Tools such as ``mcp__github__*`` are injected by the connector layer and
+    do not round-trip through Omnigent's MCP proxy, so this hook is their
+    TOOL_CALL/TOOL_RESULT policy enforcement site.
+    """
+    result = hook_payload_to_evaluation_request(
+        hook_event,
+        {
+            "tool_name": "mcp__github__create_issue",
+            "tool_input": {"title": "blocked?"},
+            "tool_output": "created",
+        },
+    )
+    assert result is not None
+    event = result["event"]
+    assert event["type"] == expected_type
+    if hook_event == "PreToolUse":
+        assert event["data"] == {
+            "name": "mcp__github__create_issue",
+            "arguments": {"title": "blocked?"},
+        }
+    else:
+        assert event["request_data"] == {
+            "name": "mcp__github__create_issue",
+            "arguments": {"title": "blocked?"},
+        }
 
 
 def test_unknown_hook_event_returns_none() -> None:

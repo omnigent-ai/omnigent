@@ -115,7 +115,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     hook_event = payload.get("hook_event_name", "")
     eval_request = hook_payload_to_evaluation_request(hook_event, payload)
     if eval_request is None:
-        # Unrecognized hook event or an mcp__* tool (relay-enforced).
+        # Unrecognized hook event or an mcp__omnigent__* tool (relay-enforced).
         return 0
 
     # Stamp the live model from this session's config.toml (what an in-TUI
