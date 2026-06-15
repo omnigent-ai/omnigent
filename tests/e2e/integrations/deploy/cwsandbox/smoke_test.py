@@ -8,7 +8,7 @@ unary exec, AddFile, public egress, detach survival (setsid nohup), and
 terminate.
 
     export CWSANDBOX_API_KEY=...
-    python deploy/cwsandbox/smoke_test.py [--image IMG] [--keep]
+    python tests/e2e/integrations/deploy/cwsandbox/smoke_test.py [--image IMG] [--keep]
 
 Transport is curl (subprocess): the system Python's TLS may be too old
 to reach the API, while curl uses the OS's. Zero pip dependencies.
@@ -43,8 +43,19 @@ class Client:
         self._auth = f"Authorization: Bearer {api_key}"
 
     def _request(self, method: str, path: str, op: str, body: dict | None = None) -> dict:
-        cmd = ["curl", "-sS", "-X", method, f"{self._base}{path}",
-               "-H", self._auth, "-H", "Accept: application/json", "-w", "\n%{http_code}"]
+        cmd = [
+            "curl",
+            "-sS",
+            "-X",
+            method,
+            f"{self._base}{path}",
+            "-H",
+            self._auth,
+            "-H",
+            "Accept: application/json",
+            "-w",
+            "\n%{http_code}",
+        ]
         if body is not None:
             cmd += ["-H", "Content-Type: application/json", "--data-binary", json.dumps(body)]
         try:
@@ -84,7 +95,9 @@ class Client:
             if status == "SANDBOX_STATUS_RUNNING":
                 return
             if status.startswith("SANDBOX_STATUS_") and status not in (
-                "SANDBOX_STATUS_CREATING", "SANDBOX_STATUS_PENDING", "SANDBOX_STATUS_UNSPECIFIED"
+                "SANDBOX_STATUS_CREATING",
+                "SANDBOX_STATUS_PENDING",
+                "SANDBOX_STATUS_UNSPECIFIED",
             ):
                 raise SmokeError(f"terminal status {status}: {payload.get('statusReason', '?')}")
             time.sleep(POLL_INTERVAL_S)
@@ -92,16 +105,23 @@ class Client:
 
     def exec(self, sandbox_id: str, command: str) -> tuple[int, str, str]:
         result = self._request(
-            "POST", f"/v1beta2/sandboxes/{sandbox_id}/exec", "exec",
+            "POST",
+            f"/v1beta2/sandboxes/{sandbox_id}/exec",
+            "exec",
             {"command": ["bash", "-lc", command], "maxTimeoutSeconds": 60},
         ).get("result", {})
         # exitCode is omitted from the response when it is 0 (zero default).
-        return (int(result.get("exitCode", 0)),
-                _b64(result.get("stdout", "")), _b64(result.get("stderr", "")))
+        return (
+            int(result.get("exitCode", 0)),
+            _b64(result.get("stdout", "")),
+            _b64(result.get("stderr", "")),
+        )
 
     def put_file(self, sandbox_id: str, path: str, contents: bytes) -> None:
         payload = self._request(
-            "POST", f"/v1beta2/sandboxes/{sandbox_id}/files", "addFile",
+            "POST",
+            f"/v1beta2/sandboxes/{sandbox_id}/files",
+            "addFile",
             {"filepath": path, "fileContents": base64.b64encode(contents).decode("ascii")},
         )
         if not payload.get("success", False):
@@ -109,7 +129,9 @@ class Client:
 
     def get_file(self, sandbox_id: str, path: str) -> bytes:
         payload = self._request(
-            "GET", f"/v1beta2/sandboxes/{sandbox_id}/files/{quote(path, safe='')}", "retrieveFile",
+            "GET",
+            f"/v1beta2/sandboxes/{sandbox_id}/files/{quote(path, safe='')}",
+            "retrieveFile",
         )
         return base64.b64decode(payload.get("fileContents", ""))
 
@@ -120,7 +142,7 @@ class Client:
 def _b64(value: str) -> str:
     try:
         return base64.b64decode(value).decode("utf-8", errors="replace") if value else ""
-    except Exception:  # noqa: BLE001 — best-effort decode of an opaque field
+    except Exception:
         return value
 
 
@@ -176,7 +198,7 @@ def main() -> int:
         print("\n[4/6] public egress (outbound https from inside)")
         code, out, _ = client.exec(
             sandbox_id,
-            "python3 -c \"import urllib.request as u; "
+            'python3 -c "import urllib.request as u; '
             "print(u.urlopen('https://api.github.com', timeout=15).status)\"",
         )
         _check(failures, code == 0 and "200" in out, "outbound HTTPS reached api.github.com")
@@ -206,7 +228,7 @@ def main() -> int:
             try:
                 client.stop(sandbox_id)
                 print(f"\n  (cleaned up {sandbox_id})")
-            except Exception as exc:  # noqa: BLE001 — best-effort cleanup
+            except Exception as exc:
                 print(f"\n  WARNING: failed to clean up {sandbox_id}: {exc}")
 
     print("\n" + "=" * 60)

@@ -10,7 +10,8 @@ Two modes:
      sandbox.provider=cwsandbox). No public-IP sandbox required — good for W&B
      serverless users who can't expose a public service.
 
-         python deploy/cwsandbox/e2e_managed.py --server http://my-omnigent:6767
+         python tests/e2e/integrations/deploy/cwsandbox/e2e_managed.py \
+             --server http://my-omnigent:6767
 
   2. (default) spin the server up inside a CW Sandbox with a public service. The
      sandbox runs a prebaked image with this fork's omnigent + the cwsandbox SDK
@@ -18,7 +19,8 @@ Two modes:
 
          export CWSANDBOX_API_KEY=...        # provisions the sandboxes
          export WANDB_INFERENCE_KEY=...      # the agent's LLM credential
-         python deploy/cwsandbox/e2e_managed.py --image docker.io/<you>/omnigent-cwsandbox:test
+         python tests/e2e/integrations/deploy/cwsandbox/e2e_managed.py \
+             --image docker.io/<you>/omnigent-cwsandbox:test
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ CONFIG_HOME = "/root/.omnigent"
 WANDB_BASE_URL = "https://api.inference.wandb.ai/v1"
 WANDB_MODEL = "Qwen/Qwen3-Coder-480B-A35B-Instruct"
 PROMPT = "What is 2+2? Reply with ONLY the number, nothing else."
+
 
 def _child_env(wandb_key: str) -> dict[str, str]:
     """Env injected into every managed CHILD sandbox — the single source of truth.
@@ -213,7 +216,7 @@ def _omnigent_children() -> list:
     """List sandboxes the launcher tags 'omnigent' (managed hosts); [] on error."""
     try:
         return Sandbox.list(tags=["omnigent"]).result()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log(f"  (could not list child sandboxes: {exc})")
         return []
 
@@ -239,7 +242,7 @@ def dump_child_logs(exclude: set[str]) -> None:
             ]
         ).result()
         log(out.stdout)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log(f"  (could not read child logs: {exc})")
 
 
@@ -387,7 +390,7 @@ def main() -> int:
             log(f"cleaning up server sandbox {sb.sandbox_id} + managed child(ren)")
             try:
                 sb.stop().result()
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 log(f"  warning: server cleanup failed: {exc}")
             # Stop only children that appeared during this run (id not in the
             # pre-run snapshot) — never another run's sandboxes.
@@ -397,7 +400,7 @@ def main() -> int:
                 try:
                     child.stop().result()
                     log(f"  stopped child {child.sandbox_id}")
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     log(f"  warning: child cleanup failed for {child.sandbox_id}: {exc}")
 
     print("\n" + "=" * 60)

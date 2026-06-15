@@ -69,9 +69,7 @@ def resolve_max_lifetime_s() -> int:
     try:
         return int(float(raw))
     except ValueError as exc:
-        raise click.ClickException(
-            f"{MAX_LIFETIME_ENV_VAR} must be a number of seconds"
-        ) from exc
+        raise click.ClickException(f"{MAX_LIFETIME_ENV_VAR} must be a number of seconds") from exc
 
 
 def managed_token_ttl_s() -> int:

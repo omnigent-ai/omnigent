@@ -59,5 +59,5 @@ stdlib + curl only):
 
 ```bash
 export CWSANDBOX_API_KEY=...
-python deploy/cwsandbox/smoke_test.py
+python tests/e2e/integrations/deploy/cwsandbox/smoke_test.py
 ```
