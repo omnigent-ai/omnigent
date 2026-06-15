@@ -24,7 +24,6 @@ and nothing else.
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import threading
@@ -32,6 +31,16 @@ from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - exercised on Windows.
+    _fcntl = None
+
+try:
+    import msvcrt as _msvcrt
+except ImportError:  # pragma: no cover - exercised on POSIX.
+    _msvcrt = None
 
 # Subdirectory segments reserved by the framework — JSON key files
 # live at ``{root}/{key}.json``. Keys must not contain path
@@ -78,14 +87,10 @@ class ToolState:
         path = self._path_for(key)
         if not path.exists():
             return default
-        with path.open("r") as f:
-            # Shared lock: allow parallel reads, block concurrent writers
-            # briefly so we see a complete JSON payload.
-            fcntl.flock(f, fcntl.LOCK_SH)
-            try:
-                return json.loads(f.read() or "null")
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
+        # Shared lock: allow parallel reads on POSIX, block concurrent writers
+        # briefly so we see a complete JSON payload.
+        with path.open("r") as f, _file_lock(f, exclusive=False):
+            return json.loads(f.read() or "null")
 
     def set(self, key: str, value: Any) -> None:
         """Replace (or create) the value at ``key``. JSON-serialized.
@@ -173,14 +178,10 @@ class ToolState:
         # we seek to 0 before read. Opening with ``r+`` would fail
         # when the file doesn't exist yet, which is a common first-
         # call case for a tool.
-        with thread_lock, path.open("a+") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            try:
-                value = _read_transaction_value(f, default)
-                yield value
-                _write_transaction_value(f, value)
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
+        with thread_lock, path.open("a+") as f, _file_lock(f, exclusive=True):
+            value = _read_transaction_value(f, default)
+            yield value
+            _write_transaction_value(f, value)
 
     # ── Internals ────────────────────────────────────────────
 
@@ -242,6 +243,33 @@ def _write_transaction_value(f: Any, value: Any) -> None:
     # the lock and read stale on-disk contents, losing the prior update.
     f.flush()
     os.fsync(f.fileno())
+
+
+@contextmanager
+def _file_lock(f: Any, *, exclusive: bool) -> Iterator[None]:
+    """Lock an open state file for the duration of the context."""
+    if _fcntl is not None:
+        mode = _fcntl.LOCK_EX if exclusive else _fcntl.LOCK_SH
+        _fcntl.flock(f, mode)
+        try:
+            yield
+        finally:
+            _fcntl.flock(f, _fcntl.LOCK_UN)
+        return
+
+    if _msvcrt is not None:
+        # Windows byte-range locks are exclusive only. Lock one stable byte at
+        # the start of the file; empty files still support this region.
+        f.seek(0)
+        _msvcrt.locking(f.fileno(), _msvcrt.LK_LOCK, 1)
+        try:
+            yield
+        finally:
+            f.seek(0)
+            _msvcrt.locking(f.fileno(), _msvcrt.LK_UNLCK, 1)
+        return
+
+    yield
 
 
 def _get_thread_lock(path: Path) -> threading.Lock:
