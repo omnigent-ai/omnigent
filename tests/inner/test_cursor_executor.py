@@ -249,8 +249,21 @@ async def test_run_turn_passes_sandbox_flag(monkeypatch: pytest.MonkeyPatch) -> 
         _ = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
     finally:
         await executor.close()
-    # os_env sandbox → cursor's own --sandbox mode on the acp launch.
-    assert state["extra_args"] == ["--sandbox", "enabled"]
+    # os_env sandbox → cursor's own --sandbox mode on the acp launch; --yolo for headless.
+    assert state["extra_args"] == ["--sandbox", "enabled", "--yolo"]
+
+
+async def test_run_turn_passes_yolo_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _patch_acp(
+        monkeypatch,
+        [[_chunk("agent_message_chunk", "ok"), ("result", {"stopReason": "end_turn"})]],
+    )
+    executor = _make_executor()
+    try:
+        _ = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+    assert state["extra_args"] == ["--sandbox", "disabled", "--yolo"]
 
 
 async def test_cursor_model_passed_through(monkeypatch: pytest.MonkeyPatch) -> None:

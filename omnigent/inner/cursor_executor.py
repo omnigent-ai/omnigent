@@ -11,7 +11,9 @@ The ACP transport lives in :class:`omnigent.inner.cursor_acp.AcpClient`.
 
 cursor-agent talks only to Cursor's own backend (``CURSOR_API_KEY`` /
 ``cursor-agent login``); there is no Databricks gateway, so a ``databricks-*``
-model id is dropped in favor of cursor's default. The system prompt is prepended
+model id is dropped in favor of cursor's default. The launch passes ``--yolo``
+(auto-approve all actions — headless workers can't answer permission prompts).
+The system prompt is prepended
 to the first turn (ACP has no system-prompt field). The agent uses its own
 native tools; bridging Omnigent spec-declared tools would require an http/sse
 MCP server via ``session/new`` ``mcpServers``, and ACP reports no token usage.
@@ -394,7 +396,7 @@ class CursorExecutor(Executor):
             self._cursor_path,
             env=self._env,
             cwd=cwd,
-            extra_args=["--sandbox", _sandbox_mode(self._os_env_spec)],
+            extra_args=["--sandbox", _sandbox_mode(self._os_env_spec), "--yolo"],
         )
         await client.start()
         state.session_id = await client.new_session(cwd=cwd, model=model, mcp_servers=[])
