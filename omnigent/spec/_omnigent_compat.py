@@ -81,6 +81,7 @@ OMNIGENT_HARNESSES = frozenset(
         "databricks_supervisor",
         "openai-agents",
         "open-responses",
+        "opencode",
         "pi",
     },
 )
