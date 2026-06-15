@@ -84,9 +84,6 @@ jobs:
         # stale committed lockfile). Fix locally with `uv lock`.
         run: uv sync --locked --extra dev
 
-      - name: Run formatting, lint, and typing checks
-        run: uv run pre-commit run --all-files --show-diff-on-failure
-
       - name: Set up Node.js
         uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af  # v4
         with:
@@ -103,6 +100,9 @@ jobs:
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: npm ci --legacy-peer-deps
+
+      - name: Run formatting, lint, and typing checks
+        run: uv run pre-commit run --all-files --show-diff-on-failure
 
       - name: Type-check ap-web
         working-directory: ap-web
