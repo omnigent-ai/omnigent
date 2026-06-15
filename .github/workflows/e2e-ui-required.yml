@@ -1,0 +1,83 @@
+name: E2E UI Required
+
+# Required-status gate: a PR that changes ap-web/** must either ship a
+# tests/e2e_ui/** test that covers the change, or carry a maintainer-effective
+# `skip-e2e-ui-test` label. Enforces the "UI behavior change ships with a UI
+# test" policy at PR time, where the author still has the change's intent in
+# head.
+#
+# Whether the change "needs a test" is decided by an LLM judge (see
+# check.sh case 2), NOT a deterministic file-presence check -- so refactors,
+# renames, dep bumps, styling and test-only edits don't trip the gate, and a
+# trivial throwaway test doesn't satisfy it.
+#
+# Trigger is `pull_request_target`, so the workflow + gate script always run
+# from the BASE branch (main), with the base token, even for fork PRs:
+#   - the PR-head copy of this file/script never runs, so a PR cannot edit
+#     the gate to weaken it (same hardening as maintainer-approval.yml);
+#   - `labeled` / `unlabeled` are included so applying the skip label
+#     re-evaluates the check and can flip it green.
+#
+# SECURITY -- the LLM judge step reads the PR's (attacker-controlled, on fork
+# PRs) diff as TEXT and sends it to the gateway with the rate-limited, revocable
+# test token (same accepted-risk profile as fork e2e). The job never checks out
+# or runs PR-head code: it checks out ONLY .github/scripts from main (pinned, no
+# persisted credentials) and reads change/label/review state via the API. The
+# judge prompt is hardened against injection and fails closed. Crucially, a
+# wrong/injected "pass" here cannot merge anything: the separate required
+# `Maintainer Approval` check still gates merge, and a maintainer reviews.
+#
+# NO `paths:` filter on purpose: a required check that is path-filtered never
+# reports on PRs that don't match, leaving the required status stuck pending
+# and blocking merge forever. Instead this always runs and the gate script
+# self-determines whether ap-web/** was touched.
+#
+# leak-scan-allow: pull_request_target
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  # PR re-syncs / relabels share a group by PR number so old runs cancel.
+  group: e2e-ui-required-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  require-e2e-ui:
+    name: E2E UI Required
+    # Skip drafts; the `ready_for_review` trigger re-fires on un-drafting.
+    if: ${{ !github.event.pull_request.draft }}
+    permissions:
+      contents: read
+      pull-requests: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out gate scripts from main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: main             # trusted base; never the PR head
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Load maintainers
+        id: maintainers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: bash .github/scripts/merge-ready/load-maintainers.sh
+
+      - name: Require e2e_ui coverage or effective waiver
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          MAINTAINERS: ${{ steps.maintainers.outputs.list }}
+          # OpenAI-compatible gateway (same secrets the e2e suites use).
+          OPENAI_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+          OPENAI_API_KEY: ${{ secrets.LLM_API_KEY }}
+          E2E_UI_JUDGE_MODEL: databricks-gpt-5-4
+        run: bash .github/scripts/e2e-ui-required/check.sh
