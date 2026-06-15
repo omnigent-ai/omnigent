@@ -453,11 +453,12 @@ export interface SessionModelEvent {
 
 /**
  * `session.reasoning_effort` — active thinking-level switch from a native
- * terminal session.
+ * session.
  *
- * Emitted by the Omnigent server when a terminal forwarder observes an effort
- * change made inside the terminal UI. Carries `null` when the terminal cleared
- * back to its model default.
+ * Emitted by the Omnigent server after a native wrapper reports an effort
+ * change observed outside the Web UI: Claude-native mirrors terminal/TUI
+ * changes, and Codex-native mirrors Codex app-server/config state. Carries
+ * `null` when the native runtime cleared back to its model default.
  */
 export interface SessionReasoningEffortEvent {
   type: "session_reasoning_effort";
