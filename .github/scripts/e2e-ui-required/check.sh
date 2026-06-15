@@ -90,9 +90,10 @@ fi
 # the others, keeping the prompt representative across many-file PRs. A final
 # head -c is an overall backstop for PRs with very many files.
 MAX_PATCH_LINES=400
+# `gh api --paginate` (no --jq) merges all pages into one JSON array; pipe that
+# to jq so --argjson reaches jq (gh api itself has no --argjson flag).
 DIFF_BLOB=$(gh api "repos/$REPO/pulls/$PR/files" --paginate \
-  --argjson max "$MAX_PATCH_LINES" \
-  --jq '.[]
+  | jq -r --argjson max "$MAX_PATCH_LINES" '.[]
     | select(.filename | startswith("ap-web/") or startswith("tests/e2e_ui/"))
     | (.patch // "(no textual patch -- binary or too large)") as $p
     | ($p | split("\n")) as $lines
