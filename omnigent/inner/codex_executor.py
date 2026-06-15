@@ -30,6 +30,7 @@ from omnigent.spec.types import RetryPolicy
 from ._subprocess_lifecycle import close_subprocess_transport
 from .databricks_executor import (
     _read_databrickscfg,
+    _read_databrickscfg_host,
 )
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .executor import (
@@ -102,28 +103,17 @@ _OPENAI_CODEX_DEFAULT_MODEL = "gpt-5.4-mini"
 # from ~/.databrickscfg credentials with no spec/override model.
 _DATABRICKS_CODEX_DEFAULT_MODEL = "databricks-gpt-5-5"
 
-# Config files from the user's real ``CODEX_HOME`` that the per-conversation
-# temp ``CODEX_HOME`` should see. Symlinked (not copied) so credential
-# refreshes in the real home propagate to running sessions.
-#
-# KNOWN LIMITATION (config.toml is shared across ALL codex sessions):
-# Because ``config.toml`` is symlinked — not copied — every codex-native
-# session's ``<codex-home>/config.toml`` points at the SAME real
-# ``~/.codex/config.toml``. An in-TUI ``/model`` writes that one shared file,
-# so the selection is global, not per-session. The cost-budget policy reads
-# the model from this file (via ``read_codex_config_model`` in the codex
-# hook), which means:
-#   * Session A switching ``/model`` to a cheap model flips the policy's view
-#     for session B too — so a session B still running an EXPENSIVE model can
-#     read the shared cheap value and never get gated (and vice-versa).
-#   * A freshly spawned session reads whatever the last ``/model`` (from any
-#     session) left in the shared file, which may not match its own launch
-#     ``--model``.
-# Acceptable for single-user/local use; a correctness hole under concurrent
-# codex sessions or multi-user deploys. The fix (not yet done) is to COPY
-# config.toml per-session and seed it with that session's launch model, so
-# ``/model`` writes stay isolated. Tracked in the codex-cost-policy design.
-_CODEX_HOME_CONFIG_FILES = ("auth.json", "config.toml")
+# Files symlinked from the real CODEX_HOME into the per-session temp home.
+# Symlinks (not copies) so credential refreshes in the real home propagate
+# to running sessions without any action from Omnigent.
+_CODEX_HOME_SYMLINK_FILES = ("auth.json",)
+
+# Files copied (not symlinked) from the real CODEX_HOME into the per-session
+# temp home. config.toml is intentionally copied so that an in-TUI ``/model``
+# command writes only to the session's own private copy and never touches the
+# shared ``~/.codex/config.toml``. This keeps model selection and cost-policy
+# enforcement isolated between concurrent sessions.
+_CODEX_HOME_COPY_FILES = ("config.toml",)
 
 # Environment variables explicitly excluded from the codex subprocess even
 # when their prefix is in the allowlist. ``OPENAI_API_KEY`` is stripped so
@@ -570,7 +560,7 @@ def _private_codex_home_config_source(path: Path) -> Path | None:
         or ``None`` if the private home has no usable source symlink.
     """
     source_dirs: set[Path] = set()
-    for filename in _CODEX_HOME_CONFIG_FILES:
+    for filename in _CODEX_HOME_SYMLINK_FILES:
         config_file = path / filename
         if not config_file.is_symlink():
             continue
@@ -627,19 +617,21 @@ def _codex_home_config_source_from_env() -> Path:
 
 def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
     """
-    Symlink user config files from the real ``CODEX_HOME`` into the temp one.
+    Bridge user config files from the real ``CODEX_HOME`` into the temp one.
 
     The executor overrides ``CODEX_HOME`` to a per-conversation temp
     directory so session data (conversation history, etc.) stays isolated
     from the user's ``~/.codex/``. However, the codex CLI also reads
     authentication tokens (``auth.json``) and provider configuration
     (``config.toml``) from ``$CODEX_HOME``. This helper bridges those
-    read-only config files into the temp directory via symlinks,
-    preserving isolation while allowing codex to authenticate via the
-    user's subscription.
+    files into the temp directory:
 
-    Follows the same symlink-with-copy-fallback pattern as
-    :func:`_populate_codex_skills`.
+    - ``auth.json`` is **symlinked** so OAuth token refreshes written to
+      the real home propagate to running sessions without delay.
+    - ``config.toml`` is **copied** so an in-TUI ``/model`` command writes
+      only to the session's own private copy and never mutates the shared
+      ``~/.codex/config.toml``. This keeps model selection and cost-policy
+      enforcement isolated between concurrent sessions.
 
     :param target_dir: The per-conversation temp ``CODEX_HOME``
         directory. Must already exist.
@@ -650,7 +642,7 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
     if not source_dir.is_dir():
         return
 
-    for filename in _CODEX_HOME_CONFIG_FILES:
+    for filename in _CODEX_HOME_SYMLINK_FILES:
         source_file = source_dir / filename
         if not source_file.is_file():
             continue
@@ -667,6 +659,15 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
                 exc,
             )
             shutil.copy2(source_file, link_path)
+
+    for filename in _CODEX_HOME_COPY_FILES:
+        source_file = source_dir / filename
+        if not source_file.is_file():
+            continue
+        dest_path = target_dir / filename
+        if dest_path.exists() or dest_path.is_symlink():
+            continue
+        shutil.copy2(source_file, dest_path)
 
 
 def _databricks_codex_base_url(host: str) -> str:
@@ -2064,13 +2065,18 @@ class CodexExecutor(Executor):
                 # No gateway host supplied directly: derive the transport from
                 # a Databricks profile (the Databricks producer's fallback).
                 creds = _read_databrickscfg(databricks_profile)
-                if creds is None:
+                host = (
+                    creds.host
+                    if creds is not None
+                    else _read_databrickscfg_host(databricks_profile)
+                )
+                if not host:
                     raise OSError(
                         "CodexExecutor(gateway=True) requires gateway credentials via "
                         "the gateway base URL / auth command or a valid "
                         "~/.databrickscfg profile."
                     )
-                host = creds.host.rstrip("/")
+                host = host.rstrip("/")
                 base_url = (
                     base_url_override
                     if base_url_override is not None
