@@ -68,6 +68,35 @@ env:
   CLAUDE_CODE: ""
 
 jobs:
+  # Compute the shard matrix once. A skipped run (draft, or a fork's
+  # pull_request) yields an EMPTY matrix -> zero shard jobs -> no skipped
+  # check-runs with an unexpanded ${{ matrix.* }} name. Shared with e2e-ui.yml
+  # via .github/scripts/ci/e2e-shard-matrix.sh (only NUM_SHARDS differs).
+  setup:
+    name: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Check out CI scripts
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          # Triggering ref (not pinned to main): the script must exist on the
+          # running ref, and it is not a security gate -- it only shards tests
+          # and can't expose secrets (fork pull_request has none), so the PR's
+          # own copy is fine.
+          sparse-checkout: .github/scripts/ci
+          persist-credentials: false
+      - name: Compute shard matrix
+        id: matrix
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+          NUM_SHARDS: "4"
+        run: bash .github/scripts/ci/e2e-shard-matrix.sh
+
   e2e:
     # Sharded matrix. Each shard runs ~1/N of the test set, well under
     # the wallclock budget at which the hardened runner image's
@@ -91,13 +120,10 @@ jobs:
     # we trip rate limits, drop ``-n`` to 1 first; only fall back to
     # ``max-parallel`` reduction if QPS still hurts.
     name: E2E Tests (shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
-    # Skip draft PRs, and skip FORK pull_request events: forks get no secrets
-    # on `pull_request`, so they run via the fork-e2e/** push that
-    # fork-e2e-mirror.yml creates after approval (a `push` event is not a
-    # 'pull_request', so it always passes this guard).
-    if: ${{ !github.event.pull_request.draft
-      && (github.event_name != 'pull_request'
-          || github.event.pull_request.head.repo.full_name == github.repository) }}
+    # Draft PRs and fork pull_request events resolve to an EMPTY matrix in
+    # `setup` (forks run via the fork-e2e/** mirror push instead), so this job
+    # produces zero shard runs for them -- and thus no skipped placeholder check.
+    needs: setup
     runs-on: ubuntu-latest
     strategy:
       # One red shard shouldn't cancel siblings; we want every shard's
@@ -105,19 +131,9 @@ jobs:
       # localized to one chunk.
       fail-fast: false
       max-parallel: 4
-      matrix:
-        # 4 shards: pytest-shard splits test node IDs deterministically,
-        # so the same test always lands in the same shard across runs.
-        # Bump count if shard runtime creeps back into the kill zone.
-        include:
-          - shard_id: 0
-            num_shards: 4
-          - shard_id: 1
-            num_shards: 4
-          - shard_id: 2
-            num_shards: 4
-          - shard_id: 3
-            num_shards: 4
+      # Shards from `setup` (pytest-shard splits node IDs deterministically, so
+      # a test always lands in the same shard); [] when the run is skipped.
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
 
     steps:
       - name: Checkout

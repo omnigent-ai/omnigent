@@ -114,6 +114,33 @@ def test_request_phase_over_budget_on_expensive_model_denies() -> None:
     assert "re-issue the tool call" not in result["reason"]
 
 
+def test_request_phase_soft_checkpoint_asks_and_records_daily_key() -> None:
+    """Crossing a daily checkpoint ASKs at the request phase → ASK + daily key.
+
+    The soft warning now also fires before the LLM turn (the request phase
+    has a server-side approval round-trip), so a text-only turn that
+    crosses a daily checkpoint parks for approval. The ASK still records to
+    the per-user+day store via ``USER_DAILY_ASK_APPROVED_STATE_KEY``.
+    """
+    policy = user_daily_cost_budget(max_cost_usd=5.0, ask_thresholds_usd=[2.0])
+    event: PolicyEvent = {
+        "type": "request",
+        "target": None,
+        "data": "please run the build",
+        "context": {
+            "actor": {},
+            "user_daily_cost": {"cost_usd": 2.0, "ask_approved_usd": 0.0},
+            "model": "databricks-claude-opus-4-8",
+        },
+        "session_state": {},
+    }
+    result = policy(event)
+    assert result["result"] == "ASK"
+    assert result["state_updates"] == [
+        {"key": USER_DAILY_ASK_APPROVED_STATE_KEY, "action": "set", "value": 2.0},
+    ]
+
+
 def test_zero_or_missing_daily_cost_allows() -> None:
     """No daily cost recorded (no owner / unpriced) → never trips."""
     policy = user_daily_cost_budget(max_cost_usd=5.0, ask_thresholds_usd=[1.0])

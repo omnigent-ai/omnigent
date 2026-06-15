@@ -10,6 +10,12 @@ name: Fork e2e mirror
 # untrusted code with secrets in scope. The fork code only runs on the
 # downstream `push` to fork-e2e/** (see e2e.yml), which is a trusted event.
 #
+# The ref is pushed with a GitHub App token, NOT the default GITHUB_TOKEN:
+# refs created/updated by GITHUB_TOKEN do not trigger workflows (GitHub
+# recursion-prevention), so the e2e `push` would never fire. Requires repo
+# variable FORK_E2E_APP_ID and secret FORK_E2E_APP_PRIVATE_KEY for an App
+# installed on this repo with contents:write.
+#
 # Gate -- .github/scripts/fork-e2e/should-mirror.sh opens when any holds:
 #   maintainer-approved  ||  returning-contributor  ||  fork-e2e/pr-N exists.
 # Once the branch exists, every later push re-mirrors (re-runs e2e on the new
@@ -42,7 +48,7 @@ jobs:
     # Fork PRs only -- same-repo PRs run e2e directly via `pull_request`.
     if: ${{ github.event.pull_request.head.repo.fork }}
     permissions:
-      contents: write       # create / update / delete the fork-e2e/pr-N ref
+      contents: read        # reads only; the App token below does the ref writes
       pull-requests: read   # read author + reviews for the gate
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -61,8 +67,21 @@ jobs:
           sparse-checkout: .github/scripts
           persist-credentials: false
 
+      - name: Mint mirror App token
+        id: app-token
+        # A ref created/updated with the default GITHUB_TOKEN does NOT trigger
+        # workflows (GitHub recursion-prevention), so e2e.yml's `push` would
+        # never fire. Push the ref with a GitHub App token instead: it carries
+        # contents:write and its pushes DO trigger downstream workflows.
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          app-id: ${{ vars.FORK_E2E_APP_ID }}
+          private-key: ${{ secrets.FORK_E2E_APP_PRIVATE_KEY }}
+
       - name: Delete mirror branch on PR close
         if: ${{ github.event.action == 'closed' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           gh api -X DELETE "repos/$REPO/git/refs/heads/$MIRROR_BRANCH" >/dev/null 2>&1 \
             && echo "Deleted $MIRROR_BRANCH" \
@@ -82,6 +101,8 @@ jobs:
 
       - name: Mirror head SHA onto trusted branch
         if: ${{ github.event.action != 'closed' && steps.gate.outputs.mirror == 'true' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           if gh api "repos/$REPO/git/refs/heads/$MIRROR_BRANCH" >/dev/null 2>&1; then
             gh api -X PATCH "repos/$REPO/git/refs/heads/$MIRROR_BRANCH" \

@@ -5,8 +5,12 @@ name: Merge Ready
 # inside this workflow defines what backs it.
 #
 # Per trigger:
-#   /merge comment   always evaluate, post green or red, enable GitHub
-#                    auto-merge, drop a sticky comment.
+#   /merge comment   from a commenter with write access only: evaluate,
+#                    post green or red, enable GitHub auto-merge, drop a
+#                    sticky comment. Comments from users without write
+#                    access are ignored (author_association pre-filter
+#                    on the job, authoritative permission-API check
+#                    before any merge action).
 #   pull_request     skipped unless PR has `automerge` label. With
 #                    label, evaluate and post green or red. When the
 #                    `automerge` label was just added (action=labeled),
@@ -101,7 +105,12 @@ jobs:
         github.event_name == 'issue_comment' &&
         github.event.issue.pull_request != null &&
         contains(github.event.comment.body, '/merge') &&
-        !endsWith(github.actor, '[bot]')
+        !endsWith(github.actor, '[bot]') &&
+        (
+          github.event.comment.author_association == 'OWNER' ||
+          github.event.comment.author_association == 'MEMBER' ||
+          github.event.comment.author_association == 'COLLABORATOR'
+        )
       )
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -252,10 +261,27 @@ jobs:
             -f description="$DESC" >/dev/null
           echo "Posted Merge Ready=$STATE on $SHA ($DESC)"
 
-      - name: Enable auto-merge on /merge
+      # Authoritative authorization for /merge: the job `if` pre-filters
+      # on author_association, but an org MEMBER may lack write on this
+      # repo, so confirm effective write access via the permission API
+      # before any merge action runs.
+      - name: Authorize /merge commenter
+        id: authz
         if: >-
           github.event_name == 'issue_comment' &&
           steps.ctx.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          AUTHOR: ${{ github.event.comment.user.login }}
+          PR: ${{ steps.ctx.outputs.pr }}
+        run: bash .github/scripts/merge-ready/authorize-merge-comment.sh
+
+      - name: Enable auto-merge on /merge
+        if: >-
+          github.event_name == 'issue_comment' &&
+          steps.ctx.outputs.skip != 'true' &&
+          steps.authz.outputs.authorized == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}

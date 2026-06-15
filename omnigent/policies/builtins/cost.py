@@ -6,17 +6,18 @@ turn, so text-only turns are budgeted too) and the **tool-call** phase
 (the point a native ``PreToolUse`` hook can block before the action
 runs):
 
-- ``ask_thresholds_usd`` (optional, soft, **tool-call phase only**): a
-  list of warning checkpoints. The first time the session's
-  ``total_cost_usd`` crosses each checkpoint, the tool call is parked for
-  user approval (ASK). Each checkpoint prompts at most once *per
-  approval* — the highest-approved checkpoint is remembered in
-  ``session_state``, so approving lets spend continue to the next
-  checkpoint. A decline blocks that one tool call but does not record the
-  checkpoint, so the next tool call over the same threshold re-asks until
-  it is approved. (The soft gate is tool-call only because the
-  request-phase policy path has no approval round-trip — an ASK there
-  would surface as a plain denial.)
+- ``ask_thresholds_usd`` (optional, soft, **request + tool-call
+  phases**): a list of warning checkpoints. The first time the session's
+  ``total_cost_usd`` crosses each checkpoint, the turn (request phase) or
+  the tool call (tool-call phase) is parked for user approval (ASK). Each
+  checkpoint prompts at most once *per approval* — the highest-approved
+  checkpoint is remembered in ``session_state``, so approving lets spend
+  continue to the next checkpoint. A decline blocks that one turn / tool
+  call but does not record the checkpoint, so the next request or tool
+  call over the same threshold re-asks until it is approved. (Both phases
+  have a server-side approval round-trip that applies the ASK's
+  ``state_updates`` only on accept — the request phase parks the whole
+  turn before it reaches the model, so text-only turns are warned too.)
 - ``max_cost_usd`` (required, hard, **request + tool-call phases**): once
   spend reaches this, the policy forces a model downgrade. Rather than
   stopping the session, it DENYs **while the session is still on an
@@ -37,9 +38,10 @@ pricing is unavailable the cost stays ``0.0`` and the policy never trips
 
 On the ``tool_call`` phase a DENY/ASK blocks that specific tool call
 (the native hook returns ``deny`` / parks for approval) rather than
-ending the session. On the ``request`` phase a DENY blocks the whole
+ending the session. On the ``request`` phase a DENY/ASK blocks the whole
 turn before the model runs — so text-only turns with no tool calls are
-budgeted too; its DENY reason is surfaced straight to the user. Cost is
+budgeted (DENY) and warned (ASK) too; the verdict is surfaced straight
+to the user via the same server-side approval round-trip. Cost is
 refreshed at turn boundaries, so a single very expensive turn can still
 overshoot before the next check.
 
@@ -353,9 +355,10 @@ def cost_budget(
     session is still on an expensive model — telling the user to
     ``/model`` to a cheaper one. The soft warning checkpoints (ASK
     "continue?"; recorded on approve so they don't re-prompt, re-asked
-    after a decline) fire on ``tool_call`` ONLY, because the request
-    phase has no approval round-trip (see ``evaluate``). Abstains (ALLOW)
-    on every other phase and whenever cost is unpriced (``0.0``).
+    after a decline) fire on BOTH the ``request`` and ``tool_call``
+    phases — both have a server-side approval round-trip (see
+    ``evaluate``). Abstains (ALLOW) on every other phase and whenever
+    cost is unpriced (``0.0``).
 
     :param max_cost_usd: Hard limit in USD. Once cumulative session cost
         reaches this, tool calls are DENYed while the session is on an
@@ -364,8 +367,8 @@ def cost_budget(
         e.g. ``[1.0, 2.5]``. Each ASKs for approval the first time
         cumulative cost crosses it (approval remembered via
         ``session_state``, so an approved checkpoint prompts at most
-        once; a decline blocks the one tool call and re-asks next time).
-        ``None`` or ``[]`` disables the soft gate. Every value must be
+        once; a decline blocks the one turn / tool call and re-asks next
+        time). ``None`` or ``[]`` disables the soft gate. Every value must be
         ``> 0`` and strictly less than *max_cost_usd*. Order does not
         matter — they are sorted internally.
     :param expensive_models: Optional case-insensitive substring tokens
@@ -409,17 +412,16 @@ def cost_budget(
           approved → ASK ("continue?") carrying a ``state_updates``
           write of the crossed value, applied only on approve so the
           checkpoint (and lower ones) won't re-prompt once approved.
-          This soft gate runs on ``tool_call`` ONLY: the request-phase
-          (input) policy path surfaces an ASK as a plain denial with no
-          approval round-trip and no ``state_updates`` persistence, so a
-          "Continue?" there would just block the turn and re-prompt every
-          turn. Soft warnings therefore fire at the first tool call of an
-          over-threshold turn instead.
+          This soft gate runs on BOTH gated phases: each has a
+          server-side approval round-trip that parks the turn (request)
+          or tool call (tool_call) and persists the ASK's
+          ``state_updates`` only on accept. Firing on ``request`` means
+          text-only turns are warned too, and the recorded checkpoint
+          stops the first tool call of the same turn from re-asking.
 
         :param event: Policy event dict.
         :returns: DENY when over budget on an expensive model; ASK when
-            a new soft checkpoint is crossed on ``tool_call``; ALLOW
-            otherwise.
+            a new soft checkpoint is newly crossed; ALLOW otherwise.
         """
         phase = event.get("type")
         if phase not in _GATED_PHASES:
@@ -441,7 +443,7 @@ def cost_budget(
                 }
             # Already on a cheaper model — the downgrade gate is satisfied.
             return _ALLOW
-        if phase == "tool_call" and thresholds:
+        if thresholds:
             # Highest checkpoint the cost has crossed so far.
             crossed = max((t for t in thresholds if cost >= t), default=None)
             if crossed is not None:
@@ -456,8 +458,8 @@ def cost_budget(
                         ),
                         # Applied only on approve → this and every lower
                         # checkpoint won't re-prompt; higher ones still will.
-                        # A declined ASK leaves this unset, so the next tool
-                        # call over the same threshold re-asks.
+                        # A declined ASK leaves this unset, so the next
+                        # request or tool call over the same threshold re-asks.
                         "state_updates": [
                             {"key": _ASK_APPROVED_KEY, "action": "set", "value": crossed},
                         ],
@@ -530,18 +532,18 @@ def user_daily_cost_budget(
     ``ask_approved_usd``), which the policy engine injects — at
     engine-build time — only when this policy is configured (from the
     ``user_daily_cost`` store, attributed to the session owner). The hard
-    limit gates the ``request`` phase (before the LLM turn) and the
-    ``tool_call`` phase; the soft warning checkpoints gate ``tool_call``
-    only (see :func:`cost_budget`).
+    limit and the soft warning checkpoints both gate the ``request`` phase
+    (before the LLM turn) and the ``tool_call`` phase (see
+    :func:`cost_budget`).
 
     - **Soft (`ask_thresholds_usd`)**: the first time the owner's daily
-      spend crosses a checkpoint, the tool call is parked for approval
-      (ASK; ``tool_call`` phase only). The approval is recorded **per
-      user+day** (in ``user_daily_cost.ask_approved_usd`` via a reserved
-      ``state_updates`` key the engine routes to that store), so an
-      approved checkpoint won't re-prompt the user again that day —
-      including from a different session. A decline blocks that one
-      tool call and re-asks next time.
+      spend crosses a checkpoint, the turn (request phase) or tool call
+      (tool-call phase) is parked for approval (ASK). The approval is
+      recorded **per user+day** (in ``user_daily_cost.ask_approved_usd``
+      via a reserved ``state_updates`` key the engine routes to that
+      store), so an approved checkpoint won't re-prompt the user again
+      that day — including from a different session. A decline blocks
+      that one turn / tool call and re-asks next time.
     - **Hard (`max_cost_usd`)**: once the owner's daily spend reaches
       the limit, DENY every tool call while the session is on an
       ``expensive_models`` model (a ``/model`` downgrade gate, not a
@@ -584,8 +586,8 @@ def user_daily_cost_budget(
 
         :param event: Policy event dict.
         :returns: DENY when over the daily budget on an expensive model;
-            ASK when a new daily soft checkpoint is crossed on
-            ``tool_call``; ALLOW otherwise.
+            ASK when a new daily soft checkpoint is newly crossed; ALLOW
+            otherwise.
         """
         phase = event.get("type")
         if phase not in _GATED_PHASES:
@@ -610,9 +612,10 @@ def user_daily_cost_budget(
                     ),
                 }
             return _ALLOW
-        # Soft ASK is tool_call-only — see cost_budget.evaluate for why the
-        # request phase cannot carry an approvable checkpoint.
-        if phase == "tool_call" and thresholds:
+        # Soft ASK fires on both gated phases — each has a server-side
+        # approval round-trip that persists the checkpoint on accept (see
+        # cost_budget.evaluate).
+        if thresholds:
             crossed = max((t for t in thresholds if cost >= t), default=None)
             if crossed is not None:
                 approved_up_to = _user_daily_ask_approved_usd(event)
@@ -652,8 +655,8 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
         "description": "Gates a session on cumulative LLM spend (USD): once a hard limit is "
         "reached DENY (the whole turn at the request phase, or each tool call) while still on "
         "an expensive model (prompting a /model downgrade), and ASK for approval at each soft "
-        "warning checkpoint (tool-call phase only). Reads event.context.usage.total_cost_usd "
-        "and event.context.model.",
+        "warning checkpoint (request + tool-call phases). Reads "
+        "event.context.usage.total_cost_usd and event.context.model.",
         "params_schema": {
             "type": "object",
             "properties": {
@@ -689,8 +692,8 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
         "sessions for the current UTC day: once a hard daily limit is reached DENY (the whole "
         "turn at the request phase, or each tool call) while still on an expensive model "
         "(prompting a /model downgrade), and ASK for approval at each soft warning checkpoint "
-        "(tool-call phase only, remembered per user+day). Reads event.context.user_daily_cost "
-        "and event.context.model.",
+        "(request + tool-call phases, remembered per user+day). Reads "
+        "event.context.user_daily_cost and event.context.model.",
         "params_schema": {
             "type": "object",
             "properties": {
