@@ -1220,3 +1220,259 @@ def server_pid(live_server: str) -> int:
     :returns: OS process id.
     """
     return int(_server_state["pid"])
+
+
+# ---------------------------------------------------------------------------
+# Per-agent chat sessions (message render-parity suite, and reusable beyond it)
+#
+# Each fixture below yields ``(base_url, session_id)`` for a session bound to
+# the shared ``live_server`` runner, ready to chat at ``/c/<session_id>``,
+# across three agent shapes whose transcript-rendering paths differ:
+#
+# * ``custom_agent_session`` — a plain ``openai-agents`` agent (the
+#   ``echo_probe`` spec below), the same harness family as ``hello_world``,
+#   registered fresh so it stands in for "spin up a different agent" without
+#   the multi-provider sprawl of the packaged ``polly`` / ``debby`` examples.
+# * ``claude_code_session`` — the auto-registered ``claude-native-ui`` built-in
+#   (the ``claude-native`` CLI harness, "Claude Code").
+# * ``codex_session`` — the auto-registered ``codex-native-ui`` built-in (the
+#   ``codex-native`` CLI harness, "Codex").
+#
+# The two native built-ins are registered by ``_ensure_default_agents`` at
+# server startup (omnigent/server/app.py), so they exist on any ``omnigent
+# server`` without extra wiring — the fixtures just create a session bound to
+# them by durable agent id and PATCH it onto the runner, the same bind the
+# ``seeded_session`` fixture does for the bundled agent.
+# ---------------------------------------------------------------------------
+
+# Names the server auto-registers for the two native CLI harnesses
+# (omnigent/server/app.py: _ensure_default_claude_agent /
+# _ensure_default_codex_agent). The matching CLI binary must be on PATH for
+# the harness to launch — callers skip when it is absent.
+CLAUDE_NATIVE_AGENT_NAME = "claude-native-ui"
+CODEX_NATIVE_AGENT_NAME = "codex-native-ui"
+
+# Model pinned on codex-native sessions — matches omnigent's own codex default
+# (omnigent/codex_native_app_server.py ``_DATABRICKS_CODEX_DEFAULT_MODEL``) and
+# is served by the Databricks gateway used in CI. See ``model_override`` on
+# :func:`_create_native_session` for why pinning is required.
+_NATIVE_CODEX_MODEL = "databricks-gpt-5-5"
+
+# A precise-echo agent on the openai-agents harness (same provider family as
+# hello_world, so it authenticates against the same gateway in CI). spec_version
+# 1 + executor.config.harness routes through the strict parser; arcname
+# config.yaml keeps it on that path.
+_CUSTOM_AGENT_NAME = "echo_probe"
+_CUSTOM_AGENT_YAML = f"""\
+spec_version: 1
+name: {_CUSTOM_AGENT_NAME}
+prompt: |
+  You are a precise echo assistant. The user sends a turn that ends with an
+  instruction to reply with one exact token. Reply with that token verbatim
+  and nothing else — no preamble, no quotes, no trailing punctuation.
+
+executor:
+  model: databricks-gpt-5-4
+  config:
+    harness: openai-agents
+"""
+
+
+def _bind_session_runner(base_url: str, session_id: str, runner_id: str) -> None:
+    """PATCH *session_id* onto *runner_id* so ``POST /v1/responses`` dispatches.
+
+    :param base_url: Spawned server base URL, e.g. ``"http://127.0.0.1:51234"``.
+    :param session_id: The session/conversation id to bind.
+    :param runner_id: The token-bound runner id the session dispatches to.
+    """
+    patch = httpx.patch(
+        f"{base_url}/v1/sessions/{session_id}",
+        json={"runner_id": runner_id},
+        timeout=10.0,
+    )
+    patch.raise_for_status()
+
+
+def _find_builtin_agent_id(base_url: str, name: str) -> str | None:
+    """Return the durable id of a built-in agent by name, or ``None``.
+
+    :param base_url: Spawned server base URL.
+    :param name: Registered agent name, e.g. ``"claude-native-ui"``.
+    :returns: The ``"ag_..."`` id, or ``None`` when the server did not
+        register it (e.g. the harness's CLI is unavailable).
+    """
+    resp = httpx.get(f"{base_url}/v1/agents", timeout=10.0)
+    resp.raise_for_status()
+    for agent in resp.json().get("data", []):
+        if agent.get("name") == name:
+            return str(agent["id"])
+    return None
+
+
+def _create_native_session(
+    base_url: str,
+    runner_id: str,
+    agent_name: str,
+    *,
+    workspace: str | None = None,
+    model_override: str | None = None,
+) -> str:
+    """Create a runner-bound session against a native built-in agent.
+
+    Native built-ins have ``session_id IS NULL``, so the JSON create body
+    (``{"agent_id": ...}``) is accepted and returns a ``SessionResponse``
+    whose ``id`` is the new session — unlike the multipart bundle create
+    (used for session-scoped agents) which returns ``session_id``.
+
+    :param base_url: Spawned server base URL.
+    :param runner_id: The token-bound runner id to bind.
+    :param agent_name: The native built-in name, e.g. ``"codex-native-ui"``.
+    :param workspace: Optional absolute path stored as the session's
+        workspace. Required for ``codex-native``: the runner refuses to
+        auto-launch the Codex terminal without a session workspace or
+        ``OMNIGENT_RUNNER_WORKSPACE`` (omnigent/runner/app.py
+        ``_codex_session_workspace``). With ``host_id`` unset the server
+        stores the path verbatim (no os_env boundary validation), so it
+        must already exist. ``claude-native`` does not need it.
+    :param model_override: Optional model id pinned on the session, passed
+        to the native CLI as ``--model`` at terminal launch. Required for
+        ``codex-native`` here: when an ``OPENAI_API_KEY`` is present (the
+        e2e_ui server sets one for the openai-agents agents) Codex resolves
+        the generic ``openai`` provider with no default model and launches
+        against a model the gateway doesn't serve, so the turn completes
+        with no output. Pinning a gateway-served model makes Codex reach a
+        real endpoint regardless of which provider it resolves.
+    :returns: The new session/conversation id.
+    :raises pytest.skip.Exception: When the built-in is not registered.
+    """
+    agent_id = _find_builtin_agent_id(base_url, agent_name)
+    if agent_id is None:
+        pytest.skip(
+            f"{agent_name!r} is not registered on the server — its CLI harness "
+            "is likely unavailable in this environment."
+        )
+    body: dict[str, object] = {"agent_id": agent_id}
+    if workspace is not None:
+        body["workspace"] = workspace
+    if model_override is not None:
+        body["model_override"] = model_override
+    create = httpx.post(
+        f"{base_url}/v1/sessions",
+        json=body,
+        timeout=30.0,
+    )
+    create.raise_for_status()
+    session_id = str(create.json()["id"])
+    _bind_session_runner(base_url, session_id, runner_id)
+    return session_id
+
+
+def _create_bundled_session(base_url: str, runner_id: str, yaml_text: str) -> str:
+    """Register a session-scoped agent from *yaml_text* and bind its session.
+
+    The multipart ``POST /v1/sessions`` both registers the agent and creates
+    the session it is scoped to, returning that ``session_id`` directly — so
+    no separate create call is needed.
+
+    :param base_url: Spawned server base URL.
+    :param runner_id: The token-bound runner id to bind.
+    :param yaml_text: The agent spec body.
+    :returns: The new session/conversation id.
+    """
+    import json as _json
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        data = yaml_text.encode()
+        info = tarfile.TarInfo("config.yaml")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+
+    create = httpx.post(
+        f"{base_url}/v1/sessions",
+        data={"metadata": _json.dumps({})},
+        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
+        timeout=30.0,
+    )
+    create.raise_for_status()
+    session_id = str(create.json()["session_id"])
+    _bind_session_runner(base_url, session_id, runner_id)
+    return session_id
+
+
+@pytest.fixture
+def custom_agent_session(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A runner-bound session on the custom ``echo_probe`` agent.
+
+    :param live_server: Spawned server fixture; its runner is reused.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``.
+    """
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    session_id = _create_bundled_session(live_server, runner_id, _CUSTOM_AGENT_YAML)
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
+            respawned.wait(timeout=5)
+
+
+@pytest.fixture
+def claude_code_session(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A runner-bound session on the ``claude-native-ui`` ("Claude Code") agent.
+
+    :param live_server: Spawned server fixture; its runner is reused.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``.
+    """
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    session_id = _create_native_session(live_server, runner_id, CLAUDE_NATIVE_AGENT_NAME)
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
+            respawned.wait(timeout=5)
+
+
+@pytest.fixture
+def codex_session(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A runner-bound session on the ``codex-native-ui`` ("Codex") agent.
+
+    :param live_server: Spawned server fixture; its runner is reused.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``.
+    """
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    # Codex refuses to auto-launch its terminal without a workspace; give it
+    # a real (empty) dir to run in. claude-native needs no such thing.
+    workspace = tmp_path_factory.mktemp("codex_workspace")
+    session_id = _create_native_session(
+        live_server,
+        runner_id,
+        CODEX_NATIVE_AGENT_NAME,
+        workspace=str(workspace),
+        model_override=_NATIVE_CODEX_MODEL,
+    )
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
+            respawned.wait(timeout=5)
