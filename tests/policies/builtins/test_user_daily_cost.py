@@ -1,7 +1,7 @@
 """Tests for the per-user daily cost-budget policy.
 
-``user_daily_cost_budget`` gates the ``tool_call`` phase on the session
-OWNER's cumulative spend for the current UTC day, read from
+``user_daily_cost_budget`` gates the ``request`` and ``tool_call`` phases
+on the session OWNER's cumulative spend for the current UTC day, read from
 ``event["context"]["user_daily_cost"]`` (injected by the engine). Same
 ASK/DENY/downgrade logic as ``cost_budget``, but:
 
@@ -72,17 +72,46 @@ def test_below_ask_threshold_allows() -> None:
     assert policy(_tool(1.0)) == {"result": "ALLOW"}
 
 
-def test_non_tool_call_phase_allows() -> None:
-    """Only the tool_call phase is gated; other phases abstain even over budget."""
+@pytest.mark.parametrize("phase", ["response", "tool_result", "llm_request", "llm_response"])
+def test_non_gated_phase_allows(phase: str) -> None:
+    """Non-gated phases abstain even over budget (request/tool_call ARE gated)."""
     policy = user_daily_cost_budget(max_cost_usd=5.0)
     event: PolicyEvent = {
-        "type": "request",
+        "type": phase,
         "target": None,
         "data": "x",
         "context": {"user_daily_cost": {"cost_usd": 9.99}, "model": "opus"},
         "session_state": {},
     }
     assert policy(event) == {"result": "ALLOW"}
+
+
+def test_request_phase_over_budget_on_expensive_model_denies() -> None:
+    """Over the hard daily limit on an expensive model DENYs at the request phase.
+
+    The daily gate now also fires before the LLM turn, so a text-only turn
+    counts against the daily budget. The reason must be the user-facing
+    variant (no tool-call directive), since a request-phase DENY is shown
+    straight to the user.
+    """
+    policy = user_daily_cost_budget(max_cost_usd=5.0)
+    event: PolicyEvent = {
+        "type": "request",
+        "target": None,
+        "data": "please run the build",
+        "context": {
+            "actor": {},
+            "user_daily_cost": {"cost_usd": 6.0, "ask_approved_usd": 0.0},
+            "model": "databricks-claude-opus-4-8",
+        },
+        "session_state": {},
+    }
+    result = policy(event)
+    assert result["result"] == "DENY"
+    assert "6.00" in result["reason"]
+    assert "daily" in result["reason"].lower()
+    # User-facing phrasing only — no tool-call directive leaks through.
+    assert "re-issue the tool call" not in result["reason"]
 
 
 def test_zero_or_missing_daily_cost_allows() -> None:
@@ -176,9 +205,15 @@ def test_deny_message_names_the_owner_when_present() -> None:
 
 
 def test_over_daily_budget_on_cheaper_model_allows() -> None:
-    """Over the daily limit but already on a cheaper model → ALLOW (downgrade satisfied)."""
+    """Over the daily limit but already on a cheaper model → ALLOW (downgrade satisfied).
+
+    Sonnet is outside the default expensive set, so a downgraded session
+    proceeds even over the daily limit. (Note: ``gpt-5-4`` is NOT a cheap
+    model under the broad ``gpt-5`` default token — only the ``-mini`` /
+    ``-nano`` variants are carved out.)
+    """
     policy = user_daily_cost_budget(max_cost_usd=5.0)
-    assert policy(_tool(6.0, model="databricks-gpt-5-4")) == {"result": "ALLOW"}
+    assert policy(_tool(6.0, model="databricks-claude-sonnet-4-6")) == {"result": "ALLOW"}
 
 
 @pytest.mark.parametrize(
