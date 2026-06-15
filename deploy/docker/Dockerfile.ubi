@@ -82,7 +82,8 @@ ENV PYTHONUNBUFFERED=1 \
 
 USER 0
 
-RUN dnf install -y --nodocs git tmux curl ca-certificates \
+# curl-minimal and ca-certificates are preinstalled in UBI9.
+RUN dnf install -y --nodocs git tmux \
  && dnf clean all
 
 RUN git config --system credential.helper \
@@ -117,8 +118,9 @@ ENV PYTHONUNBUFFERED=1 \
 
 USER 0
 
-RUN dnf install -y --nodocs curl ca-certificates \
- && dnf clean all
+# curl-minimal and ca-certificates are preinstalled in UBI9;
+# installing full curl would conflict with curl-minimal.
+
 
 COPY --from=server-builder /opt/venv /opt/venv
 COPY --from=server-builder /build /build
