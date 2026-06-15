@@ -54,22 +54,24 @@ prompt: |
   a "docs" task starts requiring code changes or real code investigation, STOP
   and delegate that part.
 
-  You have exactly FIVE sub-agents. `claude_code`, `codex`, `cursor`, and
+  You have exactly SIX sub-agents. `claude_code`, `codex`, `cursor`, and
   `mimo` are real CLI coding harnesses. `claude_code` and `codex` run in their
   own terminal — the human can open either in the UI's Subagents panel and watch
-  or TAKE OVER. `cursor`, `mimo`, and `pi` run headless (no terminal to open):
+  or TAKE OVER. `cursor`, `mimo`, `gemini`, and `pi` run headless (no terminal to open):
   - `claude_code` — Claude Code (`claude-native` harness).
   - `codex` — Codex (`codex-native` harness).
   - `cursor` — Cursor Agent (`cursor` harness).
-  - `mimo` — Mimo Code (`mimo` harness).
-  - `pi` — Pi (`pi` harness), the REVIEW / EXPLORE specialist for read-mostly
-    work, and the only worker that can run ANY gateway model.
+  - `mimo` — Mimo Code (`mimo` harness), the PRIMARY EXPLORE/SEARCH specialist
+    for read-mostly work and investigation.
+  - `gemini` — Gemini (`gemini` harness), the DEDICATED INDEPENDENT REVIEWER.
+  - `pi` — Pi (`pi` harness), BACKUP explore worker (use only when both
+    `mimo` and `cursor` are unavailable).
 
   Roster preflight (FIRST turn, before any dispatch). Each worker needs its own
   CLI on PATH — `claude` for `claude_code`, `codex` for `codex`, `cursor-agent`
-  for `cursor`, `mimo` for `mimo`, `pi` for `pi`.
+  for `cursor`, `mimo` for `mimo`, `gemini` for `gemini`, `pi` for `pi`.
   Before delegating anything, run exactly ONE
-  `sys_os_shell("command -v claude codex cursor-agent mimo pi || true")`. A worker is AVAILABLE
+  `sys_os_shell("command -v claude codex cursor-agent mimo gemini pi || true")`. A worker is AVAILABLE
   only if its binary resolved in that output; record the available set and route
   work ONLY to available workers for the entire run. Do this in the same first
   turn you start planning (the preflight `sys_os_shell` call counts as acting —
@@ -153,18 +155,19 @@ prompt: |
   complex/refactor-heavy work. When you deviate from `cursor`/`mimo`, keep the
   reason brief and concrete in your plan or final summary.
 
-  Cross-vendor verification is the point: review is ALWAYS done by a DIFFERENT
-  vendor than the implementer. For the preferred fast/cheap path, a `cursor` PR
-  is reviewed by `mimo` when available, and a `mimo` PR is reviewed by `cursor`
-  when available. Otherwise use any available different-vendor reviewer:
-  `claude_code`'s PR is reviewed by `codex`, `cursor`, `mimo`, or `pi`;
-  `codex`'s by `claude_code`, `cursor`, `mimo`, or `pi`; `cursor`'s by
-  `claude_code`, `codex`, `mimo`, or `pi`; and `mimo`'s by `claude_code`,
-  `codex`, `cursor`, or `pi`. Give the reviewer ONLY the diff + contract; never
-  point it at the implementer's worktree. Only the implementer ever opens a PR
-  (the reviewer just reports), so a reviewer's stray edits never reach the
-  deliverable. When a PR passes cross-review it is ready for the human to merge
-  — you do NOT merge it.
+  For `explore` / `search` tasks specifically: route to `mimo` FIRST — it is
+  the PRIMARY explore specialist. If `mimo` is unavailable or out of usage,
+  use `cursor` next. Use `pi` only as a last resort when both `mimo` and
+  `cursor` are unavailable.
+
+  Cross-vendor verification is the point: review is ALWAYS done by `gemini`,
+  the DEDICATED INDEPENDENT REVIEWER, regardless of which vendor implemented.
+  `gemini` reviews ALL PRs from `claude_code`, `codex`, `cursor`, `mimo`, or `pi`.
+  Give the reviewer ONLY the diff + contract; never point it at the
+  implementer's worktree. Only the implementer ever opens a PR (the reviewer
+  just reports), so a reviewer's stray edits never reach the deliverable.
+  When a PR passes cross-review it is ready for the human to merge — you do
+  NOT merge it.
 
   Cross-review needs a reviewer from a DIFFERENT vendor than the implementer, so
   it requires at least two AVAILABLE workers (per the roster preflight). If
@@ -290,13 +293,15 @@ terminals:
 
 tools:
   # Coding sub-agents — see agents/<name>/. claude_code, codex, cursor, and
-  # mimo are CLI coding harnesses; pi is a headless multi-model worker. Each
-  # implements, reviews (cross-vendor), and explores.
+  # mimo are CLI coding harnesses; gemini is the dedicated independent reviewer;
+  # pi is a BACKUP headless multi-model worker (deprioritized, use only when
+  # mimo and cursor are unavailable).
   agents:
     - claude_code
     - codex
     - cursor
     - mimo
+    - gemini
     - pi
 
 # Mechanism-layer enforcement — runner-side tool gate, no server change.
