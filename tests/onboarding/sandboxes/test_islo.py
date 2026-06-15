@@ -253,6 +253,44 @@ def test_provision_env_passthrough_missing_var_fails_loud(
     assert fake.create_payloads == []
 
 
+@pytest.mark.parametrize("cred_var", ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"])
+def test_provision_clears_seeded_helper_when_user_injects_claude_cred(
+    monkeypatch: pytest.MonkeyPatch, cred_var: str
+) -> None:
+    """
+    A user-injected Claude credential strips Islo's gateway ``apiKeyHelper``
+    so the injected credential wins (covers both CLI and managed launches,
+    which share ``provision``).
+    """
+    monkeypatch.setenv(cred_var, "secret-value")
+    monkeypatch.setattr(islo_mod, "_new_sandbox_name", lambda label: "omnigent-byo")
+    fake = _FakeIsloAPI()
+    launcher = IsloSandboxLauncher(env=[cred_var])
+    monkeypatch.setattr(launcher, "_islo", lambda: fake)
+
+    launcher.provision("host")
+
+    strip_calls = [call for call in fake.exec_calls if "apiKeyHelper" in call.command[-1]]
+    assert len(strip_calls) == 1
+    assert strip_calls[0].sandbox_id == "omnigent-byo"
+    assert strip_calls[0].command[:2] == ["bash", "-lc"]
+
+
+def test_provision_keeps_seeded_helper_without_user_claude_cred(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gateway users (Option A) inject no Claude credential, so the seeded helper stays."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setattr(islo_mod, "_new_sandbox_name", lambda label: "omnigent-gw")
+    fake = _FakeIsloAPI()
+    launcher = IsloSandboxLauncher(env=["OPENAI_API_KEY"])
+    monkeypatch.setattr(launcher, "_islo", lambda: fake)
+
+    launcher.provision("host")
+
+    assert all("apiKeyHelper" not in call.command[-1] for call in fake.exec_calls)
+
+
 def test_run_streams_stdout_and_stderr(monkeypatch: pytest.MonkeyPatch) -> None:
     """``run`` calls Islo exec streaming through ``bash -lc`` and captures both streams."""
     fake = _FakeIsloAPI()

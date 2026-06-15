@@ -72,6 +72,9 @@ deploy/
 │   ├── src/index.js      server deploy target. See its README.md.
 │   └── README.md
 │
+├── islo/              ← Islo sandbox-provider guide (gateway credential
+│   └── README.md         injection); NOT a server deploy target.
+│
 └── docker/            ← common Docker image + compose stack
     ├── Dockerfile         multi-stage slim image (node web build → python builder → runtime)
     ├── docker-compose.yaml   omnigent + postgres for any Docker host
@@ -308,7 +311,9 @@ fetch/push.
 
 The full Modal guide (CLI sandboxes, custom images, LLM and git credentials,
 troubleshooting) lives at [`modal/README.md`](modal/README.md); the Daytona
-guide lives at [`daytona/README.md`](daytona/README.md).
+guide lives at [`daytona/README.md`](daytona/README.md); the Islo guide
+(including its gateway credential-injection model) lives at
+[`islo/README.md`](islo/README.md).
 
 ## Auth
 

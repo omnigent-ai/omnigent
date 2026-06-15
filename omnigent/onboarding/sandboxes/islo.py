@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import queue
 import re
+import shlex
 import threading
 import time
 import uuid
@@ -65,6 +66,27 @@ _TOKEN_REFRESH_MARGIN_S = 60.0
 _SANDBOX_CPU = 2
 _SANDBOX_MEMORY_MB = 4096
 _REQUEST_TIMEOUT_S = 30.0
+
+# Claude credentials a user injects via sandbox env passthrough that must win
+# over the gateway ``apiKeyHelper`` Islo pre-seeds into every sandbox. When one
+# is present we strip the seeded helper (see
+# :meth:`IsloSandboxLauncher._clear_seeded_api_key_helper`).
+_USER_CLAUDE_CRED_ENV_VARS = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
+
+# In-sandbox script that removes a seeded ``apiKeyHelper`` from Claude Code's
+# settings. Best effort: a sandbox without the settings file is left untouched.
+_CLEAR_API_KEY_HELPER_SCRIPT = """\
+import json, os
+path = os.path.expanduser("~/.claude/settings.json")
+try:
+    with open(path) as handle:
+        settings = json.load(handle)
+except (FileNotFoundError, ValueError):
+    raise SystemExit(0)
+if isinstance(settings, dict) and settings.pop("apiKeyHelper", None) is not None:
+    with open(path, "w") as handle:
+        json.dump(settings, handle, indent=2)
+"""
 
 
 class _IsloAPIError(RuntimeError):
@@ -347,7 +369,39 @@ class IsloSandboxLauncher(SandboxLauncher):
         if not isinstance(created_name, str) or not created_name:
             raise click.ClickException("Islo sandbox creation returned no sandbox name")
         click.echo(f"  → created {created_name}")
+        self._clear_seeded_api_key_helper(created_name, env_vars)
         return created_name
+
+    def _clear_seeded_api_key_helper(self, sandbox_id: str, env_vars: dict[str, str]) -> None:
+        """
+        Strip Islo's gateway ``apiKeyHelper`` when the user injected their
+        own Claude credential.
+
+        Islo pre-seeds ``~/.claude/settings.json`` with an ``apiKeyHelper``
+        that resolves, through Islo's gateway, to a connected provider
+        integration. Claude Code prefers that helper over a
+        ``CLAUDE_CODE_OAUTH_TOKEN`` / ``ANTHROPIC_API_KEY`` in the
+        environment, so a user who brings their own credential through
+        sandbox env passthrough would be silently overridden. When such a
+        credential is among the injected vars, remove the seeded helper so
+        the user's credential is the sole auth path. Best effort: a sandbox
+        with no seeded settings file is left untouched, and a failed strip
+        warns rather than aborting the launch.
+        """
+        if not any(name in env_vars for name in _USER_CLAUDE_CRED_ENV_VARS):
+            return
+        click.echo(
+            "  → clearing Islo's seeded apiKeyHelper so your injected "
+            "Claude credential takes precedence"
+        )
+        try:
+            self.run(
+                sandbox_id,
+                f"python3 -c {shlex.quote(_CLEAR_API_KEY_HELPER_SCRIPT)}",
+                check=False,
+            )
+        except click.ClickException as exc:
+            click.echo(f"  → warning: could not clear seeded apiKeyHelper: {exc}", err=True)
 
     def attach(self, sandbox_id: str) -> None:
         """Validate access to an existing Islo sandbox."""
