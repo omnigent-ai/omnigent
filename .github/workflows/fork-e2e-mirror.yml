@@ -22,16 +22,20 @@ name: Fork e2e mirror
 # commits). Accepted risk: an approved first-timer's later pushes then run with
 # the secret unreviewed -- bounded by the rate-limited, revocable test token.
 #
-# pull_request_target / pull_request_review run the workflow + scripts from the
-# base (default branch), never the PR head, so a PR cannot alter the gate; the
-# script checkout is additionally pinned to main.
+# Runs on pull_request_target only: it executes the workflow + scripts from the
+# base (default branch), never the PR head, so a PR cannot alter the gate, and
+# -- unlike pull_request / pull_request_review on a fork -- it actually receives
+# the secrets/vars needed to mint the App token below. (A fork-triggered
+# pull_request_review gets no secrets, so it could only ever fail at "Mint
+# mirror App token" -- which is why it is NOT a trigger here.) A maintainer's
+# approval of a first-time contributor therefore takes effect on the PR's next
+# sync (or a manual workflow re-run), when the gate re-evaluates. The script
+# checkout is additionally pinned to main.
 #
 # leak-scan-allow: pull_request_target
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, closed]
-  pull_request_review:
-    types: [submitted]
 
 # Read-only at the top level (Scorecard Token-Permissions); write scope is on
 # the job.

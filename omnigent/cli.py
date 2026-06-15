@@ -1146,23 +1146,6 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
 )
 
 
-def _should_skip_update_check(argv: list[str]) -> bool:
-    """Decide whether the update check should be skipped for *argv*.
-
-    Skipped for help / version requests and internal subcommands
-    (``pane-split``, ``pane-picker``) that are invoked by the TUI,
-    not by the user directly.
-
-    :param argv: CLI arguments without the program name, e.g.
-        ``["run", "agent.yaml"]``.
-    :returns: ``True`` when the update check should be suppressed.
-    """
-    if not argv:
-        return True
-    first = argv[0]
-    return first in {"--help", "-h", "--version", "version", "pane-split", "pane-picker"}
-
-
 def main() -> None:
     """
     Console-script entry point for ``omnigent``.
@@ -1193,11 +1176,6 @@ def main() -> None:
     _migrate_legacy_state_dir()
 
     argv = sys.argv[1:]
-
-    if not _should_skip_update_check(argv):
-        from omnigent.update_check import maybe_show_update_notice
-
-        maybe_show_update_notice()
 
     # Bare ``omnigent`` with no args behaves like ``omnigent run`` on an
     # interactive terminal: ``run`` resolves the configured default agent /

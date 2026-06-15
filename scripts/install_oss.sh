@@ -269,8 +269,9 @@ ensure_git() {
     Linux)
       install_cmd="$(linux_pkg_install_cmd git)"
       if [ -n "$install_cmd" ] && prompt_yes_no "git is required and not installed. Install it now ($install_cmd)?"; then
-        run_with_spinner "install git" sh -c "$install_cmd" || true
-        command -v git >/dev/null 2>&1 && return
+        # Run directly (not via run_with_spinner) so sudo can prompt for a password.
+        sh -c "$install_cmd" || true
+        command -v git >/dev/null 2>&1 && { step "git installed"; return; }
       fi
       ;;
     Darwin)
@@ -385,7 +386,9 @@ check_tmux() {
     Linux)
       install_cmd="$(linux_pkg_install_cmd tmux)"
       if [ -n "$install_cmd" ] && prompt_yes_no "tmux is missing (needed for \`omnigent claude\` / \`omnigent codex\`). Install it now ($install_cmd)?"; then
-        run_with_spinner "install tmux" sh -c "$install_cmd" || warn "tmux install failed — run manually: $install_cmd"
+        # Run directly (not via run_with_spinner) so sudo can prompt for a password.
+        sh -c "$install_cmd" || warn "tmux install failed — run manually: $install_cmd"
+        command -v tmux >/dev/null 2>&1 && step "tmux installed"
         return
       fi
       if [ -n "$install_cmd" ]; then

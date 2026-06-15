@@ -2854,7 +2854,8 @@ def _run_with_remote_server(
         if prepared is not None and outcome is _AttachOutcome.DETACHED:
             active_session_id = read_active_session_id(prepared.bridge_dir) or prepared.session_id
             click.echo(
-                f"\nDetached. Agent still running at {base_url}/c/{active_session_id}",
+                f"\nDetached. Agent still running at "
+                f"{conversation_url(base_url, active_session_id)}",
                 err=True,
             )
             echo_native_resume_hint(

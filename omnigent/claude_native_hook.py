@@ -494,7 +494,12 @@ def _conversation_url_for_active_session(
     ap_server_url = config.get("ap_server_url")
     session_id = read_active_session_id(bridge_dir)
     if isinstance(ap_server_url, str) and ap_server_url and session_id:
-        return f"{ap_server_url.rstrip('/')}/c/{url_component(session_id)}"
+        # ``ap_server_url`` is the API base; route through the shared
+        # builder so workspace-hosted servers land on the ``/omnigent``
+        # SPA mount (with ``?o=<org>``) rather than the JSON API mount.
+        from omnigent.conversation_browser import conversation_url
+
+        return conversation_url(ap_server_url, session_id)
     return fallback_url
 
 
