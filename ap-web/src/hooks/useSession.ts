@@ -36,12 +36,14 @@ interface UseSessionResult {
  * Pass ``null`` to disable. The query is otherwise long-lived
  * (``staleTime: Infinity``) because chatStore is the source of truth
  * for refresh — it refetches on every bind, which writes back into
- * this same cache key.
+ * this same cache key. A cache-cold page load asks the server to
+ * refresh runner-backed state so browser refresh pierces stale AP
+ * process caches.
  */
 export function useSession(conversationId: string | null | undefined): UseSessionResult {
   const { data, isLoading, error } = useQuery({
     queryKey: conversationId ? ["session", conversationId] : ["session", null],
-    queryFn: () => getSessionSlim(conversationId as string),
+    queryFn: () => getSessionSlim(conversationId as string, { refreshState: true }),
     enabled: Boolean(conversationId),
     staleTime: Infinity,
     retry: false,

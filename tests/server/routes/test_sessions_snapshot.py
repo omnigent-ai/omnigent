@@ -654,6 +654,313 @@ async def test_session_snapshot_includes_codex_model_options_from_runner(
 
 
 @pytest.mark.asyncio
+async def test_session_snapshot_refresh_state_reloads_codex_model_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``refresh_state=True`` pierces stale runner-backed Codex catalogs.
+
+    Browser reloads pass this flag so an AP-process cache warmed by an older
+    bug or older Codex response does not keep driving the model picker after
+    refresh. The first refreshed snapshot must not serve the stale cached row;
+    once the background runner read lands, a later snapshot serves the live
+    catalog.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    _mod._session_status_cache.clear()
+    _mod._runner_skills_cache.clear()
+    _mod._runner_skills_inflight.clear()
+    _mod._codex_model_options_cache.clear()
+    _mod._codex_model_options_inflight.clear()
+    _mod._codex_model_options_cache["conv_codex_refresh"] = [
+        _mod.CodexModelOption(
+            id="stale-model",
+            model="stale-provider-model",
+            display_name="Stale Model",
+            default_reasoning_effort="low",
+            supported_reasoning_efforts=["low"],
+            is_default=False,
+        )
+    ]
+
+    class _FakeResponse:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.status_code = 200
+            self._payload = payload
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    class _FakeRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
+            self.get_calls.append(url)
+            if url.endswith("/skills"):
+                return _FakeResponse({"skills": []})
+            if url.endswith("/codex-model-options"):
+                return _FakeResponse(
+                    {
+                        "models": [
+                            {
+                                "id": "fresh-model",
+                                "model": "fresh-provider-model",
+                                "display_name": "Fresh Model",
+                                "default_reasoning_effort": "high",
+                                "supported_reasoning_efforts": ["high"],
+                                "is_default": True,
+                            }
+                        ]
+                    }
+                )
+            return _FakeResponse({"status": "idle"})
+
+    fake_client = _FakeRunnerClient()
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: fake_client)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    conv = Conversation(
+        id="conv_codex_refresh",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_codex_refresh",
+        agent_id="ag_test",
+        labels={
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={"conv_codex_refresh": conv},
+    )
+
+    refreshed = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_codex_refresh",
+        refresh_state=True,
+    )
+    # Refresh must not echo the stale cached row. If this is "stale-model",
+    # browser reloads would not recover after the server-side cache shape is fixed.
+    assert [m.id for m in refreshed.codex_model_options] == []
+    await _drain_codex_model_options("conv_codex_refresh")
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_codex_refresh",
+    )
+
+    assert "/v1/sessions/conv_codex_refresh/codex-model-options" in fake_client.get_calls
+    assert [m.id for m in snapshot.codex_model_options] == ["fresh-model"]
+    assert snapshot.codex_model_options[0].display_name == "Fresh Model"
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_retries_empty_codex_model_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An early empty Codex catalog is treated as not-ready, not cached.
+
+    This covers the startup race where the AP snapshot asks the runner for
+    model options before the codex-native forwarder has recorded bridge state.
+    Older runners returned ``200 {"models": []}`` for that window; caching
+    that response permanently hid the picker until AP restart.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    _mod._session_status_cache.clear()
+    _mod._runner_skills_cache.clear()
+    _mod._runner_skills_inflight.clear()
+    _mod._codex_model_options_cache.clear()
+    _mod._codex_model_options_inflight.clear()
+    monkeypatch.setattr(_mod, "_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S", (0.0,))
+
+    class _FakeResponse:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.status_code = 200
+            self._payload = payload
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    class _FakeRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+            self._codex_payloads: list[dict[str, object]] = [
+                {"models": []},
+                {
+                    "models": [
+                        {
+                            "id": "gpt-5.5",
+                            "model": "databricks-gpt-5-5",
+                            "display_name": "GPT-5.5",
+                            "default_reasoning_effort": "xhigh",
+                            "supported_reasoning_efforts": ["high", "xhigh"],
+                            "is_default": True,
+                        }
+                    ]
+                },
+            ]
+
+        async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
+            self.get_calls.append(url)
+            if url.endswith("/skills"):
+                return _FakeResponse({"skills": []})
+            if url.endswith("/codex-model-options"):
+                return _FakeResponse(self._codex_payloads.pop(0))
+            return _FakeResponse({"status": "idle"})
+
+    fake_client = _FakeRunnerClient()
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: fake_client)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    conv = Conversation(
+        id="conv_codex_empty_then_ready",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_codex_empty_then_ready",
+        agent_id="ag_test",
+        labels={
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={"conv_codex_empty_then_ready": conv},
+    )
+
+    first = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_codex_empty_then_ready",
+    )
+    assert first.codex_model_options == []
+    await _drain_codex_model_options("conv_codex_empty_then_ready")
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_codex_empty_then_ready",
+    )
+
+    # Two codex-model-options calls means the empty catalog was not cached;
+    # one call would recreate the missing-picker regression.
+    assert (
+        fake_client.get_calls.count("/v1/sessions/conv_codex_empty_then_ready/codex-model-options")
+        == 2
+    )
+    assert [m.id for m in snapshot.codex_model_options] == ["gpt-5.5"]
+    assert snapshot.codex_model_options[0].default_reasoning_effort == "xhigh"
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_retries_503_codex_model_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A runner ``503`` during Codex bridge startup is retried in the background.
+
+    The codex-native runner reports model options as unavailable until the
+    TUI-created thread is recorded in bridge state. The AP background fetch
+    should stay alive across that transient 503 and publish/cache the catalog
+    once the next retry succeeds.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    _mod._session_status_cache.clear()
+    _mod._runner_skills_cache.clear()
+    _mod._runner_skills_inflight.clear()
+    _mod._codex_model_options_cache.clear()
+    _mod._codex_model_options_inflight.clear()
+    monkeypatch.setattr(_mod, "_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S", (0.0,))
+
+    class _FakeResponse:
+        def __init__(
+            self,
+            payload: dict[str, object],
+            *,
+            status_code: int = 200,
+        ) -> None:
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    class _FakeRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+            self._codex_responses: list[_FakeResponse] = [
+                _FakeResponse(
+                    {
+                        "error": "codex_native_model_options_failed",
+                        "detail": "Codex-native model options are not ready yet.",
+                    },
+                    status_code=503,
+                ),
+                _FakeResponse(
+                    {
+                        "models": [
+                            {
+                                "id": "gpt-5.4",
+                                "model": "databricks-gpt-5-4",
+                                "display_name": "GPT-5.4",
+                                "default_reasoning_effort": "medium",
+                                "supported_reasoning_efforts": ["medium", "high"],
+                                "is_default": False,
+                            }
+                        ]
+                    }
+                ),
+            ]
+
+        async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
+            self.get_calls.append(url)
+            if url.endswith("/skills"):
+                return _FakeResponse({"skills": []})
+            if url.endswith("/codex-model-options"):
+                return self._codex_responses.pop(0)
+            return _FakeResponse({"status": "idle"})
+
+    fake_client = _FakeRunnerClient()
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: fake_client)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    conv = Conversation(
+        id="conv_codex_503_then_ready",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_codex_503_then_ready",
+        agent_id="ag_test",
+        labels={
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={"conv_codex_503_then_ready": conv},
+    )
+
+    first = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_codex_503_then_ready",
+    )
+    assert first.codex_model_options == []
+    await _drain_codex_model_options("conv_codex_503_then_ready")
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_codex_503_then_ready",
+    )
+
+    # Two calls proves the transient 503 did not terminate discovery; one
+    # call would leave the cache cold forever until another snapshot request.
+    assert (
+        fake_client.get_calls.count("/v1/sessions/conv_codex_503_then_ready/codex-model-options")
+        == 2
+    )
+    assert [m.id for m in snapshot.codex_model_options] == ["gpt-5.4"]
+    assert snapshot.codex_model_options[0].default_reasoning_effort == "medium"
+
+
+@pytest.mark.asyncio
 async def test_session_snapshot_publishes_skills_event_when_fetch_resolves(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

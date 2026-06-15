@@ -685,9 +685,26 @@ export async function getSession(sessionId: string): Promise<Session> {
  * on the SAME variant — mixing full and slim under one key would let a
  * cached slim snapshot serve a caller that expected items.
  */
-export async function getSessionSlim(sessionId: string): Promise<Session> {
+export interface GetSessionSlimOptions {
+  /**
+   * Ask the AP server to refresh runner-backed session state before
+   * returning the snapshot. Used by page-load/bind paths so a browser
+   * refresh pierces stale server-side capability caches.
+   */
+  refreshState?: boolean;
+}
+
+export async function getSessionSlim(
+  sessionId: string,
+  options: GetSessionSlimOptions = {},
+): Promise<Session> {
+  const params = new URLSearchParams({
+    include_items: "false",
+    include_liveness: "false",
+  });
+  if (options.refreshState === true) params.set("refresh_state", "true");
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}?include_items=false&include_liveness=false`,
+    `/v1/sessions/${encodeURIComponent(sessionId)}?${params.toString()}`,
   );
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
 }

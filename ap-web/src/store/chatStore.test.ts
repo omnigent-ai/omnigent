@@ -983,6 +983,7 @@ describe("chatStore — switchTo", () => {
     // One GET proves bindStream refetched instead of trusting the
     // pre-populated React Query session cache.
     expect(sessionFetches).toHaveLength(1);
+    expect(String(sessionFetches[0]?.[0])).toContain("refresh_state=true");
 
     const blocks = useChatStore.getState().blocks;
     // The server snapshot has one message; seeing any other count would
@@ -3303,6 +3304,71 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(useChatStore.getState().skills).toEqual([
         { name: "kept", description: "survives the error" },
       ]);
+    });
+  });
+
+  describe("refreshSessionState", () => {
+    it("forces a fresh snapshot and applies runner-backed Codex model options", async () => {
+      useChatStore.setState({
+        conversationId: "conv_codex",
+        skills: [],
+        codexModelOptions: [],
+        terminalPending: false,
+      });
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.split("?")[0] === "/v1/sessions/conv_codex" && (init?.method ?? "GET") === "GET") {
+          return mockResponse({
+            id: "conv_codex",
+            agent_id: "agent_xyz",
+            agent_name: "Codex Agent",
+            status: "idle",
+            created_at: 0,
+            items: [],
+            labels: { "omnigent.wrapper": "codex-native-ui" },
+            llm_model: "gpt-5.5",
+            harness: "codex",
+            skills: [{ name: "inspect", description: "Read session state" }],
+            codex_model_options: [
+              {
+                id: "gpt-5.5",
+                model: "gpt-5.5",
+                display_name: "GPT-5.5",
+                default_reasoning_effort: "medium",
+                supported_reasoning_efforts: ["low", "medium", "xhigh"],
+                is_default: true,
+              },
+            ],
+            terminal_pending: true,
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      await useChatStore.getState().refreshSessionState("conv_codex");
+
+      const sessionFetch = fetchMock.mock.calls.find(([u]) =>
+        String(u).startsWith("/v1/sessions/conv_codex?"),
+      );
+      expect(String(sessionFetch?.[0])).toContain("refresh_state=true");
+      expect(useChatStore.getState()).toMatchObject({
+        boundAgentName: "Codex Agent",
+        isNativeTerminalSession: true,
+        llmModel: "gpt-5.5",
+        sessionHarness: "codex",
+        terminalPending: true,
+        skills: [{ name: "inspect", description: "Read session state" }],
+        codexModelOptions: [
+          {
+            id: "gpt-5.5",
+            model: "gpt-5.5",
+            displayName: "GPT-5.5",
+            defaultReasoningEffort: "medium",
+            supportedReasoningEfforts: ["low", "medium", "xhigh"],
+            isDefault: true,
+          },
+        ],
+      });
     });
   });
 

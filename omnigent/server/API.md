@@ -692,7 +692,7 @@ When liveness is wired, each list item includes two orthogonal signals
 ### Get Session (Snapshot)
 
 ```
-GET /v1/sessions/{session_id}[?include_items=true&include_liveness=true]
+GET /v1/sessions/{session_id}[?include_items=true&include_liveness=true&refresh_state=false]
 
 200 OK — body matches the `SessionResponse` shape above.
 404 Not Found — no session with that id
@@ -716,6 +716,13 @@ Contract" below.
     `runner_online`/`host_online` stay unset. For callers that source
     liveness from the `/health` poll and the live stream (the web
     chat surface), the snapshot's copy is redundant.
+
+  refresh_state (query param, boolean, default `false`)
+    When `true`, runner-derived snapshot overlays (for example skills
+    and Codex-native model options) are refreshed from the bound runner
+    instead of served from AP-process memory. Browser reload/bind
+    requests use this so a page refresh pierces stale capability
+    caches after a server-side bug fix.
 
 When runner liveness is wired (and not skipped via
 `include_liveness=false`), the snapshot includes:
