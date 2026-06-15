@@ -40,6 +40,7 @@ import {
   type PolicyRegistryEntry,
 } from "@/hooks/usePolicies";
 import { getMe } from "@/lib/accountsApi";
+import { coercePolicyParams } from "@/lib/policyParams";
 
 // ---------------------------------------------------------------------------
 // Add-policy dialog (registry-driven, same UX as session policies)
@@ -61,6 +62,7 @@ function AddDefaultPolicyDialog({
   const [factoryParams, setFactoryParams] = useState<Record<string, string>>(
     {},
   );
+  const [paramError, setParamError] = useState<string | null>(null);
   const addPolicy = useAddDefaultPolicy();
 
   const entry = registry.find((r) => r.handler === selected);
@@ -88,31 +90,21 @@ function AddDefaultPolicyDialog({
     setSelected(handler);
     setFilter("");
     setFactoryParams({});
+    setParamError(null);
   }
 
   function handleAdd() {
     if (!entry) return;
     let parsedParams: Record<string, unknown> | undefined;
     if (entry.kind === "factory" && paramKeys.length > 0) {
-      parsedParams = {};
-      for (const key of paramKeys) {
-        const raw = factoryParams[key];
-        const prop = properties[key];
-        if (raw !== undefined && raw !== "") {
-          if (prop?.type === "integer") parsedParams[key] = parseInt(raw, 10);
-          else if (prop?.type === "number")
-            parsedParams[key] = parseFloat(raw);
-          else if (prop?.type === "boolean")
-            parsedParams[key] = raw === "true";
-          else if (prop?.type === "array")
-            parsedParams[key] = raw
-              .split(",")
-              .map((s) => s.trim())
-              .filter(Boolean);
-          else parsedParams[key] = raw;
-        }
+      const result = coercePolicyParams(paramKeys, properties, factoryParams);
+      if (!result.ok) {
+        setParamError(result.error);
+        return;
       }
+      parsedParams = result.params;
     }
+    setParamError(null);
     const includeFactoryParams =
       entry.kind === "factory"
         ? { factory_params: parsedParams ?? {} }
@@ -204,6 +196,7 @@ function AddDefaultPolicyDialog({
                   onClick={() => {
                     setSelected("");
                     setFactoryParams({});
+                    setParamError(null);
                   }}
                   className="text-[11px] text-muted-foreground hover:text-foreground"
                 >
@@ -349,12 +342,12 @@ function AddDefaultPolicyDialog({
               })}
             </div>
           )}
-          {addPolicy.isError && (
+          {(paramError || addPolicy.isError) && (
             <div
               role="alert"
               className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
             >
-              {addPolicy.error.message}
+              {paramError ?? addPolicy.error?.message}
             </div>
           )}
           <div className="flex justify-end gap-2 pt-1">
