@@ -252,7 +252,14 @@ jobs:
               anthropic:
                 base_url: "${GATEWAY_BASE_URL}"
                 api_key_ref: "env:LLM_API_KEY"
-                default_model: databricks-claude-sonnet-4-6
+                # The default model id is read from models.default (not a
+                # top-level default_model key). Without it the provider
+                # resolves model=None, Claude Code launches with no --model and
+                # falls back to its built-in 'claude-sonnet-4-6', which the
+                # Databricks gateway rejects (the endpoint name is the
+                # 'databricks-' prefixed id).
+                models:
+                  default: databricks-claude-sonnet-4-6
           EOF
           host="${GATEWAY_BASE_URL%/serving-endpoints}"
           cat > "$HOME/.databrickscfg" <<EOF
