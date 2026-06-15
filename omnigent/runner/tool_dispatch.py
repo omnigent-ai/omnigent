@@ -1044,11 +1044,16 @@ async def _execute_subagent_tool(
         if child_harness is not None:
             missing_cli = missing_harness_cli(child_harness)
             if missing_cli is not None:
+                install_hint = (
+                    f"Install it with: npm install -g {missing_cli.package}"
+                    if missing_cli.package is not None
+                    else f"Install {missing_cli.display} so {missing_cli.binary!r} is on PATH"
+                )
                 return (
                     f"Error: sub-agent {sub_agent_name!r} can't start on this "
                     f"machine: harness {child_harness!r} needs the "
                     f"{missing_cli.binary!r} CLI on PATH, which was not found. "
-                    f"Install it with: npm install -g {missing_cli.package} "
+                    f"{install_hint} "
                     f"(or don't dispatch to {sub_agent_name!r} here)."
                 )
         # Create child session on the server (no initial items —

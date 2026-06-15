@@ -152,6 +152,15 @@ HARNESS_PROBES: list[HarnessProbe] = [
         marker="CURSOR_E2E_OK",
         cli_binary="cursor-agent",
     ),
+    HarnessProbe(
+        harness="mimo",
+        # Mimo's ACP bridge is CLI-backed like Cursor; use the
+        # harness default unless overridden by OMNIGENT_TEST_MODEL_*.
+        model=resolve_model("auto", key="probe:mimo"),
+        env_prefix="HARNESS_MIMO_",
+        marker="MIMO_E2E_OK",
+        cli_binary="mimo",
+    ),
 ]
 
 

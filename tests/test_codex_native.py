@@ -482,6 +482,7 @@ def test_materialize_codex_agent_spec_uses_codex_native_harness(tmp_path: Path) 
     assert raw["executor"] == {
         "harness": "codex-native",
         "model": "gpt-test",
+        "yolo": True,
     }
 
 
