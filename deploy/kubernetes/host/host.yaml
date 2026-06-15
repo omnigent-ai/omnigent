@@ -89,8 +89,14 @@ spec:
               git config --global user.email "${GIT_USER_EMAIL}"
               git config --global --replace-all safe.directory '*'   # idempotent across restarts
               # Rewrite github SSH remotes -> HTTPS so GIT_TOKEN covers them (no ssh
-              # key needed). A self-hosted forge over HTTPS works the same way: add a
-              # scoped `~/.git-credentials` entry + a matching `insteadOf` for its host.
+              # key needed). NOTE: the image's baked GIT_TOKEN credential helper matches
+              # ANY https host, so for a SELF-HOSTED forge, empty-reset that host's helper
+              # chain before adding a scoped store helper, e.g.:
+              #   git config --global --add credential."https://forge.example".helper ""
+              #   git config --global --add credential."https://forge.example".helper \
+              #     "store --file=$HOME/.git-credentials"
+              # (the empty "" first, or the baked helper shadows yours and sends your
+              # GitHub token to the forge) + a matching `insteadOf` for its host.
               # --unset-all first so this is idempotent across restarts on the persistent
               # PVC — a non---add set over an existing multi-value insteadOf errors under
               # set -e ("cannot overwrite multiple values with a single value") -> CrashLoop.
