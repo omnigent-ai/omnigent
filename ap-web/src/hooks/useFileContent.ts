@@ -94,7 +94,9 @@ export function triggerBrowserDownload(blob: Blob, filename: string): void {
 export async function downloadWorkspaceFile(conversationId: string, path: string): Promise<void> {
   const data = await fetchFileContent(conversationId, path);
   if (data.truncated) {
-    console.warn(`[ap-web] File "${path}" was truncated by the server — downloaded content may be incomplete.`);
+    console.warn(
+      `[ap-web] File "${path}" was truncated by the server — downloaded content may be incomplete.`,
+    );
   }
   triggerBrowserDownload(fileContentToBlob(data), path.split("/").pop() ?? path);
 }
@@ -111,10 +113,7 @@ export async function downloadWorkspaceFile(conversationId: string, path: string
  * once at end-of-turn, avoiding continuous refetches that would reset the
  * editor's scroll and cursor position.
  */
-export function useFileContent(
-  conversationId: string | undefined,
-  path: string | null,
-) {
+export function useFileContent(conversationId: string | undefined, path: string | null) {
   const focusedId = useChatStore((s) => s.conversationId);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const sessionActive =

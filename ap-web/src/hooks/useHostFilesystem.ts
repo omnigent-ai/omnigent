@@ -50,18 +50,13 @@ interface HostFilesystemResponse {
  *   ``"/Users/corey/projects"``), or empty string for home.
  * @returns The relative URL to fetch.
  */
-export function buildHostFilesystemUrl(
-  hostId: string,
-  absolutePath: string,
-): string {
+export function buildHostFilesystemUrl(hostId: string, absolutePath: string): string {
   const base = `/v1/hosts/${encodeURIComponent(hostId)}/filesystem`;
   if (absolutePath === "") {
     return base;
   }
   // Strip the single leading slash; the route handler re-adds it.
-  const stripped = absolutePath.startsWith("/")
-    ? absolutePath.slice(1)
-    : absolutePath;
+  const stripped = absolutePath.startsWith("/") ? absolutePath.slice(1) : absolutePath;
   if (stripped === "") {
     // The user navigated to "/" exactly. Keep a trailing slash so
     // the route still matches /filesystem/{path:path}.
@@ -115,10 +110,7 @@ const MAX_PAGES = 50;
  *   when the page cap was hit with more entries still pending.
  * @throws FetchError carrying the HTTP status on a non-OK response.
  */
-async function fetchHostFilesystem(
-  hostId: string,
-  path: string,
-): Promise<HostDirectoryListing> {
+async function fetchHostFilesystem(hostId: string, path: string): Promise<HostDirectoryListing> {
   const baseUrl = buildHostFilesystemUrl(hostId, path);
   const entries: HostFilesystemEntry[] = [];
   let after: string | null = null;
@@ -132,13 +124,9 @@ async function fetchHostFilesystem(
       params.set("after", after);
     }
     const sep = baseUrl.includes("?") ? "&" : "?";
-    const res = await authenticatedFetch(
-      `${baseUrl}${sep}${params.toString()}`,
-    );
+    const res = await authenticatedFetch(`${baseUrl}${sep}${params.toString()}`);
     if (!res.ok) {
-      const err: FetchError = new Error(
-        `host filesystem fetch failed: HTTP ${res.status}`,
-      );
+      const err: FetchError = new Error(`host filesystem fetch failed: HTTP ${res.status}`);
       err.status = res.status;
       throw err;
     }
@@ -176,10 +164,7 @@ async function fetchHostFilesystem(
  *   ``null`` keeps the query disabled.
  * @returns React Query result with ``data: HostDirectoryListing``.
  */
-export function useHostFilesystem(
-  hostId: string | null,
-  path: string | null,
-) {
+export function useHostFilesystem(hostId: string | null, path: string | null) {
   return useQuery({
     queryKey: ["host-filesystem", hostId, path],
     queryFn: () => fetchHostFilesystem(hostId as string, path as string),

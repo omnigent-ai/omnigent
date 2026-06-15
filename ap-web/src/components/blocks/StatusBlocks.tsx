@@ -48,9 +48,7 @@ export function PolicyDeniedBanner({ reason, phase }: PolicyDeniedBannerProps) {
   return (
     <Alert>
       <ShieldXIcon />
-      <AlertTitle>
-        Blocked by policy{phase ? ` · ${phase}` : ""}
-      </AlertTitle>
+      <AlertTitle>Blocked by policy{phase ? ` · ${phase}` : ""}</AlertTitle>
       <AlertDescription>{reason}</AlertDescription>
     </Alert>
   );

@@ -15,9 +15,17 @@ vi.mock("@tiptap/react", () => ({
   // Return every badge flag false; the toolbar's formatting buttons are
   // irrelevant to these status tests.
   useEditorState: () => ({
-    canUndo: false, canRedo: false,
-    isParagraph: false, isH1: false, isH2: false, isH3: false, isBlockquote: false,
-    isBold: false, isItalic: false, isStrike: false, isCode: false,
+    canUndo: false,
+    canRedo: false,
+    isParagraph: false,
+    isH1: false,
+    isH2: false,
+    isH3: false,
+    isBlockquote: false,
+    isBold: false,
+    isItalic: false,
+    isStrike: false,
+    isCode: false,
   }),
 }));
 // Side-effect import in the component; nothing needed at runtime.

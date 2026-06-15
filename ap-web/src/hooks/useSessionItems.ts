@@ -89,35 +89,26 @@ export function useSessionItems(
   sessionId: string | null,
   pollMs?: number | null,
 ): UseSessionItemsResult {
-  const {
-    data,
-    isLoading,
-    error,
-    hasNextPage,
-    isFetchingNextPage,
-    fetchNextPage,
-  } = useInfiniteQuery({
-    queryKey:
-      sessionId === null
-        ? ["session", null, "items", "raw"]
-        : sessionItemsQueryKey(sessionId),
-    queryFn: ({ pageParam }) =>
-      fetchSessionItemsPage(sessionId as string, pageParam),
-    initialPageParam: undefined as string | undefined,
-    getNextPageParam: (lastPage) =>
-      // The server's PaginatedList contract: `has_more` is the
-      // authoritative "more rows exist" signal; `last_id` is the
-      // cursor for the next page. Stop when either is absent.
-      lastPage.has_more && lastPage.last_id ? lastPage.last_id : undefined,
-    enabled: sessionId !== null,
-    staleTime: 60_000,
-    retry: false,
-    refetchOnMount: false,
-    // TanStack refetches every loaded page on this interval, so new
-    // items land in the (formerly-empty-tail) last page on the next
-    // tick. ``false`` (the default when undefined/null) disables.
-    refetchInterval: pollMs ?? false,
-  });
+  const { data, isLoading, error, hasNextPage, isFetchingNextPage, fetchNextPage } =
+    useInfiniteQuery({
+      queryKey:
+        sessionId === null ? ["session", null, "items", "raw"] : sessionItemsQueryKey(sessionId),
+      queryFn: ({ pageParam }) => fetchSessionItemsPage(sessionId as string, pageParam),
+      initialPageParam: undefined as string | undefined,
+      getNextPageParam: (lastPage) =>
+        // The server's PaginatedList contract: `has_more` is the
+        // authoritative "more rows exist" signal; `last_id` is the
+        // cursor for the next page. Stop when either is absent.
+        lastPage.has_more && lastPage.last_id ? lastPage.last_id : undefined,
+      enabled: sessionId !== null,
+      staleTime: 60_000,
+      retry: false,
+      refetchOnMount: false,
+      // TanStack refetches every loaded page on this interval, so new
+      // items land in the (formerly-empty-tail) last page on the next
+      // tick. ``false`` (the default when undefined/null) disables.
+      refetchInterval: pollMs ?? false,
+    });
   const items = data ? data.pages.flatMap((p) => p.data) : [];
   return {
     items,

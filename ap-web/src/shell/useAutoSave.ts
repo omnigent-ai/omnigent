@@ -76,8 +76,7 @@ export function useAutoSave({
       await saveRef.current(getContentRef.current());
     } finally {
       inFlightRef.current = false;
-      const shouldResave =
-        resaveQueuedRef.current && enabledRef.current && isDirtyRef.current();
+      const shouldResave = resaveQueuedRef.current && enabledRef.current && isDirtyRef.current();
       resaveQueuedRef.current = false;
       // Trailing save: edits landed mid-write; persist the latest content.
       if (shouldResave) void runSave();
@@ -98,7 +97,12 @@ export function useAutoSave({
   }, [cancel, runSave]);
 
   // Clear the pending timer on unmount (flushing on unmount is the component's job).
-  useEffect(() => () => { window.clearTimeout(timerRef.current); }, []);
+  useEffect(
+    () => () => {
+      window.clearTimeout(timerRef.current);
+    },
+    [],
+  );
 
   // Stable identity (schedule/flush/cancel are stable) — safe as an effect dep.
   return useMemo(() => ({ schedule, flush, cancel }), [schedule, flush, cancel]);

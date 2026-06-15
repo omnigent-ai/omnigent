@@ -16,11 +16,7 @@
 import { TerminalIcon, XIcon } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { TerminalView } from "@/components/blocks/TerminalView";
-import {
-  AGENT_TERMINAL_IDS,
-  terminalTabKey,
-  useTerminals,
-} from "@/hooks/useTerminals";
+import { AGENT_TERMINAL_IDS, terminalTabKey, useTerminals } from "@/hooks/useTerminals";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { TerminalStatusBadge } from "./terminalStatus";
 import { useTerminalStatuses } from "./useTerminalStatuses";
@@ -65,11 +61,8 @@ export function MainTerminalView({
   // with the initial "" in the validity closure, and its
   // terminals[0] fallback would win).
   const [activeKey, setActiveKey] = useState(initialTerminalKey || "");
-  const {
-    getStatus,
-    setTerminalConnectionState,
-    markTerminalActive,
-  } = useTerminalStatuses(terminals);
+  const { getStatus, setTerminalConnectionState, markTerminalActive } =
+    useTerminalStatuses(terminals);
 
   // Honor a retarget while already open (a rail shell click can point
   // an open view at a different terminal); the validity effect below

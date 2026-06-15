@@ -48,14 +48,24 @@ function makeFakeEditor(initial: string): FakeEditor {
     getValue: () => value,
     // Real Monaco fires onDidChangeModelContent (→ onChange) on setValue; mirror
     // that so the component's setContentRef path is faithful.
-    setValue: (v) => { value = v; h.onChange?.(v, { isFlush: true }); },
+    setValue: (v) => {
+      value = v;
+      h.onChange?.(v, { isFlush: true });
+    },
     getModel: () => ({ setEOL: () => {} }),
-    addCommand: (_binding, handler) => { h.cmdS = handler; },
-    onDidBlurEditorWidget: (handler) => { h.blur = handler; return { dispose: () => {} }; },
+    addCommand: (_binding, handler) => {
+      h.cmdS = handler;
+    },
+    onDidBlurEditorWidget: (handler) => {
+      h.blur = handler;
+      return { dispose: () => {} };
+    },
     saveViewState: () => null,
     restoreViewState: () => {},
     getAction: () => ({ run: () => {} }),
-    __set: (v) => { value = v; },
+    __set: (v) => {
+      value = v;
+    },
   };
 }
 
@@ -109,7 +119,10 @@ let mutateAsync: ReturnType<typeof vi.fn>;
 function mockWrite(): void {
   mutateAsync = vi.fn().mockResolvedValue(undefined);
   vi.mocked(writeHook.useWriteFileContent).mockReturnValue({
-    isPending: false, isError: false, reset: vi.fn(), mutateAsync,
+    isPending: false,
+    isError: false,
+    reset: vi.fn(),
+    mutateAsync,
   } as unknown as ReturnType<typeof writeHook.useWriteFileContent>);
 }
 
@@ -140,7 +153,9 @@ async function renderMounted(el: React.ReactElement) {
 // Drive a user edit: update the buffer, then fire the captured onChange.
 async function fireEdit(value: string) {
   fakeEditor!.__set(value);
-  await act(async () => { h.onChange?.(value, {}); });
+  await act(async () => {
+    h.onChange?.(value, {});
+  });
 }
 
 beforeEach(() => {
@@ -170,7 +185,9 @@ describe("MonacoCodeEditor auto-save wiring (integration)", () => {
     await fireEdit(EDITED);
     // Still inside the debounce window — nothing written yet.
     expect(mutateAsync).not.toHaveBeenCalled();
-    await act(async () => { vi.advanceTimersByTime(1000); });
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+    });
     // If this fails the onChange→schedule→runSave→handleSave chain is broken.
     expect(mutateAsync).toHaveBeenCalledWith({ path: PATH, content: EDITED });
     // Exactly one write — a debounce regression that fires per-keystroke (or
@@ -182,7 +199,9 @@ describe("MonacoCodeEditor auto-save wiring (integration)", () => {
     await renderMounted(makeEditor());
     // No onChange fired. Monaco's getValue is byte-stable, so opening a file
     // never produces a spurious dirty/normalisation write.
-    await act(async () => { vi.advanceTimersByTime(2000); });
+    await act(async () => {
+      vi.advanceTimersByTime(2000);
+    });
     expect(mutateAsync).not.toHaveBeenCalled();
   });
 
@@ -190,7 +209,9 @@ describe("MonacoCodeEditor auto-save wiring (integration)", () => {
     await renderMounted(makeEditor());
     await fireEdit(EDITED);
     expect(mutateAsync).not.toHaveBeenCalled();
-    await act(async () => { h.blur!(); });
+    await act(async () => {
+      h.blur!();
+    });
     // Blur must flush immediately — a missing onDidBlurEditorWidget→flush wiring
     // would leave this uncalled until the timer fired.
     expect(mutateAsync).toHaveBeenCalledWith({ path: PATH, content: EDITED });
@@ -199,7 +220,9 @@ describe("MonacoCodeEditor auto-save wiring (integration)", () => {
   it("unmount flushes pending edits", async () => {
     const { unmount } = await renderMounted(makeEditor());
     await fireEdit(EDITED);
-    await act(async () => { unmount(); });
+    await act(async () => {
+      unmount();
+    });
     // The unmount cleanup must flush so a file-switch mid-debounce isn't lost.
     // Reads latestContentRef (not the disposed editor), so it still has the text.
     expect(mutateAsync).toHaveBeenCalledWith({ path: PATH, content: EDITED });
@@ -210,25 +233,39 @@ describe("MonacoCodeEditor auto-save wiring (integration)", () => {
     // auto-save: with a write already in flight it must NOT start a second
     // concurrent PUT. Calling the writer directly from the ⌘S command would.
     let resolveWrite!: () => void;
-    const writePromise = new Promise<void>((r) => { resolveWrite = r; });
+    const writePromise = new Promise<void>((r) => {
+      resolveWrite = r;
+    });
     let calls = 0;
     vi.mocked(writeHook.useWriteFileContent).mockReturnValue({
-      isPending: false, isError: false, reset: vi.fn(),
-      mutateAsync: vi.fn(() => { calls++; return writePromise; }),
+      isPending: false,
+      isError: false,
+      reset: vi.fn(),
+      mutateAsync: vi.fn(() => {
+        calls++;
+        return writePromise;
+      }),
     } as unknown as ReturnType<typeof writeHook.useWriteFileContent>);
 
     await renderMounted(makeEditor());
     await fireEdit(EDITED);
-    await act(async () => { vi.advanceTimersByTime(1000); });  // auto-save now in flight
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+    }); // auto-save now in flight
     expect(calls).toBe(1);
 
     // Manual ⌘S while the auto-save PUT is still unresolved.
-    await act(async () => { h.cmdS!(); });
+    await act(async () => {
+      h.cmdS!();
+    });
     // Single-flight coalesced it — still one write. A direct call → 2.
     expect(calls).toBe(1);
 
     // Settle: baseline now equals the saved content, so no trailing resave.
-    await act(async () => { resolveWrite(); await writePromise; });
+    await act(async () => {
+      resolveWrite();
+      await writePromise;
+    });
     expect(calls).toBe(1);
   });
 
@@ -237,13 +274,17 @@ describe("MonacoCodeEditor auto-save wiring (integration)", () => {
     vi.mocked(runnerHook.useSessionRunnerOnline).mockReturnValue(false);
     const { rerender } = await renderMounted(makeEditor());
     await fireEdit(EDITED);
-    await act(async () => { vi.advanceTimersByTime(1000); });
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+    });
     // Dirty, but offline → the scheduled save bails (enabled=false).
     expect(mutateAsync).not.toHaveBeenCalled();
 
     // Runner reconnects → the re-enable effect flushes the queued edit.
     vi.mocked(runnerHook.useSessionRunnerOnline).mockReturnValue(true);
-    await act(async () => { rerender(makeEditor()); });
+    await act(async () => {
+      rerender(makeEditor());
+    });
     expect(mutateAsync).toHaveBeenCalledWith({ path: PATH, content: EDITED });
   });
 });

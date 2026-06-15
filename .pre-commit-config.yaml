@@ -20,6 +20,24 @@ repos:
         entry: .venv/bin/python -m ruff check --fix --force-exclude
         types: [python]
 
+      - id: ap-web-prettier
+        name: ap-web prettier
+        language: system
+        entry: npm --prefix ap-web exec -- prettier --write
+        files: ^ap-web/.*\.(css|html|js|jsx|json|md|mdx|ts|tsx|yaml|yml)$
+        exclude: ^omnigent/server/static/web-ui/assets/
+
+      # Local `uv` runs rewrite uv.lock's registry to whatever index is
+      # configured on the developer's machine (e.g. the Databricks PyPI
+      # proxy). This OSS repo must always commit the public PyPI URL, so
+      # normalize it back before it lands. Fixer: re-stage if it changes.
+      - id: normalize-uv-lock-registry
+        name: normalize uv.lock registry to pypi.org
+        language: system
+        entry: .venv/bin/python scripts/normalize_uv_lock_registry.py
+        files: ^uv\.lock$
+        pass_filenames: true
+
   # ── File hygiene ────────────────────────────────────────────────
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0

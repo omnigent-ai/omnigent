@@ -305,7 +305,10 @@ export function WorkspacePanel({
         >
           <TabsList variant="pill">
             {showFilesPanel && (
-              <TabsTrigger value="files" className="h-[32px] gap-[6px] rounded-[8px] px-[12px] text-[13px] leading-5">
+              <TabsTrigger
+                value="files"
+                className="h-[32px] gap-[6px] rounded-[8px] px-[12px] text-[13px] leading-5"
+              >
                 <FileIcon className="size-4" />
                 Files
                 {changedCount > 0 && (
@@ -315,7 +318,10 @@ export function WorkspacePanel({
                 )}
               </TabsTrigger>
             )}
-            <TabsTrigger value="subagents" className="h-[32px] gap-[6px] rounded-[8px] px-[12px] text-[13px] leading-5">
+            <TabsTrigger
+              value="subagents"
+              className="h-[32px] gap-[6px] rounded-[8px] px-[12px] text-[13px] leading-5"
+            >
               <BotIcon className="size-4" />
               Agents
               <span
@@ -331,7 +337,10 @@ export function WorkspacePanel({
               </span>
             </TabsTrigger>
             {showShellsTab && (
-              <TabsTrigger value="terminals" className="h-[32px] gap-[6px] rounded-[8px] px-[12px] text-[13px] leading-5">
+              <TabsTrigger
+                value="terminals"
+                className="h-[32px] gap-[6px] rounded-[8px] px-[12px] text-[13px] leading-5"
+              >
                 <TerminalIcon className="size-4" />
                 Shells
                 {/* No badge before the first shell — a "0" next to a
@@ -344,7 +353,10 @@ export function WorkspacePanel({
               </TabsTrigger>
             )}
             {isClaudeNative && todosTotal > 0 && (
-              <TabsTrigger value="todos" className="h-[32px] gap-[6px] rounded-[8px] px-[12px] text-[13px] leading-5">
+              <TabsTrigger
+                value="todos"
+                className="h-[32px] gap-[6px] rounded-[8px] px-[12px] text-[13px] leading-5"
+              >
                 <ListTodoIcon className="size-4" />
                 Tasks
                 <span className={cn(TAB_BADGE_BASE, "ml-0.5 bg-muted text-muted-foreground")}>
@@ -360,7 +372,10 @@ export function WorkspacePanel({
                 Only meaningful in the ≥500px case where the static tabs are
                 anchored; in the <500px whole-strip-scroll case there's no fixed
                 boundary, so hide it. */}
-            <div aria-hidden className="mx-[4px] hidden h-[14px] w-px shrink-0 self-center bg-border-strong @min-[500px]/rail:block" />
+            <div
+              aria-hidden
+              className="mx-[4px] hidden h-[14px] w-px shrink-0 self-center bg-border-strong @min-[500px]/rail:block"
+            />
             {/* File-tabs region. ≥500px (rail container query): the ONLY
                 horizontal scroller (flex-1 + overflow-x-auto), so the static
                 tabs stay anchored. <500px: shrink-0 with NO overflow set — it

@@ -11,9 +11,7 @@ describe("formatPreview — bare JSON", () => {
     // `json.dumps` of a list produces a bare `[...]` preview, so the
     // `[`-dispatch branch must format too — not just objects.
     const out = formatPreview('[{"role": "user"}, {"role": "assistant"}]');
-    expect(out).toBe(
-      '[\n  {\n    "role": "user"\n  },\n  {\n    "role": "assistant"\n  }\n]',
-    );
+    expect(out).toBe('[\n  {\n    "role": "user"\n  },\n  {\n    "role": "assistant"\n  }\n]');
   });
 
   it("returns empty string for whitespace-only input", () => {

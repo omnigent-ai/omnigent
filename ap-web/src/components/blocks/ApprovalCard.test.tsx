@@ -852,12 +852,7 @@ describe("ApprovalCard — ExitPlanMode plan review", () => {
     // plan card: markdown-rendered plan + the three native-dialog
     // actions — NOT the generic binary card with a raw JSON preview.
     render(
-      <ApprovalCard
-        elicitationId="elic_plan"
-        status="pending"
-        response={null}
-        {...planProps}
-      />,
+      <ApprovalCard elicitationId="elic_plan" status="pending" response={null} {...planProps} />,
     );
 
     expect(screen.getByText("Plan review")).toBeDefined();

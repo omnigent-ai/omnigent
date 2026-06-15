@@ -1,6 +1,13 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { MemoryRouter, Route, Routes, useLocation, useNavigate, useSearchParams } from "react-router-dom";
+import {
+  MemoryRouter,
+  Route,
+  Routes,
+  useLocation,
+  useNavigate,
+  useSearchParams,
+} from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
@@ -97,7 +104,17 @@ vi.mock("./FileViewer", () => ({
   // frameless=true → the inline desktop viewer (always open when rendered).
   // frameless=false/absent → the mobile push-panel (open prop controls visibility).
   // Use different testids so tests can target the one they care about.
-  FileViewer: ({ open, path, onClose, frameless }: { open: boolean; path: string; onClose: () => void; frameless?: boolean }) => (
+  FileViewer: ({
+    open,
+    path,
+    onClose,
+    frameless,
+  }: {
+    open: boolean;
+    path: string;
+    onClose: () => void;
+    frameless?: boolean;
+  }) => (
     <div
       data-testid={frameless ? "file-viewer-inline" : "file-viewer"}
       data-state={open ? "open" : "closed"}
@@ -111,11 +128,7 @@ vi.mock("./FileViewer", () => ({
 }));
 vi.mock("./InlineTerminalsSection", () => ({
   // Minimal stand-in exposing onExpand so tests can trigger the inline terminal expand path.
-  InlineTerminalsSection: ({
-    onExpand,
-  }: {
-    onExpand: (key: string) => void;
-  }) => (
+  InlineTerminalsSection: ({ onExpand }: { onExpand: (key: string) => void }) => (
     <div data-testid="inline-terminals-section">
       <button
         type="button"
@@ -168,7 +181,10 @@ import { useTerminals } from "@/hooks/useTerminals";
 const useConvMock = vi.mocked(useConversations);
 const useTerminalsMock = vi.mocked(useTerminals);
 
-import { useWorkspaceEnvironment, useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
+import {
+  useWorkspaceEnvironment,
+  useWorkspaceChangedFiles,
+} from "@/hooks/useWorkspaceChangedFiles";
 const useEnvironmentMock = vi.mocked(useWorkspaceEnvironment);
 const useChangedFilesMock = vi.mocked(useWorkspaceChangedFiles);
 
@@ -294,8 +310,25 @@ function renderShell(path: string) {
         <MemoryRouter initialEntries={[path]}>
           <Routes>
             <Route element={<AppShell />}>
-              <Route index element={<><div>home</div><LocationDisplay /></>} />
-              <Route path="c/:conversationId" element={<><TerminalFirstViewProbe /><ForkDialogProbe /><LocationDisplay /></>} />
+              <Route
+                index
+                element={
+                  <>
+                    <div>home</div>
+                    <LocationDisplay />
+                  </>
+                }
+              />
+              <Route
+                path="c/:conversationId"
+                element={
+                  <>
+                    <TerminalFirstViewProbe />
+                    <ForkDialogProbe />
+                    <LocationDisplay />
+                  </>
+                }
+              />
             </Route>
           </Routes>
         </MemoryRouter>
@@ -360,9 +393,13 @@ beforeEach(() => {
   // Default: loading state (data undefined) → showFilesPanel stays true,
   // no flash for agents that do have os_env.
   useEnvironmentMock.mockReset();
-  useEnvironmentMock.mockReturnValue({ data: undefined, isLoading: true } as ReturnType<typeof useWorkspaceEnvironment>);
+  useEnvironmentMock.mockReturnValue({ data: undefined, isLoading: true } as ReturnType<
+    typeof useWorkspaceEnvironment
+  >);
   useChangedFilesMock.mockReset();
-  useChangedFilesMock.mockReturnValue({ data: undefined, isLoading: true } as unknown as ReturnType<typeof useWorkspaceChangedFiles>);
+  useChangedFilesMock.mockReturnValue({ data: undefined, isLoading: true } as unknown as ReturnType<
+    typeof useWorkspaceChangedFiles
+  >);
   // The Chat/TUI toggle persists its position to sessionStorage so leaving
   // and re-entering a conversation restores the last view. Clear
   // it between tests so persistence from one test can't leak into another.
@@ -431,10 +468,7 @@ describe("AppShell header", () => {
 
     renderShell("/c/conv_terminal");
 
-    expect(screen.getByTestId("view-probe")).toHaveAttribute(
-      "data-terminal-starting-up",
-      "true",
-    );
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "true");
   });
 
   it("suppresses the terminal-startup spinner once the session has failed", () => {
@@ -449,10 +483,7 @@ describe("AppShell header", () => {
 
     renderShell("/c/conv_terminal");
 
-    expect(screen.getByTestId("view-probe")).toHaveAttribute(
-      "data-terminal-starting-up",
-      "false",
-    );
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "false");
   });
 });
 
@@ -478,9 +509,7 @@ describe("TerminalFirstContext", () => {
       },
     ]);
     useTerminalsMock.mockReturnValue({
-      terminals: [
-        { id: "terminal_main", name: "claude", session: "main", running: true },
-      ],
+      terminals: [{ id: "terminal_main", name: "claude", session: "main", running: true }],
       isLoading: false,
       error: null,
     });
@@ -559,9 +588,7 @@ describe("TerminalFirstContext", () => {
       },
     ]);
     useTerminalsMock.mockReturnValue({
-      terminals: [
-        { id: "terminal_main", name: "claude", session: "main", running: true },
-      ],
+      terminals: [{ id: "terminal_main", name: "claude", session: "main", running: true }],
       isLoading: false,
       error: null,
     });
@@ -636,9 +663,7 @@ describe("TerminalFirstContext", () => {
       { id: "conv_other", permission_level: null, labels: {} },
     ]);
     useTerminalsMock.mockReturnValue({
-      terminals: [
-        { id: "terminal_main", name: "claude", session: "main", running: true },
-      ],
+      terminals: [{ id: "terminal_main", name: "claude", session: "main", running: true }],
       isLoading: false,
       error: null,
     });
@@ -680,19 +705,14 @@ describe("TerminalFirstContext", () => {
       },
     ]);
     useTerminalsMock.mockReturnValue({
-      terminals: [
-        { id: "terminal_main", name: "claude", session: "main", running: true },
-      ],
+      terminals: [{ id: "terminal_main", name: "claude", session: "main", running: true }],
       isLoading: false,
       error: null,
     });
 
     renderShell("/c/conv_native");
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "chat");
-    expect(screen.getByRole("button", { name: "Chat" })).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
+    expect(screen.getByRole("button", { name: "Chat" })).toHaveAttribute("aria-pressed", "true");
   });
 });
 
@@ -714,9 +734,7 @@ describe("Right-rail terminals card", () => {
       },
     ]);
     useTerminalsMock.mockReturnValue({
-      terminals: [
-        { id: "terminal_main", name: "claude", session: "main", running: true },
-      ],
+      terminals: [{ id: "terminal_main", name: "claude", session: "main", running: true }],
       isLoading: false,
       error: null,
     });
@@ -746,9 +764,7 @@ describe("Right-rail terminals card", () => {
     } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
     mockConversations([{ id: "conv_abc", permission_level: null }]);
     useTerminalsMock.mockReturnValue({
-      terminals: [
-        { id: "terminal_main", name: "main", session: "main", running: true },
-      ],
+      terminals: [{ id: "terminal_main", name: "main", session: "main", running: true }],
       isLoading: false,
       error: null,
     });
@@ -811,7 +827,12 @@ describe("Right-rail terminals card", () => {
               <Route element={<AppShell />}>
                 <Route
                   path="c/:conversationId"
-                  element={<><TerminalFirstViewProbe /><LocationDisplay /></>}
+                  element={
+                    <>
+                      <TerminalFirstViewProbe />
+                      <LocationDisplay />
+                    </>
+                  }
                 />
               </Route>
             </Routes>
@@ -856,9 +877,7 @@ describe("Right-rail terminals card", () => {
       },
     ]);
     useTerminalsMock.mockReturnValue({
-      terminals: [
-        { id: "terminal_main", name: "claude", session: "main", running: true },
-      ],
+      terminals: [{ id: "terminal_main", name: "claude", session: "main", running: true }],
       isLoading: false,
       error: null,
     });
@@ -888,9 +907,7 @@ describe("Chat-mode terminal panel layout", () => {
     } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
     mockConversations([{ id: "conv_abc", permission_level: null }]);
     useTerminalsMock.mockReturnValue({
-      terminals: [
-        { id: "terminal_main", name: "main", session: "main", running: true },
-      ],
+      terminals: [{ id: "terminal_main", name: "main", session: "main", running: true }],
       isLoading: false,
       error: null,
     });
@@ -953,10 +970,7 @@ describe("Subagents tab", () => {
     const tab = screen.getByRole("tab", { name: /Agents\s*1/i });
     expect(within(tab).getByText("1")).toBeInTheDocument();
     // Files is the default tab, whose content slot mounts FilesPanel.
-    expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
+    expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByTestId("files-panel")).toBeInTheDocument();
   });
 
@@ -1126,7 +1140,12 @@ describe("Subagents tab", () => {
               <Route element={<AppShell />}>
                 <Route
                   path="c/:conversationId"
-                  element={<><TerminalFirstViewProbe /><LocationDisplay /></>}
+                  element={
+                    <>
+                      <TerminalFirstViewProbe />
+                      <LocationDisplay />
+                    </>
+                  }
                 />
               </Route>
             </Routes>
@@ -1188,7 +1207,12 @@ describe("Subagents tab", () => {
               <Route element={<AppShell />}>
                 <Route
                   path="c/:conversationId"
-                  element={<><TerminalFirstViewProbe /><LocationDisplay /></>}
+                  element={
+                    <>
+                      <TerminalFirstViewProbe />
+                      <LocationDisplay />
+                    </>
+                  }
                 />
               </Route>
             </Routes>
@@ -1238,7 +1262,12 @@ describe("Subagents tab", () => {
               <Route element={<AppShell />}>
                 <Route
                   path="c/:conversationId"
-                  element={<><TerminalFirstViewProbe /><LocationDisplay /></>}
+                  element={
+                    <>
+                      <TerminalFirstViewProbe />
+                      <LocationDisplay />
+                    </>
+                  }
                 />
               </Route>
             </Routes>
@@ -1305,7 +1334,12 @@ describe("Subagents tab", () => {
               <Route element={<AppShell />}>
                 <Route
                   path="c/:conversationId"
-                  element={<><TerminalFirstViewProbe /><LocationDisplay /></>}
+                  element={
+                    <>
+                      <TerminalFirstViewProbe />
+                      <LocationDisplay />
+                    </>
+                  }
                 />
               </Route>
             </Routes>
@@ -1381,7 +1415,12 @@ describe("Subagents tab", () => {
               <Route element={<AppShell />}>
                 <Route
                   path="c/:conversationId"
-                  element={<><TerminalFirstViewProbe /><LocationDisplay /></>}
+                  element={
+                    <>
+                      <TerminalFirstViewProbe />
+                      <LocationDisplay />
+                    </>
+                  }
                 />
               </Route>
             </Routes>
@@ -1522,7 +1561,6 @@ describe("FilesPanel visibility", () => {
     expect(screen.queryByTestId("files-panel")).toBeNull();
     expect(screen.queryByTestId("files-panel-drawer")).toBeNull();
   });
-
 });
 
 describe("Right workspace card visibility", () => {
@@ -1544,10 +1582,7 @@ describe("Right workspace card visibility", () => {
     expect(screen.queryByRole("tab", { name: /Files/i })).toBeNull();
     expect(screen.queryByRole("tab", { name: /Shells/i })).toBeNull();
     // The tab-fallback effect lands on Agents (the only available tab).
-    expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
+    expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
   });
 
@@ -1627,14 +1662,8 @@ describe("Right workspace card visibility", () => {
 
     renderShell("/c/conv_tabmem");
 
-    expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
-    expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute(
-      "aria-selected",
-      "false",
-    );
+    expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute("aria-selected", "false");
   });
 
   it("restores the open file tabs per session (independent of the ?file= param)", () => {
@@ -1694,10 +1723,7 @@ describe("Embedded REPL terminal rail inventory", () => {
     expect(screen.queryByRole("tab", { name: /Shells/i })).toBeNull();
     // The pill still sees the REPL terminal — false here would grey out
     // the Terminal pill and make the embedded REPL unreachable.
-    expect(screen.getByTestId("view-probe")).toHaveAttribute(
-      "data-terminals-available",
-      "true",
-    );
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminals-available", "true");
   });
 
   it("lists only agent-launched terminals in the rail for terminal-first SDK sessions", () => {
@@ -1765,9 +1791,7 @@ describe("Embedded REPL terminal rail inventory", () => {
     expect(tab).not.toHaveTextContent(/0/);
     // Display order: Shells sits to the RIGHT of Agents in the strip.
     const agentsTab = screen.getByRole("tab", { name: /Agents/i });
-    expect(
-      agentsTab.compareDocumentPosition(tab) & Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
+    expect(agentsTab.compareDocumentPosition(tab) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     // Selecting the tab mounts the shells section (whose empty state
     // carries the new-shell affordance), not a fall-through to the
     // Files panel — the content branch must share the trigger's gate.
@@ -1807,10 +1831,7 @@ describe("AppShell URL sync — file param", () => {
     renderShell("/c/conv_abc?file=README.md");
 
     // Desktop inline viewer shows the file; the Agents panel is not rendered.
-    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute(
-      "data-path",
-      "README.md",
-    );
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
     expect(screen.queryByTestId("subagents-panel")).toBeNull();
   });
 
@@ -1948,10 +1969,7 @@ describe("AppShell URL sync — view param", () => {
     // FilesPanel mock exposes data-flat-view; false means the folder tree.
     // Failure: the conversationId effect did not read searchParams.get("view")
     // and call setFilesPanelFlatView(false).
-    expect(screen.getByTestId("files-panel")).toHaveAttribute(
-      "data-flat-view",
-      "false",
-    );
+    expect(screen.getByTestId("files-panel")).toHaveAttribute("data-flat-view", "false");
   });
 
   it("restores Changed-only view from the ?view=changed URL param on load", () => {
@@ -2090,12 +2108,14 @@ describe("Files scope default and persistence", () => {
     // blast radius to this one localStorage write — AppShell's sessionStorage
     // panel-key writes on mount/navigation still go through untouched.
     const realSetItem = Storage.prototype.setItem;
-    const setItemSpy = vi
-      .spyOn(Storage.prototype, "setItem")
-      .mockImplementation(function (this: Storage, key: string, value: string) {
-        if (key === PREF_KEY) throw new Error("storage blocked");
-        realSetItem.call(this, key, value);
-      });
+    const setItemSpy = vi.spyOn(Storage.prototype, "setItem").mockImplementation(function (
+      this: Storage,
+      key: string,
+      value: string,
+    ) {
+      if (key === PREF_KEY) throw new Error("storage blocked");
+      realSetItem.call(this, key, value);
+    });
     try {
       useEnvironmentMock.mockReturnValue({
         data: { available: true, root: null },
@@ -2233,7 +2253,9 @@ describe("AppShell scope switch — conversation redirect (stale-closure regress
     // unmounted while a file is open, so the viewer's close is now the
     // affordance wired to showScopeView.)
     fireEvent.click(
-      within(screen.getByTestId("file-viewer-inline")).getByRole("button", { name: /file-viewer: close/i }),
+      within(screen.getByTestId("file-viewer-inline")).getByRole("button", {
+        name: /file-viewer: close/i,
+      }),
     );
 
     // The conversation segment must be unchanged: clearing the file only edits
@@ -2293,7 +2315,11 @@ describe("Right-rail tab switching — file viewer close", () => {
     expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
 
     // Explicitly close the viewer with the X button (scoped to the inline rail viewer).
-    fireEvent.click(within(screen.getByTestId("file-viewer-inline")).getByRole("button", { name: /file-viewer: close/i }));
+    fireEvent.click(
+      within(screen.getByTestId("file-viewer-inline")).getByRole("button", {
+        name: /file-viewer: close/i,
+      }),
+    );
     // Failure: closeFileViewer did not clear selectedFilePath.
     expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
     expect(screen.getByTestId("files-panel")).toBeInTheDocument();
@@ -2334,9 +2360,7 @@ describe("Mobile session menu", () => {
     useTerminalsMock.mockReturnValue({
       // The vendor pane only — it is the pill's Terminal view, not a
       // shell, so the menu must not grow a Shells entry for it.
-      terminals: [
-        { id: "terminal_claude_main", name: "claude", session: "main", running: true },
-      ],
+      terminals: [{ id: "terminal_claude_main", name: "claude", session: "main", running: true }],
       isLoading: false,
       error: null,
     });
@@ -2616,9 +2640,7 @@ describe("AppShell share action", () => {
 
     renderShell("/c/conv_top");
 
-    expect(
-      screen.getByRole("button", { name: /share session/i }),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /share session/i })).toBeInTheDocument();
   });
 
   it("hides the Share button on a sub-agent (child) session", () => {

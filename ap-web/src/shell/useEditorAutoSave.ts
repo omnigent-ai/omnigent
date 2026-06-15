@@ -89,8 +89,7 @@ export function useEditorAutoSave({
   const focusedId = useChatStore((s) => s.conversationId);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const sessionActive =
-    conversationId === focusedId &&
-    (sessionStatus === "running" || sessionStatus === "waiting");
+    conversationId === focusedId && (sessionStatus === "running" || sessionStatus === "waiting");
   const sessionActiveRef = useRef(sessionActive);
   sessionActiveRef.current = sessionActive;
 
@@ -103,12 +102,17 @@ export function useEditorAutoSave({
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
-    return () => { mountedRef.current = false; };
+    return () => {
+      mountedRef.current = false;
+    };
   }, []);
 
   const handleSave = useCallback(
     async (value: string) => {
-      if (value === baselineRef.current) { setDirty(false); return; }
+      if (value === baselineRef.current) {
+        setDirty(false);
+        return;
+      }
       writeFileRef.current.reset();
       try {
         // Pre-write conflict check: mid-turn the file query isn't refetched, so
@@ -119,7 +123,11 @@ export function useEditorAutoSave({
             const fresh = await fetchFileContent(conversationId, path);
             // Torn down during the GET → don't touch the outer sync hook (it now
             // tracks a different file); fall through and let the write land.
-            if (mountedRef.current && fresh.encoding === "utf-8" && reconcileServerContent(fresh.content)) {
+            if (
+              mountedRef.current &&
+              fresh.encoding === "utf-8" &&
+              reconcileServerContent(fresh.content)
+            ) {
               return;
             }
           } catch {
@@ -146,7 +154,15 @@ export function useEditorAutoSave({
         // Surfaced via writeFile.isError in the editor's status UI.
       }
     },
-    [conversationId, path, setDirty, dismissExternalUpdate, markSaved, reconcileServerContent, baselineRef],
+    [
+      conversationId,
+      path,
+      setDirty,
+      dismissExternalUpdate,
+      markSaved,
+      reconcileServerContent,
+      baselineRef,
+    ],
   );
 
   // Auto-save is suppressed when read-only, offline, or an external-edit
@@ -163,7 +179,12 @@ export function useEditorAutoSave({
 
   // Flush a pending debounce on unmount (file switch / panel close) so an edit
   // made within the debounce window isn't lost; the write lands via React Query.
-  useEffect(() => () => { autoSave.flush(); }, [autoSave]);
+  useEffect(
+    () => () => {
+      autoSave.flush();
+    },
+    [autoSave],
+  );
 
   // Flush edits accumulated while auto-save was blocked, once it's eligible
   // again (runner reconnects, or the conflict is resolved via "Keep mine").

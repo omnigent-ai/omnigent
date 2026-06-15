@@ -32,9 +32,7 @@ function policiesQueryKey(sessionId: string) {
 }
 
 async function fetchPolicies(sessionId: string): Promise<SessionPolicy[]> {
-  const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}/policies`,
-  );
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/policies`);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as { object: string; data: SessionPolicy[] };
   return body.data;

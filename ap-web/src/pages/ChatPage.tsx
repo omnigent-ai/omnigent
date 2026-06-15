@@ -1780,9 +1780,7 @@ export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }
     return null;
   }
   const line =
-    sandboxLabel !== undefined
-      ? `${sandboxLabel}…`
-      : "Starting up… getting your terminal ready.";
+    sandboxLabel !== undefined ? `${sandboxLabel}…` : "Starting up… getting your terminal ready.";
   // role=status + aria-live so assistive tech announces the transient wait;
   // the spinner glyph itself is decorative (aria-hidden).
   if (variant === "hero") {
@@ -1997,52 +1995,52 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
           // a glance without any email text.
           style={showAuthorBadge && author ? { backgroundColor: userColorTint(author) } : undefined}
         >
-        {/* Inline image previews */}
-        {images.length > 0 && (
-          <div className="mb-1.5 flex flex-wrap gap-2">
-            {images.map((img, i) =>
-              img.file_id.startsWith("pending:") ? (
-                // Upload in-flight — show a chip placeholder
+          {/* Inline image previews */}
+          {images.length > 0 && (
+            <div className="mb-1.5 flex flex-wrap gap-2">
+              {images.map((img, i) =>
+                img.file_id.startsWith("pending:") ? (
+                  // Upload in-flight — show a chip placeholder
+                  <span
+                    key={i}
+                    className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+                  >
+                    <ImageIcon className="size-3 shrink-0" />
+                    <span className="max-w-[180px] truncate">
+                      {img.filename ?? img.file_id.replace("pending:", "")}
+                    </span>
+                  </span>
+                ) : (
+                  // Uploaded — render the actual image
+                  <SessionImage
+                    key={i}
+                    path={
+                      sessionId
+                        ? `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files/${encodeURIComponent(img.file_id)}/content`
+                        : undefined
+                    }
+                    alt={img.filename ?? img.file_id}
+                    className="max-h-64 max-w-full rounded-md object-contain"
+                  />
+                ),
+              )}
+            </div>
+          )}
+          {/* Non-image file chips */}
+          {fileChips.length > 0 && (
+            <div className="mb-1.5 flex flex-wrap gap-1.5">
+              {fileChips.map((att, i) => (
                 <span
                   key={i}
                   className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
                 >
-                  <ImageIcon className="size-3 shrink-0" />
-                  <span className="max-w-[180px] truncate">
-                    {img.filename ?? img.file_id.replace("pending:", "")}
-                  </span>
+                  <FileTextIcon className="size-3 shrink-0" />
+                  <span className="max-w-[180px] truncate">{att.filename ?? att.file_id}</span>
                 </span>
-              ) : (
-                // Uploaded — render the actual image
-                <SessionImage
-                  key={i}
-                  path={
-                    sessionId
-                      ? `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files/${encodeURIComponent(img.file_id)}/content`
-                      : undefined
-                  }
-                  alt={img.filename ?? img.file_id}
-                  className="max-h-64 max-w-full rounded-md object-contain"
-                />
-              ),
-            )}
-          </div>
-        )}
-        {/* Non-image file chips */}
-        {fileChips.length > 0 && (
-          <div className="mb-1.5 flex flex-wrap gap-1.5">
-            {fileChips.map((att, i) => (
-              <span
-                key={i}
-                className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
-              >
-                <FileTextIcon className="size-3 shrink-0" />
-                <span className="max-w-[180px] truncate">{att.filename ?? att.file_id}</span>
-              </span>
-            ))}
-          </div>
-        )}
-        {/* Render user text as markdown, matching the assistant bubble
+              ))}
+            </div>
+          )}
+          {/* Render user text as markdown, matching the assistant bubble
             (headings, lists, code fences, file-path links). `breaks` keeps
             single newlines as line breaks — users type multi-line messages
             without blank-line paragraph separators and expect their line
@@ -2780,7 +2778,9 @@ export function Composer({
   // Auto-grow the textarea from 1 row up to 10 rows, then let it scroll.
   useAutoGrowTextarea(textareaRef, value);
 
-  const { appendEntry, recallPrevious, recallNext, resetCursor } = usePromptHistory();
+  // Scope recall to the active conversation so ArrowUp surfaces only this
+  // chat's prompts, not the last thing typed in any other chat.
+  const { appendEntry, recallPrevious, recallNext, resetCursor } = usePromptHistory(conversationId);
   // Set just before recall sets `value`; cleared when the resulting onChange
   // fires. Lets onChange distinguish "user typed" (reset cursor) from
   // "recall replaced the value" (keep cursor).

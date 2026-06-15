@@ -221,8 +221,7 @@ export function ApprovalCard({
   // External URL: the elicitation points to a third-party page (OAuth,
   // external MCP server, etc.) — show a link. Our own /approve/...
   // paths are handled inline with approve/reject buttons.
-  const isExternalUrl =
-    typeof url === "string" && url.length > 0 && !url.startsWith("/approve/");
+  const isExternalUrl = typeof url === "string" && url.length > 0 && !url.startsWith("/approve/");
   const askUserQuestionTitle =
     policyName.startsWith("codex_") || phase.startsWith("codex_")
       ? "Codex needs input"

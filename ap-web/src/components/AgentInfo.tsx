@@ -23,6 +23,7 @@ import {
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { capitalizeAgentName } from "@/lib/agentLabels";
+import { coercePolicyParams } from "@/lib/policyParams";
 import { useChatStore } from "@/store/chatStore";
 
 /** Trigger-pill display aliases for native agents. */
@@ -188,6 +189,7 @@ function AddPolicyDialog({
   const [selected, setSelected] = useState<string>("");
   const [filter, setFilter] = useState("");
   const [factoryParams, setFactoryParams] = useState<Record<string, string>>({});
+  const [paramError, setParamError] = useState<string | null>(null);
   const addPolicy = useAddPolicy(sessionId);
 
   const entry = registry.find((r) => r.handler === selected);
@@ -215,29 +217,21 @@ function AddPolicyDialog({
     setSelected(handler);
     setFilter("");
     setFactoryParams({});
+    setParamError(null);
   }
 
   function handleAdd() {
     if (!entry) return;
     let parsedParams: Record<string, unknown> | undefined;
     if (entry.kind === "factory" && paramKeys.length > 0) {
-      parsedParams = {};
-      for (const key of paramKeys) {
-        const raw = factoryParams[key];
-        const prop = properties[key];
-        if (raw !== undefined && raw !== "") {
-          if (prop?.type === "integer") parsedParams[key] = parseInt(raw, 10);
-          else if (prop?.type === "number") parsedParams[key] = parseFloat(raw);
-          else if (prop?.type === "boolean") parsedParams[key] = raw === "true";
-          else if (prop?.type === "array")
-            parsedParams[key] = raw
-              .split(",")
-              .map((s) => s.trim())
-              .filter(Boolean);
-          else parsedParams[key] = raw;
-        }
+      const result = coercePolicyParams(paramKeys, properties, factoryParams);
+      if (!result.ok) {
+        setParamError(result.error);
+        return;
       }
+      parsedParams = result.params;
     }
+    setParamError(null);
     // Always send factory_params for factory-kind policies (even
     // if empty) so the stored entity has ``factory_params={}``
     // instead of ``None``. The builder uses ``arguments is not
@@ -330,6 +324,7 @@ function AddPolicyDialog({
                   onClick={() => {
                     setSelected("");
                     setFactoryParams({});
+                    setParamError(null);
                   }}
                   className="text-[11px] text-muted-foreground hover:text-foreground"
                 >
@@ -460,6 +455,14 @@ function AddPolicyDialog({
                   </div>
                 );
               })}
+            </div>
+          )}
+          {(paramError || addPolicy.isError) && (
+            <div
+              role="alert"
+              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+            >
+              {paramError ?? addPolicy.error?.message}
             </div>
           )}
           <div className="flex justify-end gap-2 pt-1">

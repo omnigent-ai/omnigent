@@ -50,10 +50,7 @@ const TERMINAL_FIRST_SDK_CTX = {
   terminalStartingUp: false,
 } as TerminalFirstContextValue;
 
-function renderInlineSection(
-  terminals: TerminalInfo[],
-  onExpand: (key: string) => void = vi.fn(),
-) {
+function renderInlineSection(terminals: TerminalInfo[], onExpand: (key: string) => void = vi.fn()) {
   useTerminalsMock.mockReturnValue({
     terminals,
     isLoading: false,
@@ -136,8 +133,6 @@ describe("InlineTerminalsSection rows open shells in the main view", () => {
     // Leading keeps the affordance at a fixed spot — trailing would
     // drift down as shells accumulate.
     const shellRow = screen.getByRole("button", { name: /s1/ });
-    expect(
-      row.compareDocumentPosition(shellRow) & Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
+    expect(row.compareDocumentPosition(shellRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 });

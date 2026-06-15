@@ -91,9 +91,7 @@ describe("index.css backdrop-filter glass rules", () => {
  */
 describe("index.css bg-card glass rule selector", () => {
   // The selector of the rule declaring the bg-card glass border/blur.
-  const cardRule = extractBackdropFilterRules(cssSource).find((rule) =>
-    rule.includes(".bg-card"),
-  )!;
+  const cardRule = extractBackdropFilterRules(cssSource).find((rule) => rule.includes(".bg-card"))!;
   // Strip comments preceding the selector in the extracted block.
   const selector = cardRule
     .slice(0, cardRule.indexOf("{"))

@@ -36,15 +36,15 @@ OMNIGENT_URL=http://localhost:9000 npm run dev
 
 Additional `omnigent server` options:
 
-| Flag | Default | Description |
-|---|---|---|
-| `--host` | `127.0.0.1` | Host to bind to |
-| `-p` / `--port` | `8000` | Port to listen on |
-| `--database-uri` | `sqlite:///omnigent.db` | Database URI for stores |
-| `--artifact-location` | `./artifacts` | Path for artifact storage |
-| `-c` / `--config` | (none) | Path to YAML config file |
-| `--execution-timeout` | `7200` | Max wall-clock seconds per execution |
-| `--agent` | (none) | Pre-register an agent (repeatable) |
+| Flag                  | Default                 | Description                          |
+| --------------------- | ----------------------- | ------------------------------------ |
+| `--host`              | `127.0.0.1`             | Host to bind to                      |
+| `-p` / `--port`       | `8000`                  | Port to listen on                    |
+| `--database-uri`      | `sqlite:///omnigent.db` | Database URI for stores              |
+| `--artifact-location` | `./artifacts`           | Path for artifact storage            |
+| `-c` / `--config`     | (none)                  | Path to YAML config file             |
+| `--execution-timeout` | `7200`                  | Max wall-clock seconds per execution |
+| `--agent`             | (none)                  | Pre-register an agent (repeatable)   |
 
 ## Build + serve from the Omnigent server
 
@@ -89,14 +89,14 @@ The TypeScript reducer at `src/lib/blockStream.ts` is a hand-mirror of
 the Python reducer at
 `sdks/python-client/omnigent_client/_stream.py`. Same for:
 
-| TS file                       | Mirrors                                         |
-| ----------------------------- | ----------------------------------------------- |
+| TS file                       | Mirrors                                       |
+| ----------------------------- | --------------------------------------------- |
 | `src/lib/blocks.ts`           | `omnigent_client/_blocks.py`                  |
 | `src/lib/events.ts`           | `omnigent_client/_events.py`                  |
 | `src/lib/types.ts`            | minimal subset of `omnigent_client/_types.py` |
 | `src/lib/sse.ts`              | `omnigent_client/_sse.py`                     |
 | `src/lib/blockStream.ts`      | `omnigent_client/_stream.py`                  |
-| `src/lib/blockStream.test.ts` | `tests/frontends/sdk/test_stream.py`            |
+| `src/lib/blockStream.test.ts` | `tests/frontends/sdk/test_stream.py`          |
 
 There is **no cross-language CI gate** today. When `_stream.py`
 changes for a real bug (e.g. new harness quirk, dedup edge case), the
@@ -138,7 +138,7 @@ parity" by mirroring them across.
 
 When `_stream.py` / `_events.py` / `_blocks.py` change for a
 substantive reason (new event type, new dedup edge case), continue to
-mirror the *behavioral* changes here; just leave the divergences above
+mirror the _behavioral_ changes here; just leave the divergences above
 alone.
 
 ## Stack
@@ -151,4 +151,3 @@ alone.
   shiki, framer-motion, cmdk, react-hotkeys-hook, use-stick-to-bottom,
   next-themes, react-hook-form, zod
 - Lint: oxlint. Format: prettier.
-

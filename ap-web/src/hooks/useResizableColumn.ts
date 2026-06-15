@@ -1,10 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-export function useResizableColumn(
-  defaultWidth = 176,
-  minWidth = 100,
-  maxWidth = 480,
-) {
+export function useResizableColumn(defaultWidth = 176, minWidth = 100, maxWidth = 480) {
   const [width, setWidth] = useState(defaultWidth);
   const dragging = useRef(false);
   const containerRef = useRef<HTMLElement | null>(null);

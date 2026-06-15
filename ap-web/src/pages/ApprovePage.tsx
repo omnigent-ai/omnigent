@@ -141,9 +141,7 @@ export function ApprovePage() {
               </>
             )}
           </AlertTitle>
-          <AlertDescription className="text-xs">
-            You can close this page.
-          </AlertDescription>
+          <AlertDescription className="text-xs">You can close this page.</AlertDescription>
         </Alert>
       )}
 
