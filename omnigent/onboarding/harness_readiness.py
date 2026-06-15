@@ -60,7 +60,7 @@ HarnessAvailability = bool | str
 # runtime), distinct from the CLI-wrapping ``antigravity-native`` (``agy``)
 # harness gated below on its binary plus a file-based OAuth credential.
 _SDK_HARNESSES: frozenset[str] = frozenset(
-    {"claude-sdk", "openai-agents", "openai-agents-sdk", "antigravity"}
+    {"claude-sdk", "openai-agents", "openai-agents-sdk", "antigravity", "rovo-cli"}
 )
 
 # Families whose CLIs authenticate via file-based credentials rather than a CLI

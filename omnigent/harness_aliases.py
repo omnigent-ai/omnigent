@@ -42,6 +42,10 @@ HARNESS_ALIASES: dict[str, str] = {
     # User-facing spelling for the GitHub Copilot SDK harness; the canonical id
     # is "copilot" (matches the registry / workflow type).
     "github-copilot": "copilot",
+    # Rovo Dev (Atlassian) ACP harness. ``rovo`` is the user-facing shorthand;
+    # ``rovo-cli`` is the canonical id. Not a native harness — it owns an ACP
+    # session, not an on-disk TUI transcript.
+    "rovo": "rovo-cli",
 }
 
 # Canonical native-CLI harness spellings. These harnesses type messages into
