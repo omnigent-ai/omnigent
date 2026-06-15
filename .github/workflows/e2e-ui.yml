@@ -312,7 +312,18 @@ jobs:
           # on GitHub-hosted runners. The previous glob targeted
           # ``e2e_ui_logs*``, which never matched, so the artifact was
           # always empty.
-          path: /tmp/pytest-of-runner/**/e2e_ui_server*/server.log
+          #
+          # The sibling runner subprocess writes ``runner.log`` next to it,
+          # and respawned / external runners under ``e2e_ui_*runner*/``. The
+          # native-CLI harness (claude/codex) routing decisions and the vendor
+          # CLI's own output land there, NOT in server.log (which only carries
+          # HTTP access lines), so capture all of them — a native-turn failure
+          # (e.g. a provider that resolves to no credential) is otherwise
+          # undiagnosable from the artifacts alone.
+          path: |
+            /tmp/pytest-of-runner/**/e2e_ui_server*/server.log
+            /tmp/pytest-of-runner/**/e2e_ui_server*/runner.log
+            /tmp/pytest-of-runner/**/e2e_ui_*runner*/runner.log
           retention-days: 3
           if-no-files-found: ignore
 

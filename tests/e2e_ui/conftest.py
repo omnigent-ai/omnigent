@@ -274,6 +274,74 @@ def _find_free_port() -> int:
         return s.getsockname()[1]
 
 
+def _maybe_isolate_gateway_config(mp: pytest.MonkeyPatch, config_home: Path) -> bool:
+    """Point native-claude at a gateway provider config when CI gateway creds exist.
+
+    The packaged ``claude-native-ui`` built-in spec declares no auth, so the
+    native-claude harness resolves its model provider from
+    ``~/.omnigent/config.yaml`` (``resolve_native_claude_config`` →
+    ``default_provider_for_harness``). On a developer machine that resolves to a
+    logged-in ``claude`` CLI (a subscription login); CI has no such login AND
+    scrubs ``ANTHROPIC_API_KEY``, so without an explicit provider the harness
+    launches Claude Code with no credentials and the turn never produces output
+    — the render-parity suite then times out waiting for the first reply (the
+    failure this guards against).
+
+    When the gateway creds the workflow already exports for the openai-agents
+    agents are present (``OPENAI_BASE_URL`` + ``OPENAI_API_KEY``), write a
+    ``gateway`` provider that serves the Databricks anthropic surface
+    (``<host>/ai-gateway/anthropic`` — see
+    ``omnigent/inner/claude_sdk_executor.py``) and point ``OMNIGENT_CONFIG_HOME``
+    at it via *mp* (mirroring ``test_model_catalog._isolate_config``), so
+    native-claude routes through the same gateway. The token is referenced
+    lazily as ``env:OPENAI_API_KEY`` so it reaches the runner (which resolves
+    the config) without baking the secret into a file. Only the ``anthropic``
+    family is declared, so openai family resolution (openai-agents / codex) is
+    untouched.
+
+    ``OMNIGENT_CONFIG_HOME`` is set only on the in-process ``os.environ`` (which
+    the spawned server + runner copy), and *mp* restores it on teardown — a
+    developer's real ``~/.omnigent/config.yaml`` is never read or written.
+    Locally (no gateway creds) this is a no-op and the subscription-login path
+    is preserved.
+
+    :param mp: A session-scoped :class:`pytest.MonkeyPatch` whose ``undo`` the
+        caller invokes on teardown.
+    :param config_home: Directory to write ``config.yaml`` into.
+    :returns: ``True`` when a config was written + the env pointed at it,
+        ``False`` when gateway creds were absent (the local no-op path).
+    """
+    import yaml
+
+    openai_base = os.environ.get("OPENAI_BASE_URL")
+    token = os.environ.get("OPENAI_API_KEY")
+    if not openai_base or not token:
+        return False
+    # The Databricks anthropic surface lives at ``<host>/ai-gateway/anthropic``;
+    # ``host`` is the gateway base minus the openai ``/serving-endpoints`` suffix.
+    host = openai_base.rstrip("/")
+    suffix = "/serving-endpoints"
+    if host.endswith(suffix):
+        host = host[: -len(suffix)]
+    config = {
+        "providers": {
+            "e2e-gateway": {
+                "kind": "gateway",
+                "default": True,
+                "anthropic": {
+                    "base_url": f"{host}/ai-gateway/anthropic",
+                    "api_key_ref": "env:OPENAI_API_KEY",
+                    "models": {"default": "databricks-claude-opus-4-8"},
+                },
+            }
+        }
+    }
+    config_home.mkdir(parents=True, exist_ok=True)
+    (config_home / "config.yaml").write_text(yaml.safe_dump(config, sort_keys=False))
+    mp.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    return True
+
+
 @pytest.fixture(scope="session")
 def built_spa(request: pytest.FixtureRequest) -> None:
     """
@@ -482,6 +550,18 @@ def live_server(
 
     binding_token = _secrets.token_urlsafe(32)
     runner_id = token_bound_runner_id(binding_token)
+    # Provision a native-claude gateway provider (CI only) so the
+    # ``claude-native-ui`` built-in authenticates through the Databricks gateway
+    # instead of a (CI-absent) Claude CLI login. The helper points
+    # ``OMNIGENT_CONFIG_HOME`` at an isolated dir via this MonkeyPatch BEFORE the
+    # server/runner env dicts are built below (they copy ``os.environ``), so
+    # every spawned process — including any runner respawn — resolves the same
+    # config. A session-scoped ``pytest.MonkeyPatch`` (the function-scoped
+    # fixture can't be used here) restores the env on teardown. A developer's
+    # real ``~/.omnigent/config.yaml`` is never touched; no-op locally (no
+    # gateway creds), preserving the subscription-login path.
+    _config_mp = pytest.MonkeyPatch()
+    _maybe_isolate_gateway_config(_config_mp, server_tmp / "omnigent_config")
     # PYTHONPATH forces the subprocess to import omnigent from
     # the worktree, not whatever's pip-installed in .venv —
     # otherwise a branch with code changes would silently run
@@ -587,6 +667,7 @@ def live_server(
                 proc.kill()
                 proc.wait(timeout=5)
         log_handle.close()
+        _config_mp.undo()
         log_text = log_path.read_text() if log_path.exists() else ""
         raise RuntimeError(
             f"`omnigent server` did not become healthy within "
@@ -606,6 +687,7 @@ def live_server(
         yield base_url
     finally:
         _server_state.clear()
+        _config_mp.undo()
         if runner_proc.poll() is None:
             runner_proc.send_signal(signal.SIGTERM)
             try:
