@@ -61,6 +61,7 @@ _LAUNCHERS: dict[str, str] = {
     # CoreWeave Sandbox via the official cwsandbox SDK (the
     # `omnigent[cwsandbox]` extra), imported lazily like modal/daytona.
     "cwsandbox": "omnigent.onboarding.sandboxes.cwsandbox:CWSandboxLauncher",
+    "islo": "omnigent.onboarding.sandboxes.islo:IsloSandboxLauncher",
 }
 
 

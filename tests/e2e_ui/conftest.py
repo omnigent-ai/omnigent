@@ -624,7 +624,10 @@ def live_server(
 
 
 @pytest.fixture
-def seeded_session(live_server: str) -> Iterator[tuple[str, str]]:
+def seeded_session(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
     """Create a session bound to ``live_server``'s runner and yield its id.
 
     The web UI no longer lets users start a new chat from inside the
@@ -636,13 +639,21 @@ def seeded_session(live_server: str) -> Iterator[tuple[str, str]]:
     session bound to that agent, then ``PATCH``-binds it to the
     spawned runner so ``POST /v1/responses`` can dispatch.
 
+    Respawns the shared runner first if a prior test in the shard killed
+    it (``test_stale_stream``); otherwise the runner-bind ``PATCH`` would
+    400 on an offline runner. Any runner this respawns is torn down with
+    the fixture. This keeps the fixture order-independent, so sharding
+    and test reordering can place the runner-killing test anywhere.
+
     :param live_server: Spawned server fixture — its
         ``OMNIGENT_RUNNER_ID`` and pre-registered agent are reused.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
     :returns: ``(base_url, session_id)``. Tests typically navigate to
         ``f"{base_url}/c/{session_id}"``.
     """
     import json as _json
 
+    respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
     # Create a session with the hello_world bundle inline. The server
     # pre-registered the agent via --agent, but since /api/agents is
@@ -668,6 +679,15 @@ def seeded_session(live_server: str) -> Iterator[tuple[str, str]]:
         yield (live_server, session_id)
     finally:
         httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        # Restore the "found" state: if we respawned the runner (a prior
+        # test had killed it), tear our copy down so it doesn't outlive us.
+        if respawned_runner is not None:
+            respawned_runner.terminate()
+            try:
+                respawned_runner.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned_runner.kill()
+                respawned_runner.wait(timeout=5)
 
 
 def _create_runner_bound_session(base_url: str, runner_id: str) -> str:
