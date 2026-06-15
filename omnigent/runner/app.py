@@ -214,6 +214,10 @@ _AUTO_FORWARDER_TASKS: dict[str, asyncio.Task[Any]] = {}
 _AUTO_FORWARDER_CANCEL_TIMEOUT_S = 10.0
 
 
+class _CodexNativeModelOptionsNotReady(RuntimeError):
+    """Raised when Codex model options are requested before bridge startup."""
+
+
 async def _cancel_auto_forwarder_task(session_id: str) -> None:
     """
     Cancel and await the session's registered transcript forwarder, if any.
@@ -6500,6 +6504,7 @@ def create_runner_app(
         conv_id: str,
         *,
         action: str,
+        missing_state_log_level: int = logging.WARNING,
     ) -> Any | None:
         """
         Read the recorded Codex app-server bridge state for a session.
@@ -6514,6 +6519,8 @@ def create_runner_app(
             ``"conv_abc123"``.
         :param action: Human-readable control action for logs, e.g.
             ``"interrupt"``.
+        :param missing_state_log_level: Log level used when bridge state has
+            not been written yet, e.g. ``logging.DEBUG`` for readiness probes.
         :returns: Bridge state for this session, or ``None`` when no matching
             state is currently recorded.
         """
@@ -6530,7 +6537,8 @@ def create_runner_app(
         bridge_id = labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or conv_id
         state = read_bridge_state(bridge_dir_for_bridge_id(bridge_id))
         if state is None:
-            _logger.warning(
+            _logger.log(
+                missing_state_log_level,
                 "Codex-native %s skipped for %s: no bridge state.",
                 action,
                 conv_id,
@@ -6719,6 +6727,8 @@ def create_runner_app(
         :param conv_id: Session/conversation identifier, e.g.
             ``"conv_abc123"``.
         :returns: Model options in the AP server's snake-case wire shape.
+        :raises _CodexNativeModelOptionsNotReady: If Codex has not written
+            bridge state for this session yet.
         :raises RuntimeError: If the app-server call fails.
         :raises ValueError: If Codex returns a malformed payload.
         """
@@ -6727,9 +6737,10 @@ def create_runner_app(
         state = await _codex_native_bridge_state_for_session(
             conv_id,
             action="model options",
+            missing_state_log_level=logging.DEBUG,
         )
         if state is None:
-            return []
+            raise _CodexNativeModelOptionsNotReady("Codex-native model options are not ready yet.")
 
         codex_client = client_for_transport(
             state.socket_path,
@@ -11622,6 +11633,14 @@ def create_runner_app(
             return JSONResponse(
                 status_code=200,
                 content={"models": await _codex_native_model_options(session_id)},
+            )
+        except _CodexNativeModelOptionsNotReady:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "codex_native_model_options_failed",
+                    "detail": "Codex-native model options are not ready yet.",
+                },
             )
         except Exception as exc:  # noqa: BLE001 - surface Codex app-server failures to AP.
             _logger.warning(

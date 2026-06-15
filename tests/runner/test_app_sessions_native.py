@@ -7549,6 +7549,84 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
 
 
 @pytest.mark.asyncio
+async def test_codex_native_model_options_returns_503_until_bridge_state_exists(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Runner model-options endpoint is retryable before Codex bridge startup.
+
+    The AP server caches successful runner responses. A codex-native runner
+    must therefore not return ``200 {"models": []}`` while the Codex terminal
+    is still creating its app-server bridge; that would permanently hide the
+    Web UI model picker for the session.
+    """
+    from omnigent import codex_native_app_server
+
+    conv_id = "conv_codex_native_model_options_not_ready"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+
+    def _client_for_transport(
+        transport: str,
+        *,
+        client_name: str = "omnigent",
+    ) -> _RecordingCodexAppServerClient:
+        """
+        Fail the test if the endpoint reaches Codex without bridge state.
+
+        :param transport: App-server transport from bridge state, e.g.
+            ``"ws://127.0.0.1:43210"``.
+        :param client_name: Client name supplied by the runner, e.g.
+            ``"omnigent-codex-native-runner"``.
+        :returns: Never returns; raises if called.
+        """
+        raise AssertionError(
+            f"client_for_transport must not be called before bridge state exists: "
+            f"{transport=} {client_name=}"
+        )
+
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "client_for_transport",
+        _client_for_transport,
+    )
+
+    codex_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the codex-native spec for any agent_id."""
+        del agent_id, session_id
+        return codex_native_spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.get(f"/v1/sessions/{conv_id}/codex-model-options")
+
+    # A retryable 503 keeps the AP server from caching an empty model list;
+    # returning 200 here would recreate the missing-picker regression.
+    assert resp.status_code == 503, resp.text
+    assert resp.json() == {
+        "error": "codex_native_model_options_failed",
+        "detail": "Codex-native model options are not ready yet.",
+    }
+
+
+@pytest.mark.asyncio
 async def test_codex_native_model_options_query_model_list(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
