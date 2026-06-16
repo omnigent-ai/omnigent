@@ -73,6 +73,7 @@ _CODEX_NATIVE_AGENT_NAME = "codex-native-ui"
 _CURSOR_NATIVE_AGENT_NAME = "cursor-native-ui"
 _MIMO_NATIVE_AGENT_NAME = "mimo-native-ui"
 _GEMINI_NATIVE_AGENT_NAME = "gemini-native-ui"
+_CMD_NATIVE_AGENT_NAME = "cmd-native-ui"
 _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
 _POLLY_CODEX_AGENT_NAME = "polly-codex"
@@ -350,6 +351,7 @@ def _ensure_default_agents(
     _ensure_default_cursor_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_mimo_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_gemini_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_cmd_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_debby_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_polly_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_polly_codex_agent(agent_store, artifact_store, agent_cache)
@@ -641,6 +643,36 @@ def _ensure_default_gemini_agent(
             harness="gemini",
             prompt=(
                 "You are a helpful AI assistant powered by Gemini. "
+                "Assist the user with their tasks."
+            ),
+        ),
+    )
+
+
+def _ensure_default_cmd_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """
+    Register or refresh the cmd-native-ui agent.
+
+    Called during server lifespan startup so the Web UI can offer Command
+    Code as a built-in top-level agent, not only as a polly sub-agent or
+    harness override. Command Code is a per-turn ``cmd --print`` subprocess
+    (no ACP), so its harness shape is the same simple CLI-harness bundle
+    the mimo / gemini seeders use.
+    """
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=_CMD_NATIVE_AGENT_NAME,
+        bundle_bytes=_build_cli_native_bundle(
+            name=_CMD_NATIVE_AGENT_NAME,
+            harness="cmd",
+            prompt=(
+                "You are a helpful AI assistant powered by Command Code. "
                 "Assist the user with their tasks."
             ),
         ),
