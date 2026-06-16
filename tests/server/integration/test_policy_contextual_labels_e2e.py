@@ -6,8 +6,8 @@ Verifies the realistic scenario where a policy monitors conversation state
 
 - A condition-gated DENY policy that fires only when ``tainted: "1"`` is set.
 - Label writes via PATCH persist across evaluations.
-- The condition gate correctly skips when the label is absent and fires
-  when the label is present.
+- The condition gate correctly skips when the label is at its initial value
+  (``"0"``) and fires when updated to the matching value (``"1"``).
 - Labels survive across multiple evaluation rounds (simulating multi-turn
   conversations).
 
@@ -47,22 +47,6 @@ def _deny_all_tool_calls(event: dict[str, Any]) -> dict[str, Any]:
     return {
         "result": "DENY",
         "reason": "Conversation is tainted from a prior turn.",
-    }
-
-
-def _allow_and_taint(event: dict[str, Any]) -> dict[str, Any]:
-    """
-    Policy that ALLOWs every tool call and writes ``tainted: "1"``.
-
-    Simulates a policy that detects a trigger condition and writes
-    a label to mark the conversation for downstream gates.
-
-    :param event: V0 event dict.
-    :returns: ALLOW with ``set_labels`` carrying the taint marker.
-    """
-    return {
-        "result": "ALLOW",
-        "set_labels": {"tainted": "1"},
     }
 
 
@@ -111,17 +95,17 @@ def _tool_call_request(tool_name: str = "Bash") -> dict[str, Any]:
 # ── Tests ──────────────────────────────────────────────────
 
 
-async def test_condition_gate_skips_when_label_absent(
+async def test_condition_gate_skips_when_label_at_initial_value(
     client: httpx.AsyncClient,
 ) -> None:
     """
-    A condition-gated DENY policy is skipped when its label condition
-    does not match the session's current labels.
+    A condition-gated DENY policy is skipped when the label is at its
+    initial value (``"0"``), which does not match the condition.
 
-    This is turn 1 of the multi-turn scenario: the conversation has not
-    yet been tainted, so the condition ``tainted: "1"`` does not match
-    and the policy is skipped entirely. The evaluate endpoint returns
-    ALLOW.
+    This is turn 1 of the multi-turn scenario: the label ``tainted``
+    starts at its declared ``initial: "0"`` value, so the condition
+    ``tainted: "1"`` does not match and the policy is skipped entirely.
+    The evaluate endpoint returns ALLOW.
     """
     agent = await create_test_agent(
         client,

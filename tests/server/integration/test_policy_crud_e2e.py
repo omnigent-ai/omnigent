@@ -328,9 +328,13 @@ async def test_policy_registry_handler_matches_create_allowlist(
     headers = _admin_headers()
 
     reg_resp = await auth_client.get("/v1/policy-registry", headers=headers)
+    assert reg_resp.status_code == 200, reg_resp.text
     entries = reg_resp.json()["data"]
     # Pick a callable (not factory) entry to avoid needing factory_params.
-    callable_entry = next(e for e in entries if e["kind"] == "callable")
+    callable_entry = next((e for e in entries if e["kind"] == "callable"), None)
+    assert callable_entry is not None, (
+        f"No callable entry in registry; got kinds: {[e.get('kind') for e in entries]}"
+    )
 
     create_resp = await auth_client.post(
         "/v1/policies",
@@ -468,7 +472,9 @@ async def test_disable_and_reenable_default_policy(
 
     # Verify it shows as disabled in the list
     list_resp = await auth_client.get("/v1/policies", headers=headers)
-    match = next(p for p in list_resp.json()["data"] if p["id"] == policy_id)
+    assert list_resp.status_code == 200, list_resp.text
+    match = next((p for p in list_resp.json()["data"] if p["id"] == policy_id), None)
+    assert match is not None, f"Policy {policy_id} not found in list"
     assert match["enabled"] is False
 
     # Re-enable

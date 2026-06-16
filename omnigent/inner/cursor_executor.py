@@ -546,14 +546,34 @@ class CursorExecutor(Executor):
         state.has_sent_prompt = True
         response_text = ""
         tool_calls = 0
+        # A tool call between two assistant text blocks means they are distinct
+        # narration segments (pre- vs post-tool); insert a paragraph break so
+        # they don't render as one run-on string ("...by the tool.- Exit: 2").
+        # Streamed deltas of a single response (no tool between) still
+        # concatenate seamlessly, so this never splits one sentence.
+        separate_next_text = False
         try:
             run = await state.agent.send(prompt)
             async for message in run.messages():
                 for event in _sdk_message_to_events(message):
                     if isinstance(event, TextChunk):
+                        if separate_next_text and response_text and event.text:
+                            # Guarantee a blank-line (paragraph) boundary between
+                            # pre- and post-tool narration, regardless of any single
+                            # trailing/leading newline the two blocks already carry
+                            # (a lone space or "\n" must still become a blank line).
+                            trailing = len(response_text) - len(response_text.rstrip("\n"))
+                            leading = len(event.text) - len(event.text.lstrip("\n"))
+                            if trailing + leading < 2:
+                                pad = "\n" * (2 - trailing - leading)
+                                event = TextChunk(text=pad + event.text)
+                        separate_next_text = False
                         response_text += event.text
                     elif isinstance(event, ToolCallRequest):
                         tool_calls += 1
+                        separate_next_text = True
+                    elif isinstance(event, ToolCallComplete):
+                        separate_next_text = True
                     yield event
             result = await run.wait()
         except asyncio.CancelledError:
@@ -570,7 +590,11 @@ class CursorExecutor(Executor):
             yield ExecutorError(message=f"cursor-sdk run error: {detail}", retryable=True)
             return
 
-        final = getattr(result, "result", "") or response_text or None
+        # Prefer the streamed text we accumulated (which carries the paragraph
+        # breaks inserted above) over the SDK's aggregate ``result`` (which does
+        # not) whenever any text was streamed; fall back to ``result`` only when
+        # nothing streamed (e.g. a tool-only turn).
+        final = response_text or getattr(result, "result", "") or None
         # PHASE_LLM_RESPONSE policy (parity with the peer harnesses): evaluate the
         # completed response before TurnComplete so a DENY blocks persistence.
         if policy_eval is not None:

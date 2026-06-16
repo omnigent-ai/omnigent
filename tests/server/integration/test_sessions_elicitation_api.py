@@ -20,7 +20,6 @@ real parked elicitations without duplicating the hook machinery.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 
 import httpx
 import pytest
@@ -75,8 +74,7 @@ async def test_get_pending_elicitation_shape(client: httpx.AsyncClient) -> None:
     finally:
         if not hook_task.done():
             hook_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await hook_task
+            await asyncio.gather(hook_task, return_exceptions=True)
         pending_elicitations.reset_for_tests()
 
 
@@ -149,8 +147,7 @@ async def test_get_after_resolution_returns_resolved(
     finally:
         if not hook_task.done():
             hook_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await hook_task
+            await asyncio.gather(hook_task, return_exceptions=True)
         pending_elicitations.reset_for_tests()
 
 
@@ -205,8 +202,7 @@ async def test_post_resolve_already_resolved_is_idempotent(
     finally:
         if not hook_task.done():
             hook_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await hook_task
+            await asyncio.gather(hook_task, return_exceptions=True)
         pending_elicitations.reset_for_tests()
 
 

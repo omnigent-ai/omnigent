@@ -62,7 +62,8 @@ def policy_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
     store, so the session policy CRUD routes are not mounted. This
     fixture adds one so ``POST /v1/sessions/{id}/policies`` and the
     evaluate endpoint's ``get_policy_store()`` both see session-attached
-    policies.
+    policies. The runtime-global ``_policy_store`` is wired separately
+    in the ``client`` fixture via monkeypatch.
 
     :param runtime_init: Fixture that initializes the runtime with a
         mock LLM.
@@ -238,10 +239,9 @@ async def test_ask_policy_approve_flow(
     session_id = await _create_session(client, agent["id"])
     await _attach_ask_policy(client, session_id)
 
+    drain = asyncio.create_task(_drain_elicitation_id(session_id))
+    evaluate = None
     try:
-        # Subscribe to the stream before triggering evaluation so the
-        # elicitation event is not missed.
-        drain = asyncio.create_task(_drain_elicitation_id(session_id))
         await asyncio.sleep(0.05)
 
         # The evaluate POST parks until the verdict arrives.
@@ -276,6 +276,10 @@ async def test_ask_policy_approve_flow(
         assert resp.status_code == 200, resp.text
         assert resp.json()["result"] == "POLICY_ACTION_ALLOW"
     finally:
+        for task in [drain, evaluate]:
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
         pending_elicitations.reset_for_tests()
 
 
@@ -295,8 +299,9 @@ async def test_ask_policy_refuse_flow(
     session_id = await _create_session(client, agent["id"])
     await _attach_ask_policy(client, session_id)
 
+    drain = asyncio.create_task(_drain_elicitation_id(session_id))
+    evaluate = None
     try:
-        drain = asyncio.create_task(_drain_elicitation_id(session_id))
         await asyncio.sleep(0.05)
 
         evaluate = asyncio.create_task(
@@ -321,4 +326,8 @@ async def test_ask_policy_refuse_flow(
         body = resp.json()
         assert body["result"] == "POLICY_ACTION_DENY"
     finally:
+        for task in [drain, evaluate]:
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
         pending_elicitations.reset_for_tests()

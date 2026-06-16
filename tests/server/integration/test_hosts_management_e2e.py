@@ -1,14 +1,16 @@
 """Integration tests for host management edge cases.
 
-Covers gaps not exercised by test_hosts_api.py or test_hosts_filesystem.py:
+Covers 8 gaps not exercised by test_hosts_api.py or test_hosts_filesystem.py:
 
 - ``GET /v1/runners`` returns empty when no runners are connected.
 - ``GET /v1/runners/{id}/status`` returns offline for an unknown runner.
+- ``GET /v1/runners/{id}/status`` omits error field for unconnected runners.
 - ``GET /v1/hosts/{id}`` response shape includes the ``runners`` field.
 - ``POST /v1/hosts/{id}/runners`` with missing ``session_id`` returns 422.
-- ``GET /v1/hosts/{id}/filesystem/{path}`` with offline host returns 409.
-- ``GET /v1/hosts`` returns offline after the host's ``last_seen_at``
+- ``POST /v1/hosts/{id}/runners`` with missing ``workspace`` returns 422.
+- ``GET /v1/hosts`` returns offline after the host's ``updated_at``
   exceeds the liveness window (stale host detection).
+- ``GET /v1/hosts/{id}`` returns offline status for an offline host.
 """
 
 from __future__ import annotations
@@ -209,25 +211,29 @@ async def test_list_hosts_stale_host_reported_offline(
     # Verify it initially shows as online.
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.get("/v1/hosts")
+    assert resp.status_code == 200, resp.text
     hosts = resp.json()["hosts"]
     assert len(hosts) == 1
     assert hosts[0]["status"] == "online"
 
-    # Manually backdate last_seen_at to simulate a crashed host.
+    # Manually backdate updated_at to simulate a crashed host.
     # The liveness window is typically 60-120s; setting it 10 minutes
     # in the past guarantees it exceeds any reasonable window.
-    from sqlalchemy import text
+    from sqlalchemy import update
+    from sqlalchemy.orm import Session
+
+    from omnigent.db.db_models import SqlHost
 
     stale_time = int(time.time()) - 600
-    with host_store._engine.connect() as conn:
-        conn.execute(
-            text("UPDATE hosts SET updated_at = :ts WHERE host_id = :hid"),
-            {"ts": stale_time, "hid": "host_stale"},
+    with Session(host_store._engine) as session:
+        session.execute(
+            update(SqlHost).where(SqlHost.host_id == "host_stale").values(updated_at=stale_time)
         )
-        conn.commit()
+        session.commit()
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.get("/v1/hosts")
+    assert resp.status_code == 200, resp.text
     hosts = resp.json()["hosts"]
     assert len(hosts) == 1
     assert hosts[0]["host_id"] == "host_stale"

@@ -6871,10 +6871,11 @@ def create_runner_app(
         Covers the case where the ASK fired while no terminal client was
         attached (the user was in the web Chat), then the user opens the
         Terminal: on attach this re-checks the session snapshot and, if a
-        native approval is still outstanding — the server-side
-        tool-policy gate (``TOOL_CALL`` / ``LLM_REQUEST``, e.g. a
-        cost-budget checkpoint) — pops it on the now-attached
-        client. Self-correcting — it only pops while the elicitation is still
+        native approval is still outstanding — the server-side policy gate
+        (``TOOL_CALL`` / ``LLM_REQUEST``, e.g. a cost-budget checkpoint, or
+        the ``REQUEST`` gate a native session enforces via the
+        ``UserPromptSubmit`` hook) — pops it on the now-attached client.
+        Self-correcting — it only pops while the elicitation is still
         pending, so an already-answered approval is not re-shown. Complements
         the ASK-time forward (which covers clients attached *before* the
         ASK). Best-effort: any miss leaves the web card.
@@ -6903,17 +6904,21 @@ def create_runner_app(
         if resp.status_code != 200:
             return
         pending = resp.json().get("pending_elicitations") or []
-        # The native popup surfaces the server-side tool-policy gate
-        # (tool_call / llm_request — including cost-budget checkpoints),
-        # which parks and resolves via the same endpoint. Re-pop whichever
-        # is pending.
+        # The native popup surfaces the server-side policy gate, which parks
+        # and resolves via the same endpoint. Re-pop whichever is pending:
+        # the tool-policy gate (tool_call / llm_request — including
+        # cost-budget checkpoints) and the request-phase gate (request),
+        # which native sessions enforce via the UserPromptSubmit hook. A
+        # request-phase ASK typically fires while the user is in the web
+        # Chat (no client attached), so the on-attach re-pop is its main
+        # path onto the terminal.
         approval = next(
             (
                 e
                 for e in pending
                 if isinstance(e, dict)
                 and isinstance(e.get("params"), dict)
-                and e["params"].get("phase") in ("tool_call", "llm_request")
+                and e["params"].get("phase") in ("request", "tool_call", "llm_request")
             ),
             None,
         )

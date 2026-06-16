@@ -12,6 +12,7 @@ from omnigent._wrapper_labels import (
     UI_MODE_TERMINAL_VALUE,
     WRAPPER_LABEL_KEY,
 )
+from omnigent.harness_aliases import canonicalize_harness
 
 
 @dataclass(frozen=True)
@@ -82,8 +83,13 @@ def native_coding_agent_for_agent_name(name: str | None) -> NativeCodingAgent | 
 
 
 def native_coding_agent_for_harness(harness: str | None) -> NativeCodingAgent | None:
-    """Return the native coding-agent metadata for *harness*, if any."""
-    return _BY_HARNESS.get(harness or "")
+    """Return the native coding-agent metadata for *harness*, if any.
+
+    Canonicalizes first, so a reversed alias (e.g. ``native-pi``) resolves to
+    the same agent as its canonical spelling (``pi-native``) and keeps
+    terminal-first presentation labels.
+    """
+    return _BY_HARNESS.get(canonicalize_harness(harness) or "")
 
 
 def native_coding_agent_for_wrapper_label(wrapper: str | None) -> NativeCodingAgent | None:

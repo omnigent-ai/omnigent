@@ -10,13 +10,24 @@ name: Integration Tests
 # nightly.yml remains the scheduled canary with Slack/issue notify.
 #
 # Triggers:
-#   pull_request        signal on every non-draft PR push.
-#   push (main)         post-merge verification, matches ci.yml / e2e.yml.
+#   schedule            09:30 UTC daily.
+#   pull_request        PR gate for SAME-REPO PRs (secrets flow).
+#                       Fork PRs skip (no secrets) and run via the
+#                       fork-e2e/** push after fork-e2e-mirror.yml.
+#   push (fork-e2e/**) The run for mirrored fork PRs -- trusted
+#                       base-repo branch, so secrets flow.
 #   workflow_dispatch   manual run against a branch.
 
 on:
   schedule:
     - cron: "30 9 * * *"
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore: ['ap-web/**']
+  push:
+    branches:
+      - 'fork-e2e/**'
+    paths-ignore: ['ap-web/**']
   workflow_dispatch:
 
 permissions:
@@ -43,7 +54,7 @@ concurrency:
 jobs:
   integration:
     name: Integration (${{ matrix.name }})
-    if: ${{ !github.event.pull_request.draft }}
+    if: ${{ !github.event.pull_request.draft && github.event.pull_request.head.repo.fork != true }}
     runs-on: ubuntu-latest
     # Per-leg ceiling. Inner test step caps at 25 min; the rest of
     # the budget covers install and the junit upload.

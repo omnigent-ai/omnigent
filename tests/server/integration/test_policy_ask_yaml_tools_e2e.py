@@ -17,7 +17,6 @@ which is the standard pattern for always-ASK gates in agent YAML.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from typing import Any
 
 import httpx
@@ -208,7 +207,9 @@ async def test_input_ask_yaml_approve(
         assert verdict.status_code == 202, verdict.text
 
         # The message POST should now return — ALLOW means the message
-        # was forwarded (not denied synchronously).
+        # was forwarded past the policy layer (not denied synchronously).
+        # It may then fail with 503 (no runner bound) — that still proves
+        # the ASK gate approved the message through.
         resp = await asyncio.wait_for(message_task, timeout=5.0)
         body = resp.json()
         assert body.get("denied") is not True, f"approved INPUT ASK should not deny; got {body}"
@@ -216,8 +217,7 @@ async def test_input_ask_yaml_approve(
         for task in [drain_task, message_task if "message_task" in dir() else None]:
             if task is not None and not task.done():
                 task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await task
+                await asyncio.gather(task, return_exceptions=True)
         pending_elicitations.reset_for_tests()
 
 
@@ -273,12 +273,14 @@ async def test_input_ask_yaml_refuse(
         body = resp.json()
         assert body.get("denied") is True, f"declined INPUT ASK should deny; got {body}"
         assert "reason" in body, f"deny verdict missing reason: {body}"
+        assert "Confirm this message before processing" in body["reason"], (
+            f"expected exact ASK reason in deny verdict; got {body['reason']!r}"
+        )
     finally:
         for task in [drain_task, message_task if "message_task" in dir() else None]:
             if task is not None and not task.done():
                 task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await task
+                await asyncio.gather(task, return_exceptions=True)
         pending_elicitations.reset_for_tests()
 
 
@@ -333,6 +335,5 @@ async def test_tool_call_ask_yaml_approve(
         for task in [drain_task, evaluate_task if "evaluate_task" in dir() else None]:
             if task is not None and not task.done():
                 task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await task
+                await asyncio.gather(task, return_exceptions=True)
         pending_elicitations.reset_for_tests()

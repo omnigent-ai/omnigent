@@ -3,9 +3,11 @@
 Verifies the PolicyEngine's composition semantics through the
 ``POST /v1/sessions/{id}/policies/evaluate`` endpoint:
 
-- DENY takes precedence over ASK on the same phase.
+- DENY takes precedence over ASK on the same phase (engine
+  short-circuits on the first DENY).
 - Removing a DENY policy lets ASK fire on re-evaluation.
-- Two DENY policies both contribute their reasons.
+- Two DENY policies: the first in declaration order short-circuits,
+  so only its reason is surfaced.
 - ALLOW does not override DENY.
 
 Uses ``make_fixed_action_callable`` factories injected via
@@ -141,11 +143,11 @@ async def test_deny_takes_precedence_over_ask(
 ) -> None:
     """When DENY and ASK policies both fire, DENY short-circuits.
 
-    The engine iterates policies in order; a DENY result ends
-    evaluation immediately (POLICIES.md section 4). Even if an ASK
-    policy is declared, the DENY fires first and no elicitation
-    prompt is shown. If this regresses, the endpoint would return
-    ASK or park for approval instead of returning DENY.
+    The engine iterates policies in declaration order; a DENY result
+    ends evaluation immediately. Even if an ASK policy is declared,
+    the DENY fires first and no elicitation prompt is shown. If this
+    regresses, the endpoint would return ASK or park for approval
+    instead of returning DENY.
     """
     _install_policies(
         monkeypatch,
@@ -183,19 +185,11 @@ async def test_ask_fires_when_deny_removed(
 
     This complements test 1: after removing the DENY policy, the
     ASK policy is no longer shadowed and fires. The evaluate
-    endpoint parks for approval on TOOL_CALL ASK, so we verify the
-    behavior by checking that the response does NOT return
-    POLICY_ACTION_DENY. Since the gate parks, we expect either a
-    timeout or a long-poll — but for this test we simply verify
-    with a non-blocking phase (using a short-lived request that
-    we can cancel). Instead, we just test that ASK-only doesn't
-    produce DENY — the ASK gate parking is covered by dedicated
+    endpoint parks for approval on TOOL_CALL, so we use
+    ``PHASE_LLM_RESPONSE`` (a non-blocking phase where ASK is
+    returned directly without gate parking) to observe the ASK
+    result. The ASK gate parking flow is covered by the dedicated
     elicitation tests.
-
-    As a simpler alternative: re-evaluate with only the ASK policy.
-    The endpoint parks for approval on TOOL_CALL, but we can use
-    PHASE_LLM_RESPONSE (a non-blocking phase) to see ASK returned
-    directly.
     """
     _install_policies(
         monkeypatch,
@@ -238,10 +232,9 @@ async def test_two_deny_policies_first_reason_visible(
     """With two DENY policies, the first one's reason is surfaced.
 
     The engine short-circuits on the first DENY in declaration
-    order (POLICIES.md section 4). The deciding policy's reason
-    is carried in the verdict. This tests that multiple DENY
-    policies compose correctly — the second never fires because
-    the first already short-circuited.
+    order. The deciding policy's reason is carried in the verdict.
+    This tests that multiple DENY policies compose correctly — the
+    second never fires because the first already short-circuited.
     """
     _install_policies(
         monkeypatch,
@@ -266,7 +259,7 @@ async def test_two_deny_policies_first_reason_visible(
     # is the one that surfaces.
     assert "Alpha deny reason" in body.get("reason", ""), (
         f"Expected the first DENY policy's reason; got {body.get('reason')!r}. "
-        "The engine should short-circuit on the first DENY in YAML order."
+        "The engine should short-circuit on the first DENY in declaration order."
     )
 
 

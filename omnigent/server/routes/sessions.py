@@ -13569,6 +13569,10 @@ def create_sessions_router(
         "PHASE_TOOL_RESULT": Phase.TOOL_RESULT,
         "PHASE_LLM_REQUEST": Phase.LLM_REQUEST,
         "PHASE_LLM_RESPONSE": Phase.LLM_RESPONSE,
+        # A native session's UserPromptSubmit hook posts the request phase
+        # here (the server-level _evaluate_input_policy skips native message
+        # events). The prompt text rides in ``event.data.text``.
+        "PHASE_REQUEST": Phase.REQUEST,
     }
     _PHASE_TO_PROTO_ACTION: dict[PolicyAction, str] = {
         PolicyAction.ALLOW: "POLICY_ACTION_ALLOW",
@@ -13654,6 +13658,22 @@ def create_sessions_router(
                 f"Session {session_id!r} not found.",
                 code=ErrorCode.NOT_FOUND,
             )
+        # Dedup the native request-phase gate. A native session's
+        # ``UserPromptSubmit`` hook posts ``PHASE_REQUEST`` here for *every*
+        # prompt, but a web-UI prompt was already gated server-side by
+        # ``_evaluate_input_policy`` at POST /events (before injection, so no
+        # TUI freeze). Re-gating it here would double-prompt the human. A
+        # web-UI prompt in flight has a ``pending_inputs`` entry (recorded at
+        # dispatch, drained when the forwarder mirrors it back); a prompt
+        # typed directly in the TUI has none and never hit POST /events, so it
+        # is gated here — the hook is its only request-phase gate. The signal
+        # is "is a web prompt in flight", not text correlation (the native
+        # transcript gives no reliable id channel — see ``pending_inputs``).
+        if phase == Phase.REQUEST and pending_inputs.snapshot_for(session_id):
+            return Response(
+                content=json.dumps({"result": "POLICY_ACTION_ALLOW"}),
+                media_type="application/json",
+            )
         agent = agent_store.get(conv.agent_id) if conv.agent_id else None
         if agent is None:
             # No agent — no policies. Return unspecified (pass-through).
@@ -13705,9 +13725,15 @@ def create_sessions_router(
         # the human. Instead we publish the approval elicitation, park
         # until the human resolves it via the resolve URL, and collapse
         # to a hard ALLOW / DENY so the caller never sees ASK.
-        # TOOL_CALL and LLM_REQUEST are the two phases that can block
-        # execution before it starts (tool dispatch / LLM call).
-        if result.action == PolicyAction.ASK and phase in (Phase.TOOL_CALL, Phase.LLM_REQUEST):
+        # TOOL_CALL, LLM_REQUEST, and REQUEST are the phases that can block
+        # before the action proceeds (tool dispatch / LLM call / a native
+        # session's user prompt via the UserPromptSubmit hook — which has no
+        # ASK primitive of its own, so the server resolves ASK here).
+        if result.action == PolicyAction.ASK and phase in (
+            Phase.TOOL_CALL,
+            Phase.LLM_REQUEST,
+            Phase.REQUEST,
+        ):
             if is_read_only:
                 # Read-only callers must not enter the ASK gate — parking
                 # creates an elicitation (a server-side mutation). Return
@@ -13729,6 +13755,7 @@ def create_sessions_router(
                     if result.action == PolicyAction.ASK and phase in (
                         Phase.TOOL_CALL,
                         Phase.LLM_REQUEST,
+                        Phase.REQUEST,
                     ):
                         approved = await _hold_native_ask_gate(
                             request,

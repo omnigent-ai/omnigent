@@ -136,17 +136,23 @@ def setup_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FastAPI:
 @pytest_asyncio.fixture()
 async def client(accounts_app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
     """Async HTTP client wired to the pre-seeded accounts app."""
+    from omnigent.db.utils import clear_engine_cache
+
     transport = httpx.ASGITransport(app=accounts_app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
+    clear_engine_cache()
 
 
 @pytest_asyncio.fixture()
 async def setup_client(setup_app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
     """Async HTTP client wired to the needs-setup accounts app."""
+    from omnigent.db.utils import clear_engine_cache
+
     transport = httpx.ASGITransport(app=setup_app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
+    clear_engine_cache()
 
 
 # ── Helpers ───────────────────────────────────────────────
@@ -304,7 +310,7 @@ async def test_invite_and_register_flow(
         json={"is_admin": False},
         headers=admin_headers,
     )
-    assert invite_resp.status_code == 200
+    assert invite_resp.status_code == 200, invite_resp.text
     invite_body = invite_resp.json()
     token = invite_body["token"]
     assert "register_url" in invite_body
@@ -318,7 +324,7 @@ async def test_invite_and_register_flow(
             "password": "bob-pw-123456",
         },
     )
-    assert reg_resp.status_code == 200
+    assert reg_resp.status_code == 200, reg_resp.text
     reg_body = reg_resp.json()
     assert reg_body["user"]["id"] == "bob"
     assert reg_body["user"]["is_admin"] is False
@@ -336,12 +342,14 @@ async def test_invite_requires_admin(
     invite_resp = await client.post(
         "/auth/invite", json={"is_admin": False}, headers=admin_headers
     )
+    assert invite_resp.status_code == 200, invite_resp.text
     token = invite_resp.json()["token"]
 
-    await client.post(
+    reg_resp = await client.post(
         "/auth/register",
         json={"invite": token, "username": "bob", "password": "bob-pw-123456"},
     )
+    assert reg_resp.status_code == 200, reg_resp.text
 
     # Login as non-admin bob.
     bob_cookies = await _login(client, "bob", "bob-pw-123456")
@@ -427,11 +435,13 @@ async def test_non_admin_cannot_list_users(
     invite_resp = await client.post(
         "/auth/invite", json={"is_admin": False}, headers=admin_headers
     )
+    assert invite_resp.status_code == 200, invite_resp.text
     token = invite_resp.json()["token"]
-    await client.post(
+    reg_resp = await client.post(
         "/auth/register",
         json={"invite": token, "username": "bob", "password": "bob-pw-123456"},
     )
+    assert reg_resp.status_code == 200, reg_resp.text
 
     bob_cookies = await _login(client, "bob", "bob-pw-123456")
     bob_headers = _cookie_header(bob_cookies)
@@ -496,7 +506,9 @@ async def test_magic_link_is_single_use(
     cookies = await _login(client, _ADMIN_USERNAME, _ADMIN_PASSWORD)
     headers = _cookie_header(cookies)
 
-    redeem_url = (await client.post("/auth/magic", headers=headers)).json()["redeem_url"]
+    mint_resp = await client.post("/auth/magic", headers=headers)
+    assert mint_resp.status_code == 200, mint_resp.text
+    redeem_url = mint_resp.json()["redeem_url"]
     parsed = urlparse(redeem_url)
     path_q = f"{parsed.path}?{parsed.query}"
 

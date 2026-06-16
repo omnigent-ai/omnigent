@@ -163,7 +163,7 @@ async def _attach_deny_policy(
     :param factory_params: Override factory params if needed.
     :returns: The created policy id.
     """
-    params = factory_params or {"action": "deny", "reason": reason}
+    params = {"action": "deny", "reason": reason} if factory_params is None else factory_params
     resp = await client.post(
         f"/v1/sessions/{session_id}/policies",
         json={
@@ -251,11 +251,15 @@ async def test_deny_policy_lifecycle(
     resp_allowed = await _send_user_message(
         policy_client, session_id, "Hello, this should go through."
     )
-    body = resp_allowed.json()
     # After policy removal the message must NOT be denied by policy.
     # It may return 202 (queued) or 503 (no runner bound) — both prove
-    # the policy layer allowed it through. A synchronous DENY verdict
-    # ({"denied": true}) would mean the policy is still active.
+    # the policy layer allowed it through.
+    assert resp_allowed.status_code in {202, 503}, (
+        f"expected 202 or 503 after policy removal; "
+        f"got {resp_allowed.status_code} {resp_allowed.text}"
+    )
+    body = resp_allowed.json()
+    # A synchronous DENY verdict ({"denied": true}) would mean the policy is still active.
     assert body.get("denied") is not True, f"message was denied after policy removal; got {body}"
 
     # ── Step 6: verify the policy list is empty ──
@@ -300,6 +304,9 @@ async def test_deny_policy_only_blocks_matching_phase(
     # May return 202 (queued) or 503 (no runner) — both prove the
     # policy layer allowed it through; only {"denied": true} is a failure.
     resp = await _send_user_message(policy_client, session_id, "Hello, this should go through.")
+    assert resp.status_code in {202, 503}, (
+        f"expected 202 or 503; got {resp.status_code} {resp.text}"
+    )
     body = resp.json()
     assert body.get("denied") is not True, (
         f"tool_call-only DENY policy incorrectly blocked an input message; got {body}"

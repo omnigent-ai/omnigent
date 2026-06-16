@@ -32,41 +32,7 @@ from tests.server.helpers import create_test_agent
 pytestmark = pytest.mark.asyncio
 
 
-# ── Policy callables ────────────────────────────────────────
-
-
-def _deny_echo_tool(event: dict[str, Any]) -> dict[str, Any]:
-    """
-    Policy that denies ``echo`` tool calls.
-
-    :param event: V0 event dict.
-    :returns: DENY for echo tool calls, ALLOW otherwise.
-    """
-    if event.get("type") != "tool_call":
-        return {"result": "ALLOW"}
-    data = event.get("data")
-    tool = data.get("name", "") if isinstance(data, dict) else ""
-    if tool == "echo":
-        return {
-            "result": "DENY",
-            "reason": "echo tool is blocked by YAML policy.",
-        }
-    return {"result": "ALLOW"}
-
-
-def _deny_all_requests(event: dict[str, Any]) -> dict[str, Any]:
-    """
-    Policy that denies all request-phase events.
-
-    :param event: V0 event dict.
-    :returns: DENY for request events, ALLOW otherwise.
-    """
-    if event.get("type") == "request":
-        return {
-            "result": "DENY",
-            "reason": "All input is blocked by request-phase policy.",
-        }
-    return {"result": "ALLOW"}
+_MAKE_FIXED = "omnigent.policies.function.make_fixed_action_callable"
 
 
 # ── Helpers ─────────────────────────────────────────────────
@@ -131,8 +97,15 @@ async def test_deny_on_specific_tool_call(
             "policies": {
                 "deny_echo": {
                     "type": "function",
+                    "on": ["tool_call"],
                     "function": {
-                        "path": f"{__name__}._deny_echo_tool",
+                        "path": _MAKE_FIXED,
+                        "arguments": {
+                            "action": "deny",
+                            "reason": "echo tool is blocked by YAML policy.",
+                            "on_phases": ["tool_call"],
+                            "on_tools": ["echo"],
+                        },
                     },
                 },
             },
@@ -163,8 +136,8 @@ async def test_deny_does_not_block_other_tools(
     tools through.
 
     A tool call to ``grep`` must return ALLOW because the policy
-    callable only inspects ``echo``. If the policy over-fires, this
-    test catches it.
+    is scoped to ``on_tools: ["echo"]``. If the policy over-fires,
+    this test catches it.
     """
     agent = await create_test_agent(
         client,
@@ -172,8 +145,15 @@ async def test_deny_does_not_block_other_tools(
             "policies": {
                 "deny_echo": {
                     "type": "function",
+                    "on": ["tool_call"],
                     "function": {
-                        "path": f"{__name__}._deny_echo_tool",
+                        "path": _MAKE_FIXED,
+                        "arguments": {
+                            "action": "deny",
+                            "reason": "echo tool is blocked by YAML policy.",
+                            "on_phases": ["tool_call"],
+                            "on_tools": ["echo"],
+                        },
                     },
                 },
             },
@@ -217,8 +197,14 @@ async def test_deny_on_request_phase_blocks_input(
             "policies": {
                 "deny_all_input": {
                     "type": "function",
+                    "on": ["request"],
                     "function": {
-                        "path": f"{__name__}._deny_all_requests",
+                        "path": _MAKE_FIXED,
+                        "arguments": {
+                            "action": "deny",
+                            "reason": "All input is blocked by request-phase policy.",
+                            "on_phases": ["request"],
+                        },
                     },
                 },
             },

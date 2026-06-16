@@ -33,7 +33,6 @@ pytestmark = pytest.mark.asyncio
 
 _TEST_SECRET = b"a" * 32
 _GITHUB_TOKEN_ENDPOINT = "https://github.com/login/oauth/access_token"
-_GITHUB_EMAILS_ENDPOINT = "https://api.github.com/user/emails"
 
 
 def _make_oidc_config() -> OIDCConfig:
@@ -63,7 +62,7 @@ def _build_oidc_app() -> httpx.ASGITransport:
 
     config = _make_oidc_config()
     auth_provider = UnifiedAuthProvider(source="oidc", oidc_config=config)
-    admin_list = AdminList(Path("/dev/null"))
+    admin_list = AdminList(Path("/tmp/nonexistent-admin-list.txt"))
 
     router = create_auth_router(
         auth_provider=auth_provider,
@@ -302,15 +301,19 @@ async def test_logout_clears_cookie_and_redirects() -> None:
 
     assert resp.status_code == 302
     assert resp.headers["location"] == "/"
-    # The session cookie should be cleared (max-age=0 or deleted).
-    cookie_header = resp.headers.get("set-cookie", "")
-    assert "ap_session" in cookie_header
+    # The session cookie should be cleared with Max-Age=0 deletion semantics.
+    set_cookie_headers = resp.headers.get_list("set-cookie")
+    session_cookies = [h for h in set_cookie_headers if "ap_session" in h]
+    assert session_cookies, "expected a Set-Cookie header for ap_session"
+    assert any("Max-Age=0" in h for h in session_cookies), (
+        f"expected Max-Age=0 deletion cookie; got {session_cookies}"
+    )
 
 
 # ── 6. Expired ticket eviction ─────────────────────────────────────
 
 
-def test_evict_expired_tickets_removes_old_entries() -> None:
+async def test_evict_expired_tickets_removes_old_entries() -> None:
     """_evict_expired_tickets removes tickets older than the TTL."""
     tickets: dict[str, _CliTicket] = {
         "fresh": _CliTicket(created_at=time.time()),
@@ -325,7 +328,7 @@ def test_evict_expired_tickets_removes_old_entries() -> None:
     assert "also_expired" not in tickets
 
 
-def test_evict_expired_tickets_noop_when_all_fresh() -> None:
+async def test_evict_expired_tickets_noop_when_all_fresh() -> None:
     """_evict_expired_tickets is a no-op when no tickets are expired."""
     tickets: dict[str, _CliTicket] = {
         "a": _CliTicket(created_at=time.time()),

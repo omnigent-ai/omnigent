@@ -315,6 +315,98 @@ async def test_run_turn_streams_and_completes(monkeypatch: pytest.MonkeyPatch) -
     assert completes[0].usage is None
 
 
+async def test_run_turn_separates_text_across_a_tool_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pre-tool and post-tool narration are distinct segments: a paragraph break
+    is inserted so they don't render as one run-on string. (Streamed deltas with
+    no tool between — see the test above — still concatenate seamlessly.)"""
+    script = {
+        "messages": [
+            _assistant("Let me check that."),
+            _tool("sys_x", "t1", "running", args={}),
+            _tool("sys_x", "t1", "completed", result="ok"),
+            _assistant("Done - exit 0."),
+        ],
+        "result": "",
+    }
+    _install_fake_sdk(monkeypatch, [script])
+    executor = CursorExecutor(api_key="crsr_x")
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    texts = [e.text for e in events if isinstance(e, TextChunk)]
+    assert texts == ["Let me check that.", "\n\nDone - exit 0."]  # post-tool text separated
+    completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert completes[0].response == "Let me check that.\n\nDone - exit 0."
+
+
+async def test_run_turn_separator_guarantees_blank_line_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The break must be a real blank line even when the pre-tool text already
+    ends in a single space or newline (which previously suppressed the separator,
+    leaving a run-on or a single-newline join)."""
+    scripts = [
+        {  # pre-tool text ends with a trailing space
+            "messages": [
+                _assistant("Checking. "),
+                _tool("x", "t1", "running", args={}),
+                _tool("x", "t1", "completed", result="ok"),
+                _assistant("Done."),
+            ],
+            "result": "",
+        },
+        {  # pre-tool text ends with a single newline
+            "messages": [
+                _assistant("Checking.\n"),
+                _tool("x", "t2", "running", args={}),
+                _tool("x", "t2", "completed", result="ok"),
+                _assistant("Done."),
+            ],
+            "result": "",
+        },
+    ]
+    _install_fake_sdk(monkeypatch, scripts)
+    executor = CursorExecutor(api_key="crsr_x")
+    try:
+        ev_space = [e async for e in executor.run_turn([_user("a", "s1")], [], "SYS")]
+        ev_newline = [e async for e in executor.run_turn([_user("b", "s2")], [], "SYS")]
+    finally:
+        await executor.close()
+    resp_space = next(e.response for e in ev_space if isinstance(e, TurnComplete))
+    resp_newline = next(e.response for e in ev_newline if isinstance(e, TurnComplete))
+    assert resp_space == "Checking. \n\nDone."  # trailing space -> still a blank line
+    assert resp_newline == "Checking.\n\nDone."  # single \n upgraded to a blank line
+
+
+async def test_run_turn_final_response_prefers_separated_streamed_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TurnComplete.response must use the separator-corrected streamed text, not
+    the SDK's aggregate ``result`` (which lacks the paragraph break) — so direct
+    consumers of the final response see the same separation as the stream."""
+    script = {
+        "messages": [
+            _assistant("Pre."),
+            _tool("x", "t1", "running", args={}),
+            _tool("x", "t1", "completed", result="ok"),
+            _assistant("Post."),
+        ],
+        "result": "Pre.Post.",  # the SDK's glued aggregate, with no separator
+    }
+    _install_fake_sdk(monkeypatch, [script])
+    executor = CursorExecutor(api_key="crsr_x")
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+    completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert completes[0].response == "Pre.\n\nPost."  # separated, not the glued "Pre.Post."
+
+
 async def test_session_reused_across_turns(monkeypatch: pytest.MonkeyPatch) -> None:
     scripts = [
         {"messages": [_assistant("one")], "result": "one"},
