@@ -42,3 +42,18 @@ Most backend areas mirror their source directory under `tests/`:
 - A trivial, empty, or unrelated test does not count as coverage.
 - When in doubt about whether a change needs a test, raise it as a question
   rather than a required change.
+
+## Frontend Test Coverage
+
+A pull request that changes behaviour under `ap-web/` should add or update a
+**colocated Vitest unit test** — a `*.test.ts` or `*.test.tsx` file beside the
+component or module it touches. If a behaviour change ships without one, flag it.
+
+- A change to user-facing UI behaviour additionally needs a Playwright test
+  under `tests/e2e_ui/`. That requirement is already enforced by the
+  `E2E UI Required` status check, so do not re-flag it here — focus the review
+  on the colocated unit test.
+- Do not ask for a test for styling/formatting-only changes, copy tweaks with
+  no flow change, type-only changes, dependency bumps, or refactors with no
+  observable behaviour change.
+- A trivial, empty, or unrelated test does not count as coverage.

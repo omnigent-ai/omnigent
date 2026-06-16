@@ -110,6 +110,19 @@ Two cross-cutting suites sit on top of these:
   user-facing functionality **must** include at least one e2e happy-path test
   (see `.github/copilot-instructions.md`).
 
+### Frontend (`ap-web/`)
+
+Frontend changes follow the same expectation with a different toolchain:
+
+- Add or update a **colocated Vitest test** — a `*.test.ts`/`*.test.tsx` file
+  next to the component or module you changed — and run it with `npm test`.
+- A change to **user-facing UI behaviour** also needs a Playwright test under
+  `tests/e2e_ui/`. This one is enforced mechanically by the `E2E UI Required`
+  check, so a UI PR won't merge without a covering test (or a maintainer
+  waiver) — see `.github/workflows/e2e-ui-required.yml`.
+- Styling/formatting-only changes, copy tweaks with no flow change, and
+  refactors with no behaviour change are exempt, same as the backend.
+
 ## Pull requests
 
 - Branch from `main`, keep changes focused, and include tests or docs when relevant.
