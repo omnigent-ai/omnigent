@@ -1,0 +1,39 @@
+name: Security Gate Selftest
+
+# TEMPORARY pre-merge verification harness. Exercises the REAL detectors in CI
+# against crafted malicious + benign fixtures, proving the scan blocks/permits
+# correctly before the scanner is on main (where the gate fail-opens as
+# bootstrap and so never runs the detectors). Runs from the PR head; no secrets.
+#
+# REMOVE this workflow and .github/scripts/security-scan/selftest.sh once the
+# gate is validated and merged.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/scripts/security-scan/**'
+      - '.github/security/**'
+      - '.github/workflows/security-gate*.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    name: Security Gate Selftest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      UV_INDEX_URL: https://pypi.org/simple
+    steps:
+      - name: Check out PR head
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@8d55fbecc275b1c35dbe060458839f8d30439ccf  # v3
+
+      - name: Run detector self-tests
+        run: bash .github/scripts/security-scan/selftest.sh
