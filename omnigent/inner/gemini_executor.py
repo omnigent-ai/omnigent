@@ -31,8 +31,8 @@ import shutil
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 
-from .cursor_acp import AcpClient, AcpError
-from .cursor_executor import _build_cursor_prompt, _update_to_event
+from .cursor_acp import AcpClient, AcpError, _update_to_event
+from .cursor_executor import _build_cursor_prompt
 from .datamodel import OSEnvSpec
 from .executor import (
     Executor,

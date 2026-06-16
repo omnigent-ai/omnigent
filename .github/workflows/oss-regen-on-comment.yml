@@ -149,10 +149,19 @@ jobs:
       # here would override the config with an absolute date and stamp
       # it into the lock, breaking every later `uv sync --locked` that
       # runs without the same env.)
+      # npm's 7-day cooldown lives in ap-web/.npmrc (`min-release-age=7`,
+      # the mirror of uv's `exclude-newer = "P7D"`) and is only honored by
+      # npm >= 11.10.0; node 20 ships npm 10.x, which silently ignores it.
+      - name: Ensure npm honors the dependency cooldown
+        run: npm install -g "npm@>=11.10.0"
+      # Delete package-lock.json so npm RESOLVES from scratch: min-release-age
+      # only filters candidates during resolution, and `--package-lock-only`
+      # keeps an existing in-range pin without re-applying the cooldown, so a
+      # too-fresh version already in the lock would survive a plain regen.
       - name: Regenerate lockfiles against public PyPI/npm
         run: |
           uv lock
-          ( cd ap-web && npm install --package-lock-only --no-audit --no-fund )
+          ( cd ap-web && rm -f package-lock.json && npm install --package-lock-only --no-audit --no-fund )
 
       # Mint the App installation token only AFTER `uv lock` so untrusted PR
       # build backends never see it, and never via the checkout (credentials

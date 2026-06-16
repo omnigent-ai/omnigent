@@ -34,17 +34,16 @@
 name: Release omnigent (PyPI)
 
 on:
-  # The release trigger: push a version tag. SemVer + PEP 440 pre-releases:
-  #   v0.1.0a1 (alpha) · v0.1.0b1 (beta) · v0.1.0rc1 (release candidate) · v0.1.0
-  # Burn pre-release tags on the pipeline first; reserve the clean vX.Y.Z
-  # for the real launch (PyPI versions are immutable — a version can't be
-  # re-used, on TestPyPI either).
-  push:
-    tags:
-      - "v*"
+  # NOTE: PyPI publishing has moved to the central secure-release repo
+  # (databricks/secure-public-registry-releases-eng, workflow `omnigent.yml`).
+  # The tag-push trigger is REMOVED so a version tag no longer fires this
+  # workflow — otherwise it double-publishes and collides with the secure
+  # pipeline on the same tag. This workflow is kept only as a manual fallback
+  # (workflow_dispatch) and will be deleted once the secure path has done a
+  # production release.
+  #
   # Manual run: builds + gates always run; destination picks the index.
-  # `pypi` is the ONLY path to a real-PyPI publish (tag pushes stop at
-  # TestPyPI), and it binds the protected `pypi` environment.
+  # `pypi` binds the protected `pypi` environment.
   workflow_dispatch:
     inputs:
       destination:

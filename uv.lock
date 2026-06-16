@@ -749,6 +749,22 @@ wheels = [
 ]
 
 [[package]]
+name = "cursor-sdk"
+version = "0.1.7"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/1c/36/dbba49561bad0f2acc21654bb5ba398b0691ecbea5667f7370f581781422/cursor_sdk-0.1.7.tar.gz", hash = "sha256:a8eead9558bf4a53aab0a4a83eb1f56bb8c38fb5f978041712b436a12c6a30d7", size = 1175, upload-time = "2026-06-05T15:44:51.544Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/35/74/f966249d4b8e251a6bc21f68af879e436c31f8a41c8138b3ef5d91e05980/cursor_sdk-0.1.7-py3-none-macosx_11_0_arm64.whl", hash = "sha256:0e7eb4999c9176caaa6da45690f1cfde674ea5e5fb4f4decfc137e36a599e535", size = 52825504, upload-time = "2026-06-05T15:44:36.199Z" },
+    { url = "https://files.pythonhosted.org/packages/1b/93/96c85399164c6ff7195661874e0728ef83ca7535721116cb989db7334080/cursor_sdk-0.1.7-py3-none-macosx_11_0_x86_64.whl", hash = "sha256:0b689cdf1a1a1c3e011ea47cd1b7257bc3b38924f3b299bc580bcea64f841f7a", size = 54423057, upload-time = "2026-06-05T15:44:39.368Z" },
+    { url = "https://files.pythonhosted.org/packages/cd/8a/9f8c7541759507be32208545a7ebb3fad451e9da83e2fff86e8b73f6356a/cursor_sdk-0.1.7-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:719c555bdb20ac68545883ef19e49dd592160fc204f4ccbd543c4cd977032a0f", size = 61457752, upload-time = "2026-06-05T15:44:42.536Z" },
+    { url = "https://files.pythonhosted.org/packages/8d/22/7ddc14b07b73603b41f62970f49c186daa1301622c5a87cd3d67136142c9/cursor_sdk-0.1.7-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:1f1d35c9136cdcd2ac8e5b4caa216f002b1087281d63992101485a1854f3a313", size = 62149668, upload-time = "2026-06-05T15:44:46.014Z" },
+    { url = "https://files.pythonhosted.org/packages/6c/a9/be47ff49fe67420b3392547b63909c3232d0081bdb068247a3f145a06e3b/cursor_sdk-0.1.7-py3-none-win_amd64.whl", hash = "sha256:5b0528f90b520a02012201ee9071b5f48081686b6c599729fa1942a29cadc0a0", size = 48834389, upload-time = "2026-06-05T15:44:49.103Z" },
+]
+
+[[package]]
 name = "cwsandbox"
 version = "0.26.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2459,6 +2475,7 @@ dependencies = [
     { name = "cel-expr-python" },
     { name = "claude-agent-sdk" },
     { name = "click" },
+    { name = "cursor-sdk" },
     { name = "fastapi" },
     { name = "ftfy" },
     { name = "httpx" },
@@ -2550,6 +2567,7 @@ requires-dist = [
     { name = "cel-expr-python", specifier = ">=0.1" },
     { name = "claude-agent-sdk", specifier = ">=0.1.62" },
     { name = "click", specifier = ">=8.0,<8.2" },
+    { name = "cursor-sdk", specifier = ">=0.1.7" },
     { name = "cwsandbox", marker = "extra == 'cwsandbox'", specifier = ">=0.26,<1" },
     { name = "databricks-mcp", marker = "extra == 'databricks'", specifier = ">=0.1.0" },
     { name = "databricks-sdk", marker = "extra == 'all'", specifier = ">=0.56.0,<1" },

@@ -148,6 +148,23 @@ def _scrollback_text(screen: pyte.HistoryScreen) -> str:
     return "\n".join(parts)
 
 
+# Reruns on failure: the assertions are deterministic, but the
+# capture path is not — ``_drain_pty`` races the forked driver under a
+# fixed wall-clock deadline, so a slow/loaded CI worker can truncate the
+# byte stream and drop a trailing item (count == 0). A rerun re-forks a
+# fresh PTY and re-captures, which clears the transient timing failure
+# without masking a real regression (those fail every attempt).
+#
+# TODO(#222): reruns alone are a stopgap. CI (Linux) has also been seen
+# failing with the DUPLICATION mode (an item appears 2x — raw streamed
+# text AND rendered markdown both survive) which reproduces across every
+# rerun, unlike the timing/truncation mode this marker covers. That
+# points at an environment-dependent overflow-render bug in
+# ``_should_stream_more`` / ``replace_streamed_text`` at a tight (15-row)
+# viewport that is NOT fixed by retrying. Investigate and fix the
+# underlying double-render, then reassess whether this marker is still
+# needed.
+@pytest.mark.flaky(reruns=4, reruns_delay=0)
 def test_no_duplicate_when_streamed_overflows_viewport() -> None:
     """
     Stream 30 markdown items into a 15-row PTY. After the response

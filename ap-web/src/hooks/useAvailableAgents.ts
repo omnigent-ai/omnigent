@@ -2,6 +2,10 @@ import { useQuery } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 import { agentBaseName } from "@/lib/forkHarness";
 import { capitalizeAgentName } from "@/lib/agentLabels";
+import {
+  nativeCodingAgentForAgentName,
+  nativeCodingAgentForHarness,
+} from "@/lib/nativeCodingAgents";
 
 export interface AvailableAgent {
   id: string;
@@ -34,6 +38,15 @@ const DISPLAY_NAMES: Record<string, string> = {
   debby: "Debby",
 };
 
+function displayNameForAgent(name: string, harness?: string | null): string {
+  return (
+    nativeCodingAgentForHarness(harness)?.displayName ??
+    nativeCodingAgentForAgentName(name)?.displayName ??
+    DISPLAY_NAMES[name] ??
+    capitalizeAgentName(name)
+  );
+}
+
 /** Wire row of the built-in list, GET /v1/agents. */
 interface BuiltinAgentWire {
   id: string;
@@ -61,7 +74,7 @@ async function fetchBuiltinAgents(): Promise<AvailableAgent[]> {
   return body.data.map((a) => ({
     id: a.id,
     name: a.name,
-    display_name: DISPLAY_NAMES[a.name] ?? capitalizeAgentName(a.name),
+    display_name: displayNameForAgent(a.name, a.harness),
     description: a.description ?? null,
     harness: a.harness ?? null,
     skills: a.skills ?? [],
@@ -129,7 +142,7 @@ async function enrichSessionAgent(scanned: ScannedSessionAgent): Promise<Availab
   const fallback: AvailableAgent = {
     id: scanned.agentId,
     name: scanned.agentName,
-    display_name: DISPLAY_NAMES[scanned.agentName] ?? capitalizeAgentName(scanned.agentName),
+    display_name: displayNameForAgent(scanned.agentName),
     description: null,
     harness: null,
     skills: [],
@@ -142,6 +155,7 @@ async function enrichSessionAgent(scanned: ScannedSessionAgent): Promise<Availab
     const json = (await res.json()) as AgentObjectWire;
     return {
       ...fallback,
+      display_name: displayNameForAgent(json.name, json.harness),
       description: json.description ?? null,
       harness: json.harness ?? null,
       skills: json.skills ?? [],

@@ -112,6 +112,58 @@ def test_session_start_hook_emits_conversation_url_system_message(
     assert read_transcript_path(bridge_dir) == transcript_path
 
 
+def test_session_start_hook_maps_workspace_hosted_server_to_ui_mount(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    SessionStart links to the SPA mount for workspace-hosted servers.
+
+    ``ap_server_url`` is the API proxy base (``/api/2.0/omnigent``);
+    pointing the "Open this session" message there returns JSON, not
+    the web UI. The message must land on the ``/omnigent`` SPA mount
+    with the ``?o=<org>`` selector — matching the CLI's ``Web UI:``
+    line and the tmux status bar.
+    """
+    from omnigent.cli_auth import store_databricks_auth
+
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(
+        "omnigent.cli_auth._token_file_path",
+        lambda: tmp_path / "auth_tokens.json",
+    )
+    server = "https://example.databricks.com/api/2.0/omnigent"
+    store_databricks_auth(
+        server,
+        "https://example.databricks.com",
+        org_id="2850744067564480",
+    )
+    bridge_dir = prepare_bridge_dir(
+        "conv_abc",
+        bridge_id="bridge_shared",
+        workspace=tmp_path,
+    )
+    build_hook_settings(bridge_dir, ap_server_url=server)
+    payload = {
+        "hook_event_name": "SessionStart",
+        "transcript_path": str(tmp_path / "session.jsonl"),
+    }
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    exit_code = claude_native_hook.main(["--bridge-dir", str(bridge_dir)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert json.loads(captured.out) == {
+        "systemMessage": (
+            "Open this session in Omnigent: "
+            "https://example.databricks.com/omnigent/c/conv_abc?o=2850744067564480"
+        )
+    }
+
+
 def test_clear_session_start_hook_rotates_before_printing_conversation_url(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

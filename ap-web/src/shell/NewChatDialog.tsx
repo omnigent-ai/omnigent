@@ -44,6 +44,12 @@ import { getOmnigentHostConfig } from "@/lib/host";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
 import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
 import { cn } from "@/lib/utils";
+import {
+  isNativeCodingAgent,
+  nativeAgentHasCapability,
+  nativeAgentSortRank,
+  nativeWrapperLabelsForAgent,
+} from "@/lib/nativeCodingAgents";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
@@ -62,7 +68,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 // returns agents newest-registered first (agent_store.list sorts by
 // created_at desc), so pin the order users expect; any agent not listed
 // here falls after, in server order.
-const AGENT_DISPLAY_ORDER = ["Claude Code", "Codex", "Polly", "Polly Codex"];
+const AGENT_DISPLAY_ORDER = ["Claude Code", "Codex", "Pi", "Polly", "Polly Codex"];
 
 // Hidden on the new-session picker only (superseded by polly; older
 // deployments still carry a seeded nessie row this filter keeps out).
@@ -590,13 +596,17 @@ export function NewChatLandingScreen() {
   const { data: directorySessions } = useDirectorySessions(true);
 
   const agentList = useMemo(() => {
-    const rank = (name: string) => {
+    const displayRank = (name: string) => {
       const i = AGENT_DISPLAY_ORDER.indexOf(name);
       return i === -1 ? AGENT_DISPLAY_ORDER.length : i;
     };
     return [...(agents ?? [])]
       .filter((a) => !NEW_SESSION_HIDDEN_AGENTS.has(a.name))
-      .sort((a, b) => rank(a.display_name) - rank(b.display_name));
+      .sort(
+        (a, b) =>
+          nativeAgentSortRank(a) - nativeAgentSortRank(b) ||
+          displayRank(a.display_name) - displayRank(b.display_name),
+      );
   }, [agents]);
 
   const [message, setMessage] = useState<string>("");
@@ -762,11 +772,11 @@ export function NewChatLandingScreen() {
   const effectiveAgentId =
     (agentList.some((a) => a.id === pickedAgentId) ? pickedAgentId : agentList[0]?.id) ?? null;
   const selectedAgent = agentList.find((a) => a.id === effectiveAgentId);
-  const isClaudeNativeAgent = selectedAgent?.name === "claude-native-ui";
+  const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
   // Native-terminal agents interpret slash commands inside their own CLI
   // (the runner injects the text verbatim), so the landing composer must
   // not intercept them — no skills menu, no slash_command routing.
-  const isNativeTerminalAgent = isClaudeNativeAgent || selectedAgent?.name === "codex-native-ui";
+  const isNativeTerminalAgent = isNativeCodingAgent(selectedAgent);
   const selectedHost = allHosts.find((h) => h.host_id === selectedHostId);
   // Warn-only readiness signal for the agent picker: only meaningful when
   // a connected host is selected (a sandbox provisions its own tooling).
@@ -924,7 +934,7 @@ export function NewChatLandingScreen() {
   // agent name. pickedHarness is non-null only for an explicit non-default
   // pick (re-picking the spec default clears it).
   const agentLabel = selectedAgent
-    ? isClaudeNativeAgent && permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
+    ? supportsPermissionMode && permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
       ? `${selectedAgent.display_name} (${permissionModeLabel})`
       : pickedHarness != null
         ? `${selectedAgent.display_name} (${BRAIN_HARNESS_LABELS[pickedHarness] ?? pickedHarness})`
@@ -967,7 +977,8 @@ export function NewChatLandingScreen() {
     try {
       const trimmedBranch = branchName.trim();
       const agent = agentList.find((a) => a.id === effectiveAgentId);
-      const isClaudeNative = agent?.name === "claude-native-ui";
+      const nativeLabels = nativeWrapperLabelsForAgent(agent);
+      const agentSupportsPermissionMode = nativeAgentHasCapability(agent, "permissionMode");
       const res = await authenticatedFetch("/v1/sessions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -995,15 +1006,11 @@ export function NewChatLandingScreen() {
           // `omnigent.wrapper` selects which CLI bridge the runner launches.
           // The values are the registered wrapper ids the runner keys off —
           // they must match the wrapper registry, not the agent display name.
-          labels: isClaudeNative
-            ? { "omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui" }
-            : agent?.name === "codex-native-ui"
-              ? { "omnigent.ui": "terminal", "omnigent.wrapper": "codex-native-ui" }
-              : undefined,
+          labels: nativeLabels,
           // Permission mode → `claude --permission-mode <mode>`, persisted as
           // terminal_launch_args. Omitted for the default and non-native agents.
           terminal_launch_args:
-            isClaudeNative && permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
+            agentSupportsPermissionMode && permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
               ? ["--permission-mode", permissionMode]
               : undefined,
           // Cost-control switch from the "Cost Optimized" pill; polly-only
@@ -1660,7 +1667,7 @@ export function NewChatLandingScreen() {
                 their own chip: the brain-harness override (bundle agents)
                 and Claude Code's permission mode. Hidden when the selected
                 agent has neither. */}
-              {(selectedAgentDefaultHarness != null || isClaudeNativeAgent) && (
+              {(selectedAgentDefaultHarness != null || supportsPermissionMode) && (
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
                     <button
@@ -1691,7 +1698,7 @@ export function NewChatLandingScreen() {
                     {/* Permission mode (Claude Code only) — claude-native has no
                       overridable harness, so the two sections never co-render
                       today; the separator covers a future agent with both. */}
-                    {isClaudeNativeAgent && (
+                    {supportsPermissionMode && (
                       <>
                         {selectedAgentDefaultHarness != null && <DropdownMenuSeparator />}
                         <div className="px-2 pt-1.5 pb-0.5 text-[11px] font-medium text-muted-foreground">

@@ -29,11 +29,12 @@ def hook_payload_to_evaluation_request(
     Convert a native-harness tool-hook payload into a proto ``EvaluationRequest``.
 
     Maps ``PreToolUse`` to a ``PHASE_TOOL_CALL`` event and
-    ``PostToolUse`` to a ``PHASE_TOOL_RESULT`` event. MCP tools
-    (``mcp__*``) are skipped because they are already policy-checked by
-    the relay path (``ProxyMcpManager`` → Omnigent ``/mcp`` endpoint →
-    ``_evaluate_tool_call_policy``); evaluating them here would
-    double-count.
+    ``PostToolUse`` to a ``PHASE_TOOL_RESULT`` event. Omnigent MCP tools
+    (``mcp__omnigent__*``) are skipped because they are already
+    policy-checked by the relay path (``ProxyMcpManager`` → Omnigent
+    ``/mcp`` endpoint → ``_evaluate_tool_call_policy``); evaluating
+    them here would double-count. Connector-native MCP tools
+    (for example ``mcp__github__*``) still need this pre-call gate.
 
     :param hook_event: Hook event name from the payload's
         ``hook_event_name`` field, e.g. ``"PreToolUse"`` or
@@ -43,13 +44,14 @@ def hook_payload_to_evaluation_request(
         "tool_input": {"command": "rm -rf /"}}``.
     :returns: An ``EvaluationRequest`` dict suitable for POSTing to
         ``/policies/evaluate``, or ``None`` when the event is not
-        policy-relevant (unknown event or an ``mcp__*`` tool).
+        policy-relevant (unknown event or an ``mcp__omnigent__*`` tool).
     """
     tool_name = payload.get("tool_name", "")
-    # MCP tools (mcp__*) are already policy-checked by the relay path
+    # Omnigent MCP tools are already policy-checked by the relay path
     # (ProxyMcpManager → Omnigent /mcp endpoint → _evaluate_tool_call_policy).
-    # Skip them here to avoid double evaluation.
-    if isinstance(tool_name, str) and tool_name.startswith("mcp__"):
+    # Skip only those here to avoid double evaluation; connector-native MCP
+    # tools such as mcp__github__* must still go through this hook.
+    if isinstance(tool_name, str) and tool_name.startswith("mcp__omnigent__"):
         return None
     tool_input = payload.get("tool_input") or {}
     if hook_event == _PRE_TOOL_USE:

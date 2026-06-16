@@ -27,12 +27,24 @@ from collections.abc import AsyncIterator, Sequence
 from typing import Any, TypeAlias
 
 from ._subprocess_lifecycle import close_subprocess_transport
+from .executor import (
+    ExecutorEvent,
+    ReasoningChunk,
+    TextChunk,
+    ToolCallComplete,
+    ToolCallRequest,
+    classify_tool_result,
+)
 
 logger = logging.getLogger(__name__)
 
 # One ACP JSON-RPC message (request / response / notification). The schema is
 # owned by the ACP spec + cursor-agent, so it is opaque JSON at this layer.
 AcpMessage: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
+
+# Body of one ``session/update`` notification (the inner ``params.update``
+# object), e.g. an ``agent_message_chunk`` / ``tool_call`` / ``tool_call_update``.
+AcpUpdate: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 
 # ACP protocol revision this client negotiates (integer, per the ACP spec).
 _ACP_PROTOCOL_VERSION = 1
@@ -406,3 +418,52 @@ def _pick_allow_option(options: list[AcpMessage]) -> str:
         if isinstance(first, str):
             return first
     return "allow"
+
+
+# ---------------------------------------------------------------------------
+# session/update → ExecutorEvent
+# ---------------------------------------------------------------------------
+#
+# Shared by every ACP-driven harness (``cursor-agent acp``, ``mimo acp``,
+# ``gemini --acp``). Originally lived in ``cursor_executor.py`` when cursor was
+# our only ACP client; promoted here when upstream replaced cursor with the
+# in-process Python SDK so gemini / mimo no longer have to import a
+# now-unrelated module.
+
+
+def _update_to_event(update: AcpUpdate) -> ExecutorEvent | None:
+    """Map one ACP ``session/update`` to an ExecutorEvent, or ``None`` to skip.
+
+    :param update: The ``params.update`` object from a ``session/update``
+        notification (carries a ``sessionUpdate`` discriminator).
+    :returns: The mapped event, or ``None`` for updates with nothing to surface
+        (mode changes, command lists, plans, echoed user input).
+    """
+    kind = update.get("sessionUpdate")
+    content = update.get("content")
+    text = content.get("text") if isinstance(content, dict) else None
+
+    if kind == "agent_message_chunk":
+        return TextChunk(text=text) if isinstance(text, str) and text else None
+    if kind == "agent_thought_chunk":
+        if isinstance(text, str) and text:
+            return ReasoningChunk(delta=text, event_type="reasoning_text")
+        return None
+    if kind == "tool_call":
+        raw_input = update.get("rawInput")
+        return ToolCallRequest(
+            name=str(update.get("title") or update.get("kind") or "tool"),
+            args=raw_input if isinstance(raw_input, dict) else {},
+            metadata={"call_id": update.get("toolCallId")},
+        )
+    if kind == "tool_call_update" and update.get("status") == "completed":
+        result = update.get("content")
+        classification = classify_tool_result(result)
+        return ToolCallComplete(
+            name=str(update.get("title") or "tool"),
+            status=classification.status,
+            result=result,
+            error=classification.error or None,
+            metadata={"call_id": update.get("toolCallId")},
+        )
+    return None

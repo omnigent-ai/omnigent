@@ -548,8 +548,18 @@ def live_server(
     proc = subprocess.Popen(
         [
             sys.executable,
-            "-m",
-            "omnigent",
+            # Equivalent of the unit tests' ``monkeypatch.setattr(presence,
+            # "_LEAVE_GRACE_S", ...)``, but applied INSIDE this spawned
+            # interpreter — a monkeypatch in the test process can't reach a
+            # subprocess. ``-c`` patches the module global before the CLI
+            # runs; the presence route reads it live at call time, so the
+            # presence-leave assertion in test_collab_realtime clears in ~1s
+            # instead of the prod 15s dwell (which only exists to absorb the
+            # ingress' ~5-min stream recycle a test server never hits).
+            # Mirrors ``python -m omnigent`` (omnigent/__main__.py).
+            "-c",
+            "import omnigent.server.presence as _p; _p._LEAVE_GRACE_S = 1.0; "
+            + "from omnigent.cli import main; main()",
             "server",
             "--host",
             "127.0.0.1",
@@ -1269,3 +1279,110 @@ def server_pid(live_server: str) -> int:
     :returns: OS process id.
     """
     return int(_server_state["pid"])
+
+
+# ---------------------------------------------------------------------------
+# Per-agent chat sessions (message render-parity suite, and reusable beyond it)
+#
+# ``custom_agent_session`` yields ``(base_url, session_id)`` for a session bound
+# to the shared ``live_server`` runner, ready to chat at ``/c/<session_id>``. It
+# registers a plain ``openai-agents`` agent (the ``echo_probe`` spec below) —
+# the same harness family as ``hello_world`` — fresh, so it stands in for "spin
+# up a different agent" without the multi-provider sprawl of the packaged
+# ``polly`` / ``debby`` examples.
+#
+# Native CLI built-ins (``claude-native-ui`` / ``codex-native-ui``) are not
+# wired up here yet: driving the real vendor TUI in a PTY needs CI-side setup
+# (gateway auth + Claude Code first-run state) owned by the native-harness CI
+# enablement work. Add those fixtures back alongside that effort.
+# ---------------------------------------------------------------------------
+
+# A precise-echo agent on the openai-agents harness (same provider family as
+# hello_world, so it authenticates against the same gateway in CI). spec_version
+# 1 + executor.config.harness routes through the strict parser; arcname
+# config.yaml keeps it on that path.
+_CUSTOM_AGENT_NAME = "echo_probe"
+_CUSTOM_AGENT_YAML = f"""\
+spec_version: 1
+name: {_CUSTOM_AGENT_NAME}
+prompt: |
+  You are a precise echo assistant. The user sends a turn that ends with an
+  instruction to reply with one exact token. Reply with that token verbatim
+  and nothing else — no preamble, no quotes, no trailing punctuation.
+
+executor:
+  model: databricks-gpt-5-4
+  config:
+    harness: openai-agents
+"""
+
+
+def _bind_session_runner(base_url: str, session_id: str, runner_id: str) -> None:
+    """PATCH *session_id* onto *runner_id* so ``POST /v1/responses`` dispatches.
+
+    :param base_url: Spawned server base URL, e.g. ``"http://127.0.0.1:51234"``.
+    :param session_id: The session/conversation id to bind.
+    :param runner_id: The token-bound runner id the session dispatches to.
+    """
+    patch = httpx.patch(
+        f"{base_url}/v1/sessions/{session_id}",
+        json={"runner_id": runner_id},
+        timeout=10.0,
+    )
+    patch.raise_for_status()
+
+
+def _create_bundled_session(base_url: str, runner_id: str, yaml_text: str) -> str:
+    """Register a session-scoped agent from *yaml_text* and bind its session.
+
+    The multipart ``POST /v1/sessions`` both registers the agent and creates
+    the session it is scoped to, returning that ``session_id`` directly — so
+    no separate create call is needed.
+
+    :param base_url: Spawned server base URL.
+    :param runner_id: The token-bound runner id to bind.
+    :param yaml_text: The agent spec body.
+    :returns: The new session/conversation id.
+    """
+    import json as _json
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        data = yaml_text.encode()
+        info = tarfile.TarInfo("config.yaml")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+
+    create = httpx.post(
+        f"{base_url}/v1/sessions",
+        data={"metadata": _json.dumps({})},
+        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
+        timeout=30.0,
+    )
+    create.raise_for_status()
+    session_id = str(create.json()["session_id"])
+    _bind_session_runner(base_url, session_id, runner_id)
+    return session_id
+
+
+@pytest.fixture
+def custom_agent_session(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A runner-bound session on the custom ``echo_probe`` agent.
+
+    :param live_server: Spawned server fixture; its runner is reused.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``.
+    """
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    session_id = _create_bundled_session(live_server, runner_id, _CUSTOM_AGENT_YAML)
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
+            respawned.wait(timeout=5)

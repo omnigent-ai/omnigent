@@ -224,6 +224,70 @@ export function buildPendingBubbles(
   });
 }
 
+// A committed bubble that exists ONLY to render one or more
+// REQUEST-phase policy elicitation cards. A REQUEST-phase ASK parks the
+// user message server-side (it is not persisted / consumed until the
+// human approves — POLICIES.md §7.2), so the message lingers as an
+// optimistic pending bubble (and later a consumed committed bubble) while
+// its elicitation card arrives as a standalone committed assistant
+// bubble. Used by `mergePendingBubbles` and
+// `reorderCommittedRequestElicitations` to keep the prompt above the card
+// that asks about it, both before and after approval.
+function isRequestElicitationBubble(bubble: Bubble): boolean {
+  return (
+    bubble.kind === "assistant" &&
+    bubble.items.length > 0 &&
+    bubble.items.every((it) => it.kind === "elicitation" && it.phase === "request")
+  );
+}
+
+// Pull a committed REQUEST-phase elicitation card below the user message
+// it gated.
+//
+// Once a REQUEST-phase ASK is approved, the parked user message is
+// consumed and appended to `blocks` — but AFTER the elicitation card,
+// which arrived (and committed) while the message was still parked
+// server-side. The committed order is therefore [card, message], so the
+// approved card would sit ABOVE the prompt that triggered it. Swap each
+// such card with the user bubble that immediately follows it so the
+// prompt stays on top, matching the pre-approval pending layout
+// (`mergePendingBubbles`). A card with no following user bubble (declined
+// / still pending) is left untouched. Returns the input array unchanged
+// (same reference) when no swap applies, so the memo stays stable.
+export function reorderCommittedRequestElicitations(committed: Bubble[]): Bubble[] {
+  let result: Bubble[] | null = null;
+  for (let i = 0; i < committed.length - 1; i += 1) {
+    if (isRequestElicitationBubble(committed[i]!) && committed[i + 1]!.kind === "user") {
+      if (result === null) result = [...committed];
+      const card = result[i]!;
+      result[i] = result[i + 1]!;
+      result[i + 1] = card;
+    }
+  }
+  return result ?? committed;
+}
+
+// Place optimistic pending user bubbles into the committed timeline.
+//
+// Pending sends normally trail everything (the input should be visible
+// immediately, and they migrate into `blocks` once their
+// `session.input.consumed` event lands). The exception is a REQUEST-phase
+// policy ASK: that message never gets a consumed event until approval, so
+// it stays pending while its elicitation card renders as a committed
+// bubble — appending the pending bubble after the card would show the
+// approval prompt ABOVE the message that triggered it. When the timeline
+// ends in a run of such request-elicitation bubbles, splice the pending
+// bubbles in just before that run so the prompt stays on top.
+export function mergePendingBubbles(committed: Bubble[], pending: Bubble[]): Bubble[] {
+  if (pending.length === 0) return committed;
+  let insertAt = committed.length;
+  while (insertAt > 0 && isRequestElicitationBubble(committed[insertAt - 1]!)) {
+    insertAt -= 1;
+  }
+  if (insertAt === committed.length) return [...committed, ...pending];
+  return [...committed.slice(0, insertAt), ...pending, ...committed.slice(insertAt)];
+}
+
 // Whether a user bubble should carry the author's avatar badge (and the
 // author-tinted background): only in a shared session, only when a human
 // author is attached (agent/tool/system output and pre-attribution
@@ -449,18 +513,25 @@ export function ChatPage() {
   // active bubble, reusing the finalized prefix by reference.
   const bubbleCacheRef = useRef<BubbleCache>(createBubbleCache());
   const bubbles = useMemo<Bubble[]>(() => {
-    const committed = buildBubbles(
-      blocks,
-      activeResponse,
-      bubbleCacheRef.current,
-      interruptedResponseIds,
+    // A REQUEST-phase elicitation card commits before the user message it
+    // gates: while pending, the message is an optimistic trailing bubble
+    // (`mergePendingBubbles` lifts it above the card); once approved, the
+    // consumed message lands in `blocks` AFTER the card
+    // (`reorderCommittedRequestElicitations` swaps the card below it).
+    // Both keep the prompt on top across the pending → approved flip.
+    const committed = reorderCommittedRequestElicitations(
+      buildBubbles(blocks, activeResponse, bubbleCacheRef.current, interruptedResponseIds),
     );
     // claude-native live previews are NOT trailing bubbles — they live in
     // `blocks` as provisional `live:*` text blocks at their streamed
     // position (see chatStore), so they render in-order with later tool /
-    // elicitation cards. Only the optimistic pending user message trails.
+    // elicitation cards. The optimistic pending user message trails too,
+    // except when the timeline ends in a REQUEST-phase elicitation card.
     if (pendingUserMessages.length === 0) return committed;
-    return [...committed, ...buildPendingBubbles(pendingUserMessages, getCurrentAuthorId())];
+    return mergePendingBubbles(
+      committed,
+      buildPendingBubbles(pendingUserMessages, getCurrentAuthorId()),
+    );
   }, [blocks, activeResponse, interruptedResponseIds, pendingUserMessages]);
 
   // Picker selection. ChatPage stays mounted across `/` to `/c/:id`,
@@ -1967,7 +2038,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
       {/* w-fit + ml-auto shrink-wrap the row so the author avatar sits
           immediately left of the right-aligned bubble (the bubble's own
           ml-auto has no free space to absorb inside a fit-width row). */}
-      <div className="ml-auto flex w-fit max-w-full items-start gap-1.5">
+      <div className="ml-auto flex w-fit max-w-full items-center gap-1.5">
         {showAuthorBadge && author && (
           <Tooltip>
             <TooltipTrigger asChild>
@@ -1975,7 +2046,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                 size="sm"
                 data-testid="message-author"
                 aria-label={author}
-                className="mt-1.5 shrink-0"
+                className="shrink-0"
               >
                 <AvatarFallback
                   className="font-medium text-white"
@@ -2677,9 +2748,9 @@ export function Composer({
         if (!showModel) return false;
         const target = arg.trim();
         if (!target) {
-          const { selectedModel, llmModel } = useChatStore.getState();
-          const current = selectedModel
-            ? `${selectedModel} (override)`
+          const { sessionModelOverride, llmModel } = useChatStore.getState();
+          const current = sessionModelOverride
+            ? `${sessionModelOverride} (override)`
             : (llmModel ?? "agent default");
           setCommandError(`Model: ${current}\nUsage: /model <name> · /model default to reset`);
           return true;
@@ -2703,9 +2774,9 @@ export function Composer({
       }
       case "/context": {
         const state = useChatStore.getState();
-        const { contextWindow, llmModel, selectedModel, tokensUsed, blocks } = state;
+        const { contextWindow, llmModel, sessionModelOverride, tokensUsed, blocks } = state;
         const lines: string[] = [];
-        if (selectedModel) lines.push(`Model: ${selectedModel} (override)`);
+        if (sessionModelOverride) lines.push(`Model: ${sessionModelOverride} (override)`);
         else if (llmModel) lines.push(`Model: ${llmModel}`);
         // contextWindow > 0 keeps a zero window out of the division (0/0 → "NaN%").
         if (tokensUsed != null && contextWindow != null && contextWindow > 0) {
@@ -3203,9 +3274,9 @@ export function Composer({
             {commandError}
           </div>
         )}
-        <div className="flex items-center justify-between px-2 pb-2">
+        <div className="flex items-center justify-between gap-2 px-2 pb-2">
           {/* Attach + mic — left side of the action row */}
-          <div className="flex items-center gap-0.5">
+          <div className="flex shrink-0 items-center gap-0.5">
             <Button
               type="button"
               size="icon"
@@ -3231,7 +3302,7 @@ export function Composer({
             />
           </div>
           {/* Cost toggle + agent picker + Send — right side */}
-          <div className="flex items-center gap-0.5">
+          <div className="flex min-w-0 items-center gap-0.5">
             {/* Temporarily hidden (#3021): re-enable by removing the false gate. */}
             {false && costRoutingEligible && (
               <IntelligentModelControl
@@ -3265,7 +3336,7 @@ export function Composer({
               // overrides the base 50% disabled-opacity so the affordance
               // reads as "waiting for input", not "almost active".
               className={cn(
-                "size-9 rounded-full md:size-8",
+                "size-9 shrink-0 rounded-full md:size-8",
                 !showInterruptButton && "hover:bg-primary/90 disabled:opacity-30",
               )}
               // Interrupt stays live during a pending elicitation —
@@ -3634,12 +3705,10 @@ function AgentPicker({
           size="sm"
           disabled={!hasAgents || disabled || !hasPickerActions}
           data-testid="agent-picker-trigger"
-          className="h-7 gap-1.5 px-2 text-muted-foreground hover:text-foreground"
+          className="h-7 min-w-0 shrink gap-1.5 px-2 text-muted-foreground hover:text-foreground"
         >
-          <span className="max-w-20 truncate text-xs tabular-nums md:max-w-[18rem]">
-            {triggerLabel}
-          </span>
-          {hasPickerActions && <ChevronDownIcon className="size-3.5 opacity-60" />}
+          <span className="min-w-0 truncate text-xs tabular-nums">{triggerLabel}</span>
+          {hasPickerActions && <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />}
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="min-w-64 p-1">

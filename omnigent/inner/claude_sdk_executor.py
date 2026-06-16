@@ -1609,6 +1609,143 @@ class ClaudeSDKExecutor(Executor):
             return PermissionResultAllow()
         return PermissionResultDeny(message="Denied via Omnigent elicitation")
 
+    async def _evaluate_tool_call_policy(
+        self,
+        tool_name: str,
+        tool_input: ToolArgs,
+    ) -> Any:  # type: ignore[explicit-any]  # PermissionResult | None
+        """
+        Run a pre-execution TOOL_CALL policy evaluation for one tool call.
+
+        This is the policy half of the ``can_use_tool`` gate. It exists
+        so connector-native MCP tools — ones injected by the Claude Agent
+        SDK / claude.ai connector layer (e.g. ``mcp__github__*``,
+        ``mcp__atlassian__*``) that are NOT part of the agent spec's
+        ``mcp_servers`` and execute INSIDE the CLI subprocess — get
+        evaluated against Omnigent TOOL_CALL-phase policies BEFORE they
+        run. Without this gate those calls bypass policy entirely (the
+        executor only OBSERVES them in the message stream, which posts no
+        policy event).
+
+        Double-evaluation guard: Omnigent's OWN tools are exposed as the
+        single ``omnigent`` SDK MCP server (the model sees
+        ``mcp__omnigent__*``). When the model calls one, the SDK wrapper
+        routes it back through Omnigent's dispatch bridge
+        (``_stable_tool_executor`` -> ``TurnContext.dispatch_tool`` ->
+        ``action_required``), and the runner re-dispatches it via
+        ``ProxyMcpManager``, which enforces TOOL_CALL + TOOL_RESULT
+        policies server-side before forwarding to ``/mcp/execute``
+        (see ``omnigent/runner/app.py`` "All tool calls go through AP:/mcp
+        ... which enforces TOOL_CALL + TOOL_RESULT policies server-side").
+        Spec-declared MCP tools are surfaced through that same
+        ``mcp__omnigent__*`` server, so they are covered there too.
+        Evaluating ``mcp__omnigent__*`` here as well would double-count
+        the same call (and could double-charge a cost-budget checkpoint),
+        so we SKIP that prefix and only gate the connector-native /
+        out-of-band tools the dispatch path never sees.
+
+        :param tool_name: Full SDK tool name, e.g.
+            ``"mcp__github__issue_write"``.
+        :param tool_input: Arguments dict for the tool call.
+        :returns: :class:`claude_agent_sdk.PermissionResultDeny` when a
+            policy denies the call. ``POLICY_ACTION_ASK`` is normally
+            collapsed to a hard ALLOW/DENY by the server-side
+            ``/policies/evaluate`` route. If a raw ASK reaches this callback
+            (for example from a read-only evaluation path), this hook runs the
+            existing Omnigent elicitation handler before returning
+            :class:`claude_agent_sdk.PermissionResultAllow` or DENY; without
+            a handler it fails closed. Returns ``None`` when the call should
+            be allowed to proceed (no policy evaluator wired, an
+            ``mcp__omnigent__*`` tool already gated on the dispatch path, or
+            an ALLOW / no-match verdict). Returning ``None`` lets the caller
+            fall through to its remaining gate logic (elicitation) without
+            forcing an allow.
+        """
+        _policy_eval = getattr(self, "_policy_evaluator", None)
+        if _policy_eval is None:
+            return None
+        # Omnigent's own tools are already TOOL_CALL-gated server-side via
+        # the dispatch bridge / ProxyMcpManager — don't evaluate them twice.
+        if tool_name.startswith("mcp__omnigent__"):
+            return None
+        _verdict = await _policy_eval(
+            "PHASE_TOOL_CALL",
+            {"name": tool_name, "arguments": tool_input},
+        )
+        _action = getattr(_verdict, "action", None)
+        if _action in ("POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED"):
+            # ALLOW / no-match — fall through (caller decides whether to also
+            # run the human-consent elicitation gate).
+            return None
+        if _action == "POLICY_ACTION_ASK":
+            from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+
+            reason = _verdict.reason or "Approval required by Omnigent TOOL_CALL policy"
+            if self._elicitation_handler is None:
+                logger.warning(
+                    "TOOL_CALL policy ASK had no elicitation handler; denying tool=%s reason=%s",
+                    tool_name,
+                    reason,
+                )
+                return PermissionResultDeny(message=reason)
+            logger.info("TOOL_CALL policy requested approval tool=%s reason=%s", tool_name, reason)
+            if await self._elicitation_handler(tool_name, tool_input):
+                return PermissionResultAllow()
+            return PermissionResultDeny(message=reason)
+        if _action == "POLICY_ACTION_DENY":
+            from claude_agent_sdk import PermissionResultDeny
+
+            reason = _verdict.reason or "Denied by Omnigent TOOL_CALL policy"
+            logger.info("TOOL_CALL policy denied tool=%s reason=%s", tool_name, reason)
+            return PermissionResultDeny(message=reason)
+        from claude_agent_sdk import PermissionResultDeny
+
+        reason = f"Unexpected Omnigent TOOL_CALL policy verdict: {_action!r}"
+        logger.warning("TOOL_CALL policy failed closed tool=%s reason=%s", tool_name, reason)
+        return PermissionResultDeny(message=reason)
+
+    async def _can_use_tool_gate(
+        self,
+        tool_name: str,
+        tool_input: ToolArgs,
+        perm_ctx: Any,  # type: ignore[explicit-any]  # ToolPermissionContext
+    ) -> Any:  # type: ignore[explicit-any]  # PermissionResult
+        """
+        Unified ``options.can_use_tool`` callback for the claude-sdk path.
+
+        Composes two independent gates, in order:
+
+        1. **TOOL_CALL policy** (always, when a ``_policy_evaluator`` is
+           wired): a hard DENY short-circuits to
+           :class:`~claude_agent_sdk.PermissionResultDeny`. This runs in
+           EVERY permission mode — including ``bypassPermissions`` — so
+           connector-native MCP tools can't slip past policy. ALLOW /
+           no-match falls through with no human interaction, preserving
+           ``bypassPermissions`` ergonomics for un-gated tools.
+        2. **Human-consent elicitation** (only when the permission mode is
+           NOT ``bypassPermissions`` and an elicitation handler is wired):
+           the pre-existing per-tool approval prompt. Under
+           ``bypassPermissions`` this step is skipped entirely, so the
+           model still acts autonomously for anything policy allows.
+
+        :param tool_name: Full SDK tool name, e.g. ``"Bash"`` or
+            ``"mcp__github__issue_write"``.
+        :param tool_input: Arguments dict for the tool call.
+        :param perm_ctx: :class:`claude_agent_sdk.ToolPermissionContext`.
+        :returns: A :class:`~claude_agent_sdk.PermissionResult`.
+        """
+        from claude_agent_sdk import PermissionResultAllow
+
+        policy_result = await self._evaluate_tool_call_policy(tool_name, tool_input)
+        if policy_result is not None:
+            # Hard DENY from policy — block before execution.
+            return policy_result
+        # Policy allowed (or no policy gate). Under bypassPermissions we
+        # never prompt; otherwise defer to the elicitation gate.
+        if self._permission_mode == "bypassPermissions" or self._elicitation_handler is None:
+            return PermissionResultAllow()
+        return await self._can_use_tool_for_permission(tool_name, tool_input, perm_ctx)
+
     async def run_turn(
         self,
         messages: list[Message],
@@ -1826,16 +1963,28 @@ class ClaudeSDKExecutor(Executor):
             options.model = model
         if self._cwd:
             options.cwd = self._cwd
-        # When an elicitation handler is installed (by ExecutorAdapter)
-        # and the permission mode is not unconditional bypass, gate every
-        # tool call through a can_use_tool callback that surfaces an AP
-        # elicitation request to the UI and parks until the user responds.
+        # Install the unified can_use_tool gate. It runs the TOOL_CALL
+        # policy evaluation in EVERY permission mode — including
+        # ``bypassPermissions`` — so connector-native MCP tools
+        # (``mcp__github__*``, ``mcp__atlassian__*``) that execute inside
+        # the CLI subprocess are evaluated against Omnigent TOOL_CALL
+        # policy before they run, instead of bypassing policy entirely.
         #
-        # ``bypassPermissions`` tells the CLI to skip all permission
-        # checks before can_use_tool is ever called, so there is nothing
-        # to intercept in that mode — only install for other modes.
-        if self._elicitation_handler is not None and self._permission_mode != "bypassPermissions":
-            options.can_use_tool = self._can_use_tool_for_permission
+        # The gate is no-friction when nothing matches: a policy ALLOW /
+        # no-match returns allow with no human prompt, so
+        # ``bypassPermissions`` ergonomics are preserved for un-gated
+        # tools. The human-consent elicitation half of the gate still only
+        # fires for non-bypass modes (see ``_can_use_tool_gate``).
+        #
+        # Install whenever EITHER a policy evaluator OR an elicitation
+        # handler is wired. Previously this only installed for non-bypass
+        # modes, which is why default ``claude-sdk`` sessions (which
+        # default to ``bypassPermissions``) had no per-tool TOOL_CALL gate.
+        if (
+            getattr(self, "_policy_evaluator", None) is not None
+            or self._elicitation_handler is not None
+        ):
+            options.can_use_tool = self._can_use_tool_gate
 
         # Log the full configuration for debugging
         logger.info(

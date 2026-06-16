@@ -51,15 +51,13 @@ from omnigent._wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE as _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
 )
 from omnigent._wrapper_labels import (
-    CODEX_NATIVE_WRAPPER_VALUE as _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
-)
-from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY as _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
 )
 from omnigent.conversation_browser import open_conversation_link_if_enabled
 from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.inner.databricks_executor import _DatabricksBearerAuth, _read_databrickscfg
+from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.spec import load as load_spec
 from omnigent.spec._omnigent_compat import OMNIGENT_EXECUTOR_TYPE
 from omnigent.spec.parser import discover_host_skills
@@ -1024,7 +1022,10 @@ def _redirect_native_resume_if_needed(
     wrapper_label = _wrapper_label_for_conversation(
         base_url=base_url, conversation_id=conversation_id
     )
-    if wrapper_label == _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE:
+    native_agent = native_coding_agent_for_wrapper_label(wrapper_label)
+    if native_agent is None:
+        return False
+    if native_agent.key == "claude":
         _run_claude_native_resume_redirect(
             base_url=base_url,
             conversation_id=conversation_id,
@@ -1032,8 +1033,16 @@ def _redirect_native_resume_if_needed(
             progress=progress,
         )
         return True
-    if wrapper_label == _CODEX_NATIVE_WRAPPER_LABEL_VALUE:
+    if native_agent.key == "codex":
         _run_codex_native_resume_redirect(
+            base_url=base_url,
+            conversation_id=conversation_id,
+            auto_open_conversation=auto_open_conversation,
+            progress=progress,
+        )
+        return True
+    if native_agent.key == "pi":
+        _run_pi_native_resume_redirect(
             base_url=base_url,
             conversation_id=conversation_id,
             auto_open_conversation=auto_open_conversation,
@@ -1135,6 +1144,38 @@ def _run_codex_native_resume_redirect(
         server=base_url,
         session_id=conversation_id,
         codex_args=(),
+        auto_open_conversation=auto_open_conversation,
+    )
+
+
+def _run_pi_native_resume_redirect(
+    *,
+    base_url: str,
+    conversation_id: str,
+    auto_open_conversation: bool,
+    progress: RunnerStartupProgress | None,
+) -> None:
+    """
+    Hand a pi-native conversation back to ``omnigent pi``.
+
+    :param base_url: Omnigent server base URL.
+    :param conversation_id: Omnigent conversation id.
+    :param auto_open_conversation: Browser-open preference for the wrapper.
+    :param progress: Optional Omnigent startup spinner to finish before redirect.
+    :returns: None.
+    """
+    _finish_native_redirect_progress(
+        progress=progress,
+        conversation_id=conversation_id,
+        wrapper_name="pi-native",
+        native_command="pi",
+    )
+    from omnigent.pi_native import run_pi_native
+
+    run_pi_native(
+        server=base_url,
+        session_id=conversation_id,
+        pi_args=(),
         auto_open_conversation=auto_open_conversation,
     )
 

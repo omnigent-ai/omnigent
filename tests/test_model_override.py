@@ -91,6 +91,7 @@ def test_validate_model_override_rejects_unsafe_values(value: str) -> None:
         "pi",
         "openai-agents",
         "cmd",
+        "cursor",
     ],
 )
 def test_harness_supports_model_override_for_plumbed_harnesses(harness: str) -> None:

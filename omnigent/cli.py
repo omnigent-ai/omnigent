@@ -1134,6 +1134,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "login",
         "pane-picker",
         "pane-split",
+        "pi",
         "polly",
         "resume",
         "run",
@@ -1144,23 +1145,6 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "version",
     }
 )
-
-
-def _should_skip_update_check(argv: list[str]) -> bool:
-    """Decide whether the update check should be skipped for *argv*.
-
-    Skipped for help / version requests and internal subcommands
-    (``pane-split``, ``pane-picker``) that are invoked by the TUI,
-    not by the user directly.
-
-    :param argv: CLI arguments without the program name, e.g.
-        ``["run", "agent.yaml"]``.
-    :returns: ``True`` when the update check should be suppressed.
-    """
-    if not argv:
-        return True
-    first = argv[0]
-    return first in {"--help", "-h", "--version", "version", "pane-split", "pane-picker"}
 
 
 def main() -> None:
@@ -1193,11 +1177,6 @@ def main() -> None:
     _migrate_legacy_state_dir()
 
     argv = sys.argv[1:]
-
-    if not _should_skip_update_check(argv):
-        from omnigent.update_check import maybe_show_update_notice
-
-        maybe_show_update_notice()
 
     # Bare ``omnigent`` with no args behaves like ``omnigent run`` on an
     # interactive terminal: ``run`` resolves the configured default agent /
@@ -3886,6 +3865,87 @@ def codex(
         codex_args=codex_args,
         model=model,
         prompt=prompt,
+        auto_open_conversation=auto_open_conversation,
+    )
+
+
+@cli.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+@click.option(
+    "--server",
+    default=None,
+    help=(
+        "Remote omnigent URL. Ensures the host daemon, asks the "
+        "daemon-spawned runner to launch Pi, and attaches this TTY. "
+        'Pass --server "" to auto-spawn a persistent local server in the '
+        "background and use that instead of a remote one."
+    ),
+)
+@click.option(
+    "-r",
+    "--resume",
+    "resume",
+    is_flag=False,
+    flag_value=_RESUME_PICKER_SENTINEL,
+    default=None,
+    help=(
+        "Resume a prior Omnigent conversation. With a conversation id "
+        "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
+        "opens an interactive picker scoped to pi-native sessions."
+    ),
+)
+@click.option(
+    "--session",
+    "session_id",
+    metavar="SESSION_ID",
+    default=None,
+    hidden=True,
+    help="Deprecated alias for ``--resume <id>``; kept for one release.",
+)
+@click.argument("pi_args", nargs=-1, type=click.UNPROCESSED)
+def pi(
+    server: str | None,
+    resume: str | None,
+    session_id: str | None,
+    pi_args: tuple[str, ...],
+) -> None:
+    """Launch Pi TUI in an Omnigent terminal.
+
+    \b
+    Examples:
+      omnigent pi
+      omnigent pi --resume conv_abc123
+      omnigent pi --resume                    # interactive picker
+      omnigent pi --model local-deepseek/deepseek-v4-flash
+    """
+    choice = _split_resume_value(resume)
+    if session_id is not None and (choice.picker or choice.conversation_id is not None):
+        raise click.UsageError(
+            "--session and --resume are mutually exclusive; "
+            "prefer --resume (--session is deprecated).",
+        )
+
+    from omnigent.pi_native import run_pi_native
+
+    cfg = _load_effective_config()
+    if server is None:
+        server = cfg.get("server")
+    auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
+
+    server = _ensure_backend(server)
+    resolved_session_id = (
+        choice.conversation_id if choice.conversation_id is not None else session_id
+    )
+
+    run_pi_native(
+        server=server,
+        session_id=resolved_session_id,
+        resume_picker=choice.picker,
+        pi_args=pi_args,
         auto_open_conversation=auto_open_conversation,
     )
 
@@ -7651,6 +7711,102 @@ def _manage_harness_providers(family: str) -> None:
             status = _manage_credential(row.provider, family)
 
 
+def _manage_cursor_harness() -> None:
+    """Run the level-2 loop for Cursor: manage its ``CURSOR_API_KEY``.
+
+    Cursor runs via the ``cursor-sdk`` package and authenticates against
+    Cursor's own backend with a ``CURSOR_API_KEY`` — the SDK requires one (a
+    ``cursor-agent login`` does not apply, and cursor has no provider/gateway
+    family). So this manages exactly that credential: set / replace / remove an
+    API key stored in the omnigent secret store, mirroring how the other
+    harnesses persist their api keys (the secret in the store, a
+    ``keychain:``/``env:`` reference in ``~/.omnigent/config.yaml``).
+
+    :returns: None. Side effects: may write the ``cursor:`` block of
+        ``~/.omnigent/config.yaml`` and the secret store.
+    """
+    from omnigent.onboarding import secrets as secret_store
+    from omnigent.onboarding.cursor_auth import cursor_api_key_configured, cursor_api_key_ref
+    from omnigent.onboarding.interactive import select
+
+    status: str | None = None
+    while True:
+        config = _load_global_config()
+        key_set = cursor_api_key_configured(config)
+
+        rows: list[_HarnessMenuRow] = [
+            _HarnessMenuRow(
+                "Replace API key (CURSOR_API_KEY)" if key_set else "Set API key (CURSOR_API_KEY)",
+                action="set_key",
+            )
+        ]
+        if key_set:
+            rows.append(_HarnessMenuRow("Remove API key", action="remove_key"))
+        rows.append(_HarnessMenuRow("← Back", action="back"))
+
+        header = "Cursor — API key configured" if key_set else "Cursor — no API key yet"
+        idx = select(header, [r.label for r in rows], clear_on_exit=True, status=status)
+        if idx < 0:  # Esc / q
+            return
+        action = rows[idx].action
+        if action == "back":
+            return
+        if action == "set_key":
+            status = _set_cursor_api_key()
+        elif action == "remove_key":
+            ref = cursor_api_key_ref(config)
+            # Only a keychain-stored secret is ours to delete; an ``env:`` ref
+            # points at the user's own environment, so just drop the config.
+            if ref is not None and ref.startswith("keychain:"):
+                secret_store.delete_secret(ref[len("keychain:") :])
+            _save_global_config({}, unset_keys=("cursor",))
+            status = "✓ Removed Cursor API key"
+
+
+def _set_cursor_api_key() -> str | None:
+    """Prompt for and store a Cursor ``CURSOR_API_KEY``; return a status line.
+
+    Offers an existing ``CURSOR_API_KEY`` from the environment first (recorded
+    as an ``env:`` reference, so the secret never enters the config or the
+    secret store), else reads the key with a hidden prompt and stores it in the
+    omnigent secret store under ``keychain:cursor``. The ``crsr_`` prefix is
+    validated with a soft warning so a wrong paste is caught without
+    hard-blocking a future key format. The key value is never echoed.
+
+    :returns: A confirmation string for the menu's transient status, or
+        ``None`` when the user aborted (empty input / declined the warning).
+    """
+    from omnigent.onboarding import secrets as secret_store
+    from omnigent.onboarding.cursor_auth import (
+        CURSOR_SECRET_NAME,
+        cursor_api_key_settings,
+        looks_like_cursor_api_key,
+    )
+    from omnigent.onboarding.interactive import prompt_text
+
+    detected = os.environ.get("CURSOR_API_KEY")
+    if detected and click.confirm(
+        "Detected CURSOR_API_KEY in the environment — use it?", default=True
+    ):
+        if not looks_like_cursor_api_key(detected) and not click.confirm(
+            "$CURSOR_API_KEY doesn't start with 'crsr_'. Use it anyway?", default=False
+        ):
+            return None
+        _save_global_config(cursor_api_key_settings("env:CURSOR_API_KEY"))
+        return "✓ Cursor API key set (from $CURSOR_API_KEY)"
+
+    pasted = prompt_text("Cursor API key (CURSOR_API_KEY)", hide_input=True).strip()
+    if not pasted:
+        return None
+    if not looks_like_cursor_api_key(pasted) and not click.confirm(
+        "That doesn't start with 'crsr_'. Store it anyway?", default=False
+    ):
+        return None
+    secret_store.store_secret(CURSOR_SECRET_NAME, pasted)
+    _save_global_config(cursor_api_key_settings(f"keychain:{CURSOR_SECRET_NAME}"))
+    return "✓ Cursor API key stored"
+
+
 def _manage_credential(provider: str, family: str) -> str | None:
     """Run the level-3 loop for one credential: make default / remove.
 
@@ -7930,7 +8086,8 @@ def _run_configure_harnesses_interactive() -> None:
         performs while navigating.
     """
     from omnigent.onboarding.configure_models import family_label
-    from omnigent.onboarding.harness_install import harness_cli_installed
+    from omnigent.onboarding.cursor_auth import cursor_api_key_configured
+    from omnigent.onboarding.harness_install import CURSOR_KEY, harness_cli_installed
     from omnigent.onboarding.interactive import select
     from omnigent.onboarding.provider_config import (
         ANTHROPIC_FAMILY,
@@ -8006,6 +8163,26 @@ def _run_configure_harnesses_interactive() -> None:
                 options.append(f"  {sub_line}")
                 selectable.append(False)  # a sub-line — cursor skips it
                 row_target.append(None)
+        # Cursor: runs via the ``cursor-sdk`` package and authenticates with a
+        # ``CURSOR_API_KEY`` (the SDK requires one; it has no provider/gateway
+        # family and a ``cursor-agent login`` does not apply). So readiness is
+        # simply whether an API key is configured — one stored by setup (the
+        # ``cursor:`` block) or inherited from the environment — and its
+        # drill-in manages exactly that key.
+        cursor_key_set = cursor_api_key_configured(config) or bool(
+            os.environ.get("CURSOR_API_KEY")
+        )
+        options.append(f"{'  ' if cursor_key_set else '[red]✗[/] '}Cursor")
+        selectable.append(True)
+        row_target.append(CURSOR_KEY)
+        cursor_sub = (
+            "[green]✓[/] API key configured"
+            if cursor_key_set
+            else "[dim]no API key yet — open to add one[/]"
+        )
+        options.append(f"  {cursor_sub}")
+        selectable.append(False)
+        row_target.append(None)
         options.append("Quit")
         selectable.append(True)
         row_target.append(_QUIT)
@@ -8018,7 +8195,9 @@ def _run_configure_harnesses_interactive() -> None:
         if idx < 0:  # Esc / q — exit
             return
         target = row_target[idx]
-        if target in families:
+        if target == CURSOR_KEY:
+            _manage_cursor_harness()
+        elif target in families:
             _manage_harness_providers(target)
         else:  # Quit row (or, defensively, a non-family row)
             return

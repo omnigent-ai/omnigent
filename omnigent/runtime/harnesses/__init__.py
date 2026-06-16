@@ -61,6 +61,8 @@ _HARNESS_MODULES: dict[str, str] = {
     # Step 4d: pi harness wrap. See
     # omnigent/inner/pi_harness.py.
     "pi": "omnigent.inner.pi_harness",
+    # Native Pi TUI bridge used by ``omnigent pi``.
+    "pi-native": "omnigent.inner.pi_native_harness",
     # Step 4e: openai-agents harness wrap. See
     # omnigent/inner/openai_agents_sdk_harness.py. Registry
     # key is the Omnigent-side spelling (``openai-agents``,

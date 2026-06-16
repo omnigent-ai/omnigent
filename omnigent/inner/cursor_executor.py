@@ -1,40 +1,46 @@
-"""CursorExecutor: run agents through a persistent ``cursor-agent acp`` session.
+"""CursorExecutor: run agents through the Cursor Python SDK (``cursor-sdk``).
 
-Drives Cursor's ``cursor-agent`` CLI over the Agent Client Protocol (ACP,
-``cursor-agent acp``). Per Omnigent conversation it holds one ACP session
-(``session/new``) that stays open across turns; each ``run_turn`` sends one
-``session/prompt`` and translates the streamed ``session/update`` notifications
-into ExecutorEvents (assistant text → :class:`TextChunk`, agent thoughts →
-:class:`ReasoningChunk`, tool calls → :class:`ToolCallRequest` /
-:class:`ToolCallComplete`), completing on the prompt response's ``stopReason``.
-The ACP transport lives in :class:`omnigent.inner.cursor_acp.AcpClient`.
+Drives Cursor via :mod:`cursor_sdk` over a local bridge — one persistent
+``AsyncAgent`` per Omnigent conversation, created on a
+:meth:`cursor_sdk.AsyncClient.launch_bridge` client and reused turn to turn.
+Each ``run_turn`` issues one ``agent.send`` and translates the streamed
+``run.messages()`` (``SDKMessage`` objects) into ExecutorEvents:
+assistant text → :class:`TextChunk`, thinking → :class:`ReasoningChunk`,
+tool calls → :class:`ToolCallRequest` / :class:`ToolCallComplete`, completing
+on the run's terminal :class:`cursor_sdk.RunResult`.
 
-cursor-agent talks only to Cursor's own backend (``CURSOR_API_KEY`` /
-``cursor-agent login``); there is no Databricks gateway, so a ``databricks-*``
-model id is dropped in favor of cursor's default. The launch passes ``--yolo``
-(auto-approve all actions — headless workers can't answer permission prompts).
-The system prompt is prepended
-to the first turn (ACP has no system-prompt field). The agent uses its own
-native tools; bridging Omnigent spec-declared tools would require an http/sse
-MCP server via ``session/new`` ``mcpServers``, and ACP reports no token usage.
+Crucially, Omnigent's spec-declared tools (``sys_session_send`` et al.) are
+bridged into Cursor **in-process** via the SDK's ``custom_tools``: each
+:class:`~omnigent.inner.executor.ToolSpec` becomes a ``cursor_sdk.CustomTool``
+whose ``execute`` callback routes back to the executor's ``_tool_executor`` —
+the same pattern the claude-sdk harness uses with its in-process MCP tools. So
+a Cursor agent can call ``sys_*``, orchestrate sub-agents, and respect policies,
+i.e. full first-party parity. (This replaces the earlier ``cursor-agent acp``
+transport, whose ACP mode exposed MCP servers only as read-only *resources*,
+never callable tools.)
+
+The SDK's tool-callback server runs on a daemon thread, so each ``execute``
+hops back to the main event loop with :func:`asyncio.run_coroutine_threadsafe`.
+
+Auth: a Cursor **API key** (``CURSOR_API_KEY`` or a spec ``api_key``). Unlike
+``cursor-agent login``, the SDK requires an API key.
 
 Requirements:
-    The ``cursor-agent`` CLI must be installed and on PATH (or
-    ``HARNESS_CURSOR_PATH`` set).
+    The ``cursor-sdk`` package must be installed (it bundles / locates the
+    local bridge it drives).
 """
 
 from __future__ import annotations
 
-import contextlib
+import asyncio
+import json
 import logging
 import os
-import shutil
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeAlias
 
-from .cursor_acp import AcpClient, AcpError
 from .datamodel import OSEnvSpec
 from .executor import (
     Executor,
@@ -46,6 +52,7 @@ from .executor import (
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
+    ToolCallStatus,
     ToolSpec,
     TurnComplete,
     classify_tool_result,
@@ -53,89 +60,50 @@ from .executor import (
 
 logger = logging.getLogger(__name__)
 
-# One ACP ``session/update`` payload (the inner ``params.update`` object).
-# Opaque JSON owned by the ACP spec / cursor-agent.
-AcpUpdate: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
+# Omnigent's bridged-tool callback: (tool_name, args) -> awaitable result.
+# Installed by the runtime adapter (see ``_executor_adapter``); mirrors the
+# claude-sdk executor's ``ToolExecutor``.
+ToolExecutor: TypeAlias = Callable[[str, dict[str, Any]], Awaitable[Any]]  # type: ignore[explicit-any]
 
-# Prefix-matched env var names allowed into the cursor-agent subprocess. Only
-# known-safe categories pass: Cursor's own config knobs, proxy/TLS settings,
-# Node.js runtime knobs (cursor-agent bundles a Node runtime), and locale.
-# Credential families (``DATABRICKS_*``, ``AWS_*``, provider API keys, ...)
-# deliberately do NOT match — mirrors :data:`pi_executor._PI_ENV_ALLOW_PREFIXES`.
-_CURSOR_ENV_ALLOW_PREFIXES: tuple[str, ...] = (
-    "CURSOR_",
-    "HTTP_",
-    "HTTPS_",
-    "ALL_PROXY",
-    "NO_PROXY",
-    "SSL_",
-    "NODE_",
-    "XDG_",
-    "LANG",
-    "LC_",
-)
-
-# Exact-matched env var names allowed into the cursor-agent subprocess: the
-# minimal set a POSIX CLI reasonably expects (HOME carries ~/.cursor login).
-_CURSOR_ENV_ALLOW_EXACT: frozenset[str] = frozenset(
-    {
-        "HOME",
-        "PATH",
-        "TERM",
-        "TMPDIR",
-        "TMP",
-        "TEMP",
-        "USER",
-        "LOGNAME",
-        "SHELL",
-        "TZ",
-    }
-)
+# Cursor's auto model-select, used when a spec pins no cursor model (the SDK
+# requires a model for local agents, so unlike the old ACP path we can't pass
+# ``None``).
+_DEFAULT_CURSOR_MODEL = "auto"
 
 
-def _find_cursor() -> str | None:
-    """Find the ``cursor-agent`` CLI on PATH."""
-    return shutil.which("cursor-agent")
+def _resolve_model(model: str | None) -> str:
+    """Resolve the cursor model id, dropping non-cursor ``databricks-*`` ids.
 
-
-def _sandbox_mode(os_env: OSEnvSpec | None) -> str:
-    """Map ``os_env.sandbox`` to cursor-agent's ``--sandbox`` mode.
-
-    Mirrors codex's ``_sandbox_mode``: a restrictive sandbox enables cursor's
-    own sandbox; ``"none"`` / unset (the headless default) disables it for full
-    access. Enforcement is cursor-agent's, not Omnigent's bwrap.
+    cursor-sdk accepts only Cursor model ids (``auto``, ``gpt-5``,
+    ``composer-2.5``, ...) and rejects gateway ids, so a ``databricks-*`` model
+    (from a spec authored for another harness) falls back to cursor's auto
+    select. ``None`` likewise resolves to ``auto`` (the SDK requires a model).
     """
-    sandbox = os_env.sandbox if os_env is not None else None
-    if sandbox is None or sandbox.type == "none":
-        return "disabled"
-    return "enabled"
+    if not model or model.startswith(("databricks-", "databricks/")):
+        if model:
+            logger.debug(
+                "CursorExecutor: %r is not a cursor model; using %r", model, _DEFAULT_CURSOR_MODEL
+            )
+        return _DEFAULT_CURSOR_MODEL
+    return model
 
 
-def _clean_cursor_env(extra_allowed: Sequence[str] | None = None) -> dict[str, str]:
-    """Build a filtered copy of ``os.environ`` for the cursor-agent subprocess.
+def _tools_fingerprint(tools: list[ToolSpec]) -> str:
+    """A stable fingerprint of the tool set (names + parameter schemas).
 
-    Deny-by-default allowlist mirroring :func:`pi_executor._clean_pi_env`: only
-    the known-safe prefixes/exact names pass, so host secrets (cloud tokens,
-    unrelated API keys) never reach the cursor-agent process. ``CURSOR_API_KEY``
-    is allowed via the ``CURSOR_`` prefix; the executor also injects it
-    explicitly from config when provided.
-
-    :param extra_allowed: Extra exact names to pass through, e.g. a spec's
-        ``os_env.sandbox.env_passthrough`` entries. ``None`` means no extras.
-    :returns: Filtered environment dict.
+    ``custom_tools`` are fixed at agent creation, so a changed tool set must
+    invalidate the persistent agent — otherwise removed tools stay callable and
+    newly-added tools are missing for the rest of the conversation.
     """
-    allow_exact = set(_CURSOR_ENV_ALLOW_EXACT)
-    if extra_allowed is not None:
-        allow_exact.update(extra_allowed)
-    return {
-        key: value
-        for key, value in os.environ.items()
-        if key in allow_exact or key.startswith(_CURSOR_ENV_ALLOW_PREFIXES)
-    }
+    entries = sorted(
+        (str(t.get("name", "")), json.dumps(t.get("parameters"), sort_keys=True, default=str))
+        for t in tools
+    )
+    return json.dumps(entries)
 
 
 # ---------------------------------------------------------------------------
-# Prompt building
+# Prompt building (unchanged contract from the ACP harness)
 # ---------------------------------------------------------------------------
 
 
@@ -171,24 +139,21 @@ def _build_cursor_prompt(
     is_first_turn: bool,
     system_prompt: str,
 ) -> str:
-    """Build the prompt text for a ``session/prompt``.
+    """Build the prompt text for an ``agent.send``.
 
-    cursor-agent's ACP session has no system-prompt field, so on the first turn
-    the Omnigent system prompt is prepended. When the first turn also carries
-    prior history (e.g. a sub-agent with ``pass_history=True``), the
-    conversation is serialized so cursor has context. On subsequent turns the
-    ACP session already holds the history, so only the latest user message is
-    sent.
+    The SDK agent persists conversation history across ``send`` calls, so on the
+    first turn the Omnigent system prompt is prepended (the SDK has no separate
+    system-prompt field), and any prior history (a sub-agent with
+    ``pass_history=True``) is serialized for context. On subsequent turns the
+    agent already holds the history, so only the latest user message is sent.
 
-    :param messages: Omnigent conversation history for the turn.
-    :param is_first_turn: ``True`` when this is the first turn against a fresh
-        cursor session (system prompt + any prior history must be included).
-    :param system_prompt: The Omnigent system prompt. Prepended only on the
-        first turn; pass ``""`` to skip.
-    :returns: The prompt string (empty string when there is nothing to send).
+    :returns: The prompt string (empty when there is nothing to send).
     """
-    user_messages = [m for m in messages if m.get("role") == "user"]
-    if is_first_turn and len(messages) > 1 and len(user_messages) > 1:
+    # Serialize prior history on the first turn whenever there is any (e.g. a
+    # ``pass_history=True`` sub-agent handed a single user message plus assistant
+    # / tool context) — not only when multiple *user* messages are present, which
+    # would drop that context.
+    if is_first_turn and len(messages) > 1:
         lines = ["Conversation so far:"]
         for msg in messages:
             role = str(msg.get("role") or "user").replace("_", " ")
@@ -207,46 +172,70 @@ def _build_cursor_prompt(
 
 
 # ---------------------------------------------------------------------------
-# session/update → ExecutorEvent
+# SDKMessage → ExecutorEvent
 # ---------------------------------------------------------------------------
 
 
-def _update_to_event(update: AcpUpdate) -> ExecutorEvent | None:
-    """Map one ACP ``session/update`` to an ExecutorEvent, or ``None`` to skip.
+def _sdk_message_to_events(message: Any) -> list[ExecutorEvent]:  # type: ignore[explicit-any]
+    """Map one ``cursor_sdk`` ``SDKMessage`` to zero or more ExecutorEvents.
 
-    :param update: The ``params.update`` object from a ``session/update``
-        notification (carries a ``sessionUpdate`` discriminator).
-    :returns: The mapped event, or ``None`` for updates with nothing to surface
-        (mode changes, command lists, plans, echoed user input).
+    Handles the message types the harness surfaces; everything else (status,
+    system, task, user echoes) yields nothing.
     """
-    kind = update.get("sessionUpdate")
-    content = update.get("content")
-    text = content.get("text") if isinstance(content, dict) else None
+    mtype = getattr(message, "type", None)
+    events: list[ExecutorEvent] = []
 
-    if kind == "agent_message_chunk":
-        return TextChunk(text=text) if isinstance(text, str) and text else None
-    if kind == "agent_thought_chunk":
-        if isinstance(text, str) and text:
-            return ReasoningChunk(delta=text, event_type="reasoning_text")
-        return None
-    if kind == "tool_call":
-        raw_input = update.get("rawInput")
-        return ToolCallRequest(
-            name=str(update.get("title") or update.get("kind") or "tool"),
-            args=raw_input if isinstance(raw_input, dict) else {},
-            metadata={"call_id": update.get("toolCallId")},
-        )
-    if kind == "tool_call_update" and update.get("status") == "completed":
-        result = update.get("content")
-        classification = classify_tool_result(result)
-        return ToolCallComplete(
-            name=str(update.get("title") or "tool"),
-            status=classification.status,
-            result=result,
-            error=classification.error or None,
-            metadata={"call_id": update.get("toolCallId")},
-        )
-    return None
+    if mtype == "assistant":
+        content = getattr(getattr(message, "message", None), "content", ()) or ()
+        for block in content:
+            if getattr(block, "type", None) == "text":
+                text = getattr(block, "text", "") or ""
+                if text:
+                    events.append(TextChunk(text=text))
+        return events
+
+    if mtype == "thinking":
+        text = getattr(message, "text", "") or ""
+        if text:
+            events.append(ReasoningChunk(delta=text, event_type="reasoning_text"))
+        return events
+
+    if mtype == "tool_call":
+        status = getattr(message, "status", "")
+        name = str(getattr(message, "name", "") or "tool")
+        raw_args = getattr(message, "args", None)
+        args: dict[str, Any] = raw_args if isinstance(raw_args, dict) else {}
+        # Cursor surfaces host custom tools under an envelope: name == "mcp",
+        # args == {providerIdentifier, toolName, args}. Unwrap to the real
+        # Omnigent tool name + args so the observed events (and any name-keyed
+        # policy / UI) see the actual tool, not "mcp".
+        if "toolName" in args:
+            name = str(args.get("toolName") or name)
+            inner = args.get("args")
+            args = inner if isinstance(inner, dict) else {}
+        call_id = getattr(message, "call_id", None)
+        if status == "running":
+            events.append(ToolCallRequest(name=name, args=args, metadata={"call_id": call_id}))
+        elif status in ("completed", "error"):
+            result = getattr(message, "result", None)
+            classification = classify_tool_result(result)
+            tool_status = classification.status
+            error = classification.error or None
+            if status == "error":
+                tool_status = ToolCallStatus.ERROR
+                error = error or (str(result) if result else "tool call failed")
+            events.append(
+                ToolCallComplete(
+                    name=name,
+                    status=tool_status,
+                    result=result,
+                    error=error,
+                    metadata={"call_id": call_id},
+                )
+            )
+        return events
+
+    return events
 
 
 # ---------------------------------------------------------------------------
@@ -256,17 +245,18 @@ def _update_to_event(update: AcpUpdate) -> ExecutorEvent | None:
 
 @dataclass
 class _CursorSessionState:
-    """Per-Omnigent-conversation ACP session state."""
+    """Per-Omnigent-conversation SDK session state."""
 
-    client: AcpClient | None = None
-    session_id: str | None = None
+    client: Any = None  # cursor_sdk.AsyncClient
+    agent: Any = None  # cursor_sdk.AsyncAgent
     system_prompt: str | None = None
     model: str | None = None
+    tools_fingerprint: str | None = None
     has_sent_prompt: bool = False
 
 
 class CursorExecutor(Executor):
-    """Execute agent turns via a persistent ``cursor-agent acp`` session."""
+    """Execute agent turns via a persistent ``cursor_sdk.AsyncAgent``."""
 
     def __init__(
         self,
@@ -274,7 +264,6 @@ class CursorExecutor(Executor):
         cwd: str | None = None,
         os_env: OSEnvSpec | None = None,
         model: str | None = None,
-        cursor_path: str | None = None,
         api_key: str | None = None,
         bundle_dir: Path | None = None,
         agent_name: str | None = None,
@@ -282,40 +271,33 @@ class CursorExecutor(Executor):
     ) -> None:
         """Create a CursorExecutor.
 
-        :param cwd: Working directory the ACP session operates in. ``None``
+        :param cwd: Working directory the local agent operates in. ``None``
             falls back to ``os_env.cwd`` then the process cwd.
         :param os_env: Optional OS environment / sandbox spec (its ``cwd`` is
             used when *cwd* is unset).
         :param model: Cursor model id (e.g. ``"gpt-5"``); a ``databricks-*`` id
-            is dropped in favor of cursor's default. ``None`` uses the default.
-        :param cursor_path: Absolute path to ``cursor-agent``. ``None`` searches PATH.
-        :param api_key: Cursor API key injected as ``CURSOR_API_KEY``. ``None``
-            relies on an inherited key or a prior ``cursor-agent login``.
+            or ``None`` falls back to cursor's ``auto`` select.
+        :param api_key: Cursor API key. ``None`` falls back to ``CURSOR_API_KEY``
+            in the environment.
         :param bundle_dir: Reserved for future skill wiring; unused in v1.
-        :param agent_name: Reserved for future use.
+        :param agent_name: Optional agent name passed to the SDK.
         :param skills_filter: Accepted for parity; cursor has no skill mechanism here.
-        :raises ImportError: When ``cursor-agent`` is not found.
         """
-        resolved = cursor_path or _find_cursor()
-        if not resolved:
-            raise ImportError(
-                "CursorExecutor requires the 'cursor-agent' CLI on PATH. "
-                "Install it with: curl https://cursor.com/install -fsS | bash"
-            )
-        self._cursor_path = resolved
         self._cwd = cwd or (os_env.cwd if os_env is not None else None)
         self._os_env_spec = os_env
         self._model_override = model
+        self._api_key = api_key or os.environ.get("CURSOR_API_KEY") or None
         self._bundle_dir = bundle_dir
         self._agent_name = agent_name
         self._skills_filter = skills_filter
-        passthrough = (
-            os_env.sandbox.env_passthrough if os_env is not None and os_env.sandbox else None
-        )
-        self._env: dict[str, str] = _clean_cursor_env(passthrough)
-        if api_key:
-            self._env["CURSOR_API_KEY"] = api_key
         self._session_states: dict[str, _CursorSessionState] = {}
+        # Installed by the runtime adapter; routes a bridged-tool call back into
+        # Omnigent's session (policy gating, sub-agent dispatch, logging).
+        self._tool_executor: ToolExecutor | None = None
+        # Installed by the runtime adapter; evaluates PHASE_LLM_REQUEST /
+        # PHASE_LLM_RESPONSE policies (the same round-trip pi / claude-sdk use).
+        # ``None`` on single-process / pre-turn paths (then policy is a no-op).
+        self._policy_evaluator: Callable[[str, dict[str, Any]], Awaitable[Any]] | None = None
 
     def supports_streaming(self) -> bool:
         return True
@@ -324,11 +306,14 @@ class CursorExecutor(Executor):
         return True
 
     def handles_tools_internally(self) -> bool:
+        # Bridged tools execute in-band via the SDK custom_tools callback (which
+        # calls ``_tool_executor``), so the runtime adapter must NOT re-dispatch
+        # the observed tool events — same contract as claude-sdk.
         return True
 
     def supports_live_message_queue(self) -> bool:
-        # Unlike claude-sdk / codex / pi, ACP exposes no confirmed mid-turn
-        # steer, so a message can't be injected into a running turn.
+        # The SDK exposes no confirmed mid-turn steer, so a message can't be
+        # injected into a running turn.
         return False
 
     def _session_key(self, messages: list[Message]) -> str:
@@ -341,24 +326,215 @@ class CursorExecutor(Executor):
                 return str(meta["session_id"])
         return "__default__"
 
-    def _resolve_model(self, config: ExecutorConfig | None) -> str | None:
-        """Resolve the cursor model; drop non-cursor ``databricks-*`` ids.
+    # -- custom-tool bridge -------------------------------------------------
 
-        cursor-agent accepts only Cursor model ids (``auto``, ``gpt-5``,
-        ``claude-4.5-sonnet``, ...) and rejects gateway ids, so a
-        ``databricks-*`` model (from a spec authored for another harness) falls
-        back to cursor's default. Returns ``None`` to use cursor's default.
+    def _make_custom_tools(
+        self, tools: list[ToolSpec], loop: asyncio.AbstractEventLoop
+    ) -> dict[str, Any]:  # type: ignore[explicit-any]
+        """Build the SDK ``custom_tools`` mapping from Omnigent ToolSpecs.
+
+        Each tool's ``execute`` runs on the SDK callback server's daemon thread,
+        so it hops back to *loop* (the main event loop) to await
+        ``_tool_executor`` — the bridge into Omnigent's tool dispatch.
         """
-        cfg = config or ExecutorConfig()
-        model = cfg.model or self._model_override
-        if model and model.startswith(("databricks-", "databricks/")):
-            logger.debug("CursorExecutor: %r is not a cursor model; using cursor's default", model)
-            return None
-        return model
+        from cursor_sdk import CustomTool  # lazy: optional dependency
+
+        custom: dict[str, Any] = {}  # type: ignore[explicit-any]
+        for spec in tools:
+            name = spec.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            params = spec.get("parameters")
+            custom[name] = CustomTool(
+                execute=self._make_execute(name, loop),
+                description=spec.get("description"),
+                input_schema=params
+                if isinstance(params, dict)
+                else {"type": "object", "properties": {}},
+            )
+        return custom
+
+    def _make_execute(
+        self, tool_name: str, loop: asyncio.AbstractEventLoop
+    ) -> Callable[[dict[str, Any], Any], str]:  # type: ignore[explicit-any]
+        """Build a sync ``execute`` that bridges a cursor tool call to Omnigent.
+
+        Runs on the SDK callback thread; blocks it on the main-loop coroutine via
+        ``run_coroutine_threadsafe`` (no tight timeout — ``sys_session_send`` and
+        friends can legitimately run for minutes).
+        """
+
+        def execute(args: dict[str, Any], _ctx: Any) -> str:  # type: ignore[explicit-any]
+            if self._tool_executor is None:
+                return f"Tool {tool_name!r} is unavailable: no tool executor wired."
+            coro = self._tool_executor(tool_name, dict(args or {}))
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
+            result = future.result()
+            if isinstance(result, str):
+                return result
+            try:
+                return json.dumps(result, default=str)
+            except (TypeError, ValueError):
+                return str(result)
+
+        return execute
+
+    # -- session lifecycle --------------------------------------------------
+
+    async def _ensure_session(
+        self, state: _CursorSessionState, model: str, tools: list[ToolSpec]
+    ) -> None:
+        """Launch the local bridge and create the SDK agent if not already live.
+
+        On any bring-up failure the partially-created client is closed before
+        propagating, so a bad ``CURSOR_API_KEY`` / launch error can't orphan a
+        bridge subprocess.
+        """
+        if state.agent is not None:
+            return
+        try:
+            from cursor_sdk import AsyncAgent, AsyncClient, LocalAgentOptions
+        except ImportError as exc:
+            raise ImportError(
+                "CursorExecutor requires the 'cursor-sdk' package. "
+                "Install it with: uv pip install cursor-sdk"
+            ) from exc
+
+        loop = asyncio.get_running_loop()
+        cwd = self._cwd or os.getcwd()
+        client = await AsyncClient.launch_bridge(workspace=cwd)
+        try:
+            local = LocalAgentOptions(
+                cwd=cwd,
+                custom_tools=self._make_custom_tools(tools, loop) or None,
+            )
+            agent = await AsyncAgent.create(
+                client=client,
+                model=model,
+                api_key=self._api_key,
+                name=self._agent_name,
+                local=local,
+            )
+        except BaseException:
+            await _safe_close(client)
+            raise
+        state.client = client
+        state.agent = agent
+
+    async def run_turn(
+        self,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        system_prompt: str,
+        config: ExecutorConfig | None = None,
+    ) -> AsyncIterator[ExecutorEvent]:
+        session_key = self._session_key(messages)
+        model = _resolve_model((config.model if config else None) or self._model_override)
+        tools_fp = _tools_fingerprint(tools)
+        state = self._session_states.setdefault(session_key, _CursorSessionState())
+
+        # System prompt, model, and tool set are all fixed at agent creation, so
+        # a change to any of them means a fresh agent (otherwise a changed tool
+        # set would leave the initial custom_tools stale for the conversation).
+        if state.agent is not None and (
+            state.system_prompt != system_prompt
+            or state.model != model
+            or state.tools_fingerprint != tools_fp
+        ):
+            await self._close_state(state)
+            state = _CursorSessionState()
+            self._session_states[session_key] = state
+        is_first_turn = not state.has_sent_prompt
+        state.system_prompt = system_prompt
+        state.model = model
+        state.tools_fingerprint = tools_fp
+
+        try:
+            await self._ensure_session(state, model, tools)
+        except Exception as exc:  # noqa: BLE001 — surfaced as ExecutorError (CancelledError propagates)
+            await self.close_session(session_key)
+            yield ExecutorError(message=f"Failed to start cursor-sdk agent: {exc}")
+            return
+
+        prompt = _build_cursor_prompt(
+            messages, is_first_turn=is_first_turn, system_prompt=system_prompt
+        )
+        if not prompt:
+            yield TurnComplete(response=None)
+            return
+
+        # PHASE_LLM_REQUEST policy (parity with claude-sdk / pi): evaluate before
+        # the LLM call so a DENY blocks it. No-op when no evaluator is wired.
+        policy_eval = self._policy_evaluator
+        if policy_eval is not None:
+            req_verdict = await policy_eval(
+                "PHASE_LLM_REQUEST",
+                {
+                    "model": model,
+                    "messages_count": sum(1 for m in messages if m.get("role") == "user") or 1,
+                    "tools_count": len(tools),
+                    "system_prompt_preview": system_prompt[:200] if system_prompt else "",
+                    "last_user_message": _latest_user_text(messages)[:500],
+                },
+            )
+            if getattr(req_verdict, "action", "") == "POLICY_ACTION_DENY":
+                reason = getattr(req_verdict, "reason", "") or "no reason given"
+                yield ExecutorError(message=f"LLM call denied by policy: {reason}")
+                return
+
+        state.has_sent_prompt = True
+        response_text = ""
+        tool_calls = 0
+        try:
+            run = await state.agent.send(prompt)
+            async for message in run.messages():
+                for event in _sdk_message_to_events(message):
+                    if isinstance(event, TextChunk):
+                        response_text += event.text
+                    elif isinstance(event, ToolCallRequest):
+                        tool_calls += 1
+                    yield event
+            result = await run.wait()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — the SDK run failed mid-turn
+            await self.close_session(session_key)
+            yield ExecutorError(message=f"cursor-sdk turn failed: {exc}", retryable=True)
+            return
+
+        status = getattr(result, "status", "")
+        if status == "error":
+            await self.close_session(session_key)
+            detail = getattr(result, "result", "") or "cursor-sdk run reported an error"
+            yield ExecutorError(message=f"cursor-sdk run error: {detail}", retryable=True)
+            return
+
+        final = getattr(result, "result", "") or response_text or None
+        # PHASE_LLM_RESPONSE policy (parity with the peer harnesses): evaluate the
+        # completed response before TurnComplete so a DENY blocks persistence.
+        if policy_eval is not None:
+            resp_verdict = await policy_eval(
+                "PHASE_LLM_RESPONSE",
+                {
+                    "model": model,
+                    "text_preview": response_text[:500] if response_text else "",
+                    "tool_calls_count": tool_calls,
+                },
+            )
+            if getattr(resp_verdict, "action", "") == "POLICY_ACTION_DENY":
+                reason = getattr(resp_verdict, "reason", "") or "no reason given"
+                yield ExecutorError(message=f"LLM response denied by policy: {reason}")
+                return
+
+        # The SDK RunResult carries no token counts, so the turn is left unpriced.
+        yield TurnComplete(response=final, usage=None)
 
     async def _close_state(self, state: _CursorSessionState) -> None:
+        if state.agent is not None:
+            await _safe_close(state.agent)
+            state.agent = None
         if state.client is not None:
-            await state.client.close()
+            await _safe_close(state.client)
             state.client = None
 
     async def close_session(self, session_key: str) -> None:
@@ -370,12 +546,9 @@ class CursorExecutor(Executor):
         state = self._session_states.get(session_key)
         if state is None:
             return False
-        if state.client is not None and state.session_id is not None:
-            with contextlib.suppress(Exception):
-                await state.client.cancel(state.session_id)
-        # Always drop the session so the next turn starts fresh — same rationale
-        # as the pi executor (a resumed turn would bypass the runner's interrupt
-        # marker).
+        # Drop the session so the next turn starts a fresh agent — mirrors the
+        # pi/cursor-acp executors (a resumed turn would bypass the runner's
+        # interrupt marker).
         try:
             await self.close_session(session_key)
             return True
@@ -387,87 +560,23 @@ class CursorExecutor(Executor):
         for key in list(self._session_states.keys()):
             await self.close_session(key)
 
-    async def _ensure_session(self, state: _CursorSessionState, model: str | None) -> None:
-        """Spawn the ACP server and open a session if one isn't live."""
-        if state.client is not None and state.client.running:
-            return
-        cwd = self._cwd or os.getcwd()
-        client = AcpClient(
-            self._cursor_path,
-            env=self._env,
-            cwd=cwd,
-            extra_args=["--sandbox", _sandbox_mode(self._os_env_spec), "--yolo"],
-        )
-        await client.start()
-        state.session_id = await client.new_session(cwd=cwd, model=model, mcp_servers=[])
-        state.client = client
 
-    async def run_turn(
-        self,
-        messages: list[Message],
-        tools: list[ToolSpec],  # noqa: ARG002 — cursor uses its own native tools in v1
-        system_prompt: str,
-        config: ExecutorConfig | None = None,
-    ) -> AsyncIterator[ExecutorEvent]:
-        session_key = self._session_key(messages)
-        model = self._resolve_model(config)
-        state = self._session_states.setdefault(session_key, _CursorSessionState())
+async def _safe_close(obj: Any) -> None:  # type: ignore[explicit-any]
+    """Best-effort async close of a ``cursor_sdk`` object, preferring ``aclose()``.
 
-        # The system prompt is baked into the first turn and the model is fixed
-        # at session creation, so a change to either means a fresh ACP session.
-        if state.client is not None and (
-            state.system_prompt != system_prompt or state.model != model
-        ):
-            await self._close_state(state)
-            state = _CursorSessionState()
-            self._session_states[session_key] = state
-        is_first_turn = not state.has_sent_prompt
-        state.system_prompt = system_prompt
-        state.model = model
-
-        try:
-            await self._ensure_session(state, model)
-        except (AcpError, OSError, ImportError) as exc:
-            await self.close_session(session_key)
-            yield ExecutorError(message=f"Failed to start cursor-agent acp: {exc}")
-            return
-
-        prompt = _build_cursor_prompt(
-            messages, is_first_turn=is_first_turn, system_prompt=system_prompt
-        )
-        if not prompt:
-            yield TurnComplete(response=None)
-            return
-
-        assert state.client is not None and state.session_id is not None
-        state.has_sent_prompt = True
-        response_text = ""
-        try:
-            async for kind, payload in state.client.prompt_stream(
-                state.session_id, [{"type": "text", "text": prompt}]
-            ):
-                if kind == "update":
-                    event = _update_to_event(payload)
-                    if event is not None:
-                        if isinstance(event, TextChunk):
-                            response_text += event.text
-                        yield event
-                elif kind == "error":
-                    yield ExecutorError(
-                        message=f"cursor-agent acp error: {payload}", retryable=True
-                    )
-                    return
-                else:  # "result"
-                    # stopReason in payload; ACP reports no token usage, so the
-                    # turn is left unpriced (usage=None).
-                    yield TurnComplete(response=response_text or None, usage=None)
-                    return
-        except AcpError as exc:
-            # The ACP server died mid-turn — drop the session so the next turn
-            # respawns it, and surface a retryable error.
-            stderr = state.client.stderr_tail() if state.client is not None else ""
-            await self.close_session(session_key)
-            suffix = f" Stderr: {stderr}" if stderr else ""
-            yield ExecutorError(
-                message=f"cursor-agent acp turn failed: {exc}{suffix}", retryable=True
-            )
+    The SDK's :class:`cursor_sdk.AsyncClient` exposes only ``aclose()`` — and
+    that is the *only* path that terminates the launched bridge subprocess and
+    shuts down the tool-callback server's daemon HTTP thread. :class:`AsyncAgent`
+    exposes ``close()`` instead. Calling a method the object doesn't have raised
+    ``AttributeError`` (swallowed below), so the client was never torn down and
+    every session leaked its bridge subprocess + daemon thread. Prefer ``aclose``
+    and fall back to ``close``; a teardown failure must not mask the original
+    error or leave the closer raising.
+    """
+    closer = getattr(obj, "aclose", None) or getattr(obj, "close", None)
+    if closer is None:
+        return
+    try:
+        await closer()
+    except Exception as exc:  # noqa: BLE001 — best-effort teardown
+        logger.debug("CursorExecutor: close failed: %s", exc)

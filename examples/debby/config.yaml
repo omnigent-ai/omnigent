@@ -113,13 +113,36 @@ prompt: |
 async: true
 cancellable: true
 
-# Debby only orchestrates the two responders and formats their output; she
-# needs no filesystem, shell, or terminals of her own.
+# Debby orchestrates the two responders and formats their output. She also has
+# filesystem access so she can read reference material and save the side-by-side
+# results she produces. Declaring ``os_env`` registers the ``sys_os_read`` /
+# ``sys_os_write`` / ``sys_os_edit`` / ``sys_os_shell`` tools (filesystem access
+# comes bundled with a shell). ``sandbox: type: none`` runs unsandboxed in the
+# caller's working directory.
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
+
+# Same blast-radius guardrail Polly uses, so Debby's shell behaves identically:
+# the catastrophic set (force-push, ``rm -rf /``, hard-reset to a remote ref) is
+# denied outright, while everything else runs without an ASK
+# (``gate_pushes: false``).
+guardrails:
+  policies:
+    blast_radius:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.blast_radius
+        arguments:
+          gate_pushes: false
 
 tools:
-  # The two plain brainstorming partners — see agents/<name>/. Both are pure
-  # responders (no coding tools); claude runs on claude-sdk, gpt on
-  # openai-agents.
+  # The two brainstorming partners — see agents/<name>/. Both reason and write,
+  # and each has its own filesystem access (`os_env`); claude runs on claude-sdk,
+  # gpt on openai-agents.
   agents:
     - claude
     - gpt

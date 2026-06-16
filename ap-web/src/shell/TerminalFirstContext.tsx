@@ -9,7 +9,7 @@
 // from different conversation labels:
 //
 //   - `omnigent.wrapper === "claude-code-native-ui"` → `isClaudeNative`
-//   - `omnigent.wrapper` ∈ {"claude-code-native-ui", "codex-native-ui"} → `isNativeWrapper`
+//   - registered `omnigent.wrapper` native value    → `isNativeWrapper`
 //   - `omnigent.ui === "terminal"`                  → `isTerminalFirst`
 //
 // `isTerminalFirst` is purely presentational (the Chat/Terminal pill and
@@ -29,8 +29,7 @@ export interface TerminalFirstContextValue {
   /** True when `omnigent.wrapper === "claude-code-native-ui"`. */
   isClaudeNative: boolean;
   /**
-   * True when the session runs a native-CLI wrapper (claude-native or
-   * codex-native). Keys harness *behavior* gates — composer slash
+   * True when the session runs a native-CLI wrapper. Keys harness *behavior* gates — composer slash
    * commands and the `/model` command — unlike `isTerminalFirst`,
    * which only gates presentation (SDK sessions with an embedded
    * Omnigent REPL terminal are terminal-first but not native).

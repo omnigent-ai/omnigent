@@ -17,6 +17,9 @@ Install local prerequisites first:
   environments and dependency management.
 - `tmux`, required for native Claude/Codex terminals launched by the local host
   (`brew install tmux` on macOS, or `apt install tmux` on Debian/Ubuntu).
+- `bubblewrap` (`bwrap`), **Linux only**, used to OS-sandbox those native
+  Claude/Codex/Pi terminals (`apt install bubblewrap` on Debian/Ubuntu). macOS
+  uses the built-in `seatbelt` sandbox and needs nothing extra.
 - Node.js 22 LTS or newer with `npm` when working on `ap-web/`.
 
 ```bash

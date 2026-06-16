@@ -55,6 +55,7 @@ from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
     OMNIGENT_REPL_TERMINAL_ROLE,
+    PI_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
@@ -398,6 +399,24 @@ class _CodexNativeLaunchConfig:
     fork_carry_history: bool
 
 
+@dataclasses.dataclass(frozen=True)
+class _PiNativeLaunchConfig:
+    """
+    Persisted launch config needed for runner-owned Pi terminal setup.
+
+    :param workspace: Workspace cwd for the Pi TUI.
+    :param server_url: Omnigent server URL for the Pi extension.
+    :param terminal_launch_args: User pass-through Pi CLI args.
+    :param external_session_id: Existing Pi session id, when captured by
+        the extension.
+    """
+
+    workspace: Path
+    server_url: str
+    terminal_launch_args: list[str] | None
+    external_session_id: str | None
+
+
 def _required_runner_env(name: str) -> str:
     """
     Return a required runner environment variable.
@@ -445,6 +464,77 @@ def _codex_session_workspace(session_workspace: str | None) -> Path:
     """
     raw = session_workspace or _required_runner_env("OMNIGENT_RUNNER_WORKSPACE")
     return Path(raw.strip()).expanduser().resolve()
+
+
+def _pi_session_workspace(session_workspace: str | None) -> Path:
+    """
+    Resolve the cwd for a runner-owned Pi terminal.
+
+    :param session_workspace: Session ``workspace`` from the server snapshot.
+    :returns: Workspace path for the terminal cwd.
+    """
+    raw = session_workspace or _required_runner_env("OMNIGENT_RUNNER_WORKSPACE")
+    return Path(raw.strip()).expanduser().resolve()
+
+
+async def _pi_native_launch_config(
+    *,
+    session_id: str,
+    server_client: httpx.AsyncClient | None,
+) -> _PiNativeLaunchConfig:
+    """
+    Fetch and validate persisted Pi launch config for a session.
+
+    :param session_id: Session/conversation id.
+    :param server_client: Runner Omnigent server client.
+    :returns: Parsed launch config.
+    """
+    if server_client is None:
+        raise RuntimeError("server_client is required for runner-owned Pi terminals.")
+    try:
+        resp = await server_client.get(
+            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+            timeout=10.0,
+        )
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"Could not fetch Pi launch config for {session_id!r}.") from exc
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"Could not fetch Pi launch config for {session_id!r}: "
+            f"GET /v1/sessions returned {resp.status_code}."
+        )
+    try:
+        snapshot = resp.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Could not fetch Pi launch config for {session_id!r}: invalid JSON."
+        ) from exc
+    if not isinstance(snapshot, dict):
+        raise RuntimeError(
+            f"Could not fetch Pi launch config for {session_id!r}: snapshot was not a JSON object."
+        )
+    terminal_launch_args = snapshot.get("terminal_launch_args")
+    if terminal_launch_args is not None and not (
+        isinstance(terminal_launch_args, list)
+        and all(isinstance(arg, str) for arg in terminal_launch_args)
+    ):
+        raise RuntimeError(f"Invalid terminal_launch_args for Pi session {session_id!r}.")
+    external_session_id = snapshot.get("external_session_id")
+    if external_session_id is not None and (
+        not isinstance(external_session_id, str) or not external_session_id
+    ):
+        raise RuntimeError(f"Invalid external_session_id for Pi session {session_id!r}.")
+    session_workspace = snapshot.get("workspace")
+    if session_workspace is not None and (
+        not isinstance(session_workspace, str) or not session_workspace
+    ):
+        raise RuntimeError(f"Invalid workspace for Pi session {session_id!r}.")
+    return _PiNativeLaunchConfig(
+        workspace=_pi_session_workspace(session_workspace),
+        server_url=os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip("/"),
+        terminal_launch_args=terminal_launch_args,
+        external_session_id=external_session_id,
+    )
 
 
 async def _codex_native_launch_config(
@@ -540,6 +630,180 @@ async def _codex_native_launch_config(
         fork_source_external_id=fork_source_external_id,
         fork_carry_history=fork_carry_history,
     )
+
+
+def _pi_args_have_session_control(args: list[str]) -> bool:
+    """
+    Return whether user Pi args already specify session behavior.
+
+    :param args: User pass-through Pi CLI args.
+    :returns: ``True`` when Omnigent should not add resume/session flags.
+    """
+    session_flags = {
+        "--session-dir",
+        "--session",
+        "--continue",
+        "--resume",
+        "--fork",
+        "--no-session",
+    }
+    for arg in args:
+        if arg in session_flags:
+            return True
+        if arg.startswith(("--session-dir=", "--session=")):
+            return True
+    return False
+
+
+def _pi_args_have_provider(args: list[str]) -> bool:
+    """Return whether user Pi args already pin a provider/model/key.
+
+    When the user passes their own ``--provider`` / ``--model`` / ``--api-key``,
+    Omnigent must not inject the ``omnigent setup`` provider on top — the
+    explicit choice wins.
+
+    :param args: User pass-through Pi CLI args.
+    :returns: ``True`` when Omnigent should not add provider/model args.
+    """
+    provider_flags = {"--provider", "--model", "--api-key"}
+    for arg in args:
+        if arg in provider_flags:
+            return True
+        if arg.startswith(("--provider=", "--model=", "--api-key=")):
+            return True
+    return False
+
+
+def _build_pi_native_args(
+    *,
+    terminal_launch_args: list[str] | None,
+    extension_path: Path,
+    session_dir: Path,
+    external_session_id: str | None,
+) -> list[str]:
+    """
+    Build Pi CLI args for a runner-owned native TUI session.
+
+    :param terminal_launch_args: User pass-through Pi args.
+    :param extension_path: Generated Omnigent Pi extension path.
+    :param session_dir: Per-Omnigent-session Pi session directory.
+    :param external_session_id: Captured Pi session id, if any.
+    :returns: Complete Pi arg vector excluding the executable.
+    """
+    user_args = list(terminal_launch_args or [])
+    args = ["--extension", str(extension_path)]
+    if not _pi_args_have_session_control(user_args):
+        args.extend(["--session-dir", str(session_dir)])
+        if external_session_id:
+            args.extend(["--session", external_session_id])
+    args.extend(user_args)
+    return args
+
+
+async def _auto_create_pi_terminal(
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+    publish_event: Callable[[str, dict[str, Any]], None],
+    *,
+    server_client: httpx.AsyncClient | None,
+) -> SessionResourceView:
+    """
+    Auto-create a Pi terminal for a pi-native session.
+
+    :param session_id: Session/conversation identifier.
+    :param resource_registry: Session resource registry for launching the
+        terminal.
+    :param publish_event: Runner session event publisher.
+    :param server_client: Runner Omnigent server client.
+    :returns: Created terminal resource view.
+    """
+    from omnigent.conversation_browser import conversation_url
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+    from omnigent.pi_native import resolve_pi_executable
+    from omnigent.pi_native_bridge import (
+        PI_NATIVE_CONFIG_ENV_VAR,
+        pi_session_dir,
+        prepare_bridge_dir,
+        write_extension_files,
+    )
+    from omnigent.pi_native_bridge import extension_path as pi_extension_path
+    from omnigent.runner._entry import _make_auth_token_factory
+
+    launch_config = await _pi_native_launch_config(
+        session_id=session_id,
+        server_client=server_client,
+    )
+    workspace = str(launch_config.workspace)
+    bridge_dir = prepare_bridge_dir(session_id)
+    pi_extension = pi_extension_path(bridge_dir)
+    session_dir = pi_session_dir(bridge_dir)
+    auth_factory = _make_auth_token_factory()
+    auth_token = auth_factory() if auth_factory is not None else None
+    auth_headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+    _extension, config = write_extension_files(
+        bridge_dir,
+        session_id=session_id,
+        server_url=launch_config.server_url,
+        conversation_url=conversation_url(launch_config.server_url, session_id),
+        auth_headers=auth_headers,
+    )
+    pi_command = resolve_pi_executable()
+    pi_args = _build_pi_native_args(
+        terminal_launch_args=launch_config.terminal_launch_args,
+        extension_path=pi_extension,
+        session_dir=session_dir,
+        external_session_id=launch_config.external_session_id,
+    )
+    pi_env = {
+        PI_NATIVE_CONFIG_ENV_VAR: str(config),
+        "OMNIGENT_PI_NATIVE_BRIDGE_DIR": str(bridge_dir),
+    }
+    # Route the runner-owned Pi process through the provider configured by
+    # ``omnigent setup`` (Databricks gateway / API key), so a separate
+    # ``pi /login`` isn't required — the parity codex-native/claude-native
+    # already have. Skipped when the user pinned their own provider/model via
+    # terminal_launch_args, or when no usable provider is configured (Pi then
+    # falls back to its own login). Writes a managed per-session Pi config dir,
+    # never touching the user's global ``~/.pi/agent``.
+    if not _pi_args_have_provider(launch_config.terminal_launch_args or []):
+        from omnigent.pi_native_credentials import (
+            pi_native_provider_launch,
+            resolve_pi_native_provider,
+        )
+
+        provider = resolve_pi_native_provider()
+        if provider is not None:
+            cred_env, cred_args = pi_native_provider_launch(bridge_dir / "pi-agent", provider)
+            pi_env.update(cred_env)
+            pi_args.extend(cred_args)
+    terminal_view = await resource_registry.launch_terminal(
+        session_id=session_id,
+        terminal_name="pi",
+        session_key="main",
+        resource_role=PI_NATIVE_TERMINAL_ROLE,
+        spec=TerminalEnvSpec(
+            os_env=OSEnvSpec(type="caller_process", cwd=workspace),
+            command=pi_command,
+            args=pi_args,
+            env=pi_env,
+            scrollback=100_000,
+            tmux_allow_passthrough=True,
+            tmux_start_on_attach=False,
+        ),
+    )
+    publish_event(
+        session_id,
+        {
+            "type": "session.resource.created",
+            "resource": session_resource_view_to_dict(terminal_view),
+        },
+    )
+    _logger.info(
+        "Auto-created pi terminal for session %s with extension %s",
+        session_id,
+        pi_extension,
+    )
+    return terminal_view
 
 
 async def _auto_create_codex_terminal(
@@ -3900,6 +4164,7 @@ def create_runner_app(
     # first-turn fallback) and closed when the session is deleted.
     _session_comment_relays: dict[str, Any] = {}
     _codex_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    _pi_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     # Per-session lock guarding the claude-native terminal auto-create in
     # ``create_session``. Two ``POST /v1/sessions`` calls can land
     # concurrently on a host-launched runner — ``_on_runner_connect``
@@ -4581,6 +4846,10 @@ def create_runner_app(
                 )
                 bridge_id = labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY)
                 spawn_env = build_codex_native_spawn_env(session_id, bridge_id=bridge_id)
+            if harness_name == "pi-native" and spawn_env is None:
+                from omnigent.pi_native_bridge import build_pi_native_spawn_env
+
+                spawn_env = build_pi_native_spawn_env(session_id)
             _session_spec_cache[session_id] = spec_entry
             from omnigent.llms.context_window import get_model_context_window
             from omnigent.runtime.workflow import _resolve_spec_model
@@ -4859,6 +5128,36 @@ def create_runner_app(
                         session_id,
                     )
 
+        if harness_name == "pi-native":
+            _pi_ensure_lock = _pi_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
+            async with _pi_ensure_lock:
+                _tr = resource_registry.terminal_registry
+                _has_pi_terminal = (
+                    _tr is not None and _tr.get(session_id, "pi", "main") is not None
+                )
+                if not _has_pi_terminal:
+                    _publish_terminal_pending(_publish_event, session_id, True)
+                    try:
+                        await _auto_create_pi_terminal(
+                            session_id,
+                            resource_registry,
+                            _publish_event,
+                            server_client=server_client,
+                        )
+                    except Exception as exc:
+                        _logger.exception(
+                            "Failed to auto-create pi terminal for %s",
+                            session_id,
+                        )
+                        _publish_native_terminal_start_error(
+                            _publish_event,
+                            session_id,
+                            "Pi",
+                            exc,
+                        )
+                    finally:
+                        _publish_terminal_pending(_publish_event, session_id, False)
+
         # Auto-bootstrap the Omnigent REPL terminal for non-native
         # (SDK-harness) top-level sessions: host the framework's own TUI
         # (``omnigent attach``) in a tmux pane so the web UI can embed it
@@ -4909,7 +5208,7 @@ def create_runner_app(
         # Native terminal transcripts are mirrored from the underlying
         # runtime. A trailing user item can be a real failed/errored native
         # turn with no assistant item, not an unanswered Omnigent task to replay.
-        if history and harness_name not in ("claude-native", "codex-native"):
+        if history and not is_native_harness(harness_name):
             _session_histories[session_id] = history
             last = history[-1]
             last_type = last.get("type")
@@ -5119,6 +5418,7 @@ def create_runner_app(
         _ingest_cond.pop(session_id, None)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
+        _pi_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
 
@@ -5809,7 +6109,7 @@ def create_runner_app(
         # source — fall through and publish. Suppress only once we positively
         # know the harness/edge is terminal-owned.
         harness = _session_harness_name(conv_id)
-        if status != "failed" and harness == "claude-native":
+        if status != "failed" and harness in {"claude-native", "pi-native"}:
             return
         if status == "idle" and harness == "codex-native":
             return
@@ -5822,7 +6122,8 @@ def create_runner_app(
         """
         Whether this session types messages directly into a terminal.
 
-        Native harnesses (``claude-native`` / ``codex-native``) have
+        Native harnesses (``claude-native`` / ``codex-native`` /
+        ``pi-native``) have
         *instant* turns — ``run_turn`` returns as soon as the message is
         typed into the pane — and type only the latest user message per
         turn. The runner's mid-turn forward + collapse-batch continuation,
@@ -5835,9 +6136,9 @@ def create_runner_app(
 
         :param conv_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
-        :returns: ``True`` for claude-native / codex-native sessions.
+        :returns: ``True`` for native terminal sessions.
         """
-        return _session_harness_name(conv_id) in ("claude-native", "codex-native")
+        return is_native_harness(_session_harness_name(conv_id))
 
     def _wake_parent_after_native_interrupt(conv_id: str) -> None:
         """Mark an interrupted native sub-agent cancelled and wake its parent.
@@ -6020,6 +6321,45 @@ def create_runner_app(
         finally:
             with contextlib.suppress(Exception):
                 await codex_client.close()
+        _wake_parent_after_native_interrupt(conv_id)
+        return Response(status_code=204)
+
+    async def _handle_pi_native_interrupt(conv_id: str) -> Response:
+        """
+        Stop a pi-native turn by asking the resident Pi extension to abort.
+
+        Pi-native turns live inside the terminal's Pi process. The runner's
+        harness task only queues the user's message into the extension inbox
+        and returns, so the generic in-process cancel floor has nothing useful
+        to cancel. Queue an explicit interrupt payload instead; the extension
+        consumes it in the TUI process and calls the active
+        ``ExtensionContext.abort()``.
+
+        :param conv_id: Session/conversation identifier, e.g.
+            ``"conv_abc123"``.
+        :returns: 204 when the interrupt payload was queued; 503 if the
+            bridge inbox could not be written.
+        """
+        from omnigent.pi_native_bridge import bridge_dir_for_session_id, enqueue_interrupt
+
+        try:
+            await asyncio.to_thread(
+                enqueue_interrupt,
+                bridge_dir_for_session_id(conv_id),
+            )
+        except OSError as exc:
+            _logger.warning(
+                "Pi-native interrupt failed for session=%s",
+                conv_id,
+                exc_info=True,
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "pi_native_interrupt_failed",
+                    "detail": _client_safe_error_detail(exc, context="pi-native interrupt"),
+                },
+            )
         _wake_parent_after_native_interrupt(conv_id)
         return Response(status_code=204)
 
@@ -8061,6 +8401,10 @@ def create_runner_app(
             )
             bridge_id = labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY)
             spawn_env = build_codex_native_spawn_env(conv_id, bridge_id=bridge_id)
+        if harness_name == "pi-native" and spawn_env is None:
+            from omnigent.pi_native_bridge import build_pi_native_spawn_env
+
+            spawn_env = build_pi_native_spawn_env(conv_id)
 
         agent_version = dispatch.agent_version if dispatch else body.get("agent_version")
         if agent_version is not None and conv_id in _version_cache:
@@ -8900,6 +9244,11 @@ def create_runner_app(
                 return await _handle_claude_native_interrupt(conversation_id)
             if _harness == "codex-native":
                 return await _handle_codex_native_interrupt(conversation_id)
+            if _harness == "pi-native":
+                # The pi-native turn lives in the Pi TUI process; the runner's
+                # harness task already returned, so the cancel floor has nothing
+                # to cancel. Queue an abort to the resident extension instead.
+                return await _handle_pi_native_interrupt(conversation_id)
             # In-process harness: mark interrupted, forward an interrupt to the
             # harness, and force-cancel the runner turn task so the turn ends
             # promptly even if the harness can't honor the interrupt in time.
@@ -8963,6 +9312,10 @@ def create_runner_app(
                 return await _handle_claude_native_stop(conversation_id)
             if _harness == "codex-native":
                 return await _handle_codex_native_interrupt(conversation_id)
+            if _harness == "pi-native":
+                # Pi has no separate session-kill; abort the active turn via the
+                # extension (mirrors codex-native reusing its interrupt handler).
+                return await _handle_pi_native_interrupt(conversation_id)
             await _cancel_inprocess_turn(conversation_id)
             return Response(status_code=204)
 
@@ -9476,6 +9829,36 @@ def create_runner_app(
                 # existing-terminal path above — two concurrent ensures can
                 # never both emit the banner.
                 return _codex_ensure_response_with_policy_notice(session_id, terminal_view)
+
+        if body.get("ensure_native_terminal") and terminal_name == "pi" and session_key == "main":
+            pi_terminal_id = terminal_resource_id("pi", "main")
+            ensure_lock = _pi_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
+            async with ensure_lock:
+                existing = await resource_registry.get_terminal_resource(
+                    session_id, pi_terminal_id
+                )
+                if existing is not None:
+                    return JSONResponse(
+                        status_code=200,
+                        content=session_resource_view_to_dict(existing),
+                    )
+                try:
+                    terminal_view = await _auto_create_pi_terminal(
+                        session_id,
+                        resource_registry,
+                        _publish_event,
+                        server_client=server_client,
+                    )
+                except Exception as exc:
+                    _logger.exception(
+                        "Pi terminal ensure failed for session=%s",
+                        session_id,
+                    )
+                    return _native_terminal_start_error_response(exc, "Pi")
+            return JSONResponse(
+                status_code=200,
+                content=session_resource_view_to_dict(terminal_view),
+            )
 
         from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
@@ -10874,6 +11257,7 @@ def create_runner_app(
         """
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
+        _pi_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         await resource_registry.cleanup_session(session_id)
         return JSONResponse(
@@ -10925,6 +11309,7 @@ def create_runner_app(
         """
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
+        _pi_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         # Close terminals with ``session.resource.deleted`` events BEFORE
         # cleanup_session — cleanup_conversation would silently pop them
@@ -11714,8 +12099,10 @@ def _build_spawn_env_from_spec(
             env = _build_cmd_spawn_env(spec, workdir=workdir)
         elif harness == "openai-agents":
             env = _build_openai_agents_sdk_spawn_env(spec)
+        elif harness == "cursor":
+            env = _build_cursor_spawn_env(spec, workdir=workdir)
         else:
-            # claude-native / codex-native / unknown — no spawn-env.
+            # Native terminal harnesses and unknown harnesses build env elsewhere.
             return None
     except ImportError:
         return None

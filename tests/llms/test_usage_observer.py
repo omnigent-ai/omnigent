@@ -447,3 +447,63 @@ def test_concurrent_notifies_do_not_lose_updates(
     assert len(written) == 1
     payload = json.loads(written[0].read_text())
     assert payload["totals"]["calls"] == threads * iters
+
+
+# ── notify_from_dict ─────────────────────────────────────────────
+
+
+def test_notify_from_dict_unpacks_usage(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """notify_from_dict unpacks standard keys and delegates to notify."""
+    monkeypatch.setenv(_usage_observer._ENV_VAR, str(tmp_path / "tokens.json"))
+    _usage_observer.set_current_test("test_from_dict")
+    _usage_observer.notify_from_dict(
+        model="m",
+        usage={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+    )
+    bucket = _usage_observer._RECORDS["test_from_dict"]
+    assert bucket["total_tokens"] == 15
+    assert bucket["calls"] == 1
+
+
+def test_notify_from_dict_none_usage_is_noop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """notify_from_dict with None usage is a no-op."""
+    monkeypatch.setenv(_usage_observer._ENV_VAR, str(tmp_path / "tokens.json"))
+    _usage_observer.set_current_test("test_none")
+    _usage_observer.notify_from_dict(model="m", usage=None)
+    assert _usage_observer._RECORDS == {}
+
+
+def test_notify_from_dict_empty_dict_is_noop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """notify_from_dict({}) resolves to notify(..., 0, 0, 0) — records stay empty."""
+    monkeypatch.setenv(_usage_observer._ENV_VAR, str(tmp_path / "tokens.json"))
+    _usage_observer.set_current_test("test_empty")
+    _usage_observer.notify_from_dict(model="m", usage={})
+    assert _usage_observer._RECORDS == {}
+
+
+def test_notify_from_dict_non_dict_is_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """notify_from_dict with a non-dict value is a no-op."""
+    monkeypatch.delenv(_usage_observer._ENV_VAR, raising=False)
+    _usage_observer.notify_from_dict(model="m", usage="not a dict")  # type: ignore[arg-type]
+    assert _usage_observer._RECORDS == {}
+
+
+# ── Double remove is idempotent ──────────────────────────────────
+
+
+def test_observer_remove_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Calling remove() twice does not raise."""
+    monkeypatch.delenv(_usage_observer._ENV_VAR, raising=False)
+
+    def cb(**_: Any) -> None:
+        pass
+
+    remove = _usage_observer.add_observer(cb)
+    remove()
+    remove()  # second call should not raise
