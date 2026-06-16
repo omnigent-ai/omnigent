@@ -372,10 +372,8 @@ class TestBuildModelsJson(unittest.TestCase):
             },
         )
         p = result["providers"]
-        # The ucode ``openai`` value is the Codex Responses gateway, which only
-        # serves ``/responses`` and 404s the ``/chat/completions`` POST pi makes
-        # for ``openai-completions``. GPT and the catch-all are re-routed to the
-        # workspace serving-endpoints; claude keeps its working anthropic gateway.
+        # The ucode ``openai`` value is the Codex Responses gateway; GPT and the
+        # catch-all re-route to serving-endpoints, claude keeps its gateway.
         self.assertEqual(
             p["databricks"]["baseUrl"],
             "https://host.example.com/serving-endpoints",
@@ -390,9 +388,8 @@ class TestBuildModelsJson(unittest.TestCase):
         )
 
     def test_ucode_codex_gateway_rerouted_off_responses_path(self):
-        # The Codex gateway only implements /responses; pi posts
-        # /chat/completions for openai-completions, so the codex URL must not
-        # survive onto a completions provider (the #241 GPT 404).
+        # The codex gateway 404s /chat/completions, so it must not survive onto
+        # a completions provider (#241 GPT 404).
         result = _build_models_json(
             "https://host.example.com",
             "tok",
@@ -404,9 +401,8 @@ class TestBuildModelsJson(unittest.TestCase):
             self.assertEqual(base_url, "https://host.example.com/serving-endpoints")
 
     def test_gemini_model_routed_off_codex_gateway(self):
-        # Gemini ids fall to databricks-completions; before the fix that
-        # inherited the codex URL too (the #241 Gemini 404). They must land on
-        # the OpenAI-compatible serving-endpoints, not the codex gateway.
+        # Gemini falls to the databricks-completions catch-all; it must land on
+        # serving-endpoints, not the codex URL it used to inherit (#241).
         result = _build_models_json(
             "https://host.example.com",
             "tok",
@@ -421,9 +417,8 @@ class TestBuildModelsJson(unittest.TestCase):
         )
 
     def test_generic_openai_base_url_used_as_is(self):
-        # A non-ucode provider (OpenRouter/LiteLLM/local) gives a real
-        # chat-completions URL with no ``/ai-gateway/codex`` segment; it must
-        # pass through untouched so the re-route never breaks generic gateways.
+        # A non-ucode openai URL (no ``/ai-gateway/codex``) must pass through so
+        # the re-route never breaks generic gateways.
         result = _build_models_json(
             "https://host.example.com",
             "tok",
