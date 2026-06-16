@@ -12044,6 +12044,7 @@ _HARNESS_MODEL_ENV_KEY: dict[str, str] = {
     "pi": "HARNESS_PI_MODEL",
     "cursor": "HARNESS_CURSOR_MODEL",
     "mimo": "HARNESS_MIMO_MODEL",
+    "agy": "HARNESS_AGY_MODEL",
     "openai-agents": "HARNESS_OPENAI_AGENTS_MODEL",
     "cmd": "HARNESS_CMD_MODEL",
 }
@@ -12073,11 +12074,11 @@ def _build_spawn_env_from_spec(
     """
     try:
         from omnigent.runtime.workflow import (
+            _build_agy_spawn_env,
             _build_claude_sdk_spawn_env,
             _build_cmd_spawn_env,
             _build_codex_spawn_env,
             _build_cursor_spawn_env,
-            _build_gemini_spawn_env,
             _build_mimo_spawn_env,
             _build_openai_agents_sdk_spawn_env,
             _build_pi_spawn_env,
@@ -12091,8 +12092,8 @@ def _build_spawn_env_from_spec(
             env = _build_pi_spawn_env(spec, workdir=workdir)
         elif harness == "cursor":
             env = _build_cursor_spawn_env(spec, workdir=workdir)
-        elif harness == "gemini":
-            env = _build_gemini_spawn_env(spec, workdir=workdir)
+        elif harness == "agy":
+            env = _build_agy_spawn_env(spec, workdir=workdir)
         elif harness == "mimo":
             env = _build_mimo_spawn_env(spec, workdir=workdir)
         elif harness == "cmd":

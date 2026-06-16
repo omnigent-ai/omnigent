@@ -576,7 +576,7 @@ async def _send_hello(
                     "cmd",
                     "cursor",
                     "databricks_supervisor",
-                    "gemini",
+                    "agy",
                     "mimo",
                     "openai-agents",
                     "open-responses",

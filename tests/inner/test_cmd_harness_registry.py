@@ -2,8 +2,7 @@
 
 Drift here means a spec with ``harness: cmd`` fails at runner spawn
 (unknown harness), at spec-load (not in the allowlist), or at runtime
-dispatch. Mirrors the cursor / mimo / gemini registry tests at
-``tests/inner/test_{cursor,mimo,gemini}_harness_registry.py``.
+dispatch. Mirrors the peer harness registry tests.
 """
 
 from __future__ import annotations

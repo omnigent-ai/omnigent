@@ -71,7 +71,7 @@ def test_cmd_harness_max_turns_bad_value_falls_back(monkeypatch) -> None:  # typ
 def test_cmd_harness_emits_no_api_key(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """Command Code owns its own auth (``cmd login``); no API key is threaded.
 
-    Documents the gap vs. cursor / gemini: there is no
+    Documents the gap vs. API-key-threading harnesses: there is no
     ``HARNESS_CMD_API_KEY`` env var, and the CmdExecutor constructor
     takes no ``api_key`` kwarg. The harness wrap must not invent one.
     """

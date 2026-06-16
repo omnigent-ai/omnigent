@@ -96,8 +96,7 @@ class AcpClient:
             (e.g. ``["--sandbox", "enabled"]``). ``None`` appends nothing.
         :param subcommand: How the CLI is told to enter ACP server mode. Most
             ACP CLIs use an ``acp`` subcommand (the default ``("acp",)``);
-            some, like the Gemini CLI, use a ``--acp`` flag instead — pass
-            ``("--acp",)`` in that case.
+            CLIs that use a flag can pass it here instead.
         """
         self._cursor_path = cursor_path
         self._env = env
@@ -424,11 +423,10 @@ def _pick_allow_option(options: list[AcpMessage]) -> str:
 # session/update → ExecutorEvent
 # ---------------------------------------------------------------------------
 #
-# Shared by every ACP-driven harness (``cursor-agent acp``, ``mimo acp``,
-# ``gemini --acp``). Originally lived in ``cursor_executor.py`` when cursor was
-# our only ACP client; promoted here when upstream replaced cursor with the
-# in-process Python SDK so gemini / mimo no longer have to import a
-# now-unrelated module.
+# Shared by every ACP-driven harness (for example ``mimo acp``). Originally
+# lived in ``cursor_executor.py`` when cursor was our only ACP client; promoted
+# here when upstream replaced cursor with the in-process Python SDK so other ACP
+# wrappers no longer have to import a now-unrelated module.
 
 
 def _update_to_event(update: AcpUpdate) -> ExecutorEvent | None:

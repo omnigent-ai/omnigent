@@ -84,45 +84,28 @@ def test_install_harness_cli_noop_for_non_npm(monkeypatch: pytest.MonkeyPatch) -
     assert hi.install_harness_cli(hi.CURSOR_KEY) is False
 
 
-def test_gemini_install_spec_has_npm_package() -> None:
-    """Gemini is CLI-backed and Omnigent knows its npm package.
-
-    Unlike cursor / mimo, the Gemini CLI ships as ``@google/gemini-cli`` so
-    ``omnigent setup`` can offer to npm-install it from the harness menu.
-    A drift in display/binary/package would either install the wrong thing
-    or check the wrong PATH entry.
-    """
-    spec = hi.harness_install_spec(hi.GEMINI_KEY)
+def test_agy_install_spec_has_install_hint() -> None:
+    """Antigravity CLI is installed by Google's native installer, not npm."""
+    spec = hi.harness_install_spec(hi.AGY_KEY)
     assert spec is not None
-    assert spec.display == "Gemini"
-    assert spec.binary == "gemini"
-    assert spec.package == "@google/gemini-cli"
-    assert hi.harness_install_command(hi.GEMINI_KEY) == [
-        "npm",
-        "install",
-        "-g",
-        "@google/gemini-cli",
-    ]
+    assert spec.display == "Antigravity"
+    assert spec.binary == "agy"
+    assert spec.package is None
+    assert spec.install_hint == "curl -fsSL https://antigravity.google/cli/install.sh | bash"
 
 
-def test_gemini_has_no_login_status_logout_args() -> None:
-    """Gemini ships no first-class auth subcommands today.
-
-    The CLI authenticates interactively on first launch (Google account /
-    ``GEMINI_API_KEY`` env var); there's no ``gemini auth login`` analog of
-    the Claude / Codex flows. Until one lands, ``configure harnesses`` must
-    not try to drive a non-existent login command.
-    """
-    spec = hi.harness_install_spec(hi.GEMINI_KEY)
+def test_agy_has_no_login_status_logout_args() -> None:
+    """Antigravity auth is interactive/keyring-driven; no wrapper subcommands."""
+    spec = hi.harness_install_spec(hi.AGY_KEY)
     assert spec is not None
     assert spec.login_args is None
     assert spec.logout_args is None
     assert spec.status_args is None
     # The high-level wrappers gate on these args being set, so they must
     # short-circuit to False without spawning anything.
-    assert hi.harness_login(hi.GEMINI_KEY) is False
-    assert hi.harness_logout(hi.GEMINI_KEY) is False
-    assert hi.harness_cli_logged_in(hi.GEMINI_KEY) is False
+    assert hi.harness_login(hi.AGY_KEY) is False
+    assert hi.harness_logout(hi.AGY_KEY) is False
+    assert hi.harness_cli_logged_in(hi.AGY_KEY) is False
 
 
 def test_unknown_key_has_no_spec_and_is_not_installed() -> None:
@@ -139,7 +122,7 @@ def test_unknown_key_has_no_spec_and_is_not_installed() -> None:
         ("codex-native", "codex"),
         ("pi", "pi"),
         ("mimo", "mimo"),
-        ("gemini", "gemini"),
+        ("agy", "agy"),
         ("cmd", "cmd"),
     ],
 )

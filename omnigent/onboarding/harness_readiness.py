@@ -28,9 +28,9 @@ import os
 
 from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
 from omnigent.onboarding.harness_install import (
+    AGY_KEY,
     CMD_KEY,
     CURSOR_KEY,
-    GEMINI_KEY,
     MIMO_KEY,
     PI_KEY,
     harness_cli_installed,
@@ -78,12 +78,12 @@ def _install_key(canonical: str) -> str:
 
     :param canonical: A canonical CLI-wrapping harness id keyed in
         ``_HARNESS_FAMILY`` (e.g. ``"codex-native"``), ``"pi"``, ``"mimo"``,
-        ``"cursor"``, ``"gemini"``, or ``"cmd"``.
+        ``"cursor"``, ``"agy"``, or ``"cmd"``.
     :returns: ``"anthropic"`` / ``"openai"`` for the claude/codex CLIs,
         :data:`~omnigent.onboarding.harness_install.PI_KEY` for pi,
         :data:`~omnigent.onboarding.harness_install.CURSOR_KEY` for cursor,
         :data:`~omnigent.onboarding.harness_install.MIMO_KEY` for mimo,
-        :data:`~omnigent.onboarding.harness_install.GEMINI_KEY` for gemini,
+        :data:`~omnigent.onboarding.harness_install.AGY_KEY` for Antigravity,
         or :data:`~omnigent.onboarding.harness_install.CMD_KEY` for
         Command Code.
     """
@@ -91,8 +91,8 @@ def _install_key(canonical: str) -> str:
         return CURSOR_KEY
     if canonical == MIMO_KEY:
         return MIMO_KEY
-    if canonical == GEMINI_KEY:
-        return GEMINI_KEY
+    if canonical == AGY_KEY:
+        return AGY_KEY
     if canonical == CMD_KEY:
         return CMD_KEY
     return _HARNESS_FAMILY.get(canonical) or PI_KEY
@@ -102,7 +102,7 @@ def harness_is_configured(harness: str) -> bool:
     """Return whether *harness* can be launched on this machine.
 
     CLI-wrapping harnesses are gated on their binary being on ``PATH``
-    (native Claude/Codex, ``pi`` / ``pi-native``, ``mimo``, ``gemini``,
+    (native Claude/Codex, ``pi`` / ``pi-native``, ``mimo``, ``agy``,
     and ``cmd``) — the one thing the daemon can check reliably and
     locally. ``cursor`` is special-cased: it runs in-process via the
     ``cursor-sdk`` package and is gated on a resolvable ``CURSOR_API_KEY``
@@ -113,7 +113,7 @@ def harness_is_configured(harness: str) -> bool:
 
     :param harness: A harness id, e.g. ``"claude-native"``, ``"codex"``,
         ``"openai-agents"``, ``"agents_sdk"``, ``"pi"``, ``"pi-native"``,
-        ``"cursor"``, ``"mimo"``, ``"gemini"``, or ``"cmd"``.
+        ``"cursor"``, ``"mimo"``, ``"agy"``, or ``"cmd"``.
     :returns: ``True`` when launchable (CLI installed, or a harness the
         daemon doesn't gate); ``False`` only when a CLI-wrapping
         harness's binary is missing from ``PATH``.
@@ -136,7 +136,7 @@ def harness_is_configured(harness: str) -> bool:
         return cursor_api_key_configured() or bool(os.environ.get("CURSOR_API_KEY"))
     if canonical not in _HARNESS_FAMILY and canonical not in _PI_HARNESSES and canonical not in {
         MIMO_KEY,
-        GEMINI_KEY,
+        AGY_KEY,
         CMD_KEY,
     }:
         # Unknown harness — the daemon has no install metadata for it, so
@@ -158,7 +158,7 @@ def configured_harness_map() -> dict[str, bool]:
     :returns: Mapping of harness spelling to readiness, e.g.
         ``{"claude-native": False, "codex-native": False,
         "claude-sdk": True, "openai-agents": True, "pi": True,
-        "mimo": False, "gemini": False, "cmd": False}``.
+        "mimo": False, "agy": False, "cmd": False}``.
     """
     spellings: set[str] = set(_HARNESS_FAMILY)
     spellings.update(_EXECUTOR_TYPE_HARNESS_ALIASES)
@@ -166,6 +166,6 @@ def configured_harness_map() -> dict[str, bool]:
     spellings.update(_PI_HARNESSES)
     spellings.add(CURSOR_KEY)
     spellings.add(MIMO_KEY)
-    spellings.add(GEMINI_KEY)
+    spellings.add(AGY_KEY)
     spellings.add(CMD_KEY)
     return {spelling: harness_is_configured(spelling) for spelling in spellings}

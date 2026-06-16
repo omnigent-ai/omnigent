@@ -4086,8 +4086,8 @@ def resume(
 # ``omnigent.chat.run_chat`` for how local-agent options get baked
 # into a materialized copy of the spec before the server starts.
 _HARNESS_CHOICES_HELP = (
-    "'claude' (alias for 'claude-sdk'), 'claude-sdk', 'codex', 'cmd', 'cursor', "
-    "'gemini', 'mimo', 'openai-agents', 'open-responses', or 'pi'"
+    "'claude' (alias for 'claude-sdk'), 'claude-sdk', 'agy', 'codex', 'cmd', "
+    "'cursor', 'mimo', 'openai-agents', 'open-responses', or 'pi'"
 )
 _HARNESS_HELP = f"Harness to use for a local agent: {_HARNESS_CHOICES_HELP}."
 _RUN_HARNESS_HELP = (

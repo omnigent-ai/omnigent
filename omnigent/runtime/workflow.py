@@ -1267,43 +1267,36 @@ def _build_cursor_spawn_env(
     return env
 
 
-def _build_gemini_spawn_env(
+def _build_agy_spawn_env(
     spec: AgentSpec,
     *,
     workdir: Path | None = None,
 ) -> dict[str, str]:
     """
-    Build the env-var dict the gemini harness wrap reads.
+    Build the env-var dict the agy harness wrap reads.
 
-    Maps spec.executor fields → the ``HARNESS_GEMINI_*`` env vars defined in
-    ``omnigent/inner/gemini_harness.py``. Like cursor, there is NO gateway or
-    Databricks-profile resolution: gemini talks only to Google's own backend
-    (``GEMINI_API_KEY`` / ``gemini`` login) and has no custom API base-URL
-    override, so it never routes through the Databricks AI gateway.
-
-    The model is pinned in the executor (see
-    :data:`omnigent.inner.gemini_executor.GEMINI_PINNED_MODEL`), so this
-    builder intentionally emits no ``HARNESS_GEMINI_MODEL`` — any spec model
-    is ignored.
-
-    Auth: an explicit ``executor.auth: {type: api_key, api_key: ...}`` is
-    forwarded as ``HARNESS_GEMINI_API_KEY`` (gemini reads it as
-    ``GEMINI_API_KEY``). With no api-key auth the harness falls back to an
-    inherited ``GEMINI_API_KEY`` or an existing ``gemini`` login.
+    Maps spec.executor fields → the ``HARNESS_AGY_*`` env vars defined in
+    ``omnigent/inner/agy_harness.py``. Antigravity CLI owns auth and provider
+    routing, so Omnigent only threads model, skills metadata, bundle path, and
+    os_env. The default model is Gemini 3.1 Pro (High); a spec model can
+    override it via ``HARNESS_AGY_MODEL`` / ``agy --model``.
 
     :param spec: The agent spec.
-    :param workdir: Unused — gemini has no skills/bundle wiring; kept on the
-        signature for symmetry with the peer builders.
     :returns: A dict of env-var overrides for
         :meth:`HarnessProcessManager.get_client(env=...)`.
     """
-    del workdir  # unused; signature parity with peer builders
+    from omnigent.inner.agy_executor import AGY_DEFAULT_MODEL
+
     env: dict[str, str] = {}
-    if isinstance(spec.executor.auth, ApiKeyAuth):
-        env["HARNESS_GEMINI_API_KEY"] = spec.executor.auth.api_key
+    env["HARNESS_AGY_MODEL"] = _resolve_spec_model(spec) or AGY_DEFAULT_MODEL
+    env["HARNESS_AGY_SKILLS_FILTER"] = json.dumps(spec.skills_filter)
+    if spec.name:
+        env["HARNESS_AGY_AGENT_NAME"] = spec.name
+    if workdir is not None:
+        env["HARNESS_AGY_BUNDLE_DIR"] = str(workdir)
     os_env_payload = _serialize_os_env(spec.os_env)
     if os_env_payload is not None:
-        env["HARNESS_GEMINI_OS_ENV"] = os_env_payload
+        env["HARNESS_AGY_OS_ENV"] = os_env_payload
     return env
 
 

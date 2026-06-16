@@ -42,19 +42,19 @@ import sys
 from dataclasses import dataclass
 
 from omnigent.onboarding.provider_config import (
+    AGY_SURFACE,
     ANTHROPIC_FAMILY,
     CURSOR_SURFACE,
-    GEMINI_SURFACE,
     OPENAI_FAMILY,
 )
 
-# Pi, Mimo, Cursor, and Gemini are not configure-menu families (the menu is
+# Pi, Mimo, Cursor, and Antigravity are not configure-menu families (the menu is
 # Claude + Codex), but the first-run ``run`` flow can launch them, so they have
 # CLI metadata too.
 PI_KEY = "pi"
 CURSOR_KEY = CURSOR_SURFACE
 MIMO_KEY = "mimo"
-GEMINI_KEY = GEMINI_SURFACE
+AGY_KEY = AGY_SURFACE
 CMD_KEY = "cmd"
 
 
@@ -129,8 +129,17 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         install_hint="curl https://cursor.com/install -fsS | bash",
         login_status_key="isAuthenticated",
     ),
-    MIMO_KEY: HarnessInstallSpec("Mimo", "mimo", None),
-    GEMINI_KEY: HarnessInstallSpec("Gemini", "gemini", "@google/gemini-cli"),
+    MIMO_KEY: HarnessInstallSpec(
+        "Mimo",
+        "mimo",
+        None,
+    ),
+    AGY_KEY: HarnessInstallSpec(
+        "Antigravity",
+        "agy",
+        None,
+        install_hint="curl -fsSL https://antigravity.google/cli/install.sh | bash",
+    ),
     CMD_KEY: HarnessInstallSpec("Command Code", "cmd", "command-code"),
 }
 
@@ -141,7 +150,7 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
 # here — the ones that cannot launch without a binary on ``PATH``:
 # ``claude-native`` wraps the ``claude`` CLI, ``codex-native`` the ``codex``
 # CLI, ``pi`` / ``pi-native`` the ``pi`` CLI, ``mimo`` the ``mimo`` CLI,
-# ``gemini`` the ``gemini`` CLI, and ``cmd`` the ``cmd`` (Command Code) CLI.
+# ``agy`` the ``agy`` CLI, and ``cmd`` the ``cmd`` (Command Code) CLI.
 # SDK-based harnesses run in-process and are deliberately absent, so they
 # resolve to "no CLI required": ``claude-sdk``, ``codex``, ``openai-agents-sdk``,
 # ``databricks_supervisor``, and ``cursor`` (which drives the ``cursor-sdk``
@@ -155,7 +164,7 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     # ``cursor-sdk`` package and gates on ``CURSOR_API_KEY`` (see
     # harness_readiness), not a binary on ``PATH``.
     MIMO_KEY: MIMO_KEY,
-    GEMINI_KEY: GEMINI_KEY,
+    AGY_KEY: AGY_KEY,
     CMD_KEY: CMD_KEY,
 }
 
@@ -203,7 +212,7 @@ def harness_install_spec(key: str) -> HarnessInstallSpec | None:
 
     :param key: A harness family (``"anthropic"`` / ``"openai"``),
         :data:`PI_KEY` (``"pi"``), :data:`MIMO_KEY` (``"mimo"``),
-        :data:`GEMINI_KEY` (``"gemini"``), or :data:`CMD_KEY`
+        :data:`AGY_KEY` (``"agy"``), or :data:`CMD_KEY`
         (``"cmd"``).
     :returns: The :class:`HarnessInstallSpec`, or ``None`` for an unknown key
         (e.g. a gateway-only family with no dedicated CLI).
@@ -219,7 +228,7 @@ def harness_cli_installed(key: str) -> bool:
     ``claude-sdk`` harness can run without the ``claude`` CLI.
 
     :param key: A harness family (``"anthropic"`` / ``"openai"``),
-        :data:`PI_KEY`, :data:`MIMO_KEY`, :data:`GEMINI_KEY`, or
+        :data:`PI_KEY`, :data:`MIMO_KEY`, :data:`AGY_KEY`, or
         :data:`CMD_KEY`.
     :returns: ``True`` when the CLI is on ``PATH``; ``False`` when it isn't or
         the key has no associated CLI.

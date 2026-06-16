@@ -57,7 +57,7 @@ def _resolve_os_env() -> OSEnvSpec:
     Decodes the JSON-encoded dict Omnigent serialized via
     :func:`dataclasses.asdict`. When the env var is missing or malformed,
     falls back to ``caller_process + sandbox=none`` — matches the
-    cursor / mimo / gemini wraps' default for specs without an
+    cursor / mimo / agy wraps' default for specs without an
     ``os_env:`` block.
     """
     raw = os.environ.get(_ENV_OS_ENV, "").strip()

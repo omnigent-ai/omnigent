@@ -1,19 +1,19 @@
 spec_version: 1
-name: gemini
-description: Gemini coding sub-agent — implements, cross-vendor reviews, or explores a scoped task in its own worktree. Pinned to gemini-3.1-pro-preview.
+name: agy
+description: Antigravity coding sub-agent — implements, cross-vendor reviews, or explores a scoped task in its own worktree. Defaults to Gemini 3.1 Pro (High).
 
-# ACP harness wrap. Drives ``gemini --acp`` over the Agent Client Protocol —
-# same transport the cursor / mimo wraps use, but Gemini enters ACP via the
-# ``--acp`` flag rather than an ``acp`` subcommand. The model is pinned in the
-# executor (gemini-3.1-pro-preview); spec / ``/model`` overrides are ignored.
+# Antigravity CLI has no ACP server. The harness drives one ``agy --print``
+# subprocess per turn and passes ``--model "Gemini 3.1 Pro (High)"`` unless a
+# spec/model override explicitly changes it.
 executor:
   type: omnigent
   config:
-    harness: gemini
+    harness: agy
+    model: Gemini 3.1 Pro (High)
 
 prompt: |
-  You are Gemini, a coding sub-agent dispatched by the polly orchestrator for a
-  single scoped task in a dedicated git worktree. Your task prompt names its
+  You are Antigravity CLI running Gemini 3.1 Pro (High), dispatched by the polly
+  orchestrator for a single scoped task in a dedicated git worktree. Your task prompt names its
   purpose — IMPLEMENT, REVIEW, or EXPLORE. Do exactly that one thing; don't
   refactor or wander unprompted.
 

@@ -75,7 +75,7 @@ _STDERR_TAIL_CHARS = 2000
 # known-safe categories pass: Command Code's own config knobs, proxy / TLS
 # settings, Node.js runtime knobs (``cmd`` ships a Node-based CLI), and
 # locale. Credential families (``DATABRICKS_*``, ``AWS_*``, provider API
-# keys, ...) deliberately do NOT match — mirrors the cursor / mimo / gemini
+# keys, ...) deliberately do NOT match — mirrors the cursor / mimo / agy
 # deny-by-default posture.
 _CMD_ENV_ALLOW_PREFIXES: tuple[str, ...] = (
     "CMD_",
@@ -120,7 +120,7 @@ def _clean_cmd_env(extra_allowed: Sequence[str] | None = None) -> dict[str, str]
     """Build a filtered copy of ``os.environ`` for the ``cmd`` subprocess.
 
     Deny-by-default allowlist mirroring :func:`pi_executor._clean_pi_env`
-    and the cursor / mimo / gemini ``_clean_*_env`` helpers: only the
+    and the cursor / mimo / agy ``_clean_*_env`` helpers: only the
     known-safe prefixes and exact names pass, so host secrets (cloud
     tokens, unrelated API keys) never reach the ``cmd`` process. The
     ``CMD_`` / ``COMMANDCODE_`` / ``COMMAND_CODE_`` prefixes let Command

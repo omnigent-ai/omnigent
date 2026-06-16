@@ -86,7 +86,7 @@ def test_sdk_and_unknown_harnesses_are_never_gated(
         "pi",
         "pi-native",
         "mimo",
-        "gemini",
+        "agy",
         "cmd",
     ],
 )
@@ -136,7 +136,7 @@ def test_configured_harness_map_covers_all_spellings(
         "native-pi",
         "cursor",
         "mimo",
-        "gemini",
+        "agy",
         "cmd",
     }
     assert set(result) == expected_keys
@@ -176,7 +176,7 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         "native-codex",
         "pi",
         "mimo",
-        "gemini",
+        "agy",
         "cmd",
     ):
         assert result[cli] is False, f"{cli} should be gated on its CLI binary"

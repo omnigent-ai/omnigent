@@ -57,21 +57,21 @@ prompt: |
   You have exactly SIX sub-agents. `claude_code`, `codex`, `cursor`, and
   `mimo` are real CLI coding harnesses. `claude_code` and `codex` run in their
   own terminal — the human can open either in the UI's Subagents panel and watch
-  or TAKE OVER. `cursor`, `mimo`, `gemini`, and `pi` run headless (no terminal to open):
+  or TAKE OVER. `cursor`, `mimo`, `agy`, and `pi` run headless (no terminal to open):
   - `claude_code` — Claude Code (`claude-native` harness).
   - `codex` — Codex (`codex-native` harness).
   - `cursor` — Cursor Agent (`cursor` harness).
   - `mimo` — Mimo Code (`mimo` harness), the PRIMARY EXPLORE/SEARCH specialist
     for read-mostly work and investigation.
-  - `gemini` — Gemini (`gemini` harness), the DEDICATED INDEPENDENT REVIEWER.
+  - `agy` — Antigravity CLI (`agy` harness, Gemini 3.1 Pro (High)), the DEDICATED INDEPENDENT REVIEWER.
   - `pi` — Pi (`pi` harness), BACKUP explore worker (use only when both
     `mimo` and `cursor` are unavailable).
 
   Roster preflight (FIRST turn, before any dispatch). Each worker needs its own
   CLI on PATH — `claude` for `claude_code`, `codex` for `codex`, `cursor-agent`
-  for `cursor`, `mimo` for `mimo`, `gemini` for `gemini`, `pi` for `pi`.
+  for `cursor`, `mimo` for `mimo`, `agy` for `agy`, `pi` for `pi`.
   Before delegating anything, run exactly ONE
-  `sys_os_shell("command -v claude codex cursor-agent mimo gemini pi || true")`. A worker is AVAILABLE
+  `sys_os_shell("command -v claude codex cursor-agent mimo agy pi || true")`. A worker is AVAILABLE
   only if its binary resolved in that output; record the available set and route
   work ONLY to available workers for the entire run. Do this in the same first
   turn you start planning (the preflight `sys_os_shell` call counts as acting —
@@ -165,9 +165,9 @@ prompt: |
   between both whenever both are AVAILABLE. Do not pile every parallel dispatch
   onto the same worker while the other is free.
 
-  Cross-vendor verification is the point: review is ALWAYS done by `gemini`,
+  Cross-vendor verification is the point: review is ALWAYS done by `agy`,
   the DEDICATED INDEPENDENT REVIEWER, regardless of which vendor implemented.
-  `gemini` reviews ALL PRs from `claude_code`, `codex`, `cursor`, `mimo`, or `pi`.
+  `agy` reviews ALL PRs from `claude_code`, `codex`, `cursor`, `mimo`, or `pi`.
   Give the reviewer ONLY the diff + contract; never point it at the
   implementer's worktree. Only the implementer ever opens a PR (the reviewer
   just reports), so a reviewer's stray edits never reach the deliverable.
@@ -298,7 +298,7 @@ terminals:
 
 tools:
   # Coding sub-agents — see agents/<name>/. claude_code, codex, cursor, and
-  # mimo are CLI coding harnesses; gemini is the dedicated independent reviewer;
+  # mimo are CLI coding harnesses; agy is the dedicated independent reviewer;
   # pi is a BACKUP headless multi-model worker (deprioritized, use only when
   # mimo and cursor are unavailable).
   agents:
@@ -306,7 +306,7 @@ tools:
     - codex
     - cursor
     - mimo
-    - gemini
+    - agy
     - pi
 
 # Mechanism-layer enforcement — runner-side tool gate, no server change.

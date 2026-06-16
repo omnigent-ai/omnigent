@@ -32,6 +32,7 @@ from omnigent.onboarding.ambient import DetectedProvider
 from omnigent.onboarding.databricks_config import databricks_sdk_installed
 from omnigent.onboarding.interactive import ACCENT, console
 from omnigent.onboarding.provider_config import (
+    AGY_SURFACE,
     ANTHROPIC_FAMILY,
     CHAT_WIRE_API,
     CLI_CONFIG_KIND,
@@ -39,7 +40,6 @@ from omnigent.onboarding.provider_config import (
     CURSOR_SURFACE,
     DATABRICKS_KIND,
     GATEWAY_KIND,
-    GEMINI_SURFACE,
     KEY_KIND,
     LOCAL_KIND,
     MIMO_SURFACE,
@@ -94,7 +94,7 @@ _FAMILY_LABEL: dict[str, str] = {
     PI_SURFACE: "Pi",
     CURSOR_SURFACE: "Cursor",
     MIMO_SURFACE: "Mimo",
-    GEMINI_SURFACE: "Gemini",
+    AGY_SURFACE: "Antigravity",
     CMD_SURFACE: "Command Code",
 }
 
@@ -107,7 +107,7 @@ _FAMILY_HARNESS_IDS: dict[str, str] = {
     PI_SURFACE: "pi",
     CURSOR_SURFACE: "cursor",
     MIMO_SURFACE: "mimo",
-    GEMINI_SURFACE: "gemini",
+    AGY_SURFACE: "agy",
     CMD_SURFACE: "cmd",
 }
 

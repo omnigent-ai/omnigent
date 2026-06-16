@@ -517,6 +517,9 @@ def test_ensure_default_polly_agent_seeds_card(seed_stores: _SeedStores) -> None
     assert seeded.name == "polly"
     # The bundle must be retrievable, not just referenced.
     assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
+    spec = seed_stores.agent_cache.load(seeded.id, seeded.bundle_location).spec
+    assert "agy" in spec.tools.agents
+    assert "gemini" not in spec.tools.agents
 
 
 def test_ensure_default_polly_codex_agent_clones_polly_with_codex_brain(
@@ -546,10 +549,10 @@ def test_ensure_default_polly_codex_agent_clones_polly_with_codex_brain(
     assert spec.executor.config["model"] == "gpt-5.5"
     assert spec.executor.config["reasoning_effort"] == "low"
     assert sorted(spec.tools.agents) == [
+        "agy",
         "claude_code",
         "codex",
         "cursor",
-        "gemini",
         "mimo",
         "pi",
     ]

@@ -50,7 +50,7 @@ from omnigent.spec.parser import check_unresolved_env_vars
 # Family keys. ``anthropic`` is the Messages-API surface (Claude SDK,
 # native Claude); ``openai`` is the Responses/Chat surface (Codex,
 # native Codex, OpenAI-Agents SDK). ``pi`` consumes both. Cursor, Mimo,
-# Gemini, and Command Code are separate CLI-owned surfaces: their CLIs own
+# Antigravity, and Command Code are separate CLI-owned surfaces: their CLIs own
 # auth/model routing rather than using Omnigent's provider-family
 # defaults.
 ANTHROPIC_FAMILY = "anthropic"
@@ -69,7 +69,7 @@ _VALID_FAMILIES = (ANTHROPIC_FAMILY, OPENAI_FAMILY)
 PI_SURFACE = "pi"
 CURSOR_SURFACE = "cursor"
 MIMO_SURFACE = "mimo"
-GEMINI_SURFACE = "gemini"
+AGY_SURFACE = "agy"
 CMD_SURFACE = "cmd"
 
 # Accepted ``wire_api`` values. ``responses`` is the OpenAI Responses API;
@@ -977,7 +977,7 @@ def surface_default_provider(config: dict[str, object], surface: str) -> Provide
     ``openai`` surfaces resolve their explicit per-family default, and the
     :data:`PI_SURFACE` surface resolves the pi harness's effective default
     (explicit pi scope, else the cross-family fallback). Cursor, Mimo,
-    Gemini, and Command Code deliberately return ``None`` here: their CLIs
+    Antigravity, and Command Code deliberately return ``None`` here: their CLIs
     own auth/model routing, so they do not have an Omnigent provider
     default. Used by the ``setup`` harness menus and the REPL startup
     header so every surface shows the provider its harness would actually
@@ -992,7 +992,7 @@ def surface_default_provider(config: dict[str, object], surface: str) -> Provide
     """
     if surface == PI_SURFACE:
         return default_provider_for_harness(config, PI_SURFACE)
-    if surface in (CURSOR_SURFACE, MIMO_SURFACE, GEMINI_SURFACE, CMD_SURFACE):
+    if surface in (CURSOR_SURFACE, MIMO_SURFACE, AGY_SURFACE, CMD_SURFACE):
         return None
     return get_default_provider(config, surface)
 
