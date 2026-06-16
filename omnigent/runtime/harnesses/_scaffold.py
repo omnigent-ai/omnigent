@@ -50,6 +50,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.policies.types import TOOL_CALL_PHASES
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server.schemas import (
     CompletedEvent,
@@ -641,7 +642,7 @@ class TurnContext:
             # Phase-aware default: advisory LLM phases fail OPEN so a missing
             # verdict never hangs the turn, but TOOL_CALL / TOOL_RESULT is the
             # authoritative gate for connector-native tools and fails CLOSED.
-            _fail_closed = phase in ("PHASE_TOOL_CALL", "PHASE_TOOL_RESULT")
+            _fail_closed = phase in TOOL_CALL_PHASES
             _action = "POLICY_ACTION_DENY" if _fail_closed else "POLICY_ACTION_ALLOW"
             _logger.warning(
                 "Policy evaluation %s timed out after %ds; defaulting to %s",

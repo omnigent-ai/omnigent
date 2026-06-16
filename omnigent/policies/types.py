@@ -37,6 +37,17 @@ if TYPE_CHECKING:
     from omnigent.entities import ConversationItem
 
 
+# Proto-style phase wire strings (the ``type`` field on events that
+# cross the harness↔runner boundary) for the tool-mediation phases.
+# These are the phases that fail CLOSED when policy evaluation is
+# unavailable: for connector-native MCP tools the in-band verdict is
+# the only enforcement point, so an unevaluable policy must not let
+# the call through. Defined once here so the two enforcement sites
+# (``omnigent.runner.app`` and ``omnigent.runtime.harnesses._scaffold``)
+# can't drift if a future tool phase is added.
+TOOL_CALL_PHASES: tuple[str, ...] = ("PHASE_TOOL_CALL", "PHASE_TOOL_RESULT")
+
+
 @dataclass(frozen=True)
 class EvaluationContext:
     """

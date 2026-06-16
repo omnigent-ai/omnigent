@@ -49,6 +49,7 @@ from omnigent.llms.summarize import (
     build_summarization_prompt,
     extract_summary_text,
 )
+from omnigent.policies.types import TOOL_CALL_PHASES
 from omnigent.runner import pending_approvals
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
@@ -2470,7 +2471,7 @@ async def _evaluate_policy_via_omnigent(
     # phases fail CLOSED (this round-trip is the authoritative gate for
     # connector-native tools), advisory LLM phases fail OPEN so a transient
     # outage never hangs the turn.
-    _fail_closed = phase in ("PHASE_TOOL_CALL", "PHASE_TOOL_RESULT")
+    _fail_closed = phase in TOOL_CALL_PHASES
     _default_action = "POLICY_ACTION_DENY" if _fail_closed else "POLICY_ACTION_ALLOW"
     verdict_action = _default_action
     verdict_reason: str | None = (
@@ -2493,6 +2494,10 @@ async def _evaluate_policy_via_omnigent(
         )
         if ap_resp.status_code == 200:
             result = ap_resp.json()
+            # A well-formed 200 carries "result"; a malformed body that
+            # omits it falls back to _default_action — i.e. DENY on a
+            # tool-call phase. That's deliberate: a 200 we can't read is
+            # an unevaluable verdict, which fails closed like any other.
             verdict_action = result.get("result", _default_action)
             verdict_reason = result.get("reason")
             verdict_data = result.get("data")
