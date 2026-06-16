@@ -15,8 +15,8 @@ This is the structured-form counterpart to the binary approval card
 (``test_approval_card.py``): the binary card covers a policy ASK, this covers
 Claude's own question tool. It rides the same ``native_claude_session`` fixture
 as the native render-parity suite — a real Claude Code boots in the session
-terminal — so it is nightly with a 900s ceiling, and the prompt is explicit
-because it depends on the model actually reaching for ``AskUserQuestion``.
+terminal — so it carries a 900s ceiling, and the prompt is explicit because it
+depends on the model actually reaching for ``AskUserQuestion``.
 
 The load-bearing assertion is that the server's parked elicitation drains after
 the form submits — proof the web answer flowed back through the same
@@ -78,7 +78,6 @@ def _wait_for(predicate, *, timeout_s: float = 30.0, interval_s: float = 0.5) ->
     raise AssertionError("condition not met within timeout")
 
 
-@pytest.mark.nightly
 @pytest.mark.timeout(900)
 def test_ask_user_question_form_renders_and_submits(
     page: Page,

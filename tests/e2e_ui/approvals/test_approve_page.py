@@ -12,7 +12,7 @@ The page fetches the elicitation from ``GET /v1/sessions/<sid>/elicitations/<eid
 and posts the verdict to the matching ``/resolve`` endpoint — the same backing
 calls the inline card uses, just on a bare route. Driven by the same
 ``approval_session`` fixture as the in-chat card test (real LLM emits the gated
-``git push``), so it is nightly with a generous timeout.
+``git push``), so it carries a generous per-test timeout.
 
 The load-bearing assertion is that the server's parked prompt drains after the
 page's Approve / Reject — proof the standalone route resolves the *same*
@@ -80,7 +80,6 @@ def _park_elicitation(page: Page, base_url: str, session_id: str) -> str:
     return elicitation_id
 
 
-@pytest.mark.nightly
 @pytest.mark.timeout(600)
 def test_approve_page_approves(
     page: Page,
@@ -101,7 +100,6 @@ def test_approve_page_approves(
     _wait_for(lambda: not _pending_elicitations(base_url, session_id))
 
 
-@pytest.mark.nightly
 @pytest.mark.timeout(600)
 def test_approve_page_rejects(
     page: Page,
@@ -121,7 +119,6 @@ def test_approve_page_rejects(
     _wait_for(lambda: not _pending_elicitations(base_url, session_id))
 
 
-@pytest.mark.nightly
 @pytest.mark.timeout(600)
 def test_approve_page_resolved_for_unknown_elicitation(
     page: Page,

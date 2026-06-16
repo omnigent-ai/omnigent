@@ -16,8 +16,8 @@ Plan mode is set by launching the session with
 ``native_claude_plan_session`` fixture. It is the sibling of
 ``test_ask_user_question.py``: both cover a Claude built-in tool that surfaces a
 structured card rather than the binary policy ASK. Rides a real Claude Code
-boot, so it is nightly with a 900s ceiling, and the prompt is explicit because
-it depends on the model reaching for ``ExitPlanMode``.
+boot, so it carries a 900s ceiling, and the prompt is explicit because it
+depends on the model reaching for ``ExitPlanMode``.
 
 The load-bearing assertion is that the parked elicitation drains after the
 review's approve — proof the verdict flowed back through the PermissionRequest
@@ -73,7 +73,6 @@ def _wait_for(predicate, *, timeout_s: float = 30.0, interval_s: float = 0.5) ->
     raise AssertionError("condition not met within timeout")
 
 
-@pytest.mark.nightly
 @pytest.mark.timeout(900)
 def test_exit_plan_mode_review_renders_and_approves(
     page: Page,
