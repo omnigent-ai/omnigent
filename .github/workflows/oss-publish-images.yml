@@ -5,6 +5,21 @@
 # modal` and server-launched managed hosts). Dockerfile ARGs default to public
 # registries, so no build-args needed.
 #
+# Tag scheme:
+#   :sha-<short>    immutable per-commit pin, published on EVERY qualifying build.
+#   :vX.Y.Z[rcN]    immutable version pin, published for every release + pre-release tag.
+#   :latest         the highest FINAL release (max over vX.Y.Z) — tracks what
+#                   `pip install omnigent` resolves to. Pre-releases never move it.
+#   :latest-rc      the highest version OVERALL, max(release, rc) — the newest
+#                   thing tagged, pre-release or not.
+#   :latest-dev     the most recent main build (bleeding edge); moves on every
+#                   qualifying main commit.
+#   :latest-nightly the most recent main build as of the daily cron; retagged
+#                   from :latest-dev once a day (no rebuild).
+# Ordering for :latest / :latest-rc uses PEP 440 (1.2.3rc1 < 1.2.3), which
+# `sort -V` gets wrong, so the max is computed with .github/scripts/
+# oss-publish-images/maxver.py (Python `packaging`).
+#
 # First run creates the GHCR packages PRIVATE; flip them to public once in the
 # org package settings to allow unauthenticated pulls (cannot be done in CI).
 name: Publish images (public)
@@ -25,14 +40,22 @@ on:
       - 'uv.lock'
       - 'ap-web/package-lock.json'
       - '.github/workflows/oss-publish-images.yml'
+  # Daily nightly promotion (07:00 UTC). Retags the current :latest-dev as
+  # :latest-nightly — handled by promote-nightly, not a rebuild.
+  schedule:
+    - cron: '0 7 * * *'
   workflow_dispatch:
     inputs:
       bump_latest:
         description: 'Also move :latest to this build (manual release of latest). Off by default.'
         type: boolean
         default: false
+      force_nightly:
+        description: 'Promote :latest-dev -> :latest-nightly now (runs only the nightly job). Off by default.'
+        type: boolean
+        default: false
 
-# Read-only at the top level; write scopes live on the job below.
+# Read-only at the top level; write scopes live on the jobs below.
 permissions:
   contents: read
 
@@ -46,8 +69,10 @@ jobs:
     permissions:
       contents: read
       packages: write # push the image to GHCR via GITHUB_TOKEN
-    # Gated to this repository; inert in forks and mirrors.
-    if: github.repository == 'omnigent-ai/omnigent'
+    # Gated to this repository; inert in forks and mirrors. Skip the (re)build
+    # on schedule and on a force_nightly dispatch — those only drive
+    # promote-nightly.
+    if: github.repository == 'omnigent-ai/omnigent' && github.event_name != 'schedule' && !inputs.force_nightly
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -57,6 +82,12 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
 
+      # Needed only for the PEP 440 max() on tag pushes; cheap on other events.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
+        with:
+          enable-cache: false
+
       - name: Log in to GHCR
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
         with:
@@ -64,47 +95,66 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # :sha-<short> is the immutable per-commit pin, published on EVERY
-      # qualifying build (each main commit included). :latest is decoupled
-      # from per-commit builds: it only moves on a real release (a v* tag,
-      # which also publishes :vX.Y.Z) or a deliberate manual dispatch with
-      # bump_latest=true. A plain main commit no longer re-points :latest.
-      # Server + host images share the scheme. ref / ref_name go through env
-      # (not inline ${{ }}) so a crafted tag name can't inject shell.
+      # Compute the tag set for this event. ref / ref_name go through env (not
+      # inline ${{ }}) so a crafted tag name can't inject shell.
       - name: Compute image tags
         id: tags
         env:
           GH_REF: ${{ github.ref }}
           GH_REF_NAME: ${{ github.ref_name }}
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BUMP_LATEST: ${{ inputs.bump_latest }}
         run: |
           set -euo pipefail
           IMAGE="ghcr.io/omnigent-ai/omnigent-server"
           HOST_IMAGE="ghcr.io/omnigent-ai/omnigent-host"
           SHORT_SHA=$(git rev-parse --short HEAD)
+
+          # Immutable per-commit pin, always.
           TAGS="${IMAGE}:sha-${SHORT_SHA}"
           HOST_TAGS="${HOST_IMAGE}:sha-${SHORT_SHA}"
-          bump_latest="false"
-          # A version tag is a release: publish the immutable :vX.Y.Z (or
-          # :vX.Y.ZrcN) pin. Only a FINAL release moves :latest — pre-release
-          # tags (vX.Y.ZrcN, vX.Y.Za/b, vX.Y.Z.devN) must not, so :latest tracks
-          # the version `pip install omnigent` resolves to (latest stable on
-          # PyPI), which ignores pre-releases.
+
+          # Append a floating/version tag to both images.
+          add_tag() {
+            TAGS="${TAGS},${IMAGE}:$1"
+            HOST_TAGS="${HOST_TAGS},${HOST_IMAGE}:$1"
+          }
+
+          # Every qualifying main commit moves :latest-dev (bleeding edge).
+          if [ "${GH_REF}" = "refs/heads/main" ]; then
+            add_tag "latest-dev"
+          fi
+
           if [[ "${GH_REF}" == refs/tags/v* ]]; then
-            TAGS="${TAGS},${IMAGE}:${GH_REF_NAME}"
-            HOST_TAGS="${HOST_TAGS},${HOST_IMAGE}:${GH_REF_NAME}"
-            if [[ "${GH_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              bump_latest="true"
+            # Immutable version pin for every release AND pre-release.
+            add_tag "${GH_REF_NAME}"
+
+            # Decide which floating release tags this version owns, using PEP 440
+            # ordering over the full tag list. :latest-rc => max(release, rc);
+            # :latest => max(final release).
+            ALL_TAGS=$(gh api "repos/${GH_REPO}/tags" --paginate --jq '.[].name')
+            decision=$(CUR="${GH_REF_NAME}" ALL_TAGS="${ALL_TAGS}" \
+              uv run --with packaging --no-project python .github/scripts/oss-publish-images/maxver.py)
+            IS_MAX_RC="${decision% *}"
+            IS_MAX_RELEASE="${decision#* }"
+            echo "version=${GH_REF_NAME} is_max_rc=${IS_MAX_RC} is_max_release=${IS_MAX_RELEASE}"
+
+            # :latest-rc tracks max(release, rc).
+            if [ "${IS_MAX_RC}" = "true" ]; then
+              add_tag "latest-rc"
+            fi
+            # :latest tracks the highest FINAL release only.
+            if [ "${IS_MAX_RELEASE}" = "true" ]; then
+              add_tag "latest"
             fi
           fi
-          # A manual dispatch can opt in to moving :latest (human approval).
+
+          # A manual dispatch can still force-move :latest (human approval).
           if [ "${BUMP_LATEST}" = "true" ]; then
-            bump_latest="true"
+            add_tag "latest"
           fi
-          if [ "${bump_latest}" = "true" ]; then
-            TAGS="${TAGS},${IMAGE}:latest"
-            HOST_TAGS="${HOST_TAGS},${HOST_IMAGE}:latest"
-          fi
+
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
           echo "host_tags=${HOST_TAGS}" >> "$GITHUB_OUTPUT"
 
@@ -137,3 +187,36 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: false
           sbom: false
+
+  promote-nightly:
+    # Daily cron (or a manual force_nightly dispatch): move :latest-nightly to
+    # the current main build by retagging the existing :latest-dev manifest
+    # (multi-arch safe, no rebuild).
+    if: github.repository == 'omnigent-ai/omnigent' && (github.event_name == 'schedule' || inputs.force_nightly)
+    permissions:
+      contents: read
+      packages: write # retag within GHCR via GITHUB_TOKEN
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promote latest-dev -> latest-nightly
+        run: |
+          set -euo pipefail
+          for img in ghcr.io/omnigent-ai/omnigent-server ghcr.io/omnigent-ai/omnigent-host; do
+            if docker buildx imagetools inspect "${img}:latest-dev" >/dev/null 2>&1; then
+              docker buildx imagetools create -t "${img}:latest-nightly" "${img}:latest-dev"
+              echo "promoted ${img}:latest-dev -> ${img}:latest-nightly"
+            else
+              echo "::warning::${img}:latest-dev not found yet; skipping nightly promotion"
+            fi
+          done

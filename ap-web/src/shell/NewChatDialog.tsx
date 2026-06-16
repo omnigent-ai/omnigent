@@ -112,22 +112,27 @@ const CLAUDE_NATIVE_PERMISSION_MODES: { value: string; label: string; descriptio
   },
 ];
 
-// Codex's `--approval-mode` choices. Codex-native sessions only.
-// "suggest" is Codex's default (prompts before everything); any other value
-// is passed through as `--approval-mode <value>` via the session's
-// terminal_launch_args. Keep in sync with `codex --help`.
-const CODEX_NATIVE_DEFAULT_APPROVAL_MODE = "suggest";
+// Codex's `--ask-for-approval` choices (codex CLI). Codex-native sessions
+// only. "on-request" is Codex's default; any other value is passed through
+// as `--ask-for-approval <value>` via the session's terminal_launch_args.
+// Keep in sync with `codex --help` and
+// https://developers.openai.com/codex/agent-approvals-security
+const CODEX_NATIVE_DEFAULT_APPROVAL_MODE = "on-request";
 const CODEX_NATIVE_APPROVAL_MODES: { value: string; label: string; description: string }[] = [
-  { value: "suggest", label: "Suggest", description: "Prompts before edits and commands" },
   {
-    value: "auto-edit",
-    label: "Auto edit",
-    description: "Auto-applies file edits; commands still prompt",
+    value: "untrusted",
+    label: "Untrusted",
+    description: "Runs only known-safe read operations automatically",
   },
   {
-    value: "full-auto",
-    label: "Full auto",
-    description: "Runs everything; no prompts or safety checks",
+    value: "on-request",
+    label: "On request",
+    description: "Model decides when to ask for approval",
+  },
+  {
+    value: "never",
+    label: "Never",
+    description: "Never asks for approval; failures go straight to the model",
   },
 ];
 
@@ -1087,7 +1092,7 @@ export function NewChatLandingScreen() {
             agentSupportsPermissionMode && permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
               ? ["--permission-mode", permissionMode]
               : agentSupportsApprovalMode && approvalMode !== CODEX_NATIVE_DEFAULT_APPROVAL_MODE
-                ? ["--approval-mode", approvalMode]
+                ? ["--ask-for-approval", approvalMode]
                 : undefined,
           // Cost-control switch from the "Cost Optimized" pill; polly-only
           // (cost control is a polly feature) and omitted when unset so the
