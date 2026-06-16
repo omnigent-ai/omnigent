@@ -72,9 +72,26 @@ jobs:
 
       # 2. Regenerate ap-web/package-lock.json against public npm. Lockfile
       #    only (the Docker build does the full install) — fast, deterministic.
+      #    The 7-day dependency cooldown comes from ap-web/.npmrc
+      #    (`min-release-age=7`, the npm mirror of uv.toml's
+      #    `exclude-newer = "P7D"`); it is only honored by npm >= 11.10.0,
+      #    and node 20 ships npm 10.x, so install a new-enough npm first or
+      #    the cooldown is silently ignored and the lock can pin a release
+      #    too fresh for the downstream JFrog mirror to serve.
+      - name: Ensure npm honors the dependency cooldown
+        run: npm install -g "npm@>=11.10.0"
+      # Delete the lockfile so npm RESOLVES from scratch. `min-release-age`
+      # only filters candidates during resolution; with an existing
+      # lockfile, `npm install --package-lock-only` keeps any pin that
+      # still satisfies package.json (it prints "up to date") and never
+      # re-applies the cooldown — so a too-fresh version already in the
+      # lock would survive. A clean resolve re-picks every dep to the
+      # newest version that clears the 7-day cooldown.
       - name: Regenerate package-lock.json
         working-directory: ap-web
-        run: npm install --package-lock-only --no-audit --no-fund
+        run: |
+          rm -f package-lock.json
+          npm install --package-lock-only --no-audit --no-fund
 
       # 3. Validate BEFORE committing: the Docker build is the real test that
       #    the regenerated locks + public registries produce a working image
@@ -88,20 +105,33 @@ jobs:
       - name: CLI smoke
         run: docker run --rm omnigent-smoke omnigent --help
 
+      # Mint the App installation token for the push + PR below. A distinct
+      # actor (not GITHUB_TOKEN), so the regen PR runs its own CI. Skipped when
+      # the App isn't configured — the step then falls back to GITHUB_TOKEN.
+      - name: Mint App token
+        id: app-token
+        if: vars.OSS_REGEN_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          app-id: ${{ vars.OSS_REGEN_APP_ID }}
+          private-key: ${{ secrets.OSS_REGEN_APP_KEY }}
+
       # 5. Persist the validated lockfiles via a PR (only if they changed and
       #    the build above passed). A PR, not a direct push to main, so it
-      #    works once main is branch-protected. Created with a repo PAT
-      #    (secrets.OSS_REGEN_TOKEN) so `gh pr create` is not blocked by the
-      #    org "Allow Actions to create PRs" restriction and the regen PR runs
-      #    its own CI. No loop: this workflow's push trigger is path-scoped to
-      #    the manifests (pyproject.toml / package.json), and the PR only
-      #    touches lockfiles, so merging it never re-fires this workflow.
-      #    Falls back to GITHUB_TOKEN if the PAT is not configured (the step
+      #    works once main is branch-protected. Created with a GitHub App
+      #    installation token (vars.OSS_REGEN_APP_ID + secrets.OSS_REGEN_APP_KEY)
+      #    so `gh pr create` is not blocked by the org "Allow Actions to create
+      #    PRs" restriction and the regen PR runs its own CI (an App token is a
+      #    distinct actor, so its push/PR re-triggers checks; GITHUB_TOKEN's
+      #    would not). No loop: this workflow is workflow_dispatch-only, and the
+      #    PR only touches lockfiles, so merging it never re-fires this workflow.
+      #    Falls back to GITHUB_TOKEN if the App is not configured (the step
       #    then degrades gracefully — see the else branch below).
       - name: Open lockfile-regen PR
         if: github.event_name != 'pull_request'
         env:
-          GH_TOKEN: ${{ secrets.OSS_REGEN_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -120,7 +150,9 @@ jobs:
           git checkout -b "$BRANCH"
           git add uv.lock ap-web/package-lock.json
           git commit -m "chore(oss): regenerate public lockfiles against public PyPI/npm"
-          git push --force origin "$BRANCH"
+          # Push via the token (App, else GITHUB_TOKEN) so a refresh of an
+          # already-open PR re-triggers its CI on the synchronize event.
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$BRANCH"
           # An already-open PR just picks up the force-pushed update.
           if [ -n "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')" ]; then
             echo "PR already open for $BRANCH — refreshed it with the latest lockfiles."

@@ -14,7 +14,13 @@
 // panel scoped to that session, which renders the raw JSON items —
 // parity with the TUI Ctrl+O overlay.
 
-import { BotIcon, ChevronDownIcon, MessageSquareIcon, TerminalIcon, type LucideIcon } from "lucide-react";
+import {
+  BotIcon,
+  ChevronDownIcon,
+  MessageSquareIcon,
+  TerminalIcon,
+  type LucideIcon,
+} from "lucide-react";
 import { useState } from "react";
 import { cn } from "@/lib/utils";
 import { Card, CardAction, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -64,12 +70,8 @@ export function SessionRail({
   if (suppressed) return null;
   return (
     <>
-      {terminals.length > 0 && (
-        <TerminalsCard terminals={terminals} onExpand={onExpandTerminals} />
-      )}
-      {debugMode && (
-        <ExecutionLogsCard childSessions={children} onExpand={onExpandExecutionLogs} />
-      )}
+      {terminals.length > 0 && <TerminalsCard terminals={terminals} onExpand={onExpandTerminals} />}
+      {debugMode && <ExecutionLogsCard childSessions={children} onExpand={onExpandExecutionLogs} />}
     </>
   );
 }
@@ -109,11 +111,7 @@ function TerminalsCard({ terminals, onExpand }: TerminalsCardProps) {
           ) : (
             <ul className="flex flex-col gap-0.5">
               {terminals.map((t) => (
-                <TerminalRow
-                  key={t.id}
-                  terminal={t}
-                  onOpen={() => onExpand(terminalTabKey(t))}
-                />
+                <TerminalRow key={t.id} terminal={t} onOpen={() => onExpand(terminalTabKey(t))} />
               ))}
             </ul>
           )}
@@ -227,9 +225,7 @@ function ExecutionLogRow({
       >
         <Icon className="size-3.5 shrink-0 text-muted-foreground" />
         <span className="truncate">{label}</span>
-        {sublabel && (
-          <span className="shrink-0 truncate text-muted-foreground">· {sublabel}</span>
-        )}
+        {sublabel && <span className="shrink-0 truncate text-muted-foreground">· {sublabel}</span>}
       </button>
     </li>
   );

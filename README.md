@@ -4,7 +4,7 @@
 
 ### A meta-harness for all your AI agents
 
-Omnigent provides a common layer over Claude Code, Codex, Pi, and the agents you write yourself: swap or combine harnesses without rewriting, keep them in check with policies and sandboxing, and collaborate in real time on the same live session, from any device.
+Omnigent provides a common layer over Claude Code, Codex, Cursor, Pi, and the agents you write yourself: swap or combine harnesses without rewriting, keep them in check with policies and sandboxing, and collaborate in real time on the same live session, from any device.
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/omnigent-ai/omnigent/blob/main/LICENSE)
 ![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)
@@ -41,9 +41,9 @@ Omnigent lets you:
   conversation to continue on their own.
 
 - **☁️ Run agents in cloud sandboxes.** No laptop required: run sessions in
-  disposable [Modal](https://modal.com) or [Daytona](https://www.daytona.io)
-  sandboxes, launched from the CLI or provisioned by the server per session
-  (*managed hosts*). More providers coming soon.
+  disposable [Modal](https://modal.com), [Daytona](https://www.daytona.io), or
+  [Islo](https://islo.dev) sandboxes, launched from the CLI or provisioned by
+  the server per session (*managed hosts*).
 
 - **🛡️ Govern your agents.** Create
   [policies](#6-govern-your-agents-with-policies) to pause for your approval
@@ -97,10 +97,39 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
 - **`tmux`**, required by the native `omnigent claude` / `omnigent codex`
   wrappers (`brew install tmux` / `apt install tmux`; the installer offers
   to install it for you).
+- **`bubblewrap`** (`bwrap`), **Linux only**. The native `omnigent claude` /
+  `omnigent codex` and `pi` harnesses wrap each agent terminal in a `bwrap`
+  OS-sandbox; on Linux that isolation is mandatory, so a missing `bwrap`
+  binary makes those terminals fail to start (`apt install bubblewrap`; the
+  installer offers to install it for you). macOS uses the built-in `seatbelt`
+  sandbox and needs nothing extra.
 - **Databricks** (optional). To use a Databricks workspace as your model
   provider, install Omnigent with the `databricks` extra:
   `uv tool install "omnigent[databricks]"`. Signing in to the workspace also
   uses the [Databricks CLI](https://docs.databricks.com/aws/en/dev-tools/cli/install).
+
+</details>
+
+<details>
+<summary>Updating to a new release</summary>
+
+When a newer release is on PyPI, Omnigent shows a one-line notice (once per
+release) pointing here. To update:
+
+```bash
+omni upgrade            # detects how you installed, drains & stops the local
+                        # server, then runs the matching upgrade command
+omni upgrade --check    # just report whether a newer release is available
+```
+
+`omni upgrade` waits for in-flight agent sessions to finish before stopping the
+local server (pass `--force` to stop them immediately); the next `omni` command
+brings the server back up on the new version. Source checkouts update with
+`git pull` instead. Silence the notice with `OMNIGENT_NO_UPDATE_CHECK=1`.
+
+The check queries your configured package index — honoring `UV_INDEX_URL` /
+`PIP_INDEX_URL` and your `uv.toml` / `pip.conf` (default PyPI), so private
+mirrors work out of the box; override with `OMNIGENT_INDEX_URL` if needed.
 
 </details>
 
@@ -145,6 +174,7 @@ omnigent run examples/debby/
 # Run an orchestrator on a different harness (sub-agents keep their own):
 omnigent run examples/polly/ --harness pi
 omnigent run examples/debby/ --harness openai-agents
+omnigent run examples/polly/ --harness cursor  # Cursor CLI (needs cursor-agent + CURSOR_API_KEY)
 ```
 
 **🐙 Polly** is a multi-agent coding orchestrator who writes no code herself.
@@ -336,7 +366,7 @@ name: my_agent
 prompt: You are a helpful data analyst.
 
 executor:
-  harness: claude-sdk          # or: codex, codex-native, claude-native, openai-agents, pi
+  harness: claude-sdk          # or: codex, codex-native, claude-native, cursor, openai-agents, pi
 
 tools:
   # A local Python function (schema auto-generated from the signature)

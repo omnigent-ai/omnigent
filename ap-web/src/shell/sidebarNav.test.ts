@@ -51,11 +51,15 @@ describe("filterConversations", () => {
       conversation("conv_codex", null, new Date(2026, 4, 14, 8), {
         labels: { "omnigent.wrapper": "codex-native-ui" },
       }),
+      conversation("conv_pi", null, new Date(2026, 4, 14, 8), {
+        labels: { "omnigent.wrapper": "pi-native-ui" },
+      }),
       conversation("conv_other", null, new Date(2026, 4, 14, 8)),
     ];
 
     expect(filterConversations(conversations, "claude").map((c) => c.id)).toEqual(["conv_native"]);
     expect(filterConversations(conversations, "codex").map((c) => c.id)).toEqual(["conv_codex"]);
+    expect(filterConversations(conversations, "pi").map((c) => c.id)).toEqual(["conv_pi"]);
   });
 });
 
@@ -131,6 +135,13 @@ describe("getConversationAgentType", () => {
     expect(getConversationAgentType(conv)).toBe("Codex");
   });
 
+  it("returns 'Pi' for pi-native-ui sessions", () => {
+    const conv = conversation("conv_pi", null, new Date(2026, 4, 14, 9), {
+      labels: { "omnigent.wrapper": "pi-native-ui" },
+    });
+    expect(getConversationAgentType(conv)).toBe("Pi");
+  });
+
   it("returns agent_name for YAML-based sessions", () => {
     const conv: Conversation = {
       ...conversation("conv_yaml", "My session", new Date(2026, 4, 14, 9)),
@@ -163,8 +174,15 @@ describe("getConversationAgentType", () => {
       }),
       agent_name: "some_agent",
     };
+    const piConv: Conversation = {
+      ...conversation("conv_both_pi", null, new Date(2026, 4, 14, 9), {
+        labels: { "omnigent.wrapper": "pi-native-ui" },
+      }),
+      agent_name: "some_agent",
+    };
     expect(getConversationAgentType(claudeConv)).toBe("Claude Code");
     expect(getConversationAgentType(codexConv)).toBe("Codex");
+    expect(getConversationAgentType(piConv)).toBe("Pi");
   });
 
   it("returns 'Other' when agent_name is null", () => {
@@ -193,6 +211,13 @@ describe("getConversationIconKind", () => {
         }),
       ),
     ).toBe("codex");
+    expect(
+      getConversationIconKind(
+        conversation("conv_pi", null, new Date(2026, 4, 14, 9), {
+          labels: { "omnigent.wrapper": "pi-native-ui" },
+        }),
+      ),
+    ).toBe("pi");
     expect(
       getConversationIconKind({
         ...conversation("conv_nessie", null, new Date(2026, 4, 14, 9)),
@@ -237,6 +262,16 @@ describe("conversationDisplayLabel", () => {
         }),
       ),
     ).toBe("Codex");
+  });
+
+  it("falls back to 'Pi' for pi-native sessions with no title", () => {
+    expect(
+      conversationDisplayLabel(
+        conversation("conv_abcdefghijklmnopqrstuvwxyz", null, new Date(2026, 4, 14, 9), {
+          labels: { "omnigent.wrapper": "pi-native-ui" },
+        }),
+      ),
+    ).toBe("Pi");
   });
 
   it("prefers the actual title over the claude-native fallback once set", () => {

@@ -13,7 +13,12 @@ import { normalizeResolvedTheme } from "@/components/theme/themeMode";
 import type { Comment } from "@/hooks/useComments";
 import { useCanEdit } from "@/hooks/usePermissions";
 import { detectLang, type ActiveSelection } from "./codeViewerHelpers";
-import { ensureLanguage, ensureMonacoReady, monacoLanguageId, resolvedThemeToMonaco } from "./monacoSetup";
+import {
+  ensureLanguage,
+  ensureMonacoReady,
+  monacoLanguageId,
+  resolvedThemeToMonaco,
+} from "./monacoSetup";
 import { useMonacoCommentLayer, type CodeEditorInstance } from "./useMonacoCommentLayer";
 import "./monacoCodeEditor.css";
 
@@ -71,28 +76,46 @@ export function MonacoDiffViewer({
     setReady(false);
     setLoadError(false);
     void Promise.all([ensureMonacoReady(), ensureLanguage(lang)]).then(
-      () => { if (!cancelled) setReady(true); },
-      () => { if (!cancelled) setLoadError(true); },
+      () => {
+        if (!cancelled) setReady(true);
+      },
+      () => {
+        if (!cancelled) setLoadError(true);
+      },
     );
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [lang]);
 
   // The modified-side code editor, obtained from the diff editor on mount.
   const modifiedEditorRef = useRef<CodeEditorInstance | null>(null);
   const [mounted, setMounted] = useState(false);
 
-  const handleMount: DiffOnMount = useCallback((diffEditor, monaco) => {
-    const modified = diffEditor.getModifiedEditor();
-    modifiedEditorRef.current = modified;
-    // Align the modified model's offsets with the raw "after" char offsets that
-    // comment anchors use (CRLF files would otherwise be counted as LF).
-    modified.getModel()?.setEOL(
-      (after ?? "").includes("\r\n") ? monaco.editor.EndOfLineSequence.CRLF : monaco.editor.EndOfLineSequence.LF,
-    );
-    setMounted(true);
-  }, [after]);
+  const handleMount: DiffOnMount = useCallback(
+    (diffEditor, monaco) => {
+      const modified = diffEditor.getModifiedEditor();
+      modifiedEditorRef.current = modified;
+      // Align the modified model's offsets with the raw "after" char offsets that
+      // comment anchors use (CRLF files would otherwise be counted as LF).
+      modified
+        .getModel()
+        ?.setEOL(
+          (after ?? "").includes("\r\n")
+            ? monaco.editor.EndOfLineSequence.CRLF
+            : monaco.editor.EndOfLineSequence.LF,
+        );
+      setMounted(true);
+    },
+    [after],
+  );
 
-  useEffect(() => () => { modifiedEditorRef.current = null; }, []);
+  useEffect(
+    () => () => {
+      modifiedEditorRef.current = null;
+    },
+    [],
+  );
 
   // Comments anchor into the current ("after") content == the saved file, so
   // they're always offset-valid here; gate only on edit permission.
@@ -106,33 +129,40 @@ export function MonacoDiffViewer({
     pendingBodyRef,
   });
 
-  const options = useMemo<DiffEditorProps["options"]>(() => ({
-    readOnly: true,           // modified side: view + select + comment, no editing
-    originalEditable: false,
-    renderSideBySide: layout === "split",
-    // Below `renderSideBySideInlineBreakpoint` (900px) Monaco collapses
-    // side-by-side into inline — a legitimate constraint for a usable diff.
-    // FileViewer only surfaces the split/unified toggle once the diff area is
-    // wide enough for split (see SPLIT_DIFF_MIN_WIDTH), so we leave Monaco's
-    // responsive default in place rather than forcing split at any width.
-    minimap: { enabled: false },
-    scrollBeyondLastLine: false,
-    fontSize: 12,
-    automaticLayout: true,
-    renderOverviewRuler: false,
-    // Collapse long unchanged runs into expandable bands (like the old pierre
-    // diff / GitHub) so only changed hunks + a few context lines are shown.
-    hideUnchangedRegions: { enabled: true, contextLineCount: 3 },
-  }), [layout]);
+  const options = useMemo<DiffEditorProps["options"]>(
+    () => ({
+      readOnly: true, // modified side: view + select + comment, no editing
+      originalEditable: false,
+      renderSideBySide: layout === "split",
+      // Below `renderSideBySideInlineBreakpoint` (900px) Monaco collapses
+      // side-by-side into inline — a legitimate constraint for a usable diff.
+      // FileViewer only surfaces the split/unified toggle once the diff area is
+      // wide enough for split (see SPLIT_DIFF_MIN_WIDTH), so we leave Monaco's
+      // responsive default in place rather than forcing split at any width.
+      minimap: { enabled: false },
+      scrollBeyondLastLine: false,
+      fontSize: 12,
+      automaticLayout: true,
+      renderOverviewRuler: false,
+      // Collapse long unchanged runs into expandable bands (like the old pierre
+      // diff / GitHub) so only changed hunks + a few context lines are shown.
+      hideUnchangedRegions: { enabled: true, contextLineCount: 3 },
+    }),
+    [layout],
+  );
 
   return (
     <div className="flex h-full flex-col">
       <div className="relative min-h-0 flex-1">
         {loadError && (
-          <div className="flex items-center justify-center p-8 text-destructive text-sm">Failed to load the diff.</div>
+          <div className="flex items-center justify-center p-8 text-destructive text-sm">
+            Failed to load the diff.
+          </div>
         )}
         {!loadError && !ready && (
-          <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">Loading diff…</div>
+          <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+            Loading diff…
+          </div>
         )}
         {!loadError && ready && (
           <DiffEditor

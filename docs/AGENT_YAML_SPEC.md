@@ -49,7 +49,7 @@ resolved from the YAML file's directory.
 
 ```yaml
 executor:
-  harness: claude-sdk        # claude-sdk, openai-agents, codex, etc.
+  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, pi, etc.
   model: databricks-claude-opus-4-7
   auth:
     type: databricks
@@ -58,6 +58,13 @@ executor:
 
 Set the Databricks profile under `executor.auth`. The older top-level
 `executor.profile` shorthand is legacy and should not be used in new specs.
+
+The `cursor` harness (Cursor's `cursor-agent`) is the exception: it talks
+only to Cursor's own backend and has no custom API base-URL, so the Databricks
+gateway / `auth.type: databricks` does not apply. Authenticate it with
+`CURSOR_API_KEY` (or a prior `cursor-agent login`), optionally pinned via
+`auth: {type: api_key, api_key: ${CURSOR_API_KEY}}`, and choose a Cursor model
+id (e.g. `auto`, `gpt-5`) rather than a `databricks-*` id.
 
 CLI flags such as `--harness` and `--model` can override or supply missing
 executor values for a run. Databricks credentials come from the spec's
@@ -166,6 +173,19 @@ tools:
     max_sessions: 2
 ```
 
+Each sub-agent picks its own `executor.harness` and `model`, so an orchestrator
+can mix harnesses by role — e.g. a `cursor` coder with a `claude-sdk`
+reviewer:
+
+```yaml
+tools:
+  coder:
+    type: agent
+    executor:
+      harness: cursor      # Cursor model id (e.g. gpt-5, auto), not a databricks-* id
+      model: gpt-5
+```
+
 Use `tools.<name>: inherit` to inherit a tool from a parent agent, or
 `tools.<name>: self` / `spec: self` for a sub-agent that clones the parent spec.
 
@@ -265,8 +285,8 @@ tools:
   Databricks-only configuration unless the example is explicitly internal.
 - Prefer `instructions: AGENTS.md` for long prompts that are shared with other
   tooling.
-- Start from a bundled example such as `examples/kimi_agent.yaml` or
-  `examples/knowledge_work_agent.yaml` and remove tools you do not need.
+- Start from a bundled example such as `examples/polly/config.yaml` or
+  `examples/debby/config.yaml` and remove tools you do not need.
 - Run the YAML before publishing it:
 
   ```bash

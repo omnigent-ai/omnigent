@@ -18,10 +18,14 @@ function resolveToken(host: string): string | null {
   }
 
   try {
-    const output = execFileSync("databricks", ["auth", "token", "--host", host, "--output", "json"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    const output = execFileSync(
+      "databricks",
+      ["auth", "token", "--host", host, "--output", "json"],
+      {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
     const tokenResponse = JSON.parse(output) as { access_token?: string };
     cachedToken = tokenResponse.access_token ?? null;
   } catch {

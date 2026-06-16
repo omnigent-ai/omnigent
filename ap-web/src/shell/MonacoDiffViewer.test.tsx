@@ -22,7 +22,12 @@ const h = vi.hoisted(() => ({
   commentOptions: null as { editorRef: { current: unknown }; mounted: boolean } | null,
 }));
 vi.mock("@monaco-editor/react", () => ({
-  DiffEditor: (props: { original?: string; modified?: string; options?: Record<string, unknown>; onMount?: DiffOnMount }) => {
+  DiffEditor: (props: {
+    original?: string;
+    modified?: string;
+    options?: Record<string, unknown>;
+    onMount?: DiffOnMount;
+  }) => {
     h.diffProps = props;
     h.onMount = props.onMount ?? null;
     return null;
@@ -47,7 +52,11 @@ vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn(() => true) }));
 
 import { MonacoDiffViewer } from "./MonacoDiffViewer";
 
-function renderDiff(props: { before: string | null; after: string | null; layout: "unified" | "split" }) {
+function renderDiff(props: {
+  before: string | null;
+  after: string | null;
+  layout: "unified" | "split";
+}) {
   return render(
     <MonacoDiffViewer
       before={props.before}
@@ -62,8 +71,14 @@ function renderDiff(props: { before: string | null; after: string | null; layout
   );
 }
 
-beforeEach(() => { h.diffProps = null; h.onMount = null; h.commentOptions = null; });
-afterEach(() => { cleanup(); });
+beforeEach(() => {
+  h.diffProps = null;
+  h.onMount = null;
+  h.commentOptions = null;
+});
+afterEach(() => {
+  cleanup();
+});
 
 describe("MonacoDiffViewer", () => {
   it("feeds before→original and after→modified into the diff editor", async () => {
@@ -109,7 +124,9 @@ describe("MonacoDiffViewer", () => {
     act(() => {
       h.onMount?.(
         { getModifiedEditor: () => fakeModified } as unknown as Parameters<DiffOnMount>[0],
-        { editor: { EndOfLineSequence: { LF: 0, CRLF: 1 } } } as unknown as Parameters<DiffOnMount>[1],
+        {
+          editor: { EndOfLineSequence: { LF: 0, CRLF: 1 } },
+        } as unknown as Parameters<DiffOnMount>[1],
       );
     });
 

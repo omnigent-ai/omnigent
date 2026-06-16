@@ -37,7 +37,12 @@ export function FileDownloadButton({ conversationId, path }: FileDownloadButtonP
   const [downloadError, setDownloadError] = useState(false);
   const errorTimerRef = useRef<number>(0);
 
-  useEffect(() => () => { window.clearTimeout(errorTimerRef.current); }, []);
+  useEffect(
+    () => () => {
+      window.clearTimeout(errorTimerRef.current);
+    },
+    [],
+  );
 
   const handleClick = async (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -76,7 +81,9 @@ export function FileDownloadButton({ conversationId, path }: FileDownloadButtonP
           <DownloadIcon className="size-3.5" />
         </button>
       </TooltipTrigger>
-      <TooltipContent side="bottom">{downloadError ? "Download failed" : "Download"}</TooltipContent>
+      <TooltipContent side="bottom">
+        {downloadError ? "Download failed" : "Download"}
+      </TooltipContent>
     </Tooltip>
   );
 }

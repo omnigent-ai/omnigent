@@ -65,21 +65,12 @@ export function useAddDefaultPolicy() {
 export function useUpdateDefaultPolicy() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async ({
-      policyId,
-      enabled,
-    }: {
-      policyId: string;
-      enabled: boolean;
-    }) => {
-      const res = await authenticatedFetch(
-        `/v1/policies/${encodeURIComponent(policyId)}`,
-        {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ enabled }),
-        },
-      );
+    mutationFn: async ({ policyId, enabled }: { policyId: string; enabled: boolean }) => {
+      const res = await authenticatedFetch(`/v1/policies/${encodeURIComponent(policyId)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled }),
+      });
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
       return (await res.json()) as DefaultPolicy;
     },
@@ -94,10 +85,9 @@ export function useDeleteDefaultPolicy() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async (policyId: string) => {
-      const res = await authenticatedFetch(
-        `/v1/policies/${encodeURIComponent(policyId)}`,
-        { method: "DELETE" },
-      );
+      const res = await authenticatedFetch(`/v1/policies/${encodeURIComponent(policyId)}`, {
+        method: "DELETE",
+      });
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     },
     onSuccess: () => {

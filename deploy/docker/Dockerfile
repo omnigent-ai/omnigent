@@ -144,10 +144,11 @@ FROM node:${NODE_VERSION}-slim AS node-runtime
 
 # ── Host runtime (`--target host`) ──────────────────────
 # Prebaked Omnigent host for remote sandboxes: full omnigent install,
-# git + tmux for harness runtime needs, curl + CA certificates for
-# outbound HTTPS and in-sandbox downloads, plus the coding-harness
-# CLIs (claude / codex / pi) so claude-sdk, claude-native, codex, and
-# pi agents can run in managed sandboxes without an in-sandbox
+# git + tmux for harness runtime needs, bubblewrap to OS-sandbox the
+# native harness terminals (mandatory and fail-loud on Linux), curl + CA
+# certificates for outbound HTTPS and in-sandbox downloads, plus the
+# coding-harness CLIs (claude / codex / pi) so claude-sdk, claude-native,
+# codex, and pi agents can run in managed sandboxes without an in-sandbox
 # install. No SPA, no psycopg, no server entrypoint.
 FROM python:${PYTHON_VERSION}-slim AS host
 ARG NPM_CONFIG_REGISTRY=
@@ -165,7 +166,7 @@ ENV PYTHONUNBUFFERED=1 \
     IS_SANDBOX=1
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git tmux curl ca-certificates \
+ && apt-get install -y --no-install-recommends git tmux bubblewrap curl ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
 # Git credential helper for private repositories over HTTPS: answers

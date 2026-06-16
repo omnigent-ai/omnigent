@@ -106,8 +106,7 @@ export function collectCommentInboxItems(
   // updated_at (microseconds, set at creation) for a stable order.
   items.sort(
     (a, b) =>
-      b.comment.created_at - a.comment.created_at ||
-      b.comment.updated_at - a.comment.updated_at,
+      b.comment.created_at - a.comment.created_at || b.comment.updated_at - a.comment.updated_at,
   );
   return items;
 }

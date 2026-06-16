@@ -11,27 +11,21 @@ import { AppShell } from "@/shell/AppShell";
 // when the user actually navigates to /login, /register, /members
 // — which never happens in non-accounts deploys because the route
 // table below doesn't register them.
-const LoginPage = lazy(() =>
-  import("@/pages/LoginPage").then((m) => ({ default: m.LoginPage })),
-);
+const LoginPage = lazy(() => import("@/pages/LoginPage").then((m) => ({ default: m.LoginPage })));
 const RegisterPage = lazy(() =>
   import("@/pages/RegisterPage").then((m) => ({ default: m.RegisterPage })),
 );
 const MembersPage = lazy(() =>
   import("@/pages/MembersPage").then((m) => ({ default: m.MembersPage })),
 );
-const SetupPage = lazy(() =>
-  import("@/pages/SetupPage").then((m) => ({ default: m.SetupPage })),
-);
+const SetupPage = lazy(() => import("@/pages/SetupPage").then((m) => ({ default: m.SetupPage })));
 const PoliciesPage = lazy(() =>
   import("@/pages/PoliciesPage").then((m) => ({ default: m.PoliciesPage })),
 );
 const ApprovePage = lazy(() =>
   import("@/pages/ApprovePage").then((m) => ({ default: m.ApprovePage })),
 );
-const InboxPage = lazy(() =>
-  import("@/pages/InboxPage").then((m) => ({ default: m.InboxPage })),
-);
+const InboxPage = lazy(() => import("@/pages/InboxPage").then((m) => ({ default: m.InboxPage })));
 
 interface AppProps {
   /**
@@ -121,10 +115,7 @@ function App({ basename }: AppProps = {}) {
             <Route path={`${prefix}/register`} element={<RegisterPage />} />
           </>
         )}
-        <Route
-          path={`${prefix}/approve/:sessionId/:elicitationId`}
-          element={<ApprovePage />}
-        />
+        <Route path={`${prefix}/approve/:sessionId/:elicitationId`} element={<ApprovePage />} />
         <Route element={<AppShell />}>
           <Route path={prefix || "/"} element={<ChatPage />} />
           <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />

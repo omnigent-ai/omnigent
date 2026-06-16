@@ -8,13 +8,11 @@ import { cn } from "@/lib/utils";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
 
-
 function avatarStyle(name: string): { backgroundColor: string; color: string } {
   let hash = 0;
   for (let i = 0; i < name.length; i++) hash = (hash * 31 + name.charCodeAt(i)) >>> 0;
   return { backgroundColor: `hsl(${hash % 360} 60% 50%)`, color: "white" };
 }
-
 
 function formatCommentTime(createdAt: number): string {
   const date = new Date(createdAt * 1000);
@@ -110,7 +108,8 @@ export function CommentsPanel({
   useEffect(() => {
     if (!activeSelection) return;
     const isExisting = comments.some(
-      c => c.start_index === activeSelection.start_index && c.end_index === activeSelection.end_index,
+      (c) =>
+        c.start_index === activeSelection.start_index && c.end_index === activeSelection.end_index,
     );
     if (!isExisting) {
       // rAF ensures the textarea has been rendered before we try to focus it.
@@ -168,7 +167,9 @@ export function CommentsPanel({
             >
               {t === "open" ? "Open" : "Addressed"}
               {count > 0 && (
-                <span className="ml-1 rounded-full bg-muted px-1.5 py-0.5 text-[10px] tabular-nums">{count}</span>
+                <span className="ml-1 rounded-full bg-muted px-1.5 py-0.5 text-[10px] tabular-nums">
+                  {count}
+                </span>
               )}
             </button>
           );
@@ -183,8 +184,14 @@ export function CommentsPanel({
 
       <div className="flex-1 overflow-y-auto">
         {/* Input section — shown when text is selected with no existing comment at same range and user can edit */}
-        {tab === "open" && activeSelection != null && !comments.some((c) => c.start_index === activeSelection.start_index && c.end_index === activeSelection.end_index) && (
-          canEdit ? (
+        {tab === "open" &&
+          activeSelection != null &&
+          !comments.some(
+            (c) =>
+              c.start_index === activeSelection.start_index &&
+              c.end_index === activeSelection.end_index,
+          ) &&
+          (canEdit ? (
             <div className="space-y-2 border-b border-border px-3 py-2">
               {activeSelection.anchor_content && (
                 <div className="truncate rounded bg-muted/40 px-2 py-1 font-mono text-[10px] text-muted-foreground">
@@ -225,8 +232,7 @@ export function CommentsPanel({
                 Add Comment
               </Button>
             </div>
-          ) : null
-        )}
+          ) : null)}
 
         {/* Comment list */}
         {tab === "open" ? (
@@ -240,7 +246,10 @@ export function CommentsPanel({
                 <CommentCard
                   key={c.id}
                   comment={c}
-                  isSelected={activeSelection?.start_index === c.start_index && activeSelection?.end_index === c.end_index}
+                  isSelected={
+                    activeSelection?.start_index === c.start_index &&
+                    activeSelection?.end_index === c.end_index
+                  }
                   onClick={() => onClickComment(c)}
                   onDelete={canModify(c) ? () => onDeleteComment(c.id) : undefined}
                   onEdit={canModify(c) ? (newBody) => onEditComment(c.id, newBody) : undefined}
@@ -249,18 +258,21 @@ export function CommentsPanel({
               ))}
             </div>
           )
+        ) : addressedComments.length === 0 ? (
+          <div className="flex items-center justify-center p-8 text-xs text-muted-foreground">
+            No addressed comments.
+          </div>
         ) : (
-          addressedComments.length === 0 ? (
-            <div className="flex items-center justify-center p-8 text-xs text-muted-foreground">
-              No addressed comments.
-            </div>
-          ) : (
-            <div className="space-y-2 p-3">
-              {addressedComments.map((c) => (
-                <CommentCard key={c.id} comment={c} onDelete={canModify(c) ? () => onDeleteComment(c.id) : undefined} onCopyLink={onCopyCommentLink ? () => onCopyCommentLink(c.id) : undefined} />
-              ))}
-            </div>
-          )
+          <div className="space-y-2 p-3">
+            {addressedComments.map((c) => (
+              <CommentCard
+                key={c.id}
+                comment={c}
+                onDelete={canModify(c) ? () => onDeleteComment(c.id) : undefined}
+                onCopyLink={onCopyCommentLink ? () => onCopyCommentLink(c.id) : undefined}
+              />
+            ))}
+          </div>
         )}
       </div>
     </div>
@@ -280,7 +292,14 @@ interface CommentCardProps {
   onCopyLink?: () => void;
 }
 
-function CommentCard({ comment: c, isSelected, onClick, onEdit, onDelete, onCopyLink }: CommentCardProps) {
+function CommentCard({
+  comment: c,
+  isSelected,
+  onClick,
+  onEdit,
+  onDelete,
+  onCopyLink,
+}: CommentCardProps) {
   const [editing, setEditing] = useState(false);
   const [editBody, setEditBody] = useState(c.body);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -294,7 +313,12 @@ function CommentCard({ comment: c, isSelected, onClick, onEdit, onDelete, onCopy
   const [expanded, setExpanded] = useState(false);
   const [clamped, setClamped] = useState(false);
 
-  useEffect(() => () => { window.clearTimeout(linkCopiedTimerRef.current); }, []);
+  useEffect(
+    () => () => {
+      window.clearTimeout(linkCopiedTimerRef.current);
+    },
+    [],
+  );
 
   useLayoutEffect(() => {
     const el = bodyRef.current;
@@ -308,7 +332,9 @@ function CommentCard({ comment: c, isSelected, onClick, onEdit, onDelete, onCopy
   }, [c.body, editing, expanded]);
 
   // Collapse when switching comments so a long body never opens pre-expanded.
-  useEffect(() => { setExpanded(false); }, [c.id]);
+  useEffect(() => {
+    setExpanded(false);
+  }, [c.id]);
 
   useEffect(() => {
     if (!editing) setEditBody(c.body);
@@ -335,7 +361,9 @@ function CommentCard({ comment: c, isSelected, onClick, onEdit, onDelete, onCopy
           ? "border-primary bg-primary/10 ring-1 ring-primary/30 cursor-default"
           : "border-border bg-muted/20 cursor-pointer hover:border-foreground/20",
       )}
-      onClick={() => { if (!editing) onClick?.(); }}
+      onClick={() => {
+        if (!editing) onClick?.();
+      }}
     >
       {/* Anchor */}
       {c.anchor_content && (
@@ -383,7 +411,10 @@ function CommentCard({ comment: c, isSelected, onClick, onEdit, onDelete, onCopy
               type="button"
               aria-expanded={expanded}
               className="cursor-pointer text-[10px] font-medium text-blue-600 hover:underline dark:text-blue-400"
-              onClick={(e) => { e.stopPropagation(); setExpanded((v) => !v); }}
+              onClick={(e) => {
+                e.stopPropagation();
+                setExpanded((v) => !v);
+              }}
             >
               {expanded ? "Show less" : "Show more"}
             </button>
@@ -396,59 +427,79 @@ function CommentCard({ comment: c, isSelected, onClick, onEdit, onDelete, onCopy
         <div className="flex items-end justify-between gap-2">
           <div className="flex min-w-0 flex-col gap-0.5">
             <div className="flex min-w-0 items-center gap-1.5">
-              <span className="inline-flex size-4 shrink-0 items-center justify-center rounded-full text-[8px] font-semibold uppercase" style={avatarStyle(c.created_by ?? "You")}>
+              <span
+                className="inline-flex size-4 shrink-0 items-center justify-center rounded-full text-[8px] font-semibold uppercase"
+                style={avatarStyle(c.created_by ?? "You")}
+              >
                 {(c.created_by ?? "Y")[0].toUpperCase()}
               </span>
               <TooltipProvider>
                 <Tooltip>
                   <TooltipTrigger asChild>
-                    <span className="truncate text-[11px] text-muted-foreground">{c.created_by ?? "You"}</span>
+                    <span className="truncate text-[11px] text-muted-foreground">
+                      {c.created_by ?? "You"}
+                    </span>
                   </TooltipTrigger>
                   <TooltipContent>{c.created_by ?? "You"}</TooltipContent>
                 </Tooltip>
               </TooltipProvider>
             </div>
-            <span className="text-[10px] text-muted-foreground/70">{formatCommentTime(c.created_at)}</span>
+            <span className="text-[10px] text-muted-foreground/70">
+              {formatCommentTime(c.created_at)}
+            </span>
             {statusLabel && (
-              <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] w-fit">{statusLabel}</span>
+              <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] w-fit">
+                {statusLabel}
+              </span>
             )}
           </div>
-          {(onEdit || onDelete || onCopyLink) && <div className="flex shrink-0 items-center gap-2 mr-0.5">
-            {onEdit && (
-              <button
-                type="button"
-                className="cursor-pointer text-[11px] text-muted-foreground transition-colors hover:text-foreground"
-                onClick={(e) => { e.stopPropagation(); startEdit(); }}
-              >
-                Edit
-              </button>
-            )}
-            {onDelete && (
-              <button
-                type="button"
-                className="cursor-pointer text-[11px] text-muted-foreground transition-colors hover:text-destructive"
-                onClick={(e) => { e.stopPropagation(); onDelete(); }}
-              >
-                Delete
-              </button>
-            )}
-            {onCopyLink && (
-              <button
-                type="button"
-                aria-label="Copy link to comment"
-                className="cursor-pointer text-[11px] text-muted-foreground transition-colors hover:text-foreground"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onCopyLink();
-                  setLinkCopied(true);
-                  window.clearTimeout(linkCopiedTimerRef.current);
-                  linkCopiedTimerRef.current = window.setTimeout(() => setLinkCopied(false), 2000);
-                }}
-              >
-                {linkCopied ? <CheckIcon className="size-3" /> : <Link2Icon className="size-3" />}
-              </button>
-            )}
-          </div>}
+          {(onEdit || onDelete || onCopyLink) && (
+            <div className="flex shrink-0 items-center gap-2 mr-0.5">
+              {onEdit && (
+                <button
+                  type="button"
+                  className="cursor-pointer text-[11px] text-muted-foreground transition-colors hover:text-foreground"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    startEdit();
+                  }}
+                >
+                  Edit
+                </button>
+              )}
+              {onDelete && (
+                <button
+                  type="button"
+                  className="cursor-pointer text-[11px] text-muted-foreground transition-colors hover:text-destructive"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onDelete();
+                  }}
+                >
+                  Delete
+                </button>
+              )}
+              {onCopyLink && (
+                <button
+                  type="button"
+                  aria-label="Copy link to comment"
+                  className="cursor-pointer text-[11px] text-muted-foreground transition-colors hover:text-foreground"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onCopyLink();
+                    setLinkCopied(true);
+                    window.clearTimeout(linkCopiedTimerRef.current);
+                    linkCopiedTimerRef.current = window.setTimeout(
+                      () => setLinkCopied(false),
+                      2000,
+                    );
+                  }}
+                >
+                  {linkCopied ? <CheckIcon className="size-3" /> : <Link2Icon className="size-3" />}
+                </button>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>

@@ -6,10 +6,10 @@ executor:
   type: omnigent
   config:
     harness: claude-native
-    # YOLO: headless workers can't answer ApprovalCards, so run Claude
-    # Code with full bypass. The server translates this into
-    # ``--permission-mode bypassPermissions`` (native sub-agents only).
-    permission_mode: bypassPermissions
+    # Headless workers can't answer ApprovalCards, and managed Claude
+    # settings disable ``bypassPermissions``. ``auto`` auto-approves without
+    # prompting and is allowed under managed settings (-> ``--permission-mode auto``).
+    permission_mode: auto
 
 prompt: |
   You are Claude Code, a coding sub-agent dispatched by the polly

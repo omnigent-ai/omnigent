@@ -188,8 +188,7 @@ function longestUnbrokenRun(text: string): number {
  */
 function isPathologicalText(text: string): boolean {
   return (
-    text.length > MAX_MARKDOWN_TEXT_LENGTH ||
-    longestUnbrokenRun(text) > MAX_UNBROKEN_TOKEN_LENGTH
+    text.length > MAX_MARKDOWN_TEXT_LENGTH || longestUnbrokenRun(text) > MAX_UNBROKEN_TOKEN_LENGTH
   );
 }
 

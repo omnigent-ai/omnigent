@@ -27,11 +27,7 @@ export function CapabilitiesProvider({
   info: ServerInfo;
   children: ReactNode;
 }) {
-  return (
-    <CapabilitiesContext.Provider value={info}>
-      {children}
-    </CapabilitiesContext.Provider>
-  );
+  return <CapabilitiesContext.Provider value={info}>{children}</CapabilitiesContext.Provider>;
 }
 
 /**

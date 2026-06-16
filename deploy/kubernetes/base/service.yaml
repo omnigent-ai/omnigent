@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: omnigent
+  labels:
+    app: omnigent
+spec:
+  type: ClusterIP
+  selector:
+    app: omnigent
+  ports:
+    - port: 80
+      targetPort: http
+      protocol: TCP
+      name: http

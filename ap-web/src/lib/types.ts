@@ -123,7 +123,7 @@ export type ContentBlock =
  * Mirrors the union in `SessionStatusEvent.status`. See
  * `omnigent/server/schemas.py:SessionStatusEvent`.
  */
-export type SessionStatus = "idle" | "running" | "waiting" | "failed";
+export type SessionStatus = "idle" | "launching" | "running" | "waiting" | "failed";
 
 /**
  * A client-submitted event/input for a session.

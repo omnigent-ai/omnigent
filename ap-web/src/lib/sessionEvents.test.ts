@@ -70,7 +70,7 @@ describe("session.status (FLAT envelope)", () => {
     expect((out[0] as SessionStatusEvent).status).toBe("waiting");
   });
 
-  it.each(["idle", "running", "waiting", "failed"] as const)(
+  it.each(["idle", "launching", "running", "waiting", "failed"] as const)(
     "accepts %s as a valid status",
     (status) => {
       const out = parse("session.status", {

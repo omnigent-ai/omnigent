@@ -386,10 +386,7 @@ describe("useRenameConversation cache patching", () => {
       ["conversations", "", true],
       infinitePage([conversation({ id: "conv_x" })]),
     );
-    queryClient.setQueryData(
-      ["conversation-backfill", "conv_x"],
-      conversation({ id: "conv_x" }),
-    );
+    queryClient.setQueryData(["conversation-backfill", "conv_x"], conversation({ id: "conv_x" }));
     queryClient.setQueryData(["session", "conv_x"], {
       id: "conv_x",
       agentId: "ag_1",

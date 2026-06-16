@@ -221,6 +221,7 @@ class OmnigentClient:
         *,
         filename: str = "agent.tar.gz",
         tool_callables: dict[str, ToolCallable] | None = None,
+        hooks: StreamHooks | None = None,
     ) -> SessionsChat:
         """Create a sessions-API-native chat helper bound to a new session.
 
@@ -239,6 +240,8 @@ class OmnigentClient:
             ``send()`` / ``query()`` / ``stream()`` call), not at
             construction. See :class:`SessionsChat` for the
             validation rules.
+        :param hooks: Optional lifecycle hooks fired from sessions
+            stream events.
         :returns: A :class:`SessionsChat` ready for use.
         :raises OmnigentError: If session creation fails.
         """
@@ -249,6 +252,7 @@ class OmnigentClient:
             files_namespace=self.files,
             tool_callables=tool_callables,
             agent_tools_getter=self._fetch_agent_tools,
+            hooks=hooks,
         )
 
     async def _fetch_agent_tools(

@@ -19,7 +19,11 @@ describe("fileViewPreferences", () => {
   });
 
   it("round-trips a written preference", () => {
-    writeFileViewPreferences({ diffActive: true, diffLayout: "split", previewableViewMode: "source" });
+    writeFileViewPreferences({
+      diffActive: true,
+      diffLayout: "split",
+      previewableViewMode: "source",
+    });
     // The exact object written must come back — proves both the write
     // serialized and the read parsed/validated every field correctly.
     expect(readFileViewPreferences()).toEqual({
@@ -48,10 +52,7 @@ describe("fileViewPreferences", () => {
     // (defaults to "unified"); previewableViewMode is missing (defaults to
     // "editor"). Proves a partial/garbage record still yields sane values for
     // the fields that are valid instead of being discarded entirely.
-    localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify({ diffActive: true, diffLayout: "sideways" }),
-    );
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ diffActive: true, diffLayout: "sideways" }));
     expect(readFileViewPreferences()).toEqual({
       diffActive: true,
       diffLayout: "unified",

@@ -87,16 +87,18 @@ export function ensureMonacoReady(): Promise<ShikiHighlighter> {
     readyPromise = createHighlighter({
       themes: [LIGHT_THEME, DARK_THEME],
       langs: [],
-    }).then((hl) => {
-      // Registers the github themes under their ids so the editor's `theme`
-      // option and monaco.editor.setTheme resolve them.
-      shikiToMonaco(hl, monaco);
-      return hl;
-    }).catch((err: unknown) => {
-      // Don't cache the failure — let the next call retry (matches ensureLanguage).
-      readyPromise = null;
-      throw err;
-    });
+    })
+      .then((hl) => {
+        // Registers the github themes under their ids so the editor's `theme`
+        // option and monaco.editor.setTheme resolve them.
+        shikiToMonaco(hl, monaco);
+        return hl;
+      })
+      .catch((err: unknown) => {
+        // Don't cache the failure — let the next call retry (matches ensureLanguage).
+        readyPromise = null;
+        throw err;
+      });
   }
   return readyPromise;
 }

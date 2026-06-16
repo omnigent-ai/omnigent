@@ -1927,13 +1927,12 @@ def test_populate_codex_skills_from_bundle_none_leaves_no_dir(tmp_path: Path) ->
 
 
 def test_populate_codex_home_config_symlinks_auth_and_config(tmp_path: Path) -> None:
-    """When ``auth.json`` and ``config.toml`` exist in the source dir,
-    both are symlinked into the target dir.
+    """``auth.json`` is symlinked; ``config.toml`` is copied (not symlinked).
 
-    Verifies the subscription-auth bridge: the per-conversation temp
-    ``CODEX_HOME`` must see the user's OAuth tokens (``auth.json``)
-    and model provider definitions (``config.toml``) so the codex CLI
-    authenticates via the user's subscription plan.
+    ``auth.json`` is symlinked so OAuth token refreshes written to the real
+    home propagate to running sessions. ``config.toml`` is copied so an
+    in-TUI ``/model`` command writes only to the session's private copy and
+    never mutates the shared ``~/.codex/config.toml``.
     """
     from omnigent.inner.codex_executor import _populate_codex_home_config
 
@@ -1946,10 +1945,37 @@ def test_populate_codex_home_config_symlinks_auth_and_config(tmp_path: Path) -> 
 
     _populate_codex_home_config(target, source)
 
+    # auth.json: symlink so live credential refreshes propagate.
     assert (target / "auth.json").is_symlink()
-    assert (target / "config.toml").is_symlink()
     assert (target / "auth.json").read_text() == '{"auth_mode": "chatgpt"}'
+    # config.toml: independent copy so /model writes stay session-local.
+    assert not (target / "config.toml").is_symlink()
+    assert (target / "config.toml").is_file()
     assert (target / "config.toml").read_text() == '[default]\nmodel = "gpt-5.4"'
+
+
+def test_populate_codex_home_config_config_toml_copy_is_isolated(tmp_path: Path) -> None:
+    """Writing to the session's ``config.toml`` copy does not affect the source.
+
+    Proves that ``/model`` inside a session cannot mutate the shared
+    ``~/.codex/config.toml`` and silently change another session's model or
+    cost-policy enforcement.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "config.toml").write_text('[default]\nmodel = "gpt-5.4"')
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    # Simulate a /model write inside the session.
+    (target / "config.toml").write_text('[default]\nmodel = "gpt-4o-mini"')
+
+    # Source must be untouched.
+    assert (source / "config.toml").read_text() == '[default]\nmodel = "gpt-5.4"'
 
 
 def test_populate_codex_home_config_missing_source_dir(tmp_path: Path) -> None:
@@ -2043,7 +2069,8 @@ def test_app_server_start_uses_real_home_for_private_inherited_codex_home(
             target_at_spawn = Path(recorded_env["CODEX_HOME"])
             assert target_at_spawn != inherited
             assert (target_at_spawn / "auth.json").is_symlink()
-            assert (target_at_spawn / "config.toml").is_symlink()
+            assert not (target_at_spawn / "config.toml").is_symlink()
+            assert (target_at_spawn / "config.toml").is_file()
             assert (target_at_spawn / "auth.json").read_text() == '{"auth_mode": "api_key"}'
             assert (target_at_spawn / "config.toml").read_text() == 'model_provider = "openai"'
             return fake_proc

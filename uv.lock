@@ -11,6 +11,9 @@ resolution-markers = [
 exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
 exclude-newer-span = "P7D"
 
+[options.exclude-newer-package]
+cwsandbox = "2026-06-12T00:00:00Z"
+
 [[package]]
 name = "aiofiles"
 version = "24.1.0"
@@ -743,6 +746,36 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/41/52/a8908dcb1a389a459a29008c29966c1d552588d4ae6d43f3a1a4512e0ebe/cryptography-46.0.7-cp38-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:a1529d614f44b863a7b480c6d000fe93b59acee9c82ffa027cfadc77521a9f5e", size = 4664256, upload-time = "2026-04-08T01:57:33.144Z" },
     { url = "https://files.pythonhosted.org/packages/4b/fa/f0ab06238e899cc3fb332623f337a7364f36f4bb3f2534c2bb95a35b132c/cryptography-46.0.7-cp38-abi3-win32.whl", hash = "sha256:f247c8c1a1fb45e12586afbb436ef21ff1e80670b2861a90353d9b025583d246", size = 3013001, upload-time = "2026-04-08T01:57:34.933Z" },
     { url = "https://files.pythonhosted.org/packages/d2/f1/00ce3bde3ca542d1acd8f8cfa38e446840945aa6363f9b74746394b14127/cryptography-46.0.7-cp38-abi3-win_amd64.whl", hash = "sha256:506c4ff91eff4f82bdac7633318a526b1d1309fc07ca76a3ad182cb5b686d6d3", size = 3472985, upload-time = "2026-04-08T01:57:36.714Z" },
+]
+
+[[package]]
+name = "cursor-sdk"
+version = "0.1.7"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/1c/36/dbba49561bad0f2acc21654bb5ba398b0691ecbea5667f7370f581781422/cursor_sdk-0.1.7.tar.gz", hash = "sha256:a8eead9558bf4a53aab0a4a83eb1f56bb8c38fb5f978041712b436a12c6a30d7", size = 1175, upload-time = "2026-06-05T15:44:51.544Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/35/74/f966249d4b8e251a6bc21f68af879e436c31f8a41c8138b3ef5d91e05980/cursor_sdk-0.1.7-py3-none-macosx_11_0_arm64.whl", hash = "sha256:0e7eb4999c9176caaa6da45690f1cfde674ea5e5fb4f4decfc137e36a599e535", size = 52825504, upload-time = "2026-06-05T15:44:36.199Z" },
+    { url = "https://files.pythonhosted.org/packages/1b/93/96c85399164c6ff7195661874e0728ef83ca7535721116cb989db7334080/cursor_sdk-0.1.7-py3-none-macosx_11_0_x86_64.whl", hash = "sha256:0b689cdf1a1a1c3e011ea47cd1b7257bc3b38924f3b299bc580bcea64f841f7a", size = 54423057, upload-time = "2026-06-05T15:44:39.368Z" },
+    { url = "https://files.pythonhosted.org/packages/cd/8a/9f8c7541759507be32208545a7ebb3fad451e9da83e2fff86e8b73f6356a/cursor_sdk-0.1.7-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:719c555bdb20ac68545883ef19e49dd592160fc204f4ccbd543c4cd977032a0f", size = 61457752, upload-time = "2026-06-05T15:44:42.536Z" },
+    { url = "https://files.pythonhosted.org/packages/8d/22/7ddc14b07b73603b41f62970f49c186daa1301622c5a87cd3d67136142c9/cursor_sdk-0.1.7-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:1f1d35c9136cdcd2ac8e5b4caa216f002b1087281d63992101485a1854f3a313", size = 62149668, upload-time = "2026-06-05T15:44:46.014Z" },
+    { url = "https://files.pythonhosted.org/packages/6c/a9/be47ff49fe67420b3392547b63909c3232d0081bdb068247a3f145a06e3b/cursor_sdk-0.1.7-py3-none-win_amd64.whl", hash = "sha256:5b0528f90b520a02012201ee9071b5f48081686b6c599729fa1942a29cadc0a0", size = 48834389, upload-time = "2026-06-05T15:44:49.103Z" },
+]
+
+[[package]]
+name = "cwsandbox"
+version = "0.26.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "googleapis-common-protos" },
+    { name = "grpcio" },
+    { name = "protobuf" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ef/d9/540f20685c878f86f8588bff841618e1a125bfb13c8ba4071fe9e041477d/cwsandbox-0.26.0.tar.gz", hash = "sha256:541fbef6fd5cf7b70e2692bf3f35a2ae8f2a577e5caf29162dececb42e973616", size = 489383, upload-time = "2026-06-11T13:09:00.329Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/67/61/ac962e3c59d3c349046d204a67c5f301b10ebab4c413b079862fd234a7d5/cwsandbox-0.26.0-py3-none-any.whl", hash = "sha256:88143a5959a93f1a0145a7897d57caabe9c488051e287f185da1a83451896105", size = 178221, upload-time = "2026-06-11T13:08:58.751Z" },
 ]
 
 [[package]]
@@ -2442,6 +2475,7 @@ dependencies = [
     { name = "cel-expr-python" },
     { name = "claude-agent-sdk" },
     { name = "click" },
+    { name = "cursor-sdk" },
     { name = "fastapi" },
     { name = "ftfy" },
     { name = "httpx" },
@@ -2455,6 +2489,7 @@ dependencies = [
     { name = "opentelemetry-exporter-otlp-proto-http" },
     { name = "opentelemetry-instrumentation-fastapi" },
     { name = "opentelemetry-instrumentation-httpx" },
+    { name = "packaging" },
     { name = "pexpect" },
     { name = "prompt-toolkit" },
     { name = "psutil" },
@@ -2481,6 +2516,9 @@ all = [
 bedrock = [
     { name = "boto3" },
     { name = "botocore" },
+]
+cwsandbox = [
+    { name = "cwsandbox" },
 ]
 databricks = [
     { name = "databricks-mcp" },
@@ -2530,6 +2568,8 @@ requires-dist = [
     { name = "cel-expr-python", specifier = ">=0.1" },
     { name = "claude-agent-sdk", specifier = ">=0.1.62" },
     { name = "click", specifier = ">=8.0,<8.2" },
+    { name = "cursor-sdk", specifier = ">=0.1.7" },
+    { name = "cwsandbox", marker = "extra == 'cwsandbox'", specifier = ">=0.26,<1" },
     { name = "databricks-mcp", marker = "extra == 'databricks'", specifier = ">=0.1.0" },
     { name = "databricks-sdk", marker = "extra == 'all'", specifier = ">=0.56.0,<1" },
     { name = "databricks-sdk", marker = "extra == 'databricks'", specifier = ">=0.56.0,<1" },
@@ -2557,6 +2597,7 @@ requires-dist = [
     { name = "opentelemetry-instrumentation-fastapi", specifier = ">=0,<1" },
     { name = "opentelemetry-instrumentation-httpx", specifier = ">=0,<1" },
     { name = "opentelemetry-instrumentation-openai-agents-v2", marker = "extra == 'agents-sdk'", specifier = ">=0.1" },
+    { name = "packaging", specifier = ">=23,<26" },
     { name = "pathspec", marker = "extra == 'dev'", specifier = ">=0.12" },
     { name = "pexpect", specifier = ">=4.9,<5" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.5" },
@@ -2584,7 +2625,7 @@ requires-dist = [
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30,<1" },
 ]
-provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "vertex", "modal", "daytona", "tracing", "agents-sdk", "databricks", "dev"]
+provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "vertex", "modal", "daytona", "cwsandbox", "tracing", "agents-sdk", "databricks", "dev"]
 
 [[package]]
 name = "omnigent-client"

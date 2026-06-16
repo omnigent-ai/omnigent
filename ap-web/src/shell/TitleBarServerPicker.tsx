@@ -100,11 +100,7 @@ export function TitleBarServerPicker({
             <span className="truncate">{hostOf(info.currentOrigin)}</span>
           </DropdownMenuItem>
           {others.map((url) => (
-            <DropdownMenuItem
-              key={url}
-              className="gap-2"
-              onSelect={() => void switchServer(url)}
-            >
+            <DropdownMenuItem key={url} className="gap-2" onSelect={() => void switchServer(url)}>
               {/* Spacer aligns hosts under the current-server check. */}
               <span className="size-4 shrink-0" aria-hidden="true" />
               <span className="truncate">{hostOf(url)}</span>

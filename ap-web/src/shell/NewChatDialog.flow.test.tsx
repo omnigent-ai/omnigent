@@ -23,7 +23,10 @@ const navigateMock = vi.fn();
 const setPendingInitialPromptMock = vi.fn();
 
 const RECENT_KEY = "omnigent:recent-workspaces";
-const PROMPT_HISTORY_KEY = "omnigent:prompt-history";
+// Prompt history is scoped per conversation; the landing composer writes under
+// the newly created session id (``conv_new`` in these tests), so the recall
+// stack lives at the prefixed key, not the bare one.
+const PROMPT_HISTORY_KEY = "omnigent:prompt-history:conv_new";
 // The seeded working directory (from the host's persisted recent) that the
 // create body must carry through.
 const SEEDED_WORKSPACE = "/Users/corey/universe/src/foo";
@@ -382,8 +385,8 @@ describe("NewChatLandingScreen create flow", () => {
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
-    // appendPromptHistoryEntry is unmocked, so it really wrote to the shared
-    // localStorage key the chat composer's usePromptHistory reads on mount.
+    // appendPromptHistoryEntry is unmocked, so it really wrote to conv_new's
+    // scoped key — the one the chat composer reads once bound to that session.
     const history = JSON.parse(localStorage.getItem(PROMPT_HISTORY_KEY) ?? "[]");
     // The stored entry is the SANITIZED prompt: the \x07 bell is gone (proving
     // sanitizeInitialPrompt ran — a bare trim would have kept it) and the

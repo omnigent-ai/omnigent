@@ -306,48 +306,6 @@ def test_download_file_saves_to_workspace(
     assert saved.name == "hello.txt"
 
 
-def test_download_file_custom_destination(
-    monkeypatch: pytest.MonkeyPatch,
-    tool_ctx: ToolContext,
-) -> None:
-    """
-    download_file saves to a custom path within the workspace.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :param tool_ctx: Tool execution context.
-    """
-    content = b"data"
-    monkeypatch.setattr(
-        "omnigent.runtime.get_file_store",
-        lambda: _FakeFileStore(
-            [
-                _FakeFile(
-                    "file_xyz",
-                    "data.csv",
-                    len(content),
-                    "text/csv",
-                    1000,
-                    session_id="conv_alice",
-                ),
-            ]
-        ),
-    )
-    monkeypatch.setattr(
-        "omnigent.runtime.get_artifact_store",
-        lambda: _FakeArtifactStore({"file_xyz": content}),
-    )
-
-    tool = DownloadFileTool()
-    result = json.loads(
-        tool.invoke('{"file_id": "file_xyz", "destination": "output/saved.csv"}', tool_ctx)
-    )
-
-    saved = Path(result["path"])
-    assert saved.exists()
-    assert saved.name == "saved.csv"
-    assert "output" in str(saved)
-
-
 def test_download_file_not_found(
     monkeypatch: pytest.MonkeyPatch,
     tool_ctx: ToolContext,

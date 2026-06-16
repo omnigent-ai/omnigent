@@ -148,7 +148,9 @@ interface UseChildSessionsResult {
  * code should call ``useChildSessions``.
  */
 export async function fetchChildSessions(sessionId: string): Promise<ChildSessionInfo[]> {
-  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/child_sessions`);
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/child_sessions`,
+  );
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const json = (await res.json()) as ChildSessionsResponse;
   return json.data.map((row) => ({

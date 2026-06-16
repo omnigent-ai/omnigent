@@ -5,11 +5,7 @@
 // editor.storage.markdown.getMarkdown() for copy / save.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@/components/ui/popover";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useEditorState } from "@tiptap/react";
 import {
   AlignCenter,
@@ -103,9 +99,7 @@ function TableBtn({ editor }: { editor: Editor | null }) {
         onMouseLeave={() => setHovered({ rows: 0, cols: 0 })}
       >
         <p className="mb-1.5 text-xs text-muted-foreground">
-          {hovered.rows > 0
-            ? `${hovered.rows} × ${hovered.cols} table`
-            : "Insert table"}
+          {hovered.rows > 0 ? `${hovered.rows} × ${hovered.cols} table` : "Insert table"}
         </p>
         <div className="flex flex-col gap-0.5">
           {Array.from({ length: MAX }, (_, r) => (
@@ -186,8 +180,7 @@ function TableAlignControls({ editor }: { editor: Editor }) {
   const state = useEditorState({
     editor,
     selector: (ctx) => ({
-      inTable:
-        (ctx.editor?.isActive("tableCell") || ctx.editor?.isActive("tableHeader")) ?? false,
+      inTable: (ctx.editor?.isActive("tableCell") || ctx.editor?.isActive("tableHeader")) ?? false,
       align:
         (ctx.editor?.getAttributes("tableCell").align as ColumnAlign | undefined) ??
         (ctx.editor?.getAttributes("tableHeader").align as ColumnAlign | undefined) ??
@@ -272,10 +265,7 @@ export function ToolbarPlugin({
   const [isCopied, setIsCopied] = useState(false);
   const copyTimeoutRef = useRef<number>(0);
 
-  const getMarkdown = useCallback(
-    () => editor?.getMarkdown() ?? "",
-    [editor],
-  );
+  const getMarkdown = useCallback(() => editor?.getMarkdown() ?? "", [editor]);
 
   const handleCopy = useCallback(() => {
     const md = getMarkdown();
@@ -285,10 +275,7 @@ export function ToolbarPlugin({
       .then(() => {
         setIsCopied(true);
         window.clearTimeout(copyTimeoutRef.current);
-        copyTimeoutRef.current = window.setTimeout(
-          () => setIsCopied(false),
-          2000,
-        );
+        copyTimeoutRef.current = window.setTimeout(() => setIsCopied(false), 2000);
       })
       .catch(() => {
         // ignore clipboard errors
@@ -313,9 +300,17 @@ export function ToolbarPlugin({
   }, [handleSave]);
 
   const {
-    canUndo, canRedo,
-    isParagraph, isH1, isH2, isH3, isBlockquote,
-    isBold, isItalic, isStrike, isCode,
+    canUndo,
+    canRedo,
+    isParagraph,
+    isH1,
+    isH2,
+    isH3,
+    isBlockquote,
+    isBold,
+    isItalic,
+    isStrike,
+    isCode,
   } = editorState ?? {};
 
   // Auto-save status pill (replaces the explicit Save button). ⌘S / clicking
@@ -327,13 +322,21 @@ export function ToolbarPlugin({
   // to save (e.g. after "Load latest" clears dirty) would otherwise show a
   // dead "Retry" — fall through to "Saved" instead.
   const saveStatus = saveDisabled
-    ? { label: "Offline", title: "Runner offline — your changes will save when it reconnects", tone: "offline" as const }
+    ? {
+        label: "Offline",
+        title: "Runner offline — your changes will save when it reconnects",
+        tone: "offline" as const,
+      }
     : saveError && isDirty
       ? { label: "Retry", title: "Save failed — click to retry", tone: "error" as const }
       : isSaving
         ? { label: "Saving…", title: "Saving…", tone: "pending" as const }
         : isDirty
-          ? { label: "Unsaved", title: "Unsaved changes — ⌘S to save now", tone: "pending" as const }
+          ? {
+              label: "Unsaved",
+              title: "Unsaved changes — ⌘S to save now",
+              tone: "pending" as const,
+            }
           : { label: "Saved", title: "All changes saved", tone: "saved" as const };
   // Clickable only when there are unsaved edits and a write can land: never
   // while offline, mid-conflict, or when there's nothing to persist.
@@ -366,27 +369,21 @@ export function ToolbarPlugin({
       <ToolbarBtn
         active={isH1}
         title="Heading 1"
-        onClick={() =>
-          editor?.chain().focus().toggleHeading({ level: 1 }).run()
-        }
+        onClick={() => editor?.chain().focus().toggleHeading({ level: 1 }).run()}
       >
         <Heading1 className="size-3.5" />
       </ToolbarBtn>
       <ToolbarBtn
         active={isH2}
         title="Heading 2"
-        onClick={() =>
-          editor?.chain().focus().toggleHeading({ level: 2 }).run()
-        }
+        onClick={() => editor?.chain().focus().toggleHeading({ level: 2 }).run()}
       >
         <Heading2 className="size-3.5" />
       </ToolbarBtn>
       <ToolbarBtn
         active={isH3}
         title="Heading 3"
-        onClick={() =>
-          editor?.chain().focus().toggleHeading({ level: 3 }).run()
-        }
+        onClick={() => editor?.chain().focus().toggleHeading({ level: 3 }).run()}
       >
         <Heading3 className="size-3.5" />
       </ToolbarBtn>
@@ -444,11 +441,7 @@ export function ToolbarPlugin({
       {editor && <TableAlignControls editor={editor} />}
       <div className="ml-auto flex items-center gap-2">
         <ToolbarBtn title="Copy" onClick={handleCopy}>
-          {isCopied ? (
-            <Check className="size-3.5" />
-          ) : (
-            <Copy className="size-3.5" />
-          )}
+          {isCopied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
         </ToolbarBtn>
         <button
           type="button"
@@ -460,7 +453,8 @@ export function ToolbarPlugin({
           disabled={!saveClickable}
           className={cn(
             "flex items-center gap-1 rounded px-2 py-0.5 text-xs transition-colors",
-            saveStatus.tone === "error" && "text-destructive hover:bg-destructive/10 cursor-pointer",
+            saveStatus.tone === "error" &&
+              "text-destructive hover:bg-destructive/10 cursor-pointer",
             saveStatus.tone === "offline" && "text-warning cursor-default",
             saveStatus.tone === "pending" &&
               (saveClickable

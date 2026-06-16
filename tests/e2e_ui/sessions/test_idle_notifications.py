@@ -143,7 +143,12 @@ Object.defineProperty(document, "hidden", {
 document.hasFocus = function () { return !window.__hidden; };
 """
 
-_PROMPT = "Write a 400-word essay about the history of timekeeping."
+# Kept deliberately tiny: these tests only need a real ``running`` ->
+# ``idle`` turn to observe, not a long generation. A short reply still
+# exercises the notification body's preview contract (non-empty, capped)
+# while cutting the LLM turn from ~15s of essay tokens to a couple of
+# seconds -- the dominant cost in this suite's slow shard.
+_PROMPT = "Reply with a one-sentence greeting and nothing else."
 
 
 def _reset_session_status_probe(page: Page) -> None:
@@ -252,8 +257,9 @@ def test_idle_notification_fires_when_backgrounded(
     _wait_for_observed_session_status(page, session_id, "idle", timeout=90_000)
     # One more observation window catches duplicate-notification
     # regressions: the single running -> idle transition should produce
-    # exactly one notification.
-    page.wait_for_timeout(10_000)
+    # exactly one notification. A duplicate fires off a re-render right
+    # after the first, so a short settle is enough to catch it.
+    page.wait_for_timeout(3_000)
     notifs = page.evaluate("window.__notifs")
     assert len(notifs) == 1, f"expected exactly one notification, got {notifs}"
     first = notifs[0]
@@ -304,5 +310,5 @@ def test_idle_notification_suppressed_when_foreground(
 
     # Leave a short post-transition window to be sure no delayed
     # notification slips through.
-    page.wait_for_timeout(10_000)
+    page.wait_for_timeout(3_000)
     assert page.evaluate("window.__notifs.length") == 0, "foreground transition must not notify"

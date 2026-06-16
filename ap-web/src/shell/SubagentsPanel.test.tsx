@@ -218,6 +218,35 @@ describe("SubagentsPanel", () => {
     expect(main).not.toHaveTextContent("claude-native-ui");
   });
 
+  it("labels Pi native-wrapper main rows with the product name", () => {
+    useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
+    useSessionMock.mockReturnValue({
+      session: {
+        id: "conv_root",
+        agentId: "ag_root",
+        agentName: "pi-native-ui",
+        runnerId: null,
+        status: "idle",
+        createdAt: 0,
+        title: null,
+        labels: { "omnigent.wrapper": "pi-native-ui" },
+        items: [],
+        pendingElicitations: [],
+        permissionLevel: 4,
+        parentSessionId: null,
+        subAgentName: null,
+      },
+      isLoading: false,
+      error: null,
+    } as unknown as ReturnType<typeof useSession>);
+
+    renderPanel({ rootSessionId: "conv_root" });
+
+    const main = screen.getByTestId("subagent-main-row");
+    expect(main).toHaveTextContent("Pi");
+    expect(main).not.toHaveTextContent("pi-native-ui");
+  });
+
   it("shows the root's latest message as the main-row preview", () => {
     useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
     useSessionMock.mockReturnValue({
@@ -301,6 +330,11 @@ describe("SubagentsPanel", () => {
       name: "codex-native wrapper → codex-native marker",
       labels: { "omnigent.wrapper": "codex-native-ui" },
       expectedKind: "codex-native",
+    },
+    {
+      name: "pi-native wrapper → pi-native marker",
+      labels: { "omnigent.wrapper": "pi-native-ui" },
+      expectedKind: "pi-native",
     },
     {
       name: "nessie agent → nessie marker",
@@ -821,6 +855,7 @@ describe("SubagentsPanel", () => {
   it("shows the status word only for notable states, not quiet ones", () => {
     mockChildTree({
       conv_parent: [
+        childInfo({ id: "c_launch", tool: "researcher", current_task_status: "launching" }),
         childInfo({ id: "c_work", tool: "researcher", busy: true }),
         childInfo({ id: "c_done", tool: "researcher", current_task_status: "completed" }),
         childInfo({ id: "c_idle", tool: "researcher" }),
@@ -832,6 +867,10 @@ describe("SubagentsPanel", () => {
 
     // The unexpected "cancelled" terminal state keeps its word so it stands out.
     expect(childRow(container, "c_cancel")).toHaveTextContent(/cancelled/);
+    // Launching is not yet real work, so it shows its word and does not reuse
+    // the active running dot.
+    expect(childRow(container, "c_launch")).toHaveTextContent(/Launching/);
+    expect(childRow(container, "c_launch").querySelector('[data-testid="running-dot"]')).toBeNull();
     // Quiet states render no word — the label lives in the tooltip. Working is
     // quiet too: the pulsing pink dot already reads as "active".
     expect(childRow(container, "c_work")).not.toHaveTextContent(/Working/);

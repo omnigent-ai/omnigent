@@ -438,6 +438,7 @@ class SeatbeltSandboxBackend(SandboxBackend):
                 if sandbox_spec.env_passthrough is not None
                 else None
             ),
+            credential_proxy=sandbox_spec.credential_proxy,
         )
 
     def wrap_launcher_argv(

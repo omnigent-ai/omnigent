@@ -1,11 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Comment } from "@/hooks/useComments";
 import type { Conversation } from "@/hooks/useConversations";
-import {
-  collectCommentInboxItems,
-  collectInboxItems,
-  sumPendingApprovals,
-} from "./inbox";
+import { collectCommentInboxItems, collectInboxItems, sumPendingApprovals } from "./inbox";
 
 function makeRow(overrides: Partial<Conversation> & { id: string }): Conversation {
   return {

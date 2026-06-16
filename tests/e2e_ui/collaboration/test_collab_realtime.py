@@ -194,12 +194,13 @@ def test_presence_circles_track_other_viewers(
         expect(name_tooltip).to_be_in_viewport()
 
         # Bob leaves. His circle must clear for Alice only after the
-        # server's leave-grace window (~15s, absorbing the ingress'
-        # reconnect churn) expires — 40s bounds grace + broadcast +
+        # server's leave-grace window expires (the spawned test server runs
+        # with _LEAVE_GRACE_S patched to 1s; see live_server. Prod is 15s to
+        # absorb ingress reconnect churn) — 15s bounds grace + broadcast +
         # render without masking a true ghost-viewer stall.
         bob_ctx.close()
         expect(alice.get_by_test_id(f"presence-avatar-{bob_email}")).to_have_count(
-            0, timeout=40_000
+            0, timeout=15_000
         )
     finally:
         alice_ctx.close()

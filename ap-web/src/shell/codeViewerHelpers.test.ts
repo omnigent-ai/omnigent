@@ -37,14 +37,29 @@ describe("detectLang", () => {
 
   it("falls back to 'text' for unknown or extension-less paths", () => {
     expect(detectLang("data.unknownext")).toBe("text");
-    expect(detectLang("Makefile")).toBe("text");
     expect(detectLang("LICENSE")).toBe("text");
   });
 
-  it("falls back to 'text' for Scala (not yet in the language map)", () => {
-    // KNOWN GAP: .scala has no entry, so it renders unhighlighted. Asserting the
-    // current behavior makes adding "scala" a deliberate, reviewed change.
-    expect(detectLang("Service.scala")).toBe("text");
+  it("highlights Scala source files", () => {
+    expect(detectLang("Service.scala")).toBe("scala");
+    expect(detectLang("build.sc")).toBe("scala");
+  });
+
+  it("highlights files identified by name rather than extension", () => {
+    expect(detectLang("Dockerfile")).toBe("dockerfile");
+    expect(detectLang("path/to/Makefile")).toBe("make");
+    expect(detectLang("CMakeLists.txt")).toBe("cmake");
+  });
+
+  it("highlights a sampling of the extended language map", () => {
+    expect(detectLang("Main.kt")).toBe("kotlin");
+    expect(detectLang("app.rb")).toBe("ruby");
+    expect(detectLang("index.php")).toBe("php");
+    expect(detectLang("View.swift")).toBe("swift");
+    expect(detectLang("styles.scss")).toBe("scss");
+    expect(detectLang("App.vue")).toBe("vue");
+    expect(detectLang("schema.graphql")).toBe("graphql");
+    expect(detectLang("Program.cs")).toBe("csharp");
   });
 });
 
@@ -71,15 +86,12 @@ describe("isBinaryPath", () => {
     expect(isBinaryPath(path)).toBe(true);
   });
 
-  it.each([
-    "app.py",
-    "index.ts",
-    "README.md",
-    "config.json",
-    "notes.txt",
-  ])("classifies %s as non-binary", (path) => {
-    expect(isBinaryPath(path)).toBe(false);
-  });
+  it.each(["app.py", "index.ts", "README.md", "config.json", "notes.txt"])(
+    "classifies %s as non-binary",
+    (path) => {
+      expect(isBinaryPath(path)).toBe(false);
+    },
+  );
 
   it("is case-insensitive on the extension", () => {
     expect(isBinaryPath("LOGO.PNG")).toBe(true);

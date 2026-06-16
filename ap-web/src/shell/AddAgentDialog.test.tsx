@@ -134,33 +134,30 @@ describe("AddAgentDialog", () => {
   // tripwire: the body fails today (no such field to type into), and goes
   // red the moment a prompt field lands and its text flows into
   // createSession — at which point promote this to a normal assertion.
-  it.fails(
-    "seeds the user's initial review prompt into the child transcript",
-    async () => {
-      createSessionMock.mockResolvedValue({
-        id: "conv_child",
-      } as unknown as Awaited<ReturnType<typeof createSession>>);
-      renderDialog("conv_parent");
+  it.fails("seeds the user's initial review prompt into the child transcript", async () => {
+    createSessionMock.mockResolvedValue({
+      id: "conv_child",
+    } as unknown as Awaited<ReturnType<typeof createSession>>);
+    renderDialog("conv_parent");
 
-      fireEvent.click(screen.getByTestId("agent-card-ag_codex"));
-      fireEvent.change(screen.getByTestId("add-agent-name-input"), {
-        target: { value: "reviewer" },
-      });
-      // No initial-prompt field exists today — getByTestId throws, which is
-      // the expected failure that keeps this xfail-equivalent green.
-      fireEvent.change(screen.getByTestId("add-agent-initial-prompt-input"), {
-        target: { value: "review the implementation against designs/feature-x.md" },
-      });
-      fireEvent.click(screen.getByTestId("add-agent-submit"));
+    fireEvent.click(screen.getByTestId("agent-card-ag_codex"));
+    fireEvent.change(screen.getByTestId("add-agent-name-input"), {
+      target: { value: "reviewer" },
+    });
+    // No initial-prompt field exists today — getByTestId throws, which is
+    // the expected failure that keeps this xfail-equivalent green.
+    fireEvent.change(screen.getByTestId("add-agent-initial-prompt-input"), {
+      target: { value: "review the implementation against designs/feature-x.md" },
+    });
+    fireEvent.click(screen.getByTestId("add-agent-submit"));
 
-      await waitFor(() => expect(createSessionMock).toHaveBeenCalledTimes(1));
-      // The prompt must travel as initial_items (a seeded user message), not
-      // the empty [] the dialog sends today.
-      const initialItems = createSessionMock.mock.calls[0][1];
-      expect(initialItems).not.toEqual([]);
-      expect(JSON.stringify(initialItems)).toContain("designs/feature-x.md");
-    },
-  );
+    await waitFor(() => expect(createSessionMock).toHaveBeenCalledTimes(1));
+    // The prompt must travel as initial_items (a seeded user message), not
+    // the empty [] the dialog sends today.
+    const initialItems = createSessionMock.mock.calls[0][1];
+    expect(initialItems).not.toEqual([]);
+    expect(JSON.stringify(initialItems)).toContain("designs/feature-x.md");
+  });
 
   it("shows an empty-state and a disabled submit when no agents are available", () => {
     mockAgents([]);
@@ -180,9 +177,7 @@ describe("AddAgentDialog", () => {
     fireEvent.click(screen.getByTestId("add-agent-submit"));
 
     await waitFor(() =>
-      expect(screen.getByTestId("add-agent-error")).toHaveTextContent(
-        "409 label already in use",
-      ),
+      expect(screen.getByTestId("add-agent-error")).toHaveTextContent("409 label already in use"),
     );
     // A failed create must not navigate the user away from the parent.
     expect(navigateMock).not.toHaveBeenCalled();

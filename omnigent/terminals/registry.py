@@ -72,10 +72,16 @@ def conversation_link_for_id(
     :returns: Web UI link, e.g. ``"/c/conv_abc123"`` or
         ``"http://127.0.0.1:6767/c/conv_abc123"``.
     """
-    path = f"/c/{quote(conversation_id, safe='')}"
     if base_url is None or not base_url.strip():
-        return path
-    return f"{base_url.strip().rstrip('/')}{path}"
+        return f"/c/{quote(conversation_id, safe='')}"
+    # Delegate to the shared builder so workspace-hosted servers get the
+    # API→UI mount swap (``/api/2.0/omnigent`` → ``/omnigent``) and the
+    # ``?o=<org>`` selector — keeping the terminal status-bar link in
+    # lockstep with the CLI's ``Web UI:`` link instead of pointing at the
+    # JSON API mount.
+    from omnigent.conversation_browser import conversation_url
+
+    return conversation_url(base_url.strip(), conversation_id)
 
 
 @dataclass(frozen=True)

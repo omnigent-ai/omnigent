@@ -1,8 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import {
-  readSessionWorkspaceState,
-  writeSessionWorkspaceState,
-} from "./sessionWorkspaceState";
+import { readSessionWorkspaceState, writeSessionWorkspaceState } from "./sessionWorkspaceState";
 
 const STORAGE_KEY = "omnigent:session-workspace-state";
 // Mirrors MAX_SESSIONS in the source; the pruning tests below seed exactly this
@@ -93,9 +90,7 @@ describe("sessionWorkspaceState", () => {
     // proving one bad field can't poison the whole entry.
     localStorage.setItem(
       STORAGE_KEY,
-      JSON.stringify([
-        { id: "conv_b", state: { open: true, widthPx: -5, rightRailTab: "bogus" } },
-      ]),
+      JSON.stringify([{ id: "conv_b", state: { open: true, widthPx: -5, rightRailTab: "bogus" } }]),
     );
     expect(readSessionWorkspaceState("conv_b")).toEqual({ open: true });
   });

@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { agentBaseName, harnessFamily, isNativeHarness, forkTargetCarriesHistory } from "./forkHarness";
+import {
+  agentBaseName,
+  harnessFamily,
+  isNativeHarness,
+  forkTargetCarriesHistory,
+} from "./forkHarness";
 
 describe("harnessFamily", () => {
   it.each([

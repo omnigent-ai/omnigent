@@ -2,11 +2,7 @@ import { cjk } from "@streamdown/cjk";
 import { code } from "@streamdown/code";
 import { math } from "@streamdown/math";
 import { mermaid } from "@streamdown/mermaid";
-import {
-  defaultRehypePlugins,
-  type LinkSafetyConfig,
-  type StreamdownProps,
-} from "streamdown";
+import { defaultRehypePlugins, type LinkSafetyConfig, type StreamdownProps } from "streamdown";
 
 type StreamdownRehypePlugins = NonNullable<StreamdownProps["rehypePlugins"]>;
 type StreamdownRehypePlugin = StreamdownRehypePlugins[number];
@@ -23,8 +19,7 @@ type StreamdownHardenPlugin = StreamdownPluginTuple & {
 };
 
 export const STREAMDOWN_PLUGINS = { cjk, code, math, mermaid };
-export const SECURE_STREAMDOWN_REHYPE_PLUGINS =
-  createSecureStreamdownRehypePlugins();
+export const SECURE_STREAMDOWN_REHYPE_PLUGINS = createSecureStreamdownRehypePlugins();
 
 // Streamdown enables a link-safety confirmation modal by default: clicking any
 // markdown link pops an "Open external link?" dialog instead of following the
@@ -60,9 +55,6 @@ function createSecureStreamdownRehypePlugins(): StreamdownRehypePlugins {
       throw new Error("Streamdown harden plugin must be a [plugin, options] tuple");
     }
 
-    return [
-      plugin[0],
-      { ...plugin[1], allowedImagePrefixes: [] },
-    ] satisfies StreamdownPluginTuple;
+    return [plugin[0], { ...plugin[1], allowedImagePrefixes: [] }] satisfies StreamdownPluginTuple;
   });
 }
