@@ -1262,9 +1262,9 @@ def two_agent_chat_session(
 # ---------------------------------------------------------------------------
 
 _APPROVAL_AGENT_NAME = "approval_probe"
-_APPROVAL_AGENT_YAML = """\
+_APPROVAL_AGENT_YAML = f"""\
 spec_version: 1
-name: approval_probe
+name: {_APPROVAL_AGENT_NAME}
 prompt: |
   You are a deterministic approval-test assistant. When the user asks you to
   push, deploy, or "run the command", you MUST do exactly this and nothing
