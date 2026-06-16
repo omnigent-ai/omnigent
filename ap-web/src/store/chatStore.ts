@@ -93,7 +93,11 @@ import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { isClaudeNativeModel } from "@/lib/claudeNativeModels";
 import { getCurrentAuthorId } from "@/lib/identity";
-import { isNativeWrapper } from "@/lib/nativeCodingAgents";
+import {
+  isNativeWrapper,
+  nativeModeConfigForWrapper,
+  parseModeFromLaunchArgs,
+} from "@/lib/nativeCodingAgents";
 
 export interface SendOptions {
   /**
@@ -323,6 +327,17 @@ export interface ChatState {
    */
   sessionHarness: string | null;
   /**
+   * Active session's permission/approval mode parsed from
+   * ``terminal_launch_args``, e.g. ``"acceptEdits"`` or ``"full-auto"``.
+   * ``null`` for non-native sessions or when no mode flag is set.
+   * Session-scoped: hydrated from the session snapshot on bind.
+   */
+  /** Native wrapper label for the active session, e.g.
+   * ``"claude-code-native-ui"`` or ``"codex-native-ui"``. ``null`` for
+   * non-native sessions. Session-scoped: hydrated on bind. */
+  sessionWrapper: string | null;
+  sessionPermissionMode: string | null;
+  /**
    * Context window size in tokens for the active session's model,
    * as looked up server-side. ``null`` before bind or when the
    * model is not in litellm's registry.
@@ -463,6 +478,12 @@ export interface ChatState {
    * default. No-ops when there is no active conversation.
    */
   setCostControlMode: (mode: "on" | "off" | null) => Promise<void>;
+  /**
+   * Set the active session's permission/approval mode. PATCHes
+   * ``terminal_launch_args`` onto the session. The new mode takes
+   * effect on the next agent turn.
+   */
+  setPermissionMode: (mode: string) => Promise<void>;
   /**
    * Fetch the next page of older messages and prepend them to `blocks`.
    *
@@ -663,6 +684,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   flashItemId: null,
   llmModel: null,
   sessionHarness: null,
+  sessionWrapper: null,
+  sessionPermissionMode: null,
   contextWindow: null,
   tokensUsed: null,
   sessionCostUsd: null,
@@ -1130,6 +1153,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
         oldestItemId: null,
         llmModel: null,
         sessionHarness: null,
+        sessionWrapper: null,
+        sessionPermissionMode: null,
         // ``selectedEffort`` / ``selectedModel`` are sticky user picks —
         // not reset here so a CLI-created new chat inherits them.
         // ``sessionModelOverride`` and the cost switch ARE session-scoped,
@@ -1270,6 +1295,32 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // Roll back so the pill doesn't claim a state the server never persisted.
       if (get().conversationId === conversationId) {
         set({ costControlModeOverride: previous });
+      }
+      throw err;
+    }
+  },
+
+  setPermissionMode: async (mode) => {
+    const { conversationId } = get();
+    if (!conversationId) return;
+    const previous = get().sessionPermissionMode;
+    // Resolve the CLI flag for this session's wrapper.
+    const wrapper = get().sessionWrapper;
+    const config = nativeModeConfigForWrapper(wrapper);
+    if (!config) return;
+    // Build the new terminal_launch_args: either the flag pair or
+    // undefined (omit) when resetting to the default.
+    const newArgs = mode === config.defaultMode ? [] : [config.cliFlag, mode];
+    set({ sessionPermissionMode: mode });
+    try {
+      const session = await updateSession(conversationId, { terminalLaunchArgs: newArgs });
+      if (get().conversationId !== conversationId) return;
+      set({
+        sessionPermissionMode: parseModeFromLaunchArgs(wrapper, session.terminalLaunchArgs),
+      });
+    } catch (err) {
+      if (get().conversationId === conversationId) {
+        set({ sessionPermissionMode: previous });
       }
       throw err;
     }
@@ -1503,6 +1554,8 @@ function sessionBindingPatch(
   | "llmModel"
   | "sessionModelOverride"
   | "sessionHarness"
+  | "sessionWrapper"
+  | "sessionPermissionMode"
   | "costControlModeOverride"
   | "contextWindow"
   | "gitBranch"
@@ -1518,6 +1571,8 @@ function sessionBindingPatch(
     llmModel: session.llmModel ?? null,
     sessionModelOverride: session.modelOverride ?? null,
     sessionHarness: session.harness ?? null,
+    sessionWrapper: wrapper ?? null,
+    sessionPermissionMode: parseModeFromLaunchArgs(wrapper, session.terminalLaunchArgs),
     costControlModeOverride: session.costControlModeOverride ?? null,
     contextWindow: session.contextWindow ?? null,
     gitBranch: session.gitBranch ?? null,

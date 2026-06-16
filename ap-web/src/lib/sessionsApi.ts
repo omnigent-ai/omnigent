@@ -189,6 +189,9 @@ interface SessionResponseWire {
    * terminal. Drives the Terminal-pill spinner; absent on older
    * snapshots (treated as false).
    */
+  /** Pass-through CLI args for native terminal wrappers, e.g.
+   * ``["--permission-mode", "acceptEdits"]``. ``null`` when unset. */
+  terminal_launch_args?: string[] | null;
   terminal_pending?: boolean;
   /**
    * Managed-sandbox launch progress while the background launch is in
@@ -277,6 +280,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     subAgentName: wire.sub_agent_name ?? null,
     todos: wire.todos ?? [],
     skills: wire.skills ?? [],
+    terminalLaunchArgs: wire.terminal_launch_args ?? null,
     terminalPending: wire.terminal_pending ?? false,
     sandboxStatus: wire.sandbox_status ?? null,
   };
@@ -557,11 +561,15 @@ export async function updateSession(
     reasoningEffort?: string | null;
     modelOverride?: string | null;
     costControlModeOverride?: "on" | "off" | null;
+    terminalLaunchArgs?: string[] | null;
     runnerId?: string;
     silent?: boolean;
   },
 ): Promise<Session> {
-  const body: Record<string, string | boolean | null> = {};
+  const body: Record<string, string | boolean | string[] | null> = {};
+  if ("terminalLaunchArgs" in updates) {
+    body.terminal_launch_args = updates.terminalLaunchArgs ?? null;
+  }
   if ("reasoningEffort" in updates) {
     body.reasoning_effort = updates.reasoningEffort ?? "default";
   }

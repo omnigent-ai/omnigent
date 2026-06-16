@@ -12874,6 +12874,15 @@ def create_sessions_router(
                     updated.model_override,
                     conversation_store,
                 )
+        if live_forward and terminal_launch_args is not None:
+            await _forward_session_change_to_runner(
+                session_id,
+                runner_router,
+                {
+                    "type": "permission_mode_change",
+                    "terminal_launch_args": updated.terminal_launch_args,
+                },
+            )
         if body.labels is not None and body.labels:
             await asyncio.to_thread(conversation_store.set_labels, session_id, body.labels)
         if body.external_session_id is not None:

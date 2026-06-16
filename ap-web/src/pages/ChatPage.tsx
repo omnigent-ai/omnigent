@@ -67,6 +67,7 @@ import {
 import { type Agent, useSessionAgent, useAgents } from "@/hooks/useAgents";
 import { agentDisplayLabel } from "@/components/AgentInfo";
 import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
+import { nativeModeConfigForWrapper } from "@/lib/nativeCodingAgents";
 import { useConversations } from "@/hooks/useConversations";
 import { usePermissions } from "@/hooks/usePermissions";
 import type { SandboxStatus, Session, SessionStatus } from "@/lib/types";
@@ -3882,6 +3883,9 @@ function AgentPicker({
   const selectedEffort = useChatStore((s) => s.selectedEffort);
   const selectedModel = useChatStore((s) => s.selectedModel);
   const llmModel = useChatStore((s) => s.llmModel);
+  const sessionWrapper = useChatStore((s) => s.sessionWrapper);
+  const sessionPermissionMode = useChatStore((s) => s.sessionPermissionMode);
+  const modeConfig = nativeModeConfigForWrapper(sessionWrapper);
 
   const isClaudeNative = showModels;
   // Only offer the agent list when there's an actual choice. Inside a
@@ -3901,7 +3905,8 @@ function AgentPicker({
   // Build the pill piece-by-piece so empty selections don't leave
   // stray separators.
   const effortLabel = showEffort && selectedEffort ? formatEffortLabel(selectedEffort) : null;
-  const hasPickerActions = showAgents || showModels || showEffort;
+  const showPermissionMode = modeConfig !== null;
+  const hasPickerActions = showAgents || showModels || showEffort || showPermissionMode;
 
   let triggerLabel: string;
   if (isLoading) {
@@ -4022,6 +4027,32 @@ function AgentPicker({
                 )}
               >
                 <span className="flex-1 truncate">{level}</span>
+              </DropdownMenuItem>
+            ))}
+          </>
+        )}
+        {showPermissionMode && modeConfig && (
+          <>
+            {(showAgents || showModels || showEffort) && <DropdownMenuSeparator className="my-1" />}
+            <PickerSectionHeader>{modeConfig.sectionLabel}</PickerSectionHeader>
+            {modeConfig.modes.map((mode) => (
+              <DropdownMenuItem
+                key={mode.value}
+                data-testid="permission-mode-picker-item"
+                data-mode-value={mode.value}
+                data-active={sessionPermissionMode === mode.value ? "true" : undefined}
+                onSelect={() =>
+                  void useChatStore
+                    .getState()
+                    .setPermissionMode(mode.value)
+                    .catch(() => {})
+                }
+                className={cn(
+                  "items-center gap-2 rounded-sm px-2 py-1.5 text-xs",
+                  "data-[active=true]:bg-accent/60 data-[active=true]:text-foreground",
+                )}
+              >
+                <span className="flex-1 truncate">{mode.label}</span>
               </DropdownMenuItem>
             ))}
           </>

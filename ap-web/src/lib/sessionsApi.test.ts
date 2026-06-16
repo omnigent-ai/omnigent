@@ -96,6 +96,7 @@ describe("createSession", () => {
       subAgentName: null,
       todos: [],
       skills: [],
+      terminalLaunchArgs: null,
       terminalPending: false,
       sandboxStatus: null,
       workspace: null,

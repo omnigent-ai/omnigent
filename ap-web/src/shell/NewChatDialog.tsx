@@ -49,6 +49,10 @@ import {
   nativeAgentHasCapability,
   nativeAgentSortRank,
   nativeWrapperLabelsForAgent,
+  CLAUDE_PERMISSION_MODES,
+  CLAUDE_PERMISSION_MODE_DEFAULT,
+  CODEX_APPROVAL_MODES,
+  CODEX_APPROVAL_MODE_DEFAULT,
 } from "@/lib/nativeCodingAgents";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
@@ -86,50 +90,12 @@ const AGENT_PICKER_DESCRIPTIONS: Record<string, string> = {
 // out — other agents keep the "/" menu as the only skill surface.
 const SKILL_PILL_AGENTS = new Set(["polly", "debby"]);
 
-// Claude Code's `claude --permission-mode` choices (v2.1). Claude-native
-// sessions only. "default" is Claude's own default and sends no flag; any
-// other value is passed through as `--permission-mode <value>` via the
-// session's terminal_launch_args. Keep in sync with `claude --help`.
-const CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE = "default";
-const CLAUDE_NATIVE_PERMISSION_MODES: { value: string; label: string; description: string }[] = [
-  { value: "default", label: "Default", description: "Prompts before edits and commands" },
-  {
-    value: "auto",
-    label: "Auto",
-    description: "Auto-runs; a classifier blocks risky actions",
-  },
-  {
-    value: "acceptEdits",
-    label: "Accept edits",
-    description: "Auto-applies file edits; commands still prompt",
-  },
-  { value: "plan", label: "Plan", description: "Plans only; makes no edits" },
-  { value: "dontAsk", label: "Don't ask", description: "Auto-denies anything not pre-approved" },
-  {
-    value: "bypassPermissions",
-    label: "Bypass permissions",
-    description: "Runs everything; no prompts or safety checks",
-  },
-];
-
-// Codex's `--approval-mode` choices. Codex-native sessions only.
-// "suggest" is Codex's default (prompts before everything); any other value
-// is passed through as `--approval-mode <value>` via the session's
-// terminal_launch_args. Keep in sync with `codex --help`.
-const CODEX_NATIVE_DEFAULT_APPROVAL_MODE = "suggest";
-const CODEX_NATIVE_APPROVAL_MODES: { value: string; label: string; description: string }[] = [
-  { value: "suggest", label: "Suggest", description: "Prompts before edits and commands" },
-  {
-    value: "auto-edit",
-    label: "Auto edit",
-    description: "Auto-applies file edits; commands still prompt",
-  },
-  {
-    value: "full-auto",
-    label: "Full auto",
-    description: "Runs everything; no prompts or safety checks",
-  },
-];
+// Aliases for the shared constants — keeps the diff small relative to the
+// original local names used throughout this file.
+const CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE = CLAUDE_PERMISSION_MODE_DEFAULT;
+const CLAUDE_NATIVE_PERMISSION_MODES = CLAUDE_PERMISSION_MODES;
+const CODEX_NATIVE_DEFAULT_APPROVAL_MODE = CODEX_APPROVAL_MODE_DEFAULT;
+const CODEX_NATIVE_APPROVAL_MODES = CODEX_APPROVAL_MODES;
 
 function HostOption({ host }: { host: Host }) {
   const isOnline = host.status === "online";

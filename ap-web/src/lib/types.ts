@@ -389,6 +389,9 @@ export interface Session {
    * build time so a client connecting mid-spin-up sees the Terminal
    * pill spinner. ``undefined`` on older snapshots (treated as false).
    */
+  /** Pass-through CLI args for native terminal wrappers, e.g.
+   * ``["--permission-mode", "acceptEdits"]``. ``null`` when unset. */
+  terminalLaunchArgs?: string[] | null;
   terminalPending?: boolean;
   /**
    * Managed-sandbox launch progress. Present while the session's

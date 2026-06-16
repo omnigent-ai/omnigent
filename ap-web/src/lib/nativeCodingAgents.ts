@@ -132,3 +132,99 @@ export function nativeAgentHasCapability(
 ): boolean {
   return nativeCodingAgentForAvailableAgent(agent)?.capabilities?.includes(capability) ?? false;
 }
+
+// ── Permission / approval mode constants ────────────────────────────
+//
+// Shared between the New Chat dialog (create-time picker) and the
+// in-session AgentPicker (mid-session switcher). Keep in sync with
+// `claude --help` / `codex --help`.
+
+export interface NativeAgentMode {
+  value: string;
+  label: string;
+  description: string;
+}
+
+// Claude Code `--permission-mode` choices.
+export const CLAUDE_PERMISSION_MODE_DEFAULT = "default";
+export const CLAUDE_PERMISSION_MODES: readonly NativeAgentMode[] = [
+  { value: "default", label: "Default", description: "Prompts before edits and commands" },
+  { value: "auto", label: "Auto", description: "Auto-runs; a classifier blocks risky actions" },
+  {
+    value: "acceptEdits",
+    label: "Accept edits",
+    description: "Auto-applies file edits; commands still prompt",
+  },
+  { value: "plan", label: "Plan", description: "Plans only; makes no edits" },
+  { value: "dontAsk", label: "Don't ask", description: "Auto-denies anything not pre-approved" },
+  {
+    value: "bypassPermissions",
+    label: "Bypass permissions",
+    description: "Runs everything; no prompts or safety checks",
+  },
+];
+
+// Codex `--approval-mode` choices.
+export const CODEX_APPROVAL_MODE_DEFAULT = "suggest";
+export const CODEX_APPROVAL_MODES: readonly NativeAgentMode[] = [
+  { value: "suggest", label: "Suggest", description: "Prompts before edits and commands" },
+  {
+    value: "auto-edit",
+    label: "Auto edit",
+    description: "Auto-applies file edits; commands still prompt",
+  },
+  {
+    value: "full-auto",
+    label: "Full auto",
+    description: "Runs everything; no prompts or safety checks",
+  },
+];
+
+/**
+ * Resolve the mode list and CLI flag for a wrapper label.
+ *
+ * @returns The mode options, default value, and CLI flag name for the
+ *   given wrapper, or ``null`` for wrappers without mode support.
+ */
+export function nativeModeConfigForWrapper(wrapper: string | null | undefined): {
+  modes: readonly NativeAgentMode[];
+  defaultMode: string;
+  cliFlag: string;
+  sectionLabel: string;
+} | null {
+  if (wrapper === "claude-code-native-ui") {
+    return {
+      modes: CLAUDE_PERMISSION_MODES,
+      defaultMode: CLAUDE_PERMISSION_MODE_DEFAULT,
+      cliFlag: "--permission-mode",
+      sectionLabel: "Permission mode",
+    };
+  }
+  if (wrapper === "codex-native-ui") {
+    return {
+      modes: CODEX_APPROVAL_MODES,
+      defaultMode: CODEX_APPROVAL_MODE_DEFAULT,
+      cliFlag: "--approval-mode",
+      sectionLabel: "Approval mode",
+    };
+  }
+  return null;
+}
+
+/**
+ * Parse a permission/approval mode from stored ``terminal_launch_args``.
+ *
+ * @returns The mode value (e.g. ``"acceptEdits"``, ``"full-auto"``), or
+ *   the wrapper's default when no mode flag is found.
+ */
+export function parseModeFromLaunchArgs(
+  wrapper: string | null | undefined,
+  args: readonly string[] | null | undefined,
+): string | null {
+  const config = nativeModeConfigForWrapper(wrapper);
+  if (!config) return null;
+  if (!args || args.length === 0) return config.defaultMode;
+  const idx = args.indexOf(config.cliFlag);
+  if (idx === -1 || idx + 1 >= args.length) return config.defaultMode;
+  return args[idx + 1];
+}
