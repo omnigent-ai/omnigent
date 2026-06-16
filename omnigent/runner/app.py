@@ -2909,6 +2909,22 @@ class _SessionSnapshot:
     sub_agent_name: str | None = None
 
 
+_TOOL_SOURCE_SUFFIXES = (".py", ".ts", ".tsx", ".mts", ".cts", ".js", ".mjs", ".cjs")
+
+
+def _is_relative_tool_file(path: str) -> bool:
+    """Whether ``path`` is a workdir-relative tool *source file* rather than a dotted callable.
+
+    ``LocalToolInfo.path`` is overloaded: it is either a relative file path (e.g.
+    ``tools/python/arxiv_search.py``) or a dotted callable import path (e.g.
+    ``pkg.module.func``). Only the former is workdir-relative; a relative source file has a
+    path separator or a known source suffix, whereas a dotted callable has neither.
+    """
+    if Path(path).is_absolute():
+        return False
+    return "/" in path or os.sep in path or path.endswith(_TOOL_SOURCE_SUFFIXES)
+
+
 def _spec_with_workdir_paths(spec: Any, workdir: Path | None) -> Any:
     if workdir is None or spec is None:
         return spec
@@ -2919,7 +2935,9 @@ def _spec_with_workdir_paths(spec: Any, workdir: Path | None) -> Any:
     changed = False
     for info in local_tools:
         path = getattr(info, "path", None)
-        if path and not Path(path).is_absolute():
+        # Only rewrite relative *file* paths. Prepending the workdir to a dotted callable
+        # import path corrupts it, so the tool fails to import and is silently dropped (#378).
+        if path and _is_relative_tool_file(path):
             resolved_tools.append(dataclasses.replace(info, path=str((workdir / path).resolve())))
             changed = True
         else:
