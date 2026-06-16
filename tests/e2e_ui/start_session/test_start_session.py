@@ -430,6 +430,25 @@ async def _drive_pi_native_start(base_url: str, session_id: str) -> None:
                 create_bodies=create_bodies,
                 agents_body=_pi_native_agents_body(),
             )
+
+            # Neutralize agent discovery so the picker shows ONLY the stubbed
+            # built-in Pi. The landing picker merges `/v1/agents` with agents
+            # found by scanning the caller's sessions (`/v1/sessions?kind=any`);
+            # on the shared e2e_ui server, sessions other tests left behind
+            # (e.g. a claude-native fork) would otherwise leak in and — ranking
+            # ahead of Pi — auto-select, so the chip would read "Claude Code".
+            # Registered after _register_common_routes so it wins for the
+            # kind=any scan; the bare POST /v1/sessions create still falls
+            # through to the capturing handler.
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
             # Seed a recent working directory so the working-directory chip
             # auto-fills and Send can enable without touching the file browser.
             await page.add_init_script(

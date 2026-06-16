@@ -655,6 +655,25 @@ def _pi_args_have_session_control(args: list[str]) -> bool:
     return False
 
 
+def _pi_args_have_provider(args: list[str]) -> bool:
+    """Return whether user Pi args already pin a provider/model/key.
+
+    When the user passes their own ``--provider`` / ``--model`` / ``--api-key``,
+    Omnigent must not inject the ``omnigent setup`` provider on top — the
+    explicit choice wins.
+
+    :param args: User pass-through Pi CLI args.
+    :returns: ``True`` when Omnigent should not add provider/model args.
+    """
+    provider_flags = {"--provider", "--model", "--api-key"}
+    for arg in args:
+        if arg in provider_flags:
+            return True
+        if arg.startswith(("--provider=", "--model=", "--api-key=")):
+            return True
+    return False
+
+
 def _build_pi_native_args(
     *,
     terminal_launch_args: list[str] | None,
@@ -735,6 +754,28 @@ async def _auto_create_pi_terminal(
         session_dir=session_dir,
         external_session_id=launch_config.external_session_id,
     )
+    pi_env = {
+        PI_NATIVE_CONFIG_ENV_VAR: str(config),
+        "OMNIGENT_PI_NATIVE_BRIDGE_DIR": str(bridge_dir),
+    }
+    # Route the runner-owned Pi process through the provider configured by
+    # ``omnigent setup`` (Databricks gateway / API key), so a separate
+    # ``pi /login`` isn't required — the parity codex-native/claude-native
+    # already have. Skipped when the user pinned their own provider/model via
+    # terminal_launch_args, or when no usable provider is configured (Pi then
+    # falls back to its own login). Writes a managed per-session Pi config dir,
+    # never touching the user's global ``~/.pi/agent``.
+    if not _pi_args_have_provider(launch_config.terminal_launch_args or []):
+        from omnigent.pi_native_credentials import (
+            pi_native_provider_launch,
+            resolve_pi_native_provider,
+        )
+
+        provider = resolve_pi_native_provider()
+        if provider is not None:
+            cred_env, cred_args = pi_native_provider_launch(bridge_dir / "pi-agent", provider)
+            pi_env.update(cred_env)
+            pi_args.extend(cred_args)
     terminal_view = await resource_registry.launch_terminal(
         session_id=session_id,
         terminal_name="pi",
@@ -744,10 +785,7 @@ async def _auto_create_pi_terminal(
             os_env=OSEnvSpec(type="caller_process", cwd=workspace),
             command=pi_command,
             args=pi_args,
-            env={
-                PI_NATIVE_CONFIG_ENV_VAR: str(config),
-                "OMNIGENT_PI_NATIVE_BRIDGE_DIR": str(bridge_dir),
-            },
+            env=pi_env,
             scrollback=100_000,
             tmux_allow_passthrough=True,
             tmux_start_on_attach=False,
