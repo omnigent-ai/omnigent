@@ -41,7 +41,6 @@ OAuth before pytest. See ``native_claude_session`` in ``conftest.py``.
 from __future__ import annotations
 
 import logging
-import os
 import uuid
 
 import pytest
@@ -120,29 +119,6 @@ def _type_into_tui(page: Page, text: str) -> None:
     page.keyboard.press("Enter")
 
 
-def _dump_tui_screenshot(page: Page, tag: str) -> None:
-    """TEMP diagnostic: screenshot the live Claude Code TUI pane.
-
-    On a CI failure the default page screenshot shows the Chat view; this
-    switches to the Terminal view and captures the xterm canvas so a
-    blocking first-run TUI screen (trust/login/theme/api-key prompt) is
-    visible in the uploaded artifact. Best-effort — never masks the real
-    failure. REMOVE with the rest of the native-claude CI validation TEMP.
-
-    :param page: The Playwright page.
-    :param tag: Short label for the screenshot filename.
-    """
-    out_dir = os.environ.get("OMNIGENT_TUI_DIAG_DIR", "/tmp")
-    try:
-        _open_terminal_view(page)
-        page.wait_for_timeout(1500)
-        page.locator(_TERMINAL_VIEW).last.screenshot(path=f"{out_dir}/claude-tui-{tag}.png")
-        _log.warning("captured Claude TUI screenshot: %s/claude-tui-%s.png", out_dir, tag)
-    except Exception as exc:
-        # Diagnostic must never mask the real failure.
-        _log.warning("failed to capture Claude TUI screenshot (%s): %s", tag, exc)
-
-
 @pytest.mark.timeout(900)
 def test_native_claude_message_render_parity(
     page: Page,
@@ -185,14 +161,9 @@ def test_native_claude_message_render_parity(
         )
         _send(page, _turn_prompt(index, user_marker, assistant_token))
         # The echoed token in an assistant bubble = this turn produced its reply.
-        try:
-            expect(page.locator(_ASSISTANT, has_text=assistant_token).first).to_be_visible(
-                timeout=_NATIVE_TURN_TIMEOUT_MS
-            )
-        except AssertionError:
-            # TEMP: capture the TUI pane so a blocking first-run screen is visible.
-            _dump_tui_screenshot(page, f"composer-turn-{index}")
-            raise
+        expect(page.locator(_ASSISTANT, has_text=assistant_token).first).to_be_visible(
+            timeout=_NATIVE_TURN_TIMEOUT_MS
+        )
         # Fully settle (working shimmer gone) before the next send, so any
         # transient native live-preview has collapsed into the committed bubble.
         expect(page.locator(_WORKING)).to_have_count(0, timeout=_NATIVE_TURN_TIMEOUT_MS)
