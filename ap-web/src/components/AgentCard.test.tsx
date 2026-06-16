@@ -51,6 +51,7 @@ describe("AgentCard icon selection", () => {
     { name: "pi", harness: "pi", expected: "pi" },
     { name: "mimo-native-ui", harness: "mimo", expected: "bot" },
     { name: "gemini-native-ui", harness: "gemini", expected: "bot" },
+    { name: "cmd-native-ui", harness: "cmd", expected: "bot" },
     // The pi match is exact: a harness merely containing "pi" stays generic.
     { name: "spec-gen", harness: "openapi", expected: "bot" },
   ])("uses the $expected glyph for harness $harness", ({ name, harness, expected }) => {

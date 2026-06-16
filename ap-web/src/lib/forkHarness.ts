@@ -36,6 +36,7 @@ export function harnessFamily(harness: string | null | undefined): "anthropic" |
     case "cursor":
     case "mimo":
     case "gemini":
+    case "cmd":
       return "openai";
     default:
       return null;

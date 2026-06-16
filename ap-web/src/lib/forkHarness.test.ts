@@ -21,6 +21,7 @@ describe("harnessFamily", () => {
     ["cursor", "openai"],
     ["mimo", "openai"],
     ["gemini", "openai"],
+    ["cmd", "openai"],
   ])("maps %s → %s", (harness, family) => {
     expect(harnessFamily(harness)).toBe(family);
   });
@@ -46,6 +47,7 @@ describe("isNativeHarness", () => {
     ["cursor", false],
     ["mimo", false],
     ["gemini", false],
+    ["cmd", false],
     [null, false],
   ])("classifies %s as native=%s", (harness, expected) => {
     expect(isNativeHarness(harness as string | null)).toBe(expected);
@@ -65,12 +67,10 @@ describe("forkTargetCarriesHistory", () => {
     ["cursor"],
     ["mimo"],
     ["gemini"],
-  ])(
-    "SDK target %s carries history",
-    (target) => {
-      expect(forkTargetCarriesHistory(target)).toBe(true);
-    },
-  );
+    ["cmd"],
+  ])("SDK target %s carries history", (target) => {
+    expect(forkTargetCarriesHistory(target)).toBe(true);
+  });
 
   // Native targets carry from ANY source: the runner clones the source's
   // native transcript when the source is same-family native, else rebuilds
