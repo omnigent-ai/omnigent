@@ -876,12 +876,45 @@ def create_app(
                 otel_publisher=server_metrics_otel,
             )
         )
+
+        # Docker managed-sandbox reaper: only when the configured provider is
+        # docker. Reap once on startup (clear orphans left by a crash/restart),
+        # then sweep periodically. Inlined gating keeps the dependency on the
+        # docker SDK lazy — non-docker deploys never import it.
+        docker_reaper_task = None
+        if (
+            sandbox_config is not None
+            and sandbox_config.provider == "docker"
+            and host_store is not None
+        ):
+            from omnigent.onboarding.sandboxes.docker import docker_client
+            from omnigent.server.docker_sandbox_reaper import (
+                reap_docker_sandboxes_once,
+                run_docker_sandbox_reaper,
+            )
+
+            _docker_reaper_client = docker_client()
+            await asyncio.to_thread(
+                reap_docker_sandboxes_once,
+                client=_docker_reaper_client,
+                host_store=host_store,
+                grace_s=300,
+            )
+            docker_reaper_task = asyncio.create_task(
+                run_docker_sandbox_reaper(
+                    client=_docker_reaper_client, host_store=host_store
+                )
+            )
+
         try:
             yield
         finally:
             metrics_publish_task.cancel()
             with suppress(asyncio.CancelledError):
                 await metrics_publish_task
+            from omnigent.server.docker_sandbox_reaper import cancel_reaper_task
+
+            await cancel_reaper_task(docker_reaper_task)
             # Stop in-flight background managed-sandbox launches so a
             # slow provision doesn't outlive the ASGI shutdown (the
             # sandbox itself, if already provisioned, is reaped by the
