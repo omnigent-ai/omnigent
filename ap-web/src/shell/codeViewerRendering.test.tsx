@@ -38,7 +38,7 @@ describe("renderLineTokens — no search query", () => {
   it("decodes Shiki fontStyle bit flags (italic|bold|underline)", () => {
     // WHY: fontStyle is a bitfield (1=italic,2=bold,4=underline); a wrong mask
     // would drop or mis-apply a decoration. 7 = all three set.
-    const host = renderTokens([tok("x", { fontStyle: 7 })], "", false);
+    const host = renderTokens([tok("x", { fontStyle: 7 as ThemedToken["fontStyle"] })], "", false);
     const span = host.querySelector("span") as HTMLElement;
     expect(span.style.fontStyle).toBe("italic");
     expect(span.style.fontWeight).toBe("bold");
@@ -48,7 +48,7 @@ describe("renderLineTokens — no search query", () => {
   it("applies only the bold decoration when only the bold bit is set", () => {
     // WHY: pins that an isolated bit (2=bold) does not leak italic/underline —
     // a regression masking the wrong flag would show extra decorations.
-    const host = renderTokens([tok("x", { fontStyle: 2 })], "", false);
+    const host = renderTokens([tok("x", { fontStyle: 2 as ThemedToken["fontStyle"] })], "", false);
     const span = host.querySelector("span") as HTMLElement;
     expect(span.style.fontWeight).toBe("bold");
     expect(span.style.fontStyle).toBe("");

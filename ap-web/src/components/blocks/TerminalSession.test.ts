@@ -233,8 +233,11 @@ class FakeWebSocket {
   sent: Array<string | Uint8Array> = [];
   closed = false;
   private listeners: Record<string, Array<(ev: unknown) => void>> = {};
+  url: string;
 
-  constructor(public url: string) {}
+  constructor(url: string) {
+    this.url = url;
+  }
 
   addEventListener(type: string, fn: (ev: unknown) => void) {
     (this.listeners[type] ??= []).push(fn);
@@ -263,7 +266,9 @@ class FakeResizeObserver {
   static instances: FakeResizeObserver[] = [];
   disconnected = false;
   observed: Element[] = [];
-  constructor(public cb: () => void) {
+  cb: () => void;
+  constructor(cb: () => void) {
+    this.cb = cb;
     FakeResizeObserver.instances.push(this);
   }
   observe(el: Element) {
