@@ -18,10 +18,12 @@ name: Test Coverage
 #
 # The two kinds of job differ only in scope (kept distinct so the follow-up
 # flip is a one-line MODE change per tier):
-#   * UNIT tiers (server / runner / runtime): per-area judge mapping
-#     omnigent/<area>/** -> its suite. The block-mode machinery (the
-#     maintainer-effective `skip-e2e-test` waiver, one shared label) is wired
-#     up and dormant; MODE=advise neutralizes it for now.
+#   * UNIT tiers (server / runner / runtime / tools / inner / llms / db /
+#     policies / repl / entities / stores / host / spec): per-area judge
+#     mapping omnigent/<area>/** -> tests/<area>/ (integration/e2e also count
+#     as coverage). The block-mode machinery (the maintainer-effective
+#     `skip-e2e-test` waiver, one shared label) is wired up and dormant;
+#     MODE=advise neutralizes it for now.
 #   * CROSS-CUTTING tiers (integration / e2e): judge whether any omnigent/**
 #     change warrants a slow, gateway-bound full-stack test. Intended to stay
 #     advisory permanently.
@@ -102,6 +104,102 @@ jobs:
               LLM. Runtime source lives under omnigent/runtime/. A test is warranted for new or changed session
               lifecycle, state transitions, message routing, or scheduling behavior -- not for internal
               refactors or logging.
+          - tier: tools
+            src: "omnigent/tools/"
+            cover: "tests/tools/ tests/integration/ tests/e2e/"
+            cover_hint: "ideally under tests/tools/, or a tests/integration/** or tests/e2e/** test"
+            guidance: >-
+              The repo keeps tool-layer tests under tests/tools/. These are isolated tests of the tool system:
+              tool definitions and schemas, the tool runner/manager, builtins, local/client-specified tools,
+              MCP tool wiring, and elicitation. They do NOT drive a live LLM. Tool source lives under
+              omnigent/tools/. A test is warranted for new or changed tool schemas, argument validation,
+              dispatch/execution behavior, or MCP wiring -- not for internal refactors or logging.
+          - tier: inner
+            src: "omnigent/inner/"
+            cover: "tests/inner/ tests/integration/ tests/e2e/"
+            cover_hint: "ideally under tests/inner/, or a tests/integration/** or tests/e2e/** test"
+            guidance: >-
+              The repo keeps inner-layer tests under tests/inner/. These cover the harness executors and their
+              sandboxing: per-harness executors/bridges (Claude/Codex/antigravity/etc.), subprocess lifecycle,
+              the bwrap/seccomp sandbox, cwd scanning, and skill bundling. Inner source lives under
+              omnigent/inner/. A test is warranted for new or changed executor/harness behavior, sandbox
+              policy, or subprocess lifecycle handling -- not for internal refactors or logging.
+          - tier: llms
+            src: "omnigent/llms/"
+            cover: "tests/llms/ tests/integration/ tests/e2e/"
+            cover_hint: "ideally under tests/llms/, or a tests/integration/** or tests/e2e/** test"
+            guidance: >-
+              The repo keeps LLM-client tests under tests/llms/. These are isolated tests of the LLM client
+              layer: provider adapters, request/response and responses<->chat conversion, model routing,
+              context-window handling, usage accounting, and summarization. They mock the provider rather than
+              calling a live LLM. LLM source lives under omnigent/llms/. A test is warranted for new or changed
+              adapter behavior, routing rules, conversion logic, or usage/context accounting -- not for internal
+              refactors or logging.
+          - tier: db
+            src: "omnigent/db/"
+            cover: "tests/db/ tests/integration/ tests/e2e/"
+            cover_hint: "ideally under tests/db/, or a tests/integration/** or tests/e2e/** test"
+            guidance: >-
+              The repo keeps database tests under tests/db/. These cover the DB layer: SQLAlchemy models,
+              converters, query/utility helpers, and Alembic migrations. DB source lives under omnigent/db/.
+              A test is warranted for new or changed models, converters, query behavior, or a schema migration
+              (migrations especially warrant coverage) -- not for internal refactors or logging.
+          - tier: policies
+            src: "omnigent/policies/"
+            cover: "tests/policies/ tests/integration/ tests/e2e/"
+            cover_hint: "ideally under tests/policies/, or a tests/integration/** or tests/e2e/** test"
+            guidance: >-
+              The repo keeps policy tests under tests/policies/. These are isolated tests of the policy engine:
+              policy schema/types, the registry, function policies, and builtins. Policy source lives under
+              omnigent/policies/. A test is warranted for new or changed policy schemas, evaluation/enforcement
+              behavior, or registry wiring -- not for internal refactors or logging.
+          - tier: repl
+            src: "omnigent/repl/"
+            cover: "tests/repl/ tests/integration/ tests/e2e/"
+            cover_hint: "ideally under tests/repl/, or a tests/integration/** or tests/e2e/** test"
+            guidance: >-
+              The repo keeps REPL tests under tests/repl/. These cover the interactive REPL: the event tape,
+              session log, resume/theme pickers, and tmux pane handling. REPL source lives under omnigent/repl/.
+              A test is warranted for new or changed REPL command/event behavior, session-log format, or
+              resume/replay logic -- not for internal refactors, prompt-only copy, or logging.
+          - tier: entities
+            src: "omnigent/entities/"
+            cover: "tests/entities/ tests/integration/ tests/e2e/"
+            cover_hint: "ideally under tests/entities/, or a tests/integration/** or tests/e2e/** test"
+            guidance: >-
+              The repo keeps entity tests under tests/entities/. These are isolated tests of the domain
+              models: account, agent, comment, conversation, file, permission, policy, session resources, and
+              pagination. Entity source lives under omnigent/entities/. A test is warranted for new or changed
+              entity fields, invariants, validation, serialization, or permission/pagination logic -- not for
+              internal refactors or logging.
+          - tier: stores
+            src: "omnigent/stores/"
+            cover: "tests/stores/ tests/integration/ tests/e2e/"
+            cover_hint: "ideally under tests/stores/, or a tests/integration/** or tests/e2e/** test"
+            guidance: >-
+              The repo keeps store tests under tests/stores/. These cover the persistence/store layer: the
+              agent, artifact, comment, conversation, file, permission, and policy stores, plus the host store.
+              Store source lives under omnigent/stores/. A test is warranted for new or changed store CRUD
+              behavior, querying/filtering, or persistence semantics -- not for internal refactors or logging.
+          - tier: host
+            src: "omnigent/host/"
+            cover: "tests/host/ tests/integration/ tests/e2e/"
+            cover_hint: "ideally under tests/host/, or a tests/integration/** or tests/e2e/** test"
+            guidance: >-
+              The repo keeps host tests under tests/host/. These cover the host layer: the daemon and its
+              launch/connect path, frame protocol, git worktree management, identity, and the local server.
+              Host source lives under omnigent/host/. A test is warranted for new or changed daemon
+              lifecycle, frame/wire protocol, worktree handling, or identity behavior -- not for internal
+              refactors or logging.
+          - tier: spec
+            src: "omnigent/spec/"
+            cover: "tests/spec/ tests/integration/ tests/e2e/"
+            cover_hint: "ideally under tests/spec/, or a tests/integration/** or tests/e2e/** test"
+            guidance: >-
+              The repo keeps agent-spec tests under tests/spec/. These are isolated tests of the agent-spec
+              format: the parser, validator, type model, tar packaging, and legacy/compat shims. Spec source
+              lives under omnigent/spec/. A test is warranted for new or changed spec fields, parsing/
+              validation rules, packaging, or backward-compat handling -- not for internal refactors or logging.
     steps:
       - name: Check out gate scripts from main
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
