@@ -54,17 +54,40 @@
 
 set -euo pipefail
 
+# Escape a string for use as the MESSAGE of a GitHub Actions workflow command
+# (::warning::/::error::). The message can contain attacker-controlled text on
+# fork PRs (the LLM `reason`, the raw model output excerpt), and a bare newline
+# or `%` there can break out of the annotation or inject further commands. Per
+# the Actions spec, message data must escape `%`, CR and LF.
+gha_escape() {
+  local s="$1"
+  s="${s//%/%25}"        # must be first, so we don't re-escape %0A/%0D/%25
+  s="${s//$'\r'/%0D}"
+  s="${s//$'\n'/%0A}"
+  printf '%s' "$s"
+}
+
 pass() { echo "$1"; exit 0; }
 
 # Consequence of a real "needs test / cannot proceed" verdict, mode-aware.
+# $1 is treated as untrusted and escaped; the trusted $TIER prefix is not.
 deny() {
+  local msg
+  msg="$(gha_escape "$1")"
   if [[ "$MODE" == "advise" ]]; then
-    echo "::warning::[$TIER] $1"
+    echo "::warning::[$TIER] $msg"
     exit 0
   fi
-  echo "::error::[$TIER] $1"
+  echo "::error::[$TIER] $msg"
   exit 1
 }
+
+# In advise mode the job must never go red: convert any unexpected non-zero
+# exit (transient gh/curl/jq failure, unset var, etc.) into a warning + exit 0.
+# Explicit `exit 0` from pass()/deny() flows through with rc=0 and no warning.
+if [[ "${MODE:-}" == "advise" ]]; then
+  trap 'rc=$?; if [[ $rc -ne 0 ]]; then echo "::warning::[${TIER:-?}] advisory check hit an unexpected error (exit $rc); treating as non-blocking."; fi; exit 0' EXIT
+fi
 
 # `startswith` against any space-separated prefix in $1; path is $2.
 matches_any() {
