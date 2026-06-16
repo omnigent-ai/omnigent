@@ -170,6 +170,33 @@ def _bundle_agents_body() -> str:
     )
 
 
+def _pi_native_agents_body() -> str:
+    """Stub body for ``GET /v1/agents``: the native Pi agent.
+
+    ``name: "pi-native-ui"`` + ``harness: "pi-native"`` is what the frontend
+    maps (via ``nativeCodingAgents``) to the display label **"Pi"** and the
+    pi-native wrapper labels. The wire ``display_name`` is deliberately set to
+    the raw ``"pi-native-ui"`` to prove the picker derives "Pi" itself
+    (``displayNameForAgent`` ignores the wire value) rather than echoing the
+    server — the regression showed the raw "Pi-native-ui" here. Sole agent, so
+    it auto-selects and no explicit pick is needed.
+    """
+    return json.dumps(
+        {
+            "data": [
+                {
+                    "id": "ag_pi_e2e",
+                    "name": "pi-native-ui",
+                    "display_name": "pi-native-ui",
+                    "description": "Pi coding agent",
+                    "harness": "pi-native",
+                    "skills": [],
+                }
+            ]
+        }
+    )
+
+
 def _hosts_body() -> str:
     """Stub body for ``GET /v1/hosts``: one online host the composer picks."""
     return json.dumps(
@@ -366,6 +393,79 @@ async def _drive_select_harness(base_url: str, session_id: str) -> None:
             assert body["host_id"] == _HOST_ID, body
             assert body["workspace"] == "/work/repo", body
             assert body.get("harness_override") == "pi", body
+        finally:
+            await browser.close()
+
+
+def test_start_session_pi_native_picker_and_wrapper_labels(
+    seeded_session: tuple[str, str],
+) -> None:
+    """Native Pi: the picker shows "Pi" and create carries terminal-first labels.
+
+    Covers the user-facing Pi native-agent flow this PR adds:
+
+    1. **Picker label/icon** — the agent chip renders the harness-derived
+       display label **"Pi"** (via ``nativeCodingAgents``), NOT the raw agent
+       name ``"pi-native-ui"`` the server sends. (The pre-fix bug surfaced the
+       raw name capitalized as "Pi-native-ui".)
+    2. **Session-creation wrapper labels** — selecting Pi and sending must POST
+       ``/v1/sessions`` with the terminal-first wrapper labels
+       (``omnigent.ui: terminal`` + ``omnigent.wrapper: pi-native-ui``) that
+       make the runner launch the Pi TUI and the web UI render the
+       Chat/Terminal view.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_pi_native_start(base_url, session_id))
+
+
+async def _drive_pi_native_start(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page,
+                created_session_id=session_id,
+                create_bodies=create_bodies,
+                agents_body=_pi_native_agents_body(),
+            )
+            # Seed a recent working directory so the working-directory chip
+            # auto-fills and Send can enable without touching the file browser.
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            # Pi auto-selects (sole agent). The chip shows the derived label
+            # "Pi" — and crucially NOT "...native...": the regression rendered
+            # the raw agent name "Pi-native-ui" when the harness→display
+            # mapping was missing.
+            agent_chip = page.get_by_test_id("new-chat-landing-agent-select")
+            await expect(agent_chip).to_contain_text("Pi")
+            await expect(agent_chip).not_to_contain_text("native")
+
+            await page.get_by_test_id("new-chat-landing-input").fill("explore the repo")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["agent_id"] == "ag_pi_e2e", body
+            assert body["host_id"] == _HOST_ID, body
+            assert body["workspace"] == "/work/repo", body
+            # The terminal-first wrapper labels are the contract that drives the
+            # runner-owned Pi TUI and the web UI's Chat/Terminal view.
+            assert body.get("labels") == {
+                "omnigent.ui": "terminal",
+                "omnigent.wrapper": "pi-native-ui",
+            }, body
         finally:
             await browser.close()
 
