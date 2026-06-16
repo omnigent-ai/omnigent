@@ -340,22 +340,27 @@ jobs:
           SHARD_ID: ${{ matrix.shard_id }}
           NUM_SHARDS: ${{ matrix.num_shards }}
         run: |
-          # TEMP (revert before merge): scope this run to ONLY the native codex
-          # render-parity test so we validate the new suite + harness wiring on
-          # CI before flipping back to the full sharded e2e_ui suite. Run it on a
-          # single shard (shard 0) and treat the other shards as empty so they
-          # pass without re-running the expensive native session. -s
-          # --log-cli-level=INFO streams the runner/native logs live for triage.
-          if [[ "$SHARD_ID" != "0" ]]; then
-            echo "::notice::TEMP single-test validation runs on shard 0 only; skipping shard $SHARD_ID."
-            exit 0
+          EXTRA_ARGS=()
+          if [[ "$NIGHTLY_FULL" != "true" ]]; then
+            EXTRA_ARGS+=(-m "not nightly")
           fi
-          uv run pytest tests/e2e_ui/messages/test_native_codex_render_parity.py \
-            -v --tb=long --showlocals --log-level=INFO --log-cli-level=INFO -s -r a \
+          # --splits/--group partition the suite across the matrix entries
+          # via a round-robin strided slice (see pytest_collection_modifyitems
+          # in tests/e2e_ui/conftest.py). Unlike pytest-shard's hash-bucketing
+          # -- which was blind to runtime and left one shard ~5min while
+          # others ran ~2min -- striding scatters each heavy file's cases
+          # one-per-shard, evening out wall-clock with no extra dependency
+          # and no durations file to maintain. --group is 1-indexed, so we
+          # map the 0-indexed matrix shard_id with +1.
+          uv run pytest tests/e2e_ui \
+            -v --tb=long --showlocals --log-level=INFO -r a \
             --ui-skip-build \
+            --splits="$NUM_SHARDS" \
+            --group="$((SHARD_ID + 1))" \
             --tracing=retain-on-failure \
             --screenshot=only-on-failure \
             --video=retain-on-failure \
+            "${EXTRA_ARGS[@]}" \
             || { rc=$?; [ "$rc" -eq 5 ] && echo "::notice::No tests collected in this shard; treating as a pass." || exit "$rc"; }
 
       - name: Upload Playwright traces / videos / screenshots on failure
