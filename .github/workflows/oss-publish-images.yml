@@ -50,6 +50,10 @@ on:
         description: 'Also move :latest to this build (manual release of latest). Off by default.'
         type: boolean
         default: false
+      force_nightly:
+        description: 'Promote :latest-dev -> :latest-nightly now (runs only the nightly job). Off by default.'
+        type: boolean
+        default: false
 
 # Read-only at the top level; write scopes live on the jobs below.
 permissions:
@@ -65,9 +69,10 @@ jobs:
     permissions:
       contents: read
       packages: write # push the image to GHCR via GITHUB_TOKEN
-    # Gated to this repository; inert in forks and mirrors. The schedule event
-    # only drives promote-nightly, so skip the (re)build job there.
-    if: github.repository == 'omnigent-ai/omnigent' && github.event_name != 'schedule'
+    # Gated to this repository; inert in forks and mirrors. Skip the (re)build
+    # on schedule and on a force_nightly dispatch — those only drive
+    # promote-nightly.
+    if: github.repository == 'omnigent-ai/omnigent' && github.event_name != 'schedule' && !inputs.force_nightly
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -184,9 +189,10 @@ jobs:
           sbom: false
 
   promote-nightly:
-    # Daily cron only: move :latest-nightly to the current main build by
-    # retagging the existing :latest-dev manifest (multi-arch safe, no rebuild).
-    if: github.repository == 'omnigent-ai/omnigent' && github.event_name == 'schedule'
+    # Daily cron (or a manual force_nightly dispatch): move :latest-nightly to
+    # the current main build by retagging the existing :latest-dev manifest
+    # (multi-arch safe, no rebuild).
+    if: github.repository == 'omnigent-ai/omnigent' && (github.event_name == 'schedule' || inputs.force_nightly)
     permissions:
       contents: read
       packages: write # retag within GHCR via GITHUB_TOKEN
