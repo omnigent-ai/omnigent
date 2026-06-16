@@ -85,9 +85,12 @@ skip_label_effective() {
 # Only PRs carry untrusted contributor code through the gate. Every other
 # trigger -- push to main / fork-e2e/** (the mirror branch only exists after a
 # returning-contributor / maintainer-approval gate), schedule, dispatch -- is a
-# trusted context, so proceed without scanning.
+# trusted context, so proceed without scanning. pull_request_review is included
+# because the fork-e2e mirror fires on a maintainer's approval, and that path
+# must still consult the head SHA's Security Scan (the review payload carries
+# the same pull_request + author_association fields).
 case "${EVENT_NAME:-}" in
-  pull_request | pull_request_target) ;;
+  pull_request | pull_request_target | pull_request_review) ;;
   *)
     emit false "non-PR event (${EVENT_NAME:-unknown}); trusted context"
     exit 0
