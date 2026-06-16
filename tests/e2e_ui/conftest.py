@@ -400,6 +400,15 @@ def _spawn_runner_against_external_server(
         "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
         "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
         "RUNNER_SERVER_URL": base_url,
+        # Runner-owned Codex / Pi terminals hard-require OMNIGENT_RUNNER_WORKSPACE
+        # (the claude-native path falls back to Path.cwd(), but
+        # _codex_session_workspace / _pi_session_workspace raise without it), so
+        # the native_codex_session fixture's _auto_create_codex_terminal needs it
+        # set. Default to the repo root (the cwd claude falls back to anyway);
+        # honor an externally-provided value if one is already exported.
+        "OMNIGENT_RUNNER_WORKSPACE": os.environ.get(
+            "OMNIGENT_RUNNER_WORKSPACE", str(_REPO_ROOT)
+        ),
     }
     log_handle = open(log_path, "w")  # noqa: SIM115 — closed in finally
     proc = subprocess.Popen(
@@ -590,6 +599,15 @@ def live_server(
         "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
         "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
         "RUNNER_SERVER_URL": base_url,
+        # Runner-owned Codex / Pi terminals hard-require OMNIGENT_RUNNER_WORKSPACE
+        # (the claude-native path falls back to Path.cwd(), but
+        # _codex_session_workspace / _pi_session_workspace raise without it), so
+        # the native_codex_session fixture's _auto_create_codex_terminal needs it
+        # set. Default to the repo root (the cwd claude falls back to anyway);
+        # honor an externally-provided value if one is already exported.
+        "OMNIGENT_RUNNER_WORKSPACE": os.environ.get(
+            "OMNIGENT_RUNNER_WORKSPACE", str(_REPO_ROOT)
+        ),
     }
     runner_proc = subprocess.Popen(
         [sys.executable, "-m", "omnigent.runner._entry"],
@@ -830,6 +848,15 @@ def _ensure_runner_online(
         "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
         "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
         "RUNNER_SERVER_URL": base_url,
+        # Runner-owned Codex / Pi terminals hard-require OMNIGENT_RUNNER_WORKSPACE
+        # (the claude-native path falls back to Path.cwd(), but
+        # _codex_session_workspace / _pi_session_workspace raise without it), so
+        # the native_codex_session fixture's _auto_create_codex_terminal needs it
+        # set. Default to the repo root (the cwd claude falls back to anyway);
+        # honor an externally-provided value if one is already exported.
+        "OMNIGENT_RUNNER_WORKSPACE": os.environ.get(
+            "OMNIGENT_RUNNER_WORKSPACE", str(_REPO_ROOT)
+        ),
     }
     proc = subprocess.Popen(
         [sys.executable, "-m", "omnigent.runner._entry"],
