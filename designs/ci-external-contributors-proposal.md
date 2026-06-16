@@ -64,19 +64,20 @@ After the security check, the three options differ in how they trade contributor
 
 ---
 
-## Option 2 — Auto-run non-key tests; maintainer reviews, then posts `/e2e` ✅ Recommended
+## Option 2 — Auto-run non-key tests; maintainer reviews, then applies an `e2e-approved` label ✅ Recommended
 
 **Pros**
-- Industry-standard pattern (`/ok-to-test`, labeled triggers, environment protection rules).
+- Industry-standard pattern (`ok-to-test`-style labels, environment protection rules).
 - Secrets only reach fork code *after* a human has read the diff — maintainer review is the primary gate.
 - Fast feedback on cheap tests; expensive/sensitive run is gated; `main` stays green.
 - Already supported by our `fork-e2e-mirror.yml` (privilege-separated: the privileged workflow never runs fork code; fork code runs with secrets only on the trusted `push` to `fork-e2e/pr-N`).
+- **A label is the cleaner trigger than a `/e2e` comment.** Applying a label is itself permission-gated — only users with triage/write access can add labels — so the maintainer action is authenticated by GitHub's permission model. A comment trigger (`issue_comment`) fires for *anyone*, so it would need an explicit author-allowlist check in the workflow (the pattern HF Transformers' `run-slow` uses); the label avoids that entirely. It also leaves a persistent, visible state on the PR (re-evaluated on each sync) rather than a one-shot comment event, matching the existing `security-scan-override` label mechanism.
 - **Addresses both vector groups.** Group (a): secrets reach fork code only *after* a human has read the diff. Group (b): the auto-run tier is secret-free and — per the baseline controls above (no fork-artifact execution, branch-scoped caches, least-privilege tokens) — can't reach the privileged paths. The audit found no unguarded fork→trusted path; the one residual is runner egress monitoring.
 
 **Cons**
-- Adds a manual step — maintainer must post `/e2e`; review latency can bottleneck merges.
+- Adds a manual step — maintainer must apply the `e2e-approved` label; review latency can bottleneck merges.
 - e2e issues surface later in the cycle (after initial review), not on first push.
-- *Implementation note:* the `/e2e` run must execute the PR's merge commit in a secret-bearing context — an environment with a required reviewer, or a maintainer-triggered `repository_dispatch`/mirror.
+- *Implementation note:* add `labeled` to `fork-e2e-mirror.yml`'s `pull_request_target` `types:` and have `should-mirror.sh` open when the `e2e-approved` label is present (alongside the existing maintainer/returning-contributor conditions). `pull_request_target` runs the gate from the trusted base ref and receives the secrets needed to mint the mirror App token, so the labeled fork PR's merge commit runs keyed e2e on the trusted `fork-e2e/pr-N` push — no `repository_dispatch` or comment-parser needed. Re-strip the label (or re-require it per push) if you want each new commit re-gated.
 
 ---
 
@@ -95,7 +96,7 @@ After the security check, the three options differ in how they trade contributor
 ---
 
 ## Recommendation
-Adopt **Option 2**, built on the existing `fork-e2e-mirror.yml` privilege-separation, with the security scan as defense-in-depth and **maintainer review as the primary gate** before any key-bearing run. Fall back to Option 3 only if `/e2e` review latency becomes the real bottleneck.
+Adopt **Option 2**, built on the existing `fork-e2e-mirror.yml` privilege-separation, with the security scan as defense-in-depth and **maintainer review as the primary gate** before any key-bearing run — triggered by an `e2e-approved` label (permission-gated, no author-allowlist needed) rather than a `/e2e` comment. Fall back to Option 3 only if label-review latency becomes the real bottleneck.
 
 ---
 
@@ -130,7 +131,7 @@ Surveyed eight widely-used OSS LLM/AI projects to validate the approach above. T
 4. **Environment-scoped secrets + tag-only trigger** (Ollama).
 
 ### Implications for this proposal
-- **Industry consensus validates Option 2.** The dominant pattern is exactly what Option 2 proposes — fast/mocked checks auto-run on forks; the secret/expensive tier is gated behind a *maintainer action that runs in a trusted context*. The `/e2e` command maps directly onto Transformers' `run-slow` comment and vLLM's `ready` label.
+- **Industry consensus validates Option 2.** The dominant pattern is exactly what Option 2 proposes — fast/mocked checks auto-run on forks; the secret/expensive tier is gated behind a *maintainer action that runs in a trusted context*. Our `e2e-approved` label maps directly onto vLLM's `ready` label and PyTorch's `ciflow/*` label; it's the label-based variant of Transformers' `run-slow` comment, with the advantage that label-add is permission-gated by default.
 - **No peer extends secret-tier trust based on past approval.** Every surveyed project re-gates the expensive tier **per PR regardless of tenure**, or never runs it on PRs. Our `fork-e2e-mirror` returning-contributor shortcut (`fork-e2e/pr-N` exists → auto-mirror without fresh approval) is an **outlier** — it grants the keyed e2e tier to previously-approved forks without a fresh human gate. This is the Option 1 risk surface re-introduced for returning contributors and should be a conscious decision: either re-gate it per PR to match the norm, or document it as an accepted risk justified by the rate-limited, revocable test-gateway token.
 - **Our privilege-separation is more advanced than most.** Where peers *withhold* keyed tests from fork code, our `pull_request_target` → trusted-mirror → `push` relay lets the keyed suite actually run on contributor code safely. That capability is what makes Option 2 low-friction for us — but it only stays safe if the trigger gate (maintainer review) is preserved.
 
