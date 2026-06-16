@@ -21,10 +21,13 @@ name: Security Scan
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    # labeled/unlabeled so applying or removing the maintainer skip label
+    # (skip-security-scan) re-runs the scan and flips this check.
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
 
 permissions:
   contents: read
+  pull-requests: read   # read PR labels + reviews for the maintainer skip waiver
 
 concurrency:
   group: security-scan-${{ github.event.pull_request.number }}
@@ -45,14 +48,27 @@ jobs:
           ref: main             # trusted; never the PR head
           sparse-checkout: |
             .github/scripts/security-scan
+            .github/scripts/merge-ready
             .github/security
           persist-credentials: false
+
+      - name: Load maintainers
+        id: maintainers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: bash .github/scripts/merge-ready/load-maintainers.sh
 
       - name: Trust gate
         id: gate
         env:
           EVENT_NAME: ${{ github.event_name }}
           AUTHOR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
+          # For the maintainer-effective skip-security-scan waiver (read-only).
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          MAINTAINERS: ${{ steps.maintainers.outputs.list }}
         run: |
           # Before this lands on main the scripts are absent there -- proceed
           # (fail-open) so the introducing PR is not bricked.
