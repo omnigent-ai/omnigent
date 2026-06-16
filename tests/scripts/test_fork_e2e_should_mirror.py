@@ -40,10 +40,12 @@ def _run(
         "set -uo pipefail\n"
         # gh pr view <pr> --repo <repo> --json labels --jq '.labels[].name'
         # shellcheck-style: unquoted expansion intentionally splits labels.
-        'if [[ "$1" == "pr" ]]; then [[ -n "$MOCK_LABELS" ]] && printf "%s\\n" $MOCK_LABELS; exit 0; fi\n'
+        'if [[ "$1" == "pr" ]]; then [[ -n "$MOCK_LABELS" ]]'
+        ' && printf "%s\\n" $MOCK_LABELS; exit 0; fi\n'
         'if [[ "$1" == "api" ]]; then\n'
         '  case "$2" in\n'
-        '    *issues/*events*) [[ -n "$MOCK_LABELER" ]] && printf "%s\\n" "$MOCK_LABELER"; exit 0 ;;\n'
+        '    *issues/*events*) [[ -n "$MOCK_LABELER" ]]'
+        ' && printf "%s\\n" "$MOCK_LABELER"; exit 0 ;;\n'
         "  esac\n"
         "fi\n"
         'echo "unexpected gh invocation: $*" >&2\n'
