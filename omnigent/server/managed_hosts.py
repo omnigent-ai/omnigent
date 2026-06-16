@@ -121,10 +121,10 @@ _logger = logging.getLogger(__name__)
 # ManagedSandboxConfig directly are not constrained by either set —
 # their launcher factory IS the support.)
 SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
-    {"lakebox", "modal", "daytona", "cwsandbox", "islo"}
+    {"lakebox", "modal", "daytona", "cwsandbox", "islo", "docker"}
 )
 PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
-    {"modal", "daytona", "cwsandbox", "islo"}
+    {"modal", "daytona", "cwsandbox", "islo", "docker"}
 )
 
 # How long a managed launch waits for the sandboxed host to register
@@ -156,6 +156,13 @@ DAYTONA_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 # deleted by managed-session teardown; use the same 7-day policy bound
 # as Daytona for long-lived hosts and stale-token cleanup.
 ISLO_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
+
+# Launch-token lifetime for the YAML docker path. Containers have no
+# platform lifetime cap, so the bound is policy (same 7-day bound as
+# Daytona/Islo): a long-lived container keeps re-authenticating its
+# tunnel across reconnects, while a token leaked from a removed
+# container expires. A relaunch mints a fresh token.
+DOCKER_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 
 # The cwsandbox launch-token TTL is NOT a constant: CW Sandbox's lifetime is
 # operator-overridable (OMNIGENT_CWSANDBOX_MAX_LIFETIME_S), so the TTL is
@@ -618,6 +625,15 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             disk_gb=_parse_provider_positive_int(raw, "islo", "disk_gb"),
         )
         token_ttl_s = ISLO_MANAGED_TOKEN_TTL_S
+    elif provider == "docker":
+        launcher_factory = _docker_launcher_factory(
+            image=_parse_provider_image(raw, "docker"),
+            env=_parse_provider_env(raw, "docker"),
+            network=_parse_provider_string(raw, "docker", "network"),
+            resources=_parse_provider_mapping(raw, "docker", "resources"),
+            security=_parse_provider_mapping(raw, "docker", "security"),
+        )
+        token_ttl_s = DOCKER_MANAGED_TOKEN_TTL_S
     else:
         launcher_factory = _unsupported_launcher_factory(provider)
         # Never consulted (the factory rejects before any token is
@@ -730,6 +746,74 @@ def _daytona_launcher_factory(
         return DaytonaSandboxLauncher(image=image, env=env)
 
     return _build
+
+
+def _docker_launcher_factory(
+    *,
+    image: str | None,
+    env: list[str] | None,
+    network: str | None,
+    resources: dict[str, object] | None,
+    security: dict[str, object] | None,
+) -> Callable[[], SandboxLauncher]:
+    """
+    Build the launcher factory for the YAML ``provider: docker`` path.
+
+    :param image: Registry image with omnigent pre-installed, or ``None``
+        to use the official prebaked host image (env-overridable).
+    :param env: SERVER-process env var NAMES injected into every sandbox
+        (LLM credentials, ``GIT_TOKEN``), or ``None``.
+    :param network: Docker network the spawned host containers join (the
+        segmented sandbox network), or ``None`` for the launcher default.
+    :param resources: ``containers.run`` resource kwargs (``mem_limit`` /
+        ``nano_cpus`` / ``pids_limit``), or ``None``.
+    :param security: ``containers.run`` security kwargs (``security_opt`` /
+        ``cap_drop``), or ``None``.
+    :returns: A factory producing parameterized Docker launchers.
+    """
+
+    def _build() -> SandboxLauncher:
+        """Construct the Docker launcher (lazy SDK import inside)."""
+        from omnigent.onboarding.sandboxes.docker import DockerSandboxLauncher
+
+        return DockerSandboxLauncher(
+            image=image,
+            env=env,
+            network=network,
+            resources=resources,
+            security=security,
+        )
+
+    return _build
+
+
+def _parse_provider_mapping(
+    raw: dict[str, object],
+    provider: str,
+    key: str,
+) -> dict[str, object] | None:
+    """
+    Extract and validate a nested mapping field from a provider section.
+
+    ``sandbox.<provider>.<key>`` is OPTIONAL — absent means ``None``. A
+    present-but-non-mapping value fails loud (operator typo stops startup).
+
+    :param raw: The raw ``sandbox`` mapping.
+    :param provider: Provider section name, e.g. ``"docker"``.
+    :param key: Field name within the section, e.g. ``"resources"``.
+    :returns: The validated mapping (a shallow copy), or ``None``.
+    :raises ValueError: When the section or the field is present but not a
+        mapping.
+    """
+    section = _parse_provider_section(raw, provider)
+    if section is None:
+        return None
+    value = section.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError(f"server config 'sandbox.{provider}.{key}' must be a mapping")
+    return dict(value)
 
 
 def _parse_daytona_image(raw: dict[str, object]) -> str | None:

@@ -870,3 +870,57 @@ def test_register_managed_host_refuses_cross_owner_recredential(db_uri: str) -> 
     assert resolved.owner == "alice@example.com"
     assert resolved.sandbox_id == "sb-m7"
     assert store.resolve_launch_token("bob-token-7") is None
+
+
+def test_list_managed_sandbox_ids_filters_by_provider_across_owners(
+    host_store: HostStore,
+) -> None:
+    """The reaper query returns ids for one provider across all owners."""
+    host_store.register_managed_host(
+        host_id="host_docker_1",
+        name="managed-docker-1",
+        owner="alice@example.com",
+        token="token-1",
+        provider="docker",
+        sandbox_id="container-1",
+        token_expires_at=now_epoch() + 3600,
+    )
+    host_store.register_managed_host(
+        host_id="host_docker_2",
+        name="managed-docker-2",
+        owner="bob@example.com",
+        token="token-2",
+        provider="docker",
+        sandbox_id="container-2",
+        token_expires_at=now_epoch() + 3600,
+    )
+    host_store.register_managed_host(
+        host_id="host_modal",
+        name="managed-modal",
+        owner="alice@example.com",
+        token="token-3",
+        provider="modal",
+        sandbox_id="modal-1",
+        token_expires_at=now_epoch() + 3600,
+    )
+
+    assert host_store.list_managed_sandbox_ids("docker") == {"container-1", "container-2"}
+    assert host_store.list_managed_sandbox_ids("modal") == {"modal-1"}
+    assert host_store.list_managed_sandbox_ids("daytona") == set()
+
+
+def test_list_managed_sandbox_ids_preserves_offline_rows(host_store: HostStore) -> None:
+    """An offline managed host is still 'present' — its id must be returned
+    so the reaper does not remove a reconnecting container."""
+    host_store.register_managed_host(
+        host_id="host_offline",
+        name="managed-offline",
+        owner="alice@example.com",
+        token="token-1",
+        provider="docker",
+        sandbox_id="container-offline",
+        token_expires_at=now_epoch() + 3600,
+    )
+    host_store.set_offline("host_offline")
+
+    assert host_store.list_managed_sandbox_ids("docker") == {"container-offline"}

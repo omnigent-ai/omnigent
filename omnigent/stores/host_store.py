@@ -521,6 +521,28 @@ class HostStore:
                 return None
             return _row_to_host(row)
 
+    def list_managed_sandbox_ids(self, provider: str) -> set[str]:
+        """
+        Return sandbox/container ids recorded for managed hosts of *provider*.
+
+        Includes online AND offline rows: the Docker orphan reaper uses row
+        presence — not liveness — to decide whether a container is still
+        backed by a current managed-host identity. An offline-but-present
+        host (tunnel reconnecting) must be preserved, not reaped.
+
+        :param provider: Sandbox provider name, e.g. ``"docker"``.
+        :returns: Set of recorded sandbox ids for the provider; empty when
+            none exist.
+        """
+        with self._session() as session:
+            rows = session.execute(
+                select(SqlHost.sandbox_id).where(
+                    SqlHost.sandbox_provider == provider,
+                    SqlHost.sandbox_id.is_not(None),
+                )
+            ).all()
+        return {row.sandbox_id for row in rows if row.sandbox_id}
+
     def register_managed_host(
         self,
         *,

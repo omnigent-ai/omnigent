@@ -2529,6 +2529,9 @@ dev = [
     { name = "ruff" },
     { name = "types-pyyaml" },
 ]
+docker = [
+    { name = "docker" },
+]
 modal = [
     { name = "modal" },
 ]
@@ -2555,6 +2558,7 @@ requires-dist = [
     { name = "databricks-sdk", marker = "extra == 'all'", specifier = ">=0.56.0,<1" },
     { name = "databricks-sdk", marker = "extra == 'databricks'", specifier = ">=0.56.0,<1" },
     { name = "daytona", marker = "extra == 'daytona'", specifier = ">=0.180,<1" },
+    { name = "docker", marker = "extra == 'docker'", specifier = ">=7,<8" },
     { name = "fastapi", specifier = ">=0.100,<1" },
     { name = "filelock", marker = "extra == 'dev'", specifier = ">=3.0" },
     { name = "ftfy", specifier = ">=6.0" },
@@ -2605,7 +2609,7 @@ requires-dist = [
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30,<1" },
 ]
-provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "vertex", "modal", "daytona", "cwsandbox", "tracing", "agents-sdk", "databricks", "dev"]
+provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "vertex", "modal", "daytona", "cwsandbox", "docker", "tracing", "agents-sdk", "databricks", "dev"]
 
 [[package]]
 name = "omnigent-client"

@@ -384,6 +384,42 @@ def install_fake_islo_launcher(
     monkeypatch.setattr(islo_mod, "IsloSandboxLauncher", _ctor)
 
 
+def install_fake_docker_launcher(
+    monkeypatch: Any,  # pytest.MonkeyPatch — Any avoids importing pytest in a helpers module
+    fake: FakeSandboxLauncher,
+) -> None:
+    """
+    Substitute the fake for ``DockerSandboxLauncher`` at its public seam.
+
+    The managed flow constructs ``DockerSandboxLauncher(image=…, env=…,
+    network=…, resources=…, security=…)``; the shim records those
+    constructor args on the fake and hands it back, so production code
+    runs unmodified against it.
+
+    :param monkeypatch: The test's ``pytest.MonkeyPatch``.
+    :param fake: The fake launcher to substitute.
+    """
+    import omnigent.onboarding.sandboxes.docker as docker_mod
+
+    def _ctor(
+        *,
+        image: str | None = None,
+        env: list[str] | None = None,
+        network: str | None = None,
+        resources: dict[str, object] | None = None,
+        security: dict[str, object] | None = None,
+    ) -> FakeSandboxLauncher:
+        """Stand-in constructor recording the construction wiring."""
+        fake.image = image
+        fake.env = env
+        fake.network = network
+        fake.resources = resources
+        fake.security = security
+        return fake
+
+    monkeypatch.setattr(docker_mod, "DockerSandboxLauncher", _ctor)
+
+
 async def wait_for_completion(
     client: httpx.AsyncClient,
     response_id: str,

@@ -105,6 +105,11 @@ daytona = ["daytona>=0.180,<1"]
 # server-managed `sandbox.provider: cwsandbox`).
 # Same lazy-import posture as above. Pre-1.0 SDK: pin minor.
 cwsandbox = ["cwsandbox>=0.26,<1"]
+# Docker sandbox launcher (server-managed `sandbox.provider: docker`).
+# Pure-Python SDK, imported lazily by the launcher, so only Docker-provider
+# deployments need it. Installed into the official server image (see
+# deploy/docker/Dockerfile); the host image never talks to a daemon.
+docker = ["docker>=7,<8"]
 # MLflow tracing is opt-in: tracing is disabled by default and the
 # server degrades gracefully when mlflow is absent, so the (heavy) mlflow
 # dependency only installs for users who want it (`omnigent[tracing]`).
@@ -248,6 +253,7 @@ markers = [
     "llm_flaky(reruns=2, reruns_delay=1): rerun a nondeterministic real-LLM test on failure, rotating to a different model each attempt (tests/_model_pools.py). Never apply to heavy e2e tests that can hit the CI --timeout=180 cap (rerun + loadscope can crash the shard).",
     "in_process_sessions: run a server integration test with the legacy in-process sessions path instead of sessions-native runner dispatch.",
     "nightly: runs only in the scheduled/dispatch pass of its suite; PR and push runs exclude it via -m 'not nightly'. Remove the marker to promote a burned-in test to the PR gate.",
+    "docker_sandbox: opt-in tests requiring a local Docker daemon (and, for the spike, the Omnigent host image). They live in the normal suite under tests/onboarding/sandboxes and auto-skip without Docker; select with `-m docker_sandbox`.",
 ]
 
 [tool.coverage.run]
@@ -456,6 +462,12 @@ ignore_missing_imports = true
 # posture as modal above.
 [[tool.mypy.overrides]]
 module = "cwsandbox.*"
+ignore_missing_imports = true
+
+# docker is an optional dep (the `docker` extra); same lazy-import posture
+# as the other sandbox SDKs above. No published type stubs.
+[[tool.mypy.overrides]]
+module = "docker.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

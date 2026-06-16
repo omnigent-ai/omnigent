@@ -15,6 +15,7 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.managed_hosts import (
     DAYTONA_MANAGED_TOKEN_TTL_S,
+    DOCKER_MANAGED_TOKEN_TTL_S,
     ISLO_MANAGED_TOKEN_TTL_S,
     MODAL_MANAGED_TOKEN_TTL_S,
     ManagedSandboxConfig,
@@ -34,6 +35,7 @@ from tests.server.helpers import (
     FakeSandboxLauncher,
     HostStartInvocation,
     install_fake_daytona_launcher,
+    install_fake_docker_launcher,
     install_fake_islo_launcher,
     install_fake_modal_launcher,
 )
@@ -196,6 +198,62 @@ def test_parse_daytona_without_section_defaults(
     assert fake.env is None
 
 
+def test_parse_valid_docker_config_builds_parameterized_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The documented docker YAML shape parses into a config whose factory
+    constructs Docker launchers carrying image, env names, the segmented
+    sandbox network, and the resource/security mappings.
+    """
+    cfg = parse_sandbox_config(
+        {
+            "provider": "docker",
+            "server_url": "http://omnigent:8000/",
+            "docker": {
+                "image": "ghcr.io/acme/omnigent-host:sha",
+                "network": "omnigent-sbx",
+                "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
+                "resources": {"mem_limit": "4g", "nano_cpus": 2000000000, "pids_limit": 512},
+                "security": {"security_opt": ["no-new-privileges:true"]},
+            },
+        }
+    )
+    assert cfg is not None
+    assert cfg.server_url == "http://omnigent:8000"  # trailing slash stripped
+    assert cfg.token_ttl_s == DOCKER_MANAGED_TOKEN_TTL_S
+    assert cfg.managed_launch_supported is True
+    assert cfg.provider == "docker"
+    fake = FakeSandboxLauncher()
+    install_fake_docker_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.image == "ghcr.io/acme/omnigent-host:sha"
+    assert fake.env == ["OPENAI_API_KEY", "GIT_TOKEN"]
+    assert fake.network == "omnigent-sbx"
+    assert fake.resources == {"mem_limit": "4g", "nano_cpus": 2000000000, "pids_limit": 512}
+    assert fake.security == {"security_opt": ["no-new-privileges:true"]}
+
+
+def test_parse_docker_without_section_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    `provider: docker` + `server_url` is a complete config: the docker
+    section is optional and its fields reach the launcher as None (its
+    own defaults apply).
+    """
+    cfg = parse_sandbox_config({"provider": "docker", "server_url": "http://omnigent:8000"})
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_docker_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.image is None
+    assert fake.env is None
+    assert fake.network is None
+    assert fake.resources is None
+    assert fake.security is None
+
+
 def test_parse_valid_islo_config_builds_parameterized_factory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -320,6 +378,24 @@ def test_parse_islo_without_section_defaults(
         (
             {"provider": "islo", "server_url": "https://s", "islo": {"memory_mb": "large"}},
             "sandbox.islo.memory_mb",
+        ),
+        # docker section present but malformed.
+        ({"provider": "docker", "server_url": "https://s", "docker": "x"}, "sandbox.docker"),
+        (
+            {"provider": "docker", "server_url": "https://s", "docker": {"image": "  "}},
+            "sandbox.docker.image",
+        ),
+        (
+            {"provider": "docker", "server_url": "https://s", "docker": {"network": "  "}},
+            "sandbox.docker.network",
+        ),
+        (
+            {"provider": "docker", "server_url": "https://s", "docker": {"env": "OPENAI"}},
+            "sandbox.docker.env",
+        ),
+        (
+            {"provider": "docker", "server_url": "https://s", "docker": {"resources": "big"}},
+            "sandbox.docker.resources",
         ),
     ],
 )
