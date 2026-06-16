@@ -181,6 +181,7 @@ class FakeSandboxLauncher(SandboxLauncher):
         # constructed the launcher with (captured by the
         # ctor-monkeypatch shims).
         self.image: str | None = None
+        self.template: str | None = None
         self.secrets: list[str] | None = None
         self.env: list[str] | None = None
         self.base_url: str | None = None
@@ -418,6 +419,35 @@ def install_fake_docker_launcher(
         return fake
 
     monkeypatch.setattr(docker_mod, "DockerSandboxLauncher", _ctor)
+
+
+def install_fake_e2b_launcher(
+    monkeypatch: Any,  # pytest.MonkeyPatch — Any avoids importing pytest in a helpers module
+    fake: FakeSandboxLauncher,
+) -> None:
+    """
+    Substitute the fake for ``E2BSandboxLauncher`` at its public seam.
+
+    The managed flow constructs ``E2BSandboxLauncher(template=…, env=…)``;
+    the shim records the template name and env names on the fake and
+    hands the fake back, so production code runs unmodified against it.
+
+    :param monkeypatch: The test's ``pytest.MonkeyPatch``.
+    :param fake: The fake launcher to substitute.
+    """
+    import omnigent.onboarding.sandboxes.e2b as e2b_mod
+
+    def _ctor(*, template: str | None = None, env: list[str] | None = None) -> FakeSandboxLauncher:
+        """Stand-in constructor recording the construction wiring."""
+        fake.template = template
+        fake.env = env
+        # Report the e2b provider so managed-host teardown's provider match
+        # (launcher.provider vs host.sandbox_provider) exercises the real path
+        # instead of the FakeSandboxLauncher default ("modal").
+        fake.provider = "e2b"  # type: ignore[misc]  # shadow the ClassVar per-instance
+        return fake
+
+    monkeypatch.setattr(e2b_mod, "E2BSandboxLauncher", _ctor)
 
 
 async def wait_for_completion(

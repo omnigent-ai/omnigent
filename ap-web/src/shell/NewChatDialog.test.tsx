@@ -670,12 +670,28 @@ describe("NewChatLandingScreen", () => {
     expect(detail.textContent).toContain("Prompts before edits and commands");
     fireEvent.pointerEnter(planOption);
     expect(detail.textContent).toContain("Plans only; makes no edits");
-    // Switch to Codex (a2: not native, no overridable harness) — the whole
-    // Advanced chip is gone since --permission-mode only applies to the
-    // claude CLI and codex-native offers no harness override.
+    // Switch to Codex (a2: codex-native) — the Advanced chip stays visible
+    // but now shows approval-mode radios instead of permission-mode radios.
+    // Close the Advanced menu first (Escape), then switch agents.
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
-    expect(screen.queryByTestId("new-chat-landing-advanced-chip")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-advanced-chip")).not.toBeNull();
+  });
+
+  it("shows approval-mode options in the Advanced menu for the codex-native agent", () => {
+    renderLanding();
+    // Switch to Codex first.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
+    const neverOption = screen.getByTestId("new-chat-landing-approval-never");
+    expect(neverOption.textContent).toContain("Never");
+    // The footer line explains the SELECTED mode until a row is hovered.
+    const detail = screen.getByTestId("new-chat-landing-approval-detail");
+    expect(detail.textContent).toContain("Model decides when to ask for approval");
+    fireEvent.pointerEnter(neverOption);
+    expect(detail.textContent).toContain("Never asks for approval");
   });
 
   it("shows a conflict banner in the file browser for an occupied directory", async () => {

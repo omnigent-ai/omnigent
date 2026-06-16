@@ -64,9 +64,10 @@ fi
 # --- 2. LLM judge: behavior change without adequate e2e_ui coverage? ------
 # Build a bounded diff blob: only ap-web/** and tests/e2e_ui/** patches. Each
 # file's patch is truncated to MAX_PATCH_LINES so one huge file can't crowd out
-# the others, keeping the prompt representative across many-file PRs. A final
-# head -c is an overall backstop for PRs with very many files.
+# the others, keeping the prompt representative across many-file PRs. An
+# overall byte cap (applied below) is a backstop for PRs with very many files.
 MAX_PATCH_LINES=400
+MAX_BLOB_BYTES=60000
 # `gh api --paginate` (no --jq) merges all pages into one JSON array; pipe that
 # to jq so --argjson reaches jq (gh api itself has no --argjson flag).
 DIFF_BLOB=$(gh api "repos/$REPO/pulls/$PR/files" --paginate \
@@ -77,8 +78,13 @@ DIFF_BLOB=$(gh api "repos/$REPO/pulls/$PR/files" --paginate \
     | (if ($lines | length) > $max
          then (($lines[:$max] | join("\n")) + "\n... (patch truncated at \($max) lines)")
          else $p end) as $trunc
-    | "=== \(.status) \(.filename) ===\n\($trunc)"' \
-  | head -c 60000)
+    | "=== \(.status) \(.filename) ===\n\($trunc)"')
+# Apply the overall byte cap in-shell, NOT via `... | head -c`. Under
+# `set -o pipefail`, head closing the pipe early sends jq SIGPIPE, and that
+# broken-pipe exit aborts the whole gate on any large UI PR (diff > cap) --
+# fail-closed before the judge or the skip-label logic ever runs. Bash slicing
+# truncates the captured string with no pipe to break.
+DIFF_BLOB=${DIFF_BLOB:0:$MAX_BLOB_BYTES}
 
 PR_TITLE=$(gh pr view "$PR" --repo "$REPO" --json title --jq '.title')
 

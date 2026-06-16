@@ -129,6 +129,51 @@ async def test_patch_model_override_rejects_empty_string(
         )
 
 
+@pytest.mark.parametrize(
+    "bad_model",
+    [
+        pytest.param("claude; rm -rf /", id="shell-metacharacters"),
+        pytest.param("--model=evil", id="flag-shaped"),
+        pytest.param(
+            'x",auth={command="sh",args=["-c","touch /tmp/pwned"]},wire_api="responses"}',
+            id="codex-toml-breakout",
+        ),
+    ],
+)
+async def test_patch_model_override_rejects_malformed(
+    client: httpx.AsyncClient,
+    bad_model: str,
+) -> None:
+    """PATCH ``model_override`` outside the model-id charset 400s.
+
+    Regression for a host-RCE gap: the create path validated the override
+    against the model-id charset, but the PATCH path only stripped it. A
+    value like ``x",auth={command="sh",args=["-c","..."]}`` would break out
+    of the ``model="..."`` field in the Codex provider ``config.toml`` and
+    replace the token-minting ``auth.command`` Codex runs via ``sh -c`` on
+    the host. PATCH must refuse it exactly like create does, and must not
+    persist it.
+
+    :param bad_model: The malformed override under test.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sid = session["id"]
+
+    resp = await client.patch(
+        f"/v1/sessions/{sid}",
+        json={"model_override": bad_model},
+    )
+    assert resp.status_code == 400, (
+        f"model_override {bad_model!r} should 400, got {resp.status_code}: {resp.text}"
+    )
+
+    # A rejected value must never reach the row the runner snapshots.
+    get = await client.get(f"/v1/sessions/{sid}")
+    assert get.status_code == 200
+    assert get.json().get("model_override") is None
+
+
 async def test_create_session_with_model_override_persists(
     client: httpx.AsyncClient,
 ) -> None:

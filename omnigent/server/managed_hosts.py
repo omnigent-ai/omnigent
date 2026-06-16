@@ -121,10 +121,10 @@ _logger = logging.getLogger(__name__)
 # ManagedSandboxConfig directly are not constrained by either set —
 # their launcher factory IS the support.)
 SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
-    {"lakebox", "modal", "daytona", "cwsandbox", "islo", "docker"}
+    {"lakebox", "modal", "daytona", "cwsandbox", "islo", "docker", "e2b"}
 )
 PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
-    {"modal", "daytona", "cwsandbox", "islo", "docker"}
+    {"modal", "daytona", "cwsandbox", "islo", "docker", "e2b"}
 )
 
 # How long a managed launch waits for the sandboxed host to register
@@ -634,6 +634,16 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             security=_parse_provider_mapping(raw, "docker", "security"),
         )
         token_ttl_s = DOCKER_MANAGED_TOKEN_TTL_S
+    elif provider == "e2b":
+        from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s
+
+        launcher_factory = _e2b_launcher_factory(
+            _parse_e2b_template(raw), _parse_provider_env(raw, "e2b")
+        )
+        # Derived from OMNIGENT_E2B_MAX_LIFETIME_S so the token always
+        # outlives the (operator-overridable) sandbox lifetime — mirrors
+        # the cwsandbox path.
+        token_ttl_s = managed_token_ttl_s()
     else:
         launcher_factory = _unsupported_launcher_factory(provider)
         # Never consulted (the factory rejects before any token is
@@ -942,6 +952,71 @@ def _parse_cwsandbox_env(raw: dict[str, object]) -> list[str] | None:
             "environment variable NAMES to inject, e.g. ['ANTHROPIC_API_KEY', 'GIT_TOKEN']"
         )
     return [name.strip() for name in env]
+
+
+def _e2b_launcher_factory(
+    template: str | None,
+    env: list[str] | None,
+) -> Callable[[], SandboxLauncher]:
+    """
+    Build the launcher factory for the YAML ``provider: e2b`` path.
+
+    :param template: E2B template NAME the Omnigent host image was built
+        into (``e2b template build``), or ``None`` to use the launcher's
+        env-var fallback / the default template. Unlike the other
+        providers' ``image`` field this is NOT a registry reference —
+        E2B boots from templates (see
+        :class:`omnigent.onboarding.sandboxes.e2b.E2BSandboxLauncher`).
+    :param env: Names of server-process environment variables (harness
+        LLM credentials, gateway URLs, ``GIT_TOKEN``) injected into
+        every sandbox, e.g. ``["OPENAI_API_KEY", "GIT_TOKEN"]``, or
+        ``None`` to resolve from the launcher's env-var fallback /
+        inject nothing.
+    :returns: A factory producing parameterized E2B launchers.
+    """
+
+    def _build() -> SandboxLauncher:
+        """Construct the E2B launcher (lazy SDK import inside)."""
+        from omnigent.onboarding.sandboxes.e2b import E2BSandboxLauncher
+
+        return E2BSandboxLauncher(template=template, env=env)
+
+    return _build
+
+
+def _parse_e2b_template(raw: dict[str, object]) -> str | None:
+    """
+    Extract and validate the e2b template from the ``sandbox`` dict.
+
+    ``sandbox.e2b.template`` names the pre-built E2B template the
+    Omnigent host image was built into — NOT a registry image reference
+    (the wording every other provider's ``image`` field uses), because
+    E2B cannot boot an arbitrary registry image. OPTIONAL — when absent,
+    the launcher resolves :data:`~omnigent.onboarding.sandboxes.e2b.TEMPLATE_ENV_VAR`
+    then the default template. A present-but-malformed value fails loud.
+
+    :param raw: The raw ``sandbox`` mapping (provider already known to
+        be ``"e2b"``).
+    :returns: The validated template name, or ``None`` to use the
+        launcher's fallback / default.
+    :raises ValueError: When ``sandbox.e2b`` is present but not a
+        mapping, or ``sandbox.e2b.template`` is present but not a
+        non-empty string.
+    """
+    section = _parse_provider_section(raw, "e2b")
+    if section is None:
+        return None
+    template = section.get("template")
+    if template is None:
+        return None
+    if not isinstance(template, str) or not template.strip():
+        raise ValueError(
+            "server config 'sandbox.e2b.template' must be the NAME of a pre-built "
+            "E2B template the omnigent host image was built into (e.g. "
+            "'omnigent-host'; see deploy/e2b/README.md) — NOT a registry image "
+            "reference (omit it to use the default template)"
+        )
+    return template.strip()
 
 
 def _islo_launcher_factory(

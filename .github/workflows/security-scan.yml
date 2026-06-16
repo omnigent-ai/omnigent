@@ -98,6 +98,12 @@ jobs:
           DIFF_FILE: ${{ github.workspace }}/pr.diff
         run: python3 .github/scripts/security-scan/secret-scan.py
 
+      - name: Exfil scan (added lines)
+        if: ${{ steps.gate.outputs.scan == 'true' }}
+        env:
+          DIFF_FILE: ${{ github.workspace }}/pr.diff
+        run: python3 .github/scripts/security-scan/exfil-scan.py
+
       - name: Sensitive-path guard
         if: ${{ steps.gate.outputs.scan == 'true' }}
         env:

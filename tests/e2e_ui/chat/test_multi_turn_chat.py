@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
 from playwright.sync_api import Page, expect
 
 _COMPOSER = "Ask the agent anything…"
@@ -27,6 +28,11 @@ def _send(page: Page, text: str) -> None:
     page.get_by_role("button", name="Send", exact=True).click()
 
 
+# Real-LLM nondeterminism: the model must reply "stored" then echo the token
+# verbatim. llm_flaky reruns rotate the model per attempt (databricks-gpt-5-4 ->
+# -5-5), which is exactly the right retry for a recall flake. Safe here because
+# e2e-ui.yml runs serially (no xdist) with no --timeout=180 cap.
+@pytest.mark.llm_flaky(reruns=2, reruns_delay=1)
 def test_multi_turn_recall_through_ui(
     page: Page,
     seeded_session: tuple[str, str],

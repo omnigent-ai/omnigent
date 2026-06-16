@@ -134,6 +134,30 @@ def _agents_body() -> str:
     )
 
 
+def _codex_native_agents_body() -> str:
+    """Stub body for ``GET /v1/agents``: the native Codex agent.
+
+    ``codex-native-ui`` + ``harness: "codex-native"`` is what the frontend
+    maps (via ``nativeCodingAgents``) to the ``approvalMode`` capability,
+    gating the Codex approval-mode UI in the Advanced menu. Sole agent, so
+    it auto-selects and no explicit pick is needed.
+    """
+    return json.dumps(
+        {
+            "data": [
+                {
+                    "id": "ag_codex_e2e",
+                    "name": "codex-native-ui",
+                    "display_name": "Codex",
+                    "description": "OpenAI's coding agent",
+                    "harness": "codex-native",
+                    "skills": [],
+                }
+            ]
+        }
+    )
+
+
 def _bundle_agents_body() -> str:
     """Stub body for ``GET /v1/agents``: the two harness-overridable bundle agents.
 
@@ -327,6 +351,81 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
             assert body["host_id"] == _HOST_ID, body
             assert body["workspace"] == "/work/repo", body
             assert body.get("terminal_launch_args") == ["--permission-mode", "acceptEdits"], body
+        finally:
+            await browser.close()
+
+
+def test_start_session_select_approval_mode(seeded_session: tuple[str, str]) -> None:
+    """Picking a non-default approval mode rides along to the create call.
+
+    Selecting "Never" in the agent picker's Advanced settings menu
+    must (a) surface in the agent chip label as immediate feedback and
+    (b) reach ``POST /v1/sessions`` as
+    ``terminal_launch_args: ["--ask-for-approval", "never"]``.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_approval_mode(base_url, session_id))
+
+
+async def _drive_approval_mode(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page,
+                created_session_id=session_id,
+                create_bodies=create_bodies,
+                agents_body=_codex_native_agents_body(),
+            )
+
+            # Neutralize agent discovery so only the stubbed Codex agent
+            # feeds the picker.
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            # Codex auto-selects (only built-in), so the Advanced chip —
+            # gated on the Codex-native agent — is present.
+            await page.get_by_test_id("new-chat-landing-advanced-chip").click()
+            # All three Codex approval modes render as radio rows.
+            for mode in ("untrusted", "on-request", "never"):
+                await expect(
+                    page.get_by_test_id(f"new-chat-landing-approval-{mode}")
+                ).to_be_visible()
+            await page.get_by_test_id("new-chat-landing-approval-never").click()
+
+            # The chip label reflects the non-default pick immediately.
+            await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_contain_text(
+                "Never"
+            )
+
+            await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["agent_id"] == "ag_codex_e2e", body
+            assert body["host_id"] == _HOST_ID, body
+            assert body["workspace"] == "/work/repo", body
+            assert body.get("terminal_launch_args") == ["--ask-for-approval", "never"], body
         finally:
             await browser.close()
 

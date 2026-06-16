@@ -19,22 +19,18 @@ class MascotPayload(TypedDict):
     color: str
 
 
-# Otto the starfish — generated from the Otto brand PNG by the
-# manytools.org image-to-ASCII converter (29 cols, symbol-only charset),
-# with the white background stripped and margins trimmed.
+# Otto the starfish — a compact Braille (U+28xx) silhouette of a
+# five-point star with two tall carved eyes, rasterized from a star
+# polygon and packed two-dots-wide by four-dots-tall per cell. Replaces
+# the old 29x12 PNG-converted blob with a 9x5 glyph that keeps the welcome
+# box at header height. Blanks are the Braille blank (U+2800) so every row
+# is a solid 9 cells wide.
 MASCOT_ART_LINES: tuple[str, ...] = (
-    "             #/##            ",
-    "            ##/###           ",
-    "           ###/(##           ",
-    "          ####/####       ###",
-    "#//#######################//#",
-    " ####//##    ###(    #//#### ",
-    "   ######    ###    #####    ",
-    "  ############ (#######      ",
-    " #  #& #################     ",
-    " #/#####//##########/###     ",
-    "     #///###     ####//##    ",
-    "      ##             ##      ",
+    "⠀⠀⠀⢠⣿⡄⠀⠀⠀",
+    "⢴⣶⣶⠉⣿⠉⣶⣶⡦",
+    "⠀⠙⣿⣶⣿⣶⣿⠋⠀",
+    "⠀⢠⣿⡿⠿⢿⣿⡄⠀",
+    "⠀⠈⠁⠀⠀⠀⠈⠁⠀",
 )
 
 MASCOT_ART_COL_WIDTH = max(len(line) for line in MASCOT_ART_LINES)

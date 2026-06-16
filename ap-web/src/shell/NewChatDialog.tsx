@@ -112,6 +112,30 @@ const CLAUDE_NATIVE_PERMISSION_MODES: { value: string; label: string; descriptio
   },
 ];
 
+// Codex's `--ask-for-approval` choices (codex CLI). Codex-native sessions
+// only. "on-request" is Codex's default; any other value is passed through
+// as `--ask-for-approval <value>` via the session's terminal_launch_args.
+// Keep in sync with `codex --help` and
+// https://developers.openai.com/codex/agent-approvals-security
+const CODEX_NATIVE_DEFAULT_APPROVAL_MODE = "on-request";
+const CODEX_NATIVE_APPROVAL_MODES: { value: string; label: string; description: string }[] = [
+  {
+    value: "untrusted",
+    label: "Untrusted",
+    description: "Runs only known-safe read operations automatically",
+  },
+  {
+    value: "on-request",
+    label: "On request",
+    description: "Model decides when to ask for approval",
+  },
+  {
+    value: "never",
+    label: "Never",
+    description: "Never asks for approval; failures go straight to the model",
+  },
+];
+
 function HostOption({ host }: { host: Host }) {
   const isOnline = host.status === "online";
   return (
@@ -534,6 +558,52 @@ function PermissionModeOptions({
 }
 
 /**
+ * Codex approval-mode radio rows, rendered inside the Advanced settings
+ * menu in the composer footer. Mirror of {@link PermissionModeOptions}
+ * for the Codex-native agent.
+ *
+ * @param value Currently selected mode, e.g. ``"suggest"``.
+ * @param onValueChange Selection callback (receives the mode value).
+ */
+function ApprovalModeOptions({
+  value,
+  onValueChange,
+}: {
+  value: string;
+  onValueChange: (mode: string) => void;
+}) {
+  const [previewed, setPreviewed] = useState<string | null>(null);
+  const detail = CODEX_NATIVE_APPROVAL_MODES.find(
+    (m) => m.value === (previewed ?? value),
+  )?.description;
+  return (
+    <>
+      <DropdownMenuRadioGroup value={value} onValueChange={onValueChange}>
+        {CODEX_NATIVE_APPROVAL_MODES.map((mode) => (
+          <DropdownMenuRadioItem
+            key={mode.value}
+            value={mode.value}
+            data-testid={`new-chat-landing-approval-${mode.value}`}
+            onFocus={() => setPreviewed(mode.value)}
+            onPointerEnter={() => setPreviewed(mode.value)}
+            className="rounded-sm pl-2 py-1 text-xs"
+          >
+            {mode.label}
+          </DropdownMenuRadioItem>
+        ))}
+      </DropdownMenuRadioGroup>
+      <DropdownMenuSeparator />
+      <p
+        data-testid="new-chat-landing-approval-detail"
+        className="min-h-5 px-2 pt-0.5 pb-1 text-xs leading-relaxed text-muted-foreground"
+      >
+        {detail}
+      </p>
+    </>
+  );
+}
+
+/**
  * Brain-harness radio rows for an overridable bundle agent, rendered
  * inside the Advanced settings menu in the composer footer.
  *
@@ -697,6 +767,10 @@ export function NewChatLandingScreen() {
   const [permissionMode, setPermissionMode] = useState<string>(
     CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
   );
+  // Approval mode for Codex (codex --approval-mode). Only meaningful for
+  // the codex-native wrapper; ignored otherwise. Lives in the footer
+  // tray's Advanced settings menu.
+  const [approvalMode, setApprovalMode] = useState<string>(CODEX_NATIVE_DEFAULT_APPROVAL_MODE);
   // Per-session brain-harness override for bundle agents (polly / debby).
   // null = the agent spec's declared harness (no override sent); cleared on
   // every agent switch so a pick never leaks across agents.
@@ -772,6 +846,7 @@ export function NewChatLandingScreen() {
     (agentList.some((a) => a.id === pickedAgentId) ? pickedAgentId : agentList[0]?.id) ?? null;
   const selectedAgent = agentList.find((a) => a.id === effectiveAgentId);
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
+  const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   // Native-terminal agents interpret slash commands inside their own CLI
   // (the runner injects the text verbatim), so the landing composer must
   // not intercept them — no skills menu, no slash_command routing.
@@ -921,6 +996,8 @@ export function NewChatLandingScreen() {
   // radios live in the footer tray's Advanced settings menu.
   const permissionModeLabel =
     CLAUDE_NATIVE_PERMISSION_MODES.find((m) => m.value === permissionMode)?.label ?? permissionMode;
+  const approvalModeLabel =
+    CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.label ?? approvalMode;
   // Effective brain harness for the selected agent: the user's pick, else
   // the spec's declared harness. null for non-overridable agents (native
   // wrappers, agents whose spec failed to load).
@@ -928,16 +1005,18 @@ export function NewChatLandingScreen() {
     selectedAgent?.harness != null && selectedAgent.harness in BRAIN_HARNESS_LABELS
       ? selectedAgent.harness
       : null;
-  // The label suffixes the permission mode / harness only when the user
-  // explicitly changed it in the Advanced menu — defaults read as just the
-  // agent name. pickedHarness is non-null only for an explicit non-default
-  // pick (re-picking the spec default clears it).
+  // The label suffixes the permission/approval mode / harness only when the
+  // user explicitly changed it in the Advanced menu — defaults read as just
+  // the agent name. pickedHarness is non-null only for an explicit
+  // non-default pick (re-picking the spec default clears it).
   const agentLabel = selectedAgent
     ? supportsPermissionMode && permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
       ? `${selectedAgent.display_name} (${permissionModeLabel})`
-      : pickedHarness != null
-        ? `${selectedAgent.display_name} (${BRAIN_HARNESS_LABELS[pickedHarness] ?? pickedHarness})`
-        : selectedAgent.display_name
+      : supportsApprovalMode && approvalMode !== CODEX_NATIVE_DEFAULT_APPROVAL_MODE
+        ? `${selectedAgent.display_name} (${approvalModeLabel})`
+        : pickedHarness != null
+          ? `${selectedAgent.display_name} (${BRAIN_HARNESS_LABELS[pickedHarness] ?? pickedHarness})`
+          : selectedAgent.display_name
     : "Select agent";
 
   function selectHost(hostId: string) {
@@ -978,6 +1057,7 @@ export function NewChatLandingScreen() {
       const agent = agentList.find((a) => a.id === effectiveAgentId);
       const nativeLabels = nativeWrapperLabelsForAgent(agent);
       const agentSupportsPermissionMode = nativeAgentHasCapability(agent, "permissionMode");
+      const agentSupportsApprovalMode = nativeAgentHasCapability(agent, "approvalMode");
       const res = await authenticatedFetch("/v1/sessions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1006,12 +1086,14 @@ export function NewChatLandingScreen() {
           // The values are the registered wrapper ids the runner keys off —
           // they must match the wrapper registry, not the agent display name.
           labels: nativeLabels,
-          // Permission mode → `claude --permission-mode <mode>`, persisted as
+          // Permission / approval mode → CLI flag pair, persisted as
           // terminal_launch_args. Omitted for the default and non-native agents.
           terminal_launch_args:
             agentSupportsPermissionMode && permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
               ? ["--permission-mode", permissionMode]
-              : undefined,
+              : agentSupportsApprovalMode && approvalMode !== CODEX_NATIVE_DEFAULT_APPROVAL_MODE
+                ? ["--ask-for-approval", approvalMode]
+                : undefined,
           // Cost-control switch from the "Cost Optimized" pill; polly-only
           // (cost control is a polly feature) and omitted when unset so the
           // session defers to the spec default.
@@ -1663,10 +1745,12 @@ export function NewChatLandingScreen() {
               )}
 
               {/* Advanced settings chip — per-agent knobs that don't warrant
-                their own chip: the brain-harness override (bundle agents)
-                and Claude Code's permission mode. Hidden when the selected
-                agent has neither. */}
-              {(selectedAgentDefaultHarness != null || supportsPermissionMode) && (
+                their own chip: the brain-harness override (bundle agents),
+                Claude Code's permission mode, and Codex's approval mode.
+                Hidden when the selected agent has none. */}
+              {(selectedAgentDefaultHarness != null ||
+                supportsPermissionMode ||
+                supportsApprovalMode) && (
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
                     <button
@@ -1707,6 +1791,20 @@ export function NewChatLandingScreen() {
                           value={permissionMode}
                           onValueChange={setPermissionMode}
                         />
+                      </>
+                    )}
+                    {/* Approval mode (Codex only) — codex-native has no
+                      overridable harness, so the two sections never co-render
+                      today; the separator covers a future agent with both. */}
+                    {supportsApprovalMode && (
+                      <>
+                        {(selectedAgentDefaultHarness != null || supportsPermissionMode) && (
+                          <DropdownMenuSeparator />
+                        )}
+                        <div className="px-2 pt-1.5 pb-0.5 text-[11px] font-medium text-muted-foreground">
+                          Approval mode
+                        </div>
+                        <ApprovalModeOptions value={approvalMode} onValueChange={setApprovalMode} />
                       </>
                     )}
                   </DropdownMenuContent>

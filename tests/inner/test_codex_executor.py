@@ -147,6 +147,31 @@ class TestCodexExecutor(unittest.TestCase):
         self.assertTrue(any("refresh_interval_ms=900000" in item for item in overrides))
         self.assertFalse(any('env_key="DATABRICKS_TOKEN"' in item for item in overrides))
 
+    def test_codex_config_overrides_neutralize_toml_breakout(self):
+        """A model id full of TOML metacharacters stays a literal string.
+
+        Defense-in-depth for the model_override RCE: the model value is
+        ``json.dumps``-escaped, so even a string crafted to close the
+        ``model="..."`` field and inject its own ``auth.command`` parses
+        back as one inert model name and never overwrites the real
+        token-minting auth command.
+        """
+        import tomllib
+
+        payload = 'x",auth={command="sh",args=["-c","touch /tmp/pwned"]},wire_api="responses"}'
+        real_auth = 'databricks auth token --host "https://example.cloud.databricks.com"'
+        overrides = _databricks_codex_config_overrides(
+            model=payload,
+            base_url="https://example.cloud.databricks.com/ai-gateway/codex/v1",
+            auth_command=real_auth,
+        )
+        parsed = tomllib.loads("\n".join(overrides))
+        # The whole payload round-trips as the literal model name.
+        self.assertEqual(parsed["model"], payload)
+        # The injected auth command did not survive — the legit one did.
+        provider = parsed["model_providers"]["omnigent_databricks"]
+        self.assertEqual(provider["auth"]["args"], ["-c", real_auth])
+
     def test_constructor_databricks_flag_with_profile(self):
         with (
             patch("omnigent.inner.codex_executor._find_codex_cli", return_value="/usr/bin/codex"),

@@ -30,7 +30,8 @@ dependencies = [
     # Merged from omnigent + omnigent.
     "pyyaml>=6.0,<7",
     "openai>=1.0,<3",
-    "rich>=13.0,<14",
+    # >=14: the `e2b` extra's SDK (>=2.26) needs rich>=14 (was >=13,<14).
+    "rich>=14,<15",
     "prompt_toolkit>=3.0,<4",
     "mcp>=1.0,<2",
     "starlette>=0.27,<1",
@@ -121,6 +122,10 @@ cwsandbox = ["cwsandbox>=0.24,<1"]
 # deployments need it. Installed into the official server image (see
 # deploy/docker/Dockerfile); the host image never talks to a daemon.
 docker = ["docker>=7,<8"]
+# E2B sandbox launcher (`omnigent sandbox --provider e2b` and
+# server-managed `sandbox.provider: e2b`).
+# Same lazy-import posture as above.
+e2b = ["e2b>=2.26,<3"]
 # MLflow tracing is opt-in: tracing is disabled by default and the
 # server degrades gracefully when mlflow is absent, so the (heavy) mlflow
 # dependency only installs for users who want it (`omnigent[tracing]`).
@@ -487,6 +492,12 @@ ignore_missing_imports = true
 # as the other sandbox SDKs above. No published type stubs.
 [[tool.mypy.overrides]]
 module = "docker.*"
+ignore_missing_imports = true
+
+# e2b is an optional dep (the `e2b` extra); same lazy-import posture as
+# modal above.
+[[tool.mypy.overrides]]
+module = "e2b.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

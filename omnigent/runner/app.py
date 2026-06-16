@@ -49,6 +49,7 @@ from omnigent.llms.summarize import (
     build_summarization_prompt,
     extract_summary_text,
 )
+from omnigent.model_override import validate_model_override
 from omnigent.runner import pending_approvals
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
@@ -583,8 +584,19 @@ async def _codex_native_launch_config(
     ):
         raise RuntimeError(f"Invalid terminal_launch_args for Codex session {session_id!r}.")
     model_override = snapshot.get("model_override")
-    if model_override is not None and (not isinstance(model_override, str) or not model_override):
-        raise RuntimeError(f"Invalid model_override for Codex session {session_id!r}.")
+    if model_override is not None:
+        if not isinstance(model_override, str) or not model_override:
+            raise RuntimeError(f"Invalid model_override for Codex session {session_id!r}.")
+        # Defense-in-depth: re-validate the persisted override at the runner
+        # boundary so a value that somehow bypassed server-side validation
+        # can never reach the Codex ``config.toml`` / ``--model`` argv as
+        # shell- or TOML-shaped input.
+        try:
+            validate_model_override(model_override)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Invalid model_override for Codex session {session_id!r}: {exc}"
+            ) from exc
     external_session_id = snapshot.get("external_session_id")
     if external_session_id is not None and (
         not isinstance(external_session_id, str) or not external_session_id

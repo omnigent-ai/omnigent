@@ -478,6 +478,51 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.terminal_launch_args).toBeUndefined();
   });
 
+  it("posts --ask-for-approval <mode> when a non-default mode is picked for codex-native", async () => {
+    setAgents([agent({ id: "ag_codex", name: "codex-native-ui", display_name: "Codex" })]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_codex" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    // Open the footer tray's Advanced menu and pick "never".
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-approval-never"));
+    // A non-default pick is suffixed onto the pill.
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
+      "Codex (Never)",
+    );
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.terminal_launch_args).toEqual(["--ask-for-approval", "never"]);
+  });
+
+  it("omits terminal_launch_args when approval mode is left at default for codex-native", async () => {
+    setAgents([agent({ id: "ag_codex", name: "codex-native-ui", display_name: "Codex" })]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_codex" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).not.toContain("(");
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.labels?.["omnigent.wrapper"]).toBe("codex-native-ui");
+    expect(body.terminal_launch_args).toBeUndefined();
+  });
+
   it("posts harness_override when a brain harness is picked from the Advanced menu", async () => {
     // polly's spec declares claude-sdk; the Advanced menu offers the
     // override set.
