@@ -110,7 +110,10 @@ def _type_into_tui(page: Page, text: str) -> None:
     :param page: The Playwright page, on the connected Terminal view.
     :param text: The single-line prompt to type into the TUI.
     """
-    xterm_input = page.locator(_XTERM_INPUT).last
+    # Scope to the active terminal-view (not page-level) so the lookup can't
+    # focus a stray textarea from another terminal widget — matches the shell
+    # E2E test pattern.
+    xterm_input = page.locator(_TERMINAL_VIEW).last.locator(_XTERM_INPUT)
     expect(xterm_input).to_be_attached(timeout=30_000)
     xterm_input.focus()
     # Type at a human-ish cadence: Claude Code's TUI composer can drop or
