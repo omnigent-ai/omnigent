@@ -573,6 +573,7 @@ async def _send_hello(
                     "claude-native",
                     "claude-sdk",
                     "codex",
+                    "cmd",
                     "cursor",
                     "databricks_supervisor",
                     "gemini",

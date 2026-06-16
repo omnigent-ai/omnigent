@@ -49,9 +49,10 @@ from omnigent.spec.parser import check_unresolved_env_vars
 
 # Family keys. ``anthropic`` is the Messages-API surface (Claude SDK,
 # native Claude); ``openai`` is the Responses/Chat surface (Codex,
-# native Codex, OpenAI-Agents SDK). ``pi`` consumes both. Cursor and
-# Mimo are separate CLI-owned surfaces: their CLIs own auth/model routing
-# rather than using Omnigent's provider-family defaults.
+# native Codex, OpenAI-Agents SDK). ``pi`` consumes both. Cursor, Mimo,
+# Gemini, and Command Code are separate CLI-owned surfaces: their CLIs own
+# auth/model routing rather than using Omnigent's provider-family
+# defaults.
 ANTHROPIC_FAMILY = "anthropic"
 OPENAI_FAMILY = "openai"
 _VALID_FAMILIES = (ANTHROPIC_FAMILY, OPENAI_FAMILY)
@@ -69,6 +70,7 @@ PI_SURFACE = "pi"
 CURSOR_SURFACE = "cursor"
 MIMO_SURFACE = "mimo"
 GEMINI_SURFACE = "gemini"
+CMD_SURFACE = "cmd"
 
 # Accepted ``wire_api`` values. ``responses`` is the OpenAI Responses API;
 # ``chat`` is Chat Completions. Only meaningful for the ``openai`` family
@@ -974,11 +976,12 @@ def surface_default_provider(config: dict[str, object], surface: str) -> Provide
     keyed by surface name rather than harness id: the ``anthropic`` /
     ``openai`` surfaces resolve their explicit per-family default, and the
     :data:`PI_SURFACE` surface resolves the pi harness's effective default
-    (explicit pi scope, else the cross-family fallback). Cursor, Mimo, and
-    Gemini deliberately return ``None`` here: their CLIs own auth/model
-    routing, so they do not have an Omnigent provider default. Used by the
-    ``setup`` harness menus and the REPL startup header so every surface shows
-    the provider its harness would actually route through.
+    (explicit pi scope, else the cross-family fallback). Cursor, Mimo,
+    Gemini, and Command Code deliberately return ``None`` here: their CLIs
+    own auth/model routing, so they do not have an Omnigent provider
+    default. Used by the ``setup`` harness menus and the REPL startup
+    header so every surface shows the provider its harness would actually
+    route through.
 
     :param config: The parsed config mapping (``providers:`` block).
     :param surface: ``"anthropic"``, ``"openai"``, or ``"pi"``.
@@ -989,7 +992,7 @@ def surface_default_provider(config: dict[str, object], surface: str) -> Provide
     """
     if surface == PI_SURFACE:
         return default_provider_for_harness(config, PI_SURFACE)
-    if surface in (CURSOR_SURFACE, MIMO_SURFACE, GEMINI_SURFACE):
+    if surface in (CURSOR_SURFACE, MIMO_SURFACE, GEMINI_SURFACE, CMD_SURFACE):
         return None
     return get_default_provider(config, surface)
 

@@ -71,6 +71,7 @@ def test_sdk_and_unknown_harnesses_are_never_gated(
         "cursor",
         "mimo",
         "gemini",
+        "cmd",
     ],
 )
 def test_cli_harness_configured_only_when_binary_installed(
@@ -118,6 +119,7 @@ def test_configured_harness_map_covers_all_spellings(
         "cursor",
         "mimo",
         "gemini",
+        "cmd",
     }
     assert set(result) == expected_keys
 
@@ -156,6 +158,7 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         "cursor",
         "mimo",
         "gemini",
+        "cmd",
     ):
         assert result[cli] is False, f"{cli} should be gated on its CLI binary"
 

@@ -35,6 +35,7 @@ from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
     CHAT_WIRE_API,
     CLI_CONFIG_KIND,
+    CMD_SURFACE,
     CURSOR_SURFACE,
     DATABRICKS_KIND,
     GATEWAY_KIND,
@@ -94,6 +95,7 @@ _FAMILY_LABEL: dict[str, str] = {
     CURSOR_SURFACE: "Cursor",
     MIMO_SURFACE: "Mimo",
     GEMINI_SURFACE: "Gemini",
+    CMD_SURFACE: "Command Code",
 }
 
 # The concrete harness ids each surface powers, shown as a dim annotation
@@ -106,6 +108,7 @@ _FAMILY_HARNESS_IDS: dict[str, str] = {
     CURSOR_SURFACE: "cursor",
     MIMO_SURFACE: "mimo",
     GEMINI_SURFACE: "gemini",
+    CMD_SURFACE: "cmd",
 }
 
 

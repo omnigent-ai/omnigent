@@ -49,6 +49,12 @@ _HARNESS_MODULES: dict[str, str] = {
     # cursor / mimo it drives an ACP session, but via the ``--acp`` flag
     # rather than an ``acp`` subcommand, and is pinned to a single model.
     "gemini": "omnigent.inner.gemini_harness",
+    # Command Code CLI harness wrap. See omnigent/inner/cmd_harness.py.
+    # Command Code is a per-turn ``cmd --print`` subprocess (no ACP server),
+    # so unlike the cursor / mimo / gemini wraps it does not maintain a
+    # persistent session. Model is forwarded as ``--model``; auth is owned
+    # by the CLI (``cmd login``), so no API key env var is threaded.
+    "cmd": "omnigent.inner.cmd_harness",
     # Step 4c: codex harness wrap. See
     # omnigent/inner/codex_harness.py.
     "codex": "omnigent.inner.codex_harness",

@@ -1335,6 +1335,37 @@ def _build_mimo_spawn_env(
     return env
 
 
+def _build_cmd_spawn_env(
+    spec: AgentSpec,
+    *,
+    workdir: Path | None = None,
+) -> dict[str, str]:
+    """
+    Build the env-var dict the cmd harness wrap reads.
+
+    Maps spec.executor fields → the ``HARNESS_CMD_*`` env vars defined in
+    ``omnigent/inner/cmd_harness.py``. Like cursor / mimo, Command Code
+    owns its own auth (``cmd login``) and has no API-key env var, so
+    Omnigent only threads model, skills metadata, bundle path, and
+    os_env. The model is forwarded as ``HARNESS_CMD_MODEL`` and rendered
+    into ``cmd --model <id>``; ``None`` lets ``cmd`` pick its
+    configured default.
+    """
+    env: dict[str, str] = {}
+    model = _resolve_spec_model(spec)
+    if model is not None:
+        env["HARNESS_CMD_MODEL"] = model
+    env["HARNESS_CMD_SKILLS_FILTER"] = json.dumps(spec.skills_filter)
+    if spec.name:
+        env["HARNESS_CMD_AGENT_NAME"] = spec.name
+    if workdir is not None:
+        env["HARNESS_CMD_BUNDLE_DIR"] = str(workdir)
+    os_env_payload = _serialize_os_env(spec.os_env)
+    if os_env_payload is not None:
+        env["HARNESS_CMD_OS_ENV"] = os_env_payload
+    return env
+
+
 def _load_global_auth() -> ApiKeyAuth | DatabricksAuth | None:
     """
     Load the ``auth:`` block from ``~/.omnigent/config.yaml``.
