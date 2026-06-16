@@ -46,6 +46,14 @@ jobs:
         run: |
           # Before the scanner lands on main the scripts are absent there --
           # proceed (fail-open) so the introducing PR is not bricked.
+          # TEMPORARY (test PR #289): force scan=true so the poller WAITS for the
+          # Security Scan check and mirrors its result, even though the author is
+          # a COLLABORATOR (who would normally short-circuit). This is what proves
+          # the end-to-end downstream block. Revert this block before merge.
+          echo "::warning::TEST: forcing poller scan=true to mirror Security Scan (PR #289)."
+          echo "scan=true" >> "$GITHUB_OUTPUT"
+          exit 0
+          # --- original logic below (unreachable while testing) ---
           if [ ! -f .github/scripts/security-scan/should-scan.sh ]; then
             echo "::warning::security scanner not present on main yet; proceeding (bootstrap)."
             echo "scan=false" >> "$GITHUB_OUTPUT"

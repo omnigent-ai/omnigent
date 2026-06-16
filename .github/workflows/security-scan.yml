@@ -44,10 +44,10 @@ jobs:
       UV_INDEX_URL: https://pypi.org/simple
       # The single enforcement switch. "false" = audit (never blocks CI);
       # "true" = blocking (a finding fails this check; pollers then skip CI).
-      # TEMPORARY (test PR #289): kept "false" (audit) so EVERY detector runs and
-      # annotates in one pass; the Audit-summary step below is test-patched to
-      # exit 1 on any finding so we still see the check go red. Revert before merge.
-      GATE_BLOCKING: "false"
+      # TEMPORARY (test PR #289): flipped to "true" (blocking) so a finding fails
+      # the Security Scan check; the poller then mirrors the failure and skips
+      # downstream CI. Revert to "false" before merge.
+      GATE_BLOCKING: "true"
     steps:
       - name: Check out scanner from main
         continue-on-error: ${{ env.GATE_BLOCKING != 'true' }}
