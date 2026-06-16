@@ -74,6 +74,50 @@ Recommended operator pattern (documented in the overlay README +
 (`kubectl label node <node> omnigent.ai/runner-ready=true`) and set
 `node_selector: {omnigent.ai/runner-ready: "true"}`.
 
+## Deeper root cause + future fix: Bun #31832 (exec vs PID-1)
+
+A follow-up investigation pinned the crash to
+**[oven-sh/bun#31832](https://github.com/oven-sh/bun/issues/31832)** — a JSC GC
+thread-suspension **regression introduced after Bun 1.3.11** that fires **only
+when Bun is started by `exec`-ing into an already-running container**
+(`docker exec` / `kubectl exec` / `runc exec`), *not* when Bun is the container's
+main process (PID 1) or a child of it. Kernel 7.0.0 is the trigger surface;
+kernel 6.8 is unaffected.
+
+This is precisely the provider's launch model: the runner Pod's PID 1 is
+`sleep infinity`, and the server `kubectl exec`s `omnigent host` (which spawns the
+Bun-based agent) into it — an exec-injected process.
+
+Empirically confirmed on a live kernel-7.0.0 node (worker-thread + forced-GC
+reproducer, `oven/bun` images):
+
+| Bun version | via `kubectl exec` | as PID 1 / main process |
+|---|---|---|
+| **1.3.14** (latest; bundled in the host image's claude CLI) | crash | **survives** |
+| **1.3.11** (last-good, pre-regression) | survives | — |
+
+- **A newer Bun does not fix it (yet):** 1.3.14 is the latest published Bun
+  (npm) and #31832 is open/unfixed — there is no version to upgrade to.
+  Downgrading the bundled Bun to ≤1.3.11 works but means pinning an older claude
+  CLI in the host image (regressive).
+- **Resolution paths, in order of preference:**
+  1. **Upstream Bun #31832 fix** (the real cure) → rebuild the host image on the
+     fixed Bun; the exec model then works on every kernel with zero provider
+     change. Preferred once available — track the issue.
+  2. **Node selection** (shipped) → pin runner Pods to known-good-kernel (≤6.x)
+     nodes via `node_selector`. Zero provider complexity; single-good-node
+     dependency (a down good-kernel node = no runner capacity).
+  3. **PID-1 launch model** (documented option, NOT implemented) → run
+     `omnigent host` as the Pod's main process (or a child of PID 1) instead of
+     via `kubectl exec`, so the Bun agent is not exec-injected. Confirmed to work
+     with the current Bun 1.3.14 on kernel 7.0.0; removes the kernel/node
+     dependency entirely. Costs: diverges from the shared `_start_host_in_sandbox`
+     exec launch (provider-specific code), needs the launch token delivered at
+     Pod-create time (spec env = token-at-rest, or a PID-1 supervisor + a short
+     non-Bun `exec` trigger to keep it ephemeral), and reworks readiness/failure
+     detection (host-up becomes container-up). Worth building only if always-on
+     multi-node runners are required before #31832 lands upstream.
+
 ## Shipping decision
 
 The `seccomp_profile` provider option (built earlier on the mistaken diagnosis)
@@ -86,11 +130,15 @@ later with real evidence.
 ## Operational notes (homelab)
 
 - **server2 is currently the only schedulable amd64 node on a good kernel**, so
-  agent runners are effectively limited to it until: Bun ships a kernel-7.0.0
-  fix and the host image is rebuilt on it, the 7.0.0 nodes are downgraded, or
-  more 6.x amd64 nodes are added. Treat as a capacity/SPOF constraint.
-- **File upstream:** Bun JSC GC `embedder failed to suspend thread` segfault on
-  Linux 7.0.0 (Ubuntu 26.04).
+  agent runners are effectively limited to it until: Bun ships the #31832 fix and
+  the host image is rebuilt on it, the 7.0.0 nodes are downgraded, more 6.x amd64
+  nodes are added, or the **PID-1 launch model** (above) is adopted. Treat as a
+  capacity/SPOF constraint — a down good-kernel node means no runner capacity.
+- **Upstream bug:** the Bun JSC GC `embedder failed to suspend thread` segfault on
+  Linux 7.0.0 is tracked as
+  [oven-sh/bun#31832](https://github.com/oven-sh/bun/issues/31832) (an
+  exec-into-running-container regression since Bun 1.3.11; see "Deeper root cause"
+  above).
 - The provider correctly surfaces the crash: provisioning/readiness pass (the Pod
   is healthy), and the Bun error appears in the session's error item when the
   turn runs — there is no way to pre-detect a Bun crash at provision time.

@@ -151,5 +151,12 @@ it, set `OMNIGENT_KUBERNETES_KUBECONFIG` to a kubeconfig path instead.
   (`kubectl label node <node> omnigent.ai/runner-ready=true`) and set
   `sandbox.kubernetes.node_selector: {omnigent.ai/runner-ready: "true"}` (see
   `sandbox-config.yaml`). Inspect node kernels with `kubectl get nodes -o wide`.
-  Longer term, a host image built on a Bun version with the kernel fix removes the
-  constraint.
+  Root cause: [oven-sh/bun#31832](https://github.com/oven-sh/bun/issues/31832) — a
+  JSC thread-suspension regression (since Bun 1.3.11, still open) that fires *only*
+  when Bun is started by `exec`-ing into an already-running container — exactly
+  this provider's `kubectl exec` launch path (it does not occur when Bun is the
+  Pod's main process). 1.3.14 is the latest Bun, so there is no newer version to
+  upgrade to yet. Longer-term fixes: the upstream #31832 fix (rebuild the host
+  image on the fixed Bun), or a **PID-1 launch model** (run the host as the Pod's
+  main process instead of via exec) — see
+  `docs/claude/kubernetes-sandbox-homelab-e2e.md` for the analysis and trade-offs.
