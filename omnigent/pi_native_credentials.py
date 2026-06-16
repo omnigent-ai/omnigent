@@ -188,28 +188,28 @@ def resolve_pi_native_provider(
     """
     try:
         config = config_loader()
-    except Exception:  # noqa: BLE001 — any config failure must not break launch
-        # A malformed/absent config must not break session launch — fall back
-        # to Pi's own login.
+        # Pi is multi-family; ``omnigent setup`` marks defaults per family, not
+        # for ``pi``. Prefer an explicit pi default, then Anthropic (Pi's native
+        # surface), then OpenAI.
+        entry = (
+            get_default_provider(config, PI_SURFACE)
+            or get_default_provider(config, ANTHROPIC_FAMILY)
+            or get_default_provider(config, OPENAI_FAMILY)
+        )
+        if entry is None:
+            return None
+        if entry.kind == DATABRICKS_KIND:
+            return _databricks_pi_provider(entry, model=model)
+        if entry.kind in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND):
+            return _inline_family_pi_provider(entry, model=model)
+        # subscription / cli-config: a CLI's own login can't be reused outside
+        # that CLI — let Pi use its own login.
         return None
-    # Pi is multi-family. ``omnigent setup`` marks a provider default for the
-    # ``anthropic`` / ``openai`` surfaces, not for ``pi`` specifically, so
-    # resolve in preference order: an explicit pi default, then the Anthropic
-    # surface (Pi speaks ``anthropic-messages`` natively), then OpenAI.
-    entry = (
-        get_default_provider(config, PI_SURFACE)
-        or get_default_provider(config, ANTHROPIC_FAMILY)
-        or get_default_provider(config, OPENAI_FAMILY)
-    )
-    if entry is None:
+    except Exception:  # noqa: BLE001 — any resolution failure must not break launch
+        # Any failure (malformed config, duplicate per-family default, or an
+        # unresolved ``api_key: $VAR``) falls back to Pi's own login rather than
+        # failing the terminal launch.
         return None
-    if entry.kind == DATABRICKS_KIND:
-        return _databricks_pi_provider(entry, model=model)
-    if entry.kind in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND):
-        return _inline_family_pi_provider(entry, model=model)
-    # subscription / cli-config: a CLI's own login (or a provider pinned in the
-    # CLI's config) is unusable outside that CLI — let Pi use its own login.
-    return None
 
 
 def write_pi_models_config(agent_dir: Path, provider: PiProviderConfig) -> Path:
