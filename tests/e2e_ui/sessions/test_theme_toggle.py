@@ -39,7 +39,7 @@ def _stored_theme(page: Page) -> str | None:
 
 
 def test_theme_toggle_cycles_and_persists(page: Page, seeded_session: tuple[str, str]) -> None:
-    """Clicking the sidebar theme button cycles system → dark → light, flipping <html> + storage."""
+    """Clicking the sidebar theme button cycles system → dark → light, flipping the theme state."""
     base_url, session_id = seeded_session
     page.goto(f"{base_url}/c/{session_id}")
     expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)

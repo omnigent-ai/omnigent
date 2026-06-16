@@ -33,7 +33,9 @@ _ATTACH_NAME = "attach_sample.txt"
 _ATTACH_BODY = "composer attachment e2e sample\n"
 
 
-def test_attach_then_remove_file(page: Page, seeded_session: tuple[str, str], tmp_path: Path) -> None:
+def test_attach_then_remove_file(
+    page: Page, seeded_session: tuple[str, str], tmp_path: Path
+) -> None:
     """Attach a file via the hidden input → chip + remove button appear → remove clears it."""
     base_url, session_id = seeded_session
     sample = tmp_path / _ATTACH_NAME
