@@ -1,0 +1,60 @@
+name: Build Crabbox from source
+description: >-
+  Temporary: build the Crabbox CLI from source pinned to a specific commit
+  (openclaw/crabbox#428, the Islo create-payload fix) until a tagged Crabbox
+  release includes it. To revert, replace the `uses:` of this action with a
+  checksum-verified `gh release download` of crabbox and delete this directory.
+
+inputs:
+  pr:
+    description: Crabbox PR number to fetch (refs/pull/<pr>/head).
+    required: true
+  ref:
+    description: Expected commit SHA of the PR head. The build fails if the fetched head does not match.
+    required: true
+  go-version:
+    description: Go toolchain version used to build crabbox.
+    required: false
+    default: "1.26"
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Go
+      uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+      with:
+        go-version: ${{ inputs.go-version }}
+
+    - name: Cache Go build and module cache
+      uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+        key: crabbox-${{ runner.os }}-go${{ inputs.go-version }}-${{ inputs.ref }}
+        restore-keys: |
+          crabbox-${{ runner.os }}-go${{ inputs.go-version }}-
+
+    - name: Fetch, verify, and build Crabbox
+      shell: bash
+      env:
+        CRABBOX_PR: ${{ inputs.pr }}
+        CRABBOX_REF: ${{ inputs.ref }}
+      run: |
+        set -euo pipefail
+        tmp="$(mktemp -d)"
+        git -C "$tmp" init -q crabbox
+        git -C "$tmp/crabbox" remote add origin https://github.com/openclaw/crabbox
+        if ! git -C "$tmp/crabbox" fetch -q --depth 1 origin "refs/pull/${CRABBOX_PR}/head"; then
+          echo "::error::Could not fetch crabbox#${CRABBOX_PR} (refs/pull/${CRABBOX_PR}/head). The PR may be closed or renamed; update CRABBOX_PR/CRABBOX_REF or revert to a release download."
+          exit 1
+        fi
+        git -C "$tmp/crabbox" checkout -q FETCH_HEAD
+        got="$(git -C "$tmp/crabbox" rev-parse HEAD)"
+        if [ "$got" != "$CRABBOX_REF" ]; then
+          echo "::error::crabbox#${CRABBOX_PR} head is $got, expected pinned $CRABBOX_REF. The PR was updated; re-verify the new head end-to-end, then bump CRABBOX_REF."
+          exit 1
+        fi
+        (cd "$tmp/crabbox" && go build -o crabbox ./cmd/crabbox)
+        sudo install -m 0755 "$tmp/crabbox/crabbox" /usr/local/bin/crabbox
+        crabbox --version

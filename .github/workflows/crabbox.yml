@@ -55,10 +55,14 @@ concurrency:
 env:
   # Crabbox is built from source pinned to openclaw/crabbox#428 (Islo create-payload fix):
   # the v0.32.0 release sends default image/workdir/capacity fields that make Islo sandbox
-  # creation fail ("ubuntu:26.04" boxes never start). TODO: revert to a release download
-  # (CRABBOX_VERSION) once a tagged crabbox release includes #428.
+  # creation fail ("ubuntu:26.04" boxes never start). The build lives in the local
+  # ./.github/actions/build-crabbox composite action.
+  # TODO: once a tagged crabbox release includes #428, replace the "Build Crabbox" step in
+  # both jobs with a checksum-verified `gh release download <version>` and delete that action.
   CRABBOX_PR: "428"
   CRABBOX_REF: 1053c50c6350b032dae76b8a486d65835849733c
+  # GH_TOKEN is consumed by `crabbox job run` for GitHub Actions lease hydration (crabbox
+  # shells out to `gh`); keep it even though the build step itself no longer needs it.
   GH_TOKEN: ${{ github.token }}
 
 jobs:
@@ -66,32 +70,18 @@ jobs:
     name: Crabbox config
     if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Building crabbox from source (cold cache) plus the dry-runs needs headroom over the
+    # original 10m; the Go caches make warm runs fast.
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - name: Set up Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+      - name: Build Crabbox (openclaw/crabbox#428 Islo fix)
+        uses: ./.github/actions/build-crabbox
         with:
-          go-version: "1.26"
-
-      - name: Build Crabbox from source (openclaw/crabbox#428 Islo fix)
-        run: |
-          set -euo pipefail
-          tmp="$(mktemp -d)"
-          git -C "$tmp" init -q crabbox
-          git -C "$tmp/crabbox" remote add origin https://github.com/openclaw/crabbox
-          git -C "$tmp/crabbox" fetch -q --depth 1 origin "refs/pull/${CRABBOX_PR}/head"
-          git -C "$tmp/crabbox" checkout -q FETCH_HEAD
-          got="$(git -C "$tmp/crabbox" rev-parse HEAD)"
-          if [ "$got" != "$CRABBOX_REF" ]; then
-            echo "::error::crabbox#${CRABBOX_PR} head is $got, expected pinned $CRABBOX_REF"
-            exit 1
-          fi
-          (cd "$tmp/crabbox" && go build -o crabbox ./cmd/crabbox)
-          sudo install -m 0755 "$tmp/crabbox/crabbox" /usr/local/bin/crabbox
-          crabbox --version
+          pr: ${{ env.CRABBOX_PR }}
+          ref: ${{ env.CRABBOX_REF }}
 
       - name: List configured jobs
         run: crabbox job list
@@ -118,27 +108,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - name: Set up Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+      - name: Build Crabbox (openclaw/crabbox#428 Islo fix)
+        uses: ./.github/actions/build-crabbox
         with:
-          go-version: "1.26"
-
-      - name: Build Crabbox from source (openclaw/crabbox#428 Islo fix)
-        run: |
-          set -euo pipefail
-          tmp="$(mktemp -d)"
-          git -C "$tmp" init -q crabbox
-          git -C "$tmp/crabbox" remote add origin https://github.com/openclaw/crabbox
-          git -C "$tmp/crabbox" fetch -q --depth 1 origin "refs/pull/${CRABBOX_PR}/head"
-          git -C "$tmp/crabbox" checkout -q FETCH_HEAD
-          got="$(git -C "$tmp/crabbox" rev-parse HEAD)"
-          if [ "$got" != "$CRABBOX_REF" ]; then
-            echo "::error::crabbox#${CRABBOX_PR} head is $got, expected pinned $CRABBOX_REF"
-            exit 1
-          fi
-          (cd "$tmp/crabbox" && go build -o crabbox ./cmd/crabbox)
-          sudo install -m 0755 "$tmp/crabbox/crabbox" /usr/local/bin/crabbox
-          crabbox --version
+          pr: ${{ env.CRABBOX_PR }}
+          ref: ${{ env.CRABBOX_REF }}
 
       - name: Configure Crabbox broker
         env:

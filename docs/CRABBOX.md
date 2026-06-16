@@ -50,10 +50,16 @@ run one job from GitHub Actions.
 The workflow builds Crabbox from source pinned to
 [openclaw/crabbox#428](https://github.com/openclaw/crabbox/pull/428) rather than
 downloading a release: the `v0.32.0` release sends default image/workdir/capacity
-fields on Islo sandbox creation, which makes Islo boxes fail to start. Once a
-tagged Crabbox release includes that fix, swap the source build back to a
-checksum-verified `gh release download` (see `CRABBOX_PR`/`CRABBOX_REF` in
-`.github/workflows/crabbox.yml`).
+fields on Islo sandbox creation, which makes Islo boxes fail to start. The build
+lives in the local composite action `.github/actions/build-crabbox`, which fetches
+the pinned PR head, asserts it matches `CRABBOX_REF`, and compiles it (with the Go
+caches warmed across runs). The pin lives in the `CRABBOX_PR`/`CRABBOX_REF` env in
+`.github/workflows/crabbox.yml`.
+
+Once a tagged Crabbox release includes that fix, revert: replace the
+`./.github/actions/build-crabbox` step in both jobs with a checksum-verified
+`gh release download <version>` of the `crabbox` binary, drop the
+`CRABBOX_PR`/`CRABBOX_REF` env, and delete `.github/actions/build-crabbox`.
 
 Repository secrets used by the live workflow:
 
