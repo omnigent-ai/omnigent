@@ -249,9 +249,18 @@ def use_busy_progress(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def use_wedged_fast_heartbeat(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Spawn the wedged-with-fast-heartbeats harness; 2s idle watchdog."""
+    """Spawn a heartbeat-only wedged harness with a short absolute cap."""
     monkeypatch.setenv("HARNESS_TEST_FIXTURE", "wedged_fast_heartbeat")
-    monkeypatch.setenv("HARNESS_TURN_TIMEOUT_S", "2")
+    monkeypatch.setenv("HARNESS_TURN_TIMEOUT_S", "1")
+    monkeypatch.setenv("HARNESS_TURN_ABSOLUTE_TIMEOUT_S", "3")
+
+
+@pytest.fixture
+def use_quiet_wait_heartbeat(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Spawn a quiet wait that outlasts the 1s idle watchdog."""
+    monkeypatch.setenv("HARNESS_TEST_FIXTURE", "quiet_wait_heartbeat")
+    monkeypatch.setenv("HARNESS_TURN_TIMEOUT_S", "1")
+    monkeypatch.setenv("HARNESS_TURN_ABSOLUTE_TIMEOUT_S", "10")
 
 
 @pytest.fixture
@@ -532,8 +541,8 @@ async def test_per_turn_watchdog_allows_active_turn_past_window(
     A turn that keeps emitting progress must complete even when its
     total duration exceeds the watchdog window.
 
-    The watchdog is an *idle* timeout: each non-heartbeat event resets
-    the deadline, so an orchestrator turn that legitimately runs for
+    The watchdog is an *idle* timeout: each stream event resets the
+    deadline, so an orchestrator turn that legitimately runs for
     minutes (tests + build + many tool calls) isn't killed mid-turn. The
     ``busy_progress`` harness emits a delta every 0.1s for ~3s against a
     2s watchdog. This test FAILS on the old fixed-cumulative watchdog
@@ -569,48 +578,74 @@ async def test_per_turn_watchdog_allows_active_turn_past_window(
     )
 
 
-async def test_per_turn_watchdog_ignores_heartbeats(
-    use_wedged_fast_heartbeat: None,
+async def test_per_turn_watchdog_allows_quiet_heartbeat_wait_past_idle_window(
+    use_quiet_wait_heartbeat: None,
     manager: HarnessProcessManager,
 ) -> None:
     """
-    Heartbeats must NOT reset the idle watchdog.
+    A quiet-but-live turn must not fail only because it emits no deltas.
 
-    ``response.heartbeat`` is keep-alive, not progress. If it reset the
-    deadline, a wedged turn emitting heartbeats every 15s would never
-    fail. The ``wedged_fast_heartbeat`` harness hangs forever while
-    firing a 0.2s heartbeat against a 2s watchdog (~10 heartbeats inside
-    the window); the watchdog must still fire and terminate the turn.
+    Polly/orchestrator turns can park inside ``run_turn`` while an LLM,
+    tool, or sub-agent is doing useful work. During that window the only
+    low-cost activity may be ``response.heartbeat``; those heartbeats
+    must keep the idle watchdog from reporting a false wedge.
     """
-    conv_id = "conv_wedged_fast_heartbeat"
+    conv_id = "conv_quiet_wait_heartbeat"
     client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
     body = {"type": "message", "role": "user", "model": "test-agent", "content": []}
     events: list[_ParsedSSEEvent] = []
-    # Above the 2s watchdog, below the suite timeout. If heartbeats wrongly
-    # reset the deadline the stream never terminates and this timeout trips
-    # — a clean failure rather than a silent pass.
     async with asyncio.timeout(20):
         async with client.stream("POST", f"/v1/sessions/{conv_id}/events", json=body) as response:
             async for event in _stream_iter(response):
                 events.append(event)
 
     event_types = [e.event for e in events]
-    # Heartbeats fired throughout, but the wedged turn made no real
-    # progress — the idle watchdog must ignore the heartbeats and fail.
-    assert event_types[-1] == "response.failed", (
-        f"Wedged turn must fail despite ongoing heartbeats; got "
-        f"{event_types[-1]!r}. If response.completed/no-terminal, "
-        f"heartbeats wrongly reset the idle watchdog."
+    assert event_types[-1] == "response.completed", (
+        f"A quiet wait with heartbeats must complete, not be killed by the "
+        f"idle watchdog; got {event_types!r}."
     )
-    # At least one heartbeat must have actually fired inside the window —
-    # otherwise this test would pass even if heartbeat-reset were broken.
+    assert "response.heartbeat" in event_types, (
+        f"Expected heartbeats during the quiet wait; got {event_types!r}."
+    )
+    assert "response.output_text.delta" in event_types, (
+        f"Expected the post-wait completion delta; got {event_types!r}."
+    )
+
+
+async def test_per_turn_absolute_watchdog_caps_heartbeat_only_wedged_turn(
+    use_wedged_fast_heartbeat: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """
+    Heartbeat-only wedged turns must still hit the absolute watchdog.
+
+    ``response.heartbeat`` is keep-alive, not substantive progress, but
+    it must refresh the idle watchdog so quiet legitimate awaits are not
+    falsely killed. The separate absolute watchdog remains the hard cap:
+    a run_turn that only heartbeats and never finishes still terminates.
+    """
+    conv_id = "conv_wedged_fast_heartbeat"
+    client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    body = {"type": "message", "role": "user", "model": "test-agent", "content": []}
+    events: list[_ParsedSSEEvent] = []
+    # Above the 3s absolute cap, below the suite timeout.
+    async with asyncio.timeout(20):
+        async with client.stream("POST", f"/v1/sessions/{conv_id}/events", json=body) as response:
+            async for event in _stream_iter(response):
+                events.append(event)
+
+    event_types = [e.event for e in events]
+    assert event_types[-1] == "response.failed", (
+        f"Heartbeat-only wedged turn must fail at the absolute cap; got "
+        f"{event_types[-1]!r} (full: {event_types!r})."
+    )
     assert "response.heartbeat" in event_types, (
         f"Expected heartbeats during the wedged window; got {event_types!r}. "
-        f"Without them this test wouldn't exercise heartbeat-vs-watchdog."
+        f"Without them this test would not exercise heartbeat activity."
     )
     error = events[-1].data["response"]["error"]
-    assert error is not None and "watchdog" in error["message"], (
-        f"Watchdog failure must carry an explanatory error message; got {error!r}."
+    assert error is not None and "absolute" in error["message"], (
+        f"Failure must come from the absolute ceiling, not idle; got {error!r}."
     )
 
 

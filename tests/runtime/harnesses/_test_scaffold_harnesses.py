@@ -401,12 +401,10 @@ class _WedgedFastHeartbeatHarness(HarnessApp):
     """
     Hangs forever in ``run_turn`` while emitting fast heartbeats.
 
-    Exercises the load-bearing detail of the idle-reset watchdog:
-    ``response.heartbeat`` is keep-alive, NOT progress, so it must NOT
-    reset the idle deadline. With a 0.2s heartbeat against a 2s watchdog,
-    ~10 heartbeats fire inside the window — if heartbeats reset the
-    watchdog, the turn would never fail; the watchdog must still fire and
-    terminate the wedged turn with ``response.failed``.
+    Exercises the absolute watchdog backstop: ``response.heartbeat`` is
+    keep-alive stream activity and refreshes the idle deadline, but a
+    run_turn that only heartbeats and never finishes must still be
+    terminated by the absolute ceiling.
 
     Overrides ``_heartbeat_loop`` (not the module constant) because the
     constant is read once at subprocess import and a test-process
@@ -425,11 +423,36 @@ class _WedgedFastHeartbeatHarness(HarnessApp):
         await asyncio.Event().wait()  # never set; hang until the watchdog fires
 
 
+class _QuietWaitHeartbeatHarness(HarnessApp):
+    """
+    Stays quiet longer than the idle watchdog while the heartbeat loop
+    proves the turn stream is still alive, then completes.
+
+    This models a legitimate long await inside ``run_turn``: the harness
+    is not producing substantive deltas while an LLM/tool/sub-agent is
+    working, but the SSE stream is still able to emit low-cost
+    ``response.heartbeat`` frames.
+    """
+
+    async def _heartbeat_loop(self, ctx: TurnContext) -> None:
+        from omnigent.server.schemas import HeartbeatEvent
+
+        while True:
+            await asyncio.sleep(0.2)
+            ctx.emit(HeartbeatEvent(type="response.heartbeat"))
+
+    async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
+        del request
+        await asyncio.sleep(2.5)
+        ctx.emit(OutputTextDeltaEvent(type="response.output_text.delta", delta="done"))
+
+
 _FIXTURES: dict[str, type[HarnessApp]] = {
     "echo": _EchoHarness,
     "wedged": _WedgedHarness,
     "busy_progress": _BusyProgressHarness,
     "wedged_fast_heartbeat": _WedgedFastHeartbeatHarness,
+    "quiet_wait_heartbeat": _QuietWaitHeartbeatHarness,
     "usage": _UsageHarness,
     "tool_dispatch": _ToolDispatchHarness,
     "elicitation": _ElicitationHarness,
