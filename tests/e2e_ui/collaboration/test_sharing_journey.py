@@ -23,6 +23,7 @@ the sidebar.
 from __future__ import annotations
 
 import json
+import subprocess
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -31,7 +32,11 @@ import httpx
 import pytest
 from playwright.sync_api import Browser, BrowserContext, Page, expect
 
-from tests.e2e_ui.conftest import _build_hello_world_bundle, _server_state
+from tests.e2e_ui.conftest import (
+    _build_hello_world_bundle,
+    _ensure_runner_online,
+    _server_state,
+)
 
 _COMPOSER = "Ask the agent anything…"
 _READONLY_PLACEHOLDER = "You have read-only access to this session"
@@ -60,13 +65,25 @@ class _SharedFixture:
 
 
 @pytest.fixture
-def shared(live_server: str) -> Iterator[_SharedFixture]:
+def shared(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[_SharedFixture]:
     """Create a ``local``-owned, runner-bound hello_world session.
 
     Mirrors ``seeded_session`` (headerless create + bind) plus a
     Bob client for the collaborator side. Teardown deletes as the
     owner (owner-only).
+
+    Respawns the shared runner first if a prior test in the shard killed
+    it (``test_stale_stream``) — otherwise the runner-bind ``PATCH`` below
+    400s ("runner is not registered"). The strided shard split
+    (``conftest.pytest_collection_modifyitems``) can place the
+    runner-killing test before this one in the same shard, so this fixture
+    must be order-independent like the conftest session fixtures. Any
+    runner this respawns is torn down with the fixture.
     """
+    respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
     suffix = uuid.uuid4().hex[:6]
     # No keep-alive pooling: these clients sit idle for minutes while
     # Playwright drives the browser, and reusing a connection the
@@ -102,6 +119,15 @@ def shared(live_server: str) -> Iterator[_SharedFixture]:
         owner.delete(f"/v1/sessions/{session_id}")
         owner.close()
         bob.close()
+        # Restore the "found" state: if we respawned the runner (a prior
+        # test had killed it), tear our copy down so it doesn't outlive us.
+        if respawned_runner is not None:
+            respawned_runner.terminate()
+            try:
+                respawned_runner.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned_runner.kill()
+                respawned_runner.wait(timeout=5)
 
 
 def _user_context(browser: Browser, email: str) -> BrowserContext:
