@@ -85,9 +85,7 @@ async def test_tool_call_non_200_fails_closed() -> None:
     assert verdict["action"] == "POLICY_ACTION_DENY", verdict
 
 
-@pytest.mark.parametrize(
-    "phase", ["PHASE_LLM_REQUEST", "PHASE_LLM_RESPONSE", "PHASE_TOOL_RESULT"]
-)
+@pytest.mark.parametrize("phase", ["PHASE_LLM_REQUEST", "PHASE_LLM_RESPONSE", "PHASE_TOOL_RESULT"])
 async def test_non_tool_call_phase_error_fails_open(phase: str) -> None:
     """Fail-open is preserved off the TOOL_CALL phase: an error yields ALLOW.
 
