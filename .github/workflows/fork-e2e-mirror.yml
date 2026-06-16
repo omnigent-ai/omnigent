@@ -4,8 +4,9 @@ name: Fork e2e mirror
 # fork-e2e/pr-N branch so e2e runs there as a `push` (with secrets). It's a pure
 # git-ref update via a GitHub App token (refs pushed by the default GITHUB_TOKEN
 # don't trigger workflows); it never checks out or runs fork code. Gated by
-# should-mirror.sh + the Fork Security Scan. pull_request_review is included so a
-# maintainer's approval mirrors immediately, not only on the PR's next push.
+# should-mirror.sh + the single contributor Security Scan, consulted through the
+# reusable security-gate.yml. pull_request_review is included so a maintainer's
+# approval mirrors immediately, not only on the PR's next push.
 #
 # leak-scan-allow: pull_request_target
 on:
@@ -22,14 +23,51 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Delete the trusted mirror branch when the PR closes. Ungated -- cleanup must
+  # always run so a closed PR never leaves a stale fork-e2e/pr-N branch behind.
+  cleanup:
+    name: cleanup
+    if: ${{ github.event.action == 'closed' && github.event.pull_request.head.repo.fork }}
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      REPO: ${{ github.repository }}
+      MIRROR_BRANCH: fork-e2e/pr-${{ github.event.pull_request.number }}
+    steps:
+      - name: Mint mirror App token
+        id: app-token
+        # App token, not GITHUB_TOKEN: its pushes DO trigger the downstream e2e.
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          app-id: ${{ vars.FORK_E2E_APP_ID }}
+          private-key: ${{ secrets.FORK_E2E_APP_PRIVATE_KEY }}
+
+      - name: Delete mirror branch
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh api -X DELETE "repos/$REPO/git/refs/heads/$MIRROR_BRANCH" >/dev/null 2>&1 \
+            && echo "Deleted $MIRROR_BRANCH" || echo "No $MIRROR_BRANCH to delete"
+
+  # The single contributor Security Scan, consulted as a BLOCKING gate before we
+  # mirror fork code onto a trusted branch where e2e runs WITH the gateway secret.
+  # The scan itself runs once on the PR (security-scan.yml); this poller mirrors
+  # its result, blocking the mirror on a finding.
+  gate:
+    name: security gate
+    if: ${{ github.event.action != 'closed' && github.event.pull_request.head.repo.fork }}
+    uses: ./.github/workflows/security-gate.yml
+
   mirror:
     name: mirror
+    needs: gate
     # Fork PRs only -- same-repo PRs run e2e directly via `pull_request`.
-    if: ${{ github.event.pull_request.head.repo.fork }}
+    if: ${{ github.event.action != 'closed' && github.event.pull_request.head.repo.fork }}
     permissions:
       contents: read
       pull-requests: read
-      statuses: write
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
@@ -55,68 +93,18 @@ jobs:
           app-id: ${{ vars.FORK_E2E_APP_ID }}
           private-key: ${{ secrets.FORK_E2E_APP_PRIVATE_KEY }}
 
-      - name: Delete mirror branch on PR close
-        if: ${{ github.event.action == 'closed' }}
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          gh api -X DELETE "repos/$REPO/git/refs/heads/$MIRROR_BRANCH" >/dev/null 2>&1 \
-            && echo "Deleted $MIRROR_BRANCH" || echo "No $MIRROR_BRANCH to delete"
-
       - name: Load maintainers
         id: maintainers
-        if: ${{ github.event.action != 'closed' }}
         run: bash .github/scripts/merge-ready/load-maintainers.sh
 
       - name: Evaluate mirror gate
         id: gate
-        if: ${{ github.event.action != 'closed' }}
         env:
           MAINTAINERS: ${{ steps.maintainers.outputs.list }}
         run: bash .github/scripts/fork-e2e/should-mirror.sh
 
-      - name: Security scan of PR diff
-        id: scan
-        # Diff TEXT only -- never checks out or runs fork code.
-        if: ${{ github.event.action != 'closed' }}
-        run: |
-          gh pr diff "$PR" --repo "$REPO" --patch > "$RUNNER_TEMP/pr.diff"
-          python3 .github/scripts/fork-e2e/security_scan.py "$RUNNER_TEMP/pr.diff"
-
-      - name: Check security-scan override label
-        id: override
-        if: ${{ github.event.action != 'closed' }}
-        run: |
-          if gh pr view "$PR" --repo "$REPO" --json labels --jq '.labels[].name' \
-               | grep -qx 'security-scan-override'; then
-            echo "override=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "override=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Post Fork Security Scan status
-        if: ${{ github.event.action != 'closed' }}
-        env:
-          CLEAN: ${{ steps.scan.outputs.clean }}
-          OVERRIDE: ${{ steps.override.outputs.override }}
-          SUMMARY: ${{ steps.scan.outputs.summary }}  # fork text via env, not interpolated
-        run: |
-          if [[ "$CLEAN" == "true" ]]; then
-            STATE=success; DESC="$SUMMARY"
-          elif [[ "$OVERRIDE" == "true" ]]; then
-            STATE=success; DESC="overridden by maintainer: $SUMMARY"
-          else
-            STATE=failure; DESC="$SUMMARY"
-          fi
-          gh api "repos/$REPO/statuses/$HEAD_SHA" \
-            -f state="$STATE" -f context="Fork Security Scan" \
-            -f description="${DESC:0:140}" >/dev/null
-
       - name: Mirror head SHA onto trusted branch
-        if: >-
-          github.event.action != 'closed'
-          && steps.gate.outputs.mirror == 'true'
-          && (steps.scan.outputs.clean == 'true' || steps.override.outputs.override == 'true')
+        if: ${{ steps.gate.outputs.mirror == 'true' }}
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |

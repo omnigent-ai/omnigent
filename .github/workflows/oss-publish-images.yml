@@ -25,7 +25,12 @@ on:
       - 'uv.lock'
       - 'ap-web/package-lock.json'
       - '.github/workflows/oss-publish-images.yml'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      bump_latest:
+        description: 'Also move :latest to this build (manual release of latest). Off by default.'
+        type: boolean
+        default: false
 
 # Read-only at the top level; write scopes live on the job below.
 permissions:
@@ -59,15 +64,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # :latest tracks main HEAD; :sha-<short> is the immutable per-commit pin;
-      # a v* tag publishes :vX.Y.Z and re-points :latest. Server + host images
-      # share the scheme. ref / ref_name go through env (not inline ${{ }}) so a
-      # crafted tag name can't inject shell.
+      # :sha-<short> is the immutable per-commit pin, published on EVERY
+      # qualifying build (each main commit included). :latest is decoupled
+      # from per-commit builds: it only moves on a real release (a v* tag,
+      # which also publishes :vX.Y.Z) or a deliberate manual dispatch with
+      # bump_latest=true. A plain main commit no longer re-points :latest.
+      # Server + host images share the scheme. ref / ref_name go through env
+      # (not inline ${{ }}) so a crafted tag name can't inject shell.
       - name: Compute image tags
         id: tags
         env:
           GH_REF: ${{ github.ref }}
           GH_REF_NAME: ${{ github.ref_name }}
+          BUMP_LATEST: ${{ inputs.bump_latest }}
         run: |
           set -euo pipefail
           IMAGE="ghcr.io/omnigent-ai/omnigent-server"
@@ -75,13 +84,20 @@ jobs:
           SHORT_SHA=$(git rev-parse --short HEAD)
           TAGS="${IMAGE}:sha-${SHORT_SHA}"
           HOST_TAGS="${HOST_IMAGE}:sha-${SHORT_SHA}"
-          if [ "${GH_REF}" = "refs/heads/main" ]; then
+          bump_latest="false"
+          # A version tag is a release: publish :vX.Y.Z and move :latest.
+          if [[ "${GH_REF}" == refs/tags/v* ]]; then
+            TAGS="${TAGS},${IMAGE}:${GH_REF_NAME}"
+            HOST_TAGS="${HOST_TAGS},${HOST_IMAGE}:${GH_REF_NAME}"
+            bump_latest="true"
+          fi
+          # A manual dispatch can opt in to moving :latest (human approval).
+          if [ "${BUMP_LATEST}" = "true" ]; then
+            bump_latest="true"
+          fi
+          if [ "${bump_latest}" = "true" ]; then
             TAGS="${TAGS},${IMAGE}:latest"
             HOST_TAGS="${HOST_TAGS},${HOST_IMAGE}:latest"
-          fi
-          if [[ "${GH_REF}" == refs/tags/v* ]]; then
-            TAGS="${TAGS},${IMAGE}:${GH_REF_NAME},${IMAGE}:latest"
-            HOST_TAGS="${HOST_TAGS},${HOST_IMAGE}:${GH_REF_NAME},${HOST_IMAGE}:latest"
           fi
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
           echo "host_tags=${HOST_TAGS}" >> "$GITHUB_OUTPUT"

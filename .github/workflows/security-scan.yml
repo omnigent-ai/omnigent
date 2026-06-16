@@ -15,9 +15,10 @@ name: Security Scan
 # / uv sync / test). Detectors run fail-fast -- the first finding fails the job,
 # so a clean PR must pass every one.
 #
-# Trust tiers (should-scan.sh): trusted (OWNER/MEMBER/COLLABORATOR) and non-PR
-# events aren't scanned; returning contributors are; first-timers are held by
-# GitHub's native fork-approval gate first.
+# Trust tiers (should-scan.sh): trusted (OWNER/MEMBER/COLLABORATOR, or an author
+# in the MAINTAINERS list -- covers maintainers with private org membership) and
+# non-PR events aren't scanned; returning contributors are; first-timers are held
+# by GitHub's native fork-approval gate first.
 
 on:
   pull_request:
