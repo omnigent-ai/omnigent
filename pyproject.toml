@@ -114,6 +114,11 @@ modal = ["modal>=1.0,<2"]
 # server-managed `sandbox.provider: daytona`).
 # Same lazy-import posture as the modal extra. Pre-1.0 SDK: pin minor.
 daytona = ["daytona>=0.180,<1"]
+# Boxlite sandbox launcher: server-managed `sandbox.provider: boxlite`, either
+# local embedded micro-VMs (KVM/HVF, no daemon) or a remote `boxlite serve`
+# pool. Same lazy-import posture as the modal/daytona extras. Pre-1.0 SDK: pin
+# minor.
+boxlite = ["boxlite>=0.9.5,<1"]
 # CoreWeave Sandbox launcher (`omnigent sandbox --provider cwsandbox` and
 # server-managed `sandbox.provider: cwsandbox`).
 # Same lazy-import posture as above. Pre-1.0 SDK: pin minor.
