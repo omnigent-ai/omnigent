@@ -3274,9 +3274,9 @@ export function Composer({
             {commandError}
           </div>
         )}
-        <div className="flex items-center justify-between px-2 pb-2">
+        <div className="flex items-center justify-between gap-2 px-2 pb-2">
           {/* Attach + mic — left side of the action row */}
-          <div className="flex items-center gap-0.5">
+          <div className="flex shrink-0 items-center gap-0.5">
             <Button
               type="button"
               size="icon"
@@ -3302,7 +3302,7 @@ export function Composer({
             />
           </div>
           {/* Cost toggle + agent picker + Send — right side */}
-          <div className="flex items-center gap-0.5">
+          <div className="flex min-w-0 items-center gap-0.5">
             {/* Temporarily hidden (#3021): re-enable by removing the false gate. */}
             {false && costRoutingEligible && (
               <IntelligentModelControl
@@ -3336,7 +3336,7 @@ export function Composer({
               // overrides the base 50% disabled-opacity so the affordance
               // reads as "waiting for input", not "almost active".
               className={cn(
-                "size-9 rounded-full md:size-8",
+                "size-9 shrink-0 rounded-full md:size-8",
                 !showInterruptButton && "hover:bg-primary/90 disabled:opacity-30",
               )}
               // Interrupt stays live during a pending elicitation —
@@ -3705,12 +3705,10 @@ function AgentPicker({
           size="sm"
           disabled={!hasAgents || disabled || !hasPickerActions}
           data-testid="agent-picker-trigger"
-          className="h-7 gap-1.5 px-2 text-muted-foreground hover:text-foreground"
+          className="h-7 min-w-0 shrink gap-1.5 px-2 text-muted-foreground hover:text-foreground"
         >
-          <span className="max-w-20 truncate text-xs tabular-nums md:max-w-[18rem]">
-            {triggerLabel}
-          </span>
-          {hasPickerActions && <ChevronDownIcon className="size-3.5 opacity-60" />}
+          <span className="min-w-0 truncate text-xs tabular-nums">{triggerLabel}</span>
+          {hasPickerActions && <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />}
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="min-w-64 p-1">

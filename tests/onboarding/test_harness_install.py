@@ -31,6 +31,47 @@ def test_install_spec_and_command(key: str, binary: str, package: str) -> None:
     assert hi.harness_install_command(key) == ["npm", "install", "-g", package]
 
 
+def test_cursor_install_spec_is_login_only_no_npm() -> None:
+    """Cursor ships via a curl installer (no npm package) and authenticates
+    through its own CLI login, so it carries an ``install_hint`` + status JSON
+    key instead of a ``package``.
+
+    Drift here (a package sneaking in, or the wrong status key) would make the
+    setup menu offer a bogus ``npm install`` or misread login state.
+    """
+    spec = hi.harness_install_spec(hi.CURSOR_KEY)
+    assert spec is not None
+    assert spec.binary == "cursor-agent"
+    assert spec.package is None
+    assert spec.install_hint is not None and "cursor.com/install" in spec.install_hint
+    assert spec.login_args == ("login",)
+    assert spec.logout_args == ("logout",)
+    assert spec.status_args == ("status", "--format", "json")
+    assert spec.login_status_key == "isAuthenticated"
+
+
+def test_install_command_rejects_non_npm_harness() -> None:
+    """A non-npm harness (cursor) has no npm install command; asking for one is
+    a loud error so the caller shows its ``install_hint`` instead."""
+    with pytest.raises(ValueError):
+        hi.harness_install_command(hi.CURSOR_KEY)
+
+
+def test_install_harness_cli_noop_for_non_npm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``install_harness_cli`` never shells npm for a non-npm CLI (cursor).
+
+    It returns ``False`` without spawning anything, so the menu falls back to
+    the manual ``install_hint`` rather than running a bogus npm command.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def _explode(*a: object, **k: object) -> None:
+        raise AssertionError("npm install spawned for a non-npm harness")
+
+    monkeypatch.setattr(hi.subprocess, "run", _explode)
+    assert hi.install_harness_cli(hi.CURSOR_KEY) is False
+
+
 def test_unknown_key_has_no_spec_and_is_not_installed() -> None:
     """A family with no dedicated CLI (e.g. a gateway-only family) → None / False,
     never a crash."""
@@ -47,7 +88,7 @@ def test_unknown_key_has_no_spec_and_is_not_installed() -> None:
     ],
 )
 def test_required_cli_for_cli_backed_harness(harness: str, binary: str) -> None:
-    """The three CLI-backed harnesses map to the binary their launch needs.
+    """The CLI-backed harnesses map to the binary their launch needs.
 
     Drift here (a wrong/missing mapping) would let sub-agent dispatch skip
     the preflight for a harness that actually needs a CLI, reintroducing the
@@ -56,6 +97,16 @@ def test_required_cli_for_cli_backed_harness(harness: str, binary: str) -> None:
     spec = hi.required_cli_for_harness(harness)
     assert spec is not None
     assert spec.binary == binary
+
+
+@pytest.mark.parametrize("harness", ["cursor", "claude-sdk", "openai-agents"])
+def test_sdk_harnesses_require_no_cli(harness: str) -> None:
+    """SDK-based harnesses (incl. ``cursor``, which drives the cursor-sdk Python
+    package) require no CLI binary, so the sub-agent dispatch preflight must not
+    flag them — otherwise it would block a launch that needs no CLI (and, for
+    cursor, print ``npm install -g None`` for its package-less spec)."""
+    assert hi.required_cli_for_harness(harness) is None
+    assert hi.missing_harness_cli(harness) is None
 
 
 @pytest.mark.parametrize(
@@ -412,6 +463,37 @@ def test_harness_cli_logged_in_codex_uses_exit_code(
 
     monkeypatch.setattr(hi.subprocess, "run", _run)
     assert hi.harness_cli_logged_in(OPENAI_FAMILY) is expected
+
+
+@pytest.mark.parametrize(
+    "stdout,returncode,expected",
+    [
+        # Cursor prints JSON with ``isAuthenticated``; the field is the verdict
+        # regardless of exit code.
+        ('{"isAuthenticated": true, "status": "authenticated"}', 0, True),
+        ('{"isAuthenticated": false}', 1, False),
+        ('{"isAuthenticated": false}', 0, False),
+    ],
+)
+def test_harness_cli_logged_in_uses_cursor_json_verdict(
+    monkeypatch: pytest.MonkeyPatch, stdout: str, returncode: int, expected: bool
+) -> None:
+    """Cursor's ``status --format json`` reports ``isAuthenticated``.
+
+    Unlike Claude (``loggedIn``) it uses a different key, so the spec's
+    ``login_status_key`` selects it. A regression would misread cursor login
+    state in the setup menu's ✓/✗ marker.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def _run(argv: list[str], **k: object):
+        assert argv == ["cursor-agent", "status", "--format", "json"]
+        return subprocess.CompletedProcess(
+            args=argv, returncode=returncode, stdout=stdout, stderr=""
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.harness_cli_logged_in(hi.CURSOR_KEY) is expected
 
 
 def test_harness_cli_logged_in_false_when_binary_missing(monkeypatch: pytest.MonkeyPatch) -> None:

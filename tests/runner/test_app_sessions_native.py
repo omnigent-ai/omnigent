@@ -7434,6 +7434,111 @@ async def test_events_stop_session_on_codex_native_uses_turn_interrupt_without_m
     ), f"no interrupt marker should enter _session_histories; got {captured_history!r}"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["interrupt", "stop_session"])
+async def test_events_interrupt_and_stop_on_pi_native_enqueue_bridge_interrupt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    event_type: str,
+) -> None:
+    """
+    POST ``/events`` interrupt / stop_session on a pi-native session queues an
+    interrupt payload to the Pi extension inbox.
+
+    A pi-native turn runs inside the resident Pi TUI process; the runner's
+    harness task only enqueues the user message and returns, so the in-process
+    cancel floor has nothing to cancel. Both the ``interrupt`` and
+    ``stop_session`` dispatch must route to ``_handle_pi_native_interrupt``,
+    which drops an ``interrupt`` payload into the bridge inbox for the extension
+    to consume via ``ExtensionContext.abort()``.
+
+    Regression guard: both branches originally enumerated only claude-native
+    and codex-native, so pi-native silently fell through to the no-op
+    ``_cancel_inprocess_turn`` floor — clicking Stop on a Pi turn did nothing.
+
+    Pins:
+    1. 204 returned.
+    2. An ``interrupt_*`` payload is written to the session's bridge inbox.
+    3. NO ``[System: interrupted]`` marker is persisted (the floor never ran).
+    """
+    import omnigent.pi_native_bridge as pi_native_bridge
+    from omnigent.runner.app import _session_histories_ref
+    from omnigent.spec.types import ExecutorSpec
+
+    conv_id = f"conv_pi_native_{event_type}"
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+
+    pi_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the pi-native spec for any agent_id."""
+        del agent_id, session_id
+        return pi_native_spec
+
+    server_client = _EventRecordingServerClient()
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        # Seeds _session_spec_cache so the dispatch detects "pi-native".
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": event_type},
+        )
+
+        captured_history = list(_session_histories_ref.get(conv_id, []))
+        flagged = conv_id in app.state.interrupted_sessions
+
+    assert resp.status_code == 204, (
+        f"pi-native {event_type} must return 204; got {resp.status_code}: {resp.text}"
+    )
+
+    # 1) The request reached the bridge inbox (the extension's abort channel). If
+    # empty, the dispatch fell through to the no-op in-process cancel floor
+    # instead of _handle_pi_native_interrupt.
+    inbox = pi_native_bridge.bridge_dir_for_session_id(conv_id) / "inbox"
+    queued = sorted(p.name for p in inbox.glob("*.json")) if inbox.exists() else []
+    assert any("interrupt_" in name for name in queued), (
+        f"pi-native {event_type} must enqueue an interrupt payload to the bridge "
+        f"inbox; inbox contained {queued!r}."
+    )
+
+    # 2) No synthesized marker — pi-native never goes through the in-process floor.
+    marker_texts = [
+        b.get("text")
+        for data in server_client.posted_items
+        for b in (data.get("item_data") or {}).get("content", [])
+        if isinstance(b, dict)
+    ]
+    assert not any("interrupted" in (t or "").lower() for t in marker_texts), (
+        f"pi-native {event_type} must NOT persist an interrupted marker; got {marker_texts!r}."
+    )
+
+    # 3) Not flagged, and nothing leaks into the runner's in-memory history.
+    assert not flagged, f"pi-native session {conv_id!r} must not be flagged interrupted."
+    assert all(
+        not (
+            h.get("role") == "user"
+            and any("interrupted" in (b.get("text") or "").lower() for b in h.get("content", []))
+        )
+        for h in captured_history
+    ), f"no interrupt marker should enter _session_histories; got {captured_history!r}"
+
+
 def test_interrupted_sessions_isolated_per_app_instance() -> None:
     """
     Each ``create_runner_app()`` gets its own ``_interrupted_sessions`` set.

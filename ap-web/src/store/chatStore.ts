@@ -93,6 +93,7 @@ import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { isClaudeNativeModel } from "@/lib/claudeNativeModels";
 import { getCurrentAuthorId } from "@/lib/identity";
+import { isNativeWrapper } from "@/lib/nativeCodingAgents";
 
 export interface SendOptions {
   /**
@@ -1511,7 +1512,7 @@ function sessionBindingPatch(
 > {
   const wrapper = session.labels?.["omnigent.wrapper"];
   return {
-    isNativeTerminalSession: wrapper === "claude-code-native-ui" || wrapper === "codex-native-ui",
+    isNativeTerminalSession: isNativeWrapper(wrapper),
     boundAgentId: session.agentId,
     boundAgentName: session.agentName,
     llmModel: session.llmModel ?? null,

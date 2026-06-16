@@ -1391,6 +1391,73 @@ def _build_openai_agents_sdk_spawn_env(spec: AgentSpec) -> dict[str, str]:
     return env
 
 
+def _build_cursor_spawn_env(
+    spec: AgentSpec,
+    *,
+    workdir: Path | None = None,
+) -> dict[str, str]:
+    """
+    Build the ``HARNESS_CURSOR_*`` env-var dict the cursor harness wrap reads.
+
+    Maps spec.executor fields → the ``HARNESS_CURSOR_*`` env vars defined
+    in ``omnigent/inner/cursor_harness.py``. Unlike the gateway-backed
+    builders (claude-sdk / codex / pi / openai-agents), there is NO gateway or
+    Databricks-profile resolution: the Cursor SDK talks only to Cursor's own
+    backend (``CURSOR_API_KEY``) and has no custom API base-URL override, so it
+    never routes through the Databricks AI gateway. That is also why cursor is
+    intentionally absent from :data:`AgentHarnessType` and the gateway/ucode
+    dicts above.
+
+    Auth: an explicit ``executor.auth: {type: api_key, api_key: ...}`` is
+    forwarded as ``HARNESS_CURSOR_API_KEY`` (the cursor harness passes it to the
+    Cursor SDK as its ``api_key``). When the spec declares no auth at all, a
+    ``CURSOR_API_KEY`` registered once via ``omnigent setup`` (the dedicated
+    ``cursor:`` config block — see :mod:`omnigent.onboarding.cursor_auth`) is
+    used instead, so a user need not export it in every shell. With neither, the
+    harness falls back to an inherited ``CURSOR_API_KEY`` — a ``DatabricksAuth``
+    profile does not apply to cursor and is ignored.
+
+    :param spec: The agent spec.
+    :param workdir: The bundle's on-disk path, threaded as
+        ``HARNESS_CURSOR_BUNDLE_DIR``.
+    :returns: A dict of env-var overrides for
+        :meth:`HarnessProcessManager.get_client(env=...)`.
+    """
+    env: dict[str, str] = {}
+    model = _resolve_spec_model(spec)
+    if model is not None:
+        env["HARNESS_CURSOR_MODEL"] = model
+    # Auth precedence: an explicit api-key auth on the spec wins; with NO spec
+    # auth at all, fall back to a CURSOR_API_KEY registered once via
+    # ``omnigent setup`` (the dedicated ``cursor:`` config block), else an
+    # ambient CURSOR_API_KEY (an exported key / a host launched with one). A
+    # Databricks / provider auth has no cursor equivalent and never silently
+    # adopts a stored or ambient cursor key.
+    if isinstance(spec.executor.auth, ApiKeyAuth):
+        env["HARNESS_CURSOR_API_KEY"] = spec.executor.auth.api_key
+    elif spec.executor.auth is None:
+        # Imported lazily — the onboarding layer pulls in the secret store /
+        # keyring, which the hot spawn-env path shouldn't import eagerly.
+        from omnigent.onboarding.cursor_auth import resolve_cursor_api_key
+
+        stored_key = resolve_cursor_api_key()
+        if stored_key is not None:
+            env["HARNESS_CURSOR_API_KEY"] = stored_key
+        elif os.environ.get("CURSOR_API_KEY"):
+            env["HARNESS_CURSOR_API_KEY"] = os.environ["CURSOR_API_KEY"]
+    # Always set so the wrap doesn't fall back to ``"all"`` and override an
+    # explicit ``skills: none`` from the spec (parity with the peer builders).
+    env["HARNESS_CURSOR_SKILLS_FILTER"] = json.dumps(spec.skills_filter)
+    if spec.name:
+        env["HARNESS_CURSOR_AGENT_NAME"] = spec.name
+    if workdir is not None:
+        env["HARNESS_CURSOR_BUNDLE_DIR"] = str(workdir)
+    os_env_payload = _serialize_os_env(spec.os_env)
+    if os_env_payload is not None:
+        env["HARNESS_CURSOR_OS_ENV"] = os_env_payload
+    return env
+
+
 def _serialize_os_env(value: OSEnvSpec | None) -> str | None:
     """
     Encode an :class:`OSEnvSpec` for the wrap's env-var input.

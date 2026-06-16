@@ -2,13 +2,29 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
+import yaml
 
 import omnigent.onboarding.harness_install as hi
 from omnigent.onboarding.harness_readiness import (
     configured_harness_map,
     harness_is_configured,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_cursor_credential(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Isolate cursor's API-key sources so its readiness is deterministic.
+
+    Cursor readiness keys off a configured ``CURSOR_API_KEY`` (the ``cursor:``
+    config block or the environment), so point the config home at an empty tmp
+    dir and clear any ambient ``CURSOR_API_KEY`` — otherwise a developer's real
+    key would flip cursor's verdict under these tests.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv("CURSOR_API_KEY", raising=False)
 
 
 def _all_clis_installed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -105,6 +121,9 @@ def test_configured_harness_map_covers_all_spellings(
         "agents_sdk",
         "claude",
         "pi",
+        "pi-native",
+        "native-pi",
+        "cursor",
     }
     assert set(result) == expected_keys
 
@@ -133,18 +152,59 @@ def test_configured_harness_map_gates_only_cli_harnesses(
     ):
         assert result[sdk] is True, f"{sdk} should never be gated"
     # CLI-wrapping spellings — gated, so False when the binary is absent.
-    for cli in ("claude-native", "native-claude", "codex", "codex-native", "native-codex", "pi"):
+    # (Cursor is excluded: it runs via the ``cursor-sdk`` package and gates on
+    # a configured ``CURSOR_API_KEY``, not a binary — covered separately.)
+    for cli in (
+        "claude-native",
+        "native-claude",
+        "codex",
+        "codex-native",
+        "native-codex",
+        "pi",
+    ):
         assert result[cli] is False, f"{cli} should be gated on its CLI binary"
 
 
 def test_configured_harness_map_all_true_with_clis(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Every spelling reads True once the CLIs are installed.
+    """Every spelling reads True once the CLIs are installed and cursor has a key.
 
-    The CLI harnesses pass their binary check and the SDK harnesses are
-    ungated, so nothing is reported unconfigured.
+    The CLI harnesses pass their binary check, the SDK harnesses are ungated,
+    and cursor (key-gated) is satisfied by a ``CURSOR_API_KEY`` — so nothing is
+    reported unconfigured.
     """
     _all_clis_installed(monkeypatch)
+    monkeypatch.setenv("CURSOR_API_KEY", "crsr_ready")
     result = configured_harness_map()
     assert all(result.values())
+
+
+def test_cursor_readiness_keys_off_api_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Cursor is configured iff a ``CURSOR_API_KEY`` is resolvable — not a binary.
+
+    The cursor harness runs via the always-present ``cursor-sdk`` package, so
+    its readiness ignores the ``cursor-agent`` binary entirely: no key → not
+    configured (even with every CLI installed); an env key or a stored
+    ``cursor:`` block → configured (even with no CLI at all). A wrong verdict
+    would either warn a key-configured cursor user "needs setup" or greenlight a
+    keyless one that fails at the first turn.
+    """
+    # No key anywhere (autouse isolation), even with all CLIs present → False.
+    _all_clis_installed(monkeypatch)
+    assert harness_is_configured("cursor") is False
+
+    # An inherited environment key satisfies it, with no CLI installed.
+    _no_clis_installed(monkeypatch)
+    monkeypatch.setenv("CURSOR_API_KEY", "crsr_from_env")
+    assert harness_is_configured("cursor") is True
+
+    # A key stored in the ``cursor:`` config block also satisfies it.
+    monkeypatch.delenv("CURSOR_API_KEY", raising=False)
+    monkeypatch.setenv("MY_CURSOR_KEY", "crsr_from_config")
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"cursor": {"api_key_ref": "env:MY_CURSOR_KEY"}})
+    )
+    assert harness_is_configured("cursor") is True

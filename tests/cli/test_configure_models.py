@@ -9,7 +9,8 @@ shape, not just the command's exit code, so a regression in the
 add/set-default/remove write paths surfaces here rather than silently.
 
 ``configure harnesses`` is a **three-level** picker. Level 1 picks a harness —
-the cursor moves between ``1=Claude``, ``2=Codex``, ``3=Pi``, and ``4=Quit`` (each
+the cursor moves between ``1=Claude``, ``2=Codex``, ``3=Pi``, ``4=Cursor``, and
+``5=Quit`` (each
 harness's prominent default + ``+N more`` summary renders as non-selectable
 sub-lines that are skipped; a harness with no usable default — uninstalled or
 unconfigured — shows a red ✗, while a configured one carries no name-level
@@ -80,6 +81,7 @@ def isolated_config(tmp_path, monkeypatch):
         "GEMINI_API_KEY",
         "OPENROUTER_API_KEY",
         "DATABRICKS_TOKEN",
+        "CURSOR_API_KEY",
     ):
         monkeypatch.delenv(var, raising=False)
     # Redirect CLI-detected credential homes so a developer's real
@@ -1960,3 +1962,85 @@ def test_add_menu_readds_dismissed_cli_config_credential(isolated_config) -> Non
     # The dismissal is cleared, so the credential behaves like an ordinary
     # detection again instead of staying half-dismissed.
     assert cfg["dismissed_detections"] == []
+
+
+# ── Cursor API-key flow ─────────────────────────────────────────────────────
+# Cursor runs via the ``cursor-sdk`` package and authenticates with a
+# ``CURSOR_API_KEY``; it has no provider/gateway family. Its drill-in (L1 row 4)
+# stores the key in the secret store + a dedicated ``cursor:`` config block,
+# mirroring the other harnesses' api-key persistence. The menu is API-key-only
+# (Set/Replace/Remove), so it touches neither the ``cursor-agent`` binary nor a
+# login probe. ``isolated_config`` clears any ambient ``CURSOR_API_KEY``.
+
+
+def test_cursor_set_api_key_paste_writes_block_and_secret(isolated_config) -> None:
+    """Pasting a ``crsr_`` key stores the secret + writes the ``cursor:`` block.
+
+    Proves the api-key path: the secret lands in the store (never plaintext in
+    config) and the config references it via ``keychain:cursor``.
+    """
+    # L1 4=Cursor → cursor menu 1=Set API key → paste key (crsr_ → no warn) →
+    # cursor menu q=back → L1 q=quit.
+    stdin = "\n".join(["4", "1", "crsr_test_key_123", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    assert cfg["cursor"] == {"api_key_ref": "keychain:cursor"}
+    # The pasted secret reached the store under the ``cursor`` name; config
+    # holds only the reference.
+    assert secrets.load_secret("cursor") == "crsr_test_key_123"
+
+
+def test_cursor_adopt_env_api_key_writes_env_ref(isolated_config, monkeypatch) -> None:
+    """Adopting an existing ``$CURSOR_API_KEY`` records an ``env:`` ref only.
+
+    The env path must NOT copy the secret into the store — it points the config
+    at the live environment variable so the key never leaves the user's shell.
+    """
+    monkeypatch.setenv("CURSOR_API_KEY", "crsr_env_key_456")
+    # L1 4=Cursor → 1=Set API key → "y" adopt detected $CURSOR_API_KEY →
+    # q back → q quit.
+    stdin = "\n".join(["4", "1", "y", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    assert cfg["cursor"] == {"api_key_ref": "env:CURSOR_API_KEY"}
+    assert secrets.load_secret("cursor") is None
+
+
+def test_cursor_remove_api_key_drops_block_and_secret(isolated_config) -> None:
+    """Removing a Cursor key deletes the stored secret AND drops the config block."""
+    # Seed a stored key: the keychain secret + the ``cursor:`` block referencing it.
+    secrets.store_secret("cursor", "crsr_seeded")
+    config_path = os.path.join(isolated_config, "config.yaml")
+    with open(config_path, "w") as f:
+        yaml.safe_dump({"cursor": {"api_key_ref": "keychain:cursor"}}, f)
+
+    # L1 4=Cursor → cursor menu (key set: 1=Replace 2=Remove 3=Back) → 2=Remove
+    # → q back → q quit.
+    stdin = "\n".join(["4", "2", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    assert "cursor" not in cfg
+    assert secrets.load_secret("cursor") is None
+
+
+def test_cursor_set_api_key_non_crsr_declined_is_not_stored(isolated_config) -> None:
+    """A non-``crsr_`` paste that the user declines to force is NOT persisted.
+
+    The soft prefix check warns and asks to store anyway; declining must leave
+    both the secret store and the config untouched.
+    """
+    # L1 4=Cursor → 1=Set API key → paste non-crsr_ key → "n" decline warning →
+    # q back → q quit.
+    stdin = "\n".join(["4", "1", "sk-not-a-cursor-key", "n", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    assert "cursor" not in cfg
+    assert secrets.load_secret("cursor") is None

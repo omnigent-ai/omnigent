@@ -27,6 +27,8 @@ from __future__ import annotations
 import io
 import os
 import sys
+from collections.abc import Callable
+from typing import Protocol, cast
 
 import click
 from rich.console import Console
@@ -40,6 +42,10 @@ MUTED = "#6a6a6a"
 # Shared Rich console for all onboarding interactive output. A module
 # singleton so all callers render through one surface.
 console = Console()
+
+
+class _TermUIWithHiddenPrompt(Protocol):
+    hidden_prompt_func: Callable[[str], str]
 
 
 def clear_screen() -> None:
@@ -427,8 +433,10 @@ def prompt_text(
 
     On a TTY this prints an accent label line, then reads the value via
     ``click.prompt`` (which handles ``hide_input`` masking and the
-    ``default`` echo). On a non-TTY the same ``click.prompt`` path runs,
-    so pipes / tests behave identically.
+    ``default`` echo). Hidden prompts also print muted metadata-only
+    feedback so users can tell a pasted secret registered without seeing
+    the secret. On a non-TTY the same ``click.prompt`` path runs, so pipes
+    / tests behave identically.
 
     :param label: The prompt label, e.g. ``"anthropic API key"``.
     :param default: Pre-filled default returned on an empty enter, or
@@ -442,11 +450,45 @@ def prompt_text(
         prompt_label = "  ❯"
     else:
         prompt_label = label
-    return str(
-        click.prompt(
-            prompt_label,
-            default=default,
-            hide_input=hide_input,
-            show_default=default is not None,
+
+    if not hide_input:
+        return str(
+            click.prompt(
+                prompt_label,
+                default=default,
+                hide_input=False,
+                show_default=default is not None,
+            )
         )
-    )
+
+    console.print(f"  [{MUTED}](input hidden; paste your key, then press Enter)[/{MUTED}]")
+    received_hidden_input = False
+    termui = cast(_TermUIWithHiddenPrompt, click.termui)
+    hidden_prompt_func = termui.hidden_prompt_func
+
+    def _record_hidden_input(text: str) -> str:
+        nonlocal received_hidden_input
+        value = hidden_prompt_func(text)
+        if value:
+            received_hidden_input = True
+        return value
+
+    termui.hidden_prompt_func = _record_hidden_input
+    try:
+        value = str(
+            click.prompt(
+                prompt_label,
+                default=default,
+                hide_input=True,
+                show_default=False,
+            )
+        )
+    finally:
+        termui.hidden_prompt_func = hidden_prompt_func
+
+    if received_hidden_input and value:
+        count = len(value)
+        unit = "character" if count == 1 else "characters"
+        console.print(f"  [{MUTED}]✓ received ({count} {unit})[/{MUTED}]")
+
+    return value

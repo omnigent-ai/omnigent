@@ -172,17 +172,25 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     ``_HARNESS_MODULES``, this file must gain a live round-trip row
     for it.
 
-    ``claude-native`` and ``codex-native`` are excluded because their
-    inner executors require bridge directories plus runner-managed
-    terminal panes to inject keys into — both set up by their native
-    launchers, not by ``omnigent run --harness <native>``. Running
-    them through this matrix would hang or crash. Their e2e coverage
-    is via native launcher smoke tests (tracked separately as
+    ``claude-native``, ``codex-native``, and ``pi-native`` are excluded
+    because their inner executors require bridge directories plus
+    runner-managed terminal panes to inject keys into — both set up by
+    their native launchers, not by ``omnigent run --harness <native>``.
+    Running them through this matrix would hang or crash. Their e2e
+    coverage is via native launcher smoke tests (tracked separately as
     native-launcher PTY/REPL smoke tests).
+
+    ``cursor`` is excluded because this matrix authenticates through
+    the Databricks gateway/profile, while cursor-agent talks only to
+    Cursor's own backend (``CURSOR_API_KEY``) and rejects gateway
+    model ids. Its live coverage is the gated row in
+    ``tests/e2e/omnigent/test_per_harness_cursor.py``.
     """
     expected_live_harnesses = set(OMNIGENT_HARNESSES).intersection(_HARNESS_MODULES) - {
         "claude-native",
         "codex-native",
+        "pi-native",
+        "cursor",
     }
     # ``supervisor`` is registered in ``_HARNESS_MODULES`` but is not
     # a coding-agent harness accepted by the ``run --harness`` compat
