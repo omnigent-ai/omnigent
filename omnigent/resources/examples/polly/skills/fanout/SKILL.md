@@ -15,12 +15,15 @@ dependency).
    (`.polly/registry.json`).
 2. Dispatch one implementation sub-agent per task, scoped to its worktree:
    `sys_session_send(agent="cursor"|"mimo"|"claude_code"|"codex", title="<task_slug>",
-   args={purpose: "implement", input: "<task + acceptance contract +
-   worktree path>"})`. Use a short task-based title such as `auth-refactor` or
-   `fix-sse-error`, never the raw vendor name. State the scope and that it must
-   work only inside `.worktrees/<task_id>`. The worker drives the task to green
-   and opens its OWN PR for the branch. Record each handle's `conversation_id`
-   in the registry. Emit the worktree + `sys_session_send` tool calls in THIS
+   args={purpose: "implement", model: "<concrete model>", input: "<task +
+   acceptance contract + worktree path>"})`. Use a short task-based title such
+   as `auth-refactor` or `fix-sse-error`, never the raw vendor name. Choose a
+   concrete model for that worker before dispatch; do not rely on worker
+   defaults. State the scope and that it must work only inside
+   `.worktrees/<task_id>`. The worker drives the task to green and opens its OWN
+   PR for the branch. Record each handle's `conversation_id`, `agent`, `title`,
+   and chosen `args.model` in the registry. Emit the worktree +
+   `sys_session_send` tool calls in THIS
    turn — never end a turn having only said you will dispatch; the dispatch
    calls and their announcement go in the same turn. Dispatch the whole
    parallel-safe set, THEN (and only then) END YOUR TURN. Do not poll.
@@ -40,7 +43,8 @@ dependency).
 ## Notes
 - When dispatching multiple tasks in parallel, spread workers across `mimo` and
   `cursor` — alternate or split evenly when both are AVAILABLE rather than
-  sending every task to the same agent.
+  sending every task to the same agent. Each parallel dispatch still needs its
+  own recorded concrete model.
 - Respect the per-turn dispatch cap (enforced by policy). More tasks than the
   cap → dispatch in waves (let the running batch finish before dispatching more).
 - The human can open any sub-agent in the UI's Subagents panel and read its

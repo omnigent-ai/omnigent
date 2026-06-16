@@ -14,20 +14,21 @@ repository-specific technical question.
    two independent lenses for ambiguous or high-stakes questions.
 2. Dispatch each task to `claude_code`, `codex`, `cursor`, `mimo`, or `pi`:
    `sys_session_send(agent="claude_code"|"codex"|"cursor"|"mimo"|"pi",
-   title="explore-<task_slug>", args={purpose: "explore", input: "<question +
-   exact scope + evidence requested>"})`. Use a task-based title such as
-   `explore-ci-flake`, never the raw vendor name. Use `purpose: "search"` only
-   when the task is primarily external/document search. Prefer `pi` when a
-   third lens or a non-Claude/GPT model is wanted; use `cursor` or `mimo` when
-   the human asks for that CLI or its configured providers are the right fit.
-   Any worker takes an optional
-   `args.model` (`sys_list_models` shows what each worker can run; an invalid
-   model/worker combination fails loud at dispatch, and `model` only applies on
-   the dispatch that CREATES the session — a send that continues an existing
-   title rejects it).
-   Tell the worker to edit nothing and return file,
-   command, URL, or line evidence. Emit these `sys_session_send` calls in the
-   SAME turn — do not end a turn having only said you will dispatch.
+   title="explore-<task_slug>", args={purpose: "explore", model: "<concrete
+   model>", input: "<question + exact scope + evidence requested>"})`. Use
+   `purpose: "search"` in the same shape when the task is primarily
+   external/document search. Use a task-based title such as `explore-ci-flake`,
+   never the raw vendor name. Choose a concrete model for every dispatched
+   worker before spawning it; do not rely on worker defaults.
+   `sys_list_models` shows what each worker can run; an invalid model/worker
+   combination fails loud at dispatch, and `model` only applies on the dispatch
+   that CREATES the session — a send that continues an existing title may reject
+   it. Prefer `pi` when a third lens or a non-Claude/GPT model is wanted; use
+   `cursor` or `mimo` when the human asks for that CLI or its configured
+   providers are the right fit. Record each worker's `conversation_id`, `agent`,
+   `title`, and chosen `args.model`. Tell the worker to edit nothing and return
+   file, command, URL, or line evidence. Emit these `sys_session_send` calls in
+   the SAME turn — do not end a turn having only said you will dispatch.
 3. End your turn AFTER the dispatch tool calls are in flight (never before).
    Do not inspect files, logs, terminals, docs, or connector output yourself
    while the workers run.

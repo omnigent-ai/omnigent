@@ -19,25 +19,38 @@ anyone needs to read through.
    PRs regardless of which vendor implemented. Use a task-based title such as
    `review-auth-refactor`, never the raw vendor name:
    `sys_session_send(agent="agy", title="review-<task_slug>",
-   args={purpose: "review", input: "<the diff> + <the acceptance contract>.
-   Review ONLY against the contract. Report blocking / non-blocking /
-   suggestions. Do not edit code."})`. Give it the diff as text — do NOT point
-   it at the implementer's worktree. Fetch the diff and emit the
-   `sys_session_send` call in the SAME turn you decide to review — never end a
-   turn having only announced "I'll load cross-review and fetch the diff" with
-   no tool call (that dropped turn stalls the run; nothing dispatches and no
-   inbox wake arrives). Once the reviewer dispatch is in flight, end your turn;
-   collect the inbox-delivered structured report with `sys_read_inbox` when it
-   returns. Use `sys_session_get_history` only to debug an empty or unclear
-   review result.
+   args={purpose: "review", model: "Gemini 3.1 Pro (High)", input: "<the diff>
+   + <the acceptance contract>. Review ONLY against the contract. Report
+   blocking / non-blocking / suggestions. Do not edit code."})`. Choose and
+   record the concrete reviewer model before dispatch; the bundled default for
+   `agy` is `Gemini 3.1 Pro (High)` unless `sys_list_models` shows a better
+   available `agy` model for this review. Give it the diff as text — do NOT
+   point it at the implementer's worktree. Record the reviewer's
+   `conversation_id`, `agent`, `title`, and `args.model` in the registry. Fetch
+   the diff and emit the `sys_session_send` call in the SAME turn you decide to
+   review — never end a turn having only announced "I'll load cross-review and
+   fetch the diff" with no tool call (that dropped turn stalls the run; nothing
+   dispatches and no inbox wake arrives). Once the reviewer dispatch is in
+   flight, end your turn; collect the inbox-delivered structured report with
+   `sys_read_inbox` when it returns. Use `sys_session_get_history` only to debug
+   an empty or unclear review result.
 4. The reviewer SURFACES issues; it does not fix them.
 5. For each **blocking** issue: add a fix-task to the registry scoped to the
    same worktree, and send the concrete fixes back to the SAME implementer
    conversation via `sys_session_send` — reuse the original implementer's
-   `agent` + `title` (or address it by `session_id`) with
-   `purpose: "implement"`, so the worker keeps its worktree/branch context and
-   updates its existing PR. A new title would spawn a fresh worker with no
-   memory of the task. Then loop to step 1.
+   `agent` + `title` (or address it by `session_id`) with the recorded
+   `purpose: "implement"` and recorded model, so the worker keeps its
+   worktree/branch context and updates its existing PR. If the platform rejects
+   `args.model` on continuation because models are create-time-only, omit
+   `args.model` from the continuation call but state the existing agent/model in
+   the prompt and registry entry. The intended continuation shape is:
+   `sys_session_send(agent="<original_agent>", title="<original_task_slug>",
+   args={purpose: "implement", model: "<recorded model>", input: "Continue the
+   existing <original_agent> session running <recorded model>. Fix these
+   blocking review issues in the existing worktree/PR: <issues>"})`. If the
+   platform rejects `model` on continuation, retry once without the `model` key
+   but preserve the existing agent/model in the prompt and registry. A new title
+   would spawn a fresh worker with no memory of the task. Then loop to step 1.
 6. When gates are green AND there are zero blocking issues, the PR passes
    review — mark it ready in the registry (with its PR URL) and leave it for
    the human to merge. polly does NOT merge it.
@@ -53,8 +66,8 @@ anyone needs to read through.
   the plan gate.
 - Give the reviewer ONLY the diff + contract — never the implementer's
   transcript or worktree. The cross-vendor independence is the whole point.
-- Review is `agy` dispatched with `purpose: "review"`. It reports issues and
-  never edits; only the implementer opens a PR, so a stray reviewer edit never
-  reaches the deliverable.
+- Review is `agy` dispatched with `purpose: "review"` and an explicit
+  `args.model`. It reports issues and never edits; only the implementer opens a
+  PR, so a stray reviewer edit never reaches the deliverable.
 - Non-blocking issues / suggestions go in the registry as follow-ups; they
   don't block the PR.
