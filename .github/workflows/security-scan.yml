@@ -44,9 +44,10 @@ jobs:
       UV_INDEX_URL: https://pypi.org/simple
       # The single enforcement switch. "false" = audit (never blocks CI);
       # "true" = blocking (a finding fails this check; pollers then skip CI).
-      # TEMPORARY (test PR #289): flipped to "true" to prove the scan blocks on
-      # a finding. Revert to "false" before merge.
-      GATE_BLOCKING: "true"
+      # TEMPORARY (test PR #289): kept "false" (audit) so EVERY detector runs and
+      # annotates in one pass; the Audit-summary step below is test-patched to
+      # exit 1 on any finding so we still see the check go red. Revert before merge.
+      GATE_BLOCKING: "false"
     steps:
       - name: Check out scanner from main
         continue-on-error: ${{ env.GATE_BLOCKING != 'true' }}
@@ -173,8 +174,12 @@ jobs:
             [ "$o" = "failure" ] && findings=1
           done
           if [ "$findings" = "1" ]; then
-            echo "::warning::Security scan found issues (see annotations above). Audit mode: CI was NOT blocked. Set GATE_BLOCKING=true in security-scan.yml to enforce."
-            { echo "### 🔍 Security scan — audit mode"; echo "Findings detected; **not** blocking CI. See annotations above."; } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::Security scan found issues (see annotations above)."
+            { echo "### 🔍 Security scan — findings detected"; echo "See annotations above."; } >> "$GITHUB_STEP_SUMMARY"
+            # TEMPORARY (test PR #289): fail the check so all-detectors-ran red
+            # capture is visible. Remove this line before merge.
+            echo "::error::TEST: failing the check because findings were detected (PR #289)."
+            exit 1
           else
             echo "Security scan: no findings."
             echo "### ✅ Security scan — audit mode: no findings" >> "$GITHUB_STEP_SUMMARY"

