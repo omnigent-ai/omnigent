@@ -59,6 +59,30 @@ jobs:
         working-directory: ap-web
         run: npm run format:check
 
-      - name: Run tests
+      - name: Run tests with coverage
         working-directory: ap-web
-        run: npm test
+        run: npm run test:coverage
+
+      # Distill the v8 json-summary into a single total.txt, mirroring the
+      # backend's coverage-report job. ui-code-coverage.yml (privileged
+      # workflow_run) consumes this artifact and posts the report-only status.
+      - name: Summarize coverage
+        if: always()
+        working-directory: ap-web
+        run: |
+          mkdir -p ui-coverage-summary
+          if [[ ! -f coverage/coverage-summary.json ]]; then
+            echo "::warning::No coverage-summary.json; skipping UI coverage report."
+            exit 0
+          fi
+          node -e "process.stdout.write(String(require('./coverage/coverage-summary.json').total.lines.pct))" \
+            > ui-coverage-summary/total.txt
+          echo "Total UI coverage: $(cat ui-coverage-summary/total.txt)%"
+
+      - name: Upload UI coverage summary
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: ui-coverage-summary-${{ github.run_id }}
+          path: ap-web/ui-coverage-summary/
+          retention-days: 14
