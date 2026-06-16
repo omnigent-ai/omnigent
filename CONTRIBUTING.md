@@ -80,6 +80,13 @@ bug fix should add a test that fails before the fix. Pure refactors, renames,
 type-only changes, dependency bumps, and edits with no observable behaviour
 change don't need a new test.
 
+Prefer the smallest test that covers the change. A fast, focused **unit test**
+in the area suite is the default and what most changes need. Reach for
+`tests/integration/` only when behaviour genuinely spans components, and for
+`tests/e2e/` only for full-stack flows that a unit test can't capture — these
+are slower and (for e2e) gateway-bound, so don't use them where a unit test
+would do.
+
 Put the test in the suite that matches the area you changed — most backend
 areas mirror their source directory under `tests/`:
 

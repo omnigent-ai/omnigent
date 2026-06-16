@@ -16,6 +16,11 @@ A pull request that changes behaviour under `omnigent/` should add or update a
 test in the suite matching the area it touches. If a behaviour change ships
 without a covering test, flag it and name the suite the test belongs in.
 
+Prefer a fast, focused **unit test** in the area suite — that is what most
+changes need. Only expect an `integration` or `e2e` test when the change
+genuinely spans components or full-stack flows; do not push for a heavier test
+where a unit test would suffice.
+
 Most backend areas mirror their source directory under `tests/`:
 
 | Area changed (`omnigent/…`) | Expected test suite (`tests/…`) |
