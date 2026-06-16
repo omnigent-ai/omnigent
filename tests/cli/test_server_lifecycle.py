@@ -442,6 +442,9 @@ def test_foreground_non_loopback_header_no_auth_warns(monkeypatch: pytest.Monkey
     # Both audiences are addressed: proxy operators and naive LAN binders.
     assert "X-Forwarded-Email" in result.output
     assert "OMNIGENT_AUTH_ENABLED=1" in result.output
+    # OIDC guidance requires the enable switch (issuer alone resolves to header
+    # mode and still 401s), so it must name AUTH_ENABLED alongside the issuer.
+    assert "OMNIGENT_AUTH_ENABLED=1 together with OMNIGENT_OIDC_ISSUER" in result.output
 
 
 def test_foreground_loopback_does_not_warn(monkeypatch: pytest.MonkeyPatch) -> None:

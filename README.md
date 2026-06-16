@@ -248,7 +248,8 @@ omnigent host  https://your-host    # new sessions can now run on this machine
 >
 > "Real auth" for a network-exposed server means one of: built-in
 > **accounts** (`OMNIGENT_AUTH_ENABLED=1`), **OIDC**
-> (`OMNIGENT_OIDC_ISSUER=...`), or a trusted reverse proxy that injects the
+> (`OMNIGENT_AUTH_ENABLED=1` with `OMNIGENT_OIDC_ISSUER=...`), or a trusted
+> reverse proxy that injects the
 > `X-Forwarded-Email` header. Plain header mode with none of these is the
 > proxy-only posture and 401s direct clients.
 

@@ -2862,7 +2862,8 @@ def server(
             "will get 401.\n"
             "  - Serving a LAN directly (e.g. from a phone): enable real "
             "auth first -- set OMNIGENT_AUTH_ENABLED=1 for the built-in "
-            "accounts login, or configure OIDC (OMNIGENT_OIDC_ISSUER=...).",
+            "accounts login, or for OIDC set OMNIGENT_AUTH_ENABLED=1 together "
+            "with OMNIGENT_OIDC_ISSUER=... (or set OMNIGENT_AUTH_PROVIDER=oidc).",
             fg="yellow",
             err=True,
         )
