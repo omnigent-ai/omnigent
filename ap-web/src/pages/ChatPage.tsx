@@ -3031,7 +3031,7 @@ export function Composer({
 
     // Enter sends; Shift+Enter inserts a newline. On mobile, Enter inserts a
     // newline (no Shift available on-screen) and Send must be tapped instead.
-    if (e.key === "Enter" && !e.shiftKey && !isMobile) {
+    if (e.key === "Enter" && !e.shiftKey && !isMobile && !e.nativeEvent.isComposing) {
       e.preventDefault();
       submit();
       return;
