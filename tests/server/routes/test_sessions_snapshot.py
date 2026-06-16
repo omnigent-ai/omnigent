@@ -597,15 +597,15 @@ async def test_session_snapshot_includes_codex_model_options_from_runner(
                             {
                                 "id": "gpt-5.5",
                                 "model": "databricks-gpt-5-5",
-                                "display_name": "GPT-5.5",
-                                "default_reasoning_effort": "high",
-                                "supported_reasoning_efforts": [
-                                    "low",
-                                    "medium",
-                                    "high",
-                                    "xhigh",
+                                "displayName": "GPT-5.5",
+                                "defaultReasoningEffort": "high",
+                                "supportedReasoningEfforts": [
+                                    {"reasoningEffort": "low", "description": "Low"},
+                                    {"reasoningEffort": "medium", "description": "Medium"},
+                                    {"reasoningEffort": "high", "description": "High"},
+                                    {"reasoningEffort": "xhigh", "description": "Extra high"},
                                 ],
-                                "is_default": True,
+                                "isDefault": True,
                             }
                         ]
                     }
@@ -643,13 +643,13 @@ async def test_session_snapshot_includes_codex_model_options_from_runner(
     )
 
     assert "/v1/sessions/conv_codex_options/codex-model-options" in fake_client.get_calls
-    assert [m.id for m in snapshot.codex_model_options] == ["gpt-5.5"]
-    assert snapshot.codex_model_options[0].display_name == "GPT-5.5"
-    assert snapshot.codex_model_options[0].supported_reasoning_efforts == [
-        "low",
-        "medium",
-        "high",
-        "xhigh",
+    assert [m["id"] for m in snapshot.codex_model_options] == ["gpt-5.5"]
+    assert snapshot.codex_model_options[0]["displayName"] == "GPT-5.5"
+    assert snapshot.codex_model_options[0]["supportedReasoningEfforts"] == [
+        {"reasoningEffort": "low", "description": "Low"},
+        {"reasoningEffort": "medium", "description": "Medium"},
+        {"reasoningEffort": "high", "description": "High"},
+        {"reasoningEffort": "xhigh", "description": "Extra high"},
     ]
 
 
@@ -674,14 +674,14 @@ async def test_session_snapshot_refresh_state_reloads_codex_model_options(
     _mod._codex_model_options_cache.clear()
     _mod._codex_model_options_inflight.clear()
     _mod._codex_model_options_cache["conv_codex_refresh"] = [
-        _mod.CodexModelOption(
-            id="stale-model",
-            model="stale-provider-model",
-            display_name="Stale Model",
-            default_reasoning_effort="low",
-            supported_reasoning_efforts=["low"],
-            is_default=False,
-        )
+        {
+            "id": "stale-model",
+            "model": "stale-provider-model",
+            "displayName": "Stale Model",
+            "defaultReasoningEffort": "low",
+            "supportedReasoningEfforts": [{"reasoningEffort": "low", "description": "Low"}],
+            "isDefault": False,
+        }
     ]
 
     class _FakeResponse:
@@ -707,10 +707,12 @@ async def test_session_snapshot_refresh_state_reloads_codex_model_options(
                             {
                                 "id": "fresh-model",
                                 "model": "fresh-provider-model",
-                                "display_name": "Fresh Model",
-                                "default_reasoning_effort": "high",
-                                "supported_reasoning_efforts": ["high"],
-                                "is_default": True,
+                                "displayName": "Fresh Model",
+                                "defaultReasoningEffort": "high",
+                                "supportedReasoningEfforts": [
+                                    {"reasoningEffort": "high", "description": "High"}
+                                ],
+                                "isDefault": True,
                             }
                         ]
                     }
@@ -743,7 +745,7 @@ async def test_session_snapshot_refresh_state_reloads_codex_model_options(
     )
     # Refresh must not echo the stale cached row. If this is "stale-model",
     # browser reloads would not recover after the server-side cache shape is fixed.
-    assert [m.id for m in refreshed.codex_model_options] == []
+    assert [m["id"] for m in refreshed.codex_model_options] == []
     await _drain_codex_model_options("conv_codex_refresh")
     snapshot = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
@@ -751,8 +753,8 @@ async def test_session_snapshot_refresh_state_reloads_codex_model_options(
     )
 
     assert "/v1/sessions/conv_codex_refresh/codex-model-options" in fake_client.get_calls
-    assert [m.id for m in snapshot.codex_model_options] == ["fresh-model"]
-    assert snapshot.codex_model_options[0].display_name == "Fresh Model"
+    assert [m["id"] for m in snapshot.codex_model_options] == ["fresh-model"]
+    assert snapshot.codex_model_options[0]["displayName"] == "Fresh Model"
 
 
 @pytest.mark.asyncio
@@ -794,10 +796,13 @@ async def test_session_snapshot_retries_empty_codex_model_options(
                         {
                             "id": "gpt-5.5",
                             "model": "databricks-gpt-5-5",
-                            "display_name": "GPT-5.5",
-                            "default_reasoning_effort": "xhigh",
-                            "supported_reasoning_efforts": ["high", "xhigh"],
-                            "is_default": True,
+                            "displayName": "GPT-5.5",
+                            "defaultReasoningEffort": "xhigh",
+                            "supportedReasoningEfforts": [
+                                {"reasoningEffort": "high", "description": "High"},
+                                {"reasoningEffort": "xhigh", "description": "Extra high"},
+                            ],
+                            "isDefault": True,
                         }
                     ]
                 },
@@ -847,8 +852,8 @@ async def test_session_snapshot_retries_empty_codex_model_options(
         fake_client.get_calls.count("/v1/sessions/conv_codex_empty_then_ready/codex-model-options")
         == 2
     )
-    assert [m.id for m in snapshot.codex_model_options] == ["gpt-5.5"]
-    assert snapshot.codex_model_options[0].default_reasoning_effort == "xhigh"
+    assert [m["id"] for m in snapshot.codex_model_options] == ["gpt-5.5"]
+    assert snapshot.codex_model_options[0]["defaultReasoningEffort"] == "xhigh"
 
 
 @pytest.mark.asyncio
@@ -902,10 +907,13 @@ async def test_session_snapshot_retries_503_codex_model_options(
                             {
                                 "id": "gpt-5.4",
                                 "model": "databricks-gpt-5-4",
-                                "display_name": "GPT-5.4",
-                                "default_reasoning_effort": "medium",
-                                "supported_reasoning_efforts": ["medium", "high"],
-                                "is_default": False,
+                                "displayName": "GPT-5.4",
+                                "defaultReasoningEffort": "medium",
+                                "supportedReasoningEfforts": [
+                                    {"reasoningEffort": "medium", "description": "Medium"},
+                                    {"reasoningEffort": "high", "description": "High"},
+                                ],
+                                "isDefault": False,
                             }
                         ]
                     }
@@ -956,8 +964,8 @@ async def test_session_snapshot_retries_503_codex_model_options(
         fake_client.get_calls.count("/v1/sessions/conv_codex_503_then_ready/codex-model-options")
         == 2
     )
-    assert [m.id for m in snapshot.codex_model_options] == ["gpt-5.4"]
-    assert snapshot.codex_model_options[0].default_reasoning_effort == "medium"
+    assert [m["id"] for m in snapshot.codex_model_options] == ["gpt-5.4"]
+    assert snapshot.codex_model_options[0]["defaultReasoningEffort"] == "medium"
 
 
 @pytest.mark.asyncio

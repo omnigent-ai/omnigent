@@ -9,7 +9,12 @@ const CODEX_MODEL_OPTIONS: CodexModelOption[] = [
     model: "databricks-gpt-5-5",
     displayName: "GPT-5.5",
     defaultReasoningEffort: "high",
-    supportedReasoningEfforts: ["low", "medium", "high", "xhigh"],
+    supportedReasoningEfforts: [
+      { reasoningEffort: "low", description: "Low" },
+      { reasoningEffort: "medium", description: "Medium" },
+      { reasoningEffort: "high", description: "High" },
+      { reasoningEffort: "xhigh", description: "Extra high" },
+    ],
     isDefault: true,
   },
   {
@@ -17,7 +22,11 @@ const CODEX_MODEL_OPTIONS: CodexModelOption[] = [
     model: "databricks-gpt-5-4-mini",
     displayName: "GPT-5.4 mini",
     defaultReasoningEffort: "medium",
-    supportedReasoningEfforts: ["minimal", "low", "medium"],
+    supportedReasoningEfforts: [
+      { reasoningEffort: "minimal", description: "Minimal" },
+      { reasoningEffort: "low", description: "Low" },
+      { reasoningEffort: "medium", description: "Medium" },
+    ],
     isDefault: false,
   },
 ];

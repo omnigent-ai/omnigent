@@ -7636,8 +7636,8 @@ async def test_codex_native_model_options_query_model_list(
 
     The Web UI must not carry its own Codex model / effort catalog. The
     runner is the process that can reach the session's Codex app-server, so
-    this endpoint should ask Codex for models and normalize each model's
-    supported reasoning efforts for the AP snapshot.
+    this endpoint should ask Codex for models and return those model objects
+    unchanged for the AP snapshot.
     """
     from omnigent import codex_native_app_server
     from omnigent.spec.types import ExecutorSpec
@@ -7754,18 +7754,23 @@ async def test_codex_native_model_options_query_model_list(
             {
                 "id": "gpt-5.5",
                 "model": "databricks-gpt-5-5",
-                "display_name": "GPT-5.5",
-                "default_reasoning_effort": "high",
-                "supported_reasoning_efforts": ["low", "medium"],
-                "is_default": True,
+                "displayName": "GPT-5.5",
+                "defaultReasoningEffort": "high",
+                "supportedReasoningEfforts": [
+                    {"reasoningEffort": "low", "description": "Low"},
+                    {"reasoningEffort": "medium", "description": "Medium"},
+                ],
+                "isDefault": True,
             },
             {
                 "id": "gpt-5.4-mini",
                 "model": "databricks-gpt-5-4-mini",
-                "display_name": "GPT-5.4 mini",
-                "default_reasoning_effort": "medium",
-                "supported_reasoning_efforts": ["minimal"],
-                "is_default": False,
+                "displayName": "GPT-5.4 mini",
+                "defaultReasoningEffort": "medium",
+                "supportedReasoningEfforts": [
+                    {"reasoningEffort": "minimal", "description": "Minimal"}
+                ],
+                "isDefault": False,
             },
         ]
     }

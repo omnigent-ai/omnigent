@@ -3,7 +3,6 @@ import { describe, expect, it } from "vitest";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import {
   codexEffortLevelsForModel,
-  codexModelPickerOptions,
   findCodexModelOption,
   isCodexNativeModel,
 } from "@/lib/codexNativeModels";
@@ -16,7 +15,12 @@ const CODEX_MODEL_OPTIONS: CodexModelOption[] = [
     model: "databricks-gpt-5-5",
     displayName: "GPT-5.5",
     defaultReasoningEffort: "high",
-    supportedReasoningEfforts: ["low", "medium", "high", "xhigh"],
+    supportedReasoningEfforts: [
+      { reasoningEffort: "low", description: "Low" },
+      { reasoningEffort: "medium", description: "Medium" },
+      { reasoningEffort: "high", description: "High" },
+      { reasoningEffort: "xhigh", description: "Extra high" },
+    ],
     isDefault: true,
   },
   {
@@ -24,7 +28,11 @@ const CODEX_MODEL_OPTIONS: CodexModelOption[] = [
     model: "databricks-gpt-5-4-mini",
     displayName: "GPT-5.4 mini",
     defaultReasoningEffort: "medium",
-    supportedReasoningEfforts: ["minimal", "low", "medium"],
+    supportedReasoningEfforts: [
+      { reasoningEffort: "minimal", description: "Minimal" },
+      { reasoningEffort: "low", description: "Low" },
+      { reasoningEffort: "medium", description: "Medium" },
+    ],
     isDefault: false,
   },
 ];
@@ -50,13 +58,6 @@ describe("CLAUDE_NATIVE_MODELS", () => {
 });
 
 describe("Codex model-list helpers", () => {
-  it("builds picker rows from Codex-returned options", () => {
-    expect(codexModelPickerOptions(CODEX_MODEL_OPTIONS)).toEqual([
-      { id: "gpt-5.5", label: "GPT-5.5" },
-      { id: "gpt-5.4-mini", label: "GPT-5.4 mini" },
-    ]);
-  });
-
   it("matches only raw Codex picker ids from the Codex catalog", () => {
     expect(findCodexModelOption(CODEX_MODEL_OPTIONS, "gpt-5.5")?.id).toBe("gpt-5.5");
     expect(findCodexModelOption(CODEX_MODEL_OPTIONS, "databricks-gpt-5-5")).toBeNull();

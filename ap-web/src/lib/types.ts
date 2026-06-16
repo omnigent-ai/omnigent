@@ -450,19 +450,30 @@ export interface SkillSummary {
 }
 
 /**
- * One Codex model option from app-server ``model/list``.
+ * One raw Codex model option from app-server ``model/list``.
  */
+export interface CodexReasoningEffortOption {
+  /** Codex effort id, e.g. ``"xhigh"``. */
+  reasoningEffort: string;
+  /** Codex-provided description, when present. */
+  description?: string;
+  /** Additional Codex metadata. */
+  [key: string]: unknown;
+}
+
 export interface CodexModelOption {
   /** Codex picker id to pass back to ``thread/settings/update``. */
   id: string;
   /** Provider-facing model id Codex will run. */
-  model: string;
+  model?: string;
   /** Codex display label. */
-  displayName: string;
+  displayName?: string;
   /** Default reasoning effort for this model. */
-  defaultReasoningEffort: string;
-  /** Effort values Codex advertises for this model. */
-  supportedReasoningEfforts: string[];
+  defaultReasoningEffort?: string;
+  /** Raw effort objects Codex advertises for this model. */
+  supportedReasoningEfforts?: CodexReasoningEffortOption[];
   /** Whether Codex marks this as the default model. */
-  isDefault: boolean;
+  isDefault?: boolean;
+  /** Additional Codex metadata. */
+  [key: string]: unknown;
 }

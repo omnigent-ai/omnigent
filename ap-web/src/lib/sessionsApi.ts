@@ -81,19 +81,6 @@ interface ModelUsageWire {
 }
 
 /**
- * Wire shape of ``CodexModelOption`` from
- * ``omnigent.server.schemas.CodexModelOption``.
- */
-interface CodexModelOptionWire {
-  id: string;
-  model: string;
-  display_name: string;
-  default_reasoning_effort: string;
-  supported_reasoning_efforts: string[];
-  is_default?: boolean | null;
-}
-
-/**
  * Wire shape of `SessionResponse` from
  * `omnigent/server/schemas.py`. Snake-case; converted to the
  * camelCase `Session` type at the parse boundary.
@@ -198,7 +185,7 @@ interface SessionResponseWire {
    * description. Surfaced in the web composer's slash-command menu.
    */
   skills?: SkillSummary[];
-  codex_model_options?: CodexModelOptionWire[];
+  codex_model_options?: CodexModelOption[];
   /**
    * True while the runner is auto-creating a terminal-first session's
    * terminal. Drives the Terminal-pill spinner; absent on older
@@ -256,20 +243,6 @@ function usageByModelFromWire(
   return out;
 }
 
-function codexModelOptionsFromWire(
-  wire: CodexModelOptionWire[] | null | undefined,
-): CodexModelOption[] {
-  if (wire == null) return [];
-  return wire.map((m) => ({
-    id: m.id,
-    model: m.model,
-    displayName: m.display_name,
-    defaultReasoningEffort: m.default_reasoning_effort,
-    supportedReasoningEfforts: m.supported_reasoning_efforts,
-    isDefault: m.is_default ?? false,
-  }));
-}
-
 function sessionFromWire(wire: SessionResponseWire): Session {
   return {
     id: wire.id,
@@ -306,7 +279,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     subAgentName: wire.sub_agent_name ?? null,
     todos: wire.todos ?? [],
     skills: wire.skills ?? [],
-    codexModelOptions: codexModelOptionsFromWire(wire.codex_model_options),
+    codexModelOptions: wire.codex_model_options ?? [],
     terminalPending: wire.terminal_pending ?? false,
     sandboxStatus: wire.sandbox_status ?? null,
   };

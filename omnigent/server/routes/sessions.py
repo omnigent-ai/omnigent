@@ -192,7 +192,6 @@ from omnigent.server.routes._host_worktree import CreatedWorktree
 from omnigent.server.schemas import (
     AgentObject,
     ChildSessionSummary,
-    CodexModelOption,
     ConversationDeleted,
     CreatedSessionResponse,
     ElicitationRequestEvent,
@@ -748,7 +747,7 @@ _runner_skills_inflight: dict[str, asyncio.Task[None]] = {}
 # Per-session codex-native model catalog cache + in-flight fetch.
 # The snapshot warms this from the bound runner's live Codex app-server
 # (``model/list``) off the hot path, same shape as runner skills.
-_codex_model_options_cache: dict[str, list[CodexModelOption]] = {}
+_codex_model_options_cache: dict[str, list[dict[str, Any]]] = {}
 _codex_model_options_inflight: dict[str, asyncio.Task[None]] = {}
 _CODEX_MODEL_OPTIONS_RETRY_DELAYS_S = (0.25, 0.5, 1.0, 2.0, 2.0)
 
@@ -2015,7 +2014,7 @@ def _build_session_response(
     host_online: bool | None = None,
     pending_elicitation_events: list[dict[str, Any]] | None = None,
     subtree_usage: dict[str, Any] | None = None,
-    codex_model_options: list[CodexModelOption] | None = None,
+    codex_model_options: list[dict[str, Any]] | None = None,
 ) -> SessionResponse:
     """
     Build a :class:`SessionResponse` from store-side entities.
@@ -2075,8 +2074,8 @@ def _build_session_response(
         ``None`` falls back to this conversation's own ``session_usage``
         (correct for childless sessions). Passed by the snapshot path;
         other callers omit it.
-    :param codex_model_options: Codex app-server ``model/list`` options
-        for this session, e.g. ``[CodexModelOption(id="gpt-5.5", ...)]``.
+    :param codex_model_options: Raw Codex app-server ``model/list``
+        options for this session, e.g. ``[{"id": "gpt-5.5"}]``.
         ``None`` is treated as ``[]``.
     :returns: The :class:`SessionResponse` for the API.
     :raises OmnigentError: If ``conv.agent_id`` is ``None``.
@@ -17638,37 +17637,23 @@ async def _load_runner_skills(
     _publish_runner_skills(session_id)
 
 
-def _codex_model_options_from_wire(raw_models: Any) -> list[CodexModelOption]:
+def _codex_model_options_from_wire(raw_models: Any) -> list[dict[str, Any]]:
     """
-    Parse runner-returned Codex ``model/list`` data into API objects.
+    Validate runner-returned raw Codex ``model/list`` data.
 
     :param raw_models: JSON value from the runner's
         ``{"models": [...]}`` response, e.g. a list of Codex model dicts.
-    :returns: Validated model options for the session snapshot.
+    :returns: Raw model options for the session snapshot.
     :raises ValueError: If the payload is not the expected list/dict
         shape.
     """
     if not isinstance(raw_models, list):
         raise ValueError("Codex model options payload must be a list")
-    options: list[CodexModelOption] = []
+    options: list[dict[str, Any]] = []
     for raw_model in raw_models:
         if not isinstance(raw_model, dict):
             raise ValueError("Codex model option must be an object")
-        supported_raw = raw_model.get("supported_reasoning_efforts")
-        if not isinstance(supported_raw, list) or not all(
-            isinstance(value, str) and value for value in supported_raw
-        ):
-            raise ValueError("Codex supported_reasoning_efforts must be strings")
-        options.append(
-            CodexModelOption(
-                id=raw_model["id"],
-                model=raw_model["model"],
-                display_name=raw_model["display_name"],
-                default_reasoning_effort=raw_model["default_reasoning_effort"],
-                supported_reasoning_efforts=supported_raw,
-                is_default=bool(raw_model.get("is_default", False)),
-            )
-        )
+        options.append(raw_model)
     return options
 
 
@@ -17676,7 +17661,7 @@ async def _fetch_codex_model_options(
     runner_client: httpx.AsyncClient | None,
     session_id: str,
     conv: Conversation,
-) -> list[CodexModelOption]:
+) -> list[dict[str, Any]]:
     """
     Fetch cached Codex model options for a codex-native session.
 

@@ -86,7 +86,6 @@ import { getCurrentAuthorId } from "@/lib/identity";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import {
   codexEffortLevelsForModel,
-  codexModelPickerOptions,
   findCodexModelOption,
 } from "@/lib/codexNativeModels";
 import {
@@ -2674,15 +2673,15 @@ export function formatStatusModelLabel(
   if (!raw) return null;
   const lower = raw.toLowerCase();
   const codexOption = findCodexModelOption(codexModelOptions, raw);
-  if (codexOption) return codexOption.displayName || codexOption.id;
+  if (codexOption) return codexOption.displayName ?? codexOption.id;
   const known = CLAUDE_NATIVE_MODELS.find((m) => m.id === lower);
   if (known) return known.label;
   return raw;
 }
 
-/** Format effort for compact status labels (``"xhigh"`` → ``"xHigh"``). */
-function formatStatusEffortLabel(effort: string | null): string | null {
+function formatStatusEffortLabel(effort: string | null, raw = false): string | null {
   if (!effort) return null;
+  if (raw) return effort;
   return effort.toLowerCase() === "xhigh" ? "xHigh" : formatEffortLabel(effort);
 }
 
@@ -2691,15 +2690,16 @@ function formatStatusEffortLabel(effort: string | null): string | null {
  *
  * @param model - Model override or bound model id.
  * @param effort - Current reasoning effort override, if any.
- * @returns Compact label such as ``"gpt-5.5 xHigh"``.
+ * @returns Compact label such as ``"gpt-5.5 xhigh"``.
  */
 export function formatModelEffortStatusLabel(
   model: string | null,
   effort: string | null,
   codexModelOptions: readonly CodexModelOption[] = [],
 ): string | null {
+  const codexOption = model ? findCodexModelOption(codexModelOptions, model.trim()) : null;
   const modelLabel = formatStatusModelLabel(model, codexModelOptions);
-  const effortLabel = formatStatusEffortLabel(effort);
+  const effortLabel = formatStatusEffortLabel(effort, codexOption !== null);
   const parts = [modelLabel, effortLabel].filter((p): p is string => p != null && p.length > 0);
   return parts.length > 0 ? parts.join(" ") : null;
 }
@@ -4010,11 +4010,11 @@ function AgentPicker({
   const selectedModel = useChatStore((s) => s.selectedModel);
   const llmModel = useChatStore((s) => s.llmModel);
 
-  const modelOptions =
+  const modelOptions: ReadonlyArray<{ id: string; label?: string; displayName?: string }> =
     modelPickerKind === "claude"
       ? CLAUDE_NATIVE_MODELS
       : modelPickerKind === "codex"
-        ? codexModelPickerOptions(codexModelOptions)
+        ? codexModelOptions
         : [];
   const isNativeModelPicker = modelPickerKind !== null;
   // Only offer the agent list when there's an actual choice. Inside a
@@ -4130,7 +4130,9 @@ function AgentPicker({
                     "data-[active=true]:bg-accent/60 data-[active=true]:text-foreground",
                   )}
                 >
-                  <span className="flex-1 truncate">{m.label}</span>
+                  <span className="flex-1 truncate">
+                    {modelPickerKind === "codex" ? (m.displayName ?? m.id) : m.label}
+                  </span>
                 </DropdownMenuItem>
               );
             })}
@@ -4157,7 +4159,8 @@ function AgentPicker({
                     .catch(() => {})
                 }
                 className={cn(
-                  "items-center gap-2 rounded-sm px-2 py-1.5 text-xs capitalize",
+                  "items-center gap-2 rounded-sm px-2 py-1.5 text-xs",
+                  modelPickerKind !== "codex" && "capitalize",
                   "data-[active=true]:bg-accent/60 data-[active=true]:text-foreground",
                 )}
               >

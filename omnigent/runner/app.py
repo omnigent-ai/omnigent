@@ -6686,47 +6686,13 @@ def create_runner_app(
                 await codex_client.close()
         return Response(status_code=204)
 
-    def _codex_model_option_from_app_server_model(raw_model: dict[str, Any]) -> dict[str, Any]:
-        """
-        Convert one Codex ``model/list`` model into the runner wire shape.
-
-        :param raw_model: Codex app-server model object, e.g.
-            ``{"id": "gpt-5.5", "displayName": "GPT-5.5"}``.
-        :returns: Snake-case model option consumed by the AP server.
-        :raises ValueError: If required Codex fields are missing or malformed.
-        """
-        supported_raw = raw_model.get("supportedReasoningEfforts")
-        if not isinstance(supported_raw, list):
-            raise ValueError("Codex model missing supportedReasoningEfforts")
-        supported: list[str] = []
-        for item in supported_raw:
-            if not isinstance(item, dict):
-                raise ValueError("Codex reasoning effort option must be an object")
-            effort = item.get("reasoningEffort")
-            if not isinstance(effort, str) or not effort:
-                raise ValueError("Codex reasoning effort option missing reasoningEffort")
-            supported.append(effort)
-        required = {
-            "id": raw_model.get("id"),
-            "model": raw_model.get("model"),
-            "display_name": raw_model.get("displayName"),
-            "default_reasoning_effort": raw_model.get("defaultReasoningEffort"),
-        }
-        if not all(isinstance(value, str) and value for value in required.values()):
-            raise ValueError("Codex model missing required string fields")
-        return {
-            **required,
-            "supported_reasoning_efforts": supported,
-            "is_default": bool(raw_model.get("isDefault", False)),
-        }
-
     async def _codex_native_model_options(conv_id: str) -> list[dict[str, Any]]:
         """
         Query Codex app-server ``model/list`` for a loaded codex-native session.
 
         :param conv_id: Session/conversation identifier, e.g.
             ``"conv_abc123"``.
-        :returns: Model options in the AP server's snake-case wire shape.
+        :returns: Raw Codex ``model/list`` model objects.
         :raises _CodexNativeModelOptionsNotReady: If Codex has not written
             bridge state for this session yet.
         :raises RuntimeError: If the app-server call fails.
@@ -6764,7 +6730,7 @@ def create_runner_app(
                 for raw_model in data:
                     if not isinstance(raw_model, dict):
                         raise ValueError("Codex model/list item must be an object")
-                    options.append(_codex_model_option_from_app_server_model(raw_model))
+                    options.append(raw_model)
                 next_cursor = result.get("nextCursor")
                 if next_cursor is None:
                     break
@@ -11622,10 +11588,8 @@ def create_runner_app(
 
         :param session_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
-        :returns: JSON ``{"models": [...]}``, where each model contains
-            ``id``, ``model``, ``display_name``,
-            ``default_reasoning_effort``, ``supported_reasoning_efforts``,
-            and ``is_default``.
+        :returns: JSON ``{"models": [...]}``, where each model is a raw
+            Codex ``model/list`` object.
         """
         if _session_harness_name(session_id) != "codex-native":
             return JSONResponse(status_code=200, content={"models": []})

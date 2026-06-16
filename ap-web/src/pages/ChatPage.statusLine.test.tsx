@@ -109,7 +109,12 @@ describe("Composer status line (branch + context ring)", () => {
           model: "databricks-gpt-5-5",
           displayName: "Codex GPT 5.5 Preview",
           defaultReasoningEffort: "high",
-          supportedReasoningEfforts: ["low", "medium", "high", "xhigh"],
+          supportedReasoningEfforts: [
+            { reasoningEffort: "low", description: "Low" },
+            { reasoningEffort: "medium", description: "Medium" },
+            { reasoningEffort: "high", description: "High" },
+            { reasoningEffort: "xhigh", description: "Extra high" },
+          ],
           isDefault: true,
         },
       ],
@@ -118,7 +123,7 @@ describe("Composer status line (branch + context ring)", () => {
 
     const modelEffort = screen.getByTestId("composer-model-effort");
     const ring = screen.getByLabelText("25% of context used");
-    expect(modelEffort).toHaveTextContent("Codex GPT 5.5 Preview xHigh");
+    expect(modelEffort).toHaveTextContent("Codex GPT 5.5 Preview xhigh");
     expect(modelEffort.compareDocumentPosition(ring) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING,
     );
@@ -212,11 +217,16 @@ describe("formatModelEffortStatusLabel", () => {
           model: "databricks-gpt-5-5",
           displayName: "codex says GPT-5.5",
           defaultReasoningEffort: "high",
-          supportedReasoningEfforts: ["low", "medium", "high", "xhigh"],
+          supportedReasoningEfforts: [
+            { reasoningEffort: "low", description: "Low" },
+            { reasoningEffort: "medium", description: "Medium" },
+            { reasoningEffort: "high", description: "High" },
+            { reasoningEffort: "xhigh", description: "Extra high" },
+          ],
           isDefault: true,
         },
       ]),
-    ).toBe("codex says GPT-5.5 xHigh");
+    ).toBe("codex says GPT-5.5 xhigh");
   });
 
   it("leaves unknown model ids raw", () => {

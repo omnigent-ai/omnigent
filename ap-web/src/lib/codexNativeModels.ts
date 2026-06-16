@@ -1,22 +1,5 @@
 import type { CodexModelOption } from "./types";
 
-export interface NativeModelPickerOption {
-  id: string;
-  label: string;
-}
-
-/**
- * Convert Codex ``model/list`` options into picker rows.
- *
- * @param options - Codex model options from the session snapshot.
- * @returns Picker rows using Codex's own id and display label.
- */
-export function codexModelPickerOptions(
-  options: readonly CodexModelOption[],
-): NativeModelPickerOption[] {
-  return options.map((m) => ({ id: m.id, label: m.displayName || m.id }));
-}
-
 /**
  * Find the Codex option matching a raw Codex model id.
  *
@@ -61,8 +44,15 @@ export function codexEffortLevelsForModel(
   if (options.length === 0) return [];
   const selected =
     findCodexModelOption(options, currentModel) ??
-    options.find((option) => option.isDefault) ??
+    options.find((option) => option.isDefault === true) ??
     options[0] ??
     null;
-  return selected ? Array.from(new Set(selected.supportedReasoningEfforts)) : [];
+  const efforts = selected?.supportedReasoningEfforts ?? [];
+  return Array.from(
+    new Set(
+      efforts
+        .map((option) => option.reasoningEffort)
+        .filter((effort): effort is string => typeof effort === "string" && effort.length > 0),
+    ),
+  );
 }

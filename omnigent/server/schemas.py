@@ -1380,35 +1380,6 @@ class ModelUsage(BaseModel):
     total_cost_usd: float | None = None
 
 
-class CodexModelOption(BaseModel):
-    """
-    Codex app-server model option exposed on a session snapshot.
-
-    Mirrors the fields the Web UI needs from Codex ``model/list`` while
-    keeping the public API snake_case like the rest of
-    :class:`SessionResponse`.
-
-    :param id: Codex picker id to pass back to
-        ``thread/settings/update``, e.g. ``"gpt-5.5"``.
-    :param model: Provider-facing model id Codex will run, e.g.
-        ``"gpt-5.5"`` or ``"databricks-gpt-5-5"``.
-    :param display_name: Codex display label, e.g. ``"GPT-5.5"``.
-    :param default_reasoning_effort: Codex default effort for this
-        model, e.g. ``"medium"``.
-    :param supported_reasoning_efforts: Effort values Codex advertises
-        for this model, e.g. ``["minimal", "low", "medium", "high"]``.
-    :param is_default: Whether Codex marks this model as the default
-        option in its catalog.
-    """
-
-    id: str
-    model: str
-    display_name: str
-    default_reasoning_effort: str
-    supported_reasoning_efforts: list[str] = Field(default_factory=list)
-    is_default: bool = False
-
-
 class SessionResponse(BaseModel):
     """
     API representation of a session.
@@ -1661,7 +1632,7 @@ class SessionResponse(BaseModel):
     archived: bool = False
     todos: list[dict[str, Any]] = Field(default_factory=list)
     skills: list[SkillSummary] = Field(default_factory=list)
-    codex_model_options: list[CodexModelOption] = Field(default_factory=list)
+    codex_model_options: list[dict[str, Any]] = Field(default_factory=list)
     terminal_pending: bool = False
     sandbox_status: SandboxStatus | None = None
 
