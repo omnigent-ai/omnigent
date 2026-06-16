@@ -2823,6 +2823,7 @@ def server(
     # deploy behind an identity-injecting proxy. setdefault so an
     # operator's explicit OMNIGENT_LOCAL_SINGLE_USER=0 wins. Must run
     # before create_auth_provider() below, which reads the var.
+    from omnigent.server.auth import local_single_user_enabled as _local_single_user_enabled
     from omnigent.server.auth import resolve_auth_source as _resolve_auth_source
 
     _is_loopback_bind = host in ("127.0.0.1", "localhost", "::1")
@@ -2833,6 +2834,38 @@ def server(
     _auth_provider_explicit = bool(_raw_auth_provider and _raw_auth_provider.strip())
     if _is_loopback_bind and not _auth_provider_explicit and _resolve_auth_source() == "header":
         os.environ.setdefault("OMNIGENT_LOCAL_SINGLE_USER", "1")
+
+    # A non-loopback bind that resolves to plain header mode with no
+    # single-user fallback rejects EVERY request with 401: header mode
+    # reads identity from the X-Forwarded-Email header, the loopback
+    # single-user fallback above did not fire (this bind is not
+    # loopback), and no operator set OMNIGENT_LOCAL_SINGLE_USER. That is
+    # the correct, expected posture behind an identity-injecting reverse
+    # proxy, but a silent foot-gun for someone exposing the server on a
+    # LAN without one. Warn (do NOT refuse — legitimate reverse-proxy
+    # deploys are also header mode): a proxy operator reads it as a
+    # reminder to set the header, a naive LAN binder learns to turn on
+    # accounts/OIDC. This is guidance only; the fail-closed behavior is
+    # unchanged and single-user is never auto-enabled on a non-loopback
+    # bind.
+    if (
+        not _is_loopback_bind
+        and not _local_single_user_enabled()
+        and _resolve_auth_source() == "header"
+    ):
+        click.secho(
+            f"WARNING: binding {host}:{port} (non-loopback) in header auth "
+            "mode with no single-user fallback. Every request without an "
+            "'X-Forwarded-Email' header will be rejected with 401.\n"
+            "  - Behind a trusted reverse proxy: ensure it injects "
+            "'X-Forwarded-Email' on every forwarded request, or clients "
+            "will get 401.\n"
+            "  - Serving a LAN directly (e.g. from a phone): enable real "
+            "auth first -- set OMNIGENT_AUTH_ENABLED=1 for the built-in "
+            "accounts login, or configure OIDC (OMNIGENT_OIDC_ISSUER=...).",
+            fg="yellow",
+            err=True,
+        )
 
     if _is_canonical_local_server:
         from omnigent.host.local_server import (
