@@ -53,16 +53,27 @@ jobs:
 
       # npm's cooldown (ap-web/.npmrc `min-release-age=7`) is only honored by
       # npm >= 11.10.0; node 20 ships npm 10.x which silently ignores it.
+      # Pin the EXACT version (not a range) and keep it in lockstep with
+      # .github/actions/setup-node: this workflow generates the lockfile and
+      # that action verifies it, so a version gap would fail the freshness
+      # gate in lint.yml. 11.12.1 satisfies the >= 11.10.0 cooldown floor.
       - name: Ensure npm honors the dependency cooldown
-        run: npm install -g "npm@>=11.10.0"
+        run: npm install -g npm@11.12.1
       # Delete the lockfile so npm RESOLVES from scratch: min-release-age only
       # filters during resolution, and --package-lock-only keeps an existing
       # in-range pin without re-applying the cooldown.
+      #
+      # --legacy-peer-deps is REQUIRED: the tree pins React 18 at runtime while
+      # much of the UI stack (and @types/react) peer-requires React 19, so npm's
+      # strict resolver would ERESOLVE-fail without it. It MUST match the flag the
+      # freshness gate in lint.yml verifies with; generating without it resolves
+      # the peer graph differently and rewrites the dev/devOptional/extraneous
+      # flags, failing that byte-exact gate.
       - name: Regenerate package-lock.json
         working-directory: ap-web
         run: |
           rm -f package-lock.json
-          npm install --package-lock-only --no-audit --no-fund
+          npm install --package-lock-only --legacy-peer-deps --no-audit --no-fund
 
       # Validate BEFORE committing: the Docker build proves the regenerated
       # locks + public registries produce a working image.

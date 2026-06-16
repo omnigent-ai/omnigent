@@ -1,0 +1,61 @@
+name: UI Code Coverage
+
+# Posts a report-only `Coverage (ui)` commit status from the `ui-coverage-summary`
+# artifact produced by the `ap-web Tests` workflow (vitest --coverage). Runs on
+# workflow_run (privileged, statuses:write) but does NOT check out PR code — it
+# only consumes the artifact, so it isn't a "dangerous workflow". The status is
+# always success (the % rides in the description) and is never required, so it
+# can't block a merge. Frontend counterpart to code-coverage.yml.
+
+on:
+  workflow_run:
+    workflows: [ap-web Tests]
+    types: [completed]
+
+# Read-only at the top level; write scopes live on the job below.
+permissions:
+  contents: read
+
+concurrency:
+  group: ui-code-coverage-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: true
+
+jobs:
+  post:
+    name: Post UI coverage status
+    permissions:
+      actions: read     # download the ui-coverage-summary artifact from the run
+      statuses: write   # post the Coverage (ui) status on the PR head SHA
+    # PR-originated runs only; other completions have no PR head SHA.
+    if: ${{ github.event.workflow_run.event == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Data only — never the PR's code. Tolerate a missing artifact (fork PRs,
+      # or a run that produced no coverage) via the no-data guard below.
+      - name: Download UI coverage summary
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          name: ui-coverage-summary-${{ github.event.workflow_run.id }}
+          path: ui-coverage-summary
+
+      - name: Post Coverage (ui) status on PR head SHA
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          if [[ ! -f ui-coverage-summary/total.txt ]]; then
+            echo "::notice::No ui-coverage-summary artifact; nothing to post."
+            exit 0
+          fi
+          TOTAL=$(cat ui-coverage-summary/total.txt)
+          gh api "repos/$REPO/statuses/$SHA" \
+            -f state=success \
+            -f context="Coverage (ui)" \
+            -f description="Total UI line coverage: ${TOTAL}%" >/dev/null
+          echo "Posted Coverage (ui)=${TOTAL}% on $SHA"

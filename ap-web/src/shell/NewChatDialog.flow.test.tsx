@@ -478,7 +478,7 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.terminal_launch_args).toBeUndefined();
   });
 
-  it("posts --approval-mode <mode> when a non-default mode is picked for codex-native", async () => {
+  it("posts --ask-for-approval <mode> when a non-default mode is picked for codex-native", async () => {
     setAgents([agent({ id: "ag_codex", name: "codex-native-ui", display_name: "Codex" })]);
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,
@@ -487,12 +487,12 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Open the footer tray's Advanced menu and pick full-auto.
+    // Open the footer tray's Advanced menu and pick "never".
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-approval-full-auto"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-approval-never"));
     // A non-default pick is suffixed onto the pill.
     expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
-      "Codex (Full auto)",
+      "Codex (Never)",
     );
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
@@ -500,7 +500,7 @@ describe("NewChatLandingScreen create flow", () => {
     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
     const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(init.body as string);
-    expect(body.terminal_launch_args).toEqual(["--approval-mode", "full-auto"]);
+    expect(body.terminal_launch_args).toEqual(["--ask-for-approval", "never"]);
   });
 
   it("omits terminal_launch_args when approval mode is left at default for codex-native", async () => {

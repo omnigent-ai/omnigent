@@ -8027,6 +8027,60 @@ def _set_cursor_api_key() -> str | None:
     return "✓ Cursor API key stored"
 
 
+def _prompt_install_antigravity() -> str | None:
+    """Offer to install the missing ``antigravity`` extra; return a status line.
+
+    Shown atop the Antigravity drill-in when the ``google-antigravity`` SDK is absent.
+    Mirrors :func:`_prompt_install_harness` — a three-choice ``select`` (install now /
+    set key anyway / print command) — but does NOT gate key management on the SDK:
+    unlike pi (which can't be configured without its CLI), the ``antigravity:`` key is
+    storable independently, so declining just falls through to the key menu. The
+    install carries no index URL (see :func:`antigravity_install_command`); on failure
+    it prints the command to run by hand.
+
+    :returns: A status string for the drill-in's transient status (install result or
+        printed-command note), or ``None`` on set-key-anyway / Esc.
+    """
+    from rich.markup import escape as _rich_escape
+
+    from omnigent.onboarding.antigravity_auth import (
+        ANTIGRAVITY_EXTRA_INSTALL_COMMAND,
+        install_antigravity_sdk,
+    )
+    from omnigent.onboarding.interactive import console, select
+
+    cmd = ANTIGRAVITY_EXTRA_INSTALL_COMMAND
+    # ``select`` renders through Rich markup, so escape the literal ``[antigravity]``.
+    cmd_markup = _rich_escape(cmd)
+    choice = select(
+        "Antigravity's SDK (google-antigravity) isn't installed. Install it now?",
+        [
+            f"Install it now ({cmd_markup})",
+            "Set the Gemini key anyway",
+            "I'll run it myself (show the command)",
+        ],
+        descriptions=[
+            f"Runs `{cmd_markup}` (uses uv when available), then continues.",
+            "Skip the install — store the key now; the SDK can be added later.",
+            "Print the command so you can install it yourself, then continue.",
+        ],
+        default=0,
+        clear_on_exit=True,
+    )
+    if choice == 0:
+        console.print(f"  [dim]Installing the antigravity extra — running `{cmd_markup}`…[/dim]")
+        if install_antigravity_sdk():
+            console.print("  [green]✓ google-antigravity installed[/green]")
+            return "✓ google-antigravity installed"
+        console.print(f"  [red]Install failed.[/red] Run it manually: [bold]{cmd_markup}[/bold]")
+        return "✗ Install failed — set the key anyway, or install by hand"
+    if choice == 2:
+        console.print(f"  Install the antigravity extra with:\n    [bold]{cmd_markup}[/bold]")
+        return None
+    # choice == 1 (set key anyway) or Esc: fall through to the key menu silently.
+    return None
+
+
 def _manage_antigravity_harness() -> None:
     """Run the level-2 loop for Antigravity: set / replace / remove its Gemini key.
 
@@ -8034,8 +8088,13 @@ def _manage_antigravity_harness() -> None:
     API key — stored in the secret store, referenced from the ``antigravity:``
     config block — mirroring how the other harnesses persist api keys.
 
-    :returns: None. Side effects: may write the ``antigravity:`` config block
-        and the secret store.
+    When the optional ``google-antigravity`` SDK is missing, the drill-in first offers
+    to install it (:func:`_prompt_install_antigravity`). Unlike the CLI-backed harnesses
+    (whose drill-in *gates* on the CLI), declining here still drops into the key menu,
+    since the ``antigravity:`` key is independently storable.
+
+    :returns: None. Side effects: may install the ``antigravity`` extra, and may write
+        the ``antigravity:`` config block and the secret store.
     """
     from omnigent.onboarding import secrets as secret_store
     from omnigent.onboarding.antigravity_auth import (
@@ -8043,10 +8102,15 @@ def _manage_antigravity_harness() -> None:
         ANTIGRAVITY_SECRET_NAME,
         antigravity_api_key_configured,
         antigravity_api_key_ref,
+        antigravity_sdk_installed,
     )
     from omnigent.onboarding.interactive import select
 
+    # Offer the install once on entry (not per loop iteration); the returned status
+    # seeds the menu's transient status line.
     status: str | None = None
+    if not antigravity_sdk_installed():
+        status = _prompt_install_antigravity()
     while True:
         config = _load_global_config()
         key_set = antigravity_api_key_configured(config)
@@ -8410,7 +8474,9 @@ def _run_configure_harnesses_interactive() -> None:
     """
     from omnigent.onboarding.antigravity_auth import (
         ANTIGRAVITY_ENV_VARS,
+        ANTIGRAVITY_EXTRA_INSTALL_COMMAND,
         antigravity_api_key_configured,
+        antigravity_sdk_installed,
     )
     from omnigent.onboarding.configure_models import family_label
     from omnigent.onboarding.cursor_auth import cursor_api_key_configured
@@ -8524,14 +8590,28 @@ def _run_configure_harnesses_interactive() -> None:
         options.append(f"{'  ' if ag_key_set else '[red]✗[/] '}Antigravity")
         selectable.append(True)
         row_target.append(_ANTIGRAVITY)
-        ag_sub = (
+        # The antigravity SDK ships in an OPTIONAL extra (unlike Cursor's baseline
+        # ``cursor-sdk``), so a user can have a key but no SDK. Lead with that gap when
+        # the extra is missing — naming the install command inline — then still report
+        # key status. ``[antigravity]`` is escaped since the sub-lines render as Rich
+        # markup (bare brackets parse as a tag).
+        ag_sub_lines: list[str] = []
+        if not antigravity_sdk_installed():
+            from rich.markup import escape as _rich_escape
+
+            ag_sub_lines.append(
+                f"[dim]not installed — open to install "
+                f"({_rich_escape(ANTIGRAVITY_EXTRA_INSTALL_COMMAND)})[/]"
+            )
+        ag_sub_lines.append(
             "[green]✓[/] Gemini API key configured"
             if ag_key_set
             else "[dim]no Gemini API key yet — open to add one[/]"
         )
-        options.append(f"  {ag_sub}")
-        selectable.append(False)
-        row_target.append(None)
+        for ag_sub in ag_sub_lines:
+            options.append(f"  {ag_sub}")
+            selectable.append(False)
+            row_target.append(None)
         options.append("Quit")
         selectable.append(True)
         row_target.append(_QUIT)
