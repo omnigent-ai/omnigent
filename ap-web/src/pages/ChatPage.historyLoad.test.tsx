@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import { HistoryAutoLoader, JumpToTopButton } from "./ChatPage";
@@ -157,7 +157,17 @@ describe("JumpToTopButton", () => {
     useChatStore.setState({ loadMoreHistory: originalLoadMoreHistory, hasMoreHistory: false });
   });
 
-  const pill = () => screen.getByRole("button", { name: /jump to the first message/i });
+  // Query by the aria-label attribute rather than role/accessible-name: when
+  // hidden the button is aria-hidden (out of the accessibility tree, so its
+  // accessible name computes to ""), and these tests assert on its
+  // className/visibility rather than reachability.
+  const pill = () => {
+    const el = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Jump to the first message"]',
+    );
+    if (!el) throw new Error("Jump-to-top pill not found");
+    return el;
+  };
 
   /**
    * A wrapper (hover/anchor) + inner scroll container, plus a stub of the

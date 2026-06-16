@@ -1743,7 +1743,10 @@ export function JumpToTopButton({
   useEffect(() => {
     if (!containerEl) return;
     const onMove = (e: MouseEvent) => {
-      setHovering(e.clientY - containerEl.getBoundingClientRect().top < HOVER_BAND_PX);
+      const next = e.clientY - containerEl.getBoundingClientRect().top < HOVER_BAND_PX;
+      // Only commit on a transition — mousemove fires continuously, and React
+      // bails on a no-op setState anyway, but skipping it avoids the work.
+      setHovering((prev) => (prev === next ? prev : next));
     };
     const onLeave = () => setHovering(false);
     containerEl.addEventListener("mousemove", onMove, { passive: true });
@@ -1758,7 +1761,10 @@ export function JumpToTopButton({
   const scrollEl = scroller?.el ?? null;
   useEffect(() => {
     if (!scrollEl) return;
-    const onScroll = () => setAtTop(scrollEl.scrollTop <= 1);
+    const onScroll = () => {
+      const next = scrollEl.scrollTop <= 1;
+      setAtTop((prev) => (prev === next ? prev : next));
+    };
     onScroll();
     scrollEl.addEventListener("scroll", onScroll, { passive: true });
     return () => scrollEl.removeEventListener("scroll", onScroll);
@@ -1833,6 +1839,11 @@ export function JumpToTopButton({
         disabled={jumping}
         onClick={() => void jumpToTop()}
         aria-label="Jump to the first message"
+        // When hidden (opacity-0 / pointer-events-none) keep the button out of
+        // the tab order and the accessibility tree so it can't take focus or be
+        // announced while invisible.
+        tabIndex={visible ? 0 : -1}
+        aria-hidden={!visible}
         className={cn(
           "h-7 gap-1.5 rounded-full px-3 text-xs shadow-sm",
           // Force an OPAQUE background in both themes and on hover. The outline
