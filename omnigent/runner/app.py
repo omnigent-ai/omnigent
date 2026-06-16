@@ -9792,11 +9792,7 @@ def create_runner_app(
                 # never both emit the banner.
                 return _codex_ensure_response_with_policy_notice(session_id, terminal_view)
 
-        if (
-            body.get("ensure_native_terminal")
-            and terminal_name == "pi"
-            and session_key == "main"
-        ):
+        if body.get("ensure_native_terminal") and terminal_name == "pi" and session_key == "main":
             pi_terminal_id = terminal_resource_id("pi", "main")
             ensure_lock = _pi_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
             async with ensure_lock:

@@ -425,15 +425,16 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
   const wrapper = session?.labels?.[WRAPPER_LABEL_KEY];
   const nativeAgent = nativeCodingAgentForWrapper(wrapper);
   const isNessie = session?.agentName === "nessie";
-  const Icon = nativeAgent?.iconKind === "claude"
-    ? ClaudeIcon
-    : nativeAgent?.iconKind === "codex"
-      ? CodexIcon
-      : nativeAgent?.iconKind === "pi"
-        ? PiIcon
-        : isNessie
-          ? NessieIcon
-          : BotIcon;
+  const Icon =
+    nativeAgent?.iconKind === "claude"
+      ? ClaudeIcon
+      : nativeAgent?.iconKind === "codex"
+        ? CodexIcon
+        : nativeAgent?.iconKind === "pi"
+          ? PiIcon
+          : isNessie
+            ? NessieIcon
+            : BotIcon;
   // Native wrappers show the product name (mirroring the sidebar) instead
   // of the spec's YAML name (e.g. "claude-native-ui"); other agents show
   // their agent name, with "main" only while the session loads or when it
@@ -452,11 +453,7 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
         data-testid="subagent-main-row"
         data-root-session-id={rootSessionId}
         data-agent-kind={
-          nativeAgent != null
-            ? `${nativeAgent.key}-native`
-            : isNessie
-              ? "nessie"
-              : "agent"
+          nativeAgent != null ? `${nativeAgent.key}-native` : isNessie ? "nessie" : "agent"
         }
         className={cn(
           "flex w-full flex-col gap-0.5 px-2.5 py-2 text-left hover:bg-accent/60",

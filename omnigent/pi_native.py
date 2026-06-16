@@ -482,9 +482,7 @@ async def _find_running_pi_terminal(
             "not bound to a runner" in text or "offline" in text
         ):
             return None
-        raise click.ClickException(
-            f"Failed to fetch Pi terminal ({resp.status_code}): {text}"
-        )
+        raise click.ClickException(f"Failed to fetch Pi terminal ({resp.status_code}): {text}")
     payload = resp.json()
     metadata = payload.get("metadata") if isinstance(payload, dict) else None
     if isinstance(metadata, dict) and metadata.get("running") is False:
