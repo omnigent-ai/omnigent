@@ -1,10 +1,25 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Agent } from "@/hooks/useAgents";
 import { useChatStore } from "@/store/chatStore";
-import { AgentInfoButton } from "./AgentInfo";
+
+// Mock the policies data layer so SessionPoliciesSection and AddPolicyDialog
+// render deterministically without network. The add/delete mutations expose
+// `mutate` spies we can assert on.
+const addMutate = vi.fn();
+const deleteMutate = vi.fn();
+const policiesData = { current: [] as unknown[] };
+const registryData = { current: [] as unknown[] };
+vi.mock("@/hooks/usePolicies", () => ({
+  usePolicies: () => ({ data: policiesData.current }),
+  usePolicyRegistry: () => ({ data: registryData.current }),
+  useAddPolicy: () => ({ mutate: addMutate, isPending: false, isError: false, error: null }),
+  useDeletePolicy: () => ({ mutate: deleteMutate }),
+}));
+
+import { AgentInfoButton, AgentInfoContent } from "./AgentInfo";
 
 afterEach(() => {
   cleanup();
@@ -210,5 +225,133 @@ describe("AgentInfoButton per-model usage breakdown", () => {
     // The popover still opens (agent name proves it), but no breakdown.
     expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
     expect(screen.queryByTestId("agent-info-usage-by-model")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SessionPoliciesSection + AddPolicyDialog, rendered via AgentInfoContent
+// (no popover trigger needed) with the policies data layer mocked.
+// ---------------------------------------------------------------------------
+
+function renderContent(sessionId: string) {
+  const qc = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  return render(
+    <QueryClientProvider client={qc}>
+      <TooltipProvider>
+        <AgentInfoContent agent={AGENT_WITH_BOTH} sessionId={sessionId} />
+      </TooltipProvider>
+    </QueryClientProvider>,
+  );
+}
+
+describe("SessionPoliciesSection", () => {
+  beforeEach(() => {
+    addMutate.mockReset();
+    deleteMutate.mockReset();
+    policiesData.current = [];
+    registryData.current = [];
+  });
+
+  it("shows the empty state when no user policies are applied", () => {
+    // WHY: only `source === "session"` policies are user-managed; a spec
+    // policy must not count, so the section reads "No policies added".
+    policiesData.current = [{ id: "p_spec", name: "spec_one", handler: "h.spec", source: "spec" }];
+    renderContent("conv_pol");
+    expect(screen.getByText("No policies added")).toBeInTheDocument();
+  });
+
+  it("lists user policies and deletes one via the popover Remove button", () => {
+    // WHY: a session-sourced policy renders as a pill; opening it and clicking
+    // Remove must call deletePolicy.mutate with the policy id.
+    policiesData.current = [
+      { id: "p1", name: "deny_pii", handler: "guard.pii", source: "session" },
+    ];
+    renderContent("conv_pol");
+
+    fireEvent.click(screen.getByRole("button", { name: /deny_pii/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Remove/ }));
+    expect(deleteMutate).toHaveBeenCalledWith("p1");
+  });
+
+  it("filters the registry list and adds a callable policy", () => {
+    // WHY: the add dialog filters available (not-yet-applied) policies by
+    // name/description, and a callable policy adds with no factory_params.
+    registryData.current = [
+      { handler: "h.alpha", kind: "callable", name: "Alpha Guard", description: "blocks alpha" },
+      { handler: "h.beta", kind: "callable", name: "Beta Guard", description: "blocks beta" },
+    ];
+    renderContent("conv_pol");
+
+    fireEvent.click(screen.getByTitle("Add policy"));
+    const dialog = screen.getByRole("dialog");
+    // Filter to just Beta.
+    fireEvent.change(within(dialog).getByPlaceholderText("Filter policies..."), {
+      target: { value: "beta" },
+    });
+    expect(within(dialog).queryByText("Alpha Guard")).toBeNull();
+    fireEvent.click(within(dialog).getByText("Beta Guard"));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Add" }));
+
+    expect(addMutate).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "beta_guard", type: "python", handler: "h.beta" }),
+      expect.anything(),
+    );
+    // Callable kind sends no factory_params.
+    expect(addMutate.mock.calls[0][0]).not.toHaveProperty("factory_params");
+  });
+
+  it("renders factory params and submits coerced values", () => {
+    // WHY: a factory policy with a params schema renders inputs and sends
+    // factory_params (always present for factory kind) on Add.
+    registryData.current = [
+      {
+        handler: "h.factory",
+        kind: "factory",
+        name: "PII Factory",
+        description: "configurable",
+        params_schema: {
+          properties: {
+            threshold: { type: "integer", default: 5 },
+            strict: { type: "boolean", default: true },
+          },
+          required: [],
+        },
+      },
+    ];
+    renderContent("conv_pol");
+
+    fireEvent.click(screen.getByTitle("Add policy"));
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(within(dialog).getByText("PII Factory"));
+
+    // The integer param input is present (number type).
+    const numberInput = within(dialog).getByPlaceholderText("5") as HTMLInputElement;
+    fireEvent.change(numberInput, { target: { value: "9" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Add" }));
+
+    expect(addMutate).toHaveBeenCalledTimes(1);
+    const payload = addMutate.mock.calls[0][0];
+    expect(payload).toHaveProperty("factory_params");
+    expect(payload.handler).toBe("h.factory");
+  });
+
+  it("shows the all-applied empty message when every registry policy is already added", () => {
+    // WHY: when appliedHandlers covers the whole registry the filtered list is
+    // empty AND available.length === 0, so the dialog says all are applied.
+    registryData.current = [
+      { handler: "h.alpha", kind: "callable", name: "Alpha Guard", description: "blocks alpha" },
+    ];
+    policiesData.current = [
+      { id: "pa", name: "alpha_guard", handler: "h.alpha", source: "session" },
+    ];
+    renderContent("conv_pol");
+
+    fireEvent.click(screen.getByTitle("Add policy"));
+    const dialog = screen.getByRole("dialog");
+    expect(
+      within(dialog).getByText("All available policies are already applied."),
+    ).toBeInTheDocument();
   });
 });

@@ -10,10 +10,24 @@ vi.mock("@/lib/permissionsApi", () => ({
   revokePermission: vi.fn(),
 }));
 
+// Host config is read-once at render to decide plain-input vs combobox and to
+// transform the share link. Mock both getters so we can drive each branch.
+vi.mock("@/lib/host", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/host")>();
+  return {
+    ...actual,
+    getOmnigentUserSearch: vi.fn(() => undefined),
+    getOmnigentTransformShareLink: vi.fn(() => undefined),
+  };
+});
+
 import * as api from "@/lib/permissionsApi";
+import * as host from "@/lib/host";
 const listMock = vi.mocked(api.listPermissions);
 const grantMock = vi.mocked(api.grantPermission);
 const revokeMock = vi.mocked(api.revokePermission);
+const userSearchMock = vi.mocked(host.getOmnigentUserSearch);
+const transformLinkMock = vi.mocked(host.getOmnigentTransformShareLink);
 
 function createWrapper() {
   const qc = new QueryClient({
@@ -32,6 +46,9 @@ beforeEach(() => {
   listMock.mockReset();
   grantMock.mockReset();
   revokeMock.mockReset();
+  // Default: standalone (no host providers). Combobox/transform tests opt in.
+  userSearchMock.mockReturnValue(undefined);
+  transformLinkMock.mockReturnValue(undefined);
 });
 
 afterEach(cleanup);
@@ -262,5 +279,112 @@ describe("PermissionsModal", () => {
     } finally {
       Object.defineProperty(window, "location", { configurable: true, value: originalLocation });
     }
+  });
+
+  it("uses the host transformShareLink when one is installed", () => {
+    // WHY: in the embed the host returns the full absolute URL; the modal must
+    // defer to that transform instead of prepending window.location.origin.
+    listMock.mockResolvedValue([]);
+    transformLinkMock.mockReturnValue((path: string) => `https://host.example.com/embed#${path}`);
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+
+    render(<PermissionsModal sessionId="conv_xyz" open={true} onOpenChange={() => {}} />, {
+      wrapper: createWrapper(),
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /copy link/i }));
+
+    return waitFor(() => {
+      expect(writeText).toHaveBeenCalledWith("https://host.example.com/embed#/c/conv_xyz");
+    });
+  });
+
+  it("surfaces a server error from a failed revoke", async () => {
+    // WHY: revoke failures (e.g. insufficient permission) must render the
+    // server message via the onError path, mirroring the grant error path.
+    listMock.mockResolvedValue([
+      { user_id: "bob@example.com", conversation_id: "conv_abc", level: 1 },
+    ]);
+    revokeMock.mockRejectedValue(new Error("cannot revoke last owner"));
+
+    render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => expect(screen.getByText("bob@example.com")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: /revoke/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText("cannot revoke last owner")).toBeInTheDocument();
+    });
+  });
+
+  describe("with a host user-search provider (combobox)", () => {
+    beforeEach(() => {
+      // Install a deterministic searcher so the add-user field upgrades to the
+      // suggestion combobox.
+      userSearchMock.mockReturnValue(
+        vi.fn(async (query: string) =>
+          query.startsWith("a")
+            ? [
+                { userId: "alice@example.com", displayName: "Alice" },
+                { userId: "amir@example.com", displayName: "Amir" },
+              ]
+            : [],
+        ),
+      );
+    });
+
+    it("renders the field as a combobox and shows suggestions while typing", async () => {
+      listMock.mockResolvedValue([]);
+      render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+        wrapper: createWrapper(),
+      });
+      await waitFor(() => expect(listMock).toHaveBeenCalled());
+
+      const input = screen.getByPlaceholderText("alice@example.com");
+      // The upgraded field carries role="combobox".
+      expect(input).toHaveAttribute("role", "combobox");
+      fireEvent.focus(input);
+      fireEvent.change(input, { target: { value: "al" } });
+
+      // The host searcher resolves to two matches, rendered as listbox options.
+      await waitFor(() => expect(screen.getByRole("listbox")).toBeInTheDocument());
+      expect(screen.getByRole("option", { name: /Alice/ })).toBeInTheDocument();
+      expect(screen.getByRole("option", { name: /Amir/ })).toBeInTheDocument();
+    });
+
+    it("commits a clicked suggestion into the input value", async () => {
+      listMock.mockResolvedValue([]);
+      render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+        wrapper: createWrapper(),
+      });
+      await waitFor(() => expect(listMock).toHaveBeenCalled());
+
+      const input = screen.getByPlaceholderText("alice@example.com") as HTMLInputElement;
+      fireEvent.focus(input);
+      fireEvent.change(input, { target: { value: "al" } });
+      await waitFor(() => expect(screen.getByRole("listbox")).toBeInTheDocument());
+
+      // mousedown (not click) so the input isn't blurred before commit.
+      fireEvent.mouseDown(screen.getByRole("option", { name: /Alice/ }));
+      expect(input.value).toBe("alice@example.com");
+    });
+
+    it("shows an empty-state message when the searcher returns no matches", async () => {
+      listMock.mockResolvedValue([]);
+      render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+        wrapper: createWrapper(),
+      });
+      await waitFor(() => expect(listMock).toHaveBeenCalled());
+
+      const input = screen.getByPlaceholderText("alice@example.com");
+      fireEvent.focus(input);
+      // "z..." matches nothing in the stub searcher.
+      fireEvent.change(input, { target: { value: "zzz" } });
+
+      await waitFor(() => expect(screen.getByText("No matches")).toBeInTheDocument());
+    });
   });
 });
