@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Decides whether a PR's diff should be put through the Security Scan.
-# Called by .github/workflows/security-scan.yml.
+# Called by .github/workflows/security-gate.yml.
 #
 # We scan UNTRUSTED authors and skip trusted ones. "Trusted" is GitHub's
 # native author_association: OWNER / MEMBER / COLLABORATOR -- people with a

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Flags PR changes to security-sensitive paths. Called by
-# .github/workflows/security-scan.yml after the trust gate opens.
+# .github/workflows/security-gate.yml after the trust gate opens.
 #
 # Two tiers:
 #   FAIL  -- paths that let a PR escalate privilege or rewrite the trust model:

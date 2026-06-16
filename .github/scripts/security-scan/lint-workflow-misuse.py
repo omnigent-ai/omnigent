@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Lint changed GitHub Actions workflows for the two highest-signal CI attacks.
 
-Called by .github/workflows/security-scan.yml. Dependency-free (stdlib +
+Called by .github/workflows/security-gate.yml. Dependency-free (stdlib +
 regex line scanning, no PyYAML) so it never needs a network install to run --
 a security check should not depend on fetching anything.
 
@@ -42,7 +42,7 @@ HEAD_REF_RE = re.compile(
 
 
 def is_pinned(ref: str) -> bool:
-    if ref.startswith("./") or ref.startswith("../"):
+    if ref.startswith(("./", "../")):
         return True  # local action, ships with the repo
     if ref.startswith("docker://"):
         return "@sha256:" in ref  # digest-pinned image
@@ -54,7 +54,8 @@ def lint_file(path: str) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
     try:
-        text = open(path, encoding="utf-8").read()
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
     except OSError as e:
         warnings.append(f"::warning file={path}::could not read workflow ({e})")
         return errors, warnings

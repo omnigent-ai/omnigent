@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Scan a PR's *added* lines for committed secrets.
 
-Called by .github/workflows/security-scan.yml. Dependency-free (stdlib only)
+Called by .github/workflows/security-gate.yml. Dependency-free (stdlib only)
 so it runs without a network install. Operates on a unified diff and inspects
 only added (`+`) lines, so it flags secrets the PR introduces, not pre-existing
 ones -- and reports them at the right file/line for inline annotations.
@@ -34,7 +34,10 @@ HIGH_CONFIDENCE = [
     ("GitHub fine-grained PAT", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{60,}\b")),
     ("Slack token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
     ("Google API key", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b")),
-    ("private key block", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----")),
+    (
+        "private key block",
+        re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----"),
+    ),
     ("Stripe secret key", re.compile(r"\b(sk|rk)_live_[0-9A-Za-z]{24,}\b")),
 ]
 
