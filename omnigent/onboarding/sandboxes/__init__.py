@@ -65,6 +65,7 @@ _LAUNCHERS: dict[str, str] = {
     # E2B (https://e2b.dev) via the official `e2b` SDK (the
     # `omnigent[e2b]` extra), imported lazily like modal/daytona.
     "e2b": "omnigent.onboarding.sandboxes.e2b:E2BSandboxLauncher",
+    "openshell": "omnigent.onboarding.sandboxes.openshell:OpenShellSandboxLauncher",
 }
 
 
