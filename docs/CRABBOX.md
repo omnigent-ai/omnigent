@@ -24,14 +24,21 @@ Available jobs:
 
 - `lint`: pre-commit plus `ap-web` type-checking
 - `pytest`: the non-live pytest suite, matching the default pytest excludes
+- `islo-smoke`: a minimal Crabbox provider smoke that leases via `provider=islo`
+  and writes a proof artifact without Databricks credentials
+- `anthropic-smoke`: a minimal Omnigent `claude-sdk` smoke using
+  `ANTHROPIC_API_KEY`
 - `e2e`: live Databricks-backed E2E tests under `tests/e2e/`
 - `e2e-ui`: Playwright UI E2E tests under `tests/e2e_ui/`
 - `release-smoke`: build distributions and smoke-install the wheels
 - `pr-gates`: lint, pytest, e2e, and e2e-ui in sequence
 
-Live E2E jobs require `LLM_API_KEY` and `GATEWAY_BASE_URL`. Crabbox only
-forwards variables named in `.crabbox.yaml`, so keep new secrets out of the
-repo and add only their names to `env.allow` when a job needs them.
+Live `e2e` and `e2e-ui` jobs require `LLM_API_KEY` and `GATEWAY_BASE_URL`
+because they run through the Databricks harness. `islo-smoke` requires
+`ISLO_API_KEY` for the Crabbox Islo provider, and `anthropic-smoke` requires
+`ANTHROPIC_API_KEY` for the Claude SDK harness. Crabbox only forwards
+variables named in `.crabbox.yaml`, so keep new secrets out of the repo and
+add only their names to `env.allow` when a job needs them.
 
 ## GitHub Actions
 
@@ -42,8 +49,10 @@ run one job from GitHub Actions.
 
 Repository secrets used by the live workflow:
 
+- `ANTHROPIC_API_KEY`
 - `CRABBOX_BROKER_URL`
 - `CRABBOX_TOKEN`
+- `ISLO_API_KEY`
 - `LLM_API_KEY`
 - `GATEWAY_BASE_URL`
 

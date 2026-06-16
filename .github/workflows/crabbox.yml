@@ -28,6 +28,8 @@ on:
         options:
           - lint
           - pytest
+          - islo-smoke
+          - anthropic-smoke
           - e2e
           - e2e-ui
           - release-smoke
@@ -51,7 +53,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CRABBOX_VERSION: v0.31.0
+  CRABBOX_VERSION: v0.32.0
   GH_TOKEN: ${{ github.token }}
 
 jobs:
@@ -86,7 +88,7 @@ jobs:
       - name: Dry-run configured jobs
         run: |
           set -euo pipefail
-          for job in lint pytest e2e e2e-ui release-smoke pr-gates; do
+          for job in lint pytest islo-smoke anthropic-smoke e2e e2e-ui release-smoke pr-gates; do
             echo "::group::crabbox job run --dry-run $job"
             crabbox job run --dry-run "$job"
             echo "::endgroup::"
@@ -137,6 +139,8 @@ jobs:
 
       - name: Run selected Crabbox job
         env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ISLO_API_KEY: ${{ secrets.ISLO_API_KEY }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
         run: |

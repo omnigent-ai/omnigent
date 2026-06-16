@@ -37,6 +37,7 @@ env:
     - DATABRICKS_BEARER
     - DATABRICKS_TOKEN
     - GATEWAY_BASE_URL
+    - ISLO_API_KEY
     - LLM_API_KEY
     - OMNIGENT_*
     - OPENAI_API_KEY
@@ -76,6 +77,37 @@ jobs:
       - artifacts/crabbox/pytest.xml
     artifactGlobs:
       - artifacts/crabbox/**
+    stop: auto
+
+  islo-smoke:
+    provider: islo
+    target: linux
+    architecture: amd64
+    class: beast
+    ttl: 30m
+    idleTimeout: 10m
+    shell: true
+    command: scripts/crabbox/islo-smoke.sh
+    label: omnigent islo smoke
+    requiredArtifacts:
+      - artifacts/crabbox/islo-smoke/proof.txt
+    stop: auto
+
+  anthropic-smoke:
+    hydrate:
+      actions: true
+      waitTimeout: 35m
+      keepAliveMinutes: 180
+    actions:
+      workflow: .github/workflows/crabbox-hydrate.yml
+      job: hydrate
+    shell: true
+    command: scripts/crabbox/anthropic-smoke.sh
+    label: omnigent anthropic smoke
+    artifactGlobs:
+      - artifacts/crabbox/anthropic-smoke/**
+    requiredArtifacts:
+      - artifacts/crabbox/anthropic-smoke/proof.txt
     stop: auto
 
   e2e:
