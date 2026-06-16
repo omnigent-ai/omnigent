@@ -50,7 +50,19 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           AUTHOR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
-        run: bash .github/scripts/security-scan/should-scan.sh
+        run: |
+          # The scanner is checked out from `main` so a PR cannot edit its own
+          # gate. Before this gate is itself merged to main the scripts are
+          # absent there -- proceed (fail-open) so the introducing PR and any
+          # main-without-scanner state are not bricked. Once merged the scripts
+          # exist on main and this branch never runs.
+          if [ ! -f .github/scripts/security-scan/should-scan.sh ]; then
+            echo "::warning::security scanner not present on main yet; proceeding without scan (bootstrap)."
+            echo "scan=false" >> "$GITHUB_OUTPUT"
+            echo "reason=scanner absent on main (bootstrap)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          bash .github/scripts/security-scan/should-scan.sh
 
       - name: Fetch PR diff
         if: ${{ steps.gate.outputs.scan == 'true' }}
