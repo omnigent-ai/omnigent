@@ -42,6 +42,19 @@ After the security check, three options:
   - All CI runs on **GitHub-hosted `ubuntu-latest` runners — no self-hosted runners** (verified across `.github/workflows/`). This is the single biggest reason group (b) isn't catastrophic: there's no persistent runner state to backdoor and no private-network foothold to pivot from. It should be treated as a **standing constraint** — introducing a self-hosted runner reachable from fork CI would sharply escalate this risk.
   - Neither constraint makes scan-only auto-gating sound: a deterministic diff-text scan still can't safely decide whether arbitrary code may execute on our runners at all.
 
+**Mitigations for the secret-independent vectors (group b), and current status.** The master control is the same one that protects the secrets — **don't execute unreviewed fork code in any context that can write shared state or that a privileged workflow consumes** (Option 2's gate). On top of that, each vector maps to a standard CI control; statuses below are from a `.github/workflows/` audit:
+
+| Vector | CI control | Status in omnigent (audited) |
+|---|---|---|
+| Supply-chain / dependency execution | Don't run untrusted code in a privileged context (Option 2); read-only token + no secrets on the auto-run tier; locked/hash-pinned deps; SHA-pin all actions; egress monitoring | **Partial** — actions are SHA-pinned; the [Security Gate](https://github.com/omnigent-ai/omnigent/pull/269) flags manifest changes; no runner egress monitoring yet |
+| Cache poisoning | Keep fork-PR cache writes out of any key a trusted run restores | **Covered** — `e2e.yml`/`e2e-ui.yml` skip forks entirely (empty matrix; forks run via the trusted `fork-e2e/**` mirror); `ci.yml`/`lint.yml` rely on GitHub's native branch-scoped cache isolation (fork-PR caches aren't readable by trusted `main` runs) |
+| Compute abuse / cryptomining | First-time-approval gate + `timeout-minutes` + concurrency caps; hard-bounded by GitHub-hosted-only | **Covered** — first-time gate (proposed), `timeout-minutes` on all 20 workflows, no self-hosted runners |
+| CI-system DoS / queue starvation | `concurrency:` with `cancel-in-progress`; `timeout-minutes`; abuse denylist | **Strong** — `concurrency:` in 18/20 workflows; abuse denylist in this proposal |
+| Artifact poisoning → privileged consumer | In `workflow_run` workflows treat downloaded artifacts as untrusted **data, never execute**; run only base-repo scripts; no fork-head checkout | **Verified safe** — all 4 `workflow_run` consumers comply: `code-coverage` reads only `total.txt`; `merge-ready` sparse-checks-out base-repo scripts (`persist-credentials: false`, fork JSON via env not interpolation); `maintainer-approval-rerun-run` only calls the re-run API |
+| `GITHUB_TOKEN` abuse | Least-privilege top-level `permissions:`; avoid `pull_request_target` except privilege-separated | **Strong** — all 20 workflows declare `permissions:`; fork `pull_request` token is read-only; the writable-token `workflow_run` consumers run base code only; the one `pull_request_target` is the privilege-separated `fork-e2e-mirror` |
+
+Net: adopting **Option 2** already neutralizes most of group (b), and the audit found no fork-artifact execution and no unguarded fork→trusted cache path. The one residual hardening item is **runner egress monitoring** (e.g. step-security/harden-runner) on the auto-run tier, to detect exfiltration and mining outbound that a static diff scan can't see.
+
 ---
 
 ## Option 2 — Auto-run non-key tests; maintainer reviews, then posts `/e2e` ✅ Recommended
