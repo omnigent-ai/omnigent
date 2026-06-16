@@ -44,7 +44,9 @@ jobs:
       UV_INDEX_URL: https://pypi.org/simple
       # The single enforcement switch. "false" = audit (never blocks CI);
       # "true" = blocking (a finding fails this check; pollers then skip CI).
-      GATE_BLOCKING: "false"
+      # TEMPORARY (test PR #289): flipped to "true" to prove the scan blocks on
+      # a finding. Revert to "false" before merge.
+      GATE_BLOCKING: "true"
     steps:
       - name: Check out scanner from main
         continue-on-error: ${{ env.GATE_BLOCKING != 'true' }}
@@ -66,6 +68,16 @@ jobs:
           # Scanner is checked out from `main` so a PR cannot edit its own scan.
           # Before this lands on main the scripts are absent there -- proceed
           # (fail-open) so the introducing PR is not bricked.
+          # TEMPORARY (test PR #289): bypass the author trust check so the
+          # detectors run even though the PR author is a COLLABORATOR. The
+          # workflow file runs from the PR head on `pull_request`, so this edit
+          # takes effect; the trust SCRIPT itself (read from main) is untouched.
+          # Revert this whole block before merge.
+          echo "::warning::TEST: forcing scan=true to exercise detectors (PR #289)."
+          echo "scan=true" >> "$GITHUB_OUTPUT"
+          echo "reason=forced for test" >> "$GITHUB_OUTPUT"
+          exit 0
+          # --- original logic below (unreachable while testing) ---
           if [ ! -f .github/scripts/security-scan/should-scan.sh ]; then
             echo "::warning::security scanner not present on main yet; proceeding without scan (bootstrap)."
             echo "scan=false" >> "$GITHUB_OUTPUT"
