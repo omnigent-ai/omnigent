@@ -53,8 +53,12 @@ jobs:
 
       # npm's cooldown (ap-web/.npmrc `min-release-age=7`) is only honored by
       # npm >= 11.10.0; node 20 ships npm 10.x which silently ignores it.
+      # Pin the EXACT version (not a range) and keep it in lockstep with
+      # .github/actions/setup-node: this workflow generates the lockfile and
+      # that action verifies it, so a version gap would fail the freshness
+      # gate in lint.yml. 11.12.1 satisfies the >= 11.10.0 cooldown floor.
       - name: Ensure npm honors the dependency cooldown
-        run: npm install -g "npm@>=11.10.0"
+        run: npm install -g npm@11.12.1
       # Delete the lockfile so npm RESOLVES from scratch: min-release-age only
       # filters during resolution, and --package-lock-only keeps an existing
       # in-range pin without re-applying the cooldown.
