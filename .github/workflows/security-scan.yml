@@ -1,0 +1,146 @@
+name: Security Scan
+
+# The single deterministic security scan for a PR. Runs ONCE per PR and produces
+# the `Security Scan` check; the per-workflow gate jobs (security-gate.yml) don't
+# re-scan, they poll THIS check and mirror its result, so the work happens once
+# while still gating every CI workflow.
+#
+# It only STATICALLY analyses the diff/head (semgrep, grep, diff-read) with NO
+# secrets on fork PRs, so it never executes untrusted code. The scanner is always
+# checked out from `main` and the scanned code sits in a separate `pr/` dir, so a
+# PR can't edit its own scan.
+#
+# Blocking: any detector that finds something fails this check; the per-workflow
+# pollers mirror the failure and skip the dependent CI jobs (no PR-code checkout
+# / uv sync / test). Detectors run fail-fast -- the first finding fails the job,
+# so a clean PR must pass every one.
+#
+# Trust tiers (should-scan.sh): trusted (OWNER/MEMBER/COLLABORATOR, or an author
+# in the MAINTAINERS list -- covers maintainers with private org membership) and
+# non-PR events aren't scanned; returning contributors are; first-timers are held
+# by GitHub's native fork-approval gate first.
+
+on:
+  pull_request:
+    # labeled/unlabeled so applying or removing the maintainer skip label
+    # (skip-security-scan) re-runs the scan and flips this check.
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read   # read PR labels + reviews for the maintainer skip waiver
+
+concurrency:
+  group: security-scan-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # Route uv at PyPI for the semgrep fetch.
+      UV_INDEX_URL: https://pypi.org/simple
+    steps:
+      - name: Check out scanner from main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: main             # trusted; never the PR head
+          sparse-checkout: |
+            .github/scripts/security-scan
+            .github/scripts/merge-ready
+            .github/security
+          persist-credentials: false
+
+      - name: Load maintainers
+        id: maintainers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: bash .github/scripts/merge-ready/load-maintainers.sh
+
+      - name: Trust gate
+        id: gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          AUTHOR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
+          # For the maintainer-effective skip-security-scan waiver (read-only).
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          MAINTAINERS: ${{ steps.maintainers.outputs.list }}
+        run: |
+          # Before this lands on main the scripts are absent there -- proceed
+          # (fail-open) so the introducing PR is not bricked.
+          if [ ! -f .github/scripts/security-scan/should-scan.sh ]; then
+            echo "::warning::security scanner not present on main yet; proceeding without scan (bootstrap)."
+            echo "scan=false" >> "$GITHUB_OUTPUT"
+            echo "reason=scanner absent on main (bootstrap)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          bash .github/scripts/security-scan/should-scan.sh
+
+      - name: Fetch PR diff
+        if: ${{ steps.gate.outputs.scan == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          gh pr diff "$PR" --repo "$REPO" > "$GITHUB_WORKSPACE/pr.diff"
+          gh pr diff "$PR" --repo "$REPO" --name-only > "$GITHUB_WORKSPACE/changed.txt"
+          echo "Changed files:"; cat "$GITHUB_WORKSPACE/changed.txt"
+
+      - name: Secret scan (added lines)
+        if: ${{ steps.gate.outputs.scan == 'true' }}
+        env:
+          DIFF_FILE: ${{ github.workspace }}/pr.diff
+        run: python3 .github/scripts/security-scan/secret-scan.py
+
+      - name: Sensitive-path guard
+        if: ${{ steps.gate.outputs.scan == 'true' }}
+        env:
+          CHANGED_FILES: ${{ github.workspace }}/changed.txt
+        run: bash .github/scripts/security-scan/sensitive-paths.sh
+
+      - name: Check out PR head for static analysis
+        if: ${{ steps.gate.outputs.scan == 'true' }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}  # untrusted: only statically scanned
+          path: pr
+          persist-credentials: false
+
+      - name: Workflow misuse lint
+        if: ${{ steps.gate.outputs.scan == 'true' }}
+        working-directory: pr
+        env:
+          CHANGED_FILES: ${{ github.workspace }}/changed.txt
+        run: python3 "$GITHUB_WORKSPACE/.github/scripts/security-scan/lint-workflow-misuse.py"
+
+      - name: Install uv
+        if: ${{ steps.gate.outputs.scan == 'true' }}
+        uses: astral-sh/setup-uv@8d55fbecc275b1c35dbe060458839f8d30439ccf  # v3
+
+      - name: Semgrep (changed files, local rules)
+        if: ${{ steps.gate.outputs.scan == 'true' }}
+        env:
+          RULES: ${{ github.workspace }}/.github/security/semgrep-rules.yml
+        run: |
+          # Scan only PR-changed files present in the head tree, so a
+          # contributor is never failed for pre-existing findings.
+          : > targets.txt
+          while IFS= read -r f; do
+            [ -n "$f" ] && [ -f "pr/$f" ] && printf 'pr/%s\n' "$f" >> targets.txt
+          done < "$GITHUB_WORKSPACE/changed.txt"
+          if [ ! -s targets.txt ]; then
+            echo "No changed files to semgrep."; exit 0
+          fi
+          echo "Semgrep targets:"; cat targets.txt
+          # Informational pass (warnings never block).
+          uvx semgrep scan --config "$RULES" --severity=WARNING \
+            --metrics=off --quiet $(cat targets.txt) || true
+          # Gating pass: ERROR-severity rules fail the scan.
+          uvx semgrep scan --config "$RULES" --severity=ERROR --error \
+            --metrics=off --quiet $(cat targets.txt)

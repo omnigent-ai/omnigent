@@ -676,6 +676,18 @@ async def forward_claude_transcript_to_session(
                         dedupe=dedupe,
                         cost_cache=cost_cache,
                     )
+                    # Mirror the live statusLine model EVERY poll (not just
+                    # when a turn produced new transcript items, which
+                    # _forward_available_items early-returns without). This
+                    # propagates an in-pane /model switch to model_override
+                    # before the user's next message, so model-gated policies
+                    # (cost-budget hard cap) no longer lag a switch by one turn.
+                    await _forward_model_from_status(
+                        client=client,
+                        session_id=current_session_id,
+                        bridge_dir=bridge_dir,
+                        dedupe=dedupe,
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -2598,37 +2610,18 @@ async def _forward_available_items(
             )
     # Mirror a TUI-side `/model` switch to the web picker. The transcript
     # records the resolved concrete id (e.g. "claude-opus-4-8"); collapse
-    # it to the picker's tier alias. ``observed_model`` is sticky across
-    # polls — the incremental window usually has no fresh message.model —
-    # so a failed POST is retried on the next poll rather than lost.
-    alias = _model_alias_for(result.latest_model)
-    if alias is not None:
-        dedupe.observed_model = alias
-    if dedupe.observed_model is not None and dedupe.observed_model != dedupe.posted_model:
-        if dedupe.posted_model is None:
-            # First observation = the spawn default; seed the baseline
-            # without posting so it can't clobber a pending silent model
-            # handoff. Only a later in-TUI switch is mirrored.
-            dedupe.posted_model = dedupe.observed_model
-        else:
-            try:
-                await _post_external_model_change(
-                    client,
-                    session_id=session_id,
-                    model=dedupe.observed_model,
-                )
-                dedupe.posted_model = dedupe.observed_model
-            except httpx.HTTPError as exc:
-                # Leave posted_model behind observed_model so the next
-                # poll retries (best-effort, like the usage post above).
-                _logger.warning(
-                    "Failed to forward Claude model change; session=%s bridge_dir=%s "
-                    "http_status=%s",
-                    session_id,
-                    bridge_dir,
-                    _http_status_for_log(exc),
-                    exc_info=True,
-                )
+    # it to the picker's tier alias. This transcript-derived observation
+    # only fires when a turn produces a fresh ``message.model``, so it lags
+    # an in-pane switch by one turn — the per-poll statusLine sync
+    # (:func:`_forward_model_from_status`) is the primary, low-latency
+    # source; this stays as a fallback for cold-resume before the first
+    # statusLine render. Both share ``dedupe`` so neither double-posts.
+    await _post_model_change_if_new(
+        client,
+        session_id=session_id,
+        dedupe=dedupe,
+        alias=_model_alias_for(result.latest_model),
+    )
     return updated
 
 
@@ -3029,6 +3022,103 @@ async def _post_external_model_change(
         json={"type": "external_model_change", "data": {"model": model}},
     )
     resp.raise_for_status()
+
+
+async def _post_model_change_if_new(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    dedupe: _ForwardDedupeState,
+    alias: str | None,
+) -> None:
+    """
+    Mirror an observed model tier alias to ``model_override``, deduped.
+
+    Shared by the transcript-driven path (:func:`_forward_available_items`)
+    and the statusLine-driven per-poll path
+    (:func:`_forward_model_from_status`). The FIRST observation is the
+    session's spawn default, not a switch, so it seeds the dedupe baseline
+    WITHOUT posting (posting it could clobber a pending silent model
+    handoff). Every later change posts ``external_model_change``. Both
+    callers pass the same ``dedupe`` so whichever observes a switch first
+    posts it and the other no-ops. Best-effort: a failed POST leaves
+    ``posted_model`` behind ``observed_model`` so the next poll retries.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id.
+    :param dedupe: Shared per-session dedupe state; mutated in place.
+    :param alias: Tier alias just observed (``"opus"`` / ``"sonnet"`` /
+        …), or ``None`` when this source carried no recognizable model on
+        this poll. ``observed_model`` is sticky across polls, so passing
+        ``None`` does NOT clear it — it just means "no fresh observation,"
+        and a previously-observed-but-unposted model is still reconciled
+        (retried) here.
+    """
+    if alias is not None:
+        dedupe.observed_model = alias
+    if dedupe.observed_model is None or dedupe.observed_model == dedupe.posted_model:
+        return
+    if dedupe.posted_model is None:
+        # First observation = the spawn default; seed the baseline without
+        # posting so it can't clobber a pending silent model handoff.
+        dedupe.posted_model = dedupe.observed_model
+        return
+    try:
+        await _post_external_model_change(
+            client,
+            session_id=session_id,
+            model=dedupe.observed_model,
+        )
+        dedupe.posted_model = dedupe.observed_model
+    except httpx.HTTPError:
+        # Leave posted_model behind observed_model so the next poll retries.
+        _logger.warning(
+            "Failed to mirror model change to Omnigent session=%s; model pill / "
+            "cost-budget gate may lag until the next poll",
+            session_id,
+            exc_info=True,
+        )
+
+
+async def _forward_model_from_status(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    dedupe: _ForwardDedupeState,
+) -> None:
+    """
+    Mirror the statusLine-reported active model to ``model_override`` each poll.
+
+    Claude Code rewrites the statusLine stdin on every TUI render — including
+    right after an in-pane ``/model`` switch, BEFORE the next turn runs. The
+    wrapper (:mod:`omnigent.claude_native_status`) persists that model into
+    ``context.json``. Reading it here, every poll and independently of new
+    transcript items, is what lets a policy that gates on the active model
+    (e.g. the session cost-budget hard cap, which only blocks expensive
+    tiers) see the new model on the user's NEXT message — instead of one
+    turn later, which is what happened when the model was derived solely
+    from the next turn's transcript ``message.model``.
+
+    Best-effort and idempotent: shares ``dedupe`` with the transcript path,
+    so a no-op when the model is unchanged.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id.
+    :param bridge_dir: Native Claude bridge directory.
+    :param dedupe: Shared per-session model dedupe state.
+    """
+    status_state = await asyncio.to_thread(read_claude_context_state, bridge_dir)
+    if status_state is None:
+        return
+    model = status_state.get("model")
+    alias = _model_alias_for(model if isinstance(model, str) else None)
+    await _post_model_change_if_new(
+        client,
+        session_id=session_id,
+        dedupe=dedupe,
+        alias=alias,
+    )
 
 
 async def _post_external_session_status(

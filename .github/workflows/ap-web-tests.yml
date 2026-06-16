@@ -1,14 +1,8 @@
 name: ap-web Tests
 
-# Runs `npm test` (Vitest) for the ap-web React/TypeScript frontend on
-# every non-draft PR that touches ap-web and on push to main.
-#
-# Triggers:
-#   pull_request    opened / synchronize / reopened / ready_for_review.
-#                   Only fires when ap-web/** files changed.
-#                   Draft PRs are skipped; the `ready_for_review` trigger
-#                   refires when the draft is converted.
-#   push (main)     post-merge run on the default branch.
+# Runs `npm test` (Vitest) + format check for the ap-web React/TypeScript
+# frontend on every non-draft PR that touches ap-web/** and on push to main.
+# Draft PRs are skipped; `ready_for_review` refires when the draft is converted.
 
 on:
   pull_request:
@@ -25,15 +19,20 @@ permissions:
   contents: read
 
 concurrency:
-  # PR re-syncs share a group by PR number so old runs cancel.
-  # Non-PR events (push) key by SHA so back-to-back merges to `main`
-  # each get their own run.
+  # PRs key by number (old runs cancel); push keys by SHA (each merge runs).
   group: ap-web-tests-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
 jobs:
+  # Security precondition gate: npm ci/test runs the PR's own install hooks and
+  # test code, so untrusted PRs are held until the scan passes (security-gate.yml).
+  # Trusted authors and non-PR events pass through.
+  gate:
+    uses: ./.github/workflows/security-gate.yml
+
   npm-test:
     name: npm test
+    needs: gate
     if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -51,9 +50,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: ap-web
-        # registry.npmjs.org TLS handshakes flake (ECONNRESET) on this
-        # runner pool — route npm through the Databricks proxy. The
-        # public export rewrites this URL back to the npmjs default.
+        # Pin the npm registry to the npmjs default.
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: npm ci --legacy-peer-deps

@@ -29,14 +29,9 @@ import click
 import httpx
 
 from omnigent._wrapper_labels import (
-    CLAUDE_NATIVE_WRAPPER_VALUE as _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
-)
-from omnigent._wrapper_labels import (
-    CODEX_NATIVE_WRAPPER_VALUE as _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
-)
-from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY,
 )
+from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
 
 _logger = logging.getLogger(__name__)
 
@@ -218,7 +213,10 @@ def _dispatch_wrapper(
     :param session_id: Omnigent conversation id.
     :returns: ``True`` when a wrapper handled the session.
     """
-    if wrapper == _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE:
+    native_agent = native_coding_agent_for_wrapper_label(wrapper)
+    if native_agent is None:
+        return False
+    if native_agent.key == "claude":
         from omnigent.claude_native import run_claude_native
 
         run_claude_native(
@@ -227,13 +225,22 @@ def _dispatch_wrapper(
             claude_args=(),
         )
         return True
-    if wrapper == _CODEX_NATIVE_WRAPPER_LABEL_VALUE:
+    if native_agent.key == "codex":
         from omnigent.codex_native import run_codex_native
 
         run_codex_native(
             server=server,
             session_id=session_id,
             codex_args=(),
+        )
+        return True
+    if native_agent.key == "pi":
+        from omnigent.pi_native import run_pi_native
+
+        run_pi_native(
+            server=server,
+            session_id=session_id,
+            pi_args=(),
         )
         return True
     return False

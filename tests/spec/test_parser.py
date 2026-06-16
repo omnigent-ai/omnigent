@@ -3279,3 +3279,357 @@ def test_parse_executor_auth_api_key_base_url_absent(
 
     assert isinstance(spec.executor.auth, ApiKeyAuth)
     assert spec.executor.auth.base_url is None
+
+
+# ── credential_proxy parser tests ─────────────────────────────────
+
+
+def _credential_proxy_config(entries: list[dict[str, object]]) -> dict[str, object]:
+    """
+    Build a minimal agent config carrying a ``credential_proxy`` block.
+
+    :param entries: The ``credential_proxy`` list to embed under
+        ``os_env.sandbox``.
+    :returns: A config dict ready to ``yaml.dump`` for :func:`parse`.
+    """
+    return {
+        "spec_version": 1,
+        "name": "cred-proxy",
+        "os_env": {
+            "type": "caller_process",
+            "cwd": ".",
+            "sandbox": {
+                "type": "linux_bwrap",
+                "egress_rules": [
+                    "* github.com/**",
+                    "* api.github.com/**",
+                    "* corp.example.com/**",
+                    "* git.example.com/**",
+                    "* bearer.example.com/**",
+                    "* basic.example.com/**",
+                ],
+                "credential_proxy": entries,
+            },
+        },
+    }
+
+
+def test_parse_credential_proxy_all_four_types(tmp_path: Path) -> None:
+    """All four ``credential_proxy`` types normalize to host bindings.
+
+    What breaks if this fails: the YAML the user writes wouldn't reach
+    the runtime as the right per-host scheme/injection, so the egress
+    proxy wouldn't swap credentials (or would swap the wrong scheme).
+    """
+    config = _credential_proxy_config(
+        [
+            {"type": "gh_basic", "source": {"env": "GH_PAT"}},
+            {
+                "type": "git_https",
+                "target": "git.example.com/org/repo.git",
+                "source": {"env": "GH_PAT"},
+            },
+            {
+                "type": "https_bearer",
+                "target": "bearer.example.com/rest",
+                "source": {"env": "CORP"},
+                "env": "CORP_TOKEN",
+            },
+            {
+                "type": "https_basic",
+                "targets": ["basic.example.com"],
+                "source": {"file": "/tmp/secret"},
+                "username": "svc",
+            },
+        ]
+    )
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    proxy = spec.os_env.sandbox.credential_proxy
+    assert proxy is not None
+    by = {(e.host, e.scheme): e for e in proxy.entries}
+
+    # gh_basic -> github.com (basic, swap-on-access) and api.github.com
+    # (token + GH_TOKEN/GITHUB_TOKEN injection because gh gates locally).
+    gh_git = by[("github.com", "basic")]
+    assert gh_git.inject_env == []  # swap-on-access: nothing injected for git
+    gh_api = by[("api.github.com", "token")]
+    assert gh_api.inject_env == ["GH_TOKEN", "GITHUB_TOKEN"]
+
+    # git_https -> swap-on-access Basic for its bound host (nothing injected).
+    git_https = by[("git.example.com", "basic")]
+    assert git_https.inject_env == []
+
+    # https_bearer with an explicit ``env`` opts into placeholder injection.
+    bearer = by[("bearer.example.com", "bearer")]
+    assert bearer.inject_env == ["CORP_TOKEN"]
+    assert bearer.source.kind == "env" and bearer.source.env == "CORP"
+
+    # https_basic keeps the explicit username and a file source; with no
+    # ``env`` it is pure swap-on-access (inject_env empty).
+    basic = by[("basic.example.com", "basic")]
+    assert basic.username == "svc"
+    assert basic.inject_env == []
+    assert basic.source.kind == "file" and basic.source.path == "/tmp/secret"
+
+
+def test_parse_credential_proxy_rejects_duplicate_host(tmp_path: Path) -> None:
+    """Two entries binding the same host fail loudly at parse time.
+
+    The egress proxy keys its swap-on-access table by host, so a
+    duplicate-host config would silently drop one credential (last
+    wins). Rejecting it up front prevents a nondeterministic,
+    hard-to-debug "wrong scheme on the wire" outcome. Here ``gh_basic``
+    already binds ``github.com`` and the explicit ``git_https`` binds it
+    again.
+    """
+    config = _credential_proxy_config(
+        [
+            {"type": "gh_basic", "source": {"env": "GH_PAT"}},
+            {"type": "git_https", "target": "github.com", "source": {"env": "GH_PAT"}},
+        ]
+    )
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=r"binds host 'github.com' more than once"):
+        parse(tmp_path)
+
+
+def test_parse_credential_proxy_git_https_default_username(tmp_path: Path) -> None:
+    """``git_https`` defaults the Basic username to ``x-access-token``.
+
+    A wrong default would make GitHub reject the Basic auth even though
+    the token is valid.
+    """
+    config = _credential_proxy_config(
+        [{"type": "git_https", "target": "github.com", "source": {"env": "GH_PAT"}}]
+    )
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    entry = spec.os_env.sandbox.credential_proxy.entries[0]
+    assert entry.username == "x-access-token"
+
+
+def test_parse_credential_proxy_https_env_optional(tmp_path: Path) -> None:
+    """``https_*`` without ``env`` parses as a swap-on-access binding.
+
+    The ``env`` field is the opt-in injection shim, not a requirement.
+    Omitting it must yield a valid entry with an empty ``inject_env`` so
+    the proxy attaches the credential on access. If ``env`` were still
+    treated as required, parsing would raise instead.
+    """
+    config = _credential_proxy_config(
+        [{"type": "https_bearer", "target": "corp.example.com", "source": {"env": "CORP"}}]
+    )
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    entry = spec.os_env.sandbox.credential_proxy.entries[0]
+    assert entry.host == "corp.example.com"
+    assert entry.scheme == "bearer"
+    assert entry.inject_env == []
+
+
+@pytest.mark.parametrize(
+    "entries,match",
+    [
+        # Unknown ``type`` — caught by the pydantic ``Literal``.
+        ([{"type": "bogus", "source": {"env": "X"}}], r"type: Input should be"),
+        # Missing ``source`` — pydantic ``Field required``.
+        ([{"type": "https_bearer", "target": "h.example.com"}], r"source: Field required"),
+        # ``source`` as a bare string (the old surface) is now rejected —
+        # it must be a nested ``{env|file|command: ...}`` mapping.
+        (
+            [{"type": "https_bearer", "target": "h.example.com", "source": "env:X", "env": "T"}],
+            r"source:.*valid dictionary",
+        ),
+        # Two source keys set — exactly one is allowed.
+        (
+            [
+                {
+                    "type": "https_bearer",
+                    "target": "h.example.com",
+                    "source": {"env": "X", "file": "/tmp/s"},
+                }
+            ],
+            r"exactly one of 'env', 'file', or 'command'",
+        ),
+        # Malformed ``env`` injection-shim name.
+        (
+            [
+                {
+                    "type": "https_bearer",
+                    "target": "h.example.com",
+                    "source": {"env": "X"},
+                    "env": "not a valid name",
+                }
+            ],
+            r"env must be a POSIX",
+        ),
+        # Both ``target`` and ``targets`` set.
+        (
+            [
+                {
+                    "type": "https_bearer",
+                    "target": "h.example.com",
+                    "targets": ["h2.example.com"],
+                    "source": {"env": "X"},
+                    "env": "T",
+                }
+            ],
+            r"exactly one of 'target' or 'targets'",
+        ),
+        # Host fails DNS-safety validation (still enforced post-pydantic).
+        (
+            [{"type": "git_https", "target": "bad_host!", "source": {"env": "X"}}],
+            r"must be an exact DNS hostname",
+        ),
+        # Unknown key — ``extra="forbid"`` rejects typos.
+        (
+            [
+                {
+                    "type": "https_bearer",
+                    "target": "h.example.com",
+                    "source": {"env": "X"},
+                    "bogus": 1,
+                }
+            ],
+            r"bogus: Extra inputs are not permitted",
+        ),
+    ],
+)
+def test_parse_credential_proxy_fail_loud(
+    tmp_path: Path, entries: list[dict[str, object]], match: str
+) -> None:
+    """Malformed ``credential_proxy`` entries fail loudly at parse time.
+
+    Each case proves a specific misconfiguration is rejected up front
+    rather than silently producing a half-wired (insecure) policy.
+    """
+    config = _credential_proxy_config(entries)
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=match):
+        parse(tmp_path)
+
+
+def test_parse_credential_proxy_requires_egress_rules(tmp_path: Path) -> None:
+    """``credential_proxy`` without ``egress_rules`` is rejected.
+
+    The MITM proxy (driven by egress_rules) is what performs the swap and
+    blocks placeholder leaks; without it the feature would be a no-op that
+    injects placeholders the agent can't use — fail loud instead.
+    """
+    config = {
+        "spec_version": 1,
+        "name": "cred-proxy-no-egress",
+        "os_env": {
+            "type": "caller_process",
+            "cwd": ".",
+            "sandbox": {
+                "type": "linux_bwrap",
+                "credential_proxy": [
+                    {"type": "git_https", "target": "github.com", "source": {"env": "X"}}
+                ],
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=r"requires os_env.sandbox.egress_rules"):
+        parse(tmp_path)
+
+
+def test_parse_credential_proxy_requires_hard_backend(tmp_path: Path) -> None:
+    """``credential_proxy`` requires a network-isolating backend.
+
+    On ``linux_landlock`` (no hard network deny) the egress proxy isn't
+    the only path out, so binding credentials there is unsafe — rejected.
+
+    We deliberately OMIT ``egress_rules`` here so the egress-rules backend
+    guard doesn't fire first: that isolates the credential_proxy-specific
+    backend check (parser.py:1117). The ``match`` asserts the
+    credential_proxy message, not the egress one — so deleting the
+    credential_proxy backend guard (falling through to the
+    "requires egress_rules" error with its different text) would fail
+    this test.
+    """
+    config = {
+        "spec_version": 1,
+        "name": "cred-proxy-soft-backend",
+        "os_env": {
+            "type": "caller_process",
+            "cwd": ".",
+            "sandbox": {
+                "type": "linux_landlock",
+                "credential_proxy": [
+                    {"type": "git_https", "target": "github.com", "source": {"env": "X"}}
+                ],
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=r"credential_proxy requires sandbox.type"):
+        parse(tmp_path)
+
+
+def test_parse_credential_proxy_gh_basic_rejected_on_macos(tmp_path: Path) -> None:
+    """``gh_basic`` is rejected on macOS (``darwin_seatbelt``).
+
+    ``gh_basic`` wires the GitHub CLI, a Go binary, and Go on macOS verifies
+    TLS via the system keychain and ignores ``SSL_CERT_FILE`` — the var the
+    egress MITM proxy uses to publish its CA — so every ``gh`` call would fail
+    at runtime with an opaque ``certificate is not trusted`` error. We fail
+    loud at parse time instead. The ``match`` asserts the macOS-specific
+    message (not the backend/egress guards, which pass here since
+    ``darwin_seatbelt`` + ``egress_rules`` are both present), so removing the
+    macOS guard would let the spec parse and fail this test.
+    """
+    config = {
+        "spec_version": 1,
+        "name": "cred-proxy-gh-macos",
+        "os_env": {
+            "type": "caller_process",
+            "cwd": ".",
+            "sandbox": {
+                "type": "darwin_seatbelt",
+                "egress_rules": ["* github.com/**", "* api.github.com/**"],
+                "credential_proxy": [{"type": "gh_basic", "source": {"env": "GH_PAT"}}],
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=r"gh_basic' does not work on macOS"):
+        parse(tmp_path)
+
+
+def test_parse_credential_proxy_https_primitive_allowed_on_macos(tmp_path: Path) -> None:
+    """The generic primitives are NOT rejected on macOS.
+
+    The macOS guard must fire ONLY for the Go-based ``gh_basic`` preset (the
+    ``token`` scheme). ``https_bearer`` (and ``https_basic`` / ``git_https``)
+    are consumed by curl/python/git, which trust ``SSL_CERT_FILE`` on macOS, so
+    they must still parse on ``darwin_seatbelt``. This guards against the guard
+    being too broad and breaking the primitives that DO work.
+    """
+    config = {
+        "spec_version": 1,
+        "name": "cred-proxy-bearer-macos",
+        "os_env": {
+            "type": "caller_process",
+            "cwd": ".",
+            "sandbox": {
+                "type": "darwin_seatbelt",
+                "egress_rules": ["* corp.example.com/**"],
+                "credential_proxy": [
+                    {
+                        "type": "https_bearer",
+                        "target": "corp.example.com/rest",
+                        "source": {"env": "CORP"},
+                        "env": "CORP_TOKEN",
+                    }
+                ],
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    proxy = spec.os_env.sandbox.credential_proxy
+    assert proxy is not None
+    assert proxy.entries[0].scheme == "bearer"

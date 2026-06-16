@@ -134,6 +134,40 @@ describe("buildBubbles — bubble grouping", () => {
     expect(bubble.stableKey).toBeUndefined();
   });
 
+  it("a REQUEST-phase elicitation with its own response id is a standalone bubble", () => {
+    // The blockStream stamps a unique response id on REQUEST-phase
+    // elicitations precisely so they do NOT fold into the previous turn's
+    // assistant bubble. With that distinct id, the card is its own
+    // elicitation-only bubble, which is what `isRequestElicitationBubble`
+    // (ChatPage) keys on to lift the prompt above it.
+    const blocks: AnyBlock[] = [
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "a1", responseId: "resp_prev" }),
+        fullText: "Previous answer.",
+        hasCodeBlocks: false,
+      },
+      {
+        type: "elicitation",
+        ctx: ctx({ itemId: null, responseId: "elicit_elic_req" }),
+        elicitationId: "elic_req",
+        message: "Continue?",
+        phase: "request",
+        policyName: "session_cost_budget",
+        contentPreview: "{}",
+        requestedSchema: {},
+        status: "pending",
+        response: null,
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.length).toBe(2);
+    const answer = bubbles[0] as Extract<Bubble, { kind: "assistant" }>;
+    expect(answer.items.map((i) => i.kind)).toEqual(["text"]);
+    const card = bubbles[1] as Extract<Bubble, { kind: "assistant" }>;
+    expect(card.items.map((i) => i.kind)).toEqual(["elicitation"]);
+  });
+
   it("two response_ids produce two assistant bubbles in order", () => {
     const blocks: AnyBlock[] = [
       {

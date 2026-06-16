@@ -157,10 +157,11 @@ FROM node:${NODE_VERSION}-slim@${NODE_DIGEST} AS node-runtime
 
 # ── Host runtime (`--target host`) ──────────────────────
 # Prebaked Omnigent host for remote sandboxes: full omnigent install,
-# git + tmux for harness runtime needs, curl + CA certificates for
-# outbound HTTPS and in-sandbox downloads, plus the coding-harness
-# CLIs (claude / codex / pi) so claude-sdk, claude-native, codex, and
-# pi agents can run in managed sandboxes without an in-sandbox
+# git + tmux for harness runtime needs, bubblewrap to OS-sandbox the
+# native harness terminals (mandatory and fail-loud on Linux), curl + CA
+# certificates for outbound HTTPS and in-sandbox downloads, plus the
+# coding-harness CLIs (claude / codex / pi) so claude-sdk, claude-native,
+# codex, and pi agents can run in managed sandboxes without an in-sandbox
 # install. No SPA, no psycopg, no server entrypoint.
 FROM python:${PYTHON_VERSION}-slim@${PYTHON_DIGEST} AS host
 ARG NPM_CONFIG_REGISTRY=
@@ -178,7 +179,7 @@ ENV PYTHONUNBUFFERED=1 \
     IS_SANDBOX=1
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git tmux curl ca-certificates bubblewrap \
+ && apt-get install -y --no-install-recommends git tmux bubblewrap curl ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
 # bubblewrap (bwrap): the native harness terminals (claude-native / codex-native

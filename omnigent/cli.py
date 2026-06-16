@@ -214,6 +214,9 @@ _CLAUDE_STARTUP_PROFILE_ENV_VAR = "OMNIGENT_CLAUDE_STARTUP_PROFILE"
 # only two subscription CLIs ambient detection emits.
 _CLI_LOGIN_BRAND: dict[str, str] = {"claude": "Claude", "codex": "ChatGPT"}
 _HOST_DAEMON_STOP_GRACE_S = 5.0
+# How often ``omni upgrade`` re-polls the local server for in-flight
+# (connected) sessions while draining before it stops the server.
+_UPGRADE_DRAIN_POLL_S = 2.0
 # When reusing an existing daemon, how long to let a live-but-offline daemon
 # (re)establish its server tunnel before treating it as a zombie and
 # respawning. Covers the daemon's reconnect backoff after a transient drop.
@@ -1134,6 +1137,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "login",
         "pane-picker",
         "pane-split",
+        "pi",
         "polly",
         "resume",
         "run",
@@ -1141,26 +1145,35 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "server",
         "setup",
         "stop",
+        "upgrade",
         "version",
     }
 )
 
 
 def _should_skip_update_check(argv: list[str]) -> bool:
-    """Decide whether the update check should be skipped for *argv*.
+    """Decide whether the update notice should be suppressed for *argv*.
 
-    Skipped for help / version requests and internal subcommands
-    (``pane-split``, ``pane-picker``) that are invoked by the TUI,
-    not by the user directly.
+    Skipped for help / version requests, internal TUI subcommands
+    (``pane-split`` / ``pane-picker``, invoked by the terminal UI rather
+    than the user), and ``upgrade`` itself (pointing the user at
+    ``omni upgrade`` while they are running it is noise).
 
     :param argv: CLI arguments without the program name, e.g.
         ``["run", "agent.yaml"]``.
-    :returns: ``True`` when the update check should be suppressed.
+    :returns: ``True`` when the update notice should not be shown.
     """
     if not argv:
         return True
-    first = argv[0]
-    return first in {"--help", "-h", "--version", "version", "pane-split", "pane-picker"}
+    return argv[0] in {
+        "--help",
+        "-h",
+        "--version",
+        "version",
+        "upgrade",
+        "pane-split",
+        "pane-picker",
+    }
 
 
 def main() -> None:
@@ -1193,11 +1206,6 @@ def main() -> None:
     _migrate_legacy_state_dir()
 
     argv = sys.argv[1:]
-
-    if not _should_skip_update_check(argv):
-        from omnigent.update_check import maybe_show_update_notice
-
-        maybe_show_update_notice()
 
     # Bare ``omnigent`` with no args behaves like ``omnigent run`` on an
     # interactive terminal: ``run`` resolves the configured default agent /
@@ -1256,11 +1264,21 @@ def main() -> None:
 
     setup_cli_logging(argv)
 
-    # ``omnigent setup`` IS the setup wizard — if it fails,
-    # telling the user to "run omnigent setup" would be circular.
-    # Internal-beta and other subcommand-on-setup forms still share
-    # the same first token.
-    suggest_setup = argv[0] != "setup"
+    # ``omnigent setup`` IS the setup wizard — if it fails, telling the
+    # user to "run omnigent setup" would be circular. ``upgrade`` is
+    # excluded too: its failures (unreachable index, dev checkout, install
+    # error) are never about a missing model credential, so the setup hint
+    # would only mislead.
+    suggest_setup = argv[0] not in {"setup", "upgrade"}
+
+    # Lightweight update notice: only on an interactive terminal and only
+    # for user-facing commands. Reads a cached "latest PyPI version" and
+    # prints at most once per release (the network refresh runs detached,
+    # off the hot path). Never blocks; any failure is swallowed inside.
+    if not _should_skip_update_check(argv) and sys.stderr.isatty():
+        from omnigent.update_check import maybe_show_update_notice
+
+        maybe_show_update_notice()
 
     try:
         cli(args=argv, standalone_mode=False)
@@ -3297,6 +3315,186 @@ def stop(force: bool) -> None:
         raise click.ClickException("; ".join(failures) + " — retry with --force.")
 
 
+def _count_running_sessions(base_url: str) -> int:
+    """Count sessions actively running a turn on the local server.
+
+    Gates on the session-list ``status`` field (``"running"`` — a runner
+    mid-turn, or with a still-running sub-agent), NOT mere connectedness:
+    an idle session keeps its host/runner connection open indefinitely, so
+    counting connected sessions would make the drain wait forever for
+    sessions that aren't doing any work. Only ``"running"`` sessions hold
+    in-flight work an upgrade should avoid interrupting.
+
+    A transient HTTP failure is treated as "none running" rather than
+    blocking the upgrade — the server's own graceful shutdown still drains
+    any runner that happens to be mid-turn.
+
+    :param base_url: Local server base URL, e.g. ``"http://127.0.0.1:6767"``.
+    :returns: Number of sessions with ``status == "running"``, or ``0`` on
+        a query failure.
+    """
+    with contextlib.suppress(click.ClickException):
+        pages = _fetch_session_pages(base_url=base_url, connected_only=True)
+        return sum(1 for session in pages.sessions if session.get("status") == "running")
+    return 0
+
+
+def _wait_for_local_sessions_to_drain() -> None:
+    """Block until no local session is actively running a turn.
+
+    Used by ``omni upgrade`` (without ``--force``) so an upgrade never
+    yanks a running agent turn. Waits only on sessions whose status is
+    ``"running"`` (see :func:`_count_running_sessions`) — idle-but-connected
+    sessions do not hold it up. Polls every :data:`_UPGRADE_DRAIN_POLL_S`
+    seconds and re-prints the count whenever it changes; ``Ctrl-C`` aborts
+    the wait (and the upgrade) cleanly. Returns immediately when the server
+    is down or already idle.
+    """
+    info = local_server_status()
+    if not (info.running and info.url is not None):
+        return
+    count = _count_running_sessions(info.url)
+    if count == 0:
+        return
+    click.echo(
+        f"Waiting for {count} running session(s) to finish — press Ctrl-C to "
+        "abort, or re-run with --force to stop them now."
+    )
+    last = count
+    while True:
+        time.sleep(_UPGRADE_DRAIN_POLL_S)
+        info = local_server_status()
+        if not (info.running and info.url is not None):
+            return
+        count = _count_running_sessions(info.url)
+        if count == 0:
+            return
+        if count != last:
+            click.echo(f"  {count} session(s) still running…")
+            last = count
+
+
+@cli.command("upgrade")
+@click.option(
+    "--check",
+    "check_only",
+    is_flag=True,
+    help="Report whether a newer release is available, without upgrading. "
+    "Exits non-zero when a newer release exists.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Stop in-flight sessions immediately instead of waiting for them to drain.",
+)
+@click.option(
+    "--pre",
+    "pre",
+    is_flag=True,
+    help="Consider pre-releases (e.g. release candidates), and pass the "
+    "installer's allow-pre-releases flag. Useful for validating a TestPyPI rc.",
+)
+def upgrade(check_only: bool, force: bool, pre: bool) -> None:
+    """Upgrade the omnigent CLI to the latest release on PyPI.
+
+    Detects how omnigent was installed (uv / pip / pipx / poetry), checks
+    the configured index for a newer release and — unless ``--check`` —
+    drains and stops the local background server and host daemon, then runs
+    the matching upgrade command. The next ``omni`` invocation starts a
+    fresh server on the new code automatically (via the version-aware
+    config signature), so no explicit restart is needed.
+
+    In-flight agent sessions are waited on by default; pass ``--force`` to
+    stop them immediately. Pass ``--pre`` to consider pre-releases (rc /
+    beta) — handy for validating a TestPyPI candidate against your
+    configured index. Source checkouts / editable installs are not upgraded
+    here — update those with ``git pull``.
+
+    :param check_only: Only report availability; do not upgrade. Exits
+        with status 1 when a newer release exists.
+    :param force: Stop in-flight sessions immediately rather than draining.
+    :param pre: Consider pre-releases and allow the installer to fetch them.
+    :returns: None.
+    """
+    import importlib.metadata
+
+    from packaging.version import InvalidVersion, parse
+
+    from omnigent.update_check import (
+        _build_upgrade_suggestion,
+        _find_repo_root,
+        _read_installed_wheel_info,
+        _run_upgrade_command,
+        fetch_latest_version,
+    )
+
+    # Source checkout / editable install — there's no released wheel to
+    # swap in place; the correct update path is git, not a reinstall.
+    if _find_repo_root() is not None:
+        raise click.ClickException(
+            "This is a source checkout — update it with `git pull` (and reinstall "
+            "dependencies), not `omni upgrade`."
+        )
+    info = _read_installed_wheel_info()
+    if info is None:
+        raise click.ClickException(
+            "Couldn't determine how omnigent is installed; upgrade it manually."
+        )
+    if info.is_editable:
+        raise click.ClickException(
+            "This is an editable install — update it with `git pull`, not `omni upgrade`."
+        )
+
+    current = importlib.metadata.version("omnigent")
+    latest = fetch_latest_version(include_prereleases=pre)
+    if latest is None:
+        raise click.ClickException(
+            "Couldn't reach the package index to check for a newer release. Check your "
+            "connection (or OMNIGENT_INDEX_URL / your configured index) and try again."
+        )
+    try:
+        is_behind = parse(latest) > parse(current)
+    except InvalidVersion:
+        is_behind = latest != current
+
+    if not is_behind:
+        click.echo(f"omnigent is up to date (v{current}).")
+        return
+
+    click.echo(f"A new release is available: v{current} → v{latest}.")
+    if check_only:
+        # Non-zero so scripts/CI can gate on "an upgrade is available".
+        # SystemExit (not ctx.exit) because main() runs the group with
+        # standalone_mode=False, where ctx.exit's code is returned and
+        # dropped rather than applied — SystemExit propagates correctly.
+        raise SystemExit(1)
+
+    suggestion = _build_upgrade_suggestion(info, allow_prerelease=pre)
+    if not suggestion.runnable:
+        raise click.ClickException(
+            f"No automatic upgrade command is known for this install. {suggestion.command}."
+        )
+
+    # Drain (or force-stop) the local server + daemon BEFORE swapping the
+    # code, so the running process never serves half-upgraded modules.
+    # The next command respawns a fresh server on the new version.
+    if not force:
+        _wait_for_local_sessions_to_drain()
+    if _stop_local_server_and_daemon(force=force):
+        click.echo("Stopped the background server before upgrading.")
+
+    console = Console()
+    code = _run_upgrade_command(suggestion.command, console)
+    if code != 0:
+        raise click.ClickException(
+            f"Upgrade command exited with status {code}; your previous install is intact."
+        )
+    click.echo(
+        f"✓ Upgraded to v{latest}. Re-run your command — the local server will "
+        "start on the new version."
+    )
+
+
 def _bundle(source: Path) -> bytes:
     """
     Produce a tar.gz bundle from a directory or standalone
@@ -3890,6 +4088,87 @@ def codex(
     )
 
 
+@cli.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+@click.option(
+    "--server",
+    default=None,
+    help=(
+        "Remote omnigent URL. Ensures the host daemon, asks the "
+        "daemon-spawned runner to launch Pi, and attaches this TTY. "
+        'Pass --server "" to auto-spawn a persistent local server in the '
+        "background and use that instead of a remote one."
+    ),
+)
+@click.option(
+    "-r",
+    "--resume",
+    "resume",
+    is_flag=False,
+    flag_value=_RESUME_PICKER_SENTINEL,
+    default=None,
+    help=(
+        "Resume a prior Omnigent conversation. With a conversation id "
+        "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
+        "opens an interactive picker scoped to pi-native sessions."
+    ),
+)
+@click.option(
+    "--session",
+    "session_id",
+    metavar="SESSION_ID",
+    default=None,
+    hidden=True,
+    help="Deprecated alias for ``--resume <id>``; kept for one release.",
+)
+@click.argument("pi_args", nargs=-1, type=click.UNPROCESSED)
+def pi(
+    server: str | None,
+    resume: str | None,
+    session_id: str | None,
+    pi_args: tuple[str, ...],
+) -> None:
+    """Launch Pi TUI in an Omnigent terminal.
+
+    \b
+    Examples:
+      omnigent pi
+      omnigent pi --resume conv_abc123
+      omnigent pi --resume                    # interactive picker
+      omnigent pi --model local-deepseek/deepseek-v4-flash
+    """
+    choice = _split_resume_value(resume)
+    if session_id is not None and (choice.picker or choice.conversation_id is not None):
+        raise click.UsageError(
+            "--session and --resume are mutually exclusive; "
+            "prefer --resume (--session is deprecated).",
+        )
+
+    from omnigent.pi_native import run_pi_native
+
+    cfg = _load_effective_config()
+    if server is None:
+        server = cfg.get("server")
+    auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
+
+    server = _ensure_backend(server)
+    resolved_session_id = (
+        choice.conversation_id if choice.conversation_id is not None else session_id
+    )
+
+    run_pi_native(
+        server=server,
+        session_id=resolved_session_id,
+        resume_picker=choice.picker,
+        pi_args=pi_args,
+        auto_open_conversation=auto_open_conversation,
+    )
+
+
 def _run_bundled_agent(name: str, run_args: tuple[str, ...]) -> None:
     """Forward a bundled-agent subcommand to ``run`` on its packaged path.
 
@@ -4027,6 +4306,7 @@ def resume(
 # into a materialized copy of the spec before the server starts.
 _HARNESS_CHOICES_HELP = (
     "'claude' (alias for 'claude-sdk'), 'claude-sdk', 'codex', "
+    "'cursor', "
     "'openai-agents', 'open-responses', or 'pi'"
 )
 _HARNESS_HELP = f"Harness to use for a local agent: {_HARNESS_CHOICES_HELP}."
@@ -4055,6 +4335,9 @@ _DEFAULT_HARNESS_PROMPTS = {
     ),
     "codex": (
         "You are Codex, running through Omnigent. Help the user with software engineering tasks."
+    ),
+    "cursor": (
+        "You are Cursor, running through Omnigent. Help the user with software engineering tasks."
     ),
 }
 _DEFAULT_HARNESS_PROMPT = "You are a helpful coding agent running through Omnigent."
@@ -7648,6 +7931,205 @@ def _manage_harness_providers(family: str) -> None:
             status = _manage_credential(row.provider, family)
 
 
+def _manage_cursor_harness() -> None:
+    """Run the level-2 loop for Cursor: manage its ``CURSOR_API_KEY``.
+
+    Cursor runs via the ``cursor-sdk`` package and authenticates against
+    Cursor's own backend with a ``CURSOR_API_KEY`` — the SDK requires one (a
+    ``cursor-agent login`` does not apply, and cursor has no provider/gateway
+    family). So this manages exactly that credential: set / replace / remove an
+    API key stored in the omnigent secret store, mirroring how the other
+    harnesses persist their api keys (the secret in the store, a
+    ``keychain:``/``env:`` reference in ``~/.omnigent/config.yaml``).
+
+    :returns: None. Side effects: may write the ``cursor:`` block of
+        ``~/.omnigent/config.yaml`` and the secret store.
+    """
+    from omnigent.onboarding import secrets as secret_store
+    from omnigent.onboarding.cursor_auth import cursor_api_key_configured, cursor_api_key_ref
+    from omnigent.onboarding.interactive import select
+
+    status: str | None = None
+    while True:
+        config = _load_global_config()
+        key_set = cursor_api_key_configured(config)
+
+        rows: list[_HarnessMenuRow] = [
+            _HarnessMenuRow(
+                "Replace API key (CURSOR_API_KEY)" if key_set else "Set API key (CURSOR_API_KEY)",
+                action="set_key",
+            )
+        ]
+        if key_set:
+            rows.append(_HarnessMenuRow("Remove API key", action="remove_key"))
+        rows.append(_HarnessMenuRow("← Back", action="back"))
+
+        header = "Cursor — API key configured" if key_set else "Cursor — no API key yet"
+        idx = select(header, [r.label for r in rows], clear_on_exit=True, status=status)
+        if idx < 0:  # Esc / q
+            return
+        action = rows[idx].action
+        if action == "back":
+            return
+        if action == "set_key":
+            status = _set_cursor_api_key()
+        elif action == "remove_key":
+            ref = cursor_api_key_ref(config)
+            # Only a keychain-stored secret is ours to delete; an ``env:`` ref
+            # points at the user's own environment, so just drop the config.
+            if ref is not None and ref.startswith("keychain:"):
+                secret_store.delete_secret(ref[len("keychain:") :])
+            _save_global_config({}, unset_keys=("cursor",))
+            status = "✓ Removed Cursor API key"
+
+
+def _set_cursor_api_key() -> str | None:
+    """Prompt for and store a Cursor ``CURSOR_API_KEY``; return a status line.
+
+    Offers an existing ``CURSOR_API_KEY`` from the environment first (recorded
+    as an ``env:`` reference, so the secret never enters the config or the
+    secret store), else reads the key with a hidden prompt and stores it in the
+    omnigent secret store under ``keychain:cursor``. The ``crsr_`` prefix is
+    validated with a soft warning so a wrong paste is caught without
+    hard-blocking a future key format. The key value is never echoed.
+
+    :returns: A confirmation string for the menu's transient status, or
+        ``None`` when the user aborted (empty input / declined the warning).
+    """
+    from omnigent.onboarding import secrets as secret_store
+    from omnigent.onboarding.cursor_auth import (
+        CURSOR_SECRET_NAME,
+        cursor_api_key_settings,
+        looks_like_cursor_api_key,
+    )
+    from omnigent.onboarding.interactive import prompt_text
+
+    detected = os.environ.get("CURSOR_API_KEY")
+    if detected and click.confirm(
+        "Detected CURSOR_API_KEY in the environment — use it?", default=True
+    ):
+        if not looks_like_cursor_api_key(detected) and not click.confirm(
+            "$CURSOR_API_KEY doesn't start with 'crsr_'. Use it anyway?", default=False
+        ):
+            return None
+        _save_global_config(cursor_api_key_settings("env:CURSOR_API_KEY"))
+        return "✓ Cursor API key set (from $CURSOR_API_KEY)"
+
+    pasted = prompt_text("Cursor API key (CURSOR_API_KEY)", hide_input=True).strip()
+    if not pasted:
+        return None
+    if not looks_like_cursor_api_key(pasted) and not click.confirm(
+        "That doesn't start with 'crsr_'. Store it anyway?", default=False
+    ):
+        return None
+    secret_store.store_secret(CURSOR_SECRET_NAME, pasted)
+    _save_global_config(cursor_api_key_settings(f"keychain:{CURSOR_SECRET_NAME}"))
+    return "✓ Cursor API key stored"
+
+
+def _manage_antigravity_harness() -> None:
+    """Run the level-2 loop for Antigravity: set / replace / remove its Gemini key.
+
+    Antigravity is Gemini-native (no provider family), so this manages just its
+    API key — stored in the secret store, referenced from the ``antigravity:``
+    config block — mirroring how the other harnesses persist api keys.
+
+    :returns: None. Side effects: may write the ``antigravity:`` config block
+        and the secret store.
+    """
+    from omnigent.onboarding import secrets as secret_store
+    from omnigent.onboarding.antigravity_auth import (
+        ANTIGRAVITY_CONFIG_KEY,
+        ANTIGRAVITY_SECRET_NAME,
+        antigravity_api_key_configured,
+        antigravity_api_key_ref,
+    )
+    from omnigent.onboarding.interactive import select
+
+    status: str | None = None
+    while True:
+        config = _load_global_config()
+        key_set = antigravity_api_key_configured(config)
+
+        rows: list[_HarnessMenuRow] = [
+            _HarnessMenuRow(
+                "Replace Gemini API key" if key_set else "Set Gemini API key",
+                action="set_key",
+            )
+        ]
+        if key_set:
+            rows.append(_HarnessMenuRow("Remove API key", action="remove_key"))
+        rows.append(_HarnessMenuRow("← Back", action="back"))
+
+        header = (
+            "Antigravity — Gemini API key configured"
+            if key_set
+            else "Antigravity — no Gemini API key yet"
+        )
+        idx = select(header, [r.label for r in rows], clear_on_exit=True, status=status)
+        if idx < 0:  # Esc / q
+            return
+        action = rows[idx].action
+        if action == "back":
+            return
+        if action == "set_key":
+            status = _set_antigravity_api_key()
+        elif action == "remove_key":
+            ref = antigravity_api_key_ref(config)
+            # Only the secret we own (``keychain:antigravity``) is ours to
+            # delete: a hand-edited block may point at a shared ``keychain:<other>``
+            # secret, and an ``env:`` ref names the user's own environment. In
+            # both of those cases just drop the config block and leave the secret.
+            if ref == f"keychain:{ANTIGRAVITY_SECRET_NAME}":
+                secret_store.delete_secret(ANTIGRAVITY_SECRET_NAME)
+            _save_global_config({}, unset_keys=(ANTIGRAVITY_CONFIG_KEY,))
+            status = "✓ Removed Gemini API key"
+
+
+def _set_antigravity_api_key() -> str | None:
+    """Prompt for and store a Gemini API key; return a status line.
+
+    Offers an existing ``GEMINI_API_KEY`` / ``ANTIGRAVITY_API_KEY`` first
+    (recorded as an ``env:`` ref, so the secret stays in the environment), else
+    reads it with a hidden prompt and stores it under ``keychain:antigravity``.
+    The ``AIza`` prefix is checked softly (a wrong paste is caught but can be
+    forced). The key is never echoed.
+
+    :returns: A status string for the menu, or ``None`` if the user aborted.
+    """
+    from omnigent.onboarding import secrets as secret_store
+    from omnigent.onboarding.antigravity_auth import (
+        ANTIGRAVITY_ENV_VARS,
+        ANTIGRAVITY_SECRET_NAME,
+        antigravity_api_key_settings,
+        looks_like_gemini_api_key,
+    )
+    from omnigent.onboarding.interactive import prompt_text
+
+    detected_var = next((v for v in ANTIGRAVITY_ENV_VARS if os.environ.get(v)), None)
+    if detected_var is not None and click.confirm(
+        f"Detected {detected_var} in the environment — use it?", default=True
+    ):
+        detected = os.environ[detected_var]
+        if not looks_like_gemini_api_key(detected) and not click.confirm(
+            f"${detected_var} doesn't start with 'AIza'. Use it anyway?", default=False
+        ):
+            return None
+        _save_global_config(antigravity_api_key_settings(f"env:{detected_var}"))
+        return f"✓ Gemini API key set (from ${detected_var})"
+
+    pasted = prompt_text("Gemini API key (GEMINI_API_KEY)", hide_input=True).strip()
+    if not pasted:
+        return None
+    if not looks_like_gemini_api_key(pasted) and not click.confirm(
+        "That doesn't start with 'AIza'. Store it anyway?", default=False
+    ):
+        return None
+    secret_store.store_secret(ANTIGRAVITY_SECRET_NAME, pasted)
+    _save_global_config(antigravity_api_key_settings(f"keychain:{ANTIGRAVITY_SECRET_NAME}"))
+    return "✓ Gemini API key stored"
+
+
 def _manage_credential(provider: str, family: str) -> str | None:
     """Run the level-3 loop for one credential: make default / remove.
 
@@ -7926,8 +8408,13 @@ def _run_configure_harnesses_interactive() -> None:
         the backfill/adopt steps and any add/set-default/remove the user
         performs while navigating.
     """
+    from omnigent.onboarding.antigravity_auth import (
+        ANTIGRAVITY_ENV_VARS,
+        antigravity_api_key_configured,
+    )
     from omnigent.onboarding.configure_models import family_label
-    from omnigent.onboarding.harness_install import harness_cli_installed
+    from omnigent.onboarding.cursor_auth import cursor_api_key_configured
+    from omnigent.onboarding.harness_install import CURSOR_KEY, harness_cli_installed
     from omnigent.onboarding.interactive import select
     from omnigent.onboarding.provider_config import (
         ANTHROPIC_FAMILY,
@@ -7962,6 +8449,10 @@ def _run_configure_harnesses_interactive() -> None:
     # overview. The menu clears in place on each choice so the session stays on
     # one screen. Quit / Esc / q exits.
     _QUIT = "\x00quit"  # sentinel marking the Quit row (not a family)
+    # Sentinel marking the Antigravity row — it is not a provider family (Gemini
+    # is outside the anthropic/openai machinery), so it dispatches to its own
+    # credential manager rather than ``_manage_harness_providers``.
+    _ANTIGRAVITY = "\x00antigravity"
     families = [ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE]
     while True:
         config = _load_global_config()
@@ -8003,6 +8494,44 @@ def _run_configure_harnesses_interactive() -> None:
                 options.append(f"  {sub_line}")
                 selectable.append(False)  # a sub-line — cursor skips it
                 row_target.append(None)
+        # Cursor: runs via the ``cursor-sdk`` package and authenticates with a
+        # ``CURSOR_API_KEY`` (the SDK requires one; it has no provider/gateway
+        # family and a ``cursor-agent login`` does not apply). So readiness is
+        # simply whether an API key is configured — one stored by setup (the
+        # ``cursor:`` block) or inherited from the environment — and its
+        # drill-in manages exactly that key.
+        cursor_key_set = cursor_api_key_configured(config) or bool(
+            os.environ.get("CURSOR_API_KEY")
+        )
+        options.append(f"{'  ' if cursor_key_set else '[red]✗[/] '}Cursor")
+        selectable.append(True)
+        row_target.append(CURSOR_KEY)
+        cursor_sub = (
+            "[green]✓[/] API key configured"
+            if cursor_key_set
+            else "[dim]no API key yet — open to add one[/]"
+        )
+        options.append(f"  {cursor_sub}")
+        selectable.append(False)
+        row_target.append(None)
+        # Antigravity (Gemini-native, no provider family): like Cursor, readiness
+        # is just whether a Gemini key is configured (``antigravity:`` block or
+        # ambient env); its drill-in manages that key. Vertex specs need no key,
+        # so a ✗ isn't a hard blocker for that path.
+        ag_key_set = antigravity_api_key_configured(config) or any(
+            os.environ.get(v) for v in ANTIGRAVITY_ENV_VARS
+        )
+        options.append(f"{'  ' if ag_key_set else '[red]✗[/] '}Antigravity")
+        selectable.append(True)
+        row_target.append(_ANTIGRAVITY)
+        ag_sub = (
+            "[green]✓[/] Gemini API key configured"
+            if ag_key_set
+            else "[dim]no Gemini API key yet — open to add one[/]"
+        )
+        options.append(f"  {ag_sub}")
+        selectable.append(False)
+        row_target.append(None)
         options.append("Quit")
         selectable.append(True)
         row_target.append(_QUIT)
@@ -8015,8 +8544,12 @@ def _run_configure_harnesses_interactive() -> None:
         if idx < 0:  # Esc / q — exit
             return
         target = row_target[idx]
-        if target in families:
+        if target == CURSOR_KEY:
+            _manage_cursor_harness()
+        elif target in families:
             _manage_harness_providers(target)
+        elif target == _ANTIGRAVITY:
+            _manage_antigravity_harness()
         else:  # Quit row (or, defensively, a non-family row)
             return
 

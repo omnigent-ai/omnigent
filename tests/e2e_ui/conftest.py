@@ -205,6 +205,55 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "instead of rebuilding. Fails if no build is present."
         ),
     )
+    # Round-robin shard split for the e2e-ui CI matrix. We roll our own
+    # (rather than pull in pytest-shard / pytest-split) so the partition
+    # is a dependency-free strided slice -- see pytest_collection_modifyitems
+    # below for why striding beats hash-bucketing for wall-clock balance.
+    parser.addoption(
+        "--splits",
+        type=int,
+        default=None,
+        help="Total number of shards to split the UI suite into (CI matrix).",
+    )
+    parser.addoption(
+        "--group",
+        type=int,
+        default=None,
+        help="1-indexed shard this run executes (requires --splits).",
+    )
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(
+    config: pytest.Config,
+    items: list[pytest.Item],
+) -> None:
+    """Round-robin the collected UI tests across the CI shard matrix.
+
+    pytest-shard hash-buckets node IDs, which is blind to per-test
+    wall-clock and left one shard at ~5min while siblings finished in
+    ~2min. A *strided* slice -- ``items[group-1::splits]`` -- deals tests
+    out like cards instead, so a heavy file (whose cases collect
+    adjacently) scatters one-per-shard rather than landing in a single
+    bucket. That averages cost across shards without maintaining a
+    durations file.
+
+    No-op unless both ``--splits`` and ``--group`` are passed, so local
+    runs and the non-sharded suites are unaffected. ``trylast`` lets the
+    repo-wide known-failures marking in ``tests/conftest.py`` tag items
+    first; markers travel with the items the slice keeps.
+    """
+    splits = config.getoption("--splits")
+    group = config.getoption("--group")
+    if splits is None and group is None:
+        return
+    if splits is None or group is None:
+        raise pytest.UsageError("--splits and --group must be passed together")
+    if splits < 1:
+        raise pytest.UsageError("--splits must be >= 1")
+    if not 1 <= group <= splits:
+        raise pytest.UsageError(f"--group must be between 1 and {splits}")
+    items[:] = items[group - 1 :: splits]
 
 
 def _register_agent_yaml(
@@ -499,8 +548,18 @@ def live_server(
     proc = subprocess.Popen(
         [
             sys.executable,
-            "-m",
-            "omnigent",
+            # Equivalent of the unit tests' ``monkeypatch.setattr(presence,
+            # "_LEAVE_GRACE_S", ...)``, but applied INSIDE this spawned
+            # interpreter — a monkeypatch in the test process can't reach a
+            # subprocess. ``-c`` patches the module global before the CLI
+            # runs; the presence route reads it live at call time, so the
+            # presence-leave assertion in test_collab_realtime clears in ~1s
+            # instead of the prod 15s dwell (which only exists to absorb the
+            # ingress' ~5-min stream recycle a test server never hits).
+            # Mirrors ``python -m omnigent`` (omnigent/__main__.py).
+            "-c",
+            "import omnigent.server.presence as _p; _p._LEAVE_GRACE_S = 1.0; "
+            + "from omnigent.cli import main; main()",
             "server",
             "--host",
             "127.0.0.1",
@@ -1179,6 +1238,129 @@ def two_agent_chat_session(
                 respawned_runner.wait(timeout=5)
 
 
+# ---------------------------------------------------------------------------
+# Approval / elicitation session (approvals suite)
+#
+# ``approval_session`` yields ``(base_url, session_id)`` for a session whose
+# agent deterministically tries a *gated* shell command, so the runner's
+# policy gate escalates an ASK to the server and the web UI renders an
+# ``ApprovalCard`` (and the same prompt surfaces on the /inbox page).
+#
+# The mechanism is the nessie ``blast_radius`` policy with ``gate_pushes:
+# true``: a plain ``git push`` is "recoverable but outward", so the policy
+# returns ASK at the TOOL_CALL phase — before the command runs — which the
+# runner forwards to ``POST /v1/sessions/{id}/policies/evaluate``. The server
+# parks the gate and publishes a ``response.elicitation_request`` the snapshot
+# replays in ``pendingElicitations``. The verdict travels back through
+# ``POST /v1/sessions/{id}/elicitations/{eid}/resolve`` (what the card's
+# Approve/Reject buttons call). ``sys_os_shell`` is registered implicitly by
+# the ``os_env`` block (no explicit ``tools`` needed).
+#
+# The prompt is explicit (mirrors ``_TERMINAL_AGENT_YAML``) because the test
+# relies on the LLM emitting the gated tool call deterministically — the gate
+# fires on the call, not on execution, so the push never has to succeed.
+# ---------------------------------------------------------------------------
+
+_APPROVAL_AGENT_NAME = "approval_probe"
+_APPROVAL_AGENT_YAML = f"""\
+spec_version: 1
+name: {_APPROVAL_AGENT_NAME}
+prompt: |
+  You are a deterministic approval-test assistant. When the user asks you to
+  push, deploy, or "run the command", you MUST do exactly this and nothing
+  else:
+
+  1. Call sys_os_shell with command set to exactly: git push origin main
+  2. After the tool result comes back, reply with one short sentence.
+
+  Do not ask for confirmation; do not explain beforehand; do not run any
+  other command or call any other tool.
+
+executor:
+  model: databricks-gpt-5-4
+  config:
+    harness: openai-agents
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
+
+guardrails:
+  # Generous window: the parked ASK must outlive the UI assertions.
+  ask_timeout: 300
+  policies:
+    blast_radius:
+      type: function
+      function:
+        path: omnigent.inner.nessie.policies.blast_radius
+        arguments:
+          # A plain `git push` is recoverable-but-outward → ASK (vs the
+          # always-DENY catastrophic set). This is the prompt the UI renders.
+          gate_pushes: true
+"""
+
+
+@pytest.fixture
+def approval_session(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """Create a runner-bound session whose agent triggers an approval prompt.
+
+    Same runner-respawn + bind contract as :func:`terminal_session`. The
+    agent is registered through the strict ``config.yaml`` parser (it carries
+    ``spec_version: 1`` + ``executor.config.harness``, plus the ``os_env`` and
+    ``guardrails`` blocks that path supports — see ``examples/polly``).
+
+    :param live_server: Spawned server fixture.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``. Send a "run the command" turn to
+        raise the gated-push approval.
+    """
+    import json as _json
+
+    respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+
+    yaml_bytes = _APPROVAL_AGENT_YAML.encode()
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        # Strict path: arcname config.yaml keeps it on the spec_version:1
+        # parser, which is the one that honors `guardrails`.
+        info = tarfile.TarInfo(name="config.yaml")
+        info.size = len(yaml_bytes)
+        tar.addfile(info, io.BytesIO(yaml_bytes))
+    create_resp = httpx.post(
+        f"{live_server}/v1/sessions",
+        data={"metadata": _json.dumps({})},
+        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
+        timeout=30.0,
+    )
+    create_resp.raise_for_status()
+    session_id = create_resp.json()["session_id"]
+
+    patch_resp = httpx.patch(
+        f"{live_server}/v1/sessions/{session_id}",
+        json={"runner_id": runner_id},
+        timeout=10.0,
+    )
+    patch_resp.raise_for_status()
+
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned_runner is not None:
+            respawned_runner.terminate()
+            try:
+                respawned_runner.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned_runner.kill()
+                respawned_runner.wait(timeout=5)
+
+
 @pytest.fixture(autouse=True)
 def _ui_defaults() -> None:
     """
@@ -1220,3 +1402,381 @@ def server_pid(live_server: str) -> int:
     :returns: OS process id.
     """
     return int(_server_state["pid"])
+
+
+# ---------------------------------------------------------------------------
+# Per-agent chat sessions (message render-parity suite, and reusable beyond it)
+#
+# ``custom_agent_session`` yields ``(base_url, session_id)`` for a session bound
+# to the shared ``live_server`` runner, ready to chat at ``/c/<session_id>``. It
+# registers a plain ``openai-agents`` agent (the ``echo_probe`` spec below) —
+# the same harness family as ``hello_world`` — fresh, so it stands in for "spin
+# up a different agent" without the multi-provider sprawl of the packaged
+# ``polly`` / ``debby`` examples.
+#
+# ``native_claude_session`` is the native-CLI counterpart: it spins up a real
+# ``claude-native`` ("Claude Code") wrapper session — the same terminal-first
+# spec ``omnigent claude`` ships — and yields ``(base_url, session_id)``. The
+# runner auto-launches Claude Code in the session terminal on bind, including
+# the gateway auth it derives from the runner's own credentials and the
+# first-run trust/onboarding pre-accept, so no CLI client is needed. In CI the
+# workflow exchanges Databricks OAuth before pytest runs (the same gateway the
+# ``hello_world`` / ``echo_probe`` agents authenticate against), so Claude Code
+# boots non-interactively. The native render-parity suite drives this fixture.
+#
+# ``native_codex_session`` is the sibling native-CLI fixture for the
+# ``codex-native`` ("Codex") wrapper: it spins up a real Codex wrapper session —
+# the same terminal-first spec ``omnigent codex`` ships — and yields
+# ``(base_url, session_id)``. The runner auto-launches Codex in the session
+# terminal on bind (gateway auth derived from the runner's own credentials +
+# first-run pre-accept handled runner-side), exactly like the claude fixture.
+# The native codex render-parity suite drives it.
+# ---------------------------------------------------------------------------
+
+# A precise-echo agent on the openai-agents harness (same provider family as
+# hello_world, so it authenticates against the same gateway in CI). spec_version
+# 1 + executor.config.harness routes through the strict parser; arcname
+# config.yaml keeps it on that path.
+_CUSTOM_AGENT_NAME = "echo_probe"
+_CUSTOM_AGENT_YAML = f"""\
+spec_version: 1
+name: {_CUSTOM_AGENT_NAME}
+prompt: |
+  You are a precise echo assistant. The user sends a turn that ends with an
+  instruction to reply with one exact token. Reply with that token verbatim
+  and nothing else — no preamble, no quotes, no trailing punctuation.
+
+executor:
+  model: databricks-gpt-5-4
+  config:
+    harness: openai-agents
+"""
+
+
+def _bind_session_runner(base_url: str, session_id: str, runner_id: str) -> None:
+    """PATCH *session_id* onto *runner_id* so ``POST /v1/responses`` dispatches.
+
+    :param base_url: Spawned server base URL, e.g. ``"http://127.0.0.1:51234"``.
+    :param session_id: The session/conversation id to bind.
+    :param runner_id: The token-bound runner id the session dispatches to.
+    """
+    patch = httpx.patch(
+        f"{base_url}/v1/sessions/{session_id}",
+        json={"runner_id": runner_id},
+        timeout=10.0,
+    )
+    patch.raise_for_status()
+
+
+def _create_bundled_session(base_url: str, runner_id: str, yaml_text: str) -> str:
+    """Register a session-scoped agent from *yaml_text* and bind its session.
+
+    The multipart ``POST /v1/sessions`` both registers the agent and creates
+    the session it is scoped to, returning that ``session_id`` directly — so
+    no separate create call is needed.
+
+    :param base_url: Spawned server base URL.
+    :param runner_id: The token-bound runner id to bind.
+    :param yaml_text: The agent spec body.
+    :returns: The new session/conversation id.
+    """
+    import json as _json
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        data = yaml_text.encode()
+        info = tarfile.TarInfo("config.yaml")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+
+    create = httpx.post(
+        f"{base_url}/v1/sessions",
+        data={"metadata": _json.dumps({})},
+        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
+        timeout=30.0,
+    )
+    create.raise_for_status()
+    session_id = str(create.json()["session_id"])
+    _bind_session_runner(base_url, session_id, runner_id)
+    return session_id
+
+
+@pytest.fixture
+def custom_agent_session(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A runner-bound session on the custom ``echo_probe`` agent.
+
+    :param live_server: Spawned server fixture; its runner is reused.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``.
+    """
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    session_id = _create_bundled_session(live_server, runner_id, _CUSTOM_AGENT_YAML)
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
+            respawned.wait(timeout=5)
+
+
+def _create_native_claude_session(
+    base_url: str,
+    runner_id: str,
+    *,
+    terminal_launch_args: list[str] | None = None,
+) -> str:
+    """Register the ``claude-native`` wrapper agent and bind its session.
+
+    Reuses the exact terminal-first spec ``omnigent claude`` ships
+    (:func:`omnigent.claude_native._materialize_claude_agent_spec`) so the
+    fixture never drifts from production, and stamps the same wrapper /
+    terminal-first labels (``omnigent.wrapper`` + ``omnigent.ui = terminal``)
+    the CLI writes. The spec carries no ``spec_version``, so it is bundled
+    under a ``*.yaml`` arcname to route through the omnigent compat translator
+    (which preserves ``executor.harness`` + ``terminals:``); a ``config.yaml``
+    arcname would hit the strict parser and reject it.
+
+    Binding the session to the runner triggers the runner's claude-native
+    auto-bootstrap: it launches Claude Code in the session terminal, derives
+    the gateway auth from its own credentials, and pre-accepts the first-run
+    trust/onboarding prompts — no CLI client required.
+
+    :param base_url: Spawned server base URL.
+    :param runner_id: The token-bound runner id to bind.
+    :param terminal_launch_args: Pass-through ``claude`` CLI args persisted on
+        the session (``conversations.terminal_launch_args``); the runner threads
+        them into the terminal launch before its own bridge/MCP/hook wiring (see
+        ``_build_claude_native_base_args`` in ``omnigent/runner/app.py``). Used
+        by the plan-mode fixture to pass ``["--permission-mode", "plan"]`` so
+        Claude boots into plan mode and reaches for ``ExitPlanMode``. ``None``
+        launches with the production defaults.
+    :returns: The new session/conversation id.
+    """
+    import json as _json
+    import tempfile
+
+    from omnigent._wrapper_labels import (
+        CLAUDE_NATIVE_WRAPPER_VALUE,
+        UI_MODE_LABEL_KEY,
+        UI_MODE_TERMINAL_VALUE,
+        WRAPPER_LABEL_KEY,
+    )
+    from omnigent.claude_native import _materialize_claude_agent_spec
+
+    with tempfile.TemporaryDirectory() as _tmp:
+        spec_path = _materialize_claude_agent_spec(Path(_tmp))
+        yaml_text = spec_path.read_text()
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        data = yaml_text.encode()
+        # Non-config.yaml arcname → omnigent compat translator (the spec has
+        # no spec_version), matching the terminal_session fixture.
+        info = tarfile.TarInfo("claude-native-ui.yaml")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+
+    labels = {
+        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
+        WRAPPER_LABEL_KEY: CLAUDE_NATIVE_WRAPPER_VALUE,
+    }
+    metadata: dict[str, object] = {"labels": labels}
+    if terminal_launch_args:
+        metadata["terminal_launch_args"] = terminal_launch_args
+    create = httpx.post(
+        f"{base_url}/v1/sessions",
+        data={"metadata": _json.dumps(metadata)},
+        files={"bundle": ("claude-native-ui.tar.gz", buf.getvalue(), "application/gzip")},
+        timeout=30.0,
+    )
+    create.raise_for_status()
+    session_id = str(create.json()["session_id"])
+    _bind_session_runner(base_url, session_id, runner_id)
+    return session_id
+
+
+@pytest.fixture
+def native_claude_session(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A runner-bound session on the real ``claude-native`` ("Claude Code") wrapper.
+
+    The runner auto-launches Claude Code in the session terminal on bind
+    (gateway auth + first-run pre-accept handled runner-side), so the SPA's
+    Terminal view attaches to a live Claude Code TUI and its Chat view renders
+    the same canonical transcript. Drives the native render-parity suite.
+
+    :param live_server: Spawned server fixture; its runner is reused.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``.
+    """
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    session_id = _create_native_claude_session(live_server, runner_id)
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
+            # Escalate to SIGKILL if the runner ignores SIGTERM, so a wedged
+            # process can't raise in teardown and leak / fail unrelated tests
+            # (matching terminal_session / seeded_session_pair).
+            try:
+                respawned.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned.kill()
+                respawned.wait(timeout=5)
+
+
+@pytest.fixture
+def native_claude_plan_session(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A native ``claude-native`` session launched in **plan mode**.
+
+    Identical to :func:`native_claude_session` except the session carries
+    ``terminal_launch_args=["--permission-mode", "plan"]`` so the runner boots
+    Claude Code into plan mode. In plan mode Claude researches a task and then
+    calls its built-in ``ExitPlanMode`` tool to present the plan for approval;
+    that call rides the native ``PermissionRequest`` hook to the server, which
+    stamps the ``exit_plan_mode`` extras and publishes an elicitation the SPA
+    renders as ``ExitPlanModeReview`` inside an ``ApprovalCard``. Drives the
+    Exit-Plan-Mode review e2e (``approvals/test_exit_plan_mode.py``).
+
+    :param live_server: Spawned server fixture; its runner is reused.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``.
+    """
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    session_id = _create_native_claude_session(
+        live_server,
+        runner_id,
+        terminal_launch_args=["--permission-mode", "plan"],
+    )
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
+            try:
+                respawned.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned.kill()
+                respawned.wait(timeout=5)
+
+
+def _create_native_codex_session(base_url: str, runner_id: str) -> str:
+    """Register the ``codex-native`` wrapper agent and bind its session.
+
+    Reuses the exact terminal-first spec ``omnigent codex`` ships
+    (:func:`omnigent.codex_native._materialize_codex_agent_spec`) so the
+    fixture never drifts from production, and stamps the same wrapper /
+    terminal-first labels (``omnigent.wrapper`` + ``omnigent.ui = terminal``)
+    the CLI writes. The spec carries no ``spec_version``, so it is bundled
+    under a ``*.yaml`` arcname to route through the omnigent compat translator
+    (which preserves ``executor.harness`` + ``terminals:``); a ``config.yaml``
+    arcname would hit the strict parser and reject it.
+
+    Binding the session to the runner triggers the runner's codex-native
+    auto-bootstrap: it launches Codex in the session terminal, derives the
+    gateway auth from its own credentials, and pre-accepts the first-run
+    trust/onboarding prompts — no CLI client required. ``model=None`` lets the
+    configured provider's default model win (matching ``_build_codex_native_bundle``).
+
+    :param base_url: Spawned server base URL.
+    :param runner_id: The token-bound runner id to bind.
+    :returns: The new session/conversation id.
+    """
+    import json as _json
+    import tempfile
+
+    from omnigent._wrapper_labels import (
+        CODEX_NATIVE_WRAPPER_VALUE,
+        UI_MODE_LABEL_KEY,
+        UI_MODE_TERMINAL_VALUE,
+        WRAPPER_LABEL_KEY,
+    )
+    from omnigent.codex_native import _materialize_codex_agent_spec
+
+    with tempfile.TemporaryDirectory() as _tmp:
+        spec_path = _materialize_codex_agent_spec(Path(_tmp), model=None)
+        yaml_text = spec_path.read_text()
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        data = yaml_text.encode()
+        # Non-config.yaml arcname → omnigent compat translator (the spec has
+        # no spec_version), matching the terminal_session fixture.
+        info = tarfile.TarInfo("codex-native-ui.yaml")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+
+    labels = {
+        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
+        WRAPPER_LABEL_KEY: CODEX_NATIVE_WRAPPER_VALUE,
+    }
+    # Runner-owned Codex terminals hard-require a workspace: unlike the
+    # claude-native path (which falls back to Path.cwd()),
+    # _codex_session_workspace raises if neither the session's stored
+    # ``workspace`` nor OMNIGENT_RUNNER_WORKSPACE is set. Pin it on THIS
+    # session only (via metadata.workspace) rather than exporting
+    # OMNIGENT_RUNNER_WORKSPACE on the shared runner — a runner-wide value
+    # changes file-surface advertisement for every other session on the runner
+    # (it regressed the mobile file-drawer suite). The repo root is the same cwd
+    # claude falls back to, and is a valid dir on the runner's filesystem.
+    metadata = {"labels": labels, "workspace": str(_REPO_ROOT)}
+    create = httpx.post(
+        f"{base_url}/v1/sessions",
+        data={"metadata": _json.dumps(metadata)},
+        files={"bundle": ("codex-native-ui.tar.gz", buf.getvalue(), "application/gzip")},
+        timeout=30.0,
+    )
+    create.raise_for_status()
+    session_id = str(create.json()["session_id"])
+    _bind_session_runner(base_url, session_id, runner_id)
+    return session_id
+
+
+@pytest.fixture
+def native_codex_session(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A runner-bound session on the real ``codex-native`` ("Codex") wrapper.
+
+    The runner auto-launches Codex in the session terminal on bind (gateway
+    auth + first-run pre-accept handled runner-side), so the SPA's Terminal
+    view attaches to a live Codex TUI and its Chat view renders the same
+    canonical transcript. Drives the native codex render-parity suite.
+
+    :param live_server: Spawned server fixture; its runner is reused.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``.
+    """
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    session_id = _create_native_codex_session(live_server, runner_id)
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
+            # Escalate to SIGKILL if the runner ignores SIGTERM, so a wedged
+            # process can't raise in teardown and leak / fail unrelated tests
+            # (matching terminal_session / seeded_session_pair).
+            try:
+                respawned.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned.kill()
+                respawned.wait(timeout=5)

@@ -816,7 +816,20 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       // `POST /v1/sessions/{id}/events {type: "approval"}`.
       yield {
         type: "elicitation",
-        ctx: ctx(state),
+        // A REQUEST-phase elicitation gates the user's prompt BEFORE any
+        // turn is forwarded, so no `response_start` has reset
+        // `state.responseId` — it still holds the PREVIOUS turn's response
+        // id. Left as-is, bubble grouping would fold this card into the
+        // prior assistant bubble (a follow-up "Hi again" ASK lands inside
+        // the last answer), defeating the ChatPage reorder that keeps the
+        // prompt above its card. Stamp a unique id off the elicitation so
+        // the card always forms its own standalone bubble. Other phases
+        // (tool_call) keep the active response id so the card renders
+        // inline with the turn that triggered it.
+        ctx:
+          event.phase === "request"
+            ? ctx(state, null, `elicit_${event.elicitationId}`)
+            : ctx(state),
         elicitationId: event.elicitationId,
         targetSessionId: event.targetSessionId,
         message: event.message,

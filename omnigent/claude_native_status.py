@@ -99,6 +99,24 @@ def _write_context_atomic(bridge_dir: Path, payload: dict[str, object]) -> None:
             and total_cost >= 0
         ):
             record["total_cost_usd"] = float(total_cost)
+    # Claude Code's statusLine stdin carries the active model as a ``model``
+    # block (``{"id": "claude-opus-4-8", "display_name": "Opus"}``), rewritten
+    # on every render — including right after an in-pane ``/model`` switch.
+    # Capture the concrete id so the forwarder can mirror the switch to
+    # ``model_override`` on the next poll, before the user's next message,
+    # rather than waiting for the next turn's transcript to reveal the model
+    # (which lagged model-gated policies by one turn). Defensive about the
+    # shape: accept a ``{id|display_name}`` dict or a bare string.
+    model = payload.get("model")
+    model_id: str | None = None
+    if isinstance(model, dict):
+        raw_model = model.get("id") or model.get("display_name")
+        if isinstance(raw_model, str) and raw_model.strip():
+            model_id = raw_model.strip()
+    elif isinstance(model, str) and model.strip():
+        model_id = model.strip()
+    if model_id is not None:
+        record["model"] = model_id
     try:
         bridge_dir.mkdir(parents=True, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(prefix=".context-", dir=str(bridge_dir))
