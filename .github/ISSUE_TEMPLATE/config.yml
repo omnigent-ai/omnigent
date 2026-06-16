@@ -1,0 +1,7 @@
+blank_issues_enabled: false
+
+contact_links:
+
+* name: Documentation
+  url: https://omnigent.ai
+  about: Review the documentation before opening an issue.

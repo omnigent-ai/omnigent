@@ -1,0 +1,90 @@
+name: Bug Report
+description: Report a bug, regression, or unexpected behavior.
+title: "[Bug]: "
+labels: ["bug"]
+
+body:
+
+* type: markdown
+  attributes:
+  value: |
+  Thanks for helping improve OmniGent. Please provide as much detail as possible so we can reproduce and investigate the issue.
+
+* type: textarea
+  id: summary
+  attributes:
+  label: Summary
+  description: Describe the issue briefly.
+  validations:
+  required: true
+
+* type: textarea
+  id: actual-behavior
+  attributes:
+  label: What happened?
+  description: Describe the observed behavior.
+  validations:
+  required: true
+
+* type: textarea
+  id: expected-behavior
+  attributes:
+  label: What did you expect?
+  description: Describe the expected behavior.
+  validations:
+  required: true
+
+* type: textarea
+  id: reproduction
+  attributes:
+  label: Steps to reproduce
+  description: Provide the exact steps needed to reproduce the issue.
+  placeholder: |
+  1.
+  2.
+  3.
+  validations:
+  required: true
+
+* type: dropdown
+  id: component
+  attributes:
+  label: Affected component
+  description: Which area of OmniGent is affected?
+  options:
+  - Agent execution
+  - Model integration
+  - Tool usage
+  - Memory / context
+  - UI / frontend
+  - Backend / API
+  - Documentation
+  - Installation / setup
+  - Other
+  validations:
+  required: true
+
+* type: textarea
+  id: environment
+  attributes:
+  label: Environment
+  description: Share any relevant environment details.
+  placeholder: |
+  OmniGent version:
+  OS:
+  Python version:
+  Browser (if applicable):
+  Model/provider used:
+  Deployment method (local, Docker, cloud, etc.):
+
+* type: textarea
+  id: logs
+  attributes:
+  label: Logs / screenshots
+  description: Paste logs, stack traces, screenshots, or error messages.
+
+* type: textarea
+  id: additional-context
+  attributes:
+  label: Additional context
+  description: Add any other information that may help diagnose the issue.
