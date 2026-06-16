@@ -86,6 +86,22 @@ jobs:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: npm ci --legacy-peer-deps
 
+      # The npm equivalent of the `uv sync --locked` gate above. `npm ci`
+      # only checks the lockfile is CONSISTENT with package.json; it
+      # tolerates cosmetic drift (dev/extraneous flags, metadata) that a
+      # fresh resolution would rewrite. Regenerate the lockfile and fail
+      # if it differs from the committed one.
+      - name: Check ap-web/package-lock.json is up to date
+        working-directory: ap-web
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: |
+          npm install --package-lock-only --legacy-peer-deps --no-audit --no-fund
+          git diff --exit-code package-lock.json || {
+            echo "::error::ap-web/package-lock.json is out of date. Run 'npm install --package-lock-only --legacy-peer-deps' in ap-web/ and commit the result."
+            exit 1
+          }
+
       - name: Run formatting, lint, and typing checks
         run: uv run pre-commit run --all-files --show-diff-on-failure
 

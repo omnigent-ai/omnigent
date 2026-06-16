@@ -685,13 +685,13 @@ describe("NewChatLandingScreen", () => {
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
-    const fullAutoOption = screen.getByTestId("new-chat-landing-approval-full-auto");
-    expect(fullAutoOption.textContent).toContain("Full auto");
+    const neverOption = screen.getByTestId("new-chat-landing-approval-never");
+    expect(neverOption.textContent).toContain("Never");
     // The footer line explains the SELECTED mode until a row is hovered.
     const detail = screen.getByTestId("new-chat-landing-approval-detail");
-    expect(detail.textContent).toContain("Prompts before edits and commands");
-    fireEvent.pointerEnter(fullAutoOption);
-    expect(detail.textContent).toContain("Runs everything; no prompts or safety checks");
+    expect(detail.textContent).toContain("Model decides when to ask for approval");
+    fireEvent.pointerEnter(neverOption);
+    expect(detail.textContent).toContain("Never asks for approval");
   });
 
   it("shows a conflict banner in the file browser for an occupied directory", async () => {

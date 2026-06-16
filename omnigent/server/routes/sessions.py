@@ -12700,12 +12700,24 @@ def create_sessions_router(
             and model_override.strip().lower() in EFFORT_CLEAR_VALUES
         )
         if model_override is not None and not clear_model:
-            if not isinstance(model_override, str) or not model_override.strip():
+            # Mirror the create path: the persisted value reaches a native
+            # CLI as a ``--model`` argv element and the Codex provider
+            # ``config.toml`` as a ``model="..."`` field, so it must pass the
+            # conservative model-id charset before it is stored. A bare
+            # strip()/non-empty check here let shell-/TOML-shaped values
+            # through, enabling host RCE via the Codex ``auth.command``.
+            if not isinstance(model_override, str):
                 raise OmnigentError(
                     "invalid model_override: must be a non-empty string",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            model_override = model_override.strip()
+            try:
+                model_override = validate_model_override(model_override)
+            except ValueError as exc:
+                raise OmnigentError(
+                    f"invalid model_override: {exc}",
+                    code=ErrorCode.INVALID_INPUT,
+                ) from exc
 
         # Cost-control switch: ``"off"`` is a real stored value here,
         # so the clear signal is an explicit JSON null (field present,
