@@ -21,6 +21,7 @@ from unittest.mock import patch
 import pytest
 
 from omnigent.inner import pi_harness
+from omnigent.runner.identity import RUNNER_WORKSPACE_ENV_VAR
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 
 
@@ -139,6 +140,47 @@ def test_executor_factory_reads_env_vars(
     assert os_env_value.type == "caller_process"
     assert os_env_value.sandbox is not None
     assert os_env_value.sandbox.type == "none"
+
+
+def test_executor_factory_falls_back_to_runner_workspace_when_cwd_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing ``HARNESS_PI_CWD`` falls back to the runner workspace.
+
+    The Pi harness does not always receive an explicit cwd env var from the
+    runner. In that case it should honor the same session workspace contract
+    as the native harnesses via ``OMNIGENT_RUNNER_WORKSPACE``.
+    """
+    monkeypatch.delenv("HARNESS_PI_CWD", raising=False)
+    monkeypatch.setenv(RUNNER_WORKSPACE_ENV_VAR, "/tmp/runner-workspace")
+
+    captured: dict[str, Any] = {}
+
+    def _fake_init(self: Any, **kwargs: Any) -> None:
+        captured["cwd"] = kwargs["cwd"]
+
+    with patch("omnigent.inner.pi_harness.PiExecutor.__init__", _fake_init):
+        pi_harness._build_pi_executor()
+
+    assert captured["cwd"] == "/tmp/runner-workspace"
+
+
+def test_executor_factory_prefers_explicit_cwd_over_runner_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit ``HARNESS_PI_CWD`` still wins over the runner workspace."""
+    monkeypatch.setenv("HARNESS_PI_CWD", "/tmp/explicit-cwd")
+    monkeypatch.setenv(RUNNER_WORKSPACE_ENV_VAR, "/tmp/runner-workspace")
+
+    captured: dict[str, Any] = {}
+
+    def _fake_init(self: Any, **kwargs: Any) -> None:
+        captured["cwd"] = kwargs["cwd"]
+
+    with patch("omnigent.inner.pi_harness.PiExecutor.__init__", _fake_init):
+        pi_harness._build_pi_executor()
+
+    assert captured["cwd"] == "/tmp/explicit-cwd"
 
 
 def test_executor_factory_decodes_os_env_json(
