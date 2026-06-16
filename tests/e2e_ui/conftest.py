@@ -1301,8 +1301,13 @@ def server_pid(live_server: str) -> int:
 # ``hello_world`` / ``echo_probe`` agents authenticate against), so Claude Code
 # boots non-interactively. The native render-parity suite drives this fixture.
 #
-# ``codex-native-ui`` is still not wired up here — add a sibling fixture
-# alongside that effort.
+# ``native_codex_session`` is the sibling native-CLI fixture for the
+# ``codex-native`` ("Codex") wrapper: it spins up a real Codex wrapper session —
+# the same terminal-first spec ``omnigent codex`` ships — and yields
+# ``(base_url, session_id)``. The runner auto-launches Codex in the session
+# terminal on bind (gateway auth derived from the runner's own credentials +
+# first-run pre-accept handled runner-side), exactly like the claude fixture.
+# The native codex render-parity suite drives it.
 # ---------------------------------------------------------------------------
 
 # A precise-echo agent on the openai-agents harness (same provider family as
@@ -1476,6 +1481,113 @@ def native_claude_session(
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
     session_id = _create_native_claude_session(live_server, runner_id)
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
+            # Escalate to SIGKILL if the runner ignores SIGTERM, so a wedged
+            # process can't raise in teardown and leak / fail unrelated tests
+            # (matching terminal_session / seeded_session_pair).
+            try:
+                respawned.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned.kill()
+                respawned.wait(timeout=5)
+
+
+def _create_native_codex_session(base_url: str, runner_id: str) -> str:
+    """Register the ``codex-native`` wrapper agent and bind its session.
+
+    Reuses the exact terminal-first spec ``omnigent codex`` ships
+    (:func:`omnigent.codex_native._materialize_codex_agent_spec`) so the
+    fixture never drifts from production, and stamps the same wrapper /
+    terminal-first labels (``omnigent.wrapper`` + ``omnigent.ui = terminal``)
+    the CLI writes. The spec carries no ``spec_version``, so it is bundled
+    under a ``*.yaml`` arcname to route through the omnigent compat translator
+    (which preserves ``executor.harness`` + ``terminals:``); a ``config.yaml``
+    arcname would hit the strict parser and reject it.
+
+    Binding the session to the runner triggers the runner's codex-native
+    auto-bootstrap: it launches Codex in the session terminal, derives the
+    gateway auth from its own credentials, and pre-accepts the first-run
+    trust/onboarding prompts — no CLI client required. ``model=None`` lets the
+    configured provider's default model win (matching ``_build_codex_native_bundle``).
+
+    :param base_url: Spawned server base URL.
+    :param runner_id: The token-bound runner id to bind.
+    :returns: The new session/conversation id.
+    """
+    import json as _json
+    import tempfile
+
+    from omnigent._wrapper_labels import (
+        CODEX_NATIVE_WRAPPER_VALUE,
+        UI_MODE_LABEL_KEY,
+        UI_MODE_TERMINAL_VALUE,
+        WRAPPER_LABEL_KEY,
+    )
+    from omnigent.codex_native import _materialize_codex_agent_spec
+
+    with tempfile.TemporaryDirectory() as _tmp:
+        spec_path = _materialize_codex_agent_spec(Path(_tmp), model=None)
+        yaml_text = spec_path.read_text()
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        data = yaml_text.encode()
+        # Non-config.yaml arcname → omnigent compat translator (the spec has
+        # no spec_version), matching the terminal_session fixture.
+        info = tarfile.TarInfo("codex-native-ui.yaml")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+
+    labels = {
+        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
+        WRAPPER_LABEL_KEY: CODEX_NATIVE_WRAPPER_VALUE,
+    }
+    # Runner-owned Codex terminals hard-require a workspace: unlike the
+    # claude-native path (which falls back to Path.cwd()),
+    # _codex_session_workspace raises if neither the session's stored
+    # ``workspace`` nor OMNIGENT_RUNNER_WORKSPACE is set. Pin it on THIS
+    # session only (via metadata.workspace) rather than exporting
+    # OMNIGENT_RUNNER_WORKSPACE on the shared runner — a runner-wide value
+    # changes file-surface advertisement for every other session on the runner
+    # (it regressed the mobile file-drawer suite). The repo root is the same cwd
+    # claude falls back to, and is a valid dir on the runner's filesystem.
+    metadata = {"labels": labels, "workspace": str(_REPO_ROOT)}
+    create = httpx.post(
+        f"{base_url}/v1/sessions",
+        data={"metadata": _json.dumps(metadata)},
+        files={"bundle": ("codex-native-ui.tar.gz", buf.getvalue(), "application/gzip")},
+        timeout=30.0,
+    )
+    create.raise_for_status()
+    session_id = str(create.json()["session_id"])
+    _bind_session_runner(base_url, session_id, runner_id)
+    return session_id
+
+
+@pytest.fixture
+def native_codex_session(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A runner-bound session on the real ``codex-native`` ("Codex") wrapper.
+
+    The runner auto-launches Codex in the session terminal on bind (gateway
+    auth + first-run pre-accept handled runner-side), so the SPA's Terminal
+    view attaches to a live Codex TUI and its Chat view renders the same
+    canonical transcript. Drives the native codex render-parity suite.
+
+    :param live_server: Spawned server fixture; its runner is reused.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``.
+    """
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    session_id = _create_native_codex_session(live_server, runner_id)
     try:
         yield (live_server, session_id)
     finally:

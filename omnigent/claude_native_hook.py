@@ -17,6 +17,7 @@ from omnigent.claude_native_bridge import (
     read_active_session_id,
     read_bridge_id,
     read_claude_session_id,
+    read_claude_status_model,
     read_permission_hook_config,
     read_seen_claude_session_ids,
     record_hook_event,
@@ -779,6 +780,25 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     if eval_request is None:
         # Unrecognized hook event — no policy to evaluate.
         return 0
+
+    # Stamp the live model from this session's statusLine capture (the
+    # statusLine wrapper writes the active model id into ``context.json`` on
+    # every render — including right after an in-pane ``/model`` switch). This
+    # is the cost gate's source of truth at hook time, race-free, unlike the
+    # forwarder's async ``model_override`` mirror which lags a poll behind.
+    # Without it the cost-budget gate can see an unresolved model (None) and
+    # fail closed — blocking a cheap-model (sonnet/haiku) session over budget,
+    # even though only expensive tiers should be gated (the server prefers a
+    # stamped model over its own resolution; see ``PolicyEngine._inject_model``).
+    # hook_payload_to_evaluation_request always returns an event with a
+    # "context" dict, so index it directly (fail loud if that contract changes).
+    context = eval_request["event"]["context"]
+    # Stamp the harness so the over-budget message names claude-native's
+    # model-switch surface (the in-pane ``/model`` picker).
+    context["harness"] = "claude-native"
+    status_model = read_claude_status_model(bridge_dir)
+    if status_model:
+        context["model"] = status_model
 
     url = f"{ap_server_url.rstrip('/')}/v1/sessions/{url_component(session_id)}/policies/evaluate"
     try:

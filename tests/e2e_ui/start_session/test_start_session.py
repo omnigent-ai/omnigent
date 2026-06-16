@@ -356,6 +356,24 @@ async def _drive_select_harness(base_url: str, session_id: str) -> None:
                 create_bodies=create_bodies,
                 agents_body=_bundle_agents_body(),
             )
+
+            # Neutralize agent discovery so only the stubbed bundle agents
+            # (Polly/Debby) feed the picker. The landing picker merges
+            # `/v1/agents` with agents found by scanning the caller's sessions
+            # (`/v1/sessions?kind=any`); on the shared e2e_ui server, a native
+            # fork another test left behind sorts ahead of bundle agents and
+            # auto-selects, so the Advanced chip would open permission modes
+            # (or nothing) instead of Polly's harness group. Registered after
+            # _register_common_routes so it wins the kind=any scan.
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
             # Seed a recent working directory so the working-directory chip
             # auto-fills and Send can enable without touching the file browser.
             await page.add_init_script(

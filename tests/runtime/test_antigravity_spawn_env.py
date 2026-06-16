@@ -112,11 +112,22 @@ def test_api_key_auth_threads_key_only() -> None:
     assert "HARNESS_ANTIGRAVITY_GATEWAY_BASE_URL" not in env
 
 
-def test_global_api_key_used_when_spec_has_no_auth(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The global config api key is used only when the spec declares no auth."""
-    monkeypatch.setattr(wf, "_load_global_auth", lambda: ApiKeyAuth(api_key="global-key"))
+def test_global_auth_is_not_adopted_when_spec_has_no_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The legacy global ``auth:`` key is NEVER adopted by antigravity.
+
+    The global block carries the OpenAI/gateway key the other SDK harnesses
+    inherit (an ``sk-…`` key); the Gemini-native SDK can't use it, so shipping
+    it as ``HARNESS_ANTIGRAVITY_API_KEY`` would guarantee an auth failure /
+    mis-billing. With no spec auth, no stored block, and no ambient Gemini key,
+    the builder must emit no key at all (the wrap then uses ambient/Vertex
+    creds). Against the old global-``auth:`` fallback this would have set
+    ``HARNESS_ANTIGRAVITY_API_KEY`` to the OpenAI key.
+    """
+    monkeypatch.setattr(wf, "_load_global_auth", lambda: ApiKeyAuth(api_key="sk-openai-global"))
     env = _build_antigravity_spawn_env(_make_spec(model="gemini-3-pro", auth=None))
-    assert env["HARNESS_ANTIGRAVITY_API_KEY"] == "global-key"
+    assert "HARNESS_ANTIGRAVITY_API_KEY" not in env
 
 
 def test_vertex_config_threads_project_and_location() -> None:
@@ -221,15 +232,16 @@ def test_spec_api_key_auth_wins_over_stored_key(
     assert env["HARNESS_ANTIGRAVITY_API_KEY"] == "AIza_explicit_999"
 
 
-def test_stored_key_wins_over_global_auth(
+def test_stored_key_used_and_global_auth_ignored(
     monkeypatch: pytest.MonkeyPatch, _isolate_global_config: Path
 ) -> None:
-    """The dedicated ``antigravity:`` block outranks the legacy global ``auth:``.
+    """The dedicated ``antigravity:`` block is used; the global ``auth:`` is ignored.
 
-    Both are no-auth-spec fallbacks; the Gemini-specific block is preferred so a
-    Gemini key never loses to a global ``auth:`` key meant for another harness.
+    The Gemini-specific block authenticates a no-auth spec, and a present global
+    ``auth:`` key (meant for another harness) has no influence at all. Against
+    the old behavior the global key was a fallback tier; now it is never read.
     """
-    monkeypatch.setattr(wf, "_load_global_auth", lambda: ApiKeyAuth(api_key="global-key"))
+    monkeypatch.setattr(wf, "_load_global_auth", lambda: ApiKeyAuth(api_key="sk-openai-global"))
     monkeypatch.setenv("GEMINI_KEY_SRC", "AIza_stored_123")
     _write_antigravity_config(_isolate_global_config, "env:GEMINI_KEY_SRC")
     env = _build_antigravity_spawn_env(_make_spec(model="gemini-3-pro", auth=None))
@@ -262,6 +274,23 @@ def test_ambient_gemini_key_adopted_when_no_config(
     launched with one) authenticates a no-auth spec without per-spec config.
     """
     monkeypatch.setattr(wf, "_load_global_auth", lambda: None)
+    monkeypatch.setenv("GEMINI_API_KEY", "AIza_ambient_456")
+    env = _build_antigravity_spawn_env(_make_spec(model="gemini-3-pro", auth=None))
+    assert env["HARNESS_ANTIGRAVITY_API_KEY"] == "AIza_ambient_456"
+
+
+def test_ambient_gemini_key_wins_over_global_openai_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ambient ``GEMINI_API_KEY`` is used while a global OpenAI ``auth:`` is ignored.
+
+    This is the core credential-safety guarantee: with no spec auth and no stored
+    ``antigravity:`` block, a present global ``auth:`` (the OpenAI/gateway
+    ``sk-…`` key) must not short-circuit the user's ambient Gemini key. Against
+    the old global-``auth:`` fallback the builder would have shipped
+    ``sk-openai-global`` instead of the real Gemini key.
+    """
+    monkeypatch.setattr(wf, "_load_global_auth", lambda: ApiKeyAuth(api_key="sk-openai-global"))
     monkeypatch.setenv("GEMINI_API_KEY", "AIza_ambient_456")
     env = _build_antigravity_spawn_env(_make_spec(model="gemini-3-pro", auth=None))
     assert env["HARNESS_ANTIGRAVITY_API_KEY"] == "AIza_ambient_456"

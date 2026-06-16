@@ -34,6 +34,7 @@ from omnigent.inner.executor import (
     TurnCancelled,
     TurnComplete,
 )
+from omnigent.llms._usage_observer import add_observer
 
 # ── Fakes mirroring the real SDK streaming shapes ───────────────────────
 
@@ -765,6 +766,152 @@ async def test_agent_reused_across_turns_same_session(monkeypatch: pytest.Monkey
     # the cached agent (and its SDK conversation state) was reused.
     assert len(captured["agents"]) == 1
     assert captured["agents"][0].conversation.sends == ["one", "two"]
+
+
+@pytest.mark.asyncio
+async def test_fresh_session_replays_prior_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A FRESH agent seeds prior user/assistant turns into its first send().
+
+    Models a rebuilt/restarted session: the turn arrives with prior history but
+    the SDK conversation is brand new (and the SDK has no history-injection
+    API). The prior turns must ride into the single send() as a context prefix,
+    so the agent doesn't lose them. Without the seeding fix the agent would only
+    ever see the latest user text.
+    """
+    captured = _install_fake_sdk(monkeypatch, scripts=[[_text_step("reply")]])
+    executor = AntigravityExecutor()
+
+    messages = [
+        {"role": "user", "content": "what is 2+2?", "session_id": "s1"},
+        {"role": "assistant", "content": "4", "session_id": "s1"},
+        {"role": "user", "content": "and times 3?", "session_id": "s1"},
+    ]
+    await _drain(executor, messages)
+
+    # One agent, one send. That send must carry the prior turns AND the latest
+    # user text — not just the latest text (the pre-fix behavior).
+    sends = captured["agents"][0].conversation.sends
+    assert len(sends) == 1
+    seeded = sends[0]
+    assert "what is 2+2?" in seeded  # prior user turn replayed
+    assert "assistant: 4" in seeded  # prior assistant turn replayed
+    assert "and times 3?" in seeded  # latest user input still present
+    # The latest input is not the whole prompt — proves a prefix was prepended.
+    assert seeded != "and times 3?"
+
+
+@pytest.mark.asyncio
+async def test_rebuilt_session_replays_history_after_signature_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A model switch rebuilds the agent; the rebuild re-seeds prior history.
+
+    A signature change (model/system-prompt/tools) discards the live SDK
+    conversation, so the *rebuilt* agent is fresh and must be re-seeded with the
+    history it just lost — the same context-loss bug a server restart causes.
+    """
+    captured = _install_fake_sdk(monkeypatch, scripts=[[_text_step("a")], [_text_step("b")]])
+    executor = AntigravityExecutor(model="gemini-3-pro")
+
+    await _drain(executor, [{"role": "user", "content": "first", "session_id": "s1"}])
+    # Second turn carries the accumulated history AND switches model, forcing a
+    # rebuild of the (now fresh) agent.
+    second = [
+        {"role": "user", "content": "first", "session_id": "s1"},
+        {"role": "assistant", "content": "answer one", "session_id": "s1"},
+        {"role": "user", "content": "second", "session_id": "s1"},
+    ]
+    await _drain(executor, second, config=ExecutorConfig(model="gemini-3-flash"))
+
+    # Two agents (model changed). The rebuilt agent's first send must replay the
+    # prior turns, not just the latest "second".
+    assert len(captured["agents"]) == 2
+    rebuilt_sends = captured["agents"][1].conversation.sends
+    assert len(rebuilt_sends) == 1
+    assert "first" in rebuilt_sends[0]
+    assert "assistant: answer one" in rebuilt_sends[0]
+    assert "second" in rebuilt_sends[0]
+
+
+@pytest.mark.asyncio
+async def test_reused_session_does_not_reseed_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A REUSED agent must NOT re-seed history (it already holds it).
+
+    The live SDK conversation accumulated the prior turns itself, so re-seeding
+    on reuse would duplicate them. The second turn's send must be exactly the
+    latest user text, with no transcript prefix.
+    """
+    captured = _install_fake_sdk(
+        monkeypatch, scripts=[[_text_step("one-reply")], [_text_step("two-reply")]]
+    )
+    executor = AntigravityExecutor()
+
+    await _drain(executor, [{"role": "user", "content": "one", "session_id": "s1"}])
+    # Second turn on the same session/signature reuses the agent. It carries the
+    # prior turn in its messages, but the reused conversation already has it.
+    second = [
+        {"role": "user", "content": "one", "session_id": "s1"},
+        {"role": "assistant", "content": "one-reply", "session_id": "s1"},
+        {"role": "user", "content": "two", "session_id": "s1"},
+    ]
+    await _drain(executor, second)
+
+    assert len(captured["agents"]) == 1  # reused, not rebuilt
+    # The reused turn's send is the bare latest text — no "Conversation so far:"
+    # prefix and no duplicated prior turn.
+    sends = captured["agents"][0].conversation.sends
+    assert sends == ["one", "two"]
+
+
+@pytest.mark.asyncio
+async def test_usage_observer_notified_on_turn_complete(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The usage observer is notified with the turn's tokens before TurnComplete.
+
+    Peers notify in-process usage subscribers on every turn; without the fix,
+    antigravity turns fire nothing, so observers see no usage for them.
+    """
+    script: list[_TurnAction] = [
+        _text_step("hi"),
+        _YieldStep(
+            _FakeStep(
+                step_type=_StepType.FINISH, status=_StepStatus.DONE, usage_metadata=_FakeUsage()
+            )
+        ),
+    ]
+    _install_fake_sdk(monkeypatch, scripts=[script])
+    executor = AntigravityExecutor(model="gemini-3-pro")
+
+    seen: list[dict[str, Any]] = []
+
+    def _observer(
+        *, model: str | None, input_tokens: int, output_tokens: int, total_tokens: int
+    ) -> None:
+        seen.append(
+            {
+                "model": model,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": total_tokens,
+            }
+        )
+
+    remove = add_observer(_observer)
+    try:
+        events = await _drain(executor, [{"role": "user", "content": "go", "session_id": "s1"}])
+    finally:
+        remove()
+
+    # Exactly one notification, carrying the model and the mapped token counts
+    # from the turn's UsageMetadata (_FakeUsage: prompt=11, candidates=7, total=18).
+    assert len(seen) == 1
+    assert seen[0] == {
+        "model": "gemini-3-pro",
+        "input_tokens": 11,
+        "output_tokens": 7,
+        "total_tokens": 18,
+    }
+    # The notification accompanies a normal TurnComplete.
+    assert any(isinstance(e, TurnComplete) for e in events)
 
 
 @pytest.mark.asyncio

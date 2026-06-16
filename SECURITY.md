@@ -8,12 +8,19 @@ credentials, tokens, or customer data in any report.
 
 ## Contributor PR security gate
 
-CI for untrusted PRs is held behind a deterministic **Security Gate** so that
+CI for untrusted PRs is held behind a deterministic security scan so that
 untrusted code is not checked out, built, or run on our runners — and the
-Actions cache is not touched — until the diff has been vetted. The gate is a
-reusable workflow (`.github/workflows/security-gate.yml`) run as the first job
-of every CI workflow (`ci`, `lint`, `e2e`, `e2e-ui`); the real jobs declare
-`needs: gate`, so a failing gate skips them entirely.
+Actions cache is not touched — until the diff has been vetted. It is split into
+two pieces so the scan work happens only **once per PR**:
+
+- **`.github/workflows/security-scan.yml`** — runs the deterministic scan once
+  on `pull_request` and produces the `Security Scan` check.
+- **`.github/workflows/security-gate.yml`** — a reusable poller run as the first
+  job (`gate`) of every CI workflow (`ci`, `lint`, `e2e`, `e2e-ui`, ap-web
+  tests); the real jobs declare `needs: gate`. It does not re-scan — for an
+  untrusted PR it waits for the `Security Scan` check and mirrors its result
+  (failure → the dependent CI jobs are skipped); trusted authors and non-PR
+  events proceed immediately.
 
 By trust tier (GitHub `author_association`):
 
@@ -32,15 +39,16 @@ CI-workflow misuse (`pull_request_target` + PR-head checkout, unpinned actions),
 and known code-execution / obfuscation patterns (semgrep, local ruleset). It
 only *statically* analyses the diff and runs with **no secrets** on fork PRs,
 and the scanner itself always runs from `main`, so a PR cannot weaken its own
-gate.
+scan.
 
-This gate is **not** a merge-required check: it gates CI, not the merge button
+This is **not** a merge-required check: it gates CI, not the merge button
 directly. When enforcing, merge stays blocked transitively (the skipped
 pytest/e2e checks are required) and `Maintainer Approval` remains the ultimate
 gate.
 
-The gate currently runs in **audit (non-blocking) mode** (`GATE_BLOCKING:
-"false"` in `security-gate.yml`): the detectors run and surface findings as
-annotations and a job summary, but the gate always succeeds, so no CI is
-blocked. Flip `GATE_BLOCKING` to `"true"` to enforce once the scan has been
-observed on real PRs.
+It currently runs in **audit (non-blocking) mode** (`GATE_BLOCKING: "false"` in
+`security-scan.yml` — the single enforcement switch): the detectors run and
+surface findings as annotations and a job summary, but the `Security Scan` check
+always succeeds, so the pollers proceed and no CI is blocked. Flip
+`GATE_BLOCKING` to `"true"` to enforce once the scan has been observed on real
+PRs.

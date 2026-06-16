@@ -1,28 +1,23 @@
 name: Security Gate
 
-# Reusable (workflow_call) security scan for UNTRUSTED contributor PRs. Each CI
-# workflow (ci, lint, e2e, e2e-ui, ap-web tests) calls this as its FIRST job and
-# makes its real jobs `needs: gate`. The scan only STATICALLY analyses the
-# diff/head (semgrep, grep, diff-read) and runs with NO secrets on fork PRs, so
-# it never executes untrusted code itself. The scanner (scripts + rules) is
-# always checked out from `main`, while the scanned code is the PR head in a
-# separate `pr/` dir, so a PR cannot edit its own gate to neuter it.
+# Reusable (workflow_call) gate, called as the FIRST job of each CI workflow
+# (ci/lint/e2e/e2e-ui/ap-web tests); their real jobs declare `needs: gate`.
 #
-# >>> CURRENTLY NON-BLOCKING (AUDIT MODE) <<<
-# GATE_BLOCKING is "false": the detectors run and surface findings as
-# annotations + a job summary, but the gate job always SUCCEEDS, so `needs: gate`
-# never skips downstream CI. This lets us observe the scan on real PRs before
-# enforcing. To ENFORCE: set GATE_BLOCKING to "true" below -- then a finding
-# fails the gate and skips the dependent CI jobs (no PR-code checkout / uv sync /
-# test). It is still not a merge-required check; merge stays blocked
-# transitively via the skipped required pytest/e2e checks.
+# This job does NOT scan -- the single scan runs once in security-scan.yml and
+# produces the `Security Scan` check. This poller only decides whether to let
+# its caller proceed:
+#   - non-PR event or trusted author -> proceed immediately (no scan needed)
+#   - untrusted PR -> wait for the `Security Scan` check on the PR head SHA and
+#     MIRROR its conclusion. success -> proceed; failure -> fail, so the
+#     dependent CI jobs (needs: gate) are skipped.
 #
-# Trust tiers (see should-scan.sh):
-#   - trusted (OWNER/MEMBER/COLLABORATOR) or any non-PR event -> proceed, no scan
-#   - returning contributor (CONTRIBUTOR) -> scanned
-#   - first-time contributor -> GitHub's native "approve fork workflows" repo
-#     setting already holds every workflow until a maintainer approves; once
-#     approved this gate's scan still applies (defense in depth).
+# Enforcement (audit vs blocking) lives in ONE place -- GATE_BLOCKING in
+# security-scan.yml. In audit mode that scan always concludes success, so this
+# poller always proceeds; flip it to "true" and a finding fails the scan, which
+# this poller then mirrors to block dependent CI. Running the scan once instead
+# of once-per-workflow is the whole point of splitting scan from gate.
+#
+# The trust decision is read from `main` (should-scan.sh) so a PR cannot edit it.
 
 on:
   workflow_call:
@@ -34,135 +29,56 @@ jobs:
   gate:
     name: Security Gate
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    env:
-      # Match CI: route uv at PyPI for the semgrep fetch.
-      UV_INDEX_URL: https://pypi.org/simple
-      # The single enforcement switch. "false" = audit (never blocks CI);
-      # "true" = blocking (a finding fails the gate and skips dependent jobs).
-      GATE_BLOCKING: "false"
+    timeout-minutes: 8
     steps:
-      - name: Check out scanner from main
-        continue-on-error: ${{ env.GATE_BLOCKING != 'true' }}
+      - name: Check out trust check from main
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           ref: main             # trusted; never the PR head
-          sparse-checkout: |
-            .github/scripts/security-scan
-            .github/security
+          sparse-checkout: .github/scripts/security-scan
           persist-credentials: false
 
       - name: Trust gate
         id: gate
-        continue-on-error: ${{ env.GATE_BLOCKING != 'true' }}
         env:
           EVENT_NAME: ${{ github.event_name }}
           AUTHOR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
         run: |
-          # The scanner is checked out from `main` so a PR cannot edit its own
-          # gate. Before this gate is itself merged to main the scripts are
-          # absent there -- proceed (fail-open) so the introducing PR and any
-          # main-without-scanner state are not bricked. Once merged the scripts
-          # exist on main and this branch never runs.
+          # Before the scanner lands on main the scripts are absent there --
+          # proceed (fail-open) so the introducing PR is not bricked.
           if [ ! -f .github/scripts/security-scan/should-scan.sh ]; then
-            echo "::warning::security scanner not present on main yet; proceeding without scan (bootstrap)."
+            echo "::warning::security scanner not present on main yet; proceeding (bootstrap)."
             echo "scan=false" >> "$GITHUB_OUTPUT"
-            echo "reason=scanner absent on main (bootstrap)" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           bash .github/scripts/security-scan/should-scan.sh
 
-      - name: Fetch PR diff
+      - name: Wait for Security Scan result
+        # Only untrusted PRs wait; trusted authors / non-PR events already
+        # proceeded above (scan=false), so their CI is not delayed by the scan.
         if: ${{ steps.gate.outputs.scan == 'true' }}
-        continue-on-error: ${{ env.GATE_BLOCKING != 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          gh pr diff "$PR" --repo "$REPO" > "$GITHUB_WORKSPACE/pr.diff"
-          gh pr diff "$PR" --repo "$REPO" --name-only > "$GITHUB_WORKSPACE/changed.txt"
-          echo "Changed files:"; cat "$GITHUB_WORKSPACE/changed.txt"
-
-      - name: Secret scan (added lines)
-        id: secret
-        if: ${{ steps.gate.outputs.scan == 'true' }}
-        continue-on-error: ${{ env.GATE_BLOCKING != 'true' }}
-        env:
-          DIFF_FILE: ${{ github.workspace }}/pr.diff
-        run: python3 .github/scripts/security-scan/secret-scan.py
-
-      - name: Sensitive-path guard
-        id: paths
-        if: ${{ steps.gate.outputs.scan == 'true' }}
-        continue-on-error: ${{ env.GATE_BLOCKING != 'true' }}
-        env:
-          CHANGED_FILES: ${{ github.workspace }}/changed.txt
-        run: bash .github/scripts/security-scan/sensitive-paths.sh
-
-      - name: Check out PR head for static analysis
-        if: ${{ steps.gate.outputs.scan == 'true' }}
-        continue-on-error: ${{ env.GATE_BLOCKING != 'true' }}
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}  # untrusted: only statically scanned
-          path: pr
-          persist-credentials: false
-
-      - name: Workflow misuse lint
-        id: wflint
-        if: ${{ steps.gate.outputs.scan == 'true' }}
-        continue-on-error: ${{ env.GATE_BLOCKING != 'true' }}
-        working-directory: pr
-        env:
-          CHANGED_FILES: ${{ github.workspace }}/changed.txt
-        run: python3 "$GITHUB_WORKSPACE/.github/scripts/security-scan/lint-workflow-misuse.py"
-
-      - name: Install uv
-        if: ${{ steps.gate.outputs.scan == 'true' }}
-        continue-on-error: ${{ env.GATE_BLOCKING != 'true' }}
-        uses: astral-sh/setup-uv@8d55fbecc275b1c35dbe060458839f8d30439ccf  # v3
-
-      - name: Semgrep (changed files, local rules)
-        id: semgrep
-        if: ${{ steps.gate.outputs.scan == 'true' }}
-        continue-on-error: ${{ env.GATE_BLOCKING != 'true' }}
-        env:
-          RULES: ${{ github.workspace }}/.github/security/semgrep-rules.yml
-        run: |
-          # Scan only PR-changed files that exist in the head tree, so a
-          # contributor is never failed for pre-existing findings.
-          : > targets.txt
-          while IFS= read -r f; do
-            [ -n "$f" ] && [ -f "pr/$f" ] && printf 'pr/%s\n' "$f" >> targets.txt
-          done < "$GITHUB_WORKSPACE/changed.txt"
-          if [ ! -s targets.txt ]; then
-            echo "No changed files to semgrep."; exit 0
-          fi
-          echo "Semgrep targets:"; cat targets.txt
-          # Informational pass (warnings never block).
-          uvx semgrep scan --config "$RULES" --severity=WARNING \
-            --metrics=off --quiet $(cat targets.txt) || true
-          # Gating pass: ERROR-severity rules fail the gate.
-          uvx semgrep scan --config "$RULES" --severity=ERROR --error \
-            --metrics=off --quiet $(cat targets.txt)
-
-      - name: Audit summary
-        # Always reports the scan outcome. In audit mode the detector steps above
-        # are continue-on-error, so this surfaces what WOULD have blocked without
-        # failing the job. In blocking mode a detector failure already failed the
-        # job before reaching here.
-        if: ${{ always() && steps.gate.outputs.scan == 'true' }}
-        run: |
-          findings=0
-          for o in "${{ steps.secret.outcome }}" "${{ steps.paths.outcome }}" \
-                   "${{ steps.wflint.outcome }}" "${{ steps.semgrep.outcome }}"; do
-            [ "$o" = "failure" ] && findings=1
+          echo "Untrusted PR -- waiting for the single 'Security Scan' check on $HEAD_SHA"
+          q='[.check_runs[] | select(.name=="Security Scan")] | sort_by(.started_at) | last'
+          conclusion=""
+          for _ in $(seq 1 72); do   # up to ~6 min (72 * 5s)
+            status=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs" --jq "$q | .status" 2>/dev/null || echo "")
+            if [ "$status" = "completed" ]; then
+              conclusion=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs" --jq "$q | .conclusion")
+              break
+            fi
+            sleep 5
           done
-          if [ "$findings" = "1" ]; then
-            echo "::warning::Security gate found issues (see annotations above). Audit mode: CI was NOT blocked. Set GATE_BLOCKING=true in security-gate.yml to enforce."
-            { echo "### 🔍 Security gate — audit mode"; echo "Findings detected; **not** blocking CI. See annotations above."; } >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "Security gate: no findings."
-            echo "### ✅ Security gate — audit mode: no findings" >> "$GITHUB_STEP_SUMMARY"
+          if [ -z "$conclusion" ]; then
+            echo "::warning::Security Scan check did not complete in time; proceeding (fail-open)."
+            exit 0
           fi
+          echo "Security Scan concluded: $conclusion"
+          case "$conclusion" in
+            success | skipped | neutral) exit 0 ;;
+            *) echo "::error::Security Scan did not pass ($conclusion); blocking dependent CI."; exit 1 ;;
+          esac

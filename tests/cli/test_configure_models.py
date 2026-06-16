@@ -2110,6 +2110,31 @@ def test_antigravity_remove_api_key_drops_block_and_secret(isolated_config) -> N
     assert secrets.load_secret("antigravity") is None
 
 
+def test_antigravity_remove_does_not_delete_foreign_keychain_secret(isolated_config) -> None:
+    """Removing antigravity drops the block but spares a shared ``keychain:<other>``.
+
+    A hand-edited ``antigravity:`` block may point at a secret we don't own
+    (here ``keychain:shared-gemini``). Remove must NOT clobber that secret —
+    only the config block is dropped. Against the old over-broad delete (any
+    ``keychain:`` ref) the shared secret would have been destroyed.
+    """
+    # Seed a foreign shared secret referenced by a hand-edited block.
+    secrets.store_secret("shared-gemini", "AIza_shared_seeded")
+    config_path = os.path.join(isolated_config, "config.yaml")
+    with open(config_path, "w") as f:
+        yaml.safe_dump({"antigravity": {"api_key_ref": "keychain:shared-gemini"}}, f)
+
+    # L1 5=Antigravity → antigravity menu 2=Remove → q back → q quit.
+    stdin = "\n".join(["5", "2", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    # Block dropped, but the secret we don't own is left intact.
+    assert "antigravity" not in cfg
+    assert secrets.load_secret("shared-gemini") == "AIza_shared_seeded"
+
+
 def test_antigravity_set_api_key_non_aiza_declined_is_not_stored(isolated_config) -> None:
     """A non-``AIza`` paste that the user declines to force is NOT persisted.
 

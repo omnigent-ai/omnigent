@@ -617,7 +617,17 @@ def _build_models_json(
     :returns: Pi ``models.json`` contents.
     """
     h = host.rstrip("/")
-    openai_base_url = (base_urls or {}).get("openai") or f"{h}/serving-endpoints"
+    serving_endpoints_url = f"{h}/serving-endpoints"
+    raw_openai_base_url = (base_urls or {}).get("openai")
+    # ucode's ``openai`` gateway is the Codex Responses gateway
+    # (``.../ai-gateway/codex/v1``), which 404s pi's openai-completions
+    # ``/chat/completions`` POST. Re-route only that case to serving-endpoints;
+    # generic providers (no ``/ai-gateway/codex``) pass through. Gemini rides
+    # this path via databricks-completions since pi can't speak generateContent.
+    if raw_openai_base_url and "/ai-gateway/codex" in raw_openai_base_url:
+        openai_base_url = serving_endpoints_url
+    else:
+        openai_base_url = raw_openai_base_url or serving_endpoints_url
     claude_base_url = (base_urls or {}).get("claude") or f"{h}/serving-endpoints/anthropic"
     config: dict[str, Any] = {  # type: ignore[explicit-any]  # Pi-owned schema, see note above
         "providers": {

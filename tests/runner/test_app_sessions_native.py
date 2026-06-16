@@ -8611,6 +8611,224 @@ async def test_events_compact_on_native_session_returns_503_when_bridge_not_read
 
 
 @pytest.mark.asyncio
+async def test_events_compact_on_codex_native_injects_slash_command(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    POST ``/events`` with ``{"type":"compact"}`` on a codex-native
+    session injects ``/compact`` into the codex tmux pane and returns 200.
+
+    Codex owns its own context window in the terminal, so explicit
+    compaction must run inside Codex — the same rationale as the
+    claude-native path.  The pane coordinates come from the resource
+    registry (not a ``tmux.json`` sidecar).  The 200 return is
+    load-bearing: the Omnigent server reads it to skip its own
+    AP-side compaction.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from tests.runner.helpers import make_test_terminal_instance
+
+    captured: list[tuple[str, list[str]]] = []
+
+    def _fake_run_tmux(socket_path: str, *args: str) -> None:
+        """Record tmux send-keys calls without touching tmux."""
+        captured.append((socket_path, list(args)))
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
+
+    codex_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the codex-native spec for any agent_id."""
+        del agent_id, session_id
+        return codex_native_spec
+
+    conv_id = "conv_codex_compact"
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("codex", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault(conv_id, {})[("codex", "main")] = instance
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "compact"},
+        )
+
+        # Drain the event queue: /compact is a control signal and must
+        # not enqueue session.status events.
+        queue = _session_event_queues_ref.get(conv_id)
+        queued_events: list[dict[str, Any]] = []
+        if queue is not None:
+            while not queue.empty():
+                item = queue.get_nowait()
+                if isinstance(item, dict):
+                    queued_events.append(item)
+
+    # 200 = codex-native dispatch routed to the compact handler and it
+    # injected successfully.
+    assert resp.status_code == 200, (
+        f"Codex-native compact must return 200 from /events; got {resp.status_code}: {resp.text}"
+    )
+
+    # Exactly 3 tmux send-keys calls: C-u, -l /compact, Enter.
+    assert len(captured) == 3, (
+        f"Expected 3 tmux send-keys calls (C-u, /compact, Enter), got {len(captured)}."
+    )
+    socket = str(instance.socket_path)
+    # 1. Clear draft: C-u
+    assert captured[0] == (socket, ["send-keys", "-t", "main", "C-u"]), (
+        f"First call must clear draft with C-u; got {captured[0]!r}."
+    )
+    # 2. Type /compact literally
+    assert captured[1] == (socket, ["send-keys", "-l", "-t", "main", "/compact"]), (
+        f"Second call must type /compact literally; got {captured[1]!r}."
+    )
+    # 3. Submit with Enter
+    assert captured[2] == (socket, ["send-keys", "-t", "main", "Enter"]), (
+        f"Third call must submit with Enter; got {captured[2]!r}."
+    )
+    # /compact is a control signal, not a state change.
+    assert queued_events == [], f"compact must not publish session events; got {queued_events!r}."
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_codex_native_returns_204_when_no_terminal() -> None:
+    """
+    Codex-native compact returns 204 when no live terminal is registered.
+
+    Without a running codex terminal the ``/compact`` slash command
+    has nowhere to go.  204 tells the Omnigent server to fall back to
+    its own AP-side compaction (or skip it).
+    """
+    codex_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the codex-native spec for any agent_id."""
+        del agent_id, session_id
+        return codex_native_spec
+
+    conv_id = "conv_codex_compact_no_term"
+    # Empty registry — no codex terminal registered.
+    terminal_registry = TerminalRegistry()
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "compact"},
+        )
+
+    assert resp.status_code == 204, (
+        f"Codex-native compact with no terminal must return 204; "
+        f"got {resp.status_code}: {resp.text}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_codex_native_returns_503_on_tmux_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Codex-native compact returns 503 when the tmux send-keys call fails.
+
+    The 503 tells the Omnigent server the control was NOT handled, so it
+    can surface an error rather than silently running its own (wrong)
+    compaction.
+    """
+    from tests.runner.helpers import make_test_terminal_instance
+
+    def _failing_run_tmux(socket_path: str, *args: str) -> None:
+        """Simulate a tmux pane that is no longer alive."""
+        del socket_path, args
+        raise RuntimeError("no server running on /tmp/dead.sock")
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _failing_run_tmux)
+
+    codex_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the codex-native spec for any agent_id."""
+        del agent_id, session_id
+        return codex_native_spec
+
+    conv_id = "conv_codex_compact_fail"
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("codex", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault(conv_id, {})[("codex", "main")] = instance
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "compact"},
+        )
+
+    assert resp.status_code == 503, (
+        f"Codex-native compact with tmux failure must return 503; "
+        f"got {resp.status_code}: {resp.text}"
+    )
+    body = resp.json()
+    assert body.get("error") == "codex_native_compact_failed", (
+        f"503 body must carry the codex bridge-failure error code; got {body!r}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_events_compact_on_non_native_session_is_204_noop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

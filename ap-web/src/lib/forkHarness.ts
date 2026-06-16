@@ -39,13 +39,15 @@ export function harnessFamily(harness: string | null | undefined): "anthropic" |
   }
 }
 
-/** Whether a harness is a native CLI harness (Claude Code / Codex). */
+/** Whether a harness is a native CLI harness (Claude Code / Codex / Pi). */
 export function isNativeHarness(harness: string | null | undefined): boolean {
   return (
     harness === "claude-native" ||
     harness === "native-claude" ||
     harness === "codex-native" ||
-    harness === "native-codex"
+    harness === "native-codex" ||
+    harness === "pi-native" ||
+    harness === "native-pi"
   );
 }
 
@@ -74,7 +76,9 @@ export function isNativeHarness(harness: string | null | undefined): boolean {
  * @param targetHarness - The harness the fork would switch to.
  */
 export function forkTargetCarriesHistory(targetHarness: string | null | undefined): boolean {
-  return harnessFamily(targetHarness) !== null;
+  // Gate on isNativeHarness too: Pi is native but multi-family, so its
+  // harnessFamily is null and it would otherwise be dropped from the pickers.
+  return isNativeHarness(targetHarness) || harnessFamily(targetHarness) !== null;
 }
 
 /**

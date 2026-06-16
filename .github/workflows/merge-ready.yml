@@ -48,7 +48,7 @@ on:
   pull_request:
     types: [labeled]
   workflow_run:
-    workflows: [PR Template, CI, Lint, E2E UI Tests, E2E Tests]
+    workflows: [PR Template, CI, Lint, E2E UI Tests, E2E Tests, Integration Tests]
     types: [completed]
   issue_comment:
     types: [created]
@@ -126,15 +126,27 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          # Passed via env (not interpolated into the script): the JSON includes
-          # PR branch names, which a same-repo author controls, so direct
-          # interpolation would be a shell-injection vector.
+          # Passed via env (not interpolated into the script): both the JSON
+          # (PR branch names) and the comment body are author-controlled, so
+          # direct interpolation would be a shell-injection vector.
           WF_PRS: ${{ toJSON(github.event.workflow_run.pull_requests) }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             PR="${{ github.event.pull_request.number }}"
             SHA="${{ github.event.pull_request.head.sha }}"
           elif [[ "${{ github.event_name }}" == "issue_comment" ]]; then
+            # The job `if` uses a loose contains() pre-filter (Actions
+            # expressions have no regex), so it also fires on incidental
+            # mentions like `workflows/merge-ready.yml` -- PR #288 merged on a
+            # comment that merely referenced that path. Re-validate that
+            # `/merge` appears as an actual command: a line whose first
+            # non-space token is exactly `/merge` (optionally followed by args).
+            if ! grep -qE '^[[:space:]]*/merge([[:space:]]|$)' <<<"$COMMENT_BODY"; then
+              echo "::notice::Skipped: comment mentions '/merge' but not as a command"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
             PR="${{ github.event.issue.number }}"
             SHA=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq '.headRefOid')
           else

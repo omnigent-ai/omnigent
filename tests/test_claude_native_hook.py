@@ -1223,6 +1223,71 @@ def test_evaluate_policy_pre_tool_use_converts_and_returns_deny(
     assert captured.err == ""
 
 
+def test_evaluate_policy_stamps_live_model_from_context_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The hook stamps the statusLine-captured live model into the request.
+
+    The statusLine wrapper writes the active model id into ``context.json``
+    on every render. The hook must stamp it (and ``harness``) onto the
+    evaluation request so the cost-budget gate sees the CURRENT model at gate
+    time — not the lagging ``model_override`` mirror. Regression guard for a
+    cheap-model session getting blocked over budget because the model was
+    unresolved (None) and the gate failed closed.
+    """
+    posted: dict[str, object] = {}
+
+    class _FakeHttpxClient:
+        """Sync HTTP client stub capturing the posted EvaluationRequest."""
+
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            """Record constructor inputs. :returns: None."""
+            del headers, timeout
+
+        def __enter__(self) -> _FakeHttpxClient:
+            """:returns: This fake client."""
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            """:returns: None."""
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> object:
+            """Record the request and return an ALLOW verdict. :returns: response."""
+            import httpx
+
+            posted["json"] = json
+            return httpx.Response(
+                200,
+                text='{"result":"POLICY_ACTION_ALLOW"}',
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FakeHttpxClient)
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
+    write_active_session_id(bridge_dir, "conv_active")
+    build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
+    # The statusLine wrapper's capture: the live model the user is on.
+    (bridge_dir / "context.json").write_text(
+        json.dumps({"model": "claude-sonnet-4-6"}), encoding="utf-8"
+    )
+    payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {}}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    exit_code = claude_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)])
+
+    assert exit_code == 0
+    context = posted["json"]["event"]["context"]
+    # The live model + harness must ride the request so the cost gate doesn't
+    # fail closed on an unresolved model.
+    assert context["model"] == "claude-sonnet-4-6"
+    assert context["harness"] == "claude-native"
+
+
 def test_evaluate_policy_post_tool_use_converts_and_returns_context(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

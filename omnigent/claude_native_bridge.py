@@ -3674,6 +3674,33 @@ def read_claude_context_state(bridge_dir: Path) -> dict[str, Any] | None:
     return parsed
 
 
+def read_claude_status_model(bridge_dir: Path) -> str | None:
+    """
+    Read the active model id from the statusLine snapshot ``context.json``.
+
+    Unlike :func:`read_claude_context_state` (which returns ``None`` unless a
+    usable ``context_window_size`` is present, since it backs the context
+    ring), this returns the model whenever the wrapper captured one — the
+    model and the window are written independently, and the cost-budget gate
+    needs the model even on a render where the window field was absent. This
+    is claude-native's race-free, gate-time source of the live ``/model``
+    selection (the analogue of the codex hook reading ``config.toml``).
+
+    :param bridge_dir: Bridge directory shared with the statusLine wrapper.
+    :returns: The model id, e.g. ``"claude-sonnet-4-6"``, or ``None`` when
+        the file is missing / unreadable / carries no model string.
+    """
+    path = bridge_dir / _CONTEXT_FILE
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    model = parsed.get("model")
+    return model if isinstance(model, str) and model else None
+
+
 def read_user_status_line_command() -> str | None:
     """
     Return the user's globally-configured statusLine shell command, if any.

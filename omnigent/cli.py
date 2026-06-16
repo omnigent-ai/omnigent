@@ -8040,6 +8040,7 @@ def _manage_antigravity_harness() -> None:
     from omnigent.onboarding import secrets as secret_store
     from omnigent.onboarding.antigravity_auth import (
         ANTIGRAVITY_CONFIG_KEY,
+        ANTIGRAVITY_SECRET_NAME,
         antigravity_api_key_configured,
         antigravity_api_key_ref,
     )
@@ -8075,10 +8076,12 @@ def _manage_antigravity_harness() -> None:
             status = _set_antigravity_api_key()
         elif action == "remove_key":
             ref = antigravity_api_key_ref(config)
-            # Only a keychain-stored secret is ours to delete; an ``env:`` ref
-            # points at the user's own environment, so just drop the config.
-            if ref is not None and ref.startswith("keychain:"):
-                secret_store.delete_secret(ref[len("keychain:") :])
+            # Only the secret we own (``keychain:antigravity``) is ours to
+            # delete: a hand-edited block may point at a shared ``keychain:<other>``
+            # secret, and an ``env:`` ref names the user's own environment. In
+            # both of those cases just drop the config block and leave the secret.
+            if ref == f"keychain:{ANTIGRAVITY_SECRET_NAME}":
+                secret_store.delete_secret(ANTIGRAVITY_SECRET_NAME)
             _save_global_config({}, unset_keys=(ANTIGRAVITY_CONFIG_KEY,))
             status = "✓ Removed Gemini API key"
 

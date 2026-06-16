@@ -1491,11 +1491,15 @@ def _build_antigravity_spawn_env(spec: AgentSpec) -> dict[str, str]:
     Antigravity is Gemini-native with no OpenAI-compatible ``base_url``, so there
     is no gateway / ucode / Databricks path — only a direct API key or Vertex AI.
     API-key resolution (first wins): (1) spec ``executor.auth`` api_key; (2) the
-    ``antigravity:`` config block from ``omnigent setup``; (3) the legacy global
-    ``auth:`` api key; (4) an ambient ``GEMINI_API_KEY`` / ``ANTIGRAVITY_API_KEY``.
-    Any ``base_url`` is dropped (the SDK has no such field). Vertex AI is opt-in
-    via ``executor.config`` vertex/project/location, independent of the key path.
-    A ``DatabricksAuth`` is unsupported — warned and ignored.
+    dedicated ``antigravity:`` config block from ``omnigent setup``; (3) an
+    ambient ``GEMINI_API_KEY`` / ``ANTIGRAVITY_API_KEY``. The legacy global
+    ``auth:`` block is deliberately NOT consulted: it carries the OpenAI/gateway
+    key the other SDK harnesses inherit (an ``sk-…`` key), which the Gemini-native
+    SDK can't use — adopting it would guarantee an auth failure / mis-billing and
+    shadow the user's ambient ``GEMINI_API_KEY``. Any ``base_url`` is dropped (the
+    SDK has no such field). Vertex AI is opt-in via ``executor.config``
+    vertex/project/location, independent of the key path. A ``DatabricksAuth`` is
+    unsupported — warned and ignored.
 
     :param spec: The agent spec.
     :returns: Env-var overrides; may be empty (the wrap then uses the SDK's
@@ -1518,8 +1522,10 @@ def _build_antigravity_spawn_env(spec: AgentSpec) -> dict[str, str]:
             type(spec_auth).__name__,
         )
 
-    # Spec api-key wins; with no spec auth, fall back to the configured /
-    # ambient key (see docstring). A non-api-key auth never adopts a key.
+    # Spec api-key wins; with no spec auth, fall back to the dedicated
+    # ``antigravity:`` block, then an ambient Gemini key (see docstring). The
+    # global ``auth:`` block is intentionally NOT consulted — it holds the
+    # OpenAI/gateway key the SDK can't use. A non-api-key auth never adopts a key.
     if isinstance(spec_auth, ApiKeyAuth):
         # base_url intentionally dropped — the SDK has no such field.
         env["HARNESS_ANTIGRAVITY_API_KEY"] = spec_auth.api_key
@@ -1531,11 +1537,8 @@ def _build_antigravity_spawn_env(spec: AgentSpec) -> dict[str, str]:
         )
 
         stored_key = resolve_antigravity_api_key()
-        loaded = _load_global_auth()
         if stored_key is not None:
             env["HARNESS_ANTIGRAVITY_API_KEY"] = stored_key
-        elif isinstance(loaded, ApiKeyAuth):
-            env["HARNESS_ANTIGRAVITY_API_KEY"] = loaded.api_key
         else:
             for _env_var in ANTIGRAVITY_ENV_VARS:
                 if os.environ.get(_env_var):

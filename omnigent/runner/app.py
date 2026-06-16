@@ -6703,6 +6703,76 @@ def create_runner_app(
             )
         return Response(status_code=200)
 
+    async def _handle_codex_native_compact(conv_id: str) -> Response:
+        """
+        Type ``/compact`` into Codex's tmux pane.
+
+        Mirrors :func:`_handle_claude_native_compact` for codex-native
+        sessions.  Codex owns its own context window in the terminal,
+        so explicit compaction must be injected as the ``/compact``
+        slash command — the same rationale as the claude-native path.
+
+        The tmux pane coordinates come from the **resource registry**
+        (not a ``tmux.json`` sidecar) because codex-native terminals
+        are launched through the registry.  This is the same resolution
+        path :func:`_handle_codex_native_cost_popup` uses.
+
+        Returns 200 on successful injection so the Omnigent server
+        knows the control was handled in the terminal and skips its
+        own AP-side compaction.  204 when no live terminal is
+        registered (the server falls back to in-process compaction).
+
+        :param conv_id: Session/conversation identifier, e.g.
+            ``"conv_abc123"``.
+        :returns: 200 once ``/compact`` has been typed into the pane.
+            204 if no live codex terminal is registered for the session.
+            503 if the tmux send-keys invocation fails.
+        """
+        registry = resource_registry.terminal_registry
+        instance = registry.get(conv_id, "codex", "main") if registry is not None else None
+        if instance is None or not instance.running:
+            # No live codex terminal — let the server run AP-side compaction.
+            return Response(status_code=204)
+
+        socket_path = str(instance.socket_path)
+        target = instance.tmux_target
+
+        try:
+            await asyncio.to_thread(_inject_codex_compact, socket_path, target)
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "codex_native_compact_failed",
+                    "detail": _client_safe_error_detail(exc, context="codex-native compact"),
+                },
+            )
+        return Response(status_code=200)
+
+    def _inject_codex_compact(socket_path: str, target: str) -> None:
+        """
+        Blocking helper: type ``/compact`` into a codex tmux pane.
+
+        Uses the same ``C-u`` → literal ``/compact`` → ``Enter``
+        sequence that :func:`~omnigent.claude_native_bridge.inject_slash_command`
+        uses for claude-native.  Factored into its own function so
+        :func:`_handle_codex_native_compact` can run it via
+        ``asyncio.to_thread`` without importing at call time.
+
+        :param socket_path: Absolute path to the tmux socket, e.g.
+            ``"/tmp/.../codex-main.sock"``.
+        :param target: Tmux target pane, e.g. ``"main"``.
+        :raises RuntimeError: If any ``tmux send-keys`` invocation fails.
+        """
+        from omnigent.claude_native_bridge import _run_tmux
+
+        # Clear any draft the user is mid-typing.
+        _run_tmux(socket_path, "send-keys", "-t", target, "C-u")
+        # Paste ``/compact`` literally.
+        _run_tmux(socket_path, "send-keys", "-l", "-t", target, "/compact")
+        # Submit.
+        _run_tmux(socket_path, "send-keys", "-t", target, "Enter")
+
     async def _handle_claude_native_cost_popup(
         conv_id: str,
         elicitation_id: str,
@@ -9378,14 +9448,16 @@ def create_runner_app(
 
         if body_type == "compact":
             # Omnigent server forwards explicit /compact here. claude-native
-            # injects the slash command into the tmux pane so Claude
-            # Code compacts its own context, and returns 200 to signal
-            # the control was handled in the terminal. Other harnesses
-            # 204 no-op — their explicit compaction is an AP-side
-            # operation the server runs when the runner does not handle
-            # the control (see ``_run_compact_locked``).
+            # and codex-native inject the slash command into the tmux
+            # pane so the CLI compacts its own context, and return 200
+            # to signal the control was handled in the terminal. Other
+            # harnesses 204 no-op — their explicit compaction is an
+            # AP-side operation the server runs when the runner does
+            # not handle the control (see ``_run_compact_locked``).
             if _session_harness_name(conversation_id) == "claude-native":
                 return await _handle_claude_native_compact(conversation_id)
+            if _session_harness_name(conversation_id) == "codex-native":
+                return await _handle_codex_native_compact(conversation_id)
             return Response(status_code=204)
 
         if body_type == "cost_approval_popup":
