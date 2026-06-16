@@ -47,7 +47,12 @@ def _callable_registry_policy(base_url: str) -> dict:
     for entry in resp.json()["data"]:
         if entry.get("kind") == "callable":
             return entry
-    pytest.skip("no parameter-free (callable) policy in the registry to exercise the dialog")
+    # ``raise`` (vs a bare ``pytest.skip(...)`` call) makes this branch
+    # explicitly non-returning, so the function has no implicit ``-> None``
+    # fall-through to contradict its ``-> dict`` annotation.
+    raise pytest.skip.Exception(
+        "no parameter-free (callable) policy in the registry to exercise the dialog"
+    )
 
 
 def _session_policies(base_url: str, session_id: str) -> list[dict]:
