@@ -64,3 +64,40 @@ After the security check, three options:
 
 ## Recommendation
 Adopt **Option 2**, built on the existing `fork-e2e-mirror.yml` privilege-separation, with the security scan as defense-in-depth and **maintainer review as the primary gate** before any key-bearing run. Fall back to Option 3 only if `/e2e` review latency becomes the real bottleneck.
+
+---
+
+## Appendix: How other popular LLM/AI projects handle this
+
+Surveyed eight widely-used OSS LLM/AI projects to validate the approach above. The findings strongly support **Option 2** — *no* surveyed project gives fork code automatic access to secrets, and they all gate the expensive/secret tier behind either a maintainer action or move it off the PR path entirely.
+
+### Platform baseline (true for all)
+1. **Fork `pull_request` runs get a read-only token and no secrets.** Same-repo branch PRs do get secrets (author already has write access). ([github.blog](https://github.blog/news-insights/product-news/github-actions-improvements-for-fork-and-pull-request-workflows/), [securitylab](https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/))
+2. **First-time / outside-contributor runs require manual maintainer approval** (a repo Actions setting; GitHub recommends the stricter "all outside collaborators" for public repos). ([docs](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/approve-runs-from-forks))
+3. **`pull_request_target` is the footgun** — it runs base-branch workflow code with secrets even for forks; the dangerous anti-pattern is combining it with an explicit checkout of untrusted PR head. ([wellarchitected](https://wellarchitected.github.com/library/application-security/recommendations/actions-security/))
+
+### Comparison
+
+| Project | Returning contrib auto-CI? | e2e/keys for contribs? | Merge process | Demonstration | Exact mechanism — the part that gates it |
+|---|---|---|---|---|---|
+| **vLLM** | Expensive: No | Gated by `ready` label | auto-merge + `ready` | [docs](https://docs.vllm.ai/en/latest/contributing/index.html) + [`.buildkite/`](https://github.com/vllm-project/vllm/tree/main/.buildkite) | Buildkite runs `fastcheck` by default; full pipeline conditioned on the `ready` label (reviewer-only). Gate is in Buildkite config, not GH Actions. |
+| **PyTorch** | Expensive: No | Gated by `ciflow/*` | `@pytorchbot merge` | [`inductor.yml`](https://github.com/pytorch/pytorch/blob/main/.github/workflows/inductor.yml) | `on: push: tags: ciflow/inductor/*` and **no `pull_request`**. Fork can't push tags; bot pushes the tag only when a maintainer applies the `ciflow/*` label → runs in trusted context. |
+| **HF Transformers** | Expensive: No | Gated by `run-slow` | manual maintainer merge | [`self-comment-ci.yml`](https://github.com/huggingface/transformers/blob/main/.github/workflows/self-comment-ci.yml) | `on: issue_comment`; `if:` requires body to start with `run-slow` AND commenter in a hardcoded ~20-name maintainer allowlist. GPU + `HF_TOKEN` job otherwise skipped. |
+| **LiteLLM** | Setting not public | No (mocked-only) | CLA + ≥1 test + green CI | [`.circleci/config.yml`](https://github.com/BerriAI/litellm/blob/main/.circleci/config.yml) | Every key-bearing job carries `filters: branches: only: [main, /litellm_.*/]`; fork PR branch names don't match, so jobs are filtered out. |
+| **LangChain** | Setting not public | No on PRs | CODEOWNERS + merge queue | [`integration_tests.yml`](https://github.com/langchain-ai/langchain/blob/master/.github/workflows/integration_tests.yml) | `on:` is `schedule` + `workflow_dispatch` only (no `pull_request`) + `if: github.repository_owner == 'langchain-ai'`. Unreachable from forks. |
+| **llama.cpp** | Setting not public | No live keys | CODEOWNERS + squash | [`server-self-hosted.yml`](https://github.com/ggml-org/llama.cpp/blob/master/.github/workflows/server-self-hosted.yml) | Test steps guarded `if: ${{ !github.event.pull_request }}`; workflow triggers on `push`/`workflow_dispatch` only. |
+| **Ollama** | Setting not public | No | GitHub UI (undocumented) | [`release.yaml`](https://github.com/ollama/ollama/blob/main/.github/workflows/release.yaml) | Signing jobs declare `environment: release` (env-scoped secrets), triggered only on `push:` of `v*` tags. PR CI references no secrets. |
+| **omnigent (us)** | **Yes (returning approved)** | **Yes, with keys** (via mirror) | `maintainer-approval` + `merge-ready` | `.github/workflows/fork-e2e-mirror.yml` | `on: pull_request_target` + `if: ...head.repo.fork`; `should-mirror.sh` gate passes if author is maintainer **OR `fork-e2e/pr-N` exists (returning contributor)** → mints App token, pushes fork HEAD to `fork-e2e/pr-N`; `e2e.yml` runs the keyed suite on that trusted `push` (empty matrix for forks on the `pull_request` path). |
+
+*(LlamaIndex omitted — no verified-quality public evidence surfaced.)*
+
+### The four gating techniques observed
+1. **No `pull_request` trigger on the secret tier** — fires only on tags/schedule/dispatch/push (PyTorch, LangChain).
+2. **Branch-name filter** fork branches can't satisfy (LiteLLM).
+3. **Event + identity `if:` guard** — `issue_comment` body + author allowlist, or `!github.event.pull_request` (Transformers, llama.cpp).
+4. **Environment-scoped secrets + tag-only trigger** (Ollama).
+
+### Implications for this proposal
+- **Industry consensus validates Option 2.** The dominant pattern is exactly what Option 2 proposes — fast/mocked checks auto-run on forks; the secret/expensive tier is gated behind a *maintainer action that runs in a trusted context*. The `/e2e` command maps directly onto Transformers' `run-slow` comment and vLLM's `ready` label.
+- **No peer extends secret-tier trust based on past approval.** Every surveyed project re-gates the expensive tier **per PR regardless of tenure**, or never runs it on PRs. Our `fork-e2e-mirror` returning-contributor shortcut (`fork-e2e/pr-N` exists → auto-mirror without fresh approval) is an **outlier** — it grants the keyed e2e tier to previously-approved forks without a fresh human gate. This is the Option 1 risk surface re-introduced for returning contributors and should be a conscious decision: either re-gate it per PR to match the norm, or document it as an accepted risk justified by the rate-limited, revocable test-gateway token.
+- **Our privilege-separation is more advanced than most.** Where peers *withhold* keyed tests from fork code, our `pull_request_target` → trusted-mirror → `push` relay lets the keyed suite actually run on contributor code safely. That capability is what makes Option 2 low-friction for us — but it only stays safe if the trigger gate (maintainer review) is preserved.
