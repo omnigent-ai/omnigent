@@ -3,11 +3,13 @@
 # sees public registries directly (lockfiles must record public sources, never
 # a proxy). Exists because sync PRs land manifest changes without lockfile
 # updates and the Dockerfile COPYs ap-web/package-lock.json, so the tree is not
-# Docker-buildable until lockfiles are (re)generated here. Manual-only by design
-# so timing stays in human hands; /regen on a PR covers the PR-scoped case.
+# Docker-buildable until lockfiles are (re)generated here. Runs every 12h (and
+# on manual dispatch); opens a PR with any regenerated lockfiles.
 name: OSS regenerate lockfiles + smoke
 
 on:
+  schedule:
+    - cron: "0 */12 * * *"  # every 12 hours (00:00 / 12:00 UTC)
   workflow_dispatch: {}
 
 permissions:
