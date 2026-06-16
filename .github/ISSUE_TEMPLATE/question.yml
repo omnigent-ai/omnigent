@@ -1,0 +1,43 @@
+name: Question
+description: Ask a question about using Pullfrog.
+title: "[Question]: "
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For usage help, please check the Pullfrog documentation first: https://docs.pullfrog.com
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: What would you like to know?
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: What are you trying to do in Pullfrog or in your repo?
+    validations:
+      required: true
+  - type: textarea
+    id: attempted
+    attributes:
+      label: What have you tried?
+      description: Share any steps you already attempted.
+  - type: textarea
+    id: relevant-details
+    attributes:
+      label: Relevant details
+      description: Share relevant repo, trigger, config, logs, or screenshots.
+      placeholder: |
+        Repository:
+        Trigger type:
+        Pullfrog config:
+        Relevant logs or screenshots:
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Anything else that would help answer the question.

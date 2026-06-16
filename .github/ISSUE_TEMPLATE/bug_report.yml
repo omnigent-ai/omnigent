@@ -1,0 +1,80 @@
+name: Bug Report
+description: Report a bug, regression, or unexpected behavior.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Pullfrog. Please include enough detail for maintainers to reproduce the issue.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Describe the bug clearly and briefly.
+    validations:
+      required: true
+  - type: textarea
+    id: actual-behavior
+    attributes:
+      label: What happened?
+      description: Tell us what you observed.
+    validations:
+      required: true
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: What did you expect?
+      description: Describe the expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: List the exact steps needed to reproduce the issue.
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: dropdown
+    id: trigger-type
+    attributes:
+      label: Trigger type
+      description: Where did the issue occur?
+      options:
+        - Issue
+        - Pull request
+        - Review
+        - CI failure
+        - Dashboard
+        - "@pullfrog comment"
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment / context
+      description: Share the relevant repo, branch, action run, config, provider, browser, OS, or permissions context.
+      placeholder: |
+        Repository:
+        GitHub Action run link:
+        Branch:
+        Pullfrog config (`pullfrog.yml`) relevant section:
+        Agent or provider used:
+        Browser:
+        OS:
+        Recent repo config or permission changes:
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / screenshots
+      description: Paste logs, error messages, screenshots, or relevant run output here.
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Add anything else that may help reproduce the issue.

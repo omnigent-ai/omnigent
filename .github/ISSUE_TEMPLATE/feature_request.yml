@@ -1,0 +1,50 @@
+name: Feature Request
+description: Suggest a new capability or improvement.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement. Please focus on the workflow or user problem first.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: What problem are you trying to solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposed-solution
+    attributes:
+      label: Proposed solution
+      description: Describe the solution you would like to see.
+    validations:
+      required: true
+  - type: textarea
+    id: usefulness
+    attributes:
+      label: Why is this useful?
+      description: Explain the benefit to Pullfrog users or maintainers.
+    validations:
+      required: true
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use case
+      description: How would this be used in a real repo workflow?
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: List any other approaches you considered.
+  - type: textarea
+    id: implementation-ideas
+    attributes:
+      label: Implementation ideas
+      description: Optional notes about how this could be implemented.
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Any examples, references, or screenshots that help explain the idea.
