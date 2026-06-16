@@ -1,43 +1,59 @@
 name: Question
-description: Ask a question about using Pullfrog.
+description: Ask a question about using OmniGent.
 title: "[Question]: "
 labels: ["question"]
+
 body:
-  - type: markdown
-    attributes:
-      value: |
-        For usage help, please check the Pullfrog documentation first: https://docs.pullfrog.com
-  - type: textarea
-    id: question
-    attributes:
-      label: Question
-      description: What would you like to know?
-    validations:
-      required: true
-  - type: textarea
-    id: context
-    attributes:
-      label: Context
-      description: What are you trying to do in Pullfrog or in your repo?
-    validations:
-      required: true
-  - type: textarea
-    id: attempted
-    attributes:
-      label: What have you tried?
-      description: Share any steps you already attempted.
-  - type: textarea
-    id: relevant-details
-    attributes:
-      label: Relevant details
-      description: Share relevant repo, trigger, config, logs, or screenshots.
-      placeholder: |
-        Repository:
-        Trigger type:
-        Pullfrog config:
-        Relevant logs or screenshots:
-  - type: textarea
-    id: additional-context
-    attributes:
-      label: Additional context
-      description: Anything else that would help answer the question.
+
+* type: markdown
+  attributes:
+  value: |
+  Before opening a question, please review the README, documentation, and existing issues to see if your question has already been answered.
+
+* type: textarea
+  id: question
+  attributes:
+  label: Question
+  description: What would you like to know?
+  validations:
+  required: true
+
+* type: textarea
+  id: context
+  attributes:
+  label: Context
+  description: What are you trying to accomplish with OmniGent?
+  placeholder: |
+  Example:
+  - Setting up OmniGent locally
+  - Configuring a model provider
+  - Building an agent workflow
+  - Integrating external tools
+  - Troubleshooting an issue
+  validations:
+  required: true
+
+* type: textarea
+  id: attempted
+  attributes:
+  label: What have you tried?
+  description: Share any steps, configurations, or troubleshooting attempts you've already made.
+
+* type: textarea
+  id: environment
+  attributes:
+  label: Relevant details
+  description: Provide any information that may help answer your question.
+  placeholder: |
+  OmniGent version:
+  OS:
+  Python version:
+  Model/provider:
+  Deployment method:
+  Relevant logs or screenshots:
+
+* type: textarea
+  id: additional-context
+  attributes:
+  label: Additional context
+  description: Include links, screenshots, configurations, examples, or anything else that may help clarify your question.

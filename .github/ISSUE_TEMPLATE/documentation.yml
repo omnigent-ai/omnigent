@@ -1,37 +1,43 @@
 name: Documentation
-description: Report unclear, missing, or outdated documentation.
+description: Report unclear, missing, outdated, or incorrect documentation.
 title: "[Docs]: "
 labels: ["documentation"]
+
 body:
-  - type: textarea
-    id: page-section
-    attributes:
-      label: Page / section
-      description: Which docs page or section is affected?
-      placeholder: https://docs.pullfrog.com/...
-    validations:
-      required: true
-  - type: textarea
-    id: issue
-    attributes:
-      label: What is unclear or missing?
-      description: Describe the issue with the documentation.
-    validations:
-      required: true
-  - type: textarea
-    id: suggested-improvement
-    attributes:
-      label: Suggested improvement
-      description: What would make this easier to understand?
-    validations:
-      required: true
-  - type: textarea
-    id: expected-outcome
-    attributes:
-      label: Expected outcome
-      description: What should a new contributor or user be able to do after reading this?
-  - type: textarea
-    id: additional-context
-    attributes:
-      label: Additional context
-      description: Add links, screenshots, or examples if helpful.
+
+* type: textarea
+  id: page-section
+  attributes:
+  label: Page / section
+  description: Which documentation page, guide, or section is affected?
+  placeholder: README, Installation Guide, Quick Start, Configuration, API Reference, etc.
+  validations:
+  required: true
+
+* type: textarea
+  id: issue
+  attributes:
+  label: What is unclear, missing, or incorrect?
+  description: Describe the documentation issue.
+  validations:
+  required: true
+
+* type: textarea
+  id: suggested-improvement
+  attributes:
+  label: Suggested improvement
+  description: How could the documentation be improved?
+  validations:
+  required: true
+
+* type: textarea
+  id: expected-outcome
+  attributes:
+  label: Expected outcome
+  description: What should a new user or contributor be able to understand or accomplish after reading the improved documentation?
+
+* type: textarea
+  id: additional-context
+  attributes:
+  label: Additional context
+  description: Add links, screenshots, examples, or references that may help.
