@@ -76,8 +76,17 @@ dependencies = [
     # to remember `--extra all`. Issue #406.
     "claude-agent-sdk>=0.1.62",
     "openai-agents>=0.0.17",
+    # The Cursor harness drives the cursor-sdk (custom_tools tool bridge over a
+    # local bridge); like the other first-party harnesses it is part of the
+    # baseline install so `--harness cursor` works without `--extra`.
+    "cursor-sdk>=0.1.7",
     "PyJWT[crypto]>=2.8,<3",
     "argon2-cffi>=23.1,<24",
+    # PEP 440 version comparison for the update check / `omni upgrade`
+    # (omnigent/update_check.py, omnigent/cli.py): compares the installed
+    # version against the latest PyPI release. Previously only a
+    # transitive dep; pinned here now that we import it directly.
+    "packaging>=23,<26",
 ]
 
 [project.optional-dependencies]
@@ -115,6 +124,10 @@ agents-sdk = [
     "openai-agents>=0.1,<1",
     "opentelemetry-instrumentation-openai-agents-v2>=0.1",
 ]
+# Google Antigravity SDK harness (`harness: antigravity`). Optional: the
+# harness module imports the SDK lazily on first turn, so only users of the
+# harness need this extra. Early SDK (v0.1.x) — pin minor.
+antigravity = ["google-antigravity>=0.1,<1"]
 databricks = [
     # Floor matches what core code was tested against when the SDK was a
     # default dependency (it moved here from `dependencies` above).
@@ -206,6 +219,7 @@ include = ["omnigent*"]
 "omnigent.db" = ["alembic.ini"]
 "omnigent.db.migrations" = ["script.py.mako"]
 "omnigent.resources.examples" = ["*.yaml", "*.sh", "debby/**/*", "polly/**/*"]
+"omnigent.resources.pi_native" = ["*.js"]
 # include UI assets in build
 "omnigent.server" = ["static/web-ui/**/*"]
 
@@ -247,6 +261,7 @@ markers = [
     "live_app: end-to-end tests requiring a deployed Databricks App server",
     "model(name, ...): one arg pins this test to that model overriding the suite-wide --model CLI default; multiple args fan the test out across all listed models via indirect parametrize.",
     "model_pinned: opt out of tests/_model_pools.py spreading and retry rotation; literal model strings are used as written.",
+    "flaky(reruns=2, reruns_delay=0): rerun a nondeterministic test on failure (pytest-rerunfailures). Use for tests flaky due to timing/scheduling races (e.g. PTY drain timing), NOT real-LLM nondeterminism — those use llm_flaky, which rotates models per attempt.",
     "llm_flaky(reruns=2, reruns_delay=1): rerun a nondeterministic real-LLM test on failure, rotating to a different model each attempt (tests/_model_pools.py). Never apply to heavy e2e tests that can hit the CI --timeout=180 cap (rerun + loadscope can crash the shard).",
     "in_process_sessions: run a server integration test with the legacy in-process sessions path instead of sessions-native runner dispatch.",
     "nightly: runs only in the scheduled/dispatch pass of its suite; PR and push runs exclude it via -m 'not nightly'. Remove the marker to promote a burned-in test to the PR gate.",

@@ -24,13 +24,8 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { capitalizeAgentName } from "@/lib/agentLabels";
 import { coercePolicyParams } from "@/lib/policyParams";
+import { nativeCodingAgentForAgentName } from "@/lib/nativeCodingAgents";
 import { useChatStore } from "@/store/chatStore";
-
-/** Trigger-pill display aliases for native agents. */
-export const AGENT_DISPLAY_NAMES: Record<string, string> = {
-  "claude-native-ui": "Claude",
-  "codex-native-ui": "Codex",
-};
 
 /**
  * Display label for an agent name: the wrapper alias when mapped, else
@@ -39,7 +34,9 @@ export const AGENT_DISPLAY_NAMES: Record<string, string> = {
  * the new-chat picker's capitalization.
  */
 export function agentDisplayLabel(name: string): string {
-  return AGENT_DISPLAY_NAMES[name] ?? capitalizeAgentName(name);
+  const nativeAgent = nativeCodingAgentForAgentName(name);
+  if (nativeAgent?.key === "claude") return "Claude";
+  return nativeAgent?.displayName ?? capitalizeAgentName(name);
 }
 
 /** Compact pill row listing MCP servers attached to an agent. */
