@@ -32,8 +32,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Security precondition gate: on untrusted PRs, npm ci/test (which runs the
+  # PR's own install hooks and test code) is held until the deterministic scan
+  # passes (see .github/workflows/security-gate.yml). Trusted authors and
+  # non-PR events pass through instantly.
+  gate:
+    uses: ./.github/workflows/security-gate.yml
+
   npm-test:
     name: npm test
+    needs: gate
     if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
