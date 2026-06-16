@@ -1,0 +1,31 @@
+# Server config for the self-contained managed-Docker profile.
+# Copy to config.managed.yaml (mounted into the server by
+# docker-compose.managed.yaml and selected via OMNIGENT_CONFIG).
+sandbox:
+  provider: docker
+  # Service name on the app network; sibling sandbox containers resolve it
+  # over the omnigent-sbx network.
+  server_url: http://omnigent:8000
+  docker:
+    # Omit `image` to use ghcr.io/omnigent-ai/omnigent-host:latest
+    # (env override: OMNIGENT_DOCKER_HOST_IMAGE).
+    image: ghcr.io/omnigent-ai/omnigent-host:latest
+    # The segmented sandbox network (defined in docker-compose.yaml).
+    network: omnigent-sbx
+    # SERVER env var NAMES injected into each sandbox (values, never names,
+    # stay out of this file). Set the matching vars in .env.
+    env:
+      - ANTHROPIC_API_KEY
+      - OPENAI_API_KEY
+      - GIT_TOKEN
+    # containers.run resource limits.
+    resources:
+      mem_limit: 4g
+      nano_cpus: 2000000000   # 2 CPUs
+      pids_limit: 512
+    # containers.run security options. Set from the A2 bwrap spike outcome:
+    # keep no-new-privileges; add cap_drop: [ALL] only if the spike confirms
+    # native-harness bwrap still activates under it.
+    security:
+      security_opt:
+        - "no-new-privileges:true"

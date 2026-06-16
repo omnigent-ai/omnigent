@@ -42,6 +42,11 @@ run-omnigents.sh
 .env
 **/.env
 
+# Local managed-Docker server config created by
+# `cp config.managed.example.yaml config.managed.yaml`. Only the
+# *.example.yaml template is tracked.
+deploy/docker/config.managed.yaml
+
 # Local server databases — created by ap/omnigents server runs in
 # this directory, should never be committed.
 *.db

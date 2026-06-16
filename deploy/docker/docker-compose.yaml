@@ -35,6 +35,11 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    # App/DB network only — Postgres is deliberately NOT on the sandbox
+    # network, so managed sandbox containers (docker-compose.managed.yaml)
+    # have no route to the database.
+    networks:
+      - omnigent-app
 
   omnigent:
     # Pre-built image published to GHCR on every main-branch merge.
@@ -134,7 +139,24 @@ services:
       - artifact-data:/data
     ports:
       - "${OMNIGENT_PORT:-8000}:8000"
+    # On both networks: omnigent-app to reach Postgres, omnigent-sbx so the
+    # managed-Docker overlay's sandbox containers can dial the server back
+    # at http://omnigent:8000. (In the default, non-managed stack nothing
+    # else joins omnigent-sbx — it's harmless.)
+    networks:
+      - omnigent-app
+      - omnigent-sbx
 
 volumes:
   postgres-data:
   artifact-data:
+
+networks:
+  # App/DB network: server + postgres.
+  omnigent-app:
+    name: omnigent-app
+  # Sandbox network: server + spawned managed-sandbox host containers.
+  # Non-internal so sandboxes keep outbound NAT (LLM/Git); the managed
+  # launcher attaches containers here via sandbox.docker.network.
+  omnigent-sbx:
+    name: omnigent-sbx

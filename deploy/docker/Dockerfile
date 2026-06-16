@@ -48,6 +48,13 @@
 # Must satisfy pyproject requires-python (>=3.12); 3.11 fails dependency resolution.
 ARG PYTHON_VERSION=3.12
 ARG NODE_VERSION=20
+# Base-image digests (H1 — pinned for reproducible, supply-chain-verified builds).
+# Multi-arch INDEX digests for python:${PYTHON_VERSION}-slim and
+# node:${NODE_VERSION}-slim (resolved 2026-06-15). When you bump a *_VERSION,
+# re-resolve and update the matching digest together:
+#   docker buildx imagetools inspect python:3.12-slim --format '{{.Manifest.Digest}}'
+ARG PYTHON_DIGEST=sha256:d764629ce0ddd8c71fd371e9901efb324a95789d2315a47db7e4d27e78f1b0e9
+ARG NODE_DIGEST=sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0
 
 # ── Web UI builder ──────────────────────────────────────
 # Builds the ap-web SPA so `docker build` works from a clean checkout —
@@ -59,7 +66,7 @@ ARG NODE_VERSION=20
 #
 # Behind a corporate npm proxy, pass it through:
 #   --build-arg NPM_CONFIG_REGISTRY=https://npm-proxy.example.com
-FROM node:${NODE_VERSION}-slim AS web-builder
+FROM node:${NODE_VERSION}-slim@${NODE_DIGEST} AS web-builder
 ARG NPM_CONFIG_REGISTRY=
 ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
 WORKDIR /web/ap-web
@@ -75,7 +82,7 @@ RUN npm run build
 # out of the shipped images. Deliberately SPA-free and psycopg-free so
 # the host target can build without node; the server-only additions
 # live in server-builder below.
-FROM python:${PYTHON_VERSION}-slim AS builder
+FROM python:${PYTHON_VERSION}-slim@${PYTHON_DIGEST} AS builder
 
 ARG PYPI_INDEX_URL=https://pypi.org/simple
 
@@ -137,10 +144,16 @@ RUN test -f ./omnigent/server/static/web-ui/index.html \
 # [databricks] extra in pyproject — so add it explicitly here.
 RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} 'psycopg[binary]>=3.1,<4'
 
+# Docker SDK for the server-managed `docker` sandbox provider: the server
+# launches sibling host containers through /var/run/docker.sock. Installed
+# only in the server image (the `host` target never talks to a daemon), so
+# it stays out of the shared builder.
+RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} 'docker>=7,<8'
+
 # ── Node alias stage ─────────────────────────────────────
 # Pure alias so the host stage can COPY node out of a version-pinned
 # image; contributes no layers of its own.
-FROM node:${NODE_VERSION}-slim AS node-runtime
+FROM node:${NODE_VERSION}-slim@${NODE_DIGEST} AS node-runtime
 
 # ── Host runtime (`--target host`) ──────────────────────
 # Prebaked Omnigent host for remote sandboxes: full omnigent install,
@@ -149,7 +162,7 @@ FROM node:${NODE_VERSION}-slim AS node-runtime
 # CLIs (claude / codex / pi) so claude-sdk, claude-native, codex, and
 # pi agents can run in managed sandboxes without an in-sandbox
 # install. No SPA, no psycopg, no server entrypoint.
-FROM python:${PYTHON_VERSION}-slim AS host
+FROM python:${PYTHON_VERSION}-slim@${PYTHON_DIGEST} AS host
 ARG NPM_CONFIG_REGISTRY=
 ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
 
@@ -165,8 +178,15 @@ ENV PYTHONUNBUFFERED=1 \
     IS_SANDBOX=1
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git tmux curl ca-certificates \
+ && apt-get install -y --no-install-recommends git tmux curl ca-certificates bubblewrap \
  && rm -rf /var/lib/apt/lists/*
+
+# bubblewrap (bwrap): the native harness terminals (claude-native / codex-native
+# / pi) wrap each agent terminal in a bwrap OS-sandbox, and on Linux that
+# isolation is mandatory and fail-loud — omnigent/inner/bwrap_sandbox.py raises
+# if `bwrap` is not on PATH. deploy/islo/README.md documents this as a host-image
+# requirement. (libseccomp2 is NOT needed — bubblewrap's deps don't pull it on
+# Debian slim; add it here only if a target distro proves otherwise.)
 
 # Git credential helper for private repositories over HTTPS: answers
 # `git credential get` from GIT_TOKEN / GIT_USERNAME in the
@@ -223,17 +243,26 @@ WORKDIR /root
 CMD ["sleep", "infinity"]
 
 # ── Server runtime (default target) ─────────────────────
-FROM python:${PYTHON_VERSION}-slim AS runtime
+FROM python:${PYTHON_VERSION}-slim@${PYTHON_DIGEST} AS runtime
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PATH="/opt/venv/bin:${PATH}"
+    PATH="/opt/venv/bin:${PATH}" \
+    HOME=/home/omnigent
 
 # curl + ca-certificates only — for the HEALTHCHECK and for outbound
 # HTTPS to LLM gateways / external services.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends curl ca-certificates \
  && rm -rf /var/lib/apt/lists/*
+
+# Non-root runtime user (H2). uid/gid 10001 with a real home dir. /data is
+# chowned below so a freshly created docker named volume / k8s PVC inherits
+# writable ownership; k8s additionally sets fsGroup (see the base deployment).
+# NOTE: this is the SERVER runtime stage only — the `host` sandbox stage stays
+# root (sandbox containers run as root; claude-code needs it under IS_SANDBOX).
+RUN groupadd -g 10001 omnigent \
+ && useradd -u 10001 -g 10001 -m -d /home/omnigent -s /usr/sbin/nologin omnigent
 
 # Preserve /build/ in the runtime stage — the venv's editable install
 # .pth files reference /build/omnigent and /build/sdks/* by absolute
@@ -244,15 +273,24 @@ COPY deploy/docker/entrypoint.py /app/entrypoint.py
 
 WORKDIR /app
 
-# /data is mounted as a persistent volume by docker-compose for the
-# artifact store.
-RUN mkdir -p /data/artifacts
+# /data is mounted as a persistent volume by docker-compose for the artifact
+# store. chown so the non-root user (and a fresh named volume / PVC that
+# inherits this ownership) can write artifacts, config, and admin-credentials.
+# `g=u` mirrors user perms to the group so an arbitrary-uid platform (OpenShift,
+# whose assigned uid lands in the root group) can also write.
+RUN mkdir -p /data/artifacts \
+ && chown -R 10001:10001 /data /home/omnigent \
+ && chmod -R g=u /data /home/omnigent
 
 ENV PORT=8000 \
     HOST=0.0.0.0 \
     ARTIFACT_DIR=/data/artifacts
 
 EXPOSE 8000
+
+# Drop to the non-root user for the running server (H2). Every root-only step
+# (apt, COPY, mkdir/chown) is above this line.
+USER 10001:10001
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl -fsS "http://127.0.0.1:${PORT}/health" || exit 1

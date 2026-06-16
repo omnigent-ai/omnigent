@@ -1,0 +1,40 @@
+# Self-contained managed-Docker profile. Layer on the base stack:
+#
+#   cd deploy/docker
+#   ./bootstrap.sh                                   # sets POSTGRES_PASSWORD etc.
+#   printf "DOCKER_GID=%s\n" "$(getent group docker | cut -d: -f3)" >> .env
+#   cp config.managed.example.yaml config.managed.yaml
+#   docker pull ghcr.io/omnigent-ai/omnigent-host:latest
+#   docker compose -f docker-compose.yaml -f docker-compose.managed.yaml up -d
+#
+# With this overlay the server provisions one sibling omnigent-host container
+# per managed session (host_type="managed"), on the omnigent-sbx network.
+#
+# Single-user (OMNIGENT_AUTH_ENABLED=0): the per-session runner tunnel is
+# refused under multi-user `accounts` auth, so the managed profile runs as a
+# trusted single tenant. OMNIGENT_AUTH_PROVIDER is left empty on purpose — an
+# explicit provider overrides AUTH_ENABLED and would silently re-enable auth
+# (and re-break the runner tunnel). For multi-user, front the server with a
+# header/OIDC proxy instead.
+#
+# Security: mounting /var/run/docker.sock gives the server host-root-equivalent
+# control of Docker. Accepted for internal deployments; a docker-socket-proxy
+# is the hardening follow-up. The socket is mounted into the SERVER only, never
+# into sandbox containers.
+
+name: omnigent
+
+services:
+  omnigent:
+    # The non-root server (UID 10001) needs the host docker group to read the
+    # mounted socket. Find it with: getent group docker | cut -d: -f3
+    group_add:
+      - "${DOCKER_GID:?set DOCKER_GID in .env to the host docker group id}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./config.managed.yaml:/etc/omnigent/config.yaml:ro
+    environment:
+      OMNIGENT_AUTH_ENABLED: "0"
+      OMNIGENT_AUTH_PROVIDER: ""
+      OMNIGENT_CONFIG: /etc/omnigent/config.yaml
+      OMNIGENT_DOCKER_HOST_IMAGE: "${OMNIGENT_DOCKER_HOST_IMAGE:-ghcr.io/omnigent-ai/omnigent-host:latest}"

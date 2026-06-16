@@ -210,6 +210,93 @@ whatever value reaches it.
 `DATABASE_URL` and `ARTIFACT_DIR` are computed by compose and
 injected into the container.
 
+## Managed Docker sandboxes (self-contained)
+
+The managed-Docker overlay lets the **server provision one sibling
+`omnigent-host` container per managed session** — no external SaaS sandbox,
+no bring-your-own host. Layer `docker-compose.managed.yaml` on the base stack:
+
+```bash
+cd deploy/docker
+./bootstrap.sh                                          # POSTGRES_PASSWORD etc.
+printf "DOCKER_GID=%s\n" "$(getent group docker | cut -d: -f3)" >> .env
+cp config.managed.example.yaml config.managed.yaml      # edit sandbox.docker.env if needed
+docker pull ghcr.io/omnigent-ai/omnigent-host:latest    # the sandbox image
+docker compose -f docker-compose.yaml -f docker-compose.managed.yaml up -d
+```
+
+Then create a session with `host_type: "managed"` (the provider comes from
+the server's `sandbox.provider: docker` config, **not** a request field). The
+server provisions a container, runs `omnigent host` inside it, and binds the
+session to it; on session delete the container is removed. Orphans left by a
+server crash are reaped on the next startup and on a periodic sweep.
+
+### Build the host image locally (no registry needed)
+
+You do **not** need access to the published `ghcr.io/omnigent-ai/omnigent-host`
+image — build it from this repo's Dockerfile `host` target and point the
+provider at your local tag:
+
+```bash
+# from the repo root
+docker build -t omnigent-host:local --target host -f deploy/docker/Dockerfile .
+# then either set it in .env …
+echo "OMNIGENT_DOCKER_HOST_IMAGE=omnigent-host:local" >> deploy/docker/.env
+# … or in config.managed.yaml under sandbox.docker.image
+```
+
+The `host` target bakes the full omnigent install plus git, tmux, bubblewrap,
+and the harness CLIs (claude / codex / pi). For a multi-node setup, push the
+tag to your own registry and reference that instead.
+
+### `DOCKER_GID` (required)
+
+The server runs as a non-root user (UID 10001), so a bare
+`/var/run/docker.sock` bind-mount (typically `root:docker`, mode `0660`) is
+**not** readable. The overlay adds the server to the host's docker group via
+`group_add: ["${DOCKER_GID}"]`. Set `DOCKER_GID` in `.env` to
+`getent group docker | cut -d: -f3`. If it's wrong, the first managed launch
+fails fast at `prepare()`'s `client.ping()`.
+
+### Auth: single-user
+
+The overlay sets `OMNIGENT_AUTH_ENABLED=0` and leaves `OMNIGENT_AUTH_PROVIDER`
+empty. Managed hosts open a per-session **runner tunnel** that authenticates
+with a resolved user credential the launch token lacks, so under multi-user
+`accounts` auth that tunnel is refused. Run the managed profile single-user
+(trusted tenant), or front the server with a header/OIDC proxy for multi-user.
+Do **not** set `OMNIGENT_AUTH_PROVIDER` under `AUTH_ENABLED=0` — an explicit
+provider overrides the switch and silently re-enables auth.
+
+### Security posture
+
+- **Docker socket = host root.** Mounting `/var/run/docker.sock` gives the
+  server host-root-equivalent control of Docker. Accepted for internal
+  deployments; a docker-socket-proxy is the hardening follow-up. The socket is
+  mounted into the **server only**, never into sandbox containers.
+- **Network segmentation.** Two networks: `omnigent-app` (server + Postgres)
+  and `omnigent-sbx` (server + sandbox containers). Sandboxes reach the server
+  at `http://omnigent:8000` and get outbound NAT, but have **no route to
+  Postgres**. Egress is coarse (Docker NAT) in this MVP; fine-grained egress
+  (internal network + egress proxy) is a follow-up.
+- **Inner sandbox (bwrap) requires a userns-enabled host.** The agent's
+  in-process `linux_bwrap` sandbox and the native harnesses
+  (claude-native/codex-native/pi, which always wrap terminals in bwrap on
+  Linux) need the host kernel to allow **unprivileged user namespaces**
+  (`sysctl kernel.unprivileged_userns_clone=1` on Debian/Ubuntu, or a non-zero
+  `user.max_user_namespaces`). On a host where that is disabled, bwrap fails to
+  create namespaces inside the unprivileged container — run native harnesses
+  only on a userns-enabled host, and run non-native agents with an explicit
+  `os_env.sandbox.type: none` (the container is then the isolation boundary).
+  The opt-in spike
+  `tests/onboarding/sandboxes/test_docker_bwrap_spike.py` verifies both paths
+  against the real host image; run it on your target host.
+- **Container limits.** `sandbox.docker.resources` (`mem_limit` / `nano_cpus`
+  / `pids_limit`) and `sandbox.docker.security` (`security_opt` / `cap_drop`)
+  are passed to `docker run`. The shipped example sets
+  `security_opt: ["no-new-privileges:true"]`; add `cap_drop: ["ALL"]` only
+  after the spike confirms bwrap still activates under it on your host.
+
 ## Host image (`--target host`)
 
 The same Dockerfile publishes a second image: the official Omnigent
