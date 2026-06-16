@@ -8,9 +8,10 @@ name: Security Gate
 #     MIRROR its conclusion (success -> proceed; failure -> fail, skipping the
 #     dependent CI jobs).
 #
-# Enforcement (audit vs blocking) lives in ONE place: GATE_BLOCKING in
-# security-scan.yml. Splitting scan from gate runs the scan once, not once per
-# workflow. The trust decision is read from `main` (should-scan.sh).
+# The scan (security-scan.yml) is blocking: a finding fails the `Security Scan`
+# check, which this poller mirrors to block dependent CI. Splitting scan from
+# gate runs the scan once, not once per workflow. The trust decision is read
+# from `main` (should-scan.sh).
 
 on:
   workflow_call:
@@ -57,10 +58,13 @@ jobs:
           echo "Untrusted PR -- waiting for the single 'Security Scan' check on $HEAD_SHA"
           q='[.check_runs[] | select(.name=="Security Scan")] | sort_by(.started_at) | last'
           conclusion=""
+          details_url=""
           for _ in $(seq 1 72); do   # up to ~6 min (72 * 5s)
             status=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs" --jq "$q | .status" 2>/dev/null || echo "")
             if [ "$status" = "completed" ]; then
               conclusion=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs" --jq "$q | .conclusion")
+              # The scan's own run page -- where the findings/annotations live.
+              details_url=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs" --jq "$q | .html_url")
               break
             fi
             sleep 5
@@ -72,5 +76,8 @@ jobs:
           echo "Security Scan concluded: $conclusion"
           case "$conclusion" in
             success | skipped | neutral) exit 0 ;;
-            *) echo "::error::Security Scan did not pass ($conclusion); blocking dependent CI."; exit 1 ;;
+            *)
+              echo "::error::Security Scan did not pass ($conclusion); dependent CI is blocked until it passes. See the findings: ${details_url:-the 'Security Scan' check on this PR}"
+              exit 1
+              ;;
           esac

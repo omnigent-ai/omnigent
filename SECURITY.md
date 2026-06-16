@@ -46,9 +46,6 @@ directly. When enforcing, merge stays blocked transitively (the skipped
 pytest/e2e checks are required) and `Maintainer Approval` remains the ultimate
 gate.
 
-It currently runs in **audit (non-blocking) mode** (`GATE_BLOCKING: "false"` in
-`security-scan.yml` — the single enforcement switch): the detectors run and
-surface findings as annotations and a job summary, but the `Security Scan` check
-always succeeds, so the pollers proceed and no CI is blocked. Flip
-`GATE_BLOCKING` to `"true"` to enforce once the scan has been observed on real
-PRs.
+It is **blocking**: a finding fails the `Security Scan` check, the pollers mirror
+that failure, and the dependent CI jobs are skipped. Detectors run fail-fast, so
+a clean PR must pass every one.
