@@ -12,10 +12,10 @@ import httpx
 import pytest
 
 from omnigent.server.routes.auth import (
+    _GITHUB_EMAILS_ENDPOINT,
     _claim_is_verified_true,
     _CliTicket,
     _evict_expired_tickets,
-    _GITHUB_EMAILS_ENDPOINT,
     _resolve_github_email,
     _sanitize_return_to,
 )
