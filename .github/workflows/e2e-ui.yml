@@ -213,11 +213,12 @@ jobs:
           npm run build
 
       # ----------------------------------------------------------------------
-      # Native-claude ("Claude Code") harness enablement. The two steps below
-      # let test_native_claude_render_parity boot a real Claude Code CLI in CI,
-      # mirroring how e2e.yml / integration.yml auth the Claude harnesses. Only
-      # the native render-parity test depends on these; the rest of the e2e-ui
-      # suite (openai-agents) ignores them.
+      # Native coding-agent harness enablement. The steps below let
+      # test_native_claude_render_parity and test_native_codex_render_parity
+      # boot a real Claude Code / Codex CLI in CI, mirroring how e2e.yml /
+      # integration.yml auth those harnesses. Only the native render-parity
+      # tests depend on these; the rest of the e2e-ui suite (openai-agents)
+      # ignores them.
       # ----------------------------------------------------------------------
       - name: Install Claude Code CLI
         # Install claude-code 2.1.170, NOT the 2.1.124 pinned in
@@ -240,28 +241,49 @@ jobs:
           node node_modules/@anthropic-ai/claude-code/install.cjs
           echo "${GITHUB_WORKSPACE}/.cc-cli/node_modules/.bin" >> "$GITHUB_PATH"
 
-      - name: Configure native-claude gateway provider
-        # The runner derives Claude Code's gateway auth from omnigent provider
-        # config (omnigent.claude_native.resolve_native_claude_config). Register
-        # the Databricks serving-endpoints gateway as the default anthropic
-        # provider: ANTHROPIC_BASE_URL := the gateway, the token reaches Claude
-        # via a printf apiKeyHelper built from env:LLM_API_KEY (the runner env
-        # allowlist excludes ANTHROPIC_API_KEY), model := the CI Claude model.
-        # The config uses an env: ref (not the literal token), so no secret is
-        # written to disk here. ~/.databrickscfg / DATABRICKS_BEARER are
-        # intentionally NOT written: the native-claude path authenticates purely
-        # from this provider config, so there's no ambient Databricks lookup to
-        # satisfy — keeping the literal token off disk.
+      - name: Install Codex CLI
+        # Install @openai/codex at the version pinned in .github/ci-deps (the
+        # same build e2e.yml's codex leg runs). `scripts: null` on the package
+        # means there is no postinstall, so --ignore-scripts is a no-op safety
+        # net; the native binary ships in the package itself and is put on PATH
+        # via node_modules/.bin. The native codex render-parity test
+        # (test_native_codex_render_parity) drives this CLI through a tmux pane
+        # (omnigent/codex_native_bridge), so `codex` must be on PATH.
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/.codex-cli" && cd "${GITHUB_WORKSPACE}/.codex-cli"
+          npm install --ignore-scripts --no-audit --no-fund @openai/codex@0.128.0-alpha.1
+          echo "${GITHUB_WORKSPACE}/.codex-cli/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Configure native-claude/codex gateway provider
+        # The runner derives each native CLI's gateway auth from omnigent
+        # provider config (claude: omnigent.claude_native.resolve_native_claude_config;
+        # codex: omnigent.codex_native_app_server.resolve_native_codex_launch).
+        # Register the Databricks gateway as the default for BOTH families so a
+        # single provider routes Claude Code (anthropic) and Codex (openai): the
+        # token reaches each CLI via an env:LLM_API_KEY ref (the runner env
+        # allowlist excludes ANTHROPIC_API_KEY / OPENAI_API_KEY), each family
+        # pins its CI model. The config uses an env: ref (not the literal token),
+        # so no secret is written to disk here. ~/.databrickscfg / DATABRICKS_BEARER
+        # are intentionally NOT written: the native paths authenticate purely from
+        # this provider config, so there's no ambient Databricks lookup to satisfy
+        # — keeping the literal token off disk.
         env:
           GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         run: |
           mkdir -p "$HOME/.omnigent"
+          # The Anthropic Messages surface and the Codex Responses surface live
+          # at different paths off the same workspace host. GATEWAY_BASE_URL is
+          # <host>/serving-endpoints (the OpenAI-compatible surface); strip that
+          # suffix to recover the bare host for the codex /ai-gateway path.
+          host="${GATEWAY_BASE_URL%/serving-endpoints}"
           cat > "$HOME/.omnigent/config.yaml" <<EOF
           providers:
             databricks-gateway:
               kind: gateway
-              default: anthropic
+              default: [anthropic, openai]
               anthropic:
                 # Databricks serves the Anthropic Messages surface at
                 # <host>/serving-endpoints/anthropic (see
@@ -279,6 +301,18 @@ jobs:
                 # 'databricks-' prefixed id).
                 models:
                   default: databricks-claude-sonnet-4-6
+              openai:
+                # Databricks serves the Codex Responses surface at
+                # <host>/ai-gateway/codex/v1 (see omnigent/inner/codex_executor.py:
+                # _databricks_codex_base_url), NOT the /serving-endpoints
+                # OpenAI-compatible surface. wire_api must be 'responses' — codex
+                # >= 0.137 rejects 'chat' at config load.
+                base_url: "${host}/ai-gateway/codex/v1"
+                api_key_ref: "env:LLM_API_KEY"
+                wire_api: responses
+                # The codex model id the e2e codex leg pins (tests/_model_pools).
+                models:
+                  default: databricks-gpt-5-4-mini
           EOF
 
       - name: Run UI e2e tests
@@ -306,27 +340,22 @@ jobs:
           SHARD_ID: ${{ matrix.shard_id }}
           NUM_SHARDS: ${{ matrix.num_shards }}
         run: |
-          EXTRA_ARGS=()
-          if [[ "$NIGHTLY_FULL" != "true" ]]; then
-            EXTRA_ARGS+=(-m "not nightly")
+          # TEMP (revert before merge): scope this run to ONLY the native codex
+          # render-parity test so we validate the new suite + harness wiring on
+          # CI before flipping back to the full sharded e2e_ui suite. Run it on a
+          # single shard (shard 0) and treat the other shards as empty so they
+          # pass without re-running the expensive native session. -s
+          # --log-cli-level=INFO streams the runner/native logs live for triage.
+          if [[ "$SHARD_ID" != "0" ]]; then
+            echo "::notice::TEMP single-test validation runs on shard 0 only; skipping shard $SHARD_ID."
+            exit 0
           fi
-          # --splits/--group partition the suite across the matrix entries
-          # via a round-robin strided slice (see pytest_collection_modifyitems
-          # in tests/e2e_ui/conftest.py). Unlike pytest-shard's hash-bucketing
-          # -- which was blind to runtime and left one shard ~5min while
-          # others ran ~2min -- striding scatters each heavy file's cases
-          # one-per-shard, evening out wall-clock with no extra dependency
-          # and no durations file to maintain. --group is 1-indexed, so we
-          # map the 0-indexed matrix shard_id with +1.
-          uv run pytest tests/e2e_ui \
-            -v --tb=long --showlocals --log-level=INFO -r a \
+          uv run pytest tests/e2e_ui/messages/test_native_codex_render_parity.py \
+            -v --tb=long --showlocals --log-level=INFO --log-cli-level=INFO -s -r a \
             --ui-skip-build \
-            --splits="$NUM_SHARDS" \
-            --group="$((SHARD_ID + 1))" \
             --tracing=retain-on-failure \
             --screenshot=only-on-failure \
             --video=retain-on-failure \
-            "${EXTRA_ARGS[@]}" \
             || { rc=$?; [ "$rc" -eq 5 ] && echo "::notice::No tests collected in this shard; treating as a pass." || exit "$rc"; }
 
       - name: Upload Playwright traces / videos / screenshots on failure
@@ -359,6 +388,20 @@ jobs:
           mkdir -p /tmp/claude-home-dump
           cp -r "$HOME/.claude/projects" /tmp/claude-home-dump/ 2>/dev/null || true
 
+      - name: Dump Codex transcript on failure
+        # Codex's per-session rollout transcripts (the JSONL with its actual API
+        # errors) live under the bridged CODEX_HOME at
+        # ~/.omnigent/codex-native/<hash>/codex-home/sessions. Copy ONLY the
+        # *.jsonl rollouts so the server-logs upload captures them. Deliberately
+        # NOT copying config.toml: its auth command embeds the gateway token
+        # (printf %s <token>), so it is never staged for upload — no credential
+        # leaves the runner.
+        if: failure()
+        run: |
+          mkdir -p /tmp/codex-home-dump
+          find "$HOME/.omnigent/codex-native" -name '*.jsonl' -print0 2>/dev/null \
+            | xargs -0 -I{} cp --parents {} /tmp/codex-home-dump/ 2>/dev/null || true
+
       - name: Upload server logs on failure
         id: upload_server_logs
         if: failure()
@@ -372,16 +415,20 @@ jobs:
           # ``e2e_ui_logs*``, which never matched, so the artifact was
           # always empty.
           #
-          # Also grab runner.log (carries the claude-native auto-launch +
-          # auth-resolution + terminal-launch logs) and the native bridge dir
+          # Also grab runner.log (carries the claude-/codex-native auto-launch +
+          # auth-resolution + terminal-launch logs) and the native bridge dirs
           # (tmux target, transcript-forward deltas) under
-          # /tmp/omnigent-<uid>/claude-native, plus the Claude transcript
-          # staged above — all needed to triage a native render-parity failure.
+          # /tmp/omnigent-<uid>/claude-native, plus the Claude / Codex
+          # transcripts staged above — all needed to triage a native
+          # render-parity failure. The codex bridge state lives under
+          # ~/.omnigent/codex-native; only its *.jsonl rollouts are staged
+          # (config.toml carries the token and is excluded).
           path: |
             /tmp/pytest-of-runner/**/e2e_ui_server*/server.log
             /tmp/pytest-of-runner/**/e2e_ui_server*/runner.log
             /tmp/omnigent-*/claude-native/**
             /tmp/claude-home-dump/**
+            /tmp/codex-home-dump/**
           retention-days: 3
           if-no-files-found: ignore
 
