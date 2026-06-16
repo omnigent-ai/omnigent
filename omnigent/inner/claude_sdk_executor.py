@@ -129,8 +129,8 @@ SdkOptions: TypeAlias = Any  # type: ignore[explicit-any]
 # this executor touches.
 #
 # The private reaches (``_query``, ``_transport``, ``_process``,
-# ``_stderr_task_group``, etc.) are necessary to tear down the CLI
-# subprocess tree when the SDK's own ``disconnect()`` path is unsafe
+# ``_stderr_task`` / ``_stderr_task_group``, etc.) are necessary to tear
+# down the CLI subprocess tree when the SDK's own ``disconnect()`` path is unsafe
 # (different event loop / task) or hangs. The SDK does not expose a
 # supported equivalent, so we treat the private attributes as part of
 # our integration contract and document them here.
@@ -159,6 +159,19 @@ class _CancelScope(Protocol):
 
 class _TaskGroup(Protocol):
     cancel_scope: _CancelScope
+
+
+class _TaskHandle(Protocol):
+    """Private view of the SDK's detached stderr-reader task.
+
+    Current ``claude-agent-sdk`` (>=0.2.x) runs the stderr reader as a
+    single task exposed as ``_stderr_task`` with a ``cancel()`` method;
+    older revs used an anyio task group (``_stderr_task_group``). The
+    executor probes both shapes during force-close, so both are typed
+    optional on ``_ClaudeTransport`` below.
+    """
+
+    def cancel(self) -> None: ...
 
 
 class _ClaudeQuery(Protocol):
@@ -193,6 +206,7 @@ class _ClaudeTransport(Protocol):
     _stdout_stream: _Stream | None
     _stdin_stream: _Stream | None
     _stderr_stream: _Stream | None
+    _stderr_task: _TaskHandle | None
     _stderr_task_group: _TaskGroup | None
     _ready: bool
 
@@ -1489,10 +1503,21 @@ class ClaudeSDKExecutor(Executor):
 
         transport = getattr(client, "_transport", None)
         if transport is not None:
-            stderr_tg = transport._stderr_task_group
-            if stderr_tg is not None:
+            # The SDK's stderr reader changed shape across revs: current
+            # claude-agent-sdk (>=0.2.x) exposes a single ``_stderr_task``
+            # TaskHandle with ``cancel()``; older revs an anyio
+            # ``_stderr_task_group``. Probe both via getattr so a force-close
+            # never raises AttributeError out of lifespan shutdown (which
+            # crashed the runner on session stop).
+            stderr_task = getattr(transport, "_stderr_task", None)
+            if stderr_task is not None:
                 with suppress(Exception):
-                    stderr_tg.cancel_scope.cancel()
+                    stderr_task.cancel()
+            else:
+                stderr_tg = getattr(transport, "_stderr_task_group", None)
+                if stderr_tg is not None:
+                    with suppress(Exception):
+                        stderr_tg.cancel_scope.cancel()
 
             for stream in (
                 transport._stdout_stream,
@@ -1528,7 +1553,10 @@ class ClaudeSDKExecutor(Executor):
             transport._stdout_stream = None
             transport._stdin_stream = None
             transport._stderr_stream = None
-            transport._stderr_task_group = None
+            if getattr(transport, "_stderr_task", None) is not None:
+                transport._stderr_task = None
+            if getattr(transport, "_stderr_task_group", None) is not None:
+                transport._stderr_task_group = None
             transport._ready = False
 
         client._query = None
