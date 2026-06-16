@@ -247,7 +247,11 @@ jobs:
         # provider: ANTHROPIC_BASE_URL := the gateway, the token reaches Claude
         # via a printf apiKeyHelper built from env:LLM_API_KEY (the runner env
         # allowlist excludes ANTHROPIC_API_KEY), model := the CI Claude model.
-        # ~/.databrickscfg mirrors e2e.yml for any ambient lookups.
+        # The config uses an env: ref (not the literal token), so no secret is
+        # written to disk here. ~/.databrickscfg / DATABRICKS_BEARER are
+        # intentionally NOT written: the native-claude path authenticates purely
+        # from this provider config, so there's no ambient Databricks lookup to
+        # satisfy — keeping the literal token off disk.
         env:
           GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
@@ -276,13 +280,6 @@ jobs:
                 models:
                   default: databricks-claude-sonnet-4-6
           EOF
-          host="${GATEWAY_BASE_URL%/serving-endpoints}"
-          cat > "$HOME/.databrickscfg" <<EOF
-          [default]
-          host  = $host
-          token = $LLM_API_KEY
-          EOF
-          echo "DATABRICKS_BEARER=$LLM_API_KEY" >> "$GITHUB_ENV"
 
       - name: Run UI e2e tests
         # --ui-skip-build: the SPA was already built in the previous
