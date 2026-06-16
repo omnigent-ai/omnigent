@@ -1238,6 +1238,129 @@ def two_agent_chat_session(
                 respawned_runner.wait(timeout=5)
 
 
+# ---------------------------------------------------------------------------
+# Approval / elicitation session (approvals suite)
+#
+# ``approval_session`` yields ``(base_url, session_id)`` for a session whose
+# agent deterministically tries a *gated* shell command, so the runner's
+# policy gate escalates an ASK to the server and the web UI renders an
+# ``ApprovalCard`` (and the same prompt surfaces on the /inbox page).
+#
+# The mechanism is the nessie ``blast_radius`` policy with ``gate_pushes:
+# true``: a plain ``git push`` is "recoverable but outward", so the policy
+# returns ASK at the TOOL_CALL phase — before the command runs — which the
+# runner forwards to ``POST /v1/sessions/{id}/policies/evaluate``. The server
+# parks the gate and publishes a ``response.elicitation_request`` the snapshot
+# replays in ``pendingElicitations``. The verdict travels back through
+# ``POST /v1/sessions/{id}/elicitations/{eid}/resolve`` (what the card's
+# Approve/Reject buttons call). ``sys_os_shell`` is registered implicitly by
+# the ``os_env`` block (no explicit ``tools`` needed).
+#
+# The prompt is explicit (mirrors ``_TERMINAL_AGENT_YAML``) because the test
+# relies on the LLM emitting the gated tool call deterministically — the gate
+# fires on the call, not on execution, so the push never has to succeed.
+# ---------------------------------------------------------------------------
+
+_APPROVAL_AGENT_NAME = "approval_probe"
+_APPROVAL_AGENT_YAML = """\
+spec_version: 1
+name: approval_probe
+prompt: |
+  You are a deterministic approval-test assistant. When the user asks you to
+  push, deploy, or "run the command", you MUST do exactly this and nothing
+  else:
+
+  1. Call sys_os_shell with command set to exactly: git push origin main
+  2. After the tool result comes back, reply with one short sentence.
+
+  Do not ask for confirmation; do not explain beforehand; do not run any
+  other command or call any other tool.
+
+executor:
+  model: databricks-gpt-5-4
+  config:
+    harness: openai-agents
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
+
+guardrails:
+  # Generous window: the parked ASK must outlive the UI assertions.
+  ask_timeout: 300
+  policies:
+    blast_radius:
+      type: function
+      function:
+        path: omnigent.inner.nessie.policies.blast_radius
+        arguments:
+          # A plain `git push` is recoverable-but-outward → ASK (vs the
+          # always-DENY catastrophic set). This is the prompt the UI renders.
+          gate_pushes: true
+"""
+
+
+@pytest.fixture
+def approval_session(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """Create a runner-bound session whose agent triggers an approval prompt.
+
+    Same runner-respawn + bind contract as :func:`terminal_session`. The
+    agent is registered through the strict ``config.yaml`` parser (it carries
+    ``spec_version: 1`` + ``executor.config.harness``, plus the ``os_env`` and
+    ``guardrails`` blocks that path supports — see ``examples/polly``).
+
+    :param live_server: Spawned server fixture.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``. Send a "run the command" turn to
+        raise the gated-push approval.
+    """
+    import json as _json
+
+    respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+
+    yaml_bytes = _APPROVAL_AGENT_YAML.encode()
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        # Strict path: arcname config.yaml keeps it on the spec_version:1
+        # parser, which is the one that honors `guardrails`.
+        info = tarfile.TarInfo(name="config.yaml")
+        info.size = len(yaml_bytes)
+        tar.addfile(info, io.BytesIO(yaml_bytes))
+    create_resp = httpx.post(
+        f"{live_server}/v1/sessions",
+        data={"metadata": _json.dumps({})},
+        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
+        timeout=30.0,
+    )
+    create_resp.raise_for_status()
+    session_id = create_resp.json()["session_id"]
+
+    patch_resp = httpx.patch(
+        f"{live_server}/v1/sessions/{session_id}",
+        json={"runner_id": runner_id},
+        timeout=10.0,
+    )
+    patch_resp.raise_for_status()
+
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned_runner is not None:
+            respawned_runner.terminate()
+            try:
+                respawned_runner.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned_runner.kill()
+                respawned_runner.wait(timeout=5)
+
+
 @pytest.fixture(autouse=True)
 def _ui_defaults() -> None:
     """
