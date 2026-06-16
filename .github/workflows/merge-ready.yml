@@ -1,60 +1,33 @@
 name: Merge Ready
 
-# Posts a "Merge Ready" commit status on the PR head SHA. That status
-# is the single required check in branch protection; the REQUIRED list
-# inside this workflow defines what backs it.
-#
-# Per trigger:
-#   /merge comment   from a commenter with write access only: evaluate,
-#                    post green or red, enable GitHub auto-merge, drop a
-#                    sticky comment. Comments from users without write
-#                    access are ignored (author_association pre-filter
-#                    on the job, authoritative permission-API check
-#                    before any merge action).
-#   pull_request     skipped unless PR has `automerge` label. With
-#                    label, evaluate and post green or red. When the
-#                    `automerge` label was just added (action=labeled),
-#                    also enable GitHub auto-merge on the PR so it
-#                    merges automatically once the gate turns green.
-#   workflow_run     always evaluate. Posts green or red with the
-#                    `automerge` label. Without label, posts only
-#                    when the gate is fully green, so the PR flips
-#                    to all-green naturally after CI without flicker.
+# Posts the "Merge Ready" commit status on the PR head SHA -- the single
+# required branch-protection check, backed by the REQUIRED list inside
+# this workflow. Triggers: `/merge` comment (write-access commenter only),
+# `pull_request` labeled (acts only with `automerge`/`force-merge`), and
+# `workflow_run` on CI completion. Posted via the REST API (not the job's
+# implicit check run) so the status lands on the PR head SHA, since these
+# jobs run on the default branch.
 #
 # Labels:
-#   automerge        enable GitHub auto-merge (one-shot when label is
-#                    added) AND opt into continuous gate updates
-#                    (green AND red).
-#   force-merge      bypass: posts green regardless of CI state, but
-#                    ONLY when the PR author is a maintainer or a
-#                    maintainer has approved the PR. The maintainer
-#                    list is read at runtime from .github/MAINTAINER
-#                    at main's tip (never the PR head SHA -- a PR
-#                    that edits MAINTAINER to grant itself bypass
-#                    should not take effect until merged). When the
-#                    label is applied without maintainer involvement
-#                    and CI is also red, the workflow posts a red
-#                    status that explains why the bypass was
-#                    rejected.
-#
-# Status is posted via the REST API rather than the job's implicit
-# check run because `workflow_run` and `issue_comment` jobs execute on
-# the default branch; an explicit POST against the PR head SHA puts
-# the status on the right commit.
+#   automerge    enable GitHub auto-merge (one-shot on label add) + opt
+#                into continuous gate updates (green AND red).
+#   force-merge  bypass posting green regardless of CI, but only when the
+#                PR author is a maintainer or a maintainer approved; the
+#                list is read from .github/MAINTAINER at main's tip (never
+#                the PR head SHA). Bypass without maintainer + red CI posts
+#                a red status explaining the rejection.
 
 on:
-  # `labeled` only -- other PR events fired a skipped run on the
-  # checks panel. `workflow_run` re-evaluates on CI completion.
+  # `labeled` only; `workflow_run` re-evaluates on CI completion.
   pull_request:
     types: [labeled]
   workflow_run:
-    workflows: [PR Template, CI, Lint, E2E UI Tests, E2E Tests]
+    workflows: [PR Template, CI, Lint, E2E UI Tests, E2E Tests, Integration Tests]
     types: [completed]
   issue_comment:
     types: [created]
 
-# Read-only at the top level (Scorecard Token-Permissions); the write
-# scopes live on the job below.
+# Read-only at top level; write scopes live on the job below.
 permissions:
   contents: read
 
@@ -71,18 +44,12 @@ jobs:
       checks: read
       actions: read         # evaluate-checks.sh reads GET /actions/runs to classify missing checks
       statuses: write
-    # Fire on automerge/force-merge label adds, PR-triggered
-    # workflow_run completions, or `/merge` comments. Other label
-    # adds no longer skip-run here.
-    #
-    # workflow_run is filtered to PR-originated runs: the watched
-    # workflows' `pull_request` completions, plus the fork-e2e run
-    # which arrives as a `push` on a `fork-e2e/**` branch (the e2e
-    # suite for a mirrored fork PR -- see fork-e2e-mirror.yml). The
-    # context-resolution step below maps that branch's head SHA back
-    # to its PR. Post-merge runs on `main` (push), nightlies, and
-    # manual dispatches have no PR to post on, so they're excluded
-    # here to avoid spinning up a wasteful runner per merge.
+    # Fire on automerge/force-merge label adds, PR-originated
+    # workflow_run completions, or `/merge` comments. workflow_run is
+    # filtered to PR runs plus the fork-e2e `push` on `fork-e2e/**`
+    # (mirrored fork PR e2e -- see fork-e2e-mirror.yml; ctx step maps
+    # its head SHA back to the PR). Post-merge/nightly/dispatch runs
+    # have no PR to post on and are excluded.
     if: >-
       (
         github.event_name == 'pull_request' &&
@@ -126,24 +93,31 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          # Passed via env (not interpolated into the script): the JSON includes
-          # PR branch names, which a same-repo author controls, so direct
+          # Via env, not interpolated: author-controlled, so direct
           # interpolation would be a shell-injection vector.
           WF_PRS: ${{ toJSON(github.event.workflow_run.pull_requests) }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             PR="${{ github.event.pull_request.number }}"
             SHA="${{ github.event.pull_request.head.sha }}"
           elif [[ "${{ github.event_name }}" == "issue_comment" ]]; then
+            # The job `if` contains() pre-filter also fires on incidental
+            # mentions; re-validate `/merge` as a command (first non-space
+            # token on a line is exactly `/merge`, optional args).
+            if ! grep -qE '^[[:space:]]*/merge([[:space:]]|$)' <<<"$COMMENT_BODY"; then
+              echo "::notice::Skipped: comment mentions '/merge' but not as a command"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
             PR="${{ github.event.issue.number }}"
             SHA=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq '.headRefOid')
           else
             PR=$(echo "$WF_PRS" | jq -r '.[0].number // empty')
             SHA="${{ github.event.workflow_run.head_sha }}"
             if [[ -z "$PR" ]]; then
-              # Fork-PR upstream runs leave workflow_run.pull_requests empty
-              # (GitHub omits cross-repo PR refs), so resolve the open PR from
-              # the head SHA. SHA is a commit hash from the event (no injection).
+              # Fork-PR runs leave workflow_run.pull_requests empty, so
+              # resolve the open PR from the head SHA.
               PR=$(gh api "repos/$REPO/commits/$SHA/pulls" \
                 --jq 'map(select(.state == "open")) | .[0].number // empty' 2>/dev/null || true)
             fi
@@ -192,9 +166,8 @@ jobs:
           MAINTAINERS: ${{ steps.maintainers.outputs.list }}
         run: bash .github/scripts/merge-ready/force-merge-eligibility.sh
 
-      # post_red gates whether a red gate state posts a Merge Ready
-      # status. /merge needs it; automerge / force-merge opt in. Without
-      # one of those triggers we only post green so partial CI doesn't
+      # post_red gates posting a red status: /merge needs it, automerge /
+      # force-merge opt in; otherwise post green only so partial CI doesn't
       # paint red.
       - name: Determine eligibility
         id: eligible
@@ -261,10 +234,9 @@ jobs:
             -f description="$DESC" >/dev/null
           echo "Posted Merge Ready=$STATE on $SHA ($DESC)"
 
-      # Authoritative authorization for /merge: the job `if` pre-filters
-      # on author_association, but an org MEMBER may lack write on this
-      # repo, so confirm effective write access via the permission API
-      # before any merge action runs.
+      # Authoritative /merge authz: the job `if` pre-filters on
+      # author_association, but an org MEMBER may lack write here, so
+      # confirm write access via the permission API before merging.
       - name: Authorize /merge commenter
         id: authz
         if: >-

@@ -224,6 +224,70 @@ export function buildPendingBubbles(
   });
 }
 
+// A committed bubble that exists ONLY to render one or more
+// REQUEST-phase policy elicitation cards. A REQUEST-phase ASK parks the
+// user message server-side (it is not persisted / consumed until the
+// human approves — POLICIES.md §7.2), so the message lingers as an
+// optimistic pending bubble (and later a consumed committed bubble) while
+// its elicitation card arrives as a standalone committed assistant
+// bubble. Used by `mergePendingBubbles` and
+// `reorderCommittedRequestElicitations` to keep the prompt above the card
+// that asks about it, both before and after approval.
+function isRequestElicitationBubble(bubble: Bubble): boolean {
+  return (
+    bubble.kind === "assistant" &&
+    bubble.items.length > 0 &&
+    bubble.items.every((it) => it.kind === "elicitation" && it.phase === "request")
+  );
+}
+
+// Pull a committed REQUEST-phase elicitation card below the user message
+// it gated.
+//
+// Once a REQUEST-phase ASK is approved, the parked user message is
+// consumed and appended to `blocks` — but AFTER the elicitation card,
+// which arrived (and committed) while the message was still parked
+// server-side. The committed order is therefore [card, message], so the
+// approved card would sit ABOVE the prompt that triggered it. Swap each
+// such card with the user bubble that immediately follows it so the
+// prompt stays on top, matching the pre-approval pending layout
+// (`mergePendingBubbles`). A card with no following user bubble (declined
+// / still pending) is left untouched. Returns the input array unchanged
+// (same reference) when no swap applies, so the memo stays stable.
+export function reorderCommittedRequestElicitations(committed: Bubble[]): Bubble[] {
+  let result: Bubble[] | null = null;
+  for (let i = 0; i < committed.length - 1; i += 1) {
+    if (isRequestElicitationBubble(committed[i]!) && committed[i + 1]!.kind === "user") {
+      if (result === null) result = [...committed];
+      const card = result[i]!;
+      result[i] = result[i + 1]!;
+      result[i + 1] = card;
+    }
+  }
+  return result ?? committed;
+}
+
+// Place optimistic pending user bubbles into the committed timeline.
+//
+// Pending sends normally trail everything (the input should be visible
+// immediately, and they migrate into `blocks` once their
+// `session.input.consumed` event lands). The exception is a REQUEST-phase
+// policy ASK: that message never gets a consumed event until approval, so
+// it stays pending while its elicitation card renders as a committed
+// bubble — appending the pending bubble after the card would show the
+// approval prompt ABOVE the message that triggered it. When the timeline
+// ends in a run of such request-elicitation bubbles, splice the pending
+// bubbles in just before that run so the prompt stays on top.
+export function mergePendingBubbles(committed: Bubble[], pending: Bubble[]): Bubble[] {
+  if (pending.length === 0) return committed;
+  let insertAt = committed.length;
+  while (insertAt > 0 && isRequestElicitationBubble(committed[insertAt - 1]!)) {
+    insertAt -= 1;
+  }
+  if (insertAt === committed.length) return [...committed, ...pending];
+  return [...committed.slice(0, insertAt), ...pending, ...committed.slice(insertAt)];
+}
+
 // Whether a user bubble should carry the author's avatar badge (and the
 // author-tinted background): only in a shared session, only when a human
 // author is attached (agent/tool/system output and pre-attribution
@@ -449,18 +513,25 @@ export function ChatPage() {
   // active bubble, reusing the finalized prefix by reference.
   const bubbleCacheRef = useRef<BubbleCache>(createBubbleCache());
   const bubbles = useMemo<Bubble[]>(() => {
-    const committed = buildBubbles(
-      blocks,
-      activeResponse,
-      bubbleCacheRef.current,
-      interruptedResponseIds,
+    // A REQUEST-phase elicitation card commits before the user message it
+    // gates: while pending, the message is an optimistic trailing bubble
+    // (`mergePendingBubbles` lifts it above the card); once approved, the
+    // consumed message lands in `blocks` AFTER the card
+    // (`reorderCommittedRequestElicitations` swaps the card below it).
+    // Both keep the prompt on top across the pending → approved flip.
+    const committed = reorderCommittedRequestElicitations(
+      buildBubbles(blocks, activeResponse, bubbleCacheRef.current, interruptedResponseIds),
     );
     // claude-native live previews are NOT trailing bubbles — they live in
     // `blocks` as provisional `live:*` text blocks at their streamed
     // position (see chatStore), so they render in-order with later tool /
-    // elicitation cards. Only the optimistic pending user message trails.
+    // elicitation cards. The optimistic pending user message trails too,
+    // except when the timeline ends in a REQUEST-phase elicitation card.
     if (pendingUserMessages.length === 0) return committed;
-    return [...committed, ...buildPendingBubbles(pendingUserMessages, getCurrentAuthorId())];
+    return mergePendingBubbles(
+      committed,
+      buildPendingBubbles(pendingUserMessages, getCurrentAuthorId()),
+    );
   }, [blocks, activeResponse, interruptedResponseIds, pendingUserMessages]);
 
   // Picker selection. ChatPage stays mounted across `/` to `/c/:id`,
@@ -1156,8 +1227,21 @@ function MainAgentSurface({
 
   // Ref forwarded to SelectionPopup to scope selection detection to the
   // conversation area, preventing selections in the composer from triggering
-  // the popup.
+  // the popup. Mirrored into state (`containerEl`) so JumpToTopButton — which
+  // renders inside this wrapper, outside the mask-faded scroll viewport — can
+  // attach its hover listeners to the wrapper (the common ancestor of both the
+  // scroll area and the pill, so moving the cursor onto the pill keeps it live).
   const conversationRef = useRef<HTMLElement | null>(null);
+  const [containerEl, setContainerEl] = useState<HTMLElement | null>(null);
+  const setConversationEl = useCallback((el: HTMLDivElement | null) => {
+    conversationRef.current = el;
+    setContainerEl(el);
+  }, []);
+  // The conversation's scroll container + the StickToBottom controls needed to
+  // override its bottom-lock, lifted out of the context by
+  // ConversationScrollRefBridge so the pinned-but-unmasked JumpToTopButton can
+  // read and drive the scroll.
+  const [scroller, setScroller] = useState<ConversationScroller | null>(null);
   const [sendScrollNonce, setSendScrollNonce] = useState(0);
   const handleSend = useCallback(
     (text: string, files?: File[]) => {
@@ -1213,10 +1297,7 @@ function MainAgentSurface({
     <>
       {/* Wrapper div gives us a ref to scope the SelectionPopup to the
           conversation area without requiring Conversation to forward refs. */}
-      <div
-        ref={conversationRef as React.Ref<HTMLDivElement>}
-        className="flex min-h-0 flex-1 overflow-hidden"
-      >
+      <div ref={setConversationEl} className="relative flex min-h-0 flex-1 overflow-hidden">
         {/* chat-scroll-fade masks the viewport's top edge so scrolling
             content dissolves into the canvas before reaching the
             ChatHeader overlay's controls (geometry in index.css). */}
@@ -1225,6 +1306,7 @@ function MainAgentSurface({
           <ConversationContent className={cn("mx-auto w-full gap-4 pt-20 pb-6", CHAT_COLUMN_WIDTH)}>
             {/* Scroll helpers — must live inside StickToBottom to access context. */}
             <ScrollToBottomOnSend nonce={sendScrollNonce} />
+            <ConversationScrollRefBridge onScroller={setScroller} />
             <HistoryAutoLoader
               hasMoreHistory={hasMoreHistory}
               loadingMoreHistory={loadingMoreHistory}
@@ -1300,6 +1382,15 @@ function MainAgentSurface({
             hidden={userMessageIds.length === 0}
           />
         </Conversation>
+        {/* Hover the top edge to reveal a pill that loads all older history and
+            scrolls to the first message. Rendered here (a wrapper sibling of
+            Conversation) rather than inside it so it escapes the chat-scroll-fade
+            mask and can sit right at the fade border. */}
+        <JumpToTopButton
+          containerEl={containerEl}
+          scroller={scroller}
+          hasMoreHistory={hasMoreHistory}
+        />
       </div>
       {/* Floating reply button — scoped to the conversation container. */}
       <SelectionPopup
@@ -1567,6 +1658,214 @@ export function HistoryAutoLoader({
 
   // No visible control — history loads purely on scroll-up / viewport fill.
   return null;
+}
+
+/**
+ * The conversation's scroll container plus the minimal StickToBottom controls
+ * the JumpToTopButton needs to override the library's bottom-lock. `state` is a
+ * stable, mutable object: clearing `isAtBottom`/`escapedFromLock` makes the
+ * resize-driven `scrollToBottom({preserveScrollPosition})` — fired on every
+ * history prepend — bail instead of yanking the view back to the bottom.
+ */
+type ConversationScroller = {
+  el: HTMLElement;
+  state: { isAtBottom: boolean; escapedFromLock: boolean };
+  stopScroll: () => void;
+};
+
+/**
+ * Lifts the StickToBottom scroll container (and lock controls) out of the
+ * context so a sibling rendered *outside* `<Conversation>` (and thus outside
+ * its `chat-scroll-fade` mask) can still read and drive it. `scrollRef`,
+ * `state`, and `stopScroll` are stable identities (see HistoryAutoLoader for
+ * the runtime-vs-types cast). Renders nothing.
+ */
+function ConversationScrollRefBridge({
+  onScroller,
+}: {
+  onScroller: (s: ConversationScroller | null) => void;
+}) {
+  const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
+    scrollRef: React.RefObject<HTMLElement>;
+    state: ConversationScroller["state"];
+    stopScroll: () => void;
+  };
+  useEffect(() => {
+    // Runs after commit, when StickToBottom has populated scrollRef.current.
+    const el = ctx.scrollRef?.current ?? null;
+    onScroller(el ? { el, state: ctx.state, stopScroll: ctx.stopScroll } : null);
+    return () => onScroller(null);
+  }, [ctx.scrollRef, ctx.state, ctx.stopScroll, onScroller]);
+  return null;
+}
+
+/**
+ * Hover-revealed "Jump to top" pill, mirroring {@link ConversationScrollButton}
+ * but for the other end. Hovering near the top edge of the conversation
+ * surfaces a pill at the fade border; clicking it pages in every older history
+ * block (the conversation is lazily paginated — see {@link HistoryAutoLoader})
+ * and then scrolls to the very first message.
+ *
+ * Rendered as a sibling of `<Conversation>`, not a child: the scroll viewport's
+ * top ~80px is mask-faded (`chat-scroll-fade`), so a pill inside it would fade
+ * out too. Sitting in the wrapper keeps it at full opacity right at the fade
+ * line, and `z-40` lifts it over the `z-30` ChatHeader so it stays clickable.
+ *
+ * Hover is detected in JS off the **wrapper** (`containerEl`), the common
+ * ancestor of both the scroll area and this pill — listening on the scroll
+ * element instead would fire `mouseleave` the instant the cursor crossed onto
+ * the pill (a non-descendant), killing the click. `scroller` carries the inner
+ * scroll container plus the StickToBottom lock controls.
+ *
+ * @param containerEl - The conversation wrapper; hover/anchor reference.
+ * @param scroller - Scroll container + lock controls (ConversationScrollRefBridge).
+ * @param hasMoreHistory - Whether older messages exist before the loaded window.
+ */
+export function JumpToTopButton({
+  containerEl,
+  scroller,
+  hasMoreHistory,
+}: {
+  containerEl: HTMLElement | null;
+  scroller: ConversationScroller | null;
+  hasMoreHistory: boolean;
+}) {
+  const [atTop, setAtTop] = useState(true);
+  const [hovering, setHovering] = useState(false);
+  const [jumping, setJumping] = useState(false);
+
+  // Pixels below the conversation's top edge that count as "hovering the top".
+  // Comfortably clears the pill (anchored at the fade border, ~50px) so moving
+  // onto it to click never drops the hover state.
+  const HOVER_BAND_PX = 140;
+
+  // Hover detection on the wrapper so the pill (a wrapper child) stays in-band.
+  useEffect(() => {
+    if (!containerEl) return;
+    const onMove = (e: MouseEvent) => {
+      const next = e.clientY - containerEl.getBoundingClientRect().top < HOVER_BAND_PX;
+      // Only commit on a transition — mousemove fires continuously, and React
+      // bails on a no-op setState anyway, but skipping it avoids the work.
+      setHovering((prev) => (prev === next ? prev : next));
+    };
+    const onLeave = () => setHovering(false);
+    containerEl.addEventListener("mousemove", onMove, { passive: true });
+    containerEl.addEventListener("mouseleave", onLeave);
+    return () => {
+      containerEl.removeEventListener("mousemove", onMove);
+      containerEl.removeEventListener("mouseleave", onLeave);
+    };
+  }, [containerEl]);
+
+  // Track whether the loaded window is scrolled to its very top.
+  const scrollEl = scroller?.el ?? null;
+  useEffect(() => {
+    if (!scrollEl) return;
+    const onScroll = () => {
+      const next = scrollEl.scrollTop <= 1;
+      setAtTop((prev) => (prev === next ? prev : next));
+    };
+    onScroll();
+    scrollEl.addEventListener("scroll", onScroll, { passive: true });
+    return () => scrollEl.removeEventListener("scroll", onScroll);
+  }, [scrollEl]);
+
+  // Somewhere to go: older pages exist, or we're scrolled down within the
+  // loaded window. At the very first message there's nothing to jump to.
+  const canJump = hasMoreHistory || !atTop;
+  const visible = jumping || (hovering && canJump);
+
+  const jumpToTop = useCallback(async () => {
+    if (!scroller) return;
+    const { el, state, stopScroll } = scroller;
+    const nextFrame = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    setJumping(true);
+    try {
+      // Release StickToBottom's bottom-lock. Without this, every history prepend
+      // resizes the content and the library's ResizeObserver yanks the view back
+      // to the bottom (scrollToBottom with preserveScrollPosition, which sticks
+      // whenever state.isAtBottom is true) — so our scrollTop=0 lost the fight
+      // and only a *second* click (everything already loaded, no resizes) won.
+      // Clearing the lock here makes those prepend-driven scrolls bail.
+      stopScroll();
+      state.isAtBottom = false;
+      state.escapedFromLock = true;
+
+      // Page in every older block before scrolling. loadMoreHistory serializes
+      // via its own loadingMoreHistory guard (so a concurrent HistoryAutoLoader
+      // fetch is harmless), and flips hasMoreHistory to false at the start of
+      // history or on error. The rAF wait yields a frame for the prepend to
+      // commit and for the in-flight flag to settle between pages. The
+      // iteration cap is a backstop against a server that never reports done.
+      for (let i = 0; i < 1000 && useChatStore.getState().hasMoreHistory; i++) {
+        await useChatStore.getState().loadMoreHistory();
+        // Keep the lock released — a prepend that briefly lands us near the
+        // bottom can otherwise re-arm it via the library's scroll handler.
+        state.isAtBottom = false;
+        state.escapedFromLock = true;
+        await nextFrame();
+      }
+      // Pin to the very top, re-asserting across frames until it holds. The last
+      // prepends keep growing scrollHeight after the store settles, and
+      // HistoryAutoLoader's offset-preservation can bump scrollTop right after
+      // we zero it. Force 0 each frame until it stays 0 for two consecutive
+      // frames (or we hit the frame cap).
+      for (let i = 0, stable = 0; i < 60 && stable < 2; i++) {
+        if (el.scrollTop === 0) stable += 1;
+        else {
+          el.scrollTop = 0;
+          stable = 0;
+        }
+        await nextFrame();
+      }
+    } finally {
+      setJumping(false);
+    }
+  }, [scroller]);
+
+  return (
+    <div
+      className={cn(
+        // top-[50px]: centers the pill on the chat-scroll-fade border (the mask
+        // ramps 48px→80px), just below the h-14 ChatHeader. z-40 > header z-30.
+        "pointer-events-none absolute inset-x-0 top-[50px] z-40 flex justify-center transition-opacity duration-150",
+        visible ? "opacity-100" : "opacity-0",
+      )}
+    >
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        disabled={jumping}
+        onClick={() => void jumpToTop()}
+        aria-label="Jump to the first message"
+        // When hidden (opacity-0 / pointer-events-none) keep the button out of
+        // the tab order and the accessibility tree so it can't take focus or be
+        // announced while invisible.
+        tabIndex={visible ? 0 : -1}
+        aria-hidden={!visible}
+        className={cn(
+          "h-7 gap-1.5 rounded-full px-3 text-xs shadow-sm",
+          // Force an OPAQUE background in both themes and on hover. The outline
+          // variant's hover (bg-muted) is a translucent black wash (--muted is
+          // #0000000f), so over the faded chat text behind the pill it bleeds
+          // through and reads as transparent. bg-background is opaque (#fff /
+          // #0d1218); hover feedback comes from a brightness filter, which keeps
+          // the fill fully opaque.
+          "bg-background hover:bg-background hover:brightness-95",
+          "dark:bg-background dark:hover:bg-background dark:hover:brightness-125",
+          visible ? "pointer-events-auto" : "pointer-events-none",
+        )}
+      >
+        {jumping ? (
+          <Loader2Icon className="size-3.5 animate-spin" aria-hidden />
+        ) : (
+          <ArrowUpIcon className="size-3.5" aria-hidden />
+        )}
+        {jumping ? "Loading history…" : "Jump to top"}
+      </Button>
+    </div>
+  );
 }
 
 /** Stable React key per bubble. */
@@ -1967,7 +2266,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
       {/* w-fit + ml-auto shrink-wrap the row so the author avatar sits
           immediately left of the right-aligned bubble (the bubble's own
           ml-auto has no free space to absorb inside a fit-width row). */}
-      <div className="ml-auto flex w-fit max-w-full items-start gap-1.5">
+      <div className="ml-auto flex w-fit max-w-full items-center gap-1.5">
         {showAuthorBadge && author && (
           <Tooltip>
             <TooltipTrigger asChild>
@@ -1975,7 +2274,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                 size="sm"
                 data-testid="message-author"
                 aria-label={author}
-                className="mt-1.5 shrink-0"
+                className="shrink-0"
               >
                 <AvatarFallback
                   className="font-medium text-white"
@@ -2677,9 +2976,9 @@ export function Composer({
         if (!showModel) return false;
         const target = arg.trim();
         if (!target) {
-          const { selectedModel, llmModel } = useChatStore.getState();
-          const current = selectedModel
-            ? `${selectedModel} (override)`
+          const { sessionModelOverride, llmModel } = useChatStore.getState();
+          const current = sessionModelOverride
+            ? `${sessionModelOverride} (override)`
             : (llmModel ?? "agent default");
           setCommandError(`Model: ${current}\nUsage: /model <name> · /model default to reset`);
           return true;
@@ -2703,9 +3002,9 @@ export function Composer({
       }
       case "/context": {
         const state = useChatStore.getState();
-        const { contextWindow, llmModel, selectedModel, tokensUsed, blocks } = state;
+        const { contextWindow, llmModel, sessionModelOverride, tokensUsed, blocks } = state;
         const lines: string[] = [];
-        if (selectedModel) lines.push(`Model: ${selectedModel} (override)`);
+        if (sessionModelOverride) lines.push(`Model: ${sessionModelOverride} (override)`);
         else if (llmModel) lines.push(`Model: ${llmModel}`);
         // contextWindow > 0 keeps a zero window out of the division (0/0 → "NaN%").
         if (tokensUsed != null && contextWindow != null && contextWindow > 0) {
@@ -2960,7 +3259,7 @@ export function Composer({
 
     // Enter sends; Shift+Enter inserts a newline. On mobile, Enter inserts a
     // newline (no Shift available on-screen) and Send must be tapped instead.
-    if (e.key === "Enter" && !e.shiftKey && !isMobile) {
+    if (e.key === "Enter" && !e.shiftKey && !isMobile && !e.nativeEvent.isComposing) {
       e.preventDefault();
       submit();
       return;
@@ -3203,9 +3502,9 @@ export function Composer({
             {commandError}
           </div>
         )}
-        <div className="flex items-center justify-between px-2 pb-2">
+        <div className="flex items-center justify-between gap-2 px-2 pb-2">
           {/* Attach + mic — left side of the action row */}
-          <div className="flex items-center gap-0.5">
+          <div className="flex shrink-0 items-center gap-0.5">
             <Button
               type="button"
               size="icon"
@@ -3231,7 +3530,7 @@ export function Composer({
             />
           </div>
           {/* Cost toggle + agent picker + Send — right side */}
-          <div className="flex items-center gap-0.5">
+          <div className="flex min-w-0 items-center gap-0.5">
             {/* Temporarily hidden (#3021): re-enable by removing the false gate. */}
             {false && costRoutingEligible && (
               <IntelligentModelControl
@@ -3265,7 +3564,7 @@ export function Composer({
               // overrides the base 50% disabled-opacity so the affordance
               // reads as "waiting for input", not "almost active".
               className={cn(
-                "size-9 rounded-full md:size-8",
+                "size-9 shrink-0 rounded-full md:size-8",
                 !showInterruptButton && "hover:bg-primary/90 disabled:opacity-30",
               )}
               // Interrupt stays live during a pending elicitation —
@@ -3634,12 +3933,10 @@ function AgentPicker({
           size="sm"
           disabled={!hasAgents || disabled || !hasPickerActions}
           data-testid="agent-picker-trigger"
-          className="h-7 gap-1.5 px-2 text-muted-foreground hover:text-foreground"
+          className="h-7 min-w-0 shrink gap-1.5 px-2 text-muted-foreground hover:text-foreground"
         >
-          <span className="max-w-20 truncate text-xs tabular-nums md:max-w-[18rem]">
-            {triggerLabel}
-          </span>
-          {hasPickerActions && <ChevronDownIcon className="size-3.5 opacity-60" />}
+          <span className="min-w-0 truncate text-xs tabular-nums">{triggerLabel}</span>
+          {hasPickerActions && <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />}
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="min-w-64 p-1">

@@ -1,21 +1,17 @@
 name: Code Coverage
 
 # Posts a report-only `Coverage` commit status from the `coverage-summary`
-# artifact produced by the CI workflow (the combine + report happen there, in
-# the unprivileged pull_request context). This job runs on workflow_run
-# (privileged: statuses:write) but deliberately does NOT check out the PR's
-# code — it only consumes the artifact — so it is not a "dangerous workflow".
-#
-# The status is always success (the % rides in the description) and is never a
-# required check, so it can't block a merge.
+# artifact produced by the CI workflow. Runs on workflow_run (privileged,
+# statuses:write) but does NOT check out PR code — it only consumes the artifact,
+# so it isn't a "dangerous workflow". The status is always success (the % rides
+# in the description) and is never required, so it can't block a merge.
 
 on:
   workflow_run:
     workflows: [CI]
     types: [completed]
 
-# Read-only at the top level (Scorecard Token-Permissions); the write
-# scopes live on the job below.
+# Read-only at the top level; write scopes live on the job below.
 permissions:
   contents: read
 
@@ -29,15 +25,13 @@ jobs:
     permissions:
       actions: read     # download the coverage-summary artifact from the CI run
       statuses: write   # post the Coverage status on the PR head SHA
-    # PR-originated CI runs only. push:main / schedule / dispatch completions
-    # have no PR head SHA worth annotating.
+    # PR-originated CI runs only; other completions have no PR head SHA.
     if: ${{ github.event.workflow_run.event == 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      # Data only — never the PR's code. Tolerate a missing artifact (fork-PR
-      # runs the token can't read, or CI that produced no coverage) by falling
-      # through to the no-data guard rather than painting a red check.
+      # Data only — never the PR's code. Tolerate a missing artifact (fork PRs,
+      # or CI that produced no coverage) via the no-data guard below.
       - name: Download coverage summary
         continue-on-error: true
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4

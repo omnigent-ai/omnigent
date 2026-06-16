@@ -14,17 +14,19 @@ empty list, active_conversation_ids) run regardless.
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.terminals import TerminalRegistry
-from omnigent.terminals.registry import conversation_link_for_id
+from omnigent.terminals.registry import TerminalListEntry, conversation_link_for_id
 
 # ── Pure bookkeeping (no tmux) ────────────────────────────────
 
@@ -87,6 +89,43 @@ def test_conversation_link_for_id_uses_base_url_when_provided() -> None:
             base_url="http://127.0.0.1:8000/",
         )
         == "http://127.0.0.1:8000/c/conv%20with%2Fslash"
+    )
+
+
+def test_conversation_link_for_id_maps_workspace_hosted_server_to_ui_mount(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Workspace-hosted runners link to the SPA mount, not the API mount.
+
+    The runner threads ``RUNNER_SERVER_URL`` — the API proxy base
+    (``/api/2.0/omnigent``) — into the registry. A naive
+    ``{base}/c/<id>`` would put the JSON API path in the tmux status
+    bar; the link must instead land on the ``/omnigent`` SPA mount and
+    carry the ``?o=<org>`` selector ``omnigent login`` recorded, exactly
+    like the CLI's ``Web UI:`` line. Pins parity with
+    :func:`omnigent.conversation_browser.conversation_url`.
+
+    :param tmp_path: Pytest tmp dir for the stubbed auth-token file.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.cli_auth import store_databricks_auth
+
+    monkeypatch.setattr(
+        "omnigent.cli_auth._token_file_path",
+        lambda: tmp_path / "auth_tokens.json",
+    )
+    server = "https://example.databricks.com/api/2.0/omnigent"
+    store_databricks_auth(
+        server,
+        "https://example.databricks.com",
+        org_id="2850744067564480",
+    )
+
+    assert (
+        conversation_link_for_id("conv_abc123", base_url=server)
+        == "https://example.databricks.com/omnigent/c/conv_abc123?o=2850744067564480"
     )
 
 
@@ -411,3 +450,337 @@ async def test_shutdown_clears_all_conversations(
     # emptied with a stale key).
     assert reg_with_tmux.list_for_conversation("conv_a") == []
     assert reg_with_tmux.list_for_conversation("conv_b") == []
+
+
+# ── Additional pure-bookkeeping tests (no tmux) ─────────────
+
+
+def test_get_instance_lock_returns_none_for_unknown_triple() -> None:
+    """
+    ``get_instance_lock`` returns ``None`` for a triple that was never
+    registered. Callers treat ``None`` as "not running" and surface
+    an error to the LLM.
+    """
+    reg = TerminalRegistry()
+    assert reg.get_instance_lock("conv_nope", "bash", "s1") is None
+
+
+def test_get_instance_lock_returns_lock_after_manual_registration(tmp_path: Path) -> None:
+    """
+    After manually inserting an instance and its lock (as ``launch``
+    would), ``get_instance_lock`` returns the same lock object.
+    """
+    reg = TerminalRegistry()
+    lock = threading.Lock()
+    instance = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "bash.sock",
+        private_dir=tmp_path / "bash",
+        running=True,
+    )
+    reg._by_conversation["conv_a"] = {("bash", "s1"): instance}
+    reg._instance_locks[("conv_a", "bash", "s1")] = lock
+
+    assert reg.get_instance_lock("conv_a", "bash", "s1") is lock
+
+
+def test_transfer_nonexistent_source_returns_false() -> None:
+    """
+    Transferring from a conversation that has no terminals returns
+    ``False`` without raising. This is the expected path when the
+    source conversation was already cleaned up.
+    """
+    reg = TerminalRegistry()
+    assert reg.transfer("no_such_conv", "target_conv", "bash", "s1") is False
+
+
+def test_transfer_nonexistent_terminal_in_source_returns_false(tmp_path: Path) -> None:
+    """
+    Transferring a specific terminal that doesn't exist in the source
+    conversation returns ``False``. The source conversation itself
+    exists but the named terminal does not.
+    """
+    reg = TerminalRegistry()
+    instance = TerminalInstance(
+        name="other",
+        session_key="s1",
+        socket_path=tmp_path / "other.sock",
+        private_dir=tmp_path / "other",
+        running=True,
+    )
+    reg._by_conversation["conv_a"] = {("other", "s1"): instance}
+
+    assert reg.transfer("conv_a", "conv_b", "bash", "s1") is False
+
+
+def test_transfer_cleans_up_empty_source_slot(tmp_path: Path) -> None:
+    """
+    After transferring the last terminal from a conversation, the
+    source conversation's slot is removed from ``_by_conversation``
+    entirely — not left as an empty dict.
+    """
+    reg = TerminalRegistry()
+    instance = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "bash.sock",
+        private_dir=tmp_path / "bash",
+        running=True,
+    )
+    lock = threading.Lock()
+    reg._by_conversation["conv_old"] = {("bash", "s1"): instance}
+    reg._instance_locks[("conv_old", "bash", "s1")] = lock
+
+    reg.transfer("conv_old", "conv_new", "bash", "s1")
+
+    assert "conv_old" not in reg._by_conversation
+    assert reg.active_conversation_ids() == ["conv_new"]
+
+
+def test_conversation_link_for_id_treats_whitespace_only_as_no_base() -> None:
+    """
+    A base_url of whitespace-only is treated the same as ``None`` —
+    falls back to a relative path. This guards against config entries
+    that are accidentally blank.
+    """
+    assert conversation_link_for_id("conv_x", base_url="   ") == "/c/conv_x"
+
+
+def test_list_for_conversation_returns_terminal_list_entries(tmp_path: Path) -> None:
+    """
+    ``list_for_conversation`` returns :class:`TerminalListEntry`
+    dataclass instances with the correct fields populated.
+    """
+    reg = TerminalRegistry()
+    inst = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "bash.sock",
+        private_dir=tmp_path / "bash",
+        running=True,
+    )
+    reg._by_conversation["conv_a"] = {("bash", "s1"): inst}
+
+    entries = reg.list_for_conversation("conv_a")
+    assert len(entries) == 1
+    entry = entries[0]
+    assert isinstance(entry, TerminalListEntry)
+    assert entry.terminal_name == "bash"
+    assert entry.session_key == "s1"
+    assert entry.instance is inst
+
+
+def test_list_for_conversation_snapshot_isolation(tmp_path: Path) -> None:
+    """
+    The list returned by ``list_for_conversation`` is a snapshot:
+    mutating the returned list does not affect the registry's internal
+    state.
+    """
+    reg = TerminalRegistry()
+    inst = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "bash.sock",
+        private_dir=tmp_path / "bash",
+        running=True,
+    )
+    reg._by_conversation["conv_a"] = {("bash", "s1"): inst}
+
+    entries = reg.list_for_conversation("conv_a")
+    entries.clear()  # mutate the returned list
+
+    # Internal state should be unchanged.
+    assert len(reg.list_for_conversation("conv_a")) == 1
+
+
+def test_conversation_link_for_id_method_delegates_to_module_function() -> None:
+    """
+    The instance method ``TerminalRegistry.conversation_link_for_id``
+    delegates to the module-level function with the registry's
+    configured base URL.
+    """
+    reg = TerminalRegistry(conversation_link_base_url=None)
+    assert reg.conversation_link_for_id("conv_abc") == "/c/conv_abc"
+
+    reg2 = TerminalRegistry(conversation_link_base_url="http://localhost:6767")
+    link = reg2.conversation_link_for_id("conv_abc")
+    assert link.startswith("http://localhost:6767")
+    assert "conv_abc" in link
+
+
+async def test_close_removes_instance_lock(tmp_path: Path) -> None:
+    """
+    After ``close``, the per-instance lock is removed so
+    ``get_instance_lock`` returns ``None``. Subsequent tool calls
+    that try to acquire the lock see "not running" rather than
+    operating on a closed tmux session.
+    """
+    reg = TerminalRegistry()
+    instance = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "bash.sock",
+        private_dir=tmp_path / "bash",
+        running=True,
+    )
+    instance.close = AsyncMock()  # type: ignore[method-assign]
+    lock = threading.Lock()
+    reg._by_conversation["conv_a"] = {("bash", "s1"): instance}
+    reg._instance_locks[("conv_a", "bash", "s1")] = lock
+
+    result = await reg.close("conv_a", "bash", "s1")
+
+    assert result is True
+    assert reg.get_instance_lock("conv_a", "bash", "s1") is None
+    instance.close.assert_awaited_once()
+
+
+async def test_close_with_timeout_still_returns_true(tmp_path: Path) -> None:
+    """
+    If ``instance.close()`` times out, ``close`` still returns ``True``
+    (the instance was found and removal from the registry succeeded).
+    The timeout is logged but does not propagate.
+    """
+    reg = TerminalRegistry()
+    instance = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "bash.sock",
+        private_dir=tmp_path / "bash",
+        running=True,
+    )
+
+    async def _hang_forever() -> None:
+        await asyncio.sleep(999)
+
+    instance.close = _hang_forever  # type: ignore[method-assign]
+    reg._by_conversation["conv_a"] = {("bash", "s1"): instance}
+    reg._instance_locks[("conv_a", "bash", "s1")] = threading.Lock()
+
+    # The close should not hang — it uses asyncio.wait_for with _CLOSE_TIMEOUT_S.
+    # We patch _CLOSE_TIMEOUT_S to a tiny value so the test finishes quickly.
+    import omnigent.terminals.registry as reg_mod
+
+    original = reg_mod._CLOSE_TIMEOUT_S
+    reg_mod._CLOSE_TIMEOUT_S = 0.01
+    try:
+        result = await reg.close("conv_a", "bash", "s1")
+    finally:
+        reg_mod._CLOSE_TIMEOUT_S = original
+
+    assert result is True
+    assert reg.get("conv_a", "bash", "s1") is None
+
+
+async def test_cleanup_conversation_tolerates_close_exception(tmp_path: Path) -> None:
+    """
+    ``cleanup_conversation`` swallows exceptions from individual
+    ``instance.close()`` calls and continues closing the remaining
+    terminals. This ensures a wedged terminal cannot block cleanup
+    of its siblings.
+    """
+    reg = TerminalRegistry()
+    good_instance = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "good.sock",
+        private_dir=tmp_path / "good",
+        running=True,
+    )
+    good_instance.close = AsyncMock()  # type: ignore[method-assign]
+    bad_instance = TerminalInstance(
+        name="bash",
+        session_key="s2",
+        socket_path=tmp_path / "bad.sock",
+        private_dir=tmp_path / "bad",
+        running=True,
+    )
+
+    async def _explode() -> None:
+        raise RuntimeError("tmux gone")
+
+    bad_instance.close = _explode  # type: ignore[method-assign]
+
+    reg._by_conversation["conv_a"] = {
+        ("bash", "s1"): good_instance,
+        ("bash", "s2"): bad_instance,
+    }
+    reg._instance_locks[("conv_a", "bash", "s1")] = threading.Lock()
+    reg._instance_locks[("conv_a", "bash", "s2")] = threading.Lock()
+
+    # Should not raise despite bad_instance.close() exploding.
+    await reg.cleanup_conversation("conv_a")
+
+    assert reg.active_conversation_ids() == []
+    # The good instance's close was still called.
+    good_instance.close.assert_awaited_once()
+
+
+async def test_shutdown_tolerates_close_exception(tmp_path: Path) -> None:
+    """
+    ``shutdown`` swallows exceptions from individual ``instance.close()``
+    calls, just like ``cleanup_conversation``. A stuck instance in one
+    conversation must not prevent cleanup of instances in other
+    conversations.
+    """
+    reg = TerminalRegistry()
+    good = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "good.sock",
+        private_dir=tmp_path / "good",
+        running=True,
+    )
+    good.close = AsyncMock()  # type: ignore[method-assign]
+    bad = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "bad.sock",
+        private_dir=tmp_path / "bad",
+        running=True,
+    )
+
+    async def _explode() -> None:
+        raise RuntimeError("tmux gone")
+
+    bad.close = _explode  # type: ignore[method-assign]
+
+    reg._by_conversation["conv_a"] = {("bash", "s1"): bad}
+    reg._by_conversation["conv_b"] = {("bash", "s1"): good}
+    reg._instance_locks[("conv_a", "bash", "s1")] = threading.Lock()
+    reg._instance_locks[("conv_b", "bash", "s1")] = threading.Lock()
+
+    await reg.shutdown()
+
+    assert reg.active_conversation_ids() == []
+    good.close.assert_awaited_once()
+
+
+def test_multiple_terminals_per_conversation(tmp_path: Path) -> None:
+    """
+    A single conversation can hold multiple terminals with different
+    names and session keys. ``list_for_conversation`` returns all of
+    them and ``get`` retrieves each individually.
+    """
+    reg = TerminalRegistry()
+    instances = {}
+    for name, key in [("bash", "s1"), ("bash", "s2"), ("python", "s1")]:
+        inst = TerminalInstance(
+            name=name,
+            session_key=key,
+            socket_path=tmp_path / f"{name}_{key}.sock",
+            private_dir=tmp_path / f"{name}_{key}",
+            running=True,
+        )
+        instances[(name, key)] = inst
+
+    reg._by_conversation["conv_a"] = dict(instances)
+
+    entries = reg.list_for_conversation("conv_a")
+    assert len(entries) == 3
+    entry_keys = {(e.terminal_name, e.session_key) for e in entries}
+    assert entry_keys == {("bash", "s1"), ("bash", "s2"), ("python", "s1")}
+
+    for (name, key), inst in instances.items():
+        assert reg.get("conv_a", name, key) is inst

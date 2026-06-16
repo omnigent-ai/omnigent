@@ -1,30 +1,11 @@
 name: Fork e2e mirror
 
-# Mirrors an approved (or returning-contributor) fork PR's head commit onto a
-# trusted base-repo branch, fork-e2e/pr-N, so the e2e suite runs there as a
-# `push` event. A fork's own `pull_request` run gets no secrets; a `push` to a
-# base-repo branch does -- that's how fork e2e reaches the test gateway.
-#
-# The mirror is a pure git-ref update via the API: it never checks out or runs
-# the fork's code, so this privileged (secret-eligible) workflow never executes
-# untrusted code with secrets in scope. The fork code only runs on the
-# downstream `push` to fork-e2e/** (see e2e.yml), which is a trusted event.
-#
-# The ref is pushed with a GitHub App token, NOT the default GITHUB_TOKEN:
-# refs created/updated by GITHUB_TOKEN do not trigger workflows (GitHub
-# recursion-prevention), so the e2e `push` would never fire. Requires repo
-# variable FORK_E2E_APP_ID and secret FORK_E2E_APP_PRIVATE_KEY for an App
-# installed on this repo with contents:write.
-#
-# Gate -- .github/scripts/fork-e2e/should-mirror.sh opens when any holds:
-#   maintainer-approved  ||  returning-contributor  ||  fork-e2e/pr-N exists.
-# Once the branch exists, every later push re-mirrors (re-runs e2e on the new
-# commits). Accepted risk: an approved first-timer's later pushes then run with
-# the secret unreviewed -- bounded by the rate-limited, revocable test token.
-#
-# pull_request_target / pull_request_review run the workflow + scripts from the
-# base (default branch), never the PR head, so a PR cannot alter the gate; the
-# script checkout is additionally pinned to main.
+# Mirrors an approved / returning-contributor fork PR's head onto a trusted
+# fork-e2e/pr-N branch so e2e runs there as a `push` (with secrets). It's a pure
+# git-ref update via a GitHub App token (refs pushed by the default GITHUB_TOKEN
+# don't trigger workflows); it never checks out or runs fork code. Gated by
+# should-mirror.sh + the Fork Security Scan. pull_request_review is included so a
+# maintainer's approval mirrors immediately, not only on the PR's next push.
 #
 # leak-scan-allow: pull_request_target
 on:
@@ -33,8 +14,6 @@ on:
   pull_request_review:
     types: [submitted]
 
-# Read-only at the top level (Scorecard Token-Permissions); write scope is on
-# the job.
 permissions:
   contents: read
 
@@ -48,8 +27,9 @@ jobs:
     # Fork PRs only -- same-repo PRs run e2e directly via `pull_request`.
     if: ${{ github.event.pull_request.head.repo.fork }}
     permissions:
-      contents: read        # reads only; the App token below does the ref writes
-      pull-requests: read   # read author + reviews for the gate
+      contents: read
+      pull-requests: read
+      statuses: write
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
@@ -63,16 +43,13 @@ jobs:
       - name: Check out gate scripts from main
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
-          ref: main             # trusted base; never the PR head
+          ref: main             # trusted; never the PR head
           sparse-checkout: .github/scripts
           persist-credentials: false
 
       - name: Mint mirror App token
         id: app-token
-        # A ref created/updated with the default GITHUB_TOKEN does NOT trigger
-        # workflows (GitHub recursion-prevention), so e2e.yml's `push` would
-        # never fire. Push the ref with a GitHub App token instead: it carries
-        # contents:write and its pushes DO trigger downstream workflows.
+        # App token, not GITHUB_TOKEN: its pushes DO trigger the downstream e2e.
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
         with:
           app-id: ${{ vars.FORK_E2E_APP_ID }}
@@ -84,8 +61,7 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           gh api -X DELETE "repos/$REPO/git/refs/heads/$MIRROR_BRANCH" >/dev/null 2>&1 \
-            && echo "Deleted $MIRROR_BRANCH" \
-            || echo "No $MIRROR_BRANCH to delete"
+            && echo "Deleted $MIRROR_BRANCH" || echo "No $MIRROR_BRANCH to delete"
 
       - name: Load maintainers
         id: maintainers
@@ -99,17 +75,55 @@ jobs:
           MAINTAINERS: ${{ steps.maintainers.outputs.list }}
         run: bash .github/scripts/fork-e2e/should-mirror.sh
 
+      - name: Security scan of PR diff
+        id: scan
+        # Diff TEXT only -- never checks out or runs fork code.
+        if: ${{ github.event.action != 'closed' }}
+        run: |
+          gh pr diff "$PR" --repo "$REPO" --patch > "$RUNNER_TEMP/pr.diff"
+          python3 .github/scripts/fork-e2e/security_scan.py "$RUNNER_TEMP/pr.diff"
+
+      - name: Check security-scan override label
+        id: override
+        if: ${{ github.event.action != 'closed' }}
+        run: |
+          if gh pr view "$PR" --repo "$REPO" --json labels --jq '.labels[].name' \
+               | grep -qx 'security-scan-override'; then
+            echo "override=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "override=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post Fork Security Scan status
+        if: ${{ github.event.action != 'closed' }}
+        env:
+          CLEAN: ${{ steps.scan.outputs.clean }}
+          OVERRIDE: ${{ steps.override.outputs.override }}
+          SUMMARY: ${{ steps.scan.outputs.summary }}  # fork text via env, not interpolated
+        run: |
+          if [[ "$CLEAN" == "true" ]]; then
+            STATE=success; DESC="$SUMMARY"
+          elif [[ "$OVERRIDE" == "true" ]]; then
+            STATE=success; DESC="overridden by maintainer: $SUMMARY"
+          else
+            STATE=failure; DESC="$SUMMARY"
+          fi
+          gh api "repos/$REPO/statuses/$HEAD_SHA" \
+            -f state="$STATE" -f context="Fork Security Scan" \
+            -f description="${DESC:0:140}" >/dev/null
+
       - name: Mirror head SHA onto trusted branch
-        if: ${{ github.event.action != 'closed' && steps.gate.outputs.mirror == 'true' }}
+        if: >-
+          github.event.action != 'closed'
+          && steps.gate.outputs.mirror == 'true'
+          && (steps.scan.outputs.clean == 'true' || steps.override.outputs.override == 'true')
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           if gh api "repos/$REPO/git/refs/heads/$MIRROR_BRANCH" >/dev/null 2>&1; then
-            gh api -X PATCH "repos/$REPO/git/refs/heads/$MIRROR_BRANCH" \
-              -f sha="$HEAD_SHA" -F force=true >/dev/null
+            gh api -X PATCH "repos/$REPO/git/refs/heads/$MIRROR_BRANCH" -f sha="$HEAD_SHA" -F force=true >/dev/null
             echo "Updated $MIRROR_BRANCH -> $HEAD_SHA"
           else
-            gh api -X POST "repos/$REPO/git/refs" \
-              -f ref="refs/heads/$MIRROR_BRANCH" -f sha="$HEAD_SHA" >/dev/null
+            gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$MIRROR_BRANCH" -f sha="$HEAD_SHA" >/dev/null
             echo "Created $MIRROR_BRANCH -> $HEAD_SHA"
           fi

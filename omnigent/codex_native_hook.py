@@ -61,7 +61,8 @@ def main(argv: list[str] | None = None) -> int:
 
 def _main_evaluate_policy(argv: list[str]) -> int:
     """
-    Evaluate a Codex ``PreToolUse`` or ``PostToolUse`` hook against Omnigent policies.
+    Evaluate a Codex ``PreToolUse`` / ``PostToolUse`` /
+    ``UserPromptSubmit`` hook against Omnigent policies.
 
     Reads the hook JSON payload from stdin, converts it into the
     proto-compatible ``EvaluationRequest`` schema via
@@ -69,7 +70,9 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     POSTs to ``/v1/sessions/{id}/policies/evaluate``, and converts the
     ``EvaluationResponse`` back into Codex's hook output format
     (``hookSpecificOutput.permissionDecision`` for PreToolUse;
-    ``additionalContext`` warning for PostToolUse).
+    ``additionalContext`` warning for PostToolUse; top-level
+    ``decision: "block"`` for UserPromptSubmit — the request-phase gate
+    for native sessions, which drops the prompt before the model runs).
 
     On any transport or lookup failure the hook returns exit 0 with no
     output, which Codex treats as "no opinion". This is the deliberate

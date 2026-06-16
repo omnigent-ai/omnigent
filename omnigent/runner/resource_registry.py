@@ -45,6 +45,7 @@ _DEFAULT_WORKSPACE_ROOT = os.path.join(
 
 CODEX_NATIVE_TERMINAL_ROLE = "codex-native"
 CLAUDE_NATIVE_TERMINAL_ROLE = "claude-native"
+PI_NATIVE_TERMINAL_ROLE = "pi-native"
 # Role marker for the embedded Omnigent REPL terminal auto-created for
 # runner-hosted SDK sessions (``omnigent attach`` in a tmux pane — the
 # SDK mirror of the native terminals above). The attach WebSocket uses
@@ -617,14 +618,13 @@ class SessionResourceRegistry:
         if a watcher is already running, and :meth:`close` stops it.
 
         For the claude-native *agent* terminal (``resource_role`` ==
-        :data:`CLAUDE_NATIVE_TERMINAL_ROLE`) the same watcher also drives
-        the session's working status: pane activity → ``running`` and a
-        short quiescence → ``idle``, emitted via the session-status
-        publisher. This is the PTY-activity-derived status that replaces
-        the hook-based ``UserPromptSubmit``/``Stop`` bracketing — it
-        catches the cases hooks miss (interrupts, compaction failures)
+        :data:`CLAUDE_NATIVE_TERMINAL_ROLE` or
+        :data:`PI_NATIVE_TERMINAL_ROLE`) the same watcher also drives the
+        session's working status: pane activity → ``running`` and a short
+        quiescence → ``idle``, emitted via the session-status publisher.
+        This PTY-derived status catches cases lifecycle hooks can miss
         because it observes the terminal directly. The status edges are
-        gated to this role so a side shell's output never flips the
+        gated to these roles so a side shell's output never flips the
         session's status.
 
         :param session_id: Session/conversation identifier.
@@ -637,10 +637,12 @@ class SessionResourceRegistry:
         """
         activity_publisher = self._terminal_activity_publisher
         status_publisher = self._session_status_publisher
-        # Status edges are derived only from the claude-native agent
-        # terminal — a generic shell's output must not move the session's
-        # working status.
-        emit_status = status_publisher is not None and resource_role == CLAUDE_NATIVE_TERMINAL_ROLE
+        # Status edges are derived only from native agent terminals — a
+        # generic shell's output must not move the session's working status.
+        emit_status = status_publisher is not None and resource_role in {
+            CLAUDE_NATIVE_TERMINAL_ROLE,
+            PI_NATIVE_TERMINAL_ROLE,
+        }
         if activity_publisher is None and not emit_status:
             return
         resource_id = terminal_resource_id(terminal_name, session_key)

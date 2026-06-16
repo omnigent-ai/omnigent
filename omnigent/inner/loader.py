@@ -762,6 +762,37 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
             "os_env.sandbox.egress_allow_private_destinations must be a "
             f"boolean, got {type(allow_private).__name__}"
         )
+    # Secretless credential proxy. Reuse the single canonical parser
+    # (``omnigent.spec.parser._parse_credential_proxy``) rather than a
+    # second copy so the single-file omnigent-YAML path and the
+    # bundle/config.yaml path can never drift — a duplicated parser here
+    # is exactly what silently dropped ``credential_proxy`` on this path
+    # before. Lazy-imported to avoid an import-time cycle with the spec
+    # layer (which imports inner.datamodel). The two cross-field guards
+    # below mirror the spec parser so an inert credential_proxy (no
+    # hardened backend / no egress rules) is rejected on both paths.
+    from omnigent.spec.parser import (
+        _credential_proxy_macos_unsupported_reason,
+        _parse_credential_proxy,
+    )
+
+    credential_proxy = _parse_credential_proxy(data.get("credential_proxy"))
+    if credential_proxy is not None and sandbox_type not in ("linux_bwrap", "darwin_seatbelt"):
+        raise ValueError(
+            "os_env.sandbox.credential_proxy requires sandbox.type=linux_bwrap "
+            "(Linux) or sandbox.type=darwin_seatbelt (macOS) so credentials are "
+            "bound to a hardened helper boundary. "
+            f"Got sandbox.type={sandbox_type!r}."
+        )
+    if credential_proxy is not None and not egress_rules:
+        raise ValueError(
+            "os_env.sandbox.credential_proxy requires os_env.sandbox.egress_rules: "
+            "the MITM egress proxy is what swaps the synthetic placeholder for the "
+            "real credential and rejects placeholder leaks, so it must be active."
+        )
+    macos_reason = _credential_proxy_macos_unsupported_reason(credential_proxy, sandbox_type)
+    if macos_reason is not None:
+        raise ValueError(macos_reason)
     # Defer the absent-field defaults to the dataclass so there is a single
     # source of truth: re-stating literals here (e.g. ``"warn"``, ``50000``)
     # silently drifts the moment the OSEnvSandboxSpec defaults change. An
@@ -797,6 +828,7 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
         env_passthrough=data.get("env_passthrough"),
         egress_rules=egress_rules,
         egress_allow_private_destinations=allow_private,
+        credential_proxy=credential_proxy,
     )
 
 

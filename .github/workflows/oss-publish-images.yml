@@ -1,18 +1,12 @@
-# Builds the server image and pushes it to ghcr.io/omnigent-ai/omnigent-server,
-# the image every deploy template references. ubuntu-latest, GHCR via
-# GITHUB_TOKEN.
+# Builds + pushes two images to GHCR via GITHUB_TOKEN: the server image
+# (ghcr.io/omnigent-ai/omnigent-server, referenced by every deploy template)
+# and the host image (the `host` target of the same Dockerfile,
+# ghcr.io/omnigent-ai/omnigent-host — default for `sandbox create --provider
+# modal` and server-launched managed hosts). Dockerfile ARGs default to public
+# registries, so no build-args needed.
 #
-# Also builds + pushes the Omnigent host image (the `host` target of the
-# same Dockerfile) as ghcr.io/omnigent-ai/omnigent-host with the identical
-# trigger / permission / login / tag setup — the default image for
-# `omnigent sandbox create --provider modal` and server-launched managed
-# hosts.
-#
-# The Dockerfile ARGs default to public registries, so no build-args are
-# needed. Actions are SHA-pinned per repo convention.
-#
-# First run creates the GHCR packages PRIVATE; to allow unauthenticated pulls,
-# flip them to public once in the org package settings (cannot be done in CI).
+# First run creates the GHCR packages PRIVATE; flip them to public once in the
+# org package settings to allow unauthenticated pulls (cannot be done in CI).
 name: Publish images (public)
 
 on:
@@ -33,14 +27,12 @@ on:
       - '.github/workflows/oss-publish-images.yml'
   workflow_dispatch: {}
 
-# Read-only at the top level (Scorecard Token-Permissions); the write
-# scopes live on the job(s) below.
+# Read-only at the top level; write scopes live on the job below.
 permissions:
   contents: read
 
 concurrency:
-  # Key by SHA so back-to-back merges each build; don't cancel a queued
-  # build mid-push.
+  # Key by SHA so back-to-back merges each build; don't cancel mid-push.
   group: oss-publish-images-${{ github.sha }}
   cancel-in-progress: false
 
@@ -67,11 +59,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # :latest tracks main HEAD; :sha-<short> is the immutable per-commit
-      # pin; a v* tag publishes :vX.Y.Z and re-points :latest. Server and
-      # host images share the same scheme.
-      # ref / ref_name go through env, not inline ${{ }}, so a crafted tag
-      # name cannot inject shell.
+      # :latest tracks main HEAD; :sha-<short> is the immutable per-commit pin;
+      # a v* tag publishes :vX.Y.Z and re-points :latest. Server + host images
+      # share the scheme. ref / ref_name go through env (not inline ${{ }}) so a
+      # crafted tag name can't inject shell.
       - name: Compute image tags
         id: tags
         env:
@@ -109,9 +100,8 @@ jobs:
           provenance: false
           sbom: false
 
-      # Host image: same Dockerfile, `host` target. Runs after the server
-      # build so it reuses the shared builder-stage layers from the gha
-      # cache — the host-only runtime stage is the only extra work.
+      # Host image: same Dockerfile, `host` target. Runs after the server build
+      # so it reuses the shared builder-stage layers from the gha cache.
       - name: Build and push host image
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
         with:

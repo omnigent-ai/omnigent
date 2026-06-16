@@ -81,6 +81,11 @@ def _agent_id_by_name(base_url: str, name: str) -> str:
         # SDK → Codex: SAME-family native target. Same carry-history rebuild
         # path; the wrapper flips to the codex-native terminal UI.
         pytest.param("codex-native-ui", "codex-native-ui", True, id="sdk-to-codex"),
+        # SDK → Pi: native, but multi-family (its harness family is null), so
+        # the picker would drop it unless gated on isNativeHarness too. This is
+        # the case #230 fixes — the option must be offerable, and the fork must
+        # flip to the Pi terminal UI with carry-history stamped.
+        pytest.param("pi-native-ui", "pi-native-ui", True, id="sdk-to-pi"),
     ],
 )
 def test_fork_switch_agent_carries_history(

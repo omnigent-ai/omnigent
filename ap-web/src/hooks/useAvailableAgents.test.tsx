@@ -90,7 +90,7 @@ describe("useAvailableAgents", () => {
     expect(urls).toContain(SCAN_URL);
   });
 
-  it("maps rows into AvailableAgent and applies the claude-native, nessie, and debby display names", async () => {
+  it("maps rows into AvailableAgent and applies native, nessie, and debby display names", async () => {
     routeFetch({
       [BUILTINS_URL]: mockResponse({
         object: "list",
@@ -100,6 +100,12 @@ describe("useAvailableAgents", () => {
             name: "claude-native-ui",
             description: null,
             harness: "claude-native",
+          },
+          {
+            id: "ag_pi_native",
+            name: "pi-native-ui",
+            description: null,
+            harness: "pi-native",
           },
           {
             id: "ag_nessie",
@@ -129,8 +135,8 @@ describe("useAvailableAgents", () => {
     const { result } = renderHook(() => useAvailableAgents(), { wrapper });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
-    // claude-native-ui is the terminal-first wrapper; the picker shows
-    // it as "Claude Code". nessie's and debby's lowercase slugs are
+    // Native terminal wrappers show product names ("Claude Code" / "Pi").
+    // nessie's and debby's lowercase slugs are
     // title-cased to "Nessie" / "Debby". A regression in DISPLAY_NAMES
     // would surface the raw slug to users. Other agents pass their name through as the
     // display name. `harness` is passed through verbatim so the picker
@@ -146,6 +152,14 @@ describe("useAvailableAgents", () => {
         display_name: "Claude Code",
         description: null,
         harness: "claude-native",
+        skills: [],
+      },
+      {
+        id: "ag_pi_native",
+        name: "pi-native-ui",
+        display_name: "Pi",
+        description: null,
+        harness: "pi-native",
         skills: [],
       },
       {
