@@ -47,6 +47,14 @@ validates every configured job with `crabbox job run --dry-run`. Maintainers
 can manually dispatch the same workflow with `live=true` to lease a box and
 run one job from GitHub Actions.
 
+The workflow builds Crabbox from source pinned to
+[openclaw/crabbox#428](https://github.com/openclaw/crabbox/pull/428) rather than
+downloading a release: the `v0.32.0` release sends default image/workdir/capacity
+fields on Islo sandbox creation, which makes Islo boxes fail to start. Once a
+tagged Crabbox release includes that fix, swap the source build back to a
+checksum-verified `gh release download` (see `CRABBOX_PR`/`CRABBOX_REF` in
+`.github/workflows/crabbox.yml`).
+
 Repository secrets used by the live workflow:
 
 - `ANTHROPIC_API_KEY`
