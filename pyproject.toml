@@ -247,6 +247,7 @@ markers = [
     "live_app: end-to-end tests requiring a deployed Databricks App server",
     "model(name, ...): one arg pins this test to that model overriding the suite-wide --model CLI default; multiple args fan the test out across all listed models via indirect parametrize.",
     "model_pinned: opt out of tests/_model_pools.py spreading and retry rotation; literal model strings are used as written.",
+    "flaky(reruns=2, reruns_delay=0): rerun a nondeterministic test on failure (pytest-rerunfailures). Use for tests flaky due to timing/scheduling races (e.g. PTY drain timing), NOT real-LLM nondeterminism — those use llm_flaky, which rotates models per attempt.",
     "llm_flaky(reruns=2, reruns_delay=1): rerun a nondeterministic real-LLM test on failure, rotating to a different model each attempt (tests/_model_pools.py). Never apply to heavy e2e tests that can hit the CI --timeout=180 cap (rerun + loadscope can crash the shard).",
     "in_process_sessions: run a server integration test with the legacy in-process sessions path instead of sessions-native runner dispatch.",
     "nightly: runs only in the scheduled/dispatch pass of its suite; PR and push runs exclude it via -m 'not nightly'. Remove the marker to promote a burned-in test to the PR gate.",
