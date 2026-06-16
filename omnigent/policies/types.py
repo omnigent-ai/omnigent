@@ -38,14 +38,21 @@ if TYPE_CHECKING:
 
 
 # Proto-style phase wire strings (the ``type`` field on events that
-# cross the harness↔runner boundary) for the tool-mediation phases.
-# These are the phases that fail CLOSED when policy evaluation is
-# unavailable: for connector-native MCP tools the in-band verdict is
-# the only enforcement point, so an unevaluable policy must not let
-# the call through. Defined once here so the two enforcement sites
+# cross the harness↔runner boundary) for which an unavailable policy
+# evaluation must fail CLOSED (default ``POLICY_ACTION_DENY``).
+#
+# Only ``PHASE_TOOL_CALL`` qualifies: for connector-native MCP tools the
+# in-band verdict is the only enforcement point — the call is never
+# re-checked server-side — so an unevaluable policy must not let the call
+# through. ``PHASE_TOOL_RESULT`` is intentionally NOT here: by the time the
+# result phase runs the tool has already executed, so failing it closed
+# would only block an already-incurred side effect; it fails OPEN like the
+# advisory LLM phases.
+#
+# Defined once here so the two enforcement sites
 # (``omnigent.runner.app`` and ``omnigent.runtime.harnesses._scaffold``)
-# can't drift if a future tool phase is added.
-TOOL_CALL_PHASES: tuple[str, ...] = ("PHASE_TOOL_CALL", "PHASE_TOOL_RESULT")
+# can't drift if the set of fail-closed phases changes.
+FAIL_CLOSED_PHASES: tuple[str, ...] = ("PHASE_TOOL_CALL",)
 
 
 @dataclass(frozen=True)

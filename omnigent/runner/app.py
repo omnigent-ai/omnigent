@@ -49,7 +49,7 @@ from omnigent.llms.summarize import (
     build_summarization_prompt,
     extract_summary_text,
 )
-from omnigent.policies.types import TOOL_CALL_PHASES
+from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runner import pending_approvals
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
@@ -2718,11 +2718,14 @@ async def _evaluate_policy_via_omnigent(
     - ``PHASE_LLM_REQUEST`` / ``PHASE_LLM_RESPONSE`` fail OPEN
       (``POLICY_ACTION_ALLOW``) so a transient Omnigent outage does not
       hang the turn — these gates are advisory.
-    - ``PHASE_TOOL_CALL`` / ``PHASE_TOOL_RESULT`` fail CLOSED
-      (``POLICY_ACTION_DENY``). For connector-native MCP tools the harness
-      ``can_use_tool`` callback (which consumes this verdict) is the *only*
-      enforcement point — the call is never re-checked server-side — so a
-      policy that cannot be evaluated must not let the tool through.
+    - ``PHASE_TOOL_CALL`` fails CLOSED (``POLICY_ACTION_DENY``). For
+      connector-native MCP tools the harness ``can_use_tool`` callback
+      (which consumes this verdict) is the *only* enforcement point — the
+      call is never re-checked server-side — so a policy that cannot be
+      evaluated must not let the tool through.
+    - ``PHASE_TOOL_RESULT`` fails OPEN: by the result phase the tool has
+      already executed, so denying would only block an already-incurred
+      side effect.
 
     :param server_client: HTTP client pointed at the Omnigent server.
     :param harness_client: HTTP client pointed at the harness subprocess.
@@ -2734,11 +2737,12 @@ async def _evaluate_policy_via_omnigent(
         ``"PHASE_LLM_REQUEST"``.
     :param data: Event data dict for the policy engine.
     """
-    # Default verdict on error / non-200 / timeout. Phase-aware: tool-call
-    # phases fail CLOSED (this round-trip is the authoritative gate for
-    # connector-native tools), advisory LLM phases fail OPEN so a transient
-    # outage never hangs the turn.
-    _fail_closed = phase in TOOL_CALL_PHASES
+    # Default verdict on error / non-200 / timeout. Phase-aware: TOOL_CALL
+    # fails CLOSED (this round-trip is the authoritative gate for
+    # connector-native tools), while advisory LLM phases and TOOL_RESULT
+    # (the tool already ran) fail OPEN so a transient outage never hangs
+    # the turn.
+    _fail_closed = phase in FAIL_CLOSED_PHASES
     _default_action = "POLICY_ACTION_DENY" if _fail_closed else "POLICY_ACTION_ALLOW"
     verdict_action = _default_action
     verdict_reason: str | None = (

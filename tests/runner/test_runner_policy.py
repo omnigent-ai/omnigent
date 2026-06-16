@@ -6,9 +6,11 @@ errors or returns non-200 the default verdict must be *phase-aware*:
 
 - LLM_REQUEST / LLM_RESPONSE fail OPEN (a transient outage must not hang
   the turn — those gates are advisory).
-- TOOL_CALL / TOOL_RESULT fail CLOSED — for connector-native MCP tools the
-  harness ``can_use_tool`` callback that consumes this verdict is the only
-  enforcement point, so an unevaluable policy must block the tool.
+- TOOL_CALL fails CLOSED — for connector-native MCP tools the harness
+  ``can_use_tool`` callback that consumes this verdict is the only
+  enforcement point, so an unevaluable policy must block the call.
+- TOOL_RESULT fails OPEN: the tool has already executed by then, so
+  denying only blocks an already-incurred side effect.
 """
 
 from __future__ import annotations
@@ -70,24 +72,30 @@ async def _run(server_client: Any, phase: str) -> dict[str, Any]:
     return harness.posted[0]
 
 
-@pytest.mark.parametrize("phase", ["PHASE_TOOL_CALL", "PHASE_TOOL_RESULT"])
-async def test_tool_phase_error_fails_closed(phase: str) -> None:
-    """A round-trip error on a tool phase yields a DENY verdict."""
-    verdict = await _run(_RaisingServerClient(), phase)
+async def test_tool_call_error_fails_closed() -> None:
+    """A round-trip error on the TOOL_CALL phase yields a DENY verdict."""
+    verdict = await _run(_RaisingServerClient(), "PHASE_TOOL_CALL")
     assert verdict["action"] == "POLICY_ACTION_DENY", verdict
     assert verdict.get("reason"), "fail-closed verdict should carry a reason"
 
 
-@pytest.mark.parametrize("phase", ["PHASE_TOOL_CALL", "PHASE_TOOL_RESULT"])
-async def test_tool_phase_non_200_fails_closed(phase: str) -> None:
-    """A non-200 from the server on a tool phase yields a DENY verdict."""
-    verdict = await _run(_StatusServerClient(500), phase)
+async def test_tool_call_non_200_fails_closed() -> None:
+    """A non-200 from the server on the TOOL_CALL phase yields a DENY verdict."""
+    verdict = await _run(_StatusServerClient(500), "PHASE_TOOL_CALL")
     assert verdict["action"] == "POLICY_ACTION_DENY", verdict
 
 
-@pytest.mark.parametrize("phase", ["PHASE_LLM_REQUEST", "PHASE_LLM_RESPONSE"])
-async def test_llm_phase_error_fails_open(phase: str) -> None:
-    """LLM-phase fail-open is preserved: an error yields ALLOW, not DENY."""
+@pytest.mark.parametrize(
+    "phase", ["PHASE_LLM_REQUEST", "PHASE_LLM_RESPONSE", "PHASE_TOOL_RESULT"]
+)
+async def test_non_tool_call_phase_error_fails_open(phase: str) -> None:
+    """Fail-open is preserved off the TOOL_CALL phase: an error yields ALLOW.
+
+    LLM phases are advisory; TOOL_RESULT fails open too because the tool
+    has already executed by then, so denying would only block an
+    already-incurred side effect (maintainer design decision — see PR
+    review thread).
+    """
     verdict = await _run(_RaisingServerClient(), phase)
     assert verdict["action"] == "POLICY_ACTION_ALLOW", verdict
 

@@ -218,11 +218,11 @@ async def test_evaluate_policy_tool_call_timeout_fails_closed(
 ) -> None:
     """A timed-out ``PHASE_TOOL_CALL`` evaluation defaults to DENY.
 
-    TOOL_CALL / TOOL_RESULT is the authoritative gate for connector-native
-    MCP tools (the harness ``can_use_tool`` callback consumes this verdict
-    and the call is never re-checked server-side). If the verdict never
-    arrives, the tool must be blocked, not allowed — the LLM-phase
-    fail-open above must NOT extend to tool calls.
+    TOOL_CALL is the authoritative gate for connector-native MCP tools
+    (the harness ``can_use_tool`` callback consumes this verdict and the
+    call is never re-checked server-side). If the verdict never arrives,
+    the tool must be blocked, not allowed — the LLM-phase fail-open above
+    must NOT extend to the tool *call*.
     """
     import omnigent.runtime.harnesses._scaffold as _scaffold_mod
 
@@ -236,6 +236,30 @@ async def test_evaluate_policy_tool_call_timeout_fails_closed(
         f"Timed-out TOOL_CALL policy evaluation must fail CLOSED (DENY); got {result.action!r}."
     )
     assert result.reason is not None
+
+
+@pytest.mark.asyncio()
+async def test_evaluate_policy_tool_result_timeout_fails_open(
+    _turn_ctx: TurnContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timed-out ``PHASE_TOOL_RESULT`` evaluation defaults to ALLOW.
+
+    By the result phase the tool has already executed, so a missing verdict
+    need not block — TOOL_RESULT fails OPEN like the advisory LLM phases,
+    unlike TOOL_CALL. (Maintainer design decision — see PR review thread.)
+    """
+    import omnigent.runtime.harnesses._scaffold as _scaffold_mod
+
+    monkeypatch.setattr(_scaffold_mod, "_POLICY_EVAL_TIMEOUT_S", 0.1)
+
+    ctx = _turn_ctx
+    result = await ctx.evaluate_policy("poleval_toolresult_timeout", "PHASE_TOOL_RESULT", {})
+
+    assert result.action == "POLICY_ACTION_ALLOW", (
+        f"Timed-out TOOL_RESULT policy evaluation must fail OPEN (ALLOW); got {result.action!r}."
+    )
+    assert result.reason is None
 
 
 def test_policy_verdict_payload_frozen() -> None:
