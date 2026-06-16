@@ -47,7 +47,12 @@ beforeEach(() => {
       },
     },
   });
-  vi.mocked(accountsApi.register).mockResolvedValue({ ok: true });
+  vi.mocked(accountsApi.register).mockResolvedValue({
+    ok: true,
+    user: { id: "alice", is_admin: false },
+    token: "t",
+    expires_in: 3600,
+  });
 });
 
 afterEach(() => {
@@ -106,7 +111,11 @@ describe("RegisterPage", () => {
   });
 
   it("surfaces the server error on failure and does not navigate", async () => {
-    vi.mocked(accountsApi.register).mockResolvedValue({ ok: false, error: "invite expired" });
+    vi.mocked(accountsApi.register).mockResolvedValue({
+      ok: false,
+      error: "invite expired",
+      status: 400,
+    });
     renderRegisterAt("?invite=tok123");
     fillForm("alice", "longenough", "longenough");
     fireEvent.click(screen.getByRole("button", { name: /create account/i }));

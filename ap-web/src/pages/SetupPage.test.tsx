@@ -46,7 +46,12 @@ beforeEach(() => {
       },
     },
   });
-  vi.mocked(accountsApi.setup).mockResolvedValue({ ok: true });
+  vi.mocked(accountsApi.setup).mockResolvedValue({
+    ok: true,
+    user: { id: "root", is_admin: true },
+    token: "t",
+    expires_in: 3600,
+  });
 });
 
 afterEach(() => {
@@ -105,7 +110,11 @@ describe("SetupPage", () => {
   });
 
   it("surfaces a non-409 error inline without navigating", async () => {
-    vi.mocked(accountsApi.setup).mockResolvedValue({ ok: false, error: "weak password" });
+    vi.mocked(accountsApi.setup).mockResolvedValue({
+      ok: false,
+      error: "weak password",
+      status: 400,
+    });
     renderSetup();
     fillForm("root", "longenough", "longenough");
     fireEvent.click(screen.getByRole("button", { name: /create admin/i }));
