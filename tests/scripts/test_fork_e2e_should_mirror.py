@@ -11,33 +11,26 @@ SCRIPT = REPO_ROOT / ".github/scripts/fork-e2e/should-mirror.sh"
 def _run(
     tmp_path: Path,
     *,
-    author_association: str,
-    maintainers: str = "",
-    branch_exists: bool = False,
-    author: str = "octocat",
-    approvers: str = "",
+    labels: str = "",
+    labeler: str = "",
+    maintainers: str = "alice bob",
 ) -> dict[str, str]:
     """
     Run should-mirror.sh against a mocked ``gh`` and return its outputs.
 
-    The mock answers the three calls the script can make:
+    The label-only gate makes exactly two ``gh`` calls, which the mock answers:
 
-    - ``api repos/{repo}/branches/{mirror_branch}`` -> exit 0 if
-      *branch_exists* else exit 1 (the existence probe).
-    - ``pr view {pr} ...`` -> *author* (the PR author login).
-    - ``api repos/{repo}/pulls/{pr}/reviews ...`` -> *approvers*, a
-      space-separated login list printed one per line (post-``--jq``
-      shape the script iterates).
+    - ``pr view {pr} ... --json labels --jq '.labels[].name'`` -> *labels*, a
+      space-separated label list printed one per line (the post-``--jq`` shape
+      the script greps).
+    - ``api repos/{repo}/issues/{pr}/events ...`` -> *labeler*, the login of the
+      account that last applied the gate label (empty if none).
 
     :param tmp_path: Pytest tmp dir for the mock + output file.
-    :param author_association: GitHub ``author_association`` value,
-        e.g. ``"FIRST_TIME_CONTRIBUTOR"`` or ``"CONTRIBUTOR"``.
+    :param labels: Space-separated labels currently on the PR; empty means none.
+    :param labeler: Login the issue-events mock attributes the gate label to.
     :param maintainers: Space-separated maintainer logins (as
         load-maintainers.sh would emit); empty means none.
-    :param branch_exists: Whether fork-e2e/pr-N already exists.
-    :param author: PR author login the ``gh pr view`` mock returns.
-    :param approvers: Space-separated logins whose latest review is
-        APPROVED, as the reviews ``--jq`` would yield.
     :returns: Parsed ``key=value`` GITHUB_OUTPUT lines, e.g.
         ``{"mirror": "true", "reason": "..."}``.
     """
@@ -45,12 +38,12 @@ def _run(
     gh.write_text(
         "#!/usr/bin/env bash\n"
         "set -uo pipefail\n"
-        'if [[ "$1" == "pr" ]]; then echo "$MOCK_AUTHOR"; exit 0; fi\n'
+        # gh pr view <pr> --repo <repo> --json labels --jq '.labels[].name'
+        # shellcheck-style: unquoted expansion intentionally splits labels.
+        'if [[ "$1" == "pr" ]]; then [[ -n "$MOCK_LABELS" ]] && printf "%s\\n" $MOCK_LABELS; exit 0; fi\n'
         'if [[ "$1" == "api" ]]; then\n'
         '  case "$2" in\n'
-        '    *branches/*) [[ "$BRANCH_EXISTS" == "1" ]] && exit 0 || exit 1 ;;\n'
-        # shellcheck-style: unquoted expansion intentionally splits logins.
-        '    *reviews*) [[ -n "$MOCK_APPROVERS" ]] && printf "%s\\n" $MOCK_APPROVERS; exit 0 ;;\n'
+        '    *issues/*events*) [[ -n "$MOCK_LABELER" ]] && printf "%s\\n" "$MOCK_LABELER"; exit 0 ;;\n'
         "  esac\n"
         "fi\n"
         'echo "unexpected gh invocation: $*" >&2\n'
@@ -68,13 +61,12 @@ def _run(
             "GH_TOKEN": "unused",
             "REPO": "test/repo",
             "PR": "7",
+            "LABEL": "e2e-approved",
             "MIRROR_BRANCH": "fork-e2e/pr-7",
-            "AUTHOR_ASSOCIATION": author_association,
             "MAINTAINERS": maintainers,
             "GITHUB_OUTPUT": str(out_file),
-            "BRANCH_EXISTS": "1" if branch_exists else "0",
-            "MOCK_AUTHOR": author,
-            "MOCK_APPROVERS": approvers,
+            "MOCK_LABELS": labels,
+            "MOCK_LABELER": labeler,
         }
     )
     proc = subprocess.run(
@@ -93,96 +85,78 @@ def _run(
     return outputs
 
 
-def test_first_time_contributor_without_approval_does_not_mirror(tmp_path: Path) -> None:
-    """A first-timer with no maintainer approval must NOT open the gate.
+def test_label_applied_by_maintainer_mirrors(tmp_path: Path) -> None:
+    """The gate label, applied by a maintainer, opens the gate.
 
-    This is the whole point of the gate: brand-new contributors don't get a
-    secret-bearing e2e run on first push. Asserts ``mirror=false`` (the e2e
-    suite stays unmirrored until a maintainer reviews).
+    The whole contract: secret-bearing e2e runs only after a maintainer applies
+    ``e2e-approved``. Asserts ``mirror=true`` and that the reason names the
+    maintainer who applied it.
     """
-    out = _run(tmp_path, author_association="FIRST_TIME_CONTRIBUTOR")
+    out = _run(tmp_path, labels="e2e-approved", labeler="bob")
+    assert out["mirror"] == "true"
+    assert "applied by maintainer" in out["reason"]
+
+
+def test_maintainer_match_is_case_insensitive(tmp_path: Path) -> None:
+    """Labeler vs MAINTAINER comparison is case-insensitive.
+
+    GitHub logins are compared lowercased, so a maintainer labelled as ``Bob``
+    still opens the gate against a ``bob`` MAINTAINER entry.
+    """
+    out = _run(tmp_path, labels="e2e-approved", labeler="Bob", maintainers="alice bob")
+    assert out["mirror"] == "true"
+
+
+def test_label_absent_does_not_mirror(tmp_path: Path) -> None:
+    """Without the gate label the gate stays shut.
+
+    No ``e2e-approved`` means no secret-bearing e2e on a fork PR. Asserts
+    ``mirror=false`` and an awaiting-label reason.
+    """
+    out = _run(tmp_path, labels="", labeler="bob")
     assert out["mirror"] == "false"
+    assert "awaiting" in out["reason"]
 
 
-def test_returning_contributor_mirrors(tmp_path: Path) -> None:
-    """A returning contributor (author_association=CONTRIBUTOR) auto-mirrors.
+def test_other_labels_are_ignored(tmp_path: Path) -> None:
+    """Unrelated labels never open the gate.
 
-    Matches GitHub's own "has contributed before" relaxation. Asserts
-    ``mirror=true`` with no maintainer list needed.
+    Only the exact gate label counts; ``bug``/``enhancement`` leave it shut.
     """
-    out = _run(tmp_path, author_association="CONTRIBUTOR")
-    assert out["mirror"] == "true"
-    assert "returning contributor" in out["reason"]
-
-
-def test_member_association_mirrors(tmp_path: Path) -> None:
-    """An org MEMBER's fork PR auto-mirrors (also a returning-type association)."""
-    out = _run(tmp_path, author_association="MEMBER")
-    assert out["mirror"] == "true"
-
-
-def test_maintainer_author_mirrors(tmp_path: Path) -> None:
-    """A first-timer whose login is in MAINTAINER opens the gate.
-
-    Covers the author-is-maintainer branch even when author_association is not
-    a returning value. Asserts ``mirror=true`` and that the reason names the
-    author.
-    """
-    out = _run(
-        tmp_path,
-        author_association="NONE",
-        maintainers="alice bob",
-        author="bob",
-    )
-    assert out["mirror"] == "true"
-    assert "maintainer" in out["reason"]
-
-
-def test_maintainer_approved_review_mirrors(tmp_path: Path) -> None:
-    """A first-timer whose PR a maintainer APPROVED opens the gate.
-
-    Covers the review-approval branch: the author isn't a maintainer, but a
-    maintainer (``bob``) approved. Asserts ``mirror=true``.
-    """
-    out = _run(
-        tmp_path,
-        author_association="FIRST_TIME_CONTRIBUTOR",
-        maintainers="alice bob",
-        author="newcomer",
-        approvers="bob",
-    )
-    assert out["mirror"] == "true"
-    assert "approved by maintainer" in out["reason"]
-
-
-def test_non_maintainer_approval_does_not_mirror(tmp_path: Path) -> None:
-    """An APPROVED review from a NON-maintainer must not open the gate.
-
-    Guards against treating any approval as sufficient: only a maintainer's
-    approval counts. ``eve`` approves but isn't in MAINTAINER, so
-    ``mirror=false``.
-    """
-    out = _run(
-        tmp_path,
-        author_association="FIRST_TIME_CONTRIBUTOR",
-        maintainers="alice bob",
-        author="newcomer",
-        approvers="eve",
-    )
+    out = _run(tmp_path, labels="bug enhancement", labeler="bob")
     assert out["mirror"] == "false"
+    assert "awaiting" in out["reason"]
 
 
-def test_existing_branch_always_remirrors(tmp_path: Path) -> None:
-    """Once fork-e2e/pr-N exists, a first-timer's new push re-mirrors.
+def test_label_applied_by_non_maintainer_does_not_mirror(tmp_path: Path) -> None:
+    """The gate label applied by a NON-maintainer must not open the gate.
 
-    The accepted always-re-mirror behavior: a first-timer with no approval
-    whose branch already exists still mirrors (new commits re-run e2e).
-    Asserts ``mirror=true`` despite the otherwise-closed gate.
+    Triage+ access lets non-maintainers apply labels too, so label presence
+    alone is insufficient: the labeler must be in MAINTAINER. ``eve`` applies it
+    but isn't a maintainer, so ``mirror=false``.
     """
-    out = _run(
-        tmp_path,
-        author_association="FIRST_TIME_CONTRIBUTOR",
-        branch_exists=True,
-    )
-    assert out["mirror"] == "true"
-    assert "re-mirror" in out["reason"]
+    out = _run(tmp_path, labels="e2e-approved", labeler="eve", maintainers="alice bob")
+    assert out["mirror"] == "false"
+    assert "non-maintainer" in out["reason"]
+
+
+def test_label_present_but_unattributable_does_not_mirror(tmp_path: Path) -> None:
+    """A present label with no labeled-event actor stays shut (fail closed).
+
+    If the label can't be attributed to anyone (e.g. seeded outside the events
+    timeline), we can't confirm a maintainer applied it, so ``mirror=false``.
+    """
+    out = _run(tmp_path, labels="e2e-approved", labeler="")
+    assert out["mirror"] == "false"
+    assert "no attributable labeler" in out["reason"]
+
+
+def test_no_maintainers_loaded_does_not_mirror(tmp_path: Path) -> None:
+    """An empty MAINTAINER list fails closed.
+
+    With no maintainers to verify against, even a present label can't be
+    trusted, so the gate stays shut regardless of the labeler.
+    """
+    out = _run(tmp_path, labels="e2e-approved", labeler="bob", maintainers="")
+    assert out["mirror"] == "false"
+    assert "no maintainers" in out["reason"]
