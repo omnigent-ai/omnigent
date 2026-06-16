@@ -4,9 +4,13 @@
 #
 # We scan UNTRUSTED authors and skip trusted ones. "Trusted" is GitHub's
 # native author_association: OWNER / MEMBER / COLLABORATOR -- people with a
-# direct relationship to the repo/org. Everyone else is scanned, INCLUDING
-# returning CONTRIBUTORs (a merged PR in the past does not vouch for the
-# contents of this one) and first-timers (FIRST_TIME_CONTRIBUTOR / NONE).
+# direct relationship to the repo/org -- OR an author in the MAINTAINERS list.
+# The list covers maintainers whose org membership is PRIVATE: GitHub only
+# reports MEMBER in author_association when membership is public, so a private
+# maintainer shows up as CONTRIBUTOR and would otherwise be scanned. Everyone
+# else is scanned, INCLUDING returning CONTRIBUTORs (a merged PR in the past
+# does not vouch for the contents of this one) and first-timers
+# (FIRST_TIME_CONTRIBUTOR / NONE).
 #
 # This is deliberately stricter than fork-e2e/should-mirror.sh, which trusts
 # CONTRIBUTOR: that gate only decides whether to spend a rate-limited test
@@ -90,12 +94,35 @@ case "${EVENT_NAME:-}" in
     ;;
 esac
 
+# Author is a known maintainer? `author_association` only reports MEMBER when
+# the org membership is PUBLIC, so a maintainer with private membership shows up
+# as CONTRIBUTOR in the event payload and would otherwise be scanned. The
+# MAINTAINERS list (from load-maintainers.sh) is authoritative and trusted, so
+# trust the author directly when they appear in it. Only evaluated when
+# MAINTAINERS is passed (the scan does; the per-workflow pollers do not).
+author_is_maintainer() {
+  [[ -n "${MAINTAINERS:-}" && -n "${MAINTAINERS// /}" ]] || return 1
+  [[ -n "${GH_TOKEN:-}" && -n "${REPO:-}" && -n "${PR:-}" ]] || return 1
+
+  local maint_lc author_lc
+  maint_lc=$(echo "$MAINTAINERS" | tr '[:upper:]' '[:lower:]')
+  author_lc=$(gh pr view "$PR" --repo "$REPO" --json author --jq '.author.login' 2>/dev/null \
+    | tr '[:upper:]' '[:lower:]')
+  [[ -n "$author_lc" ]] || return 1
+  for m in $maint_lc; do
+    [[ "$m" == "$author_lc" ]] && return 0
+  done
+  return 1
+}
+
 case "${AUTHOR_ASSOCIATION:-}" in
   OWNER | MEMBER | COLLABORATOR)
     emit false "trusted author (author_association=$AUTHOR_ASSOCIATION)"
     ;;
   *)
-    if skip_label_effective; then
+    if author_is_maintainer; then
+      emit false "trusted author (maintainer; author_association=${AUTHOR_ASSOCIATION:-unknown})"
+    elif skip_label_effective; then
       emit false "maintainer-effective '$SKIP_LABEL' waiver"
     else
       emit true "untrusted author (author_association=${AUTHOR_ASSOCIATION:-unknown})"
