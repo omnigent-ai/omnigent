@@ -49,7 +49,7 @@ def test_multi_turn_research_workflow(
     )
 
     # ── Turn 1: provide facts ─────────────────────────────
-    body_1 = send_user_message_to_session(
+    resp_id_1 = send_user_message_to_session(
         http_client,
         session_id=session_id,
         content=(
@@ -58,7 +58,6 @@ def test_multi_turn_research_workflow(
             "have received this information."
         ),
     )
-    resp_id_1 = body_1["id"]
     result_1 = poll_session_until_terminal(http_client, session_id, resp_id_1, timeout=120)
     text_1 = final_assistant_text(result_1).lower()
     assert "quuxville" in text_1 or "1847" in text_1, (
@@ -66,12 +65,11 @@ def test_multi_turn_research_workflow(
     )
 
     # ── Turn 2: follow-up requiring context retention ──────
-    body_2 = send_user_message_to_session(
+    resp_id_2 = send_user_message_to_session(
         http_client,
         session_id=session_id,
-        content=("When was the capital of Freedonia founded? Answer with just the year."),
+        content="When was the capital of Freedonia founded? Answer with just the year.",
     )
-    resp_id_2 = body_2["id"]
     result_2 = poll_session_until_terminal(http_client, session_id, resp_id_2, timeout=120)
     text_2 = final_assistant_text(result_2).lower()
     assert "1847" in text_2, (
