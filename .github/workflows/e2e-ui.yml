@@ -77,12 +77,21 @@ env:
   TERM: xterm-256color
 
 jobs:
+  # Security precondition gate: on untrusted PRs the shard setup (which checks
+  # out and runs the PR's own e2e-shard-matrix.sh) and all e2e-ui jobs are held
+  # until the deterministic scan passes (see .github/workflows/security-gate.yml).
+  # Trusted authors and non-PR events (push to fork-e2e/**, schedule, dispatch)
+  # pass through instantly.
+  gate:
+    uses: ./.github/workflows/security-gate.yml
+
   # Compute the shard matrix once. A skipped run (draft, or a fork's
   # pull_request) yields an EMPTY matrix -> zero shard jobs -> no skipped
   # check-runs with an unexpanded ${{ matrix.* }} name. Shared with e2e.yml
   # via .github/scripts/ci/e2e-shard-matrix.sh (only NUM_SHARDS differs).
   setup:
     name: setup
+    needs: gate
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:

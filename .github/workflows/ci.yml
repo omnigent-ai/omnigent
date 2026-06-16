@@ -50,8 +50,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Security precondition gate: on untrusted PRs every job below is held until
+  # the deterministic scan passes (see .github/workflows/security-gate.yml).
+  # Trusted authors and non-PR events pass through instantly.
+  gate:
+    uses: ./.github/workflows/security-gate.yml
+
   pytest:
     name: Pytest (${{ matrix.group }})
+    needs: gate
     # Skip on draft PRs; the `ready_for_review` trigger above re-fires
     # the workflow when the draft is converted, so this won't strand
     # the check pending on the eventual ready-for-review state.
