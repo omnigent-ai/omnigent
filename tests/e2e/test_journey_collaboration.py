@@ -35,6 +35,19 @@ from tests.e2e.conftest import (
 
 _LEVEL_READ = 1
 _LEVEL_EDIT = 2
+_LEVEL_MANAGE = 3
+
+
+def _extract_all_text(body: dict) -> str:  # type: ignore[type-arg]
+    """Concatenate all message text blocks from a terminal turn body."""
+    parts: list[str] = []
+    for item in body.get("output", []):
+        if item.get("type") == "message":
+            for block in item.get("content", []):
+                text = block.get("text")
+                if text:
+                    parts.append(text)
+    return "\n".join(parts)
 
 
 def _client_for(base_url: str, email: str) -> httpx.Client:
@@ -61,13 +74,17 @@ def test_share_collaborate_revoke_journey(
     alice_email = f"alice-{suffix}@e2e.test"
     bob_email = f"bob-{suffix}@e2e.test"
 
+    # The live runner is owned by the headerless ``local`` identity, so the
+    # session must also be created by a headerless client to satisfy the
+    # runner-ownership rule.  Alice and Bob get access via explicit grants.
+    owner = httpx.Client(base_url=live_server, timeout=300)
     alice = _client_for(live_server, alice_email)
     bob = _client_for(live_server, bob_email)
 
     try:
-        # ── 1. Alice creates a session ──────────────────────────────────
+        # ── 1. Owner creates a session and grants Alice MANAGE ─────────
         agent_name = register_inline_agent(
-            alice,
+            owner,
             name=f"collab-journey-{suffix}",
             harness="openai-agents",
             model="databricks-gpt-5-4-mini",
@@ -79,8 +96,12 @@ def test_share_collaborate_revoke_journey(
             ),
         )
         session_id = create_runner_bound_session(
-            alice, agent_name=agent_name, runner_id=live_runner_id
+            owner, agent_name=agent_name, runner_id=live_runner_id
         )
+        owner.put(
+            f"/v1/sessions/{session_id}/permissions",
+            json={"user_id": alice_email, "level": _LEVEL_MANAGE},
+        ).raise_for_status()
 
         # ── 2. Alice works with the agent ───────────────────────────────
         marker = f"collab-marker-{uuid.uuid4().hex[:8]}"
@@ -91,6 +112,9 @@ def test_share_collaborate_revoke_journey(
         )
         body = poll_session_until_terminal(alice, session_id=session_id, response_id=response_id)
         assert body["status"] == "completed", f"Alice's turn failed: {body.get('error')}"
+        assert marker in _extract_all_text(body), (
+            f"Marker {marker!r} not found in assistant output"
+        )
 
         # ── 3. Alice shares with Bob (EDIT) ─────────────────────────────
         grant = alice.put(
@@ -189,5 +213,6 @@ def test_share_collaborate_revoke_journey(
         assert bob.get(f"/v1/sessions/{session_id}").status_code == 404
 
     finally:
+        owner.close()
         alice.close()
         bob.close()
