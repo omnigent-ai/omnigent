@@ -78,8 +78,9 @@ jobs:
           node -e "process.stdout.write(String(require('./coverage/coverage-summary.json').total.lines.pct))" \
             > ui-coverage-summary/total.txt
           echo "Total UI coverage: $(cat ui-coverage-summary/total.txt)%"
-          # Render a markdown table into the job summary (parity with the
-          # backend coverage-report job's GITHUB_STEP_SUMMARY table).
+          # Render a markdown table; tee it to both the job log (visible inline)
+          # and the run's Summary tab (parity with the backend coverage-report
+          # job's GITHUB_STEP_SUMMARY table).
           node -e '
             const t = require("./coverage/coverage-summary.json").total;
             const row = (k) => `| ${k[0].toUpperCase()}${k.slice(1)} | ${t[k].pct}% | ${t[k].covered}/${t[k].total} |`;
@@ -87,7 +88,7 @@ jobs:
               "## UI Coverage\n\n" +
               "| Metric | % | Covered/Total |\n|---|---|---|\n" +
               ["lines","statements","functions","branches"].map(row).join("\n") + "\n");
-          ' >> "$GITHUB_STEP_SUMMARY"
+          ' | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload UI coverage summary
         if: always()
