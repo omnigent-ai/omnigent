@@ -73,6 +73,43 @@ The host URL can also be passed positionally (`omnigent host
 http://localhost:6767`). See the [README](README.md) for more on hosts,
 harnesses, and credentials.
 
+## Tests
+
+A change that alters behaviour under `omnigent/` should ship with a test, and a
+bug fix should add a test that fails before the fix. Pure refactors, renames,
+type-only changes, dependency bumps, and edits with no observable behaviour
+change don't need a new test.
+
+Put the test in the suite that matches the area you changed — most backend
+areas mirror their source directory under `tests/`:
+
+| Area changed (`omnigent/…`) | Test suite (`tests/…`) |
+| --- | --- |
+| `server/` | `server/` |
+| `runner/` | `runner/` |
+| `runtime/` | `runtime/` |
+| `tools/` | `tools/` |
+| `inner/` | `inner/` |
+| `llms/` | `llms/` |
+| `db/` | `db/` (a schema migration especially warrants one) |
+| `policies/` | `policies/` |
+| `repl/` | `repl/` |
+| `entities/` | `entities/` |
+| `stores/` | `stores/` |
+| `host/` | `host/` |
+| `spec/` | `spec/` |
+
+Two cross-cutting suites sit on top of these:
+
+- `tests/integration/` — behaviour that spans several components (e.g. server +
+  runtime) and isn't captured by any single area's unit test.
+- `tests/e2e/` — full-stack flows driven against a live LLM (sessions, the
+  runtime, sub-agent dispatch, client-tool tunneling, transports, native
+  harness bridges, steering/cancellation). These are slow and gateway-bound, so
+  reserve them for genuine end-to-end behaviour — but a PR that adds new
+  user-facing functionality **must** include at least one e2e happy-path test
+  (see `.github/copilot-instructions.md`).
+
 ## Pull requests
 
 - Branch from `main`, keep changes focused, and include tests or docs when relevant.
