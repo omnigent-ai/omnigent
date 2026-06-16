@@ -203,9 +203,7 @@ def test_provision_env_passthrough_missing_var_fails(
     """A configured but unset env name aborts before creating a sandbox."""
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     fake = _FakeOpenShellAPI()
-    launcher = OpenShellSandboxLauncher(
-        base_url="http://localhost:8000", env=["OPENAI_API_KEY"]
-    )
+    launcher = OpenShellSandboxLauncher(base_url="http://localhost:8000", env=["OPENAI_API_KEY"])
     monkeypatch.setattr(launcher, "_openshell", lambda: fake)
 
     with pytest.raises(click.ClickException, match="OPENAI_API_KEY"):
@@ -230,7 +228,6 @@ def test_run_captures_output(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_run_check_raises_on_nonzero(monkeypatch: pytest.MonkeyPatch) -> None:
     """``run`` with ``check=True`` raises on non-zero exit."""
     fake = _FakeOpenShellAPI()
-    fake_execute_orig = fake.execute
 
     def _failing_execute(sandbox_id: str, command: str, timeout: int = 300) -> dict:
         fake.exec_calls.append((sandbox_id, command))
@@ -329,9 +326,7 @@ def test_client_delete_ignores_404(monkeypatch: pytest.MonkeyPatch) -> None:
     import omnigent.onboarding.sandboxes.openshell as openshell_mod
 
     fake = _FakeHTTPClient()
-    fake.next_response = _FakeResponse(
-        404, {}, text="not found"
-    )
+    fake.next_response = _FakeResponse(404, {}, text="not found")
     monkeypatch.setattr(openshell_mod.httpx, "Client", lambda **kwargs: fake)
 
     client = _OpenShellClient(base_url="http://localhost:8000")

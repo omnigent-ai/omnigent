@@ -24,8 +24,6 @@ Platform notes that shape this launcher:
 from __future__ import annotations
 
 import os
-import re
-import uuid
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, ClassVar
@@ -86,9 +84,7 @@ class _OpenShellClient:
             timeout=max(float(timeout) + 10.0, _REQUEST_TIMEOUT_S),
         )
 
-    def upload_file(
-        self, sandbox_id: str, local_path: Path, remote_path: str
-    ) -> None:
+    def upload_file(self, sandbox_id: str, local_path: Path, remote_path: str) -> None:
         """Upload one file to an absolute path in the sandbox."""
         with local_path.open("rb") as file_obj:
             files = {"file": (local_path.name, file_obj, "application/octet-stream")}
@@ -101,9 +97,7 @@ class _OpenShellClient:
 
     def get_status(self, sandbox_id: str) -> dict[str, Any]:
         """Get the status of a sandbox."""
-        return self._request_json(
-            "GET", f"/sandboxes/{_url_component(sandbox_id)}/status"
-        )
+        return self._request_json("GET", f"/sandboxes/{_url_component(sandbox_id)}/status")
 
     def delete_sandbox(self, sandbox_id: str) -> None:
         """Delete a sandbox. Missing sandboxes are treated as gone."""
@@ -135,13 +129,9 @@ class _OpenShellClient:
         url = self._url(endpoint)
         effective_timeout = timeout if timeout is not None else _REQUEST_TIMEOUT_S
         try:
-            response = self._client.request(
-                method, url, timeout=effective_timeout, **kwargs
-            )
+            response = self._client.request(method, url, timeout=effective_timeout, **kwargs)
         except httpx.HTTPError as exc:
-            raise _OpenShellAPIError(
-                f"openshell {method} {endpoint} failed: {exc}"
-            ) from exc
+            raise _OpenShellAPIError(f"openshell {method} {endpoint} failed: {exc}") from exc
         if response.status_code >= 400:
             raise self._response_error(method, endpoint, response)
         return response
@@ -201,11 +191,7 @@ class OpenShellSandboxLauncher(SandboxLauncher):
 
     def provision(self, name: str) -> str:
         """Create a new OpenShell sandbox from the host image."""
-        resolved_ref = (
-            self._image_ref
-            or os.environ.get(HOST_IMAGE_ENV_VAR)
-            or DEFAULT_HOST_IMAGE
-        )
+        resolved_ref = self._image_ref or os.environ.get(HOST_IMAGE_ENV_VAR) or DEFAULT_HOST_IMAGE
         payload: dict[str, Any] = {
             "image": resolved_ref,
             "name": name,
@@ -221,14 +207,10 @@ class OpenShellSandboxLauncher(SandboxLauncher):
         try:
             sandbox = self._openshell().create_sandbox(payload)
         except _OpenShellAPIError as exc:
-            raise click.ClickException(
-                f"OpenShell sandbox creation failed: {exc}"
-            ) from exc
+            raise click.ClickException(f"OpenShell sandbox creation failed: {exc}") from exc
         sandbox_id = sandbox.get("id") or sandbox.get("sandbox_id") or sandbox.get("name")
         if not isinstance(sandbox_id, str) or not sandbox_id:
-            raise click.ClickException(
-                "OpenShell sandbox creation returned no sandbox identifier"
-            )
+            raise click.ClickException("OpenShell sandbox creation returned no sandbox identifier")
         click.echo(f"  → created {sandbox_id}")
         return sandbox_id
 
@@ -244,13 +226,9 @@ class OpenShellSandboxLauncher(SandboxLauncher):
 
     def keep_alive(self, sandbox_id: str) -> None:
         """No idle auto-stop management is exposed by the OpenShell API."""
-        click.echo(
-            f"  → OpenShell sandbox '{sandbox_id}' remains active until destroyed"
-        )
+        click.echo(f"  → OpenShell sandbox '{sandbox_id}' remains active until destroyed")
 
-    def run(
-        self, sandbox_id: str, command: str, *, check: bool = True
-    ) -> RemoteCommandResult:
+    def run(self, sandbox_id: str, command: str, *, check: bool = True) -> RemoteCommandResult:
         """Run a shell command in the sandbox and capture its output."""
         try:
             result = self._openshell().execute(sandbox_id, command)
@@ -270,13 +248,9 @@ class OpenShellSandboxLauncher(SandboxLauncher):
                 f"Remote command failed on OpenShell sandbox '{sandbox_id}' "
                 f"(exit {exit_code}): {command}"
             )
-        return RemoteCommandResult(
-            returncode=exit_code, stdout=stdout, stderr=stderr
-        )
+        return RemoteCommandResult(returncode=exit_code, stdout=stdout, stderr=stderr)
 
-    def put(
-        self, sandbox_id: str, local_path: Path, remote_path: str
-    ) -> None:
+    def put(self, sandbox_id: str, local_path: Path, remote_path: str) -> None:
         """Copy a local file into the sandbox."""
         try:
             self._openshell().upload_file(sandbox_id, local_path, remote_path)
@@ -315,9 +289,7 @@ class OpenShellSandboxLauncher(SandboxLauncher):
         else:
             names = [
                 name.strip()
-                for name in os.environ.get(
-                    SANDBOX_ENV_PASSTHROUGH_ENV_VAR, ""
-                ).split(",")
+                for name in os.environ.get(SANDBOX_ENV_PASSTHROUGH_ENV_VAR, "").split(",")
                 if name.strip()
             ]
         resolved: dict[str, str] = {}
