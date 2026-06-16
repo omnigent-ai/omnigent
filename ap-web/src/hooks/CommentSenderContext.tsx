@@ -38,11 +38,7 @@ export function CommentSenderProvider({
   children: ReactNode;
 }) {
   if (agentId === null) {
-    return (
-      <CommentSenderContext.Provider value={null}>
-        {children}
-      </CommentSenderContext.Provider>
-    );
+    return <CommentSenderContext.Provider value={null}>{children}</CommentSenderContext.Provider>;
   }
   return (
     <AgentBoundSenderProvider sessionId={sessionId} agentId={agentId}>
@@ -65,11 +61,7 @@ function AgentBoundSenderProvider({
     () => ({ mutate: mutation.mutate, isPending: mutation.isPending }),
     [mutation.mutate, mutation.isPending],
   );
-  return (
-    <CommentSenderContext.Provider value={value}>
-      {children}
-    </CommentSenderContext.Provider>
-  );
+  return <CommentSenderContext.Provider value={value}>{children}</CommentSenderContext.Provider>;
 }
 
 /**

@@ -34,12 +34,7 @@ describe("TerminalCommandCard", () => {
 
   it("kind='output' with stdout renders collapsible; click reveals stdout panel", () => {
     const { container } = render(
-      <TerminalCommandCard
-        kind="output"
-        input={null}
-        stdout="/home/user"
-        stderr={null}
-      />,
+      <TerminalCommandCard kind="output" input={null} stdout="/home/user" stderr={null} />,
     );
     const trigger = container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]');
     expect(trigger).not.toBeNull();
@@ -63,9 +58,8 @@ describe("TerminalCommandCard", () => {
     fireEvent.click(trigger!);
     expect(screen.getAllByText("stderr").length).toBeGreaterThan(0);
     expect(
-      screen.getAllByText((_, node) =>
-        Boolean(node?.textContent?.includes("command not found")),
-      ).length,
+      screen.getAllByText((_, node) => Boolean(node?.textContent?.includes("command not found")))
+        .length,
     ).toBeGreaterThan(0);
   });
 });

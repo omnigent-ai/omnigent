@@ -13,9 +13,10 @@
 #   --non-interactive, --verbose
 #
 # uv and git (only with --repo) are required; the installer offers to install
-# them if missing. Node/npm are needed by the Claude/Codex/Pi harnesses and
-# tmux by their terminal launchers — missing ones are warnings, not errors,
-# unless building from source.
+# them if missing. Node/npm are needed by the Claude/Codex/Pi harnesses, tmux
+# by their terminal launchers, and bubblewrap (Linux only) to OS-sandbox those
+# terminals — missing ones are warnings, not errors, unless building from
+# source.
 
 set -eu
 
@@ -268,8 +269,9 @@ ensure_git() {
     Linux)
       install_cmd="$(linux_pkg_install_cmd git)"
       if [ -n "$install_cmd" ] && prompt_yes_no "git is required and not installed. Install it now ($install_cmd)?"; then
-        run_with_spinner "install git" sh -c "$install_cmd" || true
-        command -v git >/dev/null 2>&1 && return
+        # Run directly (not via run_with_spinner) so sudo can prompt for a password.
+        sh -c "$install_cmd" || true
+        command -v git >/dev/null 2>&1 && { step "git installed"; return; }
       fi
       ;;
     Darwin)
@@ -384,7 +386,9 @@ check_tmux() {
     Linux)
       install_cmd="$(linux_pkg_install_cmd tmux)"
       if [ -n "$install_cmd" ] && prompt_yes_no "tmux is missing (needed for \`omnigent claude\` / \`omnigent codex\`). Install it now ($install_cmd)?"; then
-        run_with_spinner "install tmux" sh -c "$install_cmd" || warn "tmux install failed — run manually: $install_cmd"
+        # Run directly (not via run_with_spinner) so sudo can prompt for a password.
+        sh -c "$install_cmd" || warn "tmux install failed — run manually: $install_cmd"
+        command -v tmux >/dev/null 2>&1 && step "tmux installed"
         return
       fi
       if [ -n "$install_cmd" ]; then
@@ -394,6 +398,31 @@ check_tmux() {
       fi
       ;;
   esac
+}
+
+# The native `omnigent claude` / `omnigent codex` / `pi` harnesses wrap each
+# agent terminal in a bubblewrap (`bwrap`) OS-sandbox; on Linux that isolation
+# is mandatory and fail-loud, so a missing `bwrap` binary makes those terminals
+# fail to start. macOS sandboxes with the built-in seatbelt backend and needs
+# nothing here, so this check is Linux-only.
+check_bubblewrap() {
+  [ "$(uname -s)" = Linux ] || return 0
+
+  if command -v bwrap >/dev/null 2>&1; then
+    step "bubblewrap (bwrap) is available"
+    return
+  fi
+
+  install_cmd="$(linux_pkg_install_cmd bubblewrap)"
+  if [ -n "$install_cmd" ] && prompt_yes_no "bubblewrap is missing (needed to sandbox native \`omnigent claude\` / \`omnigent codex\` terminals). Install it now ($install_cmd)?"; then
+    run_with_spinner "install bubblewrap" sh -c "$install_cmd" || warn "bubblewrap install failed — run manually: $install_cmd"
+    return
+  fi
+  if [ -n "$install_cmd" ]; then
+    warn "bubblewrap (bwrap) not found — native \`omnigent claude\` / \`omnigent codex\` terminals need it on Linux. Install with: $install_cmd"
+  else
+    warn "bubblewrap (bwrap) not found — native \`omnigent claude\` / \`omnigent codex\` terminals need it on Linux. Install it with your package manager."
+  fi
 }
 
 install_omnigent() {
@@ -550,6 +579,7 @@ main() {
   check_node
   check_npm
   check_tmux
+  check_bubblewrap
   install_omnigent
   bin_dir="$(uv_tool_bin_dir)"
   verify_omnigent "$bin_dir"

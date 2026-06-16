@@ -78,7 +78,6 @@ export function castAskUserQuestionPayload(
   return raw as unknown as AskUserQuestionPayload;
 }
 
-
 const PREVIEW_PREFIX = "AskUserQuestion(";
 
 /**

@@ -49,9 +49,7 @@ export function PresenceAvatars() {
               </AvatarFallback>
             </Avatar>
           </TooltipTrigger>
-          <TooltipContent>
-            {viewer.idle ? `${viewer.userId} (idle)` : viewer.userId}
-          </TooltipContent>
+          <TooltipContent>{viewer.idle ? `${viewer.userId} (idle)` : viewer.userId}</TooltipContent>
         </Tooltip>
       ))}
       {overflow.length > 0 && (
@@ -61,9 +59,7 @@ export function PresenceAvatars() {
               +{overflow.length}
             </AvatarGroupCount>
           </TooltipTrigger>
-          <TooltipContent>
-            {overflow.map((viewer) => viewer.userId).join(", ")}
-          </TooltipContent>
+          <TooltipContent>{overflow.map((viewer) => viewer.userId).join(", ")}</TooltipContent>
         </Tooltip>
       )}
     </div>

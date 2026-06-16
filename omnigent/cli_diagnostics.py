@@ -573,6 +573,22 @@ def _update_latest_symlink(log_dir: Path, log_path: Path) -> None:
         pass
 
 
+def _safe_mtime(path: Path) -> float:
+    """Return *path*'s mtime, or ``0.0`` if it has vanished.
+
+    ``_prune_old_logs`` runs at the start of every ``omnigent run``, so two
+    concurrent launches can glob the same log set then race to delete it. A
+    plain ``p.stat()`` in the sort key would then hit a just-removed file and
+    raise ``FileNotFoundError``, aborting the whole prune and crashing CLI
+    startup. Treat a vanished file as oldest (it's already gone, so the
+    suppressed ``unlink`` below is a no-op).
+    """
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def _prune_old_logs(log_dir: Path) -> None:
     """
     Remove the oldest ``cli-*.log`` files when the count exceeds
@@ -584,7 +600,7 @@ def _prune_old_logs(log_dir: Path) -> None:
     :param log_dir: Directory to prune.
     """
     pattern = "cli-*.log*"
-    logs = sorted(log_dir.glob(pattern), key=lambda p: p.stat().st_mtime)
+    logs = sorted(log_dir.glob(pattern), key=_safe_mtime)
     # Keep the newest MAX_LOG_FILES; delete the rest.
     excess = logs[: max(0, len(logs) - MAX_LOG_FILES)]
     for old in excess:

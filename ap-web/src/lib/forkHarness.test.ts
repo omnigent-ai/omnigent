@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { agentBaseName, harnessFamily, isNativeHarness, forkTargetCarriesHistory } from "./forkHarness";
+import {
+  agentBaseName,
+  harnessFamily,
+  isNativeHarness,
+  forkTargetCarriesHistory,
+} from "./forkHarness";
 
 describe("harnessFamily", () => {
   it.each([
@@ -31,10 +36,14 @@ describe("isNativeHarness", () => {
     ["native-claude", true],
     ["codex-native", true],
     ["native-codex", true],
+    ["pi-native", true],
+    ["native-pi", true],
     ["claude-sdk", false],
     ["claude_sdk", false],
     ["openai-agents", false],
     ["codex", false],
+    // The SDK `pi` harness is in-process, not a native CLI wrapper.
+    ["pi", false],
     [null, false],
   ])("classifies %s as native=%s", (harness, expected) => {
     expect(isNativeHarness(harness as string | null)).toBe(expected);
@@ -59,12 +68,18 @@ describe("forkTargetCarriesHistory", () => {
   // requires plus the event_msg mirrors it rebuilds visible turns from
   // (verified against codex 0.136.0), so cross-family forks into
   // codex-native are offered like claude-native always was.
-  it.each([["claude-native"], ["native-claude"], ["codex-native"], ["native-codex"]])(
-    "native target %s carries history",
-    (target) => {
-      expect(forkTargetCarriesHistory(target)).toBe(true);
-    },
-  );
+  it.each([
+    ["claude-native"],
+    ["native-claude"],
+    ["codex-native"],
+    ["native-codex"],
+    // Pi is native but multi-family (no single harnessFamily) — it must
+    // still be offered, or the fork/switch-agent pickers silently drop it.
+    ["pi-native"],
+    ["native-pi"],
+  ])("native target %s carries history", (target) => {
+    expect(forkTargetCarriesHistory(target)).toBe(true);
+  });
 
   it("does NOT offer a target whose harness is unknown (conservative; see TODO)", () => {
     // We can't classify an unrecognised harness (the catalog may report

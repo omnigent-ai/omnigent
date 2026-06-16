@@ -128,9 +128,7 @@ interface AgentObjectWire {
  * :param sessionId: The session whose bound agent to retrieve.
  */
 async function fetchSessionAgent(sessionId: string): Promise<Agent> {
-  const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}/agent`,
-  );
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/agent`);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const json = (await res.json()) as AgentObjectWire;
   return {

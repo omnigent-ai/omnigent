@@ -18,10 +18,7 @@ import type { Editor } from "@tiptap/react";
 import type { RefObject } from "react";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
-import {
-  commentDecorationKey,
-  type CommentDecorationState,
-} from "./TipTapCommentExtension";
+import { commentDecorationKey, type CommentDecorationState } from "./TipTapCommentExtension";
 import { computeSelectionData } from "./TipTapEditorHelpers";
 import { getEmbedRoot } from "@/lib/host";
 
@@ -35,14 +32,8 @@ import { getEmbedRoot } from "@/lib/host";
  * Pass `pendingRange` to embed it directly in the meta so the plugin writes
  * it to stateRef inside apply() before the React sync-effect runs.
  */
-function rebuildDecorations(
-  editor: Editor,
-  pendingRange?: { from: number; to: number } | null,
-) {
-  const meta =
-    pendingRange !== undefined
-      ? { pendingRange }
-      : "rebuild";
+function rebuildDecorations(editor: Editor, pendingRange?: { from: number; to: number } | null) {
+  const meta = pendingRange !== undefined ? { pendingRange } : "rebuild";
   const tr = editor.state.tr.setMeta(commentDecorationKey, meta);
   editor.view.dispatch(tr);
 }
@@ -82,16 +73,24 @@ export function MarkdownCommentPlugin({
 
   // Stable refs so callbacks always see the latest values.
   const onSetActiveSelectionRef = useRef(onSetActiveSelection);
-  useEffect(() => { onSetActiveSelectionRef.current = onSetActiveSelection; }, [onSetActiveSelection]);
+  useEffect(() => {
+    onSetActiveSelectionRef.current = onSetActiveSelection;
+  }, [onSetActiveSelection]);
 
   const activeSelectionRef = useRef(activeSelection);
-  useEffect(() => { activeSelectionRef.current = activeSelection; }, [activeSelection]);
+  useEffect(() => {
+    activeSelectionRef.current = activeSelection;
+  }, [activeSelection]);
 
   const isDirtyRef = useRef(isDirty);
-  useEffect(() => { isDirtyRef.current = isDirty; }, [isDirty]);
+  useEffect(() => {
+    isDirtyRef.current = isDirty;
+  }, [isDirty]);
 
   const canEditRef = useRef(canEdit);
-  useEffect(() => { canEditRef.current = canEdit; }, [canEdit]);
+  useEffect(() => {
+    canEditRef.current = canEdit;
+  }, [canEdit]);
 
   // Tracks the PM range of the in-progress (pending) comment highlight.
   const pendingRangeRef = useRef<{ from: number; to: number } | null>(null);
@@ -134,8 +133,7 @@ export function MarkdownCommentPlugin({
     if (!editor || !activeSelection) return;
     const comment = comments.find(
       (c) =>
-        c.start_index === activeSelection.start_index &&
-        c.end_index === activeSelection.end_index,
+        c.start_index === activeSelection.start_index && c.end_index === activeSelection.end_index,
     );
     if (!comment) return;
     const rafId = requestAnimationFrame(() => {
@@ -154,9 +152,7 @@ export function MarkdownCommentPlugin({
       const onCommentEl = (e.target as Element).closest("[data-comment-id]");
       const onAddBtn = (e.target as Element).closest("[data-add-comment-btn]");
       if (!onCommentEl && !onAddBtn && activeSelectionRef.current !== null) {
-        const hasDraft =
-          pendingRangeRef.current !== null &&
-          !!pendingBodyRef?.current?.trim();
+        const hasDraft = pendingRangeRef.current !== null && !!pendingBodyRef?.current?.trim();
         if (!hasDraft) {
           onSetActiveSelectionRef.current(null);
         }
@@ -176,16 +172,18 @@ export function MarkdownCommentPlugin({
         return;
       }
       const { selection } = editor.state;
-      if (selection.empty) { setButtonPos(null); return; }
+      if (selection.empty) {
+        setButtonPos(null);
+        return;
+      }
 
       // Hide if the selection contains no actual text (e.g. only a cursor in
       // an empty node). textBetween with "\n" separator gives us the plain text.
-      const selectedText = editor.state.doc.textBetween(
-        selection.from,
-        selection.to,
-        "\n",
-      );
-      if (!selectedText.trim()) { setButtonPos(null); return; }
+      const selectedText = editor.state.doc.textBetween(selection.from, selection.to, "\n");
+      if (!selectedText.trim()) {
+        setButtonPos(null);
+        return;
+      }
 
       const nativeSel = window.getSelection();
       if (!nativeSel || nativeSel.rangeCount === 0) return;
@@ -213,12 +211,7 @@ export function MarkdownCommentPlugin({
     const { selection } = state;
     if (selection.empty) return;
 
-    const data = computeSelectionData(
-      selection.from,
-      selection.to,
-      state.doc,
-      contentRef.current,
-    );
+    const data = computeSelectionData(selection.from, selection.to, state.doc, contentRef.current);
     if (!data) return;
 
     const newRange = { from: selection.from, to: selection.to };

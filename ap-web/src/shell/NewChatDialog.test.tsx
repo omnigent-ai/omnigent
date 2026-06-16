@@ -670,12 +670,28 @@ describe("NewChatLandingScreen", () => {
     expect(detail.textContent).toContain("Prompts before edits and commands");
     fireEvent.pointerEnter(planOption);
     expect(detail.textContent).toContain("Plans only; makes no edits");
-    // Switch to Codex (a2: not native, no overridable harness) — the whole
-    // Advanced chip is gone since --permission-mode only applies to the
-    // claude CLI and codex-native offers no harness override.
+    // Switch to Codex (a2: codex-native) — the Advanced chip stays visible
+    // but now shows approval-mode radios instead of permission-mode radios.
+    // Close the Advanced menu first (Escape), then switch agents.
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
-    expect(screen.queryByTestId("new-chat-landing-advanced-chip")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-advanced-chip")).not.toBeNull();
+  });
+
+  it("shows approval-mode options in the Advanced menu for the codex-native agent", () => {
+    renderLanding();
+    // Switch to Codex first.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
+    const neverOption = screen.getByTestId("new-chat-landing-approval-never");
+    expect(neverOption.textContent).toContain("Never");
+    // The footer line explains the SELECTED mode until a row is hovered.
+    const detail = screen.getByTestId("new-chat-landing-approval-detail");
+    expect(detail.textContent).toContain("Model decides when to ask for approval");
+    fireEvent.pointerEnter(neverOption);
+    expect(detail.textContent).toContain("Never asks for approval");
   });
 
   it("shows a conflict banner in the file browser for an occupied directory", async () => {
@@ -790,7 +806,9 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-sandbox-option")).toBeNull();
     fireEvent.focus(screen.getByLabelText("Why New Sandbox is unavailable"));
     await waitFor(() =>
-      expect(screen.getAllByText("Managed sandboxes are disabled in this workspace.").length).toBeGreaterThan(0),
+      expect(
+        screen.getAllByText("Managed sandboxes are disabled in this workspace.").length,
+      ).toBeGreaterThan(0),
     );
   });
 
@@ -1000,7 +1018,9 @@ describe("NewChatLandingScreen", () => {
     expect(helpButton).toBeTruthy();
     fireEvent.focus(helpButton);
     await waitFor(() =>
-      expect(screen.getAllByText("Use Databricks Git credentials before cloning.").length).toBeGreaterThan(0),
+      expect(
+        screen.getAllByText("Use Databricks Git credentials before cloning.").length,
+      ).toBeGreaterThan(0),
     );
   });
 
@@ -1276,5 +1296,30 @@ describe("NewChatLandingScreen attachments", () => {
     expect(screen.getByText("notes.txt")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Remove notes.txt" }));
     expect(screen.queryByText("notes.txt")).toBeNull();
+  });
+
+  it("attaches files dropped onto the composer and surfaces a drop overlay", () => {
+    renderLanding();
+    const composer = screen.getByTestId("new-chat-landing-composer");
+    // Dragging over the composer lifts the drop-target overlay.
+    fireEvent.dragOver(composer, { dataTransfer: { files: [] } });
+    expect(screen.getByText("Drop files here")).toBeTruthy();
+    // Dropping a file attaches it (chip proves it reached state) and clears
+    // the overlay.
+    const file = new File(["hello"], "dropped.txt", { type: "text/plain" });
+    fireEvent.drop(composer, { dataTransfer: { files: [file] } });
+    expect(screen.getByText("dropped.txt")).toBeTruthy();
+    expect(screen.queryByText("Drop files here")).toBeNull();
+  });
+
+  it("clears the drop overlay when the drag leaves the composer", () => {
+    renderLanding();
+    const composer = screen.getByTestId("new-chat-landing-composer");
+    fireEvent.dragEnter(composer, { dataTransfer: { files: [] } });
+    expect(screen.getByText("Drop files here")).toBeTruthy();
+    // relatedTarget defaults to null (outside the composer), so the active
+    // state clears rather than sticking when moving between child elements.
+    fireEvent.dragLeave(composer, { dataTransfer: { files: [] } });
+    expect(screen.queryByText("Drop files here")).toBeNull();
   });
 });

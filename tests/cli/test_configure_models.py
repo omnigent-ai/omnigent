@@ -9,7 +9,8 @@ shape, not just the command's exit code, so a regression in the
 add/set-default/remove write paths surfaces here rather than silently.
 
 ``configure harnesses`` is a **three-level** picker. Level 1 picks a harness —
-the cursor moves between ``1=Claude``, ``2=Codex``, ``3=Pi``, and ``4=Quit`` (each
+the cursor moves between ``1=Claude``, ``2=Codex``, ``3=Pi``, ``4=Cursor``,
+``5=Antigravity``, and ``6=Quit`` (each
 harness's prominent default + ``+N more`` summary renders as non-selectable
 sub-lines that are skipped; a harness with no usable default — uninstalled or
 unconfigured — shows a red ✗, while a configured one carries no name-level
@@ -78,8 +79,10 @@ def isolated_config(tmp_path, monkeypatch):
         "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",
         "GEMINI_API_KEY",
+        "ANTIGRAVITY_API_KEY",
         "OPENROUTER_API_KEY",
         "DATABRICKS_TOKEN",
+        "CURSOR_API_KEY",
     ):
         monkeypatch.delenv(var, raising=False)
     # Redirect CLI-detected credential homes so a developer's real
@@ -1960,3 +1963,190 @@ def test_add_menu_readds_dismissed_cli_config_credential(isolated_config) -> Non
     # The dismissal is cleared, so the credential behaves like an ordinary
     # detection again instead of staying half-dismissed.
     assert cfg["dismissed_detections"] == []
+
+
+# ── Cursor API-key flow ─────────────────────────────────────────────────────
+# Cursor runs via the ``cursor-sdk`` package and authenticates with a
+# ``CURSOR_API_KEY``; it has no provider/gateway family. Its drill-in (L1 row 4)
+# stores the key in the secret store + a dedicated ``cursor:`` config block,
+# mirroring the other harnesses' api-key persistence. The menu is API-key-only
+# (Set/Replace/Remove), so it touches neither the ``cursor-agent`` binary nor a
+# login probe. ``isolated_config`` clears any ambient ``CURSOR_API_KEY``.
+
+
+def test_cursor_set_api_key_paste_writes_block_and_secret(isolated_config) -> None:
+    """Pasting a ``crsr_`` key stores the secret + writes the ``cursor:`` block.
+
+    Proves the api-key path: the secret lands in the store (never plaintext in
+    config) and the config references it via ``keychain:cursor``.
+    """
+    # L1 4=Cursor → cursor menu 1=Set API key → paste key (crsr_ → no warn) →
+    # cursor menu q=back → L1 q=quit.
+    stdin = "\n".join(["4", "1", "crsr_test_key_123", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    assert cfg["cursor"] == {"api_key_ref": "keychain:cursor"}
+    # The pasted secret reached the store under the ``cursor`` name; config
+    # holds only the reference.
+    assert secrets.load_secret("cursor") == "crsr_test_key_123"
+
+
+def test_cursor_adopt_env_api_key_writes_env_ref(isolated_config, monkeypatch) -> None:
+    """Adopting an existing ``$CURSOR_API_KEY`` records an ``env:`` ref only.
+
+    The env path must NOT copy the secret into the store — it points the config
+    at the live environment variable so the key never leaves the user's shell.
+    """
+    monkeypatch.setenv("CURSOR_API_KEY", "crsr_env_key_456")
+    # L1 4=Cursor → 1=Set API key → "y" adopt detected $CURSOR_API_KEY →
+    # q back → q quit.
+    stdin = "\n".join(["4", "1", "y", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    assert cfg["cursor"] == {"api_key_ref": "env:CURSOR_API_KEY"}
+    assert secrets.load_secret("cursor") is None
+
+
+def test_cursor_remove_api_key_drops_block_and_secret(isolated_config) -> None:
+    """Removing a Cursor key deletes the stored secret AND drops the config block."""
+    # Seed a stored key: the keychain secret + the ``cursor:`` block referencing it.
+    secrets.store_secret("cursor", "crsr_seeded")
+    config_path = os.path.join(isolated_config, "config.yaml")
+    with open(config_path, "w") as f:
+        yaml.safe_dump({"cursor": {"api_key_ref": "keychain:cursor"}}, f)
+
+    # L1 4=Cursor → cursor menu (key set: 1=Replace 2=Remove 3=Back) → 2=Remove
+    # → q back → q quit.
+    stdin = "\n".join(["4", "2", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    assert "cursor" not in cfg
+    assert secrets.load_secret("cursor") is None
+
+
+def test_cursor_set_api_key_non_crsr_declined_is_not_stored(isolated_config) -> None:
+    """A non-``crsr_`` paste that the user declines to force is NOT persisted.
+
+    The soft prefix check warns and asks to store anyway; declining must leave
+    both the secret store and the config untouched.
+    """
+    # L1 4=Cursor → 1=Set API key → paste non-crsr_ key → "n" decline warning →
+    # q back → q quit.
+    stdin = "\n".join(["4", "1", "sk-not-a-cursor-key", "n", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    assert "cursor" not in cfg
+    assert secrets.load_secret("cursor") is None
+
+
+# ── Antigravity Gemini API-key flow ─────────────────────────────────────────
+# Antigravity (Gemini-native, no provider family) drills in at L1 row 5
+# (Claude/Codex/Pi/Antigravity/Quit) and stores its key in the secret store +
+# the ``antigravity:`` config block. API-key-only menu (Set/Replace/Remove);
+# ``isolated_config`` clears ambient GEMINI_API_KEY / ANTIGRAVITY_API_KEY.
+
+
+def test_antigravity_set_api_key_paste_writes_block_and_secret(isolated_config) -> None:
+    """Pasting an ``AIza`` key stores the secret + writes the ``antigravity:`` block.
+
+    Proves the api-key path: the secret lands in the store (never plaintext in
+    config) and the config references it via ``keychain:antigravity``.
+    """
+    # L1 5=Antigravity → antigravity menu 1=Set API key → paste key (AIza → no
+    # warn) → antigravity menu q=back → L1 q=quit.
+    stdin = "\n".join(["5", "1", "AIza_test_key_123", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    assert cfg["antigravity"] == {"api_key_ref": "keychain:antigravity"}
+    # The pasted secret reached the store under the ``antigravity`` name; config
+    # holds only the reference.
+    assert secrets.load_secret("antigravity") == "AIza_test_key_123"
+
+
+def test_antigravity_adopt_env_api_key_writes_env_ref(isolated_config, monkeypatch) -> None:
+    """Adopting an existing ``$GEMINI_API_KEY`` records an ``env:`` ref only.
+
+    The env path must NOT copy the secret into the store — it points the config
+    at the live environment variable so the key never leaves the user's shell.
+    """
+    monkeypatch.setenv("GEMINI_API_KEY", "AIza_env_key_456")
+    # L1 5=Antigravity → 1=Set API key → "y" adopt detected $GEMINI_API_KEY →
+    # q back → q quit.
+    stdin = "\n".join(["5", "1", "y", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    assert cfg["antigravity"] == {"api_key_ref": "env:GEMINI_API_KEY"}
+    assert secrets.load_secret("antigravity") is None
+
+
+def test_antigravity_remove_api_key_drops_block_and_secret(isolated_config) -> None:
+    """Removing a Gemini key deletes the stored secret AND drops the config block."""
+    # Seed a stored key: the keychain secret + the ``antigravity:`` block.
+    secrets.store_secret("antigravity", "AIza_seeded")
+    config_path = os.path.join(isolated_config, "config.yaml")
+    with open(config_path, "w") as f:
+        yaml.safe_dump({"antigravity": {"api_key_ref": "keychain:antigravity"}}, f)
+
+    # L1 5=Antigravity → antigravity menu (key set: 1=Replace 2=Remove 3=Back) →
+    # 2=Remove → q back → q quit.
+    stdin = "\n".join(["5", "2", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    assert "antigravity" not in cfg
+    assert secrets.load_secret("antigravity") is None
+
+
+def test_antigravity_remove_does_not_delete_foreign_keychain_secret(isolated_config) -> None:
+    """Removing antigravity drops the block but spares a shared ``keychain:<other>``.
+
+    A hand-edited ``antigravity:`` block may point at a secret we don't own
+    (here ``keychain:shared-gemini``). Remove must NOT clobber that secret —
+    only the config block is dropped. Against the old over-broad delete (any
+    ``keychain:`` ref) the shared secret would have been destroyed.
+    """
+    # Seed a foreign shared secret referenced by a hand-edited block.
+    secrets.store_secret("shared-gemini", "AIza_shared_seeded")
+    config_path = os.path.join(isolated_config, "config.yaml")
+    with open(config_path, "w") as f:
+        yaml.safe_dump({"antigravity": {"api_key_ref": "keychain:shared-gemini"}}, f)
+
+    # L1 5=Antigravity → antigravity menu 2=Remove → q back → q quit.
+    stdin = "\n".join(["5", "2", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    # Block dropped, but the secret we don't own is left intact.
+    assert "antigravity" not in cfg
+    assert secrets.load_secret("shared-gemini") == "AIza_shared_seeded"
+
+
+def test_antigravity_set_api_key_non_aiza_declined_is_not_stored(isolated_config) -> None:
+    """A non-``AIza`` paste that the user declines to force is NOT persisted.
+
+    The soft prefix check warns and asks to store anyway; declining must leave
+    both the secret store and the config untouched.
+    """
+    # L1 5=Antigravity → 1=Set API key → paste non-AIza key → "n" decline
+    # warning → q back → q quit.
+    stdin = "\n".join(["5", "1", "sk-not-a-gemini-key", "n", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    assert "antigravity" not in cfg
+    assert secrets.load_secret("antigravity") is None

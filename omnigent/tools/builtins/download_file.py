@@ -58,15 +58,6 @@ class DownloadFileTool(Tool):
                             "type": "string",
                             "description": ('The file ID to download, e.g. "file_abc123".'),
                         },
-                        "destination": {
-                            "type": "string",
-                            "description": (
-                                "Optional path within the workspace "
-                                "to save the file. Defaults to the "
-                                "original filename in the workspace "
-                                "root."
-                            ),
-                        },
                     },
                     "required": ["file_id"],
                 },
@@ -77,8 +68,6 @@ class DownloadFileTool(Tool):
         """
         Download a file and save it to the workspace.
 
-        :param arguments: JSON with ``"file_id"`` and optional
-            ``"destination"`` keys.
         :param ctx: Provides workspace path for saving.
         :returns: JSON string with the local file path, or error.
         """
@@ -113,7 +102,6 @@ class DownloadFileTool(Tool):
             )
 
         dest = _resolve_destination(
-            args.get("destination"),
             record.filename,
             ctx.workspace,
         )
@@ -131,20 +119,15 @@ class DownloadFileTool(Tool):
 
 
 def _resolve_destination(
-    destination: str | None,
     filename: str,
     workspace: Path | None,
 ) -> Path:
     """
     Resolve the save path for a downloaded file.
 
-    :param destination: User-specified relative path, or ``None``
-        to use the original filename.
     :param filename: The file's original filename from the store.
     :param workspace: The agent's workspace directory, or ``None``.
     :returns: Absolute path to save the file.
     """
     base = workspace or Path.cwd()
-    if destination:
-        return base / destination
     return base / filename

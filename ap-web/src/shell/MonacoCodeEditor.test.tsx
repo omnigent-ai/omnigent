@@ -20,7 +20,11 @@ import type { ActiveSelection, SaveStatus } from "./codeViewerHelpers";
 // Capture the props the editor is rendered with (it returns null — we only
 // need the props, not a real DOM editor).
 const h = vi.hoisted(() => ({
-  editorProps: null as { options?: { readOnly?: boolean }; theme?: string; language?: string } | null,
+  editorProps: null as {
+    options?: { readOnly?: boolean };
+    theme?: string;
+    language?: string;
+  } | null,
 }));
 vi.mock("@monaco-editor/react", () => ({
   Editor: (props: { options?: { readOnly?: boolean }; theme?: string; language?: string }) => {
@@ -125,7 +129,9 @@ function setupHooks(
   vi.mocked(runnerHook.useSessionRunnerOnline).mockReturnValue(overrides.runnerOnline);
 }
 
-function renderEditor(props: { truncated?: boolean; onSaveStatusChange?: (s: SaveStatus) => void } = {}) {
+function renderEditor(
+  props: { truncated?: boolean; onSaveStatusChange?: (s: SaveStatus) => void } = {},
+) {
   return render(
     <MonacoCodeEditor
       content="const x = 1;"
@@ -153,21 +159,34 @@ afterEach(() => {
 
 describe("buildCommentDecorations", () => {
   it("maps a comment's offsets to a 1-based line/column range with the dim class", () => {
-    const decos = buildCommentDecorations(fakeModel(CONTENT), [mkComment({ start_index: 1, end_index: 3 })], null);
+    const decos = buildCommentDecorations(
+      fakeModel(CONTENT),
+      [mkComment({ start_index: 1, end_index: 3 })],
+      null,
+    );
 
     // One decoration for the one comment. If 0, the comment was dropped; if 2,
     // an active-selection decoration leaked in despite activeSelection === null.
     expect(decos).toHaveLength(1);
     // "bc" on line 1 → cols 2..4. A wrong offset→position computation (or
     // swapped start/end) would yield a different range here.
-    expect(decos[0].range).toEqual({ startLineNumber: 1, startColumn: 2, endLineNumber: 1, endColumn: 4 });
+    expect(decos[0].range).toEqual({
+      startLineNumber: 1,
+      startColumn: 2,
+      endLineNumber: 1,
+      endColumn: 4,
+    });
     // Non-active saved comment uses the dim class.
     expect(decos[0].options.inlineClassName).toBe("oa-comment");
   });
 
   it("uses the active class when the active selection matches the comment", () => {
     const active: ActiveSelection = { start_index: 1, end_index: 3, anchor_content: "bc" };
-    const decos = buildCommentDecorations(fakeModel(CONTENT), [mkComment({ start_index: 1, end_index: 3 })], active);
+    const decos = buildCommentDecorations(
+      fakeModel(CONTENT),
+      [mkComment({ start_index: 1, end_index: 3 })],
+      active,
+    );
 
     // Still one decoration (the active selection coincides with the comment, so
     // no separate pending highlight is added).
@@ -179,7 +198,11 @@ describe("buildCommentDecorations", () => {
 
   it("adds a separate active highlight for a not-yet-saved selection", () => {
     const active: ActiveSelection = { start_index: 5, end_index: 7, anchor_content: "fg" };
-    const decos = buildCommentDecorations(fakeModel(CONTENT), [mkComment({ start_index: 1, end_index: 3 })], active);
+    const decos = buildCommentDecorations(
+      fakeModel(CONTENT),
+      [mkComment({ start_index: 1, end_index: 3 })],
+      active,
+    );
 
     // 2 = the saved comment (dim) + the pending selection (active). If 1, the
     // pending-selection branch failed to add the highlight the user sees while
@@ -190,12 +213,21 @@ describe("buildCommentDecorations", () => {
     expect(classes).toContain("oa-comment-active");
     // The pending highlight maps offsets 5..7 → line 2, cols 2..4.
     const pending = decos.find((d) => d.options.inlineClassName === "oa-comment-active");
-    expect(pending?.range).toEqual({ startLineNumber: 2, startColumn: 2, endLineNumber: 2, endColumn: 4 });
+    expect(pending?.range).toEqual({
+      startLineNumber: 2,
+      startColumn: 2,
+      endLineNumber: 2,
+      endColumn: 4,
+    });
   });
 
   it("does not add a highlight for an empty (collapsed) active selection", () => {
     const active: ActiveSelection = { start_index: 5, end_index: 5, anchor_content: "" };
-    const decos = buildCommentDecorations(fakeModel(CONTENT), [mkComment({ start_index: 1, end_index: 3 })], active);
+    const decos = buildCommentDecorations(
+      fakeModel(CONTENT),
+      [mkComment({ start_index: 1, end_index: 3 })],
+      active,
+    );
 
     // Only the saved comment. A collapsed selection (caret, no range) must not
     // produce a zero-width highlight.
@@ -208,9 +240,27 @@ describe("buildCommentDecorations", () => {
 
 describe("MonacoCodeEditor read-only / truncated gating", () => {
   it.each([
-    { name: "editable when permitted and not truncated", canEdit: true, truncated: false, readOnly: false, banner: false },
-    { name: "read-only without edit permission", canEdit: false, truncated: false, readOnly: true, banner: false },
-    { name: "read-only + banner when truncated, even with permission", canEdit: true, truncated: true, readOnly: true, banner: true },
+    {
+      name: "editable when permitted and not truncated",
+      canEdit: true,
+      truncated: false,
+      readOnly: false,
+      banner: false,
+    },
+    {
+      name: "read-only without edit permission",
+      canEdit: false,
+      truncated: false,
+      readOnly: true,
+      banner: false,
+    },
+    {
+      name: "read-only + banner when truncated, even with permission",
+      canEdit: true,
+      truncated: true,
+      readOnly: true,
+      banner: true,
+    },
   ])("$name", async ({ canEdit, truncated, readOnly, banner }) => {
     setupHooks({ canEdit });
     renderEditor({ truncated });
@@ -235,19 +285,51 @@ describe("MonacoCodeEditor save-status reporting", () => {
   // pin the derivation from the write mutation + dirty/offline state, including
   // its priority order (error > saving > offline > saved).
   it.each([
-    { name: "unsaved while typing (dirty, online, pre-write)", state: { isDirty: true, runnerOnline: true }, expected: "unsaved" },
-    { name: "saving while a write is in flight", state: { isPending: true, isDirty: true, runnerOnline: true }, expected: "saving" },
-    { name: "saved once a clean write settles", state: { isSuccess: true, isDirty: false, runnerOnline: true }, expected: "saved" },
-    { name: "error when the last write failed", state: { isError: true, isDirty: true, runnerOnline: true }, expected: "error" },
-    { name: "offline when dirty and the runner is down", state: { isDirty: true, runnerOnline: false }, expected: "offline" },
-    { name: "error wins over a pending retry", state: { isError: true, isPending: true, isDirty: true, runnerOnline: true }, expected: "error" },
+    {
+      name: "unsaved while typing (dirty, online, pre-write)",
+      state: { isDirty: true, runnerOnline: true },
+      expected: "unsaved",
+    },
+    {
+      name: "saving while a write is in flight",
+      state: { isPending: true, isDirty: true, runnerOnline: true },
+      expected: "saving",
+    },
+    {
+      name: "saved once a clean write settles",
+      state: { isSuccess: true, isDirty: false, runnerOnline: true },
+      expected: "saved",
+    },
+    {
+      name: "error when the last write failed",
+      state: { isError: true, isDirty: true, runnerOnline: true },
+      expected: "error",
+    },
+    {
+      name: "offline when dirty and the runner is down",
+      state: { isDirty: true, runnerOnline: false },
+      expected: "offline",
+    },
+    {
+      name: "error wins over a pending retry",
+      state: { isError: true, isPending: true, isDirty: true, runnerOnline: true },
+      expected: "error",
+    },
     // A failed write leaves isError stuck on the mutation; once the user reverts
     // to a clean buffer there's nothing left to save, so the stale "Save failed"
     // chip must clear rather than linger.
-    { name: "error clears when the buffer is reverted clean", state: { isError: true, isDirty: false, runnerOnline: true }, expected: "idle" },
+    {
+      name: "error clears when the buffer is reverted clean",
+      state: { isError: true, isDirty: false, runnerOnline: true },
+      expected: "idle",
+    },
     // Dirty is resolved before "saved": a stale isSuccess from the prior save
     // must not mask the new edit while the next debounce is still pending.
-    { name: "unsaved wins over a stale prior-save success", state: { isSuccess: true, isDirty: true, runnerOnline: true }, expected: "unsaved" },
+    {
+      name: "unsaved wins over a stale prior-save success",
+      state: { isSuccess: true, isDirty: true, runnerOnline: true },
+      expected: "unsaved",
+    },
   ])("$name", async ({ state, expected }) => {
     const statuses: SaveStatus[] = [];
     setupHooks({ canEdit: true, ...state });
@@ -274,7 +356,9 @@ describe("MonacoCodeEditor save-status reporting", () => {
       // SAVED_BADGE_MS (2000) elapses → the chip self-clears so it doesn't
       // linger after the write landed. Asserting the full sequence proves the
       // setTimeout→idle actually fired (a missing clear leaves it ["saved"]).
-      await act(async () => { vi.advanceTimersByTime(2000); });
+      await act(async () => {
+        vi.advanceTimersByTime(2000);
+      });
       expect(statuses).toEqual(["saved", "idle"]);
     } finally {
       vi.useRealTimers();

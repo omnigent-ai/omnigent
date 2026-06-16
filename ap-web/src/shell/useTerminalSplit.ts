@@ -30,8 +30,11 @@ export function useTerminalSplit(conversationId: string) {
   const activeTerminal =
     activeKey !== null ? (terminals.find((t) => terminalTabKey(t) === activeKey) ?? null) : null;
 
-  const { width: listWidth, containerRef: splitRef, handleProps: columnHandleProps } =
-    useResizableColumn();
+  const {
+    width: listWidth,
+    containerRef: splitRef,
+    handleProps: columnHandleProps,
+  } = useResizableColumn();
 
   // Clear activeKey if the selected terminal is removed. Do NOT
   // auto-select — null is the intentional "no terminal selected" state.

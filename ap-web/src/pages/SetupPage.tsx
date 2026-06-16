@@ -75,21 +75,16 @@ export function SetupPage() {
     <div className="flex min-h-screen items-center justify-center bg-background px-4">
       <div className="w-full max-w-sm space-y-6">
         <div className="space-y-1 text-center">
-          <h1 className="text-2xl font-semibold tracking-tight">
-            Create the admin account
-          </h1>
+          <h1 className="text-2xl font-semibold tracking-tight">Create the admin account</h1>
           <p className="text-sm text-muted-foreground">
-            First run — pick the username and password for this server's
-            admin. You can invite others once you're in.
+            First run — pick the username and password for this server's admin. You can invite
+            others once you're in.
           </p>
         </div>
 
         <form onSubmit={onSubmit} className="space-y-4">
           <div className="space-y-1.5">
-            <label
-              htmlFor="setup-username"
-              className="text-sm font-medium leading-none"
-            >
+            <label htmlFor="setup-username" className="text-sm font-medium leading-none">
               Username
             </label>
             <Input
@@ -104,16 +99,12 @@ export function SetupPage() {
               title="Lowercase letters, digits, dots, hyphens, underscores (or a lowercase email)"
             />
             <p className="text-xs text-muted-foreground">
-              Lowercase letters, digits, dots, hyphens, underscores — or a
-              lowercase email.
+              Lowercase letters, digits, dots, hyphens, underscores — or a lowercase email.
             </p>
           </div>
 
           <div className="space-y-1.5">
-            <label
-              htmlFor="setup-password"
-              className="text-sm font-medium leading-none"
-            >
+            <label htmlFor="setup-password" className="text-sm font-medium leading-none">
               Password
             </label>
             <Input
@@ -129,10 +120,7 @@ export function SetupPage() {
           </div>
 
           <div className="space-y-1.5">
-            <label
-              htmlFor="setup-confirm"
-              className="text-sm font-medium leading-none"
-            >
+            <label htmlFor="setup-confirm" className="text-sm font-medium leading-none">
               Confirm password
             </label>
             <Input
@@ -159,11 +147,7 @@ export function SetupPage() {
           <Button
             type="submit"
             className="w-full"
-            disabled={
-              submitting ||
-              password.length < MIN_PASSWORD_LENGTH ||
-              username.length === 0
-            }
+            disabled={submitting || password.length < MIN_PASSWORD_LENGTH || username.length === 0}
           >
             {submitting ? "Creating…" : "Create admin"}
           </Button>

@@ -24,11 +24,7 @@ import {
   CodeBlockTitle,
 } from "@/components/ai-elements/code-block";
 import { Button } from "@/components/ui/button";
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from "@/components/ui/collapsible";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import type { RenderItem, ToolState } from "@/lib/renderItems";
@@ -311,7 +307,8 @@ function ToolTriggerRow({
   /** When set, the body text (e.g. file path) is rendered as a clickable link. */
   onBodyClick?: () => void;
 }) {
-  const tooltip = title.verb && title.body ? `${title.verb} ${title.body}` : title.verb ?? title.body;
+  const tooltip =
+    title.verb && title.body ? `${title.verb} ${title.body}` : (title.verb ?? title.body);
   return (
     <CollapsibleTrigger
       title={tooltip}
@@ -319,9 +316,7 @@ function ToolTriggerRow({
     >
       <StatusIcon name={name} nativeToolType={nativeToolType} state={state} />
       <span className="min-w-0 flex-1 truncate">
-        {title.verb !== null && (
-          <span className="font-semibold text-foreground">{title.verb}</span>
-        )}
+        {title.verb !== null && <span className="font-semibold text-foreground">{title.verb}</span>}
         {title.verb !== null && title.body.length > 0 && " "}
         {onBodyClick ? (
           // Use <span role="link"> instead of <button> to avoid nesting
@@ -350,9 +345,7 @@ function ToolTriggerRow({
         )}
       </span>
       {duration !== undefined && (
-        <span className="shrink-0 tabular-nums opacity-70">
-          {formatToolDuration(duration)}
-        </span>
+        <span className="shrink-0 tabular-nums opacity-70">{formatToolDuration(duration)}</span>
       )}
       <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]:rotate-90" />
     </CollapsibleTrigger>
@@ -377,9 +370,7 @@ function StatusIcon({
   if (state === "input-available") {
     // Slightly larger and tinted so the running indicator is the one
     // thing in the row that actively draws the eye.
-    return (
-      <Loader2Icon className="size-3.5 shrink-0 animate-spin text-info" />
-    );
+    return <Loader2Icon className="size-3.5 shrink-0 animate-spin text-info" />;
   }
   if (state === "output-error") {
     return <XCircleIcon className="size-3.5 shrink-0 text-destructive" />;

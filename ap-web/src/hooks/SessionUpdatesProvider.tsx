@@ -58,12 +58,11 @@ function applyItemsToCache(
     queryKey: ["conversations"],
   });
   for (const [key, data] of entries) {
-    const { data: next, found, needsRefetch: queryNeedsRefetch } = mergeItemsIntoPages(
-      data,
-      itemsById,
-      filtersFromConversationQueryKey(key),
-      activeId,
-    );
+    const {
+      data: next,
+      found,
+      needsRefetch: queryNeedsRefetch,
+    } = mergeItemsIntoPages(data, itemsById, filtersFromConversationQueryKey(key), activeId);
     for (const id of found) foundAnywhere.add(id);
     if (queryNeedsRefetch) needsRefetch = true;
     if (next !== data) queryClient.setQueryData(key, next);

@@ -1,0 +1,143 @@
+name: Fork e2e mirror
+
+# Mirrors a gated fork PR's head onto a trusted fork-e2e/pr-N branch so e2e runs
+# there as a `push` (with secrets). It's a pure git-ref update via a GitHub App
+# token (refs pushed by the default GITHUB_TOKEN don't trigger workflows); it
+# never checks out or runs fork code. Mirroring requires BOTH the contributor
+# Security Scan to pass (the blocking `gate` job, via security-gate.yml) AND the
+# `e2e-approved` label, present and applied by a maintainer (should-mirror.sh).
+#
+# The `e2e-approved` label is the sole human gate for running secret-bearing e2e
+# on a fork PR. Only Triage+ users can apply labels, and the gate further
+# verifies the labeler is in .github/MAINTAINER, so an external fork author can
+# never open it. It is intentionally separate from the merge gate
+# (maintainer-approval.yml): labeling runs e2e but does NOT approve for merge,
+# and vice-versa. Removing the label (or closing the PR) tears down the mirror
+# branch and stops further secret runs.
+#
+# leak-scan-allow: pull_request_target
+on:
+  pull_request_target:
+    # labeled/unlabeled so applying or removing `e2e-approved` opens or tears
+    # down the mirror immediately, not only on the PR's next push.
+    types: [opened, synchronize, reopened, closed, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-e2e-mirror-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  # Delete the trusted mirror branch when the PR closes or the gate label is
+  # removed. Ungated -- cleanup must always run so a closed PR (or one whose
+  # approval was withdrawn) never leaves a stale fork-e2e/pr-N branch behind.
+  cleanup:
+    name: cleanup
+    if: >-
+      github.event.pull_request.head.repo.fork
+      && (
+        github.event.action == 'closed'
+        || (github.event.action == 'unlabeled' && github.event.label.name == 'e2e-approved')
+      )
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      REPO: ${{ github.repository }}
+      MIRROR_BRANCH: fork-e2e/pr-${{ github.event.pull_request.number }}
+    steps:
+      - name: Mint mirror App token
+        id: app-token
+        # App token, not GITHUB_TOKEN: its pushes DO trigger the downstream e2e.
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          app-id: ${{ vars.FORK_E2E_APP_ID }}
+          private-key: ${{ secrets.FORK_E2E_APP_PRIVATE_KEY }}
+
+      - name: Delete mirror branch
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh api -X DELETE "repos/$REPO/git/refs/heads/$MIRROR_BRANCH" >/dev/null 2>&1 \
+            && echo "Deleted $MIRROR_BRANCH" || echo "No $MIRROR_BRANCH to delete"
+
+  # The single contributor Security Scan, consulted as a BLOCKING gate before we
+  # mirror fork code onto a trusted branch where e2e runs WITH the gateway secret.
+  # The scan itself runs once on the PR (security-scan.yml); this poller mirrors
+  # its result, blocking the mirror on a finding. Skipped on the teardown actions
+  # (handled by `cleanup`) and on label churn other than `e2e-approved`.
+  gate:
+    name: security gate
+    if: >-
+      github.event.pull_request.head.repo.fork
+      && github.event.action != 'closed'
+      && github.event.action != 'unlabeled'
+      && (github.event.action != 'labeled' || github.event.label.name == 'e2e-approved')
+    uses: ./.github/workflows/security-gate.yml
+
+  mirror:
+    name: mirror
+    needs: gate
+    # Fork PRs only -- same-repo PRs run e2e directly via `pull_request`. Mirror
+    # only when not tearing down and (for label events) only for the gate label.
+    if: >-
+      github.event.pull_request.head.repo.fork
+      && github.event.action != 'closed'
+      && github.event.action != 'unlabeled'
+      && (github.event.action != 'labeled' || github.event.label.name == 'e2e-approved')
+    permissions:
+      contents: read
+      issues: read          # read the labeled-by timeline (issues/N/events)
+      pull-requests: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      MIRROR_BRANCH: fork-e2e/pr-${{ github.event.pull_request.number }}
+    steps:
+      - name: Check out gate scripts from main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: main             # trusted; never the PR head
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Mint mirror App token
+        id: app-token
+        # App token, not GITHUB_TOKEN: its pushes DO trigger the downstream e2e.
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          app-id: ${{ vars.FORK_E2E_APP_ID }}
+          private-key: ${{ secrets.FORK_E2E_APP_PRIVATE_KEY }}
+
+      # MAINTAINER@main, never the PR head: the gate verifies the *labeler* is a
+      # maintainer, so a PR can't self-grant by editing its own MAINTAINER copy.
+      - name: Load maintainers
+        id: maintainers
+        run: bash .github/scripts/merge-ready/load-maintainers.sh
+
+      - name: Evaluate mirror gate
+        id: gate
+        env:
+          LABEL: e2e-approved
+          MAINTAINERS: ${{ steps.maintainers.outputs.list }}
+        run: bash .github/scripts/fork-e2e/should-mirror.sh
+
+      - name: Mirror head SHA onto trusted branch
+        if: ${{ steps.gate.outputs.mirror == 'true' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          if gh api "repos/$REPO/git/refs/heads/$MIRROR_BRANCH" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/$REPO/git/refs/heads/$MIRROR_BRANCH" -f sha="$HEAD_SHA" -F force=true >/dev/null
+            echo "Updated $MIRROR_BRANCH -> $HEAD_SHA"
+          else
+            gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$MIRROR_BRANCH" -f sha="$HEAD_SHA" >/dev/null
+            echo "Created $MIRROR_BRANCH -> $HEAD_SHA"
+          fi
