@@ -1297,10 +1297,7 @@ function MainAgentSurface({
     <>
       {/* Wrapper div gives us a ref to scope the SelectionPopup to the
           conversation area without requiring Conversation to forward refs. */}
-      <div
-        ref={setConversationEl}
-        className="relative flex min-h-0 flex-1 overflow-hidden"
-      >
+      <div ref={setConversationEl} className="relative flex min-h-0 flex-1 overflow-hidden">
         {/* chat-scroll-fade masks the viewport's top edge so scrolling
             content dissolves into the canvas before reaching the
             ChatHeader overlay's controls (geometry in index.css). */}
