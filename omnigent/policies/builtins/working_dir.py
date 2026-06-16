@@ -224,6 +224,37 @@ def _classify_segment(tokens: list[str], block_cd: bool, block_worktree: bool) -
     return None
 
 
+def _segment_hides_gated_command(tokens: list[str], block_cd: bool, block_worktree: bool) -> bool:
+    """
+    Whether a gated cd/worktree command sits behind an unrecognized leading token.
+
+    :func:`real_invocation_tokens` only strips known command wrappers; an
+    unknown one (``stdbuf``, ``nice`` …) leaves a real ``cd`` / ``git -C`` /
+    ``git worktree`` deeper in the token list, where the head dispatch in
+    :func:`_classify_segment` misses it and the segment is silently allowed.
+    This is the fail-closed backstop, matching on actual command tokens (not a
+    bare mention, so a quoted ``echo "cd /etc"`` stays one token and does not
+    trip it).
+
+    :param tokens: Real-invocation tokens of a segment whose leading token was
+        not itself a recognized gated command.
+    :param block_cd: Whether directory-change commands are gated.
+    :param block_worktree: Whether worktree-switch commands are gated.
+    :returns: ``True`` if a gated command appears behind the leading token.
+    """
+    for i in range(1, len(tokens)):
+        word = tokens[i].lstrip("(")
+        if block_cd and word in _CD_COMMANDS:
+            return True
+        if word == "git":
+            rest = tokens[i + 1 :]
+            if block_worktree and "worktree" in rest:
+                return True
+            if block_cd and any(t == "-C" or t.startswith("-C") for t in rest):
+                return True
+    return False
+
+
 def _looks_like_dir_op(segment: str, block_cd: bool, block_worktree: bool) -> bool:
     """
     Heuristic: does an un-tokenizable segment appear to switch dir/worktree?
@@ -373,6 +404,16 @@ def block_working_dir_changes(
             op = _classify_segment(tokens, block_cd, block_worktree)
             if op is not None:
                 worst = _worse(worst, _gate(op))
+            elif _segment_hides_gated_command(tokens, block_cd, block_worktree):
+                # An unrecognized leading wrapper hides a gated cd/worktree
+                # command — fail closed via the configured action.
+                worst = _worse(
+                    worst,
+                    _violation(
+                        f"Blocked: a shell command ({segment[:60]!r}) appears to switch "
+                        f"directories or worktrees behind an unrecognized wrapper."
+                    ),
+                )
         return worst
 
     def _evaluate(event: PolicyEvent) -> PolicyResponse | None:

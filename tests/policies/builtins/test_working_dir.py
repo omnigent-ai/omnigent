@@ -301,6 +301,45 @@ def test_untokenizable_gated_segment_surfaces_action() -> None:
     assert result is not None and result["result"] == "DENY"
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Unrecognized leading wrappers (not in CMD_WRAPPERS) keep the gated
+        # command out of head position; it must still be surfaced.
+        "stdbuf -oL cd /etc",
+        "nice git -C /etc status",
+        "nice git worktree add /tmp/wt",
+    ],
+)
+def test_gated_command_behind_unknown_wrapper_surfaces_action(command: str) -> None:
+    """A cd/worktree command hidden behind an unrecognized wrapper fails closed.
+
+    The head dispatch only recognizes a leading cd-family / ``git`` command; an
+    unknown wrapper in front would otherwise make the segment produce no op and
+    pass through. The fail-closed backstop detects it and applies the action.
+    """
+    policy = block_working_dir_changes()
+    result = policy(_sh(command))
+    assert result is not None and result["result"] == "DENY"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo 'cd /etc'",  # gated word inside a quoted string, not a command
+        "ls -la",  # no gated command at all
+    ],
+)
+def test_benign_mentions_do_not_fail_closed(command: str) -> None:
+    """The fail-closed backstop does not trip on benign mentions of a cd command.
+
+    Matching actual command tokens (not a bare substring) keeps quoted mentions
+    and unrelated commands from producing a spurious DENY.
+    """
+    policy = block_working_dir_changes(allowed_dirs=["/workspace"])
+    assert policy(_sh(command)) is None
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Layer 1 — abstention (composition) and tool selection
 # ══════════════════════════════════════════════════════════════════════════════
