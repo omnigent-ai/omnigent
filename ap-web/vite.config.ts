@@ -136,10 +136,9 @@ export default defineConfig({
     setupFiles: ["./src/test-setup.ts"],
     coverage: {
       provider: "v8",
-      // `all` counts untested source files as 0%, so the total reflects the
-      // whole frontend (parity with the backend's --cov=omnigent), not just
-      // files a test happened to import.
-      all: true,
+      // With `include` set, vitest counts every matching source file (untested
+      // ones as 0%), so the total reflects the whole frontend — parity with the
+      // backend's --cov=omnigent, not just files a test happened to import.
       include: ["src/**/*.{ts,tsx}"],
       exclude: [
         "src/**/*.test.{ts,tsx}",
