@@ -178,8 +178,13 @@ if [[ $CURL_RC -ne 0 ]]; then
 fi
 
 CONTENT=$(echo "$RESP" | jq -r '.choices[0].message.content // empty')
-# Strip any accidental markdown fencing, then pull the JSON object out.
-VERDICT_JSON=$(echo "$CONTENT" | sed -E 's/^```[a-zA-Z]*//; s/```$//' | grep -o '{.*}' | head -1)
+# Strip any accidental markdown fencing, then pull the JSON object out. The
+# `|| true` keeps the pipeline non-fatal under `set -euo pipefail`: grep exits
+# non-zero when the output has no single-line `{...}` (pretty-printed JSON,
+# leading prose, empty content), and we want the empty-verdict to flow into the
+# fail-closed "unparseable verdict -> deny" handler below (and, in block mode,
+# the skip-label escape hatch) rather than aborting the script here.
+VERDICT_JSON=$(echo "$CONTENT" | sed -E 's/^```[a-zA-Z]*//; s/```$//' | grep -o '{.*}' | head -1 || true)
 # NB: must not use `.needs_test // empty` -- the `//` operator treats the
 # boolean `false` as absent, which would silently turn a legitimate "no test
 # required" verdict into a fail-closed deny. Map the boolean explicitly.
