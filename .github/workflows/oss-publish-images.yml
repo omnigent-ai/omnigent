@@ -85,11 +85,17 @@ jobs:
           TAGS="${IMAGE}:sha-${SHORT_SHA}"
           HOST_TAGS="${HOST_IMAGE}:sha-${SHORT_SHA}"
           bump_latest="false"
-          # A version tag is a release: publish :vX.Y.Z and move :latest.
+          # A version tag is a release: publish the immutable :vX.Y.Z (or
+          # :vX.Y.ZrcN) pin. Only a FINAL release moves :latest — pre-release
+          # tags (vX.Y.ZrcN, vX.Y.Za/b, vX.Y.Z.devN) must not, so :latest tracks
+          # the version `pip install omnigent` resolves to (latest stable on
+          # PyPI), which ignores pre-releases.
           if [[ "${GH_REF}" == refs/tags/v* ]]; then
             TAGS="${TAGS},${IMAGE}:${GH_REF_NAME}"
             HOST_TAGS="${HOST_TAGS},${HOST_IMAGE}:${GH_REF_NAME}"
-            bump_latest="true"
+            if [[ "${GH_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              bump_latest="true"
+            fi
           fi
           # A manual dispatch can opt in to moving :latest (human approval).
           if [ "${BUMP_LATEST}" = "true" ]; then

@@ -12,10 +12,10 @@
 # does not vouch for the contents of this one) and first-timers
 # (FIRST_TIME_CONTRIBUTOR / NONE).
 #
-# This is deliberately stricter than fork-e2e/should-mirror.sh, which trusts
-# CONTRIBUTOR: that gate only decides whether to spend a rate-limited test
-# token, whereas this gate decides whether to inspect for attacks, so it errs
-# toward scanning more.
+# This gate is independent of fork-e2e/should-mirror.sh: that one gates secret-
+# bearing e2e on the maintainer-applied `e2e-approved` label, whereas this gate
+# decides whether to inspect for attacks and so errs toward scanning more (it
+# scans returning CONTRIBUTORs that the label gate would not by itself run).
 #
 # author_association is computed by GitHub from the actor's relationship to the
 # repo at event time; it is not attacker-settable from PR contents.
