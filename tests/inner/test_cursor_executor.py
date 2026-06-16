@@ -386,6 +386,74 @@ async def test_custom_tool_execute_bridges_to_tool_executor() -> None:
     assert json.loads(result) == {"ok": True, "echo": {"x": 1}}
 
 
+def _bridged_execute(tool_executor: Any) -> Any:
+    """Wire *tool_executor* onto a CursorExecutor and return its sync ``execute``."""
+    executor = CursorExecutor(api_key="crsr_x")
+    executor._tool_executor = tool_executor
+    return executor._make_execute("sys_session_send", asyncio.get_running_loop())
+
+
+async def test_custom_tool_execute_flags_error_dict_with_iserror() -> None:
+    """A dispatch failure ({"error": ...}) must surface to the model as an SDK
+    error (isError), not an apparently-successful result."""
+
+    async def err(name: str, args: dict[str, Any]) -> Any:
+        return {"error": "dispatch failed"}
+
+    result = await asyncio.to_thread(_bridged_execute(err), {}, None)
+    assert isinstance(result, dict) and result["isError"] is True
+    assert "dispatch failed" in result["content"][0]["text"]
+
+
+async def test_custom_tool_execute_flags_blocked_dict_with_iserror() -> None:
+    """A policy-blocked result ({"blocked": True}) is delivered as an error."""
+
+    async def blocked(name: str, args: dict[str, Any]) -> Any:
+        return {"blocked": True, "reason": "policy"}
+
+    result = await asyncio.to_thread(_bridged_execute(blocked), {}, None)
+    assert isinstance(result, dict) and result["isError"] is True
+    assert "policy" in result["content"][0]["text"]
+
+
+async def test_custom_tool_execute_success_dict_is_not_flagged() -> None:
+    """An ordinary result is returned as text (a str the SDK treats as success),
+    never flagged as an error."""
+
+    async def ok(name: str, args: dict[str, Any]) -> Any:
+        return {"ok": True, "value": 42}
+
+    result = await asyncio.to_thread(_bridged_execute(ok), {}, None)
+    assert isinstance(result, str)
+    assert json.loads(result) == {"ok": True, "value": 42}
+
+
+async def test_custom_tool_execute_times_out_to_iserror(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A tool that never completes must not block the daemon thread forever — the
+    bounded wait surfaces a timeout tool error instead of hanging."""
+    monkeypatch.setattr("omnigent.inner.cursor_executor._TOOL_CALL_TIMEOUT_S", 0.05)
+
+    async def slow(name: str, args: dict[str, Any]) -> Any:
+        await asyncio.sleep(30)
+        return "never"
+
+    result = await asyncio.to_thread(_bridged_execute(slow), {}, None)
+    assert isinstance(result, dict) and result["isError"] is True
+    assert "timed out" in result["content"][0]["text"]
+
+
+async def test_custom_tool_execute_surfaces_coroutine_exception_as_iserror() -> None:
+    """A raising coroutine becomes a structured tool error, not an uncaught
+    exception on the SDK's daemon callback thread."""
+
+    async def boom(name: str, args: dict[str, Any]) -> Any:
+        raise RuntimeError("kaboom")
+
+    result = await asyncio.to_thread(_bridged_execute(boom), {}, None)
+    assert isinstance(result, dict) and result["isError"] is True
+    assert "kaboom" in result["content"][0]["text"]
+
+
 async def test_setup_failure_closes_client_and_drops_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -23,6 +23,7 @@ import type {
   ElicitationBlock,
   ErrorBlock,
   NativeToolBlock,
+  TextDone,
   UserMessageBlock,
 } from "@/lib/blocks";
 import type { ConversationItem } from "@/lib/conversationItems";
@@ -6743,5 +6744,81 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
     expect(cards[0]!.response?.action).toBe("accept");
 
     await abortLoop(sinks, controller, loop);
+  });
+});
+
+describe("chatStore — policy deny renders once", () => {
+  const setState = useChatStore.setState as unknown as Parameters<typeof pumpStreamEvents>[3];
+  const getState = useChatStore.getState as unknown as Parameters<typeof pumpStreamEvents>[4];
+
+  function manualSched() {
+    let cb: (() => void) | null = null;
+    return {
+      scheduler: {
+        schedule: (c: () => void) => {
+          cb = c;
+        },
+        cancel: () => {
+          cb = null;
+        },
+      } as FrameScheduler,
+      fire: () => {
+        const c = cb;
+        cb = null;
+        if (c) c();
+      },
+    };
+  }
+
+  function denyCount(): number {
+    return useChatStore
+      .getState()
+      .blocks.filter(
+        (b) => b.type === "text_done" && (b as TextDone).fullText.includes("Denied by policy"),
+      ).length;
+  }
+
+  async function run(denyData: Record<string, unknown>): Promise<number> {
+    useChatStore.setState({ conversationId: "conv_deny", blocks: [] });
+    const sink = pushableStream();
+    const controller = new AbortController();
+    const manual = manualSched();
+    void pumpStreamEvents(
+      "conv_deny",
+      sink.stream,
+      controller,
+      setState,
+      getState,
+      manual.scheduler,
+    );
+    // Message 2 denied — server publishes the sentinel.
+    sink.push(sse("response.output_text.delta", denyData));
+    await tick();
+    manual.fire();
+    await tick();
+    // Message 3 submitted → next response starts (the switch that doubled it).
+    sink.push(sse("response.created", { id: "resp_2", status: "in_progress", output: [] }));
+    sink.push(
+      sse("response.output_text.delta", {
+        delta: "Hello there friend",
+        message_id: "m_reply",
+        index: 0,
+      }),
+    );
+    await tick();
+    manual.fire();
+    await tick();
+    const n = denyCount();
+    controller.abort();
+    return n;
+  }
+
+  it("renders once when the deny carries a message_id", async () => {
+    // A deny stamped with a stable message_id folds into a single
+    // live-preview block and survives the next response switch as one bubble
+    // (the server stamps one for every session — native and non-native).
+    expect(
+      await run({ delta: "[Denied by policy: over budget]", message_id: "deny_abc", index: 0 }),
+    ).toBe(1);
   });
 });

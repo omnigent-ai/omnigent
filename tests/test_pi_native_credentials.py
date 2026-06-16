@@ -103,6 +103,31 @@ def test_malformed_config_returns_none() -> None:
     assert creds.resolve_pi_native_provider(config_loader=_boom) is None
 
 
+def test_unresolvable_secret_falls_back_to_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A provider whose secret can't resolve → None, not a hard launch failure.
+
+    A key-kind default whose ``api_key`` references an env var absent from the
+    runner env makes ``entry.family()`` raise during resolution (not during the
+    config load). The contract is "any resolution failure → fall back to Pi's
+    own login", so the resolver must swallow it and return ``None`` rather than
+    let the exception fail the Pi terminal launch.
+    """
+    monkeypatch.delenv("PI_NATIVE_AUDIT_UNSET_KEY", raising=False)
+    config = {
+        "providers": {
+            "anthropic": {
+                "kind": "key",
+                "default": True,
+                "anthropic": {
+                    "base_url": "https://api.anthropic.com",
+                    "api_key": "$PI_NATIVE_AUDIT_UNSET_KEY",
+                },
+            }
+        }
+    }
+    assert creds.resolve_pi_native_provider(config_loader=lambda: config) is None
+
+
 def test_to_models_config_shape() -> None:
     """The rendered models.json carries baseUrl/api/apiKey/models (+authHeader)."""
     provider = creds.PiProviderConfig(

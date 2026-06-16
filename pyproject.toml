@@ -82,6 +82,11 @@ dependencies = [
     "cursor-sdk>=0.1.7",
     "PyJWT[crypto]>=2.8,<3",
     "argon2-cffi>=23.1,<24",
+    # PEP 440 version comparison for the update check / `omni upgrade`
+    # (omnigent/update_check.py, omnigent/cli.py): compares the installed
+    # version against the latest PyPI release. Previously only a
+    # transitive dep; pinned here now that we import it directly.
+    "packaging>=23,<26",
 ]
 
 [project.optional-dependencies]

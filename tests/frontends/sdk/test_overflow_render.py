@@ -9,36 +9,50 @@ text with literal ``**`` markers, then again as rendered markdown
 below it. Items 1-6 of a 17-item list appeared raw at top, then the
 rendered markdown for items 1-17 appeared below.
 
-Root cause: ``replace_streamed_text`` issues a cursor-up + erase to
-clear ``_streamed_line_count`` lines. Cursor-up movements past row 0
-of the viewport are no-ops — so once streamed content scrolled into
-scrollback, it could no longer be cleared. The visible viewport got
-cleared and the markdown rendered below, but scrolled-off raw text
+Root cause: each growing live render (``StreamLive``) and the final
+``StreamReplace`` are drawn by ``_replace_live_region``, which clears
+the previous region with a cursor-up + erase repeated
+``_live_line_count + _streamed_line_count`` times. Cursor-up movements
+past row 0 of the viewport are no-ops — so once a live render grew
+taller than the viewport, its top lines scrolled into scrollback and
+the next clear could no longer reach them. The visible viewport got
+cleared and the markdown rendered below, but scrolled-off content
 remained in scrollback — visible duplication wherever scrollback can
 be observed (terminal scroll, ``script(1)``, ``tmux`` capture-pane,
 screenshots with buffered context).
 
-Fix: in the streaming print path, gate each print via
-``_should_stream_more`` — refuse to print past the viewport ceiling.
-Lines beyond the ceiling are silently dropped at print time; the
-formatter's ``_paragraph_buffer`` retains the full text and emits a
-``StreamReplace`` at end. Because no streamed line ever scrolls into
-scrollback, ``replace_streamed_text``'s cursor-up reaches every
-streamed line and clears it before rendering the markdown. Markdown
-formatting is preserved end-to-end; duplication never appears.
+Fix: in ``_replace_live_region``'s non-commit (``StreamLive``) path,
+cap the rendered live region to the viewport ceiling
+(``_term_height() - _BOTTOM_RESERVED_ROWS``), keeping only the last
+``ceiling + 1`` lines. Because the live region never exceeds what
+cursor-up can reach, every subsequent clear (including the final
+committed ``StreamReplace``) erases the whole region before the
+markdown renders. Markdown formatting is preserved end-to-end;
+duplication never appears.
 
-Trade-off vs. UX: long responses pause live streaming once they fill
-the viewport (the rest renders only when the markdown panel arrives).
-Short responses stream live as before. The user gets BOTH live
-streaming feedback AND markdown-rendered final output — what the
-user explicitly asked for on 2026-04-28.
+Trade-off vs. UX: long responses show only the tail of the live render
+once they fill the viewport (the full text arrives with the committed
+markdown panel). Short responses render live in full as before.
 
-This test runs the host in a forked PTY with a TIGHT viewport (15
-rows) and streams 30 numbered items, captures the byte stream, and
-re-plays through ``pyte.HistoryScreen`` so both the visible viewport
-AND the scrollback are inspectable. Asserts: every item appears
-exactly once across visible + scrollback, AND no ``**`` raw markdown
-markers survive (proving the markdown render took over).
+This test forks the host's output path under a PTY with a TIGHT
+viewport (15 rows), produces 30 numbered markdown items, captures the
+byte stream, and re-plays through ``pyte.HistoryScreen`` so both the
+visible viewport AND the scrollback are inspectable. Asserts: every
+item appears exactly once across visible + scrollback, AND no ``**``
+raw markdown markers survive (proving the markdown render took over).
+
+Determinism: the driver (``_overflow_render_driver.py``) calls
+``TerminalHost.output`` synchronously — it does NOT run the interactive
+prompt-toolkit application. ``output`` writes the streamed renders and
+the final ``StreamReplace`` via plain ``print`` / ``sys.stdout.write``,
+all in order; the overflow guard under test lives entirely in that
+synchronous path. The earlier version ran the live app and relied on
+fixed ``asyncio.sleep`` delays, but the app's pinned prompt + toolbar
+redraw on a ~10fps timer shared the PTY and interleaved cursor moves
+between the driver's prints, corrupting the capture — the test flaked
+on CI (duplication detected) with no product regression. Driving
+``output`` directly removes that concurrent writer while exercising the
+exact same guard.
 """
 
 from __future__ import annotations
@@ -171,18 +185,17 @@ def test_no_duplicate_when_streamed_overflows_viewport() -> None:
     completes, every item must appear AT MOST ONCE across the
     combined ``visible viewport + scrollback`` text.
 
-    Without the overflow guard in ``replace_streamed_text``,
-    ``replace_streamed_text`` runs the cursor-up + erase even
-    when the streamed content has scrolled off-top. The cursor
-    can't reach scrollback, so raw items 1..N stay in scrollback
-    AND the same items render as markdown in the new visible
-    viewport — every item appears twice in any tool that captures
-    both regions (terminal screenshots, ``script(1)``, ``tmux
-    capture-pane -e -S -``).
+    Without the viewport cap in ``_replace_live_region``, a live
+    render that grew past the viewport leaves its top lines in
+    scrollback; the next cursor-up + erase can't reach them, so
+    items 1..N stay in scrollback AND the same items render as
+    markdown in the new visible viewport — every item appears twice
+    in any tool that captures both regions (terminal screenshots,
+    ``script(1)``, ``tmux capture-pane -e -S -``).
 
-    The fix renders the markdown only when ``_streamed_line_count``
-    fits inside the viewport. Long responses lose markdown
-    formatting but no longer produce duplicate visible content.
+    The fix caps the live region to the viewport ceiling so cursor-up
+    always reaches every rendered line. Long responses show only the
+    tail live but no longer produce duplicate visible content.
     """
     cols, rows = 100, 15
     pid, parent_fd = _spawn_driver_in_pty(cols, rows)
@@ -212,12 +225,12 @@ def test_no_duplicate_when_streamed_overflows_viewport() -> None:
         assert count == 1, (
             f"item{n} (signature: {rendered_sig!r}) appears {count}x "
             f"in combined visible+scrollback. Expected exactly 1. "
-            f"Count > 1 means the streamed raw text AND the rendered "
-            f"markdown BOTH made it into the captured view — the "
-            f"overflow-render duplication. The fix gates streaming "
-            f"via ``_should_stream_more`` so the cursor-up + erase "
-            f"in ``replace_streamed_text`` can always reach every "
-            f"streamed line. Combined captured text (tail):\n"
+            f"Count > 1 means a scrolled-off live render AND the "
+            f"rendered markdown BOTH made it into the captured view — "
+            f"the overflow-render duplication. The fix caps the live "
+            f"region in ``_replace_live_region`` to the viewport "
+            f"ceiling so the cursor-up + erase can always reach every "
+            f"rendered line. Combined captured text (tail):\n"
             f"{combined[-1500:]}"
         )
 

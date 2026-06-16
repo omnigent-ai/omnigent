@@ -8976,6 +8976,46 @@ def _extract_user_text_from_event(body: SessionEventInput) -> str:
     return "\n".join(parts)
 
 
+def _publish_policy_deny(session_id: str, reason: str) -> None:
+    """
+    Publish the ``[Denied by policy: ...]`` sentinel on the session stream.
+
+    The sentinel text is a load-bearing contract (the REPL renders it, e2e
+    tests assert it, and native harnesses relay it to the model), so it is
+    always carried in a ``response.output_text.delta``.
+
+    The deny is never persisted as a conversation item — the input gate
+    publishes it and returns without forwarding — so a ``message_id``-less
+    delta lands in the web reducer's response-scoped text path as an
+    un-reconciled "stray bubble" with no item to dedupe against. On the next
+    user submit the response switch re-finalizes that still-open text,
+    rendering the deny twice (observed on both native and non-native web
+    sessions). Stamping a unique ``message_id`` (matching how live streaming
+    text is tagged) routes it through the web's live-preview path instead,
+    where it folds into a single ``live:<id>`` block.
+
+    Safe for the other consumers: the REPL converts any ``output_text.delta``
+    to a ``TextDelta`` regardless of ``message_id``; the ``/v1/responses`` API
+    surfaces the deny via input-deny synthesis (not session-stream deltas);
+    and the only ``message_id``-gated accumulator (``_relay_runner_stream``)
+    reads runner-relayed deltas, never this server-published one.
+
+    :param session_id: Session/conversation identifier.
+    :param reason: Human-readable deny reason from the policy verdict.
+    """
+    session_stream.publish(
+        session_id,
+        {
+            "type": "response.output_text.delta",
+            "delta": f"[Denied by policy: {reason}]",
+            # Unique per deny so two separate denials don't fold into one
+            # block; a single delta carries the whole sentinel, so index 0.
+            "message_id": f"deny_{secrets.token_hex(8)}",
+            "index": 0,
+        },
+    )
+
+
 async def _evaluate_input_policy(
     request: Request,
     session_id: str,
@@ -15515,13 +15555,7 @@ def create_sessions_router(
                 # client/REPL sees feedback.
                 reason = _input_verdict.get("reason", "Denied by policy")
                 _publish_status(session_id, "running")
-                session_stream.publish(
-                    session_id,
-                    {
-                        "type": "response.output_text.delta",
-                        "delta": f"[Denied by policy: {reason}]",
-                    },
-                )
+                _publish_policy_deny(session_id, reason)
                 _publish_status(session_id, "idle")
                 # Return the same shape the client expects from POST
                 # /events so postEvent doesn't throw on an unexpected
@@ -15541,13 +15575,7 @@ def create_sessions_router(
             if _input_verdict is not None:
                 reason = _input_verdict.get("reason", "Denied by policy")
                 _publish_status(session_id, "running")
-                session_stream.publish(
-                    session_id,
-                    {
-                        "type": "response.output_text.delta",
-                        "delta": f"[Denied by policy: {reason}]",
-                    },
-                )
+                _publish_policy_deny(session_id, reason)
                 _publish_status(session_id, "idle")
                 return {"queued": False, "denied": True, "reason": reason}
         elif (

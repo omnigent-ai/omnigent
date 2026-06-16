@@ -722,6 +722,7 @@ async def _auto_create_pi_terminal(
     from omnigent.pi_native import resolve_pi_executable
     from omnigent.pi_native_bridge import (
         PI_NATIVE_CONFIG_ENV_VAR,
+        clear_inbox,
         pi_session_dir,
         prepare_bridge_dir,
         write_extension_files,
@@ -735,6 +736,8 @@ async def _auto_create_pi_terminal(
     )
     workspace = str(launch_config.workspace)
     bridge_dir = prepare_bridge_dir(session_id)
+    # Drop stale payloads so a relaunched Pi process can't replay them.
+    clear_inbox(bridge_dir)
     pi_extension = pi_extension_path(bridge_dir)
     session_dir = pi_session_dir(bridge_dir)
     auth_factory = _make_auth_token_factory()

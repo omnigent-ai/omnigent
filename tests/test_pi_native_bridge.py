@@ -96,3 +96,27 @@ def test_prepare_bridge_dir_is_owner_only(tmp_path: Path, monkeypatch) -> None:
 
     assert stat.S_IMODE((bridge_dir).stat().st_mode) == 0o700
     assert stat.S_IMODE((bridge_dir / "inbox").stat().st_mode) == 0o700
+
+
+def test_clear_inbox_drops_leftover_payloads(tmp_path: Path) -> None:
+    """clear_inbox empties the queue so a relaunched Pi process can't replay.
+
+    A fresh Pi process starts with an empty dedup set; without clearing, a
+    payload a prior process left behind would replay into the new session.
+    """
+    bridge_dir = tmp_path / "bridge"
+    (bridge_dir / "inbox").mkdir(parents=True)
+    pi_native_bridge.enqueue_user_message(bridge_dir, "stale")
+    pi_native_bridge.enqueue_interrupt(bridge_dir)
+    assert _inbox_files(bridge_dir), "precondition: inbox has payloads"
+
+    pi_native_bridge.clear_inbox(bridge_dir)
+
+    assert _inbox_files(bridge_dir) == []
+    # The inbox dir itself survives (only its contents are dropped).
+    assert (bridge_dir / "inbox").is_dir()
+
+
+def test_clear_inbox_is_a_noop_without_an_inbox(tmp_path: Path) -> None:
+    """clear_inbox tolerates a bridge dir that has no inbox yet."""
+    pi_native_bridge.clear_inbox(tmp_path / "nonexistent")  # must not raise

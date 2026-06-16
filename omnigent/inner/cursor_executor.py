@@ -33,6 +33,7 @@ Requirements:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import os
@@ -69,6 +70,11 @@ ToolExecutor: TypeAlias = Callable[[str, dict[str, Any]], Awaitable[Any]]  # typ
 # requires a model for local agents, so unlike the old ACP path we can't pass
 # ``None``).
 _DEFAULT_CURSOR_MODEL = "auto"
+
+# Upper bound (seconds) on one bridged-tool call: generous (sub-agent dispatches
+# can run for minutes) but finite, so a wedged tool surfaces a timeout error
+# instead of blocking the SDK's daemon callback thread forever.
+_TOOL_CALL_TIMEOUT_S = 1800.0
 
 
 def _resolve_model(model: str | None) -> str:
@@ -239,6 +245,42 @@ def _sdk_message_to_events(message: Any) -> list[ExecutorEvent]:  # type: ignore
 
 
 # ---------------------------------------------------------------------------
+# Bridged-tool result encoding
+# ---------------------------------------------------------------------------
+
+
+def _tool_error_payload(text: str) -> dict[str, Any]:  # type: ignore[explicit-any]
+    """An SDK custom-tool *error* result.
+
+    A mapping with a ``content`` list and ``isError`` is passed through unchanged
+    by the SDK's ``_normalize_custom_tool_result``, so the Cursor model sees a
+    failure — unlike a bare string, which the SDK wraps as a *successful* result.
+    """
+    return {"content": [{"type": "text", "text": text}], "isError": True}
+
+
+def _encode_tool_result(result: Any) -> Any:  # type: ignore[explicit-any]
+    """Encode a bridged-tool result for the SDK custom-tool return.
+
+    A dict carrying a truthy ``error`` or ``blocked`` is a dispatch failure or a
+    policy block (the shapes ``_bridge_one_dispatch`` / the policy layer return):
+    surface it as an ``isError`` payload so the model sees a failure — parity with
+    the claude-sdk handler, which the cursor harness otherwise diverged from by
+    delivering errors as ordinary, apparently-successful results. Everything else
+    returns its text: a ``str`` passthrough (the SDK wraps it as success), else
+    JSON.
+    """
+    if isinstance(result, dict) and (result.get("error") or result.get("blocked")):
+        return _tool_error_payload(json.dumps(result, default=str))
+    if isinstance(result, str):
+        return result
+    try:
+        return json.dumps(result, default=str)
+    except (TypeError, ValueError):
+        return str(result)
+
+
+# ---------------------------------------------------------------------------
 # CursorExecutor
 # ---------------------------------------------------------------------------
 
@@ -356,26 +398,39 @@ class CursorExecutor(Executor):
 
     def _make_execute(
         self, tool_name: str, loop: asyncio.AbstractEventLoop
-    ) -> Callable[[dict[str, Any], Any], str]:  # type: ignore[explicit-any]
+    ) -> Callable[[dict[str, Any], Any], Any]:  # type: ignore[explicit-any]
         """Build a sync ``execute`` that bridges a cursor tool call to Omnigent.
 
-        Runs on the SDK callback thread; blocks it on the main-loop coroutine via
-        ``run_coroutine_threadsafe`` (no tight timeout — ``sys_session_send`` and
-        friends can legitimately run for minutes).
+        Runs on the SDK callback server's daemon thread and blocks it on the
+        main-loop coroutine via ``run_coroutine_threadsafe``. The wait is bounded
+        by ``_TOOL_CALL_TIMEOUT_S`` (generous — ``sys_session_send`` and friends
+        can legitimately run for minutes) so a wedged tool surfaces as a tool
+        error instead of hanging the daemon thread / Cursor turn forever, and any
+        exception (a failed or cancelled coroutine) becomes a tool error rather
+        than propagating raw onto the daemon thread.
         """
 
-        def execute(args: dict[str, Any], _ctx: Any) -> str:  # type: ignore[explicit-any]
+        def execute(args: dict[str, Any], _ctx: Any) -> Any:  # type: ignore[explicit-any]
             if self._tool_executor is None:
-                return f"Tool {tool_name!r} is unavailable: no tool executor wired."
+                return _tool_error_payload(
+                    f"Tool {tool_name!r} is unavailable: no tool executor wired."
+                )
             coro = self._tool_executor(tool_name, dict(args or {}))
             future = asyncio.run_coroutine_threadsafe(coro, loop)
-            result = future.result()
-            if isinstance(result, str):
-                return result
             try:
-                return json.dumps(result, default=str)
-            except (TypeError, ValueError):
-                return str(result)
+                result = future.result(timeout=_TOOL_CALL_TIMEOUT_S)
+            except concurrent.futures.TimeoutError:
+                future.cancel()
+                return _tool_error_payload(
+                    f"Tool {tool_name!r} timed out after {_TOOL_CALL_TIMEOUT_S:.0f}s."
+                )
+            # Exception (not BaseException) still covers a cancelled coroutine —
+            # future.result() raises concurrent.futures.CancelledError, an
+            # Exception — while letting KeyboardInterrupt / SystemExit propagate.
+            except Exception as exc:  # noqa: BLE001 — surface as a tool error
+                future.cancel()
+                return _tool_error_payload(f"Tool {tool_name!r} failed: {exc}")
+            return _encode_tool_result(result)
 
         return execute
 

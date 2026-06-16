@@ -214,6 +214,9 @@ _CLAUDE_STARTUP_PROFILE_ENV_VAR = "OMNIGENT_CLAUDE_STARTUP_PROFILE"
 # only two subscription CLIs ambient detection emits.
 _CLI_LOGIN_BRAND: dict[str, str] = {"claude": "Claude", "codex": "ChatGPT"}
 _HOST_DAEMON_STOP_GRACE_S = 5.0
+# How often ``omni upgrade`` re-polls the local server for in-flight
+# (connected) sessions while draining before it stops the server.
+_UPGRADE_DRAIN_POLL_S = 2.0
 # When reusing an existing daemon, how long to let a live-but-offline daemon
 # (re)establish its server tunnel before treating it as a zombie and
 # respawning. Covers the daemon's reconnect backoff after a transient drop.
@@ -1142,9 +1145,35 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "server",
         "setup",
         "stop",
+        "upgrade",
         "version",
     }
 )
+
+
+def _should_skip_update_check(argv: list[str]) -> bool:
+    """Decide whether the update notice should be suppressed for *argv*.
+
+    Skipped for help / version requests, internal TUI subcommands
+    (``pane-split`` / ``pane-picker``, invoked by the terminal UI rather
+    than the user), and ``upgrade`` itself (pointing the user at
+    ``omni upgrade`` while they are running it is noise).
+
+    :param argv: CLI arguments without the program name, e.g.
+        ``["run", "agent.yaml"]``.
+    :returns: ``True`` when the update notice should not be shown.
+    """
+    if not argv:
+        return True
+    return argv[0] in {
+        "--help",
+        "-h",
+        "--version",
+        "version",
+        "upgrade",
+        "pane-split",
+        "pane-picker",
+    }
 
 
 def main() -> None:
@@ -1235,11 +1264,21 @@ def main() -> None:
 
     setup_cli_logging(argv)
 
-    # ``omnigent setup`` IS the setup wizard — if it fails,
-    # telling the user to "run omnigent setup" would be circular.
-    # Internal-beta and other subcommand-on-setup forms still share
-    # the same first token.
-    suggest_setup = argv[0] != "setup"
+    # ``omnigent setup`` IS the setup wizard — if it fails, telling the
+    # user to "run omnigent setup" would be circular. ``upgrade`` is
+    # excluded too: its failures (unreachable index, dev checkout, install
+    # error) are never about a missing model credential, so the setup hint
+    # would only mislead.
+    suggest_setup = argv[0] not in {"setup", "upgrade"}
+
+    # Lightweight update notice: only on an interactive terminal and only
+    # for user-facing commands. Reads a cached "latest PyPI version" and
+    # prints at most once per release (the network refresh runs detached,
+    # off the hot path). Never blocks; any failure is swallowed inside.
+    if not _should_skip_update_check(argv) and sys.stderr.isatty():
+        from omnigent.update_check import maybe_show_update_notice
+
+        maybe_show_update_notice()
 
     try:
         cli(args=argv, standalone_mode=False)
@@ -3274,6 +3313,186 @@ def stop(force: bool) -> None:
         click.echo("Nothing to stop.")
     if failures:
         raise click.ClickException("; ".join(failures) + " — retry with --force.")
+
+
+def _count_running_sessions(base_url: str) -> int:
+    """Count sessions actively running a turn on the local server.
+
+    Gates on the session-list ``status`` field (``"running"`` — a runner
+    mid-turn, or with a still-running sub-agent), NOT mere connectedness:
+    an idle session keeps its host/runner connection open indefinitely, so
+    counting connected sessions would make the drain wait forever for
+    sessions that aren't doing any work. Only ``"running"`` sessions hold
+    in-flight work an upgrade should avoid interrupting.
+
+    A transient HTTP failure is treated as "none running" rather than
+    blocking the upgrade — the server's own graceful shutdown still drains
+    any runner that happens to be mid-turn.
+
+    :param base_url: Local server base URL, e.g. ``"http://127.0.0.1:6767"``.
+    :returns: Number of sessions with ``status == "running"``, or ``0`` on
+        a query failure.
+    """
+    with contextlib.suppress(click.ClickException):
+        pages = _fetch_session_pages(base_url=base_url, connected_only=True)
+        return sum(1 for session in pages.sessions if session.get("status") == "running")
+    return 0
+
+
+def _wait_for_local_sessions_to_drain() -> None:
+    """Block until no local session is actively running a turn.
+
+    Used by ``omni upgrade`` (without ``--force``) so an upgrade never
+    yanks a running agent turn. Waits only on sessions whose status is
+    ``"running"`` (see :func:`_count_running_sessions`) — idle-but-connected
+    sessions do not hold it up. Polls every :data:`_UPGRADE_DRAIN_POLL_S`
+    seconds and re-prints the count whenever it changes; ``Ctrl-C`` aborts
+    the wait (and the upgrade) cleanly. Returns immediately when the server
+    is down or already idle.
+    """
+    info = local_server_status()
+    if not (info.running and info.url is not None):
+        return
+    count = _count_running_sessions(info.url)
+    if count == 0:
+        return
+    click.echo(
+        f"Waiting for {count} running session(s) to finish — press Ctrl-C to "
+        "abort, or re-run with --force to stop them now."
+    )
+    last = count
+    while True:
+        time.sleep(_UPGRADE_DRAIN_POLL_S)
+        info = local_server_status()
+        if not (info.running and info.url is not None):
+            return
+        count = _count_running_sessions(info.url)
+        if count == 0:
+            return
+        if count != last:
+            click.echo(f"  {count} session(s) still running…")
+            last = count
+
+
+@cli.command("upgrade")
+@click.option(
+    "--check",
+    "check_only",
+    is_flag=True,
+    help="Report whether a newer release is available, without upgrading. "
+    "Exits non-zero when a newer release exists.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Stop in-flight sessions immediately instead of waiting for them to drain.",
+)
+@click.option(
+    "--pre",
+    "pre",
+    is_flag=True,
+    help="Consider pre-releases (e.g. release candidates), and pass the "
+    "installer's allow-pre-releases flag. Useful for validating a TestPyPI rc.",
+)
+def upgrade(check_only: bool, force: bool, pre: bool) -> None:
+    """Upgrade the omnigent CLI to the latest release on PyPI.
+
+    Detects how omnigent was installed (uv / pip / pipx / poetry), checks
+    the configured index for a newer release and — unless ``--check`` —
+    drains and stops the local background server and host daemon, then runs
+    the matching upgrade command. The next ``omni`` invocation starts a
+    fresh server on the new code automatically (via the version-aware
+    config signature), so no explicit restart is needed.
+
+    In-flight agent sessions are waited on by default; pass ``--force`` to
+    stop them immediately. Pass ``--pre`` to consider pre-releases (rc /
+    beta) — handy for validating a TestPyPI candidate against your
+    configured index. Source checkouts / editable installs are not upgraded
+    here — update those with ``git pull``.
+
+    :param check_only: Only report availability; do not upgrade. Exits
+        with status 1 when a newer release exists.
+    :param force: Stop in-flight sessions immediately rather than draining.
+    :param pre: Consider pre-releases and allow the installer to fetch them.
+    :returns: None.
+    """
+    import importlib.metadata
+
+    from packaging.version import InvalidVersion, parse
+
+    from omnigent.update_check import (
+        _build_upgrade_suggestion,
+        _find_repo_root,
+        _read_installed_wheel_info,
+        _run_upgrade_command,
+        fetch_latest_version,
+    )
+
+    # Source checkout / editable install — there's no released wheel to
+    # swap in place; the correct update path is git, not a reinstall.
+    if _find_repo_root() is not None:
+        raise click.ClickException(
+            "This is a source checkout — update it with `git pull` (and reinstall "
+            "dependencies), not `omni upgrade`."
+        )
+    info = _read_installed_wheel_info()
+    if info is None:
+        raise click.ClickException(
+            "Couldn't determine how omnigent is installed; upgrade it manually."
+        )
+    if info.is_editable:
+        raise click.ClickException(
+            "This is an editable install — update it with `git pull`, not `omni upgrade`."
+        )
+
+    current = importlib.metadata.version("omnigent")
+    latest = fetch_latest_version(include_prereleases=pre)
+    if latest is None:
+        raise click.ClickException(
+            "Couldn't reach the package index to check for a newer release. Check your "
+            "connection (or OMNIGENT_INDEX_URL / your configured index) and try again."
+        )
+    try:
+        is_behind = parse(latest) > parse(current)
+    except InvalidVersion:
+        is_behind = latest != current
+
+    if not is_behind:
+        click.echo(f"omnigent is up to date (v{current}).")
+        return
+
+    click.echo(f"A new release is available: v{current} → v{latest}.")
+    if check_only:
+        # Non-zero so scripts/CI can gate on "an upgrade is available".
+        # SystemExit (not ctx.exit) because main() runs the group with
+        # standalone_mode=False, where ctx.exit's code is returned and
+        # dropped rather than applied — SystemExit propagates correctly.
+        raise SystemExit(1)
+
+    suggestion = _build_upgrade_suggestion(info, allow_prerelease=pre)
+    if not suggestion.runnable:
+        raise click.ClickException(
+            f"No automatic upgrade command is known for this install. {suggestion.command}."
+        )
+
+    # Drain (or force-stop) the local server + daemon BEFORE swapping the
+    # code, so the running process never serves half-upgraded modules.
+    # The next command respawns a fresh server on the new version.
+    if not force:
+        _wait_for_local_sessions_to_drain()
+    if _stop_local_server_and_daemon(force=force):
+        click.echo("Stopped the background server before upgrading.")
+
+    console = Console()
+    code = _run_upgrade_command(suggestion.command, console)
+    if code != 0:
+        raise click.ClickException(
+            f"Upgrade command exited with status {code}; your previous install is intact."
+        )
+    click.echo(
+        f"✓ Upgraded to v{latest}. Re-run your command — the local server will "
+        "start on the new version."
+    )
 
 
 def _bundle(source: Path) -> bytes:

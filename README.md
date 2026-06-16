@@ -110,6 +110,29 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
 
 </details>
 
+<details>
+<summary>Updating to a new release</summary>
+
+When a newer release is on PyPI, Omnigent shows a one-line notice (once per
+release) pointing here. To update:
+
+```bash
+omni upgrade            # detects how you installed, drains & stops the local
+                        # server, then runs the matching upgrade command
+omni upgrade --check    # just report whether a newer release is available
+```
+
+`omni upgrade` waits for in-flight agent sessions to finish before stopping the
+local server (pass `--force` to stop them immediately); the next `omni` command
+brings the server back up on the new version. Source checkouts update with
+`git pull` instead. Silence the notice with `OMNIGENT_NO_UPDATE_CHECK=1`.
+
+The check queries your configured package index — honoring `UV_INDEX_URL` /
+`PIP_INDEX_URL` and your `uv.toml` / `pip.conf` (default PyPI), so private
+mirrors work out of the box; override with `OMNIGENT_INDEX_URL` if needed.
+
+</details>
+
 ### 2. Start your first agent
 
 `omnigent` picks a model with you and starts a session in your terminal. It
