@@ -793,7 +793,7 @@ async def _auto_create_pi_terminal(
             cred_env, cred_args = pi_native_provider_launch(bridge_dir / "pi-agent", provider)
             pi_env.update(cred_env)
             pi_args.extend(cred_args)
-    terminal_view = await resource_registry.launch_terminal(
+    terminal_view = await resource_registry.launch_required_terminal(
         session_id=session_id,
         terminal_name="pi",
         session_key="main",

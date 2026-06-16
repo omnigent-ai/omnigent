@@ -43,9 +43,11 @@ from omnigent.runner.app import (
     ResolvedSpec,
     _auto_create_claude_terminal,
     _auto_create_codex_terminal,
+    _auto_create_pi_terminal,
     _auto_create_repl_terminal,
     _deliver_subagent_wake_post,
     _log_terminal_lookup_miss,
+    _PiNativeLaunchConfig,
     _publish_native_terminal_start_error,
     _publish_terminal_pending,
     _session_labels_for_runner_spawn,
@@ -57,6 +59,7 @@ from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
     OMNIGENT_REPL_TERMINAL_ROLE,
+    PI_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec, LocalToolInfo, MCPServerConfig
@@ -9563,6 +9566,96 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
 
     await asyncio.sleep(0)
     assert isinstance(forwarder_kwargs.get("auth"), _RunnerDatabricksAuth)
+
+
+@pytest.mark.asyncio
+async def test_auto_create_pi_terminal_launches_required_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Pi-native auto-create must launch a *required* terminal.
+
+    Regression guard for a missed call site. The pi-native runtime *is* the
+    terminal process (parity with claude-native), so when the lifecycle-aware
+    launch API replaced ``launch_terminal`` with ``launch_required_terminal`` /
+    ``launch_auxiliary_terminal``, ``_auto_create_pi_terminal`` had to move to
+    ``launch_required_terminal``. The fake registry below exposes *only*
+    ``launch_required_terminal`` (no ``launch_terminal``), so a stale call site
+    raises ``AttributeError`` here in CI instead of crashing in production the
+    moment a real pi-native session boots.
+
+    :param tmp_path: Pytest-provided temporary directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    import omnigent.pi_native as pi_native
+    import omnigent.pi_native_bridge as pi_native_bridge
+    import omnigent.pi_native_credentials as pi_native_credentials
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+    # The lifecycle of the launch — not the binary or credentials — is under
+    # test, so neither a real Pi install nor a configured provider is needed.
+    monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
+    monkeypatch.setattr(pi_native_credentials, "resolve_pi_native_provider", lambda: None)
+
+    # Skip the GET /v1/sessions round-trip: hand the flow a ready launch
+    # config pointing at the tmp workspace.
+    async def _fake_launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
+        return _PiNativeLaunchConfig(
+            workspace=tmp_path,
+            server_url="http://127.0.0.1:8000",
+            terminal_launch_args=None,
+            external_session_id=None,
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        """Records the launch; exposes ONLY the required-terminal launch API."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+        ) -> SessionResourceView:
+            """Record the launch and return a terminal resource view."""
+            captured["terminal_name"] = terminal_name
+            captured["session_key"] = session_key
+            captured["resource_role"] = resource_role
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_pi_main",
+                type="terminal",
+                session_id=session_id,
+                name="pi:main",
+                metadata={"terminal_name": "pi", "session_key": "main", "running": True},
+            )
+
+    published: list[dict[str, Any]] = []
+
+    await _auto_create_pi_terminal(
+        "conv_pi",
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, evt: published.append(evt),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    # Required lifecycle (parity with claude-native), correct terminal identity.
+    assert captured["terminal_name"] == "pi"
+    assert captured["session_key"] == "main"
+    assert captured["resource_role"] == PI_NATIVE_TERMINAL_ROLE
+    assert captured["spec"].command == "pi"
+    # The fresh terminal is surfaced on the live stream for the Terminal toggle.
+    assert any(evt.get("type") == "session.resource.created" for evt in published)
 
 
 @pytest.mark.asyncio
