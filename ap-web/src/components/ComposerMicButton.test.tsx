@@ -16,6 +16,8 @@ import { ComposerMicButton } from "./ComposerMicButton";
 let handlers: Record<string, (event: unknown) => void>;
 let startSpy: ReturnType<typeof vi.fn>;
 let stopSpy: ReturnType<typeof vi.fn>;
+/** Original navigator.mediaDevices descriptor, restored after each test. */
+let originalMediaDevices: PropertyDescriptor | undefined;
 
 function installSpeechRecognition() {
   handlers = {};
@@ -48,7 +50,9 @@ function resultEvent(transcript: string) {
 beforeEach(() => {
   installSpeechRecognition();
   // The visualizer's getUserMedia is best-effort; reject so no AudioContext
-  // (unavailable in jsdom) is ever constructed.
+  // (unavailable in jsdom) is ever constructed. Capture the original descriptor
+  // first so afterEach can restore it — otherwise this navigator stub leaks.
+  originalMediaDevices = Object.getOwnPropertyDescriptor(navigator, "mediaDevices");
   Object.defineProperty(navigator, "mediaDevices", {
     configurable: true,
     value: { getUserMedia: vi.fn().mockRejectedValue(new Error("no mic")) },
@@ -59,6 +63,12 @@ afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
   vi.clearAllMocks();
+  // Restore navigator.mediaDevices so the stub never leaks to other test files.
+  if (originalMediaDevices) {
+    Object.defineProperty(navigator, "mediaDevices", originalMediaDevices);
+  } else {
+    delete (navigator as { mediaDevices?: unknown }).mediaDevices;
+  }
 });
 
 describe("ComposerMicButton", () => {
