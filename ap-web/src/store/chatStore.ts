@@ -93,6 +93,7 @@ import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { isClaudeNativeModel } from "@/lib/claudeNativeModels";
 import { getCurrentAuthorId } from "@/lib/identity";
+import { isNativeWrapper } from "@/lib/nativeCodingAgents";
 
 export interface SendOptions {
   /**
@@ -273,6 +274,17 @@ export interface ChatState {
    * falls back to the agent's ``llmModel``.
    */
   selectedModel: string | null;
+  /**
+   * The active session's REAL model override (server ``model_override``):
+   * what the next turn actually uses, ``null`` when none and the agent
+   * ``llmModel`` default applies. Session-scoped (NOT a sticky pick):
+   * hydrated from the session snapshot on bind and kept in sync on
+   * ``setModel`` / terminal ``/model`` switches. Distinct from
+   * ``selectedModel`` (a single global sticky pick kept for cross-session
+   * restore) so the ``/model`` readout never shows an unapplied sticky
+   * pick as an active "(override)".
+   */
+  sessionModelOverride: string | null;
   /**
    * Per-session cost-control switch for the active session: ``"on"``
    * activates the spec's configured cost-control mode, ``"off"``
@@ -643,6 +655,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   conversationLoadError: null,
   selectedEffort: loadPickerPref(PICKER_PREF_EFFORT_KEY),
   selectedModel: loadPickerPref(PICKER_PREF_MODEL_KEY),
+  sessionModelOverride: null,
   costControlModeOverride: null,
   hasMoreHistory: false,
   loadingMoreHistory: false,
@@ -1119,7 +1132,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
         sessionHarness: null,
         // ``selectedEffort`` / ``selectedModel`` are sticky user picks —
         // not reset here so a CLI-created new chat inherits them.
-        // The cost switch IS session-scoped, so it resets with the session.
+        // ``sessionModelOverride`` and the cost switch ARE session-scoped,
+        // so they reset with the session and re-hydrate from the snapshot.
+        sessionModelOverride: null,
         costControlModeOverride: null,
         contextWindow: null,
         tokensUsed: null,
@@ -1225,7 +1240,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   setModel: async (model) => {
-    set({ selectedModel: model });
+    // `selectedModel` is the sticky pick; `sessionModelOverride` is this
+    // session's applied override. An explicit `/model` sets both.
+    set({ selectedModel: model, sessionModelOverride: model });
     savePickerPref(PICKER_PREF_MODEL_KEY, model);
     const { conversationId } = get();
     if (conversationId) {
@@ -1233,7 +1250,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // Server-canonical may differ from the optimistic write (e.g.
       // when a clear alias was sent) — refresh local state to match.
       const canonical = session.modelOverride ?? null;
-      set({ selectedModel: canonical });
+      set({ selectedModel: canonical, sessionModelOverride: canonical });
       savePickerPref(PICKER_PREF_MODEL_KEY, canonical);
     }
   },
@@ -1484,6 +1501,7 @@ function sessionBindingPatch(
   | "boundAgentId"
   | "boundAgentName"
   | "llmModel"
+  | "sessionModelOverride"
   | "sessionHarness"
   | "costControlModeOverride"
   | "contextWindow"
@@ -1494,10 +1512,11 @@ function sessionBindingPatch(
 > {
   const wrapper = session.labels?.["omnigent.wrapper"];
   return {
-    isNativeTerminalSession: wrapper === "claude-code-native-ui" || wrapper === "codex-native-ui",
+    isNativeTerminalSession: isNativeWrapper(wrapper),
     boundAgentId: session.agentId,
     boundAgentName: session.agentName,
     llmModel: session.llmModel ?? null,
+    sessionModelOverride: session.modelOverride ?? null,
     sessionHarness: session.harness ?? null,
     costControlModeOverride: session.costControlModeOverride ?? null,
     contextWindow: session.contextWindow ?? null,
@@ -1629,6 +1648,29 @@ async function bindStream(
     const effectiveModel = isClaudeNativeSession
       ? (session.modelOverride ?? stickyModel)
       : stickyModel;
+    // Whether the claude-native handoff below is about to persist the
+    // sticky model as this session's override. Only hand over a
+    // Claude-compatible model: `selectedModel` is a single global pick
+    // shared across harnesses, so it can hold a foreign default (e.g. a
+    // Codex session sitting on `gpt-5.4`). Applying that here would
+    // persist model_override=gpt-5.4 and launch Claude Code with
+    // `--model gpt-5.4`, which it cannot run. When the sticky pick isn't
+    // a Claude model we skip the handoff and let the session fall back to
+    // the agent's own Claude default.
+    const willApplyStickyModel =
+      !isSubAgentSession &&
+      isClaudeNativeSession &&
+      session.modelOverride == null &&
+      stickyModel != null &&
+      isClaudeNativeModel(stickyModel);
+    // The session's REAL effective override: the server's stored value,
+    // plus the sticky model the handoff is about to apply. Unlike
+    // `effectiveModel`/`selectedModel` (which hold the unapplied sticky
+    // pick for non-CN sessions), this is the session truth the `/model`
+    // readout shows, so a non-applied sticky pick is never mislabeled as
+    // an active "(override)".
+    const effectiveSessionOverride =
+      session.modelOverride ?? (willApplyStickyModel ? stickyModel : null);
     if (
       !isSubAgentSession &&
       canApplyEffort &&
@@ -1640,20 +1682,7 @@ async function bindStream(
         console.warn(`Failed to apply sticky effort=${stickyEffort} to session ${id}:`, err);
       });
     }
-    if (
-      !isSubAgentSession &&
-      isClaudeNativeSession &&
-      session.modelOverride == null &&
-      stickyModel != null &&
-      // Only hand over a Claude-compatible model. `selectedModel` is a
-      // single global pick shared across harnesses, so it can hold a
-      // foreign default (e.g. a Codex session sitting on `gpt-5.4`).
-      // Applying that here would persist model_override=gpt-5.4 and launch
-      // Claude Code with `--model gpt-5.4`, which it cannot run. When the
-      // sticky pick isn't a Claude model we skip the handoff and let the
-      // session fall back to the agent's own Claude default.
-      isClaudeNativeModel(stickyModel)
-    ) {
+    if (willApplyStickyModel) {
       updateSession(id, { modelOverride: stickyModel, silent: true }).catch((err: unknown) => {
         console.warn(`Failed to apply sticky model=${stickyModel} to session ${id}:`, err);
       });
@@ -1811,6 +1840,10 @@ async function bindStream(
         sessionStatus: session.status,
         selectedEffort: effectiveEffort,
         selectedModel: effectiveModel,
+        // Session truth for the `/model` readout — overrides the snapshot
+        // value spread via `...bindingPatch` so the claude-native sticky
+        // handoff (fired above, silent) shows immediately.
+        sessionModelOverride: effectiveSessionOverride,
         tokensUsed: session.lastTotalTokens ?? null,
         sessionCostUsd: session.totalCostUsd ?? null,
         sessionUsageByModel: session.usageByModel ?? null,
@@ -3208,7 +3241,10 @@ export function handleSessionEvent(event: StreamEvent): void {
       // persisted `model_override`, so a reload restores it; the
       // cross-session sticky pref is intentionally left untouched (a
       // terminal switch is a per-session choice, not a new default).
-      useChatStore.setState({ selectedModel: event.model });
+      useChatStore.setState({
+        selectedModel: event.model,
+        sessionModelOverride: event.model,
+      });
       return;
     case "session_presence":
       // Full-state replacement — every presence event carries the
@@ -3732,12 +3768,21 @@ function applyChildSessionUpdated(
           ),
         )
       : {};
+  const errorOrNull = (v: unknown): ChildSessionInfo["last_task_error"] => {
+    if (!v || typeof v !== "object") return null;
+    const record = v as Record<string, unknown>;
+    if (typeof record.code !== "string" || typeof record.message !== "string") return null;
+    if (!record.code || !record.message) return null;
+    return { code: record.code, message: record.message };
+  };
   if (child.title !== undefined) patch.title = strOrNull(child.title);
   if (child.tool !== undefined) patch.tool = strOrNull(child.tool);
   if (child.session_name !== undefined) patch.session_name = strOrNull(child.session_name);
   if (child.labels !== undefined) patch.labels = strRecordOrEmpty(child.labels);
   if (child.current_task_status !== undefined)
     patch.current_task_status = strOrNull(child.current_task_status);
+  if (child.last_task_error !== undefined)
+    patch.last_task_error = errorOrNull(child.last_task_error);
   if (child.busy !== undefined) patch.busy = child.busy === true;
   if (child.last_message_preview !== undefined)
     patch.last_message_preview = strOrNull(child.last_message_preview);
@@ -3756,6 +3801,7 @@ function applyChildSessionUpdated(
       session_name: patch.session_name ?? null,
       labels: patch.labels ?? {},
       current_task_status: patch.current_task_status ?? null,
+      last_task_error: patch.last_task_error ?? null,
       busy: patch.busy ?? false,
       last_message_preview: patch.last_message_preview ?? null,
       pending_elicitations_count: patch.pending_elicitations_count ?? 0,

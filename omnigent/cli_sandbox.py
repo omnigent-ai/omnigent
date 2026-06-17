@@ -169,10 +169,13 @@ def sandbox() -> None:
                Free-tier (Tier 1/2) orgs only reach allowlisted
                domains, so `connect` needs an allowlisted --server
                (see deploy/daytona/README.md).
+      islo     Uses the built-in HTTP client. Needs ISLO_API_KEY
+               (and optionally ISLO_BASE_URL for non-default API
+               endpoints).
 
     For provider-side sandbox lifecycle (list / status / delete /
-    start / stop), use the provider's own CLI directly (e.g.
-    `modal sandbox list`).
+    start / stop), use the provider's own CLI or dashboard directly
+    (e.g. `modal sandbox list`).
     """
 
 

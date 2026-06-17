@@ -10,12 +10,7 @@ afterEach(cleanup);
 describe("SlashCommandCard", () => {
   it("renders the 'Skill' framing + name with no payload", () => {
     render(
-      <SlashCommandCard
-        kind="skill"
-        name="dev-productivity:simplify"
-        arguments=""
-        output={null}
-      />,
+      <SlashCommandCard kind="skill" name="dev-productivity:simplify" arguments="" output={null} />,
     );
     expect(screen.getByText("Skill")).toBeDefined();
     expect(screen.getByText("dev-productivity:simplify")).toBeDefined();
@@ -25,9 +20,7 @@ describe("SlashCommandCard", () => {
     // Bucket-C CLI built-ins (``/effort``, ``/clear``, ``/compact``,
     // ``/model``, ``/ultrareview``) render with the Command label —
     // distinct from user-authored Skills.
-    render(
-      <SlashCommandCard kind="command" name="effort" arguments="high" output={null} />,
-    );
+    render(<SlashCommandCard kind="command" name="effort" arguments="high" output={null} />);
     expect(screen.getByText("Command")).toBeDefined();
     expect(screen.getByText("effort")).toBeDefined();
     expect(screen.getByText("high")).toBeDefined();
@@ -38,9 +31,7 @@ describe("SlashCommandCard", () => {
   });
 
   it("shows args inline in the trigger row when present", () => {
-    render(
-      <SlashCommandCard kind="skill" name="oncall" arguments="file-bug" output={null} />,
-    );
+    render(<SlashCommandCard kind="skill" name="oncall" arguments="file-bug" output={null} />);
     expect(screen.getByText("oncall")).toBeDefined();
     expect(screen.getByText("file-bug")).toBeDefined();
   });
@@ -54,9 +45,7 @@ describe("SlashCommandCard", () => {
         output="oncall: file-bug subcommand started"
       />,
     );
-    const trigger = container.querySelector<HTMLElement>(
-      '[data-slot="collapsible-trigger"]',
-    );
+    const trigger = container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]');
     expect(trigger).not.toBeNull();
     expect(trigger!.getAttribute("data-state")).toBe("closed");
 
@@ -78,12 +67,7 @@ describe("SlashCommandCard", () => {
 
   it("no payload renders without a Collapsible wrapper", () => {
     const { container } = render(
-      <SlashCommandCard
-        kind="skill"
-        name="dev-productivity:simplify"
-        arguments=""
-        output={null}
-      />,
+      <SlashCommandCard kind="skill" name="dev-productivity:simplify" arguments="" output={null} />,
     );
     expect(container.querySelector('[data-slot="collapsible-trigger"]')).toBeNull();
   });

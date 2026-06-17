@@ -43,7 +43,6 @@ export function detectIdleTransitions(
   });
 }
 
-
 /** Snapshot of each conversation's pending-elicitation count, keyed by id. */
 export function buildElicitationMap(conversations: Conversation[]): Map<string, number> {
   const map = new Map<string, number>();

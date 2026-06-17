@@ -1,10 +1,7 @@
 "use client";
 
 import { Button } from "@/components/ui/button";
-import {
-  ButtonGroup,
-  ButtonGroupText,
-} from "@/components/ui/button-group";
+import { ButtonGroup, ButtonGroupText } from "@/components/ui/button-group";
 import { cn } from "@/lib/utils";
 import type { Experimental_SpeechResult as SpeechResult } from "ai";
 import {
@@ -21,16 +18,9 @@ import {
 } from "media-chrome/react";
 import type { ComponentProps, CSSProperties } from "react";
 
-export type AudioPlayerProps = Omit<
-  ComponentProps<typeof MediaController>,
-  "audio"
->;
+export type AudioPlayerProps = Omit<ComponentProps<typeof MediaController>, "audio">;
 
-export const AudioPlayer = ({
-  children,
-  style,
-  ...props
-}: AudioPlayerProps) => (
+export const AudioPlayer = ({ children, style, ...props }: AudioPlayerProps) => (
   <MediaController
     audio
     data-slot="audio-player"
@@ -80,21 +70,14 @@ export const AudioPlayerElement = ({ ...props }: AudioPlayerElementProps) => (
   <audio
     data-slot="audio-player-element"
     slot="media"
-    src={
-      "src" in props
-        ? props.src
-        : `data:${props.data.mediaType};base64,${props.data.base64}`
-    }
+    src={"src" in props ? props.src : `data:${props.data.mediaType};base64,${props.data.base64}`}
     {...props}
   />
 );
 
 export type AudioPlayerControlBarProps = ComponentProps<typeof MediaControlBar>;
 
-export const AudioPlayerControlBar = ({
-  children,
-  ...props
-}: AudioPlayerControlBarProps) => (
+export const AudioPlayerControlBar = ({ children, ...props }: AudioPlayerControlBarProps) => (
   <MediaControlBar data-slot="audio-player-control-bar" {...props}>
     <ButtonGroup orientation="horizontal">{children}</ButtonGroup>
   </MediaControlBar>
@@ -102,10 +85,7 @@ export const AudioPlayerControlBar = ({
 
 export type AudioPlayerPlayButtonProps = ComponentProps<typeof MediaPlayButton>;
 
-export const AudioPlayerPlayButton = ({
-  className,
-  ...props
-}: AudioPlayerPlayButtonProps) => (
+export const AudioPlayerPlayButton = ({ className, ...props }: AudioPlayerPlayButtonProps) => (
   <Button asChild size="icon-sm" variant="outline">
     <MediaPlayButton
       className={cn("bg-transparent", className)}
@@ -115,9 +95,7 @@ export const AudioPlayerPlayButton = ({
   </Button>
 );
 
-export type AudioPlayerSeekBackwardButtonProps = ComponentProps<
-  typeof MediaSeekBackwardButton
->;
+export type AudioPlayerSeekBackwardButtonProps = ComponentProps<typeof MediaSeekBackwardButton>;
 
 export const AudioPlayerSeekBackwardButton = ({
   seekOffset = 10,
@@ -132,9 +110,7 @@ export const AudioPlayerSeekBackwardButton = ({
   </Button>
 );
 
-export type AudioPlayerSeekForwardButtonProps = ComponentProps<
-  typeof MediaSeekForwardButton
->;
+export type AudioPlayerSeekForwardButtonProps = ComponentProps<typeof MediaSeekForwardButton>;
 
 export const AudioPlayerSeekForwardButton = ({
   seekOffset = 10,
@@ -149,14 +125,9 @@ export const AudioPlayerSeekForwardButton = ({
   </Button>
 );
 
-export type AudioPlayerTimeDisplayProps = ComponentProps<
-  typeof MediaTimeDisplay
->;
+export type AudioPlayerTimeDisplayProps = ComponentProps<typeof MediaTimeDisplay>;
 
-export const AudioPlayerTimeDisplay = ({
-  className,
-  ...props
-}: AudioPlayerTimeDisplayProps) => (
+export const AudioPlayerTimeDisplay = ({ className, ...props }: AudioPlayerTimeDisplayProps) => (
   <ButtonGroupText asChild className="bg-transparent">
     <MediaTimeDisplay
       className={cn("tabular-nums", className)}
@@ -168,22 +139,13 @@ export const AudioPlayerTimeDisplay = ({
 
 export type AudioPlayerTimeRangeProps = ComponentProps<typeof MediaTimeRange>;
 
-export const AudioPlayerTimeRange = ({
-  className,
-  ...props
-}: AudioPlayerTimeRangeProps) => (
+export const AudioPlayerTimeRange = ({ className, ...props }: AudioPlayerTimeRangeProps) => (
   <ButtonGroupText asChild className="bg-transparent">
-    <MediaTimeRange
-      className={cn("", className)}
-      data-slot="audio-player-time-range"
-      {...props}
-    />
+    <MediaTimeRange className={cn("", className)} data-slot="audio-player-time-range" {...props} />
   </ButtonGroupText>
 );
 
-export type AudioPlayerDurationDisplayProps = ComponentProps<
-  typeof MediaDurationDisplay
->;
+export type AudioPlayerDurationDisplayProps = ComponentProps<typeof MediaDurationDisplay>;
 
 export const AudioPlayerDurationDisplay = ({
   className,
@@ -200,10 +162,7 @@ export const AudioPlayerDurationDisplay = ({
 
 export type AudioPlayerMuteButtonProps = ComponentProps<typeof MediaMuteButton>;
 
-export const AudioPlayerMuteButton = ({
-  className,
-  ...props
-}: AudioPlayerMuteButtonProps) => (
+export const AudioPlayerMuteButton = ({ className, ...props }: AudioPlayerMuteButtonProps) => (
   <ButtonGroupText asChild className="bg-transparent">
     <MediaMuteButton
       className={cn("", className)}
@@ -213,14 +172,9 @@ export const AudioPlayerMuteButton = ({
   </ButtonGroupText>
 );
 
-export type AudioPlayerVolumeRangeProps = ComponentProps<
-  typeof MediaVolumeRange
->;
+export type AudioPlayerVolumeRangeProps = ComponentProps<typeof MediaVolumeRange>;
 
-export const AudioPlayerVolumeRange = ({
-  className,
-  ...props
-}: AudioPlayerVolumeRangeProps) => (
+export const AudioPlayerVolumeRange = ({ className, ...props }: AudioPlayerVolumeRangeProps) => (
   <ButtonGroupText asChild className="bg-transparent">
     <MediaVolumeRange
       className={cn("", className)}

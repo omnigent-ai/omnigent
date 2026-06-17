@@ -240,6 +240,43 @@ async def test_session_snapshot_surfaces_runner_exit_report_as_failed() -> None:
 
 
 @pytest.mark.asyncio
+async def test_session_snapshot_surfaces_status_error_labels_as_last_task_error() -> None:
+    """
+    A terminal/runtime failure captured from ``session.status`` survives reload.
+
+    Required terminal boot failures can happen before any assistant transcript
+    or runner-crash report exists. The live SSE carries ``error``, and the
+    relay persists it as labels so a later snapshot can still render a useful
+    failure banner instead of ``last_task_error=None``.
+    """
+    conv = Conversation(
+        id="conv_failed_terminal",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_failed_terminal",
+        agent_id="ag_test",
+        labels={
+            "omnigent.last_task_error_code": "required_terminal_exited",
+            "omnigent.last_task_error_message": "Required terminal exited unexpectedly",
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={"conv_failed_terminal": conv},
+    )
+
+    snapshot = await _get_session_snapshot(  # type: ignore[arg-type]
+        conv_store,
+        "conv_failed_terminal",
+    )
+
+    assert snapshot.last_task_error == {
+        "code": "required_terminal_exited",
+        "message": "Required terminal exited unexpectedly",
+    }
+
+
+@pytest.mark.asyncio
 async def test_session_snapshot_no_exit_report_stays_unfailed() -> None:
     """A session whose runner has no exit report is not marked failed.
 

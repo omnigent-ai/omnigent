@@ -61,9 +61,7 @@ export function findPmRangeForComment(
 
   // Scale raw offset → text-content offset as a search hint.
   const hint =
-    rawContent.length > 0
-      ? Math.round((start_index * textContent.length) / rawContent.length)
-      : 0;
+    rawContent.length > 0 ? Math.round((start_index * textContent.length) / rawContent.length) : 0;
 
   const WINDOW = 500;
   const searchFrom = Math.max(0, hint - WINDOW);
@@ -107,9 +105,7 @@ export function computeSelectionData(
   const textFrom = doc.textBetween(0, from, SEP).length;
 
   const hint =
-    textContent.length > 0
-      ? Math.round((textFrom * rawContent.length) / textContent.length)
-      : 0;
+    textContent.length > 0 ? Math.round((textFrom * rawContent.length) / textContent.length) : 0;
 
   const WINDOW = 500;
   const searchFrom = Math.max(0, hint - WINDOW);

@@ -1,24 +1,38 @@
-"""Shared conversion between native-harness tool hooks and Omnigent policy events.
+"""Shared conversion between native-harness hooks and Omnigent policy events.
 
 Both Claude Code and Codex expose a command-hook system whose
 ``PreToolUse`` / ``PostToolUse`` payloads use the same field names
 (``hook_event_name``, ``tool_name``, ``tool_input``, ``tool_output``)
-and the same ``hookSpecificOutput.permissionDecision`` output contract.
-This module owns the harness-neutral translation between that hook shape
-and the server's proto-compatible ``EvaluationRequest`` /
-``EvaluationResponse`` schema served by
+and whose ``UserPromptSubmit`` payload carries the user prompt under
+``prompt``. This module owns the harness-neutral translation between
+that hook shape and the server's proto-compatible ``EvaluationRequest``
+/ ``EvaluationResponse`` schema served by
 ``POST /v1/sessions/{id}/policies/evaluate``, so the per-harness hook
 entrypoints (:mod:`omnigent.claude_native_hook`,
 :mod:`omnigent.codex_native_hook`) share one implementation.
+
+The output contract differs by hook event: ``PreToolUse`` enforces via
+``hookSpecificOutput.permissionDecision``, while ``UserPromptSubmit``
+enforces via the top-level ``decision`` / ``reason`` fields (both
+harnesses parse ``decision: "block"`` to drop the prompt before the
+model sees it).
 """
 
 from __future__ import annotations
+
+import json
 
 # Hook event names that gate tool execution and therefore carry policy
 # meaning. ``PreToolUse`` fires before the tool runs (can block);
 # ``PostToolUse`` fires after (observational — can only warn).
 _PRE_TOOL_USE = "PreToolUse"
 _POST_TOOL_USE = "PostToolUse"
+# ``UserPromptSubmit`` fires when a new user prompt reaches the harness —
+# for native sessions this is the request-phase gate (the server-level
+# ``_evaluate_input_policy`` is bypassed for native message events, so
+# this hook is the sole REQUEST gate and covers both web-UI-injected and
+# direct-terminal prompts). It can block the prompt before the model runs.
+_USER_PROMPT_SUBMIT = "UserPromptSubmit"
 
 
 def hook_payload_to_evaluation_request(
@@ -28,28 +42,46 @@ def hook_payload_to_evaluation_request(
     """
     Convert a native-harness tool-hook payload into a proto ``EvaluationRequest``.
 
-    Maps ``PreToolUse`` to a ``PHASE_TOOL_CALL`` event and
-    ``PostToolUse`` to a ``PHASE_TOOL_RESULT`` event. MCP tools
-    (``mcp__*``) are skipped because they are already policy-checked by
-    the relay path (``ProxyMcpManager`` → Omnigent ``/mcp`` endpoint →
-    ``_evaluate_tool_call_policy``); evaluating them here would
-    double-count.
+    Maps ``PreToolUse`` to a ``PHASE_TOOL_CALL`` event, ``PostToolUse``
+    to a ``PHASE_TOOL_RESULT`` event, and ``UserPromptSubmit`` to a
+    ``PHASE_REQUEST`` event (the prompt text from the payload's
+    ``prompt`` field becomes the request content). Omnigent MCP tools
+    (``mcp__omnigent__*``) are skipped because they are already
+    policy-checked by the relay path (``ProxyMcpManager`` → Omnigent
+    ``/mcp`` endpoint → ``_evaluate_tool_call_policy``); evaluating
+    them here would double-count. Connector-native MCP tools
+    (for example ``mcp__github__*``) still need this pre-call gate.
 
     :param hook_event: Hook event name from the payload's
-        ``hook_event_name`` field, e.g. ``"PreToolUse"`` or
-        ``"PostToolUse"``.
+        ``hook_event_name`` field, e.g. ``"PreToolUse"``,
+        ``"PostToolUse"``, or ``"UserPromptSubmit"``.
     :param payload: Raw hook JSON from the harness, e.g.
         ``{"hook_event_name": "PreToolUse", "tool_name": "Bash",
         "tool_input": {"command": "rm -rf /"}}``.
     :returns: An ``EvaluationRequest`` dict suitable for POSTing to
         ``/policies/evaluate``, or ``None`` when the event is not
-        policy-relevant (unknown event or an ``mcp__*`` tool).
+        policy-relevant (unknown event or an ``mcp__omnigent__*`` tool).
     """
+    if hook_event == _USER_PROMPT_SUBMIT:
+        # Request-phase gate for native sessions. The server reads REQUEST
+        # content from ``data.text`` (see ``_build_evaluation_context``).
+        prompt = payload.get("prompt", "")
+        return {
+            "event": {
+                "type": "PHASE_REQUEST",
+                "target": "",
+                "data": {
+                    "text": prompt if isinstance(prompt, str) else json.dumps(prompt),
+                },
+                "context": {},
+            },
+        }
     tool_name = payload.get("tool_name", "")
-    # MCP tools (mcp__*) are already policy-checked by the relay path
+    # Omnigent MCP tools are already policy-checked by the relay path
     # (ProxyMcpManager → Omnigent /mcp endpoint → _evaluate_tool_call_policy).
-    # Skip them here to avoid double evaluation.
-    if isinstance(tool_name, str) and tool_name.startswith("mcp__"):
+    # Skip only those here to avoid double evaluation; connector-native MCP
+    # tools such as mcp__github__* must still go through this hook.
+    if isinstance(tool_name, str) and tool_name.startswith("mcp__omnigent__"):
         return None
     tool_input = payload.get("tool_input") or {}
     if hook_event == _PRE_TOOL_USE:
@@ -113,11 +145,21 @@ def evaluation_response_to_hook_output(
     ``additionalContext`` because the tool result is already committed
     — PostToolUse hooks cannot block.
 
-    Both Claude Code and Codex consume this exact output shape, so the
+    For ``UserPromptSubmit`` the output uses the top-level ``decision`` /
+    ``reason`` contract (not ``permissionDecision``): ``DENY`` → ``{"decision":
+    "block", "reason": ...}``, which drops the prompt before the model sees
+    it. ASK is resolved server-side (``_hold_native_ask_gate`` collapses it
+    to a hard ALLOW/DENY before the response reaches the hook), so the hook
+    should never see ASK; if it somehow does, it fails closed by blocking.
+    ALLOW (and the engine's no-match default) returns ``None`` so the prompt
+    proceeds. Unlike ``PreToolUse``, there is no separate user-consent gate
+    on a prompt, so ALLOW need not preserve one.
+
+    Both Claude Code and Codex consume these exact output shapes, so the
     ``hookEventName`` echoed back is the harness-supplied ``hook_event``.
 
-    :param hook_event: Hook event name, e.g. ``"PreToolUse"`` or
-        ``"PostToolUse"``.
+    :param hook_event: Hook event name, e.g. ``"PreToolUse"``,
+        ``"PostToolUse"``, or ``"UserPromptSubmit"``.
     :param eval_response: Parsed ``EvaluationResponse`` from AP, e.g.
         ``{"result": "POLICY_ACTION_DENY", "reason": "blocked by policy"}``.
     :returns: Hook output dict for the harness to read on stdout, or
@@ -126,6 +168,19 @@ def evaluation_response_to_hook_output(
     """
     action = eval_response.get("result", "POLICY_ACTION_UNSPECIFIED")
     reason = eval_response.get("reason")
+
+    if hook_event == _USER_PROMPT_SUBMIT:
+        # DENY blocks the prompt; a stray ASK fails closed (also block) since
+        # ASK is meant to be resolved server-side before reaching the hook.
+        # ALLOW / no-match → None so the prompt proceeds. A non-empty reason
+        # is required for the block to take effect (both harnesses drop a
+        # block with an empty reason), so default one in.
+        if action in ("POLICY_ACTION_DENY", "POLICY_ACTION_ASK"):
+            return {
+                "decision": "block",
+                "reason": reason or "Denied by policy",
+            }
+        return None
 
     if hook_event == _PRE_TOOL_USE:
         # ALLOW (the engine default when no policy matches) is omitted → None,

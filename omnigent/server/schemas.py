@@ -621,6 +621,12 @@ class ChildSessionSummary(BaseModel):
         consult is what keeps the rail's "Working" badge correct.
     :param labels: Session-scoped guardrails labels on the child
         conversation (mirrors :class:`ConversationObject.labels`).
+    :param last_task_error: Error details from the child's most recent
+        failed run, e.g.
+        ``{"code": "required_terminal_exited", "message": "..."}``.
+        ``None`` when the child has no durable failure detail. This is
+        the typed projection of runner-owned failure labels; clients
+        should not parse those labels directly.
     :param last_message_preview: Single-line preview of the most
         recent message item in the child's conversation, truncated
         to ~150 chars with a trailing ellipsis when longer. ``None``
@@ -653,6 +659,7 @@ class ChildSessionSummary(BaseModel):
     current_task_status: str | None = None
     busy: bool = False
     labels: dict[str, str] = Field(default_factory=dict)
+    last_task_error: dict[str, str] | None = None
     last_message_preview: str | None = None
     pending_elicitations_count: int = 0
 

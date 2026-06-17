@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { detectLang, indexToLine, isBinaryPath, lineOverlapsSelection } from "./codeViewerHelpers";
+import {
+  detectLang,
+  getSelectionOffsets,
+  indexToLine,
+  isBinaryPath,
+  lineOverlapsSelection,
+} from "./codeViewerHelpers";
 
 // ---------------------------------------------------------------------------
 // detectLang — language matrix backing syntax highlighting
@@ -37,14 +43,29 @@ describe("detectLang", () => {
 
   it("falls back to 'text' for unknown or extension-less paths", () => {
     expect(detectLang("data.unknownext")).toBe("text");
-    expect(detectLang("Makefile")).toBe("text");
     expect(detectLang("LICENSE")).toBe("text");
   });
 
-  it("falls back to 'text' for Scala (not yet in the language map)", () => {
-    // KNOWN GAP: .scala has no entry, so it renders unhighlighted. Asserting the
-    // current behavior makes adding "scala" a deliberate, reviewed change.
-    expect(detectLang("Service.scala")).toBe("text");
+  it("highlights Scala source files", () => {
+    expect(detectLang("Service.scala")).toBe("scala");
+    expect(detectLang("build.sc")).toBe("scala");
+  });
+
+  it("highlights files identified by name rather than extension", () => {
+    expect(detectLang("Dockerfile")).toBe("dockerfile");
+    expect(detectLang("path/to/Makefile")).toBe("make");
+    expect(detectLang("CMakeLists.txt")).toBe("cmake");
+  });
+
+  it("highlights a sampling of the extended language map", () => {
+    expect(detectLang("Main.kt")).toBe("kotlin");
+    expect(detectLang("app.rb")).toBe("ruby");
+    expect(detectLang("index.php")).toBe("php");
+    expect(detectLang("View.swift")).toBe("swift");
+    expect(detectLang("styles.scss")).toBe("scss");
+    expect(detectLang("App.vue")).toBe("vue");
+    expect(detectLang("schema.graphql")).toBe("graphql");
+    expect(detectLang("Program.cs")).toBe("csharp");
   });
 });
 
@@ -71,15 +92,12 @@ describe("isBinaryPath", () => {
     expect(isBinaryPath(path)).toBe(true);
   });
 
-  it.each([
-    "app.py",
-    "index.ts",
-    "README.md",
-    "config.json",
-    "notes.txt",
-  ])("classifies %s as non-binary", (path) => {
-    expect(isBinaryPath(path)).toBe(false);
-  });
+  it.each(["app.py", "index.ts", "README.md", "config.json", "notes.txt"])(
+    "classifies %s as non-binary",
+    (path) => {
+      expect(isBinaryPath(path)).toBe(false);
+    },
+  );
 
   it("is case-insensitive on the extension", () => {
     expect(isBinaryPath("LOGO.PNG")).toBe(true);
@@ -192,5 +210,102 @@ describe("lineOverlapsSelection", () => {
     expect(lineOverlapsSelection(0, lines, 0, 8)).toBe(true);
     expect(lineOverlapsSelection(1, lines, 0, 8)).toBe(true);
     expect(lineOverlapsSelection(2, lines, 0, 8)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getSelectionOffsets — DOM Range → absolute byte offsets
+// ---------------------------------------------------------------------------
+
+describe("getSelectionOffsets", () => {
+  // Build a code container whose children carry `data-line` (1-based) and
+  // hold a single text node — mirroring the highlighted line elements
+  // CodeViewer renders. jsdom supports Range over these nodes.
+  function buildContainer(rawLines: string[]): HTMLElement {
+    const container = document.createElement("div");
+    rawLines.forEach((line, i) => {
+      const el = document.createElement("div");
+      el.dataset.line = String(i + 1);
+      el.textContent = line;
+      container.appendChild(el);
+    });
+    document.body.appendChild(container);
+    return container;
+  }
+
+  function lineTextNode(container: HTMLElement, lineIdx: number): Text {
+    return container.children[lineIdx].firstChild as Text;
+  }
+
+  it("computes absolute offsets for a single-line selection", () => {
+    // WHY: the common case — selecting chars within one line must map column
+    // offsets onto the absolute index, exercising the preRange column math.
+    const rawLines = ["hello", "world", "foo"];
+    const container = buildContainer(rawLines);
+    const range = document.createRange();
+    // Select "ell" on line 1 (cols 1..4).
+    range.setStart(lineTextNode(container, 0), 1);
+    range.setEnd(lineTextNode(container, 0), 4);
+
+    expect(getSelectionOffsets(range, container, rawLines)).toEqual({
+      start_index: 1,
+      end_index: 4,
+    });
+    container.remove();
+  });
+
+  it("sums preceding line lengths (+1 per newline) for a multi-line selection", () => {
+    // WHY: spanning lines must add each prior line's length plus its \n, so a
+    // boundary on line 2 lands past the line-1 text and its newline.
+    const rawLines = ["hello", "world", "foo"];
+    const container = buildContainer(rawLines);
+    const range = document.createRange();
+    // Start at col 2 of line 1, end at col 3 of line 2.
+    range.setStart(lineTextNode(container, 0), 2);
+    range.setEnd(lineTextNode(container, 1), 3);
+
+    // start = 2; end = ("hello".length 5 + \n 1) + 3 = 9.
+    expect(getSelectionOffsets(range, container, rawLines)).toEqual({
+      start_index: 2,
+      end_index: 9,
+    });
+    container.remove();
+  });
+
+  it("returns null when a boundary is outside any data-line element", () => {
+    // WHY: a selection that escaped the code container (e.g. into the gutter)
+    // can't be resolved to a line, so the helper must bail rather than emit a
+    // bogus offset.
+    const rawLines = ["hello"];
+    const container = buildContainer(rawLines);
+    const stray = document.createElement("span");
+    stray.textContent = "outside";
+    document.body.appendChild(stray);
+
+    const range = document.createRange();
+    range.setStart(stray.firstChild as Text, 0);
+    range.setEnd(stray.firstChild as Text, 3);
+
+    expect(getSelectionOffsets(range, container, rawLines)).toBeNull();
+    container.remove();
+    stray.remove();
+  });
+
+  it("returns null when a line element has a zero/missing line number", () => {
+    // WHY: data-line="0" parses to a falsy line number; the guard rejects it
+    // rather than computing against a non-existent line 0.
+    const container = document.createElement("div");
+    const el = document.createElement("div");
+    el.dataset.line = "0";
+    el.textContent = "abc";
+    container.appendChild(el);
+    document.body.appendChild(container);
+
+    const range = document.createRange();
+    range.setStart(el.firstChild as Text, 0);
+    range.setEnd(el.firstChild as Text, 2);
+
+    expect(getSelectionOffsets(range, container, ["abc"])).toBeNull();
+    container.remove();
   });
 });

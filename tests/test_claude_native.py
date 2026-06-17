@@ -24,6 +24,7 @@ from omnigent import claude_native
 from omnigent._runner_startup import RunnerStartupProgress
 from omnigent._startup_profile import StartupProfiler
 from omnigent._terminal_picker_theme import PICKER_ACCENT, PICKER_MUTED
+from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.spec import load_omnigent_yaml
 from omnigent.terminals.ws_bridge import (
     WS_CLOSE_TERMINAL_DETACHED,
@@ -3494,9 +3495,15 @@ def test_websocket_connect_sets_short_close_timeout(monkeypatch: pytest.MonkeyPa
     )
 
     assert result is sentinel
+    # The wrapper adds the first-party Origin sentinel alongside the
+    # caller's auth header so the server's CSWSH origin guard admits this
+    # non-browser attach client; the caller's bearer is preserved.
     assert captured == {
         "url": "wss://example.com/attach",
-        "additional_headers": {"Authorization": "Bearer tok"},
+        "additional_headers": {
+            "Authorization": "Bearer tok",
+            "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
+        },
         "close_timeout": claude_native._CLAUDE_ATTACH_WS_CLOSE_TIMEOUT_S,
     }
 
@@ -5706,7 +5713,12 @@ def test_provider_config_for_native_claude_key_injects_base_url_and_helper() -> 
 
     cfg = claude_native._provider_config_for_native_claude(entry)
     assert cfg is not None
-    assert cfg.env == {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}
+    # ANTHROPIC_BASE_URL plus the gateway-safety beta-disable flag (gateways
+    # 400 on beta flags they don't implement; see _provider_config_for_native_claude).
+    assert cfg.env == {
+        "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+    }
     # Static key delivered via the apiKeyHelper, never the env (allowlist).
     assert cfg.api_key_helper == "printf %s sk-ant-test"
     assert cfg.model == "claude-sonnet-4-6"
@@ -5733,7 +5745,10 @@ def test_provider_config_for_native_claude_uses_auth_command_verbatim() -> None:
     cfg = claude_native._provider_config_for_native_claude(entry)
     assert cfg is not None
     assert cfg.api_key_helper == "my-cli print-token"
-    assert cfg.env == {"ANTHROPIC_BASE_URL": "https://gw.example/v1"}
+    assert cfg.env == {
+        "ANTHROPIC_BASE_URL": "https://gw.example/v1",
+        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+    }
 
 
 def test_resolve_native_claude_config_spec_provider_default(

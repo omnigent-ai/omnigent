@@ -60,17 +60,6 @@ skips:
     cluster: runner-wedge-subprocess-fanout
     mode: skip
 
-  # Shard 2 iteration: drift-guard meta-test trips on real coverage
-  # gaps: several shipped agents (databricks_supervisor,
-  # databricks_supervisor_mcp_agent, devportal_mcp_agent, swe_org,
-  # agent_with_client_tools, ...) have no test_example_<name>.py.
-  # Closing those gaps is real coverage work, not the iteration scope.
-  - id: tests/e2e/omnigent/test_examples_coverage_sync.py::test_every_agent_has_a_dedicated_test_file
-    reason: "Coverage gap: several shipped examples have no test_example_*.py."
-    issue: 532
-    cluster: example-coverage-gap
-    mode: skip
-
   # Shard 2 iteration: openai-agents harness on databricks-gpt-5-mini
   # via ai-oss frequently exceeds the test's internal 60s
   # turn-completion timeout (state stays "running" past the
@@ -1021,26 +1010,6 @@ skips:
     mode: skip
 
   # ──────────────────────────────────────────────────────────────
-  # Residual after the openai-agents empty-output fix (#2707).
-  #
-  # The empty-output cluster (#2707) was fixed at the harness layer:
-  # OpenAIAgentsSDKExecutor.run_turn now retries a completed-but-empty
-  # gateway turn once and fails loud (retryable ExecutorError) if it is
-  # still empty. The other 8 quarantined tests were verified green live
-  # on the `oss` profile and unquarantined. This one remains: it is
-  # flaky on a DIFFERENT axis — it asserts the model emits TWO
-  # sys_session_send tool_calls in a single response, but the model
-  # sometimes spawns the two sub-agents sequentially across turns
-  # (1 of ~3 runs), which is model parallel-spawn variance, not the
-  # empty-output bug. Kept as `skip` (heavy e2e turn; a flaky-rerun
-  # mark on it risks wedging the loadscope shard).
-  # ──────────────────────────────────────────────────────────────
-  - id: tests/e2e/test_coder_subagent.py::test_coder_spawns_parallel_subagents
-    reason: "Flaky: model sometimes spawns the two sub-agents sequentially, not in one parallel response (#2707)."
-    issue: 2707
-    cluster: openai-agents-parallel-spawn-variance
-    mode: skip
-
   # ──────────────────────────────────────────────────────────────
   # openai-agents empty-output cluster RESURFACED on `main` (2026-06-09,
   # #2707). The 8 tests #2725 unquarantined (after the harness empty-turn

@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -694,6 +694,44 @@ class TestConstructor(unittest.TestCase):
             terminate_tree.assert_called_once()
 
         _run(_t())
+
+    def test_force_close_client_handles_sdk_without_stderr_task_group(self):
+        # Regression: claude-agent-sdk >=0.2.x renamed the stderr reader from an
+        # anyio task group (`_stderr_task_group`) to a single `_stderr_task`
+        # TaskHandle. A transport shaped like the current SDK (no
+        # `_stderr_task_group` attribute at all) must not raise AttributeError
+        # out of `_force_close_client` — that exception escaped the runner's
+        # lifespan shutdown and crashed it on every session stop.
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        stderr_task = SimpleNamespace(cancel=Mock())
+
+        class _Transport:
+            def __init__(self):
+                self._process = SimpleNamespace(returncode=None, pid=12345, wait=AsyncMock())
+                self._stdout_stream = object()
+                self._stdin_stream = object()
+                self._stderr_stream = object()
+                self._stderr_task = stderr_task  # current SDK shape
+                self._ready = True
+
+        transport = _Transport()
+        client = SimpleNamespace(_query=None, _transport=transport)
+
+        async def _t():
+            with patch(
+                "omnigent.inner.claude_sdk_executor._terminate_process_tree"
+            ) as terminate_tree:
+                await ClaudeSDKExecutor._force_close_client(client)
+            terminate_tree.assert_called_once()
+
+        _run(_t())
+
+        # New-shape stderr task was cancelled, the missing legacy attribute was
+        # never created, and the handle was cleared.
+        stderr_task.cancel.assert_called_once()
+        self.assertFalse(hasattr(transport, "_stderr_task_group"))
+        self.assertIsNone(transport._stderr_task)
 
     def test_claude_internal_write_files_omits_missing_config(self):
         from omnigent.inner.claude_sdk_executor import _claude_internal_write_files
@@ -2995,3 +3033,341 @@ async def test_result_message_usage_none_yields_turn_complete_without_usage() ->
         f"TurnComplete.usage should be None when ResultMessage.usage is None, "
         f"got {turn.usage!r}. An empty dict would display 0 tokens in the ring."
     )
+
+
+# ---------------------------------------------------------------------------
+# Tests: pre-execution TOOL_CALL policy gate (can_use_tool)
+# ---------------------------------------------------------------------------
+
+
+class TestToolCallPolicyGate(unittest.TestCase):
+    """The ``can_use_tool`` gate that enforces TOOL_CALL policy on
+    connector-native MCP tools (``mcp__github__*`` etc.) before they run.
+    """
+
+    def _make_executor(self, permission_mode="bypassPermissions"):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        return ClaudeSDKExecutor(permission_mode=permission_mode)
+
+    @staticmethod
+    def _verdict(action, reason=None):
+        from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+
+        return PolicyVerdictPayload(action=action, reason=reason)
+
+    @staticmethod
+    def _perm_ctx():
+        return SimpleNamespace(tool_use_id="tu_1", agent_id=None, suggestions=[])
+
+    def test_connector_native_tool_triggers_tool_call_eval(self):
+        """A connector-native tool name drives a PHASE_TOOL_CALL evaluation
+        with the SDK-native tool name and arguments."""
+        from claude_agent_sdk import PermissionResultAllow
+
+        async def _t():
+            executor = self._make_executor()
+            evaluator = AsyncMock(return_value=self._verdict("POLICY_ACTION_ALLOW"))
+            executor._policy_evaluator = evaluator
+
+            result = await executor._can_use_tool_gate(
+                "mcp__github__issue_write",
+                {"title": "bug", "body": "x"},
+                self._perm_ctx(),
+            )
+
+            evaluator.assert_awaited_once()
+            phase, data = evaluator.await_args.args
+            self.assertEqual(phase, "PHASE_TOOL_CALL")
+            self.assertEqual(
+                data,
+                {
+                    "name": "mcp__github__issue_write",
+                    "arguments": {"title": "bug", "body": "x"},
+                },
+            )
+            self.assertIsInstance(result, PermissionResultAllow)
+
+        _run(_t())
+
+    def test_deny_verdict_blocks_execution(self):
+        """A DENY verdict returns PermissionResultDeny carrying the
+        policy's reason and never reaches the elicitation handler."""
+        from claude_agent_sdk import PermissionResultDeny
+
+        async def _t():
+            executor = self._make_executor(permission_mode="default")
+            executor._policy_evaluator = AsyncMock(
+                return_value=self._verdict("POLICY_ACTION_DENY", reason="no writes to github")
+            )
+            elicit = AsyncMock(return_value=True)
+            executor._elicitation_handler = elicit
+
+            result = await executor._can_use_tool_gate(
+                "mcp__github__issue_write",
+                {"title": "bug"},
+                self._perm_ctx(),
+            )
+
+            self.assertIsInstance(result, PermissionResultDeny)
+            self.assertEqual(result.message, "no writes to github")
+            # DENY short-circuits — no human prompt.
+            elicit.assert_not_awaited()
+
+        _run(_t())
+
+    def test_ask_verdict_prompts_even_under_bypass(self):
+        """A raw ASK verdict is supported by routing to Omnigent
+        elicitation, even under bypassPermissions."""
+        from claude_agent_sdk import PermissionResultAllow
+
+        async def _t():
+            executor = self._make_executor(permission_mode="bypassPermissions")
+            executor._policy_evaluator = AsyncMock(
+                return_value=self._verdict("POLICY_ACTION_ASK", reason="approval required")
+            )
+            elicit = AsyncMock(return_value=True)
+            executor._elicitation_handler = elicit
+
+            result = await executor._can_use_tool_gate(
+                "mcp__github__issue_write",
+                {"title": "bug"},
+                self._perm_ctx(),
+            )
+
+            self.assertIsInstance(result, PermissionResultAllow)
+            elicit.assert_awaited_once_with("mcp__github__issue_write", {"title": "bug"})
+
+        _run(_t())
+
+    def test_ask_verdict_denies_when_user_declines(self):
+        """A declined raw ASK blocks execution with the policy reason."""
+        from claude_agent_sdk import PermissionResultDeny
+
+        async def _t():
+            executor = self._make_executor(permission_mode="bypassPermissions")
+            executor._policy_evaluator = AsyncMock(
+                return_value=self._verdict("POLICY_ACTION_ASK", reason="approval required")
+            )
+            executor._elicitation_handler = AsyncMock(return_value=False)
+
+            result = await executor._can_use_tool_gate(
+                "mcp__github__issue_write",
+                {"title": "bug"},
+                self._perm_ctx(),
+            )
+
+            self.assertIsInstance(result, PermissionResultDeny)
+            self.assertEqual(result.message, "approval required")
+
+        _run(_t())
+
+    def test_ask_verdict_without_elicitation_handler_fails_closed(self):
+        """If raw ASK reaches the callback but no handler is available,
+        the tool must not run."""
+        from claude_agent_sdk import PermissionResultDeny
+
+        async def _t():
+            executor = self._make_executor(permission_mode="bypassPermissions")
+            executor._policy_evaluator = AsyncMock(
+                return_value=self._verdict("POLICY_ACTION_ASK", reason="approval required")
+            )
+
+            result = await executor._can_use_tool_gate(
+                "mcp__github__issue_write",
+                {"title": "bug"},
+                self._perm_ctx(),
+            )
+
+            self.assertIsInstance(result, PermissionResultDeny)
+            self.assertEqual(result.message, "approval required")
+
+        _run(_t())
+
+    def test_unspecified_verdict_falls_through(self):
+        """UNSPECIFIED is a proto no-op verdict and should behave like no match."""
+        from claude_agent_sdk import PermissionResultAllow
+
+        async def _t():
+            executor = self._make_executor(permission_mode="bypassPermissions")
+            executor._policy_evaluator = AsyncMock(
+                return_value=self._verdict("POLICY_ACTION_UNSPECIFIED")
+            )
+
+            result = await executor._can_use_tool_gate(
+                "mcp__github__issue_read",
+                {"number": 1},
+                self._perm_ctx(),
+            )
+
+            self.assertIsInstance(result, PermissionResultAllow)
+
+        _run(_t())
+
+    def test_unexpected_verdict_fails_closed(self):
+        """Unknown policy actions should not silently allow a tool call."""
+        from claude_agent_sdk import PermissionResultDeny
+
+        async def _t():
+            executor = self._make_executor(permission_mode="bypassPermissions")
+            executor._policy_evaluator = AsyncMock(return_value=self._verdict("BOGUS"))
+
+            result = await executor._can_use_tool_gate(
+                "mcp__github__issue_write",
+                {"title": "bug"},
+                self._perm_ctx(),
+            )
+
+            self.assertIsInstance(result, PermissionResultDeny)
+            self.assertIn("Unexpected Omnigent TOOL_CALL policy verdict", result.message)
+
+        _run(_t())
+
+    def test_allow_verdict_no_human_prompt_under_bypass(self):
+        """ALLOW under bypassPermissions allows the call with no human
+        prompt, preserving bypass ergonomics."""
+        from claude_agent_sdk import PermissionResultAllow
+
+        async def _t():
+            executor = self._make_executor(permission_mode="bypassPermissions")
+            executor._policy_evaluator = AsyncMock(
+                return_value=self._verdict("POLICY_ACTION_ALLOW")
+            )
+            elicit = AsyncMock(return_value=True)
+            executor._elicitation_handler = elicit
+
+            result = await executor._can_use_tool_gate(
+                "mcp__github__issue_read",
+                {"number": 1},
+                self._perm_ctx(),
+            )
+
+            self.assertIsInstance(result, PermissionResultAllow)
+            elicit.assert_not_awaited()
+
+        _run(_t())
+
+    def test_no_policy_evaluator_no_match_allows_silently(self):
+        """With no policy evaluator wired (default ALLOW), the gate allows
+        with no evaluation and no human prompt under bypassPermissions."""
+        from claude_agent_sdk import PermissionResultAllow
+
+        async def _t():
+            executor = self._make_executor(permission_mode="bypassPermissions")
+            # No _policy_evaluator set, no elicitation handler.
+            result = await executor._can_use_tool_gate(
+                "mcp__atlassian__createJiraIssue",
+                {"summary": "x"},
+                self._perm_ctx(),
+            )
+            self.assertIsInstance(result, PermissionResultAllow)
+
+        _run(_t())
+
+    def test_omnigent_own_tool_skips_evaluation(self):
+        """``mcp__omnigent__*`` tools are already TOOL_CALL-gated server-side
+        via the dispatch bridge / ProxyMcpManager, so the gate must NOT
+        evaluate them again (avoids double-evaluation)."""
+        from claude_agent_sdk import PermissionResultAllow
+
+        async def _t():
+            executor = self._make_executor(permission_mode="bypassPermissions")
+            evaluator = AsyncMock(return_value=self._verdict("POLICY_ACTION_ALLOW"))
+            executor._policy_evaluator = evaluator
+
+            result = await executor._can_use_tool_gate(
+                "mcp__omnigent__sys_os_read",
+                {"path": "/tmp/x"},
+                self._perm_ctx(),
+            )
+
+            self.assertIsInstance(result, PermissionResultAllow)
+            evaluator.assert_not_awaited()
+
+        _run(_t())
+
+    def test_non_bypass_runs_elicitation_after_policy_allow(self):
+        """In a non-bypass mode, a policy ALLOW falls through to the
+        human-consent elicitation gate (pre-existing behavior)."""
+        from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+
+        async def _t():
+            executor = self._make_executor(permission_mode="default")
+            executor._policy_evaluator = AsyncMock(
+                return_value=self._verdict("POLICY_ACTION_ALLOW")
+            )
+
+            # Human approves.
+            executor._elicitation_handler = AsyncMock(return_value=True)
+            approved = await executor._can_use_tool_gate(
+                "mcp__github__issue_read", {}, self._perm_ctx()
+            )
+            self.assertIsInstance(approved, PermissionResultAllow)
+
+            # Human denies.
+            executor._elicitation_handler = AsyncMock(return_value=False)
+            denied = await executor._can_use_tool_gate(
+                "mcp__github__issue_read", {}, self._perm_ctx()
+            )
+            self.assertIsInstance(denied, PermissionResultDeny)
+
+        _run(_t())
+
+    def test_gate_installed_under_bypass_permissions(self):
+        """run_turn installs the can_use_tool gate even under
+        bypassPermissions when a policy evaluator is wired — the
+        regression this feature fixes."""
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        async def _t():
+            executor = ClaudeSDKExecutor(permission_mode="bypassPermissions")
+            executor._policy_evaluator = AsyncMock(
+                return_value=self._verdict("POLICY_ACTION_ALLOW")
+            )
+
+            captured = {}
+
+            async def fake_get_or_create_client(sdk, *, session_key, options, model):
+                captured["can_use_tool"] = options.can_use_tool
+                raise RuntimeError("stop after options build")
+
+            with patch.object(
+                executor,
+                "_get_or_create_client",
+                side_effect=fake_get_or_create_client,
+            ):
+                with self.assertRaises(RuntimeError):
+                    async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                        pass
+
+            # Bound-method identity differs per access; compare equality.
+            self.assertEqual(captured["can_use_tool"], executor._can_use_tool_gate)
+            self.assertIsNotNone(captured["can_use_tool"])
+
+        _run(_t())
+
+    def test_gate_not_installed_without_evaluator_or_handler(self):
+        """With neither a policy evaluator nor an elicitation handler, no
+        can_use_tool callback is installed (unchanged baseline)."""
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        async def _t():
+            executor = ClaudeSDKExecutor(permission_mode="bypassPermissions")
+            captured = {}
+
+            async def fake_get_or_create_client(sdk, *, session_key, options, model):
+                captured["can_use_tool"] = options.can_use_tool
+                raise RuntimeError("stop after options build")
+
+            with patch.object(
+                executor,
+                "_get_or_create_client",
+                side_effect=fake_get_or_create_client,
+            ):
+                with self.assertRaises(RuntimeError):
+                    async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                        pass
+
+            self.assertIsNone(captured["can_use_tool"])
+
+        _run(_t())

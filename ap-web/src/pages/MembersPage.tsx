@@ -24,13 +24,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "@/lib/routing";
-import {
-  CopyIcon,
-  KeyRoundIcon,
-  RefreshCwIcon,
-  Trash2Icon,
-  UserPlusIcon,
-} from "lucide-react";
+import { CopyIcon, KeyRoundIcon, RefreshCwIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -203,9 +197,7 @@ export function MembersPage() {
                   <td className="px-3 py-2 align-middle">
                     <span className="font-medium">{u.id}</span>
                     {u.id === meId && (
-                      <span className="ml-2 text-xs text-muted-foreground">
-                        (you)
-                      </span>
+                      <span className="ml-2 text-xs text-muted-foreground">(you)</span>
                     )}
                     {!u.has_password && (
                       <Badge variant="outline" className="ml-2">
@@ -214,11 +206,7 @@ export function MembersPage() {
                     )}
                   </td>
                   <td className="px-3 py-2 align-middle">
-                    {u.is_admin ? (
-                      <Badge>Admin</Badge>
-                    ) : (
-                      <Badge variant="secondary">Member</Badge>
-                    )}
+                    {u.is_admin ? <Badge>Admin</Badge> : <Badge variant="secondary">Member</Badge>}
                   </td>
                   <td className="px-3 py-2 align-middle text-muted-foreground">
                     {formatEpoch(u.last_login_at)}
@@ -275,9 +263,8 @@ export function MembersPage() {
           <DialogHeader>
             <DialogTitle>Invite a member</DialogTitle>
             <DialogDescription>
-              A single-use invite URL will be created. Share it with the
-              person you want to add. They'll choose their own username
-              and password when they redeem it.
+              A single-use invite URL will be created. Share it with the person you want to add.
+              They'll choose their own username and password when they redeem it.
             </DialogDescription>
           </DialogHeader>
           <label className="flex items-center gap-2 text-sm">
@@ -305,10 +292,7 @@ export function MembersPage() {
             >
               Cancel
             </Button>
-            <Button
-              onClick={() => void onCreateInvite()}
-              disabled={pendingAction}
-            >
+            <Button onClick={() => void onCreateInvite()} disabled={pendingAction}>
               {pendingAction ? "Creating…" : "Create invite"}
             </Button>
           </DialogFooter>
@@ -326,17 +310,12 @@ export function MembersPage() {
           <DialogHeader>
             <DialogTitle>Invite URL</DialogTitle>
             <DialogDescription>
-              Send this URL to the new member. It expires in{" "}
-              {formatTtl(inviteResult?.expires_at)} and is single-use —
-              once they redeem it, it can't be used again. This URL is
-              shown only once.
+              Send this URL to the new member. It expires in {formatTtl(inviteResult?.expires_at)}{" "}
+              and is single-use — once they redeem it, it can't be used again. This URL is shown
+              only once.
             </DialogDescription>
           </DialogHeader>
-          {inviteResult !== null && (
-            <CopyableValue
-              value={rebaseUrl(inviteResult.register_url)}
-            />
-          )}
+          {inviteResult !== null && <CopyableValue value={rebaseUrl(inviteResult.register_url)} />}
           <DialogFooter>
             <Button onClick={() => setInviteResult(null)}>Done</Button>
           </DialogFooter>
@@ -354,13 +333,10 @@ export function MembersPage() {
           <DialogHeader>
             <DialogTitle>New password for {resetResult?.id}</DialogTitle>
             <DialogDescription>
-              Send this password to the user out-of-band (e.g. Slack DM).
-              It is shown only once.
+              Send this password to the user out-of-band (e.g. Slack DM). It is shown only once.
             </DialogDescription>
           </DialogHeader>
-          {resetResult !== null && (
-            <CopyableValue value={resetResult.new_password} />
-          )}
+          {resetResult !== null && <CopyableValue value={resetResult.new_password} />}
           <DialogFooter>
             <Button onClick={() => setResetResult(null)}>Done</Button>
           </DialogFooter>
@@ -382,9 +358,8 @@ export function MembersPage() {
           <DialogHeader>
             <DialogTitle>Remove {deleteCandidate}?</DialogTitle>
             <DialogDescription>
-              This deletes the user account and revokes all their
-              session permissions. Sessions they own become inaccessible
-              unless another user has manage rights on them. This action
+              This deletes the user account and revokes all their session permissions. Sessions they
+              own become inaccessible unless another user has manage rights on them. This action
               cannot be undone.
             </DialogDescription>
           </DialogHeader>
@@ -444,12 +419,7 @@ function CopyableValue({ value }: { value: string }) {
         className="font-mono text-xs"
         onFocus={(e) => e.currentTarget.select()}
       />
-      <Button
-        variant="outline"
-        size="sm"
-        onClick={() => void onCopy()}
-        aria-label="Copy"
-      >
+      <Button variant="outline" size="sm" onClick={() => void onCopy()} aria-label="Copy">
         <CopyIcon /> {copied ? "Copied" : "Copy"}
       </Button>
     </div>

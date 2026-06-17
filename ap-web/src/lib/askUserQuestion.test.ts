@@ -82,7 +82,7 @@ describe("parseAskUserQuestionPreview", () => {
     // Other policy ASKs / PermissionRequests for non-AskUserQuestion
     // tools must NOT trigger the form rendering — the parser is the
     // only gate the UI has on which card flavor to show.
-    expect(parseAskUserQuestionPreview("Bash({\"command\": \"ls\"})")).toBeNull();
+    expect(parseAskUserQuestionPreview('Bash({"command": "ls"})')).toBeNull();
     expect(parseAskUserQuestionPreview("just some text")).toBeNull();
     expect(parseAskUserQuestionPreview("AskUserQuestion(not json)")).toBeNull();
     expect(parseAskUserQuestionPreview("")).toBeNull();
@@ -92,7 +92,7 @@ describe("parseAskUserQuestionPreview", () => {
     // A payload-shaped preview with empty `questions` would render
     // an empty form — drop instead.
     expect(parseAskUserQuestionPreview('AskUserQuestion({"questions": []})')).toBeNull();
-    expect(parseAskUserQuestionPreview('AskUserQuestion({})')).toBeNull();
+    expect(parseAskUserQuestionPreview("AskUserQuestion({})")).toBeNull();
   });
 
   it("skips questions with empty options and returns null when nothing usable remains", () => {

@@ -6,6 +6,7 @@ build-backend = "hatchling.build"
 name = "omnigent-client"
 version = "0.1.0"
 description = "Python client SDK for the omnigent server API"
+readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     # Sibling package — provides the SessionStreamEventType /

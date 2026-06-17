@@ -9,12 +9,54 @@
 //   │  - gutter icon → add comment    │                  │
 //   └──────────────────────────────────┴──────────────────┘
 
-import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { AlertTriangleIcon, ArrowLeftIcon, CheckIcon, ChevronLeftIcon, ChevronRightIcon, CloudOffIcon, CodeIcon, Columns2Icon, DownloadIcon, EyeIcon, FileDiffIcon, Link2Icon, Loader2Icon, MessageSquareTextIcon, MoreHorizontalIcon, PencilLineIcon, RowsIcon, SearchIcon, Trash2Icon } from "lucide-react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import {
+  AlertTriangleIcon,
+  ArrowLeftIcon,
+  CheckIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  CloudOffIcon,
+  CodeIcon,
+  Columns2Icon,
+  DownloadIcon,
+  EyeIcon,
+  FileDiffIcon,
+  Link2Icon,
+  Loader2Icon,
+  MessageSquareTextIcon,
+  MoreHorizontalIcon,
+  PencilLineIcon,
+  RowsIcon,
+  SearchIcon,
+  Trash2Icon,
+} from "lucide-react";
 import { useSearchParams } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
-import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { fileContentToBlob, triggerBrowserDownload, useFileContent } from "@/hooks/useFileContent";
 import { useFileDiff } from "@/hooks/useFileDiff";
@@ -25,10 +67,7 @@ import {
   useDeleteComment,
   useUpdateComment,
 } from "@/hooks/useComments";
-import {
-  CommentSenderProvider,
-  useOptionalCommentSender,
-} from "@/hooks/CommentSenderContext";
+import { CommentSenderProvider, useOptionalCommentSender } from "@/hooks/CommentSenderContext";
 import { markCommentsSeen } from "@/hooks/useSeenComments";
 import { useChatStore } from "@/store/chatStore";
 import { useResizablePanel } from "@/hooks/useResizablePanel";
@@ -87,11 +126,15 @@ export function classifyAndRemapComments(
     // nearby, to avoid remapping to a different occurrence of the same text.
     const SEARCH_WINDOW = 200;
     const windowStart = Math.max(0, c.start_index - SEARCH_WINDOW);
-    const windowEnd = Math.min(fileContent.length, c.start_index + c.anchor_content.length + SEARCH_WINDOW);
+    const windowEnd = Math.min(
+      fileContent.length,
+      c.start_index + c.anchor_content.length + SEARCH_WINDOW,
+    );
     const nearbyIdx = fileContent.indexOf(c.anchor_content, windowStart);
-    const idx = nearbyIdx !== -1 && nearbyIdx <= windowEnd
-      ? nearbyIdx
-      : fileContent.indexOf(c.anchor_content);
+    const idx =
+      nearbyIdx !== -1 && nearbyIdx <= windowEnd
+        ? nearbyIdx
+        : fileContent.indexOf(c.anchor_content);
     if (idx === -1) {
       // Anchor not found anywhere — keep at stored offsets rather than dropping.
       open.push(c);
@@ -256,7 +299,17 @@ export function FileViewer(props: FileViewerProps) {
   );
 }
 
-function FileViewerBody({ open, conversationId, path, onClose, onNavigateTo, permissionLevel, frameless, onCommentsOpenChange, sort = "recent" }: FileViewerProps) {
+function FileViewerBody({
+  open,
+  conversationId,
+  path,
+  onClose,
+  onNavigateTo,
+  permissionLevel,
+  frameless,
+  onCommentsOpenChange,
+  sort = "recent",
+}: FileViewerProps) {
   // null = single-user mode (no enforcement); undefined = prop not provided (treat as unrestricted).
   // LEVEL_EDIT = 2; levels below 2 are read-only.
   const canEdit = permissionLevel == null || permissionLevel >= 2;
@@ -277,7 +330,11 @@ function FileViewerBody({ open, conversationId, path, onClose, onNavigateTo, per
   // enough width for both the code viewer (320px) and the comments panel.
   const COMMENTS_PANEL_WIDTH_PX = 240; // Tailwind w-60
   const minWidthPx = commentsOpen ? 480 + COMMENTS_PANEL_WIDTH_PX : undefined;
-  const { panelWidth, handleProps, isDesktop } = useResizablePanel(frameless ? false : open, 50, frameless ? undefined : minWidthPx);
+  const { panelWidth, handleProps, isDesktop } = useResizablePanel(
+    frameless ? false : open,
+    50,
+    frameless ? undefined : minWidthPx,
+  );
   const fileQuery = useFileContent(conversationId, path);
   const diffQuery = useFileDiff(conversationId, path);
   const changedFiles = useWorkspaceChangedFiles(conversationId);
@@ -292,9 +349,10 @@ function FileViewerBody({ open, conversationId, path, onClose, onNavigateTo, per
   );
   const currentNavIdx = navigableFiles.indexOf(path);
   const prevPath = currentNavIdx > 0 ? navigableFiles[currentNavIdx - 1] : null;
-  const nextPath = currentNavIdx >= 0 && currentNavIdx < navigableFiles.length - 1
-    ? navigableFiles[currentNavIdx + 1]
-    : null;
+  const nextPath =
+    currentNavIdx >= 0 && currentNavIdx < navigableFiles.length - 1
+      ? navigableFiles[currentNavIdx + 1]
+      : null;
   const commentsQuery = useComments(conversationId, path);
   const addComment = useAddComment(conversationId);
   const updateComment = useUpdateComment(conversationId);
@@ -323,7 +381,11 @@ function FileViewerBody({ open, conversationId, path, onClose, onNavigateTo, per
   const linkCopiedTimerRef = useRef<number>(0);
   const [pendingAction, setPendingAction] = useState<(() => void) | null>(null);
   // Reset selection state whenever the file changes.
-  useEffect(() => { setActiveSelection(null); setIsEditorDirty(false); setSaveStatus("idle"); }, [path]);
+  useEffect(() => {
+    setActiveSelection(null);
+    setIsEditorDirty(false);
+    setSaveStatus("idle");
+  }, [path]);
   // Reset comments initialization when the viewer transitions from closed to open,
   // so the panel state is derived from the freshly-opened file's comments.
   // When navigating via < > arrows (path changes while already open), the
@@ -356,19 +418,29 @@ function FileViewerBody({ open, conversationId, path, onClose, onNavigateTo, per
   }, [open, commentsOpen, commentsQuery.data]);
   // Notify parent when comments panel opens or closes (e.g. so the parent
   // can widen the inline panel to fit both the code viewer and comments).
-  useEffect(() => { onCommentsOpenChange?.(commentsOpen); }, [commentsOpen, onCommentsOpenChange]);
+  useEffect(() => {
+    onCommentsOpenChange?.(commentsOpen);
+  }, [commentsOpen, onCommentsOpenChange]);
   // Warn on browser close/refresh while there are unsaved changes.
   useEffect(() => {
     if (!isEditorDirty) return;
-    const handler = (e: BeforeUnloadEvent) => { e.preventDefault(); };
+    const handler = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+    };
     window.addEventListener("beforeunload", handler);
     return () => window.removeEventListener("beforeunload", handler);
   }, [isEditorDirty]);
 
-  const guardDirty = useCallback((action: () => void) => {
-    if (isEditorDirty) { setPendingAction(() => action); return; }
-    action();
-  }, [isEditorDirty]);
+  const guardDirty = useCallback(
+    (action: () => void) => {
+      if (isEditorDirty) {
+        setPendingAction(() => action);
+        return;
+      }
+      action();
+    },
+    [isEditorDirty],
+  );
 
   const handleSetActiveSelection = (sel: ActiveSelection | null) => {
     setActiveSelection(sel);
@@ -378,7 +450,12 @@ function FileViewerBody({ open, conversationId, path, onClose, onNavigateTo, per
     }
   };
 
-  useEffect(() => () => { window.clearTimeout(linkCopiedTimerRef.current); }, []);
+  useEffect(
+    () => () => {
+      window.clearTimeout(linkCopiedTimerRef.current);
+    },
+    [],
+  );
 
   const downloadFile = useCallback(() => {
     const data = fileQuery.data;
@@ -390,18 +467,23 @@ function FileViewerBody({ open, conversationId, path, onClose, onNavigateTo, per
     if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) return;
     const url = new URL(window.location.href);
     if (!activeSelection) url.searchParams.delete("comment");
-    navigator.clipboard.writeText(url.toString()).then(() => {
-      setLinkCopied(true);
-      window.clearTimeout(linkCopiedTimerRef.current);
-      linkCopiedTimerRef.current = window.setTimeout(() => setLinkCopied(false), 2000);
-    }, (err) => console.warn("Failed to copy file link", err));
+    navigator.clipboard.writeText(url.toString()).then(
+      () => {
+        setLinkCopied(true);
+        window.clearTimeout(linkCopiedTimerRef.current);
+        linkCopiedTimerRef.current = window.setTimeout(() => setLinkCopied(false), 2000);
+      },
+      (err) => console.warn("Failed to copy file link", err),
+    );
   }, [activeSelection]);
 
   const copyCommentLink = useCallback((commentId: string) => {
     if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) return;
     const url = new URL(window.location.href);
     url.searchParams.set("comment", commentId);
-    navigator.clipboard.writeText(url.toString()).then(undefined, (err) => console.warn("Failed to copy comment link", err));
+    navigator.clipboard
+      .writeText(url.toString())
+      .then(undefined, (err) => console.warn("Failed to copy comment link", err));
   }, []);
 
   const sender = useOptionalCommentSender();
@@ -474,7 +556,8 @@ function FileViewerBody({ open, conversationId, path, onClose, onNavigateTo, per
   const isPreviewable = lang === "markdown" || lang === "html";
   // Show Δ button only when the file appears in the session's changed-files list.
   const isDiffAvailable = changedFiles.data?.data.some((f) => f.path === path) ?? false;
-  const isDeletedFile = changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false;
+  const isDeletedFile =
+    changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false;
 
   // Diff is a global toggle — turning it on/off on any file carries over as you
   // navigate to the next file. Source ↔ preview is also shared across previewable
@@ -506,9 +589,11 @@ function FileViewerBody({ open, conversationId, path, onClose, onNavigateTo, per
   // Non-markdown previewable (HTML): "editor" falls back to "preview" — no rich-text mode.
   // Markdown: "preview" is removed; treat as "source" if somehow set (e.g. shared state from an HTML file).
   const fileViewMode: "editor" | "preview" | "source" = isPreviewable
-    ? (lang !== "markdown" && previewableViewMode === "editor" ? "preview"
-      : lang === "markdown" && previewableViewMode === "preview" ? "source"
-      : previewableViewMode)
+    ? lang !== "markdown" && previewableViewMode === "editor"
+      ? "preview"
+      : lang === "markdown" && previewableViewMode === "preview"
+        ? "source"
+        : previewableViewMode
     : "source";
   // Derived effective view mode — diff takes priority when active and available.
   const viewMode: "editor" | "preview" | "source" | "diff" =
@@ -529,7 +614,8 @@ function FileViewerBody({ open, conversationId, path, onClose, onNavigateTo, per
   // A measured width of 0 (pre-layout, or jsdom) is indistinguishable from
   // "unknown", so treat null/zero as wide enough — only a real sub-threshold
   // measurement hides the toggle, so it never flickers off before layout.
-  const splitToggleAvailable = contentWidth === null || contentWidth === 0 || contentWidth >= MONACO_SPLIT_BREAKPOINT;
+  const splitToggleAvailable =
+    contentWidth === null || contentWidth === 0 || contentWidth >= MONACO_SPLIT_BREAKPOINT;
   useEffect(() => {
     if (viewMode !== "editor") setIsEditorDirty(false);
     // Skip on mount — only clear when the user actively switches modes.
@@ -548,15 +634,18 @@ function FileViewerBody({ open, conversationId, path, onClose, onNavigateTo, per
     const wantDiff = diffActive && isDiffAvailable;
     const hasDiff = searchParams.has("diff");
     if (wantDiff === hasDiff) return; // already in sync — no navigate needed
-    setSearchParams((prev) => {
-      const next = new URLSearchParams(prev);
-      if (wantDiff) {
-        next.set("diff", "1");
-      } else {
-        next.delete("diff");
-      }
-      return next;
-    }, { replace: true });
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (wantDiff) {
+          next.set("diff", "1");
+        } else {
+          next.delete("diff");
+        }
+        return next;
+      },
+      { replace: true },
+    );
   }, [diffActive, isDiffAvailable, open]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Toolbar actions, declared once and rendered two ways: inline icon buttons
@@ -576,18 +665,34 @@ function FileViewerBody({ open, conversationId, path, onClose, onNavigateTo, per
   };
   const toolbarActions: ToolbarAction[] = [];
   if (isPreviewable && viewMode !== "diff") {
-    const previewLabel = lang === "markdown"
-      ? (viewMode === "editor" ? "Source view" : "Rich text editor")
-      : viewMode === "preview" ? "View source" : "View preview";
+    const previewLabel =
+      lang === "markdown"
+        ? viewMode === "editor"
+          ? "Source view"
+          : "Rich text editor"
+        : viewMode === "preview"
+          ? "View source"
+          : "View preview";
     toolbarActions.push({
       key: "preview",
       label: previewLabel,
-      icon: lang === "markdown"
-        ? viewMode === "editor" ? <CodeIcon className="size-4" /> : <PencilLineIcon className="size-4" />
-        : viewMode === "preview" ? <CodeIcon className="size-4" /> : <EyeIcon className="size-4" />,
+      icon:
+        lang === "markdown" ? (
+          viewMode === "editor" ? (
+            <CodeIcon className="size-4" />
+          ) : (
+            <PencilLineIcon className="size-4" />
+          )
+        ) : viewMode === "preview" ? (
+          <CodeIcon className="size-4" />
+        ) : (
+          <EyeIcon className="size-4" />
+        ),
       onSelect: () => {
         if (lang === "markdown") {
-          guardDirty(() => setPreviewableViewMode((mode) => (mode === "editor" ? "source" : "editor")));
+          guardDirty(() =>
+            setPreviewableViewMode((mode) => (mode === "editor" ? "source" : "editor")),
+          );
         } else {
           setPreviewableViewMode((mode) => (mode === "preview" ? "source" : "preview"));
         }
@@ -599,7 +704,10 @@ function FileViewerBody({ open, conversationId, path, onClose, onNavigateTo, per
     label: commentsOpen ? "Hide comments" : "Show comments",
     icon: <MessageSquareTextIcon className="size-4" />,
     active: commentsOpen,
-    onSelect: () => { commentsInitializedRef.current = true; setCommentsOpen((prev) => !prev); },
+    onSelect: () => {
+      commentsInitializedRef.current = true;
+      setCommentsOpen((prev) => !prev);
+    },
   });
   if (isDiffAvailable) {
     toolbarActions.push({
@@ -614,7 +722,12 @@ function FileViewerBody({ open, conversationId, path, onClose, onNavigateTo, per
     toolbarActions.push({
       key: "diff-layout",
       label: diffLayout === "unified" ? "Split view" : "Unified view",
-      icon: diffLayout === "unified" ? <Columns2Icon className="size-4" /> : <RowsIcon className="size-4" />,
+      icon:
+        diffLayout === "unified" ? (
+          <Columns2Icon className="size-4" />
+        ) : (
+          <RowsIcon className="size-4" />
+        ),
       onSelect: () => setDiffLayout((l) => (l === "unified" ? "split" : "unified")),
     });
   }
@@ -628,7 +741,9 @@ function FileViewerBody({ open, conversationId, path, onClose, onNavigateTo, per
     toolbarActions.push({
       key: "download",
       label: "Download file",
-      tooltip: fileQuery.data.truncated ? "Download (file was truncated — content may be incomplete)" : "Download",
+      tooltip: fileQuery.data.truncated
+        ? "Download (file was truncated — content may be incomplete)"
+        : "Download",
       icon: <DownloadIcon className="size-4" />,
       onSelect: downloadFile,
     });
@@ -637,7 +752,11 @@ function FileViewerBody({ open, conversationId, path, onClose, onNavigateTo, per
     key: "copy-link",
     label: "Copy link to file",
     tooltip: linkCopied ? "Copied!" : "Copy link",
-    icon: linkCopied ? <CheckIcon className="size-4 text-green-500" /> : <Link2Icon className="size-4" />,
+    icon: linkCopied ? (
+      <CheckIcon className="size-4 text-green-500" />
+    ) : (
+      <Link2Icon className="size-4" />
+    ),
     onSelect: copyFileLink,
   });
 
@@ -690,7 +809,10 @@ function FileViewerBody({ open, conversationId, path, onClose, onNavigateTo, per
 
   const innerContent = (
     <>
-      <div ref={toolbarHeaderRef} className="flex min-w-0 shrink-0 items-center justify-between gap-2 border-b border-border px-4 py-3">
+      <div
+        ref={toolbarHeaderRef}
+        className="flex min-w-0 shrink-0 items-center justify-between gap-2 border-b border-border px-4 py-3"
+      >
         <div className="flex min-w-0 flex-1 items-center gap-2">
           {/* Back button is the dismiss affordance for the mobile full-screen
               overlay only. On desktop the viewer is embedded in the tabbed
@@ -744,11 +866,12 @@ function FileViewerBody({ open, conversationId, path, onClose, onNavigateTo, per
             </div>
           )}
           {/* Always show the file path/name in the toolbar, in every view. */}
-          <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">
-            {path}
-          </span>
+          <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">{path}</span>
         </div>
-        <div className="relative flex min-w-0 items-center justify-end gap-1" data-testid="FILESTOOLBAR">
+        <div
+          className="relative flex min-w-0 items-center justify-end gap-1"
+          data-testid="FILESTOOLBAR"
+        >
           {/* Auto-save status chip (replaces the editor's old Save button).
               Non-idle implies an editable Monaco buffer, so no extra gating.
               Kept outside the responsive switcher — always inline. */}
@@ -756,17 +879,46 @@ function FileViewerBody({ open, conversationId, path, onClose, onNavigateTo, per
             <span
               ref={toolbarChipRef}
               aria-live="polite"
-              title={saveStatus === "offline" ? "Runner offline — your changes will save when it reconnects" : undefined}
+              title={
+                saveStatus === "offline"
+                  ? "Runner offline — your changes will save when it reconnects"
+                  : undefined
+              }
               className={cn(
                 "mr-1 flex shrink-0 items-center gap-1 whitespace-nowrap text-[11px]",
                 saveStatus === "error" ? "text-destructive" : "text-muted-foreground",
               )}
             >
-              {saveStatus === "unsaved" && <><span className="size-1.5 rounded-full bg-muted-foreground/70" />Unsaved</>}
-              {saveStatus === "saving" && <><Loader2Icon className="size-3 animate-spin" />Saving…</>}
-              {saveStatus === "saved" && <><CheckIcon className="size-3 text-green-500" />Saved</>}
-              {saveStatus === "error" && <><AlertTriangleIcon className="size-3" />Save failed</>}
-              {saveStatus === "offline" && <><CloudOffIcon className="size-3" />Unsaved</>}
+              {saveStatus === "unsaved" && (
+                <>
+                  <span className="size-1.5 rounded-full bg-muted-foreground/70" />
+                  Unsaved
+                </>
+              )}
+              {saveStatus === "saving" && (
+                <>
+                  <Loader2Icon className="size-3 animate-spin" />
+                  Saving…
+                </>
+              )}
+              {saveStatus === "saved" && (
+                <>
+                  <CheckIcon className="size-3 text-green-500" />
+                  Saved
+                </>
+              )}
+              {saveStatus === "error" && (
+                <>
+                  <AlertTriangleIcon className="size-3" />
+                  Save failed
+                </>
+              )}
+              {saveStatus === "offline" && (
+                <>
+                  <CloudOffIcon className="size-3" />
+                  Unsaved
+                </>
+              )}
             </span>
           )}
           {/* Responsive action switcher: inline icon buttons until they no
@@ -777,18 +929,17 @@ function FileViewerBody({ open, conversationId, path, onClose, onNavigateTo, per
             {toolbarCollapsed ? (
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-sm"
-                    aria-label="More actions"
-                  >
+                  <Button type="button" variant="ghost" size="icon-sm" aria-label="More actions">
                     <MoreHorizontalIcon className="size-4" />
                   </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end" className="w-auto min-w-40">
                   {toolbarActions.map((action) => (
-                    <DropdownMenuItem key={action.key} className="whitespace-nowrap" onSelect={action.onSelect}>
+                    <DropdownMenuItem
+                      key={action.key}
+                      className="whitespace-nowrap"
+                      onSelect={action.onSelect}
+                    >
                       {action.icon}
                       {action.tooltip ?? action.label}
                     </DropdownMenuItem>
@@ -824,13 +975,14 @@ function FileViewerBody({ open, conversationId, path, onClose, onNavigateTo, per
 
       <div className="min-h-0 flex-1 flex flex-col md:flex-row overflow-hidden">
         <div ref={contentAreaRef} className="flex-1 overflow-y-auto min-w-0">
-        {isDeletedFile && viewMode !== "diff" ? (
+          {isDeletedFile && viewMode !== "diff" ? (
             <div className="flex flex-col items-center justify-center gap-2 p-8 text-sm text-muted-foreground">
               <Trash2Icon className="size-5 opacity-40" />
               <span>This file has been deleted.</span>
               {isDiffAvailable && (
                 <span className="text-xs">
-                  Click <FileDiffIcon className="inline size-3.5 align-text-bottom" /> to view its previous content.
+                  Click <FileDiffIcon className="inline size-3.5 align-text-bottom" /> to view its
+                  previous content.
                 </span>
               )}
             </div>
@@ -841,24 +993,32 @@ function FileViewerBody({ open, conversationId, path, onClose, onNavigateTo, per
             // wrong content and mis-set EOL (onMount runs once). Once data is
             // present, pass the real before/after through (legitimate nulls and all).
             !diffQuery.data ? (
-              <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">Loading diff…</div>
+              <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+                Loading diff…
+              </div>
             ) : (
-            <Suspense fallback={<div className="flex items-center justify-center p-8 text-muted-foreground text-sm">Loading diff…</div>}>
-              {/* key={path} remounts per file so onMount re-runs (EOL + comment
+              <Suspense
+                fallback={
+                  <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+                    Loading diff…
+                  </div>
+                }
+              >
+                {/* key={path} remounts per file so onMount re-runs (EOL + comment
                   wiring re-applied) and `ready` resets while the new grammar loads. */}
-              <MonacoDiffViewer
-                key={path}
-                before={diffQuery.data.before}
-                after={diffQuery.data.after}
-                path={path}
-                layout={diffLayout}
-                conversationId={conversationId}
-                comments={openComments}
-                activeSelection={activeSelection}
-                onSetActiveSelection={handleSetActiveSelection}
-                pendingBodyRef={pendingBodyRef}
-              />
-            </Suspense>
+                <MonacoDiffViewer
+                  key={path}
+                  before={diffQuery.data.before}
+                  after={diffQuery.data.after}
+                  path={path}
+                  layout={diffLayout}
+                  conversationId={conversationId}
+                  comments={openComments}
+                  activeSelection={activeSelection}
+                  onSetActiveSelection={handleSetActiveSelection}
+                  pendingBodyRef={pendingBodyRef}
+                />
+              </Suspense>
             )
           ) : (
             <CodeViewer
@@ -888,13 +1048,16 @@ function FileViewerBody({ open, conversationId, path, onClose, onNavigateTo, per
             onCopyCommentLink={copyCommentLink}
             onAddComment={(body) => {
               if (activeSelection == null) return;
-              addComment.mutate({
-                path,
-                start_index: activeSelection.start_index,
-                end_index: activeSelection.end_index,
-                body,
-                anchor_content: activeSelection.anchor_content,
-              }, { onSuccess: () => setActiveSelection(null) });
+              addComment.mutate(
+                {
+                  path,
+                  start_index: activeSelection.start_index,
+                  end_index: activeSelection.end_index,
+                  body,
+                  anchor_content: activeSelection.anchor_content,
+                },
+                { onSuccess: () => setActiveSelection(null) },
+              );
             }}
             canAddress={canEdit && sender !== null}
             onAddressAll={() => {
@@ -911,32 +1074,58 @@ function FileViewerBody({ open, conversationId, path, onClose, onNavigateTo, per
               });
               // Sync the selected comment into the URL so the address bar is
               // always shareable. AppShell clears this param when the viewer closes.
-              setSearchParams((prev) => {
-                const next = new URLSearchParams(prev);
-                next.set("comment", comment.id);
-                return next;
-              }, { replace: true });
+              setSearchParams(
+                (prev) => {
+                  const next = new URLSearchParams(prev);
+                  next.set("comment", comment.id);
+                  return next;
+                },
+                { replace: true },
+              );
             }}
             onEditComment={(id, body) => updateComment.mutate({ commentId: id, body })}
             onDeleteComment={(id) => {
               deleteComment.mutate(id);
               const deleted = [...openComments, ...addressedComments].find((c) => c.id === id);
-              if (deleted && activeSelection?.start_index === deleted.start_index && activeSelection?.end_index === deleted.end_index) setActiveSelection(null);
+              if (
+                deleted &&
+                activeSelection?.start_index === deleted.start_index &&
+                activeSelection?.end_index === deleted.end_index
+              )
+                setActiveSelection(null);
             }}
             addressPending={sender?.isPending ?? false}
             canEdit={canEdit}
           />
         )}
       </div>
-      <Dialog open={pendingAction !== null} onOpenChange={(open) => { if (!open) setPendingAction(null); }}>
+      <Dialog
+        open={pendingAction !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingAction(null);
+        }}
+      >
         <DialogContent showCloseButton={false}>
           <DialogHeader>
             <DialogTitle>Unsaved changes</DialogTitle>
-            <DialogDescription>Your edits will be lost if you leave without saving.</DialogDescription>
+            <DialogDescription>
+              Your edits will be lost if you leave without saving.
+            </DialogDescription>
           </DialogHeader>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setPendingAction(null)}>Keep editing</Button>
-            <Button variant="destructive" onClick={() => { setIsEditorDirty(false); pendingAction?.(); setPendingAction(null); }}>Discard changes</Button>
+            <Button variant="outline" onClick={() => setPendingAction(null)}>
+              Keep editing
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={() => {
+                setIsEditorDirty(false);
+                pendingAction?.();
+                setPendingAction(null);
+              }}
+            >
+              Discard changes
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -945,7 +1134,10 @@ function FileViewerBody({ open, conversationId, path, onClose, onNavigateTo, per
 
   if (frameless) {
     return (
-      <div data-testid="file-viewer" className="flex flex-col flex-1 min-h-0 overflow-hidden bg-card">
+      <div
+        data-testid="file-viewer"
+        className="flex flex-col flex-1 min-h-0 overflow-hidden bg-card"
+      >
         {innerContent}
       </div>
     );

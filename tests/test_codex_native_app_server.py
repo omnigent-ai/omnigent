@@ -686,17 +686,37 @@ def test_policy_hooks_timeout_outlasts_the_hooks_request_budget() -> None:
     """
     settings = _codex_policy_hooks_settings(Path("/b"), "/venv/bin/python")
     hooks = settings["hooks"]
-    # Both phases register the same command hook; assert the timeout on each so
-    # neither can silently regress independently.
+    # All registered phases share the same command hook; assert the timeout on
+    # each so none can silently regress independently. UserPromptSubmit gates
+    # the request phase and also blocks on a server-side ASK park, so it needs
+    # the same generous timeout as the tool phases.
     pre = hooks["PreToolUse"][0]["hooks"][0]
     post = hooks["PostToolUse"][0]["hooks"][0]
+    prompt = hooks["UserPromptSubmit"][0]["hooks"][0]
     assert pre["timeout"] == _POLICY_HOOK_TIMEOUT_SECONDS
     assert post["timeout"] == _POLICY_HOOK_TIMEOUT_SECONDS
+    assert prompt["timeout"] == _POLICY_HOOK_TIMEOUT_SECONDS
     # The invariant that actually prevents the bug: codex must wait at least as
     # long as the hook itself will block on the server. If this fails (e.g. the
     # constant is dropped back to 30), the gate becomes advisory for every
     # native tool call, sub-agent or not.
     assert _POLICY_HOOK_TIMEOUT_SECONDS >= _EVALUATE_POLICY_TIMEOUT_S
+
+
+def test_policy_hooks_register_user_prompt_submit() -> None:
+    """The request-phase gate must be wired onto UserPromptSubmit.
+
+    For native sessions the server-level ``_evaluate_input_policy`` skips
+    message events, so this hook is the sole REQUEST gate. If it were dropped
+    from ``hooks.json``, native prompts (web-UI-injected and direct-terminal
+    alike) would reach the model with no request-phase policy at all.
+    """
+    settings = _codex_policy_hooks_settings(Path("/b"), "/venv/bin/python")
+    hooks = settings["hooks"]
+    assert "UserPromptSubmit" in hooks
+    prompt_hook = hooks["UserPromptSubmit"][0]["hooks"][0]
+    # Same evaluate-policy command as the tool phases.
+    assert prompt_hook["command"] == hooks["PreToolUse"][0]["hooks"][0]["command"]
 
 
 class TestPinCodexConfigModel:

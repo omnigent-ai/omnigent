@@ -6,6 +6,7 @@ build-backend = "hatchling.build"
 name = "omnigent-ui-sdk"
 version = "0.1.0"
 description = "Terminal UI components (Rich + prompt_toolkit) for building omnigent frontends"
+readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     # Version-locked (==) with the sibling client SDK; released together

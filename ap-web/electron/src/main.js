@@ -201,9 +201,7 @@ function registerWebAuthn() {
     // Label each account by whatever name fields the credential carries;
     // the index-based fallback is display-only (the answer is always the
     // credentialId, never the label).
-    const labels = accounts.map(
-      (a, i) => a.userName || a.userDisplayName || `Account ${i + 1}`,
-    );
+    const labels = accounts.map((a, i) => a.userName || a.userDisplayName || `Account ${i + 1}`);
     void dialog
       .showMessageBox(win, {
         type: "question",
@@ -877,8 +875,7 @@ function createWindow(targetUrl, opts = {}) {
   // ephemeral windows start on the setup page so the user can enter the
   // alternate server, and normal windows fall back to the saved server.
   const candidate =
-    explicit ??
-    (ephemeral ? null : typeof saved === "string" && saved.length > 0 ? saved : null);
+    explicit ?? (ephemeral ? null : typeof saved === "string" && saved.length > 0 ? saved : null);
   // A candidate that doesn't parse (hand-edited/corrupt settings.json) is
   // treated as "no server configured" rather than crashing window creation.
   const destinationOrigin = candidate ? originOf(candidate) : null;
@@ -1013,8 +1010,7 @@ function attachContextMenu(win) {
       }
       template.push({
         label: "Add to Dictionary",
-        click: () =>
-          win.webContents.session.addWordToSpellCheckerDictionary(params.misspelledWord),
+        click: () => win.webContents.session.addWordToSpellCheckerDictionary(params.misspelledWord),
       });
       template.push({ type: "separator" });
     }
@@ -1726,7 +1722,6 @@ if (!gotLock) {
     registerIpc();
     buildMenu();
     createWindow();
-
 
     app.on("activate", () => {
       // macOS: re-create the window when the dock icon is clicked and none open.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -17,8 +18,11 @@ from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner.resource_registry import (
     CODEX_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
+    TerminalExitEvent,
+    TerminalLifecycle,
 )
 from omnigent.terminals import TerminalRegistry
+from tests.runner.helpers import make_test_terminal_instance
 
 
 @dataclass
@@ -156,13 +160,7 @@ async def test_terminal_resource_role_is_private_and_cleared_on_close(
     """
     terminal_registry = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminal_registry)
-    instance = TerminalInstance(
-        name="codex",
-        session_key="main",
-        socket_path=tmp_path / "codex-main.sock",
-        private_dir=tmp_path / "codex-main",
-        running=True,
-    )
+    instance = make_test_terminal_instance("codex", "main", tmp_path)
 
     async def _fake_launch(
         conversation_id: str,
@@ -206,7 +204,7 @@ async def test_terminal_resource_role_is_private_and_cleared_on_close(
     monkeypatch.setattr(terminal_registry, "launch", _fake_launch)
     monkeypatch.setattr(terminal_registry, "close", _fake_close)
 
-    view = await registry.launch_terminal(
+    view = await registry.launch_auxiliary_terminal(
         "conv_codex",
         "codex",
         "main",
@@ -242,13 +240,7 @@ async def test_terminal_resource_role_moves_on_transfer(
     """
     terminal_registry = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminal_registry)
-    instance = TerminalInstance(
-        name="codex",
-        session_key="main",
-        socket_path=tmp_path / "codex-main.sock",
-        private_dir=tmp_path / "codex-main",
-        running=True,
-    )
+    instance = make_test_terminal_instance("codex", "main", tmp_path)
 
     async def _fake_launch(
         conversation_id: str,
@@ -284,7 +276,7 @@ async def test_terminal_resource_role_moves_on_transfer(
     monkeypatch.setattr(terminal_registry, "launch", _fake_launch)
     monkeypatch.setattr(instance, "set_conversation_link", _no_status_link)
 
-    view = await registry.launch_terminal(
+    view = await registry.launch_auxiliary_terminal(
         "conv_old",
         "codex",
         "main",
@@ -297,6 +289,69 @@ async def test_terminal_resource_role_moves_on_transfer(
     assert moved is not None
     assert registry.terminal_resource_role("conv_old", view.id) is None
     assert registry.terminal_resource_role("conv_new", view.id) == CODEX_NATIVE_TERMINAL_ROLE
+
+
+@pytest.mark.asyncio
+async def test_terminal_lifecycle_cannot_change_after_observe(tmp_path: Path) -> None:
+    """A terminal cannot silently switch between auxiliary and required lifecycle."""
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("worker", "main", tmp_path)
+
+    await registry.observe_auxiliary_terminal("conv_lifecycle", "worker", "main", instance)
+
+    with pytest.raises(RuntimeError, match="already observed as auxiliary"):
+        await registry.observe_required_terminal("conv_lifecycle", "worker", "main", instance)
+
+
+@pytest.mark.asyncio
+async def test_auxiliary_terminal_exit_publishes_resource_exit_only(tmp_path: Path) -> None:
+    """Auxiliary terminal exit is reported with auxiliary lifecycle metadata."""
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("sidecar", "s1", tmp_path)
+    instance.command = "worker-cli"
+    instance.args = ["--verbose"]
+    instance.launch_cwd = str(tmp_path)
+    instance._remember_pane_snapshot("\x1b[31mstartup failed\x1b[0m\nretry login")
+    terminal_registry._by_conversation.setdefault("conv_exit", {})[("sidecar", "s1")] = instance
+    exits: list[TerminalExitEvent] = []
+    exit_published = asyncio.Event()
+    callbacks: dict[str, object] = {}
+
+    def _publish_exit(event: TerminalExitEvent) -> None:
+        exits.append(event)
+        exit_published.set()
+
+    def _capture_watcher(
+        on_idle: object | None = None,
+        *,
+        on_activity: object | None = None,
+        on_exit: object | None = None,
+        idle_threshold_s: float | None = None,
+        poll_interval_s: float | None = None,
+        replace: bool = False,
+    ) -> None:
+        del on_idle, on_activity, idle_threshold_s, poll_interval_s
+        callbacks["on_exit"] = on_exit
+        callbacks["replace"] = replace
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
+    registry.set_terminal_exit_publisher(_publish_exit)
+
+    await registry.observe_auxiliary_terminal("conv_exit", "sidecar", "s1", instance)
+    on_exit = callbacks["on_exit"]
+    assert callable(on_exit)
+    on_exit()
+    await asyncio.wait_for(exit_published.wait(), timeout=1.0)
+
+    assert [event.lifecycle for event in exits] == [TerminalLifecycle.AUXILIARY]
+    assert exits[0].terminal_id == "terminal_sidecar_s1"
+    assert exits[0].command == "worker-cli"
+    assert exits[0].args_count == 1
+    assert exits[0].cwd == str(tmp_path)
+    assert exits[0].last_output == "startup failed\nretry login"
+    assert terminal_registry.get("conv_exit", "sidecar", "s1") is None
 
 
 def test_get_resource_finds_default() -> None:

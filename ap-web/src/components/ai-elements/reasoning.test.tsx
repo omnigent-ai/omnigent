@@ -18,15 +18,11 @@ describe("Reasoning — auto-expand", () => {
     render(
       <Reasoning isStreaming={true}>
         <ReasoningTrigger />
-        <ReasoningContent>
-          {"![leak](https://attacker.example/pixel.png)"}
-        </ReasoningContent>
+        <ReasoningContent>{"![leak](https://attacker.example/pixel.png)"}</ReasoningContent>
       </Reasoning>,
     );
 
-    expect(
-      document.querySelector('img[src^="https://attacker.example"]'),
-    ).toBeNull();
+    expect(document.querySelector('img[src^="https://attacker.example"]')).toBeNull();
     expect(await screen.findByText("[Image blocked: leak]")).toBeTruthy();
   });
 
@@ -43,9 +39,7 @@ describe("Reasoning — auto-expand", () => {
 
   it("renders the settled 'Thought for...' label without the shimmer", () => {
     renderReasoning(false);
-    expect(screen.getByText("Thought for a few seconds").className).not.toContain(
-      "text-shimmer",
-    );
+    expect(screen.getByText("Thought for a few seconds").className).not.toContain("text-shimmer");
   });
 
   it("renders the trigger in the closed state when isStreaming=false on mount", () => {

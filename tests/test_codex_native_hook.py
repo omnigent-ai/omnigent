@@ -225,6 +225,49 @@ def test_pre_tool_use_converts_posts_and_returns_deny(
     assert captured.err == ""
 
 
+def test_user_prompt_submit_converts_posts_and_blocks(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A UserPromptSubmit hook converts to PHASE_REQUEST and maps DENY to block.
+
+    This is the request-phase enforcement path for native Codex sessions
+    (the server-level ``_evaluate_input_policy`` skips native message
+    events). The prompt rides in ``event.data.text``; a DENY maps to the
+    top-level ``decision: "block"`` contract — NOT ``permissionDecision`` —
+    which drops the prompt before the model sees it. A break here means a
+    blocked prompt would still reach the model.
+    """
+    _DenyHttpxClient.captured = {}
+    write_policy_hook_config(
+        bridge_dir,
+        ap_server_url="http://127.0.0.1:8787",
+        ap_auth_headers={"Authorization": "Bearer test-token"},
+    )
+    monkeypatch.setattr(codex_native_hook.httpx, "Client", _DenyHttpxClient)
+
+    exit_code = _run_hook(
+        bridge_dir,
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "delete the prod database",
+        },
+        monkeypatch,
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    sent = _DenyHttpxClient.captured["json"]
+    assert sent["event"]["type"] == "PHASE_REQUEST"
+    assert sent["event"]["data"] == {"text": "delete the prod database"}
+    # DENY → top-level decision/reason block (not permissionDecision).
+    result = json.loads(captured.out)
+    assert result == {"decision": "block", "reason": "rm blocked by admin policy"}
+    assert captured.err == ""
+
+
 def test_pre_tool_use_stamps_model_from_config(
     bridge_dir: Path,
     monkeypatch: pytest.MonkeyPatch,

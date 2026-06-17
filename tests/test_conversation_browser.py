@@ -177,7 +177,7 @@ def test_conversation_url_maps_workspace_hosted_server_to_ui_mount(tmp_path, mon
 
     The server base is the API proxy (``/api/2.0/omnigent``) — linking
     there returns JSON, not the web UI. The browser URL must land on
-    ``/ml/omnigent`` and carry ``?o=<org>`` recorded by ``omnigent
+    ``/omnigent`` and carry ``?o=<org>`` recorded by ``omnigent
     login`` so multi-org workspaces open in the right one.
     """
     from omnigent.cli_auth import store_databricks_auth
@@ -196,7 +196,7 @@ def test_conversation_url_maps_workspace_hosted_server_to_ui_mount(tmp_path, mon
 
     url = conversation_url(server, "conv_abc123")
 
-    assert url == ("https://example.databricks.com/ml/omnigent/c/conv_abc123?o=2850744067564480")
+    assert url == ("https://example.databricks.com/omnigent/c/conv_abc123?o=2850744067564480")
 
 
 def test_conversation_url_workspace_hosted_without_org_record(tmp_path, monkeypatch) -> None:
@@ -214,7 +214,7 @@ def test_conversation_url_workspace_hosted_without_org_record(tmp_path, monkeypa
 
     url = conversation_url("https://example.databricks.com/api/2.0/omnigent", "conv_abc123")
 
-    assert url == "https://example.databricks.com/ml/omnigent/c/conv_abc123"
+    assert url == "https://example.databricks.com/omnigent/c/conv_abc123"
 
 
 def test_conversation_url_plain_server_unchanged(tmp_path, monkeypatch) -> None:

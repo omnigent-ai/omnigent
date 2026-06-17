@@ -7,10 +7,7 @@
 
 import { useCallback, useEffect, useRef } from "react";
 import { useSyncExternalStore } from "react";
-import {
-  readSessionWorkspaceState,
-  writeSessionWorkspaceState,
-} from "@/lib/sessionWorkspaceState";
+import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
 const MIN_WIDTH_PX = 240;
 const MAX_WIDTH_RATIO = 0.6;
@@ -84,7 +81,8 @@ function subscribe(cb: () => void): () => void {
 function loadSession(sessionId: string | null): void {
   if (sessionId === currentSessionId) return;
   currentSessionId = sessionId;
-  preferredWidth = sessionId !== null ? readSessionWorkspaceState(sessionId).widthPx ?? null : null;
+  preferredWidth =
+    sessionId !== null ? (readSessionWorkspaceState(sessionId).widthPx ?? null) : null;
   setStoredWidthRaw(preferredWidth);
 }
 
@@ -130,7 +128,8 @@ export function useResizableInlinePanel(sessionId: string | null, minWidthPx = M
   // keyboard handlers mutate in place).
   let effectiveRaw = raw;
   if (sessionId !== currentSessionId) {
-    effectiveRaw = sessionId !== null ? readSessionWorkspaceState(sessionId).widthPx ?? null : null;
+    effectiveRaw =
+      sessionId !== null ? (readSessionWorkspaceState(sessionId).widthPx ?? null) : null;
   }
   const resolvedWidth = clamp(effectiveRaw ?? defaultWidthPx(), minWidthPx);
   const dragging = useRef(false);

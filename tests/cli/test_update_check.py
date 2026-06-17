@@ -11,6 +11,7 @@ from unittest.mock import patch
 import pytest
 
 from omnigent.update_check import (
+    _STALENESS_SECONDS,
     _CacheEntry,
     _fetch_and_count,
     _find_repo_root,
@@ -486,45 +487,6 @@ def test_check_failure_caches_zero(
 
 
 # ------------------------------------------------------------------
-# _should_skip_update_check (in cli.py)
-# ------------------------------------------------------------------
-
-
-def test_should_skip_help_flags() -> None:
-    """Skip for ``--help``, ``-h``, ``--version``, ``version``."""
-    from omnigent.cli import _should_skip_update_check
-
-    assert _should_skip_update_check(["--help"])
-    assert _should_skip_update_check(["-h"])
-    assert _should_skip_update_check(["--version"])
-    assert _should_skip_update_check(["version"])
-
-
-def test_should_skip_internal_subcommands() -> None:
-    """Skip for TUI-internal subcommands."""
-    from omnigent.cli import _should_skip_update_check
-
-    assert _should_skip_update_check(["pane-split"])
-    assert _should_skip_update_check(["pane-picker"])
-
-
-def test_should_skip_empty_argv() -> None:
-    """Skip when argv is empty (bare ``omnigent``)."""
-    from omnigent.cli import _should_skip_update_check
-
-    assert _should_skip_update_check([])
-
-
-def test_should_not_skip_run() -> None:
-    """Do NOT skip for normal subcommands like ``run``."""
-    from omnigent.cli import _should_skip_update_check
-
-    assert not _should_skip_update_check(["run", "agent.yaml"])
-    assert not _should_skip_update_check(["server"])
-    assert not _should_skip_update_check(["attach"])
-
-
-# ------------------------------------------------------------------
 # Installed-wheel path
 # ------------------------------------------------------------------
 
@@ -535,6 +497,7 @@ import sys  # noqa: E402
 from omnigent.update_check import (  # noqa: E402
     _build_upgrade_suggestion,
     _InstalledWheelInfo,
+    _pip_invocation,
     _read_build_info,
     _read_installed_wheel_info,
     _run_installed_wheel_check,
@@ -584,18 +547,17 @@ def _block_build_info_import(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _no_tty_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Default ``_stdin_is_tty`` to ``False`` so tests never block on a prompt.
+def _no_real_background_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub the detached PyPI refresh so tests never spawn a real process.
 
-    Whether ``sys.stdin.isatty()`` actually returns ``True`` depends
-    on how pytest itself was invoked (``pytest -s`` / a CI runner
-    with no PTY / etc.) — this fixture makes the wheel-check tests
-    deterministic regardless. Tests that exercise the interactive
-    upgrade-prompt path explicitly override this with
-    ``monkeypatch.setattr("omnigent.update_check._stdin_is_tty",
-    lambda: True)`` inside the test body.
+    The wheel-check path fires :func:`_spawn_background_refresh` whenever
+    its cached "latest version" is missing or stale. Left un-stubbed that
+    would launch a ``python -c`` subprocess (and hit the network) during
+    the test run. Replacing it with a no-op keeps the wheel-check tests
+    hermetic; tests that assert the refresh *was* triggered patch it with
+    their own recorder, which wins over this default.
     """
-    monkeypatch.setattr("omnigent.update_check._stdin_is_tty", lambda: False)
+    monkeypatch.setattr("omnigent.update_check._spawn_background_refresh", lambda: None)
 
 
 # A git URL with a recognizable host/path so assertions can match a
@@ -929,11 +891,10 @@ def test_build_upgrade_suggestion_matrix(
 ) -> None:
     """Upgrade-command formatting and runnable flag match the install shape.
 
-    The ``runnable`` half of the assertion guards the interactive
-    "Run this now?" prompt: if a prose-fallback row ever flipped to
-    runnable=True, ``_print_install_notice`` would try to
-    ``subprocess.run`` the literal string "reinstall omnigent from
-    ...", which would error or worse (if a binary named "reinstall"
+    The ``runnable`` half of the assertion guards ``omni upgrade``: if a
+    prose-fallback row ever flipped to runnable=True, the command would
+    try to ``subprocess.run`` the literal string "reinstall omnigent
+    from ...", which would error or worse (if a binary named "reinstall"
     happened to exist on PATH).
     """
     info = _InstalledWheelInfo(
@@ -953,28 +914,80 @@ def test_build_upgrade_suggestion_matrix(
     assert suggestion.runnable is expected_runnable
 
 
-def test_wheel_check_no_nag_for_fresh_install(
+def test_pip_invocation_pins_to_running_interpreter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``_pip_invocation`` targets ``sys.executable`` (with a bare fallback).
+
+    Guards the PATH gotcha: a bare ``pip`` resolves against ``PATH`` and can
+    upgrade a *different* environment than the one running ``omni``. Pinning
+    to ``<sys.executable> -m pip`` keeps the upgrade in the running
+    interpreter's environment.
+    """
+    monkeypatch.setattr(sys, "executable", "/opt/venv/bin/python")
+    assert _pip_invocation() == "/opt/venv/bin/python -m pip"
+    # An interpreter path with a space is shell-quoted so it survives the
+    # ``shlex.split`` in ``_run_upgrade_command``.
+    monkeypatch.setattr(sys, "executable", "/Applications/My App/python")
+    assert _pip_invocation() == "'/Applications/My App/python' -m pip"
+    # No interpreter path (frozen / embedded) → bare ``pip`` fallback.
+    monkeypatch.setattr(sys, "executable", "")
+    assert _pip_invocation() == "pip"
+
+
+def test_pip_upgrade_suggestions_use_running_interpreter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both pip suggestions (registry + VCS) embed ``<python> -m pip``."""
+    monkeypatch.setattr(sys, "executable", "/opt/venv/bin/python")
+
+    def _info(vcs_url: str | None) -> _InstalledWheelInfo:
+        return _InstalledWheelInfo(
+            install_time_epoch=0.0,
+            installer="pip",
+            vcs_url=vcs_url,
+            commit_sha=None,
+            is_editable=False,
+            package_version="0.1.0",
+            detected_installer="pip",
+        )
+
+    assert (
+        _build_upgrade_suggestion(_info(None)).command
+        == "/opt/venv/bin/python -m pip install -U omnigent"
+    )
+    assert (
+        _build_upgrade_suggestion(_info(_FAKE_GIT_URL)).command
+        == f"/opt/venv/bin/python -m pip install --force-reinstall {_FAKE_GIT_URL}"
+    )
+
+
+def _point_cache_at(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Redirect the update-check cache at the per-test tmp dir."""
+    monkeypatch.setattr("omnigent.update_check._CACHE_DIR", tmp_path)
+    monkeypatch.setattr("omnigent.update_check._CACHE_FILE", tmp_path / ".update_check.json")
+
+
+def test_wheel_check_no_nag_when_up_to_date(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Install < 1 day old → no nag.
+    """Latest PyPI release == installed version → no nag.
 
-    If this fails (a nag is printed), the threshold is wrong or the
-    age math is inverted — either way the user gets nagged on every
-    invocation of a fresh install, which is the worst UX.
+    The whole point of the PyPI-based check: a fresh, fully-up-to-date
+    install must never be nagged, no matter how long ago it was
+    installed. (The old install-age check failed exactly here.)
     """
     monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
-    install_time = time.time() - 3600  # 1 hour ago — well under 1 day
-    dist = _write_fake_dist_info(
-        tmp_path,
-        installer="uv",
-        direct_url={
-            "url": _FAKE_GIT_URL,
-            "vcs_info": {"vcs": "git", "commit_id": _FAKE_COMMIT},
-        },
-        uv_cache={"timestamp": {"secs_since_epoch": int(install_time)}},
+    _point_cache_at(tmp_path, monkeypatch)
+    _write_cache(
+        _CacheEntry(
+            last_check_epoch=time.time(),
+            commits_behind=0,
+            kind="wheel",
+            latest_version="0.1.0",  # == the fake dist's version
+        )
     )
+    dist = _write_fake_dist_info(tmp_path, installer="uv")
     monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
 
     _run_installed_wheel_check()
@@ -982,33 +995,67 @@ def test_wheel_check_no_nag_for_fresh_install(
     assert capsys.readouterr().err == ""
 
 
-def test_wheel_check_nag_for_stale_install_uv_git(
+def test_wheel_check_nags_when_newer_release_available(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """uv git install ≥ 1 day old → nag with the correct uv reinstall command."""
+    """Cached latest > installed → nag naming the release and ``omni upgrade``."""
     monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
-    install_time = time.time() - 5 * 86400  # 5 days ago
-    dist = _write_fake_dist_info(
-        tmp_path,
-        installer="uv",
-        direct_url={
-            "url": _FAKE_GIT_URL,
-            "vcs_info": {"vcs": "git", "commit_id": _FAKE_COMMIT},
-        },
-        uv_cache={"timestamp": {"secs_since_epoch": int(install_time)}},
+    _point_cache_at(tmp_path, monkeypatch)
+    _write_cache(
+        _CacheEntry(
+            last_check_epoch=time.time(),
+            commits_behind=0,
+            kind="wheel",
+            latest_version="0.2.0",
+        )
     )
+    dist = _write_fake_dist_info(tmp_path, installer="uv")
     monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
 
     _run_installed_wheel_check()
 
     err = _strip_rich_panel(capsys.readouterr().err)
-    # The nag must surface (a) the install age and (b) the right
-    # upgrade command. Asserting on both proves the message-formatting
-    # pipeline runs end to end — not just that *something* was printed.
-    assert "5 day(s) old" in err
-    assert f"uv tool install --reinstall {_FAKE_GIT_URL}" in err
+    # Names the new release, the installed version, and the command —
+    # proves the message pipeline runs end to end.
+    assert "omnigent 0.2.0 is out" in err
+    assert "you have 0.1.0" in err
+    assert "omni upgrade" in err
+    # The notified version is stamped so the nag fires once per release.
+    refreshed = _read_cache()
+    assert refreshed is not None
+    assert refreshed.last_notified_version == "0.2.0"
+
+
+def test_wheel_check_fires_once_per_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Already-notified release → silent (no repeat nag).
+
+    Regression for the old behavior people disliked: nagging on every
+    single invocation. Once we've shown the notice for a version, it
+    must stay quiet until an even newer one ships.
+    """
+    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
+    _point_cache_at(tmp_path, monkeypatch)
+    _write_cache(
+        _CacheEntry(
+            last_check_epoch=time.time(),
+            commits_behind=0,
+            kind="wheel",
+            latest_version="0.2.0",
+            last_notified_version="0.2.0",  # already nagged for this one
+        )
+    )
+    dist = _write_fake_dist_info(tmp_path, installer="uv")
+    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+
+    _run_installed_wheel_check()
+
+    assert capsys.readouterr().err == ""
 
 
 def test_wheel_check_bails_for_editable_install(
@@ -1016,15 +1063,18 @@ def test_wheel_check_bails_for_editable_install(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Editable install → no nag even when the dist-info mtime is ancient.
+    """Editable install → no nag and no background refresh.
 
-    Without this guard, dev users who symlinked their venv at the
-    repo and then walked away for a week would get nagged on every
-    invocation — but the right answer is ``git pull``, not
-    ``--reinstall``.
+    There's no PyPI release to compare an editable checkout against —
+    the right answer is ``git pull``, not a reinstall — so the wheel
+    path must bail before it would ever spawn a refresh.
     """
     monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
-    install_time = time.time() - 30 * 86400  # 30 days ago
+    _point_cache_at(tmp_path, monkeypatch)
+    spawned: list[bool] = []
+    monkeypatch.setattr(
+        "omnigent.update_check._spawn_background_refresh", lambda: spawned.append(True)
+    )
     dist = _write_fake_dist_info(
         tmp_path,
         installer="uv",
@@ -1032,13 +1082,13 @@ def test_wheel_check_bails_for_editable_install(
             "url": "file:///Users/me/omnigent",
             "dir_info": {"editable": True},
         },
-        dir_mtime_epoch=install_time,
     )
     monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
 
     _run_installed_wheel_check()
 
     assert capsys.readouterr().err == ""
+    assert spawned == []
 
 
 def test_wheel_check_bails_when_distribution_missing(
@@ -1052,37 +1102,38 @@ def test_wheel_check_bails_when_distribution_missing(
     assert capsys.readouterr().err == ""
 
 
-def test_wheel_check_uses_mtime_when_uv_cache_missing(
+def test_wheel_check_refreshes_when_cache_stale(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """pip git install with old mtime → nag with pip --force-reinstall.
+    """Stale wheel cache → no nag this run, but a background refresh fires.
 
-    Exercises two fallback paths simultaneously: (1) no uv_cache.json,
-    so install time falls back to dist-info mtime; (2) installer is
-    ``pip``, so the upgrade command must use ``pip install
-    --force-reinstall`` rather than uv's incantation.
+    The foreground never blocks on the network; it shows nothing when
+    the cached latest is stale and instead kicks off the detached
+    refresh so the *next* invocation has fresh data.
     """
     monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
-    install_time = time.time() - 7 * 86400  # 7 days ago
-    dist = _write_fake_dist_info(
-        tmp_path,
-        installer="pip",
-        direct_url={
-            "url": _FAKE_GIT_URL,
-            "vcs_info": {"vcs": "git", "commit_id": _FAKE_COMMIT},
-        },
-        # No uv_cache.json — pip doesn't write one.
-        dir_mtime_epoch=install_time,
+    _point_cache_at(tmp_path, monkeypatch)
+    _write_cache(
+        _CacheEntry(
+            last_check_epoch=time.time() - (_STALENESS_SECONDS + 60),
+            commits_behind=0,
+            kind="wheel",
+            latest_version="0.1.0",
+        )
     )
+    spawned: list[bool] = []
+    monkeypatch.setattr(
+        "omnigent.update_check._spawn_background_refresh", lambda: spawned.append(True)
+    )
+    dist = _write_fake_dist_info(tmp_path, installer="uv")
     monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
 
     _run_installed_wheel_check()
 
-    err = _strip_rich_panel(capsys.readouterr().err)
-    assert "7 day(s) old" in err
-    assert f"pip install --force-reinstall {_FAKE_GIT_URL}" in err
+    assert capsys.readouterr().err == ""
+    assert spawned == [True]
 
 
 def test_wheel_check_env_var_disables(
@@ -1097,16 +1148,16 @@ def test_wheel_check_env_var_disables(
     silence the nag.
     """
     monkeypatch.setenv("OMNIGENT_NO_UPDATE_CHECK", "1")
-    install_time = time.time() - 30 * 86400
-    dist = _write_fake_dist_info(
-        tmp_path,
-        installer="uv",
-        direct_url={
-            "url": _FAKE_GIT_URL,
-            "vcs_info": {"vcs": "git", "commit_id": _FAKE_COMMIT},
-        },
-        uv_cache={"timestamp": {"secs_since_epoch": int(install_time)}},
+    _point_cache_at(tmp_path, monkeypatch)
+    _write_cache(
+        _CacheEntry(
+            last_check_epoch=time.time(),
+            commits_behind=0,
+            kind="wheel",
+            latest_version="0.2.0",
+        )
     )
+    dist = _write_fake_dist_info(tmp_path, installer="uv")
     monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
     # No-clone scenario so the dispatcher routes to the wheel path.
     with patch("omnigent.update_check._find_repo_root", return_value=None):
@@ -1115,25 +1166,20 @@ def test_wheel_check_env_var_disables(
     assert capsys.readouterr().err == ""
 
 
-def test_clone_cache_does_not_mask_wheel_path(
+def test_wheel_check_ignores_clone_kind_cache(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A pre-existing clone-kind cache must not silence a wheel-path nag.
+    """A stale clone-kind cache yields no wheel nag, only a refresh.
 
-    Scenario: user previously developed against a clone (so the cache
-    has ``kind="clone"``), then later transitioned to a uv-tool install.
-    The dispatcher routes to the wheel path because there's no .git/;
-    the wheel path doesn't consult the cache, so the cross-kind cache
-    cannot suppress the nag. If this ever fails, the wheel path
-    started reading the cache and would silence nags incorrectly.
+    Scenario: the user developed against a clone (cache ``kind="clone"``)
+    then switched to a uv-tool install. The wheel path must not read a
+    clone-kind cache as a "latest version" signal — it has none — so it
+    shows nothing and kicks off a refresh to repopulate a wheel cache.
     """
     monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
-    cache_file = tmp_path / ".update_check.json"
-    monkeypatch.setattr("omnigent.update_check._CACHE_DIR", tmp_path)
-    monkeypatch.setattr("omnigent.update_check._CACHE_FILE", cache_file)
-    # Fresh clone-kind cache claiming "0 commits behind".
+    _point_cache_at(tmp_path, monkeypatch)
     _write_cache(
         _CacheEntry(
             last_check_epoch=time.time(),
@@ -1142,26 +1188,418 @@ def test_clone_cache_does_not_mask_wheel_path(
             kind="clone",
         )
     )
-
-    install_time = time.time() - 10 * 86400
-    dist_dir = tmp_path / "dist_info_holder"
-    dist_dir.mkdir()
-    dist = _write_fake_dist_info(
-        dist_dir,
-        installer="uv",
-        direct_url={
-            "url": _FAKE_GIT_URL,
-            "vcs_info": {"vcs": "git", "commit_id": _FAKE_COMMIT},
-        },
-        uv_cache={"timestamp": {"secs_since_epoch": int(install_time)}},
+    spawned: list[bool] = []
+    monkeypatch.setattr(
+        "omnigent.update_check._spawn_background_refresh", lambda: spawned.append(True)
     )
+    dist = _write_fake_dist_info(tmp_path, installer="uv")
     monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
     with patch("omnigent.update_check._find_repo_root", return_value=None):
         maybe_show_update_notice()
 
-    err = _strip_rich_panel(capsys.readouterr().err)
-    assert "10 day(s) old" in err
-    assert f"uv tool install --reinstall {_FAKE_GIT_URL}" in err
+    assert capsys.readouterr().err == ""
+    assert spawned == [True]
+
+
+# ------------------------------------------------------------------
+# PyPI version comparison + background refresh
+# ------------------------------------------------------------------
+
+
+def test_is_newer_pep440_ordering() -> None:
+    """``_is_newer`` orders versions by PEP 440, not lexically."""
+    from omnigent.update_check import _is_newer
+
+    assert _is_newer("0.2.0", "0.1.0") is True
+    assert _is_newer("0.10.0", "0.9.0") is True  # lexical "0.10" < "0.9" — must not fool us
+    assert _is_newer("0.1.0", "0.1.0") is False
+    assert _is_newer("0.1.0", "0.2.0") is False
+    # Pre-releases sort below their final release.
+    assert _is_newer("0.2.0", "0.2.0rc1") is True
+    assert _is_newer("0.2.0rc1", "0.2.0") is False
+
+
+def test_is_newer_tolerates_garbage() -> None:
+    """A non-PEP-440 latest never crashes the check."""
+    from omnigent.update_check import _is_newer
+
+    assert _is_newer("not-a-version", "0.1.0") is True  # falls back to != and non-empty
+    assert _is_newer("", "0.1.0") is False
+
+
+class _FakeResp:
+    """Minimal httpx.Response stand-in for the Simple-API parser."""
+
+    def __init__(
+        self,
+        *,
+        status_code: int = 200,
+        content_type: str = "application/vnd.pypi.simple.v1+json",
+        json_body: object | None = None,
+        text: str = "",
+    ) -> None:
+        self.status_code = status_code
+        self.headers = {"content-type": content_type}
+        self._json_body = json_body
+        self.text = text
+
+    def json(self) -> object:
+        if self._json_body is None:
+            raise ValueError("no json body")
+        return self._json_body
+
+
+_INDEX_ENV_VARS = ("OMNIGENT_INDEX_URL", "UV_DEFAULT_INDEX", "UV_INDEX_URL", "PIP_INDEX_URL")
+
+
+def _delenv_index(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset every index env var (plus ``PIP_CONFIG_FILE``)."""
+    for var in (*_INDEX_ENV_VARS, "PIP_CONFIG_FILE"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def _clear_index_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start from the pypi.org default, ignoring the host's real config.
+
+    Unsets the index env vars AND stubs the uv/pip config readers to
+    ``""`` so a developer's real ``~/.config/uv/uv.toml`` / ``pip.conf``
+    (e.g. a corporate mirror) can't leak into tests that assert the
+    default index. Config-file resolution itself is covered by the
+    dedicated ``test_resolve_index_url_from_*`` tests.
+    """
+    _delenv_index(monkeypatch)
+    monkeypatch.setattr("omnigent.update_check._index_from_uv_config", lambda: "")
+    monkeypatch.setattr("omnigent.update_check._index_from_pip_config", lambda: "")
+
+
+def test_fetch_latest_version_pep691_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    """PEP 691 ``versions`` → latest *stable* (pre/dev releases excluded)."""
+    import httpx
+
+    from omnigent.update_check import fetch_latest_version
+
+    _clear_index_env(monkeypatch)
+    captured: dict[str, object] = {}
+
+    def _get(url: str, **kwargs: object) -> _FakeResp:
+        captured["url"] = url
+        captured["headers"] = kwargs.get("headers")
+        return _FakeResp(json_body={"versions": ["0.1.0", "0.2.0", "0.3.0rc1", "0.9.0.dev1"]})
+
+    monkeypatch.setattr(httpx, "get", _get)
+
+    assert fetch_latest_version() == "0.2.0"
+    # Default index + normalized project name + JSON Accept header.
+    assert captured["url"] == "https://pypi.org/simple/omnigent/"
+    assert captured["headers"] == {"Accept": "application/vnd.pypi.simple.v1+json"}
+
+
+def test_fetch_latest_version_from_files_when_no_versions_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An index without a ``versions`` key → derive from wheel/sdist filenames."""
+    import httpx
+
+    from omnigent.update_check import fetch_latest_version
+
+    _clear_index_env(monkeypatch)
+    body = {
+        "files": [
+            {"filename": "omnigent-0.1.0-py3-none-any.whl"},
+            {"filename": "omnigent-0.2.0.tar.gz"},
+            {"filename": "omnigent-0.3.0rc1-py3-none-any.whl"},  # prerelease → excluded
+            {"filename": "not-a-distribution.txt"},  # ignored
+        ]
+    }
+    monkeypatch.setattr(httpx, "get", lambda *_a, **_k: _FakeResp(json_body=body))
+
+    assert fetch_latest_version() == "0.2.0"
+
+
+def test_fetch_latest_version_html_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A PEP 503 HTML index (no JSON) → scrape filenames from the links."""
+    import httpx
+
+    from omnigent.update_check import fetch_latest_version
+
+    _clear_index_env(monkeypatch)
+    html = (
+        "<!DOCTYPE html><html><body>"
+        '<a href="/p/omnigent-0.1.0-py3-none-any.whl#sha256=a">omnigent-0.1.0-py3-none-any.whl</a>'
+        '<a href="/p/omnigent-0.2.0.tar.gz#sha256=b">omnigent-0.2.0.tar.gz</a>'
+        "</body></html>"
+    )
+    monkeypatch.setattr(
+        httpx, "get", lambda *_a, **_k: _FakeResp(content_type="text/html", text=html)
+    )
+
+    assert fetch_latest_version() == "0.2.0"
+
+
+def test_fetch_latest_version_none_when_only_prereleases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only pre-releases available → no stable release, returns ``None``."""
+    import httpx
+
+    from omnigent.update_check import fetch_latest_version
+
+    _clear_index_env(monkeypatch)
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda *_a, **_k: _FakeResp(json_body={"versions": ["0.3.0rc1", "0.9.0.dev1"]}),
+    )
+
+    assert fetch_latest_version() is None
+
+
+def test_fetch_latest_version_include_prereleases(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``include_prereleases=True`` surfaces an rc that the default hides."""
+    import httpx
+
+    from omnigent.update_check import fetch_latest_version
+
+    _clear_index_env(monkeypatch)
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda *_a, **_k: _FakeResp(json_body={"versions": ["0.1.0", "0.1.1rc1"]}),
+    )
+
+    assert fetch_latest_version() == "0.1.0"  # default: stable only
+    assert fetch_latest_version(include_prereleases=True) == "0.1.1rc1"
+
+
+def test_build_upgrade_suggestion_allow_prerelease() -> None:
+    """``allow_prerelease`` appends each installer's allow-pre-releases flag."""
+
+    def _info(installer: str, vcs_url: str | None = None) -> _InstalledWheelInfo:
+        return _InstalledWheelInfo(
+            install_time_epoch=0.0,
+            installer=installer,
+            vcs_url=vcs_url,
+            commit_sha=None,
+            is_editable=False,
+            package_version="0.1.0",
+            detected_installer=installer,
+        )
+
+    # Default (no pre) is unchanged.
+    assert _build_upgrade_suggestion(_info("uv")).command == "uv tool upgrade omnigent"
+    # uv / pip registry installs get the right flag appended.
+    assert (
+        _build_upgrade_suggestion(_info("uv"), allow_prerelease=True).command
+        == "uv tool upgrade omnigent --prerelease allow"
+    )
+    # pip pins the upgrade to the running interpreter (``<python> -m pip``)
+    # so it can't land in some other env whose ``pip`` shadows ours on PATH.
+    assert (
+        _build_upgrade_suggestion(_info("pip"), allow_prerelease=True).command
+        == f"{_pip_invocation()} install -U omnigent --pre"
+    )
+    # VCS install carries the flag too.
+    assert (
+        _build_upgrade_suggestion(
+            _info("uv", vcs_url="git+https://x/omnigent.git"), allow_prerelease=True
+        ).command
+        == "uv tool install --reinstall git+https://x/omnigent.git --prerelease allow"
+    )
+
+
+def test_fetch_latest_version_swallows_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Network error and non-200 both return ``None`` (never raise)."""
+    import httpx
+
+    from omnigent.update_check import fetch_latest_version
+
+    _clear_index_env(monkeypatch)
+
+    def _boom(*_a: object, **_k: object) -> object:
+        raise httpx.ConnectError("offline")
+
+    monkeypatch.setattr(httpx, "get", _boom)
+    assert fetch_latest_version() is None
+
+    monkeypatch.setattr(httpx, "get", lambda *_a, **_k: _FakeResp(status_code=404))
+    assert fetch_latest_version() is None
+
+
+def test_resolve_index_url_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``_resolve_index_url`` follows env precedence and defaults to pypi.org/simple."""
+    from omnigent.update_check import _resolve_index_url
+
+    _clear_index_env(monkeypatch)
+    assert _resolve_index_url() == "https://pypi.org/simple"
+
+    monkeypatch.setenv("PIP_INDEX_URL", "https://pip.example/simple/")
+    assert _resolve_index_url() == "https://pip.example/simple"
+
+    # uv outranks pip; explicit override outranks everything.
+    monkeypatch.setenv("UV_INDEX_URL", "https://uv.example/simple/")
+    assert _resolve_index_url() == "https://uv.example/simple"
+    monkeypatch.setenv("OMNIGENT_INDEX_URL", "https://override.example/simple")
+    assert _resolve_index_url() == "https://override.example/simple"
+
+    # Multiple whitespace/comma-separated URLs → the first (primary) index.
+    monkeypatch.setenv("OMNIGENT_INDEX_URL", "https://a.example/simple, https://b.example/simple")
+    assert _resolve_index_url() == "https://a.example/simple"
+
+
+def test_resolve_index_url_from_uv_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No env var → uv.toml's ``index-url`` is used (corp-mirror-in-a-file case)."""
+    from omnigent.update_check import _resolve_index_url
+
+    _delenv_index(monkeypatch)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    # Isolate the uv path under test from any real pip.conf on the box.
+    monkeypatch.setattr("omnigent.update_check._index_from_pip_config", lambda: "")
+    uv_toml = tmp_path / "uv" / "uv.toml"
+    uv_toml.parent.mkdir(parents=True)
+    uv_toml.write_text('index-url = "https://uvcfg.example/simple/"\n')
+
+    assert _resolve_index_url() == "https://uvcfg.example/simple"
+
+
+def test_resolve_index_url_from_uv_default_index_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``[[index]]`` marked ``default = true`` wins; a plain one is ignored."""
+    from omnigent.update_check import _resolve_index_url
+
+    _delenv_index(monkeypatch)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.update_check._index_from_pip_config", lambda: "")
+    uv_toml = tmp_path / "uv" / "uv.toml"
+    uv_toml.parent.mkdir(parents=True)
+    uv_toml.write_text(
+        '[[index]]\nname = "pub"\nurl = "https://pub.example/simple"\n\n'
+        '[[index]]\nname = "corp"\nurl = "https://corp.example/simple"\ndefault = true\n'
+    )
+
+    assert _resolve_index_url() == "https://corp.example/simple"
+
+
+def test_resolve_index_url_ignores_non_default_uv_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A supplementary ``[[index]]`` (no ``default``) does not override pypi.org."""
+    from omnigent.update_check import _resolve_index_url
+
+    _delenv_index(monkeypatch)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.update_check._index_from_pip_config", lambda: "")
+    uv_toml = tmp_path / "uv" / "uv.toml"
+    uv_toml.parent.mkdir(parents=True)
+    uv_toml.write_text('[[index]]\nname = "extra"\nurl = "https://extra.example/simple"\n')
+
+    assert _resolve_index_url() == "https://pypi.org/simple"
+
+
+def test_resolve_index_url_from_pip_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """uv has nothing → pip.conf's ``[global] index-url`` is used."""
+    from omnigent.update_check import _resolve_index_url
+
+    _delenv_index(monkeypatch)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.update_check._index_from_uv_config", lambda: "")
+    pip_conf = tmp_path / "pip" / "pip.conf"
+    pip_conf.parent.mkdir(parents=True)
+    pip_conf.write_text("[global]\nindex-url = https://pipcfg.example/simple/\n")
+
+    assert _resolve_index_url() == "https://pipcfg.example/simple"
+
+
+def test_resolve_index_url_env_beats_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An index env var takes precedence over a configured one."""
+    from omnigent.update_check import _resolve_index_url
+
+    _delenv_index(monkeypatch)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    uv_toml = tmp_path / "uv" / "uv.toml"
+    uv_toml.parent.mkdir(parents=True)
+    uv_toml.write_text('index-url = "https://uvcfg.example/simple"\n')
+    monkeypatch.setenv("UV_INDEX_URL", "https://env.example/simple")
+
+    assert _resolve_index_url() == "https://env.example/simple"
+
+
+def test_refresh_update_cache_writes_latest_and_preserves_notified(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``refresh_update_cache`` records the PyPI latest, keeping the notified stamp.
+
+    Preserving ``last_notified_version`` is what stops a routine refresh
+    from re-arming a notice the user already saw.
+    """
+    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
+    _point_cache_at(tmp_path, monkeypatch)
+    # A wheel cache that already nagged for 0.2.0.
+    _write_cache(
+        _CacheEntry(
+            last_check_epoch=time.time() - 10_000,
+            commits_behind=0,
+            kind="wheel",
+            latest_version="0.2.0",
+            last_notified_version="0.2.0",
+        )
+    )
+    dist = _write_fake_dist_info(tmp_path, installer="uv")
+    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+    monkeypatch.setattr("omnigent.update_check._find_repo_root", lambda: None)
+    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda: "0.2.0")
+
+    from omnigent.update_check import refresh_update_cache
+
+    refresh_update_cache()
+
+    refreshed = _read_cache()
+    assert refreshed is not None
+    assert refreshed.kind == "wheel"
+    assert refreshed.latest_version == "0.2.0"
+    assert refreshed.last_notified_version == "0.2.0"
+
+
+def test_refresh_update_cache_noop_for_clone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """In a dev clone, the PyPI refresh does nothing (git path owns it)."""
+    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
+    _point_cache_at(tmp_path, monkeypatch)
+    monkeypatch.setattr("omnigent.update_check._find_repo_root", lambda: tmp_path)
+
+    def _must_not_fetch() -> str:
+        raise AssertionError("PyPI fetch attempted in a dev clone")
+
+    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", _must_not_fetch)
+
+    from omnigent.update_check import refresh_update_cache
+
+    refresh_update_cache()  # must not raise
+
+
+def test_upgrade_command_for_installed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``upgrade_command_for_installed`` maps the install shape to a command."""
+    from omnigent.update_check import upgrade_command_for_installed
+
+    dist = _write_fake_dist_info(tmp_path, installer="uv")  # registry uv install
+    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+    suggestion = upgrade_command_for_installed()
+    assert suggestion is not None
+    assert suggestion.command == "uv tool upgrade omnigent"
+    assert suggestion.runnable is True
+
+    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: None)
+    assert upgrade_command_for_installed() is None
 
 
 def test_wheel_info_prefers_build_info_over_uv_cache(
@@ -1367,260 +1805,8 @@ def test_legacy_cache_without_kind_field_defaults_to_clone(
 
 
 # ------------------------------------------------------------------
-# Interactive upgrade prompt (_print_install_notice)
+# Upgrade command runner (_run_upgrade_command)
 # ------------------------------------------------------------------
-
-
-from dataclasses import dataclass as _dc  # noqa: E402
-
-
-@_dc
-class _RecordedRun:
-    """A captured invocation of ``_run_upgrade_command``.
-
-    :param command: The command string that would have been
-        executed, e.g. ``"uv tool upgrade omnigent"``.
-    :param returncode: The exit code the stub returned to the
-        caller (configurable per test to simulate success/failure).
-    """
-
-    command: str
-    returncode: int
-
-
-def _make_stale_uv_info(install_time: float) -> _InstalledWheelInfo:
-    """Build a stale uv-tool ``_InstalledWheelInfo`` for prompt tests.
-
-    Centralizes the boilerplate so each prompt test focuses on its
-    interaction (TTY vs no-TTY, yes vs no, success vs failure).
-
-    :param install_time: Unix timestamp the install_time_epoch field
-        is set to, e.g. ``time.time() - 5 * 86400`` for 5 days old.
-    :returns: An ``_InstalledWheelInfo`` whose suggestion would be
-        ``"uv tool install --reinstall <git url>"`` (runnable).
-    """
-    return _InstalledWheelInfo(
-        install_time_epoch=install_time,
-        installer="uv",
-        vcs_url=_FAKE_GIT_URL,
-        commit_sha=_FAKE_COMMIT,
-        is_editable=False,
-        package_version="0.1.0",
-        detected_installer="uv",
-    )
-
-
-def test_install_notice_skips_prompt_when_stdin_not_tty(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """No TTY → skip-notice printed; prompt and subprocess never run.
-
-    Mirrors the CI / piped-stdin case. The skip notice is the
-    explanation surface — without it, a log reader would see the
-    "Run this now?" promise in the panel and wonder why nothing
-    happened.
-
-    Failure modes this catches: (a) ``_stdin_is_tty()`` check
-    accidentally inverted → we'd prompt and block in CI; (b) the
-    skip-notice ``console.print`` deleted → log readers can't tell
-    why no prompt was offered.
-    """
-    from omnigent.update_check import _print_install_notice
-
-    info = _make_stale_uv_info(install_time=time.time() - 2 * 86400)
-
-    def _fail_if_called(*_args: object, **_kwargs: object) -> bool:
-        raise AssertionError("_prompt_yes_no was called despite stdin not being a TTY")
-
-    def _fail_run(*_args: object, **_kwargs: object) -> int:
-        raise AssertionError("_run_upgrade_command was called despite stdin not being a TTY")
-
-    monkeypatch.setattr("omnigent.update_check._prompt_yes_no", _fail_if_called)
-    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", _fail_run)
-
-    _print_install_notice(info, age_seconds=2 * 86400)
-
-    err = _strip_rich_panel(capsys.readouterr().err)
-    # Skip notice is the user-visible explanation; "not a TTY"
-    # specifically must appear so the message stays diagnostic.
-    assert "Skipped interactive upgrade prompt" in err
-    assert "not a TTY" in err
-
-
-def test_install_notice_no_prompt_for_unknown_installer(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Unknown installer → panel printed, no prompt, no skip notice.
-
-    The unknown-installer fallback's "command" is prose (``"reinstall
-    omnigent from your original source"``) — running it would
-    error or, worse, exec an unrelated binary named ``reinstall``.
-    Even when stdin IS a TTY, the prompt must be suppressed.
-
-    The skip notice is also suppressed here (contrast with the
-    non-TTY case) because the panel's prose is itself the
-    explanation; printing "Skipped interactive upgrade prompt"
-    afterwards would be noisy redundancy.
-    """
-    from omnigent.update_check import _print_install_notice
-
-    # Force TTY=True so the test proves the suppression comes from
-    # the runnable=False branch, not the TTY gate.
-    monkeypatch.setattr("omnigent.update_check._stdin_is_tty", lambda: True)
-
-    def _fail_if_called(*_args: object, **_kwargs: object) -> bool:
-        raise AssertionError("_prompt_yes_no called for unknown installer")
-
-    def _fail_run(*_args: object, **_kwargs: object) -> int:
-        raise AssertionError("_run_upgrade_command called for unknown installer")
-
-    monkeypatch.setattr("omnigent.update_check._prompt_yes_no", _fail_if_called)
-    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", _fail_run)
-
-    info = _InstalledWheelInfo(
-        install_time_epoch=time.time() - 3 * 86400,
-        installer="some_custom_installer",
-        vcs_url=None,
-        commit_sha=None,
-        is_editable=False,
-        package_version="0.1.0",
-        detected_installer="some_custom_installer",
-    )
-
-    _print_install_notice(info, age_seconds=3 * 86400)
-
-    err = _strip_rich_panel(capsys.readouterr().err)
-    # Prose fallback must appear in the panel — that's the entire
-    # signal we give the user for unknown installers.
-    assert "reinstall omnigent from your original source" in err
-    # And no skip notice for this case (the panel speaks for itself).
-    assert "Skipped interactive upgrade prompt" not in err
-
-
-def test_install_notice_declined_runs_nothing(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """TTY + user answers "no" → subprocess.run never invoked, no exit.
-
-    Catches the inverted-conditional bug where ``if not
-    _prompt_yes_no(...)`` got flipped to ``if _prompt_yes_no(...)``
-    — that would run the upgrade exactly when the user declined.
-    """
-    from omnigent.update_check import _print_install_notice
-
-    monkeypatch.setattr("omnigent.update_check._stdin_is_tty", lambda: True)
-    monkeypatch.setattr("omnigent.update_check._prompt_yes_no", lambda *_a, **_k: False)
-
-    def _fail_run(*_args: object, **_kwargs: object) -> int:
-        raise AssertionError("_run_upgrade_command called after user declined")
-
-    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", _fail_run)
-
-    info = _make_stale_uv_info(install_time=time.time() - 2 * 86400)
-
-    # No SystemExit must be raised — we did not run the upgrade and
-    # so must not exit the process.
-    _print_install_notice(info, age_seconds=2 * 86400)
-
-    # Panel printed (verifies we reached the prompt at all), no
-    # "Upgrade complete" / "exited with status" follow-up.
-    err = _strip_rich_panel(capsys.readouterr().err)
-    assert "day(s) old" in err
-    assert "Upgrade complete" not in err
-    assert "Upgrade exited with status" not in err
-
-
-def test_install_notice_confirmed_success_exits_zero(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """TTY + user "yes" + upgrade exits 0 → subprocess called, sys.exit(0).
-
-    The exit is load-bearing: the running interpreter still holds
-    the pre-upgrade modules in memory, so continuing the user's
-    original command would silently execute old code. If the exit
-    is ever removed, this test catches it (no ``SystemExit`` would
-    be raised) and the success line "Re-run your command" must
-    still appear so the user knows what to do next.
-    """
-    from omnigent.update_check import _print_install_notice
-
-    monkeypatch.setattr("omnigent.update_check._stdin_is_tty", lambda: True)
-    monkeypatch.setattr("omnigent.update_check._prompt_yes_no", lambda *_a, **_k: True)
-
-    recorded: list[_RecordedRun] = []
-
-    def _stub_run(command: str, _console: object) -> int:
-        recorded.append(_RecordedRun(command=command, returncode=0))
-        return 0
-
-    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", _stub_run)
-
-    info = _make_stale_uv_info(install_time=time.time() - 2 * 86400)
-
-    with pytest.raises(SystemExit) as excinfo:
-        _print_install_notice(info, age_seconds=2 * 86400)
-
-    # SystemExit(0) means the upgrade succeeded and we cleanly
-    # bailed out of the host CLI so a re-run picks up the new code.
-    assert excinfo.value.code == 0
-    # Exactly one subprocess invocation, and it was the suggested
-    # uv command for this install shape (not, say, an empty string
-    # or a wrong installer's incantation).
-    assert len(recorded) == 1, (
-        f"Expected exactly 1 upgrade invocation, got {len(recorded)}. "
-        f"If 0, the prompt-confirmed path skipped the subprocess; "
-        f"if >1, _print_install_notice double-invoked the upgrade."
-    )
-    assert recorded[0].command == f"uv tool install --reinstall {_FAKE_GIT_URL}"
-    err = _strip_rich_panel(capsys.readouterr().err)
-    # Success message must direct the user to re-run — otherwise
-    # they'd think the upgrade had no effect.
-    assert "Upgrade complete" in err
-    assert "Re-run your command" in err
-
-
-def test_install_notice_confirmed_failure_exits_nonzero(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """TTY + user "yes" + upgrade exits non-zero → ``sys.exit(1)`` with error surfaced.
-
-    The exit on failure is intentional, not a missed branch.
-    Falling through into the user's original command would
-    silently run the *old* in-memory modules while the user
-    believes they just attempted an upgrade — that's the same
-    failure mode that motivated exiting on success. Forcing the
-    process out makes the failure honest and lets the user
-    investigate (network issue, permission error, missing
-    source) before re-running.
-    """
-    from omnigent.update_check import _print_install_notice
-
-    monkeypatch.setattr("omnigent.update_check._stdin_is_tty", lambda: True)
-    monkeypatch.setattr("omnigent.update_check._prompt_yes_no", lambda *_a, **_k: True)
-    monkeypatch.setattr(
-        "omnigent.update_check._run_upgrade_command",
-        lambda *_a, **_k: 42,  # arbitrary non-zero failure code
-    )
-
-    info = _make_stale_uv_info(install_time=time.time() - 2 * 86400)
-
-    with pytest.raises(SystemExit) as excinfo:
-        _print_install_notice(info, age_seconds=2 * 86400)
-
-    # Non-zero exit so wrapping shells / CI see the failure. We
-    # use 1 (not the subprocess's 42) because the CLI's own exit
-    # semantics don't speak the installer's exit-code language —
-    # we surface the installer's specific code in the printed
-    # message instead.
-    assert excinfo.value.code == 1
-    err = _strip_rich_panel(capsys.readouterr().err)
-    # Error line must report the specific subprocess exit code
-    # (42 here) so bug reports can correlate with installer
-    # behavior — the SystemExit code itself is just a binary.
-    assert "Upgrade exited with status 42" in err
-    # And no success message — that would mislead the user into
-    # thinking the upgrade worked.
-    assert "Upgrade complete" not in err
 
 
 def test_run_upgrade_command_invokes_subprocess(

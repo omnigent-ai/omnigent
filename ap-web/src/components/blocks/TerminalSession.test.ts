@@ -7,12 +7,15 @@
 // terminal URLs clickable — so we pin it here.
 
 import { Terminal } from "@xterm/xterm";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ConnectionState } from "./TerminalSession";
 import {
   SHIFT_ENTER_CSI_U,
   SYNC_ECHO_MAX_BYTES,
   SYNC_ECHO_WINDOW_MS,
+  TerminalSession,
   applyTerminalCopy,
+  isUnexpectedTerminalClose,
   loadWebglRenderer,
   openTerminalLink,
   shouldEchoSynchronously,
@@ -189,5 +192,218 @@ describe("terminalKeyEventPayload", () => {
     expect(
       terminalKeyEventPayload(keyEvent({ key: "Enter", shiftKey: true, altKey: true })),
     ).toBeNull();
+  });
+});
+
+describe("isUnexpectedTerminalClose", () => {
+  it("treats transport-shaped close codes as reconnectable", () => {
+    // WHY: 1001/1006/1012/1013 happen TO the connection (proxy restart, dead
+    // TCP on tab thaw, service restart) rather than being a deliberate end, so
+    // a reconnect is appropriate.
+    expect(isUnexpectedTerminalClose(1001)).toBe(true);
+    expect(isUnexpectedTerminalClose(1006)).toBe(true);
+    expect(isUnexpectedTerminalClose(1012)).toBe(true);
+    expect(isUnexpectedTerminalClose(1013)).toBe(true);
+  });
+
+  it("treats deliberate closes (normal, policy, app 4xxx) as terminal", () => {
+    // WHY: 1000 normal, 1008 policy, and the app's 4xxx codes mean the server
+    // decided the attach should end — reconnecting would loop or resurrect a
+    // terminal the user intentionally left.
+    expect(isUnexpectedTerminalClose(1000)).toBe(false);
+    expect(isUnexpectedTerminalClose(1008)).toBe(false);
+    expect(isUnexpectedTerminalClose(4404)).toBe(false);
+    expect(isUnexpectedTerminalClose(4405)).toBe(false);
+    expect(isUnexpectedTerminalClose(4500)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TerminalSession class — wired up against a fake WebSocket + ResizeObserver.
+// The real xterm Terminal runs (it already does in jsdom for loadWebglRenderer
+// above), but the WebSocket and ResizeObserver globals are stubbed so the
+// constructor can complete and we can drive its event handlers directly.
+// ---------------------------------------------------------------------------
+
+class FakeWebSocket {
+  static OPEN = 1;
+  static CLOSED = 3;
+  readyState = 0;
+  binaryType = "blob";
+  sent: Array<string | Uint8Array> = [];
+  closed = false;
+  private listeners: Record<string, Array<(ev: unknown) => void>> = {};
+  url: string;
+
+  constructor(url: string) {
+    this.url = url;
+  }
+
+  addEventListener(type: string, fn: (ev: unknown) => void) {
+    (this.listeners[type] ??= []).push(fn);
+  }
+
+  send(data: string | Uint8Array) {
+    this.sent.push(data);
+  }
+
+  close() {
+    this.closed = true;
+    this.readyState = FakeWebSocket.CLOSED;
+  }
+
+  // Test helpers to drive the handlers the session registers.
+  emit(type: string, ev: unknown) {
+    for (const fn of this.listeners[type] ?? []) fn(ev);
+  }
+  open() {
+    this.readyState = FakeWebSocket.OPEN;
+    this.emit("open", {});
+  }
+}
+
+class FakeResizeObserver {
+  static instances: FakeResizeObserver[] = [];
+  disconnected = false;
+  observed: Element[] = [];
+  cb: () => void;
+  constructor(cb: () => void) {
+    this.cb = cb;
+    FakeResizeObserver.instances.push(this);
+  }
+  observe(el: Element) {
+    this.observed.push(el);
+  }
+  disconnect() {
+    this.disconnected = true;
+  }
+}
+
+describe("TerminalSession", () => {
+  let lastSocket: FakeWebSocket | null = null;
+
+  beforeEach(() => {
+    lastSocket = null;
+    FakeResizeObserver.instances = [];
+    vi.stubGlobal(
+      "WebSocket",
+      class extends FakeWebSocket {
+        constructor(url: string) {
+          super(url);
+          lastSocket = this;
+        }
+      },
+    );
+    vi.stubGlobal("ResizeObserver", FakeResizeObserver);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function makeSession(onActivity?: () => void, onInput?: () => void) {
+    const states: ConnectionState[] = [];
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const session = new TerminalSession(
+      container,
+      "ws://localhost/attach",
+      (s) => states.push(s),
+      false,
+      onActivity,
+      onInput,
+    );
+    return { session, states, container, socket: lastSocket as unknown as FakeWebSocket };
+  }
+
+  it("reports 'connected' and sends an initial resize on socket open", () => {
+    // WHY: the open handler must push a resize frame before the user sees the
+    // default 80x24, then surface kind:"connected" to React. readyState is
+    // OPEN by the time sendResize runs, so a JSON resize control frame is sent.
+    const { states, socket, session } = makeSession();
+
+    socket.open();
+
+    expect(states.at(-1)).toEqual({ kind: "connected" });
+    const resizeFrame = socket.sent.find(
+      (m) => typeof m === "string" && m.includes('"type":"resize"'),
+    );
+    expect(resizeFrame).toBeDefined();
+    session.dispose();
+  });
+
+  it("surfaces close code + reason and error transitions", () => {
+    // WHY: the closed variant carries the WS code so consumers can tell a
+    // deliberate close from a transport drop; the error handler maps to
+    // kind:"error".
+    const { states, socket, session } = makeSession();
+
+    socket.emit("close", { reason: "", code: 1006 });
+    expect(states.at(-1)).toEqual({ kind: "closed", reason: "code 1006", code: 1006 });
+
+    socket.emit("error", {});
+    expect(states.at(-1)).toEqual({ kind: "error" });
+    session.dispose();
+  });
+
+  it("writes inbound binary frames to the terminal and fires onActivity", () => {
+    // WHY: ArrayBuffer message frames are raw PTY bytes — they must reach the
+    // terminal and trigger the best-effort activity signal. The throttle keys
+    // off performance.now(), so pin it past the 300ms window to make the first
+    // notification deterministic. Non-ArrayBuffer (text) frames are ignored so
+    // they aren't painted as output.
+    vi.spyOn(performance, "now").mockReturnValue(10_000);
+    const onActivity = vi.fn();
+    const { socket, session } = makeSession(onActivity);
+
+    // Build the buffer from the global ArrayBuffer the source's
+    // `instanceof ArrayBuffer` check sees — a TextEncoder's buffer comes from
+    // Node's realm and fails that check under jsdom.
+    const data = new ArrayBuffer(5);
+    new Uint8Array(data).set([104, 101, 108, 108, 111]); // "hello"
+    socket.emit("message", { data });
+    expect(onActivity).toHaveBeenCalledTimes(1);
+
+    socket.emit("message", { data: "text frame" });
+    expect(onActivity).toHaveBeenCalledTimes(1); // unchanged — text ignored
+    session.dispose();
+  });
+
+  it("setTheme swaps the terminal theme without reconnecting", () => {
+    // WHY: theme changes must not tear down the live WebSocket; the socket
+    // stays the same instance after setTheme(true).
+    const { socket, session } = makeSession();
+    const before = socket;
+    session.setTheme(true);
+    expect(socket).toBe(before);
+    expect(socket.closed).toBe(false);
+    session.dispose();
+  });
+
+  it("dispose is idempotent and tears down observer + socket once", () => {
+    // WHY: the view disposes explicitly on every re-dial and a future React
+    // upgrade would call the ref cleanup again — a second dispose must be a
+    // safe no-op, not a double close.
+    const { socket, session } = makeSession();
+    const observer = FakeResizeObserver.instances[0];
+
+    session.dispose();
+    expect(socket.closed).toBe(true);
+    expect(observer.disconnected).toBe(true);
+
+    // Second call: no throw, socket already closed.
+    socket.closed = false; // prove the second close() isn't invoked
+    session.dispose();
+    expect(socket.closed).toBe(false);
+  });
+
+  it("observes the container for resize", () => {
+    // WHY: layout changes (window resize, font load) must propagate a resize
+    // frame, so the session must register a ResizeObserver on its container.
+    const { container, session } = makeSession();
+    const observer = FakeResizeObserver.instances[0];
+    expect(observer.observed).toContain(container);
+    session.dispose();
   });
 });

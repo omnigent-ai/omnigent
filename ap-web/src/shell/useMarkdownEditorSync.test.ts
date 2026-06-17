@@ -74,13 +74,17 @@ describe("setContentRef", () => {
       { initialProps: { content: "v1", path: "/file.md", isSettled: true } },
     );
 
-    act(() => { result.current.setDirty(true); });
+    act(() => {
+      result.current.setDirty(true);
+    });
     rerender({ content: "v2", path: "/file.md", isSettled: true });
     expect(result.current.hasExternalUpdate).toBe(true);
     const keyBefore = result.current.editorKey;
 
     // Save completes → editor becomes clean → stashed content applied in-place.
-    act(() => { result.current.setDirty(false); });
+    act(() => {
+      result.current.setDirty(false);
+    });
 
     expect(result.current.editorKey).toBe(keyBefore);
     expect(setContentFn).toHaveBeenCalledWith("v2");
@@ -95,11 +99,15 @@ describe("setContentRef", () => {
         useMarkdownEditorSync({ ...props, onDirtyChange: undefined, setContentRef }),
       { initialProps: { content: "v1", path: "/file.md", isSettled: true } },
     );
-    act(() => { result.current.setDirty(true); });
+    act(() => {
+      result.current.setDirty(true);
+    });
     rerender({ content: "v2", path: "/file.md", isSettled: true });
     const keyBefore = result.current.editorKey;
 
-    act(() => { result.current.discardAndApplyExternal(); });
+    act(() => {
+      result.current.discardAndApplyExternal();
+    });
 
     expect(result.current.editorKey).toBe(keyBefore);
     expect(setContentFn).toHaveBeenCalledWith("v2");
@@ -123,8 +131,12 @@ describe("markSaved echo dedupe", () => {
     );
 
     // User is mid-edit (dirty); an auto-save persists "v2" and records it.
-    act(() => { result.current.setDirty(true); });
-    act(() => { result.current.markSaved("v2"); });
+    act(() => {
+      result.current.setDirty(true);
+    });
+    act(() => {
+      result.current.markSaved("v2");
+    });
     // The saved text echoes back through the file-content query.
     rerender({ content: "v2", path: "/file.md", isSettled: true });
 
@@ -144,7 +156,9 @@ describe("markSaved echo dedupe", () => {
     );
     const keyBefore = result.current.editorKey;
 
-    act(() => { result.current.markSaved("v2"); });
+    act(() => {
+      result.current.markSaved("v2");
+    });
     rerender({ content: "v2", path: "/file.md", isSettled: true });
 
     // No setContent (would reset the cursor) and no remount: the editor
@@ -156,8 +170,12 @@ describe("markSaved echo dedupe", () => {
   it("still flags a genuine external edit that differs from the last save", () => {
     const { result, rerender } = renderSync({ content: "v1" });
 
-    act(() => { result.current.setDirty(true); });
-    act(() => { result.current.markSaved("v2"); });
+    act(() => {
+      result.current.setDirty(true);
+    });
+    act(() => {
+      result.current.markSaved("v2");
+    });
     // Server reports v3 — a real external change, not our echo.
     rerender({ content: "v3", path: "/file.md", isSettled: true });
 
@@ -168,13 +186,17 @@ describe("markSaved echo dedupe", () => {
   it("resets the saved marker on path change so it can't suppress a new file's update", () => {
     const { result, rerender } = renderSync({ content: "v1", path: "/a.md" });
 
-    act(() => { result.current.markSaved("shared"); });
+    act(() => {
+      result.current.markSaved("shared");
+    });
     // Switch to a different file.
     rerender({ content: "b1", path: "/b.md", isSettled: true });
     // Edit b.md, then receive an external update that coincidentally equals
     // a.md's last-saved text. The marker must have been cleared on the path
     // change, so this is treated as a real external edit (not a stale echo).
-    act(() => { result.current.setDirty(true); });
+    act(() => {
+      result.current.setDirty(true);
+    });
     rerender({ content: "shared", path: "/b.md", isSettled: true });
 
     expect(result.current.hasExternalUpdate).toBe(true);
@@ -189,7 +211,9 @@ describe("reconcileServerContent", () => {
   it("returns false when the fetched content matches the last-known server state", () => {
     const { result } = renderSync({ content: "v1" });
     let conflict = true;
-    act(() => { conflict = result.current.reconcileServerContent("v1"); });
+    act(() => {
+      conflict = result.current.reconcileServerContent("v1");
+    });
     // Server is unchanged → no conflict → the caller may write.
     expect(conflict).toBe(false);
     expect(result.current.hasExternalUpdate).toBe(false);
@@ -197,22 +221,32 @@ describe("reconcileServerContent", () => {
 
   it("returns false when the fetched content matches our own last save", () => {
     const { result } = renderSync({ content: "v1" });
-    act(() => { result.current.setDirty(true); });
-    act(() => { result.current.markSaved("v2"); });
+    act(() => {
+      result.current.setDirty(true);
+    });
+    act(() => {
+      result.current.markSaved("v2");
+    });
     let conflict = true;
     // The server reflects exactly what we last wrote — not an external edit.
-    act(() => { conflict = result.current.reconcileServerContent("v2"); });
+    act(() => {
+      conflict = result.current.reconcileServerContent("v2");
+    });
     expect(conflict).toBe(false);
     expect(result.current.hasExternalUpdate).toBe(false);
   });
 
   it("raises a conflict (returns true) when dirty and the server changed externally", () => {
     const { result } = renderSync({ content: "v1" });
-    act(() => { result.current.setDirty(true); });
+    act(() => {
+      result.current.setDirty(true);
+    });
     let conflict = false;
     // Agent wrote "agent" while the user has unsaved edits → must block the
     // clobbering write and surface Keep mine / Load latest.
-    act(() => { conflict = result.current.reconcileServerContent("agent"); });
+    act(() => {
+      conflict = result.current.reconcileServerContent("agent");
+    });
     expect(conflict).toBe(true);
     expect(result.current.hasExternalUpdate).toBe(true);
   });
@@ -226,7 +260,9 @@ describe("reconcileServerContent", () => {
       { initialProps: { content: "v1", path: "/file.md", isSettled: true } },
     );
     let conflict = true;
-    act(() => { conflict = result.current.reconcileServerContent("v2"); });
+    act(() => {
+      conflict = result.current.reconcileServerContent("v2");
+    });
     // Clean editor → nothing to conflict with → adopt the content in place.
     expect(conflict).toBe(false);
     expect(setContentFn).toHaveBeenCalledWith("v2");
@@ -234,18 +270,26 @@ describe("reconcileServerContent", () => {
 
   it("lets a 'Keep mine' overwrite through after acknowledging the conflict", () => {
     const { result } = renderSync({ content: "v1" });
-    act(() => { result.current.setDirty(true); });
-    act(() => { result.current.reconcileServerContent("agent"); });
+    act(() => {
+      result.current.setDirty(true);
+    });
+    act(() => {
+      result.current.reconcileServerContent("agent");
+    });
     expect(result.current.hasExternalUpdate).toBe(true);
 
     // User clicks Keep mine.
-    act(() => { result.current.dismissExternalUpdate(); });
+    act(() => {
+      result.current.dismissExternalUpdate();
+    });
 
     // The next pre-write check sees the same (now acknowledged) server
     // content → no conflict → the overwrite proceeds. Proves the external
     // content was recorded as the known baseline.
     let conflict = true;
-    act(() => { conflict = result.current.reconcileServerContent("agent"); });
+    act(() => {
+      conflict = result.current.reconcileServerContent("agent");
+    });
     expect(conflict).toBe(false);
   });
 });
@@ -269,7 +313,9 @@ describe("hasExternalUpdate", () => {
   it("becomes true when content changes while the editor is dirty", () => {
     const { result, rerender } = renderSync({ content: "v1" });
 
-    act(() => { result.current.setDirty(true); });
+    act(() => {
+      result.current.setDirty(true);
+    });
     rerender({ content: "v2", path: "/file.md", isSettled: true });
 
     expect(result.current.hasExternalUpdate).toBe(true);
@@ -278,19 +324,25 @@ describe("hasExternalUpdate", () => {
   it("clears automatically when the editor becomes clean (normal save path)", () => {
     const { result, rerender } = renderSync({ content: "v1" });
 
-    act(() => { result.current.setDirty(true); });
+    act(() => {
+      result.current.setDirty(true);
+    });
     rerender({ content: "v2", path: "/file.md", isSettled: true });
     expect(result.current.hasExternalUpdate).toBe(true);
 
     // Simulate save completing → dirty clears → stash applied
-    act(() => { result.current.setDirty(false); });
+    act(() => {
+      result.current.setDirty(false);
+    });
     expect(result.current.hasExternalUpdate).toBe(false);
   });
 
   it("clears on path change", () => {
     const { result, rerender } = renderSync({ content: "v1" });
 
-    act(() => { result.current.setDirty(true); });
+    act(() => {
+      result.current.setDirty(true);
+    });
     rerender({ content: "v2", path: "/file.md", isSettled: true });
     expect(result.current.hasExternalUpdate).toBe(true);
 
@@ -308,11 +360,15 @@ describe("dismissExternalUpdate", () => {
     const { result, rerender } = renderSync({ content: "v1" });
     const keyBefore = result.current.editorKey;
 
-    act(() => { result.current.setDirty(true); });
+    act(() => {
+      result.current.setDirty(true);
+    });
     rerender({ content: "v2", path: "/file.md", isSettled: true });
     expect(result.current.hasExternalUpdate).toBe(true);
 
-    act(() => { result.current.dismissExternalUpdate(); });
+    act(() => {
+      result.current.dismissExternalUpdate();
+    });
 
     expect(result.current.hasExternalUpdate).toBe(false);
     // No remount — user chose to keep their edits.
@@ -322,9 +378,13 @@ describe("dismissExternalUpdate", () => {
   it("keeps isDirty true after dismissing", () => {
     const { result, rerender } = renderSync({ content: "v1" });
 
-    act(() => { result.current.setDirty(true); });
+    act(() => {
+      result.current.setDirty(true);
+    });
     rerender({ content: "v2", path: "/file.md", isSettled: true });
-    act(() => { result.current.dismissExternalUpdate(); });
+    act(() => {
+      result.current.dismissExternalUpdate();
+    });
 
     expect(result.current.isDirty).toBe(true);
   });
@@ -338,11 +398,15 @@ describe("discardAndApplyExternal", () => {
   it("clears hasExternalUpdate and isDirty", () => {
     const { result, rerender } = renderSync({ content: "v1" });
 
-    act(() => { result.current.setDirty(true); });
+    act(() => {
+      result.current.setDirty(true);
+    });
     rerender({ content: "v2", path: "/file.md", isSettled: true });
     expect(result.current.hasExternalUpdate).toBe(true);
 
-    act(() => { result.current.discardAndApplyExternal(); });
+    act(() => {
+      result.current.discardAndApplyExternal();
+    });
 
     expect(result.current.hasExternalUpdate).toBe(false);
     expect(result.current.isDirty).toBe(false);
@@ -352,9 +416,13 @@ describe("discardAndApplyExternal", () => {
     const { result, rerender } = renderSync({ content: "v1" });
     const keyBefore = result.current.editorKey;
 
-    act(() => { result.current.setDirty(true); });
+    act(() => {
+      result.current.setDirty(true);
+    });
     rerender({ content: "v2", path: "/file.md", isSettled: true });
-    act(() => { result.current.discardAndApplyExternal(); });
+    act(() => {
+      result.current.discardAndApplyExternal();
+    });
 
     expect(result.current.editorKey).toBeGreaterThan(keyBefore);
   });
@@ -367,11 +435,15 @@ describe("discardAndApplyExternal", () => {
       { initialProps: { content: "v1", path: "/file.md", isSettled: true } },
     );
 
-    act(() => { result.current.setDirty(true); });
+    act(() => {
+      result.current.setDirty(true);
+    });
     rerender({ content: "v2", path: "/file.md", isSettled: true });
     onDirtyChange.mockClear();
 
-    act(() => { result.current.discardAndApplyExternal(); });
+    act(() => {
+      result.current.discardAndApplyExternal();
+    });
 
     expect(onDirtyChange).toHaveBeenCalledWith(false);
   });

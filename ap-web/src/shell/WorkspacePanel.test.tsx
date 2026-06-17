@@ -10,9 +10,7 @@ import { WorkspacePanel } from "./WorkspacePanel";
 // testid (plus, for FileViewer, the path it was asked to show) so we can prove
 // which child mounted without dragging in Monaco / hook stacks.
 vi.mock("./FileViewer", () => ({
-  FileViewer: ({ path }: { path: string }) => (
-    <div data-testid="file-viewer-stub">{path}</div>
-  ),
+  FileViewer: ({ path }: { path: string }) => <div data-testid="file-viewer-stub">{path}</div>,
 }));
 vi.mock("./FilesPanel", () => ({
   FilesPanel: () => <div data-testid="files-panel-stub" />,
@@ -37,11 +35,13 @@ afterEach(() => {
  * the spied callbacks the tests assert against (openFileViewer / onCloseFile /
  * onRightRailTabChange) alongside the render result.
  */
-function renderWorkspace(overrides: {
-  rightRailTab?: RightRailTab;
-  selectedFilePath?: string | null;
-  openFiles?: string[];
-} = {}) {
+function renderWorkspace(
+  overrides: {
+    rightRailTab?: RightRailTab;
+    selectedFilePath?: string | null;
+    openFiles?: string[];
+  } = {},
+) {
   const openFileViewer = vi.fn();
   const onCloseFile = vi.fn();
   const onRightRailTabChange = vi.fn();
@@ -113,19 +113,14 @@ describe("WorkspacePanel open-file tabs", () => {
     const readmeTab = screen
       .getByRole("button", { name: "Close README.md" })
       .closest("[role='button']");
-    const appTab = screen
-      .getByRole("button", { name: "Close App.tsx" })
-      .closest("[role='button']");
+    const appTab = screen.getByRole("button", { name: "Close App.tsx" }).closest("[role='button']");
     expect(readmeTab).toHaveAttribute("aria-current", "true");
     expect(appTab).toHaveAttribute("aria-current", "false");
 
     // With a file active the radix value is a sentinel, so the fixed Files tab
     // must read inactive — otherwise both "Files" and the file tab would look
     // selected at once (the bug the sentinel prevents).
-    expect(screen.getByRole("tab", { name: /files/i })).toHaveAttribute(
-      "data-state",
-      "inactive",
-    );
+    expect(screen.getByRole("tab", { name: /files/i })).toHaveAttribute("data-state", "inactive");
   });
 
   it("shows the Files tab as active when no file is selected", () => {
@@ -133,10 +128,7 @@ describe("WorkspacePanel open-file tabs", () => {
 
     // No file selected on the Files tab → the fixed Files trigger is the active
     // selection. A failure means the sentinel leaked into the no-file case.
-    expect(screen.getByRole("tab", { name: /files/i })).toHaveAttribute(
-      "data-state",
-      "active",
-    );
+    expect(screen.getByRole("tab", { name: /files/i })).toHaveAttribute("data-state", "active");
   });
 
   it("activates a file via openFileViewer when its tab body is clicked", () => {

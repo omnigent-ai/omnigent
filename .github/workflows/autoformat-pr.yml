@@ -1,12 +1,9 @@
 name: PR Autoformat
 
-# Manual PR hygiene helper. A human comments `/autoformat` on a PR to:
-# - assign the PR author, and
-# - add missing PR-template sections without deleting the author's text.
-#
-# Security: this issue_comment workflow never checks out or executes PR
-# code. It checks out only the repository default branch script and then
-# updates PR metadata through GitHub APIs.
+# Manual PR hygiene helper: a human comments `/autoformat` to assign the PR
+# author and add missing PR-template sections without deleting the author's text.
+# This issue_comment workflow never checks out or executes PR code — it checks
+# out only the default-branch script and updates PR metadata via the API.
 
 on:
   issue_comment:

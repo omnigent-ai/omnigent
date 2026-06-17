@@ -397,6 +397,12 @@ _API_HARNESSES: dict[str, dict[str, str]] = {
         "package": "agents",
         "install": "pip install openai-agents",
     },
+    "antigravity": {
+        "display": "Antigravity (Gemini)",
+        "description": "Antigravity / Gemini API key, or an OpenAI-compatible gateway",
+        "package": "google.antigravity",
+        "install": "pip install google-antigravity",
+    },
 }
 
 
