@@ -5841,39 +5841,25 @@ async def _refresh_subagent_tree(
     """Recursively fetch the sub-agent tree under *root_id* and push it into
     the host registry.
 
-    Mirrors ap-web's ``useChildSessions`` per-node fetch capped at
-    ``MAX_TREE_DEPTH``: breadth-first over ``GET …/child_sessions``, tagging
+    Delegates the recursion to :meth:`SessionsNamespace.child_sessions_tree`
+    (the same helper the SDK ``subtree_busy`` rollup uses), which walks
+    ``GET …/child_sessions`` breadth-first capped at ``MAX_TREE_DEPTH`` and tags
     each row with the parent it was queried under so the host can reconstruct
     the hierarchy. The SSE stream only delivers the active session's direct
-    children, so this poll is what keeps grandchildren live.
+    children, so this poll is what keeps grandchildren live. A failed fetch is
+    swallowed, leaving the prior tree in place rather than crashing the REPL.
 
     :param generation: :attr:`TerminalHost.subagent_generation` captured before
         the fetch began. Passed through to :meth:`TerminalHost.seed_subagent_tree`
         so a snapshot whose tree was cleared (``/switch`` / ``/new`` / ``/clear``)
         mid-fetch is dropped instead of resurrecting the cleared nodes.
     """
-    nodes: list[dict[str, object]] = []
-    seen: set[str] = {root_id}
-    frontier: list[str] = [root_id]
-    depth = 0
-    while frontier and depth < max_depth:
-        next_frontier: list[str] = []
-        for parent_id in frontier:
-            try:
-                rows: list[dict[str, object]] = await client.sessions.child_sessions(parent_id)
-            except Exception:  # noqa: BLE001 — best-effort poll: a failed page leaves the prior tree in place rather than crashing the REPL
-                continue
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                sid = row.get("id")
-                if not isinstance(sid, str) or sid in seen:
-                    continue
-                seen.add(sid)
-                nodes.append({**row, "parent_id": parent_id})
-                next_frontier.append(sid)
-        frontier = next_frontier
-        depth += 1
+    try:
+        # Recursion + parent_id tagging now live in the shared SDK helper so the
+        # CLI tree and the SDK rollup (subtree_busy) walk identical data.
+        nodes = await client.sessions.child_sessions_tree(root_id, max_depth=max_depth)
+    except Exception:  # noqa: BLE001 — best-effort poll: a failed fetch leaves the prior tree in place rather than crashing the REPL
+        return
     host.seed_subagent_tree(root_id, nodes, generation=generation)
 
 

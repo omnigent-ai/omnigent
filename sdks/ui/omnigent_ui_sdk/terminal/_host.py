@@ -26,6 +26,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from omnigent_client import TERMINAL_TASK_STATUSES, child_session_busy
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application
 from prompt_toolkit.application.current import get_app
@@ -3160,7 +3161,7 @@ class TerminalHost:
         # with no terminal status) is "warm/idle", still chattable, and must
         # not be mislabeled ``Done``. ``done_at`` debounces the running badge;
         # a non-terminal update clears it (a reused handle / resumed child).
-        terminal = node.status in ("completed", "failed", "cancelled") or node.last_task_error
+        terminal = node.status in TERMINAL_TASK_STATUSES or node.last_task_error
         if terminal:
             if node.done_at is None:
                 node.done_at = self._monotonic()
@@ -3246,9 +3247,15 @@ class TerminalHost:
         """
         if node.done_at is not None:
             return (now - node.done_at) < _SUBAGENT_LINGER_SECONDS
-        if node.pending_elicitations > 0 or node.busy or node.status == "launching":
-            return True
-        return node.status is not None and node.status not in ("completed", "failed", "cancelled")
+        # The non-terminal "is this child working" decision is the canonical,
+        # un-debounced predicate shared with SDK rollups (subtree_busy /
+        # tree_busy) and the web SubagentsPanel; only the linger above is
+        # CLI-specific. Keeping one definition stops the CLI and SDK drifting.
+        return child_session_busy(
+            busy=node.busy,
+            current_task_status=node.status,
+            pending_elicitations_count=node.pending_elicitations,
+        )
 
     def subagent_tree(self) -> list[tuple[_SubagentNode, int]]:
         """Return the visible sub-agent nodes in pre-order with their depth.

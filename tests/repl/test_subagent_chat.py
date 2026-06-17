@@ -26,6 +26,7 @@ from typing import Any
 import pytest
 from omnigent_client import OmnigentError
 from omnigent_client._sessions import Session as SessionSnapshot
+from omnigent_client._sessions import SessionsNamespace
 from omnigent_ui_sdk.terminal._host import TerminalHost
 
 from omnigent.repl._repl import (
@@ -154,6 +155,15 @@ class _DiscoverySessions:
 
     async def child_sessions(self, session_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
         return list(self._by_parent.get(session_id, []))
+
+    async def child_sessions_tree(
+        self, session_id: str, *, max_depth: int = 3, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        # The recursion now lives in the SDK; reuse the real implementation
+        # (it only needs this stub's ``child_sessions``).
+        return await SessionsNamespace.child_sessions_tree(
+            self, session_id, max_depth=max_depth, limit=limit
+        )
 
 
 class _DiscoveryClient:

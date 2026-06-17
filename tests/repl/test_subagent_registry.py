@@ -6,8 +6,9 @@ Covers the two testable seams of the ``↓`` sub-agents feature:
 * :func:`_apply_child_session_event` — maps ``session.created`` /
   ``session.child_session.updated`` SSE events onto the host registry,
   filtered by the active conversation id.
-* :func:`_refresh_subagent_tree` — recursively fetches the tree via the
-  client's ``child_sessions`` resource (the deeper-level poll).
+* :func:`_refresh_subagent_tree` — fetches the tree via the shared SDK
+  recursion (``client.sessions.child_sessions_tree``) and seeds the host
+  registry (the deeper-level poll).
 
 The live triggers live in the ``_render_session_event`` closure inside
 ``run_repl`` (not callable in isolation), so a source-inspection guard
@@ -21,6 +22,7 @@ import inspect
 from typing import Any
 
 import pytest
+from omnigent_client._sessions import SessionsNamespace
 from omnigent_ui_sdk.terminal._host import TerminalHost
 
 from omnigent.repl import _repl
@@ -133,7 +135,13 @@ def test_child_terminal_status_settles_out_of_count() -> None:
 
 
 class _FakeSessions:
-    """Minimal stand-in for ``client.sessions`` exposing ``child_sessions``."""
+    """Minimal stand-in for ``client.sessions`` exposing ``child_sessions``.
+
+    The recursion + parent tagging now live in the SDK's
+    :meth:`SessionsNamespace.child_sessions_tree`, so the fake reuses that real
+    implementation (bound to this fake's ``child_sessions``) — the REPL→SDK
+    path is exercised end-to-end and ``calls`` still records each level fetched.
+    """
 
     def __init__(self, by_parent: dict[str, list[dict[str, Any]]]) -> None:
         self._by_parent = by_parent
@@ -142,6 +150,15 @@ class _FakeSessions:
     async def child_sessions(self, session_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
         self.calls.append(session_id)
         return list(self._by_parent.get(session_id, []))
+
+    async def child_sessions_tree(
+        self, session_id: str, *, max_depth: int = 3, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        # Delegate to the real SDK recursion — it only depends on
+        # ``self.child_sessions`` — so we test the actual shared helper.
+        return await SessionsNamespace.child_sessions_tree(
+            self, session_id, max_depth=max_depth, limit=limit
+        )
 
 
 class _FakeClient:

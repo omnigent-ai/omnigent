@@ -22,11 +22,13 @@ Excluded from default ``pytest`` runs via ``--ignore=tests/e2e``. Invoke::
 
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from typing import Any
 
 import httpx
+from omnigent_client._sessions import SessionsNamespace
 
 from tests.e2e.conftest import (
     create_runner_bound_session,
@@ -148,6 +150,27 @@ def test_parent_stream_and_child_sessions_expose_subagents(
     assert "busy" in first and "current_task_status" in first, (
         "child_sessions rows are missing the busy / current_task_status fields "
         f"the badge + menu render; got keys: {sorted(first)}"
+    )
+
+    # The SDK rollup (subtree_busy / tree_busy) an SDK driver consumes: against
+    # the same real server, child_sessions_tree must list the spawned child and
+    # subtree_busy must settle to False now the run is terminal — the SDK-side
+    # mirror of the data contract asserted above (issue #444).
+    async def _sdk_rollup() -> tuple[list[dict[str, Any]], bool]:
+        async with httpx.AsyncClient(timeout=30.0) as ac:
+            ns = SessionsNamespace(ac, live_server)
+            tree = await ns.child_sessions_tree(session_id)
+            busy = await ns.subtree_busy(session_id)
+            return tree, busy
+
+    tree, subtree_busy = asyncio.run(_sdk_rollup())
+    assert {c["id"] for c in children} <= {n["id"] for n in tree}, (
+        "child_sessions_tree did not surface the spawned child the one-level "
+        "endpoint returned — the SDK rollup would miss it."
+    )
+    assert subtree_busy is False, (
+        "subtree_busy stayed True after the run reached a terminal state — an "
+        "SDK eval driver would never resume injecting 'your turn'."
     )
 
     # The live fast-path: the parent stream emitted the transient child events.

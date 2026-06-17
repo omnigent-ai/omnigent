@@ -13,6 +13,7 @@ import sys
 from collections.abc import Iterable
 
 import pytest
+from omnigent_client import child_summary_busy
 from omnigent_ui_sdk.terminal._formatter import StreamingText
 from omnigent_ui_sdk.terminal._host import TerminalHost
 from prompt_toolkit.output import DummyOutput
@@ -1254,6 +1255,47 @@ def test_subagent_badge_pluralizes_and_returns_to_sleeping() -> None:
     # user can revisit / chat with them, so the gesture remains advertised.
     assert host.has_any_subagents() is True
     assert "↓ agents" in toolbar
+
+
+@pytest.mark.parametrize(
+    ("busy", "status", "pending"),
+    [
+        (True, None, 0),
+        (True, "completed", 0),
+        (False, "in_progress", 0),
+        (False, "queued", 0),
+        (False, "launching", 0),
+        (False, "completed", 1),  # awaiting input outranks a terminal status
+        (False, None, 2),
+        (False, "completed", 0),  # terminal → not busy
+        (False, "failed", 0),
+        (False, "cancelled", 0),
+        (False, None, 0),  # warm-idle
+    ],
+)
+def test_subagent_active_matches_sdk_predicate(
+    busy: bool, status: str | None, pending: int
+) -> None:
+    """The CLI's per-node running decision equals the shared SDK predicate.
+
+    Both consumers must agree on what "busy" means, mapped through their own
+    field names (node ``status``/``pending_elicitations`` vs the summary's
+    ``current_task_status``/``pending_elicitations_count``). The host adds a
+    UI-only linger on top, so we isolate the non-terminal decision by clearing
+    ``done_at`` before comparing. A divergence here is exactly the CLI/SDK
+    drift this shared predicate exists to prevent.
+    """
+    host = TerminalHost(model_name="test")
+    summary = {
+        "busy": busy,
+        "current_task_status": status,
+        "pending_elicitations_count": pending,
+    }
+    host.upsert_subagent("conv_c1", parent_id="conv_main", child=dict(summary))
+    node = host._subagents["conv_c1"]
+    node.done_at = None  # isolate the non-terminal branch from the linger window
+
+    assert host._subagent_active(node, host._monotonic()) == child_summary_busy(summary)
 
 
 def test_subagent_partial_update_preserves_label() -> None:
