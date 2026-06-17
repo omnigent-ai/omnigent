@@ -4,7 +4,9 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
+from fastapi import FastAPI
 
 from omnigent.inner.codex_executor import CodexExecutor
 from omnigent.inner.executor import (
@@ -16,6 +18,7 @@ from omnigent.inner.executor import (
     ToolCallStatus,
     TurnComplete,
 )
+from omnigent.server import app as app_module
 
 
 def ev_response_created(response_id: str) -> dict[str, Any]:
@@ -567,6 +570,37 @@ async def test_real_codex_goal_set_preserves_null_token_budget(
         assert goal["tokenBudget"] is None
     finally:
         await executor.close()
+
+
+@pytest.mark.asyncio
+async def test_web_ui_api_prefix_miss_returns_json_not_spa_shell(tmp_path: Path) -> None:
+    """
+    Keep the browser goal API path from failing as a JSON parse error.
+
+    The committed server mounts the SPA at ``/`` after API routers. If a
+    route is absent in a stacked build, the static fallback still receives
+    ``/v1/...``; API-shaped misses must return JSON 404 instead of
+    ``index.html`` so the ap-web Codex goal controls can surface a normal
+    request failure.
+    """
+    web_ui_dist = tmp_path / "web-ui"
+    web_ui_dist.mkdir()
+    (web_ui_dist / "index.html").write_text("<!doctype html><div id='root'></div>")
+
+    app = FastAPI()
+    app.mount("/", app_module._SPAStaticFiles(directory=web_ui_dist, html=True))  # noqa: SLF001
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        api_miss = await client.get("/v1/sessions/session_123/not_a_route")
+        spa_fallback = await client.get("/c/session_123")
+
+    assert api_miss.status_code == 404
+    assert api_miss.headers["content-type"] == "application/json"
+    assert api_miss.json() == {"error": {"code": "not_found", "message": "Not found"}}
+    assert "cache-control" not in api_miss.headers
+    assert spa_fallback.status_code == 200
+    assert spa_fallback.headers["content-type"].startswith("text/html")
 
 
 def _assert_completed(events: list[Any]) -> list[Any]:

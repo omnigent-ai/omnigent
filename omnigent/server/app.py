@@ -79,6 +79,7 @@ _WEB_UI_DIST = Path(__file__).parent / "static" / "web-ui"
 _WEB_UI_HTML_CACHE_CONTROL = "no-cache"
 _WEB_UI_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _WEB_UI_STATIC_CACHE_CONTROL = "public, max-age=3600"
+_WEB_UI_API_FALLBACK_PREFIXES = frozenset({"api", "auth", "health", "v1"})
 _WEB_UI_GZIP_MINIMUM_SIZE = 1024
 _CLAUDE_NATIVE_AGENT_NAME = CLAUDE_NATIVE_CODING_AGENT.agent_name
 _CODEX_NATIVE_AGENT_NAME = CODEX_NATIVE_CODING_AGENT.agent_name
@@ -2105,11 +2106,11 @@ class _SPAStaticFiles(StaticFiles):
     for the literal root and directory paths, so a refresh on
     ``/c/abc`` would 404.
 
-    The fallback is gated by an extension check: a path with a file
-    extension (``.js``, ``.css``, ``.png``, ``.woff2``, …) is treated as
-    an asset request and a 404 is returned verbatim — that surfaces
-    real broken-asset bugs rather than masking them with the HTML
-    shell. Extensionless paths fall back to ``index.html``.
+    The fallback is gated by an API-prefix and extension check: unmatched
+    ``/v1`` / ``/api`` / ``/auth`` / ``/health`` paths return a JSON 404,
+    and a path with a file extension (``.js``, ``.css``, ``.png``,
+    ``.woff2``, …) returns the static 404 verbatim. Other extensionless
+    paths fall back to ``index.html``.
     """
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -2130,12 +2131,39 @@ class _SPAStaticFiles(StaticFiles):
         try:
             response = await super().get_response(path, scope)
         except StarletteHTTPException as exc:
+            if exc.status_code == 404 and _is_web_ui_api_fallback_path(path):
+                return JSONResponse(
+                    status_code=404,
+                    content={
+                        "error": {
+                            "code": ErrorCode.NOT_FOUND,
+                            "message": "Not found",
+                        }
+                    },
+                )
             if exc.status_code == 404 and "." not in path.rsplit("/", 1)[-1]:
                 served_path = "index.html"
                 response = await super().get_response("index.html", scope)
             else:
                 raise
         return _apply_web_ui_cache_headers(response, served_path)
+
+
+def _is_web_ui_api_fallback_path(path: str) -> bool:
+    """
+    Return whether an unmatched static path belongs to the API namespace.
+
+    The web UI is mounted at ``/`` and receives every unmatched request after
+    the routers. Without this guard, an unknown API route such as
+    ``/v1/sessions/x/codex_goal`` is served the SPA shell as ``200 text/html``,
+    which makes browser clients fail with a JSON parse error instead of a
+    route-level 404.
+
+    :param path: Static mount-relative path, e.g. ``"v1/sessions/x"``.
+    :returns: True for paths that should never fall back to ``index.html``.
+    """
+    first_segment = path.lstrip("/").split("/", 1)[0]
+    return first_segment in _WEB_UI_API_FALLBACK_PREFIXES
 
 
 class _RangeAwareGZipMiddleware(GZipMiddleware):
