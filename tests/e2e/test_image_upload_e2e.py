@@ -50,11 +50,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 # Checked-in test image: 100x100 red square with a blue center.
 _TEST_IMAGE_PATH = _REPO_ROOT / "tests" / "resources" / "test_image.png"
 
-# Harness probes excluding databricks_supervisor (no user-facing
-# image use case for the supervisor harness).
-_IMAGE_HARNESS_PROBES: list[HarnessProbe] = [
-    p for p in HARNESS_PROBES if p.harness != "databricks_supervisor"
-]
+_IMAGE_HARNESS_PROBES: list[HarnessProbe] = list(HARNESS_PROBES)
 _IMAGE_HARNESS_IDS: list[str] = [p.harness for p in _IMAGE_HARNESS_PROBES]
 
 

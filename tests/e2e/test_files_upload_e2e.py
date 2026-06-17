@@ -55,11 +55,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _TEST_MD_PATH = _REPO_ROOT / "tests" / "resources" / "test.md"
 _TEST_PDF_PATH = _REPO_ROOT / "tests" / "resources" / "test.pdf"
 
-# Harness probes excluding databricks_supervisor (no user-facing
-# document use case for the supervisor harness).
-_FILE_HARNESS_PROBES: list[HarnessProbe] = [
-    p for p in HARNESS_PROBES if p.harness != "databricks_supervisor"
-]
+_FILE_HARNESS_PROBES: list[HarnessProbe] = list(HARNESS_PROBES)
 _FILE_HARNESS_IDS: list[str] = [p.harness for p in _FILE_HARNESS_PROBES]
 
 

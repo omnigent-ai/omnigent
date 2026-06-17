@@ -80,7 +80,6 @@ OMNIGENT_HARNESSES = frozenset(
         "codex",
         "codex-native",
         "cursor",
-        "databricks_supervisor",
         "openai-agents",
         "open-responses",
         "pi",
