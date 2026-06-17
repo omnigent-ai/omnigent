@@ -168,6 +168,10 @@ copilot = ["github-copilot-sdk>=1,<2"]
 # cursor` users need this extra (`omnigent[cursor]`). Was a baseline dependency;
 # now opt-in to keep the default install lean.
 cursor = ["cursor-sdk>=0.1.7"]
+# Hindsight long-term memory built-in tools (hindsight_retain / _recall /
+# _reflect). The tools import the client lazily, so only users who enable a
+# Hindsight memory tool need this extra.
+hindsight = ["hindsight-client>=0.4.0"]
 databricks = [
     # Floor matches what core code was tested against when the SDK was a
     # default dependency (it moved here from `dependencies` above).
@@ -180,6 +184,13 @@ databricks = [
 ]
 dev = [
     "pytest>=7.0",
+    # mlflow is now opt-in (the `tracing` / `databricks` extras), but the
+    # telemetry + tracing test suites need it, so keep it in the dev set.
+    "mlflow>=3,<4",
+    # hindsight-client is opt-in (the `hindsight` extra), but the Hindsight
+    # memory tool tests import + mock it, so keep it in the dev set (same
+    # rationale as mlflow above).
+    "hindsight-client>=0.4.0",
     "pytest-asyncio>=0.21",
     "pytest-xdist>=3.6",
     # Line coverage during the unit-test matrix. Each CI shard writes its
@@ -532,6 +543,12 @@ ignore_missing_imports = true
 # posture as modal above.
 [[tool.mypy.overrides]]
 module = "daytona.*"
+ignore_missing_imports = true
+
+# hindsight-client is an optional dep (the `hindsight` extra); the memory
+# built-in tools import it lazily so the base install never needs it.
+[[tool.mypy.overrides]]
+module = "hindsight_client.*"
 ignore_missing_imports = true
 
 # cwsandbox is an optional dep (the `cwsandbox` extra); same lazy-import
