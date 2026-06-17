@@ -234,8 +234,8 @@ def test_run_repl_wires_subagent_plumbing() -> None:
     assert "_subagent_poll_loop" in src, (
         "the background tree poll (deeper levels) is no longer started"
     )
-    assert "inside_subagent" in src and "_sync_subagent_root" in src, (
-        "the root-tracking / dived-in flag was dropped — the root could go "
-        "stale vs the live main session, making '← back' show on the top-"
-        "level session."
+    assert "_sync_subagent_root" in src and "_readonly_view" in src, (
+        "the root-tracking dropped its read-only-view source of truth — the "
+        "root could go stale vs the live main session, making '← back' show "
+        "on the top-level session."
     )

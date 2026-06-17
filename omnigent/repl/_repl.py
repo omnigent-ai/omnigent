@@ -1712,6 +1712,11 @@ class _SessionsChatReplAdapter:
             The unbind is soft-failed on old servers (see
             :meth:`_unbind_runner_soft`).
         """
+        # Switching to a top-level session re-establishes runner ownership,
+        # so clear any read-only-view suppression left over from diving into a
+        # sub-agent — otherwise the bind below (and every later bind) no-ops
+        # and the switched-to session can never dispatch a turn.
+        self._readonly_view = False
         old_session_id = self._session_id
         if old_session_id is not None and old_session_id != new_session_id:
             await self._unbind_runner_soft(old_session_id)
@@ -1752,13 +1757,17 @@ class _SessionsChatReplAdapter:
             watchdog resumes.
         :returns: The observed session id (echoed back).
         """
+        # Apply the displayed-session state atomically up front (no await in
+        # between), so the background root-tracking poll never observes a
+        # half-applied switch (session id moved but read-only flag not yet,
+        # or vice versa) and mistakes the sub-agent for the tree root.
+        self._session_id = new_session_id
         self._readonly_view = read_only
         if self._stream_task is not None:
             self._stream_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._stream_task
             self._stream_task = None
-        self._session_id = new_session_id
         session = await self._client.sessions.get(new_session_id)
         self._hydrate_from_session_snapshot(session)
         self._stream_task = asyncio.create_task(self._stream_pump())
@@ -2282,6 +2291,9 @@ class _SessionsChatReplAdapter:
         branch. Idempotent when no session is established. The unbind
         is soft-failed on old servers (see :meth:`_unbind_runner_soft`).
         """
+        # A fresh session is owned, not observed — clear any read-only-view
+        # suppression from a sub-agent dive so the new session can bind.
+        self._readonly_view = False
         old_session_id = self._session_id
         if old_session_id is not None:
             await self._unbind_runner_soft(old_session_id)
@@ -3475,6 +3487,19 @@ async def run_repl(
             await handle_slash_command(text, session, client, host, fmt)
             return
 
+        # While observing a sub-agent read-only (dived in via ↓), refuse plain
+        # message sends — posting here would inject a turn into the sub-agent's
+        # own conversation. Slash commands (handled above) still work; press ←
+        # to return to the top-level session before sending.
+        if getattr(session, "_readonly_view", False):
+            host.output(
+                Text.from_markup(
+                    f"   [{fmt.muted}]read-only view — press ← to return to the main "
+                    f"session before sending[/{fmt.muted}]",
+                ),
+            )
+            return
+
         files = [a.path for a in attachments] if attachments else None
         cwd = os.getcwd()
         filenames = [os.path.relpath(a.path, cwd) for a in attachments] if attachments else None
@@ -3665,21 +3690,21 @@ async def run_repl(
 
     # The session the tree is rooted at — the originally-launched "main"
     # session. It tracks the live top-level session id while the user is at
-    # the top (``inside_subagent`` False) and freezes once they dive into a
-    # sub-agent, so the whole hierarchy + the way back to main stay correct
-    # even if the main session id changes (e.g. a runner rebind reassigns
-    # it). ``inside_subagent`` is the source of truth for "are we below the
-    # root" — it drives both the ``← back`` hint and where Left returns to.
+    # the top and freezes once they dive into a sub-agent, so the whole
+    # hierarchy + the way back to main stay correct even if the main session
+    # id changes (e.g. a runner rebind reassigns it). The adapter's
+    # ``_readonly_view`` flag (set atomically by ``view_session`` and cleared
+    # on switch / clear / new) is the single source of truth for "are we
+    # observing a sub-agent below the root".
     subagent_root: list[str | None] = [None]
-    inside_subagent: list[bool] = [False]
 
     def _sync_subagent_root() -> None:
-        # Track the live top-level session id while we're at the top. Once the
-        # user dives into a sub-agent, ``inside_subagent`` is set (in
-        # ``_open_subagent_by_id``, *before* the stream re-points) so this
-        # freezes the root — it must NOT self-heal off ``session.session_id``,
-        # which would race the dive and capture the sub-agent as the root.
-        if not inside_subagent[0] and session.session_id is not None:
+        # Track the live top-level session id while we're at the top. While
+        # observing a sub-agent (``_readonly_view``), freeze the root — never
+        # self-heal off ``session.session_id``, which would capture the
+        # sub-agent as the root. ``view_session`` sets the session id and the
+        # read-only flag together, so this never sees a half-applied switch.
+        if not getattr(session, "_readonly_view", False) and session.session_id is not None:
             subagent_root[0] = session.session_id
 
     async def _refresh_subagents() -> None:
@@ -3719,17 +3744,13 @@ async def run_repl(
             return  # Already viewing this session (e.g. selected "main").
         # Returning to the top-level session re-enables runner ownership;
         # diving into any sub-agent is read-only (no runner rebind).
+        # ``view_session`` applies the session id + read-only flag atomically,
+        # which both freezes the root (read-only) and re-roots on return, so
+        # no extra flag bookkeeping is needed here.
         returning_to_root = subagent_root[0] is not None and target_id == subagent_root[0]
-        # Freeze the root BEFORE re-pointing the stream, so the concurrent
-        # poll can't capture the sub-agent we're diving into as the root
-        # (which would strand us — "back" would then target the sub-agent).
-        if not returning_to_root:
-            inside_subagent[0] = True
         try:
             await session.view_session(target_id, read_only=not returning_to_root)
         except Exception as exc:  # noqa: BLE001 — REPL boundary: render the failure, stay alive
-            if not returning_to_root:
-                inside_subagent[0] = False  # roll back on failure
             host.output(
                 Text.from_markup(f"  [bold red]Failed to open {target_id[:16]}…: {exc}[/]")
             )
@@ -3743,11 +3764,6 @@ async def run_repl(
             ui_name=_humanize_agent_name(session.model),
             redraw_screen=True,
         )
-        # Settled on the target. If it was the root we're back at the top —
-        # clear the flag only now (after the re-point) so the poll can resume
-        # tracking the live top-level session id.
-        if returning_to_root:
-            inside_subagent[0] = False
         await _refresh_subagents()
 
     host.on_subagent_select = _open_subagent_by_id
@@ -4621,6 +4637,9 @@ async def _start_new_conversation(
             return False
     else:
         session.reset()
+    # Drop the prior conversation's sub-agent tree so its agents don't linger
+    # in the badge / ↓ menu under the fresh session.
+    host.clear_subagents()
     return True
 
 
@@ -4718,6 +4737,9 @@ async def _cmd_switch(
             # in sessions mode, so without this the REPL keeps
             # sending to the original session.
             await session.switch_to_session(arg)  # type: ignore[attr-defined]
+            # Drop the prior session's sub-agent tree so its agents don't
+            # linger under the switched-to session's root.
+            host.clear_subagents()
 
             # ``/switch`` runs mid-session, so the user already
             # has prior-conversation transcript on screen —
@@ -5688,7 +5710,7 @@ def _apply_child_session_event(
             host.upsert_subagent(
                 event.child_session_id,
                 parent_id=active_conversation_id,
-                child={"busy": True, "current_task_status": "launching"},
+                child={"current_task_status": "launching"},
             )
         return True
     if isinstance(event, _ChildUpdated):

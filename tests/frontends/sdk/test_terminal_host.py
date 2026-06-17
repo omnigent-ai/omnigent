@@ -1567,3 +1567,58 @@ def test_subagent_count_debounces_busy_and_terminal_blips() -> None:
     host._subagents["conv_c1"].done_at = host._monotonic() - 100.0
     assert host.active_subagent_count() == 0
     assert "state: sleeping" in _formatted_text_plain(host.build_toolbar())
+
+
+def test_subagent_poll_null_status_does_not_resurrect_terminal() -> None:
+    """The REST poll reports ``current_task_status=None``; re-seeding a node
+    the SSE already marked terminal must NOT clear ``done_at`` and resurrect
+    it (which would stick the badge on 'N agents running')."""
+    host = TerminalHost(model_name="test")
+    host.upsert_subagent(
+        "conv_c1",
+        parent_id="conv_main",
+        child={"tool": "a", "busy": False, "current_task_status": "completed"},
+    )
+    done_at = host._subagents["conv_c1"].done_at
+    assert done_at is not None
+    # A 2 s poll row: null status (+ busy False). Must not clear done_at.
+    host.upsert_subagent(
+        "conv_c1",
+        parent_id="conv_main",
+        child={"id": "conv_c1", "busy": False, "current_task_status": None},
+    )
+    assert host._subagents["conv_c1"].done_at == done_at  # unchanged → not resurrected
+
+
+def test_subagent_poll_only_node_settles_via_busy_flag() -> None:
+    """A poll-only node (no SSE status — e.g. a grandchild) tracks running-ness
+    from the ``busy`` flag the poll DOES provide: busy True -> running, busy
+    False -> finished (then settles after the linger)."""
+    host = TerminalHost(model_name="test")
+    host.upsert_subagent(
+        "conv_g1",
+        parent_id="conv_child",
+        child={"id": "conv_g1", "tool": "x", "busy": True, "current_task_status": None},
+    )
+    assert host.active_subagent_count() == 1  # running
+    host.upsert_subagent(
+        "conv_g1", child={"id": "conv_g1", "busy": False, "current_task_status": None}
+    )
+    assert host.active_subagent_count() == 1  # finished, still within linger
+    host._subagents["conv_g1"].done_at = host._monotonic() - 100.0
+    assert host.active_subagent_count() == 0  # settled
+
+
+def test_subagent_finished_node_hidden_but_kept() -> None:
+    """A finished-past-linger node is hidden from the badge + menu but kept in
+    the registry — so the 2 s poll can't delete-then-recreate (resurrect) it."""
+    host = TerminalHost(model_name="test")
+    host.upsert_subagent(
+        "conv_c1",
+        parent_id="conv_main",
+        child={"tool": "a", "busy": False, "current_task_status": "completed"},
+    )
+    host._subagents["conv_c1"].done_at = host._monotonic() - 100.0
+    assert host.active_subagent_count() == 0  # hidden from the badge
+    assert host.subagent_tree() == []  # hidden from the menu
+    assert "conv_c1" in host._subagents  # but kept, so the poll can't resurrect it

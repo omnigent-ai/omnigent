@@ -208,13 +208,9 @@ _SPINNER_TICK_SECONDS: float = 0.1
 
 # A finished sub-agent lingers in the ``↓`` menu for this many seconds
 # (showing ✔/✗) before it is pruned, so a quick task still registers
-# visually instead of vanishing the instant it completes.
+# visually instead of vanishing the instant it completes. It also debounces
+# the running count so a between-turns blip can't flicker the badge.
 _SUBAGENT_LINGER_SECONDS: float = 3.0
-# Maximum sub-agent nesting depth fetched + rendered, counted in levels
-# below the root ("main") session: 1 = children, 2 = grandchildren,
-# 3 = great-grandchildren. Mirrors ap-web's ``MAX_TREE_DEPTH`` so the CLI
-# tree matches the web Agents rail.
-_MAX_SUBAGENT_TREE_DEPTH: int = 3
 # Max rows shown at once in the inline ``↓`` sub-agents menu. Longer
 # trees scroll within this window so the input bar never lifts more than
 # this many lines up the terminal.
@@ -237,10 +233,10 @@ class _SubagentNode:
     agent: str | None = None
     title: str | None = None
     # ``current_task_status``: launching / in_progress / completed / failed / …
+    # Running-ness is tracked via ``done_at`` (terminal-vs-not), not a live
+    # ``busy`` flag — see :meth:`TerminalHost.active_subagent_count`.
     status: str | None = None
-    busy: bool = False
     started_at: float = 0.0  # monotonic; stamped on first sighting
-    last_preview: str | None = None
     pending_elicitations: int = 0
     done_at: float | None = None  # monotonic; stamped when terminal
 
@@ -900,9 +896,9 @@ class TerminalHost:
         self._subagent_root: str | None = None
         # Inline ``↓`` sub-agents menu state. Open is toggled by Down (on an
         # empty input while sub-agents are active) / Esc; index + scroll
-        # drive the windowed list rendered above the prompt by
-        # ``build_prompt``. ``on_subagent_select`` is invoked by ``run`` with
-        # the chosen session id when the user presses Enter.
+        # drive the windowed list rendered below the toolbar (see the layout
+        # patch). ``on_subagent_select`` is invoked by ``run`` with the chosen
+        # session id when the user presses Enter.
         self._subagent_menu_open: bool = False
         self._subagent_menu_index: int = 0
         self._subagent_menu_scroll: int = 0
@@ -3085,10 +3081,10 @@ class TerminalHost:
     ) -> None:
         """Create or merge one sub-agent node from a partial payload.
 
-        ``child`` is a partial ``ChildSessionSummary`` dict — status deltas
-        omit ``last_message_preview``; preview deltas carry only it — so we
-        merge **present keys only** and never blank a value we already know
-        (e.g. a status-only delta must not drop the label or ``parent_id``).
+        ``child`` is a partial ``ChildSessionSummary`` dict (a status delta
+        carries only what changed), so we merge **present keys only** and
+        never blank a value we already know (e.g. a delta must not drop the
+        label or ``parent_id``).
         """
         child = child or {}
         node = self._subagents.get(session_id)
@@ -3102,18 +3098,27 @@ class TerminalHost:
             node.agent = agent
         if child.get("title") is not None:
             node.title = child.get("title")
-        if "current_task_status" in child:
-            node.status = child.get("current_task_status")
-        if "busy" in child:
-            node.busy = bool(child.get("busy"))
-        if "last_message_preview" in child:
-            node.last_preview = child.get("last_message_preview")
+        # Adopt only a REAL (non-null) task status. The live SSE
+        # (``session.child_session.updated``) delivers a real
+        # ``current_task_status``, but the REST poll (used for deeper tree
+        # levels) hardcodes it to ``None`` — letting that null overwrite the
+        # status would erase the SSE-delivered terminal state and resurrect a
+        # finished sub-agent on every 2 s poll.
+        incoming_status = child.get("current_task_status")
+        if incoming_status is not None:
+            node.status = incoming_status
         if "pending_elicitations_count" in child:
             node.pending_elicitations = int(child.get("pending_elicitations_count") or 0)
-        # A terminal task status freezes the node into its linger window;
-        # any non-terminal state clears the stamp (e.g. a reused handle that
-        # starts a fresh task after completing an earlier one).
-        if node.status in ("completed", "failed", "cancelled"):
+        # A node is finished when it has a terminal task status (from SSE),
+        # or — for poll-only nodes that never receive SSE status — when the
+        # server reports its loop is no longer busy. ``done_at`` + the linger
+        # window debounce the busy flag so a between-turns blip doesn't settle
+        # it early; a non-terminal update clears the stamp (a reused handle
+        # starting a fresh task, or a child that resumed).
+        terminal = node.status in ("completed", "failed", "cancelled") or (
+            incoming_status is None and child.get("busy") is False
+        )
+        if terminal:
             if node.done_at is None:
                 node.done_at = self._monotonic()
         else:
@@ -3159,34 +3164,35 @@ class TerminalHost:
                 del self._subagents[sid]
         self._invalidate_prompt()
 
-    def _prune_finished_subagents(self) -> None:
-        """Drop finished nodes whose linger window has elapsed.
+    def _subagent_visible(self, node: _SubagentNode, now: float) -> bool:
+        """Whether a node shows in the badge count + ↓ menu.
 
-        Keyed on terminal-vs-not (``done_at``), not the live ``busy`` flag:
-        a still-running node (``done_at is None``) is always kept; a terminal
-        one is dropped once it has outlived its linger window.
+        Visible while running (``done_at is None``) or within the linger
+        window after going terminal. Finished-past-linger nodes are hidden but
+        NOT deleted: the 2 s poll re-reports every child with a null
+        ``current_task_status``, so deleting a settled node would let the next
+        poll recreate it and resurrect the ``N agents running`` badge. Nodes
+        leave the registry only via snapshot reconciliation (the server stops
+        listing them) or :meth:`clear_subagents`.
         """
-        now = self._monotonic()
-        for sid in list(self._subagents):
-            node = self._subagents[sid]
-            if node.done_at is None:
-                continue
-            if (now - node.done_at) >= _SUBAGENT_LINGER_SECONDS:
-                del self._subagents[sid]
+        return node.done_at is None or (now - node.done_at) < _SUBAGENT_LINGER_SECONDS
 
     def subagent_tree(self) -> list[tuple[_SubagentNode, int]]:
-        """Return live sub-agent nodes in pre-order with their depth.
+        """Return the visible sub-agent nodes in pre-order with their depth.
 
         Depth is 1 for direct children of the root ("main") session, 2 for
-        grandchildren, etc. Finished-but-lingering nodes are included;
-        expired ones are pruned here. Cycle- and orphan-safe.
+        grandchildren, etc. Finished-but-lingering nodes are included; ones
+        past the linger window are hidden (but kept — see
+        :meth:`_subagent_visible`). Cycle- and orphan-safe.
         """
-        self._prune_finished_subagents()
+        now = self._monotonic()
+        visible = sorted(
+            (n for n in self._subagents.values() if self._subagent_visible(n, now)),
+            key=lambda n: n.started_at,
+        )
         children_of: dict[str | None, list[_SubagentNode]] = {}
-        for node in self._subagents.values():
+        for node in visible:  # pre-sorted, so child lists stay started_at-ordered
             children_of.setdefault(node.parent_id, []).append(node)
-        for kids in children_of.values():
-            kids.sort(key=lambda n: n.started_at)
         out: list[tuple[_SubagentNode, int]] = []
         seen: set[str] = set()
 
@@ -3199,11 +3205,10 @@ class TerminalHost:
                 _walk(node.session_id, depth + 1)
 
         _walk(self._subagent_root, 1)
-        # Surface any node not reachable from the root — an orphan whose
-        # parent isn't tracked, or a node stranded in a parent cycle — at
-        # depth 1 so no sub-agent is silently lost. The ``seen`` guard keeps
-        # each node (and the walk) single-visit, so a cycle can't loop.
-        for node in sorted(self._subagents.values(), key=lambda n: n.started_at):
+        # Surface any visible node not reachable from the root — an orphan
+        # whose parent isn't tracked (or was hidden), or a node stranded in a
+        # parent cycle — at depth 1 so no running sub-agent is silently lost.
+        for node in visible:
             if node.session_id in seen:
                 continue
             seen.add(node.session_id)
@@ -3212,30 +3217,20 @@ class TerminalHost:
         return out
 
     def active_subagent_count(self) -> int:
-        """Number of sub-agents that haven't finished yet, across the tree.
+        """Number of sub-agents currently shown as running, across the tree.
 
-        Counts a sub-agent as running from launch until it reaches a terminal
-        task status (``done_at`` stamped) — i.e. until it has delivered its
-        final reply. This is deliberately NOT the live ``busy`` flag: ``busy``
-        (server ``status in (running, waiting)``) drops to false in the gaps
-        between a child's turns / async waits and comes back, which made the
-        ``N agents running`` badge flicker on/off between status heartbeats.
-
-        It also debounces a terminal blip: a child can momentarily report a
-        terminal status (an ``idle`` between turns that the server maps to
-        ``completed``) then resume. A node counts while running
-        (``done_at is None``) OR for ``_SUBAGENT_LINGER_SECONDS`` after it
-        last went terminal — so a brief completed→running flip can't drop the
-        badge; it only settles once the child has stayed terminal (sent its
-        final reply) for the whole linger window.
+        Counts a sub-agent from launch until it has stayed terminal (delivered
+        its final reply) for the whole linger window. This is deliberately NOT
+        the live ``busy`` flag: ``busy`` (server ``status in (running,
+        waiting)``) drops to false in the gaps between a child's turns / async
+        waits and comes back, which made the ``N agents running`` badge
+        flicker on/off between status heartbeats. Keying on terminal-vs-not
+        plus the linger window also debounces a brief terminal blip (an
+        ``idle`` between turns the server maps to ``completed``) that then
+        resumes, so the badge only settles once the child is truly finished.
         """
-        self._prune_finished_subagents()
         now = self._monotonic()
-        return sum(
-            1
-            for n in self._subagents.values()
-            if n.done_at is None or (now - n.done_at) < _SUBAGENT_LINGER_SECONDS
-        )
+        return sum(1 for n in self._subagents.values() if self._subagent_visible(n, now))
 
     def has_active_subagents(self) -> bool:
         """True while any sub-agent is still running (drives the badge / hint /
@@ -3244,7 +3239,9 @@ class TerminalHost:
         return self.active_subagent_count() > 0
 
     def clear_subagents(self) -> None:
-        """Drop the whole tree (called on session switch / reset / exit)."""
+        """Drop the whole tree — called when the REPL changes which top-level
+        session it owns (``/switch``, ``/clear``, ``/new``) so the prior
+        session's sub-agents don't linger under the new one."""
         self._subagents.clear()
         self._subagent_root = None
         self._invalidate_prompt()
@@ -3302,7 +3299,7 @@ class TerminalHost:
         return rows
 
     # ------------------------------------------------------------------
-    # Inline ``↓`` sub-agents menu — a navigable list above the prompt.
+    # Inline ``↓`` sub-agents menu — a navigable list below the toolbar.
     # ------------------------------------------------------------------
     def _subagent_menu_display_rows(self) -> list[tuple[str, str]]:
         """Rows for the inline menu: a leading ``main`` entry (when the root
@@ -3346,14 +3343,14 @@ class TerminalHost:
         return rows[idx][0]
 
     def _render_subagent_menu_fragments(self) -> list[tuple[str, str]]:
-        """Build the windowed menu rows shown above the prompt.
+        """Build the windowed menu rows shown below the toolbar.
 
         Returns prompt-toolkit ``(style, text)`` fragments, one row each
         ending in a newline. At most :data:`_SUBAGENT_MENU_MAX_ROWS` rows
         show at once; longer trees scroll within that window as the
-        selection moves, so the input bar never lifts more than that many
-        lines. Empty when the menu is closed; auto-closes when the tree
-        drained while the menu was open.
+        selection moves, so the menu never grows more than that many lines.
+        Empty when the menu is closed; auto-closes when the tree drained
+        while the menu was open.
         """
         if not self._subagent_menu_open:
             return []
