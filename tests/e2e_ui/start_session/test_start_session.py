@@ -356,12 +356,13 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
 
 
 def test_start_session_select_approval_mode(seeded_session: tuple[str, str]) -> None:
-    """Picking a non-default approval mode rides along to the create call.
+    """Picking a non-default approval preset rides along to the create call.
 
-    Selecting "Never" in the agent picker's Advanced settings menu
+    Selecting "Full access" in the agent picker's Advanced settings menu
     must (a) surface in the agent chip label as immediate feedback and
     (b) reach ``POST /v1/sessions`` as
-    ``terminal_launch_args: ["--ask-for-approval", "never"]``.
+    ``terminal_launch_args: ["--sandbox", "danger-full-access",
+    "--ask-for-approval", "never"]``.
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_approval_mode(base_url, session_id))
@@ -405,16 +406,16 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
             # Codex auto-selects (only built-in), so the Advanced chip —
             # gated on the Codex-native agent — is present.
             await page.get_by_test_id("new-chat-landing-advanced-chip").click()
-            # All three Codex approval modes render as radio rows.
-            for mode in ("untrusted", "on-request", "never"):
+            # All three Codex approval presets render as radio rows.
+            for mode in ("default", "full-access", "read-only"):
                 await expect(
                     page.get_by_test_id(f"new-chat-landing-approval-{mode}")
                 ).to_be_visible()
-            await page.get_by_test_id("new-chat-landing-approval-never").click()
+            await page.get_by_test_id("new-chat-landing-approval-full-access").click()
 
             # The chip label reflects the non-default pick immediately.
             await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_contain_text(
-                "Never"
+                "Full access"
             )
 
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
@@ -425,7 +426,12 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
             assert body["agent_id"] == "ag_codex_e2e", body
             assert body["host_id"] == _HOST_ID, body
             assert body["workspace"] == "/work/repo", body
-            assert body.get("terminal_launch_args") == ["--ask-for-approval", "never"], body
+            assert body.get("terminal_launch_args") == [
+                "--sandbox",
+                "danger-full-access",
+                "--ask-for-approval",
+                "never",
+            ], body
         finally:
             await browser.close()
 

@@ -112,27 +112,37 @@ const CLAUDE_NATIVE_PERMISSION_MODES: { value: string; label: string; descriptio
   },
 ];
 
-// Codex's `--ask-for-approval` choices (codex CLI). Codex-native sessions
-// only. "on-request" is Codex's default; any other value is passed through
-// as `--ask-for-approval <value>` via the session's terminal_launch_args.
+// Codex approval presets matching the `/permissions` TUI popup.
+// Each preset bundles a sandbox profile + approval policy, mirroring
+// codex-rs/utils/approval-presets/src/lib.rs. "default" is the auto
+// preset (workspace-write + on-request) and sends no flags so the
+// runner uses Codex's built-in default.
 // Keep in sync with `codex --help` and
 // https://developers.openai.com/codex/agent-approvals-security
-const CODEX_NATIVE_DEFAULT_APPROVAL_MODE = "on-request";
-const CODEX_NATIVE_APPROVAL_MODES: { value: string; label: string; description: string }[] = [
+const CODEX_NATIVE_DEFAULT_APPROVAL_MODE = "default";
+const CODEX_NATIVE_APPROVAL_MODES: {
+  value: string;
+  label: string;
+  description: string;
+  args: string[];
+}[] = [
   {
-    value: "untrusted",
-    label: "Untrusted",
-    description: "Runs only known-safe read operations automatically",
+    value: "default",
+    label: "Default",
+    description: "Read/edit/run in workspace; approval for external edits or network",
+    args: [],
   },
   {
-    value: "on-request",
-    label: "On request",
-    description: "Model decides when to ask for approval",
+    value: "full-access",
+    label: "Full access",
+    description: "Edit any file and access the internet without approval",
+    args: ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
   },
   {
-    value: "never",
-    label: "Never",
-    description: "Never asks for approval; failures go straight to the model",
+    value: "read-only",
+    label: "Read only",
+    description: "Read files only; approval required for edits, commands, or network",
+    args: ["--sandbox", "read-only", "--ask-for-approval", "on-request"],
   },
 ];
 
@@ -1092,7 +1102,7 @@ export function NewChatLandingScreen() {
             agentSupportsPermissionMode && permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
               ? ["--permission-mode", permissionMode]
               : agentSupportsApprovalMode && approvalMode !== CODEX_NATIVE_DEFAULT_APPROVAL_MODE
-                ? ["--ask-for-approval", approvalMode]
+                ? (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.args ?? [])
                 : undefined,
           // Cost-control switch from the "Cost Optimized" pill; polly-only
           // (cost control is a polly feature) and omitted when unset so the
