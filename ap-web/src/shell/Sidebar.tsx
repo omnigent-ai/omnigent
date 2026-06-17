@@ -1101,7 +1101,7 @@ function ConversationRow({
           <DialogHeader>
             <DialogTitle>Delete conversation?</DialogTitle>
             <DialogDescription>
-              <span className="font-medium">{label}</span> and all of its history will be removed.
+              <span className="font-medium break-all">{label}</span> and all of its history will be removed.
               This cannot be undone.
             </DialogDescription>
           </DialogHeader>
