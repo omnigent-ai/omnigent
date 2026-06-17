@@ -12,9 +12,11 @@ import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createTerminal,
+  deriveIsShellView,
   fetchTerminals,
   inventoryTerminals,
   isAgentTerminalKey,
+  PANEL_NO_TERMINAL_KEY,
   PENDING_RECONCILE_INTERVAL_MS,
   terminalInfoFromResource,
   terminalsReconcileInterval,
@@ -455,6 +457,49 @@ describe("terminalTabKey", () => {
     };
     const after: TerminalInfo = { ...before, name: "bash-renamed", session: "s2" };
     expect(terminalTabKey(before)).toBe(terminalTabKey(after));
+  });
+});
+
+describe("deriveIsShellView", () => {
+  const repl: TerminalInfo = {
+    id: "terminal_tui_main",
+    name: "tui",
+    session: "main",
+    running: true,
+  };
+  const bash: TerminalInfo = {
+    id: "terminal_bash_s1",
+    name: "bash",
+    session: "s1",
+    running: true,
+  };
+
+  it("is false outside a terminal-first session", () => {
+    expect(deriveIsShellView(false, terminalTabKey(bash), [repl, bash])).toBe(false);
+  });
+
+  it("is false when no terminal is targeted (chat / list-only view)", () => {
+    expect(deriveIsShellView(true, null, [repl, bash])).toBe(false);
+    // The PANEL_NO_TERMINAL_KEY sentinel ("") is falsy — "open with no
+    // target" stays a pill view, not a shell view.
+    expect(deriveIsShellView(true, PANEL_NO_TERMINAL_KEY, [repl, bash])).toBe(false);
+  });
+
+  it("is false when the open view targets the agent's own terminal", () => {
+    expect(deriveIsShellView(true, terminalTabKey(repl), [repl, bash])).toBe(false);
+  });
+
+  it("is true while a live user shell is the open target", () => {
+    expect(deriveIsShellView(true, terminalTabKey(bash), [repl, bash])).toBe(true);
+  });
+
+  it("is false once the targeted shell is gone (exit / resource.deleted) — pill reappears, no stranding (#479)", () => {
+    // The shell exited: the runner deleted its resource, so it left the
+    // list while `panelInitialKey` still points at it. Without the
+    // presence check `isShellView` would stay true and the Chat/Terminal
+    // pill would stay hidden — stranding the session in terminal-only
+    // view. It must flip false so the pill reappears.
+    expect(deriveIsShellView(true, terminalTabKey(bash), [repl])).toBe(false);
   });
 });
 

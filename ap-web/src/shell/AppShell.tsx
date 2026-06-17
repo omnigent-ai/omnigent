@@ -26,8 +26,8 @@ import {
 import { useDebugMode } from "@/hooks/useDebugMode";
 import {
   AGENT_TERMINAL_IDS,
+  deriveIsShellView,
   inventoryTerminals,
-  isAgentTerminalKey,
   PANEL_NO_TERMINAL_KEY,
   terminalTabKey,
   useTerminals,
@@ -884,8 +884,13 @@ export function AppShell() {
   // ConnectionIndicator hides the Chat/Terminal pill while this is
   // true, and MainTerminalView renders the shell with its own close
   // affordance. The PANEL_NO_TERMINAL_KEY sentinel ("") is falsy, so
-  // "open with no target" stays a pill view.
-  const isShellView = terminalFirst && !!panelInitialKey && !isAgentTerminalKey(panelInitialKey);
+  // "open with no target" stays a pill view. The shell must also still
+  // be present in `terminals`: when a shell exits the runner deletes its
+  // resource (session.resource.deleted) but `panelInitialKey` keeps
+  // pointing at the dead key, so without the presence check the pill would
+  // stay hidden and the session would strand in terminal-only view with no
+  // way back to chat (#479). See `deriveIsShellView`.
+  const isShellView = deriveIsShellView(terminalFirst, panelInitialKey, terminals);
   const terminalFirstContextValue = useMemo<TerminalFirstContextValue>(
     () => ({
       isClaudeNative,

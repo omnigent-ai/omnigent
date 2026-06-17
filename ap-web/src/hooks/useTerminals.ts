@@ -80,6 +80,41 @@ export function isAgentTerminalKey(terminalKey: string): boolean {
 }
 
 /**
+ * Whether the open terminal view is currently showing a *live* user shell —
+ * i.e. a terminal-first session has its panel open to a non-agent terminal key
+ * that still addresses a terminal present in ``terminals``.
+ *
+ * The presence check is what un-strands the UI when a shell exits: the runner
+ * deletes the shell's resource (``session.resource.deleted``) so it leaves
+ * ``terminals``, but AppShell's ``panelInitialKey`` keeps pointing at the now-
+ * dead key. Without this check the Chat/Terminal pill stays self-hidden
+ * (``isShellView``) while ``MainTerminalView`` falls back to the agent's own
+ * terminal — leaving the session stuck in terminal-only view with no way back
+ * to chat. Requiring the shell to still be present flips ``isShellView`` false
+ * the moment the shell is gone, so the pill reappears (#479).
+ *
+ * The ``PANEL_NO_TERMINAL_KEY`` sentinel ("") is falsy, so "open with no
+ * target" stays a pill view, not a shell view.
+ *
+ * :param terminalFirst: ``true`` for terminal-first sessions
+ *     (``omnigent.ui === "terminal"``).
+ * :param panelInitialKey: The open terminal-view target key (AppShell's
+ *     ``panelInitialKey``), or ``null`` / the ``PANEL_NO_TERMINAL_KEY`` sentinel.
+ * :param terminals: The full live terminal list (``useTerminals`` result —
+ *     the agent's own terminal plus user shells).
+ * :returns: ``true`` while the open view targets a present user shell.
+ */
+export function deriveIsShellView(
+  terminalFirst: boolean,
+  panelInitialKey: string | null,
+  terminals: TerminalInfo[],
+): boolean {
+  if (!terminalFirst || !panelInitialKey) return false;
+  if (isAgentTerminalKey(panelInitialKey)) return false;
+  return terminals.some((t) => terminalTabKey(t) === panelInitialKey);
+}
+
+/**
  * Project the terminal list down to the session's *inventory* — the
  * shells shown in the right-rail Shells tab, its count badge, and the
  * mobile menu entry.
