@@ -4,6 +4,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  RunnerOfflineError,
   type WorkspaceChangedFile,
   type WorkspaceFile,
   useWorkspaceAllFiles,
@@ -12,6 +13,7 @@ import {
   useWorkspaceEnvironment,
   useWorkspaceFileSearch,
 } from "@/hooks/useWorkspaceChangedFiles";
+import { type SessionLiveness, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { FilesPanel } from "./FilesPanel";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import { FolderTree } from "./FolderTree";
@@ -24,7 +26,19 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
   useWorkspaceFileSearch: vi.fn(),
   // Real export consumed by FlatFileList's `instanceof` check; the full
   // module mock would otherwise drop it (undefined → instanceof throws).
-  RunnerOfflineError: class RunnerOfflineError extends Error {},
+  RunnerOfflineError: class extends Error {},
+}));
+
+// FilesPanel derives the runner-asleep hint from session liveness; mock the
+// hook (and its row helper) so tests drive `kind` directly. Defaults to a
+// live session — overridden per-test. `useSession` is mocked too so the panel
+// doesn't need a QueryClient in these unit renders.
+vi.mock("@/hooks/useSession", () => ({
+  useSession: vi.fn(() => ({ session: null, isLoading: false, error: null })),
+}));
+vi.mock("@/hooks/useSessionLiveness", () => ({
+  useSessionLiveness: vi.fn(() => ({ kind: "online" })),
+  livenessRowFromSession: vi.fn(() => null),
 }));
 
 const useAllFilesMock = vi.mocked(useWorkspaceAllFiles);
@@ -32,6 +46,7 @@ const useChangedFilesMock = vi.mocked(useWorkspaceChangedFiles);
 const useDirectoryMock = vi.mocked(useWorkspaceDirectory);
 const useEnvironmentMock = vi.mocked(useWorkspaceEnvironment);
 const useSearchMock = vi.mocked(useWorkspaceFileSearch);
+const useLivenessMock = vi.mocked(useSessionLiveness);
 
 function file(path: string, bytes = 10): WorkspaceFile {
   return {
@@ -158,6 +173,9 @@ beforeEach(() => {
   useDirectoryMock.mockReset();
   useEnvironmentMock.mockReset();
   useSearchMock.mockReset();
+  // Reset liveness to a live runner so a leaked override can't bleed across
+  // tests (mockReturnValue persists through clearAllMocks).
+  useLivenessMock.mockReturnValue({ kind: "online" });
 });
 
 afterEach(() => {
@@ -1140,5 +1158,67 @@ describe("FilesPanel tree (Explore) search", () => {
 
     expect(screen.getByRole("textbox", { name: "files to include" })).toHaveValue("");
     expect(screen.getByRole("textbox", { name: "files to exclude" })).toHaveValue("");
+  });
+});
+
+function changedFilesError() {
+  // The Changed-files fetch 503s when the runner is unreachable; FlatFileList
+  // detects it via `error instanceof RunnerOfflineError`.
+  return {
+    data: undefined,
+    error: new RunnerOfflineError(),
+    isError: true,
+    isLoading: false,
+  } as unknown as ReturnType<typeof useWorkspaceChangedFiles>;
+}
+
+function renderOfflinePanel(liveness: SessionLiveness) {
+  useLivenessMock.mockReturnValue(liveness);
+  useAllFilesMock.mockReturnValue(allFilesResult([]));
+  useChangedFilesMock.mockReturnValue(changedFilesError());
+  useDirectoryMock.mockReturnValue(directoryResult());
+  useEnvironmentMock.mockReturnValue(environmentResult());
+  useSearchMock.mockReturnValue(searchResult());
+  return render(
+    <MemoryRouter initialEntries={["/c/conv_offline"]}>
+      <Routes>
+        <Route
+          path="/c/:conversationId"
+          element={
+            <FilesPanel
+              sort="recent"
+              onSortChange={vi.fn()}
+              flatView={true}
+              onFileSelect={vi.fn()}
+              onFlatViewChange={vi.fn()}
+              showHidden={false}
+              onShowHiddenChange={vi.fn()}
+            />
+          }
+        />
+      </Routes>
+    </MemoryRouter>,
+  );
+}
+
+describe("FilesPanel runner-asleep reconnect hint", () => {
+  it("shows the reconnect hint when the runner is asleep (host up) and the files fetch 503s", () => {
+    // Host reconnected before the first new message: runner down, host up →
+    // liveness `runner_asleep` (sessionStatus is NOT "failed"). The panel must
+    // guide the user to send a message, not claim "No files in workspace".
+    renderOfflinePanel({ kind: "runner_asleep" });
+
+    expect(screen.getByText(/agent is asleep/i)).toBeInTheDocument();
+    expect(screen.getByText(/send a message in the chat to reconnect/i)).toBeInTheDocument();
+  });
+
+  it("keeps the empty state (not the hint) for a still-starting session", () => {
+    // A brand-new session mid-cold-boot reads as `starting`, not
+    // `runner_asleep`, so it keeps the normal empty state and does not alarm
+    // the user — the deliberate behavior this change must preserve.
+    renderOfflinePanel({ kind: "starting" });
+
+    expect(screen.queryByText(/agent is asleep/i)).toBeNull();
+    expect(screen.getByText(/no workspace changes yet/i)).toBeInTheDocument();
   });
 });

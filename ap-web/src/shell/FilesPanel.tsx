@@ -19,6 +19,8 @@ import {
   useWorkspaceEnvironment,
   useWorkspaceFileSearch,
 } from "@/hooks/useWorkspaceChangedFiles";
+import { useSession } from "@/hooks/useSession";
+import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { cn } from "@/lib/utils";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
@@ -275,18 +277,24 @@ export function FilesPanel({
   frameless,
 }: FilesPanelProps) {
   const { conversationId } = useParams<{ conversationId: string }>();
-  // The runner went offline (e.g. its host restarted): `sessionStatus`
-  // is "failed", set by `_on_runner_disconnect` server-side when the
-  // runner's tunnel drops (and also client-side in chatStore when the
-  // SSE stream itself dies). Either way the session can't be reached and
-  // a message reconnects it. A brand-new session whose runner just hasn't
-  // started is never "failed", so this distinguishes "asleep, send a
-  // message to reconnect" from a fresh session that should show the
-  // normal empty state — a real liveness signal, not an inference from
-  // chat history.
-  const runnerWentOffline = useChatStore(
+  // Show the "agent is asleep — send a message to reconnect" hint (rather
+  // than a misleading "No files" empty state) whenever a message would bring
+  // the workspace back: either the runner tunnel "failed", or the session is
+  // `runner_asleep` (runner down, host up — e.g. a host reconnect before the
+  // first new message, which never goes "failed"). A still-cold-booting
+  // session reads as `starting`, not `runner_asleep`, so it keeps the normal
+  // empty state.
+  const sessionFailed = useChatStore(
     (s) => s.conversationId === conversationId && s.sessionStatus === "failed",
   );
+  const turnActive = useChatStore(
+    (s) => s.conversationId === conversationId && s.status === "streaming",
+  );
+  const { session } = useSession(conversationId);
+  const liveness = useSessionLiveness(conversationId, livenessRowFromSession(session), {
+    turnActive,
+  });
+  const runnerWentOffline = sessionFailed || liveness.kind === "runner_asleep";
   const [collapsed, setCollapsed] = useState(false);
   const [changedSearch, setChangedSearch] = useState("");
   const [treeSearch, setTreeSearch] = useState("");
