@@ -214,9 +214,10 @@ def test_every_agent_has_a_dedicated_test_file() -> None:
     # dirs) and single-YAML demos (content-filtered to real specs).
     on_disk: set[str] = set()
     on_disk |= _scan_agent_root(repo_root / "examples", require_config_yaml=True)
-    on_disk |= _scan_agent_root(
-        repo_root / "tests" / "resources" / "examples", require_config_yaml=True
-    ) - _FIXTURE_ONLY_EXAMPLES
+    on_disk |= (
+        _scan_agent_root(repo_root / "tests" / "resources" / "examples", require_config_yaml=True)
+        - _FIXTURE_ONLY_EXAMPLES
+    )
     # Test-only fixture agents under ``tests/resources/agents/`` —
     # any directory counts (single-file bundles are valid here).
     on_disk |= _scan_agent_root(
