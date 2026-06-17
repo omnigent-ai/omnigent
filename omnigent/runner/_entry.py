@@ -16,7 +16,7 @@ import signal
 import sys
 import threading
 import time
-from collections.abc import Callable, Generator
+from collections.abc import Awaitable, Callable, Generator
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -28,6 +28,7 @@ from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_P
 if TYPE_CHECKING:
     from omnigent.runner.app import ResolvedSpec
     from omnigent.runner.transports.ws_tunnel.serve import _ASGIApp
+    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 
 _RUNNER_SERVER_URL_ENV_VAR = "RUNNER_SERVER_URL"
 _RUNNER_PREWARM_SPEC_PATH_ENV_VAR = "RUNNER_PREWARM_SPEC_PATH"
@@ -35,6 +36,8 @@ _RUNNER_VERSION = "0.1.0"
 _RUNNER_CONFIG_HOME_ENV_VAR = "OMNIGENT_CONFIG_HOME"
 _DEFAULT_RUNNER_IDLE_TIMEOUT_S = 60 * 60
 _RUNNER_IDLE_MONITOR_MAX_POLL_INTERVAL_S = 60.0
+_DEAD_PEER_SWEEP_INTERVAL_ENV_VAR = "OMNIGENT_DEAD_PEER_SWEEP_INTERVAL_S"
+_DEFAULT_DEAD_PEER_SWEEP_INTERVAL_S = 300.0
 _logger = logging.getLogger(__name__)
 
 
@@ -155,6 +158,108 @@ async def _run_inactivity_monitor(
             request_shutdown()
             return
         await asyncio.sleep(min(poll_interval_s, idle_timeout_s - elapsed_s))
+
+
+def _load_dead_peer_sweep_interval_s() -> float:
+    """Load the periodic dead-peer sweep interval from the environment.
+
+    Reads ``OMNIGENT_DEAD_PEER_SWEEP_INTERVAL_S`` (seconds). Unset
+    defaults to :data:`_DEFAULT_DEAD_PEER_SWEEP_INTERVAL_S`. ``0`` disables
+    the sweep. A negative or non-numeric value fails loud at startup so the
+    operator does not get silently different lifecycle behaviour.
+
+    :returns: Interval in seconds, e.g. ``300.0``; ``0.0`` disables.
+    :raises RuntimeError: If the value is negative or non-numeric.
+    """
+    raw = os.environ.get(_DEAD_PEER_SWEEP_INTERVAL_ENV_VAR)
+    if raw is None or not raw.strip():
+        return _DEFAULT_DEAD_PEER_SWEEP_INTERVAL_S
+    try:
+        interval_s = float(raw.strip())
+    except ValueError as exc:
+        raise RuntimeError(
+            f"{_DEAD_PEER_SWEEP_INTERVAL_ENV_VAR} must be a non-negative number of seconds"
+        ) from exc
+    if interval_s < 0:
+        raise RuntimeError(
+            f"{_DEAD_PEER_SWEEP_INTERVAL_ENV_VAR} must be a non-negative number of seconds"
+        )
+    return interval_s
+
+
+async def _run_dead_peer_sweep_pass(
+    *,
+    process_manager: HarnessProcessManager | None,
+    reap_orphaned_terminals: Callable[[], int],
+    prune_codex_bridge_dirs: Callable[[], int],
+    prune_claude_bridge_dirs: Callable[[], int],
+) -> None:
+    """Run one periodic dead-peer reclamation pass (Layer 3).
+
+    Reuses the same conservative, owner-PID-gated primitives the runner
+    already runs at boot — but in-run, so resources that Layers 1-2 miss
+    are still collected. Each primitive reaps ONLY peers whose owner PID
+    is provably dead (terminal/bridge ``owner.pid`` markers, process
+    manager ``AP_PID`` sentinel), with a TOCTOU re-check before any kill
+    and the conservative rule that a reused/foreign PID reads as alive.
+    Never time/idle-based.
+
+    Each primitive is isolated so one failure cannot abort the others
+    (defense-in-depth: a missed primitive is retried next interval).
+
+    .. note::
+        ``_sweep_orphans`` is a private method of :class:`HarnessProcessManager`
+        that is the existing in-process orphan sweep already invoked by
+        ``start()``. Using it here is intentional.
+
+    :param process_manager: The runner's :class:`HarnessProcessManager`;
+        its ``_sweep_orphans`` reclaims crashed-AP instance dirs.
+        If ``None``, the process-manager step is skipped.
+    :param reap_orphaned_terminals: ``inner.terminal.reap_orphaned_terminals``.
+    :param prune_codex_bridge_dirs: ``codex_native_bridge.prune_orphaned_bridge_dirs``.
+    :param prune_claude_bridge_dirs: ``claude_native_bridge.prune_orphaned_bridge_dirs``.
+    :returns: None.
+    """
+    if process_manager is not None:
+        try:
+            await process_manager._sweep_orphans()
+        except Exception:
+            _logger.exception("dead-peer sweep: process-manager orphan sweep failed")
+    for label, fn in (
+        ("terminals", reap_orphaned_terminals),
+        ("codex-bridge", prune_codex_bridge_dirs),
+        ("claude-bridge", prune_claude_bridge_dirs),
+    ):
+        try:
+            await asyncio.to_thread(fn)
+        except Exception:
+            _logger.exception("dead-peer sweep: %s prune failed", label)
+
+
+async def _run_dead_peer_sweep_monitor(
+    *,
+    interval_s: float,
+    run_pass: Callable[[], Awaitable[None]],
+    poll_interval_s: float | None = None,
+) -> None:
+    """Periodically run the dead-peer sweep pass (Layer 3 loop).
+
+    Runs one pass immediately, then every ``interval_s`` seconds. A
+    non-positive ``interval_s`` disables the monitor. Cancellable like the
+    inactivity monitor.
+
+    :param interval_s: Seconds between sweep passes, e.g. ``300.0``.
+        ``0`` disables.
+    :param run_pass: Zero-arg coroutine that runs one sweep pass.
+    :param poll_interval_s: Test override for the sleep cadence.
+    :returns: None.
+    """
+    if interval_s <= 0:
+        return
+    sleep_s = poll_interval_s if poll_interval_s is not None else interval_s
+    while True:
+        await run_pass()
+        await asyncio.sleep(sleep_s)
 
 
 class _RunnerDatabricksAuth(httpx.Auth):

@@ -1338,3 +1338,126 @@ def test_agent_cache_dest_normal_id_round_trips(tmp_path: Path) -> None:
     dest = _agent_cache_dest(cache_root, "ag_abc123", "3")
 
     assert dest == cache_root / "ag_abc123-v3"
+
+
+# ---------------------------------------------------------------------------
+# Dead-peer sweep pass + monitor + interval loader (Layer 3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dead_peer_sweep_pass_runs_all_primitives_and_isolates_failures() -> None:
+    """One sweep pass runs the pm orphan sweep, the terminal reap, and
+    both bridge prunes; a failure in one must not stop the others
+    (defense-in-depth, Layer 3).
+
+    :returns: None.
+    """
+    from omnigent.runner._entry import _run_dead_peer_sweep_pass
+
+    calls: list[str] = []
+
+    class _FakePM:
+        async def _sweep_orphans(self) -> None:
+            calls.append("pm")
+            raise RuntimeError("pm boom")  # isolated
+
+    def _reap_terminals() -> int:
+        calls.append("terminals")
+        return 0
+
+    def _prune_codex() -> int:
+        calls.append("codex")
+        raise RuntimeError("codex boom")  # isolated
+
+    def _prune_claude() -> int:
+        calls.append("claude")
+        return 0
+
+    await _run_dead_peer_sweep_pass(
+        process_manager=_FakePM(),
+        reap_orphaned_terminals=_reap_terminals,
+        prune_codex_bridge_dirs=_prune_codex,
+        prune_claude_bridge_dirs=_prune_claude,
+    )
+
+    assert set(calls) == {"pm", "terminals", "codex", "claude"}
+
+
+@pytest.mark.asyncio
+async def test_dead_peer_sweep_monitor_invokes_pass_then_can_be_cancelled() -> None:
+    """The monitor loop calls run_pass at least once, then sleeps; it is
+    cleanly cancellable (mirrors the idle-monitor task lifecycle).
+
+    :returns: None.
+    """
+    from omnigent.runner._entry import _run_dead_peer_sweep_monitor
+
+    passes = 0
+    seen = asyncio.Event()
+
+    async def _run_pass() -> None:
+        nonlocal passes
+        passes += 1
+        seen.set()
+
+    task = asyncio.create_task(
+        _run_dead_peer_sweep_monitor(
+            interval_s=300.0,
+            run_pass=_run_pass,
+            poll_interval_s=0.001,
+        )
+    )
+    await asyncio.wait_for(seen.wait(), timeout=1.0)
+    task.cancel()
+    with __import__("contextlib").suppress(asyncio.CancelledError):
+        await task
+    assert passes >= 1
+
+
+@pytest.mark.asyncio
+async def test_dead_peer_sweep_monitor_disabled_when_interval_zero() -> None:
+    """interval_s == 0 disables the monitor (returns without sweeping).
+
+    :returns: None.
+    """
+    from omnigent.runner._entry import _run_dead_peer_sweep_monitor
+
+    called = False
+
+    async def _run_pass() -> None:
+        nonlocal called
+        called = True
+
+    await _run_dead_peer_sweep_monitor(interval_s=0.0, run_pass=_run_pass)
+    assert called is False
+
+
+def test_load_dead_peer_sweep_interval_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Defaults to the production interval when the env var is unset.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    from omnigent.runner._entry import (
+        _DEFAULT_DEAD_PEER_SWEEP_INTERVAL_S,
+        _load_dead_peer_sweep_interval_s,
+    )
+
+    monkeypatch.delenv("OMNIGENT_DEAD_PEER_SWEEP_INTERVAL_S", raising=False)
+    assert _load_dead_peer_sweep_interval_s() == float(_DEFAULT_DEAD_PEER_SWEEP_INTERVAL_S)
+
+
+def test_load_dead_peer_sweep_interval_rejects_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A negative or non-numeric value fails loud at startup.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    from omnigent.runner._entry import _load_dead_peer_sweep_interval_s
+
+    monkeypatch.setenv("OMNIGENT_DEAD_PEER_SWEEP_INTERVAL_S", "-5")
+    with pytest.raises(RuntimeError):
+        _load_dead_peer_sweep_interval_s()
