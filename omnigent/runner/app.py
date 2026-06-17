@@ -9994,8 +9994,6 @@ def create_runner_app(
                         },
                     )
                 if harness == "codex-native":
-                    if effort is None:
-                        return Response(status_code=204)
                     return await _handle_codex_native_settings_update(
                         conversation_id,
                         {"effort": effort},

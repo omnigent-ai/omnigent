@@ -3363,16 +3363,25 @@ export function handleSessionEvent(event: StreamEvent): void {
       // persisted `model_override`, so a reload restores it; the
       // cross-session sticky pref is intentionally left untouched (a
       // terminal switch is a per-session choice, not a new default).
-      useChatStore.setState({
-        selectedModel: event.model,
-        sessionModelOverride: event.model,
-      });
+      // Guard by conversation id so a late frame from a switched-away
+      // stream cannot overwrite the model for the currently-open session.
+      useChatStore.setState((s) =>
+        s.conversationId === event.conversationId
+          ? { selectedModel: event.model, sessionModelOverride: event.model }
+          : {},
+      );
       return;
     case "session_reasoning_effort":
       // A thinking-level switch made inside a native terminal. Reflect it
       // in the picker for the open session; the server persisted
       // reasoning_effort, so reload restores the same value.
-      useChatStore.setState({ selectedEffort: event.reasoningEffort });
+      // Guard by conversation id so a late event from a previous session
+      // cannot overwrite the effort picker for the currently-open one.
+      useChatStore.setState((s) =>
+        s.conversationId === event.conversationId
+          ? { selectedEffort: event.reasoningEffort }
+          : {},
+      );
       return;
     case "session_codex_plan_mode":
       // A Codex /plan switch made in either the web UI or native TUI.

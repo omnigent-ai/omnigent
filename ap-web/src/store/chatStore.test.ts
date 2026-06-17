@@ -3398,7 +3398,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     it("reflects a TUI-side model switch in selectedModel", () => {
       // A `/model` change typed into the Claude Code terminal arrives
       // as session.model; the picker selection must follow it.
-      useChatStore.setState({ selectedModel: "opus" });
+      useChatStore.setState({ conversationId: "conv_abc", selectedModel: "opus" });
       handleSessionEvent({
         type: "session_model",
         conversationId: "conv_abc",
@@ -3406,13 +3406,23 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       });
       expect(useChatStore.getState().selectedModel).toBe("sonnet");
     });
+
+    it("ignores a model event from a different session", () => {
+      useChatStore.setState({ conversationId: "conv_open", selectedModel: "opus" });
+      handleSessionEvent({
+        type: "session_model",
+        conversationId: "conv_other",
+        model: "sonnet",
+      });
+      expect(useChatStore.getState().selectedModel).toBe("opus");
+    });
   });
 
   describe("session.reasoning_effort", () => {
     it("reflects a TUI-side effort switch in selectedEffort", () => {
       // A thinking-level change inside a native terminal arrives as
       // session.reasoning_effort; the effort picker must follow it.
-      useChatStore.setState({ selectedEffort: "high" });
+      useChatStore.setState({ conversationId: "conv_abc", selectedEffort: "high" });
       handleSessionEvent({
         type: "session_reasoning_effort",
         conversationId: "conv_abc",
@@ -3422,13 +3432,23 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     });
 
     it("reflects a terminal effort clear in selectedEffort", () => {
-      useChatStore.setState({ selectedEffort: "medium" });
+      useChatStore.setState({ conversationId: "conv_abc", selectedEffort: "medium" });
       handleSessionEvent({
         type: "session_reasoning_effort",
         conversationId: "conv_abc",
         reasoningEffort: null,
       });
       expect(useChatStore.getState().selectedEffort).toBeNull();
+    });
+
+    it("ignores an effort event from a different session", () => {
+      useChatStore.setState({ conversationId: "conv_open", selectedEffort: "high" });
+      handleSessionEvent({
+        type: "session_reasoning_effort",
+        conversationId: "conv_other",
+        reasoningEffort: "medium",
+      });
+      expect(useChatStore.getState().selectedEffort).toBe("high");
     });
   });
 
