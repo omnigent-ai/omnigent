@@ -39,10 +39,13 @@ jobs:
   record:
     name: Record PR for gate re-run
     # Only when the waiver state could have changed: the skip-security-scan
-    # label was added/removed, or a review was submitted/dismissed. Any other
-    # label is ignored, so unrelated labels record nothing and stage 2 no-ops.
+    # label was added/removed, or a DECISIVE review changed. A plain `commented`
+    # review can't flip the waiver -- should-scan.sh keys on the latest
+    # non-COMMENTED review -- so skip it; `approved`/`changes_requested` (and a
+    # `dismissed` event, whose review.state is `dismissed`) all can, so they
+    # pass. Unrelated labels record nothing, so stage 2 no-ops.
     if: >-
-      github.event_name == 'pull_request_review' ||
+      (github.event_name == 'pull_request_review' && github.event.review.state != 'commented') ||
       github.event.label.name == 'skip-security-scan'
     runs-on: ubuntu-latest
     timeout-minutes: 5
