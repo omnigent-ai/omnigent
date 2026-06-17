@@ -62,6 +62,11 @@ _HARNESS_MODULES: dict[str, str] = {
     # cursor harness wrap (Cursor's ``cursor-agent`` CLI, headless). See
     # omnigent/inner/cursor_harness.py.
     "cursor": "omnigent.inner.cursor_harness",
+    # cursor-native harness wrap (Cursor CLI via its ACP server, ``cursor-agent
+    # acp``). Streaming executor like the SDK cursor harness — NOT a resident-TUI
+    # native harness — so it is intentionally absent from ``NATIVE_HARNESSES``.
+    # See omnigent/inner/cursor_native_harness.py.
+    "cursor-native": "omnigent.inner.cursor_native_harness",
     # Google Antigravity SDK harness wrap. See
     # omnigent/inner/antigravity_harness.py. In-process SDK harness
     # (``google-antigravity``), like openai-agents — Omnigent spawns no CLI

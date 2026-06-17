@@ -1493,6 +1493,36 @@ def _build_cursor_spawn_env(
     return env
 
 
+def _build_cursor_native_spawn_env(
+    spec: AgentSpec,
+    *,
+    workdir: Path | None = None,
+) -> dict[str, str]:
+    """
+    Build the ``HARNESS_CURSOR_NATIVE_*`` env-var dict the cursor-native wrap reads.
+
+    The cursor-native harness drives ``cursor-agent acp`` (the Cursor CLI's ACP
+    server). Like the SDK ``cursor`` harness — and unlike the gateway-backed
+    builders — there is NO gateway or Databricks-profile resolution: cursor talks
+    only to its own backend. Unlike the SDK harness, auth is the ambient
+    ``cursor-agent login`` under ``$HOME/.cursor``, so NO ``CURSOR_API_KEY`` is
+    threaded here.
+
+    :param spec: The agent spec.
+    :param workdir: The bundle's on-disk path (unused today; accepted for
+        signature parity with the peer builders).
+    :returns: A dict of ``HARNESS_CURSOR_NATIVE_*`` env-var overrides.
+    """
+    del workdir
+    env: dict[str, str] = {}
+    model = _resolve_spec_model(spec)
+    if model is not None:
+        env["HARNESS_CURSOR_NATIVE_MODEL"] = model
+    if spec.os_env is not None and spec.os_env.cwd:
+        env["HARNESS_CURSOR_NATIVE_CWD"] = spec.os_env.cwd
+    return env
+
+
 def _build_antigravity_spawn_env(spec: AgentSpec) -> dict[str, str]:
     """
     Map ``spec.executor`` fields → the ``HARNESS_ANTIGRAVITY_*`` env vars the
