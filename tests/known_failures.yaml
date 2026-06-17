@@ -60,17 +60,6 @@ skips:
     cluster: runner-wedge-subprocess-fanout
     mode: skip
 
-  # Shard 2 iteration: drift-guard meta-test trips on real coverage
-  # gaps: several shipped agents (databricks_supervisor,
-  # databricks_supervisor_mcp_agent, devportal_mcp_agent, swe_org,
-  # agent_with_client_tools, ...) have no test_example_<name>.py.
-  # Closing those gaps is real coverage work, not the iteration scope.
-  - id: tests/e2e/omnigent/test_examples_coverage_sync.py::test_every_agent_has_a_dedicated_test_file
-    reason: "Coverage gap: several shipped examples have no test_example_*.py."
-    issue: 532
-    cluster: example-coverage-gap
-    mode: skip
-
   # Shard 2 iteration: openai-agents harness on databricks-gpt-5-mini
   # via ai-oss frequently exceeds the test's internal 60s
   # turn-completion timeout (state stays "running" past the
