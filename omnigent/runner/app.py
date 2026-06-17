@@ -2775,8 +2775,7 @@ async def _evaluate_policy_via_omnigent(
             else:
                 verdict_reason = "Policy evaluation returned an invalid verdict."
                 _logger.warning(
-                    "AP policy evaluate returned invalid verdict %r for %s; "
-                    "defaulting to DENY",
+                    "AP policy evaluate returned invalid verdict %r for %s; defaulting to DENY",
                     result_action,
                     evaluation_id,
                 )

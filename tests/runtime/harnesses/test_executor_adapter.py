@@ -1415,7 +1415,7 @@ async def test_executor_adapter_policy_evaluator_fails_closed_without_active_con
 
     adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
 
-    verdict = await adapter._evaluate_policy("PHASE_TOOL_CALL", {"name": "Bash"})
+    verdict = await adapter._stable_policy_evaluator("PHASE_TOOL_CALL", {"name": "Bash"})
 
     assert verdict.action == "POLICY_ACTION_DENY"
     assert verdict.reason == "Policy evaluation has no active turn context."
