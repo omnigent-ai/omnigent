@@ -97,6 +97,10 @@ class CursorAcpClient:
         # prompt request id -> session id, so the reader routes the prompt
         # response onto the right session queue as a _TurnEnd.
         self._prompt_session: dict[int, str] = {}
+        # Agent->client requests are answered on their own tasks so the read
+        # loop never blocks on its own stdin write (which would deadlock when
+        # the agent's stdout pipe is full — it can't drain our reply).
+        self._agent_request_tasks: set[asyncio.Task[None]] = set()
         self._write_lock = asyncio.Lock()
         self._closed = False
         #: Stop reason of the most recently completed prompt turn, e.g.
@@ -191,14 +195,19 @@ class CursorAcpClient:
                 "params": {"sessionId": session_id, "prompt": blocks},
             }
         )
-        while True:
-            item = await queue.get()
-            if isinstance(item, _TurnEnd):
-                self.last_stop_reason = item.stop_reason
-                if item.error is not None:
-                    raise CursorAcpError(f"session/prompt failed: {item.error}")
-                return
-            yield item
+        try:
+            while True:
+                item = await queue.get()
+                if isinstance(item, _TurnEnd):
+                    self.last_stop_reason = item.stop_reason
+                    if item.error is not None:
+                        raise CursorAcpError(f"session/prompt failed: {item.error}")
+                    return
+                yield item
+        finally:
+            # Normal completion already popped this in the reader; this cleans
+            # up if the generator is closed early (mid-turn cancel).
+            self._prompt_session.pop(request_id, None)
 
     async def cancel(self, session_id: str) -> None:
         """Best-effort ``session/cancel`` for the in-flight turn (a notification)."""
@@ -218,9 +227,13 @@ class CursorAcpClient:
         if self._closed:
             return
         self._closed = True
-        for task in (self._reader_task, self._stderr_task):
-            if task is not None:
-                task.cancel()
+        tasks = [
+            t
+            for t in (self._reader_task, self._stderr_task, *self._agent_request_tasks)
+            if t is not None
+        ]
+        for task in tasks:
+            task.cancel()
         proc = self._proc
         if proc is not None and proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
@@ -230,6 +243,10 @@ class CursorAcpClient:
             except (asyncio.TimeoutError, ProcessLookupError):
                 with contextlib.suppress(ProcessLookupError):
                     proc.kill()
+        # Await the cancelled tasks so their cleanup (reader's finally) is
+        # observed and no "Task was destroyed but is pending" warning leaks.
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         # Fail any still-pending request so awaiters don't hang.
         for fut in self._pending.values():
             if not fut.done():
@@ -288,7 +305,12 @@ class CursorAcpClient:
         """Route one parsed message: notification, agent request, or response."""
         method = msg.get("method")
         if method is not None and "id" in msg:
-            await self._handle_agent_request(msg)
+            # Answer on a separate task: replying inline would block the read
+            # loop on stdin.drain(), and if the agent's stdout pipe is full it
+            # can't read our reply — a deadlock. The task keeps stdout draining.
+            task = asyncio.create_task(self._handle_agent_request(msg))
+            self._agent_request_tasks.add(task)
+            task.add_done_callback(self._agent_request_tasks.discard)
             return
         if method is not None:
             if method == "session/update":
@@ -301,6 +323,9 @@ class CursorAcpClient:
             return
         # A response to one of our client→agent requests.
         request_id = msg.get("id")
+        if request_id is None:
+            logger.warning("cursor-acp message with neither method nor id: %r", msg)
+            return
         if request_id in self._prompt_session:
             session_id = self._prompt_session.pop(request_id)
             queue = self._update_queues.get(session_id)
@@ -340,15 +365,18 @@ class CursorAcpClient:
             else:
                 logger.debug("cursor-acp unhandled agent request: %s", method)
                 result = {}
-            await self._send({"jsonrpc": "2.0", "id": request_id, "result": result})
+            reply = {"jsonrpc": "2.0", "id": request_id, "result": result}
         except Exception as exc:  # noqa: BLE001 — surface to the agent as a JSON-RPC error
-            await self._send(
-                {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "error": {"code": -32603, "message": str(exc)},
-                }
-            )
+            reply = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": str(exc)},
+            }
+        # A failed reply-send (broken pipe, dead proc) must not propagate: this
+        # runs on its own task and would otherwise surface as an unretrieved
+        # task exception. The turn already fails via the reader's EOF path.
+        with contextlib.suppress(Exception):
+            await self._send(reply)
 
     async def _drain_stderr(self) -> None:
         """Forward the subprocess stderr to the log at debug level."""

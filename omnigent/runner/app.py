@@ -12963,7 +12963,9 @@ _HARNESS_MODEL_ENV_KEY: dict[str, str] = {
     "pi": "HARNESS_PI_MODEL",
     "openai-agents": "HARNESS_OPENAI_AGENTS_MODEL",
     "cursor": "HARNESS_CURSOR_MODEL",
-    "cursor-native": "HARNESS_CURSOR_NATIVE_MODEL",
+    # cursor-native intentionally omitted: cursor-agent acp uses its configured
+    # default model and the executor ignores a model pin, so it is also absent
+    # from model_override._SDK_MODEL_OVERRIDE_HARNESSES. Keep all three in sync.
     "antigravity": "HARNESS_ANTIGRAVITY_MODEL",
 }
 

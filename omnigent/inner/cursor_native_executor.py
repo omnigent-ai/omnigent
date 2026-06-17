@@ -25,6 +25,7 @@ ignored here — cursor-agent runs its own built-in tools.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 from collections.abc import AsyncIterator
@@ -135,24 +136,33 @@ class CursorNativeExecutor(Executor):
         del tools, config
         session_key = self._session_key(messages)
         state = self._sessions.get(session_key)
-        is_first_turn = state is None
+        # Use the persistent flag (not just session existence): a prior turn
+        # with an empty prompt returns below without ever sending, so the next
+        # turn must still be treated as first (prepend the system prompt).
+        is_first_turn = state is None or not state.has_sent_prompt
 
-        if state is None:
-            try:
-                client = CursorAcpClient(binary=self._binary, cwd=self._cwd or os.getcwd())
-                await client.start()
-                session_id = await client.new_session()
-            except Exception as exc:  # noqa: BLE001 — surfaced as ExecutorError (CancelledError propagates)
-                await self.close_session(session_key)
-                yield ExecutorError(message=f"Failed to start cursor-agent acp: {exc}")
-                return
-            state = _AcpSession(client=client, session_id=session_id)
-            self._sessions[session_key] = state
-
+        # Build the prompt before spawning anything so an empty turn is a cheap
+        # no-op (no wasted ``cursor-agent acp`` subprocess).
         prompt = _build_prompt(messages, is_first_turn=is_first_turn, system_prompt=system_prompt)
         if not prompt:
             yield TurnComplete(response=None)
             return
+
+        if state is None:
+            client = CursorAcpClient(binary=self._binary, cwd=self._cwd or os.getcwd())
+            try:
+                await client.start()
+                session_id = await client.new_session()
+            except Exception as exc:  # noqa: BLE001 — surfaced as ExecutorError (CancelledError propagates)
+                # Close the local client directly: it is not yet stored in
+                # ``self._sessions``, so ``close_session`` couldn't reach it and
+                # the subprocess + reader tasks would orphan.
+                with contextlib.suppress(Exception):
+                    await client.close()
+                yield ExecutorError(message=f"Failed to start cursor-agent acp: {exc}")
+                return
+            state = _AcpSession(client=client, session_id=session_id)
+            self._sessions[session_key] = state
 
         response_text = ""
         try:

@@ -1508,6 +1508,11 @@ def _build_cursor_native_spawn_env(
     ``cursor-agent login`` under ``$HOME/.cursor``, so NO ``CURSOR_API_KEY`` is
     threaded here.
 
+    No model is threaded: ``cursor-agent acp`` uses its configured default and
+    the executor ignores a model pin, so cursor-native is deliberately absent
+    from ``_HARNESS_MODEL_ENV_KEY`` / ``model_override._SDK_MODEL_OVERRIDE_HARNESSES``
+    too (a per-session ``/model`` would otherwise be silently no-op'd).
+
     :param spec: The agent spec.
     :param workdir: The bundle's on-disk path (unused today; accepted for
         signature parity with the peer builders).
@@ -1515,9 +1520,6 @@ def _build_cursor_native_spawn_env(
     """
     del workdir
     env: dict[str, str] = {}
-    model = _resolve_spec_model(spec)
-    if model is not None:
-        env["HARNESS_CURSOR_NATIVE_MODEL"] = model
     if spec.os_env is not None and spec.os_env.cwd:
         env["HARNESS_CURSOR_NATIVE_CWD"] = spec.os_env.cwd
     return env
