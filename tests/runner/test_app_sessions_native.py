@@ -10570,7 +10570,7 @@ async def test_auto_create_claude_terminal_inherits_agent_sandbox(
 
         terminal_registry = None
 
-        async def launch_terminal(
+        async def launch_required_terminal(
             self,
             *,
             session_id: str,
@@ -12272,7 +12272,7 @@ async def test_auto_create_repl_terminal_inherits_agent_sandbox(
     class _FakeResourceRegistry:
         """Captures the launched REPL terminal spec and parent os_env."""
 
-        async def launch_terminal(
+        async def launch_auxiliary_terminal(
             self,
             *,
             session_id: str,
