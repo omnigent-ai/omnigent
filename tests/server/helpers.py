@@ -431,15 +431,6 @@ async def wait_for_completion(
     raise AssertionError(f"Response {response_id} did not reach terminal status")
 
 
-@dataclass
-class ApiResponse:
-    """Result of an API call — avoids returning positional tuples."""
-
-    status_code: int
-    # Any: JSON response bodies are inherently heterogeneous dicts.
-    body: dict[str, Any]
-
-
 class FakeRunnerWebSocket:
     """
     Minimal WebSocket object accepted by ``TunnelRegistry.register``.
@@ -549,8 +540,7 @@ def build_agent_bundle(
         "spec_version": 1,
         "name": name,
         # LLM config is required for the real workflow to execute.
-        # The model value must match the agent name used in
-        # create_test_response(model=...).
+        # The model value must match the agent name used by tests.
         "llm": {
             "model": name,
             # api_key is required by spec validation; the workflow
@@ -755,53 +745,6 @@ async def create_test_session(
     snapshot = await client.get(f"/v1/sessions/{session_id}")
     assert snapshot.status_code == 200, f"session snapshot failed: {snapshot.text}"
     return snapshot.json()
-
-
-async def create_test_response(
-    client: httpx.AsyncClient,
-    model: str = "test-agent",
-    input_text: str = "Hello",
-    background: bool = True,
-    stream: bool = False,
-    instructions: str | None = None,
-    previous_response_id: str | None = None,
-    store: bool | None = None,
-    conversation: dict[str, str] | None = None,
-    reasoning: dict[str, str] | None = None,
-    tools: list[dict[str, Any]] | None = None,
-) -> ApiResponse:
-    """
-    Create a response via the API and return an ApiResponse.
-
-    Defaults to background=True so the endpoint returns immediately
-    without blocking on task completion.
-
-    :param tools: Optional list of client-side tool schemas in
-        standard OpenAI function format, e.g.
-        ``[{"type": "function", "function": {"name": "get_weather", ...}}]``.
-    """
-    payload: dict[str, Any] = {
-        "model": model,
-        "input": input_text,
-        "background": background,
-        "stream": stream,
-    }
-    if instructions is not None:
-        payload["instructions"] = instructions
-    if previous_response_id is not None:
-        payload["previous_response_id"] = previous_response_id
-    if store is not None:
-        payload["store"] = store
-    if conversation is not None:
-        payload["conversation"] = conversation
-    if reasoning is not None:
-        payload["reasoning"] = reasoning
-    if tools is not None:
-        payload["tools"] = tools
-    resp = await client.post("/v1/responses", json=payload)
-    body = resp.json()
-    assert "id" in body, f"POST /v1/responses returned {resp.status_code}: {body}"
-    return ApiResponse(status_code=resp.status_code, body=body)
 
 
 class CapturingRunnerClient:

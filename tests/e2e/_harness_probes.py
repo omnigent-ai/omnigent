@@ -124,24 +124,6 @@ HARNESS_PROBES: list[HarnessProbe] = [
         # this row.
         cli_binary=None,
     ),
-    HarnessProbe(
-        # Registry key matches ``_HARNESS_MODULES`` (note the
-        # underscore, unlike ``claude-sdk`` / ``openai-agents``).
-        harness="databricks_supervisor",
-        # Per the harness's docstring at
-        # ``omnigent/inner/databricks_supervisor_harness.py``,
-        # the gateway expects a Databricks-hosted Claude model;
-        # ``databricks-claude-sonnet-4-6`` is the default per
-        # CLAUDE.md and matches ``examples/databricks_supervisor``.
-        model=resolve_model("databricks-claude-sonnet-4-6", key="probe:databricks_supervisor"),
-        env_prefix="HARNESS_SUPERVISOR_",
-        marker="SUPERVISOR_E2E_OK",
-        # Supervisor is an API, not a CLI; no binary to skip on.
-        # Workspace-level setup (Supervisor preview enabled) is
-        # required for the row to pass, analogous to how
-        # ``openai-agents`` needs a gateway-reachable model.
-        cli_binary=None,
-    ),
 ]
 
 

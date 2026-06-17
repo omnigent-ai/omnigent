@@ -87,11 +87,19 @@ jobs:
             workers: "4"
           - group: spec-llms
             paths: tests/spec tests/llms
+          # Integration journey tests with mock LLM (no API key).
+          # workers=0 (serial): session-scoped live_server + mock_llm_server
+          # fixtures spawn subprocesses that must share one mock server;
+          # xdist workers would each create their own session fixtures.
+          - group: integration-mock
+            paths: tests/integration
+            workers: "0"
           # Catch-all so new top-level tests/<dir>/ are covered automatically.
           - group: misc
             paths: >-
               tests
               --ignore=tests/e2e
+              --ignore=tests/integration
               --ignore=tests/runtime
               --ignore=tests/inner
               --ignore=tests/tools
@@ -118,13 +126,14 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Install ripgrep + bubblewrap
+      - name: Install ripgrep + bubblewrap + tmux
         # ripgrep: the Grep tool prefers it. bubblewrap: the linux_bwrap sandbox
-        # needs it. apparmor sysctl: Ubuntu 24.04 blocks unprivileged user
-        # namespaces that bwrap needs; scope is the ephemeral runner.
+        # needs it. tmux: the integration-mock shard spawns harness terminals.
+        # apparmor sysctl: Ubuntu 24.04 blocks unprivileged user namespaces
+        # that bwrap needs; scope is the ephemeral runner.
         run: |
           sudo apt-get update
-          sudo apt-get install -y ripgrep bubblewrap
+          sudo apt-get install -y ripgrep bubblewrap tmux
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Cache virtualenv

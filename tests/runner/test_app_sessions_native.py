@@ -37,10 +37,12 @@ from omnigent.claude_native_bridge import (
 from omnigent.entities.session_resources import SessionResourceView, terminal_resource_id
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner import create_runner_app
+from omnigent.runner import tool_dispatch as _tool_dispatch
 from omnigent.runner.app import (
     _RUNNER_DISPATCHED_FIELD,
     _WAKE_POST_MAX_ATTEMPTS,
     ResolvedSpec,
+    _agent_os_env_from_spec,
     _auto_create_claude_terminal,
     _auto_create_codex_terminal,
     _auto_create_pi_terminal,
@@ -50,6 +52,7 @@ from omnigent.runner.app import (
     _PiNativeLaunchConfig,
     _publish_native_terminal_start_error,
     _publish_terminal_pending,
+    _resolved_workdir_for_spec,
     _session_labels_for_runner_spawn,
     _terminal_lookup_miss_log_state,
     _wake_post_is_retryable,
@@ -659,6 +662,290 @@ async def test_runner_session_tool_schemas_use_resolved_bundle_workdir(tmp_path:
     )
 
 
+def test_resolved_workdir_for_spec_prefers_bundle_workdir(tmp_path: Path) -> None:
+    """``_resolved_workdir_for_spec`` uses ``ResolvedSpec.workdir`` over fallback.
+
+    Bundle-deployed agents carry their own workdir (where
+    ``tools/python/*.py`` live). The dispatch path must thread that
+    workdir into ``dispatch_tool_locally`` so native python tools are
+    found at call time — not the generic ``runner_workspace``.
+    """
+    bundle_dir = tmp_path / "bundle"
+    runner_workspace = tmp_path / "workspace"
+    spec = AgentSpec(spec_version=1, name="bundle-agent")
+    entry = ResolvedSpec(spec=spec, workdir=bundle_dir)
+
+    assert _resolved_workdir_for_spec(entry, runner_workspace) == bundle_dir
+
+
+def test_resolved_workdir_for_spec_falls_back_without_bundle(tmp_path: Path) -> None:
+    """Non-bundle specs fall back to ``runner_workspace`` (prior behavior).
+
+    A bare ``AgentSpec`` (no ResolvedSpec wrapper) or a ``ResolvedSpec``
+    with ``workdir=None`` carries no bundle dir, so dispatch must keep
+    using the CLI launch workspace exactly as base did.
+    """
+    runner_workspace = tmp_path / "workspace"
+    bare_spec = AgentSpec(spec_version=1, name="plain-agent")
+
+    # Unwrapped spec → no workdir → fallback.
+    assert _resolved_workdir_for_spec(bare_spec, runner_workspace) == runner_workspace
+    # ResolvedSpec with no workdir → fallback.
+    wrapped_no_workdir = ResolvedSpec(spec=bare_spec, workdir=None)
+    assert _resolved_workdir_for_spec(wrapped_no_workdir, runner_workspace) == runner_workspace
+    # Missing fallback stays None (don't fabricate a path).
+    assert _resolved_workdir_for_spec(bare_spec, None) is None
+
+
+@pytest.mark.asyncio
+async def test_sessions_native_dispatches_native_tool_with_bundle_workdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bundle agent's native python tool dispatches against the bundle workdir.
+
+    End-to-end through ``POST /v1/sessions/{conv}/events`` (no live LLM):
+    the scripted harness emits an ``action_required`` for a spec-declared
+    python tool, and the runner must dispatch it locally with
+    ``runner_workspace`` set to the resolved ``ResolvedSpec.workdir`` (the
+    bundle dir), not the generic CLI ``runner_workspace``. This is the
+    dispatch-time counterpart to
+    :func:`test_runner_session_tool_schemas_use_resolved_bundle_workdir`,
+    which only proved schema generation used the bundle workdir.
+    """
+    bundle_dir = tmp_path / "bundle"
+    tool_dir = bundle_dir / "tools" / "python"
+    tool_dir.mkdir(parents=True)
+    (tool_dir / "bundle_tool.py").write_text(
+        "from omnigent_client.tools import tool\n\n"
+        "@tool\n"
+        "def bundle_tool(text: str) -> str:\n"
+        "    return text\n"
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    spec = AgentSpec(
+        spec_version=1,
+        name="bundle-agent",
+        local_tools=[
+            LocalToolInfo(
+                name="bundle_tool",
+                path="tools/python/bundle_tool.py",
+                language="python",
+            )
+        ],
+    )
+
+    captured_workspaces: list[Path | None] = []
+
+    async def _fake_dispatch(*, runner_workspace: Path | None = None, **kwargs: Any) -> str:
+        captured_workspaces.append(runner_workspace)
+        return "ok"
+
+    monkeypatch.setattr(_tool_dispatch, "dispatch_tool_locally", _fake_dispatch)
+
+    sse_frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+        _sse(
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "status": "action_required",
+                    "name": "bundle_tool",
+                    "call_id": "call_bundle",
+                    "arguments": json.dumps({"text": "from-bundle"}),
+                },
+            }
+        ),
+        _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+    ]
+    harness_client = _ScriptedHarnessClient(sse_frames)
+    pm = _FakeProcessManager(harness_client)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> ResolvedSpec:
+        del agent_id, session_id
+        return ResolvedSpec(spec=spec, workdir=bundle_dir)
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        runner_workspace=workspace,
+    )
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions/conv_bundle/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_bundle",
+                "model": "bundle-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "harness": "openai-agents",
+            },
+        )
+        assert resp.status_code == 202
+        for _ in range(100):
+            if captured_workspaces:
+                break
+            await asyncio.sleep(0.05)
+
+    assert captured_workspaces, "native tool must be dispatched locally"
+    assert captured_workspaces[0] == bundle_dir, (
+        "dispatch must use the resolved bundle workdir, not runner_workspace "
+        f"({workspace!r}); got {captured_workspaces[0]!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sessions_native_dispatches_builtin_tool_with_runner_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bundle agent's builtin OS-env tool dispatches in runner_workspace.
+
+    Bundle workdirs are only for spec-local native python tools. Builtins
+    such as ``sys_os_write`` run in the caller process and must keep the
+    original runner workspace even when the agent spec was resolved from an
+    extracted bundle directory.
+    """
+    bundle_dir = tmp_path / "bundle"
+    bundle_dir.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    spec = AgentSpec(spec_version=1, name="bundle-agent")
+
+    captured_workspaces: list[Path | None] = []
+
+    async def _fake_dispatch(*, runner_workspace: Path | None = None, **kwargs: Any) -> str:
+        captured_workspaces.append(runner_workspace)
+        return "ok"
+
+    monkeypatch.setattr(_tool_dispatch, "dispatch_tool_locally", _fake_dispatch)
+
+    sse_frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+        _sse(
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "status": "action_required",
+                    "name": "sys_os_write",
+                    "call_id": "call_write",
+                    "arguments": json.dumps(
+                        {"path": "created-by-tool.txt", "content": "from workspace"}
+                    ),
+                },
+            }
+        ),
+        _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+    ]
+    harness_client = _ScriptedHarnessClient(sse_frames)
+    pm = _FakeProcessManager(harness_client)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> ResolvedSpec:
+        del agent_id, session_id
+        return ResolvedSpec(spec=spec, workdir=bundle_dir)
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        runner_workspace=workspace,
+    )
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions/conv_builtin/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_bundle",
+                "model": "bundle-agent",
+                "content": [{"type": "input_text", "text": "write a file"}],
+                "harness": "openai-agents",
+            },
+        )
+        assert resp.status_code == 202
+        for _ in range(100):
+            if captured_workspaces:
+                break
+            await asyncio.sleep(0.05)
+
+    assert captured_workspaces, "builtin tool must be dispatched locally"
+    assert captured_workspaces[0] == workspace, (
+        "builtin OS-env dispatch must use runner_workspace, not the bundle workdir "
+        f"({bundle_dir!r}); got {captured_workspaces[0]!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_mcp_execute_dispatches_builtin_tool_with_runner_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``/mcp/execute`` also keeps builtin OS-env tools in runner_workspace."""
+    bundle_dir = tmp_path / "bundle"
+    bundle_dir.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    spec = AgentSpec(spec_version=1, name="bundle-agent")
+
+    captured_workspaces: list[Path | None] = []
+
+    async def _fake_execute_tool(*, runner_workspace: Path | None = None, **kwargs: Any) -> str:
+        captured_workspaces.append(runner_workspace)
+        return "ok"
+
+    monkeypatch.setattr(_tool_dispatch, "execute_tool", _fake_execute_tool)
+
+    harness_client = _ScriptedHarnessClient(
+        [_sse({"type": "response.completed", "response": {"id": "resp_1"}})]
+    )
+    pm = _FakeProcessManager(harness_client)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> ResolvedSpec:
+        del agent_id, session_id
+        return ResolvedSpec(spec=spec, workdir=bundle_dir)
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        runner_workspace=workspace,
+    )
+    async with _runner_client(app) as client:
+        seed_resp = await client.post(
+            "/v1/sessions/conv_execute_builtin/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_bundle",
+                "model": "bundle-agent",
+                "content": [{"type": "input_text", "text": "seed"}],
+                "harness": "openai-agents",
+            },
+        )
+        assert seed_resp.status_code == 202
+        for _ in range(100):
+            if harness_client.posted_bodies:
+                break
+            await asyncio.sleep(0.05)
+
+        execute_resp = await client.post(
+            "/v1/sessions/conv_execute_builtin/mcp/execute",
+            json={
+                "method": "tools/call",
+                "params": {
+                    "name": "sys_os_write",
+                    "arguments": {"path": "created-by-tool.txt", "content": "from workspace"},
+                },
+            },
+        )
+
+    assert execute_resp.status_code == 200
+    assert execute_resp.json() == {"result": {"output": "ok"}}
+    assert captured_workspaces == [workspace]
+
+
 @pytest.mark.asyncio
 async def test_sessions_native_path_injects_mcp_schemas() -> None:
     """``POST /v1/sessions/{conv}/events`` with a message body injects MCP schemas.
@@ -1012,6 +1299,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             session_key: str,
             spec: Any,
             resource_role: str | None = None,
+            parent_os_env: Any = None,
         ) -> SessionResourceView:
             """
             Record the terminal launch request.
@@ -1301,6 +1589,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
             session_key: str,
             spec: Any,
             resource_role: str | None = None,
+            parent_os_env: Any = None,
         ) -> SessionResourceView:
             """
             Record the terminal launch request.
@@ -1559,6 +1848,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
             session_key: str,
             spec: Any,
             resource_role: str | None = None,
+            parent_os_env: Any = None,
         ) -> SessionResourceView:
             """
             Record the terminal launch request.
@@ -1674,6 +1964,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
     """
     import omnigent.codex_native_app_server as codex_app_mod
     import omnigent.runner.app as runner_app_mod
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     session_id = "conv_codex_worktree"
     # Three distinct dirs so the assertion can only pass for the worktree:
@@ -1792,6 +2083,8 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
             "discovery forwarder publishes the new thread"
         )
 
+    launch_captured: dict[str, Any] = {}
+
     class _FakeResourceRegistry:
         """Resource registry that records the launched terminal spec."""
 
@@ -1803,6 +2096,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
             session_key: str,
             spec: Any,
             resource_role: str | None = None,
+            parent_os_env: Any = None,
         ) -> SessionResourceView:
             """
             Record the terminal launch request.
@@ -1812,9 +2106,13 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
             :param session_key: Terminal session key, e.g. ``"main"``.
             :param spec: Terminal launch spec.
             :param resource_role: Private runner resource marker.
+            :param parent_os_env: Agent os_env threaded as the inheritance
+                parent so the agent's sandbox / egress / passthrough apply.
             :returns: Terminal resource view.
             """
-            del session_key, spec, resource_role
+            del session_key, resource_role
+            launch_captured["spec"] = spec
+            launch_captured["parent_os_env"] = parent_os_env
             return SessionResourceView(
                 id="terminal_codex_main",
                 type="terminal",
@@ -1835,7 +2133,14 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
     )
 
     # agent_spec is a ResolvedSpec whose workdir is the bundle dir — the
-    # exact value the old code wrongly used as the cwd.
+    # exact value the old code wrongly used as the cwd. Its os_env declares
+    # sandbox: none, so the launched terminal must inherit that (not the
+    # platform default) — see the sandbox-override regression note below.
+    codex_os_env = OSEnvSpec(
+        type="caller_process",
+        cwd=".",
+        sandbox=OSEnvSandboxSpec(type="none"),
+    )
     agent_spec = ResolvedSpec(
         spec=AgentSpec(
             spec_version=1,
@@ -1844,6 +2149,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
                 type="omnigent",
                 config={"harness": "codex-native", "model": "gpt-5-default"},
             ),
+            os_env=codex_os_env,
         ),
         workdir=bundle_dir,
     )
@@ -1872,6 +2178,14 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
         "mean the session snapshot workspace was ignored."
     )
     assert build_calls[0]["cwd"] != bundle_dir.resolve()  # never the spec-bundle dir
+
+    # Sandbox-override regression: the launched Codex terminal must inherit
+    # the agent's sandbox: none rather than falling back to the platform
+    # default (bwrap). Without it, a codex-native agent declaring
+    # ``os_env.sandbox.type: none`` is wrongly forced into bwrap.
+    launched_sandbox = launch_captured["spec"].os_env.sandbox
+    assert launched_sandbox is not None and launched_sandbox.type == "none"
+    assert launch_captured["parent_os_env"] is codex_os_env
 
 
 @pytest.mark.asyncio
@@ -1969,6 +2283,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
             session_key: str,
             spec: Any,
             resource_role: str | None = None,
+            parent_os_env: Any = None,
         ) -> SessionResourceView:
             """:returns: A fixed terminal resource view."""
             del terminal_name, session_key, spec, resource_role
@@ -7094,7 +7409,7 @@ class _EventRecordingServerClient(NullServerClient):
 
 class _RecordingCodexAppServerClient:
     """
-    Test double for Codex app-server JSON-RPC interrupts.
+    Test double for Codex app-server JSON-RPC controls.
 
     :param transport: Transport passed to
         :func:`omnigent.codex_native_app_server.client_for_transport`, e.g.
@@ -7109,6 +7424,7 @@ class _RecordingCodexAppServerClient:
         self.connected = False
         self.closed = False
         self.requests: list[tuple[str, dict[str, Any]]] = []
+        self.model_list_responses: list[dict[str, Any]] = []
 
     async def connect(self) -> None:
         """
@@ -7128,6 +7444,8 @@ class _RecordingCodexAppServerClient:
         :returns: Empty successful JSON-RPC result.
         """
         self.requests.append((method, params))
+        if method == "model/list" and self.model_list_responses:
+            return self.model_list_responses.pop(0)
         return {"result": {}}
 
     async def close(self) -> None:
@@ -7137,6 +7455,436 @@ class _RecordingCodexAppServerClient:
         :returns: None.
         """
         self.closed = True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event_payload,expected_params",
+    [
+        (
+            {"type": "model_change", "model": "gpt-5.4"},
+            {"threadId": "thread_codex", "model": "gpt-5.4"},
+        ),
+        (
+            {"type": "effort_change", "effort": "xhigh"},
+            {"threadId": "thread_codex", "effort": "xhigh"},
+        ),
+        (
+            {"type": "plan_mode_change", "enabled": True},
+            {
+                "threadId": "thread_codex",
+                "collaborationMode": {
+                    "mode": "plan",
+                    "settings": {
+                        "model": "gpt-5.4",
+                        "reasoning_effort": None,
+                        "developer_instructions": None,
+                    },
+                },
+            },
+        ),
+    ],
+    ids=["model_change", "effort_change", "plan_mode_change"],
+)
+async def test_events_codex_native_settings_change_uses_thread_settings_update(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    event_payload: dict[str, Any],
+    expected_params: dict[str, Any],
+) -> None:
+    """
+    Codex-native model / effort updates call ``thread/settings/update``.
+
+    The web UI persists model and effort through Omnigent's normal session
+    PATCH path. The runner must translate the forwarded control event into
+    Codex app-server's structured settings RPC, not type into the terminal or
+    204 as a no-op. The update is a next-turn setting: it is valid even when
+    no active turn id is recorded.
+    """
+    from omnigent import codex_native_app_server
+    from omnigent.spec.types import ExecutorSpec
+
+    conv_id = "conv_codex_native_settings"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:43210",
+            thread_id="thread_codex",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=None,
+        ),
+    )
+
+    fake_client = _RecordingCodexAppServerClient(
+        transport="ws://127.0.0.1:43210",
+        client_name="omnigent-codex-native-runner",
+    )
+
+    def _fake_client_for_transport(
+        transport: str,
+        *,
+        client_name: str = "omnigent",
+    ) -> _RecordingCodexAppServerClient:
+        """
+        Return the fake Codex app-server client for the recorded bridge state.
+
+        :param transport: App-server transport from bridge state, e.g.
+            ``"ws://127.0.0.1:43210"``.
+        :param client_name: Client name supplied by the runner, e.g.
+            ``"omnigent-codex-native-runner"``.
+        :returns: Fake client that records JSON-RPC calls.
+        """
+        assert transport == fake_client.transport
+        assert client_name == fake_client.client_name
+        return fake_client
+
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "client_for_transport",
+        _fake_client_for_transport,
+    )
+
+    codex_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "codex-native", "model": "gpt-5.4"},
+        ),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the codex-native spec for any agent_id."""
+        del agent_id, session_id
+        return codex_native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json=event_payload,
+        )
+
+    assert resp.status_code == 204, (
+        f"codex-native {event_payload['type']} must return 204; "
+        f"got {resp.status_code}: {resp.text}"
+    )
+    assert fake_client.connected
+    assert fake_client.closed
+    assert fake_client.requests == [
+        ("thread/settings/update", expected_params),
+    ], (
+        f"codex-native {event_payload['type']} must call thread/settings/update "
+        f"with next-turn settings; got {fake_client.requests!r}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_native_model_options_returns_503_until_bridge_state_exists(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Runner model-options endpoint is retryable before Codex bridge startup.
+
+    The AP server caches successful runner responses. A codex-native runner
+    must therefore not return ``200 {"models": []}`` while the Codex terminal
+    is still creating its app-server bridge; that would permanently hide the
+    Web UI model picker for the session.
+    """
+    from omnigent import codex_native_app_server
+
+    conv_id = "conv_codex_native_model_options_not_ready"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+
+    def _client_for_transport(
+        transport: str,
+        *,
+        client_name: str = "omnigent",
+    ) -> _RecordingCodexAppServerClient:
+        """
+        Fail the test if the endpoint reaches Codex without bridge state.
+
+        :param transport: App-server transport from bridge state, e.g.
+            ``"ws://127.0.0.1:43210"``.
+        :param client_name: Client name supplied by the runner, e.g.
+            ``"omnigent-codex-native-runner"``.
+        :returns: Never returns; raises if called.
+        """
+        raise AssertionError(
+            f"client_for_transport must not be called before bridge state exists: "
+            f"{transport=} {client_name=}"
+        )
+
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "client_for_transport",
+        _client_for_transport,
+    )
+
+    codex_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the codex-native spec for any agent_id."""
+        del agent_id, session_id
+        return codex_native_spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.get(f"/v1/sessions/{conv_id}/codex-model-options")
+
+    # A retryable 503 keeps the AP server from caching an empty model list;
+    # returning 200 here would recreate the missing-picker regression.
+    assert resp.status_code == 503, resp.text
+    assert resp.json() == {
+        "error": "codex_native_model_options_failed",
+        "detail": "Codex-native model options are not ready yet.",
+    }
+
+
+@pytest.mark.asyncio
+async def test_codex_native_model_options_query_model_list(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Runner model-options endpoint queries Codex ``model/list``.
+
+    The Web UI must not carry its own Codex model / effort catalog. The
+    runner is the process that can reach the session's Codex app-server, so
+    this endpoint should ask Codex for models and return those model objects
+    unchanged for the AP snapshot.
+    """
+    from omnigent import codex_native_app_server
+    from omnigent.spec.types import ExecutorSpec
+
+    conv_id = "conv_codex_native_model_options"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:43210",
+            thread_id="thread_codex",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=None,
+        ),
+    )
+
+    fake_client = _RecordingCodexAppServerClient(
+        transport="ws://127.0.0.1:43210",
+        client_name="omnigent-codex-native-runner",
+    )
+    fake_client.model_list_responses = [
+        {
+            "result": {
+                "data": [
+                    {
+                        "id": "gpt-5.5",
+                        "model": "databricks-gpt-5-5",
+                        "displayName": "GPT-5.5",
+                        "defaultReasoningEffort": "high",
+                        "supportedReasoningEfforts": [
+                            {"reasoningEffort": "low", "description": "Low"},
+                            {"reasoningEffort": "medium", "description": "Medium"},
+                        ],
+                        "isDefault": True,
+                    }
+                ],
+                "nextCursor": "next-page",
+            }
+        },
+        {
+            "result": {
+                "data": [
+                    {
+                        "id": "gpt-5.4-mini",
+                        "model": "databricks-gpt-5-4-mini",
+                        "displayName": "GPT-5.4 mini",
+                        "defaultReasoningEffort": "medium",
+                        "supportedReasoningEfforts": [
+                            {"reasoningEffort": "minimal", "description": "Minimal"}
+                        ],
+                        "isDefault": False,
+                    }
+                ],
+                "nextCursor": None,
+            }
+        },
+    ]
+
+    def _fake_client_for_transport(
+        transport: str,
+        *,
+        client_name: str = "omnigent",
+    ) -> _RecordingCodexAppServerClient:
+        """
+        Return the fake Codex app-server client for the recorded bridge state.
+
+        :param transport: App-server transport from bridge state, e.g.
+            ``"ws://127.0.0.1:43210"``.
+        :param client_name: Client name supplied by the runner, e.g.
+            ``"omnigent-codex-native-runner"``.
+        :returns: Fake client scripted with ``model/list`` pages.
+        """
+        assert transport == fake_client.transport
+        assert client_name == fake_client.client_name
+        return fake_client
+
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "client_for_transport",
+        _fake_client_for_transport,
+    )
+
+    codex_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the codex-native spec for any agent_id."""
+        del agent_id, session_id
+        return codex_native_spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.get(f"/v1/sessions/{conv_id}/codex-model-options")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "models": [
+            {
+                "id": "gpt-5.5",
+                "model": "databricks-gpt-5-5",
+                "displayName": "GPT-5.5",
+                "defaultReasoningEffort": "high",
+                "supportedReasoningEfforts": [
+                    {"reasoningEffort": "low", "description": "Low"},
+                    {"reasoningEffort": "medium", "description": "Medium"},
+                ],
+                "isDefault": True,
+            },
+            {
+                "id": "gpt-5.4-mini",
+                "model": "databricks-gpt-5-4-mini",
+                "displayName": "GPT-5.4 mini",
+                "defaultReasoningEffort": "medium",
+                "supportedReasoningEfforts": [
+                    {"reasoningEffort": "minimal", "description": "Minimal"}
+                ],
+                "isDefault": False,
+            },
+        ]
+    }
+    assert fake_client.requests == [
+        ("model/list", {"includeHidden": False}),
+        ("model/list", {"includeHidden": False, "cursor": "next-page"}),
+    ]
+    assert fake_client.connected
+    assert fake_client.closed
+
+
+@pytest.mark.asyncio
+async def test_events_codex_native_plan_mode_requires_loaded_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Codex-native Plan-mode updates fail when no Codex bridge is loaded.
+
+    The AP server treats a 2xx runner response as proof that the UI can show
+    Plan mode. Returning 204 when no bridge state exists would therefore
+    persist a false Plan indicator even though Codex app-server never received
+    ``thread/settings/update``.
+    """
+    conv_id = "conv_codex_native_plan_no_bridge"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+
+    codex_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "codex-native", "model": "gpt-5.4"},
+        ),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """
+        Return the codex-native spec for any agent id.
+
+        :param agent_id: Agent identifier, e.g. ``"ag_1"``.
+        :param session_id: Session identifier, e.g. ``"conv_abc123"``.
+        :returns: Codex-native agent spec.
+        """
+        del agent_id, session_id
+        return codex_native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "plan_mode_change", "enabled": True},
+        )
+
+    assert resp.status_code == 503, resp.text
+    assert "loaded Codex bridge" in resp.text
 
 
 @pytest.mark.asyncio
@@ -9523,6 +10271,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
             session_key: str,
             spec: Any,
             resource_role: str | None = None,
+            parent_os_env: Any = None,
         ) -> SessionResourceView:
             """Record the spec and return a terminal resource view."""
             del terminal_name, session_key
@@ -9701,6 +10450,7 @@ async def test_auto_create_claude_terminal_passes_session_effort(
             session_key: str,
             spec: Any,
             resource_role: str | None = None,
+            parent_os_env: Any = None,
         ) -> SessionResourceView:
             """Record the spec and return a terminal resource view."""
             del terminal_name, session_key
@@ -9735,6 +10485,153 @@ async def test_auto_create_claude_terminal_passes_session_effort(
     assert "--effort" in args
     effort_idx = args.index("--effort")
     assert args[effort_idx + 1] == "high"
+
+    await fake_client.aclose()
+
+
+def test_agent_os_env_from_spec_unwraps_resolved_and_handles_none() -> None:
+    """
+    ``_agent_os_env_from_spec`` reads ``os_env`` through the resolved wrapper.
+
+    The auto-create terminals receive either a bare ``AgentSpec`` or a
+    ``ResolvedSpec`` wrapping one (the codex path passes ``ResolvedSpec``).
+    The helper must unwrap the latter and return the inner ``os_env``, and
+    return ``None`` when there is no spec — so the launch falls back to the
+    platform default only when there is genuinely no agent policy to honour.
+    """
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    os_env = OSEnvSpec(type="caller_process", cwd=".", sandbox=OSEnvSandboxSpec(type="none"))
+    bare = AgentSpec(
+        spec_version=1,
+        name="agent",
+        executor=ExecutorSpec(type="omnigent", config={}),
+        os_env=os_env,
+    )
+
+    # Bare AgentSpec: returned directly.
+    assert _agent_os_env_from_spec(bare) is os_env
+    # ResolvedSpec wrapper: unwrapped to the inner spec's os_env.
+    assert _agent_os_env_from_spec(ResolvedSpec(spec=bare, workdir=None)) is os_env
+    # No spec at all: None (caller then uses the platform default).
+    assert _agent_os_env_from_spec(None) is None
+    # AgentSpec without an os_env block: None.
+    no_os_env = AgentSpec(
+        spec_version=1,
+        name="agent",
+        executor=ExecutorSpec(type="omnigent", config={}),
+    )
+    assert _agent_os_env_from_spec(no_os_env) is None
+
+
+@pytest.mark.asyncio
+async def test_auto_create_claude_terminal_inherits_agent_sandbox(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Host-spawned Claude terminal honours the agent's ``os_env.sandbox``.
+
+    Regression for the sandbox-override bug: the auto-create path built a
+    fresh ``TerminalEnvSpec`` whose ``os_env`` carried no ``sandbox`` and
+    passed no ``parent_os_env``, so ``launch_terminal`` fell back to
+    ``_default_sandbox_for_platform`` (``linux_bwrap`` / ``darwin_seatbelt``)
+    and ignored the agent YAML. A claude-native agent that declares
+    ``os_env.sandbox.type: none`` (e.g. Polly's ``claude_code`` worker,
+    which relies on the outer container/VM as the boundary) was wrongly
+    forced into bwrap, which then failed to start in a hardened container.
+
+    Asserts the launched terminal spec's ``os_env.sandbox`` is the agent's
+    ``none`` sandbox (not the platform default) and that the agent's
+    ``os_env`` is threaded through as the launch ``parent_os_env`` so the
+    rest of the policy (egress_rules / env_passthrough) is inherited too.
+
+    :param tmp_path: Pytest-provided temporary directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+
+    async def _no_op_forwarder(**kwargs: Any) -> None:
+        del kwargs
+
+    monkeypatch.setattr(
+        "omnigent.claude_native_forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        """Captures the launched terminal spec and parent os_env."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """Record the spec + parent_os_env and return a resource view."""
+            del terminal_name, session_key
+            captured["spec"] = spec
+            captured["parent_os_env"] = parent_os_env
+            return SessionResourceView(
+                id="terminal_claude_main",
+                type="terminal",
+                session_id=session_id,
+                name="claude:main",
+                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+            )
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(200, json={"labels": {}}),
+        ),
+    )
+
+    # An agent that declares sandbox: none (runs unconfined; the outer
+    # container/VM is the boundary) — exactly Polly's coding sub-agents.
+    agent_os_env = OSEnvSpec(
+        type="caller_process",
+        cwd=".",
+        sandbox=OSEnvSandboxSpec(type="none"),
+    )
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="claude_code",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "claude-native", "model": "claude-default"},
+        ),
+        os_env=agent_os_env,
+    )
+
+    await _auto_create_claude_terminal(
+        "conv_sandbox_none",
+        _FakeResourceRegistry(),
+        lambda _sid, _evt: None,
+        server_client=fake_client,
+        agent_spec=agent_spec,
+    )
+
+    launched_sandbox = captured["spec"].os_env.sandbox
+    assert launched_sandbox is not None, (
+        "auto-create dropped the agent's sandbox; launch_terminal will fall "
+        "back to _default_sandbox_for_platform (bwrap), overriding sandbox: none"
+    )
+    assert launched_sandbox.type == "none"
+    # The whole os_env is threaded through as the inheritance parent.
+    assert captured["parent_os_env"] is agent_os_env
 
     await fake_client.aclose()
 
@@ -9812,6 +10709,7 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
             session_key: str,
             spec: Any,
             resource_role: str | None = None,
+            parent_os_env: Any = None,
         ) -> SessionResourceView:
             """Record the spec and return a terminal resource view."""
             del terminal_name, session_key
@@ -9973,6 +10871,7 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
             session_key: str,
             spec: Any,
             resource_role: str | None = None,
+            parent_os_env: Any = None,
         ) -> SessionResourceView:
             """Return a terminal resource view without spawning a TTY."""
             del terminal_name, session_key, spec
@@ -10096,6 +10995,7 @@ async def test_auto_create_claude_terminal_emits_resource_created_event(
             session_key: str,
             spec: Any,
             resource_role: str | None = None,
+            parent_os_env: Any = None,
         ) -> SessionResourceView:
             """Return the terminal resource view the runner would launch."""
             del spec
@@ -10319,6 +11219,7 @@ async def test_auto_create_claude_terminal_resets_stale_bridge_id_label(
             session_key: str,
             spec: Any,
             resource_role: str | None = None,
+            parent_os_env: Any = None,
         ) -> SessionResourceView:
             """Return a minimal terminal view so the launch doesn't error."""
             del spec
@@ -11236,6 +12137,7 @@ async def test_auto_create_repl_terminal_launches_attach_and_stamps_label(
             session_key: str,
             spec: Any,
             resource_role: str | None = None,
+            parent_os_env: Any = None,
         ) -> SessionResourceView:
             """
             Record the terminal launch request.
@@ -11330,6 +12232,111 @@ async def test_auto_create_repl_terminal_launches_attach_and_stamps_label(
     assert published_events[0]["resource"]["id"] == "terminal_tui_main"
 
 
+@pytest.mark.asyncio
+async def test_auto_create_repl_terminal_inherits_agent_sandbox(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The REPL terminal honours the agent's ``os_env.sandbox``.
+
+    Regression for the same sandbox-override bug #175 fixed on the
+    codex/claude auto-create paths but missed on the REPL path: the
+    REPL auto-create built a fresh ``TerminalEnvSpec`` whose ``os_env``
+    carried no ``sandbox`` and passed no ``parent_os_env``, so
+    ``launch_terminal`` fell back to ``_default_sandbox_for_platform``
+    (``linux_bwrap`` / ``darwin_seatbelt``) and ignored the agent YAML.
+    An SDK-harness agent that declares ``os_env.sandbox.type: none``
+    (relying on the outer container/VM as the boundary) was wrongly
+    forced into bwrap, which then failed to start in a hardened
+    container with ``native_terminal_start_failed``.
+
+    Asserts the launched terminal spec's ``os_env.sandbox`` is the
+    agent's ``none`` sandbox (not the platform default) and that the
+    agent's ``os_env`` is threaded through as the launch
+    ``parent_os_env`` so the rest of the policy is inherited too.
+
+    :param tmp_path: Temporary directory for the fake runner workspace.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    session_id = "conv_repl_sandbox_none"
+    workspace = tmp_path / "workspace"
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        """Captures the launched REPL terminal spec and parent os_env."""
+
+        async def launch_auxiliary_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """Record the spec + parent_os_env and return a resource view."""
+            del terminal_name, session_key, resource_role
+            captured["spec"] = spec
+            captured["parent_os_env"] = parent_os_env
+            return SessionResourceView(
+                id="terminal_tui_main",
+                type="terminal",
+                session_id=session_id,
+                name="tui",
+            )
+
+    class _PatchRecordingServerClient:
+        """Server client that absorbs the label PATCH from the helper."""
+
+        async def patch(self, url: str, **kwargs: Any) -> httpx.Response:
+            """Return a 200 for the presentation-label PATCH."""
+            del kwargs
+            return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
+
+    # An agent that declares sandbox: none (runs unconfined; the outer
+    # container/VM is the boundary).
+    agent_os_env = OSEnvSpec(
+        type="caller_process",
+        cwd=".",
+        sandbox=OSEnvSandboxSpec(type="none"),
+    )
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="sdk_worker",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "openai-agents", "model": "claude-default"},
+        ),
+        os_env=agent_os_env,
+    )
+
+    await _auto_create_repl_terminal(
+        session_id,
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, _evt: None,
+        server_client=_PatchRecordingServerClient(),  # type: ignore[arg-type]
+        agent_spec=agent_spec,
+    )
+
+    launched_sandbox = captured["spec"].os_env.sandbox
+    assert launched_sandbox is not None, (
+        "REPL auto-create dropped the agent's sandbox; launch_terminal will "
+        "fall back to _default_sandbox_for_platform (bwrap), overriding "
+        "sandbox: none"
+    )
+    assert launched_sandbox.type == "none"
+    # The whole os_env is threaded through as the inheritance parent.
+    assert captured["parent_os_env"] is agent_os_env
+
+
 @pytest.mark.parametrize(
     ("harness", "sub_agent_name", "expect_created"),
     [
@@ -11394,9 +12401,10 @@ async def test_create_session_repl_terminal_dispatch(
         publish_event: Any,
         *,
         server_client: Any,
+        agent_spec: Any = None,
     ) -> SessionResourceView:
         """Record the dispatch instead of launching a real tmux pane."""
-        del resource_registry, publish_event, server_client
+        del resource_registry, publish_event, server_client, agent_spec
         created_sessions.append(session_id)
         return SessionResourceView(
             id="terminal_tui_main",
@@ -12475,6 +13483,7 @@ async def test_auto_create_claude_terminal_recreate_cancels_prior_forwarder(
             session_key: str,
             spec: Any,
             resource_role: str | None = None,
+            parent_os_env: Any = None,
         ) -> SessionResourceView:
             """Return a terminal resource view without launching tmux."""
             del terminal_name, session_key, spec, resource_role
@@ -12677,6 +13686,7 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
             session_key: str,
             spec: Any,
             resource_role: str | None = None,
+            parent_os_env: Any = None,
         ) -> SessionResourceView:
             """Return a terminal resource view for the codex TUI."""
             del terminal_name, session_key, spec, resource_role

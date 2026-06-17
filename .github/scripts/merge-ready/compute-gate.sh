@@ -2,40 +2,39 @@
 # Single source of truth for the Merge Ready outcome. Downstream steps
 # just consume `state`, `short_desc`, and `long_desc`.
 #
-# Truth table (rows are mutually exclusive; first match wins):
+# The gate is green iff every required check is green on its own merits.
+# There is no CI bypass: to land despite red required checks, quarantine the
+# flaky test (tests/known_failures.yaml) or have a repo admin use GitHub's
+# native "merge without waiting for requirements" affordance.
 #
-#   force-merge | effective | CI eval  | state    | meaning
-#   ------------+-----------+----------+----------+---------------------------
-#   true        | true      | (skipped)| success  | maintainer bypass
-#   *           | *         | success  | success  | CI green on its own merits
-#   true        | false     | failure  | failure  | bypass attempted but rejected
-#   false       | false     | failure  | failure  | CI red, no bypass attempted
+#   CI eval  | state    | meaning
+#   ---------+----------+---------------------------
+#   success  | success  | CI green on its own merits
+#   failure  | failure  | CI red
 #
-# Row 2 (CI green with ineffective force-merge) is deliberately a
-# success: applying the label without maintainer involvement should be
-# a no-op, not a penalty.
-#
-# Env in: FORCE_MERGE, EFFECTIVE, REASON, EVAL, FAILED
+# Env in: EVAL, FAILED, FORK_NEEDS_E2E_LABEL (optional, default false)
 # Out:    state, short_desc, long_desc on $GITHUB_OUTPUT
 
 set -euo pipefail
 
-if [[ "$FORCE_MERGE" == "true" && "$EFFECTIVE" == "true" ]]; then
-  STATE=success
-  SHORT="Bypassed via force-merge ($REASON)"
-  LONG=":fast_forward: gate is green via \`force-merge\` ($REASON), merging now."
-elif [[ "$EVAL" == "success" ]]; then
+if [[ "$EVAL" == "success" ]]; then
   STATE=success
   SHORT="All required checks green"
   LONG=":white_check_mark: gate is green, merging now."
-elif [[ "$FORCE_MERGE" == "true" ]]; then
-  STATE=failure
-  SHORT="force-merge label is not effective: $REASON"
-  LONG=":no_entry: \`force-merge\` is not effective: $REASON. The merge will not fire until a maintainer approves or one of them retriggers \`/merge\`."
 else
   STATE=failure
-  SHORT="Required checks not all green; force-merge requires maintainer approval"
-  LONG=$':hourglass: gate not green yet. Required checks not satisfied:\n\n'"$FAILED"$'\nThe merge will fire once these turn green, or apply `force-merge` with maintainer approval to bypass.'
+  SHORT="Required checks not all green"
+  LONG=$':hourglass: gate not green yet. Required checks not satisfied:\n\n'"$FAILED"$'\nThe merge will fire once these turn green.'
+fi
+
+# Fork PRs never run e2e on their own: the fork `pull_request` run resolves to
+# an empty shard matrix, so the suite only runs once a maintainer applies the
+# `e2e-approved` label (which mirrors the head to a trusted fork-e2e/** branch).
+# Without it the e2e checks are satisfied-via-skip and the PR can go green with
+# e2e never having executed -- so nudge a maintainer to apply the label. Appended
+# to the comment only (long_desc); short_desc is the 140-char commit status.
+if [[ "${FORK_NEEDS_E2E_LABEL:-false}" == "true" ]]; then
+  LONG="$LONG"$'\n\n:information_source: e2e tests do not run automatically on fork PRs. A maintainer can apply the `e2e-approved` label to run the full e2e suite against this PR.'
 fi
 
 # GitHub commit-status descriptions max out at 140 chars.

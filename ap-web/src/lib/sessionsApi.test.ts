@@ -88,6 +88,7 @@ describe("createSession", () => {
       llmModel: undefined,
       harness: null,
       modelOverride: undefined,
+      costControlModeOverride: undefined,
       reasoningEffort: undefined,
       pendingElicitations: [],
       pendingInputs: [],
@@ -96,6 +97,7 @@ describe("createSession", () => {
       subAgentName: null,
       todos: [],
       skills: [],
+      codexModelOptions: [],
       terminalPending: false,
       sandboxStatus: null,
       workspace: null,
@@ -407,6 +409,43 @@ describe("runner binding", () => {
     expect(JSON.parse(init.body as string)).toEqual({ model_override: "default" });
   });
 
+  it("PATCHes collaboration_mode as a string", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_abc",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+        items: [],
+        labels: { "omnigent.codex_native.collaboration_mode": "plan" },
+      }),
+    );
+
+    const session = await updateSession("conv_abc", { codexPlanMode: true });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({ collaboration_mode: "plan" });
+    expect(session.labels?.["omnigent.codex_native.collaboration_mode"]).toBe("plan");
+  });
+
+  it("surfaces AP error messages from failed PATCHes", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse(
+        {
+          error: {
+            code: "runner_unavailable",
+            message: "Could not enter Plan mode: no live Codex runner is available.",
+          },
+        },
+        { ok: false, status: 503 },
+      ),
+    );
+
+    await expect(updateSession("conv_abc", { codexPlanMode: true })).rejects.toThrow(
+      "Could not enter Plan mode",
+    );
+  });
+
   it("PATCHes cost_control_mode_override as snake_case", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
@@ -525,6 +564,25 @@ describe("getSession", () => {
     );
     expect(session.agentId).toBe("agent_xyz");
     expect(session.items).toEqual([]);
+  });
+
+  it("getSessionSlim can request a runner-backed state refresh", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_abc",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+        items: [],
+      }),
+    );
+
+    await getSessionSlim("conv_abc", { refreshState: true });
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/v1/sessions/conv_abc?include_items=false&include_liveness=false&refresh_state=true",
+    );
   });
 
   it("maps permission_level from the wire to permissionLevel", async () => {

@@ -213,6 +213,15 @@ _SESSION_QUERY_TOOLS = frozenset(
 # ``_execute_subagent_tool``.
 _WEB_FETCH_TOOLS = frozenset({"web_fetch"})
 
+# Priority 5f.1b: web_search — the first-party search builtin. Runner-local
+# so a non-OpenAI model's web_search function call resolves to the spec's
+# configured backend (google / perplexity / nimble) via WebSearchTool.invoke.
+# (OpenAI models use the native web_search_preview passthrough and never reach
+# this path.) Without this entry the call fell through to the spec-callable
+# branch and errored "tool unavailable" — the gap behind the non-OpenAI
+# web_search known-failure.
+_WEB_SEARCH_TOOLS = frozenset({"web_search"})
+
 # Priority 5f.2: sys_list_models — runner-local because provider resolution
 # reads the runner host's config/credentials, same as the spawn paths.
 _LIST_MODELS_TOOLS = frozenset({"sys_list_models"})
@@ -309,6 +318,7 @@ _ALL_LOCAL_TOOLS = (
     | _SESSION_CREATE_TOOLS
     | _SESSION_QUERY_TOOLS
     | _WEB_FETCH_TOOLS
+    | _WEB_SEARCH_TOOLS
     | _TIMER_TOOLS
     | _TASK_LIFECYCLE_TOOLS
     | _SKILL_TOOLS
@@ -1851,6 +1861,83 @@ async def _execute_web_fetch_tool(
         publish_event=publish_event,
         session_inbox=session_inbox,
     )
+
+
+def _web_search_config_from_spec(agent_spec: Any | None) -> dict[str, str]:
+    """
+    Return the ``web_search`` builtin's config dict from the parent spec.
+
+    Mirrors ``ToolManager._register_builtin_tools``: scans
+    ``spec.tools.builtins`` for the entry named ``"web_search"`` and returns
+    its ``config`` (``search_provider`` + credentials). Empty dict when the
+    builtin is declared as a bare string or absent.
+
+    :param agent_spec: Parent agent's spec, or ``None``.
+    :returns: The web_search config dict, e.g.
+        ``{"search_provider": "nimble", "api_key": "..."}``.
+    """
+    if agent_spec is None:
+        return {}
+    tools = getattr(agent_spec, "tools", None)
+    builtins = getattr(tools, "builtins", None) or []
+    for entry in builtins:
+        if getattr(entry, "name", None) == "web_search":
+            return getattr(entry, "config", None) or {}
+    return {}
+
+
+async def _execute_web_search_tool(
+    args: dict[str, Any],
+    *,
+    agent_spec: Any | None,
+    conversation_id: str | None = None,
+    task_id: str | None = None,
+    agent_id: str | None = None,
+) -> str:
+    """
+    Dispatch a ``web_search`` tool call to the spec's configured backend.
+
+    Builds ``WebSearchTool`` from the spec's ``web_search`` builtin config and
+    runs its synchronous ``invoke`` off the event loop (the backend makes a
+    blocking HTTP call).
+
+    ``llm_provider`` is inferred exactly as ``ToolManager._create_web_search``
+    does, so the dispatch path preserves the same invariants as session setup:
+
+    - **OpenAI models** keep the native ``web_search_preview`` passthrough; if a
+      ``web_search`` function call ever reached this path, ``invoke()`` raises
+      (its built-in fence) and the third-party backend is never run. In normal
+      operation OpenAI models never emit a ``web_search`` function call, so this
+      is defensive — but it keeps the promise rather than silently weakening it.
+    - **``databricks-*`` models** skip provider inference (they don't support
+      ``web_search_preview``) and run in function-tool mode.
+
+    :param args: Parsed LLM arguments — ``query`` (required).
+    :param agent_spec: Parent agent's spec; carries the web_search config + model.
+    :param conversation_id: Parent session id, threaded into the context.
+    :param task_id: Calling task id, threaded into the context.
+    :param agent_id: Calling agent id, threaded into the context.
+    :returns: The formatted search results, or an error string.
+    """
+    from omnigent.tools.base import ToolContext
+    from omnigent.tools.builtins.web_search import WebSearchTool
+
+    config = _web_search_config_from_spec(agent_spec)
+    # Mirror ToolManager._create_web_search's provider inference (same skip for
+    # databricks-*, same OpenAI passthrough fence) so dispatch honors session-setup invariants.
+    llm_provider: str | None = None
+    model = getattr(getattr(agent_spec, "executor", None), "model", None)
+    if model and not model.startswith("databricks-"):
+        from omnigent.llms.routing import parse_model_string
+
+        llm_provider = parse_model_string(model).provider
+    tool = WebSearchTool(config=config, llm_provider=llm_provider)
+    ctx = ToolContext(
+        task_id=task_id or "web_search",
+        agent_id=agent_id or "web_search",
+        conversation_id=conversation_id,
+    )
+    return await asyncio.to_thread(tool.invoke, json.dumps(args), ctx)
 
 
 def _has_subagent(
@@ -3504,6 +3591,14 @@ async def execute_tool(
                 task_id=task_id,
                 publish_event=publish_event,
                 session_inbox=session_inbox,
+            )
+        elif tool_name in _WEB_SEARCH_TOOLS:
+            output = await _execute_web_search_tool(
+                args,
+                agent_spec=agent_spec,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                agent_id=agent_id,
             )
         elif tool_name in _TIMER_TOOLS:
             if tool_name == "sys_timer_set":

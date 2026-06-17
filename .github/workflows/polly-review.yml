@@ -37,33 +37,41 @@ env:
   PIP_INDEX_URL: https://pypi.org/simple
 
 jobs:
-  # Security precondition gate (security-gate.yml): untrusted PRs wait for the
-  # scan; trusted authors / non-PR events pass through.
+  # Security precondition gate (security-gate.yml): untrusted PRs wait for
+  # the scan; trusted authors pass through. Only runs on pull_request events
+  # — issue_comment and workflow_dispatch are already gated by write-access
+  # (author_association check + GitHub's own dispatch auth) and never check
+  # out PR code, so the scan is not applicable.
   gate:
+    if: github.event_name == 'pull_request'
     uses: ./.github/workflows/security-gate.yml
 
   review:
     name: Polly AI Review
     needs: gate
-    # Fire on non-draft PRs, `/review` comments by write-access users,
-    # or workflow_dispatch with a PR number.
+    # Fire on non-draft PRs (after gate passes), `/review` comments by
+    # write-access users, or workflow_dispatch. The `!cancelled()` ensures
+    # the job runs when gate is skipped (non-PR events) but not when it fails.
     if: >-
-      (
-        github.event_name == 'pull_request' &&
-        !github.event.pull_request.draft
-      ) ||
-      (
-        github.event_name == 'issue_comment' &&
-        github.event.issue.pull_request != null &&
-        contains(github.event.comment.body, '/review') &&
-        !endsWith(github.actor, '[bot]') &&
+      !cancelled() && (
         (
-          github.event.comment.author_association == 'OWNER' ||
-          github.event.comment.author_association == 'MEMBER' ||
-          github.event.comment.author_association == 'COLLABORATOR'
-        )
-      ) ||
-      github.event_name == 'workflow_dispatch'
+          github.event_name == 'pull_request' &&
+          !github.event.pull_request.draft &&
+          needs.gate.result == 'success'
+        ) ||
+        (
+          github.event_name == 'issue_comment' &&
+          github.event.issue.pull_request != null &&
+          contains(github.event.comment.body, '/review') &&
+          !endsWith(github.actor, '[bot]') &&
+          (
+            github.event.comment.author_association == 'OWNER' ||
+            github.event.comment.author_association == 'MEMBER' ||
+            github.event.comment.author_association == 'COLLABORATOR'
+          )
+        ) ||
+        github.event_name == 'workflow_dispatch'
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -89,8 +97,21 @@ jobs:
             -f content=eyes --silent || true
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve PR number
+      - name: Check LLM credentials available
         if: steps.trigger.outputs.skip != 'true'
+        id: creds
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          if [ -z "$LLM_API_KEY" ]; then
+            echo "::notice::Skipping Polly review — LLM credentials not available (fork PR or missing secrets)."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve PR number
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
         id: pr
         run: |
           set -euo pipefail
@@ -105,26 +126,26 @@ jobs:
       # avoids the TOCTOU issue CodeQL flags when issue_comment checks
       # out untrusted PR code in a privileged workflow.
       - name: Check out repo
-        if: steps.trigger.outputs.skip != 'true'
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
       - name: Set up Python
-        if: steps.trigger.outputs.skip != 'true'
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version-file: ".python-version"
 
       - name: Set up uv
-        if: steps.trigger.outputs.skip != 'true'
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
         uses: astral-sh/setup-uv@8d55fbecc275b1c35dbe060458839f8d30439ccf  # v3
         with:
           enable-cache: true
 
       - name: Install bubblewrap
-        if: steps.trigger.outputs.skip != 'true'
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
         # bubblewrap: the linux_bwrap sandbox backend needs bwrap on PATH.
         # apparmor sysctl: Ubuntu 24.04 blocks unprivileged user namespaces
         # that bwrap's unshare(CLONE_NEWUSER) needs; scope is the ephemeral runner.
@@ -134,18 +155,18 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Cache virtualenv
-        if: steps.trigger.outputs.skip != 'true'
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4
         with:
           path: .venv
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
 
       - name: Install dependencies
-        if: steps.trigger.outputs.skip != 'true'
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
         run: uv sync --extra all --extra dev
 
       - name: Install Claude Code CLI
-        if: steps.trigger.outputs.skip != 'true'
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
@@ -155,7 +176,7 @@ jobs:
           echo "${GITHUB_WORKSPACE}/.cc-cli/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Install Codex CLI
-        if: steps.trigger.outputs.skip != 'true'
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
@@ -164,13 +185,13 @@ jobs:
           echo "${GITHUB_WORKSPACE}/.codex-cli/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Set LLM credentials
-        if: steps.trigger.outputs.skip != 'true'
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         run: echo "LLM_API_KEY=${LLM_API_KEY}" >> "$GITHUB_ENV"
 
       - name: Write gateway profile (~/.databrickscfg)
-        if: steps.trigger.outputs.skip != 'true'
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
         env:
           GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
@@ -188,7 +209,7 @@ jobs:
           echo "DATABRICKS_BEARER=${LLM_API_KEY}" >> "$GITHUB_ENV"
 
       - name: Write Omnigent provider config
-        if: steps.trigger.outputs.skip != 'true'
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
         env:
           GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
         run: |
@@ -226,7 +247,7 @@ jobs:
           "
 
       - name: Collect PR context
-        if: steps.trigger.outputs.skip != 'true'
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
         id: ctx
         env:
           GH_TOKEN: ${{ github.token }}
@@ -263,7 +284,7 @@ jobs:
           - **Stats:** +{meta['additions']} / -{meta['deletions']} across {meta['changedFiles']} file(s)
 
           ## PR Description
-          {(meta.get('body') or '')[:4096]}
+          {(meta.get('body') or '')[:4096]}{"  *(truncated)*" if len(meta.get('body') or '') > 4096 else ""}
 
           ## Diff
           ```diff
@@ -273,20 +294,25 @@ jobs:
           ## Instructions
           Review the diff against the PR description. Report:
           1. **Blocking issues** — bugs, security problems, correctness errors, data loss risks.
-          2. **Non-blocking suggestions** — style, naming, performance, test coverage gaps.
-          3. **Summary** — one-paragraph overall assessment.
+          2. **Security analysis** — carefully check the security implications of the changes. Look for injection vulnerabilities (SQL, command, template), authentication/authorization bypasses, secret exposure, unsafe deserialization, path traversal, SSRF, and any change that weakens an existing security boundary. Flag even subtle issues.
+          3. **Non-blocking suggestions** — style, naming, performance, test coverage gaps.
+          4. **Summary** — one-paragraph overall assessment.
 
           Be concise. Do not restate the diff. Focus on what matters.
+
+          IMPORTANT: Your output will be posted directly as a PR comment. Output
+          ONLY the final structured review — no coordination messages, no status
+          updates about dispatching sub-agents, no "waiting for results" narration.
+          Start your response with the review content itself.
           """
           pathlib.Path("/tmp/review_prompt.txt").write_text(prompt)
           PYEOF
 
       - name: Run Polly review
-        if: steps.trigger.outputs.skip != 'true'
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
         id: polly
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-          OMNIGENT_TOKEN_USAGE_JSON: /tmp/polly-tokens.json
         run: |
           set -euo pipefail
 
@@ -295,8 +321,6 @@ jobs:
           # Run Polly headlessly with -p; it starts a local server, sends
           # one turn, prints the assistant response, and exits.
           # --no-session: ephemeral run, no persistent session state.
-          # OMNIGENT_TOKEN_USAGE_JSON: each process writes a PID-suffixed
-          # JSON file with token counts; we aggregate them below.
           uv run omnigent run examples/polly/ \
             -p "$prompt" \
             --no-session \
@@ -312,59 +336,6 @@ jobs:
           head -c 61440 /tmp/polly_output.txt >> "$GITHUB_OUTPUT"
           echo "${delim}" >> "$GITHUB_OUTPUT"
 
-      - name: Aggregate token usage
-        id: usage
-        if: always() && steps.trigger.outputs.skip != 'true'
-        run: |
-          # Each omnigent process writes its own /tmp/polly-tokens-*.json
-          # file. Aggregate all of them into totals.
-          echo "Token files found:"
-          ls -la /tmp/polly-tokens*.json 2>/dev/null || echo "  (none)"
-          python3 <<'PYEOF'
-          import glob, json, os
-
-          totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "calls": 0}
-          by_model = {}
-
-          for path in glob.glob("/tmp/polly-tokens*.json"):
-              try:
-                  data = json.loads(open(path).read())
-              except (json.JSONDecodeError, OSError):
-                  continue
-              for bucket in data.values():
-                  for k in ("input_tokens", "output_tokens", "total_tokens", "calls"):
-                      totals[k] += bucket.get(k, 0)
-                  for model, mu in bucket.get("by_model", {}).items():
-                      agg = by_model.setdefault(model, {"input_tokens": 0, "output_tokens": 0, "calls": 0})
-                      agg["input_tokens"] += mu.get("input_tokens", 0)
-                      agg["output_tokens"] += mu.get("output_tokens", 0)
-                      agg["calls"] += mu.get("calls", 0)
-
-          # Format a compact summary line.
-          inp = totals["input_tokens"]
-          out = totals["output_tokens"]
-          calls = totals["calls"]
-
-          def fmt(n):
-              if n >= 1_000_000:
-                  return f"{n / 1_000_000:.1f}M"
-              if n >= 1_000:
-                  return f"{n / 1_000:.1f}k"
-              return str(n)
-
-          parts = [f"{fmt(inp)} input", f"{fmt(out)} output", f"{calls} calls"]
-          if by_model:
-              model_parts = []
-              for m, u in sorted(by_model.items(), key=lambda x: -x[1]["input_tokens"]):
-                  model_parts.append(f"{m}: {fmt(u['input_tokens'])}→{fmt(u['output_tokens'])}")
-              parts.append("models: " + ", ".join(model_parts))
-
-          summary = " · ".join(parts)
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"usage_summary={summary}\n")
-          print(f"Token usage: {summary}")
-          PYEOF
-
       - name: Post review comment
         if: steps.polly.outputs.review_text != ''
         env:
@@ -372,7 +343,6 @@ jobs:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           REVIEW_TEXT: ${{ steps.polly.outputs.review_text }}
-          USAGE_SUMMARY: ${{ steps.usage.outputs.usage_summary }}
           RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         run: |
           set -euo pipefail
@@ -380,35 +350,20 @@ jobs:
           # Build the comment body safely — REVIEW_TEXT is passed via env
           # (not expression interpolation) to avoid expression injection.
           {
+            echo "<!-- polly-review-bot -->"
             echo "## <img src=\"https://raw.githubusercontent.com/omnigent-ai/omnigent/main/docs/images/omnigent-logo.svg\" alt=\"\" height=\"20\" valign=\"middle\" /> Polly AI Review"
             echo ""
             echo "$REVIEW_TEXT"
             echo ""
             echo "---"
-            footer="<sub>Automated review by Polly"
-            if [ -n "$USAGE_SUMMARY" ]; then
-              footer="${footer} · tokens: ${USAGE_SUMMARY}"
-            fi
-            footer="${footer} · [workflow run](${RUN_URL})</sub>"
-            echo "$footer"
+            echo "<sub>Automated review by Polly · [workflow run](${RUN_URL})</sub>"
           } > /tmp/comment.md
 
-          # Upsert: edit the existing Polly comment if one exists, otherwise create.
-          # Look for the marker image in existing comments.
-          existing_id=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
-            --paginate --jq '.[] | select(.body | contains("Polly AI Review")) | .id' \
-            | tail -1)
-
-          if [ -n "$existing_id" ]; then
-            # Use -F to read body from file via jq-style @-prefixed path.
-            gh api "repos/${REPO}/issues/comments/${existing_id}" \
-              -X PATCH \
-              -F "body=@/tmp/comment.md" > /dev/null
-            echo "Updated existing comment ${existing_id}"
-          else
-            gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/comment.md
-            echo "Created new comment"
-          fi
+          # Post a fresh comment for every review run, so each trigger (push,
+          # `/review` comment, or maintainer approval) is visible in the thread
+          # and notifies watchers — no in-place upsert of a prior comment.
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/comment.md
+          echo "Created new comment"
 
       - name: Upload logs on failure
         if: failure()

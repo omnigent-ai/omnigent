@@ -16,12 +16,16 @@ from pathlib import Path
 import pytest
 import yaml
 
+from omnigent.onboarding import cursor_auth
 from omnigent.onboarding import secrets as secret_store
 from omnigent.onboarding.cursor_auth import (
     CURSOR_SECRET_NAME,
     cursor_api_key_configured,
     cursor_api_key_ref,
     cursor_api_key_settings,
+    cursor_install_command,
+    cursor_sdk_installed,
+    install_cursor_sdk,
     looks_like_cursor_api_key,
     resolve_cursor_api_key,
 )
@@ -106,3 +110,100 @@ def test_settings_shape() -> None:
     assert cursor_api_key_settings("keychain:cursor") == {
         "cursor": {"api_key_ref": "keychain:cursor"}
     }
+
+
+# ── SDK-extra detection + install (the optional ``cursor`` extra) ─────────────
+# ``cursor-sdk`` is now an OPTIONAL extra, so setup must detect a missing SDK
+# and offer to install it.
+
+
+def test_cursor_sdk_installed_true_when_spec_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Detection returns True when ``find_spec`` resolves ``cursor_sdk``."""
+    monkeypatch.setattr(
+        cursor_auth.importlib.util,
+        "find_spec",
+        lambda name: object(),
+    )
+    assert cursor_sdk_installed() is True
+
+
+def test_cursor_sdk_installed_false_when_spec_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Detection returns False when ``find_spec`` returns ``None`` (extra absent)."""
+    monkeypatch.setattr(cursor_auth.importlib.util, "find_spec", lambda name: None)
+    assert cursor_sdk_installed() is False
+
+
+def test_cursor_sdk_installed_false_when_module_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``ModuleNotFoundError`` from ``find_spec`` reads as not-installed.
+
+    ``find_spec`` can raise (not return ``None``) when a parent package is
+    absent; the guard must swallow that rather than crash setup.
+    """
+
+    def _raise(name: str) -> object:
+        raise ModuleNotFoundError("No module named 'cursor_sdk'")
+
+    monkeypatch.setattr(cursor_auth.importlib.util, "find_spec", _raise)
+    assert cursor_sdk_installed() is False
+
+
+def test_cursor_install_command_prefers_uv(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With ``uv`` on PATH, the install runs ``uv pip install`` — no index URL."""
+    monkeypatch.setattr(cursor_auth.shutil, "which", lambda name: "/usr/bin/uv")
+    cmd = cursor_install_command()
+    assert cmd == ["uv", "pip", "install", "omnigent[cursor]"]
+    # No hardcoded index / proxy leaks into committed code.
+    assert not any("index" in part or "://" in part for part in cmd)
+
+
+def test_cursor_install_command_falls_back_to_pip(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without ``uv``, it falls back to this interpreter's pip — still no index."""
+    monkeypatch.setattr(cursor_auth.shutil, "which", lambda name: None)
+    cmd = cursor_install_command()
+    assert cmd == [
+        cursor_auth.sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "omnigent[cursor]",
+    ]
+    assert not any("index" in part or "://" in part for part in cmd)
+
+
+def test_install_cursor_sdk_runs_command_then_rechecks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shells the install argv, then reports the post-install detection verdict.
+
+    Mocks the subprocess (never really installs): the SDK "appears" only after
+    the install runs, so the function must re-check and return True.
+    """
+    import subprocess
+
+    calls: list[list[str]] = []
+    state = {"installed": False}
+
+    def _run(argv: list[str], *, check: bool = False, timeout: float | None = None):
+        calls.append(argv)
+        state["installed"] = True
+        return subprocess.CompletedProcess(args=argv, returncode=0)
+
+    monkeypatch.setattr(cursor_auth.shutil, "which", lambda name: None)
+    monkeypatch.setattr(cursor_auth.subprocess, "run", _run)
+    monkeypatch.setattr(cursor_auth, "cursor_sdk_installed", lambda: state["installed"])
+
+    assert install_cursor_sdk() is True
+    assert calls == [[cursor_auth.sys.executable, "-m", "pip", "install", "omnigent[cursor]"]]
+
+
+def test_install_cursor_sdk_false_on_spawn_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A subprocess that can't spawn (OSError) is caught and reported as False."""
+
+    def _boom(*args: object, **kwargs: object) -> object:
+        raise OSError("no pip")
+
+    monkeypatch.setattr(cursor_auth.shutil, "which", lambda name: None)
+    monkeypatch.setattr(cursor_auth.subprocess, "run", _boom)
+    assert install_cursor_sdk() is False

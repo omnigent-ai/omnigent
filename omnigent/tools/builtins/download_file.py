@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.tools.builtins.upload_file import safe_resolve
 
 
 class DownloadFileTool(Tool):
@@ -101,10 +102,13 @@ class DownloadFileTool(Tool):
                 }
             )
 
-        dest = _resolve_destination(
-            record.filename,
-            ctx.workspace,
-        )
+        try:
+            dest = _resolve_destination(
+                record.filename,
+                ctx.workspace,
+            )
+        except ValueError as exc:
+            return json.dumps({"error": str(exc)})
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(data)
 
@@ -125,9 +129,17 @@ def _resolve_destination(
     """
     Resolve the save path for a downloaded file.
 
+    The stored ``filename`` is untrusted metadata (it originates from
+    whoever uploaded the file and is persisted verbatim). It is reduced
+    to its bare basename and confined to the workspace via
+    :func:`safe_resolve`, so a malicious name such as ``../../escape``
+    or an absolute path cannot cause a write outside the workspace.
+
     :param filename: The file's original filename from the store.
     :param workspace: The agent's workspace directory, or ``None``.
-    :returns: Absolute path to save the file.
+    :returns: Absolute path to save the file, confined to ``workspace``.
+    :raises ValueError: If the resolved path escapes the workspace.
     """
     base = workspace or Path.cwd()
-    return base / filename
+    name = Path(filename).name or "downloaded.bin"
+    return safe_resolve(name, base)
