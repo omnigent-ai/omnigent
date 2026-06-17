@@ -1339,12 +1339,15 @@ class _CodexAppServerSession:
             if not isinstance(item, dict) or item.get("type") != "agentMessage":
                 continue
             phase, completed_text = _completed_agent_message_text(item, message_buffers)
-            if phase == "final_answer" or not final_response:
+            if phase == "commentary":
+                item_id = item.get("id")
+                if isinstance(item_id, str):
+                    message_buffers.pop(item_id, None)
+                continue
+            if phase == "final_answer" or phase is None:
                 final_response = completed_text
             if phase == "final_answer":
                 return final_response
-            if not final_response:
-                final_response = _latest_buffered_agent_message(message_buffers)
 
     async def run_turn(
         self,
@@ -1356,6 +1359,7 @@ class _CodexAppServerSession:
         cwd: str,
         sandbox: str,
         reasoning_effort: str | None = None,
+        collaboration_mode: CodexParams | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
         await self.start()
         assert self._proc is not None
@@ -1397,6 +1401,8 @@ class _CodexAppServerSession:
         }
         if reasoning_effort:
             turn_params["effort"] = reasoning_effort
+        if collaboration_mode is not None:
+            turn_params["collaborationMode"] = collaboration_mode
         start_response = await self._request(
             "turn/start",
             turn_params,
@@ -1605,7 +1611,10 @@ class _CodexAppServerSession:
                         phase, completed_text = _completed_agent_message_text(
                             item, message_buffers
                         )
-                        if phase == "final_answer" or not final_response:
+                        if phase == "commentary":
+                            message_buffers.pop(completed_item_id, None)
+                            continue
+                        if phase == "final_answer" or phase is None:
                             final_response = completed_text
                         if phase == "final_answer":
                             # Diagnostic: log response head + turn id so
@@ -1663,6 +1672,8 @@ class _CodexAppServerSession:
                     return
 
                 if method == "turn/failed":
+                    if isinstance(params, dict) and params.get("willRetry") is True:
+                        continue
                     turn = params.get("turn", {}) if isinstance(params, dict) else {}
                     raw_failed_turn_id = turn.get("id")
                     failed_turn_id: str | None = (
@@ -1685,6 +1696,8 @@ class _CodexAppServerSession:
                     return
 
                 if method == "error":
+                    if isinstance(params, dict) and params.get("willRetry") is True:
+                        continue
                     # JSON-RPC-shaped error frames from the app server
                     # carry ``code`` / ``message`` / ``data``. Some error
                     # paths populate only ``code``+``data`` and leave
@@ -2266,6 +2279,16 @@ class CodexExecutor(Executor):
         except ValueError as exc:
             yield ExecutorError(message=str(exc), retryable=False)
             return
+        raw_collaboration_mode = cfg.extra.get("codex_collaboration_mode")
+        if raw_collaboration_mode is not None and not isinstance(
+            raw_collaboration_mode, dict
+        ):
+            yield ExecutorError(
+                message="codex_collaboration_mode must be a JSON object",
+                retryable=False,
+            )
+            return
+        collaboration_mode: CodexParams | None = raw_collaboration_mode
 
         app_session = await self._ensure_app_session(
             state,
@@ -2285,6 +2308,7 @@ class CodexExecutor(Executor):
                 cwd=effective_cwd,
                 sandbox=sandbox_mode,
                 reasoning_effort=reasoning_effort,
+                collaboration_mode=collaboration_mode,
             ):
                 yield event
         except Exception as exc:  # noqa: BLE001 — executor boundary converts any error into an ExecutorError event
