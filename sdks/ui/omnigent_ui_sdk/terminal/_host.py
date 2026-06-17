@@ -206,10 +206,13 @@ _SPINNER_FRAMES: tuple[str, ...] = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 # calls don't dominate the event loop.
 _SPINNER_TICK_SECONDS: float = 0.1
 
-# A finished sub-agent lingers in the ``↓`` menu for this many seconds
-# (showing ✔/✗) before it is pruned, so a quick task still registers
-# visually instead of vanishing the instant it completes. It also debounces
-# the running count so a between-turns blip can't flicker the badge.
+# Debounce window for the "N agents running" badge / spinner only. A
+# sub-agent that just reached a terminal task status keeps counting as
+# "running" for this many seconds so a between-turns ``completed`` blip that
+# then resumes can't flicker the badge off. This NO LONGER hides the node:
+# finished sub-agents stay in the ``↓`` selector indefinitely (web parity —
+# see :meth:`TerminalHost._subagent_visible`), they just drop out of the
+# running count once settled.
 _SUBAGENT_LINGER_SECONDS: float = 3.0
 # Max rows shown at once in the inline ``↓`` sub-agents menu. Longer
 # trees scroll within this window so the input bar never lifts more than
@@ -239,6 +242,18 @@ class _SubagentNode:
     started_at: float = 0.0  # monotonic; stamped on first sighting
     pending_elicitations: int = 0
     done_at: float | None = None  # monotonic; stamped when terminal
+    # Live "session loop is running" flag from the server snapshot. Mirrors
+    # ``ChildSessionSummary.busy`` and feeds the web-parity ``Working`` label.
+    busy: bool = False
+    # Whether the child's latest run carries a durable failure detail. Mirrors
+    # the presence of ``ChildSessionSummary.last_task_error``; truthy => the
+    # web-parity ``Failed`` label (outranks a stale ``completed`` status).
+    last_task_error: bool = False
+    # Whether the child session is closed to new user input — derived from its
+    # labels / title via :func:`omnigent.session_lifecycle.is_session_closed`.
+    # Sticky (a closed session never reopens); gates interactive chat: a closed
+    # child is view-only because a ``message`` to it returns 409 CONFLICT.
+    closed: bool = False
 
 
 # Window for the two-press Ctrl+C exit: first Ctrl+C with an
@@ -894,6 +909,13 @@ class TerminalHost:
         # the tree is rooted at (the originally-launched "main" session).
         self._subagents: dict[str, _SubagentNode] = {}
         self._subagent_root: str | None = None
+        # Bumped every time the tree is cleared (``/switch`` / ``/new`` /
+        # ``/clear`` start a fresh root). A background ``seed_subagent_tree``
+        # whose fetch was in flight across a clear carries the stale
+        # generation and no-ops, so a slow poll can't resurrect cleared nodes
+        # (or re-root the just-cleared tree onto the old session). See
+        # :meth:`subagent_generation` / :meth:`clear_subagents`.
+        self._subagent_generation: int = 0
         # Inline ``↓`` sub-agents menu state. Open is toggled by Down (on an
         # empty input while sub-agents are active) / Esc; index + scroll
         # drive the windowed list rendered below the toolbar (see the layout
@@ -1045,7 +1067,11 @@ class TerminalHost:
         _menu_open = Condition(lambda: self._subagent_menu_open)
 
         def _can_open_subagent_menu() -> bool:
-            if self._subagent_menu_open or not self.has_active_subagents():
+            # Openable whenever ANY sub-agent node exists — active OR finished.
+            # Finished children are retained in the selector (web parity) so the
+            # user can revisit / chat with them, so the gesture stays available
+            # after they settle, not only while something is running.
+            if self._subagent_menu_open or not self.has_any_subagents():
                 return False
             try:
                 return get_app().current_buffer.text == ""
@@ -1302,6 +1328,10 @@ class TerminalHost:
                 "bar": self._accent,
                 "prompt-marker": f"{self._accent} bold",
                 "model-name": self.theme.toolbar_model,
+                # Settled (done / warm-idle) sub-agent rows in the ↓ selector
+                # are de-emphasized vs live ones — mirroring the web Agents
+                # rail's SETTLED_STATE dimming — but kept in the list.
+                "subagent-settled": "fg:ansibrightblack",
                 "bottom-toolbar.key": self._accent,
                 # Bottom toolbar background. ``noreverse`` prevents
                 # prompt-toolkit's default fg/bg swap (which would turn
@@ -3107,17 +3137,30 @@ class TerminalHost:
         incoming_status = child.get("current_task_status")
         if incoming_status is not None:
             node.status = incoming_status
+        if "busy" in child:
+            node.busy = bool(child.get("busy"))
+        if "last_task_error" in child:
+            node.last_task_error = child.get("last_task_error") is not None
         if "pending_elicitations_count" in child:
             node.pending_elicitations = int(child.get("pending_elicitations_count") or 0)
-        # A node is finished when it has a terminal task status (from SSE),
-        # or — for poll-only nodes that never receive SSE status — when the
-        # server reports its loop is no longer busy. ``done_at`` + the linger
-        # window debounce the busy flag so a between-turns blip doesn't settle
-        # it early; a non-terminal update clears the stamp (a reused handle
-        # starting a fresh task, or a child that resumed).
-        terminal = node.status in ("completed", "failed", "cancelled") or (
-            incoming_status is None and child.get("busy") is False
-        )
+        # Closed-ness is sticky: once a child's session is closed to input it
+        # never reopens, and a partial delta that omits labels must not flip it
+        # back to open. Derive it from the same labels/title the server uses so
+        # the selector knows the child is view-only (a ``message`` to a closed
+        # session 409s). Imported lazily to keep this UI SDK importable without
+        # the ``omnigent`` server package on the path.
+        if not node.closed:
+            from omnigent.session_lifecycle import is_session_closed
+
+            if is_session_closed(child.get("labels"), child.get("title")):
+                node.closed = True
+        # ``done_at`` stamps a TERMINAL task OUTCOME (completed / failed /
+        # cancelled, or a durable failure detail) — NOT a merely-not-busy loop.
+        # Web parity: a child whose loop is idle between turns (``busy=False``
+        # with no terminal status) is "warm/idle", still chattable, and must
+        # not be mislabeled ``Done``. ``done_at`` debounces the running badge;
+        # a non-terminal update clears it (a reused handle / resumed child).
+        terminal = node.status in ("completed", "failed", "cancelled") or node.last_task_error
         if terminal:
             if node.done_at is None:
                 node.done_at = self._monotonic()
@@ -3125,19 +3168,30 @@ class TerminalHost:
             node.done_at = None
         self._invalidate_prompt()
 
-    def seed_subagent_tree(self, root_id: str, nodes: list[dict[str, Any]]) -> None:
+    def seed_subagent_tree(
+        self, root_id: str, nodes: list[dict[str, Any]], *, generation: int | None = None
+    ) -> None:
         """Replace the tree from a recursively-fetched snapshot.
 
         Each entry in ``nodes`` is a ``child_sessions`` row augmented with a
         ``parent_id`` (the session it was queried under).
 
-        Reconciliation keeps an **unsent** sub-agent — one that hasn't yet
-        reached a terminal task status, so its result hasn't been delivered
-        to the main agent (``done_at is None``) — even when it's momentarily
-        absent from the snapshot (e.g. a poll racing a just-spawned child).
-        A sub-agent that HAS sent its response (terminal status) is dropped
-        once it has both left the snapshot and outlived its linger window.
+        Retention (web parity): a child the server STILL lists stays in the
+        selector regardless of whether it has finished — finished sub-agents
+        remain visible (dimmed) so the user can revisit / chat with them. A
+        node is dropped only when it is BOTH absent from the snapshot (the
+        server stopped listing it) AND terminal (its result was delivered);
+        an unsent (still-active) node that's momentarily absent — a poll racing
+        a just-spawned child — is kept.
+
+        ``generation`` guards against a clear-during-poll race: pass the value
+        captured from :attr:`subagent_generation` before the fetch started, and
+        a snapshot whose generation no longer matches (the tree was cleared and
+        re-rooted while this fetch was in flight) is dropped wholesale rather
+        than resurrecting cleared nodes onto a new root.
         """
+        if generation is not None and generation != self._subagent_generation:
+            return
         self._subagent_root = root_id
         seen: set[str] = {root_id}
         for row in nodes:
@@ -3151,7 +3205,6 @@ class TerminalHost:
                 parent_id=parent if isinstance(parent, str) else None,
                 child=row,
             )
-        now = self._monotonic()
         for sid in list(self._subagents):
             if sid in seen:
                 continue
@@ -3160,22 +3213,42 @@ class TerminalHost:
             # until they deliver their result, regardless of snapshot gaps.
             if node.done_at is None:
                 continue
-            if (now - node.done_at) >= _SUBAGENT_LINGER_SECONDS:
-                del self._subagents[sid]
+            # Terminal AND gone from the server snapshot → truly removed. Drop
+            # it (no linger wait): retained nodes are the ones the server keeps
+            # listing, not ones it has forgotten.
+            del self._subagents[sid]
         self._invalidate_prompt()
 
     def _subagent_visible(self, node: _SubagentNode, now: float) -> bool:
-        """Whether a node shows in the badge count + ↓ menu.
+        """Whether a node shows in the ↓ selector tree.
 
-        Visible while running (``done_at is None``) or within the linger
-        window after going terminal. Finished-past-linger nodes are hidden but
-        NOT deleted: the 2 s poll re-reports every child with a null
-        ``current_task_status``, so deleting a settled node would let the next
-        poll recreate it and resurrect the ``N agents running`` badge. Nodes
-        leave the registry only via snapshot reconciliation (the server stops
-        listing them) or :meth:`clear_subagents`.
+        Always ``True`` — finished / warm sub-agents are retained in the
+        selector indefinitely (web parity), so the user can revisit or chat
+        with a child after it settles. Nodes leave the selector only via
+        snapshot reconciliation (the server stops listing them — see
+        :meth:`seed_subagent_tree`) or :meth:`clear_subagents`. The
+        ``now`` parameter is unused but kept so callers don't special-case it.
         """
-        return node.done_at is None or (now - node.done_at) < _SUBAGENT_LINGER_SECONDS
+        return True
+
+    def _subagent_active(self, node: _SubagentNode, now: float) -> bool:
+        """Whether a node counts toward the "N agents running" badge / spinner.
+
+        This is the running-ness signal (NOT visibility — see
+        :meth:`_subagent_visible`). A terminal node stays counted for the
+        linger window so a between-turns ``completed`` blip that then resumes
+        can't flicker the badge off. A non-terminal node counts while it is
+        actually doing work: busy, launching, awaiting input, or mid-task with
+        a non-terminal ``current_task_status`` (``in_progress`` / ``queued`` —
+        a busy-flag gap between turns). A warm-idle child (loop idle, no
+        in-progress task, no pending input) is retained but NOT counted as
+        running — matching the web ``Idle`` state.
+        """
+        if node.done_at is not None:
+            return (now - node.done_at) < _SUBAGENT_LINGER_SECONDS
+        if node.pending_elicitations > 0 or node.busy or node.status == "launching":
+            return True
+        return node.status is not None and node.status not in ("completed", "failed", "cancelled")
 
     def subagent_tree(self) -> list[tuple[_SubagentNode, int]]:
         """Return the visible sub-agent nodes in pre-order with their depth.
@@ -3230,21 +3303,53 @@ class TerminalHost:
         resumes, so the badge only settles once the child is truly finished.
         """
         now = self._monotonic()
-        return sum(1 for n in self._subagents.values() if self._subagent_visible(n, now))
+        return sum(1 for n in self._subagents.values() if self._subagent_active(n, now))
 
     def has_active_subagents(self) -> bool:
-        """True while any sub-agent is still running (drives the badge / hint /
-        ↓ menu / spinner). See :meth:`active_subagent_count` for why this keys
-        on not-yet-terminal rather than the flickering ``busy`` flag."""
+        """True while any sub-agent is still running (drives the badge /
+        spinner). Keys on running-ness (debounced) rather than the flickering
+        raw ``busy`` flag — see :meth:`active_subagent_count`. NOTE: this is
+        running-ness, NOT selector availability; use :meth:`has_any_subagents`
+        to gate the ↓ menu so finished children remain reachable."""
         return self.active_subagent_count() > 0
+
+    def has_any_subagents(self) -> bool:
+        """True when ANY sub-agent node exists — active OR finished. Gates the
+        ↓ selector + its toolbar hint, which stay available after children
+        settle so the user can revisit / chat with finished sub-agents (web
+        parity with the Agents rail)."""
+        return bool(self._subagents)
+
+    @property
+    def subagent_generation(self) -> int:
+        """Monotonic counter bumped on every :meth:`clear_subagents`. A
+        background tree fetch captures this before it starts and passes it back
+        to :meth:`seed_subagent_tree`; a stale seed (the tree was cleared while
+        the fetch ran) no-ops instead of resurrecting cleared nodes."""
+        return self._subagent_generation
 
     def clear_subagents(self) -> None:
         """Drop the whole tree — called when the REPL changes which top-level
         session it owns (``/switch``, ``/clear``, ``/new``) so the prior
-        session's sub-agents don't linger under the new one."""
+        session's sub-agents don't linger under the new one. Bumps
+        :attr:`subagent_generation` so an in-flight tree fetch can't resurrect
+        the cleared nodes (race guard)."""
         self._subagents.clear()
         self._subagent_root = None
+        self._subagent_generation += 1
         self._invalidate_prompt()
+
+    def is_subagent_chattable(self, session_id: str) -> bool:
+        """Whether the user can send messages to *session_id* from the selector.
+
+        A child is chattable while its session is open (not closed): finished
+        and warm children stay chattable so the user can follow up (web-UI
+        co-drive parity). A closed child is view-only — a ``message`` to it
+        returns 409 CONFLICT — and unknown ids (e.g. the ``main`` row, a stale
+        selection) are not chattable.
+        """
+        node = self._subagents.get(session_id)
+        return node is not None and not node.closed
 
     def _is_inside_subagent(self) -> bool:
         """True when the active session is a sub-agent below the tree root —
@@ -3256,26 +3361,36 @@ class TerminalHost:
         return active is not None and active != self._subagent_root
 
     def _subagent_status_label(self, node: _SubagentNode) -> str:
-        """Collapse a node to a short status word.
+        """Collapse a node to a short status word, mirroring the web UI
+        ``childStatus`` precedence (``ap-web SubagentsPanel.tsx``):
 
-        Keyed on terminal-vs-not (``done_at``) rather than the live ``busy``
-        flag, so a running sub-agent reads a steady ``Working`` instead of
-        flipping to ``Idle``/raw-status in the gaps between its turns / waits
-        (the same flicker the badge avoids). Terminal nodes show their
-        outcome; a pending elicitation outranks ``Working`` since it needs
-        the user's attention.
+        1. ``pending_elicitations > 0`` → ``Needs response`` (outranks busy: a
+           sub-agent parked on an approval needs the user, not a generic badge).
+        2. ``current_task_status == "launching"`` → ``Launching``.
+        3. ``busy`` → ``Working``.
+        4. a durable failure detail → ``Failed``.
+        5. ``current_task_status`` is ``failed`` / ``cancelled`` / ``completed``
+           → ``Failed`` / ``Cancelled`` / ``Done``; any other non-null status is
+           shown raw.
+        6. otherwise (loop idle, no task) → ``Idle`` (warm — still chattable;
+           deliberately NOT ``Done``, so a between-turns idle isn't mistaken
+           for a delivered result).
         """
-        if node.done_at is not None:
-            if node.status == "failed":
-                return "Failed"
-            if node.status == "cancelled":
-                return "Cancelled"
-            return "Done"
         if node.pending_elicitations > 0:
             return "Needs response"
         if node.status == "launching":
             return "Launching"
-        return "Working"
+        if node.busy:
+            return "Working"
+        if node.last_task_error or node.status == "failed":
+            return "Failed"
+        if node.status == "cancelled":
+            return "Cancelled"
+        if node.status == "completed":
+            return "Done"
+        if node.status:
+            return node.status
+        return "Idle"
 
     def subagent_menu_rows(self) -> list[tuple[str, str]]:
         """Return ``(session_id, label)`` rows for the ``↓`` sub-agents menu.
@@ -3287,14 +3402,15 @@ class TerminalHost:
         rows: list[tuple[str, str]] = []
         for node, depth in self.subagent_tree():
             indent = "  " * max(0, depth - 1)
-            if node.done_at is not None and node.status == "completed":
+            status = self._subagent_status_label(node)
+            if status == "Done":
                 glyph = "✔ "
-            elif node.done_at is not None and node.status in ("failed", "cancelled"):
+            elif status in ("Failed", "Cancelled"):
                 glyph = "✗ "
             else:
                 glyph = ""
             name = node.title or node.agent or node.session_id[:12]
-            label = f"{indent}{glyph}{name}  · {self._subagent_status_label(node)}"
+            label = f"{indent}{glyph}{name}  · {status}"
             rows.append((node.session_id, label))
         return rows
 
@@ -3311,8 +3427,10 @@ class TerminalHost:
         return rows
 
     def _open_subagent_menu(self) -> None:
-        """Open the inline menu (no-op when no sub-agents are active)."""
-        if not self.has_active_subagents():
+        """Open the inline menu (no-op when the tree is empty). Opens whenever
+        ANY node exists — active OR finished — so finished children stay
+        reachable for revisit / chat (web parity)."""
+        if not self.has_any_subagents():
             return
         self._subagent_menu_open = True
         self._subagent_menu_index = 0
@@ -3369,12 +3487,28 @@ class TerminalHost:
         scroll = max(0, min(scroll, max(0, len(rows) - window)))
         self._subagent_menu_scroll = scroll
         frags: list[tuple[str, str]] = []
-        for offset, (_sid, label) in enumerate(rows[scroll : scroll + window]):
+        for offset, (sid, label) in enumerate(rows[scroll : scroll + window]):
             selected = (scroll + offset) == idx
             marker = "▸" if selected else " "
-            style = "class:prompt-marker" if selected else "class:model-name"
+            if selected:
+                style = "class:prompt-marker"
+            elif self._subagent_row_settled(sid):
+                # Finished / warm rows are kept but de-emphasized (web parity).
+                style = "class:subagent-settled"
+            else:
+                style = "class:model-name"
             frags.append((style, f" {marker} {label}\n"))
         return frags
+
+    def _subagent_row_settled(self, session_id: str) -> bool:
+        """Whether a selector row is in a settled (dimmed) state — a finished
+        (``Done``) or warm-idle (``Idle``) child, mirroring the web
+        ``SETTLED_STATE``. The ``main`` row and unknown ids are never settled.
+        """
+        node = self._subagents.get(session_id)
+        if node is None:
+            return False
+        return self._subagent_status_label(node) in ("Done", "Idle")
 
     def build_subagent_menu(self) -> FormattedText:
         """Render the inline menu (rows + key hint) for the Window below the
@@ -3545,7 +3679,7 @@ class TerminalHost:
             # ``← back`` hint shows while inside a sub-agent, advertising
             # Left-arrow to return to the top-level session.
             hint_items = list(self._toolbar_hints)
-            if n_sub > 0:
+            if self.has_any_subagents():
                 hint_items.append("↓ agents")
             if self._is_inside_subagent():
                 hint_items.append("← back")

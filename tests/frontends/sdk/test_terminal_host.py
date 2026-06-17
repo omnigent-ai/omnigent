@@ -1242,14 +1242,18 @@ def test_subagent_badge_pluralizes_and_returns_to_sleeping() -> None:
     # still reads "running") until they've been terminal for the linger
     # window — this is what stops the badge flickering between turns.
     assert host.active_subagent_count() == 2
-    # Backdate both completions past the linger window -> they settle out.
+    # Backdate both completions past the linger window -> they settle out of
+    # the RUNNING count, but stay retained in the selector (web parity).
     for sid in ("conv_c1", "conv_c2"):
         host._subagents[sid].done_at = host._monotonic() - 100.0
     assert host.active_subagent_count() == 0
     assert host.has_active_subagents() is False
     toolbar = _formatted_text_plain(host.build_toolbar())
     assert "state: sleeping" in toolbar
-    assert "↓ agents" not in toolbar
+    # The ↓ hint stays: finished sub-agents are retained in the selector so the
+    # user can revisit / chat with them, so the gesture remains advertised.
+    assert host.has_any_subagents() is True
+    assert "↓ agents" in toolbar
 
 
 def test_subagent_partial_update_preserves_label() -> None:
@@ -1317,8 +1321,9 @@ def test_subagent_tree_reconstructs_hierarchy_in_preorder() -> None:
 
 def test_subagent_tree_depth_count_with_finished_parent() -> None:
     """A just-finished parent and its running grandchild both count and
-    render (parent debounced within its linger); once the parent settles
-    past the linger it drops, leaving the running grandchild."""
+    render (parent debounced within its linger); once the parent settles past
+    the linger it drops out of the RUNNING count, but stays VISIBLE in the
+    selector (retention / web parity), leaving the running grandchild counted."""
     host = TerminalHost(model_name="test")
     host.seed_subagent_tree(
         "conv_main",
@@ -1329,11 +1334,12 @@ def test_subagent_tree_depth_count_with_finished_parent() -> None:
     )
     assert host.active_subagent_count() == 2
     assert {n.session_id for n, _ in host.subagent_tree()} == {"conv_child", "conv_grand"}
-    # Settle the finished parent past its linger: it drops, the running
-    # grandchild keeps counting.
+    # Settle the finished parent past its linger: it drops out of the running
+    # count, but BOTH nodes remain in the selector tree (finished children are
+    # retained, not hidden).
     host._subagents["conv_child"].done_at = host._monotonic() - 100.0
     assert host.active_subagent_count() == 1
-    assert {n.session_id for n, _ in host.subagent_tree()} == {"conv_grand"}
+    assert {n.session_id for n, _ in host.subagent_tree()} == {"conv_child", "conv_grand"}
 
 
 def test_subagent_tree_cycle_guard() -> None:
@@ -1363,18 +1369,38 @@ def test_subagent_seed_keeps_unsent_node_that_vanishes() -> None:
     assert [n.session_id for n, _ in host.subagent_tree()] == ["conv_child"]
 
 
-def test_subagent_seed_prunes_sent_node_after_linger() -> None:
-    """A sub-agent that HAS sent its response (terminal status) is dropped
-    once it has left the snapshot and outlived its linger window."""
+def test_subagent_seed_drops_terminal_node_gone_from_snapshot() -> None:
+    """A finished sub-agent is dropped only once the server STOPS listing it —
+    i.e. it's gone from the snapshot. No linger wait is needed: retained nodes
+    are the ones the server keeps reporting."""
     host = TerminalHost(model_name="test")
     host.seed_subagent_tree(
         "conv_main",
         [{"id": "conv_child", "parent_id": "conv_main", **_done()}],
     )
-    # Backdate the completion so the linger window has elapsed.
-    host._subagents["conv_child"].done_at = host._monotonic() - 100.0
+    # Terminal AND absent from the next snapshot -> dropped immediately (no
+    # linger backdating required).
     host.seed_subagent_tree("conv_main", [])
     assert host.subagent_tree() == []
+
+
+def test_subagent_seed_keeps_finished_node_still_in_snapshot() -> None:
+    """A finished sub-agent the server STILL lists is retained in the selector
+    indefinitely (web parity) — never pruned by a linger timer."""
+    host = TerminalHost(model_name="test")
+    host.seed_subagent_tree(
+        "conv_main",
+        [{"id": "conv_child", "parent_id": "conv_main", **_done()}],
+    )
+    # Backdate well past any linger window, then re-seed with the node STILL
+    # present: it stays visible (the server hasn't forgotten it).
+    host._subagents["conv_child"].done_at = host._monotonic() - 1000.0
+    host.seed_subagent_tree(
+        "conv_main",
+        [{"id": "conv_child", "parent_id": "conv_main", **_done()}],
+    )
+    assert [n.session_id for n, _ in host.subagent_tree()] == ["conv_child"]
+    assert host.active_subagent_count() == 0  # retained but not "running"
 
 
 def test_subagent_badge_spinner_animates() -> None:
@@ -1411,15 +1437,38 @@ def _seed_busy_tree(host: TerminalHost, n: int = 2, root: str = "conv_main") -> 
     )
 
 
-def test_subagent_menu_opens_only_when_active() -> None:
-    """The inline menu opens on demand, but only while sub-agents are busy."""
+def test_subagent_menu_opens_when_any_node_exists() -> None:
+    """The inline menu opens whenever ANY sub-agent node exists — active OR
+    finished — so finished children stay reachable for revisit / chat (web
+    parity). It's a no-op only when the tree is genuinely empty."""
     host = TerminalHost(model_name="test")
     host._open_subagent_menu()
-    assert host._subagent_menu_open is False  # nothing active -> no-op
+    assert host._subagent_menu_open is False  # empty tree -> no-op
 
+    # A busy child opens it.
     _seed_busy_tree(host, 2)
     host._open_subagent_menu()
     assert host._subagent_menu_open is True
+
+
+def test_subagent_menu_opens_with_only_finished_nodes() -> None:
+    """The menu opens even when EVERY child has finished — the selector retains
+    finished sub-agents so the user can dive back in and chat with them."""
+    host = TerminalHost(model_name="test")
+    host.seed_subagent_tree(
+        "conv_main",
+        [{"id": "conv_c1", "parent_id": "conv_main", "tool": "reviewer", **_done()}],
+    )
+    # Settle past the linger so nothing is "running"...
+    host._subagents["conv_c1"].done_at = host._monotonic() - 100.0
+    assert host.has_active_subagents() is False
+    # ...but the finished child is retained, so the menu still opens.
+    assert host.has_any_subagents() is True
+    host._open_subagent_menu()
+    assert host._subagent_menu_open is True
+    menu_text = _formatted_text_plain(host.build_subagent_menu())
+    assert "reviewer" in menu_text
+    assert "Done" in menu_text
 
 
 def test_subagent_menu_renders_inline_with_main_and_agents() -> None:
@@ -1590,28 +1639,39 @@ def test_subagent_poll_null_status_does_not_resurrect_terminal() -> None:
     assert host._subagents["conv_c1"].done_at == done_at  # unchanged → not resurrected
 
 
-def test_subagent_poll_only_node_settles_via_busy_flag() -> None:
-    """A poll-only node (no SSE status — e.g. a grandchild) tracks running-ness
-    from the ``busy`` flag the poll DOES provide: busy True -> running, busy
-    False -> finished (then settles after the linger)."""
+def test_subagent_poll_only_node_busy_false_is_warm_idle_not_done() -> None:
+    """A poll-only node (no SSE terminal status) whose ``busy`` flag drops to
+    False is treated as WARM/IDLE, NOT terminal — mirroring the web, which
+    shows ``Idle`` (not ``Done``) for a child whose loop is quiet with no
+    terminal task status. It drops out of the running count but is NOT stamped
+    terminal (``done_at`` stays None) and stays retained + chattable."""
     host = TerminalHost(model_name="test")
     host.upsert_subagent(
         "conv_g1",
         parent_id="conv_child",
         child={"id": "conv_g1", "tool": "x", "busy": True, "current_task_status": None},
     )
-    assert host.active_subagent_count() == 1  # running
+    assert host.active_subagent_count() == 1  # running while busy
+    node = host._subagents["conv_g1"]
+    assert host._subagent_status_label(node) == "Working"
+
+    # busy drops with NO terminal status -> warm/idle, not Done.
     host.upsert_subagent(
         "conv_g1", child={"id": "conv_g1", "busy": False, "current_task_status": None}
     )
-    assert host.active_subagent_count() == 1  # finished, still within linger
-    host._subagents["conv_g1"].done_at = host._monotonic() - 100.0
-    assert host.active_subagent_count() == 0  # settled
+    assert host.active_subagent_count() == 0  # not running
+    assert node.done_at is None  # NOT treated as terminal (web parity: B)
+    assert host._subagent_status_label(node) == "Idle"  # warm-idle, NOT "Done"
+    # Retained + chattable (its session is open).
+    assert {n.session_id for n, _ in host.subagent_tree()} == {"conv_g1"}
+    assert host.is_subagent_chattable("conv_g1") is True
 
 
-def test_subagent_finished_node_hidden_but_kept() -> None:
-    """A finished-past-linger node is hidden from the badge + menu but kept in
-    the registry — so the 2 s poll can't delete-then-recreate (resurrect) it."""
+def test_subagent_finished_node_kept_visible_in_selector() -> None:
+    """A finished-past-linger node drops out of the running BADGE but stays
+    VISIBLE in the ↓ selector indefinitely (web parity) — so the user can dive
+    back in and chat with it. (Retention: it leaves only when the server stops
+    listing it or the tree is cleared.)"""
     host = TerminalHost(model_name="test")
     host.upsert_subagent(
         "conv_c1",
@@ -1619,6 +1679,10 @@ def test_subagent_finished_node_hidden_but_kept() -> None:
         child={"tool": "a", "busy": False, "current_task_status": "completed"},
     )
     host._subagents["conv_c1"].done_at = host._monotonic() - 100.0
-    assert host.active_subagent_count() == 0  # hidden from the badge
-    assert host.subagent_tree() == []  # hidden from the menu
-    assert "conv_c1" in host._subagents  # but kept, so the poll can't resurrect it
+    assert host.active_subagent_count() == 0  # dropped from the running badge
+    # Visible in the selector tree (NOT hidden) and kept in the registry.
+    assert [n.session_id for n, _ in host.subagent_tree()] == ["conv_c1"]
+    assert "conv_c1" in host._subagents
+    node = host._subagents["conv_c1"]
+    assert host._subagent_visible(node, host._monotonic()) is True
+    assert host._subagent_status_label(node) == "Done"

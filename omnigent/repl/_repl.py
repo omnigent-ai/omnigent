@@ -1152,6 +1152,15 @@ class _SessionsChatReplAdapter:
         # watchdog — so observing a sub-agent never hijacks its runner or
         # disturbs the owned session's binding.
         self._readonly_view = False
+        # Set while CO-DRIVING a sub-agent interactively from the ↓ selector:
+        # the displayed session is a child the user is chatting with, sends are
+        # POSTed to the CHILD's existing runner (co-drive, like the web UI), and
+        # the runner binding is NOT moved. Tracked SEPARATELY from
+        # ``_readonly_view`` (which stays ``True`` in this mode so the tree root
+        # stays frozen on the parent and no bind PATCH fires) so that enabling
+        # sends never re-roots the selector — Left-arrow still returns to the
+        # parent/root after a chat. See :meth:`view_session`.
+        self._interactive_child = False
         self._on_session_start = on_session_start
         self._session_start_notified = False
         self._bound_runner_id: str | None = None
@@ -1713,10 +1722,12 @@ class _SessionsChatReplAdapter:
             :meth:`_unbind_runner_soft`).
         """
         # Switching to a top-level session re-establishes runner ownership,
-        # so clear any read-only-view suppression left over from diving into a
-        # sub-agent — otherwise the bind below (and every later bind) no-ops
-        # and the switched-to session can never dispatch a turn.
+        # so clear any read-only-view suppression (and interactive-child
+        # co-drive) left over from diving into a sub-agent — otherwise the bind
+        # below (and every later bind) no-ops and the switched-to session can
+        # never dispatch a turn.
         self._readonly_view = False
+        self._interactive_child = False
         old_session_id = self._session_id
         if old_session_id is not None and old_session_id != new_session_id:
             await self._unbind_runner_soft(old_session_id)
@@ -1735,7 +1746,9 @@ class _SessionsChatReplAdapter:
         self._stream_task = asyncio.create_task(self._stream_pump())
         return new_session_id
 
-    async def view_session(self, new_session_id: str, *, read_only: bool) -> str:
+    async def view_session(
+        self, new_session_id: str, *, read_only: bool, interactive: bool = False
+    ) -> str:
         """Re-point the displayed session WITHOUT moving runner bindings.
 
         Unlike :meth:`switch_to_session` (a top-level ``/switch`` that
@@ -1745,24 +1758,33 @@ class _SessionsChatReplAdapter:
         active sub-agent keeps running on its own runner, and the parent
         keeps the runner binding it needs to receive the sub-agent's result.
 
-        Used to dive into a running sub-agent's conversation from the inline
-        menu: moving the *binding* there would orphan the parent (it could no
-        longer wake to collect the result) and hijack the child's runner,
-        leaving the sub-agent stuck "still running" with nothing delivered.
+        Used to dive into a sub-agent's conversation from the inline menu:
+        moving the *binding* there would orphan the parent (it could no longer
+        wake to collect the result) and hijack the child's runner, leaving the
+        sub-agent stuck "still running" with nothing delivered.
 
         :param new_session_id: Session to observe, e.g. ``"conv_child123"``.
         :param read_only: ``True`` while observing a sub-agent (suppresses
             all runner-bind PATCHes via ``_readonly_view``); ``False`` when
             returning to the owned top-level session so its runner-affinity
             watchdog resumes.
+        :param interactive: ``True`` to CO-DRIVE the child — the user can send
+            messages, which POST to the child's existing runner (like the web
+            UI) with NO bind move. Only meaningful with ``read_only=True``
+            (interactive implies observing a child); it stays read-only of the
+            *runner binding* while lifting the plain-send guard. Returning to
+            the root passes ``interactive=False``.
         :returns: The observed session id (echoed back).
         """
         # Apply the displayed-session state atomically up front (no await in
         # between), so the background root-tracking poll never observes a
-        # half-applied switch (session id moved but read-only flag not yet,
-        # or vice versa) and mistakes the sub-agent for the tree root.
+        # half-applied switch (session id moved but flags not yet, or vice
+        # versa) and mistakes the sub-agent for the tree root. ``_readonly_view``
+        # stays the binding-suppression flag; ``_interactive_child`` separately
+        # gates sends, so co-driving a child never re-roots the selector.
         self._session_id = new_session_id
         self._readonly_view = read_only
+        self._interactive_child = interactive and read_only
         if self._stream_task is not None:
             self._stream_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -2292,8 +2314,10 @@ class _SessionsChatReplAdapter:
         is soft-failed on old servers (see :meth:`_unbind_runner_soft`).
         """
         # A fresh session is owned, not observed — clear any read-only-view
-        # suppression from a sub-agent dive so the new session can bind.
+        # suppression / interactive-child co-drive from a sub-agent dive so the
+        # new session can bind.
         self._readonly_view = False
+        self._interactive_child = False
         old_session_id = self._session_id
         if old_session_id is not None:
             await self._unbind_runner_soft(old_session_id)
@@ -3487,15 +3511,21 @@ async def run_repl(
             await handle_slash_command(text, session, client, host, fmt)
             return
 
-        # While observing a sub-agent read-only (dived in via ↓), refuse plain
-        # message sends — posting here would inject a turn into the sub-agent's
-        # own conversation. Slash commands (handled above) still work; press ←
-        # to return to the top-level session before sending.
-        if getattr(session, "_readonly_view", False):
+        # While observing a sub-agent read-only (dived in via ↓ on a CLOSED /
+        # non-chattable child), refuse plain message sends — there's no live
+        # runner to co-drive and a ``message`` to a closed session 409s.
+        # Interactive-child mode (a still-open child) lifts this guard: the send
+        # below POSTs to the CHILD's existing runner (co-drive), which the
+        # ``_readonly_view`` bind-suppression already routes correctly without
+        # moving the parent's runner. Slash commands (handled above) still work;
+        # press ← to return to the top-level session.
+        if getattr(session, "_readonly_view", False) and not getattr(
+            session, "_interactive_child", False
+        ):
             host.output(
                 Text.from_markup(
-                    f"   [{fmt.muted}]read-only view — press ← to return to the main "
-                    f"session before sending[/{fmt.muted}]",
+                    f"   [{fmt.muted}]read-only view (closed sub-agent) — press ← to "
+                    f"return to the main session before sending[/{fmt.muted}]",
                 ),
             )
             return
@@ -3698,32 +3728,58 @@ async def run_repl(
     # observing a sub-agent below the root".
     subagent_root: list[str | None] = [None]
 
+    # The root the selector tree was last discovered for. Lets the poll run a
+    # one-shot discovery whenever the root CHANGES (resume / ``/switch`` into a
+    # session that already has children, with no fresh SSE to seed them) even
+    # though no sub-agents are registered yet — see ``_subagent_poll_loop``.
+    polled_root: list[str | None] = [None]
+
     def _sync_subagent_root() -> None:
         # Track the live top-level session id while we're at the top. While
-        # observing a sub-agent (``_readonly_view``), freeze the root — never
-        # self-heal off ``session.session_id``, which would capture the
-        # sub-agent as the root. ``view_session`` sets the session id and the
-        # read-only flag together, so this never sees a half-applied switch.
-        if not getattr(session, "_readonly_view", False) and session.session_id is not None:
+        # observing a sub-agent — either read-only OR co-driving it
+        # interactively — freeze the root: never self-heal off
+        # ``session.session_id``, which would capture the sub-agent as the root
+        # and make Left-arrow "back to main" vanish. The root is DECOUPLED from
+        # ``_readonly_view`` alone: interactive-child mode keeps ``_readonly_view``
+        # set, but we also guard on ``_interactive_child`` so a future change
+        # that toggles read-only can't silently re-root onto the child.
+        # ``view_session`` sets the session id + both flags together, so this
+        # never sees a half-applied switch.
+        observing_child = getattr(session, "_readonly_view", False) or getattr(
+            session, "_interactive_child", False
+        )
+        if not observing_child and session.session_id is not None:
             subagent_root[0] = session.session_id
 
     async def _refresh_subagents() -> None:
         root_id = subagent_root[0]
         if root_id is None:
             return
-        await _refresh_subagent_tree(client, host, root_id)
+        # Capture the generation BEFORE the fetch so a clear-during-poll
+        # (``/switch`` / ``/new`` / ``/clear`` re-rooting mid-fetch) makes the
+        # resulting seed a no-op instead of resurrecting cleared nodes.
+        await _refresh_subagent_tree(client, host, root_id, generation=host.subagent_generation)
 
     async def _subagent_poll_loop() -> None:
-        # While sub-agents are active, periodically re-fetch the tree so
-        # nested (grandchild) levels stay live — the SSE stream only carries
-        # the active session's direct children. The root-sync runs every tick
-        # (cheap, no I/O) so the root stays accurate; the tree re-fetch only
-        # fires while agents are active.
+        # Periodically re-fetch the tree so nested (grandchild) levels + live
+        # statuses stay current — the SSE stream only carries the active
+        # session's direct children. The root-sync runs every tick (cheap, no
+        # I/O) so the root stays accurate. The tree re-fetch fires when there is
+        # ANY node to keep live (active OR retained-finished) OR when the root
+        # just changed — the latter is the discovery poll that repopulates the
+        # selector after a resume / ``/switch`` into a session that already has
+        # children, which would otherwise never poll (no SSE, no nodes yet).
         while True:
             try:
                 _sync_subagent_root()
-                if host.has_active_subagents() and subagent_root[0] is not None:
+                root_id = subagent_root[0]
+                if _should_discover_subagents(
+                    root_id,
+                    has_any_subagents=host.has_any_subagents(),
+                    last_polled_root=polled_root[0],
+                ):
                     await _refresh_subagents()
+                    polled_root[0] = root_id
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 — best-effort background poll; never crash the REPL
@@ -3743,13 +3799,22 @@ async def run_repl(
         if not target_id or target_id == session.session_id:
             return  # Already viewing this session (e.g. selected "main").
         # Returning to the top-level session re-enables runner ownership;
-        # diving into any sub-agent is read-only (no runner rebind).
-        # ``view_session`` applies the session id + read-only flag atomically,
-        # which both freezes the root (read-only) and re-roots on return, so
-        # no extra flag bookkeeping is needed here.
+        # diving into a sub-agent is always read-only of the runner BINDING (no
+        # rebind). A still-open child additionally becomes an interactive
+        # co-drive target — the user can type to chat with it, POSTing to the
+        # child's own runner (web-UI parity) without moving the parent's
+        # binding. A CLOSED child is view-only (a ``message`` to it 409s).
+        # ``view_session`` applies the session id + flags atomically, which both
+        # freezes the root (so Left-arrow still returns to the parent after a
+        # chat) and re-roots on return.
         returning_to_root = subagent_root[0] is not None and target_id == subagent_root[0]
+        interactive = not returning_to_root and host.is_subagent_chattable(target_id)
         try:
-            await session.view_session(target_id, read_only=not returning_to_root)
+            await session.view_session(
+                target_id,
+                read_only=not returning_to_root,
+                interactive=interactive,
+            )
         except Exception as exc:  # noqa: BLE001 — REPL boundary: render the failure, stay alive
             host.output(
                 Text.from_markup(f"  [bold red]Failed to open {target_id[:16]}…: {exc}[/]")
@@ -3764,6 +3829,21 @@ async def run_repl(
             ui_name=_humanize_agent_name(session.model),
             redraw_screen=True,
         )
+        # Tell the user which mode they're in so a closed child doesn't look
+        # silently unresponsive when a typed message is refused.
+        if interactive:
+            host.output(
+                Text.from_markup(
+                    f"  [{fmt.muted}]interactive — type to chat with this sub-agent; "
+                    f"← back to main[/{fmt.muted}]"
+                )
+            )
+        elif not returning_to_root:
+            host.output(
+                Text.from_markup(
+                    f"  [{fmt.muted}]read-only (closed sub-agent) — ← back to main[/{fmt.muted}]"
+                )
+            )
         await _refresh_subagents()
 
     host.on_subagent_select = _open_subagent_by_id
@@ -5676,6 +5756,32 @@ async def _list_all_conversation_items(
     return all_items
 
 
+def _should_discover_subagents(
+    root_id: str | None,
+    *,
+    has_any_subagents: bool,
+    last_polled_root: str | None,
+) -> bool:
+    """Decide whether the background loop should (re-)fetch the sub-agent tree.
+
+    Re-fetches while ANY node exists — active OR retained-finished — to keep
+    statuses + nested (grandchild) levels live; AND runs a one-shot discovery
+    when the ROOT just changed (``last_polled_root != root_id``) even with no
+    nodes registered yet. The discovery branch is the fix for a resumed /
+    ``/switch``-ed session that already has children: there's no fresh SSE to
+    seed them and ``has_any_subagents`` is False, so without it the selector
+    would stay empty.
+
+    :param root_id: The current tree root (top-level session id), or ``None``.
+    :param has_any_subagents: Whether the host registry holds any node.
+    :param last_polled_root: The root the loop last ran discovery for.
+    :returns: ``True`` to fetch the tree this tick.
+    """
+    if root_id is None:
+        return False
+    return has_any_subagents or last_polled_root != root_id
+
+
 def _apply_child_session_event(
     event: object,
     *,
@@ -5730,6 +5836,7 @@ async def _refresh_subagent_tree(
     root_id: str,
     *,
     max_depth: int = _MAX_SUBAGENT_TREE_DEPTH,
+    generation: int | None = None,
 ) -> None:
     """Recursively fetch the sub-agent tree under *root_id* and push it into
     the host registry.
@@ -5739,6 +5846,11 @@ async def _refresh_subagent_tree(
     each row with the parent it was queried under so the host can reconstruct
     the hierarchy. The SSE stream only delivers the active session's direct
     children, so this poll is what keeps grandchildren live.
+
+    :param generation: :attr:`TerminalHost.subagent_generation` captured before
+        the fetch began. Passed through to :meth:`TerminalHost.seed_subagent_tree`
+        so a snapshot whose tree was cleared (``/switch`` / ``/new`` / ``/clear``)
+        mid-fetch is dropped instead of resurrecting the cleared nodes.
     """
     nodes: list[dict[str, object]] = []
     seen: set[str] = {root_id}
@@ -5762,7 +5874,7 @@ async def _refresh_subagent_tree(
                 next_frontier.append(sid)
         frontier = next_frontier
         depth += 1
-    host.seed_subagent_tree(root_id, nodes)
+    host.seed_subagent_tree(root_id, nodes, generation=generation)
 
 
 async def _collect_overview_targets(

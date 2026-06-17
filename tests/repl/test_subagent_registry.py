@@ -226,10 +226,14 @@ def test_run_repl_wires_subagent_plumbing() -> None:
         "the active-session getter is no longer wired — Left-arrow can't "
         "tell when the user is inside a sub-agent, so back-to-top breaks."
     )
-    assert "await session.view_session(target_id" in src, (
+    assert "session.view_session(" in src, (
         "the select callback must use view_session (read-only re-point), NOT "
         "switch_to_session — moving the runner binding into a sub-agent "
         "orphans the parent and the sub-agent's result is never delivered."
+    )
+    assert "interactive=interactive" in src and "is_subagent_chattable" in src, (
+        "the select callback dropped interactive-child mode — Enter on a "
+        "chattable child can no longer co-drive (chat with) it."
     )
     assert "_subagent_poll_loop" in src, (
         "the background tree poll (deeper levels) is no longer started"
@@ -238,4 +242,12 @@ def test_run_repl_wires_subagent_plumbing() -> None:
         "the root-tracking dropped its read-only-view source of truth — the "
         "root could go stale vs the live main session, making '← back' show "
         "on the top-level session."
+    )
+    assert "_interactive_child" in src, (
+        "the root-tracking no longer guards on _interactive_child — co-driving "
+        "a child could re-root the selector onto it, breaking Left-arrow back."
+    )
+    assert "polled_root" in src and "has_any_subagents" in src, (
+        "the discovery poll regressed — a resumed / switched session with "
+        "existing children won't repopulate the selector without fresh SSE."
     )
