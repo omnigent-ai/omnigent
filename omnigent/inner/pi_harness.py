@@ -95,6 +95,7 @@ _ENV_GATEWAY_BASE_URL = "HARNESS_PI_GATEWAY_BASE_URL"
 _ENV_GATEWAY_BASE_URLS = "HARNESS_PI_GATEWAY_BASE_URLS"
 _ENV_GATEWAY_AUTH_COMMAND = "HARNESS_PI_GATEWAY_AUTH_COMMAND"
 _ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS = "HARNESS_PI_GATEWAY_AUTH_REFRESH_INTERVAL_MS"
+_ENV_EVENT_TIMEOUT = "HARNESS_PI_EVENT_TIMEOUT"
 
 # Truthy strings the wrap accepts for boolean env vars. Must
 # match the claude-sdk and codex wraps' parsers for consistency
@@ -211,6 +212,13 @@ def _build_pi_executor() -> Executor:
     bundle_dir = Path(bundle_dir_raw) if bundle_dir_raw else None
     agent_name_raw = os.environ.get(_ENV_AGENT_NAME, "").strip()
     agent_name = agent_name_raw or None
+    event_timeout: float | None = None
+    event_timeout_raw = os.environ.get(_ENV_EVENT_TIMEOUT, "").strip()
+    if event_timeout_raw:
+        try:
+            event_timeout = float(event_timeout_raw)
+        except ValueError:
+            pass
     return PiExecutor(
         cwd=os.environ.get(_ENV_CWD) or os.environ.get("OMNIGENT_RUNNER_WORKSPACE"),
         os_env=_resolve_os_env(),
@@ -225,6 +233,7 @@ def _build_pi_executor() -> Executor:
         bundle_dir=bundle_dir,
         agent_name=agent_name,
         skills_filter=_resolve_skills_filter(),
+        event_timeout=event_timeout,
     )
 
 

@@ -1315,6 +1315,7 @@ class PiExecutor(Executor):
         bundle_dir: pathlib.Path | None = None,
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
+        event_timeout: float | None = None,
     ) -> None:
         """Create a PiExecutor.
 
@@ -1369,6 +1370,10 @@ class PiExecutor(Executor):
             so Pi sees zero skills; a list adds ``--no-skills`` plus
             ``--skill`` for each named bundle skill — names not
             present in the bundle are silently skipped.
+        :param event_timeout: Seconds to wait for each JSONL line from
+            Pi's stdout before treating the turn as stalled. ``None``
+            uses the default of 120 seconds. Increase for slow local
+            models that take longer between tokens.
         """
         resolved_pi = pi_path or _find_pi_cli()
         if not resolved_pi:
@@ -1414,6 +1419,7 @@ class PiExecutor(Executor):
         # ``_build_env_and_dir`` copies ``self._extra_args`` so this
         # extension is read-only after init.
         self._extra_args.extend(_resolve_pi_skill_args(skills_filter, bundle_dir))
+        self._event_timeout: float = event_timeout if event_timeout is not None else 120.0
         # Set by Session._wire_sdk_executor().
         self._tool_executor: ToolExecutor | None = None
 
@@ -1871,7 +1877,7 @@ class PiExecutor(Executor):
         message_usages: list[dict[str, Any]] = []  # type: ignore[explicit-any]
 
         while True:
-            line = await rpc.read_line(timeout=120.0)
+            line = await rpc.read_line(timeout=self._event_timeout)
             if line is None:
                 if not streamed_any and not response_text:
                     stderr = "\n".join(rpc._stderr_lines) if rpc._stderr_lines else ""
