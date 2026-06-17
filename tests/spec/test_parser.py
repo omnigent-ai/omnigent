@@ -1072,6 +1072,45 @@ def test_parse_inline_mcp_skips_standard_tools_keys(tmp_path: Path) -> None:
     assert spec.mcp_servers[0].name == "real_mcp"
 
 
+def test_parse_tools_sandbox_docker_image_alias(tmp_path: Path) -> None:
+    """Legacy ``tools.sandbox.docker_image`` remains a valid image alias."""
+    config = {
+        "spec_version": 1,
+        "name": "legacy-docker-image",
+        "tools": {
+            "sandbox": {
+                "docker_image": "python:3.12-slim",
+                "container_runtime": "podman",
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    assert spec.tools.sandbox.container_image == "python:3.12-slim"
+    assert spec.tools.sandbox.docker_image == "python:3.12-slim"
+    assert spec.tools.sandbox.container_runtime == "podman"
+
+
+def test_parse_tools_sandbox_container_image_precedence(tmp_path: Path) -> None:
+    """Preferred ``container_image`` wins when both image keys exist."""
+    config = {
+        "spec_version": 1,
+        "name": "container-image-precedence",
+        "tools": {
+            "sandbox": {
+                "container_image": "python:3.12-slim",
+                "docker_image": "python:3.11-slim",
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    assert spec.tools.sandbox.container_image == "python:3.12-slim"
+    assert spec.tools.sandbox.docker_image == "python:3.12-slim"
+
+
 def test_parse_inline_mcp_skips_non_mcp_type_entries(tmp_path: Path) -> None:
     """
     Tools-block entries whose ``type`` is not ``"mcp"`` are silently

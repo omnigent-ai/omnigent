@@ -178,6 +178,20 @@ tools:
 
 For client-provided tools, use `runtime: client` and do not set `callable`.
 
+### Tool sandbox containers
+
+Local Python tools can run inside a container image by declaring a sandbox image.
+Use `container_image` for new specs; `docker_image` remains accepted as a
+deprecated alias for backwards compatibility. Set `container_runtime: podman` to
+run the image with Podman instead of Docker.
+
+```yaml
+tools:
+  sandbox:
+    container_image: python:3.12-slim
+    container_runtime: podman  # optional; defaults to docker
+```
+
 ### Sub-agent tool
 
 ```yaml
