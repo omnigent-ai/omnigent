@@ -11269,6 +11269,111 @@ async def test_auto_create_repl_terminal_launches_attach_and_stamps_label(
     assert published_events[0]["resource"]["id"] == "terminal_tui_main"
 
 
+@pytest.mark.asyncio
+async def test_auto_create_repl_terminal_inherits_agent_sandbox(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The REPL terminal honours the agent's ``os_env.sandbox``.
+
+    Regression for the same sandbox-override bug #175 fixed on the
+    codex/claude auto-create paths but missed on the REPL path: the
+    REPL auto-create built a fresh ``TerminalEnvSpec`` whose ``os_env``
+    carried no ``sandbox`` and passed no ``parent_os_env``, so
+    ``launch_terminal`` fell back to ``_default_sandbox_for_platform``
+    (``linux_bwrap`` / ``darwin_seatbelt``) and ignored the agent YAML.
+    An SDK-harness agent that declares ``os_env.sandbox.type: none``
+    (relying on the outer container/VM as the boundary) was wrongly
+    forced into bwrap, which then failed to start in a hardened
+    container with ``native_terminal_start_failed``.
+
+    Asserts the launched terminal spec's ``os_env.sandbox`` is the
+    agent's ``none`` sandbox (not the platform default) and that the
+    agent's ``os_env`` is threaded through as the launch
+    ``parent_os_env`` so the rest of the policy is inherited too.
+
+    :param tmp_path: Temporary directory for the fake runner workspace.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    session_id = "conv_repl_sandbox_none"
+    workspace = tmp_path / "workspace"
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        """Captures the launched REPL terminal spec and parent os_env."""
+
+        async def launch_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """Record the spec + parent_os_env and return a resource view."""
+            del terminal_name, session_key, resource_role
+            captured["spec"] = spec
+            captured["parent_os_env"] = parent_os_env
+            return SessionResourceView(
+                id="terminal_tui_main",
+                type="terminal",
+                session_id=session_id,
+                name="tui",
+            )
+
+    class _PatchRecordingServerClient:
+        """Server client that absorbs the label PATCH from the helper."""
+
+        async def patch(self, url: str, **kwargs: Any) -> httpx.Response:
+            """Return a 200 for the presentation-label PATCH."""
+            del kwargs
+            return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
+
+    # An agent that declares sandbox: none (runs unconfined; the outer
+    # container/VM is the boundary).
+    agent_os_env = OSEnvSpec(
+        type="caller_process",
+        cwd=".",
+        sandbox=OSEnvSandboxSpec(type="none"),
+    )
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="sdk_worker",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "openai-agents", "model": "claude-default"},
+        ),
+        os_env=agent_os_env,
+    )
+
+    await _auto_create_repl_terminal(
+        session_id,
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, _evt: None,
+        server_client=_PatchRecordingServerClient(),  # type: ignore[arg-type]
+        agent_spec=agent_spec,
+    )
+
+    launched_sandbox = captured["spec"].os_env.sandbox
+    assert launched_sandbox is not None, (
+        "REPL auto-create dropped the agent's sandbox; launch_terminal will "
+        "fall back to _default_sandbox_for_platform (bwrap), overriding "
+        "sandbox: none"
+    )
+    assert launched_sandbox.type == "none"
+    # The whole os_env is threaded through as the inheritance parent.
+    assert captured["parent_os_env"] is agent_os_env
+
+
 @pytest.mark.parametrize(
     ("harness", "sub_agent_name", "expect_created"),
     [
@@ -11333,9 +11438,10 @@ async def test_create_session_repl_terminal_dispatch(
         publish_event: Any,
         *,
         server_client: Any,
+        agent_spec: Any = None,
     ) -> SessionResourceView:
         """Record the dispatch instead of launching a real tmux pane."""
-        del resource_registry, publish_event, server_client
+        del resource_registry, publish_event, server_client, agent_spec
         created_sessions.append(session_id)
         return SessionResourceView(
             id="terminal_tui_main",

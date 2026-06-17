@@ -331,6 +331,7 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
         publish_event: object,
         *,
         server_client: object,
+        agent_spec: object = None,
     ) -> SessionResourceView:
         """
         Stand-in for ``_auto_create_repl_terminal`` that registers a
@@ -340,6 +341,9 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
         :param rr: The runner's resource registry (unused by the stub).
         :param publish_event: Per-session SSE emitter (unused).
         :param server_client: Omnigent server client (unused).
+        :param agent_spec: Resolved session agent spec threaded by the
+            recreate path so the REPL terminal inherits the agent sandbox
+            (unused by the stub).
         :returns: Terminal resource view for the fresh pane.
         """
         auto_create_sessions.append(session_id)
