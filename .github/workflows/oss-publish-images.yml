@@ -174,7 +174,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
-          sbom: false
+          sbom: true
 
       # Host image: same Dockerfile, `host` target. Runs after the server build
       # so it reuses the shared builder-stage layers from the gha cache.
@@ -190,7 +190,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
-          sbom: false
+          sbom: true
 
   promote-nightly:
     # Daily cron (or a manual force_nightly dispatch): move :latest-nightly to
