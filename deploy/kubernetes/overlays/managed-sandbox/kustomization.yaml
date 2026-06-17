@@ -1,0 +1,22 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Managed-sandbox overlay: deploys the server configured to launch
+# server-managed sandbox hosts (Modal / Daytona / CoreWeave). On top of the
+# base server it adds:
+#   - a sandbox: server config (mounted at /etc/omnigent/config.yaml)   [B3]
+#   - provider + injected credentials in the secret                      [B3]
+#   - non-accounts auth (managed dial-back requires it)                  [B2]
+# Prerequisite: the host image must ship `bwrap` (host Dockerfile target). [B1]
+# See ./README.md before applying.
+
+namespace: omnigent
+
+resources:
+  - ../../base
+  - sandbox-config.yaml
+
+patches:
+  - path: deployment-patch.yaml
+  - path: secret-patch.yaml
+  - path: configmap-patch.yaml

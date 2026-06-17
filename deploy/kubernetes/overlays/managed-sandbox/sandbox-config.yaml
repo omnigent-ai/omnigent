@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: omnigent-sandbox-config
+  labels:
+    app: omnigent
+data:
+  # Mounted read-only at /etc/omnigent/config.yaml; the deployment patch sets
+  # OMNIGENT_CONFIG to point here. Parsed by omnigent/server/managed_hosts.py
+  # (parse_sandbox_config). NON-secret only — provider API keys and the
+  # injected LLM/git creds live in the Secret (secret-patch.yaml), never here.
+  config.yaml: |
+    # ── Managed-sandbox configuration ───────────────────────────────
+    sandbox:
+      # provider: modal | daytona | cwsandbox  (managed launch is implemented
+      # for these; see deploy/<provider>/README.md).
+      provider: cwsandbox
+      # server_url MUST be the PUBLIC URL sandboxes dial back to — reachable
+      # from the provider's network, not localhost / the cluster-internal svc.
+      server_url: https://your-host.example.com
+      cwsandbox:
+        image: ghcr.io/omnigent-ai/omnigent-host:latest
+        # server env var NAMES to inject into each sandbox (values come from
+        # the Secret). Mirror your harness/provider needs.
+        env:
+          - ANTHROPIC_API_KEY
+          - OPENAI_API_KEY
+          - GIT_TOKEN
+      # ── Alternative providers (uncomment one, set provider: above) ──
+      # modal:
+      #   image: ghcr.io/omnigent-ai/omnigent-host:latest
+      #   # MODAL_TOKEN_ID / MODAL_TOKEN_SECRET go in the Secret.
+      # daytona:
+      #   image: ghcr.io/omnigent-ai/omnigent-host:latest
+      #   env: [ANTHROPIC_API_KEY, OPENAI_API_KEY, GIT_TOKEN]

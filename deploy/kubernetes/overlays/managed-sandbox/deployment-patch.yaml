@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: omnigent
+spec:
+  template:
+    spec:
+      containers:
+        - name: omnigent
+          # Point the server at the mounted sandbox config. (env merges by
+          # name; base sets the rest via envFrom configMap/secret.)
+          env:
+            - name: OMNIGENT_CONFIG
+              value: /etc/omnigent/config.yaml
+          # configMap mounts as a directory; the `config.yaml` key becomes
+          # /etc/omnigent/config.yaml. Kept off /data so it doesn't collide
+          # with the artifacts PVC mount.
+          volumeMounts:
+            - name: sandbox-config
+              mountPath: /etc/omnigent
+              readOnly: true
+      volumes:
+        - name: sandbox-config
+          configMap:
+            name: omnigent-sandbox-config

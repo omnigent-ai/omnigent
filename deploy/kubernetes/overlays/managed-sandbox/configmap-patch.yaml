@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: omnigent-config
+data:
+  # [B2] Managed-sandbox dial-back is REFUSED under the default `accounts`
+  # auth: a managed session opens a runner tunnel that authenticates with a
+  # resolved server credential, NOT the per-launch host token, and the host
+  # token carries no user identity. Supported modes are single-user no-auth
+  # (set here) OR header/OIDC-proxy. This overlay defaults to no-auth so it
+  # works standalone. Clear the base OMNIGENT_AUTH_PROVIDER=accounts too:
+  # explicit providers override OMNIGENT_AUTH_ENABLED. For multi-user, replace
+  # these keys with header or oidc config (see README).
+  OMNIGENT_AUTH_ENABLED: "0"
+  OMNIGENT_AUTH_PROVIDER: ""
