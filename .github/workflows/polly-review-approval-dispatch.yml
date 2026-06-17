@@ -39,7 +39,8 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
-      actions: write   # dispatch polly-review.yml
+      pull-requests: read   # pulls.get + pulls.listReviews (validation)
+      actions: write        # dispatch polly-review.yml
     steps:
       - name: Download recorded PR number
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
@@ -59,8 +60,17 @@ jobs:
               owner, repo, artifact_id: art.id, archive_format: 'zip',
             });
             fs.writeFileSync(`${process.env.GITHUB_WORKSPACE}/pr_number.zip`, Buffer.from(dl.data));
-      - name: Unzip
-        run: unzip -o pr_number.zip || true
+      - name: Unzip recorded PR number
+        run: |
+          if [ -f pr_number.zip ]; then
+            # Fail loudly on a corrupt archive -- don't mask it.
+            unzip -o pr_number.zip
+          else
+            # No artifact is the EXPECTED case when stage 1's record job was
+            # skipped (e.g. a same-repo PR approval, which still completes the
+            # stage-1 workflow). The next step no-ops cleanly on the missing file.
+            echo "No pr_number.zip from the triggering run; nothing to do."
+          fi
       - name: Validate (fork + maintainer approval) and dispatch Polly
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         with:
@@ -80,6 +90,13 @@ jobs:
 
             // Re-fetch the PR from the API -- never trust the artifact for identity.
             const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number });
+
+            // Ignore belated review events (network delay / GitHub retry) on a PR
+            // that is no longer open -- don't spend a gateway run on a merged/closed PR.
+            if (pr.state !== 'open') {
+              core.info(`PR #${pull_number} is ${pr.state}, not open; skipping.`);
+              return;
+            }
 
             // Fork only: same-repo PRs already get Polly on open.
             if (!pr.head.repo || pr.head.repo.full_name === `${owner}/${repo}`) {
@@ -109,6 +126,9 @@ jobs:
             }
 
             // Is a maintainer's latest DECISIVE (non-COMMENTED) review an APPROVAL?
+            // Keep each reviewer's latest decisive review by submitted_at, so a
+            // later DISMISSED / CHANGES_REQUESTED supersedes an earlier APPROVAL --
+            // a dismissed maintainer approval correctly does NOT count below.
             const reviews = await github.paginate(github.rest.pulls.listReviews, { owner, repo, pull_number });
             const latestByUser = new Map();
             for (const r of reviews) {
