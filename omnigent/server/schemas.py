@@ -1799,7 +1799,7 @@ class CodexGoalObject(BaseModel):
     :param thread_id: Codex app-server thread id, e.g. ``"thr_123"``.
     :param objective: Goal objective text, e.g.
         ``"Finish the migration and keep tests green"``.
-    :param status: Codex goal lifecycle status, e.g. ``"active"``.
+    :param status: Raw Codex goal lifecycle status, e.g. ``"active"``.
     :param token_budget: Optional token budget, e.g. ``40000``.
         ``None`` means no explicit budget is set.
     :param tokens_used: Tokens spent while pursuing this goal, e.g. ``1024``.
@@ -1813,14 +1813,7 @@ class CodexGoalObject(BaseModel):
 
     thread_id: str
     objective: str
-    status: Literal[
-        "active",
-        "paused",
-        "blocked",
-        "usageLimited",
-        "budgetLimited",
-        "complete",
-    ]
+    status: str
     token_budget: int | None = None
     tokens_used: int
     time_used_seconds: int

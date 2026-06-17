@@ -878,6 +878,8 @@ required for that wake-up side effect.
 
 `goal` is `null` when Codex reports no persisted goal. `created_at`
 and `updated_at` may be `null` if the app-server response omits them.
+`status` is forwarded exactly as Codex reports it; Omnigent does not
+rename or normalize lifecycle states.
 
 ```
 PUT /v1/sessions/{session_id}/codex_goal

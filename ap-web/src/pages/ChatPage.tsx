@@ -2965,26 +2965,13 @@ interface ComposerProps {
 }
 
 /**
- * Render a compact human label for a Codex goal status.
+ * Render the raw Codex goal status.
  *
  * @param status - Codex goal status, e.g. ``"budgetLimited"``.
- * @returns Lowercase display label, e.g. ``"budget limited"``.
+ * @returns The exact Codex status string.
  */
 function formatCodexGoalStatus(status: CodexGoal["status"]): string {
-  switch (status) {
-    case "active":
-      return "active";
-    case "paused":
-      return "paused";
-    case "blocked":
-      return "blocked";
-    case "usageLimited":
-      return "usage limited";
-    case "budgetLimited":
-      return "budget limited";
-    case "complete":
-      return "complete";
-  }
+  return status;
 }
 
 /**

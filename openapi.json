@@ -259,7 +259,7 @@
         "type": "object"
       },
       "CodexGoalObject": {
-        "description": "Current Codex goal state for a Codex-native session.\n\nMirrors Codex app-server's ``ThreadGoal`` shape using Omnigent's\nsnake-case API convention. ``created_at`` and ``updated_at`` are optional\nbecause older app-server documentation examples omit them even though the\ncurrent protocol includes them.\n\n:param thread_id: Codex app-server thread id, e.g. ``\"thr_123\"``.\n:param objective: Goal objective text, e.g.\n    ``\"Finish the migration and keep tests green\"``.\n:param status: Codex goal lifecycle status, e.g. ``\"active\"``.\n:param token_budget: Optional token budget, e.g. ``40000``.\n    ``None`` means no explicit budget is set.\n:param tokens_used: Tokens spent while pursuing this goal, e.g. ``1024``.\n:param time_used_seconds: Wall-clock seconds spent on this goal,\n    e.g. ``60``.\n:param created_at: Unix timestamp when the goal was created, e.g.\n    ``1776272400``. ``None`` when not provided by Codex.\n:param updated_at: Unix timestamp when the goal was last updated, e.g.\n    ``1776272460``. ``None`` when not provided by Codex.",
+        "description": "Current Codex goal state for a Codex-native session.\n\nMirrors Codex app-server's ``ThreadGoal`` shape using Omnigent's\nsnake-case API convention. ``created_at`` and ``updated_at`` are optional\nbecause older app-server documentation examples omit them even though the\ncurrent protocol includes them.\n\n:param thread_id: Codex app-server thread id, e.g. ``\"thr_123\"``.\n:param objective: Goal objective text, e.g.\n    ``\"Finish the migration and keep tests green\"``.\n:param status: Raw Codex goal lifecycle status, e.g. ``\"active\"``.\n:param token_budget: Optional token budget, e.g. ``40000``.\n    ``None`` means no explicit budget is set.\n:param tokens_used: Tokens spent while pursuing this goal, e.g. ``1024``.\n:param time_used_seconds: Wall-clock seconds spent on this goal,\n    e.g. ``60``.\n:param created_at: Unix timestamp when the goal was created, e.g.\n    ``1776272400``. ``None`` when not provided by Codex.\n:param updated_at: Unix timestamp when the goal was last updated, e.g.\n    ``1776272460``. ``None`` when not provided by Codex.",
         "properties": {
           "created_at": {
             "anyOf": [
@@ -277,14 +277,6 @@
             "type": "string"
           },
           "status": {
-            "enum": [
-              "active",
-              "paused",
-              "blocked",
-              "usageLimited",
-              "budgetLimited",
-              "complete"
-            ],
             "title": "Status",
             "type": "string"
           },

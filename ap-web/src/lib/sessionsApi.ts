@@ -219,7 +219,7 @@ interface SessionItemsResponseWire {
 interface CodexGoalWire {
   thread_id: string;
   objective: string;
-  status: "active" | "paused" | "blocked" | "usageLimited" | "budgetLimited" | "complete";
+  status: string;
   token_budget?: number | null;
   tokens_used: number;
   time_used_seconds: number;
@@ -234,7 +234,7 @@ interface CodexGoalResponseWire {
 export interface CodexGoal {
   threadId: string;
   objective: string;
-  status: "active" | "paused" | "blocked" | "usageLimited" | "budgetLimited" | "complete";
+  status: string;
   tokenBudget: number | null;
   tokensUsed: number;
   timeUsedSeconds: number;
