@@ -5,17 +5,21 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
-core_test_support = { path = "../../../third_party/codex/codex-rs/core/tests/common" }
+# Pull the upstream Codex test-support crate straight from the public Codex
+# repository instead of vendoring Codex as a git submodule. Cargo can resolve
+# `core_test_support` even though the Rust workspace lives under `codex-rs/`,
+# and the revision pin keeps these tests reproducible.
+core_test_support = { git = "https://github.com/openai/codex.git", rev = "4c79527e31a0e2f77f727ae67e8e86a1233f2876" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "time"] }
 
 # `core_test_support` is normally built inside the upstream Codex workspace.
 # That workspace patches websocket crates to OpenAI forks that expose the
-# `proxy` feature expected by Codex's networking stack. Because this sidecar is
-# an external crate that depends on Codex test support by path, it does not
-# inherit the upstream workspace patches automatically. Keep these patches in
-# sync with `third_party/codex/codex-rs/Cargo.toml`; without them Cargo resolves
+# `proxy` feature expected by Codex's networking stack. This sidecar is a
+# separate crate, so Cargo does not inherit the upstream workspace patches from
+# the fetched git dependency. Keep these patches in sync with
+# `codex-rs/Cargo.toml` at the pinned Codex revision; without them Cargo resolves
 # crates.io `tokio-tungstenite`, which does not provide the requested feature.
 [patch.crates-io]
 tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "132f5b39c862e3a970f731d709608b3e6276d5f6" }
