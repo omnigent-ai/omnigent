@@ -42,7 +42,7 @@ Triggered on every new issue. The bot classifies, deduplicates, resolves what it
 **What the bot does:**
 
 1. **Removes** `needs-triage`, **adds** `triaged`
-2. **Classifies component** — one `comp:*` label (`comp:core`, `comp:web-ui`, `comp:cli`, `comp:sdk`, `comp:sandbox`, `comp:ci`, `comp:docs`)
+2. **Classifies component** — one `comp:*` label (e.g. `comp:server`, `comp:runner`, `comp:repr`, `comp:web-ui`, `comp:policies`, `comp:harnesses`)
 3. **Assigns priority** — one of `P0-critical`, `P1-high`, `P2-medium`, `P3-low`
 4. **Routes to contributors** — adds `good-first-issue` for well-scoped, self-contained issues; `help-wanted` for issues needing community help with more context
 5. **Flags incomplete issues** — adds `needs-info` if repro steps are missing or description is too vague (replaces priority label)
@@ -82,27 +82,13 @@ Maintainers work from a filtered view: `is:issue is:open label:P0-critical,P1-hi
 
 #### Auto-assignment
 
-The bot assigns escalated issues to a maintainer automatically, based on two rules:
+The bot assigns escalated issues to a maintainer based on **domain expertise, balanced by load**:
 
-1. **Route by domain first.** The `comp:*` label determines the domain team. Each component maps to a small group of domain experts:
+1. **Route by domain.** The `comp:*` label maps to domain experts — e.g. server, runner, repr, web UI, policies, harnesses. Maintained as a config file (`.github/triage/domain-owners.yml`) so teams update it without touching CI.
 
-   | Component | Domain experts |
-   |---|---|
-   | `comp:core` | core runtime team |
-   | `comp:web-ui` | web/frontend team |
-   | `comp:sandbox` | core runtime team (sandbox specialists) |
-   | `comp:sdk` | SDK team |
-   | `comp:cli` | CLI owners |
-   | `comp:ci` | infra team |
-   | `comp:docs` | rotates across all teams |
+2. **Balance within the domain.** Among eligible experts, assign to whoever has the fewest open assigned issues. If no domain match, fall back to the full maintainer list with the same least-loaded logic.
 
-   *(Maintained as a config file — e.g. `.github/triage/domain-owners.yml` — not hardcoded in the workflow, so teams can update it without touching CI.)*
-
-2. **Round-robin within the domain group.** Among the eligible domain experts, assign to whoever has the fewest open assigned issues. This keeps load roughly balanced without ignoring expertise. If the domain group is empty or the component label is missing, fall back to the full maintainer list with the same least-loaded logic.
-
-**Why domain-first, not pure round-robin:** Pure equal distribution ignores context — a frontend maintainer assigned a sandbox bug wastes time ramping up and likely re-assigns anyway. Domain routing means the first human who looks at the issue can actually act on it. The load-balancing within the domain group prevents any single expert from becoming a bottleneck.
-
-**Override:** Maintainers can always reassign. The bot doesn't re-assign after initial routing — once a human touches it, the bot stays out.
+Maintainers can always reassign. The bot doesn't re-assign after initial routing.
 
 #### Maintainer actions at this stage
 - Override bot labels or assignment if wrong
@@ -155,8 +141,8 @@ Duplicates get a 3-day grace period. Reporter can react 👎 to prevent closure.
 | **Type** | `bug`, `enhancement`, `question`, `documentation` | What kind of issue |
 | **Triage** | `needs-triage`, `triaged`, `needs-info`, `duplicate`, `wontfix` | Triage state |
 | **Priority** | `P0-critical`, `P1-high`, `P2-medium`, `P3-low` | Severity |
-| **Component** | `comp:core`, `comp:web-ui`, `comp:cli`, `comp:sdk`, `comp:sandbox`, `comp:ci`, `comp:docs` | Which subsystem |
-| **Contributor** | `good-first-issue`, `help-wanted`, `mentor-available` | Contributor routing |
+| **Component** | `comp:server`, `comp:runner`, `comp:repr`, `comp:web-ui`, `comp:policies`, `comp:harnesses`, ... | Which subsystem (mirrors domain-owners config) |
+| **Contributor** | `good-first-issue`, `help-wanted` | Contributor routing |
 | **Lifecycle** | `stale`, `in-progress` | Automated lifecycle |
 
 ---
@@ -214,7 +200,7 @@ Track to validate the pipeline is working:
 - **Duplicate accuracy** — % of bot-flagged duplicates that were correct (target: >90%)
 - **Stale rate** — % of issues that go stale without resolution
 - **Contributor funnel** — GFI labeled → claimed → PR opened → merged
-- **Escalation rate** — % of issues reaching Stage 4 (lower is better)
+- **Escalation rate** — % of issues reaching Stage 3 (lower is better)
 
 Monthly review: sample bot labels, check accuracy, adjust prompt. If a label category has >20% error rate, refine the prompt or drop it.
 
