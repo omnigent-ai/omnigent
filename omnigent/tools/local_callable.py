@@ -11,9 +11,8 @@ distinct from native Omnigent local tools, which live as
 :class:`omnigent.tools.local.LocalPythonTool` in a subprocess.
 
 The harness contract migration (``designs/SERVER_HARNESS_CONTRACT.md``,
-step 5g) routes spec-declared tools through AP's ToolManager so
-:meth:`omnigent.runtime.executors.base.ExecutorContext.call_tool`
-can dispatch them. This module supplies the AP-side wrapper:
+step 5g) routes spec-declared tools through AP's ToolManager so the
+executor can dispatch them. This module supplies the AP-side wrapper:
 
 - :class:`LocalCallableTool` — one :class:`Tool` per registered
   callable. Imports the dotted path lazily on first invoke;
