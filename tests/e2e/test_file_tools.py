@@ -97,7 +97,12 @@ def test_list_files_finds_uploaded_file(
             "files. Only use list_files, nothing else."
         ),
     )
-    body = poll_session_until_terminal(http_client, session_id=session_id, response_id=rid, timeout=180)
+    body = poll_session_until_terminal(
+        http_client,
+        session_id=session_id,
+        response_id=rid,
+        timeout=180,
+    )
     assert body["status"] == "completed", f"Turn failed: {body.get('error')}"
 
     assert _has_tool_call(body, "list_files"), "Agent didn't call list_files"
@@ -138,7 +143,12 @@ def test_download_file_retrieves_content(
             "sys_os_read, or any other filesystem tool. Report the JSON result."
         ),
     )
-    body = poll_session_until_terminal(http_client, session_id=session_id, response_id=rid, timeout=180)
+    body = poll_session_until_terminal(
+        http_client,
+        session_id=session_id,
+        response_id=rid,
+        timeout=180,
+    )
     assert body["status"] == "completed", f"Turn failed: {body.get('error')}"
 
     assert _has_tool_call(body, "download_file"), "Agent didn't call download_file"

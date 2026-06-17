@@ -12,12 +12,18 @@ loop on a real plan-mode session: ask Claude to plan, then approve the plan in
 the web review card.
 
 Plan mode is set by launching the session with
-``terminal_launch_args=["--permission-mode", "plan"]`` — see the
-``native_claude_plan_session`` fixture. It is the sibling of
-``test_ask_user_question.py``: both cover a Claude built-in tool that surfaces a
-structured card rather than the binary policy ASK. Rides a real Claude Code
-boot, so it carries a 900s ceiling, and the prompt is explicit because it
-depends on the model reaching for ``ExitPlanMode``.
+``terminal_launch_args=["--permission-mode", "plan", "--disallowedTools",
+"AskUserQuestion"]`` — see the ``native_claude_plan_session`` fixture. It is the
+sibling of ``test_ask_user_question.py``: both cover a Claude built-in tool that
+surfaces a structured card rather than the binary policy ASK. Rides a real
+Claude Code boot, so it carries a 900s ceiling.
+
+Two layers keep the model on the ExitPlanMode path (and off the clarifying
+``AskUserQuestion`` path, which would surface the wrong card and time the test
+out): the fixture disables ``AskUserQuestion`` outright, and the prompt pins the
+exact comment text/location and forbids questions. The AskUserQuestion render
+path keeps its own dedicated coverage in ``test_ask_user_question.py``, so
+removing the tool here loses no coverage.
 
 The load-bearing assertion is that the parked elicitation drains after the
 review's approve — proof the verdict flowed back through the PermissionRequest
@@ -48,11 +54,26 @@ _PLAN_REVIEW = '[data-testid="exit-plan-mode-review"]'
 # slower than a single custom-agent call — matches the render-parity budget.
 _NATIVE_TURN_TIMEOUT_MS = 180_000
 
+# The prompt pins the comment text and location so there is nothing for Claude
+# to clarify, and explicitly forbids questions / mandates going straight to
+# ExitPlanMode. Combined with the fixture's ``--disallowedTools
+# AskUserQuestion`` (native_claude_plan_session), this keeps the model on the
+# ExitPlanMode path the review card under test depends on.
+#
+# The pinned file/comment only have to be *plausible* targets for a plan: Claude
+# is planning, never executing (the test never approves an edit), so the run is
+# unaffected even if ``README.md`` is later renamed or removed from the repo
+# root. The constant just keeps the prompt's intent explicit.
+_PLAN_FILE = "README.md"
+_PLAN_COMMENT = "<!-- Maintained by the Platform team -->"
 _PLAN_PROMPT = (
     "You are in plan mode. Put together a short plan describing how you would "
-    "add a single one-line comment to a README file in this repository, then "
-    "use the ExitPlanMode tool to present that plan for my approval. Keep the "
-    "plan to a few bullet points and do not make any edits yet."
+    f"add the one-line comment `{_PLAN_COMMENT}` as the final line of "
+    f"`{_PLAN_FILE}` in this repository. Do not ask any clarifying questions; "
+    "if any detail is unspecified, assume a reasonable default and proceed. "
+    "Then immediately use the ExitPlanMode tool to present that plan for my "
+    "approval. Keep the plan to a few bullet points and do not make any edits "
+    "yet."
 )
 
 
