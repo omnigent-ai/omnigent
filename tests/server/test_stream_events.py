@@ -25,8 +25,8 @@ from pydantic import TypeAdapter, ValidationError
 
 from omnigent.server.schemas import (
     ServerStreamEvent,
-    SessionCodexModelOptionsEvent,
     SessionCreatedEvent,
+    SessionModelOptionsEvent,
     SessionSkillsEvent,
     SessionStatusEvent,
     is_known_event,
@@ -311,22 +311,22 @@ def test_session_skills_event_round_trips_through_union() -> None:
     assert parsed.conversation_id == "conv_abc"
 
 
-def test_session_codex_model_options_event_round_trips_through_union() -> None:
-    """``session.codex_model_options`` routes via the discriminator."""
-    event = SessionCodexModelOptionsEvent(
-        type="session.codex_model_options",
+def test_session_model_options_event_round_trips_through_union() -> None:
+    """``session.model_options`` routes via the discriminator."""
+    event = SessionModelOptionsEvent(
+        type="session.model_options",
         conversation_id="conv_abc",
     )
     dumped = event.model_dump()
     assert dumped == {
-        "type": "session.codex_model_options",
+        "type": "session.model_options",
         "conversation_id": "conv_abc",
         "sequence_number": None,
     }
     parsed = _ADAPTER.validate_python(dumped)
-    # Discriminator must route to the Codex-options nudge, otherwise
+    # Discriminator must route to the model-options nudge, otherwise
     # clients would never be told to refetch the cache-warmed snapshot.
-    assert isinstance(parsed, SessionCodexModelOptionsEvent)
+    assert isinstance(parsed, SessionModelOptionsEvent)
     assert parsed.conversation_id == "conv_abc"
 
 

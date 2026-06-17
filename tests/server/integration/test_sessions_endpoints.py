@@ -4774,9 +4774,9 @@ async def test_post_external_codex_collaboration_mode_change_persists_label(
     )
 
     assert resp.status_code == 202, resp.text
-    assert [event["type"] for _, event in published] == ["session.codex_plan_mode"]
+    assert [event["type"] for _, event in published] == ["session.collaboration_mode"]
     assert published[0][1]["conversation_id"] == session["id"]
-    assert published[0][1]["enabled"] is True
+    assert published[0][1]["mode"] == "plan"
     snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
     assert snapshot["labels"]["omnigent.codex_native.collaboration_mode"] == "plan"
 
@@ -5736,16 +5736,16 @@ class _ForwardedEffort:
     body: dict[str, Any] | None
 
 
-async def test_patch_codex_plan_mode_persists_label_and_forwards_event(
+async def test_patch_collaboration_mode_persists_label_and_forwards_event(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    PATCH ``codex_plan_mode`` persists the Codex mode and forwards it live.
+    PATCH ``collaboration_mode`` persists the Codex mode and forwards it live.
 
     The web UI toggle writes through the sessions PATCH route. The server must
     persist the collaboration-mode label for reload, publish a live
-    ``session.codex_plan_mode`` event for connected clients, and forward a
+    ``session.collaboration_mode`` event for connected clients, and forward a
     harness-agnostic ``plan_mode_change`` control event to the runner so the
     loaded Codex app-server switches modes immediately.
     """
@@ -5787,7 +5787,7 @@ async def test_patch_codex_plan_mode_persists_label_and_forwards_event(
 
         resp = await client.patch(
             f"/v1/sessions/{session['id']}",
-            json={"codex_plan_mode": True},
+            json={"collaboration_mode": "plan"},
         )
     finally:
         await fake_runner.aclose()
@@ -5798,18 +5798,18 @@ async def test_patch_codex_plan_mode_persists_label_and_forwards_event(
     plan_forwards = [f for f in captured if f.url.endswith(f"/v1/sessions/{session['id']}/events")]
     assert len(plan_forwards) == 1, f"Expected one runner forward, got {captured!r}"
     assert plan_forwards[0].body == {"type": "plan_mode_change", "enabled": True}
-    assert [event["type"] for _, event in published] == ["session.codex_plan_mode"]
-    assert published[0][1]["enabled"] is True
+    assert [event["type"] for _, event in published] == ["session.collaboration_mode"]
+    assert published[0][1]["mode"] == "plan"
 
 
 @pytest.mark.parametrize("runner_status", [None, 503], ids=["no_runner", "runner_rejects"])
-async def test_patch_codex_plan_mode_requires_live_runner_before_persisting(
+async def test_patch_collaboration_mode_requires_live_runner_before_persisting(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     runner_status: int | None,
 ) -> None:
     """
-    PATCH ``codex_plan_mode`` must not persist UI state before live success.
+    PATCH ``collaboration_mode`` must not persist UI state before live success.
 
     A Plan-mode toggle is only correct if Codex app-server accepts the
     corresponding ``thread/settings/update`` through the runner. If no runner
@@ -5867,7 +5867,7 @@ async def test_patch_codex_plan_mode_requires_live_runner_before_persisting(
 
         resp = await client.patch(
             f"/v1/sessions/{session['id']}",
-            json={"codex_plan_mode": True},
+            json={"collaboration_mode": "plan"},
         )
         snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
     finally:
@@ -5889,11 +5889,11 @@ async def test_patch_codex_plan_mode_requires_live_runner_before_persisting(
         assert plan_forwards[0].body == {"type": "plan_mode_change", "enabled": True}
 
 
-async def test_patch_codex_plan_mode_rejects_non_codex_session(
+async def test_patch_collaboration_mode_rejects_non_codex_session(
     client: httpx.AsyncClient,
 ) -> None:
     """
-    ``codex_plan_mode`` is rejected for sessions that are not Codex-native.
+    ``collaboration_mode`` is rejected for sessions that are not Codex-native.
 
     This keeps a Codex-specific UI control from becoming a generic label write
     that could imply Plan mode on sessions whose runner cannot honor it.
@@ -5903,11 +5903,11 @@ async def test_patch_codex_plan_mode_rejects_non_codex_session(
 
     resp = await client.patch(
         f"/v1/sessions/{session['id']}",
-        json={"codex_plan_mode": True},
+        json={"collaboration_mode": "plan"},
     )
 
     assert resp.status_code == 400, resp.text
-    assert "codex_plan_mode is only supported" in resp.text
+    assert "collaboration_mode is only supported" in resp.text
 
 
 @pytest.mark.parametrize(

@@ -1781,7 +1781,10 @@ async function bindStream(
     if (willApplyStickyModel) {
       updateSession(id, { modelOverride: compatibleStickyModel, silent: true }).catch(
         (err: unknown) => {
-          console.warn(`Failed to apply sticky model=${compatibleStickyModel} to session ${id}:`, err);
+          console.warn(
+            `Failed to apply sticky model=${compatibleStickyModel} to session ${id}:`,
+            err,
+          );
         },
       );
     }
@@ -3378,17 +3381,15 @@ export function handleSessionEvent(event: StreamEvent): void {
       // Guard by conversation id so a late event from a previous session
       // cannot overwrite the effort picker for the currently-open one.
       useChatStore.setState((s) =>
-        s.conversationId === event.conversationId
-          ? { selectedEffort: event.reasoningEffort }
-          : {},
+        s.conversationId === event.conversationId ? { selectedEffort: event.reasoningEffort } : {},
       );
       return;
-    case "session_codex_plan_mode":
+    case "session_collaboration_mode":
       // A Codex /plan switch made in either the web UI or native TUI.
       // Guard by conversation id so a late frame from an aborted stream
       // cannot paint Plan mode onto the newly-opened conversation.
       useChatStore.setState((s) =>
-        s.conversationId === event.conversationId ? { codexPlanMode: event.enabled } : {},
+        s.conversationId === event.conversationId ? { codexPlanMode: event.mode === "plan" } : {},
       );
       return;
     case "session_presence":
@@ -3754,7 +3755,7 @@ export function handleSessionEvent(event: StreamEvent): void {
       // refetchRunnerBackedSessionState self-guards against a stale apply.
       void refetchRunnerBackedSessionState(event.conversationId);
       return;
-    case "session_codex_model_options":
+    case "session_model_options":
       // Codex app-server `model/list` just resolved. Refetch the
       // cache-warmed snapshot and apply `codexModelOptions`; the picker
       // derives both model rows and effort levels from that catalog.

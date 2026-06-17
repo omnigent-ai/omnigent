@@ -1567,7 +1567,7 @@ class SessionResponse(BaseModel):
         runner at startup. Empty list when the agent spec
         cannot be loaded, or when bundled + host discovery
         yields nothing.
-    :param codex_model_options: Codex app-server ``model/list`` options
+    :param model_options: Codex app-server ``model/list`` options
         for codex-native sessions, including each model's supported
         reasoning efforts. Empty for non-codex-native sessions or while
         the bound runner / Codex app-server cannot answer yet.
@@ -1632,7 +1632,7 @@ class SessionResponse(BaseModel):
     archived: bool = False
     todos: list[dict[str, Any]] = Field(default_factory=list)
     skills: list[SkillSummary] = Field(default_factory=list)
-    codex_model_options: list[dict[str, Any]] = Field(default_factory=list)
+    model_options: list[dict[str, Any]] = Field(default_factory=list)
     terminal_pending: bool = False
     sandbox_status: SandboxStatus | None = None
 
@@ -1667,10 +1667,10 @@ class UpdateSessionRequest(BaseModel):
         models. Clear aliases such as ``"default"``, ``"off"``, or
         ``"reset"`` remove the override (matching the REPL's
         ``/model`` semantics). ``None`` leaves unchanged.
-    :param codex_plan_mode: Codex-native collaboration-mode toggle.
-        ``True`` enters Plan mode and ``False`` returns to Default mode
-        for subsequent Codex turns. Only valid for sessions stamped with
-        the codex-native wrapper label. Omitted leaves unchanged.
+    :param collaboration_mode: Codex-native collaboration-mode string.
+        ``"plan"`` enters Plan mode and ``"default"`` returns to Default
+        mode for subsequent Codex turns. Only valid for sessions stamped
+        with the codex-native wrapper label. Omitted leaves unchanged.
     :param cost_control_mode_override: Per-session cost-control
         switch: ``"on"`` activates the spec's configured cost-control
         mode, ``"off"`` disables cost control for this session.
@@ -1711,7 +1711,7 @@ class UpdateSessionRequest(BaseModel):
     labels: dict[str, str] | None = None
     reasoning_effort: str | None = None
     model_override: str | None = None
-    codex_plan_mode: bool | None = None
+    collaboration_mode: str | None = None
     cost_control_mode_override: str | None = None
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
@@ -2156,28 +2156,28 @@ class SessionReasoningEffortEvent(_SSEEventBase):
     reasoning_effort: str | None = None
 
 
-class SessionCodexPlanModeEvent(_SSEEventBase):
+class SessionCollaborationModeEvent(_SSEEventBase):
     """
-    Active Codex Plan-mode update from a Codex-native session.
+    Active collaboration-mode update from a Codex-native session.
 
     Emitted after the web UI toggles Codex collaboration mode, and after the
     Codex forwarder observes a ``thread/settings/updated`` notification from
     the native Codex TUI. Lets connected clients show a clear Plan-mode
     indicator without a reload.
 
-    :param type: Always ``"session.codex_plan_mode"``.
+    :param type: Always ``"session.collaboration_mode"``.
     :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
-    :param enabled: ``True`` when Codex is in Plan mode, ``False`` when it is
-        in Default mode.
+    :param mode: The active collaboration mode string, e.g. ``"plan"`` or
+        ``"default"``.
 
     Category: **transient** (SSE-only). The server also writes
     ``omnigent.codex_native.collaboration_mode`` on the conversation labels,
     so reconnect clients restore the same state from the session snapshot.
     """
 
-    type: Literal["session.codex_plan_mode"]
+    type: Literal["session.collaboration_mode"]
     conversation_id: str
-    enabled: bool
+    mode: str
 
 
 class SessionAgentChangedEvent(_SSEEventBase):
@@ -2344,21 +2344,21 @@ class SessionSkillsEvent(_SSEEventBase):
     conversation_id: str
 
 
-class SessionCodexModelOptionsEvent(_SSEEventBase):
+class SessionModelOptionsEvent(_SSEEventBase):
     """
     Signal that a codex-native session's model catalog has resolved.
 
-    Codex model options are fetched from the bound runner's live
+    Model options are fetched from the bound runner's live
     Codex app-server via ``model/list`` and cached on the session
     snapshot. The initial snapshot can return an empty list while
     this background fetch is in flight; this event tells connected
     clients to re-read the snapshot and apply its now-populated
-    ``codex_model_options``.
+    ``model_options``.
 
     Carries no payload beyond the conversation id. The snapshot's
-    ``codex_model_options`` field remains the source of truth.
+    ``model_options`` field remains the source of truth.
 
-    :param type: Always ``"session.codex_model_options"``.
+    :param type: Always ``"session.model_options"``.
     :param conversation_id: Session identifier,
         e.g. ``"conv_abc123"``.
 
@@ -2366,7 +2366,7 @@ class SessionCodexModelOptionsEvent(_SSEEventBase):
     Codex model / effort controls from the session snapshot.
     """
 
-    type: Literal["session.codex_model_options"]
+    type: Literal["session.model_options"]
     conversation_id: str
 
 
@@ -3408,13 +3408,13 @@ ServerStreamEvent = Annotated[
     | SessionUsageEvent
     | SessionModelEvent
     | SessionReasoningEffortEvent
-    | SessionCodexPlanModeEvent
+    | SessionCollaborationModeEvent
     | SessionAgentChangedEvent
     | SessionTodosEvent
     | SessionTerminalPendingEvent
     | SessionSandboxStatusEvent
     | SessionSkillsEvent
-    | SessionCodexModelOptionsEvent
+    | SessionModelOptionsEvent
     | SessionInputConsumedEvent
     | SessionInterruptedEvent
     | SessionCreatedEvent

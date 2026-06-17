@@ -11,10 +11,10 @@ import { describe, expect, it } from "vitest";
 import type {
   ElicitationRequest,
   SessionAgentChangedEvent,
-  SessionCodexPlanModeEvent,
+  SessionCollaborationModeEvent,
   SessionChangedFilesInvalidatedEvent,
   SessionChildSessionUpdatedEvent,
-  SessionCodexModelOptionsEvent,
+  SessionModelOptionsEvent,
   SessionCreatedEvent,
   SessionInputConsumedEvent,
   SessionInterruptedEvent,
@@ -1215,25 +1215,25 @@ describe("session.reasoning_effort (FLAT envelope)", () => {
   });
 });
 
-describe("session.codex_plan_mode (FLAT envelope)", () => {
-  it("lifts conversation_id and enabled flag", () => {
-    const events = parse("session.codex_plan_mode", {
+describe("session.collaboration_mode (FLAT envelope)", () => {
+  it("lifts conversation_id and mode string", () => {
+    const events = parse("session.collaboration_mode", {
       conversation_id: "conv_abc",
-      enabled: true,
+      mode: "plan",
     });
     expect(events).toHaveLength(1);
-    const ev = events[0] as SessionCodexPlanModeEvent;
-    expect(ev.type).toBe("session_codex_plan_mode");
+    const ev = events[0] as SessionCollaborationModeEvent;
+    expect(ev.type).toBe("session_collaboration_mode");
     expect(ev.conversationId).toBe("conv_abc");
-    expect(ev.enabled).toBe(true);
+    expect(ev.mode).toBe("plan");
   });
 
-  it("rejects missing enabled flag", () => {
-    expect(parse("session.codex_plan_mode", { conversation_id: "conv_abc" })).toEqual([]);
+  it("rejects missing mode", () => {
+    expect(parse("session.collaboration_mode", { conversation_id: "conv_abc" })).toEqual([]);
   });
 
   it("rejects missing conversation_id", () => {
-    expect(parse("session.codex_plan_mode", { enabled: true })).toEqual([]);
+    expect(parse("session.collaboration_mode", { mode: "plan" })).toEqual([]);
   });
 });
 
@@ -1464,21 +1464,21 @@ describe("session.skills (FLAT envelope)", () => {
   });
 });
 
-describe("session.codex_model_options (FLAT envelope)", () => {
+describe("session.model_options (FLAT envelope)", () => {
   it("lifts conversation_id into the bare nudge", () => {
-    const out = parse("session.codex_model_options", {
-      type: "session.codex_model_options",
+    const out = parse("session.model_options", {
+      type: "session.model_options",
       conversation_id: "conv_abc",
     });
     expect(out).toHaveLength(1);
-    const ev = out[0] as SessionCodexModelOptionsEvent;
-    expect(ev.type).toBe("session_codex_model_options");
+    const ev = out[0] as SessionModelOptionsEvent;
+    expect(ev.type).toBe("session_model_options");
     expect(ev.conversationId).toBe("conv_abc");
   });
 
   it("rejects missing conversation_id", () => {
-    const out = parse("session.codex_model_options", {
-      type: "session.codex_model_options",
+    const out = parse("session.model_options", {
+      type: "session.model_options",
     });
     expect(out).toEqual([]);
   });

@@ -29,7 +29,7 @@ async def _drain_runner_skills(session_id: str) -> None:
         await asyncio.sleep(0)
 
 
-async def _drain_codex_model_options(session_id: str) -> None:
+async def _drain_model_options(session_id: str) -> None:
     """Pump the loop until the background Codex model-options fetch lands.
 
     Codex model options are eventual-consistent like skills: the first
@@ -37,7 +37,7 @@ async def _drain_codex_model_options(session_id: str) -> None:
     serves the cache.
     """
     for _ in range(100):
-        if session_id in _sessions_mod._codex_model_options_cache:
+        if session_id in _sessions_mod._model_options_cache:
             return
         await asyncio.sleep(0)
 
@@ -554,7 +554,7 @@ async def test_session_snapshot_includes_skills_from_runner(
 
 
 @pytest.mark.asyncio
-async def test_session_snapshot_includes_codex_model_options_from_runner(
+async def test_session_snapshot_includes_model_options_from_runner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -571,8 +571,8 @@ async def test_session_snapshot_includes_codex_model_options_from_runner(
     _mod._session_status_cache.clear()
     _mod._runner_skills_cache.clear()
     _mod._runner_skills_inflight.clear()
-    _mod._codex_model_options_cache.clear()
-    _mod._codex_model_options_inflight.clear()
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
 
     class _FakeResponse:
         def __init__(self, payload: dict[str, object]) -> None:
@@ -635,17 +635,17 @@ async def test_session_snapshot_includes_codex_model_options_from_runner(
         conv_store,  # type: ignore[arg-type]
         "conv_codex_options",
     )
-    assert first.codex_model_options == []
-    await _drain_codex_model_options("conv_codex_options")
+    assert first.model_options == []
+    await _drain_model_options("conv_codex_options")
     snapshot = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
         "conv_codex_options",
     )
 
     assert "/v1/sessions/conv_codex_options/codex-model-options" in fake_client.get_calls
-    assert [m["id"] for m in snapshot.codex_model_options] == ["gpt-5.5"]
-    assert snapshot.codex_model_options[0]["displayName"] == "GPT-5.5"
-    assert snapshot.codex_model_options[0]["supportedReasoningEfforts"] == [
+    assert [m["id"] for m in snapshot.model_options] == ["gpt-5.5"]
+    assert snapshot.model_options[0]["displayName"] == "GPT-5.5"
+    assert snapshot.model_options[0]["supportedReasoningEfforts"] == [
         {"reasoningEffort": "low", "description": "Low"},
         {"reasoningEffort": "medium", "description": "Medium"},
         {"reasoningEffort": "high", "description": "High"},
@@ -654,7 +654,7 @@ async def test_session_snapshot_includes_codex_model_options_from_runner(
 
 
 @pytest.mark.asyncio
-async def test_session_snapshot_refresh_state_reloads_codex_model_options(
+async def test_session_snapshot_refresh_state_reloads_model_options(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -671,9 +671,9 @@ async def test_session_snapshot_refresh_state_reloads_codex_model_options(
     _mod._session_status_cache.clear()
     _mod._runner_skills_cache.clear()
     _mod._runner_skills_inflight.clear()
-    _mod._codex_model_options_cache.clear()
-    _mod._codex_model_options_inflight.clear()
-    _mod._codex_model_options_cache["conv_codex_refresh"] = [
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
+    _mod._model_options_cache["conv_codex_refresh"] = [
         {
             "id": "stale-model",
             "model": "stale-provider-model",
@@ -745,20 +745,20 @@ async def test_session_snapshot_refresh_state_reloads_codex_model_options(
     )
     # Refresh must not echo the stale cached row. If this is "stale-model",
     # browser reloads would not recover after the server-side cache shape is fixed.
-    assert [m["id"] for m in refreshed.codex_model_options] == []
-    await _drain_codex_model_options("conv_codex_refresh")
+    assert [m["id"] for m in refreshed.model_options] == []
+    await _drain_model_options("conv_codex_refresh")
     snapshot = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
         "conv_codex_refresh",
     )
 
     assert "/v1/sessions/conv_codex_refresh/codex-model-options" in fake_client.get_calls
-    assert [m["id"] for m in snapshot.codex_model_options] == ["fresh-model"]
-    assert snapshot.codex_model_options[0]["displayName"] == "Fresh Model"
+    assert [m["id"] for m in snapshot.model_options] == ["fresh-model"]
+    assert snapshot.model_options[0]["displayName"] == "Fresh Model"
 
 
 @pytest.mark.asyncio
-async def test_session_snapshot_retries_empty_codex_model_options(
+async def test_session_snapshot_retries_empty_model_options(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -774,8 +774,8 @@ async def test_session_snapshot_retries_empty_codex_model_options(
     _mod._session_status_cache.clear()
     _mod._runner_skills_cache.clear()
     _mod._runner_skills_inflight.clear()
-    _mod._codex_model_options_cache.clear()
-    _mod._codex_model_options_inflight.clear()
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
     monkeypatch.setattr(_mod, "_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S", (0.0,))
 
     class _FakeResponse:
@@ -839,8 +839,8 @@ async def test_session_snapshot_retries_empty_codex_model_options(
         conv_store,  # type: ignore[arg-type]
         "conv_codex_empty_then_ready",
     )
-    assert first.codex_model_options == []
-    await _drain_codex_model_options("conv_codex_empty_then_ready")
+    assert first.model_options == []
+    await _drain_model_options("conv_codex_empty_then_ready")
     snapshot = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
         "conv_codex_empty_then_ready",
@@ -852,12 +852,12 @@ async def test_session_snapshot_retries_empty_codex_model_options(
         fake_client.get_calls.count("/v1/sessions/conv_codex_empty_then_ready/codex-model-options")
         == 2
     )
-    assert [m["id"] for m in snapshot.codex_model_options] == ["gpt-5.5"]
-    assert snapshot.codex_model_options[0]["defaultReasoningEffort"] == "xhigh"
+    assert [m["id"] for m in snapshot.model_options] == ["gpt-5.5"]
+    assert snapshot.model_options[0]["defaultReasoningEffort"] == "xhigh"
 
 
 @pytest.mark.asyncio
-async def test_session_snapshot_retries_503_codex_model_options(
+async def test_session_snapshot_retries_503_model_options(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -873,8 +873,8 @@ async def test_session_snapshot_retries_503_codex_model_options(
     _mod._session_status_cache.clear()
     _mod._runner_skills_cache.clear()
     _mod._runner_skills_inflight.clear()
-    _mod._codex_model_options_cache.clear()
-    _mod._codex_model_options_inflight.clear()
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
     monkeypatch.setattr(_mod, "_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S", (0.0,))
 
     class _FakeResponse:
@@ -951,8 +951,8 @@ async def test_session_snapshot_retries_503_codex_model_options(
         conv_store,  # type: ignore[arg-type]
         "conv_codex_503_then_ready",
     )
-    assert first.codex_model_options == []
-    await _drain_codex_model_options("conv_codex_503_then_ready")
+    assert first.model_options == []
+    await _drain_model_options("conv_codex_503_then_ready")
     snapshot = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
         "conv_codex_503_then_ready",
@@ -964,8 +964,8 @@ async def test_session_snapshot_retries_503_codex_model_options(
         fake_client.get_calls.count("/v1/sessions/conv_codex_503_then_ready/codex-model-options")
         == 2
     )
-    assert [m["id"] for m in snapshot.codex_model_options] == ["gpt-5.4"]
-    assert snapshot.codex_model_options[0]["defaultReasoningEffort"] == "medium"
+    assert [m["id"] for m in snapshot.model_options] == ["gpt-5.4"]
+    assert snapshot.model_options[0]["defaultReasoningEffort"] == "medium"
 
 
 @pytest.mark.asyncio

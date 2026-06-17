@@ -245,7 +245,7 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
       ? (JSON.parse(init.body as string) as {
           runner_id?: string;
           cost_control_mode_override?: "on" | "off" | null;
-          codex_plan_mode?: boolean;
+          collaboration_mode?: string;
         })
       : {};
     const labels = { ...(sessionLabels.get(sessionId) ?? {}) };
@@ -258,10 +258,8 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
         sessionCostControlOverrides.set(sessionId, body.cost_control_mode_override);
       }
     }
-    if ("codex_plan_mode" in body && typeof body.codex_plan_mode === "boolean") {
-      labels["omnigent.codex_native.collaboration_mode"] = body.codex_plan_mode
-        ? "plan"
-        : "default";
+    if ("collaboration_mode" in body && typeof body.collaboration_mode === "string") {
+      labels["omnigent.codex_native.collaboration_mode"] = body.collaboration_mode;
       sessionLabels.set(sessionId, labels);
     }
     return mockResponse({
@@ -3343,7 +3341,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
             llm_model: "gpt-5.5",
             harness: "codex",
             skills: [{ name: "inspect", description: "Read session state" }],
-            codex_model_options: [
+            model_options: [
               {
                 id: "gpt-5.5",
                 model: "gpt-5.5",
@@ -3452,23 +3450,23 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     });
   });
 
-  describe("session.codex_plan_mode", () => {
-    it("reflects a Codex Plan-mode event for the active session", () => {
+  describe("session.collaboration_mode", () => {
+    it("reflects a collaboration-mode event for the active session", () => {
       useChatStore.setState({ conversationId: "conv_abc", codexPlanMode: false });
       handleSessionEvent({
-        type: "session_codex_plan_mode",
+        type: "session_collaboration_mode",
         conversationId: "conv_abc",
-        enabled: true,
+        mode: "plan",
       });
       expect(useChatStore.getState().codexPlanMode).toBe(true);
     });
 
-    it("ignores a Codex Plan-mode event from a different session", () => {
+    it("ignores a collaboration-mode event from a different session", () => {
       useChatStore.setState({ conversationId: "conv_open", codexPlanMode: false });
       handleSessionEvent({
-        type: "session_codex_plan_mode",
+        type: "session_collaboration_mode",
         conversationId: "conv_other",
-        enabled: true,
+        mode: "plan",
       });
       expect(useChatStore.getState().codexPlanMode).toBe(false);
     });
@@ -4756,7 +4754,7 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     reasoning_effort?: string | null;
     model_override?: string | null;
     parent_session_id?: string | null;
-    codex_model_options?: Array<Record<string, unknown>>;
+    model_options?: Array<Record<string, unknown>>;
   }
 
   /** Override the snapshot GET so a test can inject labels + overrides. */
@@ -4775,7 +4773,7 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
           reasoning_effort: overrides.reasoning_effort ?? null,
           model_override: overrides.model_override ?? null,
           parent_session_id: overrides.parent_session_id ?? null,
-          codex_model_options: overrides.codex_model_options ?? [],
+          model_options: overrides.model_options ?? [],
         });
       }
       return defaultFetchHandler(input, init);
@@ -4824,7 +4822,7 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     seedSession("conv_codex", []);
     withSnapshot("conv_codex", {
       labels: { "omnigent.wrapper": "codex-native-ui" },
-      codex_model_options: [
+      model_options: [
         {
           id: "gpt-5.4",
           model: "databricks-gpt-5-4",
@@ -5022,7 +5020,7 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
 
     await useChatStore.getState().setCodexPlanMode(true);
 
-    expect(patchCallsFor("conv_plan_toggle")).toEqual([{ codex_plan_mode: true }]);
+    expect(patchCallsFor("conv_plan_toggle")).toEqual([{ collaboration_mode: "plan" }]);
     expect(useChatStore.getState().codexPlanMode).toBe(true);
   });
 
@@ -5052,7 +5050,7 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
       "Could not enter Plan mode",
     );
 
-    expect(patchCallsFor("conv_plan_failure")).toEqual([{ codex_plan_mode: true }]);
+    expect(patchCallsFor("conv_plan_failure")).toEqual([{ collaboration_mode: "plan" }]);
     expect(useChatStore.getState().codexPlanMode).toBe(false);
     expect(sessionLabels.get("conv_plan_failure")).not.toHaveProperty(
       "omnigent.codex_native.collaboration_mode",

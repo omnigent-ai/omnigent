@@ -185,7 +185,7 @@ interface SessionResponseWire {
    * description. Surfaced in the web composer's slash-command menu.
    */
   skills?: SkillSummary[];
-  codex_model_options?: CodexModelOption[];
+  model_options?: CodexModelOption[];
   /**
    * True while the runner is auto-creating a terminal-first session's
    * terminal. Drives the Terminal-pill spinner; absent on older
@@ -279,7 +279,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     subAgentName: wire.sub_agent_name ?? null,
     todos: wire.todos ?? [],
     skills: wire.skills ?? [],
-    codexModelOptions: wire.codex_model_options ?? [],
+    codexModelOptions: wire.model_options ?? [],
     terminalPending: wire.terminal_pending ?? false,
     sandboxStatus: wire.sandbox_status ?? null,
   };
@@ -573,7 +573,7 @@ export async function updateSession(
     body.model_override = updates.modelOverride ?? "default";
   }
   if (updates.codexPlanMode !== undefined) {
-    body.codex_plan_mode = updates.codexPlanMode;
+    body.collaboration_mode = updates.codexPlanMode ? "plan" : "default";
   }
   if ("costControlModeOverride" in updates) {
     body.cost_control_mode_override = updates.costControlModeOverride ?? null;

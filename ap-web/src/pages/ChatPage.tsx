@@ -84,10 +84,7 @@ import {
 } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
-import {
-  codexEffortLevelsForModel,
-  findCodexModelOption,
-} from "@/lib/codexNativeModels";
+import { codexEffortLevelsForModel, findCodexModelOption } from "@/lib/codexNativeModels";
 import {
   consumePendingInitialPrompt,
   type PendingInitialPrompt,
@@ -4214,9 +4211,7 @@ function AgentPicker({
             dropdown doesn't open with a stray divider at the top. */}
         {showEffort && (
           <>
-            {(showAgents || modelOptions.length > 0) && (
-              <DropdownMenuSeparator className="my-1" />
-            )}
+            {(showAgents || modelOptions.length > 0) && <DropdownMenuSeparator className="my-1" />}
             <PickerSectionHeader>Effort</PickerSectionHeader>
             {effortLevels.map((level) => (
               <DropdownMenuItem

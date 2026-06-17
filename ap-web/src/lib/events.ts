@@ -467,15 +467,15 @@ export interface SessionReasoningEffortEvent {
 }
 
 /**
- * `session.codex_plan_mode` — active Codex collaboration-mode switch.
+ * `session.collaboration_mode` — active Codex collaboration-mode switch.
  *
  * Emitted when a Codex-native thread enters or exits Plan mode, whether from
  * the web UI toggle or from the native Codex TUI.
  */
-export interface SessionCodexPlanModeEvent {
-  type: "session_codex_plan_mode";
+export interface SessionCollaborationModeEvent {
+  type: "session_collaboration_mode";
   conversationId: string;
-  enabled: boolean;
+  mode: string;
 }
 
 /**
@@ -711,12 +711,12 @@ export interface SessionSkillsEvent {
 }
 
 /**
- * `session.codex_model_options` — the Codex app-server model catalog just
+ * `session.model_options` — the Codex app-server model catalog just
  * resolved for a session. Consumers refetch the session snapshot and apply
  * its now-populated `codexModelOptions`.
  */
-export interface SessionCodexModelOptionsEvent {
-  type: "session_codex_model_options";
+export interface SessionModelOptionsEvent {
+  type: "session_model_options";
   conversationId: string;
 }
 
@@ -776,7 +776,7 @@ export type StreamEvent =
   | SessionUsageEvent
   | SessionModelEvent
   | SessionReasoningEffortEvent
-  | SessionCodexPlanModeEvent
+  | SessionCollaborationModeEvent
   | SessionAgentChangedEvent
   | SessionTodosEvent
   | SessionTerminalPendingEvent
@@ -790,5 +790,5 @@ export type StreamEvent =
   | SessionChangedFilesInvalidatedEvent
   | SessionTerminalActivityEvent
   | SessionSkillsEvent
-  | SessionCodexModelOptionsEvent
+  | SessionModelOptionsEvent
   | SessionPresenceEvent;

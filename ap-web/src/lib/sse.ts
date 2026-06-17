@@ -33,7 +33,7 @@ import type {
   RetryEvent,
   SessionChangedFilesInvalidatedEvent,
   SessionChildSessionUpdatedEvent,
-  SessionCodexModelOptionsEvent,
+  SessionModelOptionsEvent,
   SessionCreatedEvent,
   SessionInputConsumedEvent,
   SessionInterruptedEvent,
@@ -46,7 +46,7 @@ import type {
   SessionTerminalActivityEvent,
   SessionStatusEvent,
   SessionModelEvent,
-  SessionCodexPlanModeEvent,
+  SessionCollaborationModeEvent,
   SessionReasoningEffortEvent,
   SessionAgentChangedEvent,
   SessionTodosEvent,
@@ -502,16 +502,16 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       reasoningEffort,
     } satisfies SessionReasoningEffortEvent;
   }
-  if (eventType === "session.codex_plan_mode") {
+  if (eventType === "session.collaboration_mode") {
     const conversationId = data.conversation_id;
     if (typeof conversationId !== "string" || !conversationId) return null;
-    const enabled = data.enabled;
-    if (typeof enabled !== "boolean") return null;
+    const mode = data.mode;
+    if (typeof mode !== "string") return null;
     return {
-      type: "session_codex_plan_mode",
+      type: "session_collaboration_mode",
       conversationId,
-      enabled,
-    } satisfies SessionCodexPlanModeEvent;
+      mode,
+    } satisfies SessionCollaborationModeEvent;
   }
   if (eventType === "session.agent_changed") {
     const conversationId = data.conversation_id;
@@ -704,13 +704,13 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       conversationId,
     } satisfies SessionSkillsEvent;
   }
-  if (eventType === "session.codex_model_options") {
+  if (eventType === "session.model_options") {
     const conversationId = data.conversation_id;
     if (typeof conversationId !== "string" || !conversationId) return null;
     return {
-      type: "session_codex_model_options",
+      type: "session_model_options",
       conversationId,
-    } satisfies SessionCodexModelOptionsEvent;
+    } satisfies SessionModelOptionsEvent;
   }
   if (eventType === "session.presence") {
     const conversationId = data.conversation_id;

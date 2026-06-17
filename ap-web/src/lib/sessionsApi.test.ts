@@ -409,7 +409,7 @@ describe("runner binding", () => {
     expect(JSON.parse(init.body as string)).toEqual({ model_override: "default" });
   });
 
-  it("PATCHes codex_plan_mode as a boolean", async () => {
+  it("PATCHes collaboration_mode as a string", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
         id: "conv_abc",
@@ -424,7 +424,7 @@ describe("runner binding", () => {
     const session = await updateSession("conv_abc", { codexPlanMode: true });
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(JSON.parse(init.body as string)).toEqual({ codex_plan_mode: true });
+    expect(JSON.parse(init.body as string)).toEqual({ collaboration_mode: "plan" });
     expect(session.labels?.["omnigent.codex_native.collaboration_mode"]).toBe("plan");
   });
 

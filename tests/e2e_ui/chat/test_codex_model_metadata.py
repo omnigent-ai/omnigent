@@ -41,11 +41,11 @@ def _patch_session_as_codex_native(page: Page, session_id: str) -> list[dict]:
             request_body = json.loads(request.post_data or "{}")
             patch_bodies.append(request_body)
             payload = dict(latest_payload or {})
-            if "codex_plan_mode" in request_body:
+            if "collaboration_mode" in request_body:
                 labels = dict(payload.get("labels", {}))
-                labels["omnigent.codex_native.collaboration_mode"] = (
-                    "plan" if request_body["codex_plan_mode"] else "default"
-                )
+                labels["omnigent.codex_native.collaboration_mode"] = request_body[
+                    "collaboration_mode"
+                ]
                 payload["labels"] = labels
         else:
             route.continue_()
@@ -58,7 +58,7 @@ def _patch_session_as_codex_native(page: Page, session_id: str) -> list[dict]:
         payload["harness"] = "codex"
         payload["llm_model"] = "gpt-5.5"
         payload["reasoning_effort"] = "xhigh"
-        payload["codex_model_options"] = [
+        payload["model_options"] = [
             {
                 "id": "gpt-5.5",
                 "model": "databricks-gpt-5-5",
@@ -135,7 +135,7 @@ def test_codex_native_plan_mode_toggle_uses_codex_session_patch(
     """Toggle Codex Plan mode through the session PATCH route.
 
     The browser must expose the Plan button only for the codex-native wrapper,
-    send the typed ``codex_plan_mode`` flag, and render the persistent status
+    send the typed ``collaboration_mode`` field, and render the persistent status
     badge from Codex's raw ``omnigent.codex_native.collaboration_mode`` label
     returned by the session snapshot.
 
@@ -155,25 +155,29 @@ def test_codex_native_plan_mode_toggle_uses_codex_session_patch(
     expect(plan_toggle).to_have_attribute("aria-pressed", "false")
 
     with page.expect_response(
-        lambda response: response.request.method == "PATCH"
-        and urlparse(response.url).path == f"/v1/sessions/{session_id}"
-        and response.status == 200
+        lambda response: (
+            response.request.method == "PATCH"
+            and urlparse(response.url).path == f"/v1/sessions/{session_id}"
+            and response.status == 200
+        )
     ):
         plan_toggle.click()
 
-    assert patch_bodies[-1] == {"codex_plan_mode": True}
+    assert patch_bodies[-1] == {"collaboration_mode": "plan"}
     expect(plan_toggle).to_have_attribute("aria-label", "Exit Plan mode")
     expect(plan_toggle).to_have_attribute("aria-pressed", "true")
     expect(page.get_by_test_id("composer-plan-mode")).to_contain_text("Plan mode")
 
     with page.expect_response(
-        lambda response: response.request.method == "PATCH"
-        and urlparse(response.url).path == f"/v1/sessions/{session_id}"
-        and response.status == 200
+        lambda response: (
+            response.request.method == "PATCH"
+            and urlparse(response.url).path == f"/v1/sessions/{session_id}"
+            and response.status == 200
+        )
     ):
         plan_toggle.click()
 
-    assert patch_bodies[-1] == {"codex_plan_mode": False}
+    assert patch_bodies[-1] == {"collaboration_mode": "default"}
     expect(plan_toggle).to_have_attribute("aria-label", "Enter Plan mode")
     expect(plan_toggle).to_have_attribute("aria-pressed", "false")
     expect(page.get_by_test_id("composer-plan-mode")).to_have_count(0)

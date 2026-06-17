@@ -210,8 +210,7 @@ from omnigent.server.schemas import (
     SandboxStatus,
     ServerStreamEvent,
     SessionAgentChangedEvent,
-    SessionCodexModelOptionsEvent,
-    SessionCodexPlanModeEvent,
+    SessionCollaborationModeEvent,
     SessionCreatedEvent,
     SessionCreateMetadata,
     SessionCreateRequest,
@@ -225,6 +224,7 @@ from omnigent.server.schemas import (
     SessionLabelsResponse,
     SessionListItem,
     SessionModelEvent,
+    SessionModelOptionsEvent,
     SessionReasoningEffortEvent,
     SessionResourceListPage,
     SessionResourceObject,
@@ -438,19 +438,20 @@ def _codex_plan_mode_enabled(mode: str) -> bool:
     return mode == "plan"
 
 
-def _publish_codex_plan_mode(session_id: str, enabled: bool) -> None:
+def _publish_collaboration_mode(session_id: str, mode: str) -> None:
     """
-    Publish the live Codex Plan-mode flag for a session.
+    Publish the live collaboration-mode for a session.
 
     :param session_id: Session/conversation identifier, e.g.
         ``"conv_abc123"``.
-    :param enabled: ``True`` when Codex Plan mode is active.
+    :param mode: The active collaboration mode string, e.g.
+        ``"plan"`` or ``"default"``.
     :returns: None.
     """
-    event = SessionCodexPlanModeEvent(
-        type="session.codex_plan_mode",
+    event = SessionCollaborationModeEvent(
+        type="session.collaboration_mode",
         conversation_id=session_id,
-        enabled=enabled,
+        mode=mode,
     )
     session_stream.publish(session_id, event.model_dump())
 
@@ -778,8 +779,8 @@ _runner_skills_inflight: dict[str, asyncio.Task[None]] = {}
 # Per-session codex-native model catalog cache + in-flight fetch.
 # The snapshot warms this from the bound runner's live Codex app-server
 # (``model/list``) off the hot path, same shape as runner skills.
-_codex_model_options_cache: dict[str, list[dict[str, Any]]] = {}
-_codex_model_options_inflight: dict[str, asyncio.Task[None]] = {}
+_model_options_cache: dict[str, list[dict[str, Any]]] = {}
+_model_options_inflight: dict[str, asyncio.Task[None]] = {}
 _CODEX_MODEL_OPTIONS_RETRY_DELAYS_S = (0.25, 0.5, 1.0, 2.0, 2.0)
 
 
@@ -2045,7 +2046,7 @@ def _build_session_response(
     host_online: bool | None = None,
     pending_elicitation_events: list[dict[str, Any]] | None = None,
     subtree_usage: dict[str, Any] | None = None,
-    codex_model_options: list[dict[str, Any]] | None = None,
+    model_options: list[dict[str, Any]] | None = None,
 ) -> SessionResponse:
     """
     Build a :class:`SessionResponse` from store-side entities.
@@ -2105,7 +2106,7 @@ def _build_session_response(
         ``None`` falls back to this conversation's own ``session_usage``
         (correct for childless sessions). Passed by the snapshot path;
         other callers omit it.
-    :param codex_model_options: Raw Codex app-server ``model/list``
+    :param model_options: Raw Codex app-server ``model/list``
         options for this session, e.g. ``[{"id": "gpt-5.5"}]``.
         ``None`` is treated as ``[]``.
     :returns: The :class:`SessionResponse` for the API.
@@ -2181,7 +2182,7 @@ def _build_session_response(
         # non-claude-native sessions or before the first poll tick.
         todos=_session_todos_cache.get(conv.id, []),
         skills=skills or [],
-        codex_model_options=codex_model_options or [],
+        model_options=model_options or [],
         # Replay terminal spin-up state so a client connecting while the
         # runner is still creating a terminal-first session's terminal
         # sees the Terminal-pill spinner. Populated by the runner SSE
@@ -3193,7 +3194,7 @@ async def _persist_external_codex_collaboration_mode_change(
         session_id,
         {_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY: mode},
     )
-    _publish_codex_plan_mode(session_id, _codex_plan_mode_enabled(mode))
+    _publish_collaboration_mode(session_id, mode)
 
 
 async def _persist_model_change_note(
@@ -4567,7 +4568,7 @@ def _require_external_status_forward(
         )
 
 
-def _require_codex_plan_mode_forward(
+def _require_collaboration_mode_forward(
     session_id: str,
     enabled: bool,
     runner_result: _RunnerForwardResult | None,
@@ -4890,19 +4891,19 @@ def _publish_runner_skills(session_id: str) -> None:
     session_stream.publish(session_id, event.model_dump())
 
 
-def _publish_codex_model_options(session_id: str) -> None:
+def _publish_model_options(session_id: str) -> None:
     """
-    Publish a typed :class:`SessionCodexModelOptionsEvent` to the live stream.
+    Publish a typed :class:`SessionModelOptionsEvent` to the live stream.
 
     Fired when the background Codex ``model/list`` fetch populates the
     per-session model-options cache. Connected clients re-read the session
-    snapshot and apply its cache-backed ``codex_model_options`` field.
+    snapshot and apply its cache-backed ``model_options`` field.
 
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
     """
-    event = SessionCodexModelOptionsEvent(
-        type="session.codex_model_options",
+    event = SessionModelOptionsEvent(
+        type="session.model_options",
         conversation_id=session_id,
     )
     session_stream.publish(session_id, event.model_dump())
@@ -4933,9 +4934,9 @@ def _invalidate_runner_backed_snapshot_state(
         inflight = _runner_skills_inflight.pop(session_id, None)
         if inflight is not None:
             inflight.cancel()
-    _codex_model_options_cache.pop(session_id, None)
+    _model_options_cache.pop(session_id, None)
     if cancel_inflight:
-        codex_inflight = _codex_model_options_inflight.pop(session_id, None)
+        codex_inflight = _model_options_inflight.pop(session_id, None)
         if codex_inflight is not None:
             codex_inflight.cancel()
 
@@ -13024,33 +13025,39 @@ def create_sessions_router(
                     allowed_tunnel_tokens=runner_tunnel_tokens,
                     multi_user=permission_store is not None,
                 )
-        codex_plan_mode_requested = "codex_plan_mode" in body.model_fields_set
+        collaboration_mode_requested = "collaboration_mode" in body.model_fields_set
         requested_codex_collaboration_mode: str | None = None
-        conv_for_codex_plan_mode: Conversation | None = None
-        if codex_plan_mode_requested:
-            if body.codex_plan_mode is None:
+        conv_for_collaboration_mode: Conversation | None = None
+        if collaboration_mode_requested:
+            if body.collaboration_mode is None:
                 raise OmnigentError(
-                    "codex_plan_mode must be true or false",
+                    "collaboration_mode must be a non-empty string",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            conv_for_codex_plan_mode = await asyncio.to_thread(
+            if body.collaboration_mode not in _CODEX_NATIVE_COLLABORATION_MODES:
+                raise OmnigentError(
+                    "collaboration_mode must be one of "
+                    f"{sorted(_CODEX_NATIVE_COLLABORATION_MODES)}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            conv_for_collaboration_mode = await asyncio.to_thread(
                 conversation_store.get_conversation,
                 session_id,
             )
-            if conv_for_codex_plan_mode is None:
+            if conv_for_collaboration_mode is None:
                 raise OmnigentError(
                     "Session not found",
                     code=ErrorCode.NOT_FOUND,
                 )
             if (
-                conv_for_codex_plan_mode.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+                conv_for_collaboration_mode.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
                 != _CODEX_NATIVE_WRAPPER_LABEL_VALUE
             ):
                 raise OmnigentError(
-                    "codex_plan_mode is only supported for codex-native sessions",
+                    "collaboration_mode is only supported for codex-native sessions",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            requested_codex_collaboration_mode = "plan" if body.codex_plan_mode else "default"
+            requested_codex_collaboration_mode = body.collaboration_mode
         labels_to_set = dict(body.labels or {})
         if requested_codex_collaboration_mode is not None:
             labels_to_set[_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY] = (
@@ -13196,7 +13203,7 @@ def create_sessions_router(
                     conversation_store,
                 )
         else:
-            conv = conv_for_codex_plan_mode
+            conv = conv_for_collaboration_mode
             if conv is None:
                 conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
@@ -13277,7 +13284,7 @@ def create_sessions_router(
                     "enabled": _codex_plan_enabled,
                 },
             )
-            _require_codex_plan_mode_forward(
+            _require_collaboration_mode_forward(
                 session_id,
                 _codex_plan_enabled,
                 _runner_result,
@@ -13285,9 +13292,9 @@ def create_sessions_router(
         if labels_to_set:
             await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_set)
         if requested_codex_collaboration_mode is not None:
-            _publish_codex_plan_mode(
+            _publish_collaboration_mode(
                 session_id,
-                _codex_plan_mode_enabled(requested_codex_collaboration_mode),
+                requested_codex_collaboration_mode,
             )
         if body.external_session_id is not None:
             try:
@@ -17762,7 +17769,7 @@ async def _load_runner_skills(
     _publish_runner_skills(session_id)
 
 
-def _codex_model_options_from_wire(raw_models: Any) -> list[dict[str, Any]]:
+def _model_options_from_wire(raw_models: Any) -> list[dict[str, Any]]:
     """
     Validate runner-returned raw Codex ``model/list`` data.
 
@@ -17782,7 +17789,7 @@ def _codex_model_options_from_wire(raw_models: Any) -> list[dict[str, Any]]:
     return options
 
 
-async def _fetch_codex_model_options(
+async def _fetch_model_options(
     runner_client: httpx.AsyncClient | None,
     session_id: str,
     conv: Conversation,
@@ -17807,19 +17814,17 @@ async def _fetch_codex_model_options(
         return []
     if runner_client is None:
         return []
-    cached = _codex_model_options_cache.get(session_id)
+    cached = _model_options_cache.get(session_id)
     if cached is not None:
         return cached
-    if session_id not in _codex_model_options_inflight:
-        task = asyncio.create_task(_load_codex_model_options(runner_client, session_id))
-        _codex_model_options_inflight[session_id] = task
-        task.add_done_callback(
-            lambda _t, sid=session_id: _codex_model_options_inflight.pop(sid, None)
-        )
+    if session_id not in _model_options_inflight:
+        task = asyncio.create_task(_load_model_options(runner_client, session_id))
+        _model_options_inflight[session_id] = task
+        task.add_done_callback(lambda _t, sid=session_id: _model_options_inflight.pop(sid, None))
     return []
 
 
-async def _load_codex_model_options(
+async def _load_model_options(
     runner_client: httpx.AsyncClient,
     session_id: str,
 ) -> None:
@@ -17845,7 +17850,7 @@ async def _load_codex_model_options(
                 continue
             return
         try:
-            options = _codex_model_options_from_wire(resp.json().get("models", []))
+            options = _model_options_from_wire(resp.json().get("models", []))
         except (ValueError, KeyError, TypeError, ValidationError):
             _logger.debug("Runner Codex model-options payload malformed for %s", session_id)
             return
@@ -17857,8 +17862,8 @@ async def _load_codex_model_options(
                 await asyncio.sleep(_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S[attempt])
                 continue
             return
-        _codex_model_options_cache[session_id] = options
-        _publish_codex_model_options(session_id)
+        _model_options_cache[session_id] = options
+        _publish_model_options(session_id)
         return
 
 
@@ -18069,7 +18074,7 @@ async def _get_session_snapshot(
     # session's live Codex app-server ``model/list`` response. Best-effort
     # and cache-backed like skills so a snapshot poll cannot wedge the
     # runner while a turn is active.
-    codex_model_options = await _fetch_codex_model_options(runner_client, session_id, conv)
+    model_options = await _fetch_model_options(runner_client, session_id, conv)
     # Dynamic override from the forwarder (real Claude Code window).
     # Only present after the first statusLine tick; before that the
     # spec default applies.
@@ -18107,7 +18112,7 @@ async def _get_session_snapshot(
         last_task_error=last_task_error,
         agent_name=agent_name,
         skills=skills,
-        codex_model_options=codex_model_options,
+        model_options=model_options,
         runner_online=runner_online,
         host_online=host_online,
         pending_elicitation_events=await asyncio.to_thread(
