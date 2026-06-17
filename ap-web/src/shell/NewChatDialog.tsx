@@ -1089,9 +1089,7 @@ export function NewChatLandingScreen() {
           <div className="flex min-w-0 flex-1 items-baseline gap-2.5">
             <span className="truncate">{agent.display_name}</span>
             {blurb && (
-              <span className="truncate text-[11px] text-muted-foreground/70">
-                {blurb}
-              </span>
+              <span className="truncate text-[11px] text-muted-foreground/70">{blurb}</span>
             )}
           </div>
         </AgentRowTooltip>
@@ -1485,14 +1483,15 @@ export function NewChatLandingScreen() {
                     >
                       {/* Built-in agents first, then a divider, then any
                           custom (user-registered) agents. renderAgentRow is
-                          defined once and reused for both groups. */}
+                          defined once and reused for both groups. The divider
+                          only renders when BOTH groups are non-empty, so a
+                          deployment with only custom agents (or only built-ins)
+                          never shows a leading/dangling separator. */}
                       {builtinAgents.map((agent) => renderAgentRow(agent))}
-                      {customAgents.length > 0 && (
-                        <>
-                          <DropdownMenuSeparator />
-                          {customAgents.map((agent) => renderAgentRow(agent))}
-                        </>
+                      {builtinAgents.length > 0 && customAgents.length > 0 && (
+                        <DropdownMenuSeparator />
                       )}
+                      {customAgents.map((agent) => renderAgentRow(agent))}
                     </DropdownMenuContent>
                   </DropdownMenu>
                 ) : (
