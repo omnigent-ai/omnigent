@@ -289,6 +289,13 @@ export interface ChatState {
    */
   sessionModelOverride: string | null;
   /**
+   * Active permission mode for the current claude-native session, e.g.
+   * ``"auto"`` / ``"plan"`` / ``"default"`` / ``"acceptEdits"``. Kept in
+   * sync by ``session.mode`` SSE events. ``null`` when unknown (non-native
+   * sessions or before the first mode event).
+   */
+  permissionMode: string | null;
+  /**
    * Per-session cost-control switch for the active session: ``"on"``
    * activates the spec's configured cost-control mode, ``"off"``
    * disables cost control, ``null`` defers to the spec default.
@@ -685,6 +692,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   selectedEffort: loadPickerPref(PICKER_PREF_EFFORT_KEY),
   selectedModel: loadPickerPref(PICKER_PREF_MODEL_KEY),
   sessionModelOverride: null,
+  permissionMode: null,
   costControlModeOverride: null,
   codexPlanMode: false,
   hasMoreHistory: false,
@@ -1166,6 +1174,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         // ``sessionModelOverride`` and the cost switch ARE session-scoped,
         // so they reset with the session and re-hydrate from the snapshot.
         sessionModelOverride: null,
+        permissionMode: null,
         costControlModeOverride: null,
         codexPlanMode: false,
         contextWindow: null,
@@ -3391,6 +3400,13 @@ export function handleSessionEvent(event: StreamEvent): void {
       useChatStore.setState((s) =>
         s.conversationId === event.conversationId ? { codexPlanMode: event.mode === "plan" } : {},
       );
+      return;
+    case "session_mode":
+      // A setMode verdict returned to Claude Code via the PermissionRequest
+      // hook (e.g. ExitPlanMode approved with "use auto mode"). Reflect the
+      // new mode in the UI badge. Not persisted on the server — resets to
+      // null on reconnect until the next mode-changing event arrives.
+      useChatStore.setState({ permissionMode: event.mode });
       return;
     case "session_presence":
       // Full-state replacement — every presence event carries the

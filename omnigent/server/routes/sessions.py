@@ -225,6 +225,7 @@ from omnigent.server.schemas import (
     SessionInterruptedPayload,
     SessionLabelsResponse,
     SessionListItem,
+    SessionModeEvent,
     SessionModelEvent,
     SessionModelOptionsEvent,
     SessionReasoningEffortEvent,
@@ -14077,6 +14078,23 @@ def create_sessions_router(
             decision["updatedPermissions"] = [
                 {"type": "setMode", "mode": "default", "destination": "session"}
             ]
+        # Publish a ``session.mode`` SSE event when a ``setMode``
+        # permission update was stamped, so the web UI can reflect
+        # the new mode without a reload.
+        set_mode_entries = [
+            p
+            for p in decision.get("updatedPermissions", [])
+            if isinstance(p, dict) and p.get("type") == "setMode"
+        ]
+        if set_mode_entries:
+            new_mode = set_mode_entries[0].get("mode")
+            if isinstance(new_mode, str) and new_mode:
+                mode_event = SessionModeEvent(
+                    type="session.mode",
+                    conversation_id=session_id,
+                    mode=new_mode,
+                )
+                session_stream.publish(session_id, mode_event.model_dump())
         body = {
             "hookSpecificOutput": {
                 "hookEventName": "PermissionRequest",

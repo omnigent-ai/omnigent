@@ -48,6 +48,7 @@ import type {
   SessionModelEvent,
   SessionCollaborationModeEvent,
   SessionReasoningEffortEvent,
+  SessionModeEvent,
   SessionAgentChangedEvent,
   SessionTodosEvent,
   SessionSandboxStatusEvent,
@@ -512,6 +513,13 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       conversationId,
       mode,
     } satisfies SessionCollaborationModeEvent;
+  }
+  if (eventType === "session.mode") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const mode = data.mode;
+    if (typeof mode !== "string" || !mode) return null;
+    return { type: "session_mode", conversationId, mode } satisfies SessionModeEvent;
   }
   if (eventType === "session.agent_changed") {
     const conversationId = data.conversation_id;

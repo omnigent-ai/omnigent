@@ -2180,6 +2180,31 @@ class SessionCollaborationModeEvent(_SSEEventBase):
     mode: str
 
 
+class SessionModeEvent(_SSEEventBase):
+    """
+    Permission-mode update from a claude-native session.
+
+    Emitted after a ``setMode`` verdict is returned to Claude Code via the
+    PermissionRequest hook (e.g. the user approves ExitPlanMode and switches
+    to ``auto``, or approves an edit and switches to ``acceptEdits``). Lets
+    the web UI reflect the active mode without a reload.
+
+    :param type: Always ``"session.mode"``.
+    :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
+    :param mode: Claude Code permission-mode string the session is now on,
+        e.g. ``"auto"`` / ``"plan"`` / ``"default"`` / ``"acceptEdits"`` /
+        ``"bypassPermissions"``.
+
+    Category: **transient** (SSE-only). The current mode is not persisted on
+    the conversation row; clients derive it from the stream of ``session.mode``
+    events during a live connection.
+    """
+
+    type: Literal["session.mode"]
+    conversation_id: str
+    mode: str
+
+
 class SessionAgentChangedEvent(_SSEEventBase):
     """
     Bound-agent change on a live session.
@@ -3409,6 +3434,7 @@ ServerStreamEvent = Annotated[
     | SessionModelEvent
     | SessionReasoningEffortEvent
     | SessionCollaborationModeEvent
+    | SessionModeEvent
     | SessionAgentChangedEvent
     | SessionTodosEvent
     | SessionTerminalPendingEvent

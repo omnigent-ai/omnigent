@@ -479,6 +479,21 @@ export interface SessionCollaborationModeEvent {
 }
 
 /**
+ * `session.mode` — permission-mode switch from a claude-native session.
+ *
+ * Emitted by the server when a `setMode` verdict is returned to Claude Code
+ * via the PermissionRequest hook (e.g. the user approves ExitPlanMode with
+ * "use auto mode", or approves an edit with "allow all edits"). Carries the
+ * new permission-mode string so the web UI can display it live.
+ */
+export interface SessionModeEvent {
+  type: "session_mode";
+  conversationId: string;
+  /** Claude Code permission-mode, e.g. `"auto"` / `"plan"` / `"default"` / `"acceptEdits"`. */
+  mode: string;
+}
+
+/**
  * `session.agent_changed` — the session's bound agent was switched in
  * place (switch-agent route).
  *
@@ -777,6 +792,7 @@ export type StreamEvent =
   | SessionModelEvent
   | SessionReasoningEffortEvent
   | SessionCollaborationModeEvent
+  | SessionModeEvent
   | SessionAgentChangedEvent
   | SessionTodosEvent
   | SessionTerminalPendingEvent

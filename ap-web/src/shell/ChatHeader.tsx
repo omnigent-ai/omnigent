@@ -25,7 +25,62 @@ import { AgentInfoButton } from "@/components/AgentInfo";
 import { PresenceAvatars } from "@/components/PresenceAvatars";
 import type { Agent } from "@/hooks/useAgents";
 import { cn } from "@/lib/utils";
+import { useChatStore } from "@/store/chatStore";
 import { TAB_BADGE_BASE } from "./railTabs";
+
+/** Label + color for a permission-mode badge. Null means: don't render. */
+function permissionModeMeta(
+  mode: string | null,
+): { label: string; className: string } | null {
+  switch (mode) {
+    case "auto":
+      return {
+        label: "Auto mode",
+        className:
+          "border-green-300 bg-green-50 text-green-700 dark:border-green-500/30 dark:bg-green-500/10 dark:text-green-400",
+      };
+    case "plan":
+      return {
+        label: "Plan mode",
+        className:
+          "border-amber-300 bg-amber-50 text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400",
+      };
+    case "acceptEdits":
+      return {
+        label: "Accept edits",
+        className:
+          "border-blue-300 bg-blue-50 text-blue-700 dark:border-blue-500/30 dark:bg-blue-500/10 dark:text-blue-400",
+      };
+    case "bypassPermissions":
+      return {
+        label: "Bypass permissions",
+        className:
+          "border-red-300 bg-red-50 text-red-700 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-400",
+      };
+    default:
+      return null;
+  }
+}
+
+/**
+ * Shows the active Claude Code permission mode as a small badge.
+ * Reads from the chat store directly; renders nothing for `null` / `"default"`.
+ */
+function PermissionModeBadge() {
+  const permissionMode = useChatStore((s) => s.permissionMode);
+  const meta = permissionModeMeta(permissionMode);
+  if (!meta) return null;
+  return (
+    <span
+      className={cn(
+        "hidden select-none rounded border px-1.5 py-0.5 text-[11px] font-medium leading-none md:inline-flex",
+        meta.className,
+      )}
+    >
+      {meta.label}
+    </span>
+  );
+}
 
 /**
  * Gating flags + handlers for the mobile-only session-menu FAB (the
@@ -249,6 +304,10 @@ export function ChatHeader({
       </div>
 
       <div className="flex items-center gap-1">
+        {/* Permission-mode badge (plan / auto / acceptEdits / bypassPermissions).
+            Self-contained — reads the chat store directly, renders
+            nothing for null / "default". */}
+        {conversationId && <PermissionModeBadge />}
         {/* Other users currently viewing this session (presence).
             Self-contained — reads the chat store directly, renders
             nothing when the user is alone. */}
