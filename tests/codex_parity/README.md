@@ -105,12 +105,15 @@ Current executor-observable parity targets:
   - text delta routing and completed-turn response
 - selected request-routing behavior from `codex-rs/core/tests/suite/*`
   - dynamic tool call/result round trip through real Codex app-server
+- Codex app-server goal operations
+  - `thread/goal/set` + `thread/goal/get` + `thread/goal/clear` round trip
+  - explicit `tokenBudget: null` preservation
 
 Not yet represented here: upstream SDK-only app-server tests for lifecycle,
-login, approvals, goal operations, steer/interrupt, local/remote image input,
-and skill input. Those APIs do not have a direct Omnigent `CodexExecutor`
-surface yet, so they need either executor-facing analogs or a separate SDK
-compatibility harness before they can be one-for-one parity tests.
+login, approvals, steer/interrupt, local/remote image input, and skill input.
+Those APIs do not have a direct Omnigent `CodexExecutor` surface yet, so they
+need either executor-facing analogs or a separate SDK compatibility harness
+before they can be one-for-one parity tests.
 
 ## Running
 

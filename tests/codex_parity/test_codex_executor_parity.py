@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -143,6 +144,32 @@ async def _run_turn(
     ):
         events.append(event)
     return events
+
+
+def _app_session_for_test(executor: CodexExecutor) -> Any:
+    states = list(executor._session_states.values())  # noqa: SLF001
+    assert len(states) == 1
+    app_session = states[0].app_session
+    assert app_session is not None
+    assert app_session.thread_id is not None
+    return app_session
+
+
+async def _codex_goal_request(
+    app_session: Any,
+    method: str,
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    response = await asyncio.wait_for(
+        app_session._request(  # noqa: SLF001
+            method,
+            {"threadId": app_session.thread_id, **(params or {})},
+        ),
+        timeout=10,
+    )
+    result = response.get("result")
+    assert isinstance(result, dict)
+    return result
 
 
 @pytest.mark.asyncio
@@ -447,6 +474,99 @@ async def test_real_codex_dynamic_tool_round_trip(
     assert len(requests) == 2
     assert call_id in str(requests[1]["body"]["input"])
     assert "42" in str(requests[1]["body"]["input"])
+
+
+@pytest.mark.asyncio
+async def test_real_codex_goal_set_get_clear_round_trip(
+    codex_responses_sidecar,
+    resolved_codex_bin: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "source-codex-home"))
+    (tmp_path / "source-codex-home").mkdir()
+    sidecar = codex_responses_sidecar(
+        [
+            [
+                ev_response_created("resp-goal-bootstrap"),
+                ev_assistant_message("msg-goal-bootstrap", "thread ready"),
+                ev_completed("resp-goal-bootstrap"),
+            ]
+        ]
+    )
+    executor = _executor(resolved_codex_bin, sidecar.base_url, tmp_path / "workspace")
+    (tmp_path / "workspace").mkdir()
+
+    try:
+        _assert_completed(await _run_turn(executor, "bootstrap a goal thread"))
+        app_session = _app_session_for_test(executor)
+        thread_id = app_session.thread_id
+        objective = "Finish the migration"
+
+        set_result = await _codex_goal_request(
+            app_session,
+            "thread/goal/set",
+            {"objective": objective, "tokenBudget": 40000},
+        )
+
+        goal = set_result.get("goal")
+        assert isinstance(goal, dict)
+        assert goal["threadId"] == thread_id
+        assert goal["objective"] == objective
+        assert isinstance(goal["status"], str)
+        assert goal["status"]
+        assert goal["tokenBudget"] == 40000
+        assert isinstance(goal["tokensUsed"], int)
+        assert isinstance(goal["timeUsedSeconds"], int | float)
+
+        get_result = await _codex_goal_request(app_session, "thread/goal/get")
+        assert get_result.get("goal", {}).get("objective") == objective
+
+        clear_result = await _codex_goal_request(app_session, "thread/goal/clear")
+        assert isinstance(clear_result.get("cleared"), bool)
+
+        get_after_clear = await _codex_goal_request(app_session, "thread/goal/get")
+        assert get_after_clear.get("goal") is None
+    finally:
+        await executor.close()
+
+
+@pytest.mark.asyncio
+async def test_real_codex_goal_set_preserves_null_token_budget(
+    codex_responses_sidecar,
+    resolved_codex_bin: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "source-codex-home"))
+    (tmp_path / "source-codex-home").mkdir()
+    sidecar = codex_responses_sidecar(
+        [
+            [
+                ev_response_created("resp-goal-null-budget"),
+                ev_assistant_message("msg-goal-null-budget", "thread ready"),
+                ev_completed("resp-goal-null-budget"),
+            ]
+        ]
+    )
+    executor = _executor(resolved_codex_bin, sidecar.base_url, tmp_path / "workspace")
+    (tmp_path / "workspace").mkdir()
+
+    try:
+        _assert_completed(await _run_turn(executor, "bootstrap a goal thread"))
+        app_session = _app_session_for_test(executor)
+
+        set_result = await _codex_goal_request(
+            app_session,
+            "thread/goal/set",
+            {"objective": "Finish the migration", "tokenBudget": None},
+        )
+
+        goal = set_result.get("goal")
+        assert isinstance(goal, dict)
+        assert goal["tokenBudget"] is None
+    finally:
+        await executor.close()
 
 
 def _assert_completed(events: list[Any]) -> list[Any]:

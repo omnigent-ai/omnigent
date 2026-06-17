@@ -1220,7 +1220,7 @@ interface MainAgentSurfaceProps {
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
   /** Show the Codex Goal control. */
-  showCodexGoal: boolean;
+  showCodexGoal?: boolean;
   /** Latest advisor verdict for the cost-routing pill; null when none. */
   costRoutingVerdict: CostRoutingVerdict | null;
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child). */
@@ -1294,7 +1294,7 @@ function MainAgentSurface({
   modelPickerKind,
   codexModelOptions,
   showCodexPlanMode,
-  showCodexGoal,
+  showCodexGoal = false,
   costRoutingVerdict,
   costRoutingEligible,
   subAgentLabel,
@@ -2915,7 +2915,7 @@ interface ComposerProps {
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
   /** Show the Codex Goal control. */
-  showCodexGoal: boolean;
+  showCodexGoal?: boolean;
   /**
    * Terminal-first session (Chat/Terminal pill present). Presentation
    * only: tightens the composer's bottom padding to `pb-1.5` so it sits
@@ -3789,7 +3789,7 @@ export function Composer({
   modelPickerKind,
   codexModelOptions,
   showCodexPlanMode,
-  showCodexGoal,
+  showCodexGoal = false,
   isTerminalFirst = false,
   isNativeWrapper = false,
   reconnectHint = false,
