@@ -211,6 +211,7 @@ from omnigent.server.schemas import (
     ServerStreamEvent,
     SessionAgentChangedEvent,
     SessionCodexModelOptionsEvent,
+    SessionCodexPlanModeEvent,
     SessionCreatedEvent,
     SessionCreateMetadata,
     SessionCreateRequest,
@@ -424,6 +425,36 @@ _CODEX_NATIVE_SUBAGENT_ROLE_LABEL_KEY = "omnigent.codex_native.agent_role"
 _CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY = "omnigent.codex_native.collaboration_mode"
 _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE: str = "external_codex_collaboration_mode_change"
 _CODEX_NATIVE_COLLABORATION_MODES: frozenset[str] = frozenset({"default", "plan"})
+
+
+def _codex_plan_mode_enabled(mode: str) -> bool:
+    """
+    Convert a validated Codex collaboration mode kind to the UI-facing flag.
+
+    :param mode: Codex collaboration mode kind, e.g. ``"plan"`` or
+        ``"default"``.
+    :returns: ``True`` for Plan mode.
+    """
+    return mode == "plan"
+
+
+def _publish_codex_plan_mode(session_id: str, enabled: bool) -> None:
+    """
+    Publish the live Codex Plan-mode flag for a session.
+
+    :param session_id: Session/conversation identifier, e.g.
+        ``"conv_abc123"``.
+    :param enabled: ``True`` when Codex Plan mode is active.
+    :returns: None.
+    """
+    event = SessionCodexPlanModeEvent(
+        type="session.codex_plan_mode",
+        conversation_id=session_id,
+        enabled=enabled,
+    )
+    session_stream.publish(session_id, event.model_dump())
+
+
 # Display name fallback when neither nickname nor role is available.
 _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK = "Codex"
 # Labels read by ``_get_session_snapshot`` to seed the ap-web ring on
@@ -3162,6 +3193,7 @@ async def _persist_external_codex_collaboration_mode_change(
         session_id,
         {_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY: mode},
     )
+    _publish_codex_plan_mode(session_id, _codex_plan_mode_enabled(mode))
 
 
 async def _persist_model_change_note(
@@ -4531,6 +4563,45 @@ def _require_external_status_forward(
             f"Runner rejected external_session_status {status!r} for "
             f"sub-agent session {session_id!r} with status "
             f"{runner_result.status_code}{suffix}",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
+
+
+def _require_codex_plan_mode_forward(
+    session_id: str,
+    enabled: bool,
+    runner_result: _RunnerForwardResult | None,
+) -> None:
+    """
+    Fail when a live Codex Plan-mode switch was not applied by the runner.
+
+    Codex Plan mode is a loaded-thread collaboration mode inside Codex
+    app-server. Persisting the Omnigent label without a successful runner
+    update would make the web UI claim Plan mode while Codex still runs in
+    the previous mode, so explicit UI toggles require a confirmed 2xx forward.
+
+    :param session_id: Session/conversation identifier, e.g.
+        ``"conv_abc123"``.
+    :param enabled: ``True`` when entering Plan mode; ``False`` when
+        returning to Default mode.
+    :param runner_result: HTTP result returned by the runner, or ``None``
+        when no runner could be reached.
+    :returns: None.
+    :raises OmnigentError: If no runner was reachable or the runner rejected
+        the live Plan-mode update.
+    """
+    action = "enter Plan mode" if enabled else "exit Plan mode"
+    if runner_result is None:
+        raise OmnigentError(
+            f"Could not {action}: no live Codex runner is available for "
+            f"session {session_id!r}. Reconnect the session and try again.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
+    if not 200 <= runner_result.status_code < 300:
+        raise OmnigentError(
+            f"Could not {action}: runner returned status "
+            f"{runner_result.status_code} for session {session_id!r}. "
+            f"Reconnect the session and try again.",
             code=ErrorCode.RUNNER_UNAVAILABLE,
         )
 
@@ -12953,6 +13024,38 @@ def create_sessions_router(
                     allowed_tunnel_tokens=runner_tunnel_tokens,
                     multi_user=permission_store is not None,
                 )
+        codex_plan_mode_requested = "codex_plan_mode" in body.model_fields_set
+        requested_codex_collaboration_mode: str | None = None
+        conv_for_codex_plan_mode: Conversation | None = None
+        if codex_plan_mode_requested:
+            if body.codex_plan_mode is None:
+                raise OmnigentError(
+                    "codex_plan_mode must be true or false",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            conv_for_codex_plan_mode = await asyncio.to_thread(
+                conversation_store.get_conversation,
+                session_id,
+            )
+            if conv_for_codex_plan_mode is None:
+                raise OmnigentError(
+                    "Session not found",
+                    code=ErrorCode.NOT_FOUND,
+                )
+            if (
+                conv_for_codex_plan_mode.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+                != _CODEX_NATIVE_WRAPPER_LABEL_VALUE
+            ):
+                raise OmnigentError(
+                    "codex_plan_mode is only supported for codex-native sessions",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            requested_codex_collaboration_mode = "plan" if body.codex_plan_mode else "default"
+        labels_to_set = dict(body.labels or {})
+        if requested_codex_collaboration_mode is not None:
+            labels_to_set[_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY] = (
+                requested_codex_collaboration_mode
+            )
         effort = body.reasoning_effort
         clear_effort = effort in EFFORT_CLEAR_VALUES
         if effort is not None and not clear_effort:
@@ -13093,7 +13196,9 @@ def create_sessions_router(
                     conversation_store,
                 )
         else:
-            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            conv = conv_for_codex_plan_mode
+            if conv is None:
+                conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
                 raise OmnigentError(
                     "Session not found",
@@ -13162,8 +13267,28 @@ def create_sessions_router(
                     updated.model_override,
                     conversation_store,
                 )
-        if body.labels is not None and body.labels:
-            await asyncio.to_thread(conversation_store.set_labels, session_id, body.labels)
+        if requested_codex_collaboration_mode is not None and live_forward:
+            _codex_plan_enabled = _codex_plan_mode_enabled(requested_codex_collaboration_mode)
+            _runner_result = await _forward_session_change_to_runner(
+                session_id,
+                runner_router,
+                {
+                    "type": "plan_mode_change",
+                    "enabled": _codex_plan_enabled,
+                },
+            )
+            _require_codex_plan_mode_forward(
+                session_id,
+                _codex_plan_enabled,
+                _runner_result,
+            )
+        if labels_to_set:
+            await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_set)
+        if requested_codex_collaboration_mode is not None:
+            _publish_codex_plan_mode(
+                session_id,
+                _codex_plan_mode_enabled(requested_codex_collaboration_mode),
+            )
         if body.external_session_id is not None:
             try:
                 await asyncio.to_thread(

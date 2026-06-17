@@ -7440,8 +7440,22 @@ class _RecordingCodexAppServerClient:
             {"type": "effort_change", "effort": "xhigh"},
             {"threadId": "thread_codex", "effort": "xhigh"},
         ),
+        (
+            {"type": "plan_mode_change", "enabled": True},
+            {
+                "threadId": "thread_codex",
+                "collaborationMode": {
+                    "mode": "plan",
+                    "settings": {
+                        "model": "gpt-5.4",
+                        "reasoning_effort": None,
+                        "developer_instructions": None,
+                    },
+                },
+            },
+        ),
     ],
-    ids=["model_change", "effort_change"],
+    ids=["model_change", "effort_change", "plan_mode_change"],
 )
 async def test_events_codex_native_settings_change_uses_thread_settings_update(
     monkeypatch: pytest.MonkeyPatch,
@@ -7507,7 +7521,10 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
     codex_native_spec = AgentSpec(
         spec_version=1,
         name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "codex-native", "model": "gpt-5.4"},
+        ),
     )
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
@@ -7780,6 +7797,65 @@ async def test_codex_native_model_options_query_model_list(
     ]
     assert fake_client.connected
     assert fake_client.closed
+
+
+@pytest.mark.asyncio
+async def test_events_codex_native_plan_mode_requires_loaded_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Codex-native Plan-mode updates fail when no Codex bridge is loaded.
+
+    The AP server treats a 2xx runner response as proof that the UI can show
+    Plan mode. Returning 204 when no bridge state exists would therefore
+    persist a false Plan indicator even though Codex app-server never received
+    ``thread/settings/update``.
+    """
+    conv_id = "conv_codex_native_plan_no_bridge"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+
+    codex_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "codex-native", "model": "gpt-5.4"},
+        ),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """
+        Return the codex-native spec for any agent id.
+
+        :param agent_id: Agent identifier, e.g. ``"ag_1"``.
+        :param session_id: Session identifier, e.g. ``"conv_abc123"``.
+        :returns: Codex-native agent spec.
+        """
+        del agent_id, session_id
+        return codex_native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "plan_mode_change", "enabled": True},
+        )
+
+    assert resp.status_code == 503, resp.text
+    assert "loaded Codex bridge" in resp.text
 
 
 @pytest.mark.asyncio

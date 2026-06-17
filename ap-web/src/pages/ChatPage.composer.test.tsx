@@ -1,7 +1,9 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import type { ElicitationBlock } from "@/lib/blocks";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { Composer } from "./ChatPage";
 import { SlashCommandMenu } from "@/components/SlashCommandMenu";
 
@@ -34,6 +36,7 @@ function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) 
     showModels: false,
     modelPickerKind: null,
     codexModelOptions: [],
+    showCodexPlanMode: false,
     ...overrides,
   };
 }
@@ -46,6 +49,10 @@ function textarea() {
 /** The currently highlighted menu row, or null when none is highlighted. */
 function activeRow(): HTMLElement | null {
   return document.querySelector('[data-active="true"]');
+}
+
+function renderWithTooltips(ui: ReactElement) {
+  return render(<TooltipProvider>{ui}</TooltipProvider>);
 }
 
 describe("Composer slash-command menu", () => {
@@ -457,6 +464,49 @@ describe("Composer effort slash-command visibility", () => {
     );
     fireEvent.change(textarea(), { target: { value: "/" } });
     expect(screen.getByTestId("slash-menu-item-model")).toBeInTheDocument();
+  });
+});
+
+describe("Composer Codex Plan-mode control", () => {
+  const realSetCodexPlanMode = useChatStore.getState().setCodexPlanMode;
+
+  beforeEach(() => {
+    useChatStore.setState({
+      conversationId: "conv_test",
+      codexPlanMode: false,
+      skills: [],
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+    useChatStore.setState({ setCodexPlanMode: realSetCodexPlanMode, codexPlanMode: false });
+  });
+
+  it("toggles Codex Plan mode through the store action", async () => {
+    const setCodexPlanMode = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ setCodexPlanMode });
+
+    renderWithTooltips(<Composer {...composerProps({ showCodexPlanMode: true })} />);
+    fireEvent.click(screen.getByTestId("codex-plan-mode-toggle"));
+
+    await waitFor(() => expect(setCodexPlanMode).toHaveBeenCalledWith(true));
+  });
+
+  it("shows the active pressed state while Plan mode is enabled", () => {
+    useChatStore.setState({ codexPlanMode: true });
+
+    renderWithTooltips(<Composer {...composerProps({ showCodexPlanMode: true })} />);
+
+    const button = screen.getByTestId("codex-plan-mode-toggle");
+    expect(button).toHaveAttribute("aria-pressed", "true");
+    expect(button).toHaveAccessibleName("Exit Plan mode");
+  });
+
+  it("hides the control when the session is not Codex-native", () => {
+    render(<Composer {...composerProps({ showCodexPlanMode: false })} />);
+    expect(screen.queryByTestId("codex-plan-mode-toggle")).toBeNull();
   });
 });
 

@@ -467,6 +467,18 @@ export interface SessionReasoningEffortEvent {
 }
 
 /**
+ * `session.codex_plan_mode` — active Codex collaboration-mode switch.
+ *
+ * Emitted when a Codex-native thread enters or exits Plan mode, whether from
+ * the web UI toggle or from the native Codex TUI.
+ */
+export interface SessionCodexPlanModeEvent {
+  type: "session_codex_plan_mode";
+  conversationId: string;
+  enabled: boolean;
+}
+
+/**
  * `session.agent_changed` — the session's bound agent was switched in
  * place (switch-agent route).
  *
@@ -764,6 +776,7 @@ export type StreamEvent =
   | SessionUsageEvent
   | SessionModelEvent
   | SessionReasoningEffortEvent
+  | SessionCodexPlanModeEvent
   | SessionAgentChangedEvent
   | SessionTodosEvent
   | SessionTerminalPendingEvent

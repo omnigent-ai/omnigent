@@ -33,6 +33,7 @@ function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) 
     showModels: false,
     modelPickerKind: null,
     codexModelOptions: [],
+    showCodexPlanMode: false,
     ...overrides,
   };
 }
@@ -63,6 +64,7 @@ describe("Composer status line (branch + context ring)", () => {
       selectedModel: null,
       selectedEffort: null,
       codexModelOptions: [],
+      codexPlanMode: false,
     });
   });
 
@@ -205,6 +207,29 @@ describe("Composer status line (branch + context ring)", () => {
     renderComposer();
     expect(statusLine()).not.toBeNull();
     expect(screen.queryByTestId("composer-git-branch")).toBeNull();
+  });
+
+  it("shows a persistent Plan mode badge when Codex Plan mode is active", () => {
+    useChatStore.setState({ codexPlanMode: true });
+    renderComposer();
+
+    expect(statusLine()).not.toBeNull();
+    expect(screen.getByTestId("composer-plan-mode")).toHaveTextContent("Plan mode");
+  });
+
+  it("places Plan mode to the left of model and effort", () => {
+    useChatStore.setState({
+      codexPlanMode: true,
+      selectedModel: "gpt-5.5",
+      selectedEffort: "xhigh",
+    });
+    renderComposer();
+
+    const plan = screen.getByTestId("composer-plan-mode");
+    const modelEffort = screen.getByTestId("composer-model-effort");
+    expect(plan.compareDocumentPosition(modelEffort) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
   });
 });
 

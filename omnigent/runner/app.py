@@ -6686,6 +6686,100 @@ def create_runner_app(
                 await codex_client.close()
         return Response(status_code=204)
 
+    async def _codex_native_model_and_effort_for_settings_update(
+        conv_id: str,
+    ) -> tuple[str | None, str | None]:
+        """
+        Resolve the current Codex model and effort for a settings update.
+
+        ``CollaborationMode.settings.model`` is required by Codex app-server, so
+        a Plan/Default-mode update cannot send only the mode kind. Prefer the
+        server snapshot, which includes TUI-observed ``model_override`` /
+        ``reasoning_effort`` mirrors, and fall back to the cached agent spec.
+
+        :param conv_id: Session/conversation identifier, e.g.
+            ``"conv_abc123"``.
+        :returns: ``(model, effort)`` where effort may be ``None``.
+        """
+        model: str | None = None
+        effort: str | None = None
+        if server_client is not None:
+            try:
+                resp = await server_client.get(
+                    f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}",
+                    timeout=10.0,
+                )
+                if resp.status_code == 200:
+                    snapshot = resp.json()
+                    if isinstance(snapshot, dict):
+                        raw_model = snapshot.get("model_override") or snapshot.get("llm_model")
+                        if isinstance(raw_model, str) and raw_model.strip():
+                            model = raw_model.strip()
+                        raw_effort = snapshot.get("reasoning_effort")
+                        if isinstance(raw_effort, str) and raw_effort.strip():
+                            effort = raw_effort.strip()
+            except (httpx.HTTPError, RuntimeError, ValueError):
+                _logger.warning(
+                    "Codex-native plan-mode update could not fetch session snapshot for %s",
+                    conv_id,
+                    exc_info=True,
+                )
+
+        if model is None:
+            model = _codex_native_model_from_spec(_session_spec_cache.get(conv_id))
+        return model, effort
+
+    async def _handle_codex_native_plan_mode_change(
+        conv_id: str,
+        *,
+        enabled: bool,
+    ) -> Response:
+        """
+        Queue Codex app-server collaboration-mode settings for a loaded thread.
+
+        :param conv_id: Session/conversation identifier, e.g.
+            ``"conv_abc123"``.
+        :param enabled: ``True`` enters Plan mode; ``False`` returns to
+            Default mode.
+        :returns: 204 when the update lands; 503 when no bridge is loaded,
+            the current model cannot be resolved, or Codex rejects the update.
+        """
+        state = await _codex_native_bridge_state_for_session(conv_id, action="plan-mode update")
+        if state is None:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "codex_native_settings_update_failed",
+                    "detail": "Codex-native plan-mode update requires a loaded Codex bridge.",
+                },
+            )
+        model, effort = await _codex_native_model_and_effort_for_settings_update(conv_id)
+        if model is None:
+            _logger.warning(
+                "Codex-native plan-mode update skipped for %s: current model is unknown",
+                conv_id,
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "codex_native_settings_update_failed",
+                    "detail": "Codex-native plan-mode update requires a current model.",
+                },
+            )
+        return await _handle_codex_native_settings_update(
+            conv_id,
+            {
+                "collaborationMode": {
+                    "mode": "plan" if enabled else "default",
+                    "settings": {
+                        "model": model,
+                        "reasoning_effort": effort,
+                        "developer_instructions": None,
+                    },
+                },
+            },
+        )
+
     async def _codex_native_model_options(conv_id: str) -> list[dict[str, Any]]:
         """
         Query Codex app-server ``model/list`` for a loaded codex-native session.
@@ -9940,6 +10034,27 @@ def create_runner_app(
                 return await _handle_claude_native_model_change(
                     conversation_id,
                     model,
+                )
+            return Response(status_code=204)
+
+        if body_type == "plan_mode_change":
+            # Codex-native exposes Plan/Default as a structured app-server
+            # collaboration mode, not a terminal slash-command. Other
+            # harnesses have no equivalent runtime control and 204 no-op.
+            harness = _session_harness_name(conversation_id)
+            if harness == "codex-native":
+                enabled = body.get("enabled") if isinstance(body, dict) else None
+                if not isinstance(enabled, bool):
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "error": "invalid_input",
+                            "detail": "Body 'enabled' must be a boolean",
+                        },
+                    )
+                return await _handle_codex_native_plan_mode_change(
+                    conversation_id,
+                    enabled=enabled,
                 )
             return Response(status_code=204)
 

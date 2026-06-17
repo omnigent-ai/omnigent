@@ -11,6 +11,7 @@ import { describe, expect, it } from "vitest";
 import type {
   ElicitationRequest,
   SessionAgentChangedEvent,
+  SessionCodexPlanModeEvent,
   SessionChangedFilesInvalidatedEvent,
   SessionChildSessionUpdatedEvent,
   SessionCodexModelOptionsEvent,
@@ -1211,6 +1212,28 @@ describe("session.reasoning_effort (FLAT envelope)", () => {
 
   it("rejects missing effort", () => {
     expect(parse("session.reasoning_effort", { conversation_id: "conv_abc" })).toEqual([]);
+  });
+});
+
+describe("session.codex_plan_mode (FLAT envelope)", () => {
+  it("lifts conversation_id and enabled flag", () => {
+    const events = parse("session.codex_plan_mode", {
+      conversation_id: "conv_abc",
+      enabled: true,
+    });
+    expect(events).toHaveLength(1);
+    const ev = events[0] as SessionCodexPlanModeEvent;
+    expect(ev.type).toBe("session_codex_plan_mode");
+    expect(ev.conversationId).toBe("conv_abc");
+    expect(ev.enabled).toBe(true);
+  });
+
+  it("rejects missing enabled flag", () => {
+    expect(parse("session.codex_plan_mode", { conversation_id: "conv_abc" })).toEqual([]);
+  });
+
+  it("rejects missing conversation_id", () => {
+    expect(parse("session.codex_plan_mode", { enabled: true })).toEqual([]);
   });
 });
 

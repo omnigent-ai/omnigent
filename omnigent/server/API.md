@@ -765,6 +765,7 @@ Content-Type: application/json
   "labels": {"env": "test"},
   "reasoning_effort": "high",
   "model_override": "claude-opus-4-7",
+  "codex_plan_mode": true,
   "external_session_id": "a1b2c3d4-1234-5678-9abc-def012345678"
 }
 ```
@@ -797,6 +798,14 @@ Request body:
     strings fail with 400 rather than silently clearing.
     Leaves the column unchanged when omitted or `null`.
 
+  codex_plan_mode (boolean, optional)
+    Codex-native collaboration-mode toggle. `true` enters Plan mode;
+    `false` returns to Default mode. Only valid for sessions whose
+    wrapper label is `codex-native-ui`. Explicit toggles are forwarded
+    to the live runner as `plan_mode_change` before the label is
+    persisted; if no live runner or loaded Codex bridge can apply the
+    change, the request fails and the stored mode is left unchanged.
+
   cost_control_mode_override (string or null, optional)
     Per-session cost-control switch: `"on"` activates the spec's
     configured cost-control mode, `"off"` disables cost control for
@@ -816,8 +825,9 @@ Request body:
 200 OK - body matches the `SessionResponse` shape above, with
 `runner_id` set to the newly bound value when `runner_id` was present.
 
-400 Bad Request - runner is not currently registered; or
-`external_session_id` would overwrite a different existing value
+400 Bad Request - runner is not currently registered; `codex_plan_mode`
+is used on a non-Codex-native session; or `external_session_id` would
+overwrite a different existing value
 404 Not Found - no session with that id
 
 This is the mutable affinity primitive for Alpha. The same endpoint
@@ -1157,6 +1167,7 @@ stream and surface queue/interrupt semantics.
 |---|---|---|
 | `session.status` | `SessionStatusEvent` | `{type, conversation_id, status: "running" \| "waiting" \| "idle" \| "failed"}` |
 | `session.reasoning_effort` | `SessionReasoningEffortEvent` | `{type, conversation_id, reasoning_effort: string \| null}` |
+| `session.codex_plan_mode` | `SessionCodexPlanModeEvent` | `{type, conversation_id, enabled: boolean}` |
 | `session.input.consumed` | `SessionInputConsumedEvent` | `{type, data: {queued_item_id, type, data, position}}` (nested envelope) |
 | `session.interrupted` | `SessionInterruptedEvent` | `{type, data: {requested_at, queued_item_id?: null}}` (nested envelope) |
 | `session.created` | `SessionCreatedEvent` | `{type, conversation_id: <parent>, child_conversation_id, agent_id, ...}` — emitted on the PARENT session's stream when a sub-agent is spawned. |

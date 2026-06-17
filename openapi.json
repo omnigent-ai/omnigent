@@ -1825,6 +1825,7 @@
             "session.changed_files.invalidated": "#/components/schemas/SessionChangedFilesInvalidatedEvent",
             "session.child_session.updated": "#/components/schemas/SessionChildSessionUpdatedEvent",
             "session.codex_model_options": "#/components/schemas/SessionCodexModelOptionsEvent",
+            "session.codex_plan_mode": "#/components/schemas/SessionCodexPlanModeEvent",
             "session.created": "#/components/schemas/SessionCreatedEvent",
             "session.heartbeat": "#/components/schemas/SessionHeartbeatEvent",
             "session.input.consumed": "#/components/schemas/SessionInputConsumedEvent",
@@ -1860,6 +1861,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionReasoningEffortEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionCodexPlanModeEvent"
           },
           {
             "$ref": "#/components/schemas/SessionAgentChangedEvent"
@@ -2141,6 +2145,43 @@
           "conversation_id"
         ],
         "title": "SessionCodexModelOptionsEvent",
+        "type": "object"
+      },
+      "SessionCodexPlanModeEvent": {
+        "description": "Active Codex Plan-mode update from a Codex-native session.\n\nEmitted after the web UI toggles Codex collaboration mode, and after the\nCodex forwarder observes a ``thread/settings/updated`` notification from\nthe native Codex TUI. Lets connected clients show a clear Plan-mode\nindicator without a reload.\n\n:param type: Always ``\"session.codex_plan_mode\"``.\n:param conversation_id: Session identifier, e.g. ``\"conv_abc123\"``.\n:param enabled: ``True`` when Codex is in Plan mode, ``False`` when it is\n    in Default mode.\n\nCategory: **transient** (SSE-only). The server also writes\n``omnigent.codex_native.collaboration_mode`` on the conversation labels,\nso reconnect clients restore the same state from the session snapshot.",
+        "properties": {
+          "conversation_id": {
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.codex_plan_mode",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "enabled"
+        ],
+        "title": "SessionCodexPlanModeEvent",
         "type": "object"
       },
       "SessionCreatedEvent": {
@@ -3446,7 +3487,7 @@
       },
       "UpdateSessionRequest": {
         "additionalProperties": false,
-        "description": "Request body for ``PATCH /v1/sessions/{id}``.\n\nThe Alpha runner-state pivot makes this endpoint the mutable\nsession affinity primitive when ``runner_id`` is provided. The\nserver validates that the runner is online, then replaces\n``conversations.runner_id``. Existing session metadata updates\nremain supported for clients that update title, labels, or\nreasoning effort through the sessions API.\n\n:param runner_id: Identifier of a registered runner, e.g.\n    ``\"runner_abc123\"``. ``None`` leaves runner binding\n    unchanged.\n:param title: New title, e.g. ``\"debugging auth flow\"``.\n    ``None`` leaves unchanged.\n:param labels: Guardrails labels to upsert. Merges with existing\n    labels; keys not present are left untouched.\n:param reasoning_effort: Per-session reasoning-effort hint.\n    Accepted metadata values are ``\"none\"``, ``\"minimal\"``,\n    ``\"low\"``, ``\"medium\"``, ``\"high\"``, ``\"xhigh\"``, and\n    ``\"max\"``. Provider-specific support is validated when a\n    turn executes. Clear aliases such as ``\"default\"`` remove\n    the session override. ``None`` leaves unchanged.\n:param model_override: Per-session LLM model override, e.g.\n    ``\"claude-opus-4-7\"``. The value is forwarded as-is to the\n    executor at turn start; the server does not enumerate valid\n    models. Clear aliases such as ``\"default\"``, ``\"off\"``, or\n    ``\"reset\"`` remove the override (matching the REPL's\n    ``/model`` semantics). ``None`` leaves unchanged.\n:param cost_control_mode_override: Per-session cost-control\n    switch: ``\"on\"`` activates the spec's configured cost-control\n    mode, ``\"off\"`` disables cost control for this session.\n    Explicit JSON ``null`` clears the override back to the spec\n    default; omitting the field leaves it unchanged (``\"off\"`` is\n    a real value here, so the field's *presence* \u2014 not a clear\n    alias \u2014 is the clear signal, unlike ``model_override``).\n:param external_session_id: Runtime-native session id captured\n    by a wrapper bridge (e.g. Claude Code's session uuid for\n    ``omnigent claude`` sessions). Idempotent on same-value\n    writes; the server rejects attempts to overwrite an\n    already-set different value with ``invalid_input`` to\n    surface programmer errors. ``None`` leaves unchanged.\n:param terminal_launch_args: Per-session native-terminal\n    pass-through args, e.g. ``[\"--dangerously-skip-permissions\"]``.\n    A list (including ``[]``) replaces the stored value wholesale\n    \u2014 resume is last-write-wins, never an append. Bounds (count /\n    length) are validated server-side. ``None`` leaves unchanged.\n:param silent: When ``True``, persist metadata changes but skip\n    the runner-side side effects \u2014 specifically the\n    claude-native ``/effort`` and ``/model`` slash-command\n    forwards into the tmux pane. Used by automatic bind-time\n    handoffs (ap-web's sticky-pref apply on session switch, the\n    REPL's pre-create ``/model`` snapshot) where injecting a\n    visible slash command into a freshly-spawned pane would\n    render as an unexpected \"Command model X\" item before the\n    user has sent anything. Default ``False`` preserves the\n    user-driven picker / ``/model`` behaviour where the live\n    forward IS the desired feedback.\n:param archived: New archived state. ``True`` archives (hides the\n    session from the default sidebar listing), ``False`` unarchives,\n    ``None`` leaves unchanged. Owner-only (unlike ``title``, which\n    needs only edit access).",
+        "description": "Request body for ``PATCH /v1/sessions/{id}``.\n\nThe Alpha runner-state pivot makes this endpoint the mutable\nsession affinity primitive when ``runner_id`` is provided. The\nserver validates that the runner is online, then replaces\n``conversations.runner_id``. Existing session metadata updates\nremain supported for clients that update title, labels, or\nreasoning effort through the sessions API.\n\n:param runner_id: Identifier of a registered runner, e.g.\n    ``\"runner_abc123\"``. ``None`` leaves runner binding\n    unchanged.\n:param title: New title, e.g. ``\"debugging auth flow\"``.\n    ``None`` leaves unchanged.\n:param labels: Guardrails labels to upsert. Merges with existing\n    labels; keys not present are left untouched.\n:param reasoning_effort: Per-session reasoning-effort hint.\n    Accepted metadata values are ``\"none\"``, ``\"minimal\"``,\n    ``\"low\"``, ``\"medium\"``, ``\"high\"``, ``\"xhigh\"``, and\n    ``\"max\"``. Provider-specific support is validated when a\n    turn executes. Clear aliases such as ``\"default\"`` remove\n    the session override. ``None`` leaves unchanged.\n:param model_override: Per-session LLM model override, e.g.\n    ``\"claude-opus-4-7\"``. The value is forwarded as-is to the\n    executor at turn start; the server does not enumerate valid\n    models. Clear aliases such as ``\"default\"``, ``\"off\"``, or\n    ``\"reset\"`` remove the override (matching the REPL's\n    ``/model`` semantics). ``None`` leaves unchanged.\n:param codex_plan_mode: Codex-native collaboration-mode toggle.\n    ``True`` enters Plan mode and ``False`` returns to Default mode\n    for subsequent Codex turns. Only valid for sessions stamped with\n    the codex-native wrapper label. Omitted leaves unchanged.\n:param cost_control_mode_override: Per-session cost-control\n    switch: ``\"on\"`` activates the spec's configured cost-control\n    mode, ``\"off\"`` disables cost control for this session.\n    Explicit JSON ``null`` clears the override back to the spec\n    default; omitting the field leaves it unchanged (``\"off\"`` is\n    a real value here, so the field's *presence* \u2014 not a clear\n    alias \u2014 is the clear signal, unlike ``model_override``).\n:param external_session_id: Runtime-native session id captured\n    by a wrapper bridge (e.g. Claude Code's session uuid for\n    ``omnigent claude`` sessions). Idempotent on same-value\n    writes; the server rejects attempts to overwrite an\n    already-set different value with ``invalid_input`` to\n    surface programmer errors. ``None`` leaves unchanged.\n:param terminal_launch_args: Per-session native-terminal\n    pass-through args, e.g. ``[\"--dangerously-skip-permissions\"]``.\n    A list (including ``[]``) replaces the stored value wholesale\n    \u2014 resume is last-write-wins, never an append. Bounds (count /\n    length) are validated server-side. ``None`` leaves unchanged.\n:param silent: When ``True``, persist metadata changes but skip\n    the runner-side side effects \u2014 specifically the\n    native ``/effort`` / ``/model`` / Codex collaboration-mode\n    forwards into the live runtime. Used by automatic bind-time\n    handoffs (ap-web's sticky-pref apply on session switch, the\n    REPL's pre-create ``/model`` snapshot) where injecting a\n    visible slash command into a freshly-spawned pane would\n    render as an unexpected \"Command model X\" item before the\n    user has sent anything. Default ``False`` preserves the\n    user-driven picker / ``/model`` behaviour where the live\n    forward IS the desired feedback.\n:param archived: New archived state. ``True`` archives (hides the\n    session from the default sidebar listing), ``False`` unarchives,\n    ``None`` leaves unchanged. Owner-only (unlike ``title``, which\n    needs only edit access).",
         "properties": {
           "archived": {
             "anyOf": [
@@ -3458,6 +3499,17 @@
               }
             ],
             "title": "Archived"
+          },
+          "codex_plan_mode": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Codex Plan Mode"
           },
           "cost_control_mode_override": {
             "anyOf": [

@@ -1667,6 +1667,10 @@ class UpdateSessionRequest(BaseModel):
         models. Clear aliases such as ``"default"``, ``"off"``, or
         ``"reset"`` remove the override (matching the REPL's
         ``/model`` semantics). ``None`` leaves unchanged.
+    :param codex_plan_mode: Codex-native collaboration-mode toggle.
+        ``True`` enters Plan mode and ``False`` returns to Default mode
+        for subsequent Codex turns. Only valid for sessions stamped with
+        the codex-native wrapper label. Omitted leaves unchanged.
     :param cost_control_mode_override: Per-session cost-control
         switch: ``"on"`` activates the spec's configured cost-control
         mode, ``"off"`` disables cost control for this session.
@@ -1687,8 +1691,8 @@ class UpdateSessionRequest(BaseModel):
         length) are validated server-side. ``None`` leaves unchanged.
     :param silent: When ``True``, persist metadata changes but skip
         the runner-side side effects — specifically the
-        claude-native ``/effort`` and ``/model`` slash-command
-        forwards into the tmux pane. Used by automatic bind-time
+        native ``/effort`` / ``/model`` / Codex collaboration-mode
+        forwards into the live runtime. Used by automatic bind-time
         handoffs (ap-web's sticky-pref apply on session switch, the
         REPL's pre-create ``/model`` snapshot) where injecting a
         visible slash command into a freshly-spawned pane would
@@ -1707,6 +1711,7 @@ class UpdateSessionRequest(BaseModel):
     labels: dict[str, str] | None = None
     reasoning_effort: str | None = None
     model_override: str | None = None
+    codex_plan_mode: bool | None = None
     cost_control_mode_override: str | None = None
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
@@ -2149,6 +2154,30 @@ class SessionReasoningEffortEvent(_SSEEventBase):
     type: Literal["session.reasoning_effort"]
     conversation_id: str
     reasoning_effort: str | None = None
+
+
+class SessionCodexPlanModeEvent(_SSEEventBase):
+    """
+    Active Codex Plan-mode update from a Codex-native session.
+
+    Emitted after the web UI toggles Codex collaboration mode, and after the
+    Codex forwarder observes a ``thread/settings/updated`` notification from
+    the native Codex TUI. Lets connected clients show a clear Plan-mode
+    indicator without a reload.
+
+    :param type: Always ``"session.codex_plan_mode"``.
+    :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
+    :param enabled: ``True`` when Codex is in Plan mode, ``False`` when it is
+        in Default mode.
+
+    Category: **transient** (SSE-only). The server also writes
+    ``omnigent.codex_native.collaboration_mode`` on the conversation labels,
+    so reconnect clients restore the same state from the session snapshot.
+    """
+
+    type: Literal["session.codex_plan_mode"]
+    conversation_id: str
+    enabled: bool
 
 
 class SessionAgentChangedEvent(_SSEEventBase):
@@ -3379,6 +3408,7 @@ ServerStreamEvent = Annotated[
     | SessionUsageEvent
     | SessionModelEvent
     | SessionReasoningEffortEvent
+    | SessionCodexPlanModeEvent
     | SessionAgentChangedEvent
     | SessionTodosEvent
     | SessionTerminalPendingEvent
