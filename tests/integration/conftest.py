@@ -169,6 +169,7 @@ def journey_session(
     live_runner_id: str,  # noqa: F811  (pytest fixture, not the import)
     harness_name: str,
     model_name: str,
+    using_mock_llm: bool,  # noqa: F811
     request: pytest.FixtureRequest,
     mock_llm_server_url: str | None,  # noqa: F811
 ) -> JourneySession:
@@ -181,6 +182,7 @@ def journey_session(
     :param live_runner_id: Runner to bind the session to.
     :param harness_name: Harness under test.
     :param model_name: Resolved model for this test.
+    :param using_mock_llm: Whether mock LLM mode is active.
     :param request: Pytest fixture request (for ``--profile``).
     :param mock_llm_server_url: Mock LLM server URL, or ``None``.
     :returns: The registered agent + bound session.
@@ -197,9 +199,7 @@ def journey_session(
             "reply with the token text only."
         ),
         mock_llm_base_url=(
-            f"{mock_llm_server_url}/v1"
-            if _is_mock_mode(request.config) and mock_llm_server_url
-            else None
+            f"{mock_llm_server_url}/v1" if using_mock_llm and mock_llm_server_url else None
         ),
     )
     session_id = create_runner_bound_session(

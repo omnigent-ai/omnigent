@@ -96,6 +96,7 @@ class _OwnedSession:
 def owner_session(
     live_server: str,
     live_runner_id: str,
+    using_mock_llm: bool,
     mock_llm_server_url: str | None,
     request: pytest.FixtureRequest,
 ) -> Iterator[_OwnedSession]:
@@ -107,8 +108,7 @@ def owner_session(
     on the shared session-scoped server.
     """
     suffix = uuid.uuid4().hex[:6]
-    is_mock = request.config.getoption("--llm-api-key") is None
-    model = f"mock-share-{suffix}" if is_mock else "databricks-gpt-5-4-mini"
+    model = f"mock-share-{suffix}" if using_mock_llm else "databricks-gpt-5-4-mini"
     owner = httpx.Client(base_url=live_server, timeout=300)
     reset_mock_llm(mock_llm_server_url)
     agent_name = register_inline_agent(
@@ -119,7 +119,7 @@ def owner_session(
         profile=request.config.getoption("--profile"),
         prompt="You are a terse assistant. Follow instructions exactly.",
         mock_llm_base_url=(
-            f"{mock_llm_server_url}/v1" if is_mock and mock_llm_server_url else None
+            f"{mock_llm_server_url}/v1" if using_mock_llm and mock_llm_server_url else None
         ),
     )
     session_id = create_runner_bound_session(
