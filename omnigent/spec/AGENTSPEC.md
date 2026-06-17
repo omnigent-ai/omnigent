@@ -185,6 +185,12 @@ tools:
       # the agent id), budget (low | mid | high), max_tokens, tags, recall_tags
 ```
 
+Tell your agent in its `prompt` to actually use these tools — e.g. "recall before
+answering; when the user shares a durable fact you MUST call hindsight_retain, and
+never claim you saved something unless the tool ran." Models otherwise tend to
+acknowledge a fact in chat without persisting it. See `examples/remy` for a
+working prompt.
+
 ---
 
 ## Instructions

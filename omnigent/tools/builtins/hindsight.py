@@ -139,9 +139,11 @@ class HindsightRetainTool(_HindsightToolBase):
     @classmethod
     def description(cls) -> str:
         return (
-            "Store information in long-term memory (Hindsight) for later "
-            "retrieval — facts, preferences, decisions, or anything that "
-            "should be remembered across conversations."
+            "Persist information to long-term memory (Hindsight) so it survives "
+            "across conversations and sessions. Call this whenever the user "
+            "shares a durable fact, preference, or decision, or asks you to "
+            "remember something — conversation context alone is lost between "
+            "sessions, so acknowledging a fact in chat does NOT save it."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -193,8 +195,10 @@ class HindsightRecallTool(_HindsightToolBase):
     def description(cls) -> str:
         return (
             "Search long-term memory (Hindsight) for relevant information — "
-            "previously stored facts, preferences, or context. Returns the "
-            "matching memories, or a note that none were found."
+            "previously stored facts, preferences, or context. Call this BEFORE "
+            "answering anything that may depend on what you already know about "
+            "the user or past sessions. Returns the matching memories, or a note "
+            "that none were found."
         )
 
     def get_schema(self) -> dict[str, Any]:
