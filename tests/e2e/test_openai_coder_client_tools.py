@@ -1,13 +1,9 @@
 """E2E test: openai-coder agent uses client-side tools to list and manipulate files.
 
-The openai-coder agent has ``codex:Shell`` and ``codex:ApplyPatch`` as
-server-side MCP builtins, but should ALSO be able to use client-side
-tools (Read, Write, Edit, Glob, Grep, Bash) when the frontend passes
-them.  This test verifies that the agent actually invokes client-side
-tools — proving they are not masked by the codex MCP builtins.
-
-See ``test_openai_coder_codex_tools.py`` for tests covering the
-server-side codex MCP tools (Shell, ApplyPatch) directly.
+The openai-coder agent should be able to use client-side tools
+(Read, Write, Edit, Glob, Grep, Bash) when the frontend passes
+them. This test verifies that the agent invokes those tools through
+the runner-native session-events path.
 
 These tests drive client-side tools the way the real REPL does: they
 subscribe to the session's live SSE stream and respond to

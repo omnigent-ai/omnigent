@@ -10,22 +10,34 @@ name: Security Scan
 # checked out from `main` and the scanned code sits in a separate `pr/` dir, so a
 # PR can't edit its own scan.
 #
-# >>> CURRENTLY NON-BLOCKING (AUDIT MODE) <<<
-# GATE_BLOCKING "false": detectors run and surface findings, but this job always
-# SUCCEEDS, so the pollers proceed. Set it to "true" to ENFORCE — a finding then
-# fails this check, the pollers mirror the failure, and dependent CI is skipped.
-# This is the single enforcement switch.
+# Blocking: any detector that finds something fails this check; the per-workflow
+# pollers mirror the failure and skip the dependent CI jobs (no PR-code checkout
+# / uv sync / test). Detectors run fail-fast -- the first finding fails the job,
+# so a clean PR must pass every one.
 #
-# Trust tiers (should-scan.sh): trusted (OWNER/MEMBER/COLLABORATOR) and non-PR
-# events aren't scanned; returning contributors are; first-timers are held by
-# GitHub's native fork-approval gate first.
+# Trust tiers (should-scan.sh): trusted (OWNER/MEMBER/COLLABORATOR, or an author
+# in the MAINTAINERS list -- covers maintainers with private org membership) and
+# non-PR events aren't scanned; returning contributors are; first-timers are held
+# by GitHub's native fork-approval gate first.
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    # labeled/unlabeled so applying or removing the maintainer skip label
+    # (skip-security-scan) re-runs the scan and flips this check.
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+  # A maintainer's approval is the OTHER half of the skip-security-scan waiver
+  # (the label alone is not maintainer-effective -- see should-scan.sh). Without
+  # this trigger a PR that is labeled FIRST and approved LATER never re-runs, so
+  # the stale failing check sticks. `submitted` flips the check once a maintainer
+  # approves; `dismissed` re-gates if that approval is later removed. should-scan.sh
+  # already accepts the pull_request_review payload (same pull_request +
+  # author_association fields), so no script change is needed.
+  pull_request_review:
+    types: [submitted, dismissed]
 
 permissions:
   contents: read
+  pull-requests: read   # read PR labels + reviews for the maintainer skip waiver
 
 concurrency:
   group: security-scan-${{ github.event.pull_request.number }}
@@ -39,25 +51,34 @@ jobs:
     env:
       # Route uv at PyPI for the semgrep fetch.
       UV_INDEX_URL: https://pypi.org/simple
-      # Enforcement switch: "false" = audit (never blocks); "true" = blocking.
-      GATE_BLOCKING: "false"
     steps:
       - name: Check out scanner from main
-        continue-on-error: ${{ env.GATE_BLOCKING != 'true' }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           ref: main             # trusted; never the PR head
           sparse-checkout: |
             .github/scripts/security-scan
+            .github/scripts/merge-ready
             .github/security
           persist-credentials: false
 
+      - name: Load maintainers
+        id: maintainers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: bash .github/scripts/merge-ready/load-maintainers.sh
+
       - name: Trust gate
         id: gate
-        continue-on-error: ${{ env.GATE_BLOCKING != 'true' }}
         env:
           EVENT_NAME: ${{ github.event_name }}
           AUTHOR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
+          # For the maintainer-effective skip-security-scan waiver (read-only).
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          MAINTAINERS: ${{ steps.maintainers.outputs.list }}
         run: |
           # Before this lands on main the scripts are absent there -- proceed
           # (fail-open) so the introducing PR is not bricked.
@@ -71,7 +92,6 @@ jobs:
 
       - name: Fetch PR diff
         if: ${{ steps.gate.outputs.scan == 'true' }}
-        continue-on-error: ${{ env.GATE_BLOCKING != 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -82,24 +102,25 @@ jobs:
           echo "Changed files:"; cat "$GITHUB_WORKSPACE/changed.txt"
 
       - name: Secret scan (added lines)
-        id: secret
         if: ${{ steps.gate.outputs.scan == 'true' }}
-        continue-on-error: ${{ env.GATE_BLOCKING != 'true' }}
         env:
           DIFF_FILE: ${{ github.workspace }}/pr.diff
         run: python3 .github/scripts/security-scan/secret-scan.py
 
-      - name: Sensitive-path guard
-        id: paths
+      - name: Exfil scan (added lines)
         if: ${{ steps.gate.outputs.scan == 'true' }}
-        continue-on-error: ${{ env.GATE_BLOCKING != 'true' }}
+        env:
+          DIFF_FILE: ${{ github.workspace }}/pr.diff
+        run: python3 .github/scripts/security-scan/exfil-scan.py
+
+      - name: Sensitive-path guard
+        if: ${{ steps.gate.outputs.scan == 'true' }}
         env:
           CHANGED_FILES: ${{ github.workspace }}/changed.txt
         run: bash .github/scripts/security-scan/sensitive-paths.sh
 
       - name: Check out PR head for static analysis
         if: ${{ steps.gate.outputs.scan == 'true' }}
-        continue-on-error: ${{ env.GATE_BLOCKING != 'true' }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           ref: ${{ github.event.pull_request.head.sha }}  # untrusted: only statically scanned
@@ -107,9 +128,7 @@ jobs:
           persist-credentials: false
 
       - name: Workflow misuse lint
-        id: wflint
         if: ${{ steps.gate.outputs.scan == 'true' }}
-        continue-on-error: ${{ env.GATE_BLOCKING != 'true' }}
         working-directory: pr
         env:
           CHANGED_FILES: ${{ github.workspace }}/changed.txt
@@ -117,13 +136,10 @@ jobs:
 
       - name: Install uv
         if: ${{ steps.gate.outputs.scan == 'true' }}
-        continue-on-error: ${{ env.GATE_BLOCKING != 'true' }}
         uses: astral-sh/setup-uv@8d55fbecc275b1c35dbe060458839f8d30439ccf  # v3
 
       - name: Semgrep (changed files, local rules)
-        id: semgrep
         if: ${{ steps.gate.outputs.scan == 'true' }}
-        continue-on-error: ${{ env.GATE_BLOCKING != 'true' }}
         env:
           RULES: ${{ github.workspace }}/.github/security/semgrep-rules.yml
         run: |
@@ -144,21 +160,19 @@ jobs:
           uvx semgrep scan --config "$RULES" --severity=ERROR --error \
             --metrics=off --quiet $(cat targets.txt)
 
-      - name: Audit summary
-        # Audit mode: detectors are continue-on-error, so this surfaces what
-        # WOULD have blocked without failing the job. (Blocking mode already
-        # failed before reaching here.)
-        if: ${{ always() && steps.gate.outputs.scan == 'true' }}
+      # Surfaced on ANY detector failure above (sensitive-path / secret / exfil
+      # / workflow-misuse / semgrep): the detectors say WHAT they found; this
+      # says HOW a maintainer can waive it. The waiver needs BOTH a maintainer
+      # approval AND the label -- the label alone is not maintainer-effective
+      # (see should-scan.sh). Either action re-runs this scan via the labeled /
+      # pull_request_review triggers above.
+      - name: Explain the maintainer waiver (on failure)
+        if: ${{ failure() }}
         run: |
-          findings=0
-          for o in "${{ steps.secret.outcome }}" "${{ steps.paths.outcome }}" \
-                   "${{ steps.wflint.outcome }}" "${{ steps.semgrep.outcome }}"; do
-            [ "$o" = "failure" ] && findings=1
-          done
-          if [ "$findings" = "1" ]; then
-            echo "::warning::Security scan found issues (see annotations above). Audit mode: CI was NOT blocked. Set GATE_BLOCKING=true in security-scan.yml to enforce."
-            { echo "### 🔍 Security scan — audit mode"; echo "Findings detected; **not** blocking CI. See annotations above."; } >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "Security scan: no findings."
-            echo "### ✅ Security scan — audit mode: no findings" >> "$GITHUB_STEP_SUMMARY"
-          fi
+          MSG="A maintainer can skip the Security Scan by approving this PR AND applying the 'skip-security-scan' label (the label alone is not enough -- the author must be a maintainer or a maintainer must have approved). Either action re-runs this scan automatically."
+          echo "::error::$MSG"
+          {
+            echo "### Security Scan failed"
+            echo
+            echo "$MSG"
+          } >> "$GITHUB_STEP_SUMMARY"

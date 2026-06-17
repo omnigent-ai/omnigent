@@ -27,9 +27,11 @@ import httpx
 import pytest
 
 from tests.e2e.conftest import (
+    configure_mock_llm,
     create_runner_bound_session,
     poll_session_until_terminal,
     register_inline_agent,
+    reset_mock_llm,
     send_user_message_to_session,
 )
 
@@ -87,12 +89,14 @@ class _OwnedSession:
     owner_email: str
     owner: httpx.Client
     session_id: str
+    model: str = ""
 
 
 @pytest.fixture
 def owner_session(
     live_server: str,
     live_runner_id: str,
+    mock_llm_server_url: str | None,
     request: pytest.FixtureRequest,
 ) -> Iterator[_OwnedSession]:
     """A runner-bound session owned by the ``local`` identity.
@@ -103,19 +107,30 @@ def owner_session(
     on the shared session-scoped server.
     """
     suffix = uuid.uuid4().hex[:6]
+    is_mock = request.config.getoption("--llm-api-key") is None
+    model = f"mock-share-{suffix}" if is_mock else "databricks-gpt-5-4-mini"
     owner = httpx.Client(base_url=live_server, timeout=300)
+    reset_mock_llm(mock_llm_server_url)
     agent_name = register_inline_agent(
         owner,
         name=f"sharing-e2e-{suffix}",
         harness="openai-agents",
-        model="databricks-gpt-5-4-mini",
+        model=model,
         profile=request.config.getoption("--profile"),
         prompt="You are a terse assistant. Follow instructions exactly.",
+        mock_llm_base_url=(
+            f"{mock_llm_server_url}/v1" if is_mock and mock_llm_server_url else None
+        ),
     )
     session_id = create_runner_bound_session(
         owner, agent_name=agent_name, runner_id=live_runner_id
     )
-    yield _OwnedSession(owner_email="local", owner=owner, session_id=session_id)
+    yield _OwnedSession(
+        owner_email="local",
+        owner=owner,
+        session_id=session_id,
+        model=model,
+    )
     owner.close()
 
 
@@ -159,12 +174,16 @@ def test_read_grant_allows_snapshot_blocks_events(
 
 
 def test_edit_grant_bob_turn_completes_and_owner_sees_it(
-    live_server: str, owner_session: _OwnedSession
+    live_server: str,
+    owner_session: _OwnedSession,
+    mock_llm_server_url: str | None,
 ) -> None:
-    """An EDIT collaborator's turn runs the real LLM and lands in the
+    """An EDIT collaborator's turn runs the LLM and lands in the
     owner's view of the conversation."""
     sid = owner_session.session_id
     marker = f"shared-turn-{uuid.uuid4().hex[:8]}"
+    if owner_session.model:
+        configure_mock_llm(mock_llm_server_url, [{"text": marker}], key=owner_session.model)
     with _client_for(live_server, f"bob-{uuid.uuid4().hex[:6]}@e2e.test") as bob:
         owner_session.owner.put(
             f"/v1/sessions/{sid}/permissions",

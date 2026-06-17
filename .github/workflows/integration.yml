@@ -12,6 +12,9 @@ on:
   schedule:
     - cron: "30 9 * * *"
   pull_request:
+    # No labeled/unlabeled: a skip-security-scan waiver re-runs this workflow's
+    # Security Gate via rerun-security-gate.yml, so label churn need not re-run
+    # the heavy integration suite. (#399 added these for the gate; superseded.)
     types: [opened, synchronize, reopened, ready_for_review]
     paths-ignore: ['ap-web/**']
   push:
@@ -45,10 +48,42 @@ jobs:
   gate:
     uses: ./.github/workflows/security-gate.yml
 
+  # Compute the harness matrix once. A skipped run (draft, or a fork's
+  # pull_request) yields an EMPTY matrix -> zero jobs -> no skipped check-runs
+  # with an unexpanded `Integration (${{ matrix.name }})` name. Mirrors the
+  # e2e.yml / e2e-ui.yml setup-job pattern via
+  # .github/scripts/ci/integration-matrix.sh.
+  setup:
+    name: setup
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Check out CI scripts
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          # Triggering ref (not pinned to main): the script must exist on the
+          # running ref, and it is not a security gate -- it only selects which
+          # harness legs run and can't expose secrets, so the PR's own copy is
+          # fine.
+          sparse-checkout: .github/scripts/ci
+          persist-credentials: false
+      - name: Compute integration matrix
+        id: matrix
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+        run: bash .github/scripts/ci/integration-matrix.sh
+
   integration:
     name: Integration (${{ matrix.name }})
-    needs: gate
-    if: ${{ !github.event.pull_request.draft && github.event.pull_request.head.repo.fork != true }}
+    # Draft PRs and fork pull_request events resolve to an EMPTY matrix in
+    # `setup` (forks run via the fork-e2e/** mirror push instead), so this job
+    # produces zero leg runs for them -- and thus no skipped placeholder check.
+    needs: setup
     runs-on: ubuntu-latest
     # Per-leg ceiling; inner test step caps at 25 min, rest covers install +
     # junit upload. Legs run in parallel; longest gates wall-time.
@@ -56,26 +91,11 @@ jobs:
     strategy:
       # Don't cancel sibling harnesses on failure; surface which is red.
       fail-fast: false
-      # One leg per wrapped harness, no sharding. Keep the
-      # ``Integration (...)`` leg-name prefix; the notify job's jq keys on it.
-      # Model pins: claude-sdk on sonnet-4-6 (most TPM headroom), codex on
-      # gpt-5-5 (gpt-5-4-mini hit 429s), openai-agents on gpt-5-4-mini.
-      # OMNIGENT_TEST_MODEL_SPREAD may rebalance within the pool.
-      matrix:
-        include:
-          - name: claude-sdk
-            harness: claude-sdk
-            model: databricks-claude-sonnet-4-6
-            workers: 4
-          - name: openai-agents
-            harness: openai-agents
-            model: databricks-gpt-5-4-mini
-            workers: 4
-          # codex has the least rate-limit headroom; halve its burst.
-          - name: codex
-            harness: codex
-            model: databricks-gpt-5-5
-            workers: 2
+      # Harness legs (per-leg model + worker pinning) come from `setup`; [] when
+      # skipped. The ``Integration (...)`` leg-name prefix is load-bearing --
+      # the notify job's jq keys on it. Pinning rationale + codex worker halving
+      # live in .github/scripts/ci/integration-matrix.sh.
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
 
     steps:
       - name: Checkout

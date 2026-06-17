@@ -73,12 +73,11 @@ jobs:
         # a stale lockfile). Fix locally with `uv lock`.
         run: uv sync --locked --extra dev
 
+      # Sets up Node 20 and pins npm to the same major that regenerates
+      # the lockfile in the OSS-regen workflows, so the freshness gate
+      # below doesn't flake on npm version-skew churn.
       - name: Set up Node.js
-        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af  # v4
-        with:
-          node-version: "20"
-          cache: "npm"
-          cache-dependency-path: ap-web/package-lock.json
+        uses: ./.github/actions/setup-node
 
       - name: Install ap-web dependencies
         working-directory: ap-web
@@ -86,6 +85,22 @@ jobs:
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: npm ci --legacy-peer-deps
+
+      # The npm equivalent of the `uv sync --locked` gate above. `npm ci`
+      # only checks the lockfile is CONSISTENT with package.json; it
+      # tolerates cosmetic drift (dev/extraneous flags, metadata) that a
+      # fresh resolution would rewrite. Regenerate the lockfile and fail
+      # if it differs from the committed one.
+      - name: Check ap-web/package-lock.json is up to date
+        working-directory: ap-web
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: |
+          npm install --package-lock-only --legacy-peer-deps --no-audit --no-fund
+          git diff --exit-code package-lock.json || {
+            echo "::error::ap-web/package-lock.json is out of date. Run 'npm install --package-lock-only --legacy-peer-deps' in ap-web/ and commit the result."
+            exit 1
+          }
 
       - name: Run formatting, lint, and typing checks
         run: uv run pre-commit run --all-files --show-diff-on-failure

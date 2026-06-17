@@ -33,11 +33,14 @@ By trust tier (GitHub `author_association`):
   maintainer clicks **Approve and run**; after approval the gate's scan still
   applies.
 
-The scan inspects the PR diff for committed secrets, changes to privileged repo
-config (CI workflows, `.github/MAINTAINER`, `CODEOWNERS`, `.github/scripts`),
-CI-workflow misuse (`pull_request_target` + PR-head checkout, unpinned actions),
-and known code-execution / obfuscation patterns (semgrep, local ruleset). It
-only *statically* analyses the diff and runs with **no secrets** on fork PRs,
+The scan inspects the PR diff for committed secrets, secret-exfiltration shapes
+(a secret-named credential source plus a network sink in one file, an
+`os.environ` dump, a decode-then-exec, or a reverse shell), changes to
+privileged repo config (CI workflows, `.github/MAINTAINER`, `CODEOWNERS`,
+`.github/scripts`), CI-workflow misuse (`pull_request_target` + PR-head
+checkout, unpinned actions), and known code-execution / obfuscation patterns
+(semgrep, local ruleset). It only *statically* analyses the diff and runs with
+**no secrets** on fork PRs,
 and the scanner itself always runs from `main`, so a PR cannot weaken its own
 scan.
 
@@ -46,9 +49,23 @@ directly. When enforcing, merge stays blocked transitively (the skipped
 pytest/e2e checks are required) and `Maintainer Approval` remains the ultimate
 gate.
 
-It currently runs in **audit (non-blocking) mode** (`GATE_BLOCKING: "false"` in
-`security-scan.yml` — the single enforcement switch): the detectors run and
-surface findings as annotations and a job summary, but the `Security Scan` check
-always succeeds, so the pollers proceed and no CI is blocked. Flip
-`GATE_BLOCKING` to `"true"` to enforce once the scan has been observed on real
-PRs.
+It is **blocking**: a finding fails the `Security Scan` check, the pollers mirror
+that failure, and the dependent CI jobs are skipped. Detectors run fail-fast, so
+a clean PR must pass every one.
+
+### Maintainer override
+
+A maintainer can waive the scan on a specific PR with the **`skip-security-scan`**
+label (same convention as `skip-e2e-ui-test`). The waiver is only honored when it
+is *maintainer-effective*: the label is present **and** the PR author is a
+maintainer, or a maintainer's latest decisive review is `APPROVED`. The label
+alone does nothing — applying labels needs triage access, and the extra
+maintainer check is defence in depth — so a fork contributor cannot self-waive.
+The label and review state are read from the API, and the decision runs from
+`should-scan.sh` on `main`, so a PR cannot edit the waiver logic.
+
+To use it: a maintainer reviews/approves the PR and applies `skip-security-scan`;
+the `Security Scan` check re-runs and passes, then the blocked CI workflows are
+re-run (or the contributor pushes) so their gate jobs see the now-green scan.
+The waiver stays effective across pushes while the maintainer approval stands —
+remove the label (or dismiss the approval) to re-enable scanning.

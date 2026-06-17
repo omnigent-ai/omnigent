@@ -5,7 +5,7 @@ export const UI_MODE_LABEL_KEY = "omnigent.ui";
 export const UI_MODE_TERMINAL_VALUE = "terminal";
 
 export type NativeCodingAgentIconKind = "claude" | "codex" | "pi";
-export type NativeCodingAgentCapability = "permissionMode";
+export type NativeCodingAgentCapability = "permissionMode" | "approvalMode";
 
 export interface NativeCodingAgentSpec {
   key: NativeCodingAgentIconKind;
@@ -37,6 +37,7 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "Codex",
     iconKind: "codex",
     sortRank: 20,
+    capabilities: ["approvalMode"],
   },
   {
     key: "pi",

@@ -89,6 +89,49 @@ describe("BlockRenderer dispatch", () => {
     expect(card.getAttribute("data-terminal-kind")).toBe("output");
   });
 
+  it("renders error diagnostics with local wrapping and preserved line breaks", () => {
+    const message = [
+      "Required terminal exited unexpectedly; the session runtime is no longer available.",
+      "Lifecycle diagnostics:",
+      "terminal: required-runtime:main",
+      "command: runtime-worker (10 args; argv omitted because terminal args may contain secrets)",
+      "cwd: /workspace/project",
+      "last captured output:",
+      "  - first diagnostic line",
+      "  - second diagnostic line",
+    ].join("\n");
+    const items: RenderItem[] = [
+      {
+        kind: "error",
+        itemId: null,
+        source: "",
+        code: "required_terminal_exited",
+        message,
+      },
+    ];
+
+    const { container } = render(<BlockRenderer items={items} sessionStatus="idle" />);
+
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveClass("min-w-0");
+    expect(alert).toHaveClass("overflow-hidden");
+
+    const description = container.querySelector('[data-slot="alert-description"]');
+    expect(description).not.toBeNull();
+    expect(description).toHaveClass("min-w-0");
+    expect(description).toHaveClass("overflow-hidden");
+
+    const messageNode = screen.getByText(/Required terminal exited unexpectedly/);
+    expect(messageNode).toHaveClass("whitespace-pre-wrap");
+    expect(messageNode).toHaveClass("break-words");
+    expect(messageNode.textContent).toContain(
+      "Lifecycle diagnostics:\nterminal: required-runtime:main",
+    );
+    expect(messageNode.textContent).toContain(
+      "  - first diagnostic line\n  - second diagnostic line",
+    );
+  });
+
   it("treats a trailing reasoning item as streaming when sessionStatus is running", () => {
     const items: RenderItem[] = [
       { kind: "reasoning", itemId: null, text: "thinking", duration: undefined },

@@ -204,6 +204,15 @@ class TestModelFamilyMismatch:
         assert expected_rule in msg
         assert model in msg
 
+    def test_rejection_names_both_multi_model_fallbacks(self) -> None:
+        """Both single-vendor rejections name pi and openai-agents as multi-model fallbacks."""
+        claude_msg = model_family_mismatch("claude-native", "databricks-gpt-5-4")
+        codex_msg = model_family_mismatch("codex-native", "databricks-claude-sonnet-4-6")
+        for msg in (claude_msg, codex_msg):
+            assert msg is not None
+            assert "pi" in msg
+            assert "openai-agents" in msg
+
 
 @pytest.mark.parametrize(
     ("model", "expected"),

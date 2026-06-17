@@ -8,9 +8,10 @@ name: Security Gate
 #     MIRROR its conclusion (success -> proceed; failure -> fail, skipping the
 #     dependent CI jobs).
 #
-# Enforcement (audit vs blocking) lives in ONE place: GATE_BLOCKING in
-# security-scan.yml. Splitting scan from gate runs the scan once, not once per
-# workflow. The trust decision is read from `main` (should-scan.sh).
+# The scan (security-scan.yml) is blocking: a finding fails the `Security Scan`
+# check, which this poller mirrors to block dependent CI. Splitting scan from
+# gate runs the scan once, not once per workflow. The trust decision is read
+# from `main` (should-scan.sh).
 
 on:
   workflow_call:
@@ -55,12 +56,27 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           echo "Untrusted PR -- waiting for the single 'Security Scan' check on $HEAD_SHA"
+          # First-timer short-circuit. When a first-time contributor's runs are
+          # held behind GitHub's approval gate, Security Scan shows up as a
+          # workflow RUN with conclusion=action_required and NO check-run, so the
+          # poll below never sees it and spins the full ~6 min before failing
+          # open. Detect the held state and proceed now (same fail-open outcome);
+          # the gate re-runs on the next push or e2e-approved label event.
+          held=$(gh api "repos/$REPO/actions/runs?head_sha=$HEAD_SHA&event=pull_request" \
+            --jq '[.workflow_runs[] | select(.name=="Security Scan")] | sort_by(.created_at) | last | .conclusion' 2>/dev/null || echo "")
+          if [ "$held" = "action_required" ]; then
+            echo "::warning::Security Scan is awaiting maintainer approval (action_required); proceeding (fail-open). It will re-gate on the next push or the e2e-approved label event."
+            exit 0
+          fi
           q='[.check_runs[] | select(.name=="Security Scan")] | sort_by(.started_at) | last'
           conclusion=""
+          details_url=""
           for _ in $(seq 1 72); do   # up to ~6 min (72 * 5s)
             status=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs" --jq "$q | .status" 2>/dev/null || echo "")
             if [ "$status" = "completed" ]; then
               conclusion=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs" --jq "$q | .conclusion")
+              # The scan's own run page -- where the findings/annotations live.
+              details_url=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs" --jq "$q | .html_url")
               break
             fi
             sleep 5
@@ -72,5 +88,8 @@ jobs:
           echo "Security Scan concluded: $conclusion"
           case "$conclusion" in
             success | skipped | neutral) exit 0 ;;
-            *) echo "::error::Security Scan did not pass ($conclusion); blocking dependent CI."; exit 1 ;;
+            *)
+              echo "::error::Security Scan did not pass ($conclusion); dependent CI is blocked until it passes. See the findings: ${details_url:-the 'Security Scan' check on this PR}"
+              exit 1
+              ;;
           esac

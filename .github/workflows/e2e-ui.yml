@@ -14,6 +14,9 @@ name: E2E UI Tests
 
 on:
   pull_request:
+    # No labeled/unlabeled: a skip-security-scan waiver re-runs this workflow's
+    # Security Gate via rerun-security-gate.yml, so label churn need not re-run
+    # the heavy Playwright suite. (#399 added these for the gate; superseded.)
     types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches:
@@ -117,11 +120,7 @@ jobs:
           python-version-file: ".python-version"
 
       - name: Set up Node 20
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
-        with:
-          node-version: "20"
-          cache: "npm"
-          cache-dependency-path: ap-web/package-lock.json
+        uses: ./.github/actions/setup-node
 
       - name: Install uv
         uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4

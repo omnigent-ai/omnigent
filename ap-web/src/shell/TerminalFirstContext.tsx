@@ -14,8 +14,9 @@
 //
 // `isTerminalFirst` is purely presentational (the Chat/Terminal pill and
 // the inline terminal surface); `isNativeWrapper` keys the behavior
-// differences of native-CLI harnesses (no server-side slash_command
-// path, model pinned at launch). The flags used to coincide when the
+// differences of native-CLI harnesses (no server-side slash_command path;
+// `/model` is only exposed when a picker-backed propagation path exists).
+// The flags used to coincide when the
 // native wrappers were the only sessions stamping the terminal UI
 // label; runner-hosted SDK sessions now stamp `omnigent.ui` WITHOUT a
 // wrapper label (their embedded terminal hosts the Omnigent REPL), so

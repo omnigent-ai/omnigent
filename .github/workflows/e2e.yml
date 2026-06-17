@@ -18,7 +18,7 @@ on:
   schedule:
     - cron: "0 9 * * *"
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
     paths-ignore: ['ap-web/**']
   push:
     branches:

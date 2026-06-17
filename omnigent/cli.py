@@ -2638,17 +2638,19 @@ def _stop_cli_runner_process(
 def _adopt_cli_runner_process(proc: subprocess.Popen[bytes]) -> None:
     """Detach a runner from this CLI so it keeps running after CLI exit.
 
-    Sends :data:`RUNNER_ADOPT_SIGNAL` (SIGUSR1) so the runner cancels
-    its parent-pid watchdog and survives the launching CLI's exit. Used
-    when the user detaches from tmux: Claude and the runner stay alive
-    and the web UI stays connected. A no-op if the runner
-    has already exited.
+    Sends :data:`RUNNER_ADOPT_SIGNAL` (SIGUSR1, when available) so the
+    runner cancels its parent-pid watchdog and survives the launching
+    CLI's exit. Used when the user detaches from tmux: Claude and the
+    runner stay alive and the web UI stays connected. A no-op if the
+    runner has already exited, or if the platform has no adopt signal.
 
     :param proc: Runner subprocess handle to adopt.
     :returns: None.
     """
     from omnigent.runner.identity import RUNNER_ADOPT_SIGNAL
 
+    if RUNNER_ADOPT_SIGNAL is None:
+        return
     if proc.poll() is None:
         with contextlib.suppress(ProcessLookupError):
             proc.send_signal(RUNNER_ADOPT_SIGNAL)
@@ -7931,6 +7933,63 @@ def _manage_harness_providers(family: str) -> None:
             status = _manage_credential(row.provider, family)
 
 
+def _prompt_install_cursor() -> str | None:
+    """Offer to install the missing ``cursor`` extra; return a status line.
+
+    Shown atop the Cursor drill-in when the optional-extra ``cursor-sdk`` is
+    absent. Three-choice ``select`` like :func:`_prompt_install_antigravity` /
+    :func:`_prompt_install_harness` (install now / set key anyway / show
+    command), but does NOT gate key management on the SDK: the ``cursor:`` key
+    is stored independently and is useful once the SDK lands, so declining falls
+    through to the key menu (whereas ``_prompt_install_harness`` returns to the
+    picker, since pi can't configure credentials without its CLI). Install is
+    portable and index-free — see
+    :func:`omnigent.onboarding.cursor_auth.cursor_install_command`.
+
+    :returns: Status string for the drill-in's transient status line, or
+        ``None`` (set-key-anyway / Esc / printed-command, no actionable result).
+    """
+    from rich.markup import escape as _rich_escape
+
+    from omnigent.onboarding.cursor_auth import (
+        CURSOR_EXTRA_INSTALL_COMMAND,
+        install_cursor_sdk,
+    )
+    from omnigent.onboarding.interactive import console, select
+
+    cmd = CURSOR_EXTRA_INSTALL_COMMAND
+    # ``select`` renders text through Rich markup; escape the literal
+    # ``[cursor]`` so it renders verbatim.
+    cmd_markup = _rich_escape(cmd)
+    choice = select(
+        "Cursor's SDK (cursor-sdk) isn't installed. Install it now?",
+        [
+            f"Install it now ({cmd_markup})",
+            "Set the Cursor key anyway",
+            "I'll run it myself (show the command)",
+        ],
+        descriptions=[
+            f"Runs `{cmd_markup}` (uses uv when available), then continues.",
+            "Skip the install — store the key now; the SDK can be added later.",
+            "Print the command so you can install it yourself, then continue.",
+        ],
+        default=0,
+        clear_on_exit=True,
+    )
+    if choice == 0:
+        console.print(f"  [dim]Installing the cursor extra — running `{cmd_markup}`…[/dim]")
+        if install_cursor_sdk():
+            console.print("  [green]✓ cursor-sdk installed[/green]")
+            return "✓ cursor-sdk installed"
+        console.print(f"  [red]Install failed.[/red] Run it manually: [bold]{cmd_markup}[/bold]")
+        return "✗ Install failed — set the key anyway, or install by hand"
+    if choice == 2:  # run it yourself
+        console.print(f"  Install the cursor extra with:\n    [bold]{cmd_markup}[/bold]")
+        return None
+    # choice == 1 (set key anyway) or Esc: fall through to the key menu silently.
+    return None
+
+
 def _manage_cursor_harness() -> None:
     """Run the level-2 loop for Cursor: manage its ``CURSOR_API_KEY``.
 
@@ -7942,14 +8001,29 @@ def _manage_cursor_harness() -> None:
     harnesses persist their api keys (the secret in the store, a
     ``keychain:``/``env:`` reference in ``~/.omnigent/config.yaml``).
 
-    :returns: None. Side effects: may write the ``cursor:`` block of
-        ``~/.omnigent/config.yaml`` and the secret store.
+    When the optional ``cursor-sdk`` is missing, the drill-in first offers to
+    install it (:func:`_prompt_install_cursor`). Unlike the CLI-backed harnesses
+    (which gate on the CLI), declining still drops into the key menu — the
+    ``cursor:`` key is independently storable. Mirrors Antigravity post-#322.
+
+    :returns: None. Side effects: may install the ``cursor`` extra, and may
+        write the ``cursor:`` block of ``~/.omnigent/config.yaml`` and the
+        secret store.
     """
     from omnigent.onboarding import secrets as secret_store
-    from omnigent.onboarding.cursor_auth import cursor_api_key_configured, cursor_api_key_ref
+    from omnigent.onboarding.cursor_auth import (
+        cursor_api_key_configured,
+        cursor_api_key_ref,
+        cursor_sdk_installed,
+    )
     from omnigent.onboarding.interactive import select
 
+    # Offer the install once on entry (not per loop iteration) when the SDK is
+    # absent; the result seeds the menu's status line. Declining falls through
+    # to key management, since the key is SDK-independent.
     status: str | None = None
+    if not cursor_sdk_installed():
+        status = _prompt_install_cursor()
     while True:
         config = _load_global_config()
         key_set = cursor_api_key_configured(config)
@@ -8027,6 +8101,60 @@ def _set_cursor_api_key() -> str | None:
     return "✓ Cursor API key stored"
 
 
+def _prompt_install_antigravity() -> str | None:
+    """Offer to install the missing ``antigravity`` extra; return a status line.
+
+    Shown atop the Antigravity drill-in when the ``google-antigravity`` SDK is absent.
+    Mirrors :func:`_prompt_install_harness` — a three-choice ``select`` (install now /
+    set key anyway / print command) — but does NOT gate key management on the SDK:
+    unlike pi (which can't be configured without its CLI), the ``antigravity:`` key is
+    storable independently, so declining just falls through to the key menu. The
+    install carries no index URL (see :func:`antigravity_install_command`); on failure
+    it prints the command to run by hand.
+
+    :returns: A status string for the drill-in's transient status (install result or
+        printed-command note), or ``None`` on set-key-anyway / Esc.
+    """
+    from rich.markup import escape as _rich_escape
+
+    from omnigent.onboarding.antigravity_auth import (
+        ANTIGRAVITY_EXTRA_INSTALL_COMMAND,
+        install_antigravity_sdk,
+    )
+    from omnigent.onboarding.interactive import console, select
+
+    cmd = ANTIGRAVITY_EXTRA_INSTALL_COMMAND
+    # ``select`` renders through Rich markup, so escape the literal ``[antigravity]``.
+    cmd_markup = _rich_escape(cmd)
+    choice = select(
+        "Antigravity's SDK (google-antigravity) isn't installed. Install it now?",
+        [
+            f"Install it now ({cmd_markup})",
+            "Set the Gemini key anyway",
+            "I'll run it myself (show the command)",
+        ],
+        descriptions=[
+            f"Runs `{cmd_markup}` (uses uv when available), then continues.",
+            "Skip the install — store the key now; the SDK can be added later.",
+            "Print the command so you can install it yourself, then continue.",
+        ],
+        default=0,
+        clear_on_exit=True,
+    )
+    if choice == 0:
+        console.print(f"  [dim]Installing the antigravity extra — running `{cmd_markup}`…[/dim]")
+        if install_antigravity_sdk():
+            console.print("  [green]✓ google-antigravity installed[/green]")
+            return "✓ google-antigravity installed"
+        console.print(f"  [red]Install failed.[/red] Run it manually: [bold]{cmd_markup}[/bold]")
+        return "✗ Install failed — set the key anyway, or install by hand"
+    if choice == 2:
+        console.print(f"  Install the antigravity extra with:\n    [bold]{cmd_markup}[/bold]")
+        return None
+    # choice == 1 (set key anyway) or Esc: fall through to the key menu silently.
+    return None
+
+
 def _manage_antigravity_harness() -> None:
     """Run the level-2 loop for Antigravity: set / replace / remove its Gemini key.
 
@@ -8034,8 +8162,13 @@ def _manage_antigravity_harness() -> None:
     API key — stored in the secret store, referenced from the ``antigravity:``
     config block — mirroring how the other harnesses persist api keys.
 
-    :returns: None. Side effects: may write the ``antigravity:`` config block
-        and the secret store.
+    When the optional ``google-antigravity`` SDK is missing, the drill-in first offers
+    to install it (:func:`_prompt_install_antigravity`). Unlike the CLI-backed harnesses
+    (whose drill-in *gates* on the CLI), declining here still drops into the key menu,
+    since the ``antigravity:`` key is independently storable.
+
+    :returns: None. Side effects: may install the ``antigravity`` extra, and may write
+        the ``antigravity:`` config block and the secret store.
     """
     from omnigent.onboarding import secrets as secret_store
     from omnigent.onboarding.antigravity_auth import (
@@ -8043,10 +8176,15 @@ def _manage_antigravity_harness() -> None:
         ANTIGRAVITY_SECRET_NAME,
         antigravity_api_key_configured,
         antigravity_api_key_ref,
+        antigravity_sdk_installed,
     )
     from omnigent.onboarding.interactive import select
 
+    # Offer the install once on entry (not per loop iteration); the returned status
+    # seeds the menu's transient status line.
     status: str | None = None
+    if not antigravity_sdk_installed():
+        status = _prompt_install_antigravity()
     while True:
         config = _load_global_config()
         key_set = antigravity_api_key_configured(config)
@@ -8410,10 +8548,16 @@ def _run_configure_harnesses_interactive() -> None:
     """
     from omnigent.onboarding.antigravity_auth import (
         ANTIGRAVITY_ENV_VARS,
+        ANTIGRAVITY_EXTRA_INSTALL_COMMAND,
         antigravity_api_key_configured,
+        antigravity_sdk_installed,
     )
     from omnigent.onboarding.configure_models import family_label
-    from omnigent.onboarding.cursor_auth import cursor_api_key_configured
+    from omnigent.onboarding.cursor_auth import (
+        CURSOR_EXTRA_INSTALL_COMMAND,
+        cursor_api_key_configured,
+        cursor_sdk_installed,
+    )
     from omnigent.onboarding.harness_install import CURSOR_KEY, harness_cli_installed
     from omnigent.onboarding.interactive import select
     from omnigent.onboarding.provider_config import (
@@ -8506,14 +8650,28 @@ def _run_configure_harnesses_interactive() -> None:
         options.append(f"{'  ' if cursor_key_set else '[red]✗[/] '}Cursor")
         selectable.append(True)
         row_target.append(CURSOR_KEY)
-        cursor_sub = (
+        # ``cursor-sdk`` now ships in an OPTIONAL extra, so the key can be set
+        # with no SDK present. When the extra is missing, lead with that gap and
+        # the install command (parallel to Antigravity post-#322), then still
+        # report key status. ``[cursor]`` is escaped — sub-lines render through
+        # Rich markup, where bare brackets parse as a tag.
+        cursor_sub_lines: list[str] = []
+        if not cursor_sdk_installed():
+            from rich.markup import escape as _rich_escape
+
+            cursor_sub_lines.append(
+                f"[dim]not installed — open to install "
+                f"({_rich_escape(CURSOR_EXTRA_INSTALL_COMMAND)})[/]"
+            )
+        cursor_sub_lines.append(
             "[green]✓[/] API key configured"
             if cursor_key_set
             else "[dim]no API key yet — open to add one[/]"
         )
-        options.append(f"  {cursor_sub}")
-        selectable.append(False)
-        row_target.append(None)
+        for cursor_sub in cursor_sub_lines:
+            options.append(f"  {cursor_sub}")
+            selectable.append(False)
+            row_target.append(None)
         # Antigravity (Gemini-native, no provider family): like Cursor, readiness
         # is just whether a Gemini key is configured (``antigravity:`` block or
         # ambient env); its drill-in manages that key. Vertex specs need no key,
@@ -8524,14 +8682,28 @@ def _run_configure_harnesses_interactive() -> None:
         options.append(f"{'  ' if ag_key_set else '[red]✗[/] '}Antigravity")
         selectable.append(True)
         row_target.append(_ANTIGRAVITY)
-        ag_sub = (
+        # The antigravity SDK ships in an OPTIONAL extra (unlike Cursor's baseline
+        # ``cursor-sdk``), so a user can have a key but no SDK. Lead with that gap when
+        # the extra is missing — naming the install command inline — then still report
+        # key status. ``[antigravity]`` is escaped since the sub-lines render as Rich
+        # markup (bare brackets parse as a tag).
+        ag_sub_lines: list[str] = []
+        if not antigravity_sdk_installed():
+            from rich.markup import escape as _rich_escape
+
+            ag_sub_lines.append(
+                f"[dim]not installed — open to install "
+                f"({_rich_escape(ANTIGRAVITY_EXTRA_INSTALL_COMMAND)})[/]"
+            )
+        ag_sub_lines.append(
             "[green]✓[/] Gemini API key configured"
             if ag_key_set
             else "[dim]no Gemini API key yet — open to add one[/]"
         )
-        options.append(f"  {ag_sub}")
-        selectable.append(False)
-        row_target.append(None)
+        for ag_sub in ag_sub_lines:
+            options.append(f"  {ag_sub}")
+            selectable.append(False)
+            row_target.append(None)
         options.append("Quit")
         selectable.append(True)
         row_target.append(_QUIT)
