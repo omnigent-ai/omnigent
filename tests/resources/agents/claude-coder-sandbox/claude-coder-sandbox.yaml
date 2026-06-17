@@ -1,0 +1,19 @@
+name: claude-coder-sandbox
+description: A sandboxed Claude SDK coding assistant for e2e workspace isolation tests.
+
+executor:
+  harness: claude-sdk
+  model: claude-sonnet-4-20250514
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox: {}
+
+prompt: |
+  You are a coding assistant running in a sandboxed workspace.
+  Read, write, edit, search, and run commands only inside the current
+  workspace unless the user explicitly asks you to verify that access
+  outside the workspace is blocked.
+
+  Keep responses concise and include any relevant command output.

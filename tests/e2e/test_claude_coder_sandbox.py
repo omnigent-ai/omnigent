@@ -21,7 +21,7 @@ import httpx
 
 from tests.e2e.conftest import (
     create_runner_bound_session,
-    poll_until_terminal,
+    poll_session_until_terminal,
     send_user_message_to_session,
 )
 
@@ -83,12 +83,14 @@ def _dispatch_and_wait(
     """
     session_id = create_runner_bound_session(client, agent_name=agent_name, runner_id=runner_id)
     response_id = send_user_message_to_session(client, session_id=session_id, content=prompt)
-    return poll_until_terminal(client, response_id, timeout=timeout)
+    return poll_session_until_terminal(
+        client, session_id=session_id, response_id=response_id, timeout=timeout
+    )
 
 
 def test_read_blocked_outside_workspace(
     http_client: httpx.Client,
-    claude_coder_agent: str,
+    claude_coder_sandbox_agent: str,
     live_runner_id: str,
 ) -> None:
     """
@@ -118,7 +120,7 @@ def test_read_blocked_outside_workspace(
     try:
         body = _dispatch_and_wait(
             http_client,
-            agent_name=claude_coder_agent,
+            agent_name=claude_coder_sandbox_agent,
             runner_id=live_runner_id,
             prompt=f"Use the Read tool to read {secret_path}. Do NOT use Bash or cat.",
         )
@@ -141,7 +143,7 @@ def test_read_blocked_outside_workspace(
 
 def test_write_blocked_outside_workspace(
     http_client: httpx.Client,
-    claude_coder_agent: str,
+    claude_coder_sandbox_agent: str,
     live_runner_id: str,
 ) -> None:
     """
@@ -159,7 +161,7 @@ def test_write_blocked_outside_workspace(
     try:
         body = _dispatch_and_wait(
             http_client,
-            agent_name=claude_coder_agent,
+            agent_name=claude_coder_sandbox_agent,
             runner_id=live_runner_id,
             prompt=f"Run this exact Bash command: echo ESCAPED > {target}",
         )
@@ -177,7 +179,7 @@ def test_write_blocked_outside_workspace(
 
 def test_write_succeeds_inside_workspace(
     http_client: httpx.Client,
-    claude_coder_agent: str,
+    claude_coder_sandbox_agent: str,
     live_runner_id: str,
 ) -> None:
     """
@@ -191,7 +193,7 @@ def test_write_succeeds_inside_workspace(
     """
     body = _dispatch_and_wait(
         http_client,
-        agent_name=claude_coder_agent,
+        agent_name=claude_coder_sandbox_agent,
         runner_id=live_runner_id,
         prompt=(
             "Create a file called test_sandbox.txt in the "
@@ -209,7 +211,7 @@ def test_write_succeeds_inside_workspace(
 
 def test_glob_blocked_outside_workspace(
     http_client: httpx.Client,
-    claude_coder_agent: str,
+    claude_coder_sandbox_agent: str,
     live_runner_id: str,
 ) -> None:
     """
@@ -233,7 +235,7 @@ def test_glob_blocked_outside_workspace(
     try:
         body = _dispatch_and_wait(
             http_client,
-            agent_name=claude_coder_agent,
+            agent_name=claude_coder_sandbox_agent,
             runner_id=live_runner_id,
             prompt="Use the Glob tool to search for *.txt files in /tmp. Do NOT use Bash or ls.",
         )
@@ -253,7 +255,7 @@ def test_glob_blocked_outside_workspace(
 
 def test_edit_blocked_outside_workspace(
     http_client: httpx.Client,
-    claude_coder_agent: str,
+    claude_coder_sandbox_agent: str,
     live_runner_id: str,
 ) -> None:
     """
@@ -277,7 +279,7 @@ def test_edit_blocked_outside_workspace(
     try:
         body = _dispatch_and_wait(
             http_client,
-            agent_name=claude_coder_agent,
+            agent_name=claude_coder_sandbox_agent,
             runner_id=live_runner_id,
             prompt=(
                 f"Use the Edit tool to replace 'ORIGINAL_CONTENT_DO_NOT_MODIFY' "

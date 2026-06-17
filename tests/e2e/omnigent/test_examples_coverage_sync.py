@@ -122,6 +122,7 @@ _ALT_COVERED: frozenset[str] = frozenset(
         # name from existing e2e tests).
         "ask-demo",
         "claude-coder",
+        "claude-coder-sandbox",
         "coding-supervisor",
         "compaction-test",
         # Test-only fixtures added with OMNIGENT_TERMINAL_BRIDGE (commits
@@ -179,6 +180,7 @@ _ALT_COVERED: frozenset[str] = frozenset(
         # (test_host_claude_native_fork_e2e.py, test_switch_agent_e2e.py,
         # test_switch_agent_native_e2e.py, test_sessions_fork_e2e.py).
         "sdk-chat-builtin",
+        "sandbox-deps-os-env",
     }
 )
 

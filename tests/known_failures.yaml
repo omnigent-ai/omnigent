@@ -196,12 +196,6 @@ skips:
     issue: 532
     cluster: repl-pexpect-cli
     mode: skip
-  - id: tests/e2e/test_sandbox_dependencies.py::test_pip_install_and_use_package
-    reason: "The repo's uv-managed .venv doesn't expose `python -m pip`, so the agent's `pip install cowsay` errors with 'no module named pip' and the cowsay assertion fails. Dispatch path is correct (agent reaches sys_os_shell and surfaces the env failure as a real tool result); the env assumption is broken. Fix needs `python3 -m ensurepip` in the sandbox setup or a switch to `uv pip install`. The npm sibling test passes — node has no equivalent issue."
-    issue: 532
-    cluster: sandbox-deps-env
-    mode: skip
-
   - id: tests/e2e/test_sys_async_inbox_e2e.py::test_sys_cancel_async_aborts_in_flight_dispatch_e2e
     reason: "Shard 0 bulk: sys async-inbox cancel mid-dispatch. Triage under #532."
     issue: 532
@@ -648,12 +642,6 @@ skips:
   # 2 are the existing files-upload 409 'conversation not bound
   # to a runner' family. Triage under #532.
 
-  - id: tests/e2e/test_sandbox_dependencies.py::test_uv_pip_install_and_use_package
-    reason: "Failing deterministically on `main` and across multiple feature branches: 4 of 5 most recent E2E runs reported `runtime_error: harness failed` from the agent loop, with the agent never completing the `uv pip install cowsay` + python run round-trip. Sibling test_pip_install_and_use_package was already quarantined (#532). The harness-failed signal is generic; needs deeper investigation (sandbox dependency install path, harness lifecycle) before un-quarantining."
-    issue: 532
-    cluster: sandbox-deps-env
-    mode: skip
-
   - id: tests/e2e/test_filesystem_changed_files_e2e.py::test_diff_endpoint_shows_git_diff_for_modified_file
     reason: "Failing deterministically on `main` and across multiple feature branches: 3 of 5 most recent E2E runs reported `Agent turn failed with status 'failed'. The workspace-file-writer agent did not complete successfully.` Likely a regression in the workspace-file-writer agent spec or its dispatch; needs owner investigation before un-quarantining."
     issue: 532
@@ -814,38 +802,6 @@ skips:
   # Cluster: claude_coder sandbox enforcement. All 5 tests in
   # test_claude_coder_sandbox.py flipped together — suggests the
   # sandbox enforcement path or its fixture regressed.
-  - id: tests/e2e/test_claude_coder_sandbox.py::test_edit_blocked_outside_workspace
-    reason: "Force-merge backlog (claude-coder sandbox cluster: all 5 sandbox tests flipped together). First observed failing at 0449cd1a (2026-05-22T08:44:22Z, E2E)."
-    issue: 0
-    cluster: sandbox-deps-env
-    mode: skip
-  - id: tests/e2e/test_claude_coder_sandbox.py::test_glob_blocked_outside_workspace
-    reason: "Force-merge backlog (claude-coder sandbox cluster). First observed failing at 305e9bb9 (2026-05-23T06:06:59Z, E2E)."
-    issue: 0
-    cluster: sandbox-deps-env
-    mode: skip
-  - id: tests/e2e/test_claude_coder_sandbox.py::test_read_blocked_outside_workspace
-    reason: "Force-merge backlog (claude-coder sandbox cluster). First observed failing at 1a515983 (2026-05-23T06:28:30Z, E2E)."
-    issue: 0
-    cluster: sandbox-deps-env
-    mode: skip
-  - id: tests/e2e/test_claude_coder_sandbox.py::test_write_blocked_outside_workspace
-    reason: "Force-merge backlog (claude-coder sandbox cluster). First observed failing at 305e9bb9 (2026-05-23T06:06:59Z, E2E)."
-    issue: 0
-    cluster: sandbox-deps-env
-    mode: skip
-  - id: tests/e2e/test_claude_coder_sandbox.py::test_write_succeeds_inside_workspace
-    reason: "Force-merge backlog (claude-coder sandbox cluster). First observed failing at 305e9bb9 (2026-05-23T06:06:59Z, E2E)."
-    issue: 0
-    cluster: sandbox-deps-env
-    mode: skip
-
-  # Cluster: cancel/history.
-
-  # Cluster: databricks_supervisor harness parametrizations broken
-  # across multiple unrelated test files (yaml hello world, real
-  # hello world, coding supervisor with forks). Likely a single
-  # gateway-routing or supervisor-harness regression.
   - id: tests/e2e/omnigent/test_example_coding_supervisor_with_forks.py::test_coding_supervisor_with_forks_one_shot[databricks_supervisor]
     reason: "Force-merge backlog (databricks_supervisor harness cluster). First observed failing at 305e9bb9 (2026-05-23T06:06:59Z, E2E)."
     issue: 0
@@ -878,20 +834,6 @@ skips:
     issue: 0
     cluster: files-uploads-attachments
     mode: skip
-  - id: tests/e2e/test_sandbox_dependencies.py::test_npm_install_and_use_package
-    reason: "Force-merge backlog (standalone). First observed failing at 305e9bb9 (2026-05-23T06:06:59Z, E2E)."
-    issue: 0
-    cluster: sandbox-deps-env
-    mode: skip
-  # ──────────────────────────────────────────────────────────────
-  # Residual CI stabilization after #1375 (2026-05-25).
-  #
-  # #1375 quarantined the first force-merge backlog batch, but fresh
-  # post-merge CI still exposed additional red tests/hangs. These are
-  # intentionally quarantined separately so main/merge-queue can go
-  # green before focused fix+unjail PRs land.
-  # ──────────────────────────────────────────────────────────────
-
   - id: tests/e2e/omnigent/test_run_omnigent_coding_supervisor.py::test_run_omnigent_coding_supervisor_codex_shell_not_disabled
     reason: "Flaky e2e: codex worker doesn't read fixture file — shell_tool regression or supervisor delegation failure."
     issue: 0
