@@ -88,15 +88,11 @@ def test_subagent_tab_title_uses_agent_name(
 
     # The header confirms the page renders as a sub-agent (child) view:
     # the back-to-parent affordance and the "Sub-agent" identity caption.
-    expect(page.get_by_role("link", name="Back to parent session")).to_be_visible(
-        timeout=30_000
-    )
+    expect(page.get_by_role("link", name="Back to parent session")).to_be_visible(timeout=30_000)
     expect(page.get_by_text("Sub-agent", exact=True)).to_be_visible()
 
     # The tab is named after the sub-agent, not "New session". The leading
     # "● " working-indicator prefix is tolerated so a mid-turn child still
     # passes; the load-bearing part is the agent name, not the fallback.
-    expect(page).to_have_title(
-        re.compile(rf"^(?:● )?{re.escape(agent_name)}$"), timeout=30_000
-    )
+    expect(page).to_have_title(re.compile(rf"^(?:● )?{re.escape(agent_name)}$"), timeout=30_000)
     assert "New session" not in page.title()
