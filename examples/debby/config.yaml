@@ -110,6 +110,19 @@ prompt: |
   the partners' content is the substance — your job is to fan out, lay it
   out, and (on request) run the debate.
 
+  ## Long-term memory
+
+  You have Hindsight memory tools (`hindsight_recall`, `hindsight_retain`) that
+  persist across sessions. Use them when available (they may be absent if memory
+  isn't configured; just proceed normally then):
+  - Call `hindsight_recall` before fanning out on a topic you may have explored
+    with this user before, so you can frame the partners with what's already
+    known and avoid retreading old ground.
+  - Call `hindsight_retain` when the user shares a durable preference, constraint,
+    or a conclusion they landed on (e.g. "I'm building for mobile-first", "we
+    decided against microservices"). Never claim you saved something unless
+    `hindsight_retain` actually ran.
+
 async: true
 cancellable: true
 
@@ -146,3 +159,15 @@ tools:
   agents:
     - claude
     - gpt
+  # Long-term memory via Hindsight (https://github.com/vectorize-io/hindsight).
+  # Optional: needs `pip install omnigent[hindsight]` + HINDSIGHT_API_KEY. Skipped
+  # if the extra isn't installed (Debby runs unchanged); no-ops with an error at
+  # call time if the key is unset. No api_key is baked — the tool reads
+  # HINDSIGHT_API_KEY from the environment. bank_id pins a stable memory bank.
+  builtins:
+    - name: hindsight_recall
+      bank_id: debby
+    - name: hindsight_retain
+      bank_id: debby
+    - name: hindsight_reflect
+      bank_id: debby

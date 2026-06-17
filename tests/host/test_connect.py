@@ -1076,6 +1076,8 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
         "OPENAI_API_KEY": "sk-o",
         "OPENAI_BASE_URL": "https://gateway.example.com/openai",
         "GEMINI_API_KEY": "g-key",
+        "HINDSIGHT_API_KEY": "hsk-mem",
+        "HINDSIGHT_API_URL": "https://api.hindsight.vectorize.io",
     }
 
     env = _build_runner_env(
@@ -1095,6 +1097,9 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
         "GEMINI_API_KEY",
+        # Hindsight memory tools authenticate runner-side via these.
+        "HINDSIGHT_API_KEY",
+        "HINDSIGHT_API_URL",
     ):
         # Pins each conventional name into the default set — dropping
         # one breaks that harness's credentials on managed sandboxes.

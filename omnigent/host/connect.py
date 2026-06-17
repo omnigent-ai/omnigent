@@ -306,6 +306,14 @@ HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
         "GEMINI_API_KEY",
         "GIT_TOKEN",
         "GIT_USERNAME",
+        # HINDSIGHT_API_KEY / _API_URL authenticate the Hindsight memory built-in
+        # tools (hindsight_retain / recall / reflect) to the user's memory store.
+        # Like the provider keys above, these are credentials the host owner sets
+        # precisely so their runners can use them — the tools run runner-side and
+        # read them from the env (no secret is baked into the agent spec). Absent
+        # from the host env → simply not forwarded, and the tools degrade.
+        "HINDSIGHT_API_KEY",
+        "HINDSIGHT_API_URL",
     }
 )
 
