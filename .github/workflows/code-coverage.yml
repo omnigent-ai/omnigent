@@ -41,6 +41,10 @@ env:
   # "would fail once enforced" instead of a red ✗. Set "true" to post real
   # failure statuses once the gate has run cleanly for a while.
   COVERAGE_ENFORCE: "false"
+  # How many recent main commits to scan back through for the last recorded
+  # baseline status. Needs to exceed the longest expected run of consecutive
+  # merges that don't touch a given suite; 100 is a generous margin.
+  BASELINE_LOOKBACK: "100"
 
 jobs:
   post:
@@ -103,13 +107,35 @@ jobs:
             exit 0
           fi
 
-          # On a PR: baseline = the matching status on main's HEAD.
-          BASE_DESC=$(gh api "repos/$REPO/commits/main/status" \
-            -q ".statuses[] | select(.context==\"$CONTEXT\") | .description" 2>/dev/null | head -n1 || true)
-          BASELINE=$(printf '%s' "$BASE_DESC" | grep -oE '[0-9]+(\.[0-9]+)?' | head -n1 || true)
+          # On a PR: baseline = the most recent $CONTEXT status recorded on main.
+          # We can't just read main's HEAD: the two producers are path-filtered
+          # against each other (backend CI ignores ap-web/**, ap-web Tests only
+          # runs on ap-web/**), so a one-sided merge leaves HEAD carrying only one
+          # suite's status. Reading HEAD alone would then report "no baseline yet"
+          # and silently disable the other gate. Instead walk back through recent
+          # main commits and take the first one that actually carries $CONTEXT.
+          BASELINE=""
+          BASELINE_SHA=""
+          for sha in $(gh api "repos/$REPO/commits?sha=main&per_page=$BASELINE_LOOKBACK" \
+            -q '.[].sha' 2>/dev/null); do
+            d=$(gh api "repos/$REPO/commits/$sha/status" \
+              -q ".statuses[] | select(.context==\"$CONTEXT\") | .description" 2>/dev/null | head -n1 || true)
+            n=$(printf '%s' "$d" | grep -oE '[0-9]+(\.[0-9]+)?' | head -n1 || true)
+            if [[ -n "$n" ]]; then
+              BASELINE="$n"
+              BASELINE_SHA="$sha"
+              break
+            fi
+          done
+
+          if [[ -n "$BASELINE" ]]; then
+            echo "Baseline ${CONTEXT}=${BASELINE}% from main ${BASELINE_SHA}"
+          fi
 
           if [[ -z "$BASELINE" ]]; then
-            # No baseline recorded on main yet (first rollout) — report, don't gate.
+            # No $CONTEXT status in the last $BASELINE_LOOKBACK main commits
+            # (first rollout, or this suite hasn't run on main yet) — report,
+            # don't gate.
             gh api "repos/$REPO/statuses/$SHA" \
               -f state=success \
               -f context="$CONTEXT" \
