@@ -435,8 +435,7 @@ def subagent_ban_yaml_factory(tmp_path: Path) -> Callable[[str, str], Path]:
     :class:`AgentTool`) and a policy that narrows to the
     sub-agent's *declared name* via ``match_tools: [worker]``.
 
-    Exercises the Gap 8 fix in
-    :func:`omnigent.runtime.executors.omnigent._make_tool_executor_bridge`:
+    Exercises the Gap 8 fix in the tool-executor bridge:
     when the LLM calls ``worker(input=...)`` directly (rather
     than ``sys_session_send(type="worker", ...)``), the bridge
     routes the call through ``_dispatch_user_agent_tool`` and

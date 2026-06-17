@@ -42,7 +42,7 @@ def _extract_all_text(body: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-def test_archer_spawns_and_auto_collects(
+def test_agent_spawns_and_auto_collects(
     http_client: httpx.Client,
     archer_agent: str,
     live_runner_id: str,

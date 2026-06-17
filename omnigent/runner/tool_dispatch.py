@@ -213,6 +213,15 @@ _SESSION_QUERY_TOOLS = frozenset(
 # ``_execute_subagent_tool``.
 _WEB_FETCH_TOOLS = frozenset({"web_fetch"})
 
+# Priority 5f.1b: web_search — the first-party search builtin. Runner-local
+# so a non-OpenAI model's web_search function call resolves to the spec's
+# configured backend (google / perplexity / nimble) via WebSearchTool.invoke.
+# (OpenAI models use the native web_search_preview passthrough and never reach
+# this path.) Without this entry the call fell through to the spec-callable
+# branch and errored "tool unavailable" — the gap behind the non-OpenAI
+# web_search known-failure.
+_WEB_SEARCH_TOOLS = frozenset({"web_search"})
+
 # Priority 5f.2: sys_list_models — runner-local because provider resolution
 # reads the runner host's config/credentials, same as the spawn paths.
 _LIST_MODELS_TOOLS = frozenset({"sys_list_models"})
@@ -309,6 +318,7 @@ _ALL_LOCAL_TOOLS = (
     | _SESSION_CREATE_TOOLS
     | _SESSION_QUERY_TOOLS
     | _WEB_FETCH_TOOLS
+    | _WEB_SEARCH_TOOLS
     | _TIMER_TOOLS
     | _TASK_LIFECYCLE_TOOLS
     | _SKILL_TOOLS
@@ -1853,6 +1863,83 @@ async def _execute_web_fetch_tool(
     )
 
 
+def _web_search_config_from_spec(agent_spec: Any | None) -> dict[str, str]:
+    """
+    Return the ``web_search`` builtin's config dict from the parent spec.
+
+    Mirrors ``ToolManager._register_builtin_tools``: scans
+    ``spec.tools.builtins`` for the entry named ``"web_search"`` and returns
+    its ``config`` (``search_provider`` + credentials). Empty dict when the
+    builtin is declared as a bare string or absent.
+
+    :param agent_spec: Parent agent's spec, or ``None``.
+    :returns: The web_search config dict, e.g.
+        ``{"search_provider": "nimble", "api_key": "..."}``.
+    """
+    if agent_spec is None:
+        return {}
+    tools = getattr(agent_spec, "tools", None)
+    builtins = getattr(tools, "builtins", None) or []
+    for entry in builtins:
+        if getattr(entry, "name", None) == "web_search":
+            return getattr(entry, "config", None) or {}
+    return {}
+
+
+async def _execute_web_search_tool(
+    args: dict[str, Any],
+    *,
+    agent_spec: Any | None,
+    conversation_id: str | None = None,
+    task_id: str | None = None,
+    agent_id: str | None = None,
+) -> str:
+    """
+    Dispatch a ``web_search`` tool call to the spec's configured backend.
+
+    Builds ``WebSearchTool`` from the spec's ``web_search`` builtin config and
+    runs its synchronous ``invoke`` off the event loop (the backend makes a
+    blocking HTTP call).
+
+    ``llm_provider`` is inferred exactly as ``ToolManager._create_web_search``
+    does, so the dispatch path preserves the same invariants as session setup:
+
+    - **OpenAI models** keep the native ``web_search_preview`` passthrough; if a
+      ``web_search`` function call ever reached this path, ``invoke()`` raises
+      (its built-in fence) and the third-party backend is never run. In normal
+      operation OpenAI models never emit a ``web_search`` function call, so this
+      is defensive — but it keeps the promise rather than silently weakening it.
+    - **``databricks-*`` models** skip provider inference (they don't support
+      ``web_search_preview``) and run in function-tool mode.
+
+    :param args: Parsed LLM arguments — ``query`` (required).
+    :param agent_spec: Parent agent's spec; carries the web_search config + model.
+    :param conversation_id: Parent session id, threaded into the context.
+    :param task_id: Calling task id, threaded into the context.
+    :param agent_id: Calling agent id, threaded into the context.
+    :returns: The formatted search results, or an error string.
+    """
+    from omnigent.tools.base import ToolContext
+    from omnigent.tools.builtins.web_search import WebSearchTool
+
+    config = _web_search_config_from_spec(agent_spec)
+    # Mirror ToolManager._create_web_search's provider inference (same skip for
+    # databricks-*, same OpenAI passthrough fence) so dispatch honors session-setup invariants.
+    llm_provider: str | None = None
+    model = getattr(getattr(agent_spec, "executor", None), "model", None)
+    if model and not model.startswith("databricks-"):
+        from omnigent.llms.routing import parse_model_string
+
+        llm_provider = parse_model_string(model).provider
+    tool = WebSearchTool(config=config, llm_provider=llm_provider)
+    ctx = ToolContext(
+        task_id=task_id or "web_search",
+        agent_id=agent_id or "web_search",
+        conversation_id=conversation_id,
+    )
+    return await asyncio.to_thread(tool.invoke, json.dumps(args), ctx)
+
+
 def _has_subagent(
     sub_agent_name: str,
     agent_spec: Any | None,
@@ -3359,6 +3446,7 @@ async def execute_tool(
     arguments: str,
     server_client: httpx.AsyncClient | None = None,
     terminal_registry: Any | None = None,
+    resource_registry: Any | None = None,
     agent_spec: Any | None = None,
     conversation_id: str | None = None,
     task_id: str | None = None,
@@ -3386,6 +3474,9 @@ async def execute_tool(
         runner's per-session outbound queue. ``None`` from
         dispatch sites that don't need event emission (e.g.
         async background tools).
+    :param resource_registry: Optional session-resource registry used to
+        observe tool-launched terminals through the same lifecycle path as
+        runner-launched terminals.
     :param filesystem_registry: Optional registry for tracking agent
         file modifications. Forwarded to ``_execute_os_env_tool``
         so that ``sys_os_write`` and ``sys_os_edit`` calls record changed
@@ -3436,6 +3527,7 @@ async def execute_tool(
                 tool_name,
                 args,
                 terminal_registry=terminal_registry,
+                resource_registry=resource_registry,
                 agent_spec=agent_spec,
                 conversation_id=conversation_id,
                 task_id=task_id,
@@ -3453,6 +3545,7 @@ async def execute_tool(
                 harness_client=harness_client or httpx.AsyncClient(),
                 server_client=server_client,
                 terminal_registry=terminal_registry,
+                resource_registry=resource_registry,
                 agent_spec=agent_spec,
                 conversation_id=conversation_id,
                 task_id=task_id,
@@ -3498,6 +3591,14 @@ async def execute_tool(
                 task_id=task_id,
                 publish_event=publish_event,
                 session_inbox=session_inbox,
+            )
+        elif tool_name in _WEB_SEARCH_TOOLS:
+            output = await _execute_web_search_tool(
+                args,
+                agent_spec=agent_spec,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                agent_id=agent_id,
             )
         elif tool_name in _TIMER_TOOLS:
             if tool_name == "sys_timer_set":
@@ -3632,6 +3733,7 @@ async def dispatch_tool_locally(
     harness_client: httpx.AsyncClient,
     server_client: httpx.AsyncClient | None = None,
     terminal_registry: Any | None = None,
+    resource_registry: Any | None = None,
     agent_spec: Any | None = None,
     conversation_id: str | None = None,
     task_id: str | None = None,
@@ -3662,6 +3764,8 @@ async def dispatch_tool_locally(
         file modifications. Forwarded to ``execute_tool`` so that
         ``sys_os_write`` and ``sys_os_edit`` calls record changed paths
         for the ``GET …/changes`` endpoint.
+    :param resource_registry: Optional session-resource registry used to
+        observe tool-launched terminals.
     :returns: The tool output string.
     """
     output = await execute_tool(
@@ -3669,6 +3773,7 @@ async def dispatch_tool_locally(
         arguments=arguments,
         server_client=server_client,
         terminal_registry=terminal_registry,
+        resource_registry=resource_registry,
         agent_spec=agent_spec,
         conversation_id=conversation_id,
         task_id=task_id,
@@ -4179,6 +4284,7 @@ async def _execute_terminal_tool(
     args: dict[str, Any],
     *,
     terminal_registry: Any | None,
+    resource_registry: Any | None = None,
     agent_spec: Any | None,
     conversation_id: str | None,
     task_id: str | None,
@@ -4202,6 +4308,8 @@ async def _execute_terminal_tool(
         the web rail updates mid-turn instead of waiting for the
         response-end terminals-cache invalidation. ``None`` for
         in-process callers / tests that don't relay.
+    :param resource_registry: Optional session-resource registry used to
+        observe fresh launches as auxiliary terminal resources.
     """
     import asyncio
 
@@ -4255,24 +4363,26 @@ async def _execute_terminal_tool(
         SysTerminalLaunchTool.name(),
         SysTerminalCloseTool.name(),
     ):
-        _emit_terminal_resource_event(
+        await _emit_terminal_resource_event(
             tool_name=tool_name,
             output=output,
             args=args,
             conversation_id=conversation_id,
             terminal_registry=terminal_registry,
+            resource_registry=resource_registry,
             publish_event=publish_event,
         )
     return output
 
 
-def _emit_terminal_resource_event(
+async def _emit_terminal_resource_event(
     *,
     tool_name: str,
     output: str,
     args: dict[str, Any],
     conversation_id: str,
     terminal_registry: Any,
+    resource_registry: Any | None,
     publish_event: Callable[[str, dict[str, Any]], None],
 ) -> None:
     """Emit a ``session.resource.{created,deleted}`` event for a terminal tool.
@@ -4300,6 +4410,8 @@ def _emit_terminal_resource_event(
         ``"conv_abc123"``.
     :param terminal_registry: The runner's ``TerminalRegistry``,
         used to look up the live instance for a fresh launch.
+    :param resource_registry: Optional session-resource registry used to
+        observe fresh launches as auxiliary terminal resources.
     :param publish_event: The runner's per-session SSE emitter.
     """
     try:
@@ -4315,11 +4427,12 @@ def _emit_terminal_resource_event(
 
     status = envelope.get("status")
     if tool_name == SysTerminalLaunchTool.name() and status == "launched":
-        _publish_terminal_created_event(
+        await _publish_terminal_created_event(
             conversation_id=conversation_id,
             terminal_name=terminal_name,
             session_key=session_key,
             terminal_registry=terminal_registry,
+            resource_registry=resource_registry,
             publish_event=publish_event,
         )
     elif tool_name == SysTerminalCloseTool.name() and status == "closed":
@@ -4331,12 +4444,13 @@ def _emit_terminal_resource_event(
         )
 
 
-def _publish_terminal_created_event(
+async def _publish_terminal_created_event(
     *,
     conversation_id: str,
     terminal_name: str,
     session_key: str,
     terminal_registry: Any,
+    resource_registry: Any | None,
     publish_event: Callable[[str, dict[str, Any]], None],
 ) -> None:
     """Build and publish ``session.resource.created`` for a fresh launch.
@@ -4352,38 +4466,53 @@ def _publish_terminal_created_event(
     :param terminal_name: Terminal spec name, e.g. ``"bash"``.
     :param session_key: Per-launch session key, e.g. ``"s1"``.
     :param terminal_registry: The runner's ``TerminalRegistry``.
+    :param resource_registry: Optional session-resource registry used to
+        observe the launched terminal as auxiliary.
     :param publish_event: The runner's per-session SSE emitter.
     """
-    from omnigent.entities.session_resources import (
-        session_resource_view_to_dict,
-        terminal_resource_view,
-    )
-    from omnigent.terminals.registry import TerminalListEntry
+    from omnigent.entities.session_resources import session_resource_view_to_dict
 
     instance = terminal_registry.get(conversation_id, terminal_name, session_key)
     if instance is None:
         return
-    entry = TerminalListEntry(
-        terminal_name=terminal_name,
-        session_key=session_key,
-        instance=instance,
-    )
-    resource = session_resource_view_to_dict(terminal_resource_view(conversation_id, entry))
+    if resource_registry is not None:
+        try:
+            view = await resource_registry.observe_auxiliary_terminal(
+                conversation_id,
+                terminal_name,
+                session_key,
+                instance,
+            )
+        except Exception:
+            _logger.exception(
+                "Failed to observe tool-launched terminal: session=%s terminal=%s:%s",
+                conversation_id,
+                terminal_name,
+                session_key,
+            )
+            return
+        resource = session_resource_view_to_dict(view)
+    else:
+        from omnigent.entities.session_resources import terminal_resource_view
+        from omnigent.terminals.registry import TerminalListEntry
+
+        entry = TerminalListEntry(
+            terminal_name=terminal_name,
+            session_key=session_key,
+            instance=instance,
+        )
+        resource = session_resource_view_to_dict(terminal_resource_view(conversation_id, entry))
     publish_event(
         conversation_id,
         {"type": "session.resource.created", "resource": resource},
     )
 
-    # Start the runner-side pane-activity watcher for this tool-launched
-    # terminal so the web "active" badge works for it without a client
-    # attach. The agent-tool launch path uses ``terminal_registry``
-    # directly (not ``resource_registry.launch_terminal``), so this is the
-    # only hook that covers it. We run on the runner's MAIN event loop
-    # here (this fires after the launch ``to_thread`` returns), so capture
-    # it for the watcher daemon thread to hop onto via
-    # ``call_soon_threadsafe`` — the loop the tool's launch ran on is a
-    # throwaway per-call ``asyncio.run`` loop and would be dead. Idempotent
-    # (the watcher no-ops if already running) and stopped by ``close()``.
+    # Legacy fallback for callers that do not have a SessionResourceRegistry:
+    # start the runner-side pane-activity watcher here so the web "active"
+    # badge still works. Normal runner dispatch uses observe_auxiliary_terminal
+    # above, which owns the watcher and terminal-exit lifecycle semantics.
+    if resource_registry is not None:
+        return
     resource_id = resource["id"]
     if isinstance(resource_id, str) and resource_id:
         loop = asyncio.get_running_loop()
@@ -4445,6 +4574,7 @@ async def _execute_async_inbox_tool(
     session_async_tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] | None,
     server_client: httpx.AsyncClient | None,
     terminal_registry: Any | None,
+    resource_registry: Any | None,
     agent_spec: Any | None,
     conversation_id: str | None,
     task_id: str | None,
@@ -4470,6 +4600,8 @@ async def _execute_async_inbox_tool(
         changes made by tools spawned via ``sys_call_async``.
         Forwarded to ``_spawn_async_tool`` so that async OS-env tool
         calls record paths for the ``GET …/changes`` endpoint.
+    :param resource_registry: Optional session-resource registry used by
+        async terminal-tool launches.
     :param harness_client: Unused; kept for caller compatibility.
     :returns: Tool output string.
     """
@@ -4488,6 +4620,7 @@ async def _execute_async_inbox_tool(
             session_async_tasks=session_async_tasks,
             server_client=server_client,
             terminal_registry=terminal_registry,
+            resource_registry=resource_registry,
             agent_spec=agent_spec,
             conversation_id=conversation_id,
             task_id=task_id,
@@ -4871,6 +5004,7 @@ def _spawn_async_tool(
     session_async_tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] | None,
     server_client: httpx.AsyncClient | None,
     terminal_registry: Any | None,
+    resource_registry: Any | None,
     agent_spec: Any | None,
     conversation_id: str | None,
     task_id: str | None,
@@ -4893,6 +5027,8 @@ def _spawn_async_tool(
         ``execute_tool`` so that OS-env tools invoked via
         ``sys_call_async`` record file changes for the
         ``GET …/changes`` endpoint.
+    :param resource_registry: Optional session-resource registry used by
+        async terminal-tool launches.
     :returns: JSON handle string with ``handle_id``, ``tool_name``,
         ``status``.
     """
@@ -4926,6 +5062,7 @@ def _spawn_async_tool(
                 arguments=target_args,
                 server_client=server_client,
                 terminal_registry=terminal_registry,
+                resource_registry=resource_registry,
                 agent_spec=agent_spec,
                 conversation_id=conversation_id,
                 task_id=task_id,

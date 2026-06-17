@@ -24,7 +24,7 @@
 # `skip-security-scan` label, but ONLY when the waiver is maintainer-effective
 # -- the label is present AND the author is a maintainer, or a maintainer's
 # latest decisive review is APPROVED. Same semantics as e2e-ui-required's
-# `skip-e2e-ui-test` (and force-merge): the label alone is not enough, so a fork
+# `skip-e2e-ui-test`: the label alone is not enough, so a fork
 # author cannot self-waive (applying labels needs triage access anyway, and the
 # extra maintainer check is defence in depth). All state is read from the API
 # (trusted), and this script always runs from `main`, so a PR cannot edit the
@@ -86,9 +86,11 @@ skip_label_effective() {
 # trigger -- push to main / fork-e2e/** (the mirror branch only exists after a
 # returning-contributor / maintainer-approval gate), schedule, dispatch -- is a
 # trusted context, so proceed without scanning. pull_request_review is included
-# because the fork-e2e mirror fires on a maintainer's approval, and that path
-# must still consult the head SHA's Security Scan (the review payload carries
-# the same pull_request + author_association fields).
+# for two reasons: (1) the security-scan workflow itself re-runs on review so a
+# maintainer's approval can complete a skip-security-scan waiver that was labeled
+# first; (2) the fork-e2e mirror fires on a maintainer's approval and must still
+# consult the head SHA's Security Scan. Both carry the same pull_request +
+# author_association fields, so the gate is evaluated identically.
 case "${EVENT_NAME:-}" in
   pull_request | pull_request_target | pull_request_review) ;;
   *)

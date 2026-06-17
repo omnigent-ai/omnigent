@@ -40,7 +40,6 @@ from httpx_sse import connect_sse
 from tests.e2e.conftest import (
     create_runner_bound_session,
     poll_session_until_terminal,
-    poll_until_terminal,
     send_user_message_to_session,
     upload_agent,
 )
@@ -318,22 +317,23 @@ def _post_user_message(client: httpx.Client, session_id: str, text: str) -> http
 def test_policy_gate_allows_clean_message(
     http_client: httpx.Client,
     policy_gate_agent: str,
+    live_runner_id: str,
 ) -> None:
     """A normal message (no sentinel) passes through the
     policy → reaches the LLM → gets a real response. If
     this regresses, the policy is over-firing and blocking
     legitimate traffic."""
-    resp = http_client.post(
-        "/v1/responses",
-        json={
-            "model": policy_gate_agent,
-            "input": "Say hi in exactly three words.",
-            "background": True,
-        },
+    session_id = create_runner_bound_session(
+        http_client, agent_name=policy_gate_agent, runner_id=live_runner_id
     )
-    resp.raise_for_status()
-    rid = resp.json()["id"]
-    body = poll_until_terminal(http_client, rid, timeout=120)
+    rid = send_user_message_to_session(
+        http_client,
+        session_id=session_id,
+        content="Say hi in exactly three words.",
+    )
+    body = poll_session_until_terminal(
+        http_client, session_id=session_id, response_id=rid, timeout=120
+    )
     # Terminal status must be completed — policy ALLOW should
     # not turn the turn into a failure.
     assert body["status"] == "completed", f"Unexpected status: {body.get('error')}"
@@ -388,56 +388,32 @@ def test_policy_gate_denies_sentinel_message(
 def test_policy_gate_deny_persists_to_history(
     http_client: httpx.Client,
     policy_gate_agent: str,
+    live_runner_id: str,
 ) -> None:
-    """After a DENY, a follow-up turn on the same
-    conversation sees the sentinel in history. Proves the
-    sentinel was written to conversation_items (not just
-    surfaced on the stream)."""
-    # Turn 1: DENY.
-    resp1 = http_client.post(
-        "/v1/responses",
-        json={
-            "model": policy_gate_agent,
-            "input": "Trigger BLOCK_THIS_TOKEN please.",
-            "background": True,
-        },
-    )
-    resp1.raise_for_status()
-    rid1 = resp1.json()["id"]
-    body1 = poll_until_terminal(http_client, rid1, timeout=60)
-    assert body1["status"] == "completed"
-    assert "[Denied by policy" in _extract_all_assistant_text(body1)
+    """After a DENY, the sentinel is readable from conversation history.
 
-    # Turn 2: clean follow-up on the same conversation.
-    resp2 = http_client.post(
-        "/v1/responses",
-        json={
-            "model": policy_gate_agent,
-            "input": "Reply with a single word: OK",
-            "previous_response_id": rid1,
-            "background": True,
-        },
+    Proves the sentinel was written to conversation_items (not just surfaced
+    on the stream). The INPUT DENY fires before the runner/model, so this
+    regression check stays deterministic and does not need a live LLM turn.
+    """
+    session_id = create_runner_bound_session(
+        http_client, agent_name=policy_gate_agent, runner_id=live_runner_id
     )
-    resp2.raise_for_status()
-    rid2 = resp2.json()["id"]
-    body2 = poll_until_terminal(http_client, rid2, timeout=120)
-    # Turn 2 completed without crashing — the engine rebuilt
-    # cleanly on a conversation that already had a DENYed
-    # turn-1 sentinel in history.
-    assert body2["status"] == "completed", f"Turn 2 failed: {body2.get('error')}"
-    # The LLM ran on turn 2 (no sentinel in its input) and
-    # produced a non-empty response. We do NOT assert that
-    # the LLM didn't echo the sentinel from history — the
-    # LLM sees the prior turn's assistant message (the
-    # sentinel text) and may repeat part of it when asked
-    # a follow-up, which is LLM behavior, not a policy bug.
-    text2 = _extract_all_assistant_text(body2)
-    assert len(text2.strip()) > 0
+
+    # Turn 1: DENY. The events endpoint resolves INPUT-policy
+    # DENY synchronously, so no runner turn is queued.
+    resp1 = _post_user_message(http_client, session_id, "Trigger BLOCK_THIS_TOKEN please.")
+    assert resp1.status_code == 202, f"unexpected status: {resp1.status_code} {resp1.text[:300]}"
+    verdict = resp1.json()
+    assert verdict.get("denied") is True, f"expected synchronous DENY verdict; got {verdict}"
+    assert "BLOCK_THIS_TOKEN" in verdict.get("reason", ""), (
+        f"expected reason mentioning BLOCK_THIS_TOKEN; got {verdict}"
+    )
+
     # Fetch conversation items — the turn-1 sentinel MUST
     # be persisted so replay sees it.
-    conv_id = body2["conversation"]["id"]
     items_resp = http_client.get(
-        f"/v1/sessions/{conv_id}/items",
+        f"/v1/sessions/{session_id}/items",
         params={"limit": 100},
     )
     items_resp.raise_for_status()
@@ -513,22 +489,23 @@ def test_label_gate_taint_persists_across_turns(
 def test_label_gate_untainted_conversation_passes(
     http_client: httpx.Client,
     label_gate_agent: str,
+    live_runner_id: str,
 ) -> None:
     """A conversation that never triggers taint_on_banana
     should pass every turn — the condition
     ``tainted: "1"`` never matches against the default
     ``tainted: "0"`` seed."""
-    resp = http_client.post(
-        "/v1/responses",
-        json={
-            "model": label_gate_agent,
-            "input": "Hello. Reply briefly.",
-            "background": True,
-        },
+    session_id = create_runner_bound_session(
+        http_client, agent_name=label_gate_agent, runner_id=live_runner_id
     )
-    resp.raise_for_status()
-    rid = resp.json()["id"]
-    body = poll_until_terminal(http_client, rid, timeout=120)
+    rid = send_user_message_to_session(
+        http_client,
+        session_id=session_id,
+        content="Hello. Reply briefly.",
+    )
+    body = poll_session_until_terminal(
+        http_client, session_id=session_id, response_id=rid, timeout=120
+    )
     assert body["status"] == "completed", f"Clean conversation failed: {body.get('error')}"
     text = _extract_all_assistant_text(body)
     assert "[Denied by policy" not in text
@@ -593,7 +570,9 @@ def test_no_guardrails_agent_unaffected(
         session_id=session_id,
         content="What is 2 + 2? Answer with one number only.",
     )
-    body = poll_until_terminal(http_client, rid, timeout=120)
+    body = poll_session_until_terminal(
+        http_client, session_id=session_id, response_id=rid, timeout=120
+    )
     assert body["status"] == "completed", f"Archer (no guardrails) failed: {body.get('error')}"
     text = _extract_all_assistant_text(body)
     # Real LLM output — not a policy sentinel.
