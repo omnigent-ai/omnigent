@@ -1787,6 +1787,88 @@ class UpdateSessionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class CodexGoalObject(BaseModel):
+    """
+    Current Codex goal state for a Codex-native session.
+
+    Mirrors Codex app-server's ``ThreadGoal`` shape using Omnigent's
+    snake-case API convention. ``created_at`` and ``updated_at`` are optional
+    because older app-server documentation examples omit them even though the
+    current protocol includes them.
+
+    :param thread_id: Codex app-server thread id, e.g. ``"thr_123"``.
+    :param objective: Goal objective text, e.g.
+        ``"Finish the migration and keep tests green"``.
+    :param status: Codex goal lifecycle status, e.g. ``"active"``.
+    :param token_budget: Optional token budget, e.g. ``40000``.
+        ``None`` means no explicit budget is set.
+    :param tokens_used: Tokens spent while pursuing this goal, e.g. ``1024``.
+    :param time_used_seconds: Wall-clock seconds spent on this goal,
+        e.g. ``60``.
+    :param created_at: Unix timestamp when the goal was created, e.g.
+        ``1776272400``. ``None`` when not provided by Codex.
+    :param updated_at: Unix timestamp when the goal was last updated, e.g.
+        ``1776272460``. ``None`` when not provided by Codex.
+    """
+
+    thread_id: str
+    objective: str
+    status: Literal[
+        "active",
+        "paused",
+        "blocked",
+        "usageLimited",
+        "budgetLimited",
+        "complete",
+    ]
+    token_budget: int | None = None
+    tokens_used: int
+    time_used_seconds: int
+    created_at: int | None = None
+    updated_at: int | None = None
+
+
+class CodexGoalResponse(BaseModel):
+    """
+    Response body for reading or setting a Codex-native session goal.
+
+    :param goal: Current goal state, or ``None`` when the session has no
+        persisted Codex goal.
+    """
+
+    goal: CodexGoalObject | None
+
+
+class SetCodexGoalRequest(BaseModel):
+    """
+    Request body for ``PUT /v1/sessions/{id}/codex_goal``.
+
+    :param objective: Goal objective text, e.g.
+        ``"Finish the migration and keep tests green"``. Must be non-empty
+        after trimming and no longer than 4000 characters, matching Codex
+        app-server's goal contract.
+    :param token_budget: Optional positive token budget, e.g. ``40000``.
+        Explicit JSON ``null`` clears the Codex goal budget; omitting the
+        field leaves it absent from the forwarded request.
+    """
+
+    objective: str = Field(min_length=1, max_length=4000)
+    token_budget: int | None = Field(default=None, gt=0)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ClearCodexGoalResponse(BaseModel):
+    """
+    Response body for ``DELETE /v1/sessions/{id}/codex_goal``.
+
+    :param cleared: ``True`` when Codex removed an existing goal; ``False``
+        when no goal was present.
+    """
+
+    cleared: bool
+
+
 class SessionForkRequest(BaseModel):
     """
     Request body for ``POST /v1/sessions/{source_id}/fork``.

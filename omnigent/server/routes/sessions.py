@@ -195,6 +195,8 @@ from omnigent.server.schemas import (
     AgentObject,
     ChildSessionList,
     ChildSessionSummary,
+    ClearCodexGoalResponse,
+    CodexGoalResponse,
     CompletedEvent,
     ConversationDeleted,
     CreatedSessionResponse,
@@ -245,6 +247,7 @@ from omnigent.server.schemas import (
     SessionTerminalPendingEvent,
     SessionTodosEvent,
     SessionUsageEvent,
+    SetCodexGoalRequest,
     SkillSummary,
     UpdateSessionRequest,
 )
@@ -4953,6 +4956,85 @@ def _require_collaboration_mode_forward(
             f"Reconnect the session and try again.",
             code=ErrorCode.RUNNER_UNAVAILABLE,
         )
+
+
+def _require_codex_goal_runner_payload(
+    session_id: str,
+    *,
+    action: str,
+    runner_result: _RunnerForwardResult | None,
+) -> dict[str, Any]:
+    """
+    Return the JSON payload from a required Codex goal runner forward.
+
+    Codex goal state lives in Codex app-server, so AP goal routes cannot fall
+    back to persisted Omnigent labels. A missing runner, rejected control
+    event, or malformed runner body means the UI must keep its prior goal view
+    and surface an error.
+
+    :param session_id: Session/conversation identifier, e.g.
+        ``"conv_abc123"``.
+    :param action: Human-readable goal operation, e.g. ``"read"``.
+    :param runner_result: HTTP result returned by the runner, or ``None``
+        when no runner could be reached.
+    :returns: Parsed runner JSON payload, e.g. ``{"goal": None}``.
+    :raises OmnigentError: If no runner was reachable, the runner rejected the
+        operation, or the runner returned a malformed payload.
+    """
+    if runner_result is None:
+        raise OmnigentError(
+            f"Could not {action} Codex goal: no live Codex runner is available "
+            f"for session {session_id!r}. Reconnect the session and try again.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
+    if not 200 <= runner_result.status_code < 300:
+        raise OmnigentError(
+            f"Could not {action} Codex goal: runner returned status "
+            f"{runner_result.status_code} for session {session_id!r}. "
+            f"Reconnect the session and try again.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
+    try:
+        payload = json.loads(runner_result.body)
+    except json.JSONDecodeError as exc:
+        raise OmnigentError(
+            f"Could not {action} Codex goal: runner returned a malformed response.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        ) from exc
+    if not isinstance(payload, dict):
+        raise OmnigentError(
+            f"Could not {action} Codex goal: runner returned a malformed response.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
+    return payload
+
+
+async def _require_codex_native_goal_session(
+    session_id: str,
+    conversation_store: ConversationStore,
+) -> Conversation:
+    """
+    Resolve and validate the Codex-native session targeted by a goal route.
+
+    :param session_id: Session/conversation identifier, e.g.
+        ``"conv_abc123"``.
+    :param conversation_store: Store used to load the session row.
+    :returns: The validated conversation.
+    :raises OmnigentError: 404 when the session is missing, or 400 when it is
+        not a codex-native UI wrapper session.
+    """
+    conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    if conv is None:
+        raise OmnigentError(
+            "Session not found",
+            code=ErrorCode.NOT_FOUND,
+        )
+    if conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) != "codex-native-ui":
+        raise OmnigentError(
+            "codex_goal is only supported for codex-native sessions",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return conv
 
 
 def _drive_terminal_resolved_elicitation(session_id: str, persisted: ConversationItem) -> None:
@@ -13710,6 +13792,156 @@ def create_sessions_router(
         finally:
             with contextlib.suppress(RuntimeError):
                 await websocket.close()
+
+    # ── Codex-native goal controls ───────────────────────────────
+
+    @router.get(
+        "/sessions/{session_id}/codex_goal",
+        response_model=CodexGoalResponse,
+    )
+    async def get_codex_goal(
+        request: Request,
+        session_id: str,
+    ) -> CodexGoalResponse:
+        """
+        Read the current Codex app-server goal for a Codex-native session.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier, e.g.
+            ``"conv_abc123"``.
+        :returns: Current Codex goal state, or ``goal=None`` when no goal is
+            set.
+        :raises OmnigentError: 400 for non-Codex sessions, 404 for missing
+            sessions, or 503 when no live Codex runner can read the goal.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id,
+            session_id,
+            LEVEL_READ,
+            permission_store,
+            conversation_store,
+        )
+        await _require_codex_native_goal_session(session_id, conversation_store)
+        runner_payload = _require_codex_goal_runner_payload(
+            session_id,
+            action="read",
+            runner_result=await _forward_session_change_to_runner(
+                session_id,
+                runner_router,
+                {"type": "goal_get"},
+            ),
+        )
+        try:
+            return CodexGoalResponse.model_validate(runner_payload)
+        except ValueError as exc:
+            raise OmnigentError(
+                "Could not read Codex goal: runner returned a malformed response.",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            ) from exc
+
+    @router.put(
+        "/sessions/{session_id}/codex_goal",
+        response_model=CodexGoalResponse,
+    )
+    async def set_codex_goal(
+        request: Request,
+        session_id: str,
+        body: SetCodexGoalRequest,
+    ) -> CodexGoalResponse:
+        """
+        Set or replace the current Codex app-server goal.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier, e.g.
+            ``"conv_abc123"``.
+        :param body: Goal objective and optional token budget.
+        :returns: Current Codex goal state after the update.
+        :raises OmnigentError: 400 for non-Codex sessions or blank
+            objectives, 404 for missing sessions, or 503 when no live Codex
+            runner can update the goal.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id,
+            session_id,
+            LEVEL_EDIT,
+            permission_store,
+            conversation_store,
+        )
+        await _require_codex_native_goal_session(session_id, conversation_store)
+        objective = body.objective.strip()
+        if not objective:
+            raise OmnigentError(
+                "codex_goal objective must be non-empty",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        event: dict[str, Any] = {
+            "type": "goal_set",
+            "objective": objective,
+        }
+        if "token_budget" in body.model_fields_set:
+            event["token_budget"] = body.token_budget
+        runner_payload = _require_codex_goal_runner_payload(
+            session_id,
+            action="set",
+            runner_result=await _forward_session_change_to_runner(
+                session_id,
+                runner_router,
+                event,
+            ),
+        )
+        try:
+            return CodexGoalResponse.model_validate(runner_payload)
+        except ValueError as exc:
+            raise OmnigentError(
+                "Could not set Codex goal: runner returned a malformed response.",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            ) from exc
+
+    @router.delete(
+        "/sessions/{session_id}/codex_goal",
+        response_model=ClearCodexGoalResponse,
+    )
+    async def clear_codex_goal(
+        request: Request,
+        session_id: str,
+    ) -> ClearCodexGoalResponse:
+        """
+        Clear the current Codex app-server goal.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier, e.g.
+            ``"conv_abc123"``.
+        :returns: Whether Codex removed an existing goal.
+        :raises OmnigentError: 400 for non-Codex sessions, 404 for missing
+            sessions, or 503 when no live Codex runner can clear the goal.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id,
+            session_id,
+            LEVEL_EDIT,
+            permission_store,
+            conversation_store,
+        )
+        await _require_codex_native_goal_session(session_id, conversation_store)
+        runner_payload = _require_codex_goal_runner_payload(
+            session_id,
+            action="clear",
+            runner_result=await _forward_session_change_to_runner(
+                session_id,
+                runner_router,
+                {"type": "goal_clear"},
+            ),
+        )
+        try:
+            return ClearCodexGoalResponse.model_validate(runner_payload)
+        except ValueError as exc:
+            raise OmnigentError(
+                "Could not clear Codex goal: runner returned a malformed response.",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            ) from exc
 
     # ── PATCH /sessions/{session_id} ────────────────────────────
 

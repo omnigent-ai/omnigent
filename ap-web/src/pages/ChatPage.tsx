@@ -28,12 +28,22 @@ import {
   MessageSquareIcon,
   PaperclipIcon,
   SquareIcon,
+  TargetIcon,
   TerminalIcon,
   WifiOffIcon,
   XIcon,
 } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { userColor, userColorTint, userInitials } from "@/lib/userBadge";
 import { useNavigate, useParams } from "@/lib/routing";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
@@ -138,6 +148,12 @@ import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCliServerUrl } from "@/lib/host";
 import { SessionImage } from "@/components/SessionImage";
+import {
+  clearCodexGoal,
+  getCodexGoal,
+  setCodexGoal,
+  type CodexGoal,
+} from "@/lib/sessionsApi";
 
 const ATTACHED_RE = /\[Attached:[^\]]*\]\s*/g;
 
@@ -976,6 +992,7 @@ export function ChatPage() {
       modelPickerKind={modelPickerKind}
       codexModelOptions={codexModelOptions}
       showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
+      showCodexGoal={shouldShowCodexGoalControl(capabilitySource)}
       costRoutingVerdict={costRoutingVerdict}
       costRoutingEligible={costRoutingEligible}
       subAgentLabel={subAgentLabel}
@@ -1202,6 +1219,8 @@ interface MainAgentSurfaceProps {
   codexModelOptions: readonly CodexModelOption[];
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
+  /** Show the Codex Goal control. */
+  showCodexGoal: boolean;
   /** Latest advisor verdict for the cost-routing pill; null when none. */
   costRoutingVerdict: CostRoutingVerdict | null;
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child). */
@@ -1275,6 +1294,7 @@ function MainAgentSurface({
   modelPickerKind,
   codexModelOptions,
   showCodexPlanMode,
+  showCodexGoal,
   costRoutingVerdict,
   costRoutingEligible,
   subAgentLabel,
@@ -1630,6 +1650,7 @@ function MainAgentSurface({
         modelPickerKind={modelPickerKind}
         codexModelOptions={codexModelOptions}
         showCodexPlanMode={showCodexPlanMode}
+        showCodexGoal={showCodexGoal}
         isTerminalFirst={isTerminalFirst}
         isNativeWrapper={isNativeWrapper}
         reconnectHint={liveness.kind === "runner_asleep" || liveness.kind === "host_asleep"}
@@ -2893,6 +2914,8 @@ interface ComposerProps {
   codexModelOptions: readonly CodexModelOption[];
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
+  /** Show the Codex Goal control. */
+  showCodexGoal: boolean;
   /**
    * Terminal-first session (Chat/Terminal pill present). Presentation
    * only: tightens the composer's bottom padding to `pb-1.5` so it sits
@@ -2939,6 +2962,456 @@ interface ComposerProps {
    * tray above the card. See ``subAgentComposerLabel``.
    */
   subAgentLabel?: string | null;
+}
+
+/**
+ * Render a compact human label for a Codex goal status.
+ *
+ * @param status - Codex goal status, e.g. ``"budgetLimited"``.
+ * @returns Lowercase display label, e.g. ``"budget limited"``.
+ */
+function formatCodexGoalStatus(status: CodexGoal["status"]): string {
+  switch (status) {
+    case "active":
+      return "active";
+    case "paused":
+      return "paused";
+    case "blocked":
+      return "blocked";
+    case "usageLimited":
+      return "usage limited";
+    case "budgetLimited":
+      return "budget limited";
+    case "complete":
+      return "complete";
+  }
+}
+
+/**
+ * Render token and elapsed-time usage for a Codex goal.
+ *
+ * @param goal - Current Codex goal state.
+ * @returns Compact usage label, e.g. ``"1,200 / 40,000 tokens / 3 min"``.
+ */
+function formatCodexGoalUsage(goal: CodexGoal): string {
+  const tokenLabel =
+    goal.tokenBudget == null
+      ? `${goal.tokensUsed.toLocaleString()} tokens`
+      : `${goal.tokensUsed.toLocaleString()} / ${goal.tokenBudget.toLocaleString()} tokens`;
+  const minutes = Math.floor(goal.timeUsedSeconds / 60);
+  if (minutes <= 0) return tokenLabel;
+  return `${tokenLabel} / ${minutes.toLocaleString()} min`;
+}
+
+interface CodexGoalDialogProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  conversationId: string | null;
+  readOnly: boolean;
+  goal: CodexGoal | null;
+  onGoalChange: (goal: CodexGoal | null) => void;
+}
+
+interface CodexGoalSummaryProps {
+  loading: boolean;
+  goal: CodexGoal | null;
+}
+
+/**
+ * Render the current Codex goal state inside the dialog.
+ *
+ * @param props - Current loading and goal state.
+ * @param props.loading - ``true`` while the goal GET request is in flight.
+ * @param props.goal - Current goal, or ``null`` when no goal is set.
+ * @returns Current-goal summary element.
+ */
+function CodexGoalSummary({ loading, goal }: CodexGoalSummaryProps) {
+  if (loading) {
+    return (
+      <div className="flex items-center gap-2 text-sm text-muted-foreground">
+        <Loader2Icon className="size-4 animate-spin" />
+        <span>Loading goal</span>
+      </div>
+    );
+  }
+  if (!goal) {
+    return (
+      <p data-testid="codex-goal-empty" className="text-sm text-muted-foreground">
+        No goal set.
+      </p>
+    );
+  }
+  return (
+    <div
+      data-testid="codex-goal-current"
+      className="space-y-1 rounded-lg border border-border bg-muted/30 p-3"
+    >
+      <div className="flex items-center justify-between gap-3 text-xs">
+        <span className="font-medium text-foreground">{formatCodexGoalStatus(goal.status)}</span>
+        <span className="shrink-0 text-muted-foreground">{formatCodexGoalUsage(goal)}</span>
+      </div>
+      <p className="text-sm leading-5 whitespace-pre-wrap">{goal.objective}</p>
+    </div>
+  );
+}
+
+interface CodexGoalEditorProps {
+  objective: string;
+  tokenBudget: string;
+  readOnly: boolean;
+  busy: boolean;
+  error: string | null;
+  onObjectiveChange: (value: string) => void;
+  onTokenBudgetChange: (value: string) => void;
+}
+
+/**
+ * Render editable Codex goal fields.
+ *
+ * @param props - Field values, disabled state, and change handlers.
+ * @param props.objective - Draft goal objective text.
+ * @param props.tokenBudget - Draft token budget text.
+ * @param props.readOnly - ``true`` when the user lacks edit permission.
+ * @param props.busy - ``true`` while a goal operation is in flight.
+ * @param props.error - Current validation or API error, if any.
+ * @param props.onObjectiveChange - Called with updated objective text.
+ * @param props.onTokenBudgetChange - Called with updated budget text.
+ * @returns Editor fields for the dialog.
+ */
+function CodexGoalEditor({
+  objective,
+  tokenBudget,
+  readOnly,
+  busy,
+  error,
+  onObjectiveChange,
+  onTokenBudgetChange,
+}: CodexGoalEditorProps) {
+  return (
+    <>
+      <div className="space-y-1.5">
+        <label className="text-xs font-medium text-muted-foreground" htmlFor="codex-goal">
+          Objective
+        </label>
+        <Textarea
+          id="codex-goal"
+          value={objective}
+          onChange={(event) => onObjectiveChange(event.currentTarget.value)}
+          disabled={readOnly || busy}
+          maxLength={4000}
+          className="min-h-28 resize-y"
+          data-testid="codex-goal-objective"
+        />
+      </div>
+
+      <div className="space-y-1.5">
+        <label
+          className="text-xs font-medium text-muted-foreground"
+          htmlFor="codex-goal-token-budget"
+        >
+          Token budget
+        </label>
+        <Input
+          id="codex-goal-token-budget"
+          type="number"
+          inputMode="numeric"
+          min={1}
+          step={1}
+          value={tokenBudget}
+          onChange={(event) => onTokenBudgetChange(event.currentTarget.value)}
+          disabled={readOnly || busy}
+          placeholder="Optional"
+          data-testid="codex-goal-token-budget"
+        />
+      </div>
+
+      {error && <p className="text-sm text-destructive">{error}</p>}
+    </>
+  );
+}
+
+interface CodexGoalActionsProps {
+  readOnly: boolean;
+  busy: boolean;
+  saving: boolean;
+  clearing: boolean;
+  hasGoal: boolean;
+  onSave: () => void;
+  onClear: () => void;
+}
+
+interface CodexGoalDialogState {
+  objective: string;
+  tokenBudget: string;
+  loading: boolean;
+  saving: boolean;
+  clearing: boolean;
+  error: string | null;
+  setObjectiveDraft: (value: string) => void;
+  setTokenBudgetDraft: (value: string) => void;
+  saveGoal: () => Promise<void>;
+  clearGoal: () => Promise<void>;
+}
+
+/**
+ * Build a user-facing Codex goal error message.
+ *
+ * @param prefix - Operation label, e.g. ``"Could not read goal"``.
+ * @param err - Thrown value from the API call.
+ * @returns Error text for the dialog.
+ */
+function codexGoalError(prefix: string, err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  return `${prefix}: ${message}`;
+}
+
+/**
+ * Parse a token-budget text field.
+ *
+ * @param value - Raw input value, e.g. ``"40000"``.
+ * @returns Positive integer budget, or ``null`` when the field is blank.
+ * @throws Error when the value is not a positive whole number.
+ */
+function parseCodexGoalBudget(value: string): number | null {
+  const trimmedBudget = value.trim();
+  if (!trimmedBudget) return null;
+  const parsed = Number(trimmedBudget);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error("Token budget must be a positive whole number.");
+  }
+  return parsed;
+}
+
+/**
+ * Render Codex goal dialog action buttons.
+ *
+ * @param props - Button state and callbacks.
+ * @param props.readOnly - ``true`` when write actions must be disabled.
+ * @param props.busy - ``true`` while any goal operation is running.
+ * @param props.saving - ``true`` while set/update is running.
+ * @param props.clearing - ``true`` while clear is running.
+ * @param props.hasGoal - ``true`` when a current goal exists.
+ * @param props.onSave - Called to set or update the goal.
+ * @param props.onClear - Called to clear the goal.
+ * @returns Dialog footer actions.
+ */
+function CodexGoalActions({
+  readOnly,
+  busy,
+  saving,
+  clearing,
+  hasGoal,
+  onSave,
+  onClear,
+}: CodexGoalActionsProps) {
+  return (
+    <DialogFooter>
+      <Button
+        type="button"
+        variant="outline"
+        onClick={onClear}
+        disabled={readOnly || busy || !hasGoal}
+        data-testid="codex-goal-clear"
+      >
+        {clearing ? <Loader2Icon className="size-3.5 animate-spin" /> : null}
+        Clear
+      </Button>
+      <Button
+        type="button"
+        onClick={onSave}
+        disabled={readOnly || busy}
+        data-testid="codex-goal-save"
+      >
+        {saving ? <Loader2Icon className="size-3.5 animate-spin" /> : null}
+        {hasGoal ? "Update goal" : "Set goal"}
+      </Button>
+    </DialogFooter>
+  );
+}
+
+/**
+ * Own Codex goal dialog state and API operations.
+ *
+ * @param props - Session and goal bindings from ``CodexGoalDialog``.
+ * @returns Dialog state, field setters, and async goal operations.
+ */
+function useCodexGoalDialogState({
+  open,
+  conversationId,
+  goal,
+  onGoalChange,
+}: Pick<
+  CodexGoalDialogProps,
+  "open" | "conversationId" | "goal" | "onGoalChange"
+>): CodexGoalDialogState {
+  const [objective, setObjective] = useState(goal?.objective ?? "");
+  const [tokenBudget, setTokenBudget] = useState(goal?.tokenBudget?.toString() ?? "");
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [clearing, setClearing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const refreshGoal = useCallback(async () => {
+    if (!conversationId) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const response = await getCodexGoal(conversationId);
+      onGoalChange(response.goal);
+      setObjective(response.goal?.objective ?? "");
+      setTokenBudget(response.goal?.tokenBudget?.toString() ?? "");
+    } catch (err) {
+      setError(codexGoalError("Could not read goal", err));
+    } finally {
+      setLoading(false);
+    }
+  }, [conversationId, onGoalChange]);
+
+  useEffect(() => {
+    if (!open) return;
+    void refreshGoal();
+  }, [open, refreshGoal]);
+
+  useEffect(() => {
+    if (!open) return;
+    setObjective(goal?.objective ?? "");
+    setTokenBudget(goal?.tokenBudget?.toString() ?? "");
+  }, [goal, open]);
+
+  const setObjectiveDraft = (value: string) => {
+    setObjective(value);
+    if (error !== null) setError(null);
+  };
+  const setTokenBudgetDraft = (value: string) => {
+    setTokenBudget(value);
+    if (error !== null) setError(null);
+  };
+
+  const saveGoal = async () => {
+    if (!conversationId) return;
+    const trimmedObjective = objective.trim();
+    if (!trimmedObjective) {
+      setError("Goal objective cannot be empty.");
+      return;
+    }
+    let parsedBudget: number | null;
+    try {
+      parsedBudget = parseCodexGoalBudget(tokenBudget);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    try {
+      const response = await setCodexGoal(conversationId, {
+        objective: trimmedObjective,
+        tokenBudget: parsedBudget,
+      });
+      onGoalChange(response.goal);
+      setObjective(response.goal?.objective ?? trimmedObjective);
+      setTokenBudget(response.goal?.tokenBudget?.toString() ?? tokenBudget.trim());
+    } catch (err) {
+      setError(codexGoalError("Could not set goal", err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const clearGoal = async () => {
+    if (!conversationId) return;
+    setClearing(true);
+    setError(null);
+    try {
+      await clearCodexGoal(conversationId);
+      onGoalChange(null);
+      setObjective("");
+      setTokenBudget("");
+    } catch (err) {
+      setError(codexGoalError("Could not clear goal", err));
+    } finally {
+      setClearing(false);
+    }
+  };
+
+  return {
+    objective,
+    tokenBudget,
+    loading,
+    saving,
+    clearing,
+    error,
+    setObjectiveDraft,
+    setTokenBudgetDraft,
+    saveGoal,
+    clearGoal,
+  };
+}
+
+/**
+ * Dialog for viewing, setting, and clearing a Codex-native thread goal.
+ *
+ * @param props - Dialog state and session goal bindings.
+ * @param props.open - Whether the dialog is open.
+ * @param props.onOpenChange - Called when the dialog open state changes.
+ * @param props.conversationId - Active session id, e.g. ``"conv_abc123"``.
+ * @param props.readOnly - ``true`` when write actions must be disabled.
+ * @param props.goal - Current goal state, or ``null`` when none is set.
+ * @param props.onGoalChange - Called after successful read, set, or clear.
+ * @returns Codex goal dialog.
+ */
+function CodexGoalDialog({
+  open,
+  onOpenChange,
+  conversationId,
+  readOnly,
+  goal,
+  onGoalChange,
+}: CodexGoalDialogProps) {
+  const state = useCodexGoalDialogState({
+    open,
+    conversationId,
+    goal,
+    onGoalChange,
+  });
+  const { loading, saving, clearing } = state;
+  const busy = loading || saving || clearing;
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-lg" aria-describedby={undefined}>
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <TargetIcon className="size-4" />
+            <span>Goal</span>
+          </DialogTitle>
+        </DialogHeader>
+
+        <div className="space-y-3">
+          <CodexGoalSummary loading={loading} goal={goal} />
+          <CodexGoalEditor
+            objective={state.objective}
+            tokenBudget={state.tokenBudget}
+            readOnly={readOnly}
+            busy={busy}
+            error={state.error}
+            onObjectiveChange={state.setObjectiveDraft}
+            onTokenBudgetChange={state.setTokenBudgetDraft}
+          />
+        </div>
+
+        <CodexGoalActions
+          readOnly={readOnly}
+          busy={busy}
+          saving={saving}
+          clearing={clearing}
+          hasGoal={goal != null}
+          onSave={() => void state.saveGoal()}
+          onClear={() => void state.clearGoal()}
+        />
+      </DialogContent>
+    </Dialog>
+  );
 }
 
 /**
@@ -3140,7 +3613,13 @@ export function composerHarnessLabel(
  * the session has nothing to report. Session cost lives in the header
  * agent-info popover (the "i" button), not here.
  */
-function ComposerStatusLine({ harnessLabel }: { harnessLabel: string | null }) {
+function ComposerStatusLine({
+  harnessLabel,
+  codexGoal,
+}: {
+  harnessLabel: string | null;
+  codexGoal: CodexGoal | null;
+}) {
   const conversationId = useChatStore((s) => s.conversationId);
   const contextWindow = useChatStore((s) => s.contextWindow);
   const tokensUsed = useChatStore((s) => s.tokensUsed);
@@ -3156,10 +3635,11 @@ function ComposerStatusLine({ harnessLabel }: { harnessLabel: string | null }) {
   // control that changes them.
   const showHarness = !!conversationId && harnessLabel !== null;
   const showPlanMode = !!conversationId && codexPlanMode;
+  const showGoal = !!conversationId && codexGoal != null;
   // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
   const showRing =
     !!conversationId && contextWindow != null && contextWindow > 0 && tokensUsed != null;
-  if (!showBranch && !showPlanMode && !showRing && !showHarness) return null;
+  if (!showBranch && !showPlanMode && !showGoal && !showRing && !showHarness) return null;
 
   return (
     <div
@@ -3199,6 +3679,15 @@ function ComposerStatusLine({ harnessLabel }: { harnessLabel: string | null }) {
           >
             <FileTextIcon className="size-3.5 shrink-0" />
             <span>Plan mode</span>
+          </span>
+        )}
+        {showGoal && codexGoal && (
+          <span
+            data-testid="composer-goal-mode"
+            className="inline-flex items-center gap-1 text-xs font-medium text-foreground"
+          >
+            <TargetIcon className="size-3.5 shrink-0" />
+            <span>Goal {formatCodexGoalStatus(codexGoal.status)}</span>
           </span>
         )}
         {showHarness && harnessLabel && (
@@ -3313,6 +3802,7 @@ export function Composer({
   modelPickerKind,
   codexModelOptions,
   showCodexPlanMode,
+  showCodexGoal,
   isTerminalFirst = false,
   isNativeWrapper = false,
   reconnectHint = false,
@@ -3327,6 +3817,8 @@ export function Composer({
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
   const [planModeBusy, setPlanModeBusy] = useState(false);
+  const [goalDialogOpen, setGoalDialogOpen] = useState(false);
+  const [codexGoal, setCodexGoal] = useState<CodexGoal | null>(null);
   // Index of the highlighted item in the slash-command suggestions menu.
   // -1 means no item highlighted (menu closed or no matches). When the menu
   // opens with matches the reset logic below pre-selects the first item (0)
@@ -3380,6 +3872,28 @@ export function Composer({
   // module scope (not useRef) because Composer unmounts during the
   // loading gate between session switches.
   const conversationId = useChatStore((s) => s.conversationId);
+  const handleGoalChange = useCallback((goal: CodexGoal | null) => {
+    setCodexGoal(goal);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!showCodexGoal || !conversationId) {
+      setCodexGoal(null);
+      setGoalDialogOpen(false);
+      return;
+    }
+    void getCodexGoal(conversationId)
+      .then((response) => {
+        if (!cancelled) setCodexGoal(response.goal);
+      })
+      .catch(() => {
+        if (!cancelled) setCodexGoal(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [conversationId, showCodexGoal]);
   const valueRef = useRef(value);
   valueRef.current = value;
   const filesRef = useRef(files);
@@ -4179,6 +4693,31 @@ export function Composer({
                 </TooltipContent>
               </Tooltip>
             )}
+            {showCodexGoal && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={codexGoal ? "secondary" : "ghost"}
+                    className={cn(
+                      "h-9 gap-1.5 px-2 text-xs md:h-8",
+                      codexGoal && "border border-ring/30 text-foreground",
+                    )}
+                    disabled={!conversationId}
+                    aria-pressed={codexGoal != null}
+                    aria-label={codexGoal ? "View Codex goal" : "Set Codex goal"}
+                    data-testid="codex-goal-toggle"
+                    data-active={codexGoal ? "true" : undefined}
+                    onClick={() => setGoalDialogOpen(true)}
+                  >
+                    <TargetIcon className="size-3.5" />
+                    <span>Goal</span>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>{codexGoal ? "View Codex goal" : "Set Codex goal"}</TooltipContent>
+              </Tooltip>
+            )}
             <AgentPicker
               agents={agents}
               isLoading={agentsLoading}
@@ -4222,7 +4761,15 @@ export function Composer({
           </div>
         </div>
       </div>
-      <ComposerStatusLine harnessLabel={harnessLabel} />
+      <CodexGoalDialog
+        open={goalDialogOpen}
+        onOpenChange={setGoalDialogOpen}
+        conversationId={conversationId}
+        readOnly={isReadOnly}
+        goal={codexGoal}
+        onGoalChange={handleGoalChange}
+      />
+      <ComposerStatusLine harnessLabel={harnessLabel} codexGoal={codexGoal} />
     </form>
   );
 }
@@ -4475,6 +5022,19 @@ export function shouldShowEffortPicker(
 }
 
 export function shouldShowCodexPlanModeControl(
+  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+): boolean {
+  return isCodexNativeSession(conv);
+}
+
+/**
+ * True when the Codex Goal control should be visible.
+ *
+ * @param conv - Session or sidebar row carrying labels. ``null`` or missing
+ *   labels fail closed.
+ * @returns True only for Codex-native wrapper sessions.
+ */
+export function shouldShowCodexGoalControl(
   conv: { labels?: Record<string, string | null> | null } | null | undefined,
 ): boolean {
   return isCodexNativeSession(conv);

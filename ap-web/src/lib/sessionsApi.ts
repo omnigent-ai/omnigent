@@ -216,6 +216,41 @@ interface SessionItemsResponseWire {
   has_more: boolean;
 }
 
+interface CodexGoalWire {
+  thread_id: string;
+  objective: string;
+  status: "active" | "paused" | "blocked" | "usageLimited" | "budgetLimited" | "complete";
+  token_budget?: number | null;
+  tokens_used: number;
+  time_used_seconds: number;
+  created_at?: number | null;
+  updated_at?: number | null;
+}
+
+interface CodexGoalResponseWire {
+  goal: CodexGoalWire | null;
+}
+
+export interface CodexGoal {
+  threadId: string;
+  objective: string;
+  status: "active" | "paused" | "blocked" | "usageLimited" | "budgetLimited" | "complete";
+  tokenBudget: number | null;
+  tokensUsed: number;
+  timeUsedSeconds: number;
+  createdAt: number | null;
+  updatedAt: number | null;
+}
+
+export interface CodexGoalResponse {
+  goal: CodexGoal | null;
+}
+
+export interface SetCodexGoalInput {
+  objective: string;
+  tokenBudget?: number | null;
+}
+
 /**
  * Initial (and per-scroll-up-page) item count for conversation history
  * hydration. Bounds how many items the chat surface fetches, parses,
@@ -297,6 +332,37 @@ function sessionFromWire(wire: SessionResponseWire): Session {
 async function readJsonOrThrow<T>(res: Response): Promise<T> {
   if (!res.ok) throw await apiErrorFromResponse(res);
   return (await res.json()) as T;
+}
+
+/**
+ * Convert one Codex-goal wire object to the camelCase UI type.
+ *
+ * @param wire - Snake-case goal object returned by AP.
+ * @returns CamelCase goal object for UI code.
+ */
+function codexGoalFromWire(wire: CodexGoalWire): CodexGoal {
+  return {
+    threadId: wire.thread_id,
+    objective: wire.objective,
+    status: wire.status,
+    tokenBudget: wire.token_budget ?? null,
+    tokensUsed: wire.tokens_used,
+    timeUsedSeconds: wire.time_used_seconds,
+    createdAt: wire.created_at ?? null,
+    updatedAt: wire.updated_at ?? null,
+  };
+}
+
+/**
+ * Convert a Codex-goal response body to the UI type.
+ *
+ * @param wire - Snake-case AP response body.
+ * @returns CamelCase goal response.
+ */
+function codexGoalResponseFromWire(wire: CodexGoalResponseWire): CodexGoalResponse {
+  return {
+    goal: wire.goal == null ? null : codexGoalFromWire(wire.goal),
+  };
 }
 
 /**
@@ -642,6 +708,64 @@ export async function updateSession(
     body: JSON.stringify(body),
   });
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
+}
+
+/**
+ * Read the current Codex-native thread goal for a session.
+ *
+ * @param sessionId - Session identifier, e.g. ``"conv_abc123"``.
+ * @returns The current goal, or ``goal: null`` when Codex has none.
+ */
+export async function getCodexGoal(sessionId: string): Promise<CodexGoalResponse> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`,
+  );
+  return codexGoalResponseFromWire(await readJsonOrThrow<CodexGoalResponseWire>(res));
+}
+
+/**
+ * Set or replace the Codex-native thread goal for a session.
+ *
+ * @param sessionId - Session identifier, e.g. ``"conv_abc123"``.
+ * @param goal - Objective text and optional token budget. ``tokenBudget:
+ * null`` clears the Codex budget.
+ * @returns Updated Codex goal state.
+ */
+export async function setCodexGoal(
+  sessionId: string,
+  goal: SetCodexGoalInput,
+): Promise<CodexGoalResponse> {
+  const body: Record<string, string | number | null> = {
+    objective: goal.objective,
+  };
+  if (goal.tokenBudget !== undefined) {
+    body.token_budget = goal.tokenBudget;
+  }
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+  return codexGoalResponseFromWire(await readJsonOrThrow<CodexGoalResponseWire>(res));
+}
+
+/**
+ * Clear the Codex-native thread goal for a session.
+ *
+ * @param sessionId - Session identifier, e.g. ``"conv_abc123"``.
+ * @returns Whether Codex removed an existing goal.
+ */
+export async function clearCodexGoal(sessionId: string): Promise<{ cleared: boolean }> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`,
+    {
+      method: "DELETE",
+    },
+  );
+  return readJsonOrThrow<{ cleared: boolean }>(res);
 }
 
 interface RunnerSummaryWire {

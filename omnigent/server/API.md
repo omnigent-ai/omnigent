@@ -836,6 +836,94 @@ runner, waits for registration, then PATCHes the session to the new
 runner id. The write replaces any previous value in
 `conversations.runner_id`; no history table is maintained.
 
+### Codex Goal
+
+Codex-native sessions expose Codex app-server's persisted thread goal as
+a live subresource. Goal state is not mirrored into Omnigent labels or
+conversation rows; the server validates session access and forwards a
+generic goal control event to the bound runner, which calls Codex
+app-server (`thread/goal/get`, `thread/goal/set`, or
+`thread/goal/clear`).
+
+All routes are valid only for sessions stamped with
+`omnigent.wrapper=codex-native-ui`.
+
+```
+GET /v1/sessions/{session_id}/codex_goal
+```
+
+Auth: read access to the session.
+
+200 OK:
+
+```
+{
+  "goal": {
+    "thread_id": "thr_123",
+    "objective": "Finish the migration and keep tests green",
+    "status": "active",
+    "token_budget": 40000,
+    "tokens_used": 1200,
+    "time_used_seconds": 180,
+    "created_at": 1776272400,
+    "updated_at": 1776272460
+  }
+}
+```
+
+`goal` is `null` when Codex reports no persisted goal. `created_at`
+and `updated_at` may be `null` if the app-server response omits them.
+
+```
+PUT /v1/sessions/{session_id}/codex_goal
+Content-Type: application/json
+
+{
+  "objective": "Finish the migration and keep tests green",
+  "token_budget": 40000
+}
+```
+
+Auth: edit access to the session.
+
+Request body:
+
+  objective (string, required)
+    Goal objective. Trimmed by the server; must be non-empty and at
+    most 4000 characters, matching Codex app-server.
+
+  token_budget (integer or null, optional)
+    Positive token budget forwarded to Codex as `tokenBudget`. Explicit
+    `null` clears the Codex token budget. Omitting the field leaves the
+    budget field absent from the forwarded app-server request.
+
+200 OK - same `{"goal": ...}` shape as `GET`.
+
+```
+DELETE /v1/sessions/{session_id}/codex_goal
+```
+
+Auth: edit access to the session.
+
+200 OK:
+
+```
+{"cleared": true}
+```
+
+Failure modes:
+
+  400 Bad Request
+    Session is not Codex-native, objective is blank, or token_budget is
+    not positive / null.
+
+  404 Not Found
+    No session with that id.
+
+  503 Service Unavailable
+    No live runner can reach the loaded Codex bridge, the runner rejects
+    the goal control, or the runner returns a malformed goal payload.
+
 ### Post Event
 
 ```
