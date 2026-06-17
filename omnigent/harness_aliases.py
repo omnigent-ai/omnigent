@@ -15,6 +15,8 @@ HARNESS_ALIASES: dict[str, str] = {
     # canonical id is "antigravity" (matches the registry / workflow type).
     "agy": "antigravity",
     "google-antigravity": "antigravity",
+    # Qwen Code harness alias.
+    "qwen-code": "qwen",
 }
 
 # Canonical native-CLI harness spellings. These harnesses type messages into
