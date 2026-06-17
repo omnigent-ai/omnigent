@@ -1,14 +1,26 @@
 name: Code Coverage
 
-# Posts a report-only `Coverage` commit status from the `coverage-summary`
-# artifact produced by the CI workflow. Runs on workflow_run (privileged,
-# statuses:write) but does NOT check out PR code — it only consumes the artifact,
-# so it isn't a "dangerous workflow". The status is always success (the % rides
-# in the description) and is never required, so it can't block a merge.
+# Coverage ratchet for both suites — backend pytest (`Coverage`) and the ap-web
+# vitest frontend (`Coverage (ui)`). One job handles both: it triggers on either
+# producing workflow and branches on github.event.workflow_run.name to pick the
+# artifact, status context, and wording. Runs on workflow_run (privileged,
+# statuses:write) but does NOT check out PR code — it only consumes the artifact
+# and the GitHub API, so it isn't a "dangerous workflow".
+#
+# Baseline storage: the latest coverage on main is kept as the matching commit
+# status on main's HEAD (no committed file, so no bot push to a protected main and
+# no CI re-trigger). On push to main the job records that status; on a PR it reads
+# main's status as the baseline and flags a drop below it (beyond
+# COVERAGE_TOLERANCE).
+#
+# Soft rollout: while COVERAGE_ENFORCE is "false" a regression is reported as a
+# success status annotated "would fail once enforced" — never a red ✗. To turn on
+# real red statuses, set COVERAGE_ENFORCE: "true"; to make them actually block a
+# merge, also mark the status a required check in branch protection.
 
 on:
   workflow_run:
-    workflows: [CI]
+    workflows: [CI, ap-web Tests]
     types: [completed]
 
 # Read-only at the top level; write scopes live on the job below.
@@ -16,45 +28,119 @@ permissions:
   contents: read
 
 concurrency:
-  group: code-coverage-${{ github.event.workflow_run.head_sha }}
+  # Keyed by producing workflow + head SHA so backend and frontend runs on the
+  # same commit don't cancel each other.
+  group: code-coverage-${{ github.event.workflow_run.name }}-${{ github.event.workflow_run.head_sha }}
   cancel-in-progress: true
+
+env:
+  # Absorbs coverage nondeterminism (parallel shards, sysmon line-only backend)
+  # so a tiny jitter doesn't fail a PR. A real regression clears this easily.
+  COVERAGE_TOLERANCE: "0.5"
+  # "false" = observe only: a regression posts a success status annotated
+  # "would fail once enforced" instead of a red ✗. Set "true" to post real
+  # failure statuses once the gate has run cleanly for a while.
+  COVERAGE_ENFORCE: "false"
 
 jobs:
   post:
     name: Post coverage status
     permissions:
-      actions: read     # download the coverage-summary artifact from the CI run
-      statuses: write   # post the Coverage status on the PR head SHA
-    # PR-originated CI runs only; other completions have no PR head SHA.
-    if: ${{ github.event.workflow_run.event == 'pull_request' }}
+      actions: read     # download the coverage artifact from the producing run
+      contents: read    # read main's baseline status via the commits API
+      statuses: write   # post the coverage status on the head SHA
+    # PR runs (gate) and pushes to main (record baseline). Other completions have
+    # no PR head SHA / aren't the baseline branch.
+    if: >-
+      ${{ github.event.workflow_run.event == 'pull_request' ||
+          (github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    env:
+      # Per-suite parameters, selected by which workflow triggered this run.
+      ART_NAME: ${{ github.event.workflow_run.name == 'CI' && 'coverage-summary' || 'ui-coverage-summary' }}
+      CONTEXT: ${{ github.event.workflow_run.name == 'CI' && 'Coverage' || 'Coverage (ui)' }}
+      NOUN: ${{ github.event.workflow_run.name == 'CI' && 'Coverage' || 'UI coverage' }}
+      METRIC: ${{ github.event.workflow_run.name == 'CI' && 'Total coverage' || 'Total UI line coverage' }}
     steps:
       # Data only — never the PR's code. Tolerate a missing artifact (fork PRs,
-      # or CI that produced no coverage) via the no-data guard below.
+      # or a run that produced no coverage) via the no-data guard below.
       - name: Download coverage summary
         continue-on-error: true
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ github.token }}
-          name: coverage-summary-${{ github.event.workflow_run.id }}
+          name: ${{ env.ART_NAME }}-${{ github.event.workflow_run.id }}
           path: coverage-summary
 
-      - name: Post Coverage status on PR head SHA
+      - name: Evaluate coverage and post status
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           SHA: ${{ github.event.workflow_run.head_sha }}
+          EVENT: ${{ github.event.workflow_run.event }}
+          # Makes the status' "Details" link land on the producing run, whose
+          # summary has the full coverage table.
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
         run: |
+          set -euo pipefail
           if [[ ! -f coverage-summary/total.txt ]]; then
-            echo "::notice::No coverage-summary artifact; nothing to post."
+            echo "::notice::No ${ART_NAME} artifact; nothing to post."
             exit 0
           fi
-          TOTAL=$(cat coverage-summary/total.txt)
-          gh api "repos/$REPO/statuses/$SHA" \
-            -f state=success \
-            -f context=Coverage \
-            -f description="Total coverage: ${TOTAL}%" >/dev/null
-          echo "Posted Coverage=${TOTAL}% on $SHA"
+          TOTAL=$(tr -d '[:space:]' < coverage-summary/total.txt)
+
+          # On main: record the new baseline as the status on this commit.
+          if [[ "$EVENT" == "push" ]]; then
+            gh api "repos/$REPO/statuses/$SHA" \
+              -f state=success \
+              -f context="$CONTEXT" \
+              -f target_url="$RUN_URL" \
+              -f description="${METRIC}: ${TOTAL}%" >/dev/null
+            echo "Recorded baseline ${CONTEXT}=${TOTAL}% on main $SHA"
+            exit 0
+          fi
+
+          # On a PR: baseline = the matching status on main's HEAD.
+          BASE_DESC=$(gh api "repos/$REPO/commits/main/status" \
+            -q ".statuses[] | select(.context==\"$CONTEXT\") | .description" 2>/dev/null | head -n1 || true)
+          BASELINE=$(printf '%s' "$BASE_DESC" | grep -oE '[0-9]+(\.[0-9]+)?' | head -n1 || true)
+
+          if [[ -z "$BASELINE" ]]; then
+            # No baseline recorded on main yet (first rollout) — report, don't gate.
+            gh api "repos/$REPO/statuses/$SHA" \
+              -f state=success \
+              -f context="$CONTEXT" \
+              -f target_url="$RUN_URL" \
+              -f description="${METRIC}: ${TOTAL}% (no baseline yet)" >/dev/null
+            echo "::notice::No ${CONTEXT} baseline on main yet; reported ${TOTAL}% without gating."
+            exit 0
+          fi
+
+          PASS=$(awk -v c="$TOTAL" -v b="$BASELINE" -v t="$COVERAGE_TOLERANCE" \
+            'BEGIN { print (c + t >= b) ? 1 : 0 }')
+          if [[ "$PASS" == "1" ]]; then
+            gh api "repos/$REPO/statuses/$SHA" \
+              -f state=success \
+              -f context="$CONTEXT" \
+              -f target_url="$RUN_URL" \
+              -f description="${NOUN} ${TOTAL}% (baseline ${BASELINE}%)" >/dev/null
+            echo "PASS: ${NOUN} ${TOTAL}% >= baseline ${BASELINE}% (tol ${COVERAGE_TOLERANCE})"
+          elif [[ "$COVERAGE_ENFORCE" == "true" ]]; then
+            gh api "repos/$REPO/statuses/$SHA" \
+              -f state=failure \
+              -f context="$CONTEXT" \
+              -f target_url="$RUN_URL" \
+              -f description="${NOUN} dropped: ${TOTAL}% < baseline ${BASELINE}%" >/dev/null
+            echo "FAIL: ${NOUN} ${TOTAL}% < baseline ${BASELINE}% (tol ${COVERAGE_TOLERANCE})"
+          else
+            # Observe-only: surface the would-be regression without a red ✗.
+            gh api "repos/$REPO/statuses/$SHA" \
+              -f state=success \
+              -f context="$CONTEXT" \
+              -f target_url="$RUN_URL" \
+              -f description="${NOUN} ${TOTAL}% < baseline ${BASELINE}% (would fail once enforced)" >/dev/null
+            echo "::warning::${NOUN} regression (not gating): ${TOTAL}% < baseline ${BASELINE}% (tol ${COVERAGE_TOLERANCE})"
+          fi
