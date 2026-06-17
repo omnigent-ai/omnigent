@@ -12,9 +12,10 @@ name: UI Code Coverage
 # PR it reads main's status as the baseline and fails the PR's `Coverage (ui)`
 # status when coverage drops below it (beyond COVERAGE_TOLERANCE).
 #
-# Soft rollout: this posts a real failure state, but until `Coverage (ui)` is
-# marked a required status check in branch protection it cannot block a merge.
-# Flip it to required once it has run cleanly for a week or two.
+# Soft rollout: while COVERAGE_ENFORCE is "false" a regression is reported as a
+# success status annotated "would fail once enforced" — never a red ✗. To turn on
+# real red statuses, set COVERAGE_ENFORCE: "true"; to make them actually block a
+# merge, also mark `Coverage (ui)` a required status check in branch protection.
 
 on:
   workflow_run:
@@ -33,6 +34,10 @@ env:
   # Absorbs minor coverage jitter so noise doesn't fail a PR; a real regression
   # clears this easily.
   COVERAGE_TOLERANCE: "0.5"
+  # "false" = observe only: a regression posts a success status annotated
+  # "would fail once enforced" instead of a red ✗. Set "true" to post real
+  # failure statuses once the gate has run cleanly for a while.
+  COVERAGE_ENFORCE: "false"
 
 jobs:
   post:
@@ -106,10 +111,17 @@ jobs:
               -f context="Coverage (ui)" \
               -f description="UI coverage ${TOTAL}% (baseline ${BASELINE}%)" >/dev/null
             echo "PASS: UI coverage ${TOTAL}% >= baseline ${BASELINE}% (tol ${COVERAGE_TOLERANCE})"
-          else
+          elif [[ "$COVERAGE_ENFORCE" == "true" ]]; then
             gh api "repos/$REPO/statuses/$SHA" \
               -f state=failure \
               -f context="Coverage (ui)" \
               -f description="UI coverage dropped: ${TOTAL}% < baseline ${BASELINE}%" >/dev/null
             echo "FAIL: UI coverage ${TOTAL}% < baseline ${BASELINE}% (tol ${COVERAGE_TOLERANCE})"
+          else
+            # Observe-only: surface the would-be regression without a red ✗.
+            gh api "repos/$REPO/statuses/$SHA" \
+              -f state=success \
+              -f context="Coverage (ui)" \
+              -f description="UI coverage ${TOTAL}% < baseline ${BASELINE}% (would fail once enforced)" >/dev/null
+            echo "::warning::UI coverage regression (not gating): ${TOTAL}% < baseline ${BASELINE}% (tol ${COVERAGE_TOLERANCE})"
           fi
