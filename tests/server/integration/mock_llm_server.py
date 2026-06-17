@@ -294,13 +294,19 @@ class _ResponseQueue:
 
 
 class MockState:
-    """Mutable server state with keyed response queues."""
+    """Mutable server state with keyed response queues.
+
+    All mutations are guarded by ``_lock`` so concurrent coroutines
+    (e.g. two ``POST /v1/responses`` handlers) don't interleave on
+    shared structures.
+    """
 
     def __init__(self) -> None:
         self.queues: dict[str, _ResponseQueue] = {}
         self.captured_requests: list[dict] = []
         self.request_count: int = 0
         self.pending_gates: list[QueuedResponse] = []
+        self._lock = asyncio.Lock()
 
     def get_queue(self, key: str) -> _ResponseQueue:
         """Get or create a queue for *key*."""
@@ -313,23 +319,33 @@ class MockState:
 
         Lookup order:
         1. Exact match on *model* in ``self.queues``.
-        2. The ``"default"`` queue (always exists after configure).
-        3. A fresh empty queue (auto-completes with defaults).
+        2. The ``"default"`` queue.
+        3. A lazily-stored ``"default"`` queue (so subsequent
+           requests for unknown models share the same queue).
         """
         if model and model in self.queues:
             return self.queues[model]
         if _DEFAULT_KEY in self.queues:
             return self.queues[_DEFAULT_KEY]
-        return _ResponseQueue()
+        # Lazily create and store the default queue so concurrent
+        # requests to unknown models share the same instance.
+        self.queues[_DEFAULT_KEY] = _ResponseQueue()
+        return self.queues[_DEFAULT_KEY]
 
     def reset(self) -> None:
-        """Clear all state."""
-        for qr in self.pending_gates:
+        """Clear all state (queues, captured requests, gates).
+
+        Atomically swaps the pending-gates list before releasing
+        so a handler that appends between the loop and the clear
+        doesn't lose its gate.
+        """
+        old_gates = self.pending_gates
+        self.pending_gates = []
+        for qr in old_gates:
             qr._gate.set()
         self.queues.clear()
         self.captured_requests.clear()
         self.request_count = 0
-        self.pending_gates.clear()
 
 
 _state = MockState()
@@ -348,17 +364,18 @@ async def create_response(
     Routes to the keyed queue matching the request's ``model`` field.
     Falls back to the ``"default"`` queue when no key matches.
     """
-    _state.request_count += 1
     body = await request.body()
     try:
         parsed = json.loads(body)
     except (json.JSONDecodeError, ValueError):
         parsed = {"raw": body.decode(errors="replace")}
-    _state.captured_requests.append(parsed)
 
-    model = parsed.get("model") if isinstance(parsed, dict) else None
-    queue = _state.resolve_queue(model)
-    qr = queue.next()
+    async with _state._lock:
+        _state.request_count += 1
+        _state.captured_requests.append(parsed)
+        model = parsed.get("model") if isinstance(parsed, dict) else None
+        queue = _state.resolve_queue(model)
+        qr = queue.next()
 
     # Error response
     if qr.error is not None:
@@ -413,26 +430,29 @@ async def configure(request: Request) -> dict[str, object]:
     """
     body = await request.json()
     key = body.get("key", _DEFAULT_KEY)
-    queue = _state.get_queue(key)
-    queue.reset()
-    for entry in body.get("responses", []):
-        queue.responses.append(
-            QueuedResponse(
-                text=entry.get("text", "Mock LLM response"),
-                tool_calls=entry.get("tool_calls"),
-                block=entry.get("block", False),
-                stream=entry.get("stream", False),
-                error=entry.get("error"),
-                status_code=entry.get("status_code", 500),
+    async with _state._lock:
+        queue = _state.get_queue(key)
+        queue.reset()
+        for entry in body.get("responses", []):
+            queue.responses.append(
+                QueuedResponse(
+                    text=entry.get("text", "Mock LLM response"),
+                    tool_calls=entry.get("tool_calls"),
+                    block=entry.get("block", False),
+                    stream=entry.get("stream", False),
+                    error=entry.get("error"),
+                    status_code=entry.get("status_code", 500),
+                )
             )
-        )
-    return {"configured": True, "key": key, "count": len(queue.responses)}
+        count = len(queue.responses)
+    return {"configured": True, "key": key, "count": count}
 
 
 @app.post("/mock/reset")
 async def reset() -> dict[str, bool]:
     """Clear all state (all keyed queues, captured requests, gates)."""
-    _state.reset()
+    async with _state._lock:
+        _state.reset()
     return {"reset": True}
 
 

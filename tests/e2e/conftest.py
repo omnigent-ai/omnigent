@@ -346,7 +346,7 @@ def get_mock_requests(
     """
     if mock_llm_server_url is None:
         return []
-    params = {"key": key} if key else {}
+    params = {"key": key} if key is not None else {}
     resp = httpx.get(
         f"{mock_llm_server_url}/mock/requests",
         params=params,
