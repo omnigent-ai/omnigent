@@ -24,7 +24,7 @@
 # `skip-security-scan` label, but ONLY when the waiver is maintainer-effective
 # -- the label is present AND the author is a maintainer, or a maintainer's
 # latest decisive review is APPROVED. Same semantics as e2e-ui-required's
-# `skip-e2e-ui-test` (and force-merge): the label alone is not enough, so a fork
+# `skip-e2e-ui-test`: the label alone is not enough, so a fork
 # author cannot self-waive (applying labels needs triage access anyway, and the
 # extra maintainer check is defence in depth). All state is read from the API
 # (trusted), and this script always runs from `main`, so a PR cannot edit the

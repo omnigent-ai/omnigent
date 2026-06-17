@@ -49,6 +49,9 @@ vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
 // always set here, so keep this inert (returns no listing).
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: () => ({ data: undefined }),
+  // WorkspacePicker reads this on mount when the file browser opens;
+  // an idle mutation keeps it inert for these tests.
+  useCreateHostDirectory: () => ({ mutateAsync: vi.fn(), isPending: false }),
 }));
 // No other sessions in scope — keep the conflict hooks inert so they don't
 // issue their own /health fetch or surface a warning. The warning is covered

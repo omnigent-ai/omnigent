@@ -29,7 +29,9 @@
 # uncertainty. A wrong/injected "pass" cannot merge anything on its own: the
 # separate required `Maintainer Approval` check still gates merge.
 #
-# Case 3 mirrors merge-ready/force-merge-eligibility.sh exactly.
+# Case 3 applies the maintainer-effective waiver: the `skip-e2e-ui-test` label
+# is honoured only when the author is a maintainer, or a maintainer's latest
+# decisive review is APPROVED (see below) -- a fork author cannot self-waive.
 #
 # Reads change/label/review state from the API only -- never checks out or runs
 # PR-head code. Called from a base-branch (pull_request_target) job, so a PR
@@ -170,7 +172,8 @@ for m in $MAINTAINERS_LC; do
 done
 
 # Latest decisive (non-COMMENTED) review per user; effective if a maintainer's
-# latest such review is APPROVED. Same semantics as force-merge-eligibility.sh.
+# latest such review is APPROVED. Matches GitHub's UI: a later COMMENTED review
+# doesn't supersede an approval, but CHANGES_REQUESTED or DISMISSED does.
 APPROVERS=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
   --jq '[.[] | select(.state != "COMMENTED")] | group_by(.user.login) | map(max_by(.submitted_at)) | .[] | select(.state == "APPROVED") | .user.login')
 for u in $APPROVERS; do
