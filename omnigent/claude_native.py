@@ -1491,7 +1491,16 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
         family.default_model,
     )
     return ClaudeNativeUcodeConfig(
-        env={_UCODE_CLAUDE_BASE_URL_ENV: family.base_url},
+        env={
+            _UCODE_CLAUDE_BASE_URL_ENV: family.base_url,
+            # Disable Claude Code's experimental anthropic-beta flags. Gateways
+            # (Databricks serving-endpoints and the like) reject beta flags they
+            # don't implement with a 400 "invalid beta flag", which kills every
+            # turn. The ucode/databricks path already sets this; mirror it here
+            # so the generic key/gateway/local provider path is equally
+            # gateway-safe.
+            _CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV: "1",
+        },
         api_key_helper=api_key_helper,
         model=family.default_model,
     )

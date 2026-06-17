@@ -11,6 +11,10 @@ HARNESS_ALIASES: dict[str, str] = {
     "native-pi": "pi-native",
     # The SDK package / runtime dispatch spelling; specs use "openai-agents".
     "openai-agents-sdk": "openai-agents",
+    # User-facing spellings for the Google Antigravity SDK harness; the
+    # canonical id is "antigravity" (matches the registry / workflow type).
+    "agy": "antigravity",
+    "google-antigravity": "antigravity",
 }
 
 # Canonical native-CLI harness spellings. These harnesses type messages into

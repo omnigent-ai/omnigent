@@ -1,26 +1,29 @@
 #!/usr/bin/env python3
-"""
-Static security scan of a fork PR's unified diff, used as a gate before the
-fork-e2e mirror runs the contributor's code with the test-gateway secret.
+"""Scan a PR's *added* lines for secret-exfiltration and obfuscated-exec shapes.
 
-It reads diff TEXT only -- it never checks out or executes the fork's code --
-so it is safe to run anywhere. It is defense-in-depth + a reviewer aid, NOT a
-guarantee: an attacker can obfuscate past regexes, so maintainer approval
-remains the primary gate. Its job is to (a) hard-fail on high-confidence
-exfiltration shapes in ADDED lines, and (b) surface changes to files that run
-during CI bootstrap so the reviewer looks harder.
+Part of the single contributor Security Scan (.github/workflows/security-scan.yml),
+the companion to secret-scan.py: that one flags secrets a PR *commits*, this one
+flags code a PR adds to *steal* the CI secrets it runs with (the test-gateway
+token, GITHUB_TOKEN). It is the detector the fork-e2e mirror relied on before the
+scan was unified -- the mirror runs contributor code with the gateway secret, so
+an env-secret read piped to the network is the shape that matters there.
+
+It reads diff TEXT only -- it never checks out or executes the PR's code -- so it
+is safe on any event. It is defense-in-depth + a reviewer aid, NOT a guarantee:
+an attacker can obfuscate past regexes, so maintainer review remains the primary
+gate. Its job is to (a) hard-fail on high-confidence exfiltration shapes in ADDED
+lines, and (b) surface changes to files that run during CI bootstrap so the
+reviewer looks harder.
 
 Findings are two tiers:
-  - BLOCKING -> clean=false (mirror is withheld unless a maintainer applies the
-    override label): exfil shapes -- a secret-named credential source AND a
-    network sink added to the same file; a wholesale ``os.environ`` dump; a
-    decode-then-exec; or a raw TCP/reverse-shell sink.
-  - INFO -> does not block: edits to CI-bootstrap-executed files (conftest.py,
+  - BLOCKING -> non-zero exit: exfil shapes -- a secret-named credential source
+    AND a network sink added to the same file; a wholesale ``os.environ`` dump; a
+    decode-then-exec; or a raw TCP / reverse-shell sink.
+  - INFO -> ``::warning`` only: edits to CI-bootstrap-executed files (conftest.py,
     setup.py, pyproject build hooks, anything under .github/, pytest plugins).
 
-Usage:   python3 security_scan.py <unified-diff-file>
-Outputs (when $GITHUB_OUTPUT is set): ``clean=true|false`` and a one-line
-``summary=...``. Always exits 0; callers gate on the ``clean`` output.
+Env in:  DIFF_FILE (path to a ``git diff base...head`` / ``gh pr diff`` unified diff).
+Exit:    non-zero if any BLOCKING finding; 0 otherwise.
 """
 
 from __future__ import annotations
@@ -79,7 +82,7 @@ def _changed_files_and_added(diff: str) -> dict[str, list[str]]:
     """
     Group a unified diff's ADDED lines by destination file.
 
-    :param diff: Full unified-diff text (e.g. from ``gh pr diff --patch``).
+    :param diff: Full unified-diff text (e.g. from ``gh pr diff``).
     :returns: Mapping of file path (e.g. ``"tests/conftest.py"``) to the list of
         added line bodies (without the leading ``+``); diff headers excluded.
     """
@@ -96,74 +99,66 @@ def _changed_files_and_added(diff: str) -> dict[str, list[str]]:
     return by_file
 
 
-def scan_diff(diff: str) -> tuple[list[str], list[str]]:
+def scan_diff(diff: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
     """
     Classify a unified diff into blocking and info findings.
 
     :param diff: Full unified-diff text.
-    :returns: ``(blocking, info)`` -- two lists of human-readable finding
-        strings. ``blocking`` non-empty means the scan is not clean.
+    :returns: ``(blocking, info)`` -- two lists of ``(path, message)`` tuples.
+        ``blocking`` non-empty means the scan is not clean.
     """
     by_file = _changed_files_and_added(diff)
-    blocking: list[str] = []
-    info: list[str] = []
+    blocking: list[tuple[str, str]] = []
+    info: list[tuple[str, str]] = []
 
     for path, added in by_file.items():
         body = "\n".join(added)
         has_net = bool(_NETWORK.search(body))
         has_secret = bool(_SECRET.search(body))
         if has_net and has_secret:
-            blocking.append(f"exfil-shape (secret source + network sink) in {path}")
+            blocking.append((path, "exfil shape: secret-named source + network sink in one file"))
         for ln in added:
             if _STANDALONE.search(ln) and not (
                 # a lone base64/decode call is INFO; only block decode+exec
                 _DECODE.search(ln) and not _EXEC.search(ln)
             ):
-                blocking.append(f"high-risk call in {path}: {ln.strip()[:80]}")
+                blocking.append((path, f"high-risk call: {ln.strip()[:80]}"))
                 break
             if _DECODE.search(ln) and _EXEC.search(ln):
-                blocking.append(f"decode+exec in {path}: {ln.strip()[:80]}")
+                blocking.append((path, f"decode+exec: {ln.strip()[:80]}"))
                 break
         if _HIGH_RISK.search(path):
-            info.append(f"touches CI-executed file: {path}")
+            info.append((path, "touches a file that runs during CI bootstrap; review closely"))
 
     return blocking, info
 
 
-def main(argv: list[str]) -> int:
+def main() -> int:
     """
-    Scan the diff file at ``argv[1]`` and emit ``clean``/``summary`` outputs.
+    Scan the diff at ``$DIFF_FILE`` and report exfil / obfuscated-exec findings.
 
-    :param argv: Process argv; ``argv[1]`` is the unified-diff file path.
-    :returns: Always 0 (callers gate on the ``clean`` GITHUB_OUTPUT value).
+    :returns: 1 if any blocking finding, else 0.
     """
-    if len(argv) < 2:
-        print("usage: security_scan.py <diff-file>", file=sys.stderr)
-        return 0
-    with open(argv[1], encoding="utf-8", errors="replace") as fh:
+    diff_path = os.environ.get("DIFF_FILE")
+    if not diff_path or not os.path.isfile(diff_path):
+        print(f"::error::diff file {diff_path!r} missing")
+        return 1
+
+    with open(diff_path, encoding="utf-8", errors="replace") as fh:
         diff = fh.read()
     blocking, info = scan_diff(diff)
 
-    for f in blocking:
-        print(f"BLOCKING: {f}")
-    for f in info:
-        print(f"info: {f}")
+    for path, msg in info:
+        print(f"::warning file={path}::{msg}")
+    for path, msg in blocking:
+        print(f"::error file={path}::{msg}")
 
-    clean = not blocking
-    if clean:
-        summary = f"clean ({len(info)} CI-file note(s))" if info else "clean"
-    else:
-        summary = f"{len(blocking)} blocking finding(s): " + "; ".join(blocking)
-    summary = summary.replace("\n", " ")[:140]
-
-    out = os.environ.get("GITHUB_OUTPUT")
-    if out:
-        with open(out, "a", encoding="utf-8") as fh:
-            fh.write(f"clean={'true' if clean else 'false'}\n")
-            fh.write(f"summary={summary}\n")
-    print(f"clean={clean} :: {summary}")
+    if blocking:
+        print(f"::error::Exfil scan found {len(blocking)} blocking finding(s) in added lines.")
+        return 1
+    print(f"Exfil scan passed ({len(info)} CI-file note(s)).")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    sys.exit(main())

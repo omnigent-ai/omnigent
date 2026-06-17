@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import itertools
 import json
@@ -55,6 +56,27 @@ def prepare_bridge_dir(session_id: str) -> Path:
     (bridge_dir / _INBOX_DIR).mkdir(mode=0o700, exist_ok=True)
     (bridge_dir / _SESSIONS_DIR).mkdir(mode=0o700, exist_ok=True)
     return bridge_dir
+
+
+def clear_inbox(bridge_dir: Path) -> None:
+    """
+    Drop leftover inbox payloads from a previous Pi process.
+
+    A freshly launched Pi process has an empty in-memory dedup set, so any
+    payload a prior process left undelivered would replay into it. Call on
+    terminal (re)launch — mirroring codex-native's ``clear_bridge_state``.
+    Best-effort: a concurrent drain removing a file first is benign.
+
+    :param bridge_dir: The session's prepared bridge directory.
+    :returns: None.
+    """
+    inbox = bridge_dir / _INBOX_DIR
+    if not inbox.is_dir():
+        return
+    for entry in inbox.iterdir():
+        if entry.is_file():
+            with contextlib.suppress(OSError):
+                entry.unlink()
 
 
 def build_pi_native_spawn_env(conversation_id: str) -> dict[str, str]:

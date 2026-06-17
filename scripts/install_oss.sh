@@ -10,6 +10,8 @@
 #   --version X   install a specific PyPI release (default: latest)
 #   --repo URL    install from a git checkout instead (builds from source;
 #                 requires Node 22+/npm) — for development
+#   --extra NAME  install an optional-dependency extra (repeatable, or
+#                 comma-separated), e.g. --extra databricks
 #   --non-interactive, --verbose
 #
 # uv and git (only with --repo) are required; the installer offers to install
@@ -23,6 +25,10 @@ set -eu
 # Published PyPI package, the default install. --version pins a release.
 PACKAGE_NAME="omnigent"
 VERSION=
+# Comma-separated optional-dependency extras to install with the package
+# (e.g. "databricks"), accumulated from one or more --extra flags. Empty =>
+# the base install with no extras.
+EXTRAS=
 # Set by --repo to install from a git checkout instead (development; builds
 # the web UI from source). Empty => install the published wheel from PyPI.
 REPO_URL=
@@ -56,7 +62,7 @@ init_style() {
 }
 
 usage() {
-  printf 'Usage: install_oss.sh [--non-interactive] [--verbose] [--version X] [--repo URL]\n'
+  printf 'Usage: install_oss.sh [--non-interactive] [--verbose] [--version X] [--repo URL] [--extra NAME]\n'
 }
 
 step() {
@@ -163,6 +169,20 @@ parse_args() {
           exit 1
         fi
         VERSION="$2"
+        shift
+        ;;
+      --extra)
+        if [ "$#" -lt 2 ]; then
+          usage >&2
+          exit 1
+        fi
+        # Accumulate repeated flags into one comma-separated list; a value that
+        # is itself comma-separated (--extra a,b) just concatenates cleanly.
+        if [ -n "$EXTRAS" ]; then
+          EXTRAS="$EXTRAS,$2"
+        else
+          EXTRAS="$2"
+        fi
         shift
         ;;
       *)
@@ -430,15 +450,29 @@ install_omnigent() {
   # The wheel ships the prebuilt web UI, so there is no npm/Node step and no
   # source build — the fast, reliable path. `--repo` switches INSTALL_URL to a
   # git ref, which builds from source (and needs npm, checked above).
+  # Extras suffix like "[databricks]" appended to the package name so the
+  # optional-dependency group(s) install alongside the base package. Applies to
+  # every mode below; empty when no --extra was given.
+  extras_suffix=
+  if [ -n "$EXTRAS" ]; then
+    extras_suffix="[$EXTRAS]"
+  fi
   if building_from_source; then
-    target="$INSTALL_URL"
-    step "Installing Omnigent from source (Python $PYTHON_VERSION)"
+    # A PEP 508 direct reference attaches extras to a git source install:
+    # "omnigent[databricks] @ git+https://...". Without extras, keep the bare
+    # URL (the long-standing form uv accepts directly).
+    if [ -n "$extras_suffix" ]; then
+      target="${PACKAGE_NAME}${extras_suffix} @ ${INSTALL_URL}"
+    else
+      target="$INSTALL_URL"
+    fi
+    step "Installing Omnigent from source${extras_suffix:+ $extras_suffix} (Python $PYTHON_VERSION)"
   elif [ -n "$VERSION" ]; then
-    target="${PACKAGE_NAME}==${VERSION}"
-    step "Installing Omnigent $VERSION (Python $PYTHON_VERSION)"
+    target="${PACKAGE_NAME}${extras_suffix}==${VERSION}"
+    step "Installing Omnigent $VERSION${extras_suffix:+ $extras_suffix} (Python $PYTHON_VERSION)"
   else
-    target="$PACKAGE_NAME"
-    step "Installing Omnigent (Python $PYTHON_VERSION)"
+    target="${PACKAGE_NAME}${extras_suffix}"
+    step "Installing Omnigent${extras_suffix:+ $extras_suffix} (Python $PYTHON_VERSION)"
   fi
   # --force so re-running upgrades instead of no-op'ing; -q hides uv's
   # "Installed N executables" summary (the package also ships an `omni` alias).

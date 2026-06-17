@@ -1152,6 +1152,15 @@ def build_hook_settings(
         # a catch-all policy evaluation entry so TOOL_RESULT policies
         # fire for all tools, not just the forwarder-specific ones.
         hooks["PostToolUse"].append({"hooks": [evaluate_policy_hook]})
+        # UserPromptSubmit already carries the transcript forwarder's
+        # status hook (running). Append the policy hook so REQUEST-phase
+        # policies gate native prompts — for native sessions this is the
+        # sole request gate (the server-level ``_evaluate_input_policy``
+        # skips native message events). A DENY emits ``decision: "block"``,
+        # dropping the prompt before the model sees it; ASK is resolved
+        # server-side. Covers both web-UI-injected and direct-terminal
+        # prompts, since both fire UserPromptSubmit.
+        hooks["UserPromptSubmit"].append({"hooks": [evaluate_policy_hook]})
     settings: dict[str, Any] = {"hooks": hooks}
     if api_key_helper:
         settings["apiKeyHelper"] = api_key_helper
@@ -3663,6 +3672,33 @@ def read_claude_context_state(bridge_dir: Path) -> dict[str, Any] | None:
     if not isinstance(size, int) or size <= 0:
         return None
     return parsed
+
+
+def read_claude_status_model(bridge_dir: Path) -> str | None:
+    """
+    Read the active model id from the statusLine snapshot ``context.json``.
+
+    Unlike :func:`read_claude_context_state` (which returns ``None`` unless a
+    usable ``context_window_size`` is present, since it backs the context
+    ring), this returns the model whenever the wrapper captured one — the
+    model and the window are written independently, and the cost-budget gate
+    needs the model even on a render where the window field was absent. This
+    is claude-native's race-free, gate-time source of the live ``/model``
+    selection (the analogue of the codex hook reading ``config.toml``).
+
+    :param bridge_dir: Bridge directory shared with the statusLine wrapper.
+    :returns: The model id, e.g. ``"claude-sonnet-4-6"``, or ``None`` when
+        the file is missing / unreadable / carries no model string.
+    """
+    path = bridge_dir / _CONTEXT_FILE
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    model = parsed.get("model")
+    return model if isinstance(model, str) and model else None
 
 
 def read_user_status_line_command() -> str | None:

@@ -155,6 +155,23 @@ def test_stored_cursor_key_used_when_spec_has_no_auth(
     assert env["HARNESS_CURSOR_API_KEY"] == "crsr_stored_123"
 
 
+def test_stored_cursor_key_wins_over_ambient_when_both_set(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With no spec auth, the stored ``cursor:`` key (registered via ``omnigent
+    setup``) wins over an ambient ``CURSOR_API_KEY`` when BOTH are present.
+
+    This pins the middle rung of the precedence chain (spec auth > stored >
+    ambient): a refactor that swapped the two branches would silently let an
+    ambient key override the user's configured one, with no other test failing.
+    """
+    monkeypatch.setenv("CURSOR_KEY_SRC", "crsr_stored_123")
+    _write_cursor_config(tmp_path, "env:CURSOR_KEY_SRC")
+    monkeypatch.setenv("CURSOR_API_KEY", "crsr_ambient_456")
+    env = _build_cursor_spawn_env(_make_spec(auth=None))
+    assert env["HARNESS_CURSOR_API_KEY"] == "crsr_stored_123"
+
+
 def test_spec_api_key_auth_wins_over_stored_key(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

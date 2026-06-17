@@ -17,6 +17,7 @@ from omnigent.claude_native_bridge import (
     read_active_session_id,
     read_bridge_id,
     read_claude_session_id,
+    read_claude_status_model,
     read_permission_hook_config,
     read_seen_claude_session_ids,
     record_hook_event,
@@ -713,22 +714,30 @@ def _main_ask_user_question(argv: list[str]) -> int:
 
 def _main_evaluate_policy(argv: list[str]) -> int:
     """
-    Evaluate a Claude Code ``PreToolUse`` or ``PostToolUse`` hook against Omnigent policies.
+    Evaluate a Claude Code ``PreToolUse`` / ``PostToolUse`` /
+    ``UserPromptSubmit`` hook against Omnigent policies.
 
     Reads the hook JSON payload from stdin, converts it into the
     proto-compatible ``EvaluationRequest`` schema (``PHASE_TOOL_CALL``
-    for PreToolUse, ``PHASE_TOOL_RESULT`` for PostToolUse), POSTs to
+    for PreToolUse, ``PHASE_TOOL_RESULT`` for PostToolUse,
+    ``PHASE_REQUEST`` for UserPromptSubmit), POSTs to
     ``/v1/sessions/{id}/policies/evaluate``, and converts the
     ``EvaluationResponse`` back into Claude Code's hook output format.
 
-    For ``PreToolUse``, only constraining verdicts map to a
-    ``permissionDecision``: ``POLICY_ACTION_DENY`` → ``"deny"`` and
-    ``POLICY_ACTION_ASK`` → ``"defer"`` (falls through to the
-    ``PermissionRequest`` hook for interactive approval).
-    ``POLICY_ACTION_ALLOW`` (the engine's default when no policy matches)
-    emits no output — "no opinion" — so Claude's own permission prompt
-    still fires and the ``PermissionRequest`` hook can route it to the
-    web UI. See :func:`omnigent.native_policy_hook.evaluation_response_to_hook_output`.
+    For ``PreToolUse``, only the constraining ``POLICY_ACTION_DENY``
+    verdict maps to a ``permissionDecision`` (``"deny"``); ASK is
+    resolved server-side (the endpoint parks via ``_hold_native_ask_gate``
+    and returns a hard ALLOW/DENY). ``POLICY_ACTION_ALLOW`` (the engine's
+    default when no policy matches) emits no output — "no opinion" — so
+    Claude's own permission prompt still fires and the
+    ``PermissionRequest`` hook can route it to the web UI. See
+    :func:`omnigent.native_policy_hook.evaluation_response_to_hook_output`.
+
+    For ``UserPromptSubmit``, this is the request-phase gate for native
+    sessions (the server-level ``_evaluate_input_policy`` skips native
+    message events). A DENY emits top-level ``decision: "block"``, which
+    drops the prompt before the model sees it; ASK is resolved
+    server-side; ALLOW proceeds with no output.
 
     For ``PostToolUse``, policy denials are surfaced as
     ``additionalContext`` (Claude sees the warning but the tool result
@@ -771,6 +780,25 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     if eval_request is None:
         # Unrecognized hook event — no policy to evaluate.
         return 0
+
+    # Stamp the live model from this session's statusLine capture (the
+    # statusLine wrapper writes the active model id into ``context.json`` on
+    # every render — including right after an in-pane ``/model`` switch). This
+    # is the cost gate's source of truth at hook time, race-free, unlike the
+    # forwarder's async ``model_override`` mirror which lags a poll behind.
+    # Without it the cost-budget gate can see an unresolved model (None) and
+    # fail closed — blocking a cheap-model (sonnet/haiku) session over budget,
+    # even though only expensive tiers should be gated (the server prefers a
+    # stamped model over its own resolution; see ``PolicyEngine._inject_model``).
+    # hook_payload_to_evaluation_request always returns an event with a
+    # "context" dict, so index it directly (fail loud if that contract changes).
+    context = eval_request["event"]["context"]
+    # Stamp the harness so the over-budget message names claude-native's
+    # model-switch surface (the in-pane ``/model`` picker).
+    context["harness"] = "claude-native"
+    status_model = read_claude_status_model(bridge_dir)
+    if status_model:
+        context["model"] = status_model
 
     url = f"{ap_server_url.rstrip('/')}/v1/sessions/{url_component(session_id)}/policies/evaluate"
     try:

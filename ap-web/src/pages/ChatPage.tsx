@@ -1227,8 +1227,21 @@ function MainAgentSurface({
 
   // Ref forwarded to SelectionPopup to scope selection detection to the
   // conversation area, preventing selections in the composer from triggering
-  // the popup.
+  // the popup. Mirrored into state (`containerEl`) so JumpToTopButton — which
+  // renders inside this wrapper, outside the mask-faded scroll viewport — can
+  // attach its hover listeners to the wrapper (the common ancestor of both the
+  // scroll area and the pill, so moving the cursor onto the pill keeps it live).
   const conversationRef = useRef<HTMLElement | null>(null);
+  const [containerEl, setContainerEl] = useState<HTMLElement | null>(null);
+  const setConversationEl = useCallback((el: HTMLDivElement | null) => {
+    conversationRef.current = el;
+    setContainerEl(el);
+  }, []);
+  // The conversation's scroll container + the StickToBottom controls needed to
+  // override its bottom-lock, lifted out of the context by
+  // ConversationScrollRefBridge so the pinned-but-unmasked JumpToTopButton can
+  // read and drive the scroll.
+  const [scroller, setScroller] = useState<ConversationScroller | null>(null);
   const [sendScrollNonce, setSendScrollNonce] = useState(0);
   const handleSend = useCallback(
     (text: string, files?: File[]) => {
@@ -1284,10 +1297,7 @@ function MainAgentSurface({
     <>
       {/* Wrapper div gives us a ref to scope the SelectionPopup to the
           conversation area without requiring Conversation to forward refs. */}
-      <div
-        ref={conversationRef as React.Ref<HTMLDivElement>}
-        className="flex min-h-0 flex-1 overflow-hidden"
-      >
+      <div ref={setConversationEl} className="relative flex min-h-0 flex-1 overflow-hidden">
         {/* chat-scroll-fade masks the viewport's top edge so scrolling
             content dissolves into the canvas before reaching the
             ChatHeader overlay's controls (geometry in index.css). */}
@@ -1296,6 +1306,7 @@ function MainAgentSurface({
           <ConversationContent className={cn("mx-auto w-full gap-4 pt-20 pb-6", CHAT_COLUMN_WIDTH)}>
             {/* Scroll helpers — must live inside StickToBottom to access context. */}
             <ScrollToBottomOnSend nonce={sendScrollNonce} />
+            <ConversationScrollRefBridge onScroller={setScroller} />
             <HistoryAutoLoader
               hasMoreHistory={hasMoreHistory}
               loadingMoreHistory={loadingMoreHistory}
@@ -1371,6 +1382,15 @@ function MainAgentSurface({
             hidden={userMessageIds.length === 0}
           />
         </Conversation>
+        {/* Hover the top edge to reveal a pill that loads all older history and
+            scrolls to the first message. Rendered here (a wrapper sibling of
+            Conversation) rather than inside it so it escapes the chat-scroll-fade
+            mask and can sit right at the fade border. */}
+        <JumpToTopButton
+          containerEl={containerEl}
+          scroller={scroller}
+          hasMoreHistory={hasMoreHistory}
+        />
       </div>
       {/* Floating reply button — scoped to the conversation container. */}
       <SelectionPopup
@@ -1638,6 +1658,214 @@ export function HistoryAutoLoader({
 
   // No visible control — history loads purely on scroll-up / viewport fill.
   return null;
+}
+
+/**
+ * The conversation's scroll container plus the minimal StickToBottom controls
+ * the JumpToTopButton needs to override the library's bottom-lock. `state` is a
+ * stable, mutable object: clearing `isAtBottom`/`escapedFromLock` makes the
+ * resize-driven `scrollToBottom({preserveScrollPosition})` — fired on every
+ * history prepend — bail instead of yanking the view back to the bottom.
+ */
+type ConversationScroller = {
+  el: HTMLElement;
+  state: { isAtBottom: boolean; escapedFromLock: boolean };
+  stopScroll: () => void;
+};
+
+/**
+ * Lifts the StickToBottom scroll container (and lock controls) out of the
+ * context so a sibling rendered *outside* `<Conversation>` (and thus outside
+ * its `chat-scroll-fade` mask) can still read and drive it. `scrollRef`,
+ * `state`, and `stopScroll` are stable identities (see HistoryAutoLoader for
+ * the runtime-vs-types cast). Renders nothing.
+ */
+function ConversationScrollRefBridge({
+  onScroller,
+}: {
+  onScroller: (s: ConversationScroller | null) => void;
+}) {
+  const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
+    scrollRef: React.RefObject<HTMLElement>;
+    state: ConversationScroller["state"];
+    stopScroll: () => void;
+  };
+  useEffect(() => {
+    // Runs after commit, when StickToBottom has populated scrollRef.current.
+    const el = ctx.scrollRef?.current ?? null;
+    onScroller(el ? { el, state: ctx.state, stopScroll: ctx.stopScroll } : null);
+    return () => onScroller(null);
+  }, [ctx.scrollRef, ctx.state, ctx.stopScroll, onScroller]);
+  return null;
+}
+
+/**
+ * Hover-revealed "Jump to top" pill, mirroring {@link ConversationScrollButton}
+ * but for the other end. Hovering near the top edge of the conversation
+ * surfaces a pill at the fade border; clicking it pages in every older history
+ * block (the conversation is lazily paginated — see {@link HistoryAutoLoader})
+ * and then scrolls to the very first message.
+ *
+ * Rendered as a sibling of `<Conversation>`, not a child: the scroll viewport's
+ * top ~80px is mask-faded (`chat-scroll-fade`), so a pill inside it would fade
+ * out too. Sitting in the wrapper keeps it at full opacity right at the fade
+ * line, and `z-40` lifts it over the `z-30` ChatHeader so it stays clickable.
+ *
+ * Hover is detected in JS off the **wrapper** (`containerEl`), the common
+ * ancestor of both the scroll area and this pill — listening on the scroll
+ * element instead would fire `mouseleave` the instant the cursor crossed onto
+ * the pill (a non-descendant), killing the click. `scroller` carries the inner
+ * scroll container plus the StickToBottom lock controls.
+ *
+ * @param containerEl - The conversation wrapper; hover/anchor reference.
+ * @param scroller - Scroll container + lock controls (ConversationScrollRefBridge).
+ * @param hasMoreHistory - Whether older messages exist before the loaded window.
+ */
+export function JumpToTopButton({
+  containerEl,
+  scroller,
+  hasMoreHistory,
+}: {
+  containerEl: HTMLElement | null;
+  scroller: ConversationScroller | null;
+  hasMoreHistory: boolean;
+}) {
+  const [atTop, setAtTop] = useState(true);
+  const [hovering, setHovering] = useState(false);
+  const [jumping, setJumping] = useState(false);
+
+  // Pixels below the conversation's top edge that count as "hovering the top".
+  // Comfortably clears the pill (anchored at the fade border, ~50px) so moving
+  // onto it to click never drops the hover state.
+  const HOVER_BAND_PX = 140;
+
+  // Hover detection on the wrapper so the pill (a wrapper child) stays in-band.
+  useEffect(() => {
+    if (!containerEl) return;
+    const onMove = (e: MouseEvent) => {
+      const next = e.clientY - containerEl.getBoundingClientRect().top < HOVER_BAND_PX;
+      // Only commit on a transition — mousemove fires continuously, and React
+      // bails on a no-op setState anyway, but skipping it avoids the work.
+      setHovering((prev) => (prev === next ? prev : next));
+    };
+    const onLeave = () => setHovering(false);
+    containerEl.addEventListener("mousemove", onMove, { passive: true });
+    containerEl.addEventListener("mouseleave", onLeave);
+    return () => {
+      containerEl.removeEventListener("mousemove", onMove);
+      containerEl.removeEventListener("mouseleave", onLeave);
+    };
+  }, [containerEl]);
+
+  // Track whether the loaded window is scrolled to its very top.
+  const scrollEl = scroller?.el ?? null;
+  useEffect(() => {
+    if (!scrollEl) return;
+    const onScroll = () => {
+      const next = scrollEl.scrollTop <= 1;
+      setAtTop((prev) => (prev === next ? prev : next));
+    };
+    onScroll();
+    scrollEl.addEventListener("scroll", onScroll, { passive: true });
+    return () => scrollEl.removeEventListener("scroll", onScroll);
+  }, [scrollEl]);
+
+  // Somewhere to go: older pages exist, or we're scrolled down within the
+  // loaded window. At the very first message there's nothing to jump to.
+  const canJump = hasMoreHistory || !atTop;
+  const visible = jumping || (hovering && canJump);
+
+  const jumpToTop = useCallback(async () => {
+    if (!scroller) return;
+    const { el, state, stopScroll } = scroller;
+    const nextFrame = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    setJumping(true);
+    try {
+      // Release StickToBottom's bottom-lock. Without this, every history prepend
+      // resizes the content and the library's ResizeObserver yanks the view back
+      // to the bottom (scrollToBottom with preserveScrollPosition, which sticks
+      // whenever state.isAtBottom is true) — so our scrollTop=0 lost the fight
+      // and only a *second* click (everything already loaded, no resizes) won.
+      // Clearing the lock here makes those prepend-driven scrolls bail.
+      stopScroll();
+      state.isAtBottom = false;
+      state.escapedFromLock = true;
+
+      // Page in every older block before scrolling. loadMoreHistory serializes
+      // via its own loadingMoreHistory guard (so a concurrent HistoryAutoLoader
+      // fetch is harmless), and flips hasMoreHistory to false at the start of
+      // history or on error. The rAF wait yields a frame for the prepend to
+      // commit and for the in-flight flag to settle between pages. The
+      // iteration cap is a backstop against a server that never reports done.
+      for (let i = 0; i < 1000 && useChatStore.getState().hasMoreHistory; i++) {
+        await useChatStore.getState().loadMoreHistory();
+        // Keep the lock released — a prepend that briefly lands us near the
+        // bottom can otherwise re-arm it via the library's scroll handler.
+        state.isAtBottom = false;
+        state.escapedFromLock = true;
+        await nextFrame();
+      }
+      // Pin to the very top, re-asserting across frames until it holds. The last
+      // prepends keep growing scrollHeight after the store settles, and
+      // HistoryAutoLoader's offset-preservation can bump scrollTop right after
+      // we zero it. Force 0 each frame until it stays 0 for two consecutive
+      // frames (or we hit the frame cap).
+      for (let i = 0, stable = 0; i < 60 && stable < 2; i++) {
+        if (el.scrollTop === 0) stable += 1;
+        else {
+          el.scrollTop = 0;
+          stable = 0;
+        }
+        await nextFrame();
+      }
+    } finally {
+      setJumping(false);
+    }
+  }, [scroller]);
+
+  return (
+    <div
+      className={cn(
+        // top-[50px]: centers the pill on the chat-scroll-fade border (the mask
+        // ramps 48px→80px), just below the h-14 ChatHeader. z-40 > header z-30.
+        "pointer-events-none absolute inset-x-0 top-[50px] z-40 flex justify-center transition-opacity duration-150",
+        visible ? "opacity-100" : "opacity-0",
+      )}
+    >
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        disabled={jumping}
+        onClick={() => void jumpToTop()}
+        aria-label="Jump to the first message"
+        // When hidden (opacity-0 / pointer-events-none) keep the button out of
+        // the tab order and the accessibility tree so it can't take focus or be
+        // announced while invisible.
+        tabIndex={visible ? 0 : -1}
+        aria-hidden={!visible}
+        className={cn(
+          "h-7 gap-1.5 rounded-full px-3 text-xs shadow-sm",
+          // Force an OPAQUE background in both themes and on hover. The outline
+          // variant's hover (bg-muted) is a translucent black wash (--muted is
+          // #0000000f), so over the faded chat text behind the pill it bleeds
+          // through and reads as transparent. bg-background is opaque (#fff /
+          // #0d1218); hover feedback comes from a brightness filter, which keeps
+          // the fill fully opaque.
+          "bg-background hover:bg-background hover:brightness-95",
+          "dark:bg-background dark:hover:bg-background dark:hover:brightness-125",
+          visible ? "pointer-events-auto" : "pointer-events-none",
+        )}
+      >
+        {jumping ? (
+          <Loader2Icon className="size-3.5 animate-spin" aria-hidden />
+        ) : (
+          <ArrowUpIcon className="size-3.5" aria-hidden />
+        )}
+        {jumping ? "Loading history…" : "Jump to top"}
+      </Button>
+    </div>
+  );
 }
 
 /** Stable React key per bubble. */
@@ -3031,7 +3259,7 @@ export function Composer({
 
     // Enter sends; Shift+Enter inserts a newline. On mobile, Enter inserts a
     // newline (no Shift available on-screen) and Send must be tapped instead.
-    if (e.key === "Enter" && !e.shiftKey && !isMobile) {
+    if (e.key === "Enter" && !e.shiftKey && !isMobile && !e.nativeEvent.isComposing) {
       e.preventDefault();
       submit();
       return;
@@ -3096,7 +3324,7 @@ export function Composer({
         ref={fileInputRef}
         type="file"
         multiple
-        accept="image/*,application/pdf,text/*"
+        accept="image/*,application/pdf,text/*,application/json"
         className="hidden"
         onChange={(e) => {
           if (e.target.files) {

@@ -67,6 +67,8 @@ def _install_fake_sdk(
         "launch_kwargs": [],
         "sent": [],
         "closed": 0,
+        "client_closed": 0,
+        "agent_closed": 0,
     }
 
     class _FakeRun:
@@ -88,8 +90,10 @@ def _install_fake_sdk(
             state["sent"].append(prompt)
             return _FakeRun(scripts.pop(0))
 
+        # AsyncAgent exposes close() (a CloseAgent RPC + tool unregister).
         async def close(self) -> None:
             state["closed"] += 1
+            state["agent_closed"] += 1
 
     class _FakeClient:
         @classmethod
@@ -97,8 +101,13 @@ def _install_fake_sdk(
             state["launch_kwargs"].append(kwargs)
             return cls()
 
-        async def close(self) -> None:
+        # The real AsyncClient exposes ONLY aclose() (no close()); it owns the
+        # bridge subprocess + the daemon tool-callback server, both torn down
+        # there. Deliberately no close() here so a regression that closes the
+        # client via close() fails (AttributeError -> swallowed -> leak).
+        async def aclose(self) -> None:
             state["closed"] += 1
+            state["client_closed"] += 1
 
     class _FakeAsyncAgent:
         @classmethod
@@ -165,6 +174,26 @@ def test_resolve_model_drops_databricks_and_defaults_to_auto() -> None:
     assert _resolve_model(None) == "auto"
 
 
+def test_resolve_model_warns_when_dropping_a_pinned_model(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Dropping an explicit (non-cursor) model must warn, not whisper at debug —
+    otherwise a user who pinned a non-Cursor model has no idea it was ignored."""
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.inner.cursor_executor"):
+        assert _resolve_model("databricks-claude-opus-4-8") == "auto"
+    assert any(
+        r.levelno == logging.WARNING and "not a Cursor model" in r.getMessage()
+        for r in caplog.records
+    )
+    # No warning when there was no explicit model to honor.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="omnigent.inner.cursor_executor"):
+        assert _resolve_model(None) == "auto"
+    assert not caplog.records
+
+
 def test_sdk_message_to_events_maps_text_thinking_and_tools() -> None:
     assert isinstance(_sdk_message_to_events(_assistant("hi"))[0], TextChunk)
     think = _sdk_message_to_events(_thinking("hmm"))
@@ -206,6 +235,36 @@ def test_sdk_message_to_events_unwraps_cursor_custom_tool_envelope() -> None:
     assert isinstance(events[0], ToolCallRequest)
     assert events[0].name == "sys_session_send"
     assert events[0].args == {"session": "s1", "message": "go"}
+
+
+def test_sdk_message_to_events_unwraps_envelope_on_completion_and_error() -> None:
+    # The same mcp envelope (name == "mcp", real tool nested in args) also arrives
+    # on the completed/error branch. The unwrap must apply there too so the
+    # ToolCallComplete carries the real tool name (not "mcp") — otherwise any
+    # name-keyed request<->complete correlation in policy/UI would break.
+    def _envelope(status: str, result: Any) -> SimpleNamespace:
+        return SimpleNamespace(
+            type="tool_call",
+            name="mcp",
+            call_id="c1",
+            status=status,
+            args={
+                "providerIdentifier": "custom-user-tools",
+                "toolName": "sys_session_send",
+                "args": {"session": "s1"},
+            },
+            result=result,
+        )
+
+    done = _sdk_message_to_events(_envelope("completed", [{"type": "text", "text": "ok"}]))
+    assert isinstance(done[0], ToolCallComplete)
+    assert done[0].name == "sys_session_send"  # unwrapped, not "mcp"
+    assert done[0].metadata == {"call_id": "c1"}
+
+    err = _sdk_message_to_events(_envelope("error", "boom"))
+    assert isinstance(err[0], ToolCallComplete)
+    assert err[0].name == "sys_session_send"
+    assert err[0].status == ToolCallStatus.ERROR
 
 
 def test_build_cursor_prompt_prepends_system_then_drops_it() -> None:
@@ -254,6 +313,98 @@ async def test_run_turn_streams_and_completes(monkeypatch: pytest.MonkeyPatch) -
     completes = [e for e in events if isinstance(e, TurnComplete)]
     assert len(completes) == 1 and completes[0].response == "Hello world"
     assert completes[0].usage is None
+
+
+async def test_run_turn_separates_text_across_a_tool_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pre-tool and post-tool narration are distinct segments: a paragraph break
+    is inserted so they don't render as one run-on string. (Streamed deltas with
+    no tool between — see the test above — still concatenate seamlessly.)"""
+    script = {
+        "messages": [
+            _assistant("Let me check that."),
+            _tool("sys_x", "t1", "running", args={}),
+            _tool("sys_x", "t1", "completed", result="ok"),
+            _assistant("Done - exit 0."),
+        ],
+        "result": "",
+    }
+    _install_fake_sdk(monkeypatch, [script])
+    executor = CursorExecutor(api_key="crsr_x")
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    texts = [e.text for e in events if isinstance(e, TextChunk)]
+    assert texts == ["Let me check that.", "\n\nDone - exit 0."]  # post-tool text separated
+    completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert completes[0].response == "Let me check that.\n\nDone - exit 0."
+
+
+async def test_run_turn_separator_guarantees_blank_line_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The break must be a real blank line even when the pre-tool text already
+    ends in a single space or newline (which previously suppressed the separator,
+    leaving a run-on or a single-newline join)."""
+    scripts = [
+        {  # pre-tool text ends with a trailing space
+            "messages": [
+                _assistant("Checking. "),
+                _tool("x", "t1", "running", args={}),
+                _tool("x", "t1", "completed", result="ok"),
+                _assistant("Done."),
+            ],
+            "result": "",
+        },
+        {  # pre-tool text ends with a single newline
+            "messages": [
+                _assistant("Checking.\n"),
+                _tool("x", "t2", "running", args={}),
+                _tool("x", "t2", "completed", result="ok"),
+                _assistant("Done."),
+            ],
+            "result": "",
+        },
+    ]
+    _install_fake_sdk(monkeypatch, scripts)
+    executor = CursorExecutor(api_key="crsr_x")
+    try:
+        ev_space = [e async for e in executor.run_turn([_user("a", "s1")], [], "SYS")]
+        ev_newline = [e async for e in executor.run_turn([_user("b", "s2")], [], "SYS")]
+    finally:
+        await executor.close()
+    resp_space = next(e.response for e in ev_space if isinstance(e, TurnComplete))
+    resp_newline = next(e.response for e in ev_newline if isinstance(e, TurnComplete))
+    assert resp_space == "Checking. \n\nDone."  # trailing space -> still a blank line
+    assert resp_newline == "Checking.\n\nDone."  # single \n upgraded to a blank line
+
+
+async def test_run_turn_final_response_prefers_separated_streamed_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TurnComplete.response must use the separator-corrected streamed text, not
+    the SDK's aggregate ``result`` (which lacks the paragraph break) — so direct
+    consumers of the final response see the same separation as the stream."""
+    script = {
+        "messages": [
+            _assistant("Pre."),
+            _tool("x", "t1", "running", args={}),
+            _tool("x", "t1", "completed", result="ok"),
+            _assistant("Post."),
+        ],
+        "result": "Pre.Post.",  # the SDK's glued aggregate, with no separator
+    }
+    _install_fake_sdk(monkeypatch, [script])
+    executor = CursorExecutor(api_key="crsr_x")
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+    completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert completes[0].response == "Pre.\n\nPost."  # separated, not the glued "Pre.Post."
 
 
 async def test_session_reused_across_turns(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -347,6 +498,74 @@ async def test_custom_tool_execute_bridges_to_tool_executor() -> None:
     assert json.loads(result) == {"ok": True, "echo": {"x": 1}}
 
 
+def _bridged_execute(tool_executor: Any) -> Any:
+    """Wire *tool_executor* onto a CursorExecutor and return its sync ``execute``."""
+    executor = CursorExecutor(api_key="crsr_x")
+    executor._tool_executor = tool_executor
+    return executor._make_execute("sys_session_send", asyncio.get_running_loop())
+
+
+async def test_custom_tool_execute_flags_error_dict_with_iserror() -> None:
+    """A dispatch failure ({"error": ...}) must surface to the model as an SDK
+    error (isError), not an apparently-successful result."""
+
+    async def err(name: str, args: dict[str, Any]) -> Any:
+        return {"error": "dispatch failed"}
+
+    result = await asyncio.to_thread(_bridged_execute(err), {}, None)
+    assert isinstance(result, dict) and result["isError"] is True
+    assert "dispatch failed" in result["content"][0]["text"]
+
+
+async def test_custom_tool_execute_flags_blocked_dict_with_iserror() -> None:
+    """A policy-blocked result ({"blocked": True}) is delivered as an error."""
+
+    async def blocked(name: str, args: dict[str, Any]) -> Any:
+        return {"blocked": True, "reason": "policy"}
+
+    result = await asyncio.to_thread(_bridged_execute(blocked), {}, None)
+    assert isinstance(result, dict) and result["isError"] is True
+    assert "policy" in result["content"][0]["text"]
+
+
+async def test_custom_tool_execute_success_dict_is_not_flagged() -> None:
+    """An ordinary result is returned as text (a str the SDK treats as success),
+    never flagged as an error."""
+
+    async def ok(name: str, args: dict[str, Any]) -> Any:
+        return {"ok": True, "value": 42}
+
+    result = await asyncio.to_thread(_bridged_execute(ok), {}, None)
+    assert isinstance(result, str)
+    assert json.loads(result) == {"ok": True, "value": 42}
+
+
+async def test_custom_tool_execute_times_out_to_iserror(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A tool that never completes must not block the daemon thread forever — the
+    bounded wait surfaces a timeout tool error instead of hanging."""
+    monkeypatch.setattr("omnigent.inner.cursor_executor._TOOL_CALL_TIMEOUT_S", 0.05)
+
+    async def slow(name: str, args: dict[str, Any]) -> Any:
+        await asyncio.sleep(30)
+        return "never"
+
+    result = await asyncio.to_thread(_bridged_execute(slow), {}, None)
+    assert isinstance(result, dict) and result["isError"] is True
+    assert "timed out" in result["content"][0]["text"]
+
+
+async def test_custom_tool_execute_surfaces_coroutine_exception_as_iserror() -> None:
+    """A raising coroutine becomes a structured tool error, not an uncaught
+    exception on the SDK's daemon callback thread."""
+
+    async def boom(name: str, args: dict[str, Any]) -> Any:
+        raise RuntimeError("kaboom")
+
+    result = await asyncio.to_thread(_bridged_execute(boom), {}, None)
+    assert isinstance(result, dict) and result["isError"] is True
+    assert "kaboom" in result["content"][0]["text"]
+
+
 async def test_setup_failure_closes_client_and_drops_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -357,7 +576,26 @@ async def test_setup_failure_closes_client_and_drops_session(
     errors = [e for e in events if isinstance(e, ExecutorError)]
     assert len(errors) == 1 and "bad CURSOR_API_KEY" in errors[0].message
     assert "conv1" not in executor._session_states  # session dropped
-    assert state["closed"] == 1  # the launched bridge client was closed → no leak
+    # The launched bridge client was torn down via aclose() → no orphaned bridge.
+    assert state["closed"] == 1
+    assert state["client_closed"] == 1
+
+
+async def test_close_session_tears_down_bridge_client_via_aclose(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A normal session close must tear the bridge-owning AsyncClient down via
+    ``aclose()`` — its only teardown path (it owns the bridge subprocess + the
+    daemon tool-callback thread). The real SDK client has no ``close()``, so
+    closing via ``close()`` silently leaks; this pins the client to aclose()."""
+    state = _install_fake_sdk(monkeypatch, [{"messages": [_assistant("ok")], "result": "ok"}])
+    executor = CursorExecutor(api_key="crsr_x")
+    _ = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    assert state["client_closed"] == 0  # still live mid-conversation
+    await executor.close()
+    # Both the agent (close) and the bridge-owning client (aclose) are released.
+    assert state["agent_closed"] == 1
+    assert state["client_closed"] == 1
 
 
 async def test_mid_turn_error_status_drops_session(monkeypatch: pytest.MonkeyPatch) -> None:

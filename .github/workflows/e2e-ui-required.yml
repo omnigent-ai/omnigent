@@ -1,40 +1,28 @@
 name: E2E UI Required
 
-# Required-status gate: a PR that changes ap-web/** must either ship a
-# tests/e2e_ui/** test that covers the change, or carry a maintainer-effective
-# `skip-e2e-ui-test` label. Enforces the "UI behavior change ships with a UI
-# test" policy at PR time, where the author still has the change's intent in
-# head.
+# Required-status gate: a PR that changes ap-web/** must ship a tests/e2e_ui/**
+# test covering the change or carry a maintainer-effective `skip-e2e-ui-test`
+# label. The policy verdict FAILS the job; mark `E2E UI Required` as a required
+# check in branch protection for that to block merge. Whether a change "needs a
+# test" is decided by an LLM judge (check.sh case 2), not file-presence, so
+# refactors/renames/dep-bumps/styling/test-only edits don't trip the gate and a
+# throwaway test doesn't satisfy it.
 #
-# The policy verdict (UI change without a covering test or effective waiver)
-# FAILS the job. For the failure to actually block the merge button, mark
-# `E2E UI Required` as a required status check in branch protection for main.
+# Trigger is `pull_request_target`, so the workflow + gate script run from main
+# with the base token even for fork PRs: the PR-head copy never runs (a PR can't
+# weaken the gate), and `labeled`/`unlabeled` let the skip label re-evaluate it.
 #
-# Whether the change "needs a test" is decided by an LLM judge (see
-# check.sh case 2), NOT a deterministic file-presence check -- so refactors,
-# renames, dep bumps, styling and test-only edits don't trip the gate, and a
-# trivial throwaway test doesn't satisfy it.
+# SECURITY -- the LLM judge reads the PR's (attacker-controlled) diff as TEXT and
+# sends it to the gateway with the rate-limited, revocable test token (same risk
+# profile as fork e2e). The job never checks out or runs PR-head code: it checks
+# out ONLY .github/scripts from main (pinned, no persisted credentials) and reads
+# state via the API. The judge prompt is hardened against injection and fails
+# closed; a wrong "pass" can't merge anything since the required `Maintainer
+# Approval` check + a human reviewer still gate merge.
 #
-# Trigger is `pull_request_target`, so the workflow + gate script always run
-# from the BASE branch (main), with the base token, even for fork PRs:
-#   - the PR-head copy of this file/script never runs, so a PR cannot edit
-#     the gate to weaken it (same hardening as maintainer-approval.yml);
-#   - `labeled` / `unlabeled` are included so applying the skip label
-#     re-evaluates the check and can flip it green.
-#
-# SECURITY -- the LLM judge step reads the PR's (attacker-controlled, on fork
-# PRs) diff as TEXT and sends it to the gateway with the rate-limited, revocable
-# test token (same accepted-risk profile as fork e2e). The job never checks out
-# or runs PR-head code: it checks out ONLY .github/scripts from main (pinned, no
-# persisted credentials) and reads change/label/review state via the API. The
-# judge prompt is hardened against injection and fails closed. Crucially, a
-# wrong/injected "pass" here cannot merge anything: the separate required
-# `Maintainer Approval` check still gates merge, and a maintainer reviews.
-#
-# NO `paths:` filter on purpose: a required check that is path-filtered never
-# reports on PRs that don't match, leaving the required status stuck pending
-# and blocking merge forever. Instead this always runs and the gate script
-# self-determines whether ap-web/** was touched.
+# NO `paths:` filter on purpose: a path-filtered required check never reports on
+# non-matching PRs, stranding the status pending forever. This always runs and
+# the gate script self-determines whether ap-web/** was touched.
 #
 # leak-scan-allow: pull_request_target
 on:

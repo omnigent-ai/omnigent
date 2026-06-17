@@ -150,7 +150,18 @@ function interruptActiveContext(ctx) {
 
 function startInboxPoller(pi, config, handleInterrupt) {
   if (!config || !config.inboxDir || pi.__omnigentInboxPoller) return;
+  // Bound the dedup set (FIFO eviction) — delivered files are unlinked, so a
+  // long-lived TUI mustn't grow it unboundedly.
   const seen = new Set();
+  const SEEN_CAP = 4096;
+  const rememberSeen = (id) => {
+    seen.add(id);
+    while (seen.size > SEEN_CAP) seen.delete(seen.values().next().value);
+  };
+  // Cap send attempts so a persistently-failing sendUserMessage can't
+  // re-read+re-throw the same file forever (the turn is already reported done).
+  const deliverAttempts = new Map();
+  const MAX_DELIVER_ATTEMPTS = 5;
   pi.__omnigentInboxPoller = setInterval(() => {
     let files = [];
     try {
@@ -169,13 +180,15 @@ function startInboxPoller(pi, config, handleInterrupt) {
       } catch (_err) {
         continue;
       }
-      if (!payload || seen.has(payload.id)) {
+      // Dedup only on a real string id; seen.has(undefined) would drop every
+      // later id-less payload.
+      const id = typeof payload?.id === "string" ? payload.id : null;
+      if (!payload || (id !== null && seen.has(id))) {
         try {
           fs.unlinkSync(fullPath);
         } catch (_err) {}
         continue;
       }
-      seen.add(payload.id);
       if (
         payload.type === "user_message" &&
         typeof payload.content === "string"
@@ -183,9 +196,26 @@ function startInboxPoller(pi, config, handleInterrupt) {
         try {
           pi.sendUserMessage(payload.content, { deliverAs: "followUp" });
         } catch (_err) {
-          seen.delete(payload.id);
+          // Leave the file to retry next tick, capped by attempt count.
+          const key = id ?? fullPath;
+          const attempts = (deliverAttempts.get(key) ?? 0) + 1;
+          if (attempts < MAX_DELIVER_ATTEMPTS) {
+            deliverAttempts.set(key, attempts);
+            continue;
+          }
+          // Cap reached: surface a failure (a silent drop would be invisible)
+          // and consume the file to stop the spin.
+          deliverAttempts.delete(key);
+          postEvent(config, {
+            type: "external_session_status",
+            data: { status: "failed", response_id: `pi-deliver-failed-${Date.now()}` },
+          });
+          try {
+            fs.unlinkSync(fullPath);
+          } catch (_err) {}
           continue;
         }
+        deliverAttempts.delete(id ?? fullPath);
       }
       if (payload.type === "interrupt") {
         // An interrupt is point-in-time: make one delivery attempt, then
@@ -197,6 +227,7 @@ function startInboxPoller(pi, config, handleInterrupt) {
         // turn starting just after this still gets aborted via replay.
         if (typeof handleInterrupt === "function") handleInterrupt();
       }
+      if (id !== null) rememberSeen(id);
       try {
         fs.unlinkSync(fullPath);
       } catch (_err) {}

@@ -124,6 +124,10 @@ def test_configured_harness_map_covers_all_spellings(
         "pi-native",
         "native-pi",
         "cursor",
+        # Antigravity SDK harness + its user-facing aliases.
+        "antigravity",
+        "agy",
+        "google-antigravity",
     }
     assert set(result) == expected_keys
 

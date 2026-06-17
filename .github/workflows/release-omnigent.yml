@@ -1,49 +1,31 @@
-# Build the `omnigent` release distributions — the core wheel
-# with the `ap-web` web UI bundled in, plus the `omnigent-client` and
-# `omnigent-ui-sdk` SDK wheels the core package depends on — run the
-# readiness gates, and publish all three to (Test)PyPI via OIDC Trusted
-# Publishing. The three packages version-lock together: `pip install
-# omnigent==X` must resolve `omnigent-client==X` / `omnigent-ui-sdk==X`,
-# so every release publishes all three at the same version.
-#
-# SELF-CONTAINED: it publishes straight from THIS repo. Runs on
-# GitHub-hosted `ubuntu-latest` specifically for clean, direct public
-# PyPI/npm access — releases must resolve against the public registries,
-# never a mirror or proxy.
+# Build the `omnigent` release distributions (core wheel with the ap-web
+# UI bundled in, plus the `omnigent-client` and `omnigent-ui-sdk` SDK
+# wheels it depends on), run the readiness gates, and publish all three to
+# (Test)PyPI via OIDC Trusted Publishing. The three version-lock together,
+# so every release publishes all three at the same version. Self-contained:
+# publishes straight from this repo on `ubuntu-latest` for clean public
+# PyPI/npm access (never a mirror/proxy).
 #
 # Release flow:
-#   1. Push a version tag (vX.Y.Z / vX.Y.ZrcN) -> builds + gates + publishes
-#      to **TestPyPI** automatically.
-#   2. Validate the TestPyPI release (install + smoke it).
-#   3. Manually dispatch this workflow ON THE SAME TAG with
-#      destination=pypi -> publishes the identical version to **PyPI**,
-#      behind the `pypi` environment (attach a required-reviewer rule).
+#   1. Push a version tag (vX.Y.Z / vX.Y.ZrcN) -> build + gate + publish to
+#      TestPyPI automatically.
+#   2. Validate the TestPyPI release (install + smoke).
+#   3. Manually dispatch ON THE SAME TAG with destination=pypi -> publish
+#      the identical version to PyPI, behind the protected `pypi` env.
 #
-# One-time setup (per index — pypi.org AND test.pypi.org):
-#   - Trusted Publishers for ALL THREE project names (`omnigent`,
-#     `omnigent-client`, `omnigent-ui-sdk`), each pointing at:
-#       Owner/Repository = omnigent-ai/omnigent
-#       Workflow = release-omnigent.yml
-#       Environment = test-pypi (and `pypi` for the pypi.org publishers)
-#     Unclaimed names are reserved via a "pending publisher".
-#   - GitHub environments `test-pypi` (unprotected — PR self-test runs bind
-#     to it) and `pypi` (required reviewer).
-#
-# Actions are SHA-pinned (with a trailing version comment) per the repo
-# convention and the SecOps day-1 requirement; pins match sibling workflows.
+# One-time setup (per index, pypi.org AND test.pypi.org): Trusted Publishers
+# for all three project names pointing at omnigent-ai/omnigent +
+# release-omnigent.yml + the test-pypi/pypi environment (unclaimed names
+# reserved via a pending publisher); GitHub envs test-pypi (unprotected)
+# and pypi (required reviewer). Actions are SHA-pinned per repo convention.
 name: Release omnigent (PyPI)
 
 on:
-  # NOTE: PyPI publishing has moved to the central secure-release repo
-  # (databricks/secure-public-registry-releases-eng, workflow `omnigent.yml`).
-  # The tag-push trigger is REMOVED so a version tag no longer fires this
-  # workflow — otherwise it double-publishes and collides with the secure
-  # pipeline on the same tag. This workflow is kept only as a manual fallback
-  # (workflow_dispatch) and will be deleted once the secure path has done a
-  # production release.
-  #
-  # Manual run: builds + gates always run; destination picks the index.
-  # `pypi` binds the protected `pypi` environment.
+  # PyPI publishing moved to the central secure-release repo; the tag-push
+  # trigger is REMOVED so a tag no longer double-publishes. Kept as a manual
+  # fallback only, to be deleted once the secure path has done a prod release.
+  # Manual run: build + gates always run; destination picks the index, with
+  # `pypi` binding the protected environment.
   workflow_dispatch:
     inputs:
       destination:
@@ -53,8 +35,8 @@ on:
         options:
           - test-pypi
           - pypi
-  # Keep the workflow CI-tested when it changes: build + gates run on the
-  # PR; the publish steps are condition-gated to never fire on PR events.
+  # CI-test the workflow on change: build + gates run on the PR; publish
+  # steps are condition-gated off PR events.
   pull_request:
     paths:
       - ".github/workflows/release-omnigent.yml"
@@ -73,14 +55,10 @@ jobs:
     # Gated to this repository; inert in forks and mirrors.
     if: github.repository == 'omnigent-ai/omnigent'
     runs-on: ubuntu-latest
-    # Bound a hung run well under GitHub's 6-hour default (cold npm ci + FE
-    # build + wheel builds + smoke install run in a few minutes; 30 leaves
-    # headroom).
+    # Bound a hung run under GitHub's 6-hour default (real work takes minutes).
     timeout-minutes: 30
-    # The environment binds the PyPI Trusted Publisher config. `test-pypi`
-    # stays unprotected (tag pushes and PR self-tests bind it); `pypi`
-    # carries the required-reviewer rule so a real release needs a human
-    # approval even after the manual dispatch.
+    # Environment binds the Trusted Publisher config: test-pypi unprotected,
+    # pypi gated by a required-reviewer rule for real releases.
     environment:
       name: ${{ (github.event_name == 'workflow_dispatch' && inputs.destination == 'pypi') && 'pypi' || 'test-pypi' }}
 
@@ -98,27 +76,19 @@ jobs:
         with:
           node-version: "20"
 
-      # 1. Build the web UI FIRST, into the package tree, with a CLEAN
-      #    outDir. Ordering is load-bearing: the wheel packages whatever is
-      #    on disk, so the bundle must exist BEFORE `uv build`. setuptools
-      #    never shells out to npm (JS is built as a separate step). The
-      #    `rm -rf` backstops Vite's `emptyOutDir` so stale hashed bundles
-      #    can never ride along even if that config flag regresses. `npm ci`
-      #    (not `npm install`) installs the exact locked deps for THIS
-      #    commit — which is why a release always ships the matching UI.
+      # 1. Build the web UI FIRST into the package tree, clean. Ordering is
+      #    load-bearing: the wheel packages on-disk files, so the bundle must
+      #    exist before `uv build`. `rm -rf` backstops Vite's emptyOutDir
+      #    against stale bundles; `npm ci` installs the exact locked deps.
       - name: Build web UI (clean, fresh)
         run: |
           rm -rf omnigent/server/static/web-ui
           npm --prefix ap-web ci
           npm --prefix ap-web run build # Vite outDir -> omnigent/server/static/web-ui
 
-      # 2. Tag-driven releases: the pushed tag (vX.Y.Z) must match the
-      #    version in ALL THREE pyprojects, and the core package's exact
-      #    `==` pins on its sibling SDKs must point at that same version —
-      #    a stale pin would make `pip install omnigent==X` pull a
-      #    different SDK release than the one shipped alongside it.
-      #    Skipped on PR / manual dispatch of a non-tag ref (no release tag
-      #    to compare; dispatching ON a tag still verifies).
+      # 2. Tag-driven: the tag must match the version in all three pyprojects
+      #    and the core package's `==` sibling-SDK pins, so the lockstep
+      #    contract holds. Skipped on a non-tag ref (nothing to compare).
       - name: Verify tag matches package versions
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
@@ -127,9 +97,8 @@ jobs:
           import tomllib
 
           tag = sys.argv[1]
-          # Every package must carry the tag's version, and every
-          # cross-package dependency must be an exact `==tag` pin (the
-          # lockstep contract described in the header comment).
+          # Every package carries the tag's version; every cross-package
+          # dep is an exact `==tag` pin (the lockstep contract).
           packages = {
               "pyproject.toml": ("omnigent-client", "omnigent-ui-sdk"),
               "sdks/python-client/pyproject.toml": ("omnigent",),
@@ -152,10 +121,8 @@ jobs:
               sys.exit(1)
           PY
 
-      # 3. Build sdist + wheel for all three packages from the (now
-      #    UI-populated) tree, into one dist/ that the gates and the publish
-      #    steps consume. The SDKs are plain path-deps (not a uv workspace),
-      #    so each needs its own build invocation.
+      # 3. Build sdist + wheel for all three into one dist/. The SDKs are
+      #    path-deps (not a uv workspace), so each needs its own build.
       - name: Build sdists + wheels
         run: |
           uv build --out-dir dist
@@ -167,11 +134,9 @@ jobs:
       - name: twine check
         run: uvx twine check dist/*
 
-      # 5. GATE: the built UI bundle MUST be inside the core wheel. Fails
-      #    loud if the UI is missing or empty — catches "shipped a wheel
-      #    with no UI" that pure config misses. (The SDK wheels are
-      #    `omnigent_client-*` / `omnigent_ui_sdk-*`, so the glob below
-      #    matches only the core wheel.)
+      # 5. GATE: the UI bundle must be inside the core wheel; fail loud if
+      #    missing/empty. The glob matches only the core wheel (SDK wheels
+      #    are omnigent_client-* / omnigent_ui_sdk-*).
       - name: Assert web-UI bundle shipped in the wheel
         run: |
           uv run --no-project python - <<'PY'
@@ -190,48 +155,36 @@ jobs:
           sys.exit(0 if (ui and has_index) else "WEB-UI BUNDLE MISSING FROM WHEEL")
           PY
 
-      # 6. GATE: the wheels actually install together and the CLI entry
-      #    point imports — deps resolve from public PyPI, so this also
-      #    catches a dependency that only exists on the internal proxy.
+      # 6. GATE: the wheels install together and the CLI entry point imports,
+      #    resolving deps from public PyPI (catches proxy-only deps).
       - name: Smoke-install the built wheels
         run: |
           uv venv --python 3.12 /tmp/omnigent-smoke
           uv pip install --python /tmp/omnigent-smoke/bin/python dist/*.whl
           /tmp/omnigent-smoke/bin/omnigent --version
 
-      # 7. Persist the built artifacts so the exact distributions a run
-      #    would have shipped are downloadable for inspection.
+      # 7. Persist the built artifacts for inspection.
       - name: Upload built distributions
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dist-omnigent
           path: dist/
 
-      # ---------------------------------------------------------------
-      # PUBLISH — OIDC Trusted Publishing (no token anywhere; id-token:
-      # write is granted above). Attestations stay ON (the action's
-      # default): PEP 740 provenance is a trust signal for a public
-      # project.
-      # ---------------------------------------------------------------
+      # PUBLISH via OIDC Trusted Publishing (no token; id-token: write granted
+      # above). Attestations stay ON (PEP 740 provenance for a public project).
       - name: Publish to TestPyPI
-        # Tag pushes and explicit test-pypi dispatches land on TestPyPI;
-        # PR self-test runs never publish.
+        # Tag pushes + explicit test-pypi dispatches; PR runs never publish.
         if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.destination == 'test-pypi')
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
         with:
           repository-url: https://test.pypi.org/legacy/
-          # TestPyPI is the retry-prone dry-run index and PyPI never allows a
-          # filename to be re-uploaded: without this, a re-run after a partial
-          # publish (e.g. one package's Trusted Publisher misconfigured)
-          # aborts on the first already-landed file and never reaches the
-          # packages that still need publishing. The real-PyPI step below
-          # deliberately omits it — a prod release must fail loud on any
-          # collision.
+          # Let a re-run skip already-landed files after a partial publish;
+          # the real-PyPI step omits this so a prod collision fails loud.
           skip-existing: true
 
       - name: Publish to PyPI
-        # Real PyPI only via a deliberate manual dispatch with
-        # destination=pypi, behind the protected `pypi` environment.
+        # Real PyPI only via deliberate dispatch with destination=pypi,
+        # behind the protected `pypi` environment.
         if: github.event_name == 'workflow_dispatch' && inputs.destination == 'pypi'
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
         # default repository-url is pypi.org

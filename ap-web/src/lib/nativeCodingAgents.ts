@@ -5,7 +5,7 @@ export const UI_MODE_LABEL_KEY = "omnigent.ui";
 export const UI_MODE_TERMINAL_VALUE = "terminal";
 
 export type NativeCodingAgentIconKind = "claude" | "codex" | "pi";
-export type NativeCodingAgentCapability = "permissionMode";
+export type NativeCodingAgentCapability = "permissionMode" | "approvalMode";
 
 export interface NativeCodingAgentSpec {
   key: NativeCodingAgentIconKind;
@@ -37,6 +37,7 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "Codex",
     iconKind: "codex",
     sortRank: 20,
+    capabilities: ["approvalMode"],
   },
   {
     key: "pi",
@@ -59,6 +60,13 @@ const BY_WRAPPER: Map<string, NativeCodingAgentSpec> = new Map(
   NATIVE_CODING_AGENTS.map((agent) => [agent.wrapperLabel, agent]),
 );
 
+// Reversed harness spellings that fold to a canonical native `harness`.
+// Mirrors omnigent.harness_aliases on the server: only `native-pi` is a
+// supported reversed alias (claude/codex use the canonical form).
+const HARNESS_ALIASES: Record<string, string> = {
+  "native-pi": "pi-native",
+};
+
 export function nativeCodingAgentForAgentName(
   name: string | null | undefined,
 ): NativeCodingAgentSpec | undefined {
@@ -68,7 +76,8 @@ export function nativeCodingAgentForAgentName(
 export function nativeCodingAgentForHarness(
   harness: string | null | undefined,
 ): NativeCodingAgentSpec | undefined {
-  return harness == null ? undefined : BY_HARNESS.get(harness);
+  if (harness == null) return undefined;
+  return BY_HARNESS.get(HARNESS_ALIASES[harness] ?? harness);
 }
 
 export function nativeCodingAgentForWrapper(

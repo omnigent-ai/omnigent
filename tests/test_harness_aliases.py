@@ -20,6 +20,10 @@ from omnigent.harness_aliases import canonicalize_harness, is_native_harness
         ("pi", "pi"),
         # Canonical cursor id passes through unchanged (no alias).
         ("cursor", "cursor"),
+        # Antigravity SDK harness: user-facing spellings → canonical id.
+        ("agy", "antigravity"),
+        ("google-antigravity", "antigravity"),
+        ("antigravity", "antigravity"),
         # Unknown names return unchanged so callers keep their own errors.
         ("bogus", "bogus"),
         (None, None),

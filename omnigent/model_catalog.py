@@ -91,9 +91,14 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, str] = {
     "codex-native": "codex",
     "native-codex": "codex",
     "pi": "pi",
+    "pi-native": "pi",
+    "native-pi": "pi",
     "openai-agents": "openai-agents-sdk",
     "openai-agents-sdk": "openai-agents-sdk",
     "agents_sdk": "openai-agents-sdk",
+    "antigravity": "antigravity",
+    "agy": "antigravity",
+    "google-antigravity": "antigravity",
 }
 
 # Preferred inline family per single-family harness (pi consumes both).
@@ -101,6 +106,7 @@ _KEY_AUTH_FAMILY: dict[str, str] = {
     "claude-sdk": ANTHROPIC_FAMILY,
     "codex": OPENAI_FAMILY,
     "openai-agents-sdk": OPENAI_FAMILY,
+    "antigravity": OPENAI_FAMILY,
 }
 
 # Multi-family providers (pi): anthropic first, matching _apply_provider_to_pi.
@@ -350,7 +356,12 @@ def _provider_from_legacy_auth(spec: Any, harness_type: str) -> ResolvedModelPro
     """
     if harness_type == "claude-sdk":
         return _legacy_claude_sdk_provider(spec)
-    if harness_type == "openai-agents-sdk":
+    if harness_type in ("openai-agents-sdk", "antigravity"):
+        # Both resolve spec/global ``auth:`` api-key blocks via this branch.
+        # NB: the antigravity spawn-env builder (unlike openai-agents) ignores
+        # ``config["profile"]`` — it's Gemini-native with no Databricks/gateway
+        # path — so for a profile-only antigravity spec this readout can
+        # over-report; api-key (and Vertex) specs resolve correctly.
         return _legacy_openai_agents_provider(spec)
     return _legacy_profile_only_provider(spec, harness_type)
 

@@ -1,0 +1,70 @@
+name: PR Size Labeling
+
+# Applies a `size/{XS,S,M,L,XL}` label to each PR based on its added +
+# deleted lines (excluding lock / generated files), so reviewers can gauge
+# review effort at a glance. Runs as pull_request_target so it can label fork
+# PRs, but never checks out or executes PR code -- it reads file stats and
+# updates labels via the API, using only the default-branch script.
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+
+permissions:
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: pr-size-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  label-pr-size:
+    name: PR Size Labeling
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout default-branch script
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/scripts/pr-size
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.11"
+
+      - name: Compute and apply size label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          size_label=$(
+            gh api --paginate "/repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100" \
+              | .github/scripts/pr-size/compute_label.py
+          )
+          echo "Computed: ${size_label}"
+
+          # Ensure the label exists (idempotent), then attach it.
+          gh label create "${size_label}" --repo "${REPO}" --color ededed \
+            --description "Pull request size: ${size_label#size/}" --force >/dev/null
+
+          gh pr edit "${PR_NUMBER}" --repo "${REPO}" --add-label "${size_label}"
+
+          # Drop any stale size/* labels from a previous run.
+          gh api --paginate "/repos/${REPO}/issues/${PR_NUMBER}/labels" --jq '.[].name' \
+            | while read -r label; do
+                if [[ "${label}" == size/* && "${label}" != "${size_label}" ]]; then
+                  echo "Removing stale label: ${label}"
+                  gh pr edit "${PR_NUMBER}" --repo "${REPO}" --remove-label "${label}"
+                fi
+              done

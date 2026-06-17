@@ -2250,7 +2250,19 @@ async def _query_sessions_once(
         raise
     if result.text:
         return result.text
-    return await _persisted_turn_text(client, bound.id)
+    reconciled = await _persisted_turn_text(client, bound.id)
+    if reconciled is not None:
+        return reconciled
+    # No assistant text for this turn. If the runner persisted a terminal
+    # ``error`` item (e.g. a harness start failure like the cursor SDK's
+    # invalid-model rejection), surface it instead of returning ``None`` —
+    # otherwise the headless caller renders a failed turn as a silent,
+    # exit-0 empty success. The callers wrap this in ``except
+    # ClientOmnigentError`` and print the message to stderr + exit non-zero.
+    turn_error = await _persisted_turn_error(client, bound.id)
+    if turn_error is not None:
+        raise ClientOmnigentError(turn_error)
+    return None
 
 
 def _sessions_tool_callables(
@@ -2369,6 +2381,44 @@ async def _persisted_turn_text(
     # Restore chronological order so multi-message output joins correctly.
     this_turn_assistant.reverse()
     return _response_output_text(this_turn_assistant)
+
+
+async def _persisted_turn_error(
+    client: OmnigentClient,
+    session_id: str,
+) -> str | None:
+    """Read the latest turn's persisted terminal error message, if any.
+
+    Companion to :func:`_persisted_turn_text`. When a turn produced no
+    ``completed`` assistant text, the runner may still have persisted a
+    terminal ``error`` item — e.g. a harness *start* failure such as the
+    cursor SDK rejecting an unknown model. Without this, the headless ``-p``
+    path renders that as a silent, exit-0 empty success; returning the message
+    lets the caller surface it and exit non-zero.
+
+    Mirrors :func:`_persisted_turn_text`'s walk: newest → oldest, stopping at
+    the current turn's user message, so a prior turn's error is never
+    attributed to this turn.
+
+    :param client: Connected SDK client bound to the session's server.
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :returns: The current turn's terminal error message, or ``None``.
+    """
+    try:
+        recent: _ResponseOutput = await client.sessions.list_items(
+            session_id, limit=_RECONCILE_ITEMS_LIMIT, order="desc"
+        )
+    except ClientOmnigentError as exc:
+        logger.debug("reconcile error read failed for %s: %r", session_id, exc)
+        return None
+    for item in recent:
+        if item.get("type") == "message" and item.get("role") == "user":
+            break  # reached the start of the current turn
+        if item.get("type") == "error":
+            message = item.get("message")
+            if isinstance(message, str) and message:
+                return message
+    return None
 
 
 def _resolve_resume_target(

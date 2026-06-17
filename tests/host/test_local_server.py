@@ -177,6 +177,34 @@ def test_ensure_local_omnigent_server_respawns_on_config_drift(
     )
 
 
+def test_server_config_signature_changes_with_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A package-version bump changes the signature (auth held constant).
+
+    This is what makes ``omni upgrade`` (and a manual ``uv tool upgrade``)
+    cycle a running local server: the recorded signature no longer matches
+    the upgraded CLI's, so ``ensure_local_omnigent_server`` respawns it on
+    the new code through the existing config-drift path.
+    """
+    import importlib.metadata
+
+    from omnigent.server import auth as auth_mod
+
+    # Pin auth so only the version varies between the two signatures.
+    monkeypatch.setattr(auth_mod, "resolve_auth_source", lambda: "noauth")
+
+    monkeypatch.setattr(importlib.metadata, "version", lambda _name: "1.0.0")
+    sig_old = local_server.server_config_signature()
+
+    monkeypatch.setattr(importlib.metadata, "version", lambda _name: "1.0.1")
+    sig_new = local_server.server_config_signature()
+
+    assert sig_old != sig_new
+    # Same version → stable signature (no spurious respawns on every call).
+    assert sig_new == local_server.server_config_signature()
+
+
 def test_ensure_local_omnigent_server_spawns_when_none_healthy(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

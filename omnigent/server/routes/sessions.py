@@ -32,7 +32,7 @@ import time
 import urllib.parse
 import weakref
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal, cast
 
@@ -418,6 +418,11 @@ _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK = "Codex"
 # reload for sessions where no Omnigent task carries usage (claude-native).
 _LAST_CONTEXT_TOKENS_LABEL_KEY: str = "omnigent.last_context_tokens"
 _LAST_CONTEXT_WINDOW_LABEL_KEY: str = "omnigent.last_context_window"
+# Labels read by ``_get_session_snapshot`` to surface the latest terminal /
+# runner task failure after the live ``session.status: failed`` SSE has gone
+# by. Empty string clears a stale value because labels are upsert-only.
+_LAST_TASK_ERROR_CODE_LABEL_KEY: str = "omnigent.last_task_error_code"
+_LAST_TASK_ERROR_MESSAGE_LABEL_KEY: str = "omnigent.last_task_error_message"
 
 # Todo-list update from the claude-native forwarder. Carries the raw
 # todo items captured from PostToolUse/TodoWrite hook events. Payload
@@ -4488,6 +4493,68 @@ def _publish_status(
     session_stream.publish(session_id, payload)
 
 
+async def _persist_session_status_error_labels(
+    session_id: str,
+    error: ErrorDetail | None,
+    conversation_store: ConversationStore,
+) -> None:
+    """
+    Persist or clear the reload-visible failure detail for a session status.
+
+    ``session.status`` is an SSE edge, so its ``error`` object disappears on
+    reload. Terminal-native sessions can fail before any transcript item is
+    written, so store the latest failure detail as runner-owned labels and let
+    snapshots project it as ``last_task_error``. Empty string clears stale
+    values because the label store is upsert-only.
+
+    :param session_id: Session/conversation identifier.
+    :param error: Failure detail from a ``session.status: failed`` edge, or
+        ``None`` to clear stale error labels on subsequent activity.
+    :param conversation_store: Store used to upsert labels.
+    """
+    updates = (
+        {
+            _LAST_TASK_ERROR_CODE_LABEL_KEY: error.code,
+            _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: error.message,
+        }
+        if error is not None
+        else {
+            _LAST_TASK_ERROR_CODE_LABEL_KEY: "",
+            _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: "",
+        }
+    )
+    try:
+        await asyncio.to_thread(conversation_store.set_labels, session_id, updates)
+    except Exception:
+        _logger.exception(
+            "Failed to persist session status error labels for %s",
+            session_id,
+        )
+
+
+def _last_task_error_from_labels(labels: Mapping[str, str]) -> dict[str, str] | None:
+    """
+    Project runner-owned failure labels into the typed API error shape.
+
+    Terminal/native runtimes can fail before they write any transcript item,
+    so the session-status relay stores the latest failure as durable labels.
+    This helper is the single server-side boundary where those internal labels
+    become public ``last_task_error`` data for snapshots and child summaries.
+
+    :param labels: Conversation labels, usually after closed-status projection.
+    :returns: ``{"code": "...", "message": "..."}``, or ``None`` when either
+        value is absent/cleared.
+    """
+    raw_error_code = labels.get(_LAST_TASK_ERROR_CODE_LABEL_KEY)
+    raw_error_message = labels.get(_LAST_TASK_ERROR_MESSAGE_LABEL_KEY)
+    if raw_error_code and raw_error_message:
+        return {
+            "code": raw_error_code,
+            "message": raw_error_message,
+        }
+    return None
+
+
 def _publish_runner_recovered_status(session_id: str) -> None:
     """
     Clear a stale failed session status after runner recovery.
@@ -7978,6 +8045,18 @@ async def _relay_runner_stream(
                                 if isinstance(raw_err, dict)
                                 else None
                             )
+                            if status == "failed" and status_error is not None:
+                                await _persist_session_status_error_labels(
+                                    session_id,
+                                    status_error,
+                                    conversation_store,
+                                )
+                            elif status == "running":
+                                await _persist_session_status_error_labels(
+                                    session_id,
+                                    None,
+                                    conversation_store,
+                                )
                             # PTY-activity status is a UI signal only. Terminal
                             # sub-agent delivery rides the Stop/StopFailure hook
                             # via external_session_status (the codex-shared path)
@@ -8974,6 +9053,46 @@ def _extract_user_text_from_event(body: SessionEventInput) -> str:
             if isinstance(text, str):
                 parts.append(text)
     return "\n".join(parts)
+
+
+def _publish_policy_deny(session_id: str, reason: str) -> None:
+    """
+    Publish the ``[Denied by policy: ...]`` sentinel on the session stream.
+
+    The sentinel text is a load-bearing contract (the REPL renders it, e2e
+    tests assert it, and native harnesses relay it to the model), so it is
+    always carried in a ``response.output_text.delta``.
+
+    The deny is never persisted as a conversation item — the input gate
+    publishes it and returns without forwarding — so a ``message_id``-less
+    delta lands in the web reducer's response-scoped text path as an
+    un-reconciled "stray bubble" with no item to dedupe against. On the next
+    user submit the response switch re-finalizes that still-open text,
+    rendering the deny twice (observed on both native and non-native web
+    sessions). Stamping a unique ``message_id`` (matching how live streaming
+    text is tagged) routes it through the web's live-preview path instead,
+    where it folds into a single ``live:<id>`` block.
+
+    Safe for the other consumers: the REPL converts any ``output_text.delta``
+    to a ``TextDelta`` regardless of ``message_id``; the ``/v1/responses`` API
+    surfaces the deny via input-deny synthesis (not session-stream deltas);
+    and the only ``message_id``-gated accumulator (``_relay_runner_stream``)
+    reads runner-relayed deltas, never this server-published one.
+
+    :param session_id: Session/conversation identifier.
+    :param reason: Human-readable deny reason from the policy verdict.
+    """
+    session_stream.publish(
+        session_id,
+        {
+            "type": "response.output_text.delta",
+            "delta": f"[Denied by policy: {reason}]",
+            # Unique per deny so two separate denials don't fold into one
+            # block; a single delta carries the whole sentinel, so index 0.
+            "message_id": f"deny_{secrets.token_hex(8)}",
+            "index": 0,
+        },
+    )
 
 
 async def _evaluate_input_policy(
@@ -10812,6 +10931,10 @@ def _child_session_summary_from_conversation(
         busy = True
     else:
         busy = False
+    last_task_error = _last_task_error_from_labels(labels)
+    current_task_status = (
+        "failed" if cached_status == "failed" or last_task_error is not None else None
+    )
 
     # For Codex children, fall back to the prompt label as preview when the
     # real transcript has not arrived yet — avoids synthesizing a user message
@@ -10835,9 +10958,10 @@ def _child_session_summary_from_conversation(
         agent_id=conv.agent_id,
         agent_name=None,
         current_task_id=None,
-        current_task_status=None,
+        current_task_status=current_task_status,
         busy=busy,
         labels=labels,
+        last_task_error=last_task_error,
         last_message_preview=last_message_preview,
         # Surface the sub-agent's parked-elicitation count from the same
         # in-memory index that feeds the sidebar badge, so the Agents
@@ -12660,12 +12784,24 @@ def create_sessions_router(
             and model_override.strip().lower() in EFFORT_CLEAR_VALUES
         )
         if model_override is not None and not clear_model:
-            if not isinstance(model_override, str) or not model_override.strip():
+            # Mirror the create path: the persisted value reaches a native
+            # CLI as a ``--model`` argv element and the Codex provider
+            # ``config.toml`` as a ``model="..."`` field, so it must pass the
+            # conservative model-id charset before it is stored. A bare
+            # strip()/non-empty check here let shell-/TOML-shaped values
+            # through, enabling host RCE via the Codex ``auth.command``.
+            if not isinstance(model_override, str):
                 raise OmnigentError(
                     "invalid model_override: must be a non-empty string",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            model_override = model_override.strip()
+            try:
+                model_override = validate_model_override(model_override)
+            except ValueError as exc:
+                raise OmnigentError(
+                    f"invalid model_override: {exc}",
+                    code=ErrorCode.INVALID_INPUT,
+                ) from exc
 
         # Cost-control switch: ``"off"`` is a real stored value here,
         # so the clear signal is an explicit JSON null (field present,
@@ -13529,6 +13665,10 @@ def create_sessions_router(
         "PHASE_TOOL_RESULT": Phase.TOOL_RESULT,
         "PHASE_LLM_REQUEST": Phase.LLM_REQUEST,
         "PHASE_LLM_RESPONSE": Phase.LLM_RESPONSE,
+        # A native session's UserPromptSubmit hook posts the request phase
+        # here (the server-level _evaluate_input_policy skips native message
+        # events). The prompt text rides in ``event.data.text``.
+        "PHASE_REQUEST": Phase.REQUEST,
     }
     _PHASE_TO_PROTO_ACTION: dict[PolicyAction, str] = {
         PolicyAction.ALLOW: "POLICY_ACTION_ALLOW",
@@ -13614,6 +13754,22 @@ def create_sessions_router(
                 f"Session {session_id!r} not found.",
                 code=ErrorCode.NOT_FOUND,
             )
+        # Dedup the native request-phase gate. A native session's
+        # ``UserPromptSubmit`` hook posts ``PHASE_REQUEST`` here for *every*
+        # prompt, but a web-UI prompt was already gated server-side by
+        # ``_evaluate_input_policy`` at POST /events (before injection, so no
+        # TUI freeze). Re-gating it here would double-prompt the human. A
+        # web-UI prompt in flight has a ``pending_inputs`` entry (recorded at
+        # dispatch, drained when the forwarder mirrors it back); a prompt
+        # typed directly in the TUI has none and never hit POST /events, so it
+        # is gated here — the hook is its only request-phase gate. The signal
+        # is "is a web prompt in flight", not text correlation (the native
+        # transcript gives no reliable id channel — see ``pending_inputs``).
+        if phase == Phase.REQUEST and pending_inputs.snapshot_for(session_id):
+            return Response(
+                content=json.dumps({"result": "POLICY_ACTION_ALLOW"}),
+                media_type="application/json",
+            )
         agent = agent_store.get(conv.agent_id) if conv.agent_id else None
         if agent is None:
             # No agent — no policies. Return unspecified (pass-through).
@@ -13665,9 +13821,15 @@ def create_sessions_router(
         # the human. Instead we publish the approval elicitation, park
         # until the human resolves it via the resolve URL, and collapse
         # to a hard ALLOW / DENY so the caller never sees ASK.
-        # TOOL_CALL and LLM_REQUEST are the two phases that can block
-        # execution before it starts (tool dispatch / LLM call).
-        if result.action == PolicyAction.ASK and phase in (Phase.TOOL_CALL, Phase.LLM_REQUEST):
+        # TOOL_CALL, LLM_REQUEST, and REQUEST are the phases that can block
+        # before the action proceeds (tool dispatch / LLM call / a native
+        # session's user prompt via the UserPromptSubmit hook — which has no
+        # ASK primitive of its own, so the server resolves ASK here).
+        if result.action == PolicyAction.ASK and phase in (
+            Phase.TOOL_CALL,
+            Phase.LLM_REQUEST,
+            Phase.REQUEST,
+        ):
             if is_read_only:
                 # Read-only callers must not enter the ASK gate — parking
                 # creates an elicitation (a server-side mutation). Return
@@ -13689,6 +13851,7 @@ def create_sessions_router(
                     if result.action == PolicyAction.ASK and phase in (
                         Phase.TOOL_CALL,
                         Phase.LLM_REQUEST,
+                        Phase.REQUEST,
                     ):
                         approved = await _hold_native_ask_gate(
                             request,
@@ -15515,13 +15678,7 @@ def create_sessions_router(
                 # client/REPL sees feedback.
                 reason = _input_verdict.get("reason", "Denied by policy")
                 _publish_status(session_id, "running")
-                session_stream.publish(
-                    session_id,
-                    {
-                        "type": "response.output_text.delta",
-                        "delta": f"[Denied by policy: {reason}]",
-                    },
-                )
+                _publish_policy_deny(session_id, reason)
                 _publish_status(session_id, "idle")
                 # Return the same shape the client expects from POST
                 # /events so postEvent doesn't throw on an unexpected
@@ -15541,13 +15698,7 @@ def create_sessions_router(
             if _input_verdict is not None:
                 reason = _input_verdict.get("reason", "Denied by policy")
                 _publish_status(session_id, "running")
-                session_stream.publish(
-                    session_id,
-                    {
-                        "type": "response.output_text.delta",
-                        "delta": f"[Denied by policy: {reason}]",
-                    },
-                )
+                _publish_policy_deny(session_id, reason)
                 _publish_status(session_id, "idle")
                 return {"queued": False, "denied": True, "reason": reason}
         elif (
@@ -17387,6 +17538,7 @@ async def _get_session_snapshot(
     raw_label = conv.labels.get(_LAST_CONTEXT_TOKENS_LABEL_KEY)
     if isinstance(raw_label, str) and raw_label.isdigit():
         last_total_tokens = int(raw_label)
+    last_task_error = _last_task_error_from_labels(conv.labels)
     # Runner-crash durability: if the session's bound runner reported an
     # unexpected exit (host.runner_exited → RunnerExitReports), surface the
     # cause as last_task_error so a reload/late-open still renders the error

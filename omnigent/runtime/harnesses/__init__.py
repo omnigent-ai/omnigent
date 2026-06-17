@@ -62,6 +62,13 @@ _HARNESS_MODULES: dict[str, str] = {
     # cursor harness wrap (Cursor's ``cursor-agent`` CLI, headless). See
     # omnigent/inner/cursor_harness.py.
     "cursor": "omnigent.inner.cursor_harness",
+    # Google Antigravity SDK harness wrap. See
+    # omnigent/inner/antigravity_harness.py. In-process SDK harness
+    # (``google-antigravity``), like openai-agents — Omnigent spawns no CLI
+    # binary or sandbox subprocess (the SDK itself launches a native
+    # localharness binary; needs glibc >=~2.36). Drives Gemini 3.5 Flash by
+    # default (also Claude / GPT-OSS), with Gemini API-key or Vertex AI auth.
+    "antigravity": "omnigent.inner.antigravity_harness",
     # Supervisor harness wrap. See
     # omnigent/inner/databricks_supervisor_harness.py. Drives the Databricks
     # Agent Bricks Supervisor API at
