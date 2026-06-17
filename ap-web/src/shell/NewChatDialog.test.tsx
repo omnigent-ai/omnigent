@@ -593,6 +593,32 @@ describe("NewChatLandingScreen", () => {
     expect(submit.disabled).toBe(false);
   });
 
+  it("does not create a session when Enter confirms IME composition", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    const submit = screen.getByTestId("new-chat-landing-submit") as HTMLButtonElement;
+    const draft = screen.getByTestId("new-chat-landing-input");
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+
+    fireEvent.compositionStart(draft);
+    fireEvent.change(draft, { target: { value: "あ" } });
+    expect(submit.disabled).toBe(false);
+    expect(fireEvent.keyDown(draft, { key: "Enter", code: "Enter" })).toBe(true);
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+
+    fireEvent.compositionEnd(draft);
+    expect(fireEvent.keyDown(draft, { key: "Enter", code: "Enter" })).toBe(false);
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(draft, { key: "Enter", code: "Enter" });
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+  });
+
   it("keeps submit disabled when no agents exist", () => {
     mockAgents([]);
     renderLanding();
@@ -1130,6 +1156,18 @@ describe("NewChatLandingScreen skills menu", () => {
     expect((screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement).value).toBe(
       "/review-pr ",
     );
+  });
+
+  it("does not complete a slash command while Enter is confirming IME composition", () => {
+    mockAgents([skilledAgent()]);
+    renderLanding();
+    typeMessage("/rev");
+    const draft = screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement;
+
+    fireEvent.compositionStart(draft);
+    expect(fireEvent.keyDown(draft, { key: "Enter", code: "Enter" })).toBe(false);
+    expect(draft.value).toBe("/rev");
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
   });
 
   it("closes the menu once the command name is complete (space typed)", () => {

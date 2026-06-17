@@ -86,6 +86,14 @@ const AGENT_PICKER_DESCRIPTIONS: Record<string, string> = {
 // out — other agents keep the "/" menu as the only skill surface.
 const SKILL_PILL_AGENTS = new Set(["polly", "debby"]);
 
+// Temporarily hidden (#3021): re-enable by flipping this feature flag.
+const SHOW_COST_CONTROL = false;
+
+// Some WebKit builds dispatch compositionend before the keydown for the
+// same Enter key that confirmed IME text. Keep a short guard so that keydown
+// is treated as IME confirmation rather than a send command.
+const IME_COMMIT_GRACE_MS = 100;
+
 // Claude Code's `claude --permission-mode` choices (v2.1). Claude-native
 // sessions only. "default" is Claude's own default and sends no flag; any
 // other value is passed through as `--permission-mode <value>` via the
@@ -680,9 +688,21 @@ export function NewChatLandingScreen() {
 
   const [message, setMessage] = useState<string>("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const imeComposingRef = useRef(false);
+  const imeCommitJustEndedRef = useRef(false);
+  const imeCommitResetTimerRef = useRef<number | null>(null);
   // maxRows 9 = 180px of 20px lines, matching the composer's 200px
   // border-box max (180px content + 16px top / 4px bottom padding).
   useAutoGrowTextarea(textareaRef, message, 9);
+
+  useEffect(
+    () => () => {
+      if (imeCommitResetTimerRef.current !== null) {
+        window.clearTimeout(imeCommitResetTimerRef.current);
+      }
+    },
+    [],
+  );
 
   // Attachments for the first message — same affordances as the in-session
   // composer (paperclip + paste); carried to ChatPage via the pending
@@ -1215,7 +1235,35 @@ export function NewChatLandingScreen() {
               ref={textareaRef}
               value={message}
               onChange={(e) => setMessage(e.target.value)}
+              onCompositionStart={() => {
+                imeComposingRef.current = true;
+                imeCommitJustEndedRef.current = false;
+                if (imeCommitResetTimerRef.current !== null) {
+                  window.clearTimeout(imeCommitResetTimerRef.current);
+                }
+              }}
+              onCompositionEnd={() => {
+                imeComposingRef.current = false;
+                imeCommitJustEndedRef.current = true;
+                if (imeCommitResetTimerRef.current !== null) {
+                  window.clearTimeout(imeCommitResetTimerRef.current);
+                }
+                imeCommitResetTimerRef.current = window.setTimeout(() => {
+                  imeCommitJustEndedRef.current = false;
+                  imeCommitResetTimerRef.current = null;
+                }, IME_COMMIT_GRACE_MS);
+              }}
               onKeyDown={(e) => {
+                const nativeEvent = e.nativeEvent;
+                const isEnter = e.key === "Enter" && !e.shiftKey;
+                const isComposing =
+                  imeComposingRef.current || nativeEvent.isComposing || nativeEvent.keyCode === 229;
+                const isImeCommitEnter = isEnter && (isComposing || imeCommitJustEndedRef.current);
+                if (isImeCommitEnter) {
+                  if (slashMenuOpen || imeCommitJustEndedRef.current) e.preventDefault();
+                  imeCommitJustEndedRef.current = false;
+                  return;
+                }
                 // While the skills menu is open, ArrowUp/Down navigate it and
                 // Enter/Tab complete the highlighted item — these take
                 // priority over submission (same UX as the in-session
@@ -1232,7 +1280,7 @@ export function NewChatLandingScreen() {
                     return;
                   }
                   if (
-                    (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) &&
+                    (e.key === "Tab" || isEnter) &&
                     slashMenuIndex >= 0
                   ) {
                     e.preventDefault();
@@ -1249,7 +1297,7 @@ export function NewChatLandingScreen() {
                   }
                 }
                 // Enter sends; Shift+Enter inserts a newline.
-                if (e.key === "Enter" && !e.shiftKey) {
+                if (isEnter) {
                   e.preventDefault();
                   void handleCreate();
                 }
@@ -1362,8 +1410,7 @@ export function NewChatLandingScreen() {
               <div className="flex items-center gap-0.5">
                 {/* Polly-only surface — cost control is a polly feature, so
                     the toggle is hidden unless the selected agent is polly. */}
-                {/* Temporarily hidden (#3021): re-enable by removing the false gate. */}
-                {false && selectedAgent?.name === "polly" && (
+                {SHOW_COST_CONTROL && selectedAgent?.name === "polly" && (
                   // Mode-only variant: no verdict can exist before the session does.
                   <IntelligentModelControl value={costControlMode} onChange={setCostControlMode} />
                 )}
