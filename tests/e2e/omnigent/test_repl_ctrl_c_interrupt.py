@@ -92,6 +92,20 @@ _FOLLOW_UP_PROMPT = "say hi"
 # being silently dropped.
 _CANCEL_ACK_MARKER = r"cancelled"
 
+# The ``◆`` diamond the formatter commits in front of an assistant
+# message (``_DiamondMarkdown`` in omnigent_ui_sdk; ``◆ <model>`` on
+# the resume path). It is committed to scrollback only when the model
+# actually returns text, and never appears in the user-prompt echo
+# (``❯``) or toolbar chrome — so it is an assistant-ONLY signal, not
+# satisfiable by the submitted prompt's echo.
+_ASSISTANT_HEADER_GLYPH = "◆"
+
+# Minimum prose length (after the ``◆`` header) required to count the
+# follow-up as a real assistant response. A bare header with no body
+# — or the prompt echo alone — must not pass. Two chars clears those
+# while staying robust to a terse reply like "Hi".
+_MIN_ASSISTANT_BODY_CHARS = 2
+
 _SPAWN_TIMEOUT = 60.0
 _BOOT_TIMEOUT = 30.0
 _RUNNING_TIMEOUT = 20.0
@@ -181,15 +195,35 @@ def test_repl_cancel_re_arms_for_next_turn(
     # echo paints around the ``working`` handshake boundary).
     combined_stripped = followup_turn.stripped + "\n" + strip_ansi(child.before or "")
 
+    # Assistant-only signal: the ``◆`` diamond header the formatter
+    # commits in front of an assistant message (``_DiamondMarkdown``
+    # in omnigent_ui_sdk; ``◆ <model>`` on the resume path). It is
+    # emitted ONLY when the model actually returns text — a failed or
+    # empty turn (e.g. the consumer not re-arming after cancellation)
+    # commits no ◆ and no body. Crucially this glyph never appears in
+    # the user-prompt echo (``❯ <text>``) or the toolbar chrome, so —
+    # unlike a bare non-empty-length check, which the prompt echo
+    # alone satisfies — it cannot be faked by the submitted prompt.
+    diamond_idx = combined_stripped.find(_ASSISTANT_HEADER_GLYPH)
+    # Require real prose after the header, not just a bare diamond, so
+    # a phantom header with no body can't pass either.
+    assistant_body = (
+        combined_stripped[diamond_idx + len(_ASSISTANT_HEADER_GLYPH) :]
+        if diamond_idx != -1
+        else ""
+    )
+
     observed: dict[str, Any] = {
         "exit_code": exit_code,
-        # The follow-up turn must produce assistant text. The turn
-        # spans from the ``working`` handshake to the settled ``❯``
-        # prompt; a non-trivial stripped body proves the model
-        # actually returned text after the cancellation rather than
-        # the consumer hanging half-cancelled. (Replaces the removed
-        # ``Agent>`` banner check.)
-        "follow_up_assistant_response_rendered": len(followup_turn.stripped.strip()) > 0,
+        # The follow-up turn must produce an assistant message: the
+        # ``◆`` header must be present AND followed by a non-trivial
+        # body. This proves the streaming consumer re-armed and the
+        # model returned text after the cancellation — the exact
+        # regression this test exists to catch. (Replaces the removed
+        # ``Agent>`` banner check; a non-empty-length check would be a
+        # tautology because the prompt echo is always present.)
+        "follow_up_assistant_response_rendered": diamond_idx != -1
+        and len(assistant_body.strip()) >= _MIN_ASSISTANT_BODY_CHARS,
         # Follow-up's user-prompt echo must also be present — the
         # ``❯ <text>`` echo proves the input area accepted the second
         # submission (not just the cancellation). (Replaces the
