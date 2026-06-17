@@ -725,6 +725,7 @@ async def _auto_create_pi_terminal(
     publish_event: Callable[[str, dict[str, Any]], None],
     *,
     server_client: httpx.AsyncClient | None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
 ) -> SessionResourceView:
     """
     Auto-create a Pi terminal for a pi-native session.
@@ -798,13 +799,21 @@ async def _auto_create_pi_terminal(
             cred_env, cred_args = pi_native_provider_launch(bridge_dir / "pi-agent", provider)
             pi_env.update(cred_env)
             pi_args.extend(cred_args)
+    # Inherit the agent's declared sandbox (egress_rules / env_passthrough)
+    # so the native Pi TUI runs inside the session's sandbox rather than
+    # outside it — mirrors create_session_terminal's os_env threading (#173).
+    agent_os_env = getattr(agent_spec, "os_env", None) if agent_spec is not None else None
     terminal_view = await resource_registry.launch_required_terminal(
         session_id=session_id,
         terminal_name="pi",
         session_key="main",
         resource_role=PI_NATIVE_TERMINAL_ROLE,
         spec=TerminalEnvSpec(
-            os_env=OSEnvSpec(type="caller_process", cwd=workspace),
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=workspace,
+                sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
+            ),
             command=pi_command,
             args=pi_args,
             env=pi_env,
@@ -1179,6 +1188,10 @@ async def _auto_create_codex_terminal(
     # claude-native, whose terminal IS the agent process. On failure, close
     # the listener and app-server here: the background forwarder task (which
     # otherwise owns their teardown) has not been created yet.
+    # Inherit the agent's declared sandbox (egress_rules / env_passthrough)
+    # so the native Codex TUI runs inside the session's sandbox rather than
+    # outside it — mirrors create_session_terminal's os_env threading (#173).
+    agent_os_env = getattr(agent_spec, "os_env", None) if agent_spec is not None else None
     try:
         terminal_view = await resource_registry.launch_auxiliary_terminal(
             session_id=session_id,
@@ -1186,7 +1199,11 @@ async def _auto_create_codex_terminal(
             session_key="main",
             resource_role=CODEX_NATIVE_TERMINAL_ROLE,
             spec=TerminalEnvSpec(
-                os_env=OSEnvSpec(type="caller_process", cwd=workspace),
+                os_env=OSEnvSpec(
+                    type="caller_process",
+                    cwd=workspace,
+                    sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
+                ),
                 command=app_server.codex_path,
                 # Fresh sessions pass no thread id so the TUI creates the
                 # thread and the background task adopts it. Resume sessions
@@ -1849,6 +1866,7 @@ async def _auto_create_claude_terminal(
     bundle_dir: Path | None = None,
     agent_name: str | None = None,
     skills_filter: str | list[str] = "all",
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
 ) -> SessionResourceView:
     """
     Auto-create a Claude Code terminal for a claude-native session.
@@ -2259,8 +2277,17 @@ async def _auto_create_claude_terminal(
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
     )
 
+    # Inherit the agent's declared sandbox (egress_rules / env_passthrough)
+    # so the claude-native terminal runs inside the session's sandbox rather
+    # than outside it — mirrors create_session_terminal's os_env threading
+    # (#173).
+    agent_os_env = getattr(agent_spec, "os_env", None) if agent_spec is not None else None
     env_spec = TerminalEnvSpec(
-        os_env=OSEnvSpec(type="caller_process", cwd=workspace),
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=workspace,
+            sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
+        ),
         command="claude",
         args=list(claude_args),
         # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL
@@ -2408,6 +2435,7 @@ async def _auto_create_repl_terminal(
     publish_event: Callable[[str, dict[str, Any]], None],
     *,
     server_client: httpx.AsyncClient,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
 ) -> SessionResourceView:
     """
     Auto-create an Omnigent REPL terminal for a runner-hosted SDK session.
@@ -2453,8 +2481,16 @@ async def _auto_create_repl_terminal(
     started_at = time.monotonic()
     workspace = os.environ.get("OMNIGENT_RUNNER_WORKSPACE", str(Path.cwd()))
     server_url = os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767")
+    # Inherit the agent's declared sandbox (egress_rules / env_passthrough)
+    # so the hosted REPL runs inside the session's sandbox rather than
+    # outside it — mirrors create_session_terminal's os_env threading (#173).
+    agent_os_env = getattr(agent_spec, "os_env", None) if agent_spec is not None else None
     env_spec = TerminalEnvSpec(
-        os_env=OSEnvSpec(type="caller_process", cwd=workspace),
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=workspace,
+            sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
+        ),
         # The runner's interpreter is the venv with omnigent installed;
         # ``python -m omnigent`` avoids depending on the console script
         # being on the tmux pane's PATH.
@@ -5261,6 +5297,7 @@ def create_runner_app(
                             bundle_dir=_native_bundle_dir,
                             agent_name=_native_agent_name,
                             skills_filter=_native_skills_filter,
+                            agent_spec=_native_spec,
                         )
                     except Exception as exc:
                         _logger.exception(
@@ -5373,6 +5410,7 @@ def create_runner_app(
                             resource_registry,
                             _publish_event,
                             server_client=server_client,
+                            agent_spec=spec_entry,
                         )
                     except Exception as exc:
                         _logger.exception(
@@ -5418,6 +5456,7 @@ def create_runner_app(
                             resource_registry,
                             _publish_event,
                             server_client=server_client,
+                            agent_spec=spec,
                         )
                     except Exception:
                         # Unlike the native branches, the REPL terminal is a
@@ -10448,11 +10487,16 @@ def create_runner_app(
                     claude_terminal_id,
                 )
                 try:
+                    _ensure_claude_spec = await _resolve_session_agent_spec(session_id)
+                except OmnigentError:
+                    _ensure_claude_spec = None
+                try:
                     terminal_view = await _auto_create_claude_terminal(
                         session_id,
                         resource_registry,
                         _publish_event,
                         server_client=server_client,
+                        agent_spec=_ensure_claude_spec,
                     )
                 except Exception as exc:
                     _logger.exception(
@@ -10533,11 +10577,16 @@ def create_runner_app(
                         content=session_resource_view_to_dict(existing),
                     )
                 try:
+                    _pi_ensure_spec = await _resolve_session_agent_spec(session_id)
+                except OmnigentError:
+                    _pi_ensure_spec = None
+                try:
                     terminal_view = await _auto_create_pi_terminal(
                         session_id,
                         resource_registry,
                         _publish_event,
                         server_client=server_client,
+                        agent_spec=_pi_ensure_spec,
                     )
                 except Exception as exc:
                     _logger.exception(
@@ -10865,11 +10914,16 @@ def create_runner_app(
                 # the entry unconditionally and tears the instance down.
                 await registry.close(session_id, _REPL_TERMINAL_NAME, _REPL_TERMINAL_SESSION_KEY)
                 try:
+                    _repl_spec = await _resolve_session_agent_spec(session_id)
+                except OmnigentError:
+                    _repl_spec = None
+                try:
                     await _auto_create_repl_terminal(
                         session_id,
                         resource_registry,
                         _publish_event,
                         server_client=server_client,
+                        agent_spec=_repl_spec,
                     )
                 except Exception:
                     # Broad catch, same rationale as the session-create

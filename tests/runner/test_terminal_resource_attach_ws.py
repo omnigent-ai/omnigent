@@ -331,6 +331,7 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
         publish_event: object,
         *,
         server_client: object,
+        **_kwargs: object,
     ) -> SessionResourceView:
         """
         Stand-in for ``_auto_create_repl_terminal`` that registers a

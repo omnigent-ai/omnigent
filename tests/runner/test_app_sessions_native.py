@@ -10304,12 +10304,17 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     raises ``AttributeError`` here in CI instead of crashing in production the
     moment a real pi-native session boots.
 
+    Also guards #173: the agent's declared ``os_env.sandbox`` must reach the
+    launched terminal's ``os_env`` (egress_rules / env_passthrough), not the
+    platform-default sandbox backend.
+
     :param tmp_path: Pytest-provided temporary directory.
     :param monkeypatch: Pytest monkeypatch fixture.
     """
     import omnigent.pi_native as pi_native
     import omnigent.pi_native_bridge as pi_native_bridge
     import omnigent.pi_native_credentials as pi_native_credentials
+    from omnigent.inner.datamodel import AgentDef, OSEnvSandboxSpec, OSEnvSpec
 
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
     monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
@@ -10361,11 +10366,28 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
 
     published: list[dict[str, Any]] = []
 
+    # #173: the agent's declared os_env.sandbox must reach the launched
+    # terminal (egress_rules / env_passthrough), via the ResolvedSpec
+    # __getattr__ delegation the codex caller (agent_spec=spec_entry) relies on.
+    sandbox = OSEnvSandboxSpec(
+        type="darwin_seatbelt",
+        egress_rules=["* api.github.com/**"],
+        env_passthrough=["DATABRICKS_TOKEN"],
+    )
+    agent_spec = ResolvedSpec(
+        spec=AgentDef(
+            name="hardened",
+            os_env=OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=sandbox),
+        ),
+        workdir=tmp_path,
+    )
+
     await _auto_create_pi_terminal(
         "conv_pi",
         _FakeResourceRegistry(),  # type: ignore[arg-type]
         lambda _sid, evt: published.append(evt),
         server_client=NullServerClient(),  # type: ignore[arg-type]
+        agent_spec=agent_spec,
     )
 
     # Required lifecycle (parity with claude-native), correct terminal identity.
@@ -10375,6 +10397,11 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     assert captured["spec"].command == "pi"
     # The fresh terminal is surfaced on the live stream for the Terminal toggle.
     assert any(evt.get("type") == "session.resource.created" for evt in published)
+    # #173: the agent's declared sandbox reaches the launched terminal's
+    # os_env.sandbox (egress_rules / env_passthrough), not the platform default.
+    assert captured["spec"].os_env.sandbox is sandbox
+    assert captured["spec"].os_env.sandbox.egress_rules == ["* api.github.com/**"]
+    assert captured["spec"].os_env.sandbox.env_passthrough == ["DATABRICKS_TOKEN"]
 
 
 @pytest.mark.asyncio
@@ -12049,6 +12076,96 @@ async def test_auto_create_repl_terminal_launches_attach_and_stamps_label(
     assert published_events[0]["resource"]["id"] == "terminal_tui_main"
 
 
+@pytest.mark.asyncio
+async def test_auto_create_repl_terminal_threads_agent_os_env_sandbox(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The REPL terminal inherits the agent's declared ``os_env.sandbox`` (#173).
+
+    Regression: ``_auto_create_repl_terminal`` built its ``OSEnvSpec`` from a
+    bare ``caller_process`` cwd with no sandbox, so a session whose YAML
+    declared an egress allow-list ran its hosted REPL completely outside the
+    agent's sandbox. The resolved agent spec's ``os_env.sandbox`` (egress_rules
+    / env_passthrough / sandbox type) must land on the launched terminal's
+    ``os_env.sandbox`` — mirroring ``create_session_terminal``'s threading. A
+    ``ResolvedSpec`` wrapper exercises the ``__getattr__`` delegation that the
+    codex auto-create caller (``agent_spec=spec_entry``) relies on.
+
+    :param tmp_path: Temporary directory for the fake runner workspace.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from omnigent.inner.datamodel import AgentDef, OSEnvSandboxSpec, OSEnvSpec
+
+    session_id = "conv_repl_sandbox"
+    workspace = tmp_path / "workspace"
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+
+    sandbox = OSEnvSandboxSpec(
+        type="darwin_seatbelt",
+        egress_rules=["* api.github.com/**"],
+        env_passthrough=["DATABRICKS_TOKEN"],
+    )
+    agent = AgentDef(
+        name="hardened",
+        os_env=OSEnvSpec(type="caller_process", cwd=str(workspace), sandbox=sandbox),
+    )
+    agent_spec = ResolvedSpec(spec=agent, workdir=workspace)
+
+    launched_specs: list[Any] = []
+
+    class _FakeResourceRegistry:
+        """Resource registry that records the launched REPL terminal spec."""
+
+        async def launch_auxiliary_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+        ) -> SessionResourceView:
+            assert terminal_name == "tui"
+            assert session_key == "main"
+            assert resource_role == OMNIGENT_REPL_TERMINAL_ROLE
+            launched_specs.append(spec)
+            return SessionResourceView(
+                id="terminal_tui_main",
+                type="terminal",
+                session_id=session_id,
+                name="tui",
+            )
+
+    class _PatchRecordingServerClient:
+        def __init__(self) -> None:
+            self.patches: list[_RecordedPatch] = []
+
+        async def patch(self, url: str, **kwargs: Any) -> httpx.Response:
+            self.patches.append(_RecordedPatch(url=url, json=kwargs.get("json") or {}))
+            return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
+
+    await _auto_create_repl_terminal(
+        session_id,
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, event: None,
+        server_client=_PatchRecordingServerClient(),  # type: ignore[arg-type]
+        agent_spec=agent_spec,
+    )
+
+    assert len(launched_specs) == 1
+    launched = launched_specs[0]
+    # The agent's sandbox reaches the launched terminal's os_env by reference:
+    # the OSEnvSpec is built with ``sandbox=agent_os_env.sandbox``, where
+    # ``agent_os_env`` is the agent spec's ``os_env`` (resolved through
+    # ``ResolvedSpec.__getattr__`` here).
+    assert launched.os_env.sandbox is sandbox
+    assert launched.os_env.sandbox.egress_rules == ["* api.github.com/**"]
+    assert launched.os_env.sandbox.env_passthrough == ["DATABRICKS_TOKEN"]
+
+
 @pytest.mark.parametrize(
     ("harness", "sub_agent_name", "expect_created"),
     [
@@ -12113,9 +12230,10 @@ async def test_create_session_repl_terminal_dispatch(
         publish_event: Any,
         *,
         server_client: Any,
+        **_kwargs: Any,
     ) -> SessionResourceView:
         """Record the dispatch instead of launching a real tmux pane."""
-        del resource_registry, publish_event, server_client
+        del resource_registry, publish_event, server_client, _kwargs
         created_sessions.append(session_id)
         return SessionResourceView(
             id="terminal_tui_main",
