@@ -1,0 +1,380 @@
+name: Flake stress (E2E)
+
+# Manually-dispatched flake-reproducer for the LLM-backed `tests/e2e/`
+# suite (workflow_dispatch only). Runs a pytest target N times in parallel,
+# each attempt a full run of the target, then renders a pass/fail summary
+# on the run page. failures/N is the observed flake probability for the
+# target + config.
+#
+# Why a SEPARATE workflow from flake-stress.yml: the original was built for
+# NON-LLM (server/unit) targets. It runs creds-stripped (`env -u
+# OPENAI_API_KEY -u ANTHROPIC_API_KEY -u DATABRICKS_TOKEN`) and never passes
+# `--llm-api-key`/`--profile`, so every `tests/e2e/` attempt errors at
+# setup: tests/e2e/conftest.py's session-scoped `llm_api_key` fixture raises
+# `pytest.UsageError("tests/e2e/ requires --llm-api-key <KEY>")`. This
+# variant injects the Databricks gateway credentials exactly like e2e.yml
+# (write ~/.databrickscfg from secrets, set DATABRICKS_BEARER) and runs
+# pytest with `--llm-api-key "$LLM_API_KEY" --profile <profile>` so the e2e
+# fixtures resolve. Use it to verify a de-flaked / un-suppressed e2e test
+# (point at the fix branch, expect 0/N) or quantify a flake rate (point at
+# main). The original flake-stress.yml stays intact for server/unit targets.
+#
+# Examples:
+#   gh workflow run flake-stress-e2e.yml --ref main \
+#     -f test_target=tests/e2e/test_subagents.py
+#   gh workflow run flake-stress-e2e.yml --ref main \
+#     -f test_target='tests/e2e/test_routes.py::test_patch_session' \
+#     -f workers=1 -f attempts=30 -f extra_pytest_args=--no-skip-known
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_target:
+        description: "Pytest target under tests/e2e/: path or node-id; space-separated list ok (e.g. tests/e2e/test_subagents.py)"
+        required: true
+      target_branch:
+        description: "Branch or SHA to check out for the test (default: main)"
+        required: false
+        default: "main"
+      attempts:
+        description: "Number of parallel attempts (1-50, default: 20)"
+        required: false
+        default: "20"
+      workers:
+        description: "pytest-xdist -n value (default: 2, matching e2e.yml per-shard concurrency)"
+        required: false
+        default: "2"
+      dist:
+        description: "pytest-xdist --dist mode (loadfile|worksteal|loadscope|load|each|no, default: loadscope)"
+        required: false
+        default: "loadscope"
+      profile:
+        description: "Databricks config profile written to ~/.databrickscfg and passed to --profile (default: default)"
+        required: false
+        default: "default"
+      extra_pytest_args:
+        description: "Extra pytest args appended to the command, e.g. '--no-skip-known' (default: empty)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  # No ap-web SPA build during `uv sync`: this job never serves the bundle
+  # and the build hits public npm with no registry mirror (mirrors e2e.yml).
+  OMNIGENT_SKIP_WEB_UI: "true"
+  # Pin the PyPI index for uv/pip resolution (same as flake-stress.yml).
+  UV_INDEX_URL: https://pypi.org/simple
+  PIP_INDEX_URL: https://pypi.org/simple
+  # Never let the test server pick up the runner's own credentials; the
+  # gateway key flows ONLY via ~/.databrickscfg + --llm-api-key (e2e.yml).
+  ANTHROPIC_API_KEY: ""
+  OPENAI_API_KEY: ""
+  CODEX: ""
+  CLAUDE_CODE: ""
+
+jobs:
+  prep:
+    # Validate inputs and turn ``attempts`` into a JSON array the matrix
+    # fans out across (arrays must exist at job-graph construction time;
+    # the downstream job picks it up via ``fromJSON``).
+    name: Validate inputs
+    runs-on: ubuntu-latest
+    outputs:
+      attempts_json: ${{ steps.gen.outputs.attempts_json }}
+    steps:
+      - name: Generate attempts array
+        id: gen
+        env:
+          ATTEMPTS: ${{ github.event.inputs.attempts }}
+          WORKERS: ${{ github.event.inputs.workers }}
+          DIST: ${{ github.event.inputs.dist }}
+          TEST_TARGET: ${{ github.event.inputs.test_target }}
+          PROFILE: ${{ github.event.inputs.profile }}
+          EXTRA_ARGS: ${{ github.event.inputs.extra_pytest_args }}
+        run: |
+          set -euo pipefail
+          # attempts ∈ [1, 50]; 50 soft-caps runner-pool consumption. Each
+          # attempt makes live gateway calls, so keep N modest to avoid 429s.
+          if ! [[ "$ATTEMPTS" =~ ^[1-9][0-9]?$ ]] || (( ATTEMPTS > 50 )); then
+            echo "::error::attempts must be an integer in [1, 50], got '$ATTEMPTS'"
+            exit 1
+          fi
+          # workers ∈ [1, 32]; above that xdist setup outweighs parallelism.
+          if ! [[ "$WORKERS" =~ ^([1-9]|[12][0-9]|3[0-2])$ ]]; then
+            echo "::error::workers must be 1-32, got '$WORKERS'"
+            exit 1
+          fi
+          # dist is an enum; reject anything else.
+          case "$DIST" in
+            loadfile|worksteal|loadscope|load|each|no) ;;
+            *)
+              echo "::error::dist must be one of loadfile|worksteal|loadscope|load|each|no, got '$DIST'"
+              exit 1
+              ;;
+          esac
+          # profile names a ~/.databrickscfg section header and the
+          # --profile value; restrict to config-section-safe chars.
+          if ! [[ "$PROFILE" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+            echo "::error::profile must match [a-zA-Z0-9._-]+, got '$PROFILE'"
+            exit 1
+          fi
+          # test_target / extra_pytest_args reach a shell; restrict to
+          # legitimate pytest node-id chars so hostile input can't smuggle
+          # command substitution (belt-and-suspenders atop authz dispatch).
+          # Quoted so bash doesn't strip backslashes / glob-expand brackets.
+          # POSIX char-class rules: ``]`` first (literal), ``-`` last (not a
+          # range).
+          allowed_chars='^[]a-zA-Z0-9./_:[ =-]+$'
+          if ! [[ "$TEST_TARGET" =~ $allowed_chars ]]; then
+            echo "::error::test_target contains disallowed characters; allowed: a-zA-Z0-9 . / _ : [ ] - = space"
+            exit 1
+          fi
+          if [[ -n "$EXTRA_ARGS" ]] && ! [[ "$EXTRA_ARGS" =~ $allowed_chars ]]; then
+            echo "::error::extra_pytest_args contains disallowed characters; allowed: a-zA-Z0-9 . / _ : [ ] - = space"
+            exit 1
+          fi
+          # Build JSON array [1,2,...,N] for the matrix.
+          ARR=$(python3 -c "import json,os; print(json.dumps(list(range(1, int(os.environ['ATTEMPTS'])+1))))")
+          echo "attempts_json=$ARR" >> "$GITHUB_OUTPUT"
+          echo "Will run $ATTEMPTS attempts of: $TEST_TARGET"
+          echo "Config: -n $WORKERS --dist=$DIST --profile=$PROFILE  extra='$EXTRA_ARGS'"
+
+  repro:
+    name: Attempt ${{ matrix.attempt }}
+    needs: prep
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      # Keep going after a failure to observe the full distribution.
+      fail-fast: false
+      matrix:
+        attempt: ${{ fromJSON(needs.prep.outputs.attempts_json) }}
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ github.event.inputs.target_branch }}
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version-file: ".python-version"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@8d55fbecc275b1c35dbe060458839f8d30439ccf  # v3
+        with:
+          enable-cache: true
+
+      - name: Cache virtualenv
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
+
+      - name: Set LLM credentials
+        # GitHub masks the secret in logs; bind via $GITHUB_ENV so the
+        # pytest step reads it from env (never a ${{ }} shell interpolation).
+        run: echo "LLM_API_KEY=${{ secrets.LLM_API_KEY }}" >> "$GITHUB_ENV"
+
+      - name: Write gateway profile (~/.databrickscfg)
+        env:
+          GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          PROFILE: ${{ github.event.inputs.profile }}
+        run: |
+          # Strip the /serving-endpoints suffix the conftest re-appends.
+          host="${GATEWAY_BASE_URL%/serving-endpoints}"
+          cat > "$HOME/.databrickscfg" <<EOF
+          [$PROFILE]
+          host  = $host
+          token = $LLM_API_KEY
+          EOF
+          # PAT passthrough for the codex / claude-sdk auth commands.
+          echo "DATABRICKS_BEARER=$LLM_API_KEY" >> "$GITHUB_ENV"
+
+      - name: Install project and dev dependencies
+        # Matches e2e.yml; ``--extra all`` pulls the harness SDKs so the
+        # executor adapters import at collection time.
+        run: uv sync --extra all --extra dev
+
+      - name: Install binary dependencies
+        # Mirrors e2e.yml. ripgrep: Grep fallback for inner tests. tmux +
+        # bubblewrap: the e2e runner runs real agents under the linux_bwrap
+        # sandbox, which fails loud if `bwrap` is missing. The apparmor
+        # sysctl mirrors ci.yml (Ubuntu 24.04 blocks unprivileged user
+        # namespaces, which bwrap's unshare(CLONE_NEWUSER) needs). npm install
+        # with --ignore-scripts blocks postinstall; the claude-code stub needs
+        # its audited install.cjs run explicitly (platform detect + same-tree
+        # hardlink, no network/exec) for claude-sdk harness rows.
+        working-directory: .github/ci-deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep tmux bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          npm install --ignore-scripts
+          node node_modules/@anthropic-ai/claude-code/install.cjs
+          echo "${GITHUB_WORKSPACE}/.github/ci-deps/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Run pytest target
+        # Inputs validated by prep. Word-splitting on $TEST_TARGET /
+        # $EXTRA_ARGS is intentional (multi-token); bound via env (not
+        # ``${{ }}``) to avoid expression injection at the shell. LLM_API_KEY
+        # / DATABRICKS_BEARER arrive from $GITHUB_ENV (set above), so the key
+        # never appears in a ${{ }} interpolation here.
+        shell: bash
+        timeout-minutes: 40
+        env:
+          TEST_TARGET: ${{ github.event.inputs.test_target }}
+          WORKERS: ${{ github.event.inputs.workers }}
+          DIST: ${{ github.event.inputs.dist }}
+          PROFILE: ${{ github.event.inputs.profile }}
+          EXTRA_ARGS: ${{ github.event.inputs.extra_pytest_args }}
+          # Spread interchangeable gateway models across tests + drain the
+          # low-quota gpt-5-4 model, so sustained 429s don't masquerade as
+          # flakes (mirrors e2e.yml).
+          OMNIGENT_TEST_MODEL_SPREAD: "1"
+          OMNIGENT_TEST_MODEL_POOL_GPT: "databricks-gpt-5-5,databricks-gpt-5-4-mini"
+        run: |
+          mkdir -p artifacts "artifacts/basetemp-${{ matrix.attempt }}"
+          # --junitxml emits per-test results eagerly so diagnostics survive a
+          # wall-clock overrun (the summarize job parses these). --timeout=180
+          # caps each test; --timeout-method=thread because our pty/subprocess
+          # children don't get SIGALRM. --max-worker-restart=0 fails fast
+          # rather than letting loadscope requeue deadlock the controller.
+          # NOTE: deliberately NO --showlocals (unlike e2e.yml / flake-stress.yml):
+          # it would dump the llm_api_key fixture / env dicts into the junit
+          # <failure> CDATA, and junit is uploaded as an artifact. --harness
+          # databricks matches e2e.yml (also the conftest default).
+          # shellcheck disable=SC2086
+          uv run pytest $TEST_TARGET \
+            --llm-api-key "$LLM_API_KEY" \
+            --profile "$PROFILE" \
+            --harness databricks \
+            -n "$WORKERS" --dist="$DIST" \
+            --max-worker-restart=0 \
+            --timeout=180 \
+            --timeout-method=thread \
+            --basetemp="artifacts/basetemp-${{ matrix.attempt }}" \
+            --junitxml=artifacts/pytest-attempt-${{ matrix.attempt }}.xml \
+            -v --tb=long --log-level=INFO -r a \
+            $EXTRA_ARGS \
+            || { rc=$?; [ "$rc" -eq 5 ] && echo "::notice::No tests collected; treating as a pass." || exit "$rc"; }
+
+      - name: Upload pytest artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          # Only the junit XML (basetemp holds large per-test DBs / tarballs
+          # and could embed the key); the summarize job needs nothing else.
+          name: pytest-attempt-${{ matrix.attempt }}-${{ github.run_id }}
+          path: artifacts/pytest-attempt-${{ matrix.attempt }}.xml
+          retention-days: 7
+          if-no-files-found: ignore
+
+  summarize:
+    # Render a pass/fail summary table on the run page for an at-a-glance
+    # flake rate. ``if: always()`` so failed attempts still summarize.
+    # Copied verbatim from flake-stress.yml (only the job's siblings differ).
+    name: Summarize results
+    needs: repro
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all attempt artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          pattern: pytest-attempt-*-${{ github.run_id }}
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Render summary
+        # Parse each junit XML per attempt to surface which tests failed
+        # and how often (the matrix conclusion already drives visible status).
+        run: |
+          python3 - <<'PY'
+          import glob
+          import os
+          import xml.etree.ElementTree as ET
+
+          summary_path = os.environ["GITHUB_STEP_SUMMARY"]
+          rows = []
+          test_failure_counts: dict[str, int] = {}
+          for path in sorted(glob.glob("artifacts/pytest-attempt-*.xml")):
+              attempt = path.rsplit("-", 1)[-1].removesuffix(".xml")
+              root = ET.parse(path).getroot()
+              tests = passed = failed = errored = skipped = 0
+              failures: list[str] = []
+              for case in root.iter("testcase"):
+                  tests += 1
+                  fail = case.find("failure")
+                  err = case.find("error")
+                  skip = case.find("skipped")
+                  if fail is not None:
+                      failed += 1
+                      tid = f"{case.attrib.get('classname','')}::{case.attrib.get('name','')}"
+                      failures.append(tid)
+                      test_failure_counts[tid] = test_failure_counts.get(tid, 0) + 1
+                  elif err is not None:
+                      errored += 1
+                      tid = f"{case.attrib.get('classname','')}::{case.attrib.get('name','')}"
+                      failures.append(tid)
+                      test_failure_counts[tid] = test_failure_counts.get(tid, 0) + 1
+                  elif skip is not None:
+                      skipped += 1
+                  else:
+                      passed += 1
+              status = ":white_check_mark:" if (failed + errored) == 0 else ":x:"
+              rows.append(
+                  {
+                      "attempt": int(attempt),
+                      "status": status,
+                      "tests": tests,
+                      "passed": passed,
+                      "failed": failed,
+                      "errored": errored,
+                      "skipped": skipped,
+                      "failures": failures,
+                  }
+              )
+
+          rows.sort(key=lambda r: r["attempt"])
+          n = len(rows)
+          n_red = sum(1 for r in rows if r["failed"] + r["errored"] > 0)
+          rate = (n_red / n * 100.0) if n else 0.0
+
+          lines = [
+              "## Flake stress results",
+              "",
+              f"**Failure rate: {n_red}/{n} ({rate:.0f}%)**",
+              "",
+              "| Attempt | Status | Tests | Pass | Fail | Error | Skip | Failing test(s) |",
+              "|---:|:---:|---:|---:|---:|---:|---:|---|",
+          ]
+          for r in rows:
+              fails = ", ".join(f"`{t}`" for t in r["failures"]) or "—"
+              lines.append(
+                  f"| {r['attempt']} | {r['status']} | {r['tests']} | "
+                  f"{r['passed']} | {r['failed']} | {r['errored']} | "
+                  f"{r['skipped']} | {fails} |"
+              )
+
+          if test_failure_counts:
+              lines += [
+                  "",
+                  "### Per-test failure counts",
+                  "",
+                  "| Test | Failed in N attempts |",
+                  "|---|---:|",
+              ]
+              for tid, c in sorted(
+                  test_failure_counts.items(),
+                  key=lambda kv: (-kv[1], kv[0]),
+              ):
+                  lines.append(f"| `{tid}` | {c} |")
+
+          with open(summary_path, "a") as f:
+              f.write("\n".join(lines) + "\n")
+          PY
