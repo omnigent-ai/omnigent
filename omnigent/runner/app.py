@@ -7238,6 +7238,76 @@ def create_runner_app(
             )
         return Response(status_code=204)
 
+    async def _handle_cursor_native_interrupt(conv_id: str) -> Response:
+        """Cancel the in-flight cursor turn by sending ``Escape`` to its TUI pane.
+
+        cursor-native turns run inside the cursor-agent TUI; the runner harness
+        task returns right after the tmux paste, so the in-process cancel floor
+        has nothing to cancel. ``Escape`` stops a running cursor turn (verified).
+
+        :param conv_id: Session/conversation identifier.
+        :returns: 204 when Escape was sent; 503 if the tmux target is unavailable.
+        """
+        from omnigent.cursor_native_bridge import bridge_dir_for_session_id, inject_interrupt
+
+        try:
+            await asyncio.to_thread(
+                inject_interrupt, bridge_dir_for_session_id(conv_id), timeout_s=1.0
+            )
+        except RuntimeError as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "cursor_native_interrupt_failed",
+                    "detail": _client_safe_error_detail(exc, context="cursor-native interrupt"),
+                },
+            )
+        _wake_parent_after_native_interrupt(conv_id)
+        return Response(status_code=204)
+
+    async def _handle_cursor_native_stop(conv_id: str) -> Response:
+        """Hard-stop a cursor-native session by killing its tmux session.
+
+        Mirrors :func:`_handle_claude_native_stop`: kill the pane (ends
+        cursor-agent), tear the terminal resource down so the web UI stops
+        showing a live terminal, publish ``idle`` so the spinner clears, and
+        reclaim any sub-agent work entry.
+
+        :param conv_id: Session/conversation identifier.
+        :returns: 204 on success; 503 if the tmux target is unavailable.
+        """
+        from omnigent.cursor_native_bridge import bridge_dir_for_session_id, kill_session
+
+        try:
+            await asyncio.to_thread(
+                kill_session, bridge_dir_for_session_id(conv_id), timeout_s=1.0
+            )
+        except RuntimeError as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "cursor_native_stop_failed",
+                    "detail": _client_safe_error_detail(exc, context="cursor-native stop"),
+                },
+            )
+        await _teardown_session_terminals(conv_id)
+        _publish_event(conv_id, {"type": "session.status", "status": "idle"})
+        delivery_ack = _mark_subagent_terminal_and_wake(
+            conv_id,
+            status="cancelled",
+            output="[System: sub-agent stopped]",
+        )
+        if not delivery_ack.delivered and (
+            delivery_ack.entry is not None or conv_id in _session_sub_agent_names
+        ):
+            _logger.warning(
+                "Cursor-native stop succeeded but sub-agent delivery was "
+                "not confirmed; session=%s reason=%s",
+                conv_id,
+                delivery_ack.reason,
+            )
+        return Response(status_code=204)
+
     async def _handle_claude_native_effort_change(
         conv_id: str,
         effort: str | None,
@@ -10143,6 +10213,9 @@ def create_runner_app(
                 # harness task already returned, so the cancel floor has nothing
                 # to cancel. Queue an abort to the resident extension instead.
                 return await _handle_pi_native_interrupt(conversation_id)
+            if _harness == "cursor-native":
+                # cursor turn lives in the cursor-agent TUI; send Escape to stop it.
+                return await _handle_cursor_native_interrupt(conversation_id)
             # In-process harness: mark interrupted, forward an interrupt to the
             # harness, and force-cancel the runner turn task so the turn ends
             # promptly even if the harness can't honor the interrupt in time.
@@ -10210,6 +10283,9 @@ def create_runner_app(
                 # Pi has no separate session-kill; abort the active turn via the
                 # extension (mirrors codex-native reusing its interrupt handler).
                 return await _handle_pi_native_interrupt(conversation_id)
+            if _harness == "cursor-native":
+                # Hard-kill the cursor-agent tmux pane (the TUI is the runtime).
+                return await _handle_cursor_native_stop(conversation_id)
             await _cancel_inprocess_turn(conversation_id)
             return Response(status_code=204)
 

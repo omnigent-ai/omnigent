@@ -60,7 +60,7 @@ class CursorNativeExecutor(Executor):
     async def enqueue_session_message(self, session_key: str, content: Any) -> bool:
         """Inject a live steering message into the Cursor terminal."""
         del session_key
-        text = _content_to_text(content)
+        text = _content_to_text(content, self._bridge_dir)
         if not text:
             return False
         try:
@@ -79,7 +79,7 @@ class CursorNativeExecutor(Executor):
     ) -> AsyncIterator[ExecutorEvent]:
         """Inject the latest web-UI user message into the Cursor TUI pane."""
         del tools, system_prompt, config
-        text = _latest_user_text(messages)
+        text = _latest_user_text(messages, self._bridge_dir)
         if not text:
             yield ExecutorError(message="cursor native turn had no user text to send")
             return
@@ -100,24 +100,40 @@ def _bridge_dir_from_env() -> Path:
     return Path(raw)
 
 
-def _latest_user_text(messages: list[Message]) -> str:
-    """Return the latest user message's text."""
+def _latest_user_text(messages: list[Message], bridge_dir: Path) -> str:
+    """Return the latest user message's text (attachments materialized to disk)."""
     for message in reversed(messages):
         if message.get("role") == "user":
-            return _content_to_text(message.get("content"))
+            return _content_to_text(message.get("content"), bridge_dir)
     return ""
 
 
-def _content_to_text(content: Any) -> str:
-    """Normalize executor content into plain text (string or input_text blocks)."""
+def _content_to_text(content: Any, bridge_dir: Path) -> str:
+    """Normalize executor content into text the Cursor TUI receives.
+
+    Text blocks are extracted directly. Image/file blocks carrying a base64
+    data URI are materialized to the bridge dir and referenced by absolute path
+    (``[Attached: <path>]``) so cursor-agent can open them with its Read tool —
+    otherwise web-UI attachments are silently dropped. Mirrors claude-native.
+    """
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        parts: list[str] = []
+        from omnigent.inner.native_attachments import materialize_attachment
+
+        attachment_lines: list[str] = []
+        text_parts: list[str] = []
         for block in content:
-            if isinstance(block, dict) and block.get("type") in ("input_text", "text"):
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type", "")
+            if block_type in ("input_text", "text"):
                 text = block.get("text")
                 if isinstance(text, str):
-                    parts.append(text)
-        return "\n\n".join(parts)
+                    text_parts.append(text)
+            elif block_type in ("input_image", "input_file"):
+                path = materialize_attachment(block, bridge_dir)
+                if path is not None:
+                    attachment_lines.append(f"[Attached: {path}]")
+        return "\n\n".join(attachment_lines + text_parts)
     return ""

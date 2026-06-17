@@ -33,6 +33,10 @@ _TMUX_SEND_TIMEOUT_S = 10.0
 _POLL_INTERVAL_S = 0.2
 _PASTE_SETTLE_S = 0.3
 _PASTE_BUFFER = "omnigent-cursor-paste"
+# How long to wait for the pasted text to become visible in the pane before
+# sending Enter — submitting before the TUI commits the paste folds the Enter
+# into the paste as a newline and the message sits unsent.
+_PASTE_COMMIT_TIMEOUT_S = 5.0
 # cursor-agent TUI markers (Phase 0): idle input placeholder / running footer /
 # first-run trust modal.
 _IDLE_MARKERS = ("Plan, search, build", "Add a follow-up")
@@ -166,19 +170,49 @@ def _paste_payload_bytes(text: str) -> bytes:
     return bytes(body)
 
 
+def _session_alive(socket_path: str, tmux_target: str) -> bool:
+    """Return whether the tmux session/pane still exists (the TUI is running)."""
+    try:
+        proc = subprocess.run(
+            ["tmux", "-S", socket_path, "has-session", "-t", tmux_target],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_TMUX_SEND_TIMEOUT_S,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return proc.returncode == 0
+
+
+def _submit_needle(content: str) -> str:
+    """A stable single-line substring used to confirm the paste rendered in the pane."""
+    for line in content.splitlines():
+        stripped = line.strip()
+        if len(stripped) >= 4:
+            return stripped[:24]
+    stripped = content.strip()
+    return stripped[:24] if len(stripped) >= 4 else ""
+
+
 def _settle_pane(socket_path: str, tmux_target: str, *, timeout_s: float) -> None:
     """Best-effort wait until the Cursor input box is ready to receive a paste.
 
-    Accepts the first-run "Trust this workspace" modal (sends ``a``) so the input
-    box can mount, and waits for an idle/running input marker. Falls through after
-    the timeout (mid-turn steering has no idle placeholder) rather than raising.
+    Accepts the first-run "Trust this workspace" modal (sends ``a`` at most once)
+    so the input box can mount, then waits for an idle/running input marker. Falls
+    through after the timeout (mid-turn steering has no idle placeholder) rather
+    than raising.
     """
     deadline = time.monotonic() + timeout_s
+    trust_accepted = False
     while time.monotonic() < deadline:
         pane = _capture_pane(socket_path, tmux_target)
         if any(marker in pane for marker in _IDLE_MARKERS):
             return
-        if _TRUST_MARKER in pane:
+        # One-shot, only when no input marker is up (so a later transcript that
+        # merely echoes the phrase can't spray repeated keystrokes into the TUI).
+        if not trust_accepted and _TRUST_MARKER in pane:
+            trust_accepted = True
             with contextlib.suppress(RuntimeError):
                 _run_tmux(socket_path, "send-keys", "-t", tmux_target, "a")
         time.sleep(_POLL_INTERVAL_S)
@@ -207,6 +241,13 @@ def inject_user_message(
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
+    # Fast-fail if the TUI already exited: otherwise _settle_pane polls a dead
+    # pane for the full timeout and the web message is silently lost. A clear
+    # error lets run_turn surface ExecutorError so the UI can say "restart".
+    if not _session_alive(socket_path, tmux_target):
+        raise RuntimeError(
+            "cursor terminal is no longer running (the TUI exited); restart the session"
+        )
     _settle_pane(socket_path, tmux_target, timeout_s=timeout_s)
     # Clear any leftover draft: Home (C-a) + kill-to-end (C-k).
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
@@ -232,5 +273,44 @@ def inject_user_message(
     finally:
         with contextlib.suppress(OSError):
             os.unlink(paste_path)
+    # Wait until the paste is visibly committed to the input box before Enter.
+    # Submitting mid-paste folds the Enter in as a newline (the cursor TUI
+    # coalesces rapid stdin bursts), leaving the message unsent. Poll for the
+    # text, then submit; fall through to a blind submit if no needle is usable.
+    needle = _submit_needle(content)
+    if needle:
+        deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
+        while time.monotonic() < deadline:
+            if needle in _capture_pane(socket_path, tmux_target):
+                break
+            time.sleep(_POLL_INTERVAL_S)
     time.sleep(_PASTE_SETTLE_S)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+
+
+def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) -> None:
+    """Cancel the in-flight Cursor turn by sending ``Escape`` to the pane.
+
+    cursor-agent stops a running turn on a single ``Escape`` (verified live).
+    The harness ``run_turn`` returns right after the paste, so the runner's
+    in-process cancel floor can't reach the turn — this is the analog of
+    :func:`inject_user_message` for the web UI's Stop button.
+
+    :raises RuntimeError: If the tmux target is not advertised or send-keys fails.
+    """
+    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    # No ``-l``: tmux must interpret ``Escape`` as a key name.
+    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Escape")
+
+
+def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) -> None:
+    """Hard-stop the Cursor session by killing its tmux session.
+
+    Terminates ``cursor-agent`` and the pane outright — the analog of the
+    user manually exiting the attached TUI, for the web UI's "Stop session"
+    affordance. Mirrors :func:`omnigent.claude_native_bridge.kill_session`.
+
+    :raises RuntimeError: If the tmux target is not advertised or kill-session fails.
+    """
+    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    _run_tmux(info["socket_path"], "kill-session", "-t", info["tmux_target"])

@@ -935,6 +935,10 @@ class SessionResourceRegistry:
         emit_status = status_publisher is not None and resource_role in {
             CLAUDE_NATIVE_TERMINAL_ROLE,
             PI_NATIVE_TERMINAL_ROLE,
+            # cursor-native has no forwarder/hook (run_turn returns immediately
+            # after the paste), so — like pi/claude — the PTY watcher is its only
+            # status source. Without this the web "Working…" badge never clears.
+            CURSOR_NATIVE_TERMINAL_ROLE,
         }
         if activity_publisher is None and not emit_status and exit_publisher is None:
             return
