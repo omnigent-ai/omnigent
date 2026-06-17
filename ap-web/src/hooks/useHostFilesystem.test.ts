@@ -10,7 +10,11 @@ import { createElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { HostFilesystemEntry } from "./useHostFilesystem";
-import { buildHostFilesystemUrl, useHostFilesystem } from "./useHostFilesystem";
+import {
+  buildHostFilesystemUrl,
+  createHostDirectory,
+  useHostFilesystem,
+} from "./useHostFilesystem";
 
 describe("buildHostFilesystemUrl", () => {
   it("returns the no-path endpoint when absolutePath is empty", () => {
@@ -188,5 +192,52 @@ describe("useHostFilesystem", () => {
     const err = result.current.error as (Error & { status?: number }) | null;
     expect(err?.status).toBe(404);
     expect(err?.message).toContain("HTTP 404");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// createHostDirectory — POSTs to /v1/hosts/{id}/directories and surfaces the
+// server's error detail. Shares the same seam as the useHostFilesystem suite:
+// authenticatedFetch ultimately calls the global fetch, so we stub that.
+// ---------------------------------------------------------------------------
+
+describe("createHostDirectory", () => {
+  const fetchMock = vi.fn();
+
+  beforeEach(() => {
+    fetchMock.mockReset();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("POSTs the path and returns the created absolute path", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ object: "directory", path: "/Users/me/new" }), {
+        status: 200,
+      }),
+    );
+
+    const created = await createHostDirectory("host_abc", "/Users/me/new");
+
+    expect(created).toBe("/Users/me/new");
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/v1/hosts/host_abc/directories");
+    expect(init?.method).toBe("POST");
+    expect(JSON.parse(init?.body as string)).toEqual({ path: "/Users/me/new" });
+  });
+
+  it("throws the server's detail message on a non-OK response", async () => {
+    // A 409 with a detail must surface the human message ("directory
+    // already exists") so the picker shows it instead of a bare code.
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ detail: "directory already exists" }), { status: 409 }),
+    );
+
+    await expect(createHostDirectory("host_abc", "/Users/me/dup")).rejects.toThrow(
+      "directory already exists",
+    );
   });
 });

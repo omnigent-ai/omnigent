@@ -38,9 +38,11 @@ env:
   # so a tiny jitter doesn't fail a PR. A real regression clears this easily.
   COVERAGE_TOLERANCE: "0.5"
   # "false" = observe only: a regression posts a success status annotated
-  # "would fail once enforced" instead of a red ✗. Set "true" to post real
-  # failure statuses once the gate has run cleanly for a while.
-  COVERAGE_ENFORCE: "false"
+  # "would fail once enforced" instead of a red ✗. "true" = a regression posts a
+  # real failure (red ✗). This stays non-blocking until the status is also marked
+  # a required check in branch protection — so red ✗ surfaces the drop without
+  # blocking the merge.
+  COVERAGE_ENFORCE: "true"
   # How many recent main commits to scan for the last recorded baseline status.
   # Must exceed the longest expected run of consecutive merges that don't touch
   # a given suite. Capped at 100 (the GraphQL history page size); raising it

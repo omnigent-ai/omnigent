@@ -50,6 +50,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server.schemas import (
     CompletedEvent,
@@ -638,12 +639,26 @@ class TurnContext:
         try:
             return await asyncio.wait_for(future, timeout=_POLICY_EVAL_TIMEOUT_S)
         except asyncio.TimeoutError:
+            # Phase-aware default: advisory LLM phases and TOOL_RESULT (the
+            # tool already ran) fail OPEN so a missing verdict never hangs the
+            # turn, but TOOL_CALL is the authoritative gate for
+            # connector-native tools and fails CLOSED.
+            _fail_closed = phase in FAIL_CLOSED_PHASES
+            _action = "POLICY_ACTION_DENY" if _fail_closed else "POLICY_ACTION_ALLOW"
             _logger.warning(
-                "Policy evaluation %s timed out after %ds; defaulting to ALLOW",
+                "Policy evaluation %s timed out after %ds; defaulting to %s",
                 evaluation_id,
                 _POLICY_EVAL_TIMEOUT_S,
+                _action,
             )
-            return PolicyVerdictPayload(action="POLICY_ACTION_ALLOW")
+            return PolicyVerdictPayload(
+                action=_action,
+                reason=(
+                    f"Policy evaluation timed out; failing closed for {phase}."
+                    if _fail_closed
+                    else None
+                ),
+            )
         finally:
             self._pending_policy_evaluations.pop(evaluation_id, None)
 

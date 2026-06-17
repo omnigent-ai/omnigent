@@ -713,6 +713,127 @@ async def _drive_folder_selection(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
+def test_start_session_create_folder(seeded_session: tuple[str, str]) -> None:
+    """Creating a folder in the picker makes it the session's workspace.
+
+    The user opens the file browser, navigates into a folder, clicks "New
+    folder", names it, and confirms. The picker POSTs
+    ``/v1/hosts/{id}/directories``, drops into the freshly created
+    directory, and the working-directory chip follows. On Send the new
+    folder's path must reach ``POST /v1/sessions`` as ``workspace`` — i.e.
+    the agent's working directory is the folder the user just made.
+
+    Like the other tests here, the tunneled runner registers no host, so
+    ``/v1/hosts/{id}/directories`` is faked: the handler captures the
+    requested path and echoes it back as the created absolute path (the
+    real ``os.makedirs`` never runs in this harness).
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_create_folder(base_url, session_id))
+
+
+async def _drive_create_folder(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+
+            async def handle_filesystem(route: Route) -> None:
+                # Home shows "projects"; "/home/e2e/projects" shows its child;
+                # the freshly created "/home/e2e/projects/new-app" lists empty.
+                # Deepest match first so the new folder isn't shadowed.
+                path_part = route.request.url.split("?")[0]
+                if path_part.endswith("/filesystem/home/e2e/projects/new-app"):
+                    entries: list[dict[str, Any]] = []
+                elif path_part.endswith("/filesystem/home/e2e/projects"):
+                    entries = [
+                        {
+                            "name": "src",
+                            "path": "/home/e2e/projects/src",
+                            "type": "directory",
+                            "bytes": None,
+                            "modified_at": 0,
+                        }
+                    ]
+                else:
+                    entries = [
+                        {
+                            "name": "projects",
+                            "path": "/home/e2e/projects",
+                            "type": "directory",
+                            "bytes": None,
+                            "modified_at": 0,
+                        }
+                    ]
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"object": "list", "data": entries, "has_more": False}),
+                )
+
+            create_dir_bodies: list[dict[str, Any]] = []
+
+            async def handle_create_dir(route: Route) -> None:
+                # Mirror the server's success shape: echo the requested path
+                # back as the created absolute path. Capturing the body lets
+                # the test assert the picker sent the joined parent + name.
+                body = json.loads(route.request.post_data or "{}")
+                create_dir_bodies.append(body)
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"object": "directory", "path": body["path"]}),
+                )
+
+            # Registered after the broad globs so these win for their URLs.
+            await page.route(_FILESYSTEM_RE, handle_filesystem)
+            await page.route(re.compile(r"/v1/hosts/[^/]+/directories$"), handle_create_dir)
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_contain_text(
+                "e2e"
+            )
+
+            # Open the picker and navigate into "projects" so the new folder
+            # has a resolved absolute parent to be created under.
+            await page.get_by_test_id("new-chat-landing-workspace-chip").click()
+            await expect(page.get_by_test_id("workspace-picker")).to_be_visible()
+            await page.get_by_test_id("workspace-picker-entry-projects").click()
+            await expect(page.get_by_test_id("workspace-picker-entry-src")).to_be_visible()
+
+            # Create a new folder under /home/e2e/projects.
+            await page.get_by_test_id("workspace-picker-new-folder").click()
+            await page.get_by_test_id("workspace-picker-new-folder-input").fill("new-app")
+            await page.get_by_test_id("workspace-picker-new-folder-create").click()
+
+            # The picker POSTs the joined path and drops into the new folder.
+            await _wait_until(lambda: len(create_dir_bodies) == 1)
+            assert create_dir_bodies[0]["path"] == "/home/e2e/projects/new-app", create_dir_bodies
+
+            # Filling the message closes the popover; the chip now shows the
+            # folder we just created.
+            await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
+            await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_contain_text(
+                "new-app"
+            )
+
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["host_id"] == _HOST_ID, body
+            assert body["workspace"] == "/home/e2e/projects/new-app", body
+        finally:
+            await browser.close()
+
+
 def test_start_session_add_worktree(seeded_session: tuple[str, str]) -> None:
     """Naming a branch attaches a git worktree spec to the create call.
 

@@ -49,6 +49,8 @@ class HostFrameKind(str, Enum):
     CREATE_WORKTREE_RESULT = "host.create_worktree_result"
     REMOVE_WORKTREE = "host.remove_worktree"
     REMOVE_WORKTREE_RESULT = "host.remove_worktree_result"
+    CREATE_DIR = "host.create_dir"
+    CREATE_DIR_RESULT = "host.create_dir_result"
 
 
 # ── Frame dataclasses ────────────────────────────────────
@@ -426,6 +428,50 @@ class HostRemoveWorktreeResultFrame:
     error: str | None = None
 
 
+@dataclass
+class HostCreateDirFrame:
+    """Server → host: create a new directory on the host.
+
+    Backs ``POST /v1/hosts/{id}/directories``, used by the Web UI's
+    workspace picker so a user can make a fresh folder to start a
+    session in without dropping to a terminal. The host owns ``~``
+    resolution, same rules as ``host.list_dir`` / ``host.stat``.
+
+    :param request_id: Correlates the result, e.g. ``"req_mkdir_1"``.
+    :param path: Absolute or tilde-prefixed directory path to create,
+        e.g. ``"/Users/corey/projects/new-app"`` or ``"~/scratch"``.
+        Missing parent directories are created (``os.makedirs``).
+    """
+
+    request_id: str
+    path: str
+
+
+@dataclass
+class HostCreateDirResultFrame:
+    """Host → server: outcome of a create-dir request.
+
+    :param request_id: Correlates to the
+        :class:`HostCreateDirFrame`, e.g. ``"req_mkdir_1"``.
+    :param status: ``"ok"`` or ``"failed"``. ``"failed"`` is reserved
+        for unexpected I/O errors; an expected filesystem error (the
+        directory already exists, permission denied, a parent path
+        component is a file) collapses to ``"ok"`` with a descriptive
+        ``error`` so the route layer can map it to a 409 rather than a
+        500 — same posture as ``host.list_dir`` for a missing path.
+    :param path: Absolute path of the created directory, e.g.
+        ``"/Users/corey/projects/new-app"``. ``None`` when the
+        directory was not created.
+    :param error: Filesystem error, e.g. ``"directory already
+        exists"`` or ``"permission denied"``. ``None`` on success.
+    """
+
+    request_id: str
+    status: str
+    path: str | None = None
+    error: str | None = None
+
+
 HostFrame = (
     HostHelloFrame
     | HostLaunchRunnerFrame
@@ -441,6 +487,8 @@ HostFrame = (
     | HostCreateWorktreeResultFrame
     | HostRemoveWorktreeFrame
     | HostRemoveWorktreeResultFrame
+    | HostCreateDirFrame
+    | HostCreateDirResultFrame
 )
 
 
@@ -602,6 +650,24 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error": frame.error,
             }
         )
+    if isinstance(frame, HostCreateDirFrame):
+        return json.dumps(
+            {
+                "kind": HostFrameKind.CREATE_DIR.value,
+                "request_id": frame.request_id,
+                "path": frame.path,
+            }
+        )
+    if isinstance(frame, HostCreateDirResultFrame):
+        return json.dumps(
+            {
+                "kind": HostFrameKind.CREATE_DIR_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "path": frame.path,
+                "error": frame.error,
+            }
+        )
     raise TypeError(f"unknown host frame type: {type(frame).__name__}")
 
 
@@ -690,6 +756,10 @@ def _decode_known_host_frame(
             return _decode_remove_worktree(msg)
         case HostFrameKind.REMOVE_WORKTREE_RESULT:
             return _decode_remove_worktree_result(msg)
+        case HostFrameKind.CREATE_DIR:
+            return _decode_create_dir(msg)
+        case HostFrameKind.CREATE_DIR_RESULT:
+            return _decode_create_dir_result(msg)
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
 
 
@@ -932,6 +1002,32 @@ def _decode_remove_worktree_result(
     return HostRemoveWorktreeResultFrame(
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
+def _decode_create_dir(msg: dict[str, Any]) -> HostCreateDirFrame:
+    """Decode a host.create_dir request frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.create_dir frame.
+    """
+    return HostCreateDirFrame(
+        request_id=_required_str(msg, "request_id"),
+        path=_required_str(msg, "path"),
+    )
+
+
+def _decode_create_dir_result(msg: dict[str, Any]) -> HostCreateDirResultFrame:
+    """Decode a host.create_dir_result frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.create_dir_result frame.
+    """
+    return HostCreateDirResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        path=_optional_nullable_str(msg, "path"),
         error=_optional_nullable_str(msg, "error"),
     )
 
