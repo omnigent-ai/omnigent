@@ -43,9 +43,10 @@ dependencies = [
     "psutil>=5.9,<8",
     # CEL (Common Expression Language) for inline policy evaluation.
     # Non-Turing-complete, side-effect-free, guaranteed to terminate.
-    # No ARM64 Linux wheel; excluded on aarch64 so installation succeeds.
-    # The CEL policy module degrades gracefully when the library is absent.
-    'cel-expr-python>=0.1; platform_machine != "aarch64"',
+    # No wheels for Linux aarch64 or macOS x86_64 (Intel); excluded so
+    # installation succeeds. The CEL policy module degrades gracefully
+    # when the library is absent.
+    'cel-expr-python>=0.1; platform_machine != "aarch64" and (sys_platform != "darwin" or platform_machine != "x86_64")',
     # OS keychain for storing model-provider API keys (OSS model
     # selection). Used by omnigent/onboarding/secrets.py; falls back to
     # a 0600 file when no keyring backend is available (e.g. headless).

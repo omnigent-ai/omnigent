@@ -2638,17 +2638,19 @@ def _stop_cli_runner_process(
 def _adopt_cli_runner_process(proc: subprocess.Popen[bytes]) -> None:
     """Detach a runner from this CLI so it keeps running after CLI exit.
 
-    Sends :data:`RUNNER_ADOPT_SIGNAL` (SIGUSR1) so the runner cancels
-    its parent-pid watchdog and survives the launching CLI's exit. Used
-    when the user detaches from tmux: Claude and the runner stay alive
-    and the web UI stays connected. A no-op if the runner
-    has already exited.
+    Sends :data:`RUNNER_ADOPT_SIGNAL` (SIGUSR1, when available) so the
+    runner cancels its parent-pid watchdog and survives the launching
+    CLI's exit. Used when the user detaches from tmux: Claude and the
+    runner stay alive and the web UI stays connected. A no-op if the
+    runner has already exited, or if the platform has no adopt signal.
 
     :param proc: Runner subprocess handle to adopt.
     :returns: None.
     """
     from omnigent.runner.identity import RUNNER_ADOPT_SIGNAL
 
+    if RUNNER_ADOPT_SIGNAL is None:
+        return
     if proc.poll() is None:
         with contextlib.suppress(ProcessLookupError):
             proc.send_signal(RUNNER_ADOPT_SIGNAL)
