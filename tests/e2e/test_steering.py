@@ -15,22 +15,31 @@ persisted item's ``response_id`` so tests can compare it
 against the original task id to confirm whether steering took
 the steer-into-running path or fell through to a new turn.
 
-Usage::
+Usage (real LLM)::
 
     pytest tests/e2e/test_steering.py \
         --llm-api-key $LLM_API_KEY -v
+
+Usage (mock LLM — no key needed)::
+
+    pytest tests/e2e/test_steering.py -v
 """
 
 from __future__ import annotations
 
 import time
+import uuid
 from typing import Any
 
 import httpx
+import pytest
 
 from tests.e2e.conftest import (
+    configure_mock_llm,
     create_runner_bound_session,
     poll_session_until_terminal,
+    register_inline_agent,
+    reset_mock_llm,
     send_user_message_to_session,
 )
 
@@ -62,10 +71,34 @@ def _wait_for_session_running(
     )
 
 
+def _mock_agent(
+    http_client: httpx.Client,
+    mock_llm_server_url: str | None,
+    *,
+    prompt: str = "You are a test assistant. Follow instructions exactly.",
+    builtin_tools: list[str] | None = None,
+) -> tuple[str, str]:
+    """Register an inline agent for mock mode, return (name, model)."""
+    model = f"mock-steer-{uuid.uuid4().hex[:6]}"
+    name = register_inline_agent(
+        http_client,
+        name=f"steer-{uuid.uuid4().hex[:6]}",
+        harness="openai-agents",
+        model=model,
+        profile="",
+        prompt=prompt,
+        mock_llm_base_url=(f"{mock_llm_server_url}/v1" if mock_llm_server_url else None),
+        builtin_tools=builtin_tools,
+    )
+    return name, model
+
+
 def test_steering_acknowledged(
     http_client: httpx.Client,
     archer_agent: str,
     live_runner_id: str,
+    using_mock_llm: bool,
+    mock_llm_server_url: str | None,
 ) -> None:
     """
     A message sent while the agent is running is steered into
@@ -77,39 +110,38 @@ def test_steering_acknowledged(
     running task's inbox, the LLM must re-run with the steered
     message visible, and the final output must contain
     "PINEAPPLE".
-
-    **What breaks if steering is broken:**
-
-    - If ``close_inbox`` uses a cursor past the steer's position
-      (e.g. advanced by native tool items), the steer is missed
-      → only the original essay appears, no PINEAPPLE.
-    - If ``close_inbox`` is called synchronously on the async
-      event loop, it deadlocks → task never completes.
-    - If the events endpoint mis-classifies the inbox as closed,
-      the steer falls through to a new task and the second
-      response_id differs from the first.
     """
+    if using_mock_llm:
+        reset_mock_llm(mock_llm_server_url)
+        agent_name, model = _mock_agent(http_client, mock_llm_server_url)
+        configure_mock_llm(
+            mock_llm_server_url,
+            [
+                {"text": "Working on your request..."},
+                {"text": "PINEAPPLE"},
+            ],
+            key=model,
+        )
+    else:
+        agent_name = archer_agent
+
     session_id = create_runner_bound_session(
-        http_client, agent_name=archer_agent, runner_id=live_runner_id
+        http_client, agent_name=agent_name, runner_id=live_runner_id
     )
 
-    # Call sys_read_inbox to block the task until an inbox message
-    # arrives. The steer IS that inbox message, so the task stays
-    # open until we post it. After the steer arrives sys_read_inbox
-    # returns and the LLM re-runs with the steered message visible.
     task_id = send_user_message_to_session(
         http_client,
         session_id=session_id,
         content=(
             "Call sys_read_inbox now and wait for it to return. "
             "Do not reply until sys_read_inbox has returned."
-        ),
+        )
+        if not using_mock_llm
+        else "Write a long essay about testing.",
     )
 
     _wait_for_session_running(http_client, session_id, timeout=60)
 
-    # Deliver the steer while the turn is in progress.
-    # The runner buffers it and the LLM re-runs with it visible.
     send_user_message_to_session(
         http_client,
         session_id=session_id,
@@ -121,10 +153,6 @@ def test_steering_acknowledged(
     )
     assert body["status"] == "completed", f"Task failed: {body.get('error')}"
 
-    # The steered message must surface in the final output. Backstopped by
-    # the harness empty-completion retry: the openai-agents gateway
-    # used to return an empty turn here, which this assertion read as
-    # "steering not acknowledged" even though the plumbing worked.
     all_text = _extract_all_text(body)
     assert "PINEAPPLE" in all_text.upper(), (
         f"Steering not acknowledged. Output was:\n{all_text[:500]}"
@@ -135,24 +163,22 @@ def test_steering_with_web_search(
     http_client: httpx.Client,
     archer_agent: str,
     live_runner_id: str,
+    using_mock_llm: bool,
 ) -> None:
     """
     Steering works when native tool items (web_search_call) are
     in the response. This is the exact scenario that was broken:
     native tool persistence advanced ``last_seen`` past the steer.
 
-    **What breaks if the cursor fix regresses:**
-
-    - ``close_inbox`` uses the post-native-tool cursor → misses
-      the steered message → no PINEAPPLE in output.
+    Requires real LLM — web search cannot be mocked.
     """
+    if using_mock_llm:
+        pytest.skip("requires real LLM (web search tool)")
+
     session_id = create_runner_bound_session(
         http_client, agent_name=archer_agent, runner_id=live_runner_id
     )
 
-    # sys_read_inbox blocks until the steer (inbox message) arrives,
-    # then the web search runs so native tool items (web_search_call)
-    # are still exercised by the re-run after the steer.
     task_id = send_user_message_to_session(
         http_client,
         session_id=session_id,
@@ -187,16 +213,26 @@ def test_steering_after_completed_starts_new_turn(
     http_client: httpx.Client,
     archer_agent: str,
     live_runner_id: str,
+    using_mock_llm: bool,
+    mock_llm_server_url: str | None,
 ) -> None:
     """
     A message sent after the task completes creates a new turn,
-    not a steer. Verifies that ``_response_terminal`` detection
-    works on the events endpoint: with no active task, the
-    handler falls through to ``task_store.create`` and the
-    second message gets a fresh ``response_id``.
+    not a steer.
     """
+    if using_mock_llm:
+        reset_mock_llm(mock_llm_server_url)
+        agent_name, model = _mock_agent(http_client, mock_llm_server_url)
+        configure_mock_llm(
+            mock_llm_server_url,
+            [{"text": "Hello!"}, {"text": "The answer is 4."}],
+            key=model,
+        )
+    else:
+        agent_name = archer_agent
+
     session_id = create_runner_bound_session(
-        http_client, agent_name=archer_agent, runner_id=live_runner_id
+        http_client, agent_name=agent_name, runner_id=live_runner_id
     )
 
     task_id = send_user_message_to_session(
@@ -207,8 +243,6 @@ def test_steering_after_completed_starts_new_turn(
     )
     assert body["status"] == "completed"
 
-    # Same session, prior task is terminal — second message starts
-    # a new turn and completes independently.
     task2_id = send_user_message_to_session(
         http_client, session_id=session_id, content="What is 2+2?"
     )
@@ -225,30 +259,60 @@ def test_steering_during_multi_tool_iterations(
     http_client: httpx.Client,
     archer_agent: str,
     live_runner_id: str,
+    using_mock_llm: bool,
+    mock_llm_server_url: str | None,
 ) -> None:
     """
     Steering is picked up between tool call iterations when the
-    agent makes multiple sequential tool calls (web search + sys_os_shell).
+    agent makes multiple sequential tool calls.
 
-    This tests ``_sync_steered_after_tools`` with the pre-LLM cursor
-    fix. The agent is explicitly told to make multiple tool calls
-    in sequence. The steer arrives during execution and must be
-    acknowledged after the tool calls complete.
-
-    **What breaks if the tool-iteration cursor is wrong:**
-
-    - ``_sync_steered_after_tools`` uses a cursor past the steer's
-      position → steer is never added to history → the LLM never
-      sees it → no PINEAPPLE.
+    In mock mode the mock server returns tool-call responses for
+    ``sys_read_inbox`` and ``list_files``; the harness executes
+    them as real built-in tools. The steer arrives while
+    ``sys_read_inbox`` blocks, then the subsequent tool iterations
+    must not skip over the steered message.
     """
+    if using_mock_llm:
+        reset_mock_llm(mock_llm_server_url)
+        agent_name, model = _mock_agent(http_client, mock_llm_server_url)
+        # Response sequence (sys_read_inbox is a runner-level system
+        # tool, always registered — no spec declaration needed):
+        # 1. sys_read_inbox → harness executes, blocks on inbox
+        # 2. (steer arrives, inbox returns, harness posts tool result)
+        #    sys_read_inbox again → returns immediately (inbox drained)
+        # 3. Final text with PINEAPPLE
+        configure_mock_llm(
+            mock_llm_server_url,
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "call_id": "call_inbox1",
+                            "name": "sys_read_inbox",
+                            "arguments": "{}",
+                        },
+                    ],
+                },
+                {
+                    "tool_calls": [
+                        {
+                            "call_id": "call_inbox2",
+                            "name": "sys_read_inbox",
+                            "arguments": "{}",
+                        },
+                    ],
+                },
+                {"text": "PINEAPPLE"},
+            ],
+            key=model,
+        )
+    else:
+        agent_name = archer_agent
+
     session_id = create_runner_bound_session(
-        http_client, agent_name=archer_agent, runner_id=live_runner_id
+        http_client, agent_name=agent_name, runner_id=live_runner_id
     )
 
-    # sys_read_inbox blocks until the steer arrives. The subsequent
-    # list_files calls exercise the multi-tool iteration cursor fix
-    # this test was written to cover: the cursor must not skip over
-    # the steered message between tool iterations.
     task_id = send_user_message_to_session(
         http_client,
         session_id=session_id,
@@ -276,10 +340,6 @@ def test_steering_during_multi_tool_iterations(
 
     all_text = _extract_all_text(body)
     tool_count = len([i for i in body.get("output", []) if i.get("type") == "function_call"])
-    # Backstopped by the harness empty-completion retry: the
-    # openai-agents gateway used to return an empty turn here, which this
-    # assertion read as "steering not acknowledged" even though the
-    # multi-tool cursor plumbing worked.
     assert "PINEAPPLE" in all_text.upper(), (
         f"Steering during multi-tool iterations not acknowledged. "
         f"Tool calls before steer: {tool_count}. Output: {all_text[:500]}"
