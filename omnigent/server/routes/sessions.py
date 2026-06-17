@@ -55,6 +55,7 @@ from fastapi import (
 from fastapi.responses import Response, StreamingResponse
 from pydantic import TypeAdapter, ValidationError
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from starlette.datastructures import State
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from omnigent.codex_native_elicitation import codex_elicitation_id
@@ -5007,6 +5008,299 @@ def _require_codex_goal_runner_payload(
             code=ErrorCode.RUNNER_UNAVAILABLE,
         )
     return payload
+
+
+async def _post_codex_goal_event_to_runner(
+    session_id: str,
+    runner_client: httpx.AsyncClient,
+    event: dict[str, Any],
+) -> _RunnerForwardResult | None:
+    """
+    POST a Codex goal control event to a known runner client.
+
+    Used after an auto-relaunch has already resolved a runner client. The
+    generic forward helper intentionally re-resolves through the router; this
+    helper keeps the retry attached to the runner that just connected.
+
+    :param session_id: Session/conversation identifier, e.g.
+        ``"conv_abc123"``.
+    :param runner_client: Runner client resolved for the session.
+    :param event: Goal control event, e.g. ``{"type": "goal_get"}``.
+    :returns: Runner status/body, or ``None`` if the runner disappeared
+        during the retry.
+    """
+    try:
+        resp = await runner_client.post(
+            f"/v1/sessions/{session_id}/events",
+            json=event,
+            timeout=5.0,
+        )
+    except (httpx.HTTPError, ConnectionError):
+        _logger.warning(
+            "Codex goal retry failed after runner relaunch for session=%s type=%r",
+            session_id,
+            event.get("type"),
+            exc_info=True,
+        )
+        return None
+    return _RunnerForwardResult(status_code=resp.status_code, body=resp.text)
+
+
+async def _wait_for_existing_codex_goal_runner(
+    *,
+    session_id: str,
+    conv: Conversation,
+    runner_router: RunnerRouter | None,
+    tunnel_registry: TunnelRegistry | None,
+    runner_exit_reports: RunnerExitReports | None,
+) -> httpx.AsyncClient | None:
+    """
+    Wait briefly for a currently-bound runner before relaunching.
+
+    A freshly started host session can have ``runner_id`` persisted before the
+    tunnel registration reaches this server. Goal-open should not spawn a
+    duplicate runner in that normal startup gap.
+
+    :param session_id: Session/conversation identifier, e.g.
+        ``"conv_abc123"``.
+    :param conv: Conversation row carrying the current ``runner_id``.
+    :param runner_router: Runner router for resolving a connected runner.
+    :param tunnel_registry: Runner tunnel registry, or ``None`` in tests.
+    :param runner_exit_reports: Host runner-exit reports used to stop waiting
+        once the runner is known dead.
+    :returns: Connected runner client, or ``None`` if the grace wait expires.
+    """
+    if conv.runner_id is None or _HOST_BOUND_RUNNER_CONNECT_GRACE_S <= 0:
+        return None
+    return await _wait_for_runner_client(
+        session_id,
+        runner_router,
+        tunnel_registry,
+        runner_id=conv.runner_id,
+        timeout_s=_HOST_BOUND_RUNNER_CONNECT_GRACE_S,
+        runner_exit_reports=runner_exit_reports,
+    )
+
+
+async def _start_codex_goal_runner_on_bound_host(
+    *,
+    session_id: str,
+    conv: Conversation,
+    app_state: State,
+    conversation_store: ConversationStore,
+) -> str | None:
+    """
+    Ask the session's existing host binding to spawn a runner.
+
+    This does not accept caller-supplied host or workspace input; it only
+    reuses the binding already stored on the session. External hosts must be
+    online. Managed hosts can relaunch their sandbox generation when the host
+    tunnel is gone.
+
+    :param session_id: Session/conversation identifier, e.g.
+        ``"conv_abc123"``.
+    :param conv: Host-bound conversation row.
+    :param app_state: FastAPI app state carrying host registries and managed
+        launch trackers.
+    :param conversation_store: Store used for runner-id rotation.
+    :returns: Runner id expected to connect, or ``None`` if no launch was
+        possible.
+    :raises OmnigentError: If the host reports a non-retryable harness
+        configuration failure or the session disappears.
+    """
+    host_registry = getattr(app_state, "host_registry", None)
+    if host_registry is None:
+        return None
+    host_conn = host_registry.get(conv.host_id)
+    if host_conn is not None:
+        launch_attempt = await _launch_runner_on_host(
+            conv,
+            conversation_store,
+            host_registry,
+            host_conn,
+        )
+        if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE:
+            raise OmnigentError(
+                launch_attempt.error or "host failed to launch runner: harness not configured",
+                code=ErrorCode.HARNESS_NOT_CONFIGURED,
+            )
+        return launch_attempt.runner_id
+    if not await _maybe_relaunch_managed_sandbox(
+        session_id=session_id,
+        conv=conv,
+        app_state=app_state,
+        conversation_store=conversation_store,
+    ):
+        return None
+    refreshed_conv = await asyncio.to_thread(
+        conversation_store.get_conversation,
+        session_id,
+    )
+    if refreshed_conv is None:
+        raise OmnigentError(
+            "Session not found",
+            code=ErrorCode.NOT_FOUND,
+        )
+    return refreshed_conv.runner_id
+
+
+async def _initialize_codex_goal_runner(
+    session_id: str,
+    runner_client: httpx.AsyncClient,
+    conversation_store: ConversationStore,
+) -> None:
+    """
+    Run the session-init handshake before retrying a goal RPC.
+
+    The Codex goal handlers require the Codex-native app-server bridge loaded
+    inside the runner. Session init creates that bridge, matching the message
+    relaunch path's ordering.
+
+    :param session_id: Session/conversation identifier, e.g.
+        ``"conv_abc123"``.
+    :param runner_client: Connected runner client to initialize.
+    :param conversation_store: Store used to reload the post-relaunch
+        conversation row.
+    :returns: None.
+    :raises OmnigentError: If the session disappeared before init.
+    """
+    refreshed_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    if refreshed_conv is None:
+        raise OmnigentError(
+            "Session not found",
+            code=ErrorCode.NOT_FOUND,
+        )
+    await _ensure_runner_session_initialized(session_id, refreshed_conv, runner_client)
+
+
+async def _launch_runner_for_codex_goal(
+    *,
+    session_id: str,
+    conv: Conversation,
+    request: Request,
+    user_id: str | None,
+    runner_router: RunnerRouter | None,
+    conversation_store: ConversationStore,
+    permission_store: PermissionStore | None,
+    runner_exit_reports: RunnerExitReports | None,
+) -> httpx.AsyncClient | None:
+    """
+    Relaunch an existing host-bound Codex session for goal controls.
+
+    Goal state lives in Codex app-server, so opening the Goal dialog needs a
+    live runner even when no user message is being sent. This mirrors the
+    message-dispatch relaunch path but does not let callers choose a host or
+    workspace: it only wakes the session's existing binding.
+
+    :param session_id: Session/conversation identifier, e.g.
+        ``"conv_abc123"``.
+    :param conv: Codex-native conversation row.
+    :param request: Incoming FastAPI request; ``request.app.state`` carries
+        host and tunnel registries.
+    :param user_id: Authenticated user id, e.g. ``"alice@example.com"``,
+        or ``None`` when auth is disabled.
+    :param runner_router: Runner router for resolving a connected runner.
+    :param conversation_store: Store used for runner-id rotation.
+    :param permission_store: Permission store for the edit-level wake gate.
+    :param runner_exit_reports: Host runner-exit reports used to stop waiting
+        once a launched runner is known dead.
+    :returns: Connected runner client, or ``None`` when no runner can be
+        launched or reached.
+    :raises OmnigentError: If the caller lacks edit access or the host
+        reports a non-retryable harness configuration failure.
+    """
+    if conv.host_id is None:
+        return None
+    await _require_access(
+        user_id,
+        session_id,
+        LEVEL_EDIT,
+        permission_store,
+        conversation_store,
+    )
+    tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
+    runner_client = await _wait_for_existing_codex_goal_runner(
+        session_id=session_id,
+        conv=conv,
+        runner_router=runner_router,
+        tunnel_registry=tunnel_registry,
+        runner_exit_reports=runner_exit_reports,
+    )
+    if runner_client is not None:
+        return runner_client
+    launched_runner_id = await _start_codex_goal_runner_on_bound_host(
+        session_id=session_id,
+        conv=conv,
+        app_state=request.app.state,
+        conversation_store=conversation_store,
+    )
+    runner_client = await _wait_for_runner_client(
+        session_id,
+        runner_router,
+        tunnel_registry,
+        runner_id=launched_runner_id,
+        timeout_s=_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
+        runner_exit_reports=runner_exit_reports,
+    )
+    if runner_client is None:
+        return None
+    await _initialize_codex_goal_runner(session_id, runner_client, conversation_store)
+    return runner_client
+
+
+async def _forward_codex_goal_event(
+    *,
+    session_id: str,
+    conv: Conversation,
+    event: dict[str, Any],
+    request: Request,
+    user_id: str | None,
+    runner_router: RunnerRouter | None,
+    conversation_store: ConversationStore,
+    permission_store: PermissionStore | None,
+    runner_exit_reports: RunnerExitReports | None,
+) -> _RunnerForwardResult | None:
+    """
+    Forward a Codex goal event, waking a host-bound runner if needed.
+
+    The first attempt preserves the cheap live-runner path. If no runner can
+    be resolved, the helper wakes the session's existing host-bound runner
+    using the same relaunch mechanism as message dispatch, initializes the
+    session on the new runner, then retries the goal event.
+
+    :param session_id: Session/conversation identifier, e.g.
+        ``"conv_abc123"``.
+    :param conv: Codex-native conversation row.
+    :param event: Goal control event, e.g. ``{"type": "goal_get"}``.
+    :param request: Incoming FastAPI request.
+    :param user_id: Authenticated user id, or ``None`` when auth is disabled.
+    :param runner_router: Runner router for resolving session clients.
+    :param conversation_store: Store used for host relaunch.
+    :param permission_store: Permission store for the relaunch edit gate.
+    :param runner_exit_reports: Host runner-exit report store.
+    :returns: Runner forward result, or ``None`` if no runner could be
+        reached.
+    """
+    runner_result = await _forward_session_change_to_runner(
+        session_id,
+        runner_router,
+        event,
+    )
+    if runner_result is not None:
+        return runner_result
+    runner_client = await _launch_runner_for_codex_goal(
+        session_id=session_id,
+        conv=conv,
+        request=request,
+        user_id=user_id,
+        runner_router=runner_router,
+        conversation_store=conversation_store,
+        permission_store=permission_store,
+        runner_exit_reports=runner_exit_reports,
+    )
+    if runner_client is None:
+        return None
+    return await _post_codex_goal_event_to_runner(session_id, runner_client, event)
 
 
 async def _require_codex_native_goal_session(
@@ -13822,14 +14116,20 @@ def create_sessions_router(
             permission_store,
             conversation_store,
         )
-        await _require_codex_native_goal_session(session_id, conversation_store)
+        conv = await _require_codex_native_goal_session(session_id, conversation_store)
         runner_payload = _require_codex_goal_runner_payload(
             session_id,
             action="read",
-            runner_result=await _forward_session_change_to_runner(
-                session_id,
-                runner_router,
-                {"type": "goal_get"},
+            runner_result=await _forward_codex_goal_event(
+                session_id=session_id,
+                conv=conv,
+                event={"type": "goal_get"},
+                request=request,
+                user_id=user_id,
+                runner_router=runner_router,
+                conversation_store=conversation_store,
+                permission_store=permission_store,
+                runner_exit_reports=runner_exit_reports,
             ),
         )
         try:
@@ -13869,7 +14169,7 @@ def create_sessions_router(
             permission_store,
             conversation_store,
         )
-        await _require_codex_native_goal_session(session_id, conversation_store)
+        conv = await _require_codex_native_goal_session(session_id, conversation_store)
         objective = body.objective.strip()
         if not objective:
             raise OmnigentError(
@@ -13885,10 +14185,16 @@ def create_sessions_router(
         runner_payload = _require_codex_goal_runner_payload(
             session_id,
             action="set",
-            runner_result=await _forward_session_change_to_runner(
-                session_id,
-                runner_router,
-                event,
+            runner_result=await _forward_codex_goal_event(
+                session_id=session_id,
+                conv=conv,
+                event=event,
+                request=request,
+                user_id=user_id,
+                runner_router=runner_router,
+                conversation_store=conversation_store,
+                permission_store=permission_store,
+                runner_exit_reports=runner_exit_reports,
             ),
         )
         try:
@@ -13925,14 +14231,20 @@ def create_sessions_router(
             permission_store,
             conversation_store,
         )
-        await _require_codex_native_goal_session(session_id, conversation_store)
+        conv = await _require_codex_native_goal_session(session_id, conversation_store)
         runner_payload = _require_codex_goal_runner_payload(
             session_id,
             action="clear",
-            runner_result=await _forward_session_change_to_runner(
-                session_id,
-                runner_router,
-                {"type": "goal_clear"},
+            runner_result=await _forward_codex_goal_event(
+                session_id=session_id,
+                conv=conv,
+                event={"type": "goal_clear"},
+                request=request,
+                user_id=user_id,
+                runner_router=runner_router,
+                conversation_store=conversation_store,
+                permission_store=permission_store,
+                runner_exit_reports=runner_exit_reports,
             ),
         )
         try:

@@ -843,7 +843,10 @@ a live subresource. Goal state is not mirrored into Omnigent labels or
 conversation rows; the server validates session access and forwards a
 generic goal control event to the bound runner, which calls Codex
 app-server (`thread/goal/get`, `thread/goal/set`, or
-`thread/goal/clear`).
+`thread/goal/clear`). If no runner is currently registered, the server
+first tries to wake the session's existing host/workspace binding and
+initializes the relaunched runner before retrying the goal control. The
+caller cannot choose a new host or workspace through these routes.
 
 All routes are valid only for sessions stamped with
 `omnigent.wrapper=codex-native-ui`.
@@ -852,7 +855,9 @@ All routes are valid only for sessions stamped with
 GET /v1/sessions/{session_id}/codex_goal
 ```
 
-Auth: read access to the session.
+Auth: read access to the session. If the session's runner is offline
+and the server must relaunch the stored host binding, edit access is
+required for that wake-up side effect.
 
 200 OK:
 
@@ -920,9 +925,14 @@ Failure modes:
   404 Not Found
     No session with that id.
 
+  403 Forbidden
+    Caller can read the session but cannot relaunch an offline
+    host-bound runner.
+
   503 Service Unavailable
-    No live runner can reach the loaded Codex bridge, the runner rejects
-    the goal control, or the runner returns a malformed goal payload.
+    No live runner can reach the loaded Codex bridge, the session has no
+    usable bound host to relaunch, the runner rejects the goal control,
+    or the runner returns a malformed goal payload.
 
 ### Post Event
 
