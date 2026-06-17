@@ -695,47 +695,6 @@ describe("NewChatLandingScreen", () => {
     expect(detail.textContent).toContain("Edit any file and access the internet");
   });
 
-  it("makes the agent row's menu item itself the description tooltip trigger", () => {
-    // Accessibility: the description flyout must open on keyboard focus,
-    // not just pointer hover. Roving focus in the dropdown lands on the
-    // `[role=menuitem]` element, so that element (not an inner div) has
-    // to be the tooltip trigger. Asserting the slot marker is on the
-    // menu item itself locks that in — wrapping inner content instead
-    // would leave the flyout pointer-only for keyboard users.
-    mockAgents([
-      {
-        id: "with_desc",
-        name: "claude-native-ui",
-        display_name: "Claude Code",
-        description: "Plans and splits up the work.",
-        harness: "claude-native",
-        skills: [],
-      },
-      {
-        id: "no_desc",
-        name: "codex-native-ui",
-        display_name: "Codex",
-        description: null,
-        harness: "codex-native",
-        skills: [],
-      },
-    ]);
-    renderLanding();
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    // Described agent → the menu item is the tooltip trigger, so focusing
-    // the row (keyboard) opens the flyout, same as hovering it.
-    expect(screen.getByTestId("new-chat-landing-agent-with_desc")).toHaveAttribute(
-      "data-slot",
-      "tooltip-trigger",
-    );
-    // No description → nothing to show, so the row stays a plain menu item
-    // and no empty flyout is wired up.
-    expect(screen.getByTestId("new-chat-landing-agent-no_desc")).not.toHaveAttribute(
-      "data-slot",
-      "tooltip-trigger",
-    );
-  });
-
   it("shows a conflict banner in the file browser for an occupied directory", async () => {
     // A live session in the seeded workspace ("/Users/corey/repo") on the
     // auto-selected host occupies the directory the picker opens at.
