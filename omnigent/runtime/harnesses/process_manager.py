@@ -826,6 +826,12 @@ class HarnessProcessManager:
             stdout=None,
             stderr=None,
             env=effective_env,
+            # Own session/process group so _close_entry can group-kill the
+            # harness and any same-group children as a crash backstop,
+            # independent of the inner executor's close succeeding (O5). The
+            # child re-arms PR_SET_PDEATHSIG in-process after exec, which tracks
+            # the parent process and is unaffected by the new session.
+            start_new_session=(os.name == "posix"),
         )
         await _wait_for_socket_bind(process, socket_path, harness, conversation_id)
 
@@ -878,6 +884,16 @@ class HarnessProcessManager:
                 entry.process.kill()
                 await entry.process.wait()
         close_subprocess_transport(entry.process)
+        # Backstop (O5): the harness ran in its own session (start_new_session),
+        # so killpg its group to reap any same-group child the per-process
+        # SIGTERM/SIGKILL above (or a throwing inner-executor close) left behind.
+        # This targets ONLY the harness's own new-session group (pgid == the
+        # harness pid), never the runner's group. Codex inner children live in
+        # their OWN session and are covered by O1's atexit/signal reaper -- the
+        # two backstops are complementary.
+        if os.name == "posix" and entry.process.pid is not None:
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                os.killpg(entry.process.pid, signal.SIGKILL)
         # Best-effort socket cleanup. uvicorn's atexit usually
         # handles this when SIGTERM lands cleanly, but a
         # hard-killed runner won't.

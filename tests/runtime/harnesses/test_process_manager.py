@@ -810,3 +810,56 @@ async def test_orphan_sweep_escalates_to_sigkill(
 
     assert calls == 2
     assert killed == [(12345, signal.SIGTERM), (12345, signal.SIGKILL)]
+
+
+# ── O5: harness session leadership + group-kill backstop ──────
+
+
+async def test_spawned_harness_is_session_leader(
+    manager: HarnessProcessManager,
+) -> None:
+    """The harness subprocess is spawned in its own session (O5), so
+    _close_entry can group-kill it without touching the runner's group."""
+    if os.name != "posix":
+        pytest.skip("process groups are POSIX-only")
+    await manager.start()
+    try:
+        client = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
+        pid = (await client.get("/pid")).json()["pid"]
+        # start_new_session => the child is its own session/group leader.
+        assert os.getpgid(pid) == pid
+    finally:
+        await manager.shutdown()
+
+
+async def test_close_entry_group_kills_as_backstop(
+    manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_close_entry killpg's the harness's own group even when the normal
+    per-process teardown is made to look successful, proving the backstop is
+    independent of the inner-executor close (O5)."""
+    if os.name != "posix":
+        pytest.skip("process groups are POSIX-only")
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    killed_groups: list[int] = []
+    real_killpg = os.killpg
+    monkeypatch.setattr(
+        pm_mod.os,
+        "killpg",
+        lambda pgid, sig: (killed_groups.append(pgid), real_killpg(pgid, sig))[1],
+    )
+    await manager.start()
+    try:
+        client = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
+        pid = (await client.get("/pid")).json()["pid"]
+        await manager.release("conv_a")
+        assert pid in killed_groups
+        for _ in range(20):
+            if not _pid_alive(pid):
+                break
+            await asyncio.sleep(0.05)
+        assert not _pid_alive(pid)
+    finally:
+        await manager.shutdown()
