@@ -1,10 +1,20 @@
 name: Code Coverage
 
-# Posts a report-only `Coverage` commit status from the `coverage-summary`
-# artifact produced by the CI workflow. Runs on workflow_run (privileged,
-# statuses:write) but does NOT check out PR code — it only consumes the artifact,
-# so it isn't a "dangerous workflow". The status is always success (the % rides
-# in the description) and is never required, so it can't block a merge.
+# Coverage ratchet for the backend pytest suite, driven by the `coverage-summary`
+# artifact the CI workflow produces (on PRs *and* on push to main). Runs on
+# workflow_run (privileged, statuses:write) but does NOT check out PR code — it
+# only consumes the artifact and the GitHub API, so it isn't a "dangerous
+# workflow".
+#
+# Baseline storage: the latest coverage on main is kept as the `Coverage` commit
+# status on main's HEAD (no committed file, so no bot push to a protected main
+# and no CI re-trigger). On push to main this job records that status; on a PR it
+# reads main's status as the baseline and fails the PR's `Coverage` status when
+# coverage drops below it (beyond COVERAGE_TOLERANCE).
+#
+# Soft rollout: this posts a real failure state, but until `Coverage` is marked a
+# required status check in branch protection it cannot block a merge. Flip it to
+# required once it has run cleanly for a week or two.
 
 on:
   workflow_run:
@@ -19,14 +29,23 @@ concurrency:
   group: code-coverage-${{ github.event.workflow_run.head_sha }}
   cancel-in-progress: true
 
+env:
+  # Absorbs coverage nondeterminism (parallel shards, sysmon line-only backend)
+  # so a tiny jitter doesn't fail a PR. A real regression clears this easily.
+  COVERAGE_TOLERANCE: "0.5"
+
 jobs:
   post:
     name: Post coverage status
     permissions:
       actions: read     # download the coverage-summary artifact from the CI run
-      statuses: write   # post the Coverage status on the PR head SHA
-    # PR-originated CI runs only; other completions have no PR head SHA.
-    if: ${{ github.event.workflow_run.event == 'pull_request' }}
+      contents: read    # read main's baseline status via the commits API
+      statuses: write   # post the Coverage status on the head SHA
+    # PR runs (gate) and pushes to main (record baseline). Other completions have
+    # no PR head SHA / aren't the baseline branch.
+    if: >-
+      ${{ github.event.workflow_run.event == 'pull_request' ||
+          (github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -41,20 +60,58 @@ jobs:
           name: coverage-summary-${{ github.event.workflow_run.id }}
           path: coverage-summary
 
-      - name: Post Coverage status on PR head SHA
+      - name: Evaluate coverage and post status
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           SHA: ${{ github.event.workflow_run.head_sha }}
+          EVENT: ${{ github.event.workflow_run.event }}
         run: |
+          set -euo pipefail
           if [[ ! -f coverage-summary/total.txt ]]; then
             echo "::notice::No coverage-summary artifact; nothing to post."
             exit 0
           fi
-          TOTAL=$(cat coverage-summary/total.txt)
-          gh api "repos/$REPO/statuses/$SHA" \
-            -f state=success \
-            -f context=Coverage \
-            -f description="Total coverage: ${TOTAL}%" >/dev/null
-          echo "Posted Coverage=${TOTAL}% on $SHA"
+          TOTAL=$(tr -d '[:space:]' < coverage-summary/total.txt)
+
+          # On main: record the new baseline as the Coverage status on this commit.
+          if [[ "$EVENT" == "push" ]]; then
+            gh api "repos/$REPO/statuses/$SHA" \
+              -f state=success \
+              -f context=Coverage \
+              -f description="Total coverage: ${TOTAL}%" >/dev/null
+            echo "Recorded baseline Coverage=${TOTAL}% on main $SHA"
+            exit 0
+          fi
+
+          # On a PR: baseline = the Coverage status on main's HEAD.
+          BASE_DESC=$(gh api "repos/$REPO/commits/main/status" \
+            -q '.statuses[] | select(.context=="Coverage") | .description' 2>/dev/null | head -n1 || true)
+          BASELINE=$(printf '%s' "$BASE_DESC" | grep -oE '[0-9]+(\.[0-9]+)?' | head -n1 || true)
+
+          if [[ -z "$BASELINE" ]]; then
+            # No baseline recorded on main yet (first rollout) — report, don't gate.
+            gh api "repos/$REPO/statuses/$SHA" \
+              -f state=success \
+              -f context=Coverage \
+              -f description="Total coverage: ${TOTAL}% (no baseline yet)" >/dev/null
+            echo "::notice::No Coverage baseline on main yet; reported ${TOTAL}% without gating."
+            exit 0
+          fi
+
+          PASS=$(awk -v c="$TOTAL" -v b="$BASELINE" -v t="$COVERAGE_TOLERANCE" \
+            'BEGIN { print (c + t >= b) ? 1 : 0 }')
+          if [[ "$PASS" == "1" ]]; then
+            gh api "repos/$REPO/statuses/$SHA" \
+              -f state=success \
+              -f context=Coverage \
+              -f description="Coverage ${TOTAL}% (baseline ${BASELINE}%)" >/dev/null
+            echo "PASS: Coverage ${TOTAL}% >= baseline ${BASELINE}% (tol ${COVERAGE_TOLERANCE})"
+          else
+            gh api "repos/$REPO/statuses/$SHA" \
+              -f state=failure \
+              -f context=Coverage \
+              -f description="Coverage dropped: ${TOTAL}% < baseline ${BASELINE}%" >/dev/null
+            echo "FAIL: Coverage ${TOTAL}% < baseline ${BASELINE}% (tol ${COVERAGE_TOLERANCE})"
+          fi
