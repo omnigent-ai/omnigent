@@ -295,7 +295,22 @@ class ToolManager:
         :meth:`_create_builtin` instead.
         """
         for entry in self._spec.tools.builtins:
-            tool = self._create_builtin(entry.name, entry.config)
+            try:
+                tool = self._create_builtin(entry.name, entry.config)
+            except ImportError as e:
+                # A built-in backed by an OPTIONAL extra (e.g. the Hindsight
+                # memory tools need ``omnigent[hindsight]``) raises ImportError
+                # from its factory when the extra isn't installed. Skip it with
+                # a clear warning rather than failing the whole agent load — so
+                # bundled agents that declare an optional-dep tool still run on a
+                # base install. The tool simply isn't advertised to the model.
+                _logger.warning(
+                    "Built-in tool %r needs an optional dependency that isn't "
+                    "installed — skipping: %s",
+                    entry.name,
+                    e,
+                )
+                continue
             if tool is None:
                 _logger.warning(
                     "Unknown built-in tool %r — skipping. "

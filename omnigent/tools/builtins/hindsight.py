@@ -20,10 +20,11 @@ Usage in config.yaml::
         - name: hindsight_reflect
           api_key: ${HINDSIGHT_API_KEY}
 
-Config keys (all optional except ``api_key``):
+Config keys (all optional):
 
-- ``api_key``: Hindsight API key (or set it via ``${HINDSIGHT_API_KEY}``).
-- ``api_url``: API base URL. Defaults to Hindsight Cloud.
+- ``api_key``: Hindsight API key. Falls back to the ``HINDSIGHT_API_KEY`` env
+  var when omitted (lets bundled agents enable memory without baking a secret).
+- ``api_url``: API base URL. Falls back to ``HINDSIGHT_API_URL``, else Hindsight Cloud.
 - ``bank_id``: Memory bank to read/write. Defaults to ``ctx.agent_id``.
 - ``budget``: recall/reflect budget level — ``low`` / ``mid`` / ``high``.
 - ``max_tokens``: max tokens for recall results.
@@ -35,6 +36,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import TYPE_CHECKING, Any
 
 from omnigent.tools.base import Tool, ToolContext
@@ -84,17 +86,27 @@ class _HindsightToolBase(Tool):
         if self._cached_client is not None:
             return self._cached_client
 
-        api_key = self._config.get("api_key")
+        # Spec config takes precedence; fall back to the environment. The env
+        # fallback lets bundled agents (e.g. polly / debby) enable memory by
+        # declaring the tool with no `api_key:` — they can't bake a secret into
+        # a shared config, and a literal `${HINDSIGHT_API_KEY}` would crash the
+        # client-side env expansion when the var is unset. Explicit configs
+        # (e.g. remy's `api_key: ${HINDSIGHT_API_KEY}`) are unaffected.
+        api_key = self._config.get("api_key") or os.environ.get("HINDSIGHT_API_KEY")
         if not api_key:
             raise ValueError(
-                "Hindsight memory tools require an 'api_key' in the tool config "
-                "(e.g. api_key: ${HINDSIGHT_API_KEY})."
+                "Hindsight memory tools require an API key. Set the "
+                "HINDSIGHT_API_KEY environment variable, or pass api_key in the "
+                "tool config (e.g. api_key: ${HINDSIGHT_API_KEY})."
             )
 
         import hindsight_client
 
+        base_url = (
+            self._config.get("api_url") or os.environ.get("HINDSIGHT_API_URL") or _DEFAULT_API_URL
+        )
         self._cached_client = hindsight_client.Hindsight(
-            base_url=self._config.get("api_url") or _DEFAULT_API_URL,
+            base_url=base_url,
             api_key=api_key,
             timeout=30.0,
         )

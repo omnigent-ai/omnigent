@@ -211,10 +211,32 @@ def test_reflect_empty_returns_fallback(tool_ctx: ToolContext) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_missing_api_key_returns_error(tool_ctx: ToolContext) -> None:
-    tool = HindsightRecallTool({})  # no api_key
+def test_missing_api_key_returns_error(tool_ctx: ToolContext, monkeypatch) -> None:
+    monkeypatch.delenv("HINDSIGHT_API_KEY", raising=False)  # no config key AND no env key
+    tool = HindsightRecallTool({})
     result = tool.invoke(json.dumps({"query": "q"}), tool_ctx)
-    assert "api_key" in result.lower()
+    assert "api_key" in result.lower() or "hindsight_api_key" in result.lower()
+
+
+def test_api_key_falls_back_to_env(tool_ctx: ToolContext, monkeypatch) -> None:
+    # No api_key in config — the tool reads HINDSIGHT_API_KEY from the env.
+    monkeypatch.setenv("HINDSIGHT_API_KEY", "hsk_from_env")
+    client = _mock_client()
+    client.recall.return_value = _recall_response(["m"])
+    tool = HindsightRecallTool({"bank_id": "b"})  # note: no api_key
+    with patch("hindsight_client.Hindsight", return_value=client) as mock_cls:
+        tool.invoke(json.dumps({"query": "q"}), tool_ctx)
+    assert mock_cls.call_args.kwargs["api_key"] == "hsk_from_env"
+
+
+def test_config_api_key_takes_precedence_over_env(tool_ctx: ToolContext, monkeypatch) -> None:
+    monkeypatch.setenv("HINDSIGHT_API_KEY", "hsk_from_env")
+    client = _mock_client()
+    client.recall.return_value = _recall_response(["m"])
+    tool = HindsightRecallTool(_cfg(bank_id="b"))  # _cfg sets api_key=hsk_test
+    with patch("hindsight_client.Hindsight", return_value=client) as mock_cls:
+        tool.invoke(json.dumps({"query": "q"}), tool_ctx)
+    assert mock_cls.call_args.kwargs["api_key"] == "hsk_test"
 
 
 def test_client_exception_is_caught(tool_ctx: ToolContext) -> None:
