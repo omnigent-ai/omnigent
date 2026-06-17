@@ -825,6 +825,9 @@ def create_os_environment(spec: OSEnvSpec | None) -> OSEnvironment | None:
     """Instantiate the configured OS environment."""
     if spec is None:
         return None
+    if spec.type == "createos":
+        from .createos_os_env import CreateosOSEnvironment
+        return CreateosOSEnvironment.create_sync(spec)
     if spec.type != "caller_process":
         raise NotImplementedError(f"os_env type '{spec.type}' is not implemented")
 
@@ -860,6 +863,8 @@ def create_os_environment(spec: OSEnvSpec | None) -> OSEnvironment | None:
 
 def default_os_env_spec_for_type(env_type: str) -> OSEnvSpec:
     """Build a default OSEnvSpec for string shorthand config."""
+    if env_type == "createos":
+        return OSEnvSpec(type="createos")
     if env_type != "caller_process":
         raise NotImplementedError(f"os_env type '{env_type}' is not implemented")
     return OSEnvSpec(type="caller_process")

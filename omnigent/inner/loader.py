@@ -669,6 +669,10 @@ def _parse_os_env_spec(data: YamlData | str | bool | None) -> OSEnvSpec | None:
         sandbox=sandbox,
         fork=fork,
         start_in_scratch=start_in_scratch,
+        createos_base_url=str(data["base_url"]) if data.get("base_url") else None,
+        createos_api_key=str(data["api_key"]) if data.get("api_key") else None,
+        createos_shape=str(data["shape"]) if data.get("shape") else None,
+        createos_rootfs=str(data["rootfs"]) if data.get("rootfs") else None,
     )
 
 
