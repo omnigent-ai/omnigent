@@ -4,14 +4,17 @@ import json
 
 import pytest
 
+from omnigent.llms._responses_to_chat import chat_stream_to_response_events
 from omnigent.llms.adapters.gemini import (
     _chat_to_gemini,
     _convert_tools,
     _extract_usage,
+    _gemini_stream_chunk_to_chat,
     _gemini_to_chat,
     _normalize_finish_reason,
     _translate_part_to_gemini,
 )
+from omnigent.llms.types import FunctionCallOutput
 
 # ── Request translation ──────────────────────────────────
 
@@ -305,6 +308,65 @@ def test_string_user_content_becomes_text_part() -> None:
     messages = [{"role": "user", "content": "Hello"}]
     payload = _chat_to_gemini(messages, None, {})
     assert payload["contents"][0]["parts"] == [{"text": "Hello"}]
+
+
+# ── Streaming ─────────────────────────────────────────────
+
+
+def _parallel_function_call_chunk() -> dict:
+    """A single Gemini stream chunk with two parallel function calls."""
+    return {
+        "candidates": [
+            {
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {"functionCall": {"name": "get_weather", "args": {"city": "London"}}},
+                        {"functionCall": {"name": "get_time", "args": {"tz": "UTC"}}},
+                    ],
+                },
+                "finishReason": "STOP",
+            }
+        ],
+        "usageMetadata": {},
+    }
+
+
+def test_stream_parallel_function_calls_get_distinct_indices() -> None:
+    """
+    Parallel ``functionCall`` parts in one chunk must each receive a
+    distinct ``tool_calls`` index. A fixed index of 0 makes the downstream
+    accumulator collapse them into one call with concatenated arguments.
+    """
+    chunks = list(_gemini_stream_chunk_to_chat(_parallel_function_call_chunk()))
+    indices = [
+        tc["index"]
+        for chunk in chunks
+        for choice in chunk["choices"]
+        for tc in (choice["delta"].get("tool_calls") or [])
+    ]
+    assert indices == [0, 1]
+
+
+async def test_stream_parallel_function_calls_survive_accumulation() -> None:
+    """
+    Two parallel Gemini function calls in a streamed response are assembled
+    into two separate, uncorrupted ``FunctionCallOutput``s — matching what the
+    non-streaming path produces for the same content.
+    """
+
+    async def _chunks():
+        for chunk in _gemini_stream_chunk_to_chat(_parallel_function_call_chunk()):
+            yield chunk
+
+    events = [e async for e in chat_stream_to_response_events(_chunks(), model="gemini-test")]
+    response = events[-1].response
+    calls = [o for o in response.output if isinstance(o, FunctionCallOutput)]
+
+    assert len(calls) == 2
+    by_name = {c.name: c for c in calls}
+    assert json.loads(by_name["get_weather"].arguments) == {"city": "London"}
+    assert json.loads(by_name["get_time"].arguments) == {"tz": "UTC"}
 
 
 # ── Streaming chunk translation ──────────────────────────

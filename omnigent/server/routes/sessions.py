@@ -16927,10 +16927,11 @@ def create_sessions_router(
         :class:`AgentObject`.
 
         Loads the agent spec from *cache* to populate ``mcp_servers``,
-        ``policies``, and ``skills``. If the cache is ``None``, the
-        spec is not cached, or the load fails, all are left as empty
-        lists rather than raising — the endpoint must not fail because
-        one spec can't be read.
+        ``policies``, ``skills``, and (when the stored row has none) the
+        ``description``. If the cache is ``None``, the spec is not
+        cached, or the load fails, those fall back to empty lists / the
+        stored value rather than raising — the endpoint must not fail
+        because one spec can't be read.
 
         :param agent: The runtime agent entity.
         :param cache: Agent cache, or ``None`` in test setups.
@@ -16943,12 +16944,19 @@ def create_sessions_router(
         # Harness/kind for the UI; None until the spec loads (mirrors the
         # GET /v1/agents catalog so both endpoints report it consistently).
         harness: str | None = None
+        # Prefer the stored entity's description; fall back to the spec's
+        # top-level description when the stored value is unset (single-file
+        # YAML agents don't persist it at registration today). Lets the
+        # new-session picker show a hover description without a migration.
+        description: str | None = agent.description
         if cache is not None:
             try:
                 loaded = cache.load(
                     agent.id, agent.bundle_location, expand_env=agent.session_id is None
                 )
                 harness = loaded.spec.executor.harness_kind
+                if description is None:
+                    description = loaded.spec.description
                 # Declared terminal names, in spec order — the Web UI
                 # gates its "new terminal" affordance on this list.
                 terminals = list(loaded.spec.terminals or {})
@@ -16994,7 +17002,7 @@ def create_sessions_router(
             id=agent.id,
             name=agent.name,
             version=agent.version,
-            description=agent.description,
+            description=description,
             created_at=agent.created_at,
             updated_at=agent.updated_at,
             harness=harness,

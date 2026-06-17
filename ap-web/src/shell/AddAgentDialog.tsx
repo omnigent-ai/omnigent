@@ -129,6 +129,7 @@ export function AddAgentDialog({
                   agent={agent}
                   selected={agent.id === selectedAgentId}
                   onSelect={() => selectAgent(agent.id)}
+                  hover
                 />
               ))
             )}

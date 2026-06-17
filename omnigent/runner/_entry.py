@@ -947,6 +947,8 @@ def _install_signal_handlers(
     if adopted_event is not None:
         from omnigent.runner.identity import RUNNER_ADOPT_SIGNAL
 
+        if RUNNER_ADOPT_SIGNAL is None:
+            return
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(RUNNER_ADOPT_SIGNAL, adopted_event.set)
 

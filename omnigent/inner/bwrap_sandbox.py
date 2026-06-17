@@ -1002,12 +1002,37 @@ def _dotfile_and_symlink_mask_args(
             entries.append(entry)
     args: list[str] = []
     for entry in entries:
+        # Re-stat just before emitting: a mask overlays onto an EXISTING
+        # path, so a transient dotfile (e.g. coverage.py's `.coverage.*`)
+        # that vanished since the scan would force bwrap to create the
+        # mountpoint inside the ro-bound cwd and abort. Skipping a gone
+        # target is safe — persistent host dotfiles still exist and are
+        # still masked.
+        if not _path_exists_lstat(entry.path):
+            continue
         if entry.kind == "dir":
             args.extend(["--tmpfs", str(entry.path)])
         else:
-            # --bind-try: silently skips if the file vanished since scan (TOCTOU).
             args.extend(["--bind-try", "/dev/null", str(entry.path)])
     return args
+
+
+def _path_exists_lstat(path: Path) -> bool:
+    """
+    Return whether *path* exists without following a final symlink.
+
+    ``lstat`` (not ``stat``) so a dangling / escaping symlink still
+    counts as present and gets masked.
+
+    :param path: Candidate mask target.
+    :returns: ``True`` when the path still exists (including broken
+        symlinks), ``False`` when it has been removed.
+    """
+    try:
+        os.lstat(path)
+    except OSError:
+        return False
+    return True
 
 
 def _scratch_tmpdir(write_roots: list[Path]) -> Path | None:

@@ -392,3 +392,78 @@ async def test_catalog_entry_exposes_availability_and_reason(
     # AgentObject schema today, so these key lookups fail (the xfail).
     assert "availability" in entry
     assert "unavailable_reason" in entry
+
+
+async def test_catalog_description_falls_back_to_spec_when_row_unset(
+    agent_store: SqlAlchemyAgentStore,
+    artifact_store: LocalArtifactStore,
+    agents_client: httpx.AsyncClient,
+) -> None:
+    """
+    ``GET /v1/agents`` surfaces the spec's top-level ``description`` when
+    the stored agent row has none.
+
+    Single-file YAML built-ins don't persist a description at
+    registration today, so the stored column is ``None`` for them. The
+    new-session picker shows a hover description, and without this
+    fallback those agents would hover blank. Registering with
+    ``description=None`` but a spec that declares one proves the route
+    reads through to the bundle rather than echoing the empty column.
+    """
+    bundle = build_agent_bundle(
+        name="hoverable-agent",
+        description="Planned and split across sub-agents.",
+    )
+    _register_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_id="ag_specdesc",
+        name="hoverable-agent",
+        bundle=bundle,
+        description=None,
+    )
+
+    resp = await agents_client.get("/v1/agents")
+
+    assert resp.status_code == 200, resp.text
+    entry = next(a for a in resp.json()["data"] if a["id"] == "ag_specdesc")
+    # The stored column is None, so a non-None value here can only have
+    # come from the spec via the load → AgentObject fallback path.
+    assert entry["description"] == "Planned and split across sub-agents."
+
+
+async def test_catalog_description_prefers_stored_row_over_spec(
+    agent_store: SqlAlchemyAgentStore,
+    artifact_store: LocalArtifactStore,
+    agents_client: httpx.AsyncClient,
+) -> None:
+    """
+    ``GET /v1/agents`` prefers the stored row's ``description`` over the
+    spec's when both are set.
+
+    The fallback to the spec must be exactly that — a fallback. An
+    operator who set a description on the row (e.g. a curated catalog
+    label) must not have it silently overridden by whatever the bundled
+    spec happens to say. Registering with a stored description that
+    differs from the spec's proves the stored value wins.
+    """
+    bundle = build_agent_bundle(
+        name="relabelled-agent",
+        description="Spec description (should be ignored).",
+    )
+    _register_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_id="ag_storeddesc",
+        name="relabelled-agent",
+        bundle=bundle,
+        description="Curated catalog label.",
+    )
+
+    resp = await agents_client.get("/v1/agents")
+
+    assert resp.status_code == 200, resp.text
+    entry = next(a for a in resp.json()["data"] if a["id"] == "ag_storeddesc")
+    # Stored value present → it wins; the differing spec description
+    # proves the route didn't blindly overwrite with the bundle's.
+    assert entry["description"] == "Curated catalog label."

@@ -147,7 +147,7 @@ def _final_text(response_body: dict) -> str:
 
 
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
-def test_archer_word_count_e2e(
+def test_word_count_tool_e2e(
     http_client: httpx.Client,
     archer_agent: str,
     live_runner_id: str,
