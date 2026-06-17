@@ -2680,10 +2680,9 @@ dependencies = [
     { name = "anyio" },
     { name = "argon2-cffi" },
     { name = "cachetools" },
-    { name = "cel-expr-python", marker = "platform_machine != 'aarch64'" },
+    { name = "cel-expr-python", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or (platform_machine != 'aarch64' and sys_platform != 'darwin')" },
     { name = "claude-agent-sdk" },
     { name = "click" },
-    { name = "cursor-sdk" },
     { name = "fastapi" },
     { name = "ftfy" },
     { name = "httpx" },
@@ -2727,6 +2726,9 @@ antigravity = [
 bedrock = [
     { name = "boto3" },
     { name = "botocore" },
+]
+cursor = [
+    { name = "cursor-sdk" },
 ]
 cwsandbox = [
     { name = "cwsandbox" },
@@ -2779,10 +2781,10 @@ requires-dist = [
     { name = "boto3", marker = "extra == 'bedrock'", specifier = ">=1.30,<2" },
     { name = "botocore", marker = "extra == 'bedrock'", specifier = ">=1.30,<2" },
     { name = "cachetools", specifier = ">=5.0,<7" },
-    { name = "cel-expr-python", marker = "platform_machine != 'aarch64'", specifier = ">=0.1" },
+    { name = "cel-expr-python", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or (platform_machine != 'aarch64' and sys_platform != 'darwin')", specifier = ">=0.1" },
     { name = "claude-agent-sdk", specifier = ">=0.1.62" },
     { name = "click", specifier = ">=8.0,<8.2" },
-    { name = "cursor-sdk", specifier = ">=0.1.7" },
+    { name = "cursor-sdk", marker = "extra == 'cursor'", specifier = ">=0.1.7" },
     { name = "cwsandbox", marker = "extra == 'cwsandbox'", specifier = ">=0.24,<1" },
     { name = "databricks-mcp", marker = "extra == 'databricks'", specifier = ">=0.1.0" },
     { name = "databricks-sdk", marker = "extra == 'all'", specifier = ">=0.56.0,<1" },
@@ -2841,7 +2843,7 @@ requires-dist = [
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30,<1" },
 ]
-provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "vertex", "modal", "daytona", "cwsandbox", "e2b", "tracing", "agents-sdk", "antigravity", "databricks", "dev"]
+provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "vertex", "modal", "daytona", "cwsandbox", "e2b", "tracing", "agents-sdk", "antigravity", "cursor", "databricks", "dev"]
 
 [[package]]
 name = "omnigent-client"

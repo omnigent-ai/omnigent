@@ -629,12 +629,21 @@ async def _resolve_github_email(
     client: httpx.AsyncClient,
     access_token: str,
 ) -> str | None:
-    """Fetch the primary verified email from GitHub's user API.
+    """Fetch the primary *verified* email from GitHub's user API.
+
+    Only a ``primary`` and ``verified`` address from ``/user/emails`` is
+    returned. GitHub's ``/user.email`` (the public *profile* email) is not
+    guaranteed to be verified or owned by the caller, so it is never used
+    as the sign-in identity — trusting it would let a user log in as an
+    arbitrary address they merely typed into their profile, bypassing the
+    domain allowlist and (if that address is admin-listed) escalating to
+    admin. This mirrors the ``email_verified`` gate the OIDC ``id_token``
+    path already enforces.
 
     :param client: An active ``httpx.AsyncClient``.
     :param access_token: GitHub OAuth access token.
-    :returns: The user's primary verified email, or ``None`` if
-        unavailable.
+    :returns: The user's primary verified email, or ``None`` if none is
+        available (the caller rejects a ``None`` email with 400).
     """
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -652,15 +661,10 @@ async def _resolve_github_email(
             if entry.get("primary") and entry.get("verified"):
                 return entry.get("email")
 
-    # Fallback: try the user profile endpoint.
-    user_resp = await client.get(
-        "https://api.github.com/user",
-        headers=headers,
-        timeout=10.0,
-    )
-    if user_resp.status_code == 200:
-        return user_resp.json().get("email")
-
+    # No primary, verified address. Deliberately do NOT fall back to the
+    # ``/user.email`` profile field: it is unverified and attacker-settable,
+    # so returning it would let a caller assume an identity they do not own.
+    # Fail closed — the caller turns a ``None`` email into a 400.
     return None
 
 

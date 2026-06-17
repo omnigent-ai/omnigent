@@ -14,7 +14,10 @@ name: E2E UI Tests
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+    # No labeled/unlabeled: a skip-security-scan waiver re-runs this workflow's
+    # Security Gate via rerun-security-gate.yml, so label churn need not re-run
+    # the heavy Playwright suite. (#399 added these for the gate; superseded.)
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches:
       - 'fork-e2e/**'

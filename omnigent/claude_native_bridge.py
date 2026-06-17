@@ -1167,6 +1167,10 @@ def build_hook_settings(
             # timeout is irrelevant there.
             "timeout": 10,
         }
+        # The ``AskUserQuestion`` matcher only fires if that tool is actually
+        # callable. A session launched with ``--disallowedTools AskUserQuestion``
+        # (e.g. the exit-plan-mode e2e fixture) can never trigger this hook, so
+        # the registration is dormant there — harmless, just never reached.
         hooks["PreToolUse"] = [
             {"matcher": "AskUserQuestion", "hooks": [ask_uq_hook]},
             {"hooks": [evaluate_policy_hook]},

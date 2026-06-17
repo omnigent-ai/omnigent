@@ -222,10 +222,10 @@ def _reject_unsupported_concepts(spec: AgentSpec) -> None:
     # a spec field" because the field is consumed upstream and
     # has no meaning to the harness.
 
-    # Sandbox declarations (omnigent ``tools.sandbox.docker_image``
+    # Sandbox declarations (omnigent ``tools.sandbox.container_image``
     # and the omnigent OSEnvSandboxSpec) are unsupported. Fail loud
     # if either is populated.
-    if spec.tools.sandbox.docker_image is not None:
+    if spec.tools.sandbox.container_image is not None:
         raise OmnigentError(
             "tools.sandbox translation to omnigent OSEnvSpec is unsupported; "
             "the adapter rejects specs with sandbox rather than silently dropping it",
@@ -1773,7 +1773,6 @@ def _translate_executor_from_def(
             f"whose prefix maps to a known harness.",
             code=ErrorCode.INVALID_INPUT,
         )
-    # Supervisor spawn-env reads spec.executor.profile, not config["profile"].
     return ExecutorSpec(
         type=OMNIGENT_EXECUTOR_TYPE,
         config=config,
