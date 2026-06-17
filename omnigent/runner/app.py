@@ -50,6 +50,7 @@ from omnigent.llms.summarize import (
     extract_summary_text,
 )
 from omnigent.model_override import validate_model_override
+from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runner import pending_approvals
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
@@ -2725,11 +2726,20 @@ async def _evaluate_policy_via_omnigent(
     the verdict back to the harness as a ``policy_verdict`` inbound
     event.
 
-    On any failure (AP unreachable, malformed response), defaults to
-    ``POLICY_ACTION_ALLOW`` so a transient Omnigent outage does not block
-    the agent's LLM call — fail-open is appropriate here because the
-    Omnigent server's own enforcement sites (REQUEST, TOOL_CALL, etc.)
-    provide the authoritative blocking gate.
+    On failure (AP unreachable, non-200, malformed response) the default
+    verdict is phase-aware:
+
+    - ``PHASE_LLM_REQUEST`` / ``PHASE_LLM_RESPONSE`` fail OPEN
+      (``POLICY_ACTION_ALLOW``) so a transient Omnigent outage does not
+      hang the turn — these gates are advisory.
+    - ``PHASE_TOOL_CALL`` fails CLOSED (``POLICY_ACTION_DENY``). For
+      connector-native MCP tools the harness ``can_use_tool`` callback
+      (which consumes this verdict) is the *only* enforcement point — the
+      call is never re-checked server-side — so a policy that cannot be
+      evaluated must not let the tool through.
+    - ``PHASE_TOOL_RESULT`` fails OPEN: by the result phase the tool has
+      already executed, so denying would only block an already-incurred
+      side effect.
 
     :param server_client: HTTP client pointed at the Omnigent server.
     :param harness_client: HTTP client pointed at the harness subprocess.
@@ -2741,9 +2751,19 @@ async def _evaluate_policy_via_omnigent(
         ``"PHASE_LLM_REQUEST"``.
     :param data: Event data dict for the policy engine.
     """
-    # Default verdict: allow. Used on error paths.
-    verdict_action = "POLICY_ACTION_ALLOW"
-    verdict_reason: str | None = None
+    # Default verdict on error / non-200 / timeout. Phase-aware: TOOL_CALL
+    # fails CLOSED (this round-trip is the authoritative gate for
+    # connector-native tools), while advisory LLM phases and TOOL_RESULT
+    # (the tool already ran) fail OPEN so a transient outage never hangs
+    # the turn.
+    _fail_closed = phase in FAIL_CLOSED_PHASES
+    _default_action = "POLICY_ACTION_DENY" if _fail_closed else "POLICY_ACTION_ALLOW"
+    verdict_action = _default_action
+    verdict_reason: str | None = (
+        f"Omnigent policy evaluation unavailable; failing closed for {phase}."
+        if _fail_closed
+        else None
+    )
     verdict_data: dict[str, Any] | None = None
 
     try:
@@ -2759,19 +2779,25 @@ async def _evaluate_policy_via_omnigent(
         )
         if ap_resp.status_code == 200:
             result = ap_resp.json()
-            verdict_action = result.get("result", "POLICY_ACTION_ALLOW")
+            # A well-formed 200 carries "result"; a malformed body that
+            # omits it falls back to _default_action — i.e. DENY on a
+            # tool-call phase. That's deliberate: a 200 we can't read is
+            # an unevaluable verdict, which fails closed like any other.
+            verdict_action = result.get("result", _default_action)
             verdict_reason = result.get("reason")
             verdict_data = result.get("data")
         else:
             _logger.warning(
-                "AP policy evaluate returned %d for %s; defaulting to ALLOW",
+                "AP policy evaluate returned %d for %s; defaulting to %s",
                 ap_resp.status_code,
                 evaluation_id,
+                _default_action,
             )
-    except Exception:  # noqa: BLE001 — fail-open on Omnigent errors
+    except Exception:  # noqa: BLE001 — fail-open (LLM phases) / fail-closed (tool phases)
         _logger.warning(
-            "AP policy evaluate failed for %s; defaulting to ALLOW",
+            "AP policy evaluate failed for %s; defaulting to %s",
             evaluation_id,
+            _default_action,
             exc_info=True,
         )
 

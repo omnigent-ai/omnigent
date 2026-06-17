@@ -5,7 +5,7 @@ Verifies that the ``sys_os_shell`` tool can install packages via
 workspace, and that the installed packages are usable by subsequent
 commands within the same turn.
 
-Uses the ``archer`` agent which has ``sys_os_shell`` enabled.
+Uses a minimal ``os_env`` fixture agent with ``sys_os_shell`` enabled.
 
 Usage::
 
@@ -21,7 +21,7 @@ import httpx
 
 from tests.e2e.conftest import (
     create_runner_bound_session,
-    poll_until_terminal,
+    poll_session_until_terminal,
     send_user_message_to_session,
 )
 
@@ -60,7 +60,7 @@ def _has_tool_call(body: dict[str, Any], name: str) -> bool:
 
 def test_pip_install_and_use_package(
     http_client: httpx.Client,
-    archer_agent: str,
+    sandbox_deps_os_env_agent: str,
     live_runner_id: str,
 ) -> None:
     """
@@ -71,24 +71,29 @@ def test_pip_install_and_use_package(
     installs in <2 seconds.
 
     :param http_client: HTTP client pointed at the live e2e server.
-    :param archer_agent: The uploaded archer agent name.
+    :param sandbox_deps_os_env_agent: The uploaded os_env test agent name.
     :param live_runner_id: Runner id to bind the session to.
     """
     session_id = create_runner_bound_session(
-        http_client, agent_name=archer_agent, runner_id=live_runner_id
+        http_client, agent_name=sandbox_deps_os_env_agent, runner_id=live_runner_id
     )
     response_id = send_user_message_to_session(
         http_client,
         session_id=session_id,
         content=(
-            "Use the sys_os_shell tool to: "
-            "1) pip install cowsay "
-            "2) Run: python -c \"import cowsay; cowsay.cow('hello from omnigent')\" "
-            "Show me the output."
+            "Use the sys_os_shell tool to run these commands in order. "
+            "Do not skip steps or use other install methods.\n"
+            "1) `python3 -m ensurepip --upgrade`\n"
+            "2) `python3 -m pip install cowsay --target ./_sandbox_pip_cowsay`\n"
+            "3) `PYTHONPATH=./_sandbox_pip_cowsay python3 -c "
+            "\"import cowsay; cowsay.cow('hello from omnigent')\"`\n"
+            "Show me the cow ASCII art output."
         ),
     )
 
-    body = poll_until_terminal(http_client, response_id, timeout=300)
+    body = poll_session_until_terminal(
+        http_client, session_id=session_id, response_id=response_id, timeout=300
+    )
 
     assert body["status"] == "completed", (
         f"Expected completed, got {body['status']}. "
@@ -122,7 +127,7 @@ def test_pip_install_and_use_package(
 
 def test_npm_install_and_use_package(
     http_client: httpx.Client,
-    archer_agent: str,
+    sandbox_deps_os_env_agent: str,
     live_runner_id: str,
 ) -> None:
     """
@@ -132,11 +137,11 @@ def test_npm_install_and_use_package(
     Uses ``cowsay`` (npm version) — tiny, no native deps.
 
     :param http_client: HTTP client pointed at the live e2e server.
-    :param archer_agent: The uploaded archer agent name.
+    :param sandbox_deps_os_env_agent: The uploaded os_env test agent name.
     :param live_runner_id: Runner id to bind the session to.
     """
     session_id = create_runner_bound_session(
-        http_client, agent_name=archer_agent, runner_id=live_runner_id
+        http_client, agent_name=sandbox_deps_os_env_agent, runner_id=live_runner_id
     )
     response_id = send_user_message_to_session(
         http_client,
@@ -150,7 +155,9 @@ def test_npm_install_and_use_package(
         ),
     )
 
-    body = poll_until_terminal(http_client, response_id, timeout=300)
+    body = poll_session_until_terminal(
+        http_client, session_id=session_id, response_id=response_id, timeout=300
+    )
 
     assert body["status"] == "completed", (
         f"Expected completed, got {body['status']}. "
@@ -176,7 +183,7 @@ def test_npm_install_and_use_package(
 
 def test_uv_pip_install_and_use_package(
     http_client: httpx.Client,
-    archer_agent: str,
+    sandbox_deps_os_env_agent: str,
     live_runner_id: str,
 ) -> None:
     """
@@ -189,11 +196,11 @@ def test_uv_pip_install_and_use_package(
     per-conversation workspace (same as the ``npm install`` sibling).
 
     :param http_client: HTTP client pointed at the live e2e server.
-    :param archer_agent: The uploaded archer agent name.
+    :param sandbox_deps_os_env_agent: The uploaded os_env test agent name.
     :param live_runner_id: Runner id to bind the session to.
     """
     session_id = create_runner_bound_session(
-        http_client, agent_name=archer_agent, runner_id=live_runner_id
+        http_client, agent_name=sandbox_deps_os_env_agent, runner_id=live_runner_id
     )
     response_id = send_user_message_to_session(
         http_client,
@@ -209,7 +216,9 @@ def test_uv_pip_install_and_use_package(
         ),
     )
 
-    body = poll_until_terminal(http_client, response_id, timeout=300)
+    body = poll_session_until_terminal(
+        http_client, session_id=session_id, response_id=response_id, timeout=300
+    )
 
     assert body["status"] == "completed", (
         f"Expected completed, got {body['status']}. "

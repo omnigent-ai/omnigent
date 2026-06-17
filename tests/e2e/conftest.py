@@ -93,6 +93,7 @@ _DATABRICKS_MODEL_MAP: dict[str, str] = {
 # at them from elsewhere in the repo.
 _CLAUDE_CODER_DIR = _REPO_ROOT / "tests" / "resources" / "agents" / "claude-coder"
 _OPENAI_CODER_DIR = _REPO_ROOT / "tests" / "resources" / "examples" / "openai-coder"
+_SANDBOX_DEPS_OS_ENV_DIR = _REPO_ROOT / "tests" / "resources" / "agents" / "sandbox-deps-os-env"
 _SYS_TERMINAL_TEST_DIR = _REPO_ROOT / "tests" / "resources" / "agents" / "sys-terminal-test"
 # A plain claude-sdk chat agent seeded as a BUILT-IN (via the server's
 # OMNIGENT_BUILTIN_AGENT_DIRS hook) so fork-switch e2e tests have a
@@ -790,6 +791,23 @@ def claude_coder_agent(http_client: httpx.Client, databricks_workspace_host: str
     return upload_agent(
         http_client,
         _CLAUDE_CODER_DIR,
+        rewrite_model_for_databricks=databricks_workspace_host is not None,
+    )
+
+
+@pytest.fixture(scope="session")
+def sandbox_deps_os_env_agent(
+    http_client: httpx.Client, databricks_workspace_host: str | None
+) -> str:
+    """
+    Upload the minimal os_env dependency-install test fixture.
+
+    :param http_client: HTTP client pointed at the server.
+    :returns: The agent name, ``"sandbox-deps-os-env"``.
+    """
+    return upload_agent(
+        http_client,
+        _SANDBOX_DEPS_OS_ENV_DIR,
         rewrite_model_for_databricks=databricks_workspace_host is not None,
     )
 
