@@ -12,7 +12,10 @@ on:
   schedule:
     - cron: "30 9 * * *"
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+    # No labeled/unlabeled: a skip-security-scan waiver re-runs this workflow's
+    # Security Gate via rerun-security-gate.yml, so label churn need not re-run
+    # the heavy integration suite. (#399 added these for the gate; superseded.)
+    types: [opened, synchronize, reopened, ready_for_review]
     paths-ignore: ['ap-web/**']
   push:
     branches:
