@@ -186,11 +186,22 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ steps.ctx.outputs.pr }}
         run: |
-          NAMES=$(gh pr view "$PR" --repo "$REPO" --json labels --jq '.labels[].name')
+          INFO=$(gh pr view "$PR" --repo "$REPO" --json labels,isCrossRepository)
+          NAMES=$(echo "$INFO" | jq -r '.labels[].name')
           if echo "$NAMES" | grep -qx "automerge"; then
             echo "automerge=true" >> "$GITHUB_OUTPUT"
           else
             echo "automerge=false" >> "$GITHUB_OUTPUT"
+          fi
+          # A fork PR without the maintainer-only `e2e-approved` label never
+          # runs e2e (the fork pull_request run is an empty matrix), so the gate
+          # message nudges a maintainer to apply it. Same-repo PRs run e2e with
+          # secrets directly and need no label.
+          if [[ "$(echo "$INFO" | jq -r '.isCrossRepository')" == "true" ]] \
+             && ! echo "$NAMES" | grep -qx "e2e-approved"; then
+            echo "fork_needs_e2e_label=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "fork_needs_e2e_label=false" >> "$GITHUB_OUTPUT"
           fi
 
       # post_red gates posting a red status: /merge needs it, automerge opts
@@ -230,6 +241,7 @@ jobs:
         env:
           EVAL: ${{ steps.eval.outcome }}
           FAILED: ${{ steps.eval.outputs.failed }}
+          FORK_NEEDS_E2E_LABEL: ${{ steps.labels.outputs.fork_needs_e2e_label }}
         run: bash .github/scripts/merge-ready/compute-gate.sh
 
       # Skipped when post_red is false AND gate is red: leaves prior
