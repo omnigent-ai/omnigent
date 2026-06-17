@@ -9,6 +9,7 @@
 
 import { AlertCircleIcon, RotateCcwIcon, ShieldXIcon, ShrinkIcon } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { CliCommandBlock } from "@/shell/CliCommandBlock";
 
 interface ErrorBannerProps {
   message: string;
@@ -17,11 +18,86 @@ interface ErrorBannerProps {
 }
 
 /**
+ * Detect the shared "<Executor> requires the '<pkg>' package. Install it
+ * with: <cmd>" pattern the inner executors raise when an optional harness
+ * dependency is missing (antigravity, claude-agent-sdk, cursor-sdk,
+ * openai-agents, databricks-sdk, mlflow, …). The message is copy-pasted
+ * across executors, so this is a stable convention. Returns null when the
+ * message isn't that shape so the banner falls back to the generic raw
+ * rendering. #548
+ */
+const MISSING_DEP_RE = /requires the '([^']+)' package\. Install it with:\s*(.+)$/;
+function parseMissingDependency(
+  message: string,
+): { packageName: string; installCommand: string } | null {
+  if (!message) return null;
+  const m = MISSING_DEP_RE.exec(message);
+  if (!m) return null;
+  // Some executors trail the command with a period; strip one so the
+  // copied install command doesn't carry it.
+  return { packageName: m[1], installCommand: m[2].replace(/\.$/, "").trim() };
+}
+
+interface MissingDependencyBannerProps {
+  packageName: string;
+  installCommand: string;
+  rawMessage: string;
+}
+
+/**
+ * Friendly remediation for a missing optional dependency: a concise summary,
+ * the install command as a copyable action, and the raw executor error
+ * collapsed behind a details block for diagnostics. Replaces the raw
+ * `RuntimeError` dump the chat transcript used to show for these. #548
+ */
+function MissingDependencyBanner({
+  packageName,
+  installCommand,
+  rawMessage,
+}: MissingDependencyBannerProps) {
+  return (
+    <Alert
+      variant="destructive"
+      className="min-w-0 max-w-full overflow-hidden has-[>svg]:grid-cols-[auto_minmax(0,1fr)]"
+    >
+      <AlertCircleIcon />
+      <AlertTitle className="min-w-0 break-words [overflow-wrap:anywhere]">Missing dependency</AlertTitle>
+      <AlertDescription className="min-w-0 max-w-full overflow-hidden">
+        <p className="text-sm">
+          The <code className="font-mono">{packageName}</code> package is required to run this agent.
+        </p>
+        <div className="mt-2">
+          <CliCommandBlock command={installCommand} testIdPrefix="missing-dep-install" />
+        </div>
+        <details className="mt-2">
+          <summary className="cursor-pointer text-xs text-muted-foreground">Raw error</summary>
+          <span className="mt-1 block max-w-full whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-xs text-muted-foreground">
+            {rawMessage}
+          </span>
+        </details>
+      </AlertDescription>
+    </Alert>
+  );
+}
+
+/**
  * Loud destructive banner for `error` blocks. Falls back to `code` when
  * `message` is empty (matches the reducer's intent — never show a blank
- * panel even when the LLM error payload omits the message).
+ * panel even when the LLM error payload omits the message). Missing-
+ * dependency errors route to `MissingDependencyBanner` for a friendlier,
+ * actionable remediation. #548
  */
 export function ErrorBanner({ message, source, code }: ErrorBannerProps) {
+  const dep = parseMissingDependency(message);
+  if (dep) {
+    return (
+      <MissingDependencyBanner
+        packageName={dep.packageName}
+        installCommand={dep.installCommand}
+        rawMessage={message}
+      />
+    );
+  }
   const display = message || code || "Unknown error";
   return (
     <Alert

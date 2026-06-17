@@ -132,6 +132,51 @@ describe("BlockRenderer dispatch", () => {
     );
   });
 
+  it("renders a missing-dependency error as a friendly banner with a copyable install command (#548)", () => {
+    const message =
+      "AntigravityExecutor requires the 'google-antigravity' package. " +
+      "Install it with: pip install google-antigravity (or " +
+      "pip install 'omnigent[antigravity]').";
+    const items: RenderItem[] = [
+      { kind: "error", itemId: null, source: "execution", code: "executor_error", message },
+    ];
+
+    const { container } = render(<BlockRenderer items={items} sessionStatus="idle" />);
+
+    // Friendly summary instead of the raw RuntimeError dump.
+    expect(screen.getByText("Missing dependency")).toBeDefined();
+    const pkg = container.querySelector("code.font-mono");
+    expect(pkg?.textContent).toBe("google-antigravity");
+    // The install command renders as a copyable action (CliCommandBlock),
+    // not as raw error text — trailing period stripped so the copy is clean.
+    const command = screen.getByTestId("missing-dep-install-command");
+    expect(command.textContent).toBe(
+      "pip install google-antigravity (or pip install 'omnigent[antigravity]')",
+    );
+    expect(screen.getByTestId("missing-dep-install-copy")).toBeDefined();
+    // The raw executor error stays available for diagnostics, collapsed.
+    expect(screen.getByText("Raw error")).toBeDefined();
+    // The generic "Error · source · code" heading is NOT shown for these.
+    expect(screen.queryByText(/Error · execution/)).toBeNull();
+  });
+
+  it("does not treat an unrelated error as a missing dependency (#548)", () => {
+    const items: RenderItem[] = [
+      {
+        kind: "error",
+        itemId: null,
+        source: "llm",
+        code: "llm_auth_failed",
+        message: "Authentication failed: invalid API key.",
+      },
+    ];
+    render(<BlockRenderer items={items} sessionStatus="idle" />);
+    // Generic raw banner still handles non-dependency errors unchanged.
+    expect(screen.getByText(/Authentication failed/)).toBeDefined();
+    expect(screen.queryByText("Missing dependency")).toBeNull();
+    expect(screen.queryByTestId("missing-dep-install-command")).toBeNull();
+  });
+
   it("treats a trailing reasoning item as streaming when sessionStatus is running", () => {
     const items: RenderItem[] = [
       { kind: "reasoning", itemId: null, text: "thinking", duration: undefined },
