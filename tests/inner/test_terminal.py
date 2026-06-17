@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -52,6 +53,59 @@ def contains_subsequence(values: list[str], expected: list[str]) -> bool:
     return any(
         values[index : index + len(expected)] == expected for index in range(last_start + 1)
     )
+
+
+def test_threaded_idle_watcher_reports_terminal_exit(tmp_path: Path) -> None:
+    """
+    The threaded watcher reports tmux disappearance instead of exiting silently.
+
+    :param tmp_path: Temporary directory used for placeholder tmux paths.
+    """
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    exited = threading.Event()
+
+    instance._capture_pane_for_idle_or_none = lambda: None  # type: ignore[method-assign]
+
+    instance.start_idle_watcher_thread(
+        on_exit=exited.set,
+        poll_interval_s=0.01,
+    )
+
+    assert exited.wait(timeout=1.0)
+    assert instance.running is False
+
+
+def test_threaded_idle_watcher_keeps_last_pane_text_on_exit(tmp_path: Path) -> None:
+    """
+    The exit callback can still report the last pane text after tmux disappears.
+
+    :param tmp_path: Temporary directory used for placeholder tmux paths.
+    """
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    exited = threading.Event()
+    snapshots = iter(["\x1b[31mstartup failed\x1b[0m\ntry config", None])
+
+    instance._capture_pane_for_idle_or_none = lambda: next(snapshots)  # type: ignore[method-assign]
+
+    instance.start_idle_watcher_thread(
+        on_exit=exited.set,
+        poll_interval_s=0.01,
+    )
+
+    assert exited.wait(timeout=1.0)
+    assert instance.last_pane_text() == "startup failed\ntry config"
 
 
 @pytest.mark.asyncio

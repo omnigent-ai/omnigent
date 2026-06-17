@@ -711,13 +711,14 @@ describe("NewChatLandingScreen", () => {
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
-    const neverOption = screen.getByTestId("new-chat-landing-approval-never");
-    expect(neverOption.textContent).toContain("Never");
+    const fullAccessOption = screen.getByTestId("new-chat-landing-approval-full-access");
+    expect(fullAccessOption.textContent).toContain("Full access");
     // The footer line explains the SELECTED mode until a row is hovered.
     const detail = screen.getByTestId("new-chat-landing-approval-detail");
-    expect(detail.textContent).toContain("Model decides when to ask for approval");
-    fireEvent.pointerEnter(neverOption);
-    expect(detail.textContent).toContain("Never asks for approval");
+    // Default is selected initially.
+    expect(detail.textContent).toContain("Read/edit/run in workspace");
+    fireEvent.pointerEnter(fullAccessOption);
+    expect(detail.textContent).toContain("Edit any file and access the internet");
   });
 
   it("shows a conflict banner in the file browser for an occupied directory", async () => {

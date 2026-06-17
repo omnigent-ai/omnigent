@@ -7,6 +7,7 @@ import type { ComponentType, SVGProps } from "react";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { nativeCodingAgentForAvailableAgent } from "@/lib/nativeCodingAgents";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { AgentHoverCard } from "@/components/AgentHoverCard";
 
 /**
  * Pick the glyph for a catalog agent.
@@ -49,17 +50,24 @@ function iconForAgent(agent: AvailableAgent): ComponentType<SVGProps<SVGSVGEleme
  * @param compact - When true, render icon + name only (no inline
  *   description) so cards stay even in a horizontal row; the
  *   description is surfaced as a hover tooltip instead.
+ * @param hover - When true, wrap the card in a Cursor-style hover
+ *   flyout (``AgentHoverCard``) that opens to the right with the
+ *   agent's name + description. Additive to the inline description.
+ *   Ignored in compact mode, which already surfaces the description
+ *   via its own tooltip.
  */
 export function AgentCard({
   agent,
   selected,
   onSelect,
   compact = false,
+  hover = false,
 }: {
   agent: AvailableAgent;
   selected: boolean;
   onSelect: () => void;
   compact?: boolean;
+  hover?: boolean;
 }) {
   const Icon = iconForAgent(agent);
   const card = (
@@ -92,6 +100,11 @@ export function AgentCard({
         <TooltipContent>{agent.description}</TooltipContent>
       </Tooltip>
     );
+  }
+  // Non-compact opt-in: surface the richer Cursor-style flyout to the
+  // right on hover. AgentHoverCard no-ops when there's no description.
+  if (hover) {
+    return <AgentHoverCard agent={agent}>{card}</AgentHoverCard>;
   }
   return card;
 }

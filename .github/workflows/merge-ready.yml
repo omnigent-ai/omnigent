@@ -21,15 +21,15 @@ name: Merge Ready
 #                a red status explaining the rejection.
 
 on:
-  # `labeled` only; `workflow_run` re-evaluates on same-repo CI completion.
+  # `labeled` only; `workflow_run` re-evaluates on CI completion (same-repo PRs
+  # and the fork-e2e/** mirror push -- see the job `if`).
   pull_request:
     types: [labeled]
   workflow_run:
     workflows: [PR Template, CI, Lint, E2E UI Tests, E2E Tests, Integration Tests]
     types: [completed]
-  # Fork PR e2e runs on a trusted fork-e2e/** mirror branch (see
-  # fork-e2e-mirror.yml); its check_suite completing is the re-eval signal.
-  # ctx maps the suite's head SHA back to the open PR.
+  # check_suite is a fork-PR fallback (workflow_run on the fork-e2e/** push is
+  # primary); ctx maps the head SHA back to the open PR.
   check_suite:
     types: [completed]
   issue_comment:
@@ -64,11 +64,10 @@ jobs:
       checks: read
       actions: read         # evaluate-checks.sh reads GET /actions/runs to classify missing checks
       statuses: write
-    # Fire on automerge/force-merge label adds, same-repo PR workflow_run
-    # completions, fork-e2e/** check_suite completions (mirrored fork PR
-    # e2e -- ctx maps the head SHA back to the PR), `/merge` comments, or a
-    # workflow_dispatch re-eval. Post-merge/nightly runs (push to main, etc.)
-    # have no open PR and are dropped by the ctx step.
+    # Fire on automerge/force-merge label adds, PR CI workflow_run completions
+    # (same-repo and the fork-e2e/** mirror push), `/merge` comments, or a
+    # workflow_dispatch re-eval; check_suite is a fork-PR fallback. Runs with no
+    # open PR (push to main, etc.) are dropped by the ctx step.
     if: >-
       (
         github.event_name == 'pull_request' &&
@@ -79,7 +78,13 @@ jobs:
       ) ||
       (
         github.event_name == 'workflow_run' &&
-        github.event.workflow_run.event == 'pull_request'
+        (
+          github.event.workflow_run.event == 'pull_request' ||
+          (
+            github.event.workflow_run.event == 'push' &&
+            startsWith(github.event.workflow_run.head_branch, 'fork-e2e/')
+          )
+        )
       ) ||
       (
         github.event_name == 'check_suite' &&

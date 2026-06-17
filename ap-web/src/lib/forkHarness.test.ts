@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
-  agentBaseName,
+  agentRootName,
   harnessFamily,
   isNativeHarness,
   forkTargetCarriesHistory,
@@ -91,29 +91,27 @@ describe("forkTargetCarriesHistory", () => {
   });
 });
 
-describe("agentBaseName", () => {
+describe("agentRootName", () => {
   it("returns a plain name unchanged", () => {
-    expect(agentBaseName("claude-native-ui")).toBe("claude-native-ui");
+    expect(agentRootName("claude-native-ui")).toBe("claude-native-ui");
   });
 
-  it("strips a fork suffix", () => {
-    expect(agentBaseName("claude-native-ui (fork conv_ab12)")).toBe("claude-native-ui");
+  it("peels a single fork or switch layer", () => {
+    expect(agentRootName("claude-native-ui (fork ag_3a9fa87)")).toBe("claude-native-ui");
+    expect(agentRootName("nessie (switch conv_9f3c)")).toBe("nessie");
   });
 
-  it("strips a switch suffix", () => {
-    expect(agentBaseName("nessie (switch conv_9f3c)")).toBe("nessie");
+  it("peels every layer of a fork-of-a-fork", () => {
+    // A single-layer strip would stop at "claude-native-ui (fork ag_a)";
+    // agentRootName recurses to the root so a multi-fork clone of a built-in
+    // still matches the built-in catalog (and is dropped by the agent picker).
+    expect(agentRootName("claude-native-ui (fork ag_a) (fork ag_b)")).toBe("claude-native-ui");
+    expect(agentRootName("polly (fork conv_a) (switch conv_b)")).toBe("polly");
   });
 
   it("leaves interior or non-clone parentheses alone", () => {
-    // Only the exact trailing " (fork <id>)" / " (switch <id>)" shape is a
-    // clone marker — user-chosen names with parens must not be mangled.
-    expect(agentBaseName("my-agent (beta)")).toBe("my-agent (beta)");
-    expect(agentBaseName("agent (fork pun) helper")).toBe("agent (fork pun) helper");
-  });
-
-  it("strips only the outermost suffix when a clone was itself cloned", () => {
-    // Fork-of-a-fork names accumulate suffixes; one call removes one
-    // layer (callers compare against catalogs of single-layer names).
-    expect(agentBaseName("polly (fork conv_a) (switch conv_b)")).toBe("polly (fork conv_a)");
+    // Only trailing clone markers are peeled — user-chosen parens survive.
+    expect(agentRootName("my-agent (beta)")).toBe("my-agent (beta)");
+    expect(agentRootName("agent (fork pun) helper")).toBe("agent (fork pun) helper");
   });
 });

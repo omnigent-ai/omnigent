@@ -26,11 +26,18 @@ from pathlib import Path
 from playwright.sync_api import Page, expect
 
 _COMPOSER = "Ask the agent anything…"
-# Composer accepts image/*,application/pdf,text/* (the hidden input's accept
-# attr); a .txt file is in-scope and keeps the fixture trivial. ``set_input_files``
-# bypasses the accept filter anyway — ``addFiles`` does no client-side filtering.
+# Composer accepts image/*,application/pdf,text/*,application/json (the hidden
+# input's accept attr); a .txt file is in-scope and keeps the fixture trivial.
+# ``set_input_files`` bypasses the accept filter anyway — ``addFiles`` does no
+# client-side filtering.
 _ATTACH_NAME = "attach_sample.txt"
 _ATTACH_BODY = "composer attachment e2e sample\n"
+
+# JSON is its own MIME (``application/json``), which is NOT covered by the
+# ``text/*`` wildcard, so it has to be listed in the ``accept`` attr explicitly
+# for the OS picker (and the drag-drop ``matchesAccept`` validator) to admit it.
+_JSON_NAME = "attach_sample.json"
+_JSON_BODY = '{"composer": "attachment", "e2e": true}\n'
 
 
 def test_attach_then_remove_file(
@@ -59,3 +66,38 @@ def test_attach_then_remove_file(
     remove_button.click()
     expect(remove_button).to_be_hidden(timeout=10_000)
     expect(page.get_by_text(_ATTACH_NAME, exact=True)).to_be_hidden()
+
+
+def test_attach_json_file(page: Page, seeded_session: tuple[str, str], tmp_path: Path) -> None:
+    """A ``.json`` file is admitted by the picker and attaches as a chip.
+
+    Guards the change that added ``application/json`` to the composer's
+    ``accept`` list. Two things are asserted:
+
+    1. The hidden input advertises ``application/json`` in its ``accept`` attr.
+       This is the part the OS file picker and the drag-drop ``matchesAccept``
+       validator (``prompt-input.tsx``) actually read — and the part that would
+       regress if the MIME were dropped from the list. ``set_input_files`` can't
+       cover it because it bypasses the accept filter entirely.
+    2. Driving a real ``.json`` file through the input still yields the chip +
+       remove control, i.e. ``addFiles`` accepts the JSON end-to-end.
+    """
+    base_url, session_id = seeded_session
+    sample = tmp_path / _JSON_NAME
+    sample.write_text(_JSON_BODY)
+
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
+
+    file_input = page.locator('input[type="file"][accept*="image/"]')
+    # The accept attr is what gates the picker/drag-drop; assert JSON is listed.
+    accept = file_input.get_attribute("accept")
+    assert accept is not None and "application/json" in accept, (
+        f"composer file input should accept application/json; got {accept!r}"
+    )
+
+    file_input.set_input_files(str(sample))
+
+    remove_button = page.get_by_role("button", name=f"Remove {_JSON_NAME}")
+    expect(remove_button).to_be_visible(timeout=10_000)
+    expect(page.get_by_text(_JSON_NAME, exact=True)).to_be_visible()

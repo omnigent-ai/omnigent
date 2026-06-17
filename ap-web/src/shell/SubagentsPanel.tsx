@@ -149,6 +149,16 @@ interface AgentStatus {
   activity: AgentActivity;
   /** Human label, shown inline for notable states and always in the tooltip. */
   label: string;
+  /** Optional detail for the tooltip / accessible label. */
+  details?: string;
+}
+
+function firstErrorLine(message: string): string {
+  const first = message
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean);
+  return first ?? message;
 }
 
 /**
@@ -173,8 +183,15 @@ function childStatus(child: ChildSessionInfo): AgentStatus {
     return { activity: "launching", label: "Launching" };
   }
   if (child.busy) return { activity: "working", label: "Working" };
-  if (child.current_task_status === "completed") return { activity: "done", label: "Done" };
+  if (child.last_task_error) {
+    return {
+      activity: "failed",
+      label: "Failed",
+      details: firstErrorLine(child.last_task_error.message),
+    };
+  }
   if (child.current_task_status === "failed") return { activity: "failed", label: "Failed" };
+  if (child.current_task_status === "completed") return { activity: "done", label: "Done" };
   if (child.current_task_status) {
     return { activity: "other", label: child.current_task_status };
   }
@@ -198,8 +215,7 @@ function sessionStatus(status: string | undefined): AgentStatus {
 // Dot color per dot-rendered state. Working uses the animated RunningDot
 // and awaiting uses the "Needs response" tag, so both are excluded here.
 // "done" is a quiet, expected outcome, so it reads as a muted dot rather
-// than a loud green one — only failures keep a saturated (red) tone to draw
-// the eye.
+// than a loud green one.
 const DOT_TONE: Record<Exclude<AgentActivity, "working" | "awaiting">, string> = {
   done: "bg-muted-foreground/55",
   failed: "bg-destructive",
@@ -306,7 +322,8 @@ function brandChildIcon(child: ChildSessionInfo): AgentRowIcon | null {
  *
  * @param status - The resolved activity + label to render.
  */
-function StatusIndicator({ activity, label }: AgentStatus) {
+function StatusIndicator({ activity, label, details }: AgentStatus) {
+  const title = details ? `${label}: ${details}` : label;
   // Awaiting renders the exact same "Needs response" tag as the sidebar
   // (SessionStateBadge) so the approval affordance reads identically across
   // the app. The tag carries its own copy, so the row's separate label word
@@ -314,8 +331,8 @@ function StatusIndicator({ activity, label }: AgentStatus) {
   if (activity === "awaiting") {
     return (
       <span
-        aria-label={label}
-        title={label}
+        aria-label={title}
+        title={title}
         data-testid="subagent-status-dot"
         className="inline-flex shrink-0 items-center text-xs"
       >
@@ -323,10 +340,23 @@ function StatusIndicator({ activity, label }: AgentStatus) {
       </span>
     );
   }
+  if (activity === "failed") {
+    return (
+      <span
+        aria-label={title}
+        title={title}
+        data-testid="subagent-status-dot"
+        className="inline-flex shrink-0 items-center gap-1 text-destructive text-xs"
+      >
+        <span>{label}</span>
+        <span className={cn("inline-block size-2 shrink-0 rounded-full", DOT_TONE.failed)} />
+      </span>
+    );
+  }
   return (
     <span
-      aria-label={label}
-      title={label}
+      aria-label={title}
+      title={title}
       data-testid="subagent-status-dot"
       className="inline-flex shrink-0 items-center gap-1 text-muted-foreground text-xs"
     >

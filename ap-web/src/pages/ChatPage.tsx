@@ -2869,6 +2869,17 @@ export function Composer({
     };
   }, [conversationId]);
 
+  // Adding a reply quote (via the floating "Reply" button) should drop the
+  // caret straight into the composer so the user can type immediately. Only
+  // focus when the count grows — removing a quote shouldn't steal focus.
+  const prevQuoteCountRef = useRef(replyQuotes.length);
+  useEffect(() => {
+    if (replyQuotes.length > prevQuoteCountRef.current) {
+      textareaRef.current?.focus();
+    }
+    prevQuoteCountRef.current = replyQuotes.length;
+  }, [replyQuotes.length]);
+
   // Session skills (bundled + host-discovered) come from the snapshot
   // on bind and populate the suggestions menu as ``/skill-name``
   // entries alongside the built-ins.
@@ -3324,7 +3335,7 @@ export function Composer({
         ref={fileInputRef}
         type="file"
         multiple
-        accept="image/*,application/pdf,text/*"
+        accept="image/*,application/pdf,text/*,application/json"
         className="hidden"
         onChange={(e) => {
           if (e.target.files) {
