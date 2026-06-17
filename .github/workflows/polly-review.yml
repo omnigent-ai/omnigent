@@ -318,6 +318,8 @@ jobs:
         run: |
           # Each omnigent process writes its own /tmp/polly-tokens-*.json
           # file. Aggregate all of them into totals.
+          echo "Token files found:"
+          ls -la /tmp/polly-tokens*.json 2>/dev/null || echo "  (none)"
           python3 <<'PYEOF'
           import glob, json, os
 
