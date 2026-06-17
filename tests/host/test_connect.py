@@ -22,6 +22,8 @@ from omnigent.host.connect import (
 )
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HostCreateDirFrame,
+    HostCreateDirResultFrame,
     HostHelloFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
@@ -1461,6 +1463,120 @@ def test_handle_list_dir_pagination_last_page_has_more_false(
     assert result.status == "ok"
     assert len(result.entries) == 2
     assert result.has_more is False
+
+
+# ── host.create_dir handler ─────────────────────────────
+
+
+def test_handle_create_dir_creates_directory(tmp_path: Path) -> None:
+    """
+    Verify ``_handle_create_dir`` makes the directory and returns its
+    absolute path.
+
+    This is the picker's "New folder" happy path — the returned path
+    is what the picker navigates into afterward.
+    """
+    host = _make_host_process()
+    target = tmp_path / "new-app"
+
+    result = host._handle_create_dir(HostCreateDirFrame(request_id="m1", path=str(target)))
+
+    assert isinstance(result, HostCreateDirResultFrame)
+    assert result.status == "ok"
+    assert result.error is None
+    assert result.path == str(target)
+    assert target.is_dir()
+
+
+def test_handle_create_dir_creates_missing_parents(tmp_path: Path) -> None:
+    """
+    Verify missing parent directories are created (``os.makedirs``).
+
+    Lets the picker accept a nested name like ``a/b/c`` in one go
+    rather than forcing the user to create each level.
+    """
+    host = _make_host_process()
+    target = tmp_path / "a" / "b" / "c"
+
+    result = host._handle_create_dir(HostCreateDirFrame(request_id="m2", path=str(target)))
+
+    assert result.status == "ok"
+    assert target.is_dir()
+
+
+def test_handle_create_dir_existing_returns_error_not_failed(tmp_path: Path) -> None:
+    """
+    Verify creating an existing directory returns ``status: "ok"`` with
+    an "already exists" error rather than ``status: "failed"``.
+
+    The route maps a non-empty ``error`` to a 409 so the picker shows
+    "directory already exists" inline; surfacing ``failed`` would 502
+    instead.
+    """
+    host = _make_host_process()
+    existing = tmp_path / "dup"
+    existing.mkdir()
+
+    result = host._handle_create_dir(HostCreateDirFrame(request_id="m3", path=str(existing)))
+
+    assert result.status == "ok"
+    assert result.error == "directory already exists"
+    assert result.path is None
+
+
+def test_handle_create_dir_leaf_is_file_reports_file_not_directory(tmp_path: Path) -> None:
+    """
+    Verify a regular file at the target path reports a file, not a
+    directory.
+
+    ``os.makedirs`` raises ``FileExistsError`` for both an existing
+    directory and an existing file; the handler must distinguish them
+    so the picker doesn't mislabel "a file is in the way" as
+    "directory already exists".
+    """
+    host = _make_host_process()
+    a_file = tmp_path / "taken"
+    a_file.write_text("hi")
+
+    result = host._handle_create_dir(HostCreateDirFrame(request_id="m3b", path=str(a_file)))
+
+    assert result.status == "ok"
+    assert result.error == "a file already exists at that path"
+    assert result.path is None
+
+
+def test_handle_create_dir_parent_is_file_returns_error(tmp_path: Path) -> None:
+    """
+    Verify creating under a path whose parent is a regular file returns
+    a clean error rather than crashing.
+    """
+    host = _make_host_process()
+    a_file = tmp_path / "file.txt"
+    a_file.write_text("hi")
+    target = a_file / "child"
+
+    result = host._handle_create_dir(HostCreateDirFrame(request_id="m4", path=str(target)))
+
+    assert result.status == "ok"
+    assert "not a directory" in (result.error or "")
+    assert result.path is None
+
+
+def test_handle_create_dir_expands_tilde(tmp_path: Path, monkeypatch) -> None:
+    """
+    Verify ``~`` expands against the host process owner's home.
+
+    The host owns ``~`` resolution; without expansion ``~/scratch``
+    would become a literal ``~`` subdir of the process cwd.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    host = _make_host_process()
+    result = host._handle_create_dir(HostCreateDirFrame(request_id="m5", path="~/scratch"))
+
+    assert result.status == "ok"
+    assert (tmp_path / "scratch").is_dir()
+    assert result.path == str(tmp_path / "scratch")
 
 
 # --- Fail-loud on permanent tunnel failures ----------------------------

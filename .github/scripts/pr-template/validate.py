@@ -107,6 +107,7 @@ def _contains_placeholder(text: str) -> bool:
 
 
 def validate_pr_body(body: str) -> ValidationResult:
+    body = body.lstrip("\ufeff")
     errors: list[str] = []
 
     spans = _heading_spans(body)

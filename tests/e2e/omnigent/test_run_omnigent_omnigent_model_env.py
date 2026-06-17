@@ -12,6 +12,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from tests.e2e._run_with_group_timeout import run_with_group_timeout
+
 _VALID_MODEL = "databricks-gpt-5-4-mini"
 
 # ``databricks-gpt-`` prefix is load-bearing on two counts:
@@ -25,7 +27,22 @@ _VALID_MODEL = "databricks-gpt-5-4-mini"
 _BOGUS_MODEL = "databricks-gpt-this-model-does-not-exist-omnigent-env-test-9f3a"
 
 _PROMPT = "say hi in 5 words"
-_RUN_TIMEOUT_SEC = 180.0
+# Wall-clock budget for the subprocess. ``omnigent run`` spawns the
+# AP server + runner as grandchildren, so a plain ``subprocess.run``
+# timeout could not reap them — the grandchildren kept the captured
+# pipe open and ``communicate()`` wedged the shard ~15+ min past the
+# nominal timeout (the bug that suppressed
+# ``test_omnigent_model_env_var_bogus_value_fails_with_named_error``).
+# ``run_with_group_timeout`` SIGKILLs the whole process group at the
+# deadline, so the budget below is a hard ceiling regardless of how
+# the grandchildren behave. A bogus model 404s on the first FM API
+# call (404 is not in the SDK's retryable set), so the negative case
+# resolves in seconds; the positive sibling is one short turn. 120s
+# covers server+runner cold-start plus a slow gateway day on the
+# positive path while staying under the CI per-test --timeout=180
+# cap, so the group cleanup fires before pytest's thread-timeout
+# gives up. Either way the shard can no longer wedge for minutes.
+_RUN_TIMEOUT_SEC = 120.0
 _MIN_ASSISTANT_CHARS = 4
 
 _MINIMAL_YAML = (
@@ -48,15 +65,25 @@ def _run_omnigent_with_model_env(
     ``hello_world.yaml`` would defeat the test because that file declares
     ``executor.model``, which short-circuits the env-var fallback gate.
 
+    Uses :func:`run_with_group_timeout` rather than ``subprocess.run``
+    because ``omnigent run`` spawns the AP server + runner as
+    grandchildren in the same process group; a stock ``subprocess.run``
+    timeout only kills the immediate child, leaving the grandchildren to
+    hold the captured pipe open and wedge ``communicate()`` long past the
+    deadline.
+
     :param model_env_value: ``OMNIGENT_MODEL`` value (real or bogus).
     :param tmp_path: Per-test tmp dir for the minimal YAML.
     :returns: Subprocess result with stdout/stderr captured as text.
+    :raises subprocess.TimeoutExpired: When the run exceeds
+        ``_RUN_TIMEOUT_SEC``; the whole process group is SIGKILLed and
+        any captured stdout/stderr is attached to the exception.
     """
     yaml_path = tmp_path / "hello_world_no_executor.yaml"
     yaml_path.write_text(_MINIMAL_YAML)
     env = dict(omnigent_credentials_env)
     env["OMNIGENT_MODEL"] = model_env_value
-    return subprocess.run(
+    return run_with_group_timeout(
         [
             str(omnigent_python),
             "-m",

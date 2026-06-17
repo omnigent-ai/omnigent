@@ -10,7 +10,7 @@ name: CI
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
     paths-ignore: ['ap-web/**']
   push:
     branches:
@@ -87,11 +87,19 @@ jobs:
             workers: "4"
           - group: spec-llms
             paths: tests/spec tests/llms
+          # Integration journey tests (mock LLM, no API key needed).
+          # workers=0 (serial): session-scoped live_server + mock_llm_server
+          # fixtures spawn subprocesses that must share one mock server;
+          # xdist workers would each create their own session fixtures.
+          - group: integration-mock
+            paths: tests/integration
+            workers: "0"
           # Catch-all so new top-level tests/<dir>/ are covered automatically.
           - group: misc
             paths: >-
               tests
               --ignore=tests/e2e
+              --ignore=tests/integration
               --ignore=tests/runtime
               --ignore=tests/inner
               --ignore=tests/tools
@@ -118,13 +126,14 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Install ripgrep + bubblewrap
+      - name: Install ripgrep + bubblewrap + tmux
         # ripgrep: the Grep tool prefers it. bubblewrap: the linux_bwrap sandbox
-        # needs it. apparmor sysctl: Ubuntu 24.04 blocks unprivileged user
-        # namespaces that bwrap needs; scope is the ephemeral runner.
+        # needs it. tmux: the integration-mock shard spawns harness terminals.
+        # apparmor sysctl: Ubuntu 24.04 blocks unprivileged user namespaces
+        # that bwrap needs; scope is the ephemeral runner.
         run: |
           sudo apt-get update
-          sudo apt-get install -y ripgrep bubblewrap
+          sudo apt-get install -y ripgrep bubblewrap tmux
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Cache virtualenv
@@ -144,12 +153,15 @@ jobs:
           PYTHONFAULTHANDLER: "1"
           PYTEST_PROGRESS_LOG_DIR: artifacts/progress
           OMNIGENT_TOKEN_USAGE_JSON: artifacts/tokens-${{ matrix.group }}.json
-          COVERAGE_FILE: artifacts/.coverage.${{ matrix.group }}
+          # Outside the repo: coverage.py's transient `.coverage.*` files
+          # under the ro-bound cwd raced the sandbox's dotfile masker. Staged
+          # back into artifacts/ below for the coverage-report job.
+          COVERAGE_FILE: ${{ runner.temp }}/omnigent-coverage/.coverage.${{ matrix.group }}
           # sysmon: the default C-trace coverage backend pushed the heaviest
           # shard past its timeout; only line coverage is collected.
           COVERAGE_CORE: sysmon
         run: |
-          mkdir -p artifacts artifacts/progress
+          mkdir -p artifacts artifacts/progress "$(dirname "$COVERAGE_FILE")"
           EXTRA_ARGS=()
           if [[ "$FORCE_ALL_TESTS" == "true" ]]; then
             EXTRA_ARGS=(--no-skip-known)
@@ -167,6 +179,17 @@ jobs:
               -v --tb=long --showlocals --log-level=INFO -r a \
               "${EXTRA_ARGS[@]}" \
               || { rc=$?; [ "$rc" -eq 5 ] && echo "::notice::No tests collected in this shard; treating as a pass." || exit "$rc"; }
+
+      - name: Stage coverage data for upload
+        if: always()
+        shell: bash
+        run: |
+          cov_file="${{ runner.temp }}/omnigent-coverage/.coverage.${{ matrix.group }}"
+          if [[ -f "$cov_file" ]]; then
+            cp "$cov_file" "artifacts/.coverage.${{ matrix.group }}"
+          else
+            echo "::notice::No coverage data file at $cov_file; nothing to stage."
+          fi
 
       - name: Upload pytest artifacts
         if: always()

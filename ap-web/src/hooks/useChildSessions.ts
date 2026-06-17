@@ -9,6 +9,11 @@ import { authenticatedFetch } from "@/lib/identity";
  */
 export const MAX_TREE_DEPTH = 3;
 
+export interface ChildSessionError {
+  code: string;
+  message: string;
+}
+
 /**
  * UI-facing child (sub-agent) session record.
  *
@@ -30,6 +35,8 @@ export interface ChildSessionInfo {
   labels?: Record<string, string>;
   /** Status of the latest task, e.g. ``"completed"``. */
   current_task_status: string | null;
+  /** Durable error details from the latest failed child run. */
+  last_task_error?: ChildSessionError | null;
   /** True when the latest task is in an active (queued/in_progress) state. */
   busy: boolean;
   /**
@@ -58,6 +65,7 @@ interface ChildSessionWire {
   session_name: string | null;
   labels?: Record<string, string>;
   current_task_status: string | null;
+  last_task_error?: ChildSessionError | null;
   busy: boolean;
   last_message_preview?: string | null;
   pending_elicitations_count?: number;
@@ -135,6 +143,14 @@ export function executionLogTabKey(idOrMain: string): string {
   return `executionLog:${idOrMain}`;
 }
 
+function parseChildSessionError(value: unknown): ChildSessionError | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  if (typeof record.code !== "string" || typeof record.message !== "string") return null;
+  if (!record.code || !record.message) return null;
+  return { code: record.code, message: record.message };
+}
+
 interface UseChildSessionsResult {
   children: ChildSessionInfo[];
   isLoading: boolean;
@@ -160,6 +176,7 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
     session_name: row.session_name,
     labels: row.labels ?? {},
     current_task_status: row.current_task_status,
+    last_task_error: parseChildSessionError(row.last_task_error),
     busy: row.busy,
     last_message_preview: row.last_message_preview ?? null,
     pending_elicitations_count: row.pending_elicitations_count ?? 0,

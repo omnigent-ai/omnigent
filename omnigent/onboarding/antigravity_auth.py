@@ -12,12 +12,83 @@ key from being mis-consumed by claude-sdk / codex / pi / openai-agents. Mirrors
 
 from __future__ import annotations
 
+import importlib.util
+import shutil
+import subprocess
+import sys
+
 from omnigent.errors import OmnigentError
 from omnigent.onboarding.provider_config import load_config, resolve_secret
 
 # Stable secret-store name (and thus ``keychain:<name>``) so setup and the
 # resolver agree.
 ANTIGRAVITY_SECRET_NAME = "antigravity"
+
+# The Gemini-native SDK (``google-antigravity``) ships in an OPTIONAL extra, so a
+# user can configure the ``antigravity:`` key in setup and still have no SDK to run
+# the harness; setup surfaces this command when the extra is missing. (Cursor needs
+# no parallel: ``cursor-sdk`` is a baseline dep.) The literal brackets must be
+# escaped on any markup-rendered surface.
+ANTIGRAVITY_EXTRA = "antigravity"
+ANTIGRAVITY_EXTRA_INSTALL_COMMAND = 'pip install "omnigent[antigravity]"'
+
+
+def antigravity_sdk_installed() -> bool:
+    """Return whether the ``google-antigravity`` SDK (the optional extra) is importable.
+
+    Setup uses this to detect a missing SDK and offer to install it. Mirrors
+    :func:`omnigent.onboarding.databricks_config.databricks_sdk_installed`: uses
+    :func:`importlib.util.find_spec` to avoid importing the heavy SDK, and guards the
+    ``ModuleNotFoundError`` ``find_spec`` raises when the parent ``google`` namespace
+    package is absent (it raises instead of returning ``None``).
+
+    :returns: ``True`` when ``google.antigravity`` is importable.
+    """
+    try:
+        return importlib.util.find_spec("google.antigravity") is not None
+    except ModuleNotFoundError:
+        # Raised (not None) when the parent `google` namespace package is absent.
+        return False
+
+
+def antigravity_install_command() -> list[str]:
+    """Return the argv that installs the ``antigravity`` extra into this env.
+
+    Prefers ``uv pip install`` when ``uv`` is on ``PATH``, else this interpreter's own
+    pip (``sys.executable -m pip``) so the package lands in the running install.
+    Deliberately carries **no index URL**: pip/uv pick up the user's own configured
+    index, so a private proxy is honored without hardcoding one into committed code.
+
+    :returns: The install argv, e.g.
+        ``["uv", "pip", "install", "omnigent[antigravity]"]`` or
+        ``[sys.executable, "-m", "pip", "install", "omnigent[antigravity]"]``.
+    """
+    target = f"omnigent[{ANTIGRAVITY_EXTRA}]"
+    if shutil.which("uv") is not None:
+        return ["uv", "pip", "install", target]
+    return [sys.executable, "-m", "pip", "install", target]
+
+
+def install_antigravity_sdk() -> bool:
+    """Install the ``antigravity`` extra; return whether the SDK is now present.
+
+    Shells out to :func:`antigravity_install_command` and re-checks
+    :func:`antigravity_sdk_installed`. Surfaces pip/uv output (no capture) so a failing
+    install is visible. Mirrors
+    :func:`omnigent.onboarding.harness_install.install_harness_cli`.
+
+    :returns: ``True`` when ``google.antigravity`` is importable after the attempt;
+        ``False`` when the install failed to spawn, timed out, or the SDK is still
+        absent.
+    """
+    try:
+        subprocess.run(antigravity_install_command(), check=False, timeout=600)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    # Invalidate import caches so a just-installed package is seen without a restart.
+    importlib.invalidate_caches()
+    return antigravity_sdk_installed()
+
 
 # The dedicated top-level config block and the field that references the key.
 ANTIGRAVITY_CONFIG_KEY = "antigravity"

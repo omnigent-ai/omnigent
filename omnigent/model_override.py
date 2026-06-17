@@ -116,7 +116,7 @@ def model_family_mismatch(harness: str, model: str) -> str | None:
         return (
             f"harness {canon!r} only runs Claude models (id containing "
             f"'claude'); got {model!r}. Use the codex worker for GPT models "
-            "or the pi worker for any other gateway model."
+            "or the pi / openai-agents worker for any other gateway model."
         )
     if canon in _CODEX_FAMILY_HARNESSES and not is_gpt:
         return (

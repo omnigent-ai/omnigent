@@ -30,7 +30,8 @@ dependencies = [
     # Merged from omnigent + omnigent.
     "pyyaml>=6.0,<7",
     "openai>=1.0,<3",
-    "rich>=13.0,<14",
+    # >=14: the `e2b` extra's SDK (>=2.26) needs rich>=14 (was >=13,<14).
+    "rich>=14,<15",
     "prompt_toolkit>=3.0,<4",
     "mcp>=1.0,<2",
     "starlette>=0.27,<1",
@@ -42,9 +43,10 @@ dependencies = [
     "psutil>=5.9,<8",
     # CEL (Common Expression Language) for inline policy evaluation.
     # Non-Turing-complete, side-effect-free, guaranteed to terminate.
-    # No ARM64 Linux wheel; excluded on aarch64 so installation succeeds.
-    # The CEL policy module degrades gracefully when the library is absent.
-    'cel-expr-python>=0.1; platform_machine != "aarch64"',
+    # No wheels for Linux aarch64 or macOS x86_64 (Intel); excluded so
+    # installation succeeds. The CEL policy module degrades gracefully
+    # when the library is absent.
+    'cel-expr-python>=0.1; platform_machine != "aarch64" and (sys_platform != "darwin" or platform_machine != "x86_64")',
     # OS keychain for storing model-provider API keys (OSS model
     # selection). Used by omnigent/onboarding/secrets.py; falls back to
     # a 0600 file when no keyring backend is available (e.g. headless).
@@ -116,6 +118,10 @@ daytona = ["daytona>=0.180,<1"]
 # server-managed `sandbox.provider: cwsandbox`).
 # Same lazy-import posture as above. Pre-1.0 SDK: pin minor.
 cwsandbox = ["cwsandbox>=0.24,<1"]
+# E2B sandbox launcher (`omnigent sandbox --provider e2b` and
+# server-managed `sandbox.provider: e2b`).
+# Same lazy-import posture as above.
+e2b = ["e2b>=2.26,<3"]
 # MLflow tracing is opt-in: tracing is disabled by default and the
 # server degrades gracefully when mlflow is absent, so the (heavy) mlflow
 # dependency only installs for users who want it (`omnigent[tracing]`).
@@ -475,6 +481,12 @@ ignore_missing_imports = true
 # posture as modal above.
 [[tool.mypy.overrides]]
 module = "cwsandbox.*"
+ignore_missing_imports = true
+
+# e2b is an optional dep (the `e2b` extra); same lazy-import posture as
+# modal above.
+[[tool.mypy.overrides]]
+module = "e2b.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

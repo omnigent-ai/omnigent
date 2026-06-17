@@ -1,22 +1,32 @@
 """Phase 0 characterization test — REPL smoke under pexpect.
 
 Spawns ``omnigent run <yaml>`` under a PTY, waits for the
-REPL to reach its initial ``state: sleeping`` marker, types a
-prompt, awaits the turn completion, then exits cleanly via
-Ctrl+D. Proves the REPL's basic input/output pipeline works
-end-to-end. The full key-binding / overview / interrupt matrix
-lands in follow-ups per the design doc.
+REPL's ``❯`` input prompt, types a prompt, awaits the turn
+completion, then exits cleanly via Ctrl+D. Proves the REPL's
+basic input/output pipeline works end-to-end. The full
+key-binding / overview / interrupt matrix lands in follow-ups
+per the design doc.
+
+Synchronization contract (post REPL UI refactor): the turn is
+driven off the visible ``⠹ working`` activity line and the
+``❯`` input prompt that re-renders when the turn settles —
+the same markers the green Ctrl+R / ``/model`` e2e tests use.
+The old bottom-right ``state: running``/``state: sleeping``
+badge is no longer a reliable pexpect signal: it sits at the
+far edge of the toolbar and is truncated/CPR-suppressed under
+a PTY. Likewise the user/assistant turns now render as a ``❯``
+echo and a ``◆ <model>`` header — the legacy ``You>`` / ``Agent>``
+banners were removed in the prompt-toolkit rewrite.
 
 **What breaks if this fails:**
 - ``omnigent.cli._run_agent`` REPL entrypoint stops booting
   under a PTY (prompt-toolkit layout errors, terminal-type
   handling regression).
-- The REPL's state machine regresses so the status bar no
-  longer prints ``state: sleeping`` / ``state: running`` —
-  these substrings are the test's synchronization contract.
+- The REPL stops echoing the submitted prompt with its ``❯``
+  marker — the submission never reached the Session.
 - ``Session.stream_turn`` stops actually producing events
-  when driven from the REPL (turn never transitions back to
-  ``sleeping``).
+  when driven from the REPL (turn never returns to the idle
+  ``❯`` prompt).
 - Ctrl+D stops terminating the REPL cleanly (either hangs the
   subprocess or crashes on shutdown).
 
@@ -36,7 +46,6 @@ from tests.e2e.omnigent._pexpect_harness import (
     spawn_omnigent_run,
     strip_ansi,
     submit_prompt,
-    wait_for_ready,
 )
 from tests.e2e.omnigent._snapshot import compare_snapshot
 
@@ -46,8 +55,16 @@ _MODEL = resolve_model("databricks-gpt-5-mini", key=__name__)
 _HARNESS = "openai-agents"
 _PROMPT = "say hi in 5 words"
 
+# Visible turn-synchronization markers (see module docstring).
+# ``working`` is the activity-line label the REPL paints while a
+# turn streams; ``❯ `` is the input prompt it re-renders when the
+# turn settles. Both are mid-toolbar / mid-screen text that
+# survives PTY truncation, unlike the far-right ``state:`` badge.
+_RUNNING_MARKER = r"working"
+_COMPLETION_MARKER = r"❯ "
+
 # Minimum stripped-length for the turn's rendered output. The
-# REPL always echoes the prompt, the "You>" banner, spinner
+# REPL always echoes the prompt, the ``❯`` marker, spinner
 # frames, and a status line — even a failed turn produces more
 # than a few dozen characters. Setting this high enough that a
 # blank turn fails, low enough that a terse reply passes.
@@ -99,18 +116,23 @@ def test_repl_smoke_single_prompt(
         timeout=_SPAWN_TIMEOUT,
     )
     try:
-        wait_for_ready(child, timeout=_BOOT_TIMEOUT)
+        # Boot readiness: the visible ``❯`` input prompt. Prefer it
+        # over the bottom-toolbar ``state:`` badge, which CPR
+        # suppression can hide under a PTY even when the REPL is ready.
+        child.expect(_COMPLETION_MARKER, timeout=_BOOT_TIMEOUT)
         submit_prompt(child, _PROMPT)
         turn = await_turn_complete(
             child,
             running_timeout=_RUNNING_TIMEOUT,
             completion_timeout=_COMPLETION_TIMEOUT,
+            running_marker=_RUNNING_MARKER,
+            completion_pattern=_COMPLETION_MARKER,
         )
-        # Drain anything rendered between the final "state:
-        # sleeping" and Ctrl+D — the post-turn render often
-        # repaints the assistant text outside the range
-        # await_turn_complete captured. We check both the
-        # captured turn and the post-drain buffer.
+        # Drain anything rendered between the settled ``❯`` prompt
+        # and Ctrl+D — the post-turn render often repaints the
+        # assistant text outside the range await_turn_complete
+        # captured. We check both the captured turn and the
+        # post-drain buffer.
         clean_exit(child, timeout=_EXIT_TIMEOUT)
         exit_code = child.exitstatus
         signal_status = child.signalstatus
@@ -126,15 +148,12 @@ def test_repl_smoke_single_prompt(
     observed: dict[str, Any] = {
         "exit_code": exit_code,
         "signal_status": signal_status,
-        # The "You> " banner is the REPL's deterministic echo of
-        # the user's prompt; its presence proves the prompt
-        # submission reached the Session, not just the input
-        # buffer.
-        "user_banner_present": "You>" in combined_stripped,
-        # The "Agent>" banner signals the REPL rendered an
-        # assistant message. Proves the turn produced model
-        # output, not just state transitions.
-        "agent_banner_present": "Agent>" in combined_stripped,
+        # The ``❯`` marker is the REPL's deterministic echo of the
+        # user's submitted prompt (``RichBlockFormatter.user_message``
+        # renders ``❯ <text>``); its presence with the prompt text
+        # proves the submission reached the Session, not just the
+        # input buffer. Replaces the removed ``You>`` banner.
+        "user_prompt_echoed": "❯" in combined_stripped and _PROMPT in combined_stripped,
     }
     diffs = compare_snapshot("test_repl_smoke", observed)
     assert diffs == [], (

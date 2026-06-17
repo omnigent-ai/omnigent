@@ -19,7 +19,7 @@ vi.mock("@/hooks/usePolicies", () => ({
   useDeletePolicy: () => ({ mutate: deleteMutate }),
 }));
 
-import { AgentInfoButton, AgentInfoContent } from "./AgentInfo";
+import { AgentInfoButton, AgentInfoContent, agentDisplayLabel } from "./AgentInfo";
 
 afterEach(() => {
   cleanup();
@@ -353,5 +353,37 @@ describe("SessionPoliciesSection", () => {
     expect(
       within(dialog).getByText("All available policies are already applied."),
     ).toBeInTheDocument();
+  });
+});
+
+describe("agentDisplayLabel", () => {
+  it("maps native wrapper slugs to their display name", () => {
+    expect(agentDisplayLabel("pi-native-ui")).toBe("Pi");
+    expect(agentDisplayLabel("claude-native-ui")).toBe("Claude");
+    expect(agentDisplayLabel("codex-native-ui")).toBe("Codex");
+  });
+
+  it("strips the fork/switch clone suffix before resolving the native label", () => {
+    // Fork/switch routes clone a bound agent as "<name> (fork|switch <id>)".
+    // The label must still resolve to "Pi" rather than the capitalized raw
+    // slug "Pi-native-ui …" shown in the in-session model picker.
+    expect(agentDisplayLabel("pi-native-ui (fork conv_ab12)")).toBe("Pi");
+    expect(agentDisplayLabel("pi-native-ui (switch conv_ab12)")).toBe("Pi");
+    expect(agentDisplayLabel("claude-native-ui (fork conv_ab12)")).toBe("Claude");
+    expect(agentDisplayLabel("codex-native-ui (switch conv_ab12)")).toBe("Codex");
+  });
+
+  it("strips EVERY clone layer of a fork-of-a-fork before resolving", () => {
+    // A fork of a fork nests suffixes. A single-layer strip would leave
+    // "pi-native-ui (fork conv_a)" — no native match → the raw slug leaks
+    // into the model picker. agentRootName peels every layer to the root.
+    expect(agentDisplayLabel("pi-native-ui (fork conv_a) (fork conv_b)")).toBe("Pi");
+    expect(agentDisplayLabel("claude-native-ui (fork conv_a) (switch conv_b)")).toBe("Claude");
+    expect(agentDisplayLabel("polly (fork conv_a) (fork conv_b)")).toBe("Polly");
+  });
+
+  it("capitalizes non-native names and strips their clone suffix", () => {
+    expect(agentDisplayLabel("polly")).toBe("Polly");
+    expect(agentDisplayLabel("polly (fork conv_ab12)")).toBe("Polly");
   });
 });

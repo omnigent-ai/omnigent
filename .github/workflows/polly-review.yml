@@ -1,0 +1,377 @@
+name: Polly AI Review
+
+# Spins up a local Omnigent server + runner inside the CI runner, starts a
+# Polly session with the PR diff, waits for the cross-vendor review to
+# complete, and posts the findings as a PR comment. Uses the same LLM
+# gateway secrets as the e2e suite (LLM_API_KEY + GATEWAY_BASE_URL).
+# Draft PRs are skipped (ready_for_review re-fires).
+#
+# Triggers:
+#   - pull_request opened/reopened/ready_for_review (automatic, once per PR)
+#   - `/review` comment on a PR (manual retrigger by write-access users)
+#   - workflow_dispatch with a PR number (manual retrigger from Actions tab)
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: PR number to review.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: polly-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
+  cancel-in-progress: true
+
+env:
+  OMNIGENT_SKIP_WEB_UI: "true"
+  UV_INDEX_URL: https://pypi.org/simple
+  PIP_INDEX_URL: https://pypi.org/simple
+
+jobs:
+  # Security precondition gate (security-gate.yml): untrusted PRs wait for
+  # the scan; trusted authors pass through. Only runs on pull_request events
+  # — issue_comment and workflow_dispatch are already gated by write-access
+  # (author_association check + GitHub's own dispatch auth) and never check
+  # out PR code, so the scan is not applicable.
+  gate:
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/security-gate.yml
+
+  review:
+    name: Polly AI Review
+    needs: gate
+    # Fire on non-draft PRs (after gate passes), `/review` comments by
+    # write-access users, or workflow_dispatch. The `!cancelled()` ensures
+    # the job runs when gate is skipped (non-PR events) but not when it fails.
+    if: >-
+      !cancelled() && (
+        (
+          github.event_name == 'pull_request' &&
+          !github.event.pull_request.draft &&
+          needs.gate.result == 'success'
+        ) ||
+        (
+          github.event_name == 'issue_comment' &&
+          github.event.issue.pull_request != null &&
+          contains(github.event.comment.body, '/review') &&
+          !endsWith(github.actor, '[bot]') &&
+          (
+            github.event.comment.author_association == 'OWNER' ||
+            github.event.comment.author_association == 'MEMBER' ||
+            github.event.comment.author_association == 'COLLABORATOR'
+          )
+        ) ||
+        github.event_name == 'workflow_dispatch'
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Validate /review command
+        id: trigger
+        if: github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          # Validate `/review` appears as a command (first non-space token on a line).
+          if ! grep -qE '^[[:space:]]*/review([[:space:]]|$)' <<<"$COMMENT_BODY"; then
+            echo "::notice::Comment mentions '/review' but not as a command; skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # React with eyes to acknowledge.
+          gh api "repos/$REPO/issues/comments/$COMMENT_ID/reactions" \
+            -f content=eyes --silent || true
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Check LLM credentials available
+        if: steps.trigger.outputs.skip != 'true'
+        id: creds
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          if [ -z "$LLM_API_KEY" ]; then
+            echo "::notice::Skipping Polly review — LLM credentials not available (fork PR or missing secrets)."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve PR number
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        id: pr
+        run: |
+          set -euo pipefail
+          case "${{ github.event_name }}" in
+            issue_comment)      echo "pr_number=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT" ;;
+            workflow_dispatch)   echo "pr_number=${{ inputs.pr }}" >> "$GITHUB_OUTPUT" ;;
+            *)                  echo "pr_number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      # Always check out the default branch (trusted). The PR diff is
+      # fetched via the API — we never execute PR-authored code. This
+      # avoids the TOCTOU issue CodeQL flags when issue_comment checks
+      # out untrusted PR code in a privileged workflow.
+      - name: Check out repo
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Set up Python
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version-file: ".python-version"
+
+      - name: Set up uv
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        uses: astral-sh/setup-uv@8d55fbecc275b1c35dbe060458839f8d30439ccf  # v3
+        with:
+          enable-cache: true
+
+      - name: Install bubblewrap
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        # bubblewrap: the linux_bwrap sandbox backend needs bwrap on PATH.
+        # apparmor sysctl: Ubuntu 24.04 blocks unprivileged user namespaces
+        # that bwrap's unshare(CLONE_NEWUSER) needs; scope is the ephemeral runner.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap tmux
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Cache virtualenv
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
+
+      - name: Install dependencies
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        run: uv sync --extra all --extra dev
+
+      - name: Install Claude Code CLI
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/.cc-cli" && cd "${GITHUB_WORKSPACE}/.cc-cli"
+          npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.170
+          node node_modules/@anthropic-ai/claude-code/install.cjs
+          echo "${GITHUB_WORKSPACE}/.cc-cli/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Install Codex CLI
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/.codex-cli" && cd "${GITHUB_WORKSPACE}/.codex-cli"
+          npm install --ignore-scripts --no-audit --no-fund @openai/codex@0.128.0-alpha.1
+          echo "${GITHUB_WORKSPACE}/.codex-cli/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Set LLM credentials
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: echo "LLM_API_KEY=${LLM_API_KEY}" >> "$GITHUB_ENV"
+
+      - name: Write gateway profile (~/.databrickscfg)
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        env:
+          GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          # Use python to write the config safely — avoids interpolating
+          # secrets into a heredoc where special chars could break YAML.
+          python3 -c "
+          import pathlib, os
+          cfg = '[default]\nhost  = {host}\ntoken = {token}\n'.format(
+              host=os.environ['GATEWAY_BASE_URL'].removesuffix('/serving-endpoints'),
+              token=os.environ['LLM_API_KEY'],
+          )
+          pathlib.Path.home().joinpath('.databrickscfg').write_text(cfg)
+          "
+          echo "DATABRICKS_BEARER=${LLM_API_KEY}" >> "$GITHUB_ENV"
+
+      - name: Write Omnigent provider config
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        env:
+          GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+        run: |
+          mkdir -p "$HOME/.omnigent"
+          # Use python to write the config safely — avoids interpolating
+          # secrets/URLs into a heredoc where special chars could break YAML.
+          # Uses json (stdlib) instead of yaml to avoid needing PyYAML on
+          # the system python; the output is valid YAML (JSON is a subset).
+          python3 -c "
+          import pathlib, os, json
+          gw = os.environ['GATEWAY_BASE_URL']
+          host = gw.removesuffix('/serving-endpoints')
+          cfg = {
+              'providers': {
+                  'databricks-gateway': {
+                      'kind': 'gateway',
+                      'default': ['anthropic', 'openai'],
+                      'anthropic': {
+                          'base_url': gw + '/anthropic',
+                          'api_key_ref': 'env:LLM_API_KEY',
+                          'models': {'default': 'databricks-claude-sonnet-4-6'},
+                      },
+                      'openai': {
+                          'base_url': host + '/ai-gateway/codex/v1',
+                          'api_key_ref': 'env:LLM_API_KEY',
+                          'wire_api': 'responses',
+                          'models': {'default': 'databricks-gpt-5-4-mini'},
+                      },
+                  }
+              }
+          }
+          pathlib.Path.home().joinpath('.omnigent', 'config.yaml').write_text(
+              json.dumps(cfg, indent=2)
+          )
+          "
+
+      - name: Collect PR context
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        id: ctx
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          # Fetch the diff (capped at 64 KB to stay within prompt limits).
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
+            -H "Accept: application/vnd.github.v3.diff" \
+            | head -c 65536 > /tmp/pr_diff.txt
+
+          # Fetch PR metadata to separate files — avoids embedding
+          # attacker-controlled strings (PR title/body) into heredocs.
+          gh pr view "$PR_NUMBER" --repo "$REPO" \
+            --json title,body,baseRefName,headRefName,additions,deletions,changedFiles \
+            > /tmp/pr_meta.json
+
+          # Build the review prompt safely using python — all untrusted
+          # fields (title, body, diff) are read from files, never
+          # interpolated into shell heredocs.
+          python3 <<'PYEOF'
+          import json, pathlib
+
+          meta = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
+          diff = pathlib.Path("/tmp/pr_diff.txt").read_text()
+
+          prompt = f"""Review this pull request and provide structured feedback.
+
+          ## PR Metadata
+          - **Title:** {meta['title']}
+          - **Branch:** {meta['headRefName']} → {meta['baseRefName']}
+          - **Stats:** +{meta['additions']} / -{meta['deletions']} across {meta['changedFiles']} file(s)
+
+          ## PR Description
+          {(meta.get('body') or '')[:4096]}{"  *(truncated)*" if len(meta.get('body') or '') > 4096 else ""}
+
+          ## Diff
+          ```diff
+          {diff}
+          ```
+
+          ## Instructions
+          Review the diff against the PR description. Report:
+          1. **Blocking issues** — bugs, security problems, correctness errors, data loss risks.
+          2. **Security analysis** — carefully check the security implications of the changes. Look for injection vulnerabilities (SQL, command, template), authentication/authorization bypasses, secret exposure, unsafe deserialization, path traversal, SSRF, and any change that weakens an existing security boundary. Flag even subtle issues.
+          3. **Non-blocking suggestions** — style, naming, performance, test coverage gaps.
+          4. **Summary** — one-paragraph overall assessment.
+
+          Be concise. Do not restate the diff. Focus on what matters.
+
+          IMPORTANT: Your output will be posted directly as a PR comment. Output
+          ONLY the final structured review — no coordination messages, no status
+          updates about dispatching sub-agents, no "waiting for results" narration.
+          Start your response with the review content itself.
+          """
+          pathlib.Path("/tmp/review_prompt.txt").write_text(prompt)
+          PYEOF
+
+      - name: Run Polly review
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        id: polly
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          prompt=$(cat /tmp/review_prompt.txt)
+
+          # Run Polly headlessly with -p; it starts a local server, sends
+          # one turn, prints the assistant response, and exits.
+          # --no-session: ephemeral run, no persistent session state.
+          uv run omnigent run examples/polly/ \
+            -p "$prompt" \
+            --no-session \
+            2>polly-stderr.log \
+            | tee /tmp/polly_output.txt \
+            || { echo "::warning::Polly review exited non-zero"; cat polly-stderr.log; }
+
+          # Use a collision-resistant random delimiter so model output
+          # containing "REVIEW_EOF" cannot truncate the output.
+          delim="REVIEW_$(openssl rand -hex 8)"
+          echo "review_text<<${delim}" >> "$GITHUB_OUTPUT"
+          # Cap at 60 KB — GitHub comment body limit is ~65 KB.
+          head -c 61440 /tmp/polly_output.txt >> "$GITHUB_OUTPUT"
+          echo "${delim}" >> "$GITHUB_OUTPUT"
+
+      - name: Post review comment
+        if: steps.polly.outputs.review_text != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          REVIEW_TEXT: ${{ steps.polly.outputs.review_text }}
+          RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          set -euo pipefail
+
+          # Build the comment body safely — REVIEW_TEXT is passed via env
+          # (not expression interpolation) to avoid expression injection.
+          {
+            echo "<!-- polly-review-bot -->"
+            echo "## <img src=\"https://raw.githubusercontent.com/omnigent-ai/omnigent/main/docs/images/omnigent-logo.svg\" alt=\"\" height=\"20\" valign=\"middle\" /> Polly AI Review"
+            echo ""
+            echo "$REVIEW_TEXT"
+            echo ""
+            echo "---"
+            echo "<sub>Automated review by Polly · [workflow run](${RUN_URL})</sub>"
+          } > /tmp/comment.md
+
+          # Post a fresh comment for every review run, so each trigger (push,
+          # `/review` comment, or maintainer approval) is visible in the thread
+          # and notifies watchers — no in-place upsert of a prior comment.
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/comment.md
+          echo "Created new comment"
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: polly-review-logs-${{ github.run_id }}
+          path: |
+            polly-stderr.log
+            /tmp/polly_output.txt
+          retention-days: 7
+          if-no-files-found: ignore

@@ -93,6 +93,7 @@ _DATABRICKS_MODEL_MAP: dict[str, str] = {
 # at them from elsewhere in the repo.
 _CLAUDE_CODER_DIR = _REPO_ROOT / "tests" / "resources" / "agents" / "claude-coder"
 _OPENAI_CODER_DIR = _REPO_ROOT / "tests" / "resources" / "examples" / "openai-coder"
+_SANDBOX_DEPS_OS_ENV_DIR = _REPO_ROOT / "tests" / "resources" / "agents" / "sandbox-deps-os-env"
 _SYS_TERMINAL_TEST_DIR = _REPO_ROOT / "tests" / "resources" / "agents" / "sys-terminal-test"
 # A plain claude-sdk chat agent seeded as a BUILT-IN (via the server's
 # OMNIGENT_BUILTIN_AGENT_DIRS hook) so fork-switch e2e tests have a
@@ -171,24 +172,188 @@ def llm_api_key(request: pytest.FixtureRequest) -> str:
 
     The option itself is declared at the top-level ``tests/conftest.py``
     so both ``tests/e2e/`` and ``tests/frontends/`` share one declaration.
-    e2e tests fail loud when the option is missing — declaring ``required=True``
-    on the option would block collection of the rest of the suite, so we
-    enforce it here at fixture resolution instead.
+    When ``--llm-api-key`` is omitted, falls back to ``"mock-key"`` so
+    tests run against the mock LLM server without real credentials.
 
     :param request: Pytest request object.
-    :returns: The API key string.
-    :raises pytest.UsageError: When ``--llm-api-key`` is missing.
+    :returns: The API key string, or ``"mock-key"`` when unset.
     """
     key: str | None = request.config.getoption("--llm-api-key")
     if key is None:
-        raise pytest.UsageError(
-            "tests/e2e/ requires --llm-api-key <KEY>. "
-            "For Databricks (--profile <name>): pass a workspace "
-            "PAT for that profile; model defaults to "
-            "databricks-gpt-5-4-mini (OpenAI harness) or "
-            "databricks-claude-sonnet-4-6 (Claude harness)."
-        )
+        return "mock-key"
     return key
+
+
+@pytest.fixture(scope="session")
+def using_mock_llm(request: pytest.FixtureRequest) -> bool:
+    """True when no real ``--llm-api-key`` was provided.
+
+    Tests can use this to skip assertions that only make sense with
+    a real LLM, or to pre-configure the mock server's response queue.
+
+    :param request: Pytest fixture request.
+    :returns: Whether the mock LLM server is in use.
+    """
+    return request.config.getoption("--llm-api-key") is None
+
+
+@pytest.fixture(scope="session")
+def mock_llm_server_url(
+    using_mock_llm: bool,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[str | None]:
+    """
+    Start a mock LLM server when running without a real API key.
+
+    The mock server implements ``POST /v1/responses`` with pre-canned
+    SSE responses. Tests configure it via ``POST /mock/configure``
+    before each turn. When a real ``--llm-api-key`` is provided,
+    yields ``None`` (real LLM path).
+
+    :param using_mock_llm: Whether mock mode is active.
+    :param tmp_path_factory: Pytest temp path factory for logs.
+    :returns: The mock server base URL, or ``None``.
+    """
+    if not using_mock_llm:
+        yield None
+        return
+
+    mock_port = find_free_port()
+    mock_log = tmp_path_factory.mktemp("mock_llm_logs") / "mock_llm.log"
+    log_handle = open(mock_log, "w")  # noqa: SIM115
+
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(_REPO_ROOT / "tests" / "server" / "integration" / "mock_llm_server.py"),
+            str(mock_port),
+        ],
+        env={**os.environ, "PYTHONPATH": str(_REPO_ROOT)},
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+    )
+    base_url = f"http://127.0.0.1:{mock_port}"
+
+    # Wait for the mock server to be ready
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        try:
+            resp = httpx.get(f"{base_url}/stats", timeout=1.0)
+            if resp.status_code == 200:
+                break
+        except httpx.ConnectError:
+            # Expected while the mock server is still booting.
+            continue
+        time.sleep(0.1)
+    else:
+        proc.kill()
+        log_handle.close()
+        log_contents = mock_log.read_text() if mock_log.exists() else ""
+        raise RuntimeError(
+            f"Mock LLM server didn't start within 10s.\nLog at {mock_log}:\n{log_contents[-2000:]}"
+        )
+
+    try:
+        yield base_url
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        log_handle.close()
+
+
+def configure_mock_llm(
+    mock_llm_server_url: str | None,
+    responses: list[dict[str, Any]],
+    *,
+    key: str = "default",
+) -> None:
+    """
+    Configure a keyed response queue on the mock LLM server.
+
+    No-op when running against a real LLM. Each dict in *responses*
+    maps to a ``QueuedResponse`` on the mock server. The *key*
+    determines which queue the responses are stored in — the mock
+    server routes each ``POST /v1/responses`` request to the queue
+    whose key matches the request's ``model`` field.
+
+    Use different keys to give each agent its own response stream::
+
+        # Parent agent uses "mock-parent" model
+        configure_mock_llm(url, [{"text": "spawning reviewer..."}],
+                           key="mock-parent")
+        # Sub-agent uses "mock-reviewer" model
+        configure_mock_llm(url, [{"text": "LGTM"}],
+                           key="mock-reviewer")
+
+    :param mock_llm_server_url: Mock server URL or ``None``.
+    :param responses: List of response configs. Keys:
+        ``text``, ``tool_calls``, ``block``, ``stream``,
+        ``error``, ``status_code``.
+    :param key: Queue key — typically the model name baked into the
+        agent spec. Defaults to ``"default"`` (matches any model
+        not assigned to a more specific queue).
+    """
+    if mock_llm_server_url is None:
+        return
+    resp = httpx.post(
+        f"{mock_llm_server_url}/mock/configure",
+        json={"key": key, "responses": responses},
+        timeout=5.0,
+    )
+    resp.raise_for_status()
+
+
+def reset_mock_llm(mock_llm_server_url: str | None) -> None:
+    """
+    Clear all keyed queues, captured requests, and gates.
+
+    :param mock_llm_server_url: Mock server URL or ``None``.
+    """
+    if mock_llm_server_url is None:
+        return
+    resp = httpx.post(f"{mock_llm_server_url}/mock/reset", timeout=5.0)
+    resp.raise_for_status()
+
+
+def release_mock_gate(mock_llm_server_url: str | None) -> None:
+    """
+    Release the oldest pending gate on the mock LLM server.
+
+    :param mock_llm_server_url: Mock server URL or ``None``.
+    """
+    if mock_llm_server_url is None:
+        return
+    resp = httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0)
+    resp.raise_for_status()
+
+
+def get_mock_requests(
+    mock_llm_server_url: str | None,
+    *,
+    key: str | None = None,
+) -> list[dict]:
+    """
+    Retrieve captured request bodies from the mock LLM server.
+
+    :param mock_llm_server_url: Mock server URL or ``None``.
+    :param key: When set, only return requests whose ``model``
+        field matches this key.
+    :returns: List of request body dicts, or empty list in real mode.
+    """
+    if mock_llm_server_url is None:
+        return []
+    params = {"key": key} if key is not None else {}
+    resp = httpx.get(
+        f"{mock_llm_server_url}/mock/requests",
+        params=params,
+        timeout=5.0,
+    )
+    resp.raise_for_status()
+    return resp.json()["requests"]
 
 
 @pytest.fixture(scope="session")
@@ -269,6 +434,7 @@ def live_server(
     databricks_workspace_host: str | None,
     tmp_path_factory: pytest.TempPathFactory,
     live_runner_id: str,
+    mock_llm_server_url: str | None,
 ) -> Iterator[str]:
     """
     Start a real ``omnigent server`` subprocess and yield its base URL.
@@ -279,13 +445,18 @@ def live_server(
     server's ``OPENAI_BASE_URL`` is pointed at the workspace's
     serving-endpoints; bundles' ``llm.model`` get rewritten by
     :func:`upload_agent` (see :data:`_DATABRICKS_MODEL_MAP`).
+    When running in mock mode (no ``--llm-api-key``), the server's
+    ``OPENAI_BASE_URL`` is pointed at the mock LLM server.
 
     :param llm_api_key: The API key for the LLM (a Databricks
-        bearer under ``--profile``, otherwise an OpenAI key).
+        bearer under ``--profile``, otherwise an OpenAI key, or
+        ``"mock-key"`` in mock mode).
     :param databricks_workspace_host: Workspace host URL or ``None``.
     :param tmp_path_factory: Pytest temp path factory for the DB.
     :param live_runner_id: Runner id the server subprocess should
         advertise and tests should bind sessions to.
+    :param mock_llm_server_url: Mock LLM server URL, or ``None``
+        when using a real LLM.
     :returns: The server's base URL, e.g. ``"http://localhost:18501"``.
     """
     # Dynamic free port so back-to-back test sessions don't race
@@ -321,7 +492,12 @@ def live_server(
         "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
         "OMNIGENT_BUILTIN_AGENT_DIRS": str(builtin_sdk_chat_spec),
     }
-    if databricks_workspace_host is not None:
+    if mock_llm_server_url is not None:
+        # Mock mode: point all LLM calls at the mock server.
+        # The OpenAI SDK appends /responses to the base URL, so
+        # include /v1 in the base so the SDK hits /v1/responses.
+        env["OPENAI_BASE_URL"] = f"{mock_llm_server_url}/v1"
+    elif databricks_workspace_host is not None:
         env["OPENAI_BASE_URL"] = f"{databricks_workspace_host}/serving-endpoints"
         # Thread --profile so claude-sdk and other harnesses that read
         # ~/.databrickscfg directly pick the right profile. Without it
@@ -365,7 +541,23 @@ def live_server(
         "--artifact-location",
         str(artifact_dir),
     ]
-    if databricks_workspace_host is not None:
+    if mock_llm_server_url is not None:
+        server_cfg = tmp_path_factory.mktemp("e2e_server_cfg") / "server.yaml"
+        server_cfg.write_text(
+            yaml.safe_dump(
+                {
+                    "llm": {
+                        "model": "mock-model",
+                        "connection": {
+                            "base_url": f"{mock_llm_server_url}/v1",
+                            "api_key": "mock-key",
+                        },
+                    }
+                }
+            )
+        )
+        server_args.extend(["--config", str(server_cfg)])
+    elif databricks_workspace_host is not None:
         server_cfg = tmp_path_factory.mktemp("e2e_server_cfg") / "server.yaml"
         server_cfg.write_text(
             yaml.safe_dump(
@@ -542,6 +734,8 @@ def register_inline_agent(
     model: str,
     profile: str,
     prompt: str,
+    mock_llm_base_url: str | None = None,
+    builtin_tools: list[str] | None = None,
 ) -> str:
     """
     Register a single-file omnigent agent built in-memory.
@@ -558,6 +752,11 @@ def register_inline_agent(
     :param model: Model identifier the executor receives.
     :param profile: Databricks profile name baked into the executor.
     :param prompt: System prompt for the agent.
+    :param mock_llm_base_url: When set, bake an ``auth.type: api_key``
+        block into the executor so the harness hits the mock server
+        instead of ``api.openai.com``.
+    :param builtin_tools: When set, add a ``tools.builtins`` list to
+        the agent spec, e.g. ``["list_files", "upload_file"]``.
     :returns: The agent name (use the return value, not the *name*
         argument, they differ on rerun attempts).
     """
@@ -568,11 +767,24 @@ def register_inline_agent(
         # Fresh name per rerun: a 409 re-register would keep the first
         # attempt's model and defeat llm_flaky rotation.
         name = f"{name}-r{attempt}"
+    executor: dict[str, object] = {
+        "harness": harness,
+        "model": resolve_model(model),
+        "profile": profile,
+    }
+    if mock_llm_base_url is not None:
+        executor["auth"] = {
+            "type": "api_key",
+            "api_key": "mock-key",
+            "base_url": mock_llm_base_url,
+        }
     config: dict[str, object] = {
         "name": name,
         "prompt": prompt,
-        "executor": {"harness": harness, "model": resolve_model(model), "profile": profile},
+        "executor": executor,
     }
+    if builtin_tools:
+        config["tools"] = {"builtins": builtin_tools}
     with io.BytesIO() as buf:
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
             yaml_bytes = yaml.dump(config).encode()
@@ -790,6 +1002,23 @@ def claude_coder_agent(http_client: httpx.Client, databricks_workspace_host: str
     return upload_agent(
         http_client,
         _CLAUDE_CODER_DIR,
+        rewrite_model_for_databricks=databricks_workspace_host is not None,
+    )
+
+
+@pytest.fixture(scope="session")
+def sandbox_deps_os_env_agent(
+    http_client: httpx.Client, databricks_workspace_host: str | None
+) -> str:
+    """
+    Upload the minimal os_env dependency-install test fixture.
+
+    :param http_client: HTTP client pointed at the server.
+    :returns: The agent name, ``"sandbox-deps-os-env"``.
+    """
+    return upload_agent(
+        http_client,
+        _SANDBOX_DEPS_OS_ENV_DIR,
         rewrite_model_for_databricks=databricks_workspace_host is not None,
     )
 

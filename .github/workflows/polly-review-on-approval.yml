@@ -1,0 +1,52 @@
+name: Polly Review On Approval
+
+# Stage 1 of the "run Polly when a maintainer approves a fork PR" relay.
+#
+# Why a relay: a fork PR's `pull_request_review` token is read-only and held
+# behind the fork-approval gate, so this job can't dispatch Polly (which needs
+# the LLM gateway secret) itself. It only records the PR number as an artifact;
+# the privileged dispatch happens in polly-review-approval-dispatch.yml on
+# `workflow_run`. Same shape as the maintainer-approval-rerun relay.
+#
+# Scope: ONLY fork PRs. Same-repo (collaborator) PRs already get an automatic
+# Polly review on open (polly-review.yml), so they don't need this path.
+#
+# This stage records on ANY approving review of a fork PR; the authoritative
+# "was it a maintainer?" check is done in stage 2 from trusted API data +
+# MAINTAINER@main (this read-only stage is not trusted to make that decision).
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: polly-review-on-approval-${{ github.event.pull_request.number }}
+  # Don't cancel in-progress: a cancelled run could drop the recorded artifact.
+  cancel-in-progress: false
+
+jobs:
+  record:
+    # Approvals only, and only on fork PRs (same-repo PRs are handled on open).
+    if: >-
+      github.event.review.state == 'approved'
+      && github.event.pull_request.head.repo.fork
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Record PR number
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          mkdir -p pr
+          echo "$PR_NUMBER" > pr/pr_number
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: polly-approval-pr-number
+          path: pr/
+          retention-days: 1
+          if-no-files-found: error
