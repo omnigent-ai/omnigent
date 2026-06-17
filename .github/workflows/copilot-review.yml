@@ -19,8 +19,12 @@ name: Copilot Review Request
 # no access to our secrets) and is ADVISORY -- it never gates merge.
 
 on:
+  # `synchronize` is included so that if the Security Scan fails on open and the
+  # contributor pushes a fix that then passes, the Copilot request still fires on
+  # the new commit (it would otherwise never be requested). A redundant re-request
+  # on a later push is handled by the warn-not-fail step below.
   pull_request_target:
-    types: [opened, reopened, ready_for_review]
+    types: [opened, reopened, ready_for_review, synchronize]
 
 permissions:
   contents: read
