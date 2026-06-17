@@ -5042,6 +5042,492 @@ async def test_post_external_output_text_delta_sends_expected_payload(tmp_path: 
     ]
 
 
+# ── deltas-before-done ordering (assistant item hold-back) ────────────
+
+
+def _write_assistant_transcript(path: Path, uuid: str, text: str) -> None:
+    """
+    Append one assistant text record to a Claude transcript JSONL file.
+
+    :param path: Transcript file path.
+    :param uuid: Record uuid, e.g. ``"u1"``.
+    :param text: Assistant text block content, e.g. ``"Hello world"``.
+    :returns: None.
+    """
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "uuid": uuid,
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": text}],
+                    },
+                }
+            )
+            + "\n"
+        )
+
+
+def _transcript_state_for(transcript_path: Path) -> forwarder.TranscriptForwardState:
+    """
+    Build a fresh transcript cursor state for ``transcript_path``.
+
+    :param transcript_path: Transcript file the state points at.
+    :returns: A zero-cursor :class:`TranscriptForwardState`.
+    """
+    return forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+
+
+@pytest.mark.asyncio
+async def test_assistant_item_held_until_its_deltas_forward(tmp_path: Path) -> None:
+    """
+    An assistant item whose deltas haven't fully forwarded is deferred.
+
+    The transcript record and the deltas file have independent writers,
+    so the record can hit disk a poll before the message's chunks
+    (commit-before-delta). If the item posted first, the client would
+    render the committed text AND build a late `live:` preview from the
+    trailing chunks — the duplicate-bubble bug. This drives the real
+    race through both forwarders: with only a non-final chunk forwarded
+    the item must be held (no `external_conversation_item` POST, cursor
+    unadvanced); once the final chunk forwards and the joined text
+    byte-equals the item's, the item posts AFTER the deltas.
+    """
+    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
+    transcript_path = tmp_path / "session.jsonl"
+    _write_assistant_transcript(transcript_path, "u1", "Hello world")
+    # Only the first chunk has been written by the hook so far.
+    _write_deltas_file(
+        bridge_dir, [{"message_id": "m1", "index": 0, "final": False, "delta": "Hello "}]
+    )
+
+    ordering = forwarder._DeltaOrderingState()
+    seen_deltas: dict[tuple[str, int], None] = {}
+    captured: list[_CapturedDeltaPost] = []
+    async with _delta_capture_client(captured) as client:
+        delta_state = await forwarder._forward_available_deltas(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            state=forwarder.DeltaForwardState(),
+            seen_keys=seen_deltas,
+            ordering=ordering,
+        )
+        item_state = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=_transcript_state_for(transcript_path),
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=forwarder._ForwardDedupeState(),
+            ordering=ordering,
+        )
+        # Held: the item was NOT posted and the durable cursor did not
+        # advance past it, so the next poll re-reads it.
+        assert [c.body["type"] for c in captured] == ["external_output_text_delta"]
+        assert item_state.byte_offset == 0
+        assert item_state.seen_source_ids == ()
+
+        # Next poll: the hook's final chunk lands, completing the text.
+        _write_deltas_file(
+            bridge_dir, [{"message_id": "m1", "index": 1, "final": True, "delta": "world"}]
+        )
+        await forwarder._forward_available_deltas(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            state=delta_state,
+            seen_keys=seen_deltas,
+            ordering=ordering,
+        )
+        item_state = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=item_state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=forwarder._ForwardDedupeState(),
+            ordering=ordering,
+        )
+
+    # The item posted AFTER both of its chunks — the ordering every
+    # downstream suppression layer assumes. Content asserted (not just
+    # counts) to prove the matched item is the right one.
+    item_posts = [c.body for c in captured if c.body["type"] == "external_conversation_item"]
+    assert len(item_posts) == 1
+    assert item_posts[0]["data"]["item_data"]["content"] == [
+        {"type": "output_text", "text": "Hello world"}
+    ]
+    assert [c.body["type"] for c in captured][:2] == [
+        "external_output_text_delta",
+        "external_output_text_delta",
+    ]
+    assert item_state.byte_offset == transcript_path.stat().st_size
+    # The matched stream was consumed: a later identical-text message
+    # must match its own deltas, not this stale entry.
+    assert ordering.texts == {}
+
+
+@pytest.mark.asyncio
+async def test_assistant_item_posts_after_hold_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    An item whose deltas never arrive posts once the hold timeout expires.
+
+    Deltas are best-effort (the hook can drop them; a multi-text-block
+    message's per-block item text never byte-equals the whole-message
+    stream), so the hold must be bounded or such messages would never
+    persist. Past ``_ASSISTANT_ITEM_DELTA_HOLD_S`` the item posts even
+    with no matching stream — safe, because with no forwarded deltas
+    there is no live preview to duplicate.
+    """
+    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
+    transcript_path = tmp_path / "session.jsonl"
+    _write_assistant_transcript(transcript_path, "u1", "Hello world")
+    # Deltas file exists (hook active) but carries an UNRELATED stream,
+    # so the item can never match by text.
+    _write_deltas_file(
+        bridge_dir, [{"message_id": "m9", "index": 0, "final": True, "delta": "other"}]
+    )
+    clock = {"now": 100.0}
+    monkeypatch.setattr(forwarder, "_hold_monotonic", lambda: clock["now"])
+
+    ordering = forwarder._DeltaOrderingState()
+    captured: list[_CapturedDeltaPost] = []
+    async with _delta_capture_client(captured) as client:
+        await forwarder._forward_available_deltas(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            state=forwarder.DeltaForwardState(),
+            seen_keys={},
+            ordering=ordering,
+        )
+        state = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=_transcript_state_for(transcript_path),
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=forwarder._ForwardDedupeState(),
+            ordering=ordering,
+        )
+        assert [c.body["type"] for c in captured] == ["external_output_text_delta"]
+        assert state.byte_offset == 0  # held
+
+        clock["now"] = 100.0 + forwarder._ASSISTANT_ITEM_DELTA_HOLD_S
+        state = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=forwarder._ForwardDedupeState(),
+            ordering=ordering,
+        )
+
+    item_posts = [c.body for c in captured if c.body["type"] == "external_conversation_item"]
+    assert len(item_posts) == 1
+    assert item_posts[0]["data"]["item_data"]["content"] == [
+        {"type": "output_text", "text": "Hello world"}
+    ]
+    assert state.byte_offset == transcript_path.stat().st_size
+
+
+@pytest.mark.asyncio
+async def test_assistant_item_not_held_without_deltas_file(tmp_path: Path) -> None:
+    """
+    A session whose MessageDisplay hook never fired is never held.
+
+    With no deltas file there can be no live preview, hence no
+    duplicate — holding would only add latency to every assistant
+    message. The item must post on the first poll.
+    """
+    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
+    transcript_path = tmp_path / "session.jsonl"
+    _write_assistant_transcript(transcript_path, "u1", "Hello world")
+
+    captured: list[_CapturedDeltaPost] = []
+    async with _delta_capture_client(captured) as client:
+        state = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=_transcript_state_for(transcript_path),
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=forwarder._ForwardDedupeState(),
+            ordering=forwarder._DeltaOrderingState(),
+        )
+
+    item_posts = [c.body for c in captured if c.body["type"] == "external_conversation_item"]
+    assert len(item_posts) == 1
+    assert state.byte_offset == transcript_path.stat().st_size
+
+
+@pytest.mark.asyncio
+async def test_assistant_item_stays_held_until_true_final_chunk(tmp_path: Path) -> None:
+    """
+    The commit stays held while a NON-final chunk lands after it.
+
+    Per-chunk hooks are independent subprocesses, so any chunk — not just
+    the final one — can be forwarded AFTER the commit is already ready and
+    held (the observed ``D D C D`` race where the trailing ``D`` is not the
+    final chunk). The hold must wait for the message's ``final`` chunk to
+    byte-match, NOT release on "another delta arrived"; otherwise the late
+    non-final chunk would build a second ``live:`` preview after the commit
+    already rendered.
+    """
+    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
+    transcript_path = tmp_path / "session.jsonl"
+    _write_assistant_transcript(transcript_path, "u1", "Hello big world")
+
+    ordering = forwarder._DeltaOrderingState()
+    seen: dict[tuple[str, int], None] = {}
+    delta_state = forwarder.DeltaForwardState()
+    item_state = _transcript_state_for(transcript_path)
+    captured: list[_CapturedDeltaPost] = []
+
+    async def _poll(client: httpx.AsyncClient) -> None:
+        nonlocal delta_state, item_state
+        delta_state = await forwarder._forward_available_deltas(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            state=delta_state,
+            seen_keys=seen,
+            ordering=ordering,
+        )
+        item_state = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=item_state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=forwarder._ForwardDedupeState(),
+            ordering=ordering,
+        )
+
+    async with _delta_capture_client(captured) as client:
+        # Poll 1: only the first (non-final) chunk; the commit is ready.
+        _write_deltas_file(
+            bridge_dir, [{"message_id": "m1", "index": 0, "final": False, "delta": "Hello "}]
+        )
+        await _poll(client)
+        assert item_state.byte_offset == 0  # held — no final chunk yet
+
+        # Poll 2: a SECOND non-final chunk lands AFTER the commit — still held.
+        _write_deltas_file(
+            bridge_dir, [{"message_id": "m1", "index": 1, "final": False, "delta": "big "}]
+        )
+        await _poll(client)
+        assert item_state.byte_offset == 0  # STILL held: stream not final
+        assert not [c for c in captured if c.body["type"] == "external_conversation_item"]
+
+        # Poll 3: the true final chunk lands → byte-matches → released.
+        _write_deltas_file(
+            bridge_dir, [{"message_id": "m1", "index": 2, "final": True, "delta": "world"}]
+        )
+        await _poll(client)
+
+    # Commit posts only AFTER all three deltas — the order downstream assumes.
+    assert [c.body["type"] for c in captured] == [
+        "external_output_text_delta",
+        "external_output_text_delta",
+        "external_output_text_delta",
+        "external_conversation_item",
+    ]
+    item = next(c.body for c in captured if c.body["type"] == "external_conversation_item")
+    assert item["data"]["item_data"]["content"] == [
+        {"type": "output_text", "text": "Hello big world"}
+    ]
+    assert item_state.byte_offset == transcript_path.stat().st_size
+
+
+@pytest.mark.asyncio
+async def test_assistant_item_held_when_final_seen_but_chunk_missing(tmp_path: Path) -> None:
+    """
+    Seeing the ``final`` chunk is not enough — the join must byte-equal.
+
+    If a middle chunk was dropped (or not yet forwarded), the concatenated
+    forwarded text does not equal the commit text, so the item must stay
+    held even though ``final`` was seen — never released on the ``final``
+    flag alone. This is why the release gate requires BOTH ``entry.final``
+    and the byte-equal check.
+    """
+    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
+    transcript_path = tmp_path / "session.jsonl"
+    _write_assistant_transcript(transcript_path, "u1", "Hello big world")
+    # Forward index 0 and the FINAL index 2 — but NOT the middle index 1.
+    _write_deltas_file(
+        bridge_dir,
+        [
+            {"message_id": "m1", "index": 0, "final": False, "delta": "Hello "},
+            {"message_id": "m1", "index": 2, "final": True, "delta": "world"},
+        ],
+    )
+
+    ordering = forwarder._DeltaOrderingState()
+    captured: list[_CapturedDeltaPost] = []
+    async with _delta_capture_client(captured) as client:
+        await forwarder._forward_available_deltas(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            state=forwarder.DeltaForwardState(),
+            seen_keys={},
+            ordering=ordering,
+        )
+        item_state = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=_transcript_state_for(transcript_path),
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=forwarder._ForwardDedupeState(),
+            ordering=ordering,
+        )
+
+    # final WAS seen, but join "Hello world" != commit "Hello big world".
+    assert ordering.texts["m1"].final is True
+    assert "".join(ordering.texts["m1"].parts) == "Hello world"
+    assert item_state.byte_offset == 0  # held despite the final flag
+    assert not [c for c in captured if c.body["type"] == "external_conversation_item"]
+
+
+@pytest.mark.asyncio
+async def test_two_identical_text_items_each_match_own_stream(tmp_path: Path) -> None:
+    """
+    Two assistant messages with identical text are matched by count.
+
+    Consume-once: the first commit pops one matching stream, the second
+    pops the other — both post, neither blocks nor steals from the other,
+    and the ordering state ends empty. Identical text renders identically,
+    so which physical stream a commit consumes does not matter.
+    """
+    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
+    transcript_path = tmp_path / "session.jsonl"
+    _write_assistant_transcript(transcript_path, "u1", "OK")
+    _write_assistant_transcript(transcript_path, "u2", "OK")
+    _write_deltas_file(
+        bridge_dir,
+        [
+            {"message_id": "mA", "index": 0, "final": True, "delta": "OK"},
+            {"message_id": "mB", "index": 0, "final": True, "delta": "OK"},
+        ],
+    )
+
+    ordering = forwarder._DeltaOrderingState()
+    captured: list[_CapturedDeltaPost] = []
+    async with _delta_capture_client(captured) as client:
+        await forwarder._forward_available_deltas(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            state=forwarder.DeltaForwardState(),
+            seen_keys={},
+            ordering=ordering,
+        )
+        item_state = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=_transcript_state_for(transcript_path),
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=forwarder._ForwardDedupeState(),
+            ordering=ordering,
+        )
+
+    item_posts = [c.body for c in captured if c.body["type"] == "external_conversation_item"]
+    assert len(item_posts) == 2  # both released, neither blocked
+    assert all(
+        p["data"]["item_data"]["content"] == [{"type": "output_text", "text": "OK"}]
+        for p in item_posts
+    )
+    assert ordering.texts == {}  # both streams consumed (consume-once)
+    assert item_state.byte_offset == transcript_path.stat().st_size
+
+
+@pytest.mark.asyncio
+async def test_without_hold_commit_posts_before_final_delta(tmp_path: Path) -> None:
+    """
+    Break-the-feature guard: with the hold disabled the bug reproduces.
+
+    ``ordering=None`` disables the hold (the pre-fix behaviour). In the
+    inverted race the commit then posts immediately, landing BEFORE the
+    message's final delta — the exact ordering that builds a duplicate
+    ``live:`` preview. Paired with
+    ``test_assistant_item_held_until_its_deltas_forward`` (hold on → commit
+    posts AFTER its deltas), this pins the hold as the thing that fixes it.
+    """
+    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
+    transcript_path = tmp_path / "session.jsonl"
+    _write_assistant_transcript(transcript_path, "u1", "Hello world")
+    _write_deltas_file(
+        bridge_dir, [{"message_id": "m1", "index": 0, "final": False, "delta": "Hello "}]
+    )
+
+    seen: dict[tuple[str, int], None] = {}
+    delta_state = forwarder.DeltaForwardState()
+    captured: list[_CapturedDeltaPost] = []
+    async with _delta_capture_client(captured) as client:
+        delta_state = await forwarder._forward_available_deltas(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            state=delta_state,
+            seen_keys=seen,
+            ordering=None,
+        )
+        await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=_transcript_state_for(transcript_path),
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=forwarder._ForwardDedupeState(),
+            ordering=None,
+        )
+        # Bug: with no hold the commit posts immediately, before the final chunk.
+        assert [c.body["type"] for c in captured] == [
+            "external_output_text_delta",
+            "external_conversation_item",
+        ]
+        _write_deltas_file(
+            bridge_dir, [{"message_id": "m1", "index": 1, "final": True, "delta": "world"}]
+        )
+        await forwarder._forward_available_deltas(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            state=delta_state,
+            seen_keys=seen,
+            ordering=None,
+        )
+
+    # The final delta lands AFTER the commit — the inverted order that dupes.
+    types = [c.body["type"] for c in captured]
+    commit_idx = types.index("external_conversation_item")
+    final_delta_idx = max(i for i, t in enumerate(types) if t == "external_output_text_delta")
+    assert commit_idx < final_delta_idx
+
+
 # ── session cost reconciliation (max(S, C)) ───────────────────────────
 
 
