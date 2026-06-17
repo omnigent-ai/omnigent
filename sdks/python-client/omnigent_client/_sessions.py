@@ -675,6 +675,39 @@ class SessionsNamespace:
         body = require_json_object(resp, "GET /v1/sessions/{session_id}/items")
         return body.get("data", [])
 
+    async def child_sessions(
+        self,
+        session_id: str,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """
+        List sub-agent (child) sessions under a parent session.
+
+        Calls ``GET /v1/sessions/{session_id}/child_sessions`` and
+        returns a page of ``ChildSessionSummary`` dicts (``id``,
+        ``title``, ``tool``, ``agent_name``, ``busy``,
+        ``current_task_status``, ``last_message_preview``,
+        ``pending_elicitations_count``, …). The REPL recurses this per
+        node to assemble the sub-agent tree shown on the main interface.
+
+        :param session_id: Parent session/conversation identifier,
+            e.g. ``"conv_parent123"``.
+        :param limit: Maximum number of children to return
+            (1-1000, default 100).
+        :returns: List of child-session summary dicts (empty when the
+            session has no sub-agents).
+        :raises OmnigentError: On non-2xx status (404 when the
+            session does not exist).
+        """
+        resp = await self._http.get(
+            f"{self._base}/v1/sessions/{session_id}/child_sessions",
+            params={"limit": limit},
+        )
+        raise_for_status(resp.status_code, response_body(resp))
+        body = require_json_object(resp, "GET /v1/sessions/{session_id}/child_sessions")
+        return body.get("data", [])
+
     async def get(self, session_id: str) -> Session:
         """
         Fetch the current snapshot of a session.
