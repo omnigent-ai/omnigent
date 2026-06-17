@@ -14,7 +14,9 @@ import {
   dispatchInitialPrompt,
   isSessionSharedWithOthers,
   isUnboundCodingFork,
+  mergePendingBubbles,
   readOnlyReasonForSessionLabels,
+  reorderCommittedRequestElicitations,
   shouldSendInitialPrompt,
   shouldShowAuthorBadge,
   shouldShowWorkingIndicator,
@@ -329,6 +331,145 @@ describe("buildPendingBubbles", () => {
     ];
     // p.author ("bob") wins over the viewer's selfAuthor ("alice").
     expect(bubble.createdBy).toBe("bob@example.com");
+  });
+});
+
+// ── mergePendingBubbles ────────────────────────────────────────────────────
+
+// Shared bubble builders for the request-elicitation ordering tests.
+const userBubble = (id: string): Bubble => ({
+  kind: "user",
+  itemId: id,
+  content: [{ type: "input_text", text: id }],
+});
+const assistantText = (id: string): Bubble => ({
+  kind: "assistant",
+  responseId: id,
+  stableId: id,
+  lifecycle: "completed",
+  error: null,
+  items: [{ kind: "text", itemId: id, text: "hi", final: true }],
+});
+const elicitationBubble = (id: string, phase: string): Bubble => ({
+  kind: "assistant",
+  responseId: id,
+  stableId: id,
+  lifecycle: "completed",
+  error: null,
+  items: [
+    {
+      kind: "elicitation",
+      itemId: id,
+      elicitationId: id,
+      message: "Continue?",
+      phase,
+      policyName: "session_cost_budget",
+      contentPreview: "{}",
+      requestedSchema: {},
+      status: "pending",
+      response: null,
+    },
+  ],
+});
+const bubbleIds = (bubbles: Bubble[]): string[] =>
+  bubbles.map((b) => (b.kind === "user" ? b.itemId : b.kind === "assistant" ? b.stableId : ""));
+
+describe("mergePendingBubbles", () => {
+  it("appends pending bubbles at the end when nothing trails", () => {
+    const committed = [userBubble("u1"), assistantText("a1")];
+    const pending = [userBubble("pend_1")];
+    const merged = mergePendingBubbles(committed, pending);
+    expect(merged.map((b) => (b.kind === "assistant" ? b.stableId : b.itemId))).toEqual([
+      "u1",
+      "a1",
+      "pend_1",
+    ]);
+  });
+
+  it("returns committed unchanged when there are no pending bubbles", () => {
+    const committed = [userBubble("u1"), elicitationBubble("e1", "request")];
+    const merged = mergePendingBubbles(committed, []);
+    expect(merged).toBe(committed);
+  });
+
+  it("splices the pending prompt ABOVE a trailing request-phase elicitation card", () => {
+    // The bug: a REQUEST-phase ASK parks the user message server-side, so
+    // it stays an optimistic pending bubble while its card arrives as a
+    // committed bubble — appending after the card would show the approval
+    // prompt above the message that triggered it.
+    const committed = [assistantText("a1"), elicitationBubble("e1", "request")];
+    const pending = [userBubble("pend_1")];
+    const merged = mergePendingBubbles(committed, pending);
+    expect(merged.map((b) => (b.kind === "assistant" ? b.stableId : b.itemId))).toEqual([
+      "a1",
+      "pend_1",
+      "e1",
+    ]);
+  });
+
+  it("splices above a run of multiple trailing request-phase elicitations", () => {
+    const committed = [elicitationBubble("e1", "request"), elicitationBubble("e2", "request")];
+    const pending = [userBubble("pend_1")];
+    const merged = mergePendingBubbles(committed, pending);
+    expect(merged.map((b) => (b.kind === "assistant" ? b.stableId : b.itemId))).toEqual([
+      "pend_1",
+      "e1",
+      "e2",
+    ]);
+  });
+
+  it("does NOT reorder for a tool_call-phase elicitation (message already committed)", () => {
+    // A tool_call ASK fires after the user message is committed into the
+    // timeline, so the trailing append is correct — only request-phase
+    // cards need the prompt lifted above them.
+    const committed = [userBubble("u1"), elicitationBubble("e1", "tool_call")];
+    const pending = [userBubble("pend_1")];
+    const merged = mergePendingBubbles(committed, pending);
+    expect(merged.map((b) => (b.kind === "assistant" ? b.stableId : b.itemId))).toEqual([
+      "u1",
+      "e1",
+      "pend_1",
+    ]);
+  });
+});
+
+// ── reorderCommittedRequestElicitations ─────────────────────────────────────
+
+describe("reorderCommittedRequestElicitations", () => {
+  it("swaps an approved request card below the user message it gated", () => {
+    // After approval the parked message is consumed into `blocks` AFTER
+    // the card, giving [card, message]. The card must drop below the
+    // prompt that triggered it.
+    const committed = [elicitationBubble("e1", "request"), userBubble("u1")];
+    expect(bubbleIds(reorderCommittedRequestElicitations(committed))).toEqual(["u1", "e1"]);
+  });
+
+  it("keeps the card between the prompt and the assistant response", () => {
+    const committed = [
+      assistantText("a0"),
+      elicitationBubble("e1", "request"),
+      userBubble("u1"),
+      assistantText("a1"),
+    ];
+    expect(bubbleIds(reorderCommittedRequestElicitations(committed))).toEqual([
+      "a0",
+      "u1",
+      "e1",
+      "a1",
+    ]);
+  });
+
+  it("leaves a lone request card (declined / still pending) untouched and returns same ref", () => {
+    const committed = [assistantText("a0"), elicitationBubble("e1", "request")];
+    const result = reorderCommittedRequestElicitations(committed);
+    expect(result).toBe(committed);
+  });
+
+  it("does NOT reorder a tool_call-phase card followed by a user message", () => {
+    const committed = [elicitationBubble("e1", "tool_call"), userBubble("u1")];
+    const result = reorderCommittedRequestElicitations(committed);
+    expect(result).toBe(committed);
+    expect(bubbleIds(result)).toEqual(["e1", "u1"]);
   });
 });
 

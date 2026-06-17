@@ -2008,6 +2008,13 @@ def test_run_without_agent_drops_into_configure_when_unconfigured(
         "omnigent.onboarding.provider_config.default_provider_for_harness",
         _fake_provider_for(),  # nothing configured
     )
+    # The opencode fallback in _resolve_first_run_plan_inner gates on the
+    # ``opencode`` binary being on PATH. Stub it to False so the test stays
+    # deterministic on machines where the developer has opencode installed.
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_installed",
+        lambda _key: False,
+    )
     # The configure picker would block on a real terminal; stub it.
     configure = Mock()
     monkeypatch.setattr("omnigent.cli._run_configure_harnesses_interactive", configure)
@@ -3581,7 +3588,6 @@ def test_bare_omnigent_tty_dispatches_to_run(
 
     monkeypatch.setattr(sys, "argv", ["omnigent"])
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
-    monkeypatch.setattr("omnigent.update_check.maybe_show_update_notice", Mock())
 
     dispatched: dict[str, list[str]] = {}
 
@@ -3602,7 +3608,6 @@ def test_bare_omnigent_rejects_positional_server_url(
     """Top-level server URLs must use ``run --server`` explicitly."""
     from omnigent.cli import main
 
-    monkeypatch.setattr("omnigent.update_check.maybe_show_update_notice", Mock())
     monkeypatch.setattr(sys, "argv", ["omnigent", "http://localhost:8000"])
 
     with pytest.raises(SystemExit) as exc_info:
@@ -3627,7 +3632,6 @@ def test_unknown_command_reports_no_such_command(
     """
     from omnigent.cli import main
 
-    monkeypatch.setattr("omnigent.update_check.maybe_show_update_notice", Mock())
     monkeypatch.setattr(sys, "argv", ["omnigent", "blah"])
 
     with pytest.raises(SystemExit) as exc_info:
@@ -3931,6 +3935,13 @@ def test_pick_first_run_harness_none_when_unconfigured(monkeypatch: pytest.Monke
         "omnigent.onboarding.provider_config.default_provider_for_harness",
         _fake_provider_for(),  # nothing configured
     )
+    # The opencode fallback in _resolve_first_run_plan_inner gates on the
+    # ``opencode`` binary being on PATH. Stub it to False so the test stays
+    # deterministic on machines where the developer has opencode installed.
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_installed",
+        lambda _key: False,
+    )
     assert _pick_first_run_harness() is None
 
 
@@ -4012,6 +4023,13 @@ def test_resolve_first_run_plan_drops_into_configure_when_empty(
     monkeypatch.setattr(
         "omnigent.onboarding.provider_config.default_provider_for_harness",
         _fake_provider_for(),  # nothing configured, before and after configure
+    )
+    # The opencode fallback in _resolve_first_run_plan_inner gates on the
+    # ``opencode`` binary being on PATH. Stub it to False so this test stays
+    # deterministic regardless of the developer's local install.
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_installed",
+        lambda _key: False,
     )
     configure = Mock()
     monkeypatch.setattr("omnigent.cli._run_configure_harnesses_interactive", configure)

@@ -4508,20 +4508,19 @@ def _session_usage_data_from_params(params: dict[str, Any]) -> dict[str, int] | 
     total = token_usage.get("total")
     if not isinstance(total, dict):
         return None
-    context_tokens = total.get("inputTokens")
+    cumulative_input_tokens = total.get("inputTokens")
     context_window = total.get("contextWindow")
     output_tokens = total.get("outputTokens")
     cached_input_tokens = total.get("cachedInputTokens")
     data: dict[str, int] = {}
-    if isinstance(context_tokens, int) and context_tokens >= 0:
-        data["context_tokens"] = context_tokens
+    if isinstance(cumulative_input_tokens, int) and cumulative_input_tokens >= 0:
         # Codex's ``tokenUsage.total`` is CUMULATIVE across the whole thread
         # (the CLI subtracts prior totals to recover per-turn deltas), so
         # ``total.inputTokens`` / ``outputTokens`` are the session's cumulative
         # token counts. Forward them as the cumulative fields the server prices
         # into ``total_cost_usd`` (SET semantics) — codex-native produces no
         # ``response.completed``, so the Omnigent relay never accounts its cost.
-        data["cumulative_input_tokens"] = context_tokens
+        data["cumulative_input_tokens"] = cumulative_input_tokens
         # Codex's ``inputTokens`` is INCLUSIVE of cached tokens
         # (``non_cached_input = input_tokens - cached_input_tokens`` in
         # codex-rs ``protocol.rs``). Forward the cumulative cached count so the
@@ -4530,6 +4529,18 @@ def _session_usage_data_from_params(params: dict[str, Any]) -> dict[str, int] | 
         # cumulative (SET) semantics as ``cumulative_input_tokens``.
         if isinstance(cached_input_tokens, int) and cached_input_tokens >= 0:
             data["cumulative_cache_read_input_tokens"] = cached_input_tokens
+    # ``context_tokens`` drives the context-window ring in the web UI. It
+    # must reflect the CURRENT context occupancy (how much of the window
+    # the latest turn consumed), NOT the cumulative total across all turns.
+    # Codex's ``tokenUsage.last`` carries the per-turn breakdown; fall back
+    # to ``total.inputTokens`` only when ``last`` is unavailable (first
+    # frame before a turn completes).
+    last = token_usage.get("last")
+    last_input = last.get("inputTokens") if isinstance(last, dict) else None
+    if isinstance(last_input, int) and last_input >= 0:
+        data["context_tokens"] = last_input
+    elif isinstance(cumulative_input_tokens, int) and cumulative_input_tokens >= 0:
+        data["context_tokens"] = cumulative_input_tokens
     if isinstance(output_tokens, int) and output_tokens >= 0:
         data["cumulative_output_tokens"] = output_tokens
     if isinstance(context_window, int) and context_window > 0:

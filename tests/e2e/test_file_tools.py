@@ -18,18 +18,13 @@ import httpx
 
 from tests.e2e.conftest import (
     create_runner_bound_session,
-    poll_until_terminal,
+    poll_session_until_terminal,
     send_user_message_to_session,
 )
 
 
 def _extract_all_text(body: dict[str, Any]) -> str:
-    """
-    Concatenate all assistant output_text blocks.
-
-    :param body: The terminal response body.
-    :returns: All assistant text joined by newlines.
-    """
+    """Concatenate all assistant text blocks from a terminal response."""
     parts: list[str] = []
     for item in body.get("output", []):
         if item.get("type") == "message":
@@ -49,109 +44,119 @@ def _has_tool_call(body: dict[str, Any], name: str) -> bool:
     :returns: True if found.
     """
     return any(
-        i.get("type") == "function_call" and i.get("name") == name for i in body.get("output", [])
+        (i.get("type") == "function_call" and i.get("name") == name)
+        or (i.get("event_type") == "tool_call" and i.get("tool_name") == name)
+        for i in body.get("output", [])
     )
+
+
+def _tool_outputs(body: dict[str, Any], name: str) -> list[str]:
+    """Return outputs for completed tool calls named *name*."""
+    call_ids = {
+        item["call_id"]
+        for item in body.get("output", [])
+        if item.get("type") == "function_call" and item.get("name") == name
+    }
+    return [
+        item["output"]
+        for item in body.get("output", [])
+        if item.get("type") == "function_call_output"
+        and item.get("call_id") in call_ids
+        and item.get("output", "").strip()
+    ]
 
 
 def test_list_files_finds_uploaded_file(
     http_client: httpx.Client,
     archer_agent: str,
+    live_runner_id: str,
 ) -> None:
     """
-    Agent uploads a file, then list_files finds it.
+    A session-uploaded file is visible to list_files in the same session.
 
     :param http_client: HTTP client pointed at the live server.
     :param archer_agent: The registered archer agent name.
     """
-    # Turn 1: create and upload
-    resp1 = http_client.post(
-        "/v1/responses",
-        json={
-            "model": archer_agent,
-            "input": (
-                "Use sys_os_shell to create a file called "
-                "test_data.txt containing 'Hello from omnigent'. "
-                "Then upload it with upload_file."
-            ),
-            "background": True,
-        },
+    session_id = create_runner_bound_session(
+        http_client,
+        agent_name=archer_agent,
+        runner_id=live_runner_id,
     )
-    resp1.raise_for_status()
-    rid1 = resp1.json()["id"]
-    body1 = poll_until_terminal(http_client, rid1, timeout=180)
-    assert body1["status"] == "completed", f"Turn 1 failed: {body1.get('error')}"
 
-    # Turn 2: list files only
-    resp2 = http_client.post(
-        "/v1/responses",
-        json={
-            "model": archer_agent,
-            "input": (
-                "Use the list_files tool to show me all uploaded "
-                "files. Only use list_files, nothing else."
-            ),
-            "previous_response_id": rid1,
-            "background": True,
-        },
+    upload_resp = http_client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("test_data.txt", b"Hello from omnigent", "text/plain")},
     )
-    resp2.raise_for_status()
-    rid2 = resp2.json()["id"]
-    body2 = poll_until_terminal(http_client, rid2, timeout=180)
-    assert body2["status"] == "completed", f"Turn 2 failed: {body2.get('error')}"
+    upload_resp.raise_for_status()
 
-    assert _has_tool_call(body2, "list_files"), "Agent didn't call list_files"
-    text = _extract_all_text(body2)
-    assert "test_data" in text.lower(), f"list_files didn't find uploaded file: {text[:300]}"
+    rid = send_user_message_to_session(
+        http_client,
+        session_id=session_id,
+        content=(
+            "Use the list_files tool to show me all uploaded "
+            "files. Only use list_files, nothing else."
+        ),
+    )
+    body = poll_session_until_terminal(
+        http_client,
+        session_id=session_id,
+        response_id=rid,
+        timeout=180,
+    )
+    assert body["status"] == "completed", f"Turn failed: {body.get('error')}"
+
+    assert _has_tool_call(body, "list_files"), "Agent didn't call list_files"
+    assert any("test_data.txt" in output for output in _tool_outputs(body, "list_files")), (
+        f"list_files didn't return uploaded file. Output: {body.get('output', [])}"
+    )
 
 
 def test_download_file_retrieves_content(
     http_client: httpx.Client,
     archer_agent: str,
+    live_runner_id: str,
 ) -> None:
     """
-    Agent uploads a file, then download_file retrieves its content.
+    download_file retrieves a session-uploaded file by ID.
 
     :param http_client: HTTP client pointed at the live server.
     :param archer_agent: The registered archer agent name.
     """
-    # Turn 1: create and upload
-    resp1 = http_client.post(
-        "/v1/responses",
-        json={
-            "model": archer_agent,
-            "input": (
-                "Use sys_os_shell to create a file called "
-                "greeting.txt containing exactly 'HELLO_WORLD'. "
-                "Then upload it with upload_file."
-            ),
-            "background": True,
-        },
+    session_id = create_runner_bound_session(
+        http_client,
+        agent_name=archer_agent,
+        runner_id=live_runner_id,
     )
-    resp1.raise_for_status()
-    rid1 = resp1.json()["id"]
-    body1 = poll_until_terminal(http_client, rid1, timeout=180)
-    assert body1["status"] == "completed", f"Turn 1 failed: {body1.get('error')}"
 
-    # Turn 2: download and show contents
-    resp2 = http_client.post(
-        "/v1/responses",
-        json={
-            "model": archer_agent,
-            "input": (
-                "Use download_file to download greeting.txt and tell me exactly what it contains."
-            ),
-            "previous_response_id": rid1,
-            "background": True,
-        },
+    upload_resp = http_client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("greeting.txt", b"HELLO_WORLD", "text/plain")},
     )
-    resp2.raise_for_status()
-    rid2 = resp2.json()["id"]
-    body2 = poll_until_terminal(http_client, rid2, timeout=180)
-    assert body2["status"] == "completed", f"Turn 2 failed: {body2.get('error')}"
+    upload_resp.raise_for_status()
+    file_id = upload_resp.json()["id"]
 
-    assert _has_tool_call(body2, "download_file"), "Agent didn't call download_file"
-    text = _extract_all_text(body2)
-    assert "hello_world" in text.lower(), f"Agent didn't show file contents: {text[:300]}"
+    rid = send_user_message_to_session(
+        http_client,
+        session_id=session_id,
+        content=(
+            f"Use download_file with file_id {file_id}. Do not call sys_os_shell, "
+            "sys_os_read, or any other filesystem tool. Report the JSON result."
+        ),
+    )
+    body = poll_session_until_terminal(
+        http_client,
+        session_id=session_id,
+        response_id=rid,
+        timeout=180,
+    )
+    assert body["status"] == "completed", f"Turn failed: {body.get('error')}"
+
+    assert _has_tool_call(body, "download_file"), "Agent didn't call download_file"
+    outputs = _tool_outputs(body, "download_file")
+    assert outputs, f"download_file returned no tool output. Output: {body.get('output', [])}"
+    assert any("HELLO_WORLD" in output for output in outputs), (
+        f"download_file didn't return expected content. Tool outputs: {outputs}"
+    )
 
 
 def test_markdown_file_attachment(
@@ -199,7 +204,12 @@ def test_markdown_file_attachment(
             {"type": "input_file", "file_id": file_id, "filename": "plan.md"},
         ],
     )
-    body = poll_until_terminal(http_client, rid, timeout=60)
+    body = poll_session_until_terminal(
+        http_client,
+        session_id=session_id,
+        response_id=rid,
+        timeout=60,
+    )
 
     assert body["status"] == "completed", (
         f"Status: {body['status']!r}. Error: {body.get('error')}. Output: {body.get('output', [])}"

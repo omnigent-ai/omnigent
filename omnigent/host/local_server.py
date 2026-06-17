@@ -86,23 +86,42 @@ def server_config_signature() -> str:
 
     The daemon (in local mode) spawns the Omnigent server once and never
     re-reads its spawn config, so a reused server silently keeps the auth
-    mode it was born with. Stamping this signature lets reuse detect when
-    a later invocation wants a *different* server config (e.g. the user
-    flips ``OMNIGENT_AUTH_ENABLED``) and respawn instead of serving the
-    stale one.
+    mode — and the *code* — it was born with. Stamping this signature lets
+    reuse detect when a later invocation wants a *different* server (e.g.
+    the user flips ``OMNIGENT_AUTH_ENABLED``, or upgrades the package) and
+    respawn instead of serving the stale one.
 
-    Covers only the inputs that change server behavior at spawn time —
-    the resolved auth source — deliberately narrow so unrelated env
-    churn does not force needless restarts.
+    Covers the inputs that change server behavior at spawn time:
+
+    * the resolved auth source — auth mode is baked at boot and cannot be
+      reconfigured in place; and
+    * the installed package version — a running server holds its code in
+      memory, so after ``omni upgrade`` (or a manual ``uv tool upgrade``)
+      the old process keeps serving pre-upgrade code until it is cycled.
+      Folding the version in makes the next CLI command notice the drift
+      and respawn the server on the new code through the existing
+      config-drift path in :func:`ensure_local_omnigent_server` — no
+      explicit restart required.
+
+    Deliberately narrow otherwise, so unrelated env churn does not force
+    needless restarts.
 
     :returns: A short hex digest, e.g. ``"3f9a1c2b4d5e6f70"``.
     """
     import hashlib
+    import importlib.metadata
     import json
 
     from omnigent.server.auth import resolve_auth_source
 
-    payload = json.dumps({"auth": resolve_auth_source()}, sort_keys=True)
+    try:
+        version = importlib.metadata.version("omnigent")
+    except importlib.metadata.PackageNotFoundError:
+        # Running from a source tree with no registered distribution —
+        # nothing to key version-drift on, so leave it out of the payload.
+        version = ""
+
+    payload = json.dumps({"auth": resolve_auth_source(), "version": version}, sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 

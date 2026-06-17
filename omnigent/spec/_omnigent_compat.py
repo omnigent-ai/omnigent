@@ -74,19 +74,24 @@ OMNIGENT_EXECUTOR_TYPE = "omnigent"
 # 'open-responses'" error.
 OMNIGENT_HARNESSES = frozenset(
     {
+        "antigravity",
         "claude-native",
         "claude-sdk",
         "codex",
         "codex-native",
+        "cursor",
         "databricks_supervisor",
         "openai-agents",
         "open-responses",
         "opencode",
         "pi",
+        "pi-native",
     },
 )
 # User-facing aliases accepted in specs and normalized before runtime dispatch.
-OMNIGENT_HARNESS_ALIASES = frozenset({"claude", "openai-agents-sdk"})
+OMNIGENT_HARNESS_ALIASES = frozenset(
+    {"claude", "native-pi", "openai-agents-sdk", "agy", "google-antigravity"}
+)
 _OMNIGENT_ACCEPTED_HARNESSES = OMNIGENT_HARNESSES | OMNIGENT_HARNESS_ALIASES
 
 

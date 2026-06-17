@@ -35,8 +35,10 @@ when the credentials file is absent — see ``ambient._claude_login_detected``.)
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
@@ -44,6 +46,11 @@ from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
 # Pi is not a configure-menu family (the menu is Claude + Codex), but the
 # first-run ``run`` flow falls back to it, so it has install metadata too.
 PI_KEY = "pi"
+
+# Cursor authenticates against its own backend (``cursor-agent login`` /
+# ``CURSOR_API_KEY``) with no provider/gateway credential, and ships via a curl
+# installer rather than npm — so it carries an ``install_hint``, not a ``package``.
+CURSOR_KEY = "cursor"
 
 # Like Pi, OpenCode (https://opencode.ai) is a CLI-backed harness that doesn't
 # fit either the Anthropic or OpenAI family — it's multi-provider, configured
@@ -60,7 +67,8 @@ class HarnessInstallSpec:
     :param binary: The CLI executable name looked up on ``PATH``, e.g.
         ``"claude"``.
     :param package: The npm package that provides the binary, e.g.
-        ``"@anthropic-ai/claude-code"``.
+        ``"@anthropic-ai/claude-code"``; ``None`` for a CLI not installed via
+        npm (use *install_hint* instead).
     :param login_args: Argv (after *binary*) for the harness's own interactive
         subscription login, e.g. ``("auth", "login", "--claudeai")`` for Claude
         or ``("login",)`` for Codex; ``None`` when the harness has no login
@@ -71,14 +79,22 @@ class HarnessInstallSpec:
         in?" status command, e.g. ``("auth", "status")`` (Claude, prints JSON
         with a ``loggedIn`` field) / ``("login", "status")`` (Codex, exits 0
         when logged in); ``None`` when the harness has no status command.
+    :param install_hint: Shell command shown to the user to install the CLI
+        when it has no npm *package* (e.g. cursor-agent's curl installer);
+        ``None`` for npm-installable harnesses.
+    :param login_status_key: The boolean field in the status command's JSON
+        output that reports login state, e.g. ``"isAuthenticated"`` for
+        cursor-agent. ``None`` falls back to ``"loggedIn"``, then the exit code.
     """
 
     display: str
     binary: str
-    package: str
+    package: str | None
     login_args: tuple[str, ...] | None = None
     logout_args: tuple[str, ...] | None = None
     status_args: tuple[str, ...] | None = None
+    install_hint: str | None = None
+    login_status_key: str | None = None
 
 
 # Keyed by harness family (Claude=anthropic, Codex=openai) plus the pi
@@ -104,6 +120,16 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         status_args=("login", "status"),
     ),
     PI_KEY: HarnessInstallSpec("Pi", "pi", "@earendil-works/pi-coding-agent"),
+    CURSOR_KEY: HarnessInstallSpec(
+        "Cursor",
+        "cursor-agent",
+        package=None,
+        login_args=("login",),
+        logout_args=("logout",),
+        status_args=("status", "--format", "json"),
+        install_hint="curl https://cursor.com/install -fsS | bash",
+        login_status_key="isAuthenticated",
+    ),
     # OpenCode ships an ``opencode`` binary via the ``opencode-ai`` npm
     # package (or via ``curl -fsSL https://opencode.ai/install | bash``
     # for the non-npm path). ``opencode auth login`` is the interactive
@@ -128,13 +154,16 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
 # :data:`_HARNESS_INSTALL` family key. Only the CLI-backed harnesses appear
 # here — the ones that cannot launch without a binary on ``PATH``:
 # ``claude-native`` wraps the ``claude`` CLI, ``codex-native`` the ``codex``
-# CLI, and ``pi`` the ``pi`` CLI. SDK-based harnesses (``claude-sdk``,
-# ``codex``, ``openai-agents-sdk``, ``databricks_supervisor``) run in-process
-# and are deliberately absent, so they resolve to "no CLI required".
+# CLI, and ``pi`` / ``pi-native`` the ``pi`` CLI.
+# SDK-based harnesses run in-process and are deliberately absent, so they
+# resolve to "no CLI required": ``claude-sdk``, ``codex``, ``openai-agents-sdk``,
+# ``databricks_supervisor``, and ``cursor`` (which drives the ``cursor-sdk``
+# Python package over its own bundled bridge, NOT the ``cursor-agent`` CLI).
 _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "claude-native": ANTHROPIC_FAMILY,
     "codex-native": OPENAI_FAMILY,
     PI_KEY: PI_KEY,
+    "pi-native": PI_KEY,
     # OpenCode is multi-provider but still binary-gated: it cannot launch
     # without the ``opencode`` CLI on ``PATH``. Listed here so
     # ``required_cli_for_harness`` returns its install spec and
@@ -218,8 +247,13 @@ def harness_install_command(key: str) -> list[str]:
         ``["npm", "install", "-g", "@anthropic-ai/claude-code"]``.
     :raises KeyError: If *key* has no install spec (caller should gate on
         :func:`harness_install_spec`).
+    :raises ValueError: If *key* has a spec but no npm ``package`` (a CLI
+        installed out-of-band, e.g. cursor-agent); show its ``install_hint``.
     """
-    return ["npm", "install", "-g", _HARNESS_INSTALL[key].package]
+    package = _HARNESS_INSTALL[key].package
+    if package is None:
+        raise ValueError(f"{key!r} has no npm package; show its install_hint instead")
+    return ["npm", "install", "-g", package]
 
 
 def install_harness_cli(key: str) -> bool:
@@ -235,6 +269,10 @@ def install_harness_cli(key: str) -> bool:
         present), ``False`` if npm is missing or the install failed.
     :raises KeyError: If *key* has no install spec.
     """
+    spec = _HARNESS_INSTALL.get(key)
+    if spec is not None and spec.package is None:
+        # Non-npm CLI (e.g. cursor-agent): no auto-install; caller shows install_hint.
+        return False
     if shutil.which("npm") is None:
         return False
     cmd = harness_install_command(key)
@@ -289,8 +327,9 @@ def harness_cli_logged_in(key: str) -> bool:
         payload = json.loads(result.stdout)
     except (json.JSONDecodeError, ValueError):
         return result.returncode == 0
-    if isinstance(payload, dict) and "loggedIn" in payload:
-        return bool(payload["loggedIn"])
+    status_key = spec.login_status_key or "loggedIn"
+    if isinstance(payload, dict) and status_key in payload:
+        return bool(payload[status_key])
     return result.returncode == 0
 
 
@@ -320,7 +359,27 @@ def harness_login(key: str) -> bool:
     if harness_cli_logged_in(key):
         return True
     try:
-        subprocess.run([spec.binary, *spec.login_args], check=False, timeout=600)
+        # Open /dev/tty explicitly so the child process sees a real TTY even
+        # when the parent's stdio is piped (e.g. launched via `uv tool run` or
+        # another wrapper). The Claude CLI checks isatty() and skips opening the
+        # browser when it returns false, which strands the login until it times
+        # out. Fall back to inherited stdio when /dev/tty can't be opened (a
+        # headless run with no controlling terminal).
+        tty_fd = None
+        kwargs: dict = {"check": False, "timeout": 600}
+        if not sys.stdin.isatty():
+            try:
+                tty_fd = os.open("/dev/tty", os.O_RDWR)
+                kwargs["stdin"] = tty_fd
+                kwargs["stdout"] = tty_fd
+                kwargs["stderr"] = tty_fd
+            except OSError:
+                pass
+        try:
+            subprocess.run([spec.binary, *spec.login_args], **kwargs)
+        finally:
+            if tty_fd is not None:
+                os.close(tty_fd)
     except (OSError, subprocess.TimeoutExpired):
         return False
     return harness_cli_logged_in(key)

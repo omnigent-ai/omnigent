@@ -37,17 +37,21 @@ from omnigent.claude_native_bridge import (
 from omnigent.entities.session_resources import SessionResourceView, terminal_resource_id
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner import create_runner_app
+from omnigent.runner import tool_dispatch as _tool_dispatch
 from omnigent.runner.app import (
     _RUNNER_DISPATCHED_FIELD,
     _WAKE_POST_MAX_ATTEMPTS,
     ResolvedSpec,
     _auto_create_claude_terminal,
     _auto_create_codex_terminal,
+    _auto_create_pi_terminal,
     _auto_create_repl_terminal,
     _deliver_subagent_wake_post,
     _log_terminal_lookup_miss,
+    _PiNativeLaunchConfig,
     _publish_native_terminal_start_error,
     _publish_terminal_pending,
+    _resolved_workdir_for_spec,
     _session_labels_for_runner_spawn,
     _terminal_lookup_miss_log_state,
     _wake_post_is_retryable,
@@ -57,6 +61,7 @@ from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
     OMNIGENT_REPL_TERMINAL_ROLE,
+    PI_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec, LocalToolInfo, MCPServerConfig
@@ -656,6 +661,290 @@ async def test_runner_session_tool_schemas_use_resolved_bundle_workdir(tmp_path:
     )
 
 
+def test_resolved_workdir_for_spec_prefers_bundle_workdir(tmp_path: Path) -> None:
+    """``_resolved_workdir_for_spec`` uses ``ResolvedSpec.workdir`` over fallback.
+
+    Bundle-deployed agents carry their own workdir (where
+    ``tools/python/*.py`` live). The dispatch path must thread that
+    workdir into ``dispatch_tool_locally`` so native python tools are
+    found at call time — not the generic ``runner_workspace``.
+    """
+    bundle_dir = tmp_path / "bundle"
+    runner_workspace = tmp_path / "workspace"
+    spec = AgentSpec(spec_version=1, name="bundle-agent")
+    entry = ResolvedSpec(spec=spec, workdir=bundle_dir)
+
+    assert _resolved_workdir_for_spec(entry, runner_workspace) == bundle_dir
+
+
+def test_resolved_workdir_for_spec_falls_back_without_bundle(tmp_path: Path) -> None:
+    """Non-bundle specs fall back to ``runner_workspace`` (prior behavior).
+
+    A bare ``AgentSpec`` (no ResolvedSpec wrapper) or a ``ResolvedSpec``
+    with ``workdir=None`` carries no bundle dir, so dispatch must keep
+    using the CLI launch workspace exactly as base did.
+    """
+    runner_workspace = tmp_path / "workspace"
+    bare_spec = AgentSpec(spec_version=1, name="plain-agent")
+
+    # Unwrapped spec → no workdir → fallback.
+    assert _resolved_workdir_for_spec(bare_spec, runner_workspace) == runner_workspace
+    # ResolvedSpec with no workdir → fallback.
+    wrapped_no_workdir = ResolvedSpec(spec=bare_spec, workdir=None)
+    assert _resolved_workdir_for_spec(wrapped_no_workdir, runner_workspace) == runner_workspace
+    # Missing fallback stays None (don't fabricate a path).
+    assert _resolved_workdir_for_spec(bare_spec, None) is None
+
+
+@pytest.mark.asyncio
+async def test_sessions_native_dispatches_native_tool_with_bundle_workdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bundle agent's native python tool dispatches against the bundle workdir.
+
+    End-to-end through ``POST /v1/sessions/{conv}/events`` (no live LLM):
+    the scripted harness emits an ``action_required`` for a spec-declared
+    python tool, and the runner must dispatch it locally with
+    ``runner_workspace`` set to the resolved ``ResolvedSpec.workdir`` (the
+    bundle dir), not the generic CLI ``runner_workspace``. This is the
+    dispatch-time counterpart to
+    :func:`test_runner_session_tool_schemas_use_resolved_bundle_workdir`,
+    which only proved schema generation used the bundle workdir.
+    """
+    bundle_dir = tmp_path / "bundle"
+    tool_dir = bundle_dir / "tools" / "python"
+    tool_dir.mkdir(parents=True)
+    (tool_dir / "bundle_tool.py").write_text(
+        "from omnigent_client.tools import tool\n\n"
+        "@tool\n"
+        "def bundle_tool(text: str) -> str:\n"
+        "    return text\n"
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    spec = AgentSpec(
+        spec_version=1,
+        name="bundle-agent",
+        local_tools=[
+            LocalToolInfo(
+                name="bundle_tool",
+                path="tools/python/bundle_tool.py",
+                language="python",
+            )
+        ],
+    )
+
+    captured_workspaces: list[Path | None] = []
+
+    async def _fake_dispatch(*, runner_workspace: Path | None = None, **kwargs: Any) -> str:
+        captured_workspaces.append(runner_workspace)
+        return "ok"
+
+    monkeypatch.setattr(_tool_dispatch, "dispatch_tool_locally", _fake_dispatch)
+
+    sse_frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+        _sse(
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "status": "action_required",
+                    "name": "bundle_tool",
+                    "call_id": "call_bundle",
+                    "arguments": json.dumps({"text": "from-bundle"}),
+                },
+            }
+        ),
+        _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+    ]
+    harness_client = _ScriptedHarnessClient(sse_frames)
+    pm = _FakeProcessManager(harness_client)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> ResolvedSpec:
+        del agent_id, session_id
+        return ResolvedSpec(spec=spec, workdir=bundle_dir)
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        runner_workspace=workspace,
+    )
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions/conv_bundle/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_bundle",
+                "model": "bundle-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "harness": "openai-agents",
+            },
+        )
+        assert resp.status_code == 202
+        for _ in range(100):
+            if captured_workspaces:
+                break
+            await asyncio.sleep(0.05)
+
+    assert captured_workspaces, "native tool must be dispatched locally"
+    assert captured_workspaces[0] == bundle_dir, (
+        "dispatch must use the resolved bundle workdir, not runner_workspace "
+        f"({workspace!r}); got {captured_workspaces[0]!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sessions_native_dispatches_builtin_tool_with_runner_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bundle agent's builtin OS-env tool dispatches in runner_workspace.
+
+    Bundle workdirs are only for spec-local native python tools. Builtins
+    such as ``sys_os_write`` run in the caller process and must keep the
+    original runner workspace even when the agent spec was resolved from an
+    extracted bundle directory.
+    """
+    bundle_dir = tmp_path / "bundle"
+    bundle_dir.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    spec = AgentSpec(spec_version=1, name="bundle-agent")
+
+    captured_workspaces: list[Path | None] = []
+
+    async def _fake_dispatch(*, runner_workspace: Path | None = None, **kwargs: Any) -> str:
+        captured_workspaces.append(runner_workspace)
+        return "ok"
+
+    monkeypatch.setattr(_tool_dispatch, "dispatch_tool_locally", _fake_dispatch)
+
+    sse_frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+        _sse(
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "status": "action_required",
+                    "name": "sys_os_write",
+                    "call_id": "call_write",
+                    "arguments": json.dumps(
+                        {"path": "created-by-tool.txt", "content": "from workspace"}
+                    ),
+                },
+            }
+        ),
+        _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+    ]
+    harness_client = _ScriptedHarnessClient(sse_frames)
+    pm = _FakeProcessManager(harness_client)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> ResolvedSpec:
+        del agent_id, session_id
+        return ResolvedSpec(spec=spec, workdir=bundle_dir)
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        runner_workspace=workspace,
+    )
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions/conv_builtin/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_bundle",
+                "model": "bundle-agent",
+                "content": [{"type": "input_text", "text": "write a file"}],
+                "harness": "openai-agents",
+            },
+        )
+        assert resp.status_code == 202
+        for _ in range(100):
+            if captured_workspaces:
+                break
+            await asyncio.sleep(0.05)
+
+    assert captured_workspaces, "builtin tool must be dispatched locally"
+    assert captured_workspaces[0] == workspace, (
+        "builtin OS-env dispatch must use runner_workspace, not the bundle workdir "
+        f"({bundle_dir!r}); got {captured_workspaces[0]!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_mcp_execute_dispatches_builtin_tool_with_runner_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``/mcp/execute`` also keeps builtin OS-env tools in runner_workspace."""
+    bundle_dir = tmp_path / "bundle"
+    bundle_dir.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    spec = AgentSpec(spec_version=1, name="bundle-agent")
+
+    captured_workspaces: list[Path | None] = []
+
+    async def _fake_execute_tool(*, runner_workspace: Path | None = None, **kwargs: Any) -> str:
+        captured_workspaces.append(runner_workspace)
+        return "ok"
+
+    monkeypatch.setattr(_tool_dispatch, "execute_tool", _fake_execute_tool)
+
+    harness_client = _ScriptedHarnessClient(
+        [_sse({"type": "response.completed", "response": {"id": "resp_1"}})]
+    )
+    pm = _FakeProcessManager(harness_client)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> ResolvedSpec:
+        del agent_id, session_id
+        return ResolvedSpec(spec=spec, workdir=bundle_dir)
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        runner_workspace=workspace,
+    )
+    async with _runner_client(app) as client:
+        seed_resp = await client.post(
+            "/v1/sessions/conv_execute_builtin/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_bundle",
+                "model": "bundle-agent",
+                "content": [{"type": "input_text", "text": "seed"}],
+                "harness": "openai-agents",
+            },
+        )
+        assert seed_resp.status_code == 202
+        for _ in range(100):
+            if harness_client.posted_bodies:
+                break
+            await asyncio.sleep(0.05)
+
+        execute_resp = await client.post(
+            "/v1/sessions/conv_execute_builtin/mcp/execute",
+            json={
+                "method": "tools/call",
+                "params": {
+                    "name": "sys_os_write",
+                    "arguments": {"path": "created-by-tool.txt", "content": "from workspace"},
+                },
+            },
+        )
+
+    assert execute_resp.status_code == 200
+    assert execute_resp.json() == {"result": {"output": "ok"}}
+    assert captured_workspaces == [workspace]
+
+
 @pytest.mark.asyncio
 async def test_sessions_native_path_injects_mcp_schemas() -> None:
     """``POST /v1/sessions/{conv}/events`` with a message body injects MCP schemas.
@@ -1001,7 +1290,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     class _FakeResourceRegistry:
         """Resource registry that records the launched terminal spec."""
 
-        async def launch_terminal(
+        async def launch_auxiliary_terminal(
             self,
             *,
             session_id: str,
@@ -1290,7 +1579,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
     class _FakeResourceRegistry:
         """Resource registry that records the launched terminal spec."""
 
-        async def launch_terminal(
+        async def launch_auxiliary_terminal(
             self,
             *,
             session_id: str,
@@ -1548,7 +1837,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
     class _FakeResourceRegistry:
         """Resource registry that records the launched terminal spec."""
 
-        async def launch_terminal(
+        async def launch_auxiliary_terminal(
             self,
             *,
             session_id: str,
@@ -1792,7 +2081,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
     class _FakeResourceRegistry:
         """Resource registry that records the launched terminal spec."""
 
-        async def launch_terminal(
+        async def launch_auxiliary_terminal(
             self,
             *,
             session_id: str,
@@ -1958,7 +2247,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     class _FakeResourceRegistry:
         """Resource registry returning a fixed terminal view."""
 
-        async def launch_terminal(
+        async def launch_auxiliary_terminal(
             self,
             *,
             session_id: str,
@@ -5238,6 +5527,7 @@ async def test_external_session_status_running_fans_out_child_busy_to_parent() -
                 "session_name": "impl",
                 "busy": True,
                 "current_task_status": "in_progress",
+                "last_task_error": None,
             },
         }
     ]
@@ -5309,6 +5599,7 @@ async def test_external_status_sequence_coalesces_duplicates_but_emits_task_stat
                 "session_name": "impl",
                 "busy": True,
                 "current_task_status": "in_progress",
+                "last_task_error": None,
             },
         },
         {
@@ -7434,6 +7725,111 @@ async def test_events_stop_session_on_codex_native_uses_turn_interrupt_without_m
     ), f"no interrupt marker should enter _session_histories; got {captured_history!r}"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["interrupt", "stop_session"])
+async def test_events_interrupt_and_stop_on_pi_native_enqueue_bridge_interrupt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    event_type: str,
+) -> None:
+    """
+    POST ``/events`` interrupt / stop_session on a pi-native session queues an
+    interrupt payload to the Pi extension inbox.
+
+    A pi-native turn runs inside the resident Pi TUI process; the runner's
+    harness task only enqueues the user message and returns, so the in-process
+    cancel floor has nothing to cancel. Both the ``interrupt`` and
+    ``stop_session`` dispatch must route to ``_handle_pi_native_interrupt``,
+    which drops an ``interrupt`` payload into the bridge inbox for the extension
+    to consume via ``ExtensionContext.abort()``.
+
+    Regression guard: both branches originally enumerated only claude-native
+    and codex-native, so pi-native silently fell through to the no-op
+    ``_cancel_inprocess_turn`` floor — clicking Stop on a Pi turn did nothing.
+
+    Pins:
+    1. 204 returned.
+    2. An ``interrupt_*`` payload is written to the session's bridge inbox.
+    3. NO ``[System: interrupted]`` marker is persisted (the floor never ran).
+    """
+    import omnigent.pi_native_bridge as pi_native_bridge
+    from omnigent.runner.app import _session_histories_ref
+    from omnigent.spec.types import ExecutorSpec
+
+    conv_id = f"conv_pi_native_{event_type}"
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+
+    pi_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the pi-native spec for any agent_id."""
+        del agent_id, session_id
+        return pi_native_spec
+
+    server_client = _EventRecordingServerClient()
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        # Seeds _session_spec_cache so the dispatch detects "pi-native".
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": event_type},
+        )
+
+        captured_history = list(_session_histories_ref.get(conv_id, []))
+        flagged = conv_id in app.state.interrupted_sessions
+
+    assert resp.status_code == 204, (
+        f"pi-native {event_type} must return 204; got {resp.status_code}: {resp.text}"
+    )
+
+    # 1) The request reached the bridge inbox (the extension's abort channel). If
+    # empty, the dispatch fell through to the no-op in-process cancel floor
+    # instead of _handle_pi_native_interrupt.
+    inbox = pi_native_bridge.bridge_dir_for_session_id(conv_id) / "inbox"
+    queued = sorted(p.name for p in inbox.glob("*.json")) if inbox.exists() else []
+    assert any("interrupt_" in name for name in queued), (
+        f"pi-native {event_type} must enqueue an interrupt payload to the bridge "
+        f"inbox; inbox contained {queued!r}."
+    )
+
+    # 2) No synthesized marker — pi-native never goes through the in-process floor.
+    marker_texts = [
+        b.get("text")
+        for data in server_client.posted_items
+        for b in (data.get("item_data") or {}).get("content", [])
+        if isinstance(b, dict)
+    ]
+    assert not any("interrupted" in (t or "").lower() for t in marker_texts), (
+        f"pi-native {event_type} must NOT persist an interrupted marker; got {marker_texts!r}."
+    )
+
+    # 3) Not flagged, and nothing leaks into the runner's in-memory history.
+    assert not flagged, f"pi-native session {conv_id!r} must not be flagged interrupted."
+    assert all(
+        not (
+            h.get("role") == "user"
+            and any("interrupted" in (b.get("text") or "").lower() for b in h.get("content", []))
+        )
+        for h in captured_history
+    ), f"no interrupt marker should enter _session_histories; got {captured_history!r}"
+
+
 def test_interrupted_sessions_isolated_per_app_instance() -> None:
     """
     Each ``create_runner_app()`` gets its own ``_interrupted_sessions`` set.
@@ -7983,6 +8379,147 @@ async def test_events_stop_session_closes_terminal_and_publishes_deleted(
 
 
 @pytest.mark.asyncio
+async def test_required_terminal_exit_publishes_deleted_and_failed(tmp_path: Path) -> None:
+    """
+    A required terminal disappearing fails the owning session.
+
+    This uses a generic ``worker`` terminal name to pin the lifecycle rule,
+    not a Claude-specific branch: if the terminal was registered as required,
+    the runner must publish both resource deletion and ``session.status:
+    failed`` when its watcher reports that tmux disappeared.
+
+    :param tmp_path: Temporary directory for fake terminal paths.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.app import _session_event_queues_ref
+    from tests.runner.helpers import make_test_terminal_instance
+
+    parent_id = f"conv_parent_required_exit_{uuid.uuid4().hex[:12]}"
+    conv_id = f"conv_required_exit_{uuid.uuid4().hex[:12]}"
+    parent_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("worker", "main", tmp_path)
+    instance.command = "worker-cli"
+    instance.args = ["--profile", "test"]
+    instance.launch_cwd = str(tmp_path)
+    instance._remember_pane_snapshot("startup failed\ncomplete setup first")
+    terminal_registry._by_conversation.setdefault(conv_id, {})[("worker", "main")] = instance
+    callbacks: dict[str, Any] = {}
+
+    def _capture_watcher(
+        on_idle: object | None = None,
+        *,
+        on_activity: object | None = None,
+        on_exit: object | None = None,
+        idle_threshold_s: float | None = None,
+        poll_interval_s: float | None = None,
+        replace: bool = False,
+    ) -> None:
+        del on_idle, on_activity, idle_threshold_s, poll_interval_s
+        callbacks["on_exit"] = on_exit
+        callbacks["replace"] = replace
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    pm._sessions.add(conv_id)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+    )
+    resource_registry = app.state.session_resource_registry
+    runner_app._session_inboxes_ref[parent_id] = parent_inbox
+    runner_app.register_child_session(
+        conv_id,
+        parent_session_id=parent_id,
+        title="worker:main",
+        tool="worker",
+        session_name="main",
+    )
+    runner_app.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=conv_id,
+        agent="worker",
+        title="main",
+    )
+
+    async def _collect_exit_events() -> list[dict[str, Any]]:
+        while True:
+            queue = _session_event_queues_ref.get(conv_id)
+            if queue is not None and queue.qsize() >= 2:
+                events: list[dict[str, Any]] = []
+                while not queue.empty():
+                    item = queue.get_nowait()
+                    if isinstance(item, dict):
+                        events.append(item)
+                return events
+            await asyncio.sleep(0)
+
+    try:
+        await resource_registry.observe_required_terminal(
+            conv_id,
+            "worker",
+            "main",
+            instance,
+        )
+        on_exit = callbacks.get("on_exit")
+        assert callable(on_exit)
+        on_exit()
+        queued_events = await asyncio.wait_for(_collect_exit_events(), timeout=1.0)
+        for _ in range(100):
+            if pm.released:
+                break
+            await asyncio.sleep(0)
+        parent_events = _drain_session_event_queue(_session_event_queues_ref.get(parent_id))
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+        _session_event_queues_ref.pop(parent_id, None)
+        runner_app.unregister_subagent_work(conv_id)
+        runner_app.unregister_child_session(conv_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    assert terminal_registry.get(conv_id, "worker", "main") is None
+    assert {
+        "type": "session.resource.deleted",
+        "resource_id": "terminal_worker_main",
+        "resource_type": "terminal",
+        "session_id": conv_id,
+    } in queued_events
+    failed_events = [
+        event
+        for event in queued_events
+        if event.get("type") == "session.status" and event.get("status") == "failed"
+    ]
+    assert len(failed_events) == 1, f"expected one failed status, got {queued_events!r}"
+    assert failed_events[0]["error"]["code"] == "required_terminal_exited"
+    assert "Required terminal exited unexpectedly" in failed_events[0]["error"]["message"]
+    assert parent_events == [
+        {
+            "type": "session.child_session.updated",
+            "conversation_id": parent_id,
+            "child_session_id": conv_id,
+            "child": {
+                "id": conv_id,
+                "title": "worker:main",
+                "tool": "worker",
+                "session_name": "main",
+                "busy": False,
+                "current_task_status": "failed",
+                "last_task_error": failed_events[0]["error"],
+            },
+        }
+    ]
+    assert pm.released == [conv_id]
+    inbox_item = parent_inbox.get_nowait()
+    assert inbox_item["status"] == "failed"
+    assert "Required terminal exited unexpectedly" in inbox_item["output"]
+    assert "command: worker-cli (2 args; argv omitted" in inbox_item["output"]
+    assert f"cwd: {tmp_path}" in inbox_item["output"]
+    assert "startup failed\ncomplete setup first" in inbox_item["output"]
+    assert "Suggested next checks" not in inbox_item["output"]
+
+
+@pytest.mark.asyncio
 async def test_events_effort_change_on_native_session_types_slash_command(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -8502,6 +9039,224 @@ async def test_events_compact_on_native_session_returns_503_when_bridge_not_read
     body = resp.json()
     assert body.get("error") == "claude_native_compact_failed", (
         f"503 body must carry the bridge-failure error code; got {body!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_codex_native_injects_slash_command(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    POST ``/events`` with ``{"type":"compact"}`` on a codex-native
+    session injects ``/compact`` into the codex tmux pane and returns 200.
+
+    Codex owns its own context window in the terminal, so explicit
+    compaction must run inside Codex — the same rationale as the
+    claude-native path.  The pane coordinates come from the resource
+    registry (not a ``tmux.json`` sidecar).  The 200 return is
+    load-bearing: the Omnigent server reads it to skip its own
+    AP-side compaction.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from tests.runner.helpers import make_test_terminal_instance
+
+    captured: list[tuple[str, list[str]]] = []
+
+    def _fake_run_tmux(socket_path: str, *args: str) -> None:
+        """Record tmux send-keys calls without touching tmux."""
+        captured.append((socket_path, list(args)))
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
+
+    codex_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the codex-native spec for any agent_id."""
+        del agent_id, session_id
+        return codex_native_spec
+
+    conv_id = "conv_codex_compact"
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("codex", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault(conv_id, {})[("codex", "main")] = instance
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "compact"},
+        )
+
+        # Drain the event queue: /compact is a control signal and must
+        # not enqueue session.status events.
+        queue = _session_event_queues_ref.get(conv_id)
+        queued_events: list[dict[str, Any]] = []
+        if queue is not None:
+            while not queue.empty():
+                item = queue.get_nowait()
+                if isinstance(item, dict):
+                    queued_events.append(item)
+
+    # 200 = codex-native dispatch routed to the compact handler and it
+    # injected successfully.
+    assert resp.status_code == 200, (
+        f"Codex-native compact must return 200 from /events; got {resp.status_code}: {resp.text}"
+    )
+
+    # Exactly 3 tmux send-keys calls: C-u, -l /compact, Enter.
+    assert len(captured) == 3, (
+        f"Expected 3 tmux send-keys calls (C-u, /compact, Enter), got {len(captured)}."
+    )
+    socket = str(instance.socket_path)
+    # 1. Clear draft: C-u
+    assert captured[0] == (socket, ["send-keys", "-t", "main", "C-u"]), (
+        f"First call must clear draft with C-u; got {captured[0]!r}."
+    )
+    # 2. Type /compact literally
+    assert captured[1] == (socket, ["send-keys", "-l", "-t", "main", "/compact"]), (
+        f"Second call must type /compact literally; got {captured[1]!r}."
+    )
+    # 3. Submit with Enter
+    assert captured[2] == (socket, ["send-keys", "-t", "main", "Enter"]), (
+        f"Third call must submit with Enter; got {captured[2]!r}."
+    )
+    # /compact is a control signal, not a state change.
+    assert queued_events == [], f"compact must not publish session events; got {queued_events!r}."
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_codex_native_returns_204_when_no_terminal() -> None:
+    """
+    Codex-native compact returns 204 when no live terminal is registered.
+
+    Without a running codex terminal the ``/compact`` slash command
+    has nowhere to go.  204 tells the Omnigent server to fall back to
+    its own AP-side compaction (or skip it).
+    """
+    codex_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the codex-native spec for any agent_id."""
+        del agent_id, session_id
+        return codex_native_spec
+
+    conv_id = "conv_codex_compact_no_term"
+    # Empty registry — no codex terminal registered.
+    terminal_registry = TerminalRegistry()
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "compact"},
+        )
+
+    assert resp.status_code == 204, (
+        f"Codex-native compact with no terminal must return 204; "
+        f"got {resp.status_code}: {resp.text}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_codex_native_returns_503_on_tmux_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Codex-native compact returns 503 when the tmux send-keys call fails.
+
+    The 503 tells the Omnigent server the control was NOT handled, so it
+    can surface an error rather than silently running its own (wrong)
+    compaction.
+    """
+    from tests.runner.helpers import make_test_terminal_instance
+
+    def _failing_run_tmux(socket_path: str, *args: str) -> None:
+        """Simulate a tmux pane that is no longer alive."""
+        del socket_path, args
+        raise RuntimeError("no server running on /tmp/dead.sock")
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _failing_run_tmux)
+
+    codex_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the codex-native spec for any agent_id."""
+        del agent_id, session_id
+        return codex_native_spec
+
+    conv_id = "conv_codex_compact_fail"
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("codex", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault(conv_id, {})[("codex", "main")] = instance
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "compact"},
+        )
+
+    assert resp.status_code == 503, (
+        f"Codex-native compact with tmux failure must return 503; "
+        f"got {resp.status_code}: {resp.text}"
+    )
+    body = resp.json()
+    assert body.get("error") == "codex_native_compact_failed", (
+        f"503 body must carry the codex bridge-failure error code; got {body!r}"
     )
 
 
@@ -9046,7 +9801,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
         # None, so the test doesn't need a real terminal instance.
         terminal_registry = None
 
-        async def launch_terminal(
+        async def launch_required_terminal(
             self,
             *,
             session_id: str,
@@ -9100,6 +9855,96 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
 
 
 @pytest.mark.asyncio
+async def test_auto_create_pi_terminal_launches_required_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Pi-native auto-create must launch a *required* terminal.
+
+    Regression guard for a missed call site. The pi-native runtime *is* the
+    terminal process (parity with claude-native), so when the lifecycle-aware
+    launch API replaced ``launch_terminal`` with ``launch_required_terminal`` /
+    ``launch_auxiliary_terminal``, ``_auto_create_pi_terminal`` had to move to
+    ``launch_required_terminal``. The fake registry below exposes *only*
+    ``launch_required_terminal`` (no ``launch_terminal``), so a stale call site
+    raises ``AttributeError`` here in CI instead of crashing in production the
+    moment a real pi-native session boots.
+
+    :param tmp_path: Pytest-provided temporary directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    import omnigent.pi_native as pi_native
+    import omnigent.pi_native_bridge as pi_native_bridge
+    import omnigent.pi_native_credentials as pi_native_credentials
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+    # The lifecycle of the launch — not the binary or credentials — is under
+    # test, so neither a real Pi install nor a configured provider is needed.
+    monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
+    monkeypatch.setattr(pi_native_credentials, "resolve_pi_native_provider", lambda: None)
+
+    # Skip the GET /v1/sessions round-trip: hand the flow a ready launch
+    # config pointing at the tmp workspace.
+    async def _fake_launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
+        return _PiNativeLaunchConfig(
+            workspace=tmp_path,
+            server_url="http://127.0.0.1:8000",
+            terminal_launch_args=None,
+            external_session_id=None,
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        """Records the launch; exposes ONLY the required-terminal launch API."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+        ) -> SessionResourceView:
+            """Record the launch and return a terminal resource view."""
+            captured["terminal_name"] = terminal_name
+            captured["session_key"] = session_key
+            captured["resource_role"] = resource_role
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_pi_main",
+                type="terminal",
+                session_id=session_id,
+                name="pi:main",
+                metadata={"terminal_name": "pi", "session_key": "main", "running": True},
+            )
+
+    published: list[dict[str, Any]] = []
+
+    await _auto_create_pi_terminal(
+        "conv_pi",
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, evt: published.append(evt),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    # Required lifecycle (parity with claude-native), correct terminal identity.
+    assert captured["terminal_name"] == "pi"
+    assert captured["session_key"] == "main"
+    assert captured["resource_role"] == PI_NATIVE_TERMINAL_ROLE
+    assert captured["spec"].command == "pi"
+    # The fresh terminal is surfaced on the live stream for the Terminal toggle.
+    assert any(evt.get("type") == "session.resource.created" for evt in published)
+
+
+@pytest.mark.asyncio
 async def test_auto_create_claude_terminal_passes_session_effort(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -9134,7 +9979,7 @@ async def test_auto_create_claude_terminal_passes_session_effort(
 
         terminal_registry = None
 
-        async def launch_terminal(
+        async def launch_required_terminal(
             self,
             *,
             session_id: str,
@@ -9245,7 +10090,7 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
 
         terminal_registry = None
 
-        async def launch_terminal(
+        async def launch_required_terminal(
             self,
             *,
             session_id: str,
@@ -9406,7 +10251,7 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
 
         terminal_registry = None
 
-        async def launch_terminal(
+        async def launch_required_terminal(
             self,
             *,
             session_id: str,
@@ -9529,7 +10374,7 @@ async def test_auto_create_claude_terminal_emits_resource_created_event(
         # ``_publish_tmux_target_for_bridge`` early-returns when this is None.
         terminal_registry = None
 
-        async def launch_terminal(
+        async def launch_required_terminal(
             self,
             *,
             session_id: str,
@@ -9752,7 +10597,7 @@ async def test_auto_create_claude_terminal_resets_stale_bridge_id_label(
 
         terminal_registry = None
 
-        async def launch_terminal(
+        async def launch_required_terminal(
             self,
             *,
             session_id: str,
@@ -10086,7 +10931,7 @@ class _EnsureTerminalCase:
     :param expect_auto_create: Whether the request must route to
         ``_auto_create_claude_terminal`` (the ensure path).
     :param expect_launch: Whether the request must route to the generic
-        ``launch_terminal`` path instead.
+        terminal launch path instead.
     :param expect_name: ``name`` of the resource the route must return —
         identifies which collaborator produced the response.
     """
@@ -10146,15 +10991,15 @@ async def test_create_session_terminal_ensure_routes_claude_native(
     no ``spec`` and no ``bridge_inject_dir`` must go to the full native
     ``_auto_create_claude_terminal`` (or return the live terminal if one
     exists), while a request carrying ``spec``/``bridge_inject_dir`` (the
-    fresh-launch wrapper path) must still use the generic ``launch_terminal``.
+    fresh-launch wrapper path) must still use the generic terminal launch.
 
     The three collaborators are stubbed so the routing decision is the only
     thing under test; each returns a distinctly-named real
     :class:`SessionResourceView`, so the response ``name`` proves which path
     handled the request. Remove the ensure branch and the auto-create cases
-    fall through to ``launch_terminal`` (wrong name, ``launched`` recorded);
-    drop the ``not spec`` guard and the explicit-spec case wrongly
-    auto-creates — either way this test fails.
+    fall through to the generic terminal launch path (wrong name,
+    ``launched`` recorded); drop the ``not spec`` guard and the explicit-spec
+    case wrongly auto-creates — either way this test fails.
 
     :param case: The parametrized routing scenario.
     :param monkeypatch: Pytest monkeypatch fixture.
@@ -10188,7 +11033,7 @@ async def test_create_session_terminal_ensure_routes_claude_native(
             )
         return None
 
-    async def _stub_launch_terminal(
+    async def _stub_launch_auxiliary_terminal(
         self: object, *, session_id: str, terminal_name: str, session_key: str, **_kwargs: object
     ) -> SessionResourceView:
         """Record the generic-launch call and return a tagged terminal view."""
@@ -10203,7 +11048,11 @@ async def test_create_session_terminal_ensure_routes_claude_native(
 
     monkeypatch.setattr("omnigent.runner.app._auto_create_claude_terminal", _stub_auto_create)
     monkeypatch.setattr(SessionResourceRegistry, "get_terminal_resource", _stub_get_terminal)
-    monkeypatch.setattr(SessionResourceRegistry, "launch_terminal", _stub_launch_terminal)
+    monkeypatch.setattr(
+        SessionResourceRegistry,
+        "launch_auxiliary_terminal",
+        _stub_launch_auxiliary_terminal,
+    )
 
     app = create_runner_app(
         process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
@@ -10498,7 +11347,7 @@ async def test_create_session_terminal_ensure_routes_codex_native(
         close_calls.append(f"{session_id}:{terminal_id}")
         return True
 
-    async def _stub_launch_terminal(
+    async def _stub_launch_auxiliary_terminal(
         self: object,
         *,
         session_id: str,
@@ -10534,7 +11383,11 @@ async def test_create_session_terminal_ensure_routes_codex_native(
         _stub_terminal_resource_role,
     )
     monkeypatch.setattr(SessionResourceRegistry, "close_terminal", _stub_close_terminal)
-    monkeypatch.setattr(SessionResourceRegistry, "launch_terminal", _stub_launch_terminal)
+    monkeypatch.setattr(
+        SessionResourceRegistry,
+        "launch_auxiliary_terminal",
+        _stub_launch_auxiliary_terminal,
+    )
 
     app = create_runner_app(
         process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
@@ -10661,7 +11514,7 @@ async def test_auto_create_repl_terminal_launches_attach_and_stamps_label(
     class _FakeResourceRegistry:
         """Resource registry that records the launched REPL terminal spec."""
 
-        async def launch_terminal(
+        async def launch_auxiliary_terminal(
             self,
             *,
             session_id: str,
@@ -11900,7 +12753,7 @@ async def test_auto_create_claude_terminal_recreate_cancels_prior_forwarder(
 
         terminal_registry = None
 
-        async def launch_terminal(
+        async def launch_required_terminal(
             self,
             *,
             session_id: str,
@@ -12102,7 +12955,7 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
     class _FakeResourceRegistry:
         """Returns a terminal resource view without launching tmux."""
 
-        async def launch_terminal(
+        async def launch_auxiliary_terminal(
             self,
             *,
             session_id: str,

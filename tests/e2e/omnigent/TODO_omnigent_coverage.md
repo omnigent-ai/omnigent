@@ -54,6 +54,20 @@ Covered by the unit tests `test_harness_auto_picks_from_model_prefix`
 (parametrized over claude/gpt variants) and the e2e cases
 `simple_chat` and `agent_with_subagent_session`.
 
+### Fixed — Gap 7: Stock omnigent policy callables don't work under Omnigent
+
+`resolve_function_policy` now detects legacy `(content, phase)` callables at
+load time and wraps them in `_omnigent_legacy_shim` — a one-argument adapter
+that unpacks the engine's evaluation object into `(content, phase_string)`
+before forwarding to the original callable. The shim is transparent: return
+values and exceptions propagate unchanged.
+
+The motivating example callables (`examples.tool_functions.block_long_sleep`
+and friends) were already rewritten to the modern single-argument signature
+before this fix landed, so they no longer exercise the shim path. The shim
+exists to protect any user-written omnigent-style policy callables that have
+not yet been migrated.
+
 ### Fixed — Gap 2: parent-to-inline-AgentTool `harness:` propagation
 
 Inline AgentTools in `coding_supervisor_with_forks.yaml` /
@@ -105,29 +119,6 @@ validator allowlist (`['claude-sdk', 'codex', 'openai-agents',
 'pi']`). Expected to fail at spec-load with a harness-required
 error, but the adapter reads `harness` as a plain string so
 the actual error is unclear. Needs investigation.
-
-### Gap 7 — Stock omnigent policy callables don't work under Omnigent
-
-Example YAMLs like `agent_with_policies.yaml` ship with policy
-callables such as `examples.tool_functions.block_long_sleep`
-that take two arguments: the tool call content and the phase
-name. That's how omnigent calls them. Agent-plane's policy
-engine calls policy callables differently — it hands them a
-single object that has the phase and content bundled together.
-
-So even though the adapter correctly lifts these policies into
-the omnigent spec, the callables themselves blow up at
-runtime because the arguments don't line up. My enforcement
-tests sidestep this by using an omnigent-shaped callable
-instead (`omnigent._e2e_policy_callables.block_on_sentinel`).
-
-**Fix**: teach Omnigent' `resolve_function_policy` to
-recognize the omnigent-style signature and adapt it. When the
-callable takes two positional arguments and returns a plain
-dict, unpack the engine's evaluation object into `(content,
-phase_string)` before calling. This is a one-function shim, not
-a design change — the goal is that an unmodified omnigent
-policy YAML works the same on both paths.
 
 ### Gap 8 — Can't ban a specific sub-agent by name
 

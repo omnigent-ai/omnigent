@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import socket
 import ssl
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
 
+from omnigent.inner.credential_proxy import (
+    SYNTHETIC_CREDENTIAL_PREFIX,
+    CredentialRewriteRule,
+)
 from omnigent.inner.egress.ca import ensure_ca, ensure_ca_bundle
 from omnigent.inner.egress.certs import HostCertCache
 from omnigent.inner.egress.proxy import EgressProxy
@@ -1446,3 +1451,509 @@ async def test_upstream_ca_pinned_at_construction_not_reread_per_request(
         )
     finally:
         await proxy.stop()
+
+
+# ---------------------------------------------------------------------------
+# Credential-proxy rewrite (secretless credential_proxy) — real round trips
+# through the plain-HTTP proxy path with a local capturing upstream.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _CapturedRequest:
+    """Selected headers captured by the local upstream.
+
+    :param authorization: The exact ``Authorization`` header value the
+        upstream received, e.g. ``"Bearer real-secret"``, or ``None``
+        when the request carried no such header.
+    :param connection: Every ``Connection`` header value the upstream
+        received, lowercased, in order. A list (not a scalar) so a test
+        can assert the proxy collapsed any client-supplied
+        ``Connection`` / ``Keep-Alive`` headers into exactly one
+        ``close`` rather than forwarding duplicates.
+    """
+
+    authorization: str | None
+    connection: list[str] = field(default_factory=list)
+
+
+async def _start_capturing_upstream(captured: list[_CapturedRequest]) -> asyncio.Server:
+    """Start a loopback HTTP server that records each ``Authorization`` header.
+
+    The server reads the request head, appends the captured authorization
+    to *captured*, and always replies ``200 OK``. This is the upstream the
+    proxy forwards rewritten requests to, so the captured value is exactly
+    what crossed the proxy boundary toward the real service.
+
+    :param captured: List the server appends one entry to per request.
+    :returns: A running :class:`asyncio.Server` on ``127.0.0.1``.
+    """
+
+    async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        head = await reader.readuntil(b"\r\n\r\n")
+        auth: str | None = None
+        connection: list[str] = []
+        for line in head.split(b"\r\n"):
+            if line[:14].lower() == b"authorization:":
+                auth = line.partition(b":")[2].strip().decode("latin-1")
+            elif line[:11].lower() == b"connection:":
+                connection.append(line.partition(b":")[2].strip().decode("latin-1").lower())
+        captured.append(_CapturedRequest(authorization=auth, connection=connection))
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+        await writer.drain()
+        writer.close()
+
+    return await asyncio.start_server(_handle, "127.0.0.1", 0)
+
+
+async def _proxied_http_get(
+    *,
+    proxy_port: int,
+    upstream_port: int,
+    authorization: str | None,
+) -> bytes:
+    """Send one plain-HTTP GET through the proxy, optionally authenticated.
+
+    :param proxy_port: Loopback TCP port the proxy listens on.
+    :param upstream_port: Port of the local capturing upstream.
+    :param authorization: The raw ``Authorization`` value the sandbox
+        would send (carrying a synthetic placeholder), or ``None`` to
+        send a bare request with no ``Authorization`` header — the
+        swap-on-access client shape.
+    :returns: The raw response bytes the client received from the proxy.
+    """
+    reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
+    auth_line = f"Authorization: {authorization}\r\n" if authorization is not None else ""
+    request = (
+        f"GET http://127.0.0.1:{upstream_port}/probe HTTP/1.1\r\n"
+        f"Host: 127.0.0.1:{upstream_port}\r\n"
+        f"{auth_line}"
+        "Connection: close\r\n"
+        "\r\n"
+    ).encode("latin-1")
+    writer.write(request)
+    await writer.drain()
+    response = await asyncio.wait_for(reader.read(4096), timeout=5)
+    writer.close()
+    with contextlib.suppress(Exception):
+        await writer.wait_closed()
+    return response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scheme,username,sent_authorization_tmpl,expected_upstream",
+    [
+        # bearer: sandbox sends "Bearer <synthetic>"; upstream gets the real secret.
+        ("bearer", None, "Bearer {synthetic}", "Bearer real-secret-value"),
+        # token (GitHub CLI): sandbox sends "token <synthetic>".
+        ("token", None, "token {synthetic}", "token real-secret-value"),
+    ],
+)
+async def test_credential_rewrite_swaps_bearer_and_token(
+    ca_paths: tuple[Path, Path, Path],
+    scheme: str,
+    username: str | None,
+    sent_authorization_tmpl: str,
+    expected_upstream: str,
+) -> None:
+    """The proxy swaps a synthetic bearer/token placeholder for the real secret.
+
+    A failure means the rewrite didn't fire (upstream would see the
+    synthetic, never the real value) — i.e. the secretless proxy isn't
+    actually authenticating the upstream call.
+    """
+    cert_path, key_path, _ = ca_paths
+    synthetic = f"{SYNTHETIC_CREDENTIAL_PREFIX}abc123"
+    rule = CredentialRewriteRule(
+        host="127.0.0.1",
+        scheme=scheme,
+        synthetic=synthetic,
+        real_secret="real-secret-value",
+        username=username,
+    )
+    captured: list[_CapturedRequest] = []
+    upstream = await _start_capturing_upstream(captured)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+
+    proxy = EgressProxy(
+        parse_rules(["* 127.0.0.1/**"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+        credential_rewrites=[rule],
+    )
+    proxy_port = await proxy.start_tcp()
+    try:
+        response = await _proxied_http_get(
+            proxy_port=proxy_port,
+            upstream_port=upstream_port,
+            authorization=sent_authorization_tmpl.format(synthetic=synthetic),
+        )
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+    assert b"200 OK" in response, f"Request did not complete through proxy: {response[:200]!r}"
+    assert len(captured) == 1, "Upstream should have received exactly one request"
+    # The upstream MUST receive the REAL secret, formatted per the rule's
+    # scheme — proving the synthetic→real swap happened at the proxy.
+    assert captured[0].authorization == expected_upstream
+    # And the synthetic placeholder must NOT have leaked upstream.
+    assert synthetic not in (captured[0].authorization or "")
+
+
+@pytest.mark.asyncio
+async def test_credential_rewrite_swaps_basic_password(
+    ca_paths: tuple[Path, Path, Path],
+) -> None:
+    """A Basic-auth synthetic password is swapped for the real secret upstream.
+
+    Covers the git_https / https_basic shape where the synthetic lives in
+    the password field of ``Basic base64(user:pass)``.
+    """
+    cert_path, key_path, _ = ca_paths
+    synthetic = f"{SYNTHETIC_CREDENTIAL_PREFIX}basicpw"
+    rule = CredentialRewriteRule(
+        host="127.0.0.1",
+        scheme="basic",
+        synthetic=synthetic,
+        real_secret="gho_realtoken",
+        username="x-access-token",
+    )
+    captured: list[_CapturedRequest] = []
+    upstream = await _start_capturing_upstream(captured)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+
+    sent = "Basic " + base64.b64encode(f"x-access-token:{synthetic}".encode()).decode()
+    proxy = EgressProxy(
+        parse_rules(["* 127.0.0.1/**"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+        credential_rewrites=[rule],
+    )
+    proxy_port = await proxy.start_tcp()
+    try:
+        response = await _proxied_http_get(
+            proxy_port=proxy_port,
+            upstream_port=upstream_port,
+            authorization=sent,
+        )
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+    assert b"200 OK" in response, f"Request did not complete: {response[:200]!r}"
+    # Exactly one upstream request — the proxy forwarded once, not 0
+    # (dropped) or >1 (retried/duplicated).
+    assert len(captured) == 1
+    received = captured[0].authorization or ""
+    assert received.startswith("Basic ")
+    decoded = base64.b64decode(received.split(" ", 1)[1]).decode()
+    # The real token reaches upstream in the password field, behind the
+    # configured username — the synthetic must be gone.
+    assert decoded == "x-access-token:gho_realtoken"
+    assert synthetic not in decoded
+
+
+@pytest.mark.asyncio
+async def test_credential_rewrite_rejects_synthetic_on_wrong_host(
+    ca_paths: tuple[Path, Path, Path],
+) -> None:
+    """A placeholder bound to one host is refused (403) when sent to another.
+
+    This is the leak guard: a compromised sandbox must not be able to
+    relay its synthetic placeholder to an attacker-controlled host. If the
+    binding check regressed, the proxy would forward the request and the
+    upstream would receive a (swapped) real secret — a credential
+    exfiltration. The test asserts the request is 403'd and the upstream
+    is never contacted.
+    """
+    cert_path, key_path, _ = ca_paths
+    synthetic = f"{SYNTHETIC_CREDENTIAL_PREFIX}boundelsewhere"
+    # Rule binds the synthetic to a DIFFERENT host than the request target.
+    rule = CredentialRewriteRule(
+        host="api.github.com",
+        scheme="bearer",
+        synthetic=synthetic,
+        real_secret="real-secret-value",
+        username=None,
+    )
+    captured: list[_CapturedRequest] = []
+    upstream = await _start_capturing_upstream(captured)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+
+    proxy = EgressProxy(
+        parse_rules(["* 127.0.0.1/**"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+        credential_rewrites=[rule],
+    )
+    proxy_port = await proxy.start_tcp()
+    try:
+        response = await _proxied_http_get(
+            proxy_port=proxy_port,
+            upstream_port=upstream_port,
+            authorization=f"Bearer {synthetic}",
+        )
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+    # 403 = the proxy refused to forward the cross-host placeholder.
+    assert b"403 Forbidden" in response, (
+        f"Synthetic bound to api.github.com MUST be refused on 127.0.0.1. Got: {response[:200]!r}"
+    )
+    # The upstream must NEVER have been reached — no swapped secret leaked.
+    assert captured == []
+
+
+@pytest.mark.asyncio
+async def test_credential_rewrite_passes_through_non_synthetic(
+    ca_paths: tuple[Path, Path, Path],
+) -> None:
+    """A real (non-synthetic) Authorization header is forwarded untouched.
+
+    Ensures the rewrite only acts on this proxy's own placeholders and
+    never mangles a legitimate token a tool sends directly.
+    """
+    cert_path, key_path, _ = ca_paths
+    rule = CredentialRewriteRule(
+        host="127.0.0.1",
+        scheme="bearer",
+        synthetic=f"{SYNTHETIC_CREDENTIAL_PREFIX}unused",
+        real_secret="real-secret-value",
+        username=None,
+    )
+    captured: list[_CapturedRequest] = []
+    upstream = await _start_capturing_upstream(captured)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+
+    proxy = EgressProxy(
+        parse_rules(["* 127.0.0.1/**"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+        credential_rewrites=[rule],
+    )
+    proxy_port = await proxy.start_tcp()
+    try:
+        response = await _proxied_http_get(
+            proxy_port=proxy_port,
+            upstream_port=upstream_port,
+            authorization="Bearer a-users-own-real-token",
+        )
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+    assert b"200 OK" in response
+    # Exactly one forwarded request (not dropped, not duplicated).
+    assert len(captured) == 1
+    # Non-synthetic header forwarded verbatim — no accidental rewrite.
+    assert captured[0].authorization == "Bearer a-users-own-real-token"
+
+
+@pytest.mark.asyncio
+async def test_credential_rewrite_injects_on_access_without_header(
+    ca_paths: tuple[Path, Path, Path],
+) -> None:
+    """Swap-on-access: a bare request to a bound host gets the real credential.
+
+    This is the default model — the entry injected nothing into the
+    sandbox (``synthetic=None``), so the request arrives with no
+    ``Authorization`` header and the proxy attaches the real credential on
+    the way out. If injection regressed, the upstream would receive no
+    ``Authorization`` header (``None``) and authenticate as nobody.
+    """
+    cert_path, key_path, _ = ca_paths
+    rule = CredentialRewriteRule(
+        host="127.0.0.1",
+        scheme="bearer",
+        real_secret="real-secret-value",
+        synthetic=None,
+        username=None,
+    )
+    captured: list[_CapturedRequest] = []
+    upstream = await _start_capturing_upstream(captured)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+
+    proxy = EgressProxy(
+        parse_rules(["* 127.0.0.1/**"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+        credential_rewrites=[rule],
+    )
+    proxy_port = await proxy.start_tcp()
+    try:
+        response = await _proxied_http_get(
+            proxy_port=proxy_port,
+            upstream_port=upstream_port,
+            authorization=None,
+        )
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+    assert b"200 OK" in response, f"Request did not complete: {response[:200]!r}"
+    assert len(captured) == 1
+    # The proxy synthesized the Authorization header from the rule — the
+    # client sent none.
+    assert captured[0].authorization == "Bearer real-secret-value"
+
+
+# ---------------------------------------------------------------------------
+# Single-shot upstream framing (Connection: close) and shutdown draining.
+#
+# Regression coverage for the git-over-proxy hang: the proxy serves one
+# inner request per upstream connection and relays by reading to EOF, so a
+# keep-alive upstream would park the relay until its 60 s timeout and a
+# pipelining client (git's libcurl: unauth /info/refs -> 401 -> auth retry
+# on the same tunnel) would stall. ``_force_connection_close`` makes every
+# forwarded request single-shot; ``stop`` cancels handlers still parked in
+# a read so they don't leak past the loop.
+# ---------------------------------------------------------------------------
+
+
+def test_force_connection_close_replaces_hop_by_hop_headers() -> None:
+    """``_force_connection_close`` collapses connection headers to one ``close``.
+
+    The header block the proxy forwards upstream MUST carry exactly one
+    ``Connection: close`` and none of the client's keep-alive-flavored
+    hop-by-hop headers (``Connection`` / ``Proxy-Connection`` /
+    ``Keep-Alive``). If any survived, a keep-alive upstream would hold the
+    socket open and ``_relay_response`` would block until its timeout
+    instead of returning at end-of-body. The directive must also land in
+    the header section (before the blank-line separator), not after it.
+    """
+    headers = (
+        b"Host: example.com\r\n"
+        b"Connection: keep-alive\r\n"
+        b"Proxy-Connection: keep-alive\r\n"
+        b"Keep-Alive: timeout=5, max=100\r\n"
+        b"User-Agent: probe\r\n"
+        b"\r\n"
+    )
+
+    out = EgressProxy._force_connection_close(headers)
+
+    head, sep, _body = out.partition(b"\r\n\r\n")
+    assert sep == b"\r\n\r\n", "header block must retain its blank-line terminator"
+    lines = head.split(b"\r\n")
+    # Exactly one Connection header, and it is the forced close.
+    connection_lines = [ln for ln in lines if ln.lower().startswith(b"connection:")]
+    assert connection_lines == [b"Connection: close"], connection_lines
+    # None of the keep-alive-flavored hop-by-hop headers survived.
+    assert not any(ln.lower().startswith(b"proxy-connection:") for ln in lines)
+    assert not any(ln.lower().startswith(b"keep-alive:") for ln in lines)
+    # Unrelated headers are preserved untouched.
+    assert b"Host: example.com" in lines
+    assert b"User-Agent: probe" in lines
+
+
+@pytest.mark.asyncio
+async def test_forwarded_request_is_single_shot_connection_close(
+    ca_paths: tuple[Path, Path, Path],
+) -> None:
+    """A keep-alive client request reaches the upstream as ``Connection: close``.
+
+    End-to-end proof that ``_force_connection_close`` is wired into the
+    forward path: the client asks for keep-alive, but the upstream — the
+    real network peer the proxy talks to — must receive exactly one
+    ``Connection: close`` so it closes after the response and the relay
+    gets a prompt EOF. A regression here reintroduces the git-over-proxy
+    hang.
+    """
+    cert_path, key_path, _ = ca_paths
+    captured: list[_CapturedRequest] = []
+    upstream = await _start_capturing_upstream(captured)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+
+    proxy = EgressProxy(
+        parse_rules(["* 127.0.0.1/**"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+    )
+    proxy_port = await proxy.start_tcp()
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
+        request = (
+            f"GET http://127.0.0.1:{upstream_port}/probe HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{upstream_port}\r\n"
+            "Connection: keep-alive\r\n"
+            "Keep-Alive: timeout=5\r\n"
+            "\r\n"
+        ).encode("latin-1")
+        writer.write(request)
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(4096), timeout=5)
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+    assert b"200 OK" in response, f"Request did not complete through proxy: {response[:200]!r}"
+    assert len(captured) == 1, "Upstream should have received exactly one request"
+    # The client's keep-alive was rewritten to a single close upstream.
+    assert captured[0].connection == ["close"], captured[0].connection
+
+
+@pytest.mark.asyncio
+async def test_stop_cancels_in_flight_connection_handlers(
+    ca_paths: tuple[Path, Path, Path],
+) -> None:
+    """``stop`` cancels handlers parked in a read instead of leaking them.
+
+    A client that connects but sends no request line leaves
+    ``_handle_client`` parked in its 30 s readline. Without explicit
+    cancellation in ``stop`` such handlers outlive the event loop and the
+    interpreter prints "Task was destroyed but it is pending" on teardown.
+    The test parks two handlers, stops the proxy, and asserts the tracked
+    set is drained and every handler task reached a terminal (done) state.
+    """
+    cert_path, key_path, _ = ca_paths
+    proxy = EgressProxy(parse_rules(["GET example.com/**"]), cert_path, key_path)
+    port = await proxy.start_tcp()
+
+    socks = [socket.create_connection(("127.0.0.1", port)) for _ in range(2)]
+    try:
+        # Wait (event-driven, not a fixed sleep) until the server has
+        # accepted both connections and registered their handler tasks.
+        async def _both_parked() -> list[asyncio.Task[None]]:
+            while True:
+                parked = [t for t in proxy._client_tasks if not t.done()]
+                if len(parked) == 2:
+                    return parked
+                await asyncio.sleep(0)
+
+        # Two connections opened -> exactly two parked handlers; a
+        # different count would mean accept-time tracking (_client_connected)
+        # dropped or duplicated a handler.
+        parked = await asyncio.wait_for(_both_parked(), timeout=5)
+
+        await proxy.stop()
+
+        # Every previously-parked handler must be terminal (done) the moment
+        # stop() returns. This is the real regression detector: the handlers
+        # are blocked in a 30 s readline, so without stop()'s cancel/gather
+        # loop they would still be pending here (and leak past the loop as
+        # "Task was destroyed but it is pending"). They finish done-not-
+        # cancelled because _handle_client's finally swallows the injected
+        # CancelledError while closing the writer — but they only got to run
+        # that cleanup because stop() cancelled them.
+        assert all(t.done() for t in parked)
+    finally:
+        for s in socks:
+            s.close()

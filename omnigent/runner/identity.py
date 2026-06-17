@@ -13,9 +13,10 @@ RUNNER_ID_ENV_VAR = "OMNIGENT_RUNNER_ID"
 RUNNER_PARENT_PID_ENV_VAR = "OMNIGENT_RUNNER_PARENT_PID"
 # Signal the CLI sends to "adopt" a runner: stop watching the parent
 # pid so the runner survives an intentional CLI exit (tmux detach) and
-# keeps serving the web UI. SIGUSR1 is unused elsewhere
-# in the runner and is POSIX-only, which matches the runner's platforms.
-RUNNER_ADOPT_SIGNAL = signal.SIGUSR1
+# keeps serving the web UI. SIGUSR1 is unused elsewhere in the runner.
+# Some platforms (notably native Windows) do not define SIGUSR1; keep
+# imports working there and let callers skip adopt signaling.
+RUNNER_ADOPT_SIGNAL: signal.Signals | None = getattr(signal, "SIGUSR1", None)
 RUNNER_WORKSPACE_ENV_VAR = "OMNIGENT_RUNNER_WORKSPACE"
 RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR = "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN"
 RUNNER_TUNNEL_TOKEN_HEADER = "X-Omnigent-Runner-Tunnel-Token"

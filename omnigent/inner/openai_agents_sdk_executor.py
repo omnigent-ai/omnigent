@@ -477,7 +477,11 @@ def _get_openai_async_client(
             else:
                 raise
         except ImportError:
-            pass
+            logger.warning(
+                "databricks-sdk is not installed; cannot resolve Databricks "
+                "profile %r. Falling back to OPENAI_BASE_URL/OPENAI_API_KEY.",
+                profile,
+            )
 
     if os.environ.get("OPENAI_BASE_URL"):
         return AsyncOpenAI(
@@ -501,9 +505,18 @@ def _get_openai_async_client(
         )
 
     # No profile, no env — final fallback via ambient Databricks credentials.
-    from .databricks_executor import _resolve_databricks_auth
+    try:
+        from .databricks_executor import _resolve_databricks_auth
 
-    auth, host = _resolve_databricks_auth(profile)
+        auth, host = _resolve_databricks_auth(profile)
+    except ImportError as exc:
+        raise ImportError(
+            "The 'databricks-sdk' package is required for Databricks "
+            "authentication but is not installed, and no OPENAI_API_KEY or "
+            "OPENAI_BASE_URL environment variables are set. Either install "
+            "the package (`pip install 'omnigent[databricks]'`) or set "
+            "OPENAI_API_KEY/OPENAI_BASE_URL for non-Databricks OpenAI access."
+        ) from exc
     return AsyncOpenAI(
         base_url=base_url_override or _databricks_openai_base_url(host),
         api_key=_OPENAI_KEY_PLACEHOLDER,

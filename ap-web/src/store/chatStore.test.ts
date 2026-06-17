@@ -23,6 +23,7 @@ import type {
   ElicitationBlock,
   ErrorBlock,
   NativeToolBlock,
+  TextDone,
   UserMessageBlock,
 } from "@/lib/blocks";
 import type { ConversationItem } from "@/lib/conversationItems";
@@ -933,11 +934,12 @@ describe("chatStore — switchTo", () => {
 
   // The session.status handler keys off isNativeTerminalSession to decide
   // whether to clear the optimistic bubble on idle (see that handler's
-  // test). It must be true for BOTH native wrappers and false otherwise,
+  // test). It must be true for every registered native wrapper and false otherwise,
   // or the host-restart "bubble disappears" fix mis-fires.
   it.each([
     ["claude-code-native-ui", true],
     ["codex-native-ui", true],
+    ["pi-native-ui", true],
     ["some-other-wrapper", false],
     [null, false],
   ])("switchTo derives isNativeTerminalSession from wrapper=%s", async (wrapper, expected) => {
@@ -3929,6 +3931,7 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       session_name: "auth",
       current_task_status: "in_progress",
       busy: true,
+      last_task_error: null,
       last_message_preview: "looking…",
       ...overrides,
     });
@@ -3950,6 +3953,7 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
           session_name: "auth",
           labels: {},
           current_task_status: "in_progress",
+          last_task_error: null,
           busy: true,
           last_message_preview: "looking…",
           // Insert path defaults the count to 0 when the delta omits it.
@@ -4041,6 +4045,80 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       expect(row?.last_message_preview).toBe("found the bug"); // updated
       expect(row?.busy).toBe(true); // preserved
       expect(row?.current_task_status).toBe("in_progress"); // preserved
+    });
+
+    it("merges a failed status delta with a durable error", () => {
+      client.setQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"), [
+        {
+          id: "conv_child1",
+          title: "researcher:auth",
+          tool: "researcher",
+          session_name: "auth",
+          current_task_status: "in_progress",
+          busy: true,
+          last_message_preview: "booting worker",
+          pending_elicitations_count: 0,
+        },
+      ]);
+      handleSessionEvent({
+        type: "session_child_session_updated",
+        conversationId: "conv_parent",
+        childSessionId: "conv_child1",
+        child: {
+          id: "conv_child1",
+          busy: false,
+          current_task_status: "failed",
+          last_task_error: {
+            code: "required_terminal_exited",
+            message: "Required terminal exited unexpectedly",
+          },
+        },
+      });
+      const row = client.getQueryData<ChildSessionInfo[]>(
+        childSessionsQueryKey("conv_parent"),
+      )?.[0];
+      expect(row?.busy).toBe(false);
+      expect(row?.current_task_status).toBe("failed");
+      expect(row?.last_task_error).toEqual({
+        code: "required_terminal_exited",
+        message: "Required terminal exited unexpectedly",
+      });
+    });
+
+    it("clears a stale child error when the runner sends an active status", () => {
+      client.setQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"), [
+        {
+          id: "conv_child1",
+          title: "researcher:auth",
+          tool: "researcher",
+          session_name: "auth",
+          current_task_status: "failed",
+          busy: false,
+          last_task_error: {
+            code: "required_terminal_exited",
+            message: "Required terminal exited unexpectedly",
+          },
+          last_message_preview: "boot failed",
+          pending_elicitations_count: 0,
+        },
+      ]);
+      handleSessionEvent({
+        type: "session_child_session_updated",
+        conversationId: "conv_parent",
+        childSessionId: "conv_child1",
+        child: {
+          id: "conv_child1",
+          busy: true,
+          current_task_status: "in_progress",
+          last_task_error: null,
+        },
+      });
+      const row = client.getQueryData<ChildSessionInfo[]>(
+        childSessionsQueryKey("conv_parent"),
+      )?.[0];
+      expect(row?.busy).toBe(true);
+      expect(row?.current_task_status).toBe("in_progress");
+      expect(row?.last_task_error).toBeNull();
     });
 
     it("initializes a cold child-sessions cache from a full delta", () => {
@@ -4710,6 +4788,58 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     const state = useChatStore.getState();
     expect(state.selectedEffort).toBe("low");
     expect(state.selectedModel).toBe("claude-sonnet-4-6");
+    // The server override is the session truth shown by `/model`.
+    expect(state.sessionModelOverride).toBe("claude-sonnet-4-6");
+  });
+
+  it("does NOT surface an unapplied sticky model as the session override (custom session)", async () => {
+    // Regression: a fresh non-claude-native session inherits the global
+    // sticky pick into `selectedModel`, but the pick is NOT applied
+    // server-side. `/model` reads `sessionModelOverride`, which must stay
+    // null so the readout shows "agent default" rather than a bogus
+    // "(override)". See ChatPage `/model` and `/context` readouts.
+    seedSession("conv_sticky_custom", []);
+    withSnapshot("conv_sticky_custom", { labels: {} });
+
+    useChatStore.setState({ selectedModel: "claude-sonnet-4-6", sessionModelOverride: null });
+    await useChatStore.getState().switchTo("conv_sticky_custom");
+
+    const patches = patchCallsFor("conv_sticky_custom");
+    expect(patches.some((p) => "model_override" in p)).toBe(false);
+
+    const state = useChatStore.getState();
+    // Sticky pick preserved for cross-session restore...
+    expect(state.selectedModel).toBe("claude-sonnet-4-6");
+    // ...but it is NOT the session's active override.
+    expect(state.sessionModelOverride).toBeNull();
+  });
+
+  it("surfaces the applied sticky model as the session override (claude-native)", async () => {
+    // The claude-native handoff persists the sticky model, so it IS the
+    // session's active override — `/model` should show it.
+    seedSession("conv_sticky_cn", []);
+    withSnapshot("conv_sticky_cn", { labels: { "omnigent.wrapper": "claude-code-native-ui" } });
+
+    useChatStore.setState({ selectedModel: "claude-opus-4-7", sessionModelOverride: null });
+    await useChatStore.getState().switchTo("conv_sticky_cn");
+
+    expect(patchCallsFor("conv_sticky_cn")).toEqual(
+      expect.arrayContaining([{ model_override: "claude-opus-4-7", silent: true }]),
+    );
+    expect(useChatStore.getState().sessionModelOverride).toBe("claude-opus-4-7");
+  });
+
+  it("does NOT surface a non-Claude sticky model as the session override (claude-native)", async () => {
+    // The handoff skips a non-Claude sticky pick (Claude Code can't run
+    // it), so it never becomes the session override.
+    seedSession("conv_sticky_gpt", []);
+    withSnapshot("conv_sticky_gpt", { labels: { "omnigent.wrapper": "claude-code-native-ui" } });
+
+    useChatStore.setState({ selectedModel: "gpt-5.4", sessionModelOverride: null });
+    await useChatStore.getState().switchTo("conv_sticky_gpt");
+
+    expect(patchCallsFor("conv_sticky_gpt").some((p) => "model_override" in p)).toBe(false);
+    expect(useChatStore.getState().sessionModelOverride).toBeNull();
   });
 });
 
@@ -6690,5 +6820,81 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
     expect(cards[0]!.response?.action).toBe("accept");
 
     await abortLoop(sinks, controller, loop);
+  });
+});
+
+describe("chatStore — policy deny renders once", () => {
+  const setState = useChatStore.setState as unknown as Parameters<typeof pumpStreamEvents>[3];
+  const getState = useChatStore.getState as unknown as Parameters<typeof pumpStreamEvents>[4];
+
+  function manualSched() {
+    let cb: (() => void) | null = null;
+    return {
+      scheduler: {
+        schedule: (c: () => void) => {
+          cb = c;
+        },
+        cancel: () => {
+          cb = null;
+        },
+      } as FrameScheduler,
+      fire: () => {
+        const c = cb;
+        cb = null;
+        if (c) c();
+      },
+    };
+  }
+
+  function denyCount(): number {
+    return useChatStore
+      .getState()
+      .blocks.filter(
+        (b) => b.type === "text_done" && (b as TextDone).fullText.includes("Denied by policy"),
+      ).length;
+  }
+
+  async function run(denyData: Record<string, unknown>): Promise<number> {
+    useChatStore.setState({ conversationId: "conv_deny", blocks: [] });
+    const sink = pushableStream();
+    const controller = new AbortController();
+    const manual = manualSched();
+    void pumpStreamEvents(
+      "conv_deny",
+      sink.stream,
+      controller,
+      setState,
+      getState,
+      manual.scheduler,
+    );
+    // Message 2 denied — server publishes the sentinel.
+    sink.push(sse("response.output_text.delta", denyData));
+    await tick();
+    manual.fire();
+    await tick();
+    // Message 3 submitted → next response starts (the switch that doubled it).
+    sink.push(sse("response.created", { id: "resp_2", status: "in_progress", output: [] }));
+    sink.push(
+      sse("response.output_text.delta", {
+        delta: "Hello there friend",
+        message_id: "m_reply",
+        index: 0,
+      }),
+    );
+    await tick();
+    manual.fire();
+    await tick();
+    const n = denyCount();
+    controller.abort();
+    return n;
+  }
+
+  it("renders once when the deny carries a message_id", async () => {
+    // A deny stamped with a stable message_id folds into a single
+    // live-preview block and survives the next response switch as one bubble
+    // (the server stamps one for every session — native and non-native).
+    expect(
+      await run({ delta: "[Denied by policy: over budget]", message_id: "deny_abc", index: 0 }),
+    ).toBe(1);
   });
 });

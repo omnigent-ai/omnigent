@@ -8,32 +8,46 @@ issue a cursor-up + erase that can't reach scrolled-off rows, leaving
 raw markdown in scrollback while the rendered markdown also appears in
 the viewport — visible duplication wherever the user can see scrollback.
 
-Sister to ``_double_render_driver.py``, which exercises the
-in-viewport replace path. Both drive a real :class:`TerminalHost` via
-``host.run(handler)``.
+The streamed text and the final markdown ``StreamReplace`` are written
+synchronously by :meth:`TerminalHost.output` (plain ``print`` /
+``sys.stdout.write``). We drive those calls directly, in order, instead
+of running the interactive prompt-toolkit application. The app's pinned
+prompt + toolbar redraw concurrently on a ~10fps animation timer and
+share the same PTY, interleaving cursor moves and erases between the
+driver's synchronous prints — which made the captured byte stream
+nondeterministic (the test flaked with the rendered markdown AND the
+raw streamed text both surviving). The overflow guard under test
+(``_should_stream_more`` + the cursor-up clear in ``_replace_live_region``)
+does not involve the prompt redraw at all, so driving ``output`` without
+the live app exercises the exact same code path deterministically.
+
+``_term_height`` / ``_term_width`` read the real PTY size (set by the
+test's ``ioctl(TIOCSWINSZ)``), so the viewport ceiling and the
+scrollback behaviour are faithful to a real terminal.
+
+Sister to ``_double_render_driver.py``, which exercises the in-viewport
+replace path.
 """
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import sys
 
 from omnigent_client import BlockContext, TextChunk, TextDone
 from omnigent_ui_sdk.terminal._formatter import RichBlockFormatter
 from omnigent_ui_sdk.terminal._host import TerminalHost
-from prompt_toolkit.application import get_app
-
-WELCOME_HINTS = ["/help help", "Ctrl+O debug", "Esc cancel", "Ctrl+C exit"]
 
 
-async def _drive(host: TerminalHost) -> None:
+def _main() -> None:
     """
-    Drive the host with a long numbered list (intentionally exceeds
-    the viewport). Splits via ``RichBlockFormatter`` exactly as the
-    REPL would for a streamed text response.
+    Drive the host with a long numbered list (intentionally exceeds the
+    viewport). Splits via ``RichBlockFormatter`` exactly as the REPL
+    would for a streamed text response, then emits the end-of-response
+    markdown ``StreamReplace``. All output is synchronous and ordered —
+    no event loop, no sleeps, no concurrent prompt redraw — so the
+    captured byte stream is identical on every run.
     """
-    await asyncio.sleep(0.5)
+    host = TerminalHost(model_name="overflow_test")
     fmt = RichBlockFormatter()
     ctx = BlockContext(agent=None, depth=0, turn=0)
 
@@ -50,25 +64,11 @@ async def _drive(host: TerminalHost) -> None:
     for c in chunks:
         for item in fmt.format_text_chunk(TextChunk(text=c, ctx=ctx)):
             host.output(item)
-        await asyncio.sleep(0)
     for item in fmt.format_text_done(TextDone(full_text=full, ctx=ctx)):
         host.output(item)
-    await asyncio.sleep(1.0)
-    with contextlib.suppress(Exception):
-        get_app().exit(exception=EOFError())
-
-
-async def _amain() -> None:
-    host = TerminalHost(model_name="overflow_test", toolbar_hints=WELCOME_HINTS)
-    driver_task = asyncio.create_task(_drive(host))  # noqa: RUF006, F841
-
-    async def _handler(text: str) -> None:
-        return None
-
-    with contextlib.suppress(EOFError, KeyboardInterrupt):
-        await host.run(_handler)
+    sys.stdout.flush()
 
 
 if __name__ == "__main__":
-    asyncio.run(_amain())
+    _main()
     sys.exit(0)

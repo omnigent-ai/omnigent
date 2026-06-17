@@ -1,4 +1,5 @@
 import type { Conversation } from "@/hooks/useConversations";
+import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 
 export const PINNED_CONVERSATION_IDS_STORAGE_KEY = "omnigent:pinned-conversation-ids";
 
@@ -14,15 +15,13 @@ export interface ActiveChatOverride {
   updatedAt: number;
 }
 
-const WRAPPER_LABEL_KEY = "omnigent.wrapper";
-const CLAUDE_NATIVE_WRAPPER = "claude-code-native-ui";
-const CODEX_NATIVE_WRAPPER = "codex-native-ui";
 // Exported so other surfaces (e.g. the Agents rail's main row) show the
 // same friendly product names for native-wrapper sessions.
 export const CLAUDE_NATIVE_DEFAULT_LABEL = "Claude Code";
 export const CODEX_NATIVE_DEFAULT_LABEL = "Codex";
+export const PI_NATIVE_DEFAULT_LABEL = "Pi";
 
-export type ConversationIconKind = "claude" | "codex" | "nessie" | null;
+export type ConversationIconKind = "claude" | "codex" | "pi" | "nessie" | null;
 
 // Display label for a session with no title and no native-wrapper name —
 // shown in the sidebar row and as the browser tab title fallback.
@@ -34,15 +33,13 @@ function wrapperLabel(conversation: Conversation): string | undefined {
 
 function nativeWrapperLabel(conversation: Conversation): string | null {
   const wrapper = wrapperLabel(conversation);
-  if (wrapper === CLAUDE_NATIVE_WRAPPER) return CLAUDE_NATIVE_DEFAULT_LABEL;
-  if (wrapper === CODEX_NATIVE_WRAPPER) return CODEX_NATIVE_DEFAULT_LABEL;
-  return null;
+  return nativeCodingAgentForWrapper(wrapper)?.displayName ?? null;
 }
 
 export function getConversationIconKind(conversation: Conversation): ConversationIconKind {
   const wrapper = wrapperLabel(conversation);
-  if (wrapper === CLAUDE_NATIVE_WRAPPER) return "claude";
-  if (wrapper === CODEX_NATIVE_WRAPPER) return "codex";
+  const nativeAgent = nativeCodingAgentForWrapper(wrapper);
+  if (nativeAgent != null) return nativeAgent.iconKind;
   if (conversation.agent_name === "nessie") return "nessie";
   return null;
 }

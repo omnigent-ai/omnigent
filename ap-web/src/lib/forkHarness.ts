@@ -39,13 +39,15 @@ export function harnessFamily(harness: string | null | undefined): "anthropic" |
   }
 }
 
-/** Whether a harness is a native CLI harness (Claude Code / Codex). */
+/** Whether a harness is a native CLI harness (Claude Code / Codex / Pi). */
 export function isNativeHarness(harness: string | null | undefined): boolean {
   return (
     harness === "claude-native" ||
     harness === "native-claude" ||
     harness === "codex-native" ||
-    harness === "native-codex"
+    harness === "native-codex" ||
+    harness === "pi-native" ||
+    harness === "native-pi"
   );
 }
 
@@ -74,18 +76,53 @@ export function isNativeHarness(harness: string | null | undefined): boolean {
  * @param targetHarness - The harness the fork would switch to.
  */
 export function forkTargetCarriesHistory(targetHarness: string | null | undefined): boolean {
-  return harnessFamily(targetHarness) !== null;
+  // Gate on isNativeHarness too: Pi is native but multi-family, so its
+  // harnessFamily is null and it would otherwise be dropped from the pickers.
+  return isNativeHarness(targetHarness) || harnessFamily(targetHarness) !== null;
 }
 
 /**
- * Strip the `" (fork <id>)"` / `" (switch <id>)"` suffix the fork/switch
- * routes append to an agent's name when cloning it, so a clone can be
- * matched back to the agent it was cloned from by name.
+ * Strip ONE trailing `" (fork <id>)"` / `" (switch <id>)"` suffix.
+ *
+ * Internal one-layer primitive for {@link agentRootName}; not exported,
+ * because a fork of a fork stacks these suffixes and every caller that
+ * matches a clone name back to its origin (built-in catalog, native-label
+ * map, switch-dialog dedup) wants the FULLY rooted name. Reaching for a
+ * single-layer strip is the footgun that lets a multi-fork clone slip the
+ * match — so callers use `agentRootName`, never this.
  *
  * @param name - An agent name, e.g. `"claude-native-ui (fork conv_ab12)"`.
- * @returns The base name, e.g. `"claude-native-ui"`. Names without a
- *   clone suffix are returned unchanged.
+ * @returns The name with one clone suffix removed.
  */
-export function agentBaseName(name: string): string {
+function agentBaseName(name: string): string {
   return name.replace(/ \((?:fork|switch) [^)]+\)$/, "");
+}
+
+/**
+ * The root agent name behind ANY chain of fork/switch clone suffixes.
+ *
+ * The fork/switch routes clone a bound agent as `"<name> (fork <id>)"`, and
+ * a fork of a fork accumulates them — e.g. `"claude-native-ui (fork ag_a)
+ * (fork ag_b)"`. This peels EVERY layer to the root, so a clone (however
+ * deep) still matches the agent it derives from by name.
+ *
+ * Use this for ALL clone-name → catalog matching: the new-session picker
+ * dropping session agents that shadow a built-in (`useAvailableAgents`),
+ * the in-session model-picker / agent-info label (`agentDisplayLabel`), and
+ * the switch-agent dialog excluding the current agent's origin. A
+ * single-layer strip would leave `"claude-native-ui (fork ag_a)"`, miss the
+ * match, and surface the clone as a spurious "custom" agent / duplicate
+ * built-in / raw suffixed label.
+ *
+ * @param name - An agent name, possibly with nested clone suffixes.
+ * @returns The root base name with all clone suffixes removed.
+ */
+export function agentRootName(name: string): string {
+  let prev: string;
+  let cur = name;
+  do {
+    prev = cur;
+    cur = agentBaseName(cur);
+  } while (cur !== prev);
+  return cur;
 }

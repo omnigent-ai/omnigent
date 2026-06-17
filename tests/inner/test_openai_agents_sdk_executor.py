@@ -1726,6 +1726,70 @@ def test_get_openai_client_invalid_profile_with_env_fallback_warns(monkeypatch, 
     )
 
 
+def test_get_openai_client_missing_databricks_sdk_raises_actionable_error(monkeypatch):
+    """Missing ``databricks-sdk`` with no env-var fallback gives an actionable error.
+
+    When a Databricks-hosted model is requested, ``databricks-sdk`` is not
+    installed, and no ``OPENAI_API_KEY``/``OPENAI_BASE_URL`` fallback is
+    available, the function must raise ``ImportError`` with install
+    instructions — not crash with an opaque traceback.
+
+    Regression test for https://github.com/omnigent-ai/omnigent/issues/123.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    import pytest
+
+    import omnigent.inner.databricks_executor as db_exec
+    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+
+    def _import_error(*_args, **_kw):
+        raise ImportError("No module named 'databricks.sdk'")
+
+    monkeypatch.setattr(db_exec, "_resolve_databricks_auth", _import_error)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+
+    with pytest.raises(ImportError, match="pip install"):
+        _get_openai_async_client(profile=None, model="databricks-gpt-5")
+
+
+def test_get_openai_client_missing_databricks_sdk_with_env_falls_through(monkeypatch, caplog):
+    """Missing ``databricks-sdk`` with OPENAI_API_KEY set falls through gracefully.
+
+    When ``databricks-sdk`` is absent but env-var credentials are available,
+    the function should log a warning and return a client configured from the
+    env vars — not crash.
+
+    Regression test for https://github.com/omnigent-ai/omnigent/issues/123.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param caplog: Pytest log capture fixture.
+    """
+    import logging
+
+    import omnigent.inner.databricks_executor as db_exec
+    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+
+    def _import_error(*_args, **_kw):
+        raise ImportError("No module named 'databricks.sdk'")
+
+    monkeypatch.setattr(db_exec, "_resolve_databricks_auth", _import_error)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+
+    with caplog.at_level(logging.WARNING):
+        client = _get_openai_async_client(profile="dev", model="databricks-gpt-5")
+
+    assert any("databricks-sdk" in record.message for record in caplog.records), (
+        f"Expected a warning about missing databricks-sdk. "
+        f"Got: {[r.message for r in caplog.records]}"
+    )
+    assert client is not None
+
+
 def test_run_turn_auth_error_yields_actionable_message(monkeypatch):
     """``run_turn`` yields the actionable ``DatabricksAuthError`` message,
     not the raw ``__cause__`` string.
