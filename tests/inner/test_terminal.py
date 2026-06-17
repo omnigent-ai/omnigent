@@ -882,6 +882,47 @@ def test_reap_orphaned_terminals_kills_server_for_dead_owner_socket(
     assert kill_calls == [["tmux", "-S", str(socket_path), "kill-server"]]
 
 
+def test_reap_orphaned_terminals_keeps_dir_when_kill_server_times_out(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dead-owner dir whose ``kill-server`` times out is left for the
+    next sweep (B11).
+
+    If we rmtree the socket dir after a failed kill, a still-running
+    tmux server loses its socket path and becomes permanently
+    unreapable. So on a TimeoutExpired the dir (and tmux.sock) must
+    survive and the reaped count must not include it.
+
+    :param tmp_path: Fake temp root the sweep scans.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+
+    def _timeout_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        """Simulate a wedged tmux server: kill-server times out."""
+        raise TimeoutError(argv)
+
+    monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: tmp_path)
+    monkeypatch.setattr(terminal_mod, "_tmux_available", lambda: True)
+    monkeypatch.setattr(
+        terminal_mod,
+        "subprocess",
+        SimpleNamespace(run=_timeout_run, TimeoutExpired=TimeoutError),
+    )
+    dead_dir = _write_instance_dir(tmp_path, "omnigent-terminal-wedged", _dead_pid())
+    socket_path = dead_dir / "tmux.sock"
+    socket_path.touch()
+
+    reaped = terminal_mod.reap_orphaned_terminals()
+
+    # Nothing was successfully reaped: the dir and its socket survive so
+    # the next sweep can retry the kill against a real socket.
+    assert reaped == 0
+    assert dead_dir.exists()
+    assert socket_path.exists()
+
+
 @pytest.mark.skipif(
     sys.platform not in ("linux", "darwin"),
     reason="sandbox backends only resolve on Linux (bwrap) or macOS (seatbelt)",

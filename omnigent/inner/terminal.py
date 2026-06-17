@@ -554,15 +554,35 @@ def reap_orphaned_terminals() -> int:
             continue
         socket_path = entry / "tmux.sock"
         if socket_path.exists():
-            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            # Re-check liveness immediately before the kill (TOCTOU): a
+            # PID reused by a live process between the read above and now
+            # reads as alive, so we skip and never kill a live owner.
+            if _process_alive(pid):
+                continue
+            try:
                 subprocess.run(
                     ["tmux", "-S", str(socket_path), "kill-server"],
                     # kill-server on an already-dead server exits non-zero;
-                    # that is the common case for half-torn-down orphans.
+                    # that is the common case for half-torn-down orphans, so
+                    # a non-zero exit still counts as "no server left".
                     check=False,
                     capture_output=True,
                     timeout=_REAP_KILL_TIMEOUT_S,
                 )
+            except subprocess.TimeoutExpired:
+                # The server is wedged but ALIVE. Do NOT rmtree: deleting
+                # tmux.sock now would orphan a running server with no
+                # socket path, making it permanently unreapable. Leave the
+                # dir for the next sweep to retry against the real socket.
+                logger.warning(
+                    "kill-server timed out for %s; leaving dir for next sweep",
+                    socket_path,
+                )
+                continue
+            except OSError:
+                # tmux missing/unspawnable: dir removal is still safe
+                # (no live server backing this socket).
+                pass
         shutil.rmtree(entry, ignore_errors=True)
         reaped += 1
     return reaped
