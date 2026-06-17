@@ -179,18 +179,6 @@ skips:
     cluster: async-dispatch-inbox-sse
     mode: skip
 
-  - id: tests/e2e/test_file_tools.py::test_download_file_retrieves_content
-    reason: "Shard 0 bulk: file-tools download assertion fails. Triage under #532."
-    issue: 532
-    cluster: files-uploads-attachments
-    mode: skip
-
-  - id: tests/e2e/test_openai_coder_codex_tools.py::test_openai_coder_uses_codex_shell
-    reason: "Shard 0 bulk: openai-coder + codex tool interop. Triage under #532."
-    issue: 532
-    cluster: run-ap-examples-harness
-    mode: skip
-
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_tool_call_refusal_blocks_tool
     reason: "Shard 0 bulk: REPL approval pexpect-timeout family (same as other test_repl_approval_e2e entries)."
     issue: 532
@@ -293,19 +281,7 @@ skips:
     mode: skip
 
   - id: tests/e2e/test_decorated_tools_e2e.py::test_decorated_tools_varied_signatures_e2e
-    reason: "Shard 1 bulk: decorated tools varied signatures. Triage under #532."
-    issue: 532
-    cluster: run-ap-examples-harness
-    mode: skip
-
-  - id: tests/e2e/test_openai_coder_codex_tools.py::test_openai_coder_codex_creates_and_lists_file
-    reason: "Shard 1 bulk: openai-coder + codex tools interop."
-    issue: 532
-    cluster: files-uploads-attachments
-    mode: skip
-
-  - id: tests/e2e/test_openai_coder_codex_tools.py::test_openai_coder_codex_lists_directory
-    reason: "Shard 1 bulk: openai-coder + codex tools interop."
+    reason: "openai-agents harness test hits platform.openai.com directly and 401s under the Databricks gateway profile (dapi PAT rejected as OpenAI key); needs gateway-routing/base_url fix before it can run in CI. Passes only with a real OPENAI_API_KEY locally."
     issue: 532
     cluster: run-ap-examples-harness
     mode: skip
@@ -460,12 +436,6 @@ skips:
     issue: 532
     cluster: async-dispatch-inbox-sse
     mode: skip
-  - id: tests/e2e/test_file_tools.py::test_list_files_finds_uploaded_file
-    reason: "Shard 3 bulk: file-tools list-files assertion."
-    issue: 532
-    cluster: files-uploads-attachments
-    mode: skip
-
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_output_ask_refuse_replaces_reply_with_sentinel
     reason: "Shard 3 bulk: REPL output ask-refuse family."
     issue: 532
@@ -631,12 +601,6 @@ skips:
     issue: 532
     cluster: run-ap-examples-harness
     mode: skip
-  - id: tests/e2e/omnigent/test_serve_omnigent_routes_to_omnigent.py::test_serve_omnigent_routes_to_omnigent
-    reason: "Nightly bulk: serve-flags / serve-smoke cluster."
-    issue: 532
-    cluster: run-ap-examples-harness
-    mode: skip
-
   - id: tests/e2e/omnigent/test_serve_smoke.py::test_serve_smoke_one_chat_round_trip
     reason: "Nightly bulk: serve-flags / serve-smoke cluster."
     issue: 532
@@ -876,18 +840,6 @@ skips:
     cluster: sandbox-deps-env
     mode: skip
 
-  # Cluster: cancel/history.
-  - id: tests/e2e/test_cancel_history.py::test_cancel_appends_history_marker_and_followup_sees_it
-    reason: "Force-merge backlog (cancel-history cluster). First observed failing at 2fe283bf (2026-05-23T00:08:54Z, E2E)."
-    issue: 0
-    cluster: steering-cancel-compaction-state
-    mode: skip
-  - id: tests/e2e/test_cancel_history.py::test_cancel_mid_tool_call_followup_succeeds
-    reason: "Force-merge backlog (cancel-history cluster). First observed failing at 305e9bb9 (2026-05-23T06:06:59Z, E2E)."
-    issue: 0
-    cluster: steering-cancel-compaction-state
-    mode: skip
-
   # Cluster: databricks_supervisor harness parametrizations broken
   # across multiple unrelated test files (yaml hello world, real
   # hello world, coding supervisor with forks). Likely a single
@@ -918,11 +870,6 @@ skips:
     reason: "Force-merge backlog (standalone). First observed failing at 305e9bb9 (2026-05-23T06:06:59Z, E2E)."
     issue: 0
     cluster: repl-pexpect-cli
-    mode: skip
-  - id: tests/e2e/test_file_tools.py::test_markdown_file_attachment
-    reason: "Force-merge backlog (standalone). First observed failing at 305e9bb9 (2026-05-23T06:06:59Z, E2E)."
-    issue: 0
-    cluster: files-uploads-attachments
     mode: skip
   - id: tests/e2e/test_filesystem_changed_files_e2e.py::test_filesystem_changes_appear_after_agent_write
     reason: "Force-merge backlog (standalone). First observed failing at 305e9bb9 (2026-05-23T06:06:59Z, E2E)."

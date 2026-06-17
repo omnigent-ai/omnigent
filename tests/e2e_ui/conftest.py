@@ -1643,13 +1643,25 @@ def native_claude_plan_session(
     """A native ``claude-native`` session launched in **plan mode**.
 
     Identical to :func:`native_claude_session` except the session carries
-    ``terminal_launch_args=["--permission-mode", "plan"]`` so the runner boots
-    Claude Code into plan mode. In plan mode Claude researches a task and then
-    calls its built-in ``ExitPlanMode`` tool to present the plan for approval;
-    that call rides the native ``PermissionRequest`` hook to the server, which
-    stamps the ``exit_plan_mode`` extras and publishes an elicitation the SPA
-    renders as ``ExitPlanModeReview`` inside an ``ApprovalCard``. Drives the
-    Exit-Plan-Mode review e2e (``approvals/test_exit_plan_mode.py``).
+    ``terminal_launch_args=["--permission-mode", "plan", "--disallowedTools",
+    "AskUserQuestion"]`` so the runner boots Claude Code into plan mode *with
+    the AskUserQuestion tool removed*. In plan mode Claude researches a task and
+    then calls its built-in ``ExitPlanMode`` tool to present the plan for
+    approval; that call rides the native ``PermissionRequest`` hook to the
+    server, which stamps the ``exit_plan_mode`` extras and publishes an
+    elicitation the SPA renders as ``ExitPlanModeReview`` inside an
+    ``ApprovalCard``. Drives the Exit-Plan-Mode review e2e
+    (``approvals/test_exit_plan_mode.py``).
+
+    The ``--disallowedTools AskUserQuestion`` is the load-bearing flake fix:
+    given the deliberately under-specified plan prompt, Claude would otherwise
+    sometimes reach for its built-in ``AskUserQuestion`` tool first (to clarify
+    the comment text/location) instead of going straight to ``ExitPlanMode``,
+    surfacing the *wrong* approval card and timing the test out. Removing the
+    tool eliminates that degree of freedom structurally rather than relying on
+    the model's sampling. The AskUserQuestion render path keeps its own
+    dedicated coverage in ``approvals/test_ask_user_question.py``, so disabling
+    it here costs no coverage.
 
     :param live_server: Spawned server fixture; its runner is reused.
     :param tmp_path_factory: Pytest temp path factory (for a respawn log).
@@ -1660,7 +1672,15 @@ def native_claude_plan_session(
     session_id = _create_native_claude_session(
         live_server,
         runner_id,
-        terminal_launch_args=["--permission-mode", "plan"],
+        terminal_launch_args=[
+            "--permission-mode",
+            "plan",
+            # Remove AskUserQuestion so the under-specified plan prompt can only
+            # surface via ExitPlanMode (the card under test), never a clarifying
+            # question. See this fixture's docstring + test_exit_plan_mode.py.
+            "--disallowedTools",
+            "AskUserQuestion",
+        ],
     )
     try:
         yield (live_server, session_id)

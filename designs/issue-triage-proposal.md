@@ -52,7 +52,7 @@ Triggered on every new issue. The bot classifies, deduplicates, resolves what it
 - Close issues (the lifecycle bot handles that)
 - Re-triage after initial classification (maintainers can override freely)
 
-**Tool:** `anthropics/claude-code-action` via GitHub Actions workflow, triggered `on: issues: [opened]`. Permissions: `issues: write` only.
+**Tool:** `omnigent run .github/triage/` via GitHub Actions workflow, triggered `on: issues: [opened]`. The triage agent is a tool-less Claude SDK harness that outputs structured JSON; all GitHub mutations (labeling, assignment, comments) happen in trusted workflow steps that validate against allowlists. LLM credentials route through the Databricks gateway (`LLM_API_KEY` + `GATEWAY_BASE_URL`). Permissions: `issues: write` only.
 
 **Most issues never need a maintainer.** The bot + lifecycle automation resolves them:
 
@@ -103,16 +103,17 @@ The bot applies labels but does NOT post comments (except for duplicate flagging
 
 **Why:** LangChain's Dosu bot received significant community backlash ([discussion #25153](https://github.com/langchain-ai/langchain/discussions/25153)) for "polluting reported issues" with verbose, often unhelpful AI-generated responses. Claude Code's labels-only approach handles 2K+ issues/week without this problem. Labels are machine-readable, filterable, and silent - comments are noisy and set expectations of a conversation the bot can't sustain.
 
-### Decision: `claude-code-action` over alternatives
+### Decision: Omnigent triage agent over `claude-code-action`
 
-Use `anthropics/claude-code-action` as the triage engine.
+Use `omnigent run .github/triage/` as the triage engine — a tool-less Claude SDK harness that outputs structured JSON, with all GitHub mutations in trusted workflow steps.
 
-**Why:** Battle-tested at scale on Claude Code's own repo (~6K open issues, ~2K new/week, 49-71% of closures bot-driven). It's a GitHub Action - no external SaaS dependency, no data leaving GitHub except the Anthropic API call. We already use Claude models. Pin to a specific SHA per our existing practice.
+**Why:** `claude-code-action` requires a direct Anthropic API key (`ANTHROPIC_API_KEY`), which we don't have — our LLM access routes through the Databricks gateway. More critically, `claude-code-action` gives the LLM shell access and a GitHub token, creating a prompt injection → secret exfiltration attack surface (a crafted issue body could trick the agent into running `printenv` → `gh issue comment`). The Omnigent approach eliminates this structurally: the LLM has no tools, no shell, and no `GH_TOKEN` — it only outputs JSON that is validated against allowlists before any GitHub mutation occurs.
 
 **Alternatives considered:**
 
 | Alternative | Why not |
 |---|---|
+| `claude-code-action` | Requires direct Anthropic API key; gives LLM shell + GH_TOKEN (prompt injection risk) |
 | Dosu (SaaS) | External dependency; community backlash on LangChain for noisy responses |
 | GitHub native AI triage | Still in preview; less customizable prompt control |
 | Pullfrog AI | Model-agnostic BYOK (by Zod author, May 2026). Strong fallback, but newer and less proven at scale |
@@ -166,13 +167,15 @@ Use `actions/first-interaction` to post a short welcome message on a contributor
 
 ## Security Considerations
 
-- **Triage bot has `issues: write` only** - no code access, no secrets beyond the Anthropic API key
-- **AI bot is gated by security scan** - the bot only runs after the security scan passes on the issue content, preventing prompt injection or malicious payloads from reaching the LLM triage step
+- **Structural prompt injection defense** - the triage agent has NO tools, NO shell access, and NO `GH_TOKEN`. It outputs structured JSON only. All GitHub mutations (labeling, assignment, duplicate comments) happen in trusted workflow steps that validate the JSON against hardcoded allowlists. Even a successful prompt injection cannot exfiltrate secrets or perform unauthorized actions.
+- **Trusted/untrusted step separation** - issue content is fetched by a trusted step (via `gh issue view`) and passed to the LLM as data. The LLM's output is parsed by a trusted step that only accepts values from allowlists (`ALLOWED_TYPES`, `ALLOWED_COMPONENTS`, `ALLOWED_PRIORITIES`). No attacker-controlled string is ever interpolated into shell commands or workflow expressions.
+- **LLM credentials route through the gateway** - `LLM_API_KEY` + `GATEWAY_BASE_URL` via Databricks, not a direct Anthropic API key. The `GH_TOKEN` is only available in trusted steps, never in the LLM step.
+- **Workflow has `issues: write` only** - no code access, no `contents: write`
 - **No bot-driven code changes** - all code changes go through the existing PR + maintainer approval + security scan pipeline
 - **Duplicate closure has a veto** - reporter reacts 👎 to block
 - **Stale closure is reversible** - anyone can reopen
 - **`pull_request_target` in welcome bot** is safe - static comment only, no fork code checkout
-- **Pin `claude-code-action` to a specific SHA** per existing practice
+- **Bot-opened issues are skipped** - the workflow checks `!endsWith(github.event.issue.user.login, '[bot]')` to prevent feedback loops
 
 ---
 
