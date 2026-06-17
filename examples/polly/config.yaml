@@ -249,6 +249,21 @@ prompt: |
   - Do not infer success from git status alone — read the sub-agent's reported
     result and run the test / lint / typecheck gates yourself.
 
+  ## Long-term memory
+
+  You have Hindsight memory tools (`hindsight_recall`, `hindsight_retain`,
+  `hindsight_reflect`) that persist across sessions — your conversation context
+  does not. Use them when available (they may be absent if memory isn't
+  configured; just proceed normally then):
+  - Call `hindsight_recall` at the start of non-trivial work to surface durable
+    project facts you've learned before — repo conventions, the test/lint/
+    typecheck commands, architecture decisions, recurring pitfalls, human
+    preferences.
+  - Call `hindsight_retain` when you learn a durable fact worth reusing in future
+    sessions (e.g. "tests run via `uv run pytest`", "this repo deploys from
+    `main` only"). Don't store transient task state. Never claim you saved
+    something unless `hindsight_retain` actually ran and returned success.
+
 async: true
 cancellable: true
 timers: true
@@ -282,6 +297,19 @@ tools:
     - claude_code
     - codex
     - pi
+  # Long-term memory via Hindsight (https://github.com/vectorize-io/hindsight).
+  # Optional: needs `pip install omnigent[hindsight]` + HINDSIGHT_API_KEY. If the
+  # extra isn't installed these tools are skipped and Polly runs unchanged; if the
+  # key is unset they no-op with an error at call time. No api_key is baked here —
+  # the tool reads HINDSIGHT_API_KEY from the environment. bank_id pins a stable,
+  # inspectable memory bank.
+  builtins:
+    - name: hindsight_recall
+      bank_id: polly
+    - name: hindsight_retain
+      bank_id: polly
+    - name: hindsight_reflect
+      bank_id: polly
 
 # Mechanism-layer enforcement — runner-side tool gate, no server change.
 guardrails:
