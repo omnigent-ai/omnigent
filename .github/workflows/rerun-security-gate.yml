@@ -44,8 +44,12 @@ permissions:
   contents: read
 
 concurrency:
+  # NOT cancel-in-progress: this workflow fires on EVERY label, so an unrelated
+  # label spins a run that enters this group; cancelling an in-flight
+  # coordination mid-loop would leave it partial. The coordinator is idempotent
+  # (it re-checks each run's state), so overlapping runs are safe to complete.
   group: rerun-security-gate-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   rerun:
@@ -80,6 +84,11 @@ jobs:
           )
 
           for wf in "${WORKFLOWS[@]}"; do
+            # Reset per iteration: `read` leaves these UNTOUCHED on EOF (a
+            # workflow with no run for this SHA -- e.g. path-filtered ap-web
+            # Tests), which would otherwise carry over the previous workflow's
+            # run id/conclusion and re-run the wrong run.
+            id=""; conclusion=""
             # Latest run of this workflow for the PR head SHA.
             read -r id conclusion < <(
               gh api "repos/$REPO/actions/runs?head_sha=$SHA&per_page=100" --paginate \
