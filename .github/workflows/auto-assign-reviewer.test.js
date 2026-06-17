@@ -34,7 +34,9 @@ async function run({ files, load = {}, current = [], author = "someexternaldev",
     payload: { pull_request: {
       number: 1, draft: false,
       user: { login: author },
-      head: { repo: { fork } },
+      // precise fork detection compares head vs base full_name
+      head: { repo: { full_name: fork ? "external-contributor/omnigent" : "omnigent-ai/omnigent" } },
+      base: { repo: { full_name: "omnigent-ai/omnigent" } },
       requested_reviewers: current.map((l) => ({ login: l })),
     } },
   };
@@ -81,19 +83,43 @@ function assert(name, cond, detail) {
     JSON.stringify(r.removed) === JSON.stringify(["SabhyaC26", "TomeHirata"]) && r.added.length === 0,
     JSON.stringify(r));
 
-  // 5. external human reviewer (outside pool) is never removed.
+  // 5. mixed current: a managed reviewer not in `desired` is removed, while an
+  //    external (unmanaged) reviewer in the same call is preserved.
   r = await run({
     files: ["omnigent/inner/foo.py"],
     load: { dhruv0811: 0, dbczumar: 1, SabhyaC26: 5, TomeHirata: 4 },
-    current: ["dhruv0811", "dbczumar", "some-external-human"],
+    current: ["SabhyaC26", "some-external-human"],
   });
-  assert("external reviewer preserved", !r.removed.includes("some-external-human"), JSON.stringify(r));
+  assert("mixed: managed removed, external preserved",
+    r.removed.includes("SabhyaC26") &&
+    !r.removed.includes("some-external-human") &&
+    JSON.stringify(r.added) === JSON.stringify(["dbczumar", "dhruv0811"]),
+    JSON.stringify(r));
 
-  // 6. scope guard: non-fork PR -> nothing assigned.
+  // 6. single-owner area (sandbox -> @SabhyaC26): tops up to 2 from the pool.
+  r = await run({
+    files: ["omnigent/sandbox/x.py"],
+    load: { SabhyaC26: 0, hzub: 0, dhruv0811: 9, dbczumar: 9, TomeHirata: 9, PattaraS: 9,
+            "serena-ruan": 9, "daniellok-db": 9, fanzeyi: 9, "ckcuslife-source": 9, bbqiu: 9, Edwinhe03: 9 },
+  });
+  assert("single-owner area tops up to 2",
+    r.added.length === 2 && r.added.includes("SabhyaC26"), JSON.stringify(r));
+
+  // 7. multi-area PR (inner + tools): candidate pool is the UNION; a tools-only
+  //    owner (PattaraS) and an inner owner (dhruv0811) can both be picked.
+  r = await run({
+    files: ["omnigent/inner/a.py", "omnigent/tools/b.py"],
+    load: { SabhyaC26: 9, TomeHirata: 9, dbczumar: 9, PattaraS: 0, dhruv0811: 1 },
+  });
+  assert("multi-area unions both areas' owners",
+    r.added.includes("PattaraS") && r.added.includes("dhruv0811") && r.added.length === 2,
+    JSON.stringify(r));
+
+  // 8. scope guard: non-fork PR -> nothing assigned.
   r = await run({ files: ["omnigent/inner/foo.py"], fork: false });
   assert("non-fork PR is skipped", r.added.length === 0 && r.removed.length === 0, JSON.stringify(r));
 
-  // 7. scope guard: fork PR authored by a maintainer -> nothing assigned.
+  // 9. scope guard: fork PR authored by a maintainer -> nothing assigned.
   r = await run({ files: ["omnigent/inner/foo.py"], author: "dhruv0811" });
   assert("maintainer-authored fork PR is skipped", r.added.length === 0 && r.removed.length === 0, JSON.stringify(r));
 })();

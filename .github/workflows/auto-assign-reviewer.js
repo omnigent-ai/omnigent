@@ -9,20 +9,17 @@
 // the full set of handles in the file. Maintainers not listed there are never in
 // rotation.
 //
-// Scope guard (skipped only for dryRun, which just logs): assignment runs only
-// when the PR is from a fork AND the author is not in .github/MAINTAINER --
-// non-fork / collaborator / maintainer PRs are left alone (authors pick their
-// own reviewers).
+// Scope guard: assignment runs only when the PR is from a fork AND the author is
+// not in .github/MAINTAINER. Non-fork / collaborator / maintainer PRs are left
+// alone (authors pick their own reviewers). Fails closed -- if maintainer status
+// can't be determined, it skips rather than risk assigning a maintainer's PR.
 //
 // "Balance in general": picks are the candidates with the fewest CURRENTLY open
 // review requests across the repo (random tie-break) -- stateless fairness.
 //
 // Only handles drawn from .github/reviewers are ever removed when reconciling,
 // so a manually-added reviewer outside that set is left untouched.
-//
-// `dryRun` (set when the workflow runs on a `pull_request` that edits this
-// script) logs the picks instead of mutating reviewers -- a live smoke test.
-module.exports = async ({ github, context, core, dryRun = false }) => {
+module.exports = async ({ github, context, core }) => {
   const fs = require("fs");
   const TARGET = 2;
   const { owner, repo } = context.repo;
@@ -33,28 +30,32 @@ module.exports = async ({ github, context, core, dryRun = false }) => {
   }
   const author = (pr.user && pr.user.login ? pr.user.login : "").toLowerCase();
 
-  // --- Scope guard: fork PRs from non-maintainers only. Skipped for dryRun
-  // (the smoke test exercises the selection logic on a same-repo PR).
-  if (!dryRun) {
-    const isFork = !!(pr.head && pr.head.repo && pr.head.repo.fork);
-    if (!isFork) {
-      core.info("Not a fork PR; skipping (reviewer auto-assignment is fork-only).");
-      return;
-    }
-    let authorIsMaintainer = false;
-    try {
-      const m = fs.readFileSync(".github/MAINTAINER", "utf8");
-      const maint = new Set(
-        m.split("\n").map((l) => l.replace(/#.*/, "").trim().toLowerCase()).filter(Boolean)
-      );
-      authorIsMaintainer = maint.has(author);
-    } catch (e) {
-      core.warning("Could not read .github/MAINTAINER; proceeding without the maintainer check.");
-    }
-    if (authorIsMaintainer) {
-      core.info(`Author @${author} is a maintainer; skipping (fork PRs from non-maintainers only).`);
-      return;
-    }
+  // --- Scope guard: fork PRs from non-maintainers only.
+  // Precise fork test: the head repo differs from the base repo (head.repo.fork
+  // alone means "head repo is a fork of anything", which can false-positive).
+  const isFork = !!(
+    pr.head && pr.head.repo && pr.base && pr.base.repo &&
+    pr.head.repo.full_name !== pr.base.repo.full_name
+  );
+  if (!isFork) {
+    core.info("Not a fork PR; skipping (reviewer auto-assignment is fork-only).");
+    return;
+  }
+  let maint;
+  try {
+    const m = fs.readFileSync(".github/MAINTAINER", "utf8");
+    maint = new Set(
+      m.split("\n").map((l) => l.replace(/#.*/, "").trim().toLowerCase()).filter(Boolean)
+    );
+  } catch (e) {
+    // Fail closed: can't verify maintainer status -> don't risk assigning a
+    // maintainer-authored PR.
+    core.warning("Could not read .github/MAINTAINER; skipping to stay fail-closed.");
+    return;
+  }
+  if (maint.has(author)) {
+    core.info(`Author @${author} is a maintainer; skipping (fork PRs from non-maintainers only).`);
+    return;
   }
 
   // --- Parse .github/reviewers into ordered (prefix -> owners) rules + the pool.
@@ -74,7 +75,8 @@ module.exports = async ({ github, context, core, dryRun = false }) => {
   }
   const managed = new Set([...poolSet.keys()]); // everyone this action can manage
 
-  // --- Owners of the area(s) this PR touches (last matching rule wins per file).
+  // --- Owners of the area(s) this PR touches (last matching rule wins per file,
+  // unioned across all changed files).
   const files = await github.paginate(github.rest.pulls.listFiles, {
     owner,
     repo,
@@ -138,9 +140,9 @@ module.exports = async ({ github, context, core, dryRun = false }) => {
   }
   const desiredLc = new Set(desired.map((u) => u.toLowerCase()));
 
-  // --- Reconcile current requested reviewers to exactly `desired`. With native
-  // CODEOWNERS gone there is normally nothing pre-requested, but on a reopened
-  // PR (or after a manual add) this keeps the set at the 2 balanced picks.
+  // --- Reconcile current requested reviewers to exactly `desired`. Normally
+  // nothing is pre-requested, but on a reopened PR (or after a manual add) this
+  // keeps the set at the 2 balanced picks.
   const current = (pr.requested_reviewers || []).map((r) => r.login);
   const currentLc = new Set(current.map((c) => c.toLowerCase()));
   const toAdd = desired.filter((u) => !currentLc.has(u.toLowerCase()));
@@ -150,18 +152,18 @@ module.exports = async ({ github, context, core, dryRun = false }) => {
     (u) => managed.has(u.toLowerCase()) && !desiredLc.has(u.toLowerCase())
   );
 
-  if (toAdd.length && !dryRun) {
+  if (toAdd.length) {
     await github.rest.pulls.requestReviewers({
       owner, repo, pull_number: pr.number, reviewers: toAdd,
     });
   }
-  if (toRemove.length && !dryRun) {
+  if (toRemove.length) {
     await github.rest.pulls.removeRequestedReviewers({
       owner, repo, pull_number: pr.number, reviewers: toRemove,
     });
   }
   core.info(
-    `${dryRun ? "[DRY RUN] " : ""}Reviewers -> [${desired.join(", ")}]` +
+    `Reviewers -> [${desired.join(", ")}]` +
       ` (area pool ${areaOwners.size || "∅→full"}, +${toAdd.length}/-${toRemove.length}).`
   );
 };

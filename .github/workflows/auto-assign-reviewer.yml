@@ -12,54 +12,40 @@ name: Auto-assign Reviewer
 # pull_request token is read-only). Safe: it checks out only the trusted default
 # branch (.github), never PR head, and runs no PR code -- it reads .github/
 # reviewers + .github/MAINTAINER + the changed-file list and calls the reviewers
-# API.
+# API. The offline unit test (auto-assign-reviewer.test.js) covers the logic.
 
 on:
   pull_request_target:
     types: [opened, reopened, ready_for_review]
-  # Smoke test: when a PR edits this assigner, run it against the PR's OWN
-  # version in DRY-RUN (logs picks, mutates nothing). The companion unit test
-  # (auto-assign-reviewer.test.js) covers the logic offline.
-  pull_request:
-    types: [opened, synchronize]
-    paths:
-      - .github/workflows/auto-assign-reviewer.yml
-      - .github/workflows/auto-assign-reviewer.js
 
 permissions:
   contents: read
 
 concurrency:
   group: auto-assign-reviewer-${{ github.event.pull_request.number }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   assign:
-    # Real runs only spin up for fork PRs; the dry-run (pull_request event on an
-    # assigner edit) always runs. The author-is-maintainer check needs the
-    # MAINTAINER file, so it lives in the script.
+    # Fork PRs only (precise: head repo differs from this repo). The
+    # author-is-maintainer half of the guard needs the MAINTAINER file, so it
+    # lives in the script.
     if: >-
       github.repository == 'omnigent-ai/omnigent'
       && !github.event.pull_request.draft
       && !endsWith(github.actor, '[bot]')
-      && (
-        github.event.pull_request.head.repo.fork
-        || github.event_name == 'pull_request'
-      )
+      && github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       pull-requests: write   # request reviewers
     steps:
-      # Real runs (pull_request_target): check out the TRUSTED default branch.
-      # Dry-run smoke test (pull_request): check out the PR head so we exercise
-      # the PR's own version of the script. (pull_request gets a read-only token
-      # and no secrets, and dry-run mutates nothing -- so running the PR's
-      # script here is safe.)
+      # Trusted default branch only (.github sparse). Never the PR head, so no
+      # PR-authored code runs.
       - name: Check out .github
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event.repository.default_branch }}
+          ref: ${{ github.event.repository.default_branch }}
           sparse-checkout: .github
           persist-credentials: false
       - name: Assign 2 balanced reviewers from the .github/reviewers pool
@@ -68,4 +54,4 @@ jobs:
           retries: 3
           script: |
             const script = require('./.github/workflows/auto-assign-reviewer.js');
-            await script({ github, context, core, dryRun: context.eventName === 'pull_request' });
+            await script({ github, context, core });
