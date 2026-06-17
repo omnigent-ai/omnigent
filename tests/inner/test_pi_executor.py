@@ -28,6 +28,7 @@ from omnigent.inner.pi_executor import (
     _pi_provider_for_model,
     _PiRpcSession,
     _sanitize_schema,
+    _split_pi_prompt,
     _ToolServer,
 )
 from omnigent.onboarding.databricks_config import DATABRICKS_CLAUDE_DEFAULT_MODEL
@@ -342,6 +343,29 @@ class TestPiProviderForModel(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# _split_pi_prompt tests
+# ---------------------------------------------------------------------------
+
+
+def test_split_pi_prompt_separates_text_and_images():
+    # #515: multimodal blocks must go to Pi's native message + images, not be
+    # JSON-encoded into the text (which the model reads as a literal blob).
+    message, images = _split_pi_prompt(
+        [
+            {"type": "input_text", "text": "what is in this image?"},
+            {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+        ]
+    )
+    assert message == "what is in this image?"
+    assert images == [{"type": "image", "data": "AAAA", "mimeType": "image/png"}]
+
+
+def test_split_pi_prompt_text_only_has_no_images():
+    message, images = _split_pi_prompt([{"type": "input_text", "text": "hi"}])
+    assert message == "hi"
+    assert images == []
+
+
 # _build_models_json tests
 # ---------------------------------------------------------------------------
 
@@ -353,6 +377,16 @@ class TestBuildModelsJson(unittest.TestCase):
         self.assertIn("databricks", providers)
         self.assertIn("databricks-anthropic", providers)
         self.assertIn("databricks-completions", providers)
+
+    def test_dynamic_model_declared_image_capable(self):
+        # #515: a dynamically-registered model must advertise image input, or
+        # Pi's transformMessages strips every image block ("model does not
+        # support images") before the message reaches the provider.
+        model = "databricks-qwen2-5-vl-72b"
+        result = _build_models_json("https://host.example.com", "tok", model=model)
+        provider = result["providers"][_pi_provider_for_model(model)]
+        entry = next(e for e in provider["models"] if e["id"] == model)
+        self.assertEqual(entry.get("input"), ["text", "image"])
 
     def test_base_urls_use_host(self):
         result = _build_models_json("https://host.example.com/", "tok")
@@ -2502,9 +2536,11 @@ def test_build_models_json_registers_unknown_model_with_routed_provider() -> Non
         model="moonshotai/kimi-k2.6",
     )
     completions = result["providers"]["databricks-completions"]
-    # The run model is registered (bare-id entry, the shape ucode writes)
-    # under the provider _pi_provider_for_model routes it to…
-    assert {"id": "moonshotai/kimi-k2.6"} in completions["models"]
+    # The run model is registered (so Pi resolves it) under the provider
+    # _pi_provider_for_model routes it to, advertising image input so Pi
+    # doesn't strip attached images (#515).
+    entry = next((e for e in completions["models"] if e["id"] == "moonshotai/kimi-k2.6"), None)
+    assert entry == {"id": "moonshotai/kimi-k2.6", "input": ["text", "image"]}
     # …and that provider points at the generic gateway with the
     # Chat-Completions dialect OpenRouter speaks.
     assert completions["baseUrl"] == "https://openrouter.ai/api/v1"

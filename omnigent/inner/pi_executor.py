@@ -680,7 +680,14 @@ def _build_models_json(
             # Rebind (don't append): the static lists are module-level
             # constants shared across builds, so in-place mutation would
             # leak this run's model id into every later models.json.
-            provider["models"] = [*provider["models"], {"id": model}]
+            # Declare image input: Pi's transformMessages drops every image
+            # block ("model does not support images") unless the model entry
+            # advertises it, so a dynamically-registered vision model would
+            # silently lose its images (#515).
+            provider["models"] = [
+                *provider["models"],
+                {"id": model, "input": ["text", "image"]},
+            ]
     return config
 
 
@@ -1011,6 +1018,55 @@ def _extract_latest_user_content(
                 return content
             return str(content)
     return ""
+
+
+def _parse_data_uri(uri: str) -> tuple[str, str]:
+    """Parse a ``data:`` URI into ``(media_type, base64_payload)``.
+
+    :param uri: A data URI, e.g. ``"data:image/png;base64,iVBOR..."``.
+    :returns: Tuple of ``(media_type, base64_payload)``.
+    :raises ValueError: If ``uri`` is not a ``data:`` URI.
+    """
+    if not uri.startswith("data:"):
+        raise ValueError(f"Not a data URI: {uri[:40]!r}")
+    header, _, payload = uri[5:].partition(",")
+    media_type = header.replace(";base64", "")
+    return media_type, payload
+
+
+def _split_pi_prompt(blocks: list[dict[str, Any]]) -> tuple[str, list[dict[str, str]]]:
+    """Split content blocks into Pi's prompt ``message`` text and ``images``.
+
+    Pi's RPC ``prompt`` command carries text in ``message`` and images in a
+    native ``images`` field (``ImageContent = {type, data, mimeType}``), which
+    the ``openai-completions`` provider converts to ``image_url`` blocks.
+    JSON-encoding the blocks into ``message`` instead (the previous behavior)
+    makes Pi forward the image data URI as literal text, so the model never
+    sees the image (#515).
+
+    :param blocks: Responses-API content block dicts (``input_text`` /
+        ``input_image``). Non-text, non-image blocks have no Pi channel and are
+        skipped.
+    :returns: ``(message, images)`` — joined text and a list of Pi
+        ``ImageContent`` dicts.
+    """
+    text_parts: list[str] = []
+    images: list[dict[str, str]] = []
+    for block in blocks:
+        block_type = block.get("type")
+        if block_type in ("input_text", "output_text", "text"):
+            text_parts.append(str(block.get("text") or ""))
+        elif block_type == "input_image":
+            image_url = block.get("image_url")
+            if not isinstance(image_url, str) or not image_url.startswith("data:"):
+                raise ValueError(
+                    "input_image block must carry an inline data URI in "
+                    "'image_url'. Upload the image via the session files API "
+                    "and reference it by file_id."
+                )
+            media_type, data = _parse_data_uri(image_url)
+            images.append({"type": "image", "data": data, "mimeType": media_type})
+    return "\n".join(text_parts), images
 
 
 def _build_pi_prompt(
@@ -1838,24 +1894,22 @@ class PiExecutor(Executor):
         if state is not None:
             state._has_sent_prompt = True
 
-        # Send prompt command. Pi's JSONL protocol requires
-        # ``message`` to be a string. When the prompt carries
-        # multimodal content blocks, JSON-encode them so the
-        # LLM sees the image data URIs in its context.
+        # Send prompt command. Pi's JSONL protocol carries text in ``message``
+        # and images in a native ``images`` field. Split multimodal blocks into
+        # both (rather than JSON-encoding them into the text) so the model
+        # actually receives attached images instead of a base64 text blob (#515).
         message: str
+        images: list[dict[str, str]] = []
         if isinstance(prompt, list):
-            message = json.dumps(prompt)
+            message, images = _split_pi_prompt(prompt)
         else:
             message = prompt
         cmd_id = f"turn_{id(messages)}"
+        command: dict[str, Any] = {"type": "prompt", "message": message, "id": cmd_id}
+        if images:
+            command["images"] = images
         try:
-            await rpc.send_command(
-                {
-                    "type": "prompt",
-                    "message": message,
-                    "id": cmd_id,
-                }
-            )
+            await rpc.send_command(command)
         except Exception as exc:  # noqa: BLE001 — executor boundary surfaces prompt-send errors as ExecutorError
             yield ExecutorError(message=f"Failed to send prompt to Pi: {exc}")
             return
