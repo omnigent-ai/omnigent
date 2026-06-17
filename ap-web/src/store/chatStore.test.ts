@@ -3472,6 +3472,28 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     });
   });
 
+  describe("session.mode", () => {
+    it("stores the new permission mode in permissionMode", () => {
+      useChatStore.setState({ permissionMode: null });
+      handleSessionEvent({
+        type: "session_mode",
+        conversationId: "conv_abc",
+        mode: "auto",
+      });
+      expect(useChatStore.getState().permissionMode).toBe("auto");
+    });
+
+    it("updates permissionMode when mode changes again", () => {
+      useChatStore.setState({ permissionMode: "auto" });
+      handleSessionEvent({
+        type: "session_mode",
+        conversationId: "conv_abc",
+        mode: "default",
+      });
+      expect(useChatStore.getState().permissionMode).toBe("default");
+    });
+  });
+
   describe("session.input.consumed", () => {
     it("promotes the oldest pending user message into blocks (FIFO, plain append)", () => {
       const existingAssistant: AnyBlock = {

@@ -126,6 +126,7 @@ import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCliServerUrl } from "@/lib/host";
 import { SessionImage } from "@/components/SessionImage";
+import { permissionModeMeta } from "@/lib/permissionMode";
 
 const ATTACHED_RE = /\[Attached:[^\]]*\]\s*/g;
 
@@ -2742,6 +2743,7 @@ function ComposerStatusLine() {
   // alongside contextWindow — so the branch reads from the same store as
   // the other status-line values rather than a separate fetch.
   const gitBranch = useChatStore((s) => s.gitBranch);
+  const permissionMode = useChatStore((s) => s.permissionMode);
 
   const showBranch = !!conversationId && !!gitBranch;
   const modelEffortLabel = conversationId
@@ -2751,7 +2753,9 @@ function ComposerStatusLine() {
   // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
   const showRing =
     !!conversationId && contextWindow != null && contextWindow > 0 && tokensUsed != null;
-  if (!showBranch && !showPlanMode && !showRing && modelEffortLabel === null) return null;
+  const modeMeta = conversationId ? permissionModeMeta(permissionMode) : null;
+  if (!showBranch && !showPlanMode && !showRing && modelEffortLabel === null && !modeMeta)
+    return null;
 
   return (
     <div
@@ -2782,7 +2786,7 @@ function ComposerStatusLine() {
           </>
         )}
       </span>
-      {/* Right: model/effort and context ring, never shrinks. */}
+      {/* Right: plan mode, model/effort, permission-mode badge, and context ring, never shrinks. */}
       <div className="flex min-w-0 shrink-0 items-center gap-3">
         {showPlanMode && (
           <span
@@ -2800,6 +2804,17 @@ function ComposerStatusLine() {
             title={modelEffortLabel}
           >
             {modelEffortLabel}
+          </span>
+        )}
+        {modeMeta && (
+          <span
+            data-testid="composer-permission-mode"
+            className={cn(
+              "select-none rounded border px-1.5 py-0.5 text-[11px] font-medium leading-none",
+              modeMeta.className,
+            )}
+          >
+            {modeMeta.label}
           </span>
         )}
         {showRing && <ContextRing contextWindow={contextWindow} tokensUsed={tokensUsed} />}
