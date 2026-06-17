@@ -11,6 +11,8 @@ path, ``action_required`` function_calls are published to the live
 stream only and never persisted as conversation items (see
 ``tests/e2e/test_openai_coder_client_tools.py``), so snapshot polling
 would hang waiting for an item that never appears.
+
+Runs with either a real LLM or the mock LLM server.
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ from typing import Any
 
 import httpx
 
-from tests.e2e.conftest import send_user_message_to_session
+from tests.e2e.conftest import configure_mock_llm, send_user_message_to_session
 from tests.integration.conftest import JourneySession
 from tests.integration.helpers import all_message_text, failure_detail, run_turn
 
@@ -158,10 +160,34 @@ def _turn_with_tool(
 
 
 def test_client_tool_result_recalled_across_turns(
-    live_server: str, journey_session: JourneySession
+    live_server: str,
+    journey_session: JourneySession,
+    mock_llm_server_url: str | None,
 ) -> None:
     marker = f"widget-color-{uuid.uuid4().hex[:8]}"
+    call_id = f"call_{uuid.uuid4().hex[:8]}"
     sid = journey_session.session_id
+
+    # In mock mode, queue: tool call → text with marker → recall text.
+    # The first response is a tool call; after the test posts the tool
+    # result, the second response includes the marker; the third
+    # response (turn 2) recalls from transcript.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": call_id,
+                        "name": "lookup_widget",
+                        "arguments": json.dumps({"widget_id": 42}),
+                    },
+                ],
+            },
+            {"text": f"The widget color is {marker}."},
+            {"text": f"The color was {marker}."},
+        ],
+    )
 
     text_1 = _turn_with_tool(
         live_server,
