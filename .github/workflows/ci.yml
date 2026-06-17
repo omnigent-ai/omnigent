@@ -144,12 +144,23 @@ jobs:
           PYTHONFAULTHANDLER: "1"
           PYTEST_PROGRESS_LOG_DIR: artifacts/progress
           OMNIGENT_TOKEN_USAGE_JSON: artifacts/tokens-${{ matrix.group }}.json
-          COVERAGE_FILE: artifacts/.coverage.${{ matrix.group }}
+          # Write coverage data OUTSIDE the repo working dir. coverage.py's
+          # parallel writer (xdist -n) drops transient
+          # ``.coverage.<group>.<host>.pid<N>.<rand>`` files next to
+          # COVERAGE_FILE and renames them away as it combines. When those
+          # landed under the repo (the bwrap sandbox ro-binds cwd), the
+          # dotfile masker could race them: it scanned a transient file,
+          # then bwrap tried to create the now-vanished mountpoint inside a
+          # read-only mount and aborted the helper ("Can't create file ...:
+          # Read-only file system"). Keeping the churn in $RUNNER_TEMP means
+          # the sandbox never sees it. The final combined file is copied back
+          # into artifacts/ below for the coverage-report job to consume.
+          COVERAGE_FILE: ${{ runner.temp }}/omnigent-coverage/.coverage.${{ matrix.group }}
           # sysmon: the default C-trace coverage backend pushed the heaviest
           # shard past its timeout; only line coverage is collected.
           COVERAGE_CORE: sysmon
         run: |
-          mkdir -p artifacts artifacts/progress
+          mkdir -p artifacts artifacts/progress "$(dirname "$COVERAGE_FILE")"
           EXTRA_ARGS=()
           if [[ "$FORCE_ALL_TESTS" == "true" ]]; then
             EXTRA_ARGS=(--no-skip-known)
@@ -167,6 +178,20 @@ jobs:
               -v --tb=long --showlocals --log-level=INFO -r a \
               "${EXTRA_ARGS[@]}" \
               || { rc=$?; [ "$rc" -eq 5 ] && echo "::notice::No tests collected in this shard; treating as a pass." || exit "$rc"; }
+
+      - name: Stage coverage data for upload
+        if: always()
+        shell: bash
+        # COVERAGE_FILE lives under $RUNNER_TEMP (outside the sandboxed repo);
+        # copy the combined per-shard data file back into artifacts/ so the
+        # coverage-report job's ``covdata/**/.coverage.*`` glob still finds it.
+        run: |
+          cov_file="${{ runner.temp }}/omnigent-coverage/.coverage.${{ matrix.group }}"
+          if [[ -f "$cov_file" ]]; then
+            cp "$cov_file" "artifacts/.coverage.${{ matrix.group }}"
+          else
+            echo "::notice::No coverage data file at $cov_file; nothing to stage."
+          fi
 
       - name: Upload pytest artifacts
         if: always()

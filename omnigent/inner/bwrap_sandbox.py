@@ -1002,12 +1002,52 @@ def _dotfile_and_symlink_mask_args(
             entries.append(entry)
     args: list[str] = []
     for entry in entries:
+        # Re-stat at the last moment before emitting. A mask mount
+        # overlays /dev/null (file) or a tmpfs (dir) ONTO an existing
+        # path; bwrap never has to create the mountpoint when the
+        # target is still there. But a transient dotfile (e.g. the
+        # ``.coverage.<group>.<host>.pid<N>.<rand>`` files coverage.py
+        # writes-then-renames under cwd while ``--cov`` runs in
+        # parallel) can vanish between the scan above and the ``bwrap``
+        # exec. When that target lives under a read-only bind (cwd is
+        # ro-bound by default), bwrap must CREATE the missing mountpoint
+        # inside a RO mount and aborts the whole sandbox with
+        # "Can't create file ...: Read-only file system" — note that
+        # ``--bind-try`` only tolerates a missing SOURCE (/dev/null
+        # always exists), NOT an uncreatable TARGET. Skipping a target
+        # that no longer exists is safe: there is nothing left to leak,
+        # and every PERSISTENT host dotfile still exists at this point
+        # so it is still masked — the host-dotfile-leak defense is
+        # unchanged.
+        if not _path_exists_lstat(entry.path):
+            continue
         if entry.kind == "dir":
             args.extend(["--tmpfs", str(entry.path)])
         else:
-            # --bind-try: silently skips if the file vanished since scan (TOCTOU).
+            # --bind-try: silently skips if the file vanished between
+            # this re-stat and the exec (narrower residual TOCTOU).
             args.extend(["--bind-try", "/dev/null", str(entry.path)])
     return args
+
+
+def _path_exists_lstat(path: Path) -> bool:
+    """
+    Return whether *path* exists without following a final symlink.
+
+    Used to drop dotfile-mask candidates that raced out from under the
+    scan before the ``bwrap`` exec. ``lstat`` (not ``stat``) so a
+    dangling or escaping symlink still counts as present and gets
+    masked — we want to overlay the link path itself, not its target.
+
+    :param path: Candidate mask target.
+    :returns: ``True`` when the path still exists (including broken
+        symlinks), ``False`` when it has been removed.
+    """
+    try:
+        os.lstat(path)
+    except OSError:
+        return False
+    return True
 
 
 def _scratch_tmpdir(write_roots: list[Path]) -> Path | None:
