@@ -1824,12 +1824,15 @@
             "session.agent_changed": "#/components/schemas/SessionAgentChangedEvent",
             "session.changed_files.invalidated": "#/components/schemas/SessionChangedFilesInvalidatedEvent",
             "session.child_session.updated": "#/components/schemas/SessionChildSessionUpdatedEvent",
+            "session.collaboration_mode": "#/components/schemas/SessionCollaborationModeEvent",
             "session.created": "#/components/schemas/SessionCreatedEvent",
             "session.heartbeat": "#/components/schemas/SessionHeartbeatEvent",
             "session.input.consumed": "#/components/schemas/SessionInputConsumedEvent",
             "session.interrupted": "#/components/schemas/SessionInterruptedEvent",
             "session.model": "#/components/schemas/SessionModelEvent",
+            "session.model_options": "#/components/schemas/SessionModelOptionsEvent",
             "session.presence": "#/components/schemas/SessionPresenceEvent",
+            "session.reasoning_effort": "#/components/schemas/SessionReasoningEffortEvent",
             "session.resource.created": "#/components/schemas/SessionResourceCreatedEvent",
             "session.resource.deleted": "#/components/schemas/SessionResourceDeletedEvent",
             "session.sandbox_status": "#/components/schemas/SessionSandboxStatusEvent",
@@ -1857,6 +1860,12 @@
             "$ref": "#/components/schemas/SessionModelEvent"
           },
           {
+            "$ref": "#/components/schemas/SessionReasoningEffortEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionCollaborationModeEvent"
+          },
+          {
             "$ref": "#/components/schemas/SessionAgentChangedEvent"
           },
           {
@@ -1870,6 +1879,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionSkillsEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionModelOptionsEvent"
           },
           {
             "$ref": "#/components/schemas/SessionInputConsumedEvent"
@@ -2101,6 +2113,43 @@
           "child"
         ],
         "title": "SessionChildSessionUpdatedEvent",
+        "type": "object"
+      },
+      "SessionCollaborationModeEvent": {
+        "description": "Active collaboration-mode update from a Codex-native session.\n\nEmitted after the web UI toggles Codex collaboration mode, and after the\nCodex forwarder observes a ``thread/settings/updated`` notification from\nthe native Codex TUI. Lets connected clients show a clear Plan-mode\nindicator without a reload.\n\n:param type: Always ``\"session.collaboration_mode\"``.\n:param conversation_id: Session identifier, e.g. ``\"conv_abc123\"``.\n:param mode: The active collaboration mode string, e.g. ``\"plan\"`` or\n    ``\"default\"``.\n\nCategory: **transient** (SSE-only). The server also writes\n``omnigent.codex_native.collaboration_mode`` on the conversation labels,\nso reconnect clients restore the same state from the session snapshot.",
+        "properties": {
+          "conversation_id": {
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "mode": {
+            "title": "Mode",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.collaboration_mode",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "mode"
+        ],
+        "title": "SessionCollaborationModeEvent",
         "type": "object"
       },
       "SessionCreatedEvent": {
@@ -2509,6 +2558,38 @@
         "title": "SessionModelEvent",
         "type": "object"
       },
+      "SessionModelOptionsEvent": {
+        "description": "Signal that a codex-native session's model catalog has resolved.\n\nModel options are fetched from the bound runner's live\nCodex app-server via ``model/list`` and cached on the session\nsnapshot. The initial snapshot can return an empty list while\nthis background fetch is in flight; this event tells connected\nclients to re-read the snapshot and apply its now-populated\n``model_options``.\n\nCarries no payload beyond the conversation id. The snapshot's\n``model_options`` field remains the source of truth.\n\n:param type: Always ``\"session.model_options\"``.\n:param conversation_id: Session identifier,\n    e.g. ``\"conv_abc123\"``.\n\nCategory: **transient** (SSE-only). On reconnect, clients seed\nCodex model / effort controls from the session snapshot.",
+        "properties": {
+          "conversation_id": {
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.model_options",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id"
+        ],
+        "title": "SessionModelOptionsEvent",
+        "type": "object"
+      },
       "SessionPresenceEvent": {
         "description": "The session's viewer list changed \u2014 full state, not a delta.\n\nEmitted on ``GET /v1/sessions/{id}/stream`` whenever a user\njoins, leaves (after the server-side grace window absorbs\nreconnect churn), or flips their idle aggregate, and once to\neach newly-connected stream as a snapshot-on-connect. Every\nevent carries the COMPLETE viewer list so clients replace their\nstate wholesale \u2014 missed events self-heal on the next event or\nreconnect. Viewers are scoped to the session *tree* (the root\nconversation and every sub-agent conversation under it), so a\nuser on a sub-agent page and a user on the root page appear in\neach other's lists. See ``omnigent/server/presence.py`` and\n``designs/UI/PRESENCE.md``.\n\n:param type: Always ``\"session.presence\"``.\n:param conversation_id: The conversation whose stream delivered\n    this event \u2014 the root or a sub-agent conversation, e.g.\n    ``\"conv_abc123\"``. Matches the streamed conversation (not\n    necessarily the tree's root) so clients can guard events by\n    the conversation they are viewing.\n:param viewers: All users currently viewing any conversation in\n    the session tree (including the receiving user \u2014 the web\n    filters self out for display), ordered by join time.",
         "properties": {
@@ -2547,6 +2628,50 @@
           "viewers"
         ],
         "title": "SessionPresenceEvent",
+        "type": "object"
+      },
+      "SessionReasoningEffortEvent": {
+        "description": "Active reasoning-effort update from a terminal-backed integration.\n\nEmitted after an ``external_reasoning_effort_change`` POST from a native\nterminal forwarder when the user changes the thinking level inside the\nterminal UI. Lets the web effort picker reflect a TUI-side switch without\na reload.\n\n:param type: Always ``\"session.reasoning_effort\"``.\n:param conversation_id: Session identifier, e.g. ``\"conv_abc123\"``.\n:param reasoning_effort: Reasoning effort now active for the session, e.g.\n    ``\"medium\"``, or ``None`` when Codex cleared to its default.\n\nCategory: **transient** (SSE-only). The server also writes\n``reasoning_effort`` on the conversation, so on reconnect clients restore\nthe selection from the session snapshot rather than from a replayed event.",
+        "properties": {
+          "conversation_id": {
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reasoning Effort"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.reasoning_effort",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id"
+        ],
+        "title": "SessionReasoningEffortEvent",
         "type": "object"
       },
       "SessionResourceCreatedEvent": {
@@ -3362,7 +3487,7 @@
       },
       "UpdateSessionRequest": {
         "additionalProperties": false,
-        "description": "Request body for ``PATCH /v1/sessions/{id}``.\n\nThe Alpha runner-state pivot makes this endpoint the mutable\nsession affinity primitive when ``runner_id`` is provided. The\nserver validates that the runner is online, then replaces\n``conversations.runner_id``. Existing session metadata updates\nremain supported for clients that update title, labels, or\nreasoning effort through the sessions API.\n\n:param runner_id: Identifier of a registered runner, e.g.\n    ``\"runner_abc123\"``. ``None`` leaves runner binding\n    unchanged.\n:param title: New title, e.g. ``\"debugging auth flow\"``.\n    ``None`` leaves unchanged.\n:param labels: Guardrails labels to upsert. Merges with existing\n    labels; keys not present are left untouched.\n:param reasoning_effort: Per-session reasoning-effort hint.\n    Accepted metadata values are ``\"none\"``, ``\"minimal\"``,\n    ``\"low\"``, ``\"medium\"``, ``\"high\"``, ``\"xhigh\"``, and\n    ``\"max\"``. Provider-specific support is validated when a\n    turn executes. Clear aliases such as ``\"default\"`` remove\n    the session override. ``None`` leaves unchanged.\n:param model_override: Per-session LLM model override, e.g.\n    ``\"claude-opus-4-7\"``. The value is forwarded as-is to the\n    executor at turn start; the server does not enumerate valid\n    models. Clear aliases such as ``\"default\"``, ``\"off\"``, or\n    ``\"reset\"`` remove the override (matching the REPL's\n    ``/model`` semantics). ``None`` leaves unchanged.\n:param cost_control_mode_override: Per-session cost-control\n    switch: ``\"on\"`` activates the spec's configured cost-control\n    mode, ``\"off\"`` disables cost control for this session.\n    Explicit JSON ``null`` clears the override back to the spec\n    default; omitting the field leaves it unchanged (``\"off\"`` is\n    a real value here, so the field's *presence* \u2014 not a clear\n    alias \u2014 is the clear signal, unlike ``model_override``).\n:param external_session_id: Runtime-native session id captured\n    by a wrapper bridge (e.g. Claude Code's session uuid for\n    ``omnigent claude`` sessions). Idempotent on same-value\n    writes; the server rejects attempts to overwrite an\n    already-set different value with ``invalid_input`` to\n    surface programmer errors. ``None`` leaves unchanged.\n:param terminal_launch_args: Per-session native-terminal\n    pass-through args, e.g. ``[\"--dangerously-skip-permissions\"]``.\n    A list (including ``[]``) replaces the stored value wholesale\n    \u2014 resume is last-write-wins, never an append. Bounds (count /\n    length) are validated server-side. ``None`` leaves unchanged.\n:param silent: When ``True``, persist metadata changes but skip\n    the runner-side side effects \u2014 specifically the\n    claude-native ``/effort`` and ``/model`` slash-command\n    forwards into the tmux pane. Used by automatic bind-time\n    handoffs (ap-web's sticky-pref apply on session switch, the\n    REPL's pre-create ``/model`` snapshot) where injecting a\n    visible slash command into a freshly-spawned pane would\n    render as an unexpected \"Command model X\" item before the\n    user has sent anything. Default ``False`` preserves the\n    user-driven picker / ``/model`` behaviour where the live\n    forward IS the desired feedback.\n:param archived: New archived state. ``True`` archives (hides the\n    session from the default sidebar listing), ``False`` unarchives,\n    ``None`` leaves unchanged. Owner-only (unlike ``title``, which\n    needs only edit access).",
+        "description": "Request body for ``PATCH /v1/sessions/{id}``.\n\nThe Alpha runner-state pivot makes this endpoint the mutable\nsession affinity primitive when ``runner_id`` is provided. The\nserver validates that the runner is online, then replaces\n``conversations.runner_id``. Existing session metadata updates\nremain supported for clients that update title, labels, or\nreasoning effort through the sessions API.\n\n:param runner_id: Identifier of a registered runner, e.g.\n    ``\"runner_abc123\"``. ``None`` leaves runner binding\n    unchanged.\n:param title: New title, e.g. ``\"debugging auth flow\"``.\n    ``None`` leaves unchanged.\n:param labels: Guardrails labels to upsert. Merges with existing\n    labels; keys not present are left untouched.\n:param reasoning_effort: Per-session reasoning-effort hint.\n    Accepted metadata values are ``\"none\"``, ``\"minimal\"``,\n    ``\"low\"``, ``\"medium\"``, ``\"high\"``, ``\"xhigh\"``, and\n    ``\"max\"``. Provider-specific support is validated when a\n    turn executes. Clear aliases such as ``\"default\"`` remove\n    the session override. ``None`` leaves unchanged.\n:param model_override: Per-session LLM model override, e.g.\n    ``\"claude-opus-4-7\"``. The value is forwarded as-is to the\n    executor at turn start; the server does not enumerate valid\n    models. Clear aliases such as ``\"default\"``, ``\"off\"``, or\n    ``\"reset\"`` remove the override (matching the REPL's\n    ``/model`` semantics). ``None`` leaves unchanged.\n:param collaboration_mode: Codex-native collaboration-mode string.\n    ``\"plan\"`` enters Plan mode and ``\"default\"`` returns to Default\n    mode for subsequent Codex turns. Only valid for sessions stamped\n    with the codex-native wrapper label. Omitted leaves unchanged.\n:param cost_control_mode_override: Per-session cost-control\n    switch: ``\"on\"`` activates the spec's configured cost-control\n    mode, ``\"off\"`` disables cost control for this session.\n    Explicit JSON ``null`` clears the override back to the spec\n    default; omitting the field leaves it unchanged (``\"off\"`` is\n    a real value here, so the field's *presence* \u2014 not a clear\n    alias \u2014 is the clear signal, unlike ``model_override``).\n:param external_session_id: Runtime-native session id captured\n    by a wrapper bridge (e.g. Claude Code's session uuid for\n    ``omnigent claude`` sessions). Idempotent on same-value\n    writes; the server rejects attempts to overwrite an\n    already-set different value with ``invalid_input`` to\n    surface programmer errors. ``None`` leaves unchanged.\n:param terminal_launch_args: Per-session native-terminal\n    pass-through args, e.g. ``[\"--dangerously-skip-permissions\"]``.\n    A list (including ``[]``) replaces the stored value wholesale\n    \u2014 resume is last-write-wins, never an append. Bounds (count /\n    length) are validated server-side. ``None`` leaves unchanged.\n:param silent: When ``True``, persist metadata changes but skip\n    the runner-side side effects \u2014 specifically the\n    native ``/effort`` / ``/model`` / Codex collaboration-mode\n    forwards into the live runtime. Used by automatic bind-time\n    handoffs (ap-web's sticky-pref apply on session switch, the\n    REPL's pre-create ``/model`` snapshot) where injecting a\n    visible slash command into a freshly-spawned pane would\n    render as an unexpected \"Command model X\" item before the\n    user has sent anything. Default ``False`` preserves the\n    user-driven picker / ``/model`` behaviour where the live\n    forward IS the desired feedback.\n:param archived: New archived state. ``True`` archives (hides the\n    session from the default sidebar listing), ``False`` unarchives,\n    ``None`` leaves unchanged. Owner-only (unlike ``title``, which\n    needs only edit access).",
         "properties": {
           "archived": {
             "anyOf": [
@@ -3374,6 +3499,17 @@
               }
             ],
             "title": "Archived"
+          },
+          "collaboration_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Collaboration Mode"
           },
           "cost_control_mode_override": {
             "anyOf": [
@@ -4692,7 +4828,7 @@
         ]
       },
       "get": {
-        "description": "Return a session snapshot: identity, status, and committed\nitems.\n\n:param request: The incoming FastAPI request (for auth).\n:param response: The FastAPI response (for cache headers).\n:param session_id: Session/conversation identifier,\n    e.g. ``\"conv_abc123\"``.\n:param include_items: When ``False``, skip the committed-items\n    read and return ``items=[]``. The web chat surface passes\n    ``False`` because it hydrates the transcript via the\n    paginated ``GET /sessions/{id}/items`` endpoint in parallel\n    and never reads the snapshot's copy; the items read is the\n    single most expensive step of the snapshot build.\n:param include_liveness: When ``False``, skip the runner/host\n    liveness lookup and return ``runner_online``/``host_online``\n    as ``None``. The web chat surface passes ``False`` because\n    it sources liveness from the ``/health`` poll and the WS\n    stream, not the snapshot.\n:returns: The matching :class:`SessionResponse`.\n:raises OmnigentError: 404 if no session exists.",
+        "description": "Return a session snapshot: identity, status, and committed\nitems.\n\n:param request: The incoming FastAPI request (for auth).\n:param response: The FastAPI response (for cache headers).\n:param session_id: Session/conversation identifier,\n    e.g. ``\"conv_abc123\"``.\n:param include_items: When ``False``, skip the committed-items\n    read and return ``items=[]``. The web chat surface passes\n    ``False`` because it hydrates the transcript via the\n    paginated ``GET /sessions/{id}/items`` endpoint in parallel\n    and never reads the snapshot's copy; the items read is the\n    single most expensive step of the snapshot build.\n:param include_liveness: When ``False``, skip the runner/host\n    liveness lookup and return ``runner_online``/``host_online``\n    as ``None``. The web chat surface passes ``False`` because\n    it sources liveness from the ``/health`` poll and the WS\n    stream, not the snapshot.\n:param refresh_state: When ``True``, refresh runner-derived\n    snapshot overlays from the live session instead of serving\n    stale AP-process caches. Browser reload/bind requests use\n    this to recover from fixed bugs without restarting the AP\n    server.\n:returns: The matching :class:`SessionResponse`.\n:raises OmnigentError: 404 if no session exists.",
         "operationId": "get_session_v1_sessions__session_id__get",
         "parameters": [
           {
@@ -4721,6 +4857,16 @@
             "schema": {
               "default": true,
               "title": "Include Liveness",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "refresh_state",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Refresh State",
               "type": "boolean"
             }
           }
@@ -5432,7 +5578,7 @@
     },
     "/v1/sessions/{session_id}/events": {
       "post": {
-        "description": "Submit a session event (input message, tool output,\napproval, or interrupt).\n\nDispatches on ``body.type``:\n\n- ``\"interrupt\"`` cancels any active task and publishes a\n  ``session.interrupted`` event. Bypasses item persistence.\n- ``\"approval\"`` resolves an outstanding elicitation\n  in-band (see :func:`_dispatch_approval`).\n- ``\"external_assistant_message\"`` appends and streams an\n  assistant message observed outside the Omnigent task runtime,\n  without starting or steering a task.\n- ``\"external_conversation_item\"`` appends and streams a\n  completed item observed outside the Omnigent task runtime,\n  without starting or steering a task.\n- ``\"external_output_text_delta\"`` publishes a transient\n  ``response.output_text.delta`` event observed outside the\n  Omnigent task runtime, without persisting an item or starting /\n  steering a task.\n- ``\"external_session_interrupted\"`` publishes a\n  ``session.interrupted`` event observed outside the Omnigent task\n  runtime, without persisting an item or starting / steering a\n  task.\n- ``\"external_elicitation_resolved\"`` marks a native\n  harness-originated elicitation as resolved elsewhere so\n  subscribed clients clear the pending approval card.\n- ``\"external_session_status\"`` publishes a terminal-observed\n  ``session.status`` edge without persisting an item or\n  starting/steering a task.\n- ``\"external_model_change\"`` persists a terminal-observed\n  model switch to ``model_override`` and publishes a\n  ``session.model`` SSE event so the web picker reflects it.\n- ``\"stop_session\"`` terminates the live session without\n  deleting the conversation (owner-only). Forwarded\n  harness-agnostically to the runner, which hard-kills the\n  external process for harnesses that have one (claude-native\n  kills its tmux pane) and 204s otherwise. Stop is non-sticky:\n  it writes no persistent marker, so the next message\n  auto-relaunches the session on its (still-online) host via\n  the normal message-dispatch relaunch path.\n- ``\"message\"`` on an ``omnigent claude`` terminal session\n  is forwarded to the bound runner for tmux injection only;\n  the accepted prompt is persisted later when Claude records\n  it in the terminal transcript.\n- Any other (item-typed) event is persisted into\n  ``conversation_items`` via the legacy create-or-steer path\n  (legacy persist path): if an active\n  task is present, the item is delivered into its inbox;\n  otherwise a new task is created and started. In both\n  cases ``session.input.consumed`` fires with the persisted\n  item's id.\n\n:param session_id: Session/conversation identifier.\n:param body: The validated :class:`SessionEventInput`.\n:returns: ``{\"queued\": True, \"item_id\": \"...\"}`` for\n    item-typed events, where ``item_id`` is the persisted\n    conversation item id also emitted by\n    ``session.input.consumed``; ``{\"queued\": False}`` for\n    control and internal transient events.\n:raises OmnigentError: 404 if no session exists.",
+        "description": "Submit a session event (input message, tool output,\napproval, or interrupt).\n\nDispatches on ``body.type``:\n\n- ``\"interrupt\"`` cancels any active task and publishes a\n  ``session.interrupted`` event. Bypasses item persistence.\n- ``\"approval\"`` resolves an outstanding elicitation\n  in-band (see :func:`_dispatch_approval`).\n- ``\"external_assistant_message\"`` appends and streams an\n  assistant message observed outside the Omnigent task runtime,\n  without starting or steering a task.\n- ``\"external_conversation_item\"`` appends and streams a\n  completed item observed outside the Omnigent task runtime,\n  without starting or steering a task.\n- ``\"external_output_text_delta\"`` publishes a transient\n  ``response.output_text.delta`` event observed outside the\n  Omnigent task runtime, without persisting an item or starting /\n  steering a task.\n- ``\"external_session_interrupted\"`` publishes a\n  ``session.interrupted`` event observed outside the Omnigent task\n  runtime, without persisting an item or starting / steering a\n  task.\n- ``\"external_elicitation_resolved\"`` marks a native\n  harness-originated elicitation as resolved elsewhere so\n  subscribed clients clear the pending approval card.\n- ``\"external_session_status\"`` publishes a terminal-observed\n  ``session.status`` edge without persisting an item or\n  starting/steering a task.\n- ``\"external_model_change\"`` persists a terminal-observed\n  model switch to ``model_override`` and publishes a\n  ``session.model`` SSE event so the web picker reflects it.\n- ``\"external_reasoning_effort_change\"`` persists a terminal-observed\n  thinking-level switch to ``reasoning_effort`` and publishes a\n  ``session.reasoning_effort`` SSE event so the web picker reflects it.\n- ``\"external_codex_collaboration_mode_change\"`` persists the\n  Codex app-server collaboration mode kind as an internal session label\n  (``omnigent.codex_native.collaboration_mode``).\n- ``\"stop_session\"`` terminates the live session without\n  deleting the conversation (owner-only). Forwarded\n  harness-agnostically to the runner, which hard-kills the\n  external process for harnesses that have one (claude-native\n  kills its tmux pane) and 204s otherwise. Stop is non-sticky:\n  it writes no persistent marker, so the next message\n  auto-relaunches the session on its (still-online) host via\n  the normal message-dispatch relaunch path.\n- ``\"message\"`` on an ``omnigent claude`` terminal session\n  is forwarded to the bound runner for tmux injection only;\n  the accepted prompt is persisted later when Claude records\n  it in the terminal transcript.\n- Any other (item-typed) event is persisted into\n  ``conversation_items`` via the legacy create-or-steer path\n  (legacy persist path): if an active\n  task is present, the item is delivered into its inbox;\n  otherwise a new task is created and started. In both\n  cases ``session.input.consumed`` fires with the persisted\n  item's id.\n\n:param session_id: Session/conversation identifier.\n:param body: The validated :class:`SessionEventInput`.\n:returns: ``{\"queued\": True, \"item_id\": \"...\"}`` for\n    item-typed events, where ``item_id`` is the persisted\n    conversation item id also emitted by\n    ``session.input.consumed``; ``{\"queued\": False}`` for\n    control and internal transient events.\n:raises OmnigentError: 404 if no session exists.",
         "operationId": "post_event_v1_sessions__session_id__events_post",
         "parameters": [
           {

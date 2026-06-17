@@ -383,6 +383,13 @@ export interface Session {
    */
   skills?: SkillSummary[];
   /**
+   * Codex app-server model options for codex-native sessions. Each option
+   * comes from Codex ``model/list`` and carries the model-specific reasoning
+   * efforts the picker should offer. Empty for non-codex-native sessions or
+   * while the runner has not answered yet.
+   */
+  codexModelOptions?: CodexModelOption[];
+  /**
    * True while the runner is auto-creating the terminal for a
    * terminal-first session (claude-native / codex-native). Sourced
    * from the server's `_session_terminal_pending_cache` at snapshot
@@ -440,4 +447,33 @@ export interface SkillSummary {
   name: string;
   /** One-line summary from the SKILL.md frontmatter. */
   description: string;
+}
+
+/**
+ * One raw Codex model option from app-server ``model/list``.
+ */
+export interface CodexReasoningEffortOption {
+  /** Codex effort id, e.g. ``"xhigh"``. */
+  reasoningEffort: string;
+  /** Codex-provided description, when present. */
+  description?: string;
+  /** Additional Codex metadata. */
+  [key: string]: unknown;
+}
+
+export interface CodexModelOption {
+  /** Codex picker id to pass back to ``thread/settings/update``. */
+  id: string;
+  /** Provider-facing model id Codex will run. */
+  model?: string;
+  /** Codex display label. */
+  displayName?: string;
+  /** Default reasoning effort for this model. */
+  defaultReasoningEffort?: string;
+  /** Raw effort objects Codex advertises for this model. */
+  supportedReasoningEfforts?: CodexReasoningEffortOption[];
+  /** Whether Codex marks this as the default model. */
+  isDefault?: boolean;
+  /** Additional Codex metadata. */
+  [key: string]: unknown;
 }

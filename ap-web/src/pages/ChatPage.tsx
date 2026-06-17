@@ -69,7 +69,7 @@ import { agentDisplayLabel } from "@/components/AgentInfo";
 import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
 import { useConversations } from "@/hooks/useConversations";
 import { usePermissions } from "@/hooks/usePermissions";
-import type { SandboxStatus, Session, SessionStatus } from "@/lib/types";
+import type { CodexModelOption, SandboxStatus, Session, SessionStatus } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import type { MessageContentBlock } from "@/lib/blocks";
@@ -84,6 +84,7 @@ import {
 } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
+import { codexEffortLevelsForModel, findCodexModelOption } from "@/lib/codexNativeModels";
 import {
   consumePendingInitialPrompt,
   type PendingInitialPrompt,
@@ -92,6 +93,7 @@ import {
 } from "@/store/chatStore";
 import { useSession } from "@/hooks/useSession";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { useRefreshSessionStateOnRunnerOnline } from "@/hooks/useSessionOnlineRefresh";
 import {
   type SessionLiveness,
   livenessRowFromSession,
@@ -120,6 +122,7 @@ import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { useForkDialog } from "@/shell/ForkDialogContext";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
+import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCliServerUrl } from "@/lib/host";
 import { SessionImage } from "@/components/SessionImage";
 
@@ -488,6 +491,7 @@ export function ChatPage() {
   // RunnerHealthProvider). `undefined` = not yet polled — the indicator
   // stays hidden until the first poll for this session resolves.
   const runnerOnline = useSessionRunnerOnline(urlConvId);
+  useRefreshSessionStateOnRunnerOnline(urlConvId, runnerOnline);
   // OR'd into "Working…" so cross-client turns surface a shimmer.
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const loadingConversation = useChatStore((s) => s.loadingConversation);
@@ -737,6 +741,10 @@ export function ChatPage() {
     document.title = showsWorking ? `● ${base}` : base;
   }, [activeConv?.title, showsWorking, urlConvId]);
 
+  const codexModelOptions = useChatStore((s) => s.codexModelOptions);
+  const selectedModel = useChatStore((s) => s.selectedModel);
+  const llmModel = useChatStore((s) => s.llmModel);
+
   // Loading + error gates for `/c/:id` hydration.
   if (urlConvId) {
     if (loadingConversation) return <HydratingPlaceholder />;
@@ -826,6 +834,13 @@ export function ChatPage() {
   const capabilitySource = {
     labels: activeSession ? (activeSession.labels ?? {}) : (activeConv?.labels ?? {}),
   };
+  const modelPickerKind = modelPickerKindForConv(capabilitySource);
+  const effortLevels = effortLevelsForConv(
+    capabilitySource,
+    codexModelOptions,
+    selectedModel ?? llmModel,
+  );
+  const showEffort = shouldShowEffortPicker(capabilitySource) && effortLevels.length > 0;
 
   // When inside a session, only show the bound agent — the session is
   // tied 1:1 to its runner and can't be reassigned. Show all agents on
@@ -871,9 +886,12 @@ export function ChatPage() {
       loadingMoreHistory={loadingMoreHistory}
       permissionLevel={permissionLevel}
       readOnlyReason={readOnlyReason}
-      effortLevels={effortLevelsForConv(capabilitySource)}
-      showEffort={shouldShowEffortPicker(capabilitySource)}
-      showModels={shouldShowModelPicker(capabilitySource)}
+      effortLevels={effortLevels}
+      showEffort={showEffort}
+      showModels={modelPickerKind !== null}
+      modelPickerKind={modelPickerKind}
+      codexModelOptions={codexModelOptions}
+      showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
       costRoutingVerdict={costRoutingVerdict}
       costRoutingEligible={costRoutingEligible}
       subAgentLabel={subAgentLabel}
@@ -1094,6 +1112,12 @@ interface MainAgentSurfaceProps {
   showEffort: boolean;
   /** Whether the picker dropdown should include a Models section. */
   showModels: boolean;
+  /** Native model picker family, when present. */
+  modelPickerKind: NativeModelPickerKind | null;
+  /** Codex app-server model options for codex-native sessions. */
+  codexModelOptions: readonly CodexModelOption[];
+  /** Show the Codex Plan-mode toggle. */
+  showCodexPlanMode: boolean;
   /** Latest advisor verdict for the cost-routing pill; null when none. */
   costRoutingVerdict: CostRoutingVerdict | null;
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child). */
@@ -1164,6 +1188,9 @@ function MainAgentSurface({
   effortLevels,
   showEffort,
   showModels,
+  modelPickerKind,
+  codexModelOptions,
+  showCodexPlanMode,
   costRoutingVerdict,
   costRoutingEligible,
   subAgentLabel,
@@ -1417,6 +1444,9 @@ function MainAgentSurface({
         effortLevels={effortLevels}
         showEffort={showEffort}
         showModels={showModels}
+        modelPickerKind={modelPickerKind}
+        codexModelOptions={codexModelOptions}
+        showCodexPlanMode={showCodexPlanMode}
         isTerminalFirst={isTerminalFirst}
         isNativeWrapper={isNativeWrapper}
         reconnectHint={liveness.kind === "runner_asleep"}
@@ -2476,6 +2506,12 @@ interface ComposerProps {
   showEffort: boolean;
   /** Whether the picker dropdown should include a Models section. */
   showModels: boolean;
+  /** Native model picker family, when present. */
+  modelPickerKind: NativeModelPickerKind | null;
+  /** Codex app-server model options for codex-native sessions. */
+  codexModelOptions: readonly CodexModelOption[];
+  /** Show the Codex Plan-mode toggle. */
+  showCodexPlanMode: boolean;
   /**
    * Terminal-first session (Chat/Terminal pill present). Presentation
    * only: tightens the composer's bottom padding to `pb-1.5` so it sits
@@ -2485,11 +2521,9 @@ interface ComposerProps {
   isTerminalFirst?: boolean;
   /**
    * Native-CLI wrapper session (claude-native / codex-native). Drops the
-   * `/model` slash command unless the session also has the model picker
-   * (`showModels`, claude-native — the runner propagates the override
-   * live). Codex-native pins its model at launch, so the command would
-   * be a misleading no-op there. Terminal-first SDK sessions (embedded
-   * Omnigent REPL terminal) keep it.
+   * `/model` slash command unless the session also has a model picker
+   * (`showModels`); terminal-first SDK sessions (embedded Omnigent REPL
+   * terminal) keep it.
    */
   isNativeWrapper?: boolean;
   /**
@@ -2628,9 +2662,57 @@ function ContextRing({ contextWindow, tokensUsed }: { contextWindow: number; tok
 }
 
 /**
+ * Model label for the composer status tray.
+ *
+ * @param model - Model override or bound agent model id.
+ * @param codexModelOptions - Codex-returned model metadata, when available.
+ * @returns Codex's display label for known Codex models, a local Claude alias
+ *   label for Claude native tiers, the raw model id otherwise, or ``null``
+ *   when no model is known.
+ */
+export function formatStatusModelLabel(
+  model: string | null,
+  codexModelOptions: readonly CodexModelOption[] = [],
+): string | null {
+  const raw = model?.trim();
+  if (!raw) return null;
+  const lower = raw.toLowerCase();
+  const codexOption = findCodexModelOption(codexModelOptions, raw);
+  if (codexOption) return codexOption.displayName ?? codexOption.id;
+  const known = CLAUDE_NATIVE_MODELS.find((m) => m.id === lower);
+  if (known) return known.label;
+  return raw;
+}
+
+function formatStatusEffortLabel(effort: string | null, raw = false): string | null {
+  if (!effort) return null;
+  if (raw) return effort;
+  return effort.toLowerCase() === "xhigh" ? "xHigh" : formatEffortLabel(effort);
+}
+
+/**
+ * Compose the current model and effort for the composer status tray.
+ *
+ * @param model - Model override or bound model id.
+ * @param effort - Current reasoning effort override, if any.
+ * @returns Compact label such as ``"gpt-5.5 xhigh"``.
+ */
+export function formatModelEffortStatusLabel(
+  model: string | null,
+  effort: string | null,
+  codexModelOptions: readonly CodexModelOption[] = [],
+): string | null {
+  const codexOption = model ? findCodexModelOption(codexModelOptions, model.trim()) : null;
+  const modelLabel = formatStatusModelLabel(model, codexModelOptions);
+  const effortLabel = formatStatusEffortLabel(effort, codexOption !== null);
+  const parts = [modelLabel, effortLabel].filter((p): p is string => p != null && p.length > 0);
+  return parts.length > 0 ? parts.join(" ") : null;
+}
+
+/**
  * Status-line tray tucked behind the composer card: the worktree branch
  * on the left (truncated to an ellipsis so the tray never wraps), the
- * context ring on the right. Shares the card's background so the two
+ * model/effort + context ring on the right. Shares the card's background so the two
  * read as one rounded shape: the card keeps its full rounded-2xl and
  * paints on top (it's position:relative), while this in-flow sibling is
  * pulled up behind it so a rounded shelf peeks out below the card's
@@ -2643,16 +2725,25 @@ function ComposerStatusLine() {
   const conversationId = useChatStore((s) => s.conversationId);
   const contextWindow = useChatStore((s) => s.contextWindow);
   const tokensUsed = useChatStore((s) => s.tokensUsed);
+  const selectedEffort = useChatStore((s) => s.selectedEffort);
+  const selectedModel = useChatStore((s) => s.selectedModel);
+  const codexPlanMode = useChatStore((s) => s.codexPlanMode);
+  const llmModel = useChatStore((s) => s.llmModel);
+  const codexModelOptions = useChatStore((s) => s.codexModelOptions);
   // Seeded from the session snapshot on bind (chatStore.sessionBindingPatch),
   // alongside contextWindow — so the branch reads from the same store as
   // the other status-line values rather than a separate fetch.
   const gitBranch = useChatStore((s) => s.gitBranch);
 
   const showBranch = !!conversationId && !!gitBranch;
+  const modelEffortLabel = conversationId
+    ? formatModelEffortStatusLabel(selectedModel ?? llmModel, selectedEffort, codexModelOptions)
+    : null;
+  const showPlanMode = !!conversationId && codexPlanMode;
   // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
   const showRing =
     !!conversationId && contextWindow != null && contextWindow > 0 && tokensUsed != null;
-  if (!showBranch && !showRing) return null;
+  if (!showBranch && !showPlanMode && !showRing && modelEffortLabel === null) return null;
 
   return (
     <div
@@ -2683,8 +2774,26 @@ function ComposerStatusLine() {
           </>
         )}
       </span>
-      {/* Right: context ring, never shrinks. */}
-      <div className="flex shrink-0 items-center gap-3">
+      {/* Right: model/effort and context ring, never shrinks. */}
+      <div className="flex min-w-0 shrink-0 items-center gap-3">
+        {showPlanMode && (
+          <span
+            data-testid="composer-plan-mode"
+            className="inline-flex items-center gap-1 text-xs font-medium text-foreground"
+          >
+            <FileTextIcon className="size-3.5 shrink-0" />
+            <span>Plan mode</span>
+          </span>
+        )}
+        {modelEffortLabel && (
+          <span
+            data-testid="composer-model-effort"
+            className="max-w-36 truncate text-xs text-muted-foreground sm:max-w-52"
+            title={modelEffortLabel}
+          >
+            {modelEffortLabel}
+          </span>
+        )}
         {showRing && <ContextRing contextWindow={contextWindow} tokensUsed={tokensUsed} />}
       </div>
     </div>
@@ -2785,6 +2894,9 @@ export function Composer({
   effortLevels,
   showEffort,
   showModels,
+  modelPickerKind,
+  codexModelOptions,
+  showCodexPlanMode,
   isTerminalFirst = false,
   isNativeWrapper = false,
   reconnectHint = false,
@@ -2796,6 +2908,7 @@ export function Composer({
   const [value, setValue] = useState("");
   const [files, setFiles] = useState<File[]>([]);
   const [commandError, setCommandError] = useState<string | null>(null);
+  const [planModeBusy, setPlanModeBusy] = useState(false);
   // Index of the highlighted item in the slash-command suggestions menu.
   // -1 means no item highlighted (menu closed or no matches). When the menu
   // opens with matches the reset logic below pre-selects the first item (0)
@@ -2833,6 +2946,7 @@ export function Composer({
 
   // Per-session cost-control switch, hydrated from the snapshot on bind.
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
+  const codexPlanMode = useChatStore((s) => s.codexPlanMode);
 
   // Preserve unsent text + file attachments per session so switching
   // tabs and coming back restores the draft. The drafts map lives at
@@ -2885,13 +2999,9 @@ export function Composer({
   // entries alongside the built-ins.
   const skills = useChatStore((s) => s.skills);
   // ``/model`` writes ``conv.model_override`` (the same column the REPL's
-  // ``/model`` and the claude-native picker write). In-process harnesses
-  // re-resolve it each turn; claude-native (``showModels``) propagates it
-  // live — the runner injects ``/model <name>`` into the pane and
-  // auto-confirms the TUI's "Switch model?" dialog. Sent as plaintext
-  // instead, that dialog would block the pane with nothing web-side to
-  // answer it. Only codex-native (model pinned at launch) drops the
-  // command.
+  // ``/model`` and native pickers write). In-process harnesses re-resolve
+  // it each turn; native wrappers expose it only when they have a picker
+  // path that the runner can propagate without blocking the vendor TUI.
   const showModel = !isNativeWrapper || showModels;
   const slashCommands = useMemo(
     () => buildSlashCommandMap(skills, showEffort, showModel),
@@ -2922,6 +3032,19 @@ export function Composer({
   const composerIsCommand = files.length === 0 && isSlashCommandText(value);
   const hasDraft = value.trim().length > 0 || files.length > 0;
   const showInterruptButton = isWorking && !hasDraft;
+  const toggleCodexPlanMode = async () => {
+    if (planModeBusy) return;
+    setCommandError(null);
+    setPlanModeBusy(true);
+    try {
+      await useChatStore.getState().setCodexPlanMode(!codexPlanMode);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setCommandError(`Could not ${codexPlanMode ? "exit" : "enter"} Plan mode: ${message}`);
+    } finally {
+      setPlanModeBusy(false);
+    }
+  };
   // Filtered matches — kept in sync with what SlashCommandMenu renders so
   // keyboard nav indexes into the same list.
   const menuMatches = menuOpen
@@ -3556,6 +3679,37 @@ export function Composer({
                 verdict={costRoutingVerdict}
               />
             )}
+            {showCodexPlanMode && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={codexPlanMode ? "secondary" : "ghost"}
+                    className={cn(
+                      "h-9 gap-1.5 px-2 text-xs md:h-8",
+                      codexPlanMode && "border border-ring/30 text-foreground",
+                    )}
+                    disabled={isReadOnly || planModeBusy}
+                    aria-pressed={codexPlanMode}
+                    aria-label={codexPlanMode ? "Exit Plan mode" : "Enter Plan mode"}
+                    data-testid="codex-plan-mode-toggle"
+                    data-active={codexPlanMode ? "true" : undefined}
+                    onClick={() => void toggleCodexPlanMode()}
+                  >
+                    {planModeBusy ? (
+                      <Loader2Icon className="size-3.5 animate-spin" />
+                    ) : (
+                      <FileTextIcon className="size-3.5" />
+                    )}
+                    <span>Plan</span>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  {codexPlanMode ? "Exit Plan mode" : "Enter Plan mode"}
+                </TooltipContent>
+              </Tooltip>
+            )}
             <AgentPicker
               agents={agents}
               isLoading={agentsLoading}
@@ -3563,7 +3717,8 @@ export function Composer({
               onSelect={onSelectAgent}
               effortLevels={effortLevels}
               showEffort={showEffort}
-              showModels={showModels}
+              modelPickerKind={modelPickerKind}
+              codexModelOptions={codexModelOptions}
               disabled={isReadOnly}
               openNonce={pickerOpenNonce}
             />
@@ -3764,6 +3919,8 @@ const EFFORT_LEVELS = ["low", "medium", "high"] as const;
 /** Anthropic-side efforts for claude-native sessions (matches ANTHROPIC_EFFORTS in reasoning_effort.py). */
 const CLAUDE_NATIVE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
+type NativeModelPickerKind = "claude" | "codex";
+
 type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
 
 /**
@@ -3796,24 +3953,43 @@ export function readOnlyReasonForSessionLabels(
 
 export function effortLevelsForConv(
   conv: { labels?: Record<string, string | null> | null } | null | undefined,
+  codexModelOptions: readonly CodexModelOption[] = [],
+  currentModel: string | null = null,
 ): readonly string[] {
-  if (conv?.labels?.["omnigent.wrapper"] === "claude-code-native-ui") {
-    return CLAUDE_NATIVE_EFFORT_LEVELS;
+  switch (conv?.labels?.["omnigent.wrapper"]) {
+    case "claude-code-native-ui":
+      return CLAUDE_NATIVE_EFFORT_LEVELS;
+    case "codex-native-ui":
+      return codexEffortLevelsForModel(codexModelOptions, currentModel);
+    default:
+      return EFFORT_LEVELS;
   }
-  return EFFORT_LEVELS;
 }
 
 /**
- * Should the model picker be visible for *conv*?
+ * Which native model picker should be visible for *conv*?
  *
  * Gated on the wrapper label, not `omnigent.ui === "terminal"`:
- * other terminal-first wrappers may not be Anthropic (see
+ * other terminal-first wrappers may not be Claude/Codex-native (see
  * `TerminalFirstContext.tsx`).
  */
+export function modelPickerKindForConv(
+  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+): NativeModelPickerKind | null {
+  switch (conv?.labels?.["omnigent.wrapper"]) {
+    case "claude-code-native-ui":
+      return "claude";
+    case "codex-native-ui":
+      return "codex";
+    default:
+      return null;
+  }
+}
+
 export function shouldShowModelPicker(
   conv: { labels?: Record<string, string | null> | null } | null | undefined,
 ): boolean {
-  return conv?.labels?.["omnigent.wrapper"] === "claude-code-native-ui";
+  return modelPickerKindForConv(conv) !== null;
 }
 
 /**
@@ -3827,6 +4003,12 @@ export function shouldShowEffortPicker(
   conv: { labels?: Record<string, string | null> | null } | null | undefined,
 ): boolean {
   return supportsEffortControl(conv);
+}
+
+export function shouldShowCodexPlanModeControl(
+  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+): boolean {
+  return isCodexNativeSession(conv);
 }
 
 /**
@@ -3847,8 +4029,10 @@ interface AgentPickerProps {
   effortLevels: readonly string[];
   /** Show the Effort section and selected effort. */
   showEffort: boolean;
-  /** When true, render the Models section between agents and effort. */
-  showModels: boolean;
+  /** Native model picker family, when present. */
+  modelPickerKind: NativeModelPickerKind | null;
+  /** Codex app-server model options for codex-native sessions. */
+  codexModelOptions: readonly CodexModelOption[];
   /**
    * Disables the picker trigger. The picker is purely a write
    * surface (selecting an agent / model / effort changes how the
@@ -3876,7 +4060,8 @@ function AgentPicker({
   onSelect,
   effortLevels,
   showEffort,
-  showModels,
+  modelPickerKind,
+  codexModelOptions,
   disabled = false,
   openNonce = 0,
 }: AgentPickerProps) {
@@ -3894,13 +4079,19 @@ function AgentPicker({
   const selectedModel = useChatStore((s) => s.selectedModel);
   const llmModel = useChatStore((s) => s.llmModel);
 
-  const isClaudeNative = showModels;
+  const modelOptions: ReadonlyArray<{ id: string; label?: string; displayName?: string }> =
+    modelPickerKind === "claude"
+      ? CLAUDE_NATIVE_MODELS
+      : modelPickerKind === "codex"
+        ? codexModelOptions
+        : [];
+  const isNativeModelPicker = modelPickerKind !== null;
   // Only offer the agent list when there's an actual choice. Inside a
   // session the picker is scoped to the single bound agent (the runner is
   // tied 1:1 to it and can't be reassigned), so a one-row "Agents" section
   // is pure noise — drop it and let the dropdown be just the effort/model
   // controls.
-  const showAgents = !isClaudeNative && (agents?.length ?? 0) > 1;
+  const showAgents = !isNativeModelPicker && (agents?.length ?? 0) > 1;
   const rawAgentName = agents?.find((a) => a.id === selectedId)?.name ?? agents?.[0]?.name;
   const agentDisplayName = rawAgentName ? agentDisplayLabel(rawAgentName) : rawAgentName;
   // Effective brain harness from the session snapshot (override-aware).
@@ -3912,18 +4103,20 @@ function AgentPicker({
   // Build the pill piece-by-piece so empty selections don't leave
   // stray separators.
   const effortLabel = showEffort && selectedEffort ? formatEffortLabel(selectedEffort) : null;
-  const hasPickerActions = showAgents || showModels || showEffort;
+  const hasPickerActions = showAgents || modelOptions.length > 0 || showEffort;
 
   let triggerLabel: string;
   if (isLoading) {
     triggerLabel = "Loading…";
   } else if (!hasAgents) {
     triggerLabel = "No agents";
-  } else if (isClaudeNative) {
-    // claude-native sessions are always the bound Claude agent. Show just
-    // "Claude" in the pill — the model and effort are still selectable in the
+  } else if (modelPickerKind === "claude") {
+    // Native sessions are always scoped to the bound vendor agent. Show just
+    // the vendor name in the pill — model and effort remain selectable in the
     // dropdown, so spelling them out here only costs horizontal space.
     triggerLabel = "Claude";
+  } else if (modelPickerKind === "codex") {
+    triggerLabel = "Codex";
   } else {
     // The harness reads as part of the identity — "Polly (Pi)" — while
     // effort stays a separate " · "-joined segment.
@@ -3977,14 +4170,17 @@ function AgentPicker({
             ))}
           </>
         )}
-        {showModels && (
+        {modelOptions.length > 0 && (
           <>
-            {!isClaudeNative && <DropdownMenuSeparator className="my-1" />}
+            {!isNativeModelPicker && <DropdownMenuSeparator className="my-1" />}
             <PickerSectionHeader>Models</PickerSectionHeader>
-            {CLAUDE_NATIVE_MODELS.map((m) => {
+            {modelOptions.map((m) => {
               const isExplicit = selectedModel === m.id;
               const isImplicit =
-                selectedModel === null && isModelImplicitlySelected(m.id, llmModel);
+                selectedModel === null &&
+                (modelPickerKind === "codex"
+                  ? findCodexModelOption(codexModelOptions, llmModel)?.id === m.id
+                  : isModelImplicitlySelected(m.id, llmModel));
               const isActive = isExplicit || isImplicit;
               return (
                 <DropdownMenuItem
@@ -4003,7 +4199,9 @@ function AgentPicker({
                     "data-[active=true]:bg-accent/60 data-[active=true]:text-foreground",
                   )}
                 >
-                  <span className="flex-1 truncate">{m.label}</span>
+                  <span className="flex-1 truncate">
+                    {modelPickerKind === "codex" ? (m.displayName ?? m.id) : m.label}
+                  </span>
                 </DropdownMenuItem>
               );
             })}
@@ -4013,7 +4211,7 @@ function AgentPicker({
             dropdown doesn't open with a stray divider at the top. */}
         {showEffort && (
           <>
-            {(showAgents || showModels) && <DropdownMenuSeparator className="my-1" />}
+            {(showAgents || modelOptions.length > 0) && <DropdownMenuSeparator className="my-1" />}
             <PickerSectionHeader>Effort</PickerSectionHeader>
             {effortLevels.map((level) => (
               <DropdownMenuItem
@@ -4028,7 +4226,8 @@ function AgentPicker({
                     .catch(() => {})
                 }
                 className={cn(
-                  "items-center gap-2 rounded-sm px-2 py-1.5 text-xs capitalize",
+                  "items-center gap-2 rounded-sm px-2 py-1.5 text-xs",
+                  modelPickerKind !== "codex" && "capitalize",
                   "data-[active=true]:bg-accent/60 data-[active=true]:text-foreground",
                 )}
               >
