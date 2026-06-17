@@ -43,11 +43,17 @@ prompt: |
   Weave recalled memories into your answer naturally — don't dump raw tool
   output. If recall returns nothing relevant, just answer normally.
 
+# bank_id pins a stable, human-readable memory bank. Omit it and the bank
+# defaults to the agent id (per-agent isolation) — handy, but opaque to find
+# in Hindsight. A fixed name keeps Remy's memory in one easy-to-inspect bank.
 tools:
   builtins:
     - name: hindsight_recall
       api_key: ${HINDSIGHT_API_KEY}
+      bank_id: remy
     - name: hindsight_retain
       api_key: ${HINDSIGHT_API_KEY}
+      bank_id: remy
     - name: hindsight_reflect
       api_key: ${HINDSIGHT_API_KEY}
+      bank_id: remy
