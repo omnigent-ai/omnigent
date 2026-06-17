@@ -81,6 +81,9 @@ jobs:
           REPO: ${{ github.repository }}
           SHA: ${{ github.event.workflow_run.head_sha }}
           EVENT: ${{ github.event.workflow_run.event }}
+          # Makes the status' "Details" link land on the producing run, whose
+          # summary has the full coverage table.
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
         run: |
           set -euo pipefail
           if [[ ! -f coverage-summary/total.txt ]]; then
@@ -94,6 +97,7 @@ jobs:
             gh api "repos/$REPO/statuses/$SHA" \
               -f state=success \
               -f context="$CONTEXT" \
+              -f target_url="$RUN_URL" \
               -f description="${METRIC}: ${TOTAL}%" >/dev/null
             echo "Recorded baseline ${CONTEXT}=${TOTAL}% on main $SHA"
             exit 0
@@ -109,6 +113,7 @@ jobs:
             gh api "repos/$REPO/statuses/$SHA" \
               -f state=success \
               -f context="$CONTEXT" \
+              -f target_url="$RUN_URL" \
               -f description="${METRIC}: ${TOTAL}% (no baseline yet)" >/dev/null
             echo "::notice::No ${CONTEXT} baseline on main yet; reported ${TOTAL}% without gating."
             exit 0
@@ -120,12 +125,14 @@ jobs:
             gh api "repos/$REPO/statuses/$SHA" \
               -f state=success \
               -f context="$CONTEXT" \
+              -f target_url="$RUN_URL" \
               -f description="${NOUN} ${TOTAL}% (baseline ${BASELINE}%)" >/dev/null
             echo "PASS: ${NOUN} ${TOTAL}% >= baseline ${BASELINE}% (tol ${COVERAGE_TOLERANCE})"
           elif [[ "$COVERAGE_ENFORCE" == "true" ]]; then
             gh api "repos/$REPO/statuses/$SHA" \
               -f state=failure \
               -f context="$CONTEXT" \
+              -f target_url="$RUN_URL" \
               -f description="${NOUN} dropped: ${TOTAL}% < baseline ${BASELINE}%" >/dev/null
             echo "FAIL: ${NOUN} ${TOTAL}% < baseline ${BASELINE}% (tol ${COVERAGE_TOLERANCE})"
           else
@@ -133,6 +140,7 @@ jobs:
             gh api "repos/$REPO/statuses/$SHA" \
               -f state=success \
               -f context="$CONTEXT" \
+              -f target_url="$RUN_URL" \
               -f description="${NOUN} ${TOTAL}% < baseline ${BASELINE}% (would fail once enforced)" >/dev/null
             echo "::warning::${NOUN} regression (not gating): ${TOTAL}% < baseline ${BASELINE}% (tol ${COVERAGE_TOLERANCE})"
           fi
