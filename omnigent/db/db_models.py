@@ -780,3 +780,189 @@ class SqlUserDailyCost(Base):
     cost_usd: Mapped[float] = mapped_column(Float, nullable=False)
     ask_approved_usd: Mapped[float] = mapped_column(Float, nullable=False, server_default="0")
     updated_at: Mapped[int] = mapped_column(Integer)
+
+
+class SqlTurn(Base):
+    """
+    SQLAlchemy model for the ``turns`` table.
+
+    A turn is the server-authoritative, durable record of a single
+    agent response/dispatch. It promotes the latent ``response_id``
+    (``resp_...``) concept — already stamped on
+    ``conversation_items`` — into a first-class row owned by the
+    runner under a lease, so the turn's lifecycle is decoupled from
+    the client connection. A client disconnect updates only
+    ``attached`` / ``last_client_seen`` and must never transition a
+    ``RUNNING`` turn.
+
+    See ``designs/PHASE1_SERVER_AUTHORITATIVE_TURNS.md`` (issue #466).
+
+    :param id: The turn id, which **is** the response/task id minted
+        by :func:`omnigent.db.utils.generate_task_id`, e.g.
+        ``"resp_d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3"``. Not a parallel
+        id space.
+    :param conversation_id: Owning conversation/session id.
+    :param status: Lifecycle state — one of ``CREATED``, ``QUEUED``,
+        ``RUNNING``, ``PAUSING``, ``PAUSED``, ``COMPLETED``,
+        ``FAILED``, ``CANCELLED``. ``PAUSING``/``PAUSED`` are
+        forward-compat for Phase 4 and unused in Phase 1.
+    :param error_code: Failure taxonomy value set at a terminal
+        transition — one of ``TRANSPORT_DISCONNECT``, ``RUNNER_LOST``,
+        ``WORKER_BOOT_FAILURE``, ``WORKER_TASK_FAILURE``,
+        ``CANCELLED``. Only ``WORKER_*`` values may feed vendor
+        health/routing. ``None`` on non-terminal or successful turns.
+    :param error_message: Optional human-readable failure detail.
+    :param vendor: Worker vendor the turn dispatched to, e.g.
+        ``"claude_code"``, ``"codex"``, ``"pi"``.
+    :param intent: Send intent that created the turn — one of
+        ``enqueue``, ``steer``, ``attach``.
+    :param input_json: The send payload, persisted durably *before*
+        any work starts so a retried/idempotent send returns the same
+        turn rather than re-sending empty state.
+    :param lease_owner: Runner id that currently owns execution of
+        this turn (the runner pinned via ``conversations.runner_id``).
+        ``None`` until a runner claims the lease. Runner-held, never
+        client-held.
+    :param lease_epoch: Monotonic fencing token. Incremented on each
+        lease acquisition; every heartbeat and terminal write carries
+        it so a stale owner's compare-and-set affects zero rows.
+    :param last_heartbeat_at: Unix epoch seconds of the last runner
+        heartbeat, or ``None`` before the turn runs.
+    :param lease_expires_at: ``last_heartbeat_at + TTL`` (epoch
+        seconds); the orphan sweeper marks live turns past this as
+        ``RUNNER_LOST``.
+    :param attached: Whether a client is currently observing the
+        turn's stream. Observation only — never gates execution.
+    :param last_client_seen: Unix epoch seconds a client was last
+        attached, or ``None``.
+    :param created_at: Unix epoch seconds when the turn row was
+        created.
+    :param start_ts: Unix epoch seconds when the turn entered
+        ``RUNNING``, or ``None``.
+    :param end_ts: Unix epoch seconds when the turn reached a terminal
+        state, or ``None``.
+    :param checkpoint_id: Phase 4 forward-compat for tool-boundary
+        checkpoints. Always ``None`` in Phase 1.
+    """
+
+    __tablename__ = "turns"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    # --- state machine ---
+    status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="CREATED")
+    error_code: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # --- dispatch payload (durable before work starts) ---
+    vendor: Mapped[str] = mapped_column(String(32), nullable=False)
+    intent: Mapped[str] = mapped_column(String(16), nullable=False)
+    input_json: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # --- lease / ownership (runner-held, never client-held) ---
+    lease_owner: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_epoch: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    last_heartbeat_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    lease_expires_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # --- observation (client liveness; never gates execution) ---
+    attached: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    last_client_seen: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # --- timing ---
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    start_ts: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    end_ts: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # --- Phase 4 forward-compat; always NULL in Phase 1 ---
+    checkpoint_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('CREATED','QUEUED','RUNNING','PAUSING','PAUSED',"
+            "'COMPLETED','FAILED','CANCELLED')",
+            name="ck_turns_status",
+        ),
+        CheckConstraint(
+            "error_code IS NULL OR error_code IN "
+            "('TRANSPORT_DISCONNECT','RUNNER_LOST','WORKER_BOOT_FAILURE',"
+            "'WORKER_TASK_FAILURE','CANCELLED')",
+            name="ck_turns_error_code",
+        ),
+        # Orphan-sweep hot path: scan live, leased turns by expiry.
+        Index(
+            "ix_turns_live_lease",
+            "lease_expires_at",
+            sqlite_where=text("status IN ('RUNNING','PAUSING')"),
+            postgresql_where=text("status IN ('RUNNING','PAUSING')"),
+        ),
+        # Per-session listing and "current turn" lookup.
+        Index(
+            "ix_turns_conversation_created",
+            "conversation_id",
+            text("created_at DESC"),
+        ),
+        # At most ONE non-terminal turn per conversation (queue depth 1,
+        # single-runner affinity). Makes "agent is already processing" a
+        # DB invariant: a racing dispatch hits IntegrityError, which the
+        # API converts to a structured 409 Attach-Required. Same pattern
+        # as ix_conversations_parent_title_unique above.
+        Index(
+            "ux_turns_one_active_per_conversation",
+            "conversation_id",
+            unique=True,
+            sqlite_where=text("status IN ('CREATED','QUEUED','RUNNING','PAUSING','PAUSED')"),
+            postgresql_where=text("status IN ('CREATED','QUEUED','RUNNING','PAUSING','PAUSED')"),
+        ),
+    )
+
+
+class SqlIdempotencyKey(Base):
+    """
+    SQLAlchemy model for the ``idempotency_keys`` table.
+
+    Records a client-generated idempotency key so a retried mutating
+    send (e.g. one resent after a reconnect) is a no-op that returns
+    the original turn rather than creating a duplicate or an
+    empty-state turn.
+
+    See ``designs/PHASE1_SERVER_AUTHORITATIVE_TURNS.md`` (issue #466).
+
+    :param key: The client-generated idempotency key (UUIDv7),
+        stored raw as the primary key.
+    :param conversation_id: Owning conversation/session id.
+    :param turn_id: The turn this key created or returned. A replayed
+        key resolves back to this same turn.
+    :param request_fingerprint: SHA-256 hex of the canonicalized
+        request payload. A second use of the same key with a
+        different fingerprint is rejected (HTTP 422) rather than
+        silently returning the wrong turn.
+    :param created_at: Unix epoch seconds when the key was first seen.
+        Used by a TTL sweep to GC keys past the client retry horizon.
+    """
+
+    __tablename__ = "idempotency_keys"
+
+    key: Mapped[str] = mapped_column(String(36), primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    turn_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("turns.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        Index("ix_idempotency_keys_conversation", "conversation_id"),
+        Index("ix_idempotency_keys_created_at", "created_at"),
+    )
