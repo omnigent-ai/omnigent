@@ -1,35 +1,28 @@
-# A maintainer comments `/regen` on a PR to regenerate the repo's
-# lockfiles (uv.lock + ap-web/package-lock.json) against public PyPI/npm and
-# commit them ONTO that PR's branch. Complements oss-regenerate-and-smoke.yml
-# (which opens a standalone rolling PR when a maintainer dispatches it); use
-# this when the PR itself moved a dependency and you want the lock fixed in
-# place.
+# A maintainer comments `/regen` on a PR to regenerate the repo's lockfiles
+# (uv.lock + ap-web/package-lock.json) against public PyPI/npm and commit them
+# ONTO that PR's branch. Use when the PR itself moved a dependency; complements
+# oss-regenerate-and-smoke.yml (standalone rolling PR on dispatch).
 #
-# Validation is deliberately left to the PR's own CI: the push is made with a
-# PAT (secrets.OSS_REGEN_TOKEN), NOT GITHUB_TOKEN, so it re-fires the PR's full
-# check suite — including the Docker build — on the new commit. A GITHUB_TOKEN
-# push would NOT re-trigger those checks (GitHub suppresses it to avoid loops),
-# leaving stale results; that is why the PAT is required here.
+# Validation is left to the PR's own CI: the push uses a GitHub App token (NOT
+# GITHUB_TOKEN, which GitHub suppresses to avoid loops), so it re-fires the full
+# check suite on the new commit. Falls back to GITHUB_TOKEN if the App isn't
+# configured (lands, but a maintainer must re-push to run CI).
 #
-# Authorization: only maintainers listed in .github/MAINTAINER (read from main's
-# tip by merge-ready/load-maintainers.sh) may run it — the action pushes code.
-# Same-repo PRs only; pushing to a fork branch needs the fork's permission.
-#
-# Actions are SHA-pinned (trailing version comment) per the repo convention.
+# Authorization: only .github/MAINTAINER entries (read from main's tip) may run
+# it — it pushes code. Same-repo PRs only (can't push to a fork branch).
 name: OSS regenerate lockfiles on /regen comment
 
 on:
   issue_comment:
     types: [created]
 
-# Read-only at the top level (Scorecard Token-Permissions); the write
-# scopes live on the job(s) below.
+# Read-only at the top level; write scopes live on the jobs below.
 permissions:
   contents: read
 
 jobs:
-  # Cheap gate: confirm this is a `/regen` comment on a PR in the OSS repo and
-  # that the commenter is a maintainer. Exposes the PR head ref to the regen job.
+  # Gate: confirm a `/regen` comment on a PR in the OSS repo by a maintainer.
+  # Exposes the PR head ref to the regen job.
   authorize:
     permissions:
       contents: read       # checkout main for load-maintainers.sh
@@ -46,8 +39,8 @@ jobs:
       head: ${{ steps.pr.outputs.head }}
       cross: ${{ steps.pr.outputs.cross }}
     steps:
-      # Checkout main only to get load-maintainers.sh; the PR branch is checked
-      # out later (in the regen job), after authorization passes.
+      # Checkout main only for load-maintainers.sh; the PR branch is checked
+      # out later (regen job), after authorization passes.
       - name: Checkout (for the maintainer script)
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -85,8 +78,7 @@ jobs:
           echo "head=$(echo "$data" | jq -r .headRefName)" >> "$GITHUB_OUTPUT"
           echo "cross=$(echo "$data" | jq -r .isCrossRepository)" >> "$GITHUB_OUTPUT"
 
-      # All ${{ }} values are passed via env: and referenced as "$VAR" rather
-      # than interpolated into the script body, to avoid expression injection.
+      # ${{ }} values pass via env: and referenced as "$VAR" to avoid injection.
       - name: Acknowledge (or reject forks)
         if: steps.authz.outputs.ok == 'true'
         env:
@@ -118,11 +110,9 @@ jobs:
       group: oss-regen-comment-${{ github.event.issue.number }}
       cancel-in-progress: false
     steps:
-      # No token and no persisted credentials: the public repo needs no auth
-      # to fetch, and `uv lock` below can execute build backends the PR head
-      # chooses (sdists, [build-system] hooks in pyproject.toml) — nothing it
-      # runs should find OSS_REGEN_TOKEN on disk. The PAT enters only at the
-      # push step.
+      # No token / no persisted credentials: `uv lock` can execute PR-chosen
+      # build backends, which must not find a push token on disk. The App token
+      # is minted only after `uv lock` and enters only at the push step.
       - name: Checkout the PR branch
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -139,29 +129,46 @@ jobs:
         with:
           node-version: "20"
 
-      # The 7-day dependency cooldown comes from the repo's uv.toml
-      # (`exclude-newer = "P7D"`), which uv records in the lock as a
-      # relative span — so `uv sync --locked` stays consistent without
-      # this workflow injecting a cutoff. (An env-var UV_EXCLUDE_NEWER
-      # here would override the config with an absolute date and stamp
-      # it into the lock, breaking every later `uv sync --locked` that
-      # runs without the same env.)
+      # 7-day cooldown comes from uv.toml (`exclude-newer = "P7D"`), recorded as
+      # a relative span; an env-var cutoff would stamp an absolute date and break
+      # later `uv sync --locked`. npm's cooldown (ap-web/.npmrc min-release-age=7)
+      # is only honored by npm >= 11.10.0; node 20 ships npm 10.x which ignores it.
+      # Pin the EXACT version (not a range) and keep it in lockstep with
+      # .github/actions/setup-node (npm 11.12.1): this workflow generates the
+      # lockfile and that action verifies it, so a version gap would fail the
+      # freshness gate in lint.yml.
+      - name: Ensure npm honors the dependency cooldown
+        run: npm install -g npm@11.12.1
+      # Delete package-lock.json so npm RESOLVES from scratch: min-release-age
+      # only filters during resolution, and --package-lock-only keeps an existing
+      # in-range pin without re-applying the cooldown.
+      # --legacy-peer-deps is REQUIRED and MUST match the flag lint.yml verifies
+      # with (React 18 runtime vs React 19 peers would otherwise ERESOLVE-fail,
+      # and a flag mismatch rewrites dev/extraneous flags, failing the gate).
       - name: Regenerate lockfiles against public PyPI/npm
         run: |
           uv lock
-          ( cd ap-web && npm install --package-lock-only --no-audit --no-fund )
+          ( cd ap-web && rm -f package-lock.json && npm install --package-lock-only --legacy-peer-deps --no-audit --no-fund )
 
-      # All ${{ }} values are passed via env: and referenced as "$VAR" rather
-      # than interpolated into the script body — HEAD_REF is the PR author's
-      # branch name (user-influenced), so this avoids expression injection.
-      # The PAT authenticates the push inline (scoped to this step, never
-      # written to .git/config) so the push re-triggers the PR's CI; Actions
-      # masks the secret in logs.
+      # Mint the App token only AFTER `uv lock` so untrusted PR build backends
+      # never see it. Skipped when the App isn't configured (push then falls back
+      # to GITHUB_TOKEN and a maintainer must re-push to run CI).
+      - name: Mint App token
+        id: app-token
+        if: vars.OSS_REGEN_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.OSS_REGEN_APP_ID }}
+          private-key: ${{ secrets.OSS_REGEN_APP_KEY }}
+
+      # ${{ }} values pass via env: as "$VAR" to avoid injection (HEAD_REF is a
+      # user-influenced branch name). The push token authenticates inline (scoped
+      # to this step, never in .git/config) so the push re-triggers the PR's CI.
       - name: Commit and push to the PR branch
         id: push
         env:
           HEAD_REF: ${{ needs.authorize.outputs.head }}
-          OSS_REGEN_TOKEN: ${{ secrets.OSS_REGEN_TOKEN }}
+          PUSH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
           git config user.name "github-actions[bot]"
@@ -174,7 +181,7 @@ jobs:
           fi
           git add uv.lock ap-web/package-lock.json
           git commit -m "chore(oss): regenerate public lockfiles against public PyPI/npm"
-          git push "https://x-access-token:${OSS_REGEN_TOKEN}@github.com/${REPO}.git" "HEAD:$HEAD_REF"
+          git push "https://x-access-token:${PUSH_TOKEN}@github.com/${REPO}.git" "HEAD:$HEAD_REF"
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
       - name: Comment the result
@@ -184,17 +191,23 @@ jobs:
           ISSUE: ${{ github.event.issue.number }}
           REPO: ${{ github.repository }}
           CHANGED: ${{ steps.push.outputs.changed }}
+          # App token used → push re-triggers CI; skipped (GITHUB_TOKEN fallback) → it won't.
+          APP_USED: ${{ steps.app-token.conclusion == 'success' }} # App token → re-triggers CI; fallback → won't
         run: |
           if [ "$CHANGED" = "true" ]; then
-            gh pr comment "$ISSUE" --repo "$REPO" \
-              --body "✅ Regenerated \`uv.lock\` + \`ap-web/package-lock.json\` against public PyPI/npm and pushed to this PR. CI will re-run on the new commit."
+            base="✅ Regenerated \`uv.lock\` + \`ap-web/package-lock.json\` against public PyPI/npm and pushed to this PR."
+            if [ "$APP_USED" = "true" ]; then
+              body="$base CI will re-run on the new commit."
+            else
+              body="$base ⚠️ No regen App configured, so this push won't auto-trigger CI — push any commit (or amend) to re-run checks."
+            fi
+            gh pr comment "$ISSUE" --repo "$REPO" --body "$body"
           else
             gh pr comment "$ISSUE" --repo "$REPO" \
               --body "ℹ️ Lockfiles already current against public PyPI/npm — nothing to regenerate."
           fi
 
-      # Failure path: regen/push errored, so tell the maintainer on the PR
-      # instead of leaving them to dig through the Actions tab.
+      # Failure path: tell the maintainer on the PR instead of the Actions tab.
       - name: Comment on failure
         if: failure()
         env:

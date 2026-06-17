@@ -2,18 +2,22 @@
 Tests for the built-in cost-budget policy
 (:mod:`omnigent.policies.builtins.cost`) — the ``cost_budget`` factory.
 
-The policy gates the ``tool_call`` phase: ASK at each soft warning
-checkpoint, and once the hard limit is reached DENY tool calls while the
-session is still on an expensive model (forcing a ``/model`` downgrade),
-ALLOW once it has switched to a cheaper one.
+The policy's hard limit gates both the ``request`` and ``tool_call``
+phases: once reached, DENY (the whole turn on ``request``, or each tool
+call on ``tool_call``) while the session is still on an expensive model
+(forcing a ``/model`` downgrade), ALLOW once it has switched to a cheaper
+one. The soft warning checkpoints ASK on BOTH the ``request`` and
+``tool_call`` phases (each has a server-side approval round-trip that
+persists the crossed checkpoint on accept).
 
 Layers:
 
-- **Layer 1** — direct callable on the ``tool_call`` phase: ALLOW below
-  the soft checkpoints, ASK (recorded via ``session_state`` so an
-  approved checkpoint doesn't re-prompt) when one is crossed, DENY over
-  the hard limit on an expensive/unknown model, ALLOW over the limit on
-  a cheaper model, abstain on every other phase, and factory validation.
+- **Layer 1** — direct callable on the ``request`` / ``tool_call``
+  phases: ALLOW below the soft checkpoints, ASK (recorded via
+  ``session_state`` so an approved checkpoint doesn't re-prompt) when one
+  is crossed, DENY over the hard limit on an expensive/unknown model,
+  ALLOW over the limit on a cheaper model, abstain on every non-gated
+  phase, and factory validation.
 - **Layer 2** — spec resolution through :func:`resolve_function_policy`,
   proving DENY and ASK thread through the engine boundary with the cost
   on ``EvaluationContext.usage`` and the active model on
@@ -73,15 +77,52 @@ def _tool(
     }
 
 
+def _request(
+    cost: float | None,
+    *,
+    model: str | None = "databricks-claude-opus-4-8",
+    session_state: dict[str, Any] | None = None,
+    harness: str | None = None,
+) -> PolicyEvent:
+    """
+    Build a ``request`` :class:`PolicyEvent` with a cost + active model.
+
+    The request phase fires before the LLM turn; its ``data`` is the user
+    message string and there is no tool ``target``. Used to prove the
+    budget now gates whole turns (including text-only ones), not just
+    tool calls.
+
+    :param cost: ``total_cost_usd`` under ``context.usage``, e.g. ``6.0``.
+        ``None`` omits the field (unpriced-session case).
+    :param model: Active model under ``context.model``, e.g.
+        ``"databricks-claude-opus-4-8"`` or the alias ``"opus"``; ``None``
+        for the undeterminable-model case.
+    :param session_state: Optional persisted state, e.g.
+        ``{_ASK_APPROVED_KEY: 2.0}``. ``None`` means empty.
+    :param harness: Harness under ``context.harness``; ``None`` is the
+        web / API path (the request phase is not natively stamped).
+    :returns: A ``request`` event dict.
+    """
+    usage: dict[str, Any] = {} if cost is None else {"total_cost_usd": cost}
+    return {
+        "type": "request",
+        "target": None,
+        "data": "please run the build",
+        "context": {"actor": {}, "usage": usage, "model": model, "harness": harness},
+        "session_state": session_state or {},
+    }
+
+
 def _event(phase: str, cost: float) -> PolicyEvent:
     """
-    Build a non-tool-call :class:`PolicyEvent` carrying a session cost.
+    Build a non-gated-phase :class:`PolicyEvent` carrying a session cost.
 
-    :param phase: Event type, e.g. ``"request"`` / ``"response"`` /
-        ``"tool_result"``.
+    :param phase: Event type, e.g. ``"response"`` / ``"tool_result"`` /
+        ``"llm_request"`` / ``"llm_response"`` (NOT ``"request"`` or
+        ``"tool_call"``, which are gated).
     :param cost: ``total_cost_usd`` under ``context.usage``, e.g. ``9.99``.
     :returns: An event dict of the given phase (over budget, to prove the
-        non-tool-call phases are not gated).
+        non-gated phases are not gated).
     """
     return {
         "type": phase,
@@ -168,7 +209,7 @@ def test_over_budget_on_expensive_model_denies() -> None:
     assert "6.00" in result["reason"]  # current cost surfaced
     # The high-cost tokens are listed so the user knows which to avoid.
     assert "opus" in result["reason"]
-    assert "gpt-5.5" in result["reason"]
+    assert "gpt-5" in result["reason"]
 
 
 def test_deny_reason_for_codex_points_to_terminal() -> None:
@@ -239,24 +280,48 @@ def test_hard_limit_wins_over_checkpoint_approval() -> None:
     assert result["result"] == "DENY"
 
 
-def test_default_expensive_set_matches_opus_and_gpt55() -> None:
-    """The default expensive set blocks Fable, Opus, and GPT-5.5 spellings.
+@pytest.mark.parametrize(
+    "model,expected",
+    [
+        # Opus — concrete deployment id and the bare picker alias.
+        ("databricks-claude-opus-4-8", "DENY"),
+        ("opus", "DENY"),
+        # GPT-5 family: the broad "gpt-5" token covers bare gpt-5, the
+        # dot-spelled 5.5, and the dash-spelled deployment id.
+        ("gpt-5", "DENY"),
+        ("gpt-5.5", "DENY"),
+        ("databricks-gpt-5-5", "DENY"),
+        # Fable is the costliest tier (above Opus at 2x its price); both the
+        # concrete id and the bare picker alias must be gated, or switching to
+        # Fable becomes a budget bypass for a session downgraded off Opus.
+        ("claude-fable-5", "DENY"),
+        ("fable", "DENY"),
+        # Cheap GPT-5 variants are carved out by the -mini / -nano excludes,
+        # even though they contain the "gpt-5" substring → ALLOW over budget.
+        ("gpt-5-mini", "ALLOW"),
+        ("gpt-5-nano", "ALLOW"),
+        ("databricks-gpt-5-mini", "ALLOW"),
+        # A non-listed model is treated as cheap → allowed over budget.
+        ("databricks-claude-haiku-4-5", "ALLOW"),
+        # "gemini" contains the substring "mini" but NOT "-mini"; the
+        # leading dash in the exclude token keeps it from being wrongly
+        # carved out (it's simply not an expensive token either) → ALLOW.
+        ("databricks-gemini-2-5-pro", "ALLOW"),
+    ],
+)
+def test_default_expensive_set_matches_and_excludes(model: str, expected: str) -> None:
+    """The default set blocks Fable/Opus/GPT-5 but exempts -mini/-nano.
 
     Substring + case-insensitive matching must hit the deployment ids in
-    this stack: ``databricks-claude-opus-4-8`` and ``databricks-gpt-5-5``
-    (dashes). A miss would let the costliest models run past budget under
-    the zero-config default.
+    this stack (``databricks-claude-opus-4-8``, ``databricks-gpt-5-5``)
+    while the cheap ``gpt-5-mini`` / ``gpt-5-nano`` variants — which share
+    the ``gpt-5`` substring — are carved back out so they are NOT blocked.
+    A miss either way would mis-budget the zero-config default: blocking a
+    cheap variant traps users needlessly; letting Opus/GPT-5 through lets
+    the costliest models run past budget.
     """
     policy = cost_budget(max_cost_usd=5.0)
-    assert policy(_tool(6.0, model="databricks-claude-opus-4-8"))["result"] == "DENY"
-    assert policy(_tool(6.0, model="databricks-gpt-5-5"))["result"] == "DENY"
-    # Fable is the costliest tier (above Opus at 2x its price); both the
-    # concrete id and the bare picker alias must be gated, or switching to
-    # Fable becomes a budget bypass for a session downgraded off Opus.
-    assert policy(_tool(6.0, model="claude-fable-5"))["result"] == "DENY"
-    assert policy(_tool(6.0, model="fable"))["result"] == "DENY"
-    # A non-listed model is treated as cheap → allowed over budget.
-    assert policy(_tool(6.0, model="databricks-claude-haiku-4-5")) == {"result": "ALLOW"}
+    assert policy(_tool(6.0, model=model))["result"] == expected
 
 
 def test_custom_expensive_models_substring_case_insensitive() -> None:
@@ -269,6 +334,20 @@ def test_custom_expensive_models_substring_case_insensitive() -> None:
     policy = cost_budget(max_cost_usd=5.0, expensive_models=["FoO"])
     assert policy(_tool(6.0, model="x-foo-bar"))["result"] == "DENY"
     assert policy(_tool(6.0, model="claude-sonnet-4-6")) == {"result": "ALLOW"}
+
+
+def test_explicit_expensive_models_apply_no_mini_nano_exclusion() -> None:
+    """An explicit ``expensive_models`` list is matched literally — no excludes.
+
+    The ``-mini`` / ``-nano`` carve-out applies ONLY to the built-in
+    default set. When the author spells the tokens themselves, the set is
+    matched exactly: ``["gpt-5"]`` then blocks ``gpt-5-mini`` too. If the
+    exclusion leaked into explicit lists, an author who deliberately
+    listed a cheap-variant-inclusive token could not enforce it.
+    """
+    policy = cost_budget(max_cost_usd=5.0, expensive_models=["gpt-5"])
+    assert policy(_tool(6.0, model="gpt-5-mini"))["result"] == "DENY"
+    assert policy(_tool(6.0, model="gpt-5-nano"))["result"] == "DENY"
 
 
 def test_empty_expensive_models_disables_hard_gate() -> None:
@@ -288,17 +367,101 @@ def test_empty_expensive_models_disables_hard_gate() -> None:
     assert policy(_tool(2.0, model="opus"))["result"] == "ASK"
 
 
-def test_abstains_on_non_tool_call_phases() -> None:
-    """Only ``tool_call`` is gated — request/response/tool_result abstain.
+@pytest.mark.parametrize("phase", ["response", "tool_result", "llm_request", "llm_response"])
+def test_abstains_on_non_gated_phases(phase: str) -> None:
+    """Only ``request`` / ``tool_call`` are gated — other phases abstain.
 
-    The cost gate runs at ``tool_call`` (the one phase a PreToolUse hook
-    can block); an over-budget event of any other phase must ALLOW so the
-    policy does not block text-only turns or post-hoc results.
+    The cost gate runs at ``request`` (before the turn) and ``tool_call``
+    (the PreToolUse hook); an over-budget event of any other phase must
+    ALLOW so the policy does not block post-hoc results or per-round-trip
+    LLM events. (``request`` is covered by its own gating tests below.)
     """
     policy = cost_budget(max_cost_usd=1.0, ask_thresholds_usd=[0.5])
-    assert policy(_event("request", 9.99)) == {"result": "ALLOW"}
-    assert policy(_event("response", 9.99)) == {"result": "ALLOW"}
-    assert policy(_event("tool_result", 9.99)) == {"result": "ALLOW"}
+    assert policy(_event(phase, 9.99)) == {"result": "ALLOW"}
+
+
+def test_request_phase_over_budget_on_expensive_model_denies() -> None:
+    """Over the hard limit on an expensive model DENYs at the request phase.
+
+    The request phase fires before the LLM turn, so a text-only turn (no
+    tool call) is now budgeted: an over-budget request on Opus must be
+    blocked. The reason must be the USER-FACING variant (the turn never
+    reaches the model), so it must NOT carry the tool-call directive
+    ("re-issue the tool call" / "Relay this to the user verbatim"). If
+    this regressed, text-only turns would bypass the budget entirely, or
+    the user would see model-directed instructions meant for the agent.
+    """
+    policy = cost_budget(max_cost_usd=5.0)
+    result = policy(_request(6.0, model="databricks-claude-opus-4-8"))
+    assert result["result"] == "DENY"
+    assert "6.00" in result["reason"]  # current cost surfaced to the user
+    # User-facing phrasing only — no tool-call directive leaks through.
+    assert "re-issue the tool call" not in result["reason"]
+    assert "Relay this to the user verbatim" not in result["reason"]
+    # Still names the limit + how to recover so the user can act.
+    assert "switch to a cheaper model" in result["reason"]
+
+
+def test_request_phase_over_budget_on_cheaper_model_allows() -> None:
+    """Over the hard limit on a cheaper model ALLOWs at the request phase.
+
+    Mirrors the tool-call downgrade gate: once the session is off an
+    expensive model, an over-budget request must proceed. A DENY here
+    would trap a downgraded user out of starting any new turn.
+    """
+    policy = cost_budget(max_cost_usd=5.0)
+    assert policy(_request(6.0, model="claude-sonnet-4-6")) == {"result": "ALLOW"}
+
+
+def test_request_phase_soft_checkpoint_asks_and_records_it() -> None:
+    """A crossed soft checkpoint ASKs at the request phase → ASK + record.
+
+    The request phase has a server-side approval round-trip (the engine
+    parks the whole turn before it reaches the model and applies the ASK's
+    ``state_updates`` only on accept), so a newly-crossed checkpoint must
+    ASK here exactly as it does on ``tool_call`` — warning text-only turns
+    too. The ASK carries the same ``state_updates`` SET so an approved
+    checkpoint (and lower ones) won't re-prompt.
+    """
+    policy = cost_budget(max_cost_usd=5.0, ask_thresholds_usd=[2.0])
+    # $2 is over the soft checkpoint but under the $5 hard cap.
+    result = policy(_request(2.0, model="opus"))
+    assert result["result"] == "ASK"
+    assert result["state_updates"] == [
+        {"key": _ASK_APPROVED_KEY, "action": "set", "value": 2.0},
+    ]
+
+
+def test_request_phase_below_threshold_allows() -> None:
+    """Spend under the lowest checkpoint abstains (ALLOW) at the request phase."""
+    policy = cost_budget(max_cost_usd=5.0, ask_thresholds_usd=[2.0])
+    assert policy(_request(1.0, model="opus")) == {"result": "ALLOW"}
+
+
+def test_request_phase_approved_checkpoint_does_not_reask() -> None:
+    """An already-approved checkpoint does NOT re-ASK at the request phase.
+
+    Once the request-phase ASK is approved its crossed value is persisted
+    to ``session_state``; the next request under the same checkpoint must
+    ALLOW (not re-prompt). A regression here would wedge every subsequent
+    turn on the approval card.
+    """
+    policy = cost_budget(max_cost_usd=5.0, ask_thresholds_usd=[2.0])
+    event = _request(2.0, model="opus", session_state={_ASK_APPROVED_KEY: 2.0})
+    assert policy(event) == {"result": "ALLOW"}
+
+
+def test_request_approval_carries_over_to_tool_call() -> None:
+    """A request-phase approval suppresses the first tool call's re-ASK.
+
+    The request phase records the crossed checkpoint on approve, so the
+    first tool call of the same over-threshold turn sees it already
+    approved and ALLOWs — the user is warned once per checkpoint, not
+    twice (once on the turn, once on its first tool call).
+    """
+    policy = cost_budget(max_cost_usd=5.0, ask_thresholds_usd=[2.0])
+    state = {_ASK_APPROVED_KEY: 2.0}
+    assert policy(_tool(2.0, model="opus", session_state=state)) == {"result": "ALLOW"}
 
 
 def test_unpriced_session_never_trips() -> None:
@@ -414,6 +577,34 @@ async def test_resolve_from_spec_asks_in_soft_zone() -> None:
     policy: FunctionPolicy = resolve_function_policy(spec)
     result = await policy.evaluate(_tool_ctx(3.0, "opus"), {})
     assert result.action == PolicyAction.ASK
+
+
+@pytest.mark.asyncio
+async def test_resolve_from_spec_denies_over_budget_on_request_phase() -> None:
+    """Over-budget on an expensive model DENYs at the REQUEST phase too.
+
+    The request phase is the path :func:`_evaluate_request_policy` in the
+    server uses (it builds a ``Phase.REQUEST`` ``EvaluationContext`` with
+    ``usage`` + ``model``). This proves the cost + model thread through the
+    engine boundary on that phase and the DENY comes back as a
+    :class:`PolicyAction`, so a text-only over-budget turn is blocked
+    before the LLM runs.
+    """
+    spec = FunctionPolicySpec(
+        name="cost",
+        on=None,
+        function=FunctionRef(path=_HANDLER, arguments={"max_cost_usd": 5.0}),
+    )
+    policy: FunctionPolicy = resolve_function_policy(spec)
+    ctx = EvaluationContext(
+        phase=Phase.REQUEST,
+        content="please run the build",
+        tool_name=None,
+        usage={"total_cost_usd": 6.0},
+        model="databricks-claude-opus-4-8",
+    )
+    result = await policy.evaluate(ctx, {})
+    assert result.action == PolicyAction.DENY
 
 
 # ══════════════════════════════════════════════════════════════════════════════

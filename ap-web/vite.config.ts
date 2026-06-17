@@ -18,10 +18,14 @@ function resolveToken(host: string): string | null {
   }
 
   try {
-    const output = execFileSync("databricks", ["auth", "token", "--host", host, "--output", "json"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    const output = execFileSync(
+      "databricks",
+      ["auth", "token", "--host", host, "--output", "json"],
+      {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
     const tokenResponse = JSON.parse(output) as { access_token?: string };
     cachedToken = tokenResponse.access_token ?? null;
   } catch {
@@ -130,6 +134,24 @@ export default defineConfig({
     globals: true,
     environment: "jsdom",
     setupFiles: ["./src/test-setup.ts"],
+    coverage: {
+      provider: "v8",
+      // With `include` set, vitest counts every matching source file (untested
+      // ones as 0%), so the total reflects the whole frontend — parity with the
+      // backend's --cov=omnigent, not just files a test happened to import.
+      include: ["src/**/*.{ts,tsx}"],
+      exclude: [
+        "src/**/*.test.{ts,tsx}",
+        "src/**/*.d.ts",
+        "src/test-setup.ts",
+        // Vendored UI kit, not product code (see tests/e2e_ui/COVERAGE_GAPS.md).
+        "src/components/ai-elements/**",
+      ],
+      reportsDirectory: "./coverage",
+      // text-summary: human-readable console line; json-summary: machine-
+      // readable coverage/coverage-summary.json that CI distills to total.txt.
+      reporter: ["text-summary", "json-summary"],
+    },
   },
   server: {
     proxy: proxyConfig,

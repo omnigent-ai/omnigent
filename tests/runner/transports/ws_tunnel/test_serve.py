@@ -12,7 +12,10 @@ from typing_extensions import Unpack
 from websockets.exceptions import InvalidStatus, InvalidURI, WebSocketException
 from websockets.http11 import Response
 
-from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+from omnigent.runner.identity import (
+    OMNIGENT_INTERNAL_WS_ORIGIN,
+    RUNNER_TUNNEL_TOKEN_HEADER,
+)
 from omnigent.runner.transports.ws_tunnel import serve as serve_module
 from omnigent.runner.transports.ws_tunnel.frames import (
     PingFrame,
@@ -545,8 +548,12 @@ async def test_serve_tunnel_once_sends_bearer_header(
     )
 
     assert captured["url"] == "wss://example.databricksapps.com/v1/runners/runner_auth/tunnel"
+    # The runner also sends the first-party Origin sentinel so the server's
+    # CSWSH origin guard admits the tunnel (a non-browser client), in
+    # addition to the bearer and tunnel-binding token.
     assert captured["kwargs"] == {
         "additional_headers": {
+            "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
             "Authorization": "Bearer tok-auth",
             RUNNER_TUNNEL_TOKEN_HEADER: "bind-token",
         },

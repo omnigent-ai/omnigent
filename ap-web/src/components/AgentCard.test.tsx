@@ -34,9 +34,7 @@ function agent(overrides: Partial<AvailableAgent> = {}): AvailableAgent {
 }
 
 function chosenIcon(a: AvailableAgent): string | null | undefined {
-  const { container } = render(
-    <AgentCard agent={a} selected={false} onSelect={() => {}} />,
-  );
+  const { container } = render(<AgentCard agent={a} selected={false} onSelect={() => {}} />);
   return container.querySelector("[data-icon]")?.getAttribute("data-icon");
 }
 
@@ -49,23 +47,19 @@ describe("AgentCard icon selection", () => {
     { name: "design-reviewer", harness: "codex", expected: "codex" },
     { name: "codex-native-ui", harness: "codex-native", expected: "codex" },
     { name: "claude-native-ui", harness: "claude-native", expected: "claude" },
+    { name: "pi-native-ui", harness: "pi-native", expected: "pi" },
     { name: "x", harness: "claude-sdk", expected: "claude" },
     { name: "pi", harness: "pi", expected: "pi" },
     // The pi match is exact: a harness merely containing "pi" stays generic.
     { name: "spec-gen", harness: "openapi", expected: "bot" },
-  ])(
-    "uses the $expected glyph for harness $harness",
-    ({ name, harness, expected }) => {
-      expect(chosenIcon(agent({ name, harness }))).toBe(expected);
-    },
-  );
+  ])("uses the $expected glyph for harness $harness", ({ name, harness, expected }) => {
+    expect(chosenIcon(agent({ name, harness }))).toBe(expected);
+  });
 
   it("uses the nessie glyph by name even on the claude-sdk harness", () => {
     // nessie runs on claude-sdk, so a harness-first check would mislabel
     // it as Claude. The name match must win.
-    expect(chosenIcon(agent({ name: "nessie", harness: "claude-sdk" }))).toBe(
-      "nessie",
-    );
+    expect(chosenIcon(agent({ name: "nessie", harness: "claude-sdk" }))).toBe("nessie");
   });
 
   it("uses the nessie glyph by name when harness is null", () => {
@@ -75,9 +69,7 @@ describe("AgentCard icon selection", () => {
   it("falls back to the generic bot glyph for an unknown agent", () => {
     // Neither the codex/claude harness match nor the nessie name match
     // fires, so the generic bot is the floor.
-    expect(chosenIcon(agent({ name: "mystery", harness: "agents_sdk" }))).toBe(
-      "bot",
-    );
+    expect(chosenIcon(agent({ name: "mystery", harness: "agents_sdk" }))).toBe("bot");
   });
 });
 
@@ -93,12 +85,7 @@ describe("AgentCard compact mode", () => {
     // via the tooltip instead.
     render(
       <TooltipProvider>
-        <AgentCard
-          agent={withDescription}
-          selected={false}
-          onSelect={() => {}}
-          compact
-        />
+        <AgentCard agent={withDescription} selected={false} onSelect={() => {}} compact />
       </TooltipProvider>,
     );
     const card = screen.getByTestId("agent-card-ag_1");
@@ -113,9 +100,7 @@ describe("AgentCard compact mode", () => {
   });
 
   it("renders the description inline with no tooltip in the default mode", () => {
-    render(
-      <AgentCard agent={withDescription} selected={false} onSelect={() => {}} />,
-    );
+    render(<AgentCard agent={withDescription} selected={false} onSelect={() => {}} />);
     const card = screen.getByTestId("agent-card-ag_1");
     // Non-compact (AddAgentDialog) keeps the full card: description
     // inline, and the card is not wrapped as a tooltip trigger.

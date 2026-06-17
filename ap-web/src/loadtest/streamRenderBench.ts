@@ -261,7 +261,9 @@ export async function runStreamRenderBench(opts: {
     sse("response.completed", {
       id: "resp_stream",
       status: "completed",
-      output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: full }] }],
+      output: [
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: full }] },
+      ],
     }),
   );
   sink.close();

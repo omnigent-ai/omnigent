@@ -12,16 +12,8 @@
 
 import { ChevronRightIcon, CommandIcon, WandSparklesIcon, type LucideIcon } from "lucide-react";
 import { useMemo } from "react";
-import {
-  CodeBlock,
-  CodeBlockHeader,
-  CodeBlockTitle,
-} from "@/components/ai-elements/code-block";
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from "@/components/ui/collapsible";
+import { CodeBlock, CodeBlockHeader, CodeBlockTitle } from "@/components/ai-elements/code-block";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 
 type SlashCommandKind = "skill" | "command";
 
@@ -59,12 +51,7 @@ interface SlashCommandCardProps {
   output: string | null;
 }
 
-export function SlashCommandCard({
-  kind,
-  name,
-  arguments: args,
-  output,
-}: SlashCommandCardProps) {
+export function SlashCommandCard({ kind, name, arguments: args, output }: SlashCommandCardProps) {
   const hasArgs = args.length > 0;
   const hasOutput = output !== null && output.length > 0;
   const canExpand = hasArgs || hasOutput;
@@ -84,8 +71,7 @@ export function SlashCommandCard({
     >
       <Icon className={`size-3 shrink-0 ${iconClass}`} />
       <span className="min-w-0 flex-1 truncate">
-        <span className="font-semibold text-foreground">{prefix}</span>{" "}
-        <span>{name}</span>
+        <span className="font-semibold text-foreground">{prefix}</span> <span>{name}</span>
         {hasArgs && (
           <>
             {" "}

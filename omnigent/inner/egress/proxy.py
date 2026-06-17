@@ -25,14 +25,23 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
+import email.policy
 import hmac
 import ipaddress
 import logging
 import socket
 import ssl
+from dataclasses import dataclass
+from email.message import Message
+from email.parser import BytesParser
 from pathlib import Path
 from urllib.parse import urlparse
 
+from omnigent.inner.credential_proxy import (
+    SYNTHETIC_CREDENTIAL_PREFIX,
+    CredentialRewriteRule,
+)
 from omnigent.inner.egress.certs import HostCertCache
 from omnigent.inner.egress.rules import (
     EgressRule,
@@ -50,6 +59,49 @@ _HEADER_MAX = 65536
 # this is a control byte and is rejected in the inner request line — see
 # ``_handle_connect`` for the request-line-smuggling rationale.
 _MIN_PRINTABLE_BYTE = 0x20
+
+
+def _parse_http_headers(headers_raw: bytes) -> Message:
+    """
+    Parse a raw HTTP request header block with the stdlib email parser.
+
+    HTTP/1.1's header grammar descends from the RFC 822 message format,
+    so the standard library's email parser — the same machinery
+    :mod:`http.client` uses under the hood — tokenizes header blocks
+    correctly: case-insensitive field names, surrounding whitespace,
+    obsolete line folding, and repeated headers, none of which a
+    hand-rolled ``split(b"\\r\\n")`` loop handles. ``policy.HTTP``
+    round-trips with CRLF line separators and ``max_line_length=None``
+    (no folding on output), preserving header order and values so a
+    re-serialized block stays byte-faithful to what the client sent.
+
+    :param headers_raw: Raw request header block (CRLF-separated,
+        terminated by a blank line), e.g.
+        ``b"Host: github.com\\r\\nUser-Agent: git/2\\r\\n\\r\\n"``. The
+        request line and body are handled by the caller, not included
+        here.
+    :returns: The parsed message (headers only; an empty payload). Set
+        headers via ``msg["Name"] = value`` / ``del msg["Name"]`` and
+        re-serialize with ``msg.as_bytes(policy=email.policy.HTTP)``.
+    """
+    return BytesParser(policy=email.policy.HTTP).parsebytes(headers_raw)
+
+
+@dataclass(frozen=True)
+class _AuthRewriteResult:
+    """Outcome of a credential-proxy ``Authorization`` rewrite pass.
+
+    :param headers: The header block to forward upstream — rewritten
+        when a synthetic placeholder matched, otherwise the input bytes
+        unchanged.
+    :param error: A human-readable reason to reject the request with
+        ``403`` (a placeholder was sent to the wrong host or is unknown),
+        or ``None`` when the request may proceed.
+    """
+
+    headers: bytes
+    error: str | None
+
 
 # S2 (security): CSP-internal endpoints that present as globally
 # routable IPs but actually reach inside the cloud tenant. These slip
@@ -129,6 +181,14 @@ class EgressProxy:
         KERN_PROCARGS2``. The header is stripped before forwarding
         upstream (``Proxy-Authorization`` is hop-by-hop per RFC 7235
         but be paranoid). ``None`` (the default) disables the check.
+    :param credential_rewrites: Optional host-scoped real-credential
+        rules. By default (swap-on-access) the proxy attaches the real
+        credential to a bound-host request that carries no
+        ``Authorization`` header — nothing credential-shaped ever enters
+        the sandbox. A rule whose entry opted into ``inject_env`` also
+        carries a synthetic placeholder; the proxy swaps that placeholder
+        for the real secret and rejects the same placeholder sent to any
+        other host with ``403`` (the cross-host leak guard).
     """
 
     def __init__(
@@ -140,6 +200,7 @@ class EgressProxy:
         upstream_ca_bundle: Path | None = None,
         block_private_destinations: bool = True,
         auth_token: str | None = None,
+        credential_rewrites: list[CredentialRewriteRule] | None = None,
     ) -> None:
         self._rules = rules
         self._cert_cache = HostCertCache(ca_cert_path, ca_key_path)
@@ -160,6 +221,23 @@ class EgressProxy:
             self._upstream_ssl_ctx = ssl.create_default_context()
         self._block_private_destinations = block_private_destinations
         self._auth_token = auth_token
+        # Two indexes over the rewrite rules:
+        #
+        # - ``_cred_by_host``: the swap-on-access path. For a request to a
+        #   bound host that carries no Authorization header, the proxy
+        #   injects the real credential. Exactly one rule per host — the
+        #   parser rejects duplicate-host bindings, so this map never
+        #   silently drops a rule.
+        # - ``_cred_by_synthetic``: the opt-in placeholder path. Only
+        #   entries that injected an ``oa_cred_*`` env var register here;
+        #   the synthetic is globally unique so it alone identifies the
+        #   rule (and thus the bound host) for the swap + leak guard.
+        self._cred_by_host: dict[str, CredentialRewriteRule] = {}
+        self._cred_by_synthetic: dict[str, CredentialRewriteRule] = {}
+        for rule in credential_rewrites or []:
+            self._cred_by_host[rule.host.lower()] = rule
+            if rule.synthetic is not None:
+                self._cred_by_synthetic[rule.synthetic] = rule
         # Precompute the expected header bytes ONCE so the per-request
         # comparison is a constant-time memcmp instead of repeating
         # the base64 round-trip on every connection. Stored as bytes
@@ -173,6 +251,14 @@ class EgressProxy:
             self._expected_auth_value = None
         self._servers: list[asyncio.AbstractServer] = []
         self._tcp_port: int | None = None
+        # In-flight connection handlers, tracked from accept time by
+        # ``_client_connected`` (which creates the task itself rather than
+        # letting ``asyncio.start_server`` wrap a coroutine in a Task we
+        # never see). Without this, a handler parked in a readline/relay
+        # read would outlive ``loop.stop()`` and surface as "Task was
+        # destroyed but it is pending"; holding the handle lets
+        # :meth:`stop` cancel and drain every handler before the loop closes.
+        self._client_tasks: set[asyncio.Task[None]] = set()
 
     @property
     def port(self) -> int:
@@ -191,7 +277,7 @@ class EgressProxy:
         :param host: Bind address, e.g. ``"127.0.0.1"``.
         :returns: The assigned port number.
         """
-        server = await asyncio.start_server(self._handle_client, host, 0)
+        server = await asyncio.start_server(self._client_connected, host, 0)
         addr = server.sockets[0].getsockname()
         self._tcp_port = addr[1]
         self._servers.append(server)
@@ -207,22 +293,63 @@ class EgressProxy:
         """
         sock_path = Path(path)
         sock_path.unlink(missing_ok=True)
-        server = await asyncio.start_unix_server(self._handle_client, str(sock_path))
+        server = await asyncio.start_unix_server(self._client_connected, str(sock_path))
         self._servers.append(server)
         logger.info("Egress proxy listening on unix:%s", sock_path)
 
     async def stop(self) -> None:
-        """Stop all proxy listeners."""
+        """Stop all proxy listeners and drain in-flight handlers."""
         for server in self._servers:
             server.close()
             await server.wait_closed()
         self._servers.clear()
         self._tcp_port = None
+        # Cancel any connection handlers still parked in a read/relay so
+        # they run their ``finally`` close blocks and reach a terminal
+        # state before the owning loop is stopped, rather than being
+        # abandoned mid-await (which surfaces as "Task was destroyed but
+        # it is pending"). The listeners are already closed, so no new
+        # handlers can appear; every accepted connection is tracked from
+        # accept time (see ``_client_connected``), so this single snapshot
+        # is complete.
+        pending = [task for task in self._client_tasks if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._client_tasks.clear()
         logger.info("Egress proxy stopped")
 
     # ------------------------------------------------------------------
     # Connection handling
     # ------------------------------------------------------------------
+
+    def _client_connected(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        """Server accept callback — create and track the handler task.
+
+        Passed to ``asyncio.start_server`` as a *plain* (non-coroutine)
+        callback so asyncio does not wrap the handler itself: we create
+        the task here and add it to :attr:`_client_tasks` synchronously,
+        the instant the connection is accepted. That closes the race a
+        self-registering handler would have — a handler whose task is
+        scheduled but has not yet run its first line is invisible to a
+        ``_client_tasks`` snapshot in :meth:`stop`, so it would leak past
+        ``loop.stop()`` as "Task was destroyed but it is pending". Holding
+        the handle from accept time means :meth:`stop` can always cancel
+        it.
+
+        :param reader: Stream reader for the accepted client connection,
+            handed straight to :meth:`_handle_client`.
+        :param writer: Stream writer for the accepted client connection,
+            handed straight to :meth:`_handle_client`.
+        """
+        task = asyncio.ensure_future(self._handle_client(reader, writer))
+        self._client_tasks.add(task)
+        task.add_done_callback(self._client_tasks.discard)
 
     async def _handle_client(
         self,
@@ -282,6 +409,8 @@ class EgressProxy:
         except Exception:
             logger.exception("Unexpected error in proxy handler")
         finally:
+            # Task removal from ``_client_tasks`` is handled by the
+            # done-callback wired in ``_client_connected``.
             try:
                 writer.close()
                 await asyncio.wait_for(writer.wait_closed(), timeout=2)
@@ -545,6 +674,20 @@ class EgressProxy:
         # exists to close. ``server_hostname=host`` keeps TLS SNI and
         # certificate verification bound to the original hostname.
         connect_host = pinned_ip or host
+        # Swap any synthetic credential placeholder for the real secret,
+        # bound to this host (rejects cross-host replay with 403).
+        rewrite = self._rewrite_authorization(host=host, headers_raw=headers_raw)
+        if rewrite.error is not None:
+            logger.warning(
+                "BLOCKED-CREDENTIAL %s https://%s%s — %s", method, host, path, rewrite.error
+            )
+            await self._send_forbidden(client_writer, rewrite.error)
+            return
+        # Single-shot the upstream so ``_relay_response`` gets a prompt EOF
+        # instead of blocking on a keep-alive socket — and so pipelining
+        # clients (git's libcurl) don't stall waiting to reuse a tunnel the
+        # proxy only services once. See ``_force_connection_close``.
+        headers_raw = self._force_connection_close(rewrite.headers)
         try:
             upstream_reader, upstream_writer = await asyncio.wait_for(
                 asyncio.open_connection(
@@ -673,6 +816,16 @@ class EgressProxy:
             body = await asyncio.wait_for(reader.readexactly(content_length), timeout=30)
 
         relative_line = f"{method} {path} HTTP/1.1\r\n".encode("latin-1")
+        rewrite = self._rewrite_authorization(host=host, headers_raw=headers_raw)
+        if rewrite.error is not None:
+            logger.warning(
+                "BLOCKED-CREDENTIAL %s http://%s%s — %s", method, host, path, rewrite.error
+            )
+            await self._send_forbidden(writer, rewrite.error)
+            return
+        # Single-shot the upstream (prompt EOF for the relay, no stalled
+        # tunnel reuse). See ``_force_connection_close``.
+        headers_raw = self._force_connection_close(rewrite.headers)
 
         # Connect to the IP pinned by the destination check (or the
         # hostname when blocking is disabled and ``pinned_ip`` is
@@ -740,13 +893,21 @@ class EgressProxy:
 
     @staticmethod
     def _parse_header_dict(raw: bytes) -> dict[str, str]:
-        """Parse raw header bytes into a lowercase-keyed dict."""
-        result: dict[str, str] = {}
-        for line in raw.split(b"\r\n"):
-            if b":" in line:
-                key, _, val = line.partition(b":")
-                result[key.decode("latin-1").strip().lower()] = val.decode("latin-1").strip()
-        return result
+        """
+        Parse raw header bytes into a lowercase-keyed dict.
+
+        :param raw: Raw request header block (CRLF-separated,
+            terminated by a blank line), e.g.
+            ``b"Host: github.com\\r\\nContent-Length: 12\\r\\n\\r\\n"``.
+        :returns: A dict mapping each lowercased header name to its
+            value (last value wins on repeats), e.g.
+            ``{"host": "github.com", "content-length": "12"}``.
+        """
+        msg = _parse_http_headers(raw)
+        # Last value wins on repeated header names, matching the prior
+        # hand-rolled parser; the only consumer reads single-valued
+        # headers (e.g. ``content-length``).
+        return {key.lower(): value for key, value in msg.items()}
 
     async def _assert_destination_allowed(self, host: str, port: int) -> str | None:
         """
@@ -920,6 +1081,143 @@ class EgressProxy:
         except Exception:  # noqa: BLE001 — response write is best-effort
             pass
 
+    def _rewrite_authorization(self, *, host: str, headers_raw: bytes) -> _AuthRewriteResult:
+        """
+        Attach the real credential to a bound-host request.
+
+        Two paths, both keyed on the request host:
+
+        - **Swap-on-access (default).** When a rule binds *host* and the
+          request carries no ``Authorization`` header, the proxy injects
+          ``Authorization: <scheme> <real>`` on the way out. The sandbox
+          never held anything credential-shaped.
+        - **Placeholder swap (opt-in).** When the request's
+          ``Authorization`` header carries one of this proxy's synthetic
+          placeholders (recognised by
+          :data:`~omnigent.inner.credential_proxy.SYNTHETIC_CREDENTIAL_PREFIX`
+          across the ``Basic`` / ``Bearer`` / ``token`` schemes), the
+          header is rewritten to the real credential. A placeholder that
+          is unknown or bound to a *different* host is rejected with
+          ``403`` — the cross-host leak guard for a compromised sandbox.
+
+        A non-synthetic ``Authorization`` header the client set itself is
+        left untouched (and suppresses injection), so the proxy never
+        clobbers an unrelated credential a tool deliberately sent.
+
+        :param host: Upstream request host (case-insensitive).
+        :param headers_raw: Raw HTTP header block (CRLF-separated).
+        :returns: An :class:`_AuthRewriteResult` carrying either the
+            (possibly rewritten / injected) headers or a rejection reason.
+        """
+        if not self._cred_by_host:
+            return _AuthRewriteResult(headers=headers_raw, error=None)
+
+        host_key = host.lower()
+        host_rule = self._cred_by_host.get(host_key)
+        msg = _parse_http_headers(headers_raw)
+        existing = msg.get_all("Authorization")
+        changed = False
+        if existing:
+            rewritten: list[str] = []
+            for value in existing:
+                synthetic = self._extract_synthetic(value)
+                if synthetic is None:
+                    # A real/foreign Authorization the client set itself —
+                    # leave it alone (and don't also inject over it).
+                    rewritten.append(value)
+                    continue
+                rule = self._cred_by_synthetic.get(synthetic)
+                if rule is None or rule.host != host_key:
+                    # A value carrying our placeholder prefix that we don't
+                    # recognise for this host. Refuse rather than forward —
+                    # this is the leak guard for a compromised sandbox that
+                    # tries to send a placeholder to an attacker host.
+                    return _AuthRewriteResult(
+                        headers=headers_raw,
+                        error="synthetic credential is not allowed for this host",
+                    )
+                rewritten.append(self._format_real_auth(rule))
+                changed = True
+            if changed:
+                del msg["Authorization"]
+                for value in rewritten:
+                    msg["Authorization"] = value
+        elif host_rule is not None:
+            # Swap-on-access: the request reached a bound host with no
+            # Authorization header, so attach the real credential now.
+            msg["Authorization"] = self._format_real_auth(host_rule)
+            changed = True
+        if not changed:
+            # Nothing matched — forward the client's bytes untouched rather
+            # than round-tripping them through the serializer.
+            return _AuthRewriteResult(headers=headers_raw, error=None)
+        return _AuthRewriteResult(headers=msg.as_bytes(policy=email.policy.HTTP), error=None)
+
+    @staticmethod
+    def _extract_synthetic(auth_value: str) -> str | None:
+        """
+        Extract a synthetic placeholder from an ``Authorization`` value.
+
+        :param auth_value: The header value after ``Authorization:``,
+            e.g. ``"Bearer oa_cred_..."`` or
+            ``"Basic <base64(user:oa_cred_...)>"``.
+        :returns: The placeholder string when the value carries one (in
+            the Bearer/token token position or the Basic password field),
+            else ``None``.
+        """
+        lowered = auth_value.lower()
+        if lowered.startswith("basic "):
+            encoded = auth_value[6:].strip()
+            try:
+                decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+            except (binascii.Error, UnicodeDecodeError):
+                return None
+            _, sep, password = decoded.partition(":")
+            if not sep:
+                return None
+            candidate = password
+        elif lowered.startswith("bearer "):
+            candidate = auth_value[7:].strip()
+        elif lowered.startswith("token "):
+            candidate = auth_value[6:].strip()
+        else:
+            return None
+        return candidate if candidate.startswith(SYNTHETIC_CREDENTIAL_PREFIX) else None
+
+    @staticmethod
+    def _format_real_auth(rule: CredentialRewriteRule) -> str:
+        """
+        Format the real ``Authorization`` value for a matched rule.
+
+        Returns a ``str`` because the value is set on an
+        :class:`email.message.Message` header, which the ``policy.HTTP``
+        serializer renders back to bytes. All three schemes use the same
+        encoding path: tokens / PATs are ASCII in practice, and Basic
+        base64-encodes the ``username:secret`` pair as UTF-8 (permitted by
+        RFC 7617), so there is no scheme-specific encoding divergence.
+
+        :param rule: The matched synthetic-to-real rewrite rule.
+        :returns: The header value string, e.g.
+            ``"Bearer <real>"``, ``"token <real>"``, or
+            ``"Basic <base64(username:real)>"``.
+        :raises ValueError: If the rule carries an unsupported scheme.
+        """
+        if rule.scheme == "bearer":
+            return f"Bearer {rule.real_secret}"
+        if rule.scheme == "token":
+            return f"token {rule.real_secret}"
+        if rule.scheme == "basic":
+            # The parser always populates ``username`` for Basic
+            # bindings; fail loud rather than invent one if a malformed
+            # rule reaches the emit path.
+            if rule.username is None:
+                raise ValueError(
+                    f"basic credential rewrite for host {rule.host!r} is missing a username"
+                )
+            pair = f"{rule.username}:{rule.real_secret}".encode()
+            return "Basic " + base64.b64encode(pair).decode("ascii")
+        raise ValueError(f"unsupported credential rewrite scheme: {rule.scheme!r}")
+
     @staticmethod
     async def _send_bad_gateway(writer: asyncio.StreamWriter, message: str) -> None:
         """Send HTTP 502 response."""
@@ -1028,3 +1326,49 @@ class EgressProxy:
                 continue
             kept.append(line)
         return b"\r\n".join(kept)
+
+    @staticmethod
+    def _force_connection_close(headers_raw: bytes) -> bytes:
+        """
+        Force ``Connection: close`` on a request's forwarded header block.
+
+        The proxy serves exactly one inner HTTP request per upstream
+        connection and relays the reply by reading until EOF
+        (:meth:`_relay_response`). An HTTP/1.1 upstream defaults to
+        keep-alive and holds the socket open after the response, so the
+        relay would otherwise block on its read until the 60 s timeout
+        rather than finishing the moment the body is done.
+
+        That stall also breaks clients that pipeline requests on a single
+        connection. ``git``'s libcurl sends its unauthenticated
+        ``/info/refs`` probe, receives ``401``, then sends the
+        authenticated retry **on the same tunnel**. Because the proxy is
+        still parked in the relay read (no upstream EOF), it never reads
+        git's second request and git hangs until the caller's timeout.
+        ``curl`` happened to dodge this: it consumed a
+        ``Content-Length``-framed body and exited while the orphaned relay
+        read lingered invisibly.
+
+        Rewriting the hop-by-hop connection headers to a single
+        ``Connection: close`` makes the upstream close after one response
+        (a prompt, clean EOF for the relay) and signals the client that
+        the tunnel is single-shot, so git transparently opens a fresh
+        ``CONNECT`` for its retry. ``Connection``, ``Proxy-Connection``,
+        and ``Keep-Alive`` are all hop-by-hop (RFC 7230 §6.1), so dropping
+        the client's originals and substituting our own is correct rather
+        than merely expedient.
+
+        :param headers_raw: Raw request header block (CRLF-separated,
+            terminated by a blank line).
+        :returns: The header block with any ``Connection`` /
+            ``Proxy-Connection`` / ``Keep-Alive`` headers dropped and a
+            single ``Connection: close`` appended in the header section.
+        """
+        msg = _parse_http_headers(headers_raw)
+        # ``del`` removes every instance of each hop-by-hop header
+        # (RFC 7230 §6.1) before we substitute our own single directive.
+        del msg["Connection"]
+        del msg["Proxy-Connection"]
+        del msg["Keep-Alive"]
+        msg["Connection"] = "close"
+        return msg.as_bytes(policy=email.policy.HTTP)

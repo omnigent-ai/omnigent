@@ -32,7 +32,7 @@ import time
 import urllib.parse
 import weakref
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal, cast
 
@@ -41,6 +41,7 @@ import httpx
 from fastapi import (
     APIRouter,
     BackgroundTasks,
+    Depends,
     File,
     HTTPException,
     Query,
@@ -87,6 +88,15 @@ from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
 from omnigent.model_override import validate_model_override
+from omnigent.native_coding_agents import (
+    CLAUDE_NATIVE_CODING_AGENT,
+    CODEX_NATIVE_CODING_AGENT,
+    NativeCodingAgent,
+    native_coding_agent_for_agent_name,
+    native_coding_agent_for_harness,
+    native_coding_agent_for_terminal_name,
+    native_coding_agent_for_wrapper_label,
+)
 from omnigent.policies.types import (
     ElicitationRequest,
     EvaluationContext,
@@ -174,6 +184,10 @@ from omnigent.server.routes._auth_helpers import (
     require_user as _require_user,
 )
 from omnigent.server.routes._codex_elicitation import parse_codex_elicitation_request
+from omnigent.server.routes._content_type import (
+    require_json_content_type,
+    require_json_or_multipart_content_type,
+)
 from omnigent.server.routes._host_worktree import CreatedWorktree
 from omnigent.server.schemas import (
     AgentObject,
@@ -404,6 +418,11 @@ _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK = "Codex"
 # reload for sessions where no Omnigent task carries usage (claude-native).
 _LAST_CONTEXT_TOKENS_LABEL_KEY: str = "omnigent.last_context_tokens"
 _LAST_CONTEXT_WINDOW_LABEL_KEY: str = "omnigent.last_context_window"
+# Labels read by ``_get_session_snapshot`` to surface the latest terminal /
+# runner task failure after the live ``session.status: failed`` SSE has gone
+# by. Empty string clears a stale value because labels are upsert-only.
+_LAST_TASK_ERROR_CODE_LABEL_KEY: str = "omnigent.last_task_error_code"
+_LAST_TASK_ERROR_MESSAGE_LABEL_KEY: str = "omnigent.last_task_error_message"
 
 # Todo-list update from the claude-native forwarder. Carries the raw
 # todo items captured from PostToolUse/TodoWrite hook events. Payload
@@ -415,7 +434,7 @@ _EXTERNAL_SESSION_TODOS_TYPE: str = "external_session_todos"
 # runner for tmux injection, and rendered transcript items must come
 # back through ``external_conversation_item`` only.
 _CLAUDE_NATIVE_WRAPPER_LABEL_KEY = "omnigent.wrapper"
-_CLAUDE_NATIVE_WRAPPER_LABEL_VALUE = "claude-code-native-ui"
+_CLAUDE_NATIVE_WRAPPER_LABEL_VALUE = CLAUDE_NATIVE_CODING_AGENT.wrapper_label
 # Marks a session as terminal-first in the Web UI (AppShell renders the
 # Claude Code terminal pane via TerminalFirstContext). Stamped alongside
 # the wrapper label so a claude-native session — created fresh by the
@@ -424,11 +443,11 @@ _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE = "claude-code-native-ui"
 _CLAUDE_NATIVE_UI_LABEL_KEY = "omnigent.ui"
 _CLAUDE_NATIVE_UI_LABEL_VALUE = "terminal"
 
-_CLAUDE_NATIVE_HARNESS = "claude-native"
-_CLAUDE_NATIVE_MODEL = "claude-native-ui"
-_CODEX_NATIVE_WRAPPER_LABEL_VALUE = "codex-native-ui"
-_CODEX_NATIVE_HARNESS = "codex-native"
-_CODEX_NATIVE_MODEL = "codex-native-ui"
+_CLAUDE_NATIVE_HARNESS = CLAUDE_NATIVE_CODING_AGENT.harness
+_CLAUDE_NATIVE_MODEL = CLAUDE_NATIVE_CODING_AGENT.agent_name
+_CODEX_NATIVE_WRAPPER_LABEL_VALUE = CODEX_NATIVE_CODING_AGENT.wrapper_label
+_CODEX_NATIVE_HARNESS = CODEX_NATIVE_CODING_AGENT.harness
+_CODEX_NATIVE_MODEL = CODEX_NATIVE_CODING_AGENT.agent_name
 _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S = 30.0
 _NATIVE_TERMINAL_START_FAILED_CODE = "native_terminal_start_failed"
 _NATIVE_TERMINAL_ENSURE_FAILED_CODE = "native_terminal_ensure_failed"
@@ -887,6 +906,28 @@ async def _poll_request_disconnect(request: Request) -> None:
         message = await request.receive()
         if message["type"] == "http.disconnect":
             return
+
+
+def _attachment_disposition(filename: str) -> str:
+    """Build a safe ``Content-Disposition: attachment`` header value.
+
+    The filename is user-controlled, so it cannot be interpolated
+    into the header verbatim — a quote or newline would let the
+    uploader inject header content or break parsing. We emit an
+    ASCII-only ``filename`` fallback (with quotes/backslashes/control
+    characters stripped) plus an RFC 5987 ``filename*`` parameter that
+    percent-encodes the full UTF-8 name for modern browsers.
+
+    :param filename: The stored, user-supplied filename.
+    :returns: A ``Content-Disposition`` header value forcing download.
+    """
+    # ASCII fallback: drop anything outside printable ASCII and the
+    # characters that are structurally significant in the header.
+    ascii_name = "".join(ch for ch in filename if 0x20 <= ord(ch) < 0x7F and ch not in '"\\')
+    if not ascii_name:
+        ascii_name = "download"
+    encoded = urllib.parse.quote(filename, safe="")
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded}"
 
 
 def _stored_file_to_resource(
@@ -3408,21 +3449,26 @@ async def _hold_native_ask_gate(
     conversation_store: ConversationStore,
 ) -> bool:
     """
-    Hold a native-harness tool call until a human resolves the ASK.
+    Hold a server-side ASK gate until a human resolves it.
 
-    URL-based elicitation for native harnesses. Publishes a
-    ``response.elicitation_request`` (the web UI / REPL render the
-    approve card) and parks a server-side Future via
+    Publishes a ``response.elicitation_request`` (the web UI / REPL
+    render the approve card) and parks a server-side Future via
     :func:`_publish_and_wait_for_harness_elicitation`, exactly as the
     ``PermissionRequest`` hook does. The human approves through the
     elicitation's resolve URL; this collapses the verdict to a single
     boolean the caller maps to ALLOW / DENY.
 
+    Used for any phase whose ASK must be resolved on the server rather
+    than by a runner-side ``wait_for_user_approval`` park:
+    :attr:`Phase.TOOL_CALL` (the native ``PreToolUse`` hook gate) and
+    :attr:`Phase.REQUEST` (the user-message input gate, which has no
+    runner in the loop yet — see :func:`_evaluate_input_policy`).
+
     Unlike the old ASK→``defer`` path, the gate lives on the server,
     so a permissive native ``permission_mode`` (``acceptEdits`` /
-    ``bypassPermissions``) cannot skip it — the tool call stays
-    blocked until a real human verdict. Timeout / disconnect fail
-    closed (return ``False`` → DENY).
+    ``bypassPermissions``) cannot skip it — the action stays blocked
+    until a real human verdict. Timeout / disconnect fail closed
+    (return ``False`` → DENY).
 
     On approve, the ASK-accumulated ``set_labels`` / ``state_updates``
     are applied (POLICIES.md §7.2: side effects land only on approve);
@@ -3431,10 +3477,12 @@ async def _hold_native_ask_gate(
     :param request: FastAPI request, for upstream-disconnect detection
         inside the parking helper.
     :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
-    :param phase: Enforcement phase — :attr:`Phase.TOOL_CALL` here
-        (the only phase a native PreToolUse hook can block).
-    :param data: The proto event ``data``; for a tool call,
-        ``{"name": "Bash", "arguments": {"command": "ls"}}``.
+    :param phase: Enforcement phase being gated, e.g.
+        :attr:`Phase.TOOL_CALL` or :attr:`Phase.REQUEST`.
+    :param data: The proto event ``data`` — for a tool call,
+        ``{"name": "Bash", "arguments": {"command": "ls"}}``; for a
+        request, the user ``message`` body
+        (``{"role": "user", "content": [...]}``).
     :param engine: The policy engine, used to resolve the per-policy
         ``ask_timeout`` and to apply approved side effects.
     :param result: The composed ASK :class:`PolicyResult` — carries
@@ -4443,6 +4491,68 @@ def _publish_status(
     if response_id is None:
         payload.pop("response_id", None)
     session_stream.publish(session_id, payload)
+
+
+async def _persist_session_status_error_labels(
+    session_id: str,
+    error: ErrorDetail | None,
+    conversation_store: ConversationStore,
+) -> None:
+    """
+    Persist or clear the reload-visible failure detail for a session status.
+
+    ``session.status`` is an SSE edge, so its ``error`` object disappears on
+    reload. Terminal-native sessions can fail before any transcript item is
+    written, so store the latest failure detail as runner-owned labels and let
+    snapshots project it as ``last_task_error``. Empty string clears stale
+    values because the label store is upsert-only.
+
+    :param session_id: Session/conversation identifier.
+    :param error: Failure detail from a ``session.status: failed`` edge, or
+        ``None`` to clear stale error labels on subsequent activity.
+    :param conversation_store: Store used to upsert labels.
+    """
+    updates = (
+        {
+            _LAST_TASK_ERROR_CODE_LABEL_KEY: error.code,
+            _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: error.message,
+        }
+        if error is not None
+        else {
+            _LAST_TASK_ERROR_CODE_LABEL_KEY: "",
+            _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: "",
+        }
+    )
+    try:
+        await asyncio.to_thread(conversation_store.set_labels, session_id, updates)
+    except Exception:
+        _logger.exception(
+            "Failed to persist session status error labels for %s",
+            session_id,
+        )
+
+
+def _last_task_error_from_labels(labels: Mapping[str, str]) -> dict[str, str] | None:
+    """
+    Project runner-owned failure labels into the typed API error shape.
+
+    Terminal/native runtimes can fail before they write any transcript item,
+    so the session-status relay stores the latest failure as durable labels.
+    This helper is the single server-side boundary where those internal labels
+    become public ``last_task_error`` data for snapshots and child summaries.
+
+    :param labels: Conversation labels, usually after closed-status projection.
+    :returns: ``{"code": "...", "message": "..."}``, or ``None`` when either
+        value is absent/cleared.
+    """
+    raw_error_code = labels.get(_LAST_TASK_ERROR_CODE_LABEL_KEY)
+    raw_error_message = labels.get(_LAST_TASK_ERROR_MESSAGE_LABEL_KEY)
+    if raw_error_code and raw_error_message:
+        return {
+            "code": raw_error_code,
+            "message": raw_error_message,
+        }
+    return None
 
 
 def _publish_runner_recovered_status(session_id: str) -> None:
@@ -5696,10 +5806,8 @@ def _is_native_terminal_session(conv: Conversation) -> bool:
     :returns: ``True`` for wrappers whose transcript forwarder is the
         single writer for conversation history.
     """
-    return conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) in {
-        _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
-        _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
-    }
+    wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+    return native_coding_agent_for_wrapper_label(wrapper) is not None
 
 
 def _native_terminal_runtime(conv: Conversation) -> tuple[str, str, str]:
@@ -5711,10 +5819,9 @@ def _native_terminal_runtime(conv: Conversation) -> tuple[str, str, str]:
     :raises OmnigentError: If the wrapper label is unsupported.
     """
     wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
-    if wrapper == _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE:
-        return "Claude", _CLAUDE_NATIVE_MODEL, _CLAUDE_NATIVE_HARNESS
-    if wrapper == _CODEX_NATIVE_WRAPPER_LABEL_VALUE:
-        return "Codex", _CODEX_NATIVE_MODEL, _CODEX_NATIVE_HARNESS
+    native_agent = native_coding_agent_for_wrapper_label(wrapper)
+    if native_agent is not None:
+        return native_agent.display_name, native_agent.agent_name, native_agent.harness
     raise OmnigentError(
         "Unsupported native terminal session",
         code=ErrorCode.INVALID_INPUT,
@@ -5730,10 +5837,9 @@ def _native_terminal_name_for_harness(harness: str) -> str:
     :raises OmnigentError: If *harness* is not a supported native
         terminal harness.
     """
-    if harness == _CLAUDE_NATIVE_HARNESS:
-        return "claude"
-    if harness == _CODEX_NATIVE_HARNESS:
-        return "codex"
+    native_agent = native_coding_agent_for_harness(harness)
+    if native_agent is not None:
+        return native_agent.terminal_name
     raise OmnigentError(
         "Unsupported native terminal session",
         code=ErrorCode.INVALID_INPUT,
@@ -7939,6 +8045,18 @@ async def _relay_runner_stream(
                                 if isinstance(raw_err, dict)
                                 else None
                             )
+                            if status == "failed" and status_error is not None:
+                                await _persist_session_status_error_labels(
+                                    session_id,
+                                    status_error,
+                                    conversation_store,
+                                )
+                            elif status == "running":
+                                await _persist_session_status_error_labels(
+                                    session_id,
+                                    None,
+                                    conversation_store,
+                                )
                             # PTY-activity status is a UI signal only. Terminal
                             # sub-agent delivery rides the Stop/StopFailure hook
                             # via external_session_status (the codex-shared path)
@@ -8506,6 +8624,24 @@ def _agent_is_native(agent: Agent) -> bool:
     return is_native_harness(spec.executor.harness_kind)
 
 
+def _native_coding_agent_for_agent(agent: Agent) -> NativeCodingAgent | None:
+    """
+    Return native coding-agent metadata for an agent's harness.
+
+    :param agent: The agent whose bundle should be inspected.
+    :returns: Registry metadata for the native TUI harness, or ``None``.
+    """
+    try:
+        spec = (
+            get_agent_cache()
+            .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
+            .spec
+        )
+    except Exception:  # noqa: BLE001 — unloadable bundle → non-native presentation
+        return None
+    return native_coding_agent_for_harness(spec.executor.harness_kind)
+
+
 def _presentation_labels_for_agent(agent: Agent) -> dict[str, str]:
     """Return the Web UI presentation labels for an agent's harness.
 
@@ -8520,24 +8656,8 @@ def _presentation_labels_for_agent(agent: Agent) -> dict[str, str]:
     :returns: ``{ui: terminal, wrapper: <value>}`` for a native agent, or
         ``{}`` for an SDK agent / undeterminable family (chat mode).
     """
-    from omnigent._wrapper_labels import (
-        CLAUDE_NATIVE_WRAPPER_VALUE,
-        CODEX_NATIVE_WRAPPER_VALUE,
-        UI_MODE_LABEL_KEY,
-        UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY,
-    )
-
-    if not _agent_is_native(agent):
-        return {}
-    family = _agent_provider_family(agent)
-    wrapper = {
-        "anthropic": CLAUDE_NATIVE_WRAPPER_VALUE,
-        "openai": CODEX_NATIVE_WRAPPER_VALUE,
-    }.get(family or "")
-    if wrapper is None:
-        return {}
-    return {UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE, WRAPPER_LABEL_KEY: wrapper}
+    native_agent = _native_coding_agent_for_agent(agent)
+    return native_agent.presentation_labels if native_agent is not None else {}
 
 
 async def _register_policy_elicitation(
@@ -8935,7 +9055,48 @@ def _extract_user_text_from_event(body: SessionEventInput) -> str:
     return "\n".join(parts)
 
 
+def _publish_policy_deny(session_id: str, reason: str) -> None:
+    """
+    Publish the ``[Denied by policy: ...]`` sentinel on the session stream.
+
+    The sentinel text is a load-bearing contract (the REPL renders it, e2e
+    tests assert it, and native harnesses relay it to the model), so it is
+    always carried in a ``response.output_text.delta``.
+
+    The deny is never persisted as a conversation item — the input gate
+    publishes it and returns without forwarding — so a ``message_id``-less
+    delta lands in the web reducer's response-scoped text path as an
+    un-reconciled "stray bubble" with no item to dedupe against. On the next
+    user submit the response switch re-finalizes that still-open text,
+    rendering the deny twice (observed on both native and non-native web
+    sessions). Stamping a unique ``message_id`` (matching how live streaming
+    text is tagged) routes it through the web's live-preview path instead,
+    where it folds into a single ``live:<id>`` block.
+
+    Safe for the other consumers: the REPL converts any ``output_text.delta``
+    to a ``TextDelta`` regardless of ``message_id``; the ``/v1/responses`` API
+    surfaces the deny via input-deny synthesis (not session-stream deltas);
+    and the only ``message_id``-gated accumulator (``_relay_runner_stream``)
+    reads runner-relayed deltas, never this server-published one.
+
+    :param session_id: Session/conversation identifier.
+    :param reason: Human-readable deny reason from the policy verdict.
+    """
+    session_stream.publish(
+        session_id,
+        {
+            "type": "response.output_text.delta",
+            "delta": f"[Denied by policy: {reason}]",
+            # Unique per deny so two separate denials don't fold into one
+            # block; a single delta carries the whole sentinel, so index 0.
+            "message_id": f"deny_{secrets.token_hex(8)}",
+            "index": 0,
+        },
+    )
+
+
 async def _evaluate_input_policy(
+    request: Request,
     session_id: str,
     conv: Conversation,
     body: SessionEventInput,
@@ -8946,26 +9107,36 @@ async def _evaluate_input_policy(
     actor: dict[str, str] | None = None,
 ) -> dict[str, Any] | None:
     """
-    Evaluate a user message against INPUT phase policy rules.
+    Evaluate a user message against REQUEST (input) phase policy rules.
 
-    Pure evaluation — does NOT persist the event. Returns
-    ``None`` on ALLOW (caller should persist via the active
-    path). Returns a verdict dict on DENY or ASK (caller
-    should NOT forward to runner).
+    Does not persist the event. On ALLOW returns ``None`` (caller
+    forwards the message). On DENY returns a verdict dict (caller does
+    NOT forward). On ASK this function **parks for human approval**
+    before returning: unlike the ``tool_call`` phase — where the runner
+    parks via ``wait_for_user_approval`` — the REQUEST phase has no
+    runner in the loop yet (the message hasn't been forwarded), so the
+    approval gate must live here. It reuses :func:`_hold_native_ask_gate`
+    (the same server-side park the native ``tool_call`` gate uses):
+    accept collapses to ALLOW (``None``, forward the message), while
+    decline / timeout collapses to a DENY verdict (fail-closed).
 
+    :param request: The active FastAPI request, threaded to
+        :func:`_hold_native_ask_gate` for upstream-disconnect detection
+        while parked on an ASK.
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
     :param conv: The session's :class:`Conversation` entity.
     :param body: The validated ``message`` event.
     :param conversation_store: Store for label state.
     :param agent_store: Store for agent spec lookups.
-    :param runner_router: Unused, kept for signature
+    :param _runner_router: Unused, kept for signature
         consistency.
     :param actor: Authenticated principal, e.g.
         ``{"run_as": "alice@example.com"}``. ``None`` when
         identity is unknown.
-    :returns: ``None`` on ALLOW (fall through to persist
-        path). Verdict dict on DENY/ASK.
+    :returns: ``None`` on ALLOW or an approved ASK (fall through to the
+        forward path). A verdict dict ``{"verdict": "deny", "reason":
+        ...}`` on DENY or a declined / timed-out ASK.
     """
 
     user_text = _extract_user_text_from_event(body)
@@ -9009,18 +9180,29 @@ async def _evaluate_input_policy(
             "reason": result.reason or "Denied by policy",
         }
 
-    # ASK — publish elicitation event.
-    elicitation_id = await _register_policy_elicitation(
+    # ASK — park server-side for human approval. The REQUEST phase has no
+    # runner-side approval round-trip (the message has not been forwarded to
+    # a runner yet, so nothing would park on a "pending" verdict — it would
+    # collapse to a silent deny). Hold the gate here exactly like the native
+    # tool_call path: _hold_native_ask_gate publishes the approval card,
+    # awaits the human verdict on a server-side Future, and applies the
+    # deciding policy's writes only on accept (POLICIES.md §7.2). Accept ->
+    # ALLOW (fall through to forward the message); decline / timeout ->
+    # DENY (fail-closed).
+    approved = await _hold_native_ask_gate(
+        request,
         session_id=session_id,
+        phase=Phase.REQUEST,
+        data=body.data,
+        engine=engine,
         result=result,
-        arguments_preview=user_text[:1024],
         conversation_store=conversation_store,
     )
+    if approved:
+        return None
     return {
-        "verdict": "pending",
-        "elicitation_id": elicitation_id,
-        # Spec-resolved approval window; the runner's park honors it.
-        "ask_timeout": resolve_ask_timeout(engine, result),
+        "verdict": "deny",
+        "reason": result.reason or "Denied by policy",
     }
 
 
@@ -9869,14 +10051,10 @@ def _native_subagent_wrapper_labels_from_spec(sub_spec: AgentSpec) -> dict[str, 
         sub-agent, or ``{}`` when the sub-agent is not native.
     """
     harness = _spec_harness(sub_spec)
-    if harness == _CLAUDE_NATIVE_HARNESS:
+    native_agent = native_coding_agent_for_harness(harness)
+    if native_agent is not None:
         return {
-            _CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
-            _CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE,
-        }
-    if harness == _CODEX_NATIVE_HARNESS:
-        return {
-            _CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+            _CLAUDE_NATIVE_WRAPPER_LABEL_KEY: native_agent.wrapper_label,
             _CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE,
         }
     return {}
@@ -10235,23 +10413,16 @@ async def _create_session_from_existing_agent(
                 code=ErrorCode.INTERNAL_ERROR,
             )
         conv = updated_conv
-    # Set wrapper label at creation time if the agent is a native
-    # terminal wrapper (claude-native or codex-native), so all messages
+    # Set wrapper labels at creation time if the agent is a native
+    # terminal wrapper, so all messages
     # (including early ones sent before the runner connects) take
     # the native path and avoid double-persistence with the
     # transcript forwarder.
-    if agent.name == "claude-native-ui":
-        _cn_labels = dict(body.labels) if body.labels else {}
-        _cn_labels[_CLAUDE_NATIVE_WRAPPER_LABEL_KEY] = _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE
-        # Terminal-first rendering label, so an added Claude Code child
-        # shows the terminal pane even though the dialog sends no labels.
-        _cn_labels[_CLAUDE_NATIVE_UI_LABEL_KEY] = _CLAUDE_NATIVE_UI_LABEL_VALUE
-        await asyncio.to_thread(conversation_store.set_labels, conv.id, _cn_labels)
-        conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
-    elif agent.name == "codex-native-ui":
-        _cx_labels = dict(body.labels) if body.labels else {}
-        _cx_labels[_CLAUDE_NATIVE_WRAPPER_LABEL_KEY] = _CODEX_NATIVE_WRAPPER_LABEL_VALUE
-        await asyncio.to_thread(conversation_store.set_labels, conv.id, _cx_labels)
+    native_agent = native_coding_agent_for_agent_name(agent.name)
+    if native_agent is not None:
+        _native_labels = dict(body.labels) if body.labels else {}
+        _native_labels.update(native_agent.presentation_labels)
+        await asyncio.to_thread(conversation_store.set_labels, conv.id, _native_labels)
         conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
     elif (
         body.sub_agent_name
@@ -10760,6 +10931,10 @@ def _child_session_summary_from_conversation(
         busy = True
     else:
         busy = False
+    last_task_error = _last_task_error_from_labels(labels)
+    current_task_status = (
+        "failed" if cached_status == "failed" or last_task_error is not None else None
+    )
 
     # For Codex children, fall back to the prompt label as preview when the
     # real transcript has not arrived yet — avoids synthesizing a user message
@@ -10783,9 +10958,10 @@ def _child_session_summary_from_conversation(
         agent_id=conv.agent_id,
         agent_name=None,
         current_task_id=None,
-        current_task_status=None,
+        current_task_status=current_task_status,
         busy=busy,
         labels=labels,
+        last_task_error=last_task_error,
         last_message_preview=last_message_preview,
         # Surface the sub-agent's parked-elicitation count from the same
         # in-memory index that feeds the sidebar badge, so the Agents
@@ -11521,6 +11697,10 @@ def create_sessions_router(
         "/sessions",
         status_code=201,
         response_model=None,
+        # CSRF hardening: this route dispatches on Content-Type (JSON vs
+        # multipart bundled-create), so reject text/plain and other simple
+        # types up front while still allowing both legitimate body shapes.
+        dependencies=[Depends(require_json_or_multipart_content_type)],
     )
     async def create_session(
         request: Request,
@@ -12604,12 +12784,24 @@ def create_sessions_router(
             and model_override.strip().lower() in EFFORT_CLEAR_VALUES
         )
         if model_override is not None and not clear_model:
-            if not isinstance(model_override, str) or not model_override.strip():
+            # Mirror the create path: the persisted value reaches a native
+            # CLI as a ``--model`` argv element and the Codex provider
+            # ``config.toml`` as a ``model="..."`` field, so it must pass the
+            # conservative model-id charset before it is stored. A bare
+            # strip()/non-empty check here let shell-/TOML-shaped values
+            # through, enabling host RCE via the Codex ``auth.command``.
+            if not isinstance(model_override, str):
                 raise OmnigentError(
                     "invalid model_override: must be a non-empty string",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            model_override = model_override.strip()
+            try:
+                model_override = validate_model_override(model_override)
+            except ValueError as exc:
+                raise OmnigentError(
+                    f"invalid model_override: {exc}",
+                    code=ErrorCode.INVALID_INPUT,
+                ) from exc
 
         # Cost-control switch: ``"off"`` is a real stored value here,
         # so the clear signal is an explicit JSON null (field present,
@@ -13212,6 +13404,9 @@ def create_sessions_router(
     @router.post(
         "/sessions/{session_id}/hooks/permission-request",
         response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
     )
     async def claude_permission_request_hook(
         request: Request,
@@ -13470,6 +13665,10 @@ def create_sessions_router(
         "PHASE_TOOL_RESULT": Phase.TOOL_RESULT,
         "PHASE_LLM_REQUEST": Phase.LLM_REQUEST,
         "PHASE_LLM_RESPONSE": Phase.LLM_RESPONSE,
+        # A native session's UserPromptSubmit hook posts the request phase
+        # here (the server-level _evaluate_input_policy skips native message
+        # events). The prompt text rides in ``event.data.text``.
+        "PHASE_REQUEST": Phase.REQUEST,
     }
     _PHASE_TO_PROTO_ACTION: dict[PolicyAction, str] = {
         PolicyAction.ALLOW: "POLICY_ACTION_ALLOW",
@@ -13484,6 +13683,9 @@ def create_sessions_router(
         # Returns EvaluationResponse JSON; no Pydantic model since the
         # proto-style schema is validated manually.
         response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
     )
     async def evaluate_policy(
         request: Request,
@@ -13552,6 +13754,22 @@ def create_sessions_router(
                 f"Session {session_id!r} not found.",
                 code=ErrorCode.NOT_FOUND,
             )
+        # Dedup the native request-phase gate. A native session's
+        # ``UserPromptSubmit`` hook posts ``PHASE_REQUEST`` here for *every*
+        # prompt, but a web-UI prompt was already gated server-side by
+        # ``_evaluate_input_policy`` at POST /events (before injection, so no
+        # TUI freeze). Re-gating it here would double-prompt the human. A
+        # web-UI prompt in flight has a ``pending_inputs`` entry (recorded at
+        # dispatch, drained when the forwarder mirrors it back); a prompt
+        # typed directly in the TUI has none and never hit POST /events, so it
+        # is gated here — the hook is its only request-phase gate. The signal
+        # is "is a web prompt in flight", not text correlation (the native
+        # transcript gives no reliable id channel — see ``pending_inputs``).
+        if phase == Phase.REQUEST and pending_inputs.snapshot_for(session_id):
+            return Response(
+                content=json.dumps({"result": "POLICY_ACTION_ALLOW"}),
+                media_type="application/json",
+            )
         agent = agent_store.get(conv.agent_id) if conv.agent_id else None
         if agent is None:
             # No agent — no policies. Return unspecified (pass-through).
@@ -13603,9 +13821,15 @@ def create_sessions_router(
         # the human. Instead we publish the approval elicitation, park
         # until the human resolves it via the resolve URL, and collapse
         # to a hard ALLOW / DENY so the caller never sees ASK.
-        # TOOL_CALL and LLM_REQUEST are the two phases that can block
-        # execution before it starts (tool dispatch / LLM call).
-        if result.action == PolicyAction.ASK and phase in (Phase.TOOL_CALL, Phase.LLM_REQUEST):
+        # TOOL_CALL, LLM_REQUEST, and REQUEST are the phases that can block
+        # before the action proceeds (tool dispatch / LLM call / a native
+        # session's user prompt via the UserPromptSubmit hook — which has no
+        # ASK primitive of its own, so the server resolves ASK here).
+        if result.action == PolicyAction.ASK and phase in (
+            Phase.TOOL_CALL,
+            Phase.LLM_REQUEST,
+            Phase.REQUEST,
+        ):
             if is_read_only:
                 # Read-only callers must not enter the ASK gate — parking
                 # creates an elicitation (a server-side mutation). Return
@@ -13627,6 +13851,7 @@ def create_sessions_router(
                     if result.action == PolicyAction.ASK and phase in (
                         Phase.TOOL_CALL,
                         Phase.LLM_REQUEST,
+                        Phase.REQUEST,
                     ):
                         approved = await _hold_native_ask_gate(
                             request,
@@ -13673,6 +13898,9 @@ def create_sessions_router(
     @router.post(
         "/sessions/{session_id}/hooks/codex-elicitation-request",
         response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
     )
     async def codex_elicitation_request_hook(
         request: Request,
@@ -14268,6 +14496,9 @@ def create_sessions_router(
     @router.post(
         "/sessions/{session_id}/resources/terminals",
         response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
     )
     async def create_session_terminal(
         session_id: str,
@@ -14289,10 +14520,10 @@ def create_sessions_router(
         they launch undeclared names via the runner's
         synthesize-from-body path and predate the gate. The markers
         are client-controlled, so the exemption is narrowed to the
-        exact shape those wrappers send — ``terminal`` of ``"claude"``
-        or ``"codex"`` with ``session_key`` ``"main"`` — anything else
-        carrying a marker still goes through the declared-name gate
-        (it would otherwise be an arbitrary-terminal bypass).
+        exact shape those wrappers send — a registered native terminal
+        name with ``session_key`` ``"main"`` — anything else carrying a
+        marker still goes through the declared-name gate (it would
+        otherwise be an arbitrary-terminal bypass).
 
         :param session_id: Session/conversation identifier.
         :param request: JSON body with ``terminal`` and
@@ -14306,7 +14537,7 @@ def create_sessions_router(
         body = await request.json()
         is_native_bootstrap = (
             bool(body.get("ensure_native_terminal") or body.get("bridge_inject_dir"))
-            and body.get("terminal") in ("claude", "codex")
+            and native_coding_agent_for_terminal_name(body.get("terminal")) is not None
             and body.get("session_key") == "main"
         )
         if not is_native_bootstrap:
@@ -14368,6 +14599,9 @@ def create_sessions_router(
     @router.post(
         "/sessions/{session_id}/resources/terminals/{terminal_id}/transfer",
         response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
     )
     async def transfer_session_terminal(
         request: Request,
@@ -14656,7 +14890,22 @@ def create_sessions_router(
             )
         content = artifact_store.get(stored.id)
         media_type = mimetypes.guess_type(stored.filename)[0] or "application/octet-stream"
-        return Response(content=content, media_type=media_type)
+        # The filename and bytes are fully user-controlled. Serving the
+        # content inline lets a browser navigating directly to this URL
+        # render an uploaded ``evil.html`` as ``text/html`` and execute
+        # its script in the server's own origin (stored XSS — acute on
+        # the OSS/local server, which has no CSRF/apiproxy boundary).
+        # Force a download with ``Content-Disposition: attachment`` and
+        # disable MIME sniffing so the response cannot be reinterpreted
+        # as an active type.
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={
+                "Content-Disposition": _attachment_disposition(stored.filename),
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     @router.delete(
         "/sessions/{session_id}/resources/files/{file_id}",
@@ -15054,6 +15303,9 @@ def create_sessions_router(
     @router.post(
         "/sessions/{session_id}/resources/environments/{environment_id}/shell",
         response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
     )
     async def run_environment_shell(
         session_id: str,
@@ -15395,6 +15647,7 @@ def create_sessions_router(
         ):
             try:
                 _input_verdict = await _evaluate_input_policy(
+                    request,
                     session_id,
                     conv,
                     body,
@@ -15425,13 +15678,7 @@ def create_sessions_router(
                 # client/REPL sees feedback.
                 reason = _input_verdict.get("reason", "Denied by policy")
                 _publish_status(session_id, "running")
-                session_stream.publish(
-                    session_id,
-                    {
-                        "type": "response.output_text.delta",
-                        "delta": f"[Denied by policy: {reason}]",
-                    },
-                )
+                _publish_policy_deny(session_id, reason)
                 _publish_status(session_id, "idle")
                 # Return the same shape the client expects from POST
                 # /events so postEvent doesn't throw on an unexpected
@@ -15440,6 +15687,7 @@ def create_sessions_router(
                 return {"queued": False, "denied": True, "reason": reason}
         elif body.type == _SLASH_COMMAND_TYPE and conv.agent_id is not None:
             _input_verdict = await _evaluate_input_policy(
+                request,
                 session_id,
                 conv,
                 _build_skill_slash_command_policy_body(body),
@@ -15450,13 +15698,7 @@ def create_sessions_router(
             if _input_verdict is not None:
                 reason = _input_verdict.get("reason", "Denied by policy")
                 _publish_status(session_id, "running")
-                session_stream.publish(
-                    session_id,
-                    {
-                        "type": "response.output_text.delta",
-                        "delta": f"[Denied by policy: {reason}]",
-                    },
-                )
+                _publish_policy_deny(session_id, reason)
                 _publish_status(session_id, "idle")
                 return {"queued": False, "denied": True, "reason": reason}
         elif (
@@ -16990,6 +17232,10 @@ def create_sessions_router(
     @router.post(
         "/sessions/{session_id}/mcp",
         response_model=None,  # Returns a raw Response with application/json
+        # CSRF hardening: the MCP Streamable HTTP contract already mandates
+        # an application/json request body; enforce it so a cross-site
+        # text/plain request can't drive JSON-RPC against this proxy.
+        dependencies=[Depends(require_json_content_type)],
     )
     async def mcp_proxy(
         session_id: str,
@@ -17292,6 +17538,7 @@ async def _get_session_snapshot(
     raw_label = conv.labels.get(_LAST_CONTEXT_TOKENS_LABEL_KEY)
     if isinstance(raw_label, str) and raw_label.isdigit():
         last_total_tokens = int(raw_label)
+    last_task_error = _last_task_error_from_labels(conv.labels)
     # Runner-crash durability: if the session's bound runner reported an
     # unexpected exit (host.runner_exited → RunnerExitReports), surface the
     # cause as last_task_error so a reload/late-open still renders the error

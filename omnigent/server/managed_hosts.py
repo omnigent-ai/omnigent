@@ -32,7 +32,7 @@ stores into ``create_app``):
    ``<data_dir>/config.yaml``)::
 
        sandbox:
-         provider: modal          # lakebox | modal | daytona
+         provider: modal          # lakebox | modal | daytona | islo
          server_url: https://omnigent.example.com
          modal:                   # optional block
            image: docker.io/me/omnigent-host:latest  # default: official image
@@ -43,6 +43,17 @@ stores into ``create_app``):
            env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES whose
                                              # values are injected as
                                              # sandbox env
+         islo:                    # optional block (provider: islo)
+           image: docker.io/me/omnigent-host:latest  # default: official image
+           env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES injected
+                                             # as sandbox env
+           base_url: https://api.islo.dev    # optional API override
+           gateway_profile: default          # optional Islo gateway profile
+           snapshot_name: warm-host          # optional Islo snapshot name
+           workdir: /root/workspace          # optional sandbox workdir
+           vcpus: 2
+           memory_mb: 4096
+           disk_gb: 20
 
    The image defaults to the official prebaked host image
    (``ghcr.io/omnigent-ai/omnigent-host:latest``; see
@@ -52,9 +63,11 @@ stores into ``create_app``):
    (12-factor): the Modal launcher reads ``MODAL_TOKEN_ID`` /
    ``MODAL_TOKEN_SECRET`` (or ``~/.modal.toml``) and the Daytona
    launcher reads ``DAYTONA_API_KEY`` (plus optional
-   ``DAYTONA_API_URL`` / ``DAYTONA_TARGET``) from the server process
-   environment. ``modal`` and ``daytona`` have managed-launch
-   support; ``lakebox`` parses but rejects at launch.
+   ``DAYTONA_API_URL`` / ``DAYTONA_TARGET``), and the Islo launcher
+   reads ``ISLO_API_KEY`` (plus optional ``ISLO_BASE_URL``) from the
+   server process environment. ``modal``, ``daytona``, and ``islo``
+   have managed-launch support; ``lakebox`` parses but rejects at
+   launch.
 
 2. **Direct construction** (embedding deployments): build
    :class:`ManagedSandboxConfig` with a custom
@@ -102,13 +115,17 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 # Providers the YAML `sandbox:` section accepts. Parsing accepts all
-# three so a deployment can stage config ahead of support landing, but
-# only PROVIDERS_WITH_MANAGED_LAUNCH can actually serve a managed
-# session today. (Deployments that construct ManagedSandboxConfig
-# directly are not constrained by either set — their launcher factory
-# IS the support.)
-SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset({"lakebox", "modal", "daytona"})
-PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset({"modal", "daytona"})
+# known providers so a deployment can stage config ahead of support
+# landing, but only PROVIDERS_WITH_MANAGED_LAUNCH can actually serve a
+# managed session today. (Deployments that construct
+# ManagedSandboxConfig directly are not constrained by either set —
+# their launcher factory IS the support.)
+SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
+    {"lakebox", "modal", "daytona", "cwsandbox", "islo", "e2b"}
+)
+PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
+    {"modal", "daytona", "cwsandbox", "islo", "e2b"}
+)
 
 # How long a managed launch waits for the sandboxed host to register
 # before declaring failure. The image is pre-baked (no pip install at
@@ -134,6 +151,17 @@ MODAL_MANAGED_TOKEN_TTL_S = 25 * 3600
 # session past 7 days going through the dead-host relaunch path) mints
 # a fresh token.
 DAYTONA_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
+
+# Launch-token lifetime for the YAML islo path. Islo sandboxes are
+# deleted by managed-session teardown; use the same 7-day policy bound
+# as Daytona for long-lived hosts and stale-token cleanup.
+ISLO_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
+
+# The cwsandbox launch-token TTL is NOT a constant: CW Sandbox's lifetime is
+# operator-overridable (OMNIGENT_CWSANDBOX_MAX_LIFETIME_S), so the TTL is
+# derived from the resolved lifetime at parse time via
+# cwsandbox.managed_token_ttl_s() — always above the cap, so a live sandbox
+# can re-authenticate its tunnel across reconnects while a leaked token can't.
 
 # Where the in-sandbox host process logs — named in launch-failure
 # errors so an operator knows where to look inside the sandbox.
@@ -505,10 +533,9 @@ def _unsupported_launcher_factory(provider: str) -> Callable[[], SandboxLauncher
     """
     Build a factory that rejects launch for a not-yet-supported provider.
 
-    Lets a deployment stage ``sandbox:`` config for ``lakebox`` /
-    ``daytona`` before managed-launch support lands: parsing succeeds,
-    and the clear 400 only surfaces if a managed session is actually
-    requested.
+    Lets a deployment stage ``sandbox:`` config for a provider before
+    managed-launch support lands: parsing succeeds, and the clear 400
+    only surfaces if a managed session is actually requested.
 
     :param provider: The configured provider name, e.g. ``"daytona"``.
     :returns: A factory that raises ``HTTPException`` 400 when called.
@@ -569,6 +596,38 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             _parse_daytona_image(raw), _parse_daytona_env(raw)
         )
         token_ttl_s = DAYTONA_MANAGED_TOKEN_TTL_S
+    elif provider == "cwsandbox":
+        from omnigent.onboarding.sandboxes.cwsandbox import managed_token_ttl_s
+
+        launcher_factory = _cwsandbox_launcher_factory(
+            _parse_cwsandbox_image(raw), _parse_cwsandbox_env(raw)
+        )
+        # Derived from OMNIGENT_CWSANDBOX_MAX_LIFETIME_S so the token always
+        # outlives the (operator-overridable) sandbox lifetime.
+        token_ttl_s = managed_token_ttl_s()
+    elif provider == "islo":
+        launcher_factory = _islo_launcher_factory(
+            image=_parse_provider_image(raw, "islo"),
+            env=_parse_provider_env(raw, "islo"),
+            base_url=_parse_provider_string(raw, "islo", "base_url"),
+            gateway_profile=_parse_provider_string(raw, "islo", "gateway_profile"),
+            snapshot_name=_parse_provider_string(raw, "islo", "snapshot_name"),
+            workdir=_parse_provider_string(raw, "islo", "workdir"),
+            vcpus=_parse_provider_positive_int(raw, "islo", "vcpus"),
+            memory_mb=_parse_provider_positive_int(raw, "islo", "memory_mb"),
+            disk_gb=_parse_provider_positive_int(raw, "islo", "disk_gb"),
+        )
+        token_ttl_s = ISLO_MANAGED_TOKEN_TTL_S
+    elif provider == "e2b":
+        from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s
+
+        launcher_factory = _e2b_launcher_factory(
+            _parse_e2b_template(raw), _parse_provider_env(raw, "e2b")
+        )
+        # Derived from OMNIGENT_E2B_MAX_LIFETIME_S so the token always
+        # outlives the (operator-overridable) sandbox lifetime — mirrors
+        # the cwsandbox path.
+        token_ttl_s = managed_token_ttl_s()
     else:
         launcher_factory = _unsupported_launcher_factory(provider)
         # Never consulted (the factory rejects before any token is
@@ -757,6 +816,291 @@ def _parse_daytona_env(raw: dict[str, object]) -> list[str] | None:
             "'GIT_TOKEN']"
         )
     return [name.strip() for name in env]
+
+
+def _cwsandbox_launcher_factory(
+    image: str | None,
+    env: list[str] | None,
+) -> Callable[[], SandboxLauncher]:
+    """Build the launcher factory for the YAML ``provider: cwsandbox`` path."""
+
+    def _build() -> SandboxLauncher:
+        from omnigent.onboarding.sandboxes.cwsandbox import CWSandboxLauncher
+
+        return CWSandboxLauncher(image=image, env=env)
+
+    return _build
+
+
+def _parse_cwsandbox_image(raw: dict[str, object]) -> str | None:
+    """Extract and validate ``sandbox.cwsandbox.image`` (optional)."""
+    section = raw.get("cwsandbox")
+    if section is None:
+        return None
+    if not isinstance(section, dict):
+        raise ValueError("server config 'sandbox.cwsandbox' must be a mapping")
+    image = section.get("image")
+    if image is None:
+        return None
+    if not isinstance(image, str) or not image.strip():
+        raise ValueError(
+            "server config 'sandbox.cwsandbox.image' must be a registry image "
+            "reference with omnigent pre-installed (omit it to use the official image)"
+        )
+    return image.strip()
+
+
+def _parse_cwsandbox_env(raw: dict[str, object]) -> list[str] | None:
+    """Extract and validate ``sandbox.cwsandbox.env`` — server env var NAMES (optional)."""
+    section = raw.get("cwsandbox")
+    if section is None:
+        return None
+    if not isinstance(section, dict):
+        raise ValueError("server config 'sandbox.cwsandbox' must be a mapping")
+    env = section.get("env")
+    if env is None:
+        return None
+    if not isinstance(env, list) or not all(
+        isinstance(name, str) and name.strip() for name in env
+    ):
+        raise ValueError(
+            "server config 'sandbox.cwsandbox.env' must be a list of server "
+            "environment variable NAMES to inject, e.g. ['ANTHROPIC_API_KEY', 'GIT_TOKEN']"
+        )
+    return [name.strip() for name in env]
+
+
+def _e2b_launcher_factory(
+    template: str | None,
+    env: list[str] | None,
+) -> Callable[[], SandboxLauncher]:
+    """
+    Build the launcher factory for the YAML ``provider: e2b`` path.
+
+    :param template: E2B template NAME the Omnigent host image was built
+        into (``e2b template build``), or ``None`` to use the launcher's
+        env-var fallback / the default template. Unlike the other
+        providers' ``image`` field this is NOT a registry reference —
+        E2B boots from templates (see
+        :class:`omnigent.onboarding.sandboxes.e2b.E2BSandboxLauncher`).
+    :param env: Names of server-process environment variables (harness
+        LLM credentials, gateway URLs, ``GIT_TOKEN``) injected into
+        every sandbox, e.g. ``["OPENAI_API_KEY", "GIT_TOKEN"]``, or
+        ``None`` to resolve from the launcher's env-var fallback /
+        inject nothing.
+    :returns: A factory producing parameterized E2B launchers.
+    """
+
+    def _build() -> SandboxLauncher:
+        """Construct the E2B launcher (lazy SDK import inside)."""
+        from omnigent.onboarding.sandboxes.e2b import E2BSandboxLauncher
+
+        return E2BSandboxLauncher(template=template, env=env)
+
+    return _build
+
+
+def _parse_e2b_template(raw: dict[str, object]) -> str | None:
+    """
+    Extract and validate the e2b template from the ``sandbox`` dict.
+
+    ``sandbox.e2b.template`` names the pre-built E2B template the
+    Omnigent host image was built into — NOT a registry image reference
+    (the wording every other provider's ``image`` field uses), because
+    E2B cannot boot an arbitrary registry image. OPTIONAL — when absent,
+    the launcher resolves :data:`~omnigent.onboarding.sandboxes.e2b.TEMPLATE_ENV_VAR`
+    then the default template. A present-but-malformed value fails loud.
+
+    :param raw: The raw ``sandbox`` mapping (provider already known to
+        be ``"e2b"``).
+    :returns: The validated template name, or ``None`` to use the
+        launcher's fallback / default.
+    :raises ValueError: When ``sandbox.e2b`` is present but not a
+        mapping, or ``sandbox.e2b.template`` is present but not a
+        non-empty string.
+    """
+    section = _parse_provider_section(raw, "e2b")
+    if section is None:
+        return None
+    template = section.get("template")
+    if template is None:
+        return None
+    if not isinstance(template, str) or not template.strip():
+        raise ValueError(
+            "server config 'sandbox.e2b.template' must be the NAME of a pre-built "
+            "E2B template the omnigent host image was built into (e.g. "
+            "'omnigent-host'; see deploy/e2b/README.md) — NOT a registry image "
+            "reference (omit it to use the default template)"
+        )
+    return template.strip()
+
+
+def _islo_launcher_factory(
+    *,
+    image: str | None,
+    env: list[str] | None,
+    base_url: str | None,
+    gateway_profile: str | None,
+    snapshot_name: str | None,
+    workdir: str | None,
+    vcpus: int | None,
+    memory_mb: int | None,
+    disk_gb: int | None,
+) -> Callable[[], SandboxLauncher]:
+    """
+    Build the launcher factory for the YAML ``provider: islo`` path.
+
+    :param image: Registry image reference with omnigent pre-installed,
+        e.g. ``"docker.io/me/omnigent-host:latest"``, or ``None`` to
+        use the official prebaked host image (env-overridable; see
+        :class:`omnigent.onboarding.sandboxes.islo.IsloSandboxLauncher`).
+    :param env: Names of server-process environment variables injected
+        into every sandbox, e.g. ``["OPENAI_API_KEY", "GIT_TOKEN"]``,
+        or ``None`` to resolve from the launcher's env-var fallback /
+        inject nothing.
+    :param base_url: Optional Islo API base URL override.
+    :param gateway_profile: Optional Islo gateway profile name.
+    :param snapshot_name: Optional Islo snapshot name.
+    :param workdir: Optional sandbox working directory.
+    :param vcpus: Optional vCPU count.
+    :param memory_mb: Optional memory allocation in MiB.
+    :param disk_gb: Optional disk allocation in GiB.
+    :returns: A factory producing parameterized Islo launchers.
+    """
+
+    def _build() -> SandboxLauncher:
+        """Construct the Islo launcher."""
+        from omnigent.onboarding.sandboxes.islo import IsloSandboxLauncher
+
+        return IsloSandboxLauncher(
+            image=image,
+            env=env,
+            base_url=base_url,
+            gateway_profile=gateway_profile,
+            snapshot_name=snapshot_name,
+            workdir=workdir,
+            vcpus=vcpus,
+            memory_mb=memory_mb,
+            disk_gb=disk_gb,
+        )
+
+    return _build
+
+
+def _parse_provider_section(raw: dict[str, object], provider: str) -> dict[str, object] | None:
+    """
+    Extract a provider-specific optional config block.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :param provider: Provider block name, e.g. ``"islo"``.
+    :returns: The provider mapping, or ``None`` when omitted.
+    :raises ValueError: When the block is present but not a mapping.
+    """
+    section = raw.get(provider)
+    if section is None:
+        return None
+    if not isinstance(section, dict):
+        raise ValueError(f"server config 'sandbox.{provider}' must be a mapping")
+    return section
+
+
+def _parse_provider_image(raw: dict[str, object], provider: str) -> str | None:
+    """
+    Extract and validate a provider image from the raw ``sandbox`` dict.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :param provider: Provider block name, e.g. ``"islo"``.
+    :returns: The validated image reference, or ``None`` to use the
+        official default.
+    :raises ValueError: When the provider block or image value is
+        malformed.
+    """
+    section = _parse_provider_section(raw, provider)
+    if section is None:
+        return None
+    image = section.get("image")
+    if image is None:
+        return None
+    if not isinstance(image, str) or not image.strip():
+        raise ValueError(
+            f"server config 'sandbox.{provider}.image' must be a registry image "
+            "reference with omnigent pre-installed, e.g. "
+            "'docker.io/me/omnigent-host:latest' (omit it to use the "
+            "official image)"
+        )
+    return image.strip()
+
+
+def _parse_provider_env(raw: dict[str, object], provider: str) -> list[str] | None:
+    """
+    Extract and validate provider env passthrough names.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :param provider: Provider block name, e.g. ``"islo"``.
+    :returns: Validated environment variable names, or ``None`` when
+        not configured.
+    :raises ValueError: When the provider block or env list is
+        malformed.
+    """
+    section = _parse_provider_section(raw, provider)
+    if section is None:
+        return None
+    env = section.get("env")
+    if env is None:
+        return None
+    if not isinstance(env, list) or not all(
+        isinstance(name, str) and name.strip() for name in env
+    ):
+        raise ValueError(
+            f"server config 'sandbox.{provider}.env' must be a list of server "
+            "environment variable NAMES to inject, e.g. ['OPENAI_API_KEY', "
+            "'GIT_TOKEN']"
+        )
+    return [name.strip() for name in env]
+
+
+def _parse_provider_string(raw: dict[str, object], provider: str, key: str) -> str | None:
+    """
+    Extract and validate an optional provider string field.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :param provider: Provider block name, e.g. ``"islo"``.
+    :param key: Field name under the provider block.
+    :returns: The stripped string, or ``None`` when omitted.
+    :raises ValueError: When the field is present but not a non-empty
+        string.
+    """
+    section = _parse_provider_section(raw, provider)
+    if section is None:
+        return None
+    value = section.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"server config 'sandbox.{provider}.{key}' must be a non-empty string")
+    return value.strip()
+
+
+def _parse_provider_positive_int(raw: dict[str, object], provider: str, key: str) -> int | None:
+    """
+    Extract and validate an optional positive integer provider field.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :param provider: Provider block name, e.g. ``"islo"``.
+    :param key: Field name under the provider block.
+    :returns: The integer, or ``None`` when omitted.
+    :raises ValueError: When the field is present but is not a positive
+        integer.
+    """
+    section = _parse_provider_section(raw, provider)
+    if section is None:
+        return None
+    value = section.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"server config 'sandbox.{provider}.{key}' must be a positive integer")
+    return value
 
 
 async def launch_managed_host(

@@ -26,10 +26,17 @@ if TYPE_CHECKING:
 DEFAULT_POLICY_CLASSIFIER_TIMEOUT = 30
 
 # Default timeout (seconds) for user approval on an ASK policy.
-# 30 s matches omnigent parity. Overrideable per-policy via
-# ``PolicySpec.ask_timeout`` or spec-wide via
-# ``GuardrailsSpec.ask_timeout``. See POLICIES.md §7, §13.
-DEFAULT_ASK_TIMEOUT = 30
+# One day — an ASK is a human-in-the-loop gate and should outlive a
+# user stepping away, matching every other wait-for-a-human budget in
+# the native path (the PermissionRequest / evaluate-policy hook
+# long-polls and their server-side mirrors are all 86400). A shorter
+# default fails closed (DENY) without any user input, flipping the web
+# card to a neutral "Resolved elsewhere" — surprising for an
+# interactive session. Headless/unattended agents that want a fast
+# fail-closed should override this per-policy via ``PolicySpec.ask_timeout``
+# or spec-wide via ``GuardrailsSpec.ask_timeout`` (see polly's config).
+# See POLICIES.md §7, §13.
+DEFAULT_ASK_TIMEOUT = 86400
 
 
 @dataclass(frozen=True)
@@ -345,9 +352,9 @@ class _PiRetryAdapter:
         before subprocess spawn.
 
         Schema audited from
-        ``@mariozechner/pi-coding-agent@0.68.1/docs/settings.md``
-        (the package now ships as ``@earendil-works/pi-coding-agent``
-        — github.com/earendil-works/pi — with the same settings
+        ``@earendil-works/pi-coding-agent/docs/settings.md``
+        (github.com/earendil-works/pi; formerly published as
+        ``@mariozechner/pi-coding-agent@0.68.1``, same settings
         schema). Pi natively implements exponential backoff with
         jitter and ``Retry-After`` honoring; we configure the budget
         and shape.
@@ -1332,7 +1339,7 @@ class GuardrailsSpec:
     :param ask_timeout: Spec-wide default approval timeout in
         seconds. Individual policies may override via
         ``PolicySpec.ask_timeout``. Defaults to
-        :data:`DEFAULT_ASK_TIMEOUT` (30 s).
+        :data:`DEFAULT_ASK_TIMEOUT` (1 day).
     """
 
     labels: dict[str, LabelDef] | None = None

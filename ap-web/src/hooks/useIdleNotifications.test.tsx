@@ -64,11 +64,7 @@ async function flushPreview(): Promise<void> {
   });
 }
 
-function conv(
-  id: string,
-  status: Conversation["status"],
-  pendingElicitations = 0,
-): Conversation {
+function conv(id: string, status: Conversation["status"], pendingElicitations = 0): Conversation {
   return {
     id,
     object: "conversation",
@@ -93,7 +89,6 @@ function setConversations(list: Conversation[]): void {
 function setWindowFocused(focused: boolean): void {
   vi.spyOn(document, "hasFocus").mockReturnValue(focused);
 }
-
 
 beforeEach(() => {
   navigateMock.mockReset();

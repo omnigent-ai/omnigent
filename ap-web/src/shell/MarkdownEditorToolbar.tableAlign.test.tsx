@@ -29,22 +29,24 @@ vi.mock("@tiptap/pm/tables", () => ({
 }));
 
 import { useEditorState } from "@tiptap/react";
-import {
-  TableMap,
-  cellAround,
-  colCount,
-  findTable,
-  isInTable,
-} from "@tiptap/pm/tables";
+import { TableMap, cellAround, colCount, findTable, isInTable } from "@tiptap/pm/tables";
 import type { Editor } from "@tiptap/react";
 import { ToolbarPlugin } from "./MarkdownEditorToolbar";
 
 // Combined state object for both ToolbarPlugin's and TableAlignControls'
 // useEditorState calls — the mock returns the same object for every call.
 const TOOLBAR_DEFAULTS = {
-  canUndo: false, canRedo: false,
-  isParagraph: false, isH1: false, isH2: false, isH3: false, isBlockquote: false,
-  isBold: false, isItalic: false, isStrike: false, isCode: false,
+  canUndo: false,
+  canRedo: false,
+  isParagraph: false,
+  isH1: false,
+  isH2: false,
+  isH3: false,
+  isBlockquote: false,
+  isBold: false,
+  isItalic: false,
+  isStrike: false,
+  isCode: false,
 };
 
 type AlignState = { inTable: boolean; align: string | null };

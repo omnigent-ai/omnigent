@@ -2047,6 +2047,61 @@ def test_augment_claude_args_registers_permission_command_hook(
     assert "omnigent.claude_native_status" in settings["statusLine"]["command"]
 
 
+def test_augment_claude_args_registers_user_prompt_submit_policy_hook(
+    tmp_path: Path,
+) -> None:
+    """
+    Passing ``ap_server_url`` wires the evaluate-policy hook onto
+    ``UserPromptSubmit`` alongside the transcript forwarder's status hook.
+
+    For native sessions the server-level ``_evaluate_input_policy`` skips
+    message events, so this hook is the sole REQUEST-phase gate (covering
+    both web-UI-injected and direct-terminal prompts). If it regressed,
+    native prompts would reach the model with no request-phase policy. The
+    forwarder's own UserPromptSubmit hook (status → running) must survive,
+    so the policy hook is appended, not substituted.
+    """
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        ap_server_url="http://127.0.0.1:8787/",
+        ap_auth_headers={"Authorization": "Bearer xyz"},
+    )
+    settings = json.loads(args[args.index("--settings") + 1])
+    entries = settings["hooks"]["UserPromptSubmit"]
+    commands = [h["command"] for entry in entries for h in entry["hooks"]]
+    # The forwarder status hook stays; the policy hook is appended.
+    assert any("evaluate-policy" in command for command in commands), (
+        f"UserPromptSubmit must carry the evaluate-policy hook; got {commands!r}."
+    )
+    assert any("evaluate-policy" not in command for command in commands), (
+        "The transcript forwarder's UserPromptSubmit hook must not be replaced."
+    )
+
+
+def test_augment_claude_args_omits_user_prompt_submit_policy_hook_without_server(
+    tmp_path: Path,
+) -> None:
+    """
+    Without ``ap_server_url`` the UserPromptSubmit policy hook is not wired.
+
+    Policy hooks only make sense when an Omnigent server is configured to
+    evaluate against; the forwarder's status hook still registers, but no
+    evaluate-policy command should appear (mirrors PreToolUse/PostToolUse,
+    which are also gated behind ``ap_server_url``).
+    """
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+    settings = json.loads(args[args.index("--settings") + 1])
+    entries = settings["hooks"]["UserPromptSubmit"]
+    commands = [h["command"] for entry in entries for h in entry["hooks"]]
+    assert all("evaluate-policy" not in command for command in commands)
+
+
 def test_augment_claude_args_keeps_permission_hook_without_launch_session_id(
     tmp_path: Path,
 ) -> None:

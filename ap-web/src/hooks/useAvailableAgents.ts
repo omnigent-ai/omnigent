@@ -1,7 +1,11 @@
 import { useQuery } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
-import { agentBaseName } from "@/lib/forkHarness";
+import { agentRootName } from "@/lib/forkHarness";
 import { capitalizeAgentName } from "@/lib/agentLabels";
+import {
+  nativeCodingAgentForAgentName,
+  nativeCodingAgentForHarness,
+} from "@/lib/nativeCodingAgents";
 
 export interface AvailableAgent {
   id: string;
@@ -21,13 +25,20 @@ export interface AvailableAgent {
 }
 
 const DISPLAY_NAMES: Record<string, string> = {
-  "claude-native-ui": "Claude Code",
-  "codex-native-ui": "Codex",
   // nessie is no longer seeded, but older deployments retain their row.
   nessie: "Nessie",
   polly: "Polly",
   debby: "Debby",
 };
+
+function displayNameForAgent(name: string, harness?: string | null): string {
+  return (
+    nativeCodingAgentForHarness(harness)?.displayName ??
+    nativeCodingAgentForAgentName(name)?.displayName ??
+    DISPLAY_NAMES[name] ??
+    capitalizeAgentName(name)
+  );
+}
 
 /** Wire row of the built-in list, GET /v1/agents. */
 interface BuiltinAgentWire {
@@ -56,7 +67,7 @@ async function fetchBuiltinAgents(): Promise<AvailableAgent[]> {
   return body.data.map((a) => ({
     id: a.id,
     name: a.name,
-    display_name: DISPLAY_NAMES[a.name] ?? capitalizeAgentName(a.name),
+    display_name: displayNameForAgent(a.name, a.harness),
     description: a.description ?? null,
     harness: a.harness ?? null,
     skills: a.skills ?? [],
@@ -124,7 +135,7 @@ async function enrichSessionAgent(scanned: ScannedSessionAgent): Promise<Availab
   const fallback: AvailableAgent = {
     id: scanned.agentId,
     name: scanned.agentName,
-    display_name: DISPLAY_NAMES[scanned.agentName] ?? capitalizeAgentName(scanned.agentName),
+    display_name: displayNameForAgent(scanned.agentName),
     description: null,
     harness: null,
     skills: [],
@@ -137,6 +148,7 @@ async function enrichSessionAgent(scanned: ScannedSessionAgent): Promise<Availab
     const json = (await res.json()) as AgentObjectWire;
     return {
       ...fallback,
+      display_name: displayNameForAgent(json.name, json.harness),
       description: json.description ?? null,
       harness: json.harness ?? null,
       skills: json.skills ?? [],
@@ -156,8 +168,10 @@ async function enrichSessionAgent(scanned: ScannedSessionAgent): Promise<Availab
  *
  * Session-discovered agents that shadow a built-in are dropped: by id
  * (most sessions bind a built-in's agent row directly) and by clone
- * base name (fork/switch create per-session rows named
- * `"<builtin> (fork <id>)"`). What survives is genuinely custom —
+ * ROOT name (fork/switch create per-session rows named
+ * `"<builtin> (fork <id>)"`, and a fork of a fork nests them —
+ * `agentRootName` peels every layer so multi-fork clones still match).
+ * What survives is genuinely custom —
  * ad-hoc uploaded agents that were previously invisible to the picker.
  * Surviving custom agents are then collapsed by base name, keeping the
  * newest session's row: a custom agent launched repeatedly from a local
@@ -183,7 +197,11 @@ async function fetchAvailableAgents(): Promise<AvailableAgent[]> {
   // identical-name rows are indistinguishable in the picker anyway.
   const customByName = new Map<string, ScannedSessionAgent>();
   for (const agent of scanned) {
-    const base = agentBaseName(agent.agentName);
+    // Peel EVERY clone layer, not just one: a fork of a fork is named
+    // `"<builtin> (fork ag_a) (fork ag_b)"`, and a single-layer strip
+    // leaves `"<builtin> (fork ag_a)"` — which is not a built-in name, so
+    // the clone would slip past the shadow check and pollute the picker.
+    const base = agentRootName(agent.agentName);
     if (builtinIds.has(agent.agentId) || builtinNames.has(base)) continue;
     if (!customByName.has(base)) customByName.set(base, agent);
   }

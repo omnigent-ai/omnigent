@@ -46,11 +46,7 @@ let _serverLoginUrl: string | null = null;
  */
 function _isOnLoginPath(): boolean {
   const path = window.location.pathname;
-  return (
-    path === "/login" ||
-    path === "/register" ||
-    path.startsWith("/auth/login")
-  );
+  return path === "/login" || path === "/register" || path.startsWith("/auth/login");
 }
 
 /**

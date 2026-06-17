@@ -12,12 +12,7 @@ const path = require("path");
 module.exports = async function afterPack(context) {
   if (context.electronPlatformName !== "darwin") return;
   const appName = context.packager.appInfo.productFilename;
-  const resourcesDir = path.join(
-    context.appOutDir,
-    `${appName}.app`,
-    "Contents",
-    "Resources",
-  );
+  const resourcesDir = path.join(context.appOutDir, `${appName}.app`, "Contents", "Resources");
   fs.copyFileSync(
     path.join(__dirname, "..", "icons", "Assets.car"),
     path.join(resourcesDir, "Assets.car"),

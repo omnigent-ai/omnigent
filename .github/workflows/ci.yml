@@ -1,24 +1,16 @@
 name: CI
 
-# Runs the unit-test pytest matrix on every non-draft PR and on push
-# to main. Tests are split across directory-based matrix groups
-# (runtime-harnesses / runtime-policies / runtime-core, server-*,
-# inner-terminal / inner-env / inner-tracing / inner-rest, tools,
-# repl-sdk, spec-llms, misc) so slow files don't bottleneck a single
-# runner. The slowest subgroups use ``--dist=worksteal`` to fan tests
-# out within a file. See the `matrix.include` block for the per-group
-# rationale.
-#
-# Triggers:
-#   pull_request    opened / synchronize / reopened / ready_for_review.
-#                   Draft PRs are skipped; the `ready_for_review`
-#                   trigger refires the workflow when the draft is
-#                   converted, so the check doesn't strand pending.
-#   push (main)     post-merge run on the default branch.
+# Unit-test pytest matrix on every non-draft PR and on push to main. Tests are
+# split across directory-based matrix groups (runtime-*, server-*, inner-rest,
+# tools, repl-sdk, spec-llms, misc) so slow files don't bottleneck one runner;
+# the slowest groups use `--dist=worksteal` to fan tests out within a file. The
+# `misc` group is a catch-all so new top-level tests/<dir>/ are picked up
+# automatically. Draft PRs are skipped (ready_for_review re-fires the workflow).
+# A `coverage-report` job combines per-shard coverage for code-coverage.yml.
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
     paths-ignore: ['ap-web/**']
   push:
     branches:
@@ -29,61 +21,41 @@ permissions:
   contents: read
 
 env:
-  # No ap-web SPA build during `uv sync` (setup.py `_build_web_ui`):
-  # this job never serves the bundle, and the hardened runner's npm has
-  # no registry mirror so the build otherwise times out ~10min on public npm.
+  # No ap-web SPA build during `uv sync`; this job never serves the bundle.
   OMNIGENT_SKIP_WEB_UI: "true"
-  # Hardened runners have no outbound network to public PyPI; route
-  # both uv and pip through the Databricks proxy. PIP_INDEX_URL is
-  # only needed if anything in the workflow shells out to pip (e.g.
-  # a pre-commit hook fetched from a remote repo); set both for
-  # parity with `lint.yml` so behaviour stays uniform.
   UV_INDEX_URL: https://pypi.org/simple
   PIP_INDEX_URL: https://pypi.org/simple
 
 concurrency:
-  # PR re-syncs share a group by PR number so old runs cancel.
-  # Non-PR events (push) key by SHA so back-to-back merges to `main`
-  # each get their own run -- needed for per-commit regression
-  # visibility.
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
 jobs:
+  # Security precondition gate (security-gate.yml): untrusted PRs wait for the
+  # scan; trusted authors / non-PR events pass through.
+  gate:
+    uses: ./.github/workflows/security-gate.yml
+
   pytest:
     name: Pytest (${{ matrix.group }})
-    # Skip on draft PRs; the `ready_for_review` trigger above re-fires
-    # the workflow when the draft is converted, so this won't strand
-    # the check pending on the eventual ready-for-review state.
+    needs: gate
     if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
-    # 30 (was 25): headroom for the residual coverage overhead under
-    # sys.monitoring. The heaviest shard (server-rest) ran ~8 min to 98%
-    # before this; sysmon keeps it well under 30.
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Runtime is split into three matrix entries so the heavy
-          # harness/process-manager tests don't bottleneck the whole
-          # group. CPU-time breakdown (sampled from main): test_scaffold
-          # ~107s, test_process_manager ~56s, test_executor_adapter ~49s
-          # (all in ``tests/runtime/harnesses/``); test_workflow ~48s,
-          # test_telemetry ~33s, test_executor ~33s in the top level;
-          # ``tests/runtime/policies/`` totals ~85s across many small
-          # files. ``runtime-harnesses`` uses ``--dist=worksteal`` so
-          # test_scaffold's 15 tests fan out across the 8 workers
-          # instead of pinning one for 107s. No fixture in
-          # ``tests/runtime/`` is module/session-scoped, so
-          # work-stealing is safe.
           - group: runtime-harnesses
             paths: tests/runtime/harnesses
             dist: worksteal
           - group: runtime-policies
             paths: tests/runtime/policies
           - group: runtime-core
-            paths: tests/runtime --ignore=tests/runtime/harnesses --ignore=tests/runtime/policies
+            paths: >-
+              tests/runtime
+              --ignore=tests/runtime/harnesses
+              --ignore=tests/runtime/policies
             dist: worksteal
           - group: inner-rest
             paths: tests/inner
@@ -91,51 +63,46 @@ jobs:
             paths: tests/tools tests/test_errors.py
           - group: repl-sdk
             paths: tests/frontends tests/repl tests/terminals
-          # Server is split into three matrix entries. CPU-time
-          # breakdown (sampled from main, 6/2026): tests/server/
-          # integration totals ~580s, the rest of tests/server ~180s,
-          # tests/onboarding ~5s - one shard serialised the whole
-          # ~765s behind 4 workers. Each subgroup keeps ``-n 4``
-          # because 8 workers contend heavily on the hardened runner
-          # (real workflows + httpx round-trips; #104).
-          #
-          # ``server-approvals`` isolates the elicitation/permission-
-          # hook/policy-gate integration files (~95s): they park real
-          # long-polls on server-side futures and are where the #2860
-          # wedge bites, so a hang there stalls one small job instead
-          # of the whole server shard, and reruns are cheap. Kept on
-          # the default ``loadfile`` to preserve their current
-          # serialised-per-file execution.
+          # Isolates the park-on-future elicitation/permission/policy files so a
+          # wedge there stalls one small job, not the whole server shard.
           - group: server-approvals
-            paths: tests/server/integration/test_sessions_permission_request_hook.py tests/server/integration/test_sessions_elicitation_resolve_url.py tests/server/integration/test_sessions_policy_evaluate.py
+            paths: >-
+              tests/server/integration/test_sessions_permission_request_hook.py
+              tests/server/integration/test_sessions_elicitation_resolve_url.py
+              tests/server/integration/test_sessions_policy_evaluate.py
             workers: "4"
-          # ``server-integration`` runs the rest of tests/server/
-          # integration (~485s). ``--dist=worksteal`` because the
-          # biggest file (``test_sessions_endpoints`` ~160s across 125
-          # tests) would otherwise pin one worker past the shard's
-          # ~120s balanced wall time. All fixtures in
-          # ``tests/server/conftest.py`` are function-scoped, so
-          # work-stealing is safe.
+          # worksteal: the biggest file would otherwise pin one worker past the
+          # shard's balanced wall time. server/conftest fixtures are function-scoped.
           - group: server-integration
-            paths: tests/server/integration --ignore=tests/server/integration/test_sessions_permission_request_hook.py --ignore=tests/server/integration/test_sessions_elicitation_resolve_url.py --ignore=tests/server/integration/test_sessions_policy_evaluate.py
+            paths: >-
+              tests/server/integration
+              --ignore=tests/server/integration/test_sessions_permission_request_hook.py
+              --ignore=tests/server/integration/test_sessions_elicitation_resolve_url.py
+              --ignore=tests/server/integration/test_sessions_policy_evaluate.py
             workers: "4"
             dist: worksteal
-          # ``server-rest`` keeps its historical name (it stays in
-          # merge-ready's REQUIRED list) and covers everything else:
-          # tests/server outside integration/ plus tests/onboarding
-          # (~185s). The old ``--ignore`` of test_routes_agents.py was
-          # dropped - that file was deleted in #1559.
+          # Historical name; stays in merge-ready's REQUIRED list.
           - group: server-rest
             paths: tests/server --ignore=tests/server/integration tests/onboarding
             workers: "4"
           - group: spec-llms
             paths: tests/spec tests/llms
-          # Catch-all: runs everything the other groups don't already
-          # cover, so newly added top-level `tests/<dir>/` directories
-          # are picked up automatically. Sweep into a named group
-          # periodically if this gets slow.
+          # Catch-all so new top-level tests/<dir>/ are covered automatically.
           - group: misc
-            paths: tests --ignore=tests/e2e --ignore=tests/runtime --ignore=tests/inner --ignore=tests/tools --ignore=tests/test_errors.py --ignore=tests/frontends --ignore=tests/repl --ignore=tests/terminals --ignore=tests/server --ignore=tests/onboarding --ignore=tests/spec --ignore=tests/llms
+            paths: >-
+              tests
+              --ignore=tests/e2e
+              --ignore=tests/runtime
+              --ignore=tests/inner
+              --ignore=tests/tools
+              --ignore=tests/test_errors.py
+              --ignore=tests/frontends
+              --ignore=tests/repl
+              --ignore=tests/terminals
+              --ignore=tests/server
+              --ignore=tests/onboarding
+              --ignore=tests/spec
+              --ignore=tests/llms
 
     steps:
       - name: Check out repo
@@ -152,25 +119,9 @@ jobs:
           enable-cache: true
 
       - name: Install ripgrep + bubblewrap
-        # ripgrep: the `Grep` client tool prefers it and only falls
-        # back to `grep -r` when missing. The fallback omits the
-        # filename prefix on single-file searches, which fails
-        # `test_grep_smoke` (it asserts the path is in the output).
-        #
-        # bubblewrap: required by the `linux_bwrap` sandbox backend
-        # introduced in PR #79. Without `bwrap` on PATH, every test
-        # in `tests/inner/test_bwrap_sandbox.py` fails with
-        # `OSError: linux_bwrap sandbox requires the 'bwrap' binary
-        # on PATH`.
-        #
-        # apparmor sysctl: Ubuntu 24.04 ships an apparmor profile that
-        # blocks unprivileged user-namespace creation by default, so
-        # ``bwrap`` (which calls ``unshare(CLONE_NEWUSER)``) fails with
-        # ``setting up uid map: Permission denied`` even after install.
-        # Disabling the restriction at the sysctl level mirrors what
-        # the Ubuntu 22.04 runner image did implicitly. Scope is the
-        # ephemeral CI runner, so the security trade-off is bounded
-        # to the duration of one job.
+        # ripgrep: the Grep tool prefers it. bubblewrap: the linux_bwrap sandbox
+        # needs it. apparmor sysctl: Ubuntu 24.04 blocks unprivileged user
+        # namespaces that bwrap needs; scope is the ephemeral runner.
         run: |
           sudo apt-get update
           sudo apt-get install -y ripgrep bubblewrap
@@ -183,47 +134,31 @@ jobs:
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
 
       - name: Install dependencies
-        # `--extra all` pulls the optional `claude-sdk` + `openai-agents`
-        # extras so unit tests that exercise harness adapters can import
-        # the underlying SDKs. Matches the install set used by `e2e.yml`.
         run: uv sync --extra all --extra dev
 
       - name: Run pytest
-        # The `force-all-tests` PR label bypasses tests/known_failures.yaml
-        # so contributors can verify that quarantined tests still need
-        # to be quarantined. Apply the label and re-run; remove to
-        # restore normal behaviour.
         shell: bash
         env:
+          # force-all-tests label bypasses tests/known_failures.yaml.
           FORCE_ALL_TESTS: ${{ contains(github.event.pull_request.labels.*.name, 'force-all-tests') }}
-          # Dump thread stacks on Python-level crash signals (SIGKILL
-          # is uncatchable, so OOM-kills still leave no trace).
           PYTHONFAULTHANDLER: "1"
-          # Per-worker fsync'd START/END/RSS logs (#426). Uploaded as
-          # artifacts so a wedged worker leaves the last test on disk.
           PYTEST_PROGRESS_LOG_DIR: artifacts/progress
           OMNIGENT_TOKEN_USAGE_JSON: artifacts/tokens-${{ matrix.group }}.json
-          # One coverage data file per shard, uploaded inside artifacts/.
-          # The code-coverage workflow downloads all shards and combines
-          # them. pytest-cov already merges the xdist workers within a shard.
-          COVERAGE_FILE: artifacts/.coverage.${{ matrix.group }}
-          # Use CPython 3.12's sys.monitoring backend. The default C-trace
-          # function adds 2-5x per-line overhead, which pushed the heaviest
-          # shard (server-rest) past its timeout; sysmon cuts that to ~10-20%.
-          # We only collect line coverage (no branch), which sysmon supports.
+          # Outside the repo: coverage.py's transient `.coverage.*` files
+          # under the ro-bound cwd raced the sandbox's dotfile masker. Staged
+          # back into artifacts/ below for the coverage-report job.
+          COVERAGE_FILE: ${{ runner.temp }}/omnigent-coverage/.coverage.${{ matrix.group }}
+          # sysmon: the default C-trace coverage backend pushed the heaviest
+          # shard past its timeout; only line coverage is collected.
           COVERAGE_CORE: sysmon
         run: |
-          mkdir -p artifacts artifacts/progress
+          mkdir -p artifacts artifacts/progress "$(dirname "$COVERAGE_FILE")"
           EXTRA_ARGS=()
           if [[ "$FORCE_ALL_TESTS" == "true" ]]; then
             EXTRA_ARGS=(--no-skip-known)
             echo "::notice::force-all-tests label present; bypassing tests/known_failures.yaml"
           fi
-          # ``matrix.paths`` is intentionally unquoted: it expands to
-          # multiple space-separated tokens (e.g.
-          # ``tests/runtime --ignore=tests/runtime/harnesses``), so
-          # shell word-splitting is the feature. The shellcheck
-          # disable is for that one token only.
+          # matrix.paths is unquoted on purpose: it word-splits into pytest args.
           # shellcheck disable=SC2086
           env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u DATABRICKS_TOKEN \
             uv run pytest ${{ matrix.paths }} \
@@ -236,6 +171,17 @@ jobs:
               "${EXTRA_ARGS[@]}" \
               || { rc=$?; [ "$rc" -eq 5 ] && echo "::notice::No tests collected in this shard; treating as a pass." || exit "$rc"; }
 
+      - name: Stage coverage data for upload
+        if: always()
+        shell: bash
+        run: |
+          cov_file="${{ runner.temp }}/omnigent-coverage/.coverage.${{ matrix.group }}"
+          if [[ -f "$cov_file" ]]; then
+            cp "$cov_file" "artifacts/.coverage.${{ matrix.group }}"
+          else
+            echo "::notice::No coverage data file at $cov_file; nothing to stage."
+          fi
+
       - name: Upload pytest artifacts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
@@ -243,17 +189,13 @@ jobs:
           name: pytest-${{ matrix.group }}-${{ github.run_id }}
           path: artifacts/
           retention-days: 14
-          # The per-shard coverage data file is artifacts/.coverage.<group>
-          # (a dotfile); upload-artifact@v4 omits hidden files by default.
-          include-hidden-files: true
+          include-hidden-files: true  # the per-shard .coverage.<group> dotfile
 
   coverage-report:
     name: Coverage report
-    # Combines the per-shard coverage data into a `coverage-summary` artifact
-    # (total.txt + coverage.xml). This runs in the unprivileged pull_request
-    # context, so checking out + reading the PR's source is safe here; the
-    # privileged status-poster (code-coverage.yml) then only consumes the
-    # artifact and never touches the PR's code. Report-only.
+    # Combines per-shard coverage into a coverage-summary artifact. Runs in the
+    # unprivileged pull_request context (read-only); code-coverage.yml consumes
+    # the artifact and posts the status. Report-only.
     needs: pytest
     if: ${{ !cancelled() && !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
@@ -291,9 +233,7 @@ jobs:
           fi
           echo "Combining ${#files[@]} shard data file(s)."
           coverage combine "${files[@]}"
-          # --ignore-errors: a plain checkout has no files generated during
-          # `uv sync` (e.g. omnigent/_build_info.py); skip those rather than
-          # exit 1 on "No source for code".
+          # --ignore-errors: a plain checkout lacks uv-sync-generated files.
           { echo "## Coverage"; echo; coverage report --format=markdown --ignore-errors; } >> "$GITHUB_STEP_SUMMARY"
           coverage xml -o coverage-summary/coverage.xml --ignore-errors
           coverage report --format=total --ignore-errors > coverage-summary/total.txt

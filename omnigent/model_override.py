@@ -26,7 +26,7 @@ _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]*$")
 # SDK harnesses whose model override lands in the spawn env — must stay
 # in sync with ``_HARNESS_MODEL_ENV_KEY`` in ``omnigent/runner/app.py``.
 _SDK_MODEL_OVERRIDE_HARNESSES: frozenset[str] = frozenset(
-    {"claude-sdk", "codex", "pi", "openai-agents"}
+    {"claude-sdk", "codex", "pi", "openai-agents", "cursor", "antigravity"}
 )
 
 
@@ -70,6 +70,22 @@ _CLAUDE_FAMILY_HARNESSES: frozenset[str] = frozenset(
 # tool-calling turn on the gateway over the chat wire, so the harness is
 # multi-model like pi and accepts any validated id (no family rejection).
 _CODEX_FAMILY_HARNESSES: frozenset[str] = frozenset({"codex", "codex-native", "native-codex"})
+# antigravity is Gemini-native: it authenticates a direct Gemini API key /
+# Vertex AI and has no Databricks/gateway path (see _build_antigravity_spawn_env
+# in omnigent/runtime/workflow.py). So unlike the single-vendor harnesses above,
+# the rule here is framed as a *reject-list* of the families it definitively
+# cannot serve (Claude / GPT, and any ``databricks-``-prefixed gateway id),
+# rather than a strict Gemini allow-list — bare/ambiguous ids (e.g. a future
+# ``gemini-pro`` alias the SDK accepts) still pass through to the Gemini-native
+# SDK path. Mirrors how the cross-family rejection above fails loud at the
+# dispatch gate instead of leaking a ``HARNESS_ANTIGRAVITY_MODEL`` the SDK can
+# never route.
+_ANTIGRAVITY_FAMILY_HARNESSES: frozenset[str] = frozenset(
+    {"antigravity", "agy", "google-antigravity"}
+)
+# A ``databricks-`` gateway prefix marks an id bound to the Databricks gateway,
+# which antigravity never reaches — a definitive mismatch on its own.
+_DATABRICKS_GATEWAY_PREFIX = "databricks-"
 
 
 def model_family_mismatch(harness: str, model: str) -> str | None:
@@ -81,6 +97,9 @@ def model_family_mismatch(harness: str, model: str) -> str | None:
     ``"codex"`` (``databricks-gpt-5-4``). Single-vendor harnesses reject
     the other family and ids whose family cannot be determined — failing
     loud at dispatch beats an opaque harness/gateway error after spawn.
+    The Gemini-native ``antigravity`` harness rejects the Claude/GPT
+    families and any ``databricks-`` gateway id (it has no gateway path),
+    but accepts Gemini shapes and bare/ambiguous ids the SDK may honor.
     Multi-model harnesses (pi, openai-agents) accept any validated id.
 
     :param harness: Harness id from the sub-agent spec, alias or
@@ -105,6 +124,15 @@ def model_family_mismatch(harness: str, model: str) -> str | None:
             f"or 'codex'); got {model!r}. Use the claude_code worker for "
             "Claude models or the pi / openai-agents worker for any other "
             "gateway model."
+        )
+    if canon in _ANTIGRAVITY_FAMILY_HARNESSES and (
+        is_claude or is_gpt or lower.startswith(_DATABRICKS_GATEWAY_PREFIX)
+    ):
+        return (
+            f"harness {canon!r} is Gemini-native and cannot run Claude/GPT or "
+            f"Databricks-gateway models; got {model!r}. Use a Gemini id "
+            "(e.g. 'gemini-3.5-flash'), or the claude_code / codex / pi worker "
+            "for those families."
         )
     return None
 

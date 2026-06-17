@@ -2,9 +2,9 @@
 # The e2e + e2e-ui suites also gate PRs, but only run with secrets on same-repo
 # PRs (maintainer branches); fork PRs cannot read the LLM_API_KEY /
 # GATEWAY_BASE_URL secrets, so their e2e jobs skip via a workflow fork guard.
-# The e2e check names are therefore in BOTH REQUIRED (a same-repo PR must pass
-# them) and ALLOW_SKIP (a fork PR's skipped check still satisfies the gate). The
-# integration suite runs on schedule/dispatch only and is intentionally absent.
+# The e2e and integration check names are therefore in BOTH REQUIRED (a
+# same-repo PR must pass them) and ALLOW_SKIP (a fork PR's skipped check still
+# satisfies the gate).
 # Generated file -- do not hand-edit; it is replaced wholesale on every sync.
 
 REQUIRED=(
@@ -29,6 +29,9 @@ REQUIRED=(
   "E2E UI Tests (shard 0/3)"
   "E2E UI Tests (shard 1/3)"
   "E2E UI Tests (shard 2/3)"
+  "Integration (claude-sdk)"
+  "Integration (openai-agents)"
+  "Integration (codex)"
 )
 
 ALLOW_SKIP=(
@@ -52,6 +55,9 @@ ALLOW_SKIP=(
   "E2E UI Tests (shard 0/3)"
   "E2E UI Tests (shard 1/3)"
   "E2E UI Tests (shard 2/3)"
+  "Integration (claude-sdk)"
+  "Integration (openai-agents)"
+  "Integration (codex)"
 )
 
 is_allow_skip() { printf '%s\n' "${ALLOW_SKIP[@]}" | grep -qxF "$1"; }
@@ -65,6 +71,7 @@ workflow_for() {
     "Pytest ("*)             echo "CI" ;;
     "E2E Tests (shard "*)    echo "E2E Tests" ;;
     "E2E UI Tests (shard "*) echo "E2E UI Tests" ;;
+    "Integration ("*)        echo "Integration Tests" ;;
     *)                       echo "" ;;
   esac
 }
