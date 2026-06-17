@@ -1,0 +1,73 @@
+name: Copilot Review Request
+
+# Requests a GitHub Copilot code review on EXTERNAL CONTRIBUTOR (fork) PRs, but
+# only AFTER the security scan has passed. Same-repo (collaborator) PRs are left
+# to the repo's default Copilot behaviour and are not handled here.
+#
+# Why a workflow instead of the native "automatic Copilot review" ruleset:
+# rulesets can target only branch/repo patterns -- they cannot scope to fork
+# PRs or wait for a status check. We need both (fork-only, post-scan), so the
+# request is driven from CI.
+#
+# Trigger is `pull_request_target` so the job gets a read-WRITE token even for
+# fork PRs (a fork's `pull_request` token is read-only and can't add a
+# reviewer). Safe because this workflow checks out NO code and runs NO PR code
+# -- it only calls the API to add Copilot as a requested reviewer. The security
+# scan still gates it via the reusable Security Gate (`needs: gate`).
+#
+# Copilot review itself runs on GitHub's infrastructure (off our runners, with
+# no access to our secrets) and is ADVISORY -- it never gates merge.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: copilot-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # Security precondition (security-gate.yml): an untrusted fork PR waits for the
+  # `Security Scan` check to pass before we ask Copilot to review. Only forks
+  # reach here; same-repo PRs are handled by the default Copilot config.
+  gate:
+    if: >-
+      github.event.pull_request.head.repo.fork
+      && !github.event.pull_request.draft
+    uses: ./.github/workflows/security-gate.yml
+
+  request:
+    name: Request Copilot review
+    needs: gate
+    # `!cancelled()` lets the job evaluate even when `gate` is skipped (non-fork
+    # PRs), but the fork/draft guards below still keep it to post-scan forks.
+    if: >-
+      !cancelled()
+      && needs.gate.result == 'success'
+      && github.event.pull_request.head.repo.fork
+      && !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write   # add Copilot as a requested reviewer
+    steps:
+      - name: Request Copilot review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          echo "Using $(gh --version | head -1)"
+          # Officially supported path (gh >= 2.88): add @copilot as a reviewer.
+          # Advisory feature -- if Copilot code review isn't enabled on the org
+          # plan, or the token can't add it, warn but DON'T fail: this is not a
+          # required check and must never break CI.
+          if gh pr edit "$PR" --repo "$REPO" --add-reviewer "@copilot"; then
+            echo "Requested Copilot review on PR #$PR"
+          else
+            echo "::warning::Could not request Copilot review on PR #$PR -- verify Copilot code review is enabled for the org and that the token can request it (may require gh >= 2.88)."
+          fi
