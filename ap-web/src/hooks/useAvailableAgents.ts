@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
-import { agentBaseName } from "@/lib/forkHarness";
+import { agentRootName } from "@/lib/forkHarness";
 import { capitalizeAgentName } from "@/lib/agentLabels";
 import {
   nativeCodingAgentForAgentName,
@@ -168,8 +168,10 @@ async function enrichSessionAgent(scanned: ScannedSessionAgent): Promise<Availab
  *
  * Session-discovered agents that shadow a built-in are dropped: by id
  * (most sessions bind a built-in's agent row directly) and by clone
- * base name (fork/switch create per-session rows named
- * `"<builtin> (fork <id>)"`). What survives is genuinely custom —
+ * ROOT name (fork/switch create per-session rows named
+ * `"<builtin> (fork <id>)"`, and a fork of a fork nests them —
+ * `agentRootName` peels every layer so multi-fork clones still match).
+ * What survives is genuinely custom —
  * ad-hoc uploaded agents that were previously invisible to the picker.
  * Surviving custom agents are then collapsed by base name, keeping the
  * newest session's row: a custom agent launched repeatedly from a local
@@ -195,7 +197,11 @@ async function fetchAvailableAgents(): Promise<AvailableAgent[]> {
   // identical-name rows are indistinguishable in the picker anyway.
   const customByName = new Map<string, ScannedSessionAgent>();
   for (const agent of scanned) {
-    const base = agentBaseName(agent.agentName);
+    // Peel EVERY clone layer, not just one: a fork of a fork is named
+    // `"<builtin> (fork ag_a) (fork ag_b)"`, and a single-layer strip
+    // leaves `"<builtin> (fork ag_a)"` — which is not a built-in name, so
+    // the clone would slip past the shadow check and pollute the picker.
+    const base = agentRootName(agent.agentName);
     if (builtinIds.has(agent.agentId) || builtinNames.has(base)) continue;
     if (!customByName.has(base)) customByName.set(base, agent);
   }

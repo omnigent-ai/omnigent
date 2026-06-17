@@ -12,12 +12,16 @@ from pathlib import Path
 import pytest
 import yaml
 
+from omnigent.onboarding import antigravity_auth
 from omnigent.onboarding import secrets as secret_store
 from omnigent.onboarding.antigravity_auth import (
     ANTIGRAVITY_SECRET_NAME,
     antigravity_api_key_configured,
     antigravity_api_key_ref,
     antigravity_api_key_settings,
+    antigravity_install_command,
+    antigravity_sdk_installed,
+    install_antigravity_sdk,
     looks_like_gemini_api_key,
     resolve_antigravity_api_key,
 )
@@ -103,3 +107,102 @@ def test_settings_shape() -> None:
     assert antigravity_api_key_settings("keychain:antigravity") == {
         "antigravity": {"api_key_ref": "keychain:antigravity"}
     }
+
+
+# ── SDK-extra detection + install (the optional ``antigravity`` extra) ────────
+
+
+def test_antigravity_sdk_installed_true_when_spec_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Detection returns True when ``find_spec`` resolves ``google.antigravity``."""
+    monkeypatch.setattr(
+        antigravity_auth.importlib.util,
+        "find_spec",
+        lambda name: object(),
+    )
+    assert antigravity_sdk_installed() is True
+
+
+def test_antigravity_sdk_installed_false_when_spec_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Detection returns False when ``find_spec`` returns ``None`` (extra absent)."""
+    monkeypatch.setattr(antigravity_auth.importlib.util, "find_spec", lambda name: None)
+    assert antigravity_sdk_installed() is False
+
+
+def test_antigravity_sdk_installed_false_when_namespace_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``ModuleNotFoundError`` (no ``google`` parent namespace) reads as False.
+
+    ``find_spec`` *raises* (not ``None``) when the parent namespace is absent; the guard
+    must swallow that and report not-installed rather than crash setup.
+    """
+
+    def _raise(name: str) -> object:
+        raise ModuleNotFoundError("No module named 'google'")
+
+    monkeypatch.setattr(antigravity_auth.importlib.util, "find_spec", _raise)
+    assert antigravity_sdk_installed() is False
+
+
+def test_antigravity_install_command_prefers_uv(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With ``uv`` on PATH, the install runs ``uv pip install`` — no index URL."""
+    monkeypatch.setattr(antigravity_auth.shutil, "which", lambda name: "/usr/bin/uv")
+    cmd = antigravity_install_command()
+    assert cmd == ["uv", "pip", "install", "omnigent[antigravity]"]
+    # No hardcoded index / proxy leaks into committed code.
+    assert not any("index" in part or "://" in part for part in cmd)
+
+
+def test_antigravity_install_command_falls_back_to_pip(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without ``uv``, it falls back to this interpreter's pip — still no index."""
+    monkeypatch.setattr(antigravity_auth.shutil, "which", lambda name: None)
+    cmd = antigravity_install_command()
+    assert cmd == [
+        antigravity_auth.sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "omnigent[antigravity]",
+    ]
+    assert not any("index" in part or "://" in part for part in cmd)
+
+
+def test_install_antigravity_sdk_runs_command_then_rechecks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shells the install argv, then reports the post-install detection verdict.
+
+    The mocked SDK "appears" only after the install runs, so the function must re-check
+    and return True.
+    """
+    import subprocess
+
+    calls: list[list[str]] = []
+    state = {"installed": False}
+
+    def _run(argv: list[str], *, check: bool = False, timeout: float | None = None):
+        calls.append(argv)
+        state["installed"] = True
+        return subprocess.CompletedProcess(args=argv, returncode=0)
+
+    monkeypatch.setattr(antigravity_auth.shutil, "which", lambda name: None)
+    monkeypatch.setattr(antigravity_auth.subprocess, "run", _run)
+    monkeypatch.setattr(antigravity_auth, "antigravity_sdk_installed", lambda: state["installed"])
+
+    assert install_antigravity_sdk() is True
+    assert calls == [
+        [antigravity_auth.sys.executable, "-m", "pip", "install", "omnigent[antigravity]"]
+    ]
+
+
+def test_install_antigravity_sdk_false_on_spawn_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A subprocess that can't spawn (OSError) is caught and reported as False."""
+
+    def _boom(*args: object, **kwargs: object) -> object:
+        raise OSError("no pip")
+
+    monkeypatch.setattr(antigravity_auth.shutil, "which", lambda name: None)
+    monkeypatch.setattr(antigravity_auth.subprocess, "run", _boom)
+    assert install_antigravity_sdk() is False

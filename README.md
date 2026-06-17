@@ -105,8 +105,9 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
   sandbox and needs nothing extra.
 - **Databricks** (optional). To use a Databricks workspace as your model
   provider, install Omnigent with the `databricks` extra:
-  `uv tool install "omnigent[databricks]"`. Signing in to the workspace also
-  uses the [Databricks CLI](https://docs.databricks.com/aws/en/dev-tools/cli/install).
+  `uv tool install "omnigent[databricks]"` — or pass it to the bootstrap
+  installer with `... | sh -s -- --extra databricks`. Signing in to the
+  workspace also uses the [Databricks CLI](https://docs.databricks.com/aws/en/dev-tools/cli/install).
 
 </details>
 

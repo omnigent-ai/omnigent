@@ -730,12 +730,12 @@ def _databricks_codex_config_overrides(
     provider_name = "omnigent_databricks"
     auth_command_json = json.dumps(auth_command)
     return [
-        f'model="{model}"',
+        f"model={json.dumps(model)}",
         f'model_provider="{provider_name}"',
         (
             "model_providers.omnigent_databricks="
             '{name="Omnigent Databricks",'
-            f'base_url="{base_url}",'
+            f"base_url={json.dumps(base_url)},"
             'auth={command="sh",'
             f'args=["-c",{auth_command_json}],'
             "timeout_ms=5000,"
@@ -791,12 +791,12 @@ def _provider_codex_config_overrides(
     effective_wire_api = "responses" if wire_api == "chat" else wire_api
     overrides: list[str] = []
     if model:
-        overrides.append(f'model="{model}"')
+        overrides.append(f"model={json.dumps(model)}")
     overrides.append(f'model_provider="{provider_name}"')
     overrides.append(
         f"model_providers.{provider_name}="
         '{name="Omnigent Provider",'
-        f'base_url="{base_url}",'
+        f"base_url={json.dumps(base_url)},"
         'auth={command="sh",'
         f'args=["-c",{auth_command_json}],'
         "timeout_ms=5000,"
