@@ -1,0 +1,127 @@
+name: Rerun Security Gate Run
+
+# Privileged half of the gate re-run relay (stage 1 is rerun-security-gate.yml).
+# Triggered by the completion of that workflow, this runs from the base repo on
+# `workflow_run`, so it gets a writable token (`actions: write`) even for fork
+# PRs and is not held behind the fork-approval gate. It reads the recorded PR
+# number, resolves the PR's CURRENT head SHA, and re-runs every gate-bearing
+# workflow whose latest run for that SHA is a completed failure whose
+# `Security Gate` job failed -- so a workflow that already self-triggered on the
+# label (ci/e2e trigger on `labeled` for force-all-tests etc.) is in-progress or
+# green and skipped, avoiding a double-run. fork-e2e-mirror is excluded: it is
+# e2e-approved-driven mirror plumbing with branch side effects, not a
+# gate-mirroring check.
+#
+# The triggering run may have been initiated by an untrusted fork PR, so the
+# recorded artifact is treated as untrusted input (the PR number is GitHub-
+# provided, but it is still sanitised to digits). No PR code is checked out.
+# https://securitylab.github.com/research/github-actions-preventing-pwn-requests/
+
+on:
+  workflow_run:
+    workflows: [Rerun Security Gate]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rerun-security-gate-run-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  rerun:
+    name: Rerun Security Gate
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write        # gh run rerun + read workflow runs/artifacts
+      pull-requests: read   # resolve the PR head SHA
+    steps:
+      - name: Download recorded PR number
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const arts = await github.rest.actions.listWorkflowRunArtifacts({
+              owner, repo, run_id: context.payload.workflow_run.id,
+            });
+            const art = arts.data.artifacts.find(a => a.name === 'rerun-security-gate-pr-number');
+            if (!art) {
+              core.info('No PR-number artifact on the triggering run; nothing to do.');
+              return;
+            }
+            const dl = await github.rest.actions.downloadArtifact({
+              owner, repo, artifact_id: art.id, archive_format: 'zip',
+            });
+            fs.writeFileSync(`${process.env.GITHUB_WORKSPACE}/pr_number.zip`, Buffer.from(dl.data));
+
+      - name: Unzip
+        run: unzip -o pr_number.zip || true
+
+      - name: Re-run failed Security Gate runs for the PR head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ ! -f pr_number ]; then
+            echo "No pr_number file; nothing to do."; exit 0
+          fi
+          # Sanitise to digits: the artifact comes from a possibly fork-triggered
+          # run, so never interpolate it raw into an API path.
+          PR_NUMBER="$(tr -dc '0-9' < pr_number)"
+          [ -n "$PR_NUMBER" ] || { echo "Empty PR number; nothing to do."; exit 0; }
+
+          # Resolve the PR's CURRENT head SHA -- more robust than a recorded SHA
+          # that a later push could have superseded.
+          SHA="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha')"
+          echo "PR #$PR_NUMBER head $SHA"
+
+          # Every workflow whose first job is the reusable Security Gate. We
+          # re-run one only when its LATEST run for this SHA is a completed
+          # gate-failure (below), so a workflow that already re-ran via its own
+          # `labeled` trigger is in-progress/green and skipped -- no double-run.
+          WORKFLOWS=(
+            "Lint" "CI" "E2E Tests" "E2E UI Tests" "Integration Tests"
+            "ap-web Tests" "Copilot Review Request" "Polly AI Review"
+          )
+
+          for wf in "${WORKFLOWS[@]}"; do
+            # Reset per iteration: `read` leaves these UNTOUCHED on EOF (a
+            # workflow with no run for this SHA -- e.g. path-filtered ap-web
+            # Tests), which would otherwise carry over the previous workflow's
+            # run id/conclusion and re-run the wrong run.
+            id=""; conclusion=""
+            # Latest run of this workflow for the PR head SHA.
+            read -r id conclusion < <(
+              gh api "repos/$REPO/actions/runs?head_sha=$SHA&per_page=100" --paginate \
+                --jq "[.workflow_runs[] | select(.name==\"$wf\")]
+                      | sort_by(.created_at) | last
+                      | if . == null then empty else \"\(.id) \(.conclusion // \"pending\")\" end"
+            ) || true
+
+            if [ -z "${id:-}" ]; then
+              echo "• $wf: no run for $SHA -- nothing to re-run"; continue
+            fi
+            if [ "$conclusion" != "failure" ]; then
+              echo "• $wf: latest run $id is '$conclusion' -- skipping"; continue
+            fi
+
+            # Re-run only when the Security Gate job itself failed, so we don't
+            # pointlessly replay a genuine (non-gate) job failure. A full
+            # `gh run rerun` (not --failed) is intentional: the gated jobs were
+            # SKIPPED, not failed, so --failed would not re-trigger them.
+            gate_failed=$(
+              gh api "repos/$REPO/actions/runs/$id/jobs" --paginate \
+                --jq '[.jobs[] | select(.name | test("Security Gate")) | select(.conclusion == "failure")] | length'
+            )
+            if [ "${gate_failed:-0}" -gt 0 ]; then
+              echo "• $wf: Security Gate failed in run $id -- re-running"
+              gh run rerun "$id" || echo "::warning::$wf: could not re-run $id"
+            else
+              echo "• $wf: run $id failed but not at the Security Gate -- skipping"
+            fi
+          done

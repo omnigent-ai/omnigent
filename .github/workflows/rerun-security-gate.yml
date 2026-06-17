@@ -1,37 +1,23 @@
 name: Rerun Security Gate
 
-# Re-runs the per-workflow `Security Gate` poller (and the jobs that depend on
-# it) when a skip-security-scan waiver could have changed verdict -- WITHOUT
-# re-running on unrelated labels and without touching the host workflows'
-# triggers.
+# Stage 1 of a two-stage relay (the privileged half is rerun-security-gate-run.yml).
 #
-# Why this exists: the gate poller (security-gate.yml) only re-evaluates when
-# its host workflow runs, and most host workflows neither do nor should
-# re-trigger on label/review changes (that would re-run their full job set on
-# every label). GitHub can't filter a `labeled` trigger to one label name, and
-# guarding the gate job by name would SKIP the required `Pre-commit checks`
-# (Lint) on unrelated labels and re-block Merge Ready. So instead this tiny
-# workflow fires on the label, guards on the label NAME here, and re-runs the
-# already-failed gate runs via the API. It targets EVERY gate-bearing workflow,
-# but re-runs one ONLY when its latest run for the head SHA is a completed
-# failure whose gate job failed. So a workflow that already self-triggered on
-# the label (ci/e2e/e2e-ui/integration trigger on `labeled` for force-all-tests
-# etc.) is seen in-progress or green and skipped here -- no double-run -- while
-# the review case (nothing else self-triggers on review) and the label-only
-# workflows (Lint/ap-web/Copilot/Polly) are still covered.
+# When a skip-security-scan waiver could change verdict -- the label is added or
+# removed, or a review is submitted/dismissed -- the per-workflow `Security Gate`
+# pollers must re-run so they re-mirror the (now-flipped) single `Security Scan`
+# check. Re-running another workflow needs `actions: write`, but on a FORK PR the
+# `pull_request_review` token is read-only and held behind the fork-approval gate,
+# so it cannot re-run anything itself (see maintainer-approval-rerun.yml, which
+# solves the identical problem the same way). So this stage only RECORDS the PR
+# number as an artifact (read-only, works on forks); the privileged re-run runs in
+# rerun-security-gate-run.yml on `workflow_run`, which gets a writable token even
+# for forks and is not held behind the fork-approval gate.
+# https://securitylab.github.com/research/github-actions-preventing-pwn-requests/
 #
 # Triggers (the two halves of the maintainer waiver):
 #   - skip-security-scan labeled/unlabeled  -> the label half changed
 #   - a review submitted/dismissed          -> the approval half changed
-# Other labels are ignored by the job `if:` below.
-#
-# Security: uses pull_request_target so the token can carry actions:write even
-# for fork PRs (a fork's pull_request token is read-only). Safe because it
-# checks out NO code and runs NO PR code -- it only calls `gh run rerun`. A
-# re-run replays the ORIGINAL (untrusted) run, whose gate re-derives trust from
-# `main`, so nothing is escalated. Triggering requires applying the label
-# (needs triage access) or a review, neither of which a fork author can use to
-# self-waive.
+# Other labels are ignored by the job `if:` below (stage 2 then no-ops).
 
 on:
   pull_request_target:
@@ -40,80 +26,38 @@ on:
     types: [submitted, dismissed]
 
 permissions:
-  actions: write   # gh run rerun
   contents: read
 
 concurrency:
-  # NOT cancel-in-progress: this workflow fires on EVERY label, so an unrelated
-  # label spins a run that enters this group; cancelling an in-flight
-  # coordination mid-loop would leave it partial. The coordinator is idempotent
-  # (it re-checks each run's state), so overlapping runs are safe to complete.
+  # NOT cancel-in-progress: this fires on EVERY label, so an unrelated label
+  # spins a run that enters this group; cancelling an in-flight record would
+  # drop a legitimate trigger. Recording is cheap and idempotent.
   group: rerun-security-gate-${{ github.event.pull_request.number }}
   cancel-in-progress: false
 
 jobs:
-  rerun:
-    name: Rerun Security Gate
+  record:
+    name: Record PR for gate re-run
     # Only when the waiver state could have changed: the skip-security-scan
     # label was added/removed, or a review was submitted/dismissed. Any other
-    # label is ignored, so unrelated labels never re-run anything.
+    # label is ignored, so unrelated labels record nothing and stage 2 no-ops.
     if: >-
       github.event_name == 'pull_request_review' ||
       github.event.label.name == 'skip-security-scan'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
     steps:
-      - name: Re-run failed Security Gate runs for the PR head
+      - name: Record PR number
         env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          set -euo pipefail
-          # Every workflow whose first job is the reusable Security Gate. We
-          # re-run one only when its LATEST run for this SHA is a completed
-          # gate-failure (below), so a workflow that already re-ran via its own
-          # `labeled` trigger is in-progress/green and skipped -- no double-run.
-          # (Lint's `Pre-commit checks` is the only merge-blocker; the rest keep
-          # their gate consistent.) fork-e2e-mirror is excluded: it is
-          # e2e-approved-driven mirror plumbing with branch side effects, not a
-          # gate-mirroring check.
-          WORKFLOWS=(
-            "Lint" "CI" "E2E Tests" "E2E UI Tests" "Integration Tests"
-            "ap-web Tests" "Copilot Review Request" "Polly AI Review"
-          )
-
-          for wf in "${WORKFLOWS[@]}"; do
-            # Reset per iteration: `read` leaves these UNTOUCHED on EOF (a
-            # workflow with no run for this SHA -- e.g. path-filtered ap-web
-            # Tests), which would otherwise carry over the previous workflow's
-            # run id/conclusion and re-run the wrong run.
-            id=""; conclusion=""
-            # Latest run of this workflow for the PR head SHA.
-            read -r id conclusion < <(
-              gh api "repos/$REPO/actions/runs?head_sha=$SHA&per_page=100" --paginate \
-                --jq "[.workflow_runs[] | select(.name==\"$wf\")]
-                      | sort_by(.created_at) | last
-                      | if . == null then empty else \"\(.id) \(.conclusion // \"pending\")\" end"
-            ) || true
-
-            if [ -z "${id:-}" ]; then
-              echo "• $wf: no run for $SHA -- nothing to re-run"; continue
-            fi
-            if [ "$conclusion" != "failure" ]; then
-              echo "• $wf: latest run $id is '$conclusion' -- skipping"; continue
-            fi
-
-            # Re-run only when the Security Gate job itself failed, so we don't
-            # pointlessly replay a genuine (non-gate) job failure.
-            gate_failed=$(
-              gh api "repos/$REPO/actions/runs/$id/jobs" --paginate \
-                --jq '[.jobs[] | select(.name | test("Security Gate")) | select(.conclusion == "failure")] | length'
-            )
-            if [ "${gate_failed:-0}" -gt 0 ]; then
-              echo "• $wf: Security Gate failed in run $id -- re-running"
-              gh run rerun "$id" || echo "::warning::$wf: could not re-run $id"
-            else
-              echo "• $wf: run $id failed but not at the Security Gate -- skipping"
-            fi
-          done
+          mkdir -p pr
+          echo "$PR_NUMBER" > pr/pr_number
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: rerun-security-gate-pr-number
+          path: pr/
+          retention-days: 1
+          if-no-files-found: error
