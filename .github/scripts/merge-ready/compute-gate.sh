@@ -12,7 +12,7 @@
 #   success  | success  | CI green on its own merits
 #   failure  | failure  | CI red
 #
-# Env in: EVAL, FAILED
+# Env in: EVAL, FAILED, FORK_NEEDS_E2E_LABEL (optional, default false)
 # Out:    state, short_desc, long_desc on $GITHUB_OUTPUT
 
 set -euo pipefail
@@ -25,6 +25,16 @@ else
   STATE=failure
   SHORT="Required checks not all green"
   LONG=$':hourglass: gate not green yet. Required checks not satisfied:\n\n'"$FAILED"$'\nThe merge will fire once these turn green.'
+fi
+
+# Fork PRs never run e2e on their own: the fork `pull_request` run resolves to
+# an empty shard matrix, so the suite only runs once a maintainer applies the
+# `e2e-approved` label (which mirrors the head to a trusted fork-e2e/** branch).
+# Without it the e2e checks are satisfied-via-skip and the PR can go green with
+# e2e never having executed -- so nudge a maintainer to apply the label. Appended
+# to the comment only (long_desc); short_desc is the 140-char commit status.
+if [[ "${FORK_NEEDS_E2E_LABEL:-false}" == "true" ]]; then
+  LONG="$LONG"$'\n\n:information_source: e2e tests do not run automatically on fork PRs. A maintainer can apply the `e2e-approved` label to run the full e2e suite against this PR.'
 fi
 
 # GitHub commit-status descriptions max out at 140 chars.
