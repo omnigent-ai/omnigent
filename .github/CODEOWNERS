@@ -19,12 +19,14 @@
 # whose only touches were sweeps have no entry and fall through to the default.
 # Worth a final human sanity-check.
 #
-# DEFAULT / round-robin: there is intentionally no `*` owner here. PRs that
-# match none of the rules below are routed by a repo-level GitHub Action
-# (.github/workflows/auto-assign-reviewer.yml), which load-balances one
-# reviewer from the pool of handles listed in THIS file. That avoids needing
-# an org team (and org-owner setup) for native round-robin, and it naturally
-# excludes maintainers who aren't assigned to any area here.
+# ASSIGNMENT: there is intentionally no `*` owner here. A repo-level GitHub
+# Action (.github/workflows/auto-assign-reviewer.yml) assigns EXACTLY 2
+# load-balanced reviewers per PR, preferring the owners listed below for the
+# area(s) the PR touches (falling back to the full set of handles in this file
+# for unowned paths). It reconciles GitHub's native CODEOWNERS request (which
+# would otherwise ping every owner) down to those 2. So the per-area lists
+# below are the CANDIDATE pool per area, not "everyone gets requested".
+# Maintainers not listed anywhere here are never put into review rotation.
 
 # Repo automation / CI
 /.github/                    @PattaraS @serena-ruan @dhruv0811 @TomeHirata

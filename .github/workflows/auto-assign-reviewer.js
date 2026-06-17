@@ -1,94 +1,132 @@
-// Repo-level round-robin reviewer assignment (no org team needed).
+// Repo-level reviewer assignment: assign EXACTLY 2 load-balanced reviewers per
+// PR, preferring the owners of the area(s) the PR touches.
 //
-// Acts as the "default" owner for PRs that CODEOWNERS did NOT already route:
-// if a PR has no requested reviewer, assign one maintainer from a load-balanced
-// pool. The pool is derived FROM .github/CODEOWNERS at runtime -- the union of
-// per-area owner handles -- so maintainers who aren't assigned anywhere in
-// CODEOWNERS are intentionally excluded from review rotation.
+// Ownership comes from .github/CODEOWNERS (read at runtime), but GitHub's native
+// CODEOWNERS auto-request would request ALL area owners -- we want only 2,
+// balanced -- so this action reconciles the request list down to its 2 picks.
+// The candidate pool is the union of CODEOWNERS owners for the PR's changed
+// files; if the PR touches no owned path, it falls back to the full CODEOWNERS
+// pool. Maintainers not listed anywhere in CODEOWNERS are never in rotation.
 //
-// Fairness is stateless: we pick the candidate with the fewest CURRENTLY open
-// review requests (random tie-break), so load self-balances without a tracking
-// file/issue.
+// "Balance in general": picks are the candidates with the fewest CURRENTLY open
+// review requests across the repo (random tie-break) -- stateless fairness.
 //
-// Invoked from auto-assign-reviewer.yml via actions/github-script.
+// Only handles drawn from CODEOWNERS are ever removed, so a manually-added
+// reviewer outside that set is left untouched.
 module.exports = async ({ github, context, core }) => {
   const fs = require("fs");
+  const TARGET = 2;
   const { owner, repo } = context.repo;
   const pr = context.payload.pull_request;
-  if (!pr) {
-    core.info("No pull_request in payload; nothing to do.");
+  if (!pr || pr.draft) {
+    core.info("No PR or draft; nothing to do.");
     return;
   }
-  if (pr.draft) {
-    core.info("Draft PR; skipping.");
-    return;
-  }
+  const author = (pr.user && pr.user.login ? pr.user.login : "").toLowerCase();
 
-  // Don't pile on: if CODEOWNERS (or anyone) already requested a reviewer/team,
-  // this default rotation stays out of the way.
-  const already =
-    (pr.requested_reviewers || []).length + (pr.requested_teams || []).length;
-  if (already > 0) {
-    core.info(`PR already has ${already} requested reviewer(s)/team(s); skipping default rotation.`);
-    return;
-  }
-
-  // Build the pool from CODEOWNERS: handles on path rules only, excluding
-  // org/team handles (which contain a "/") and the PR author.
+  // --- Parse CODEOWNERS into ordered (prefix -> owners) rules + the full pool.
   const text = fs.readFileSync(".github/CODEOWNERS", "utf8");
-  const pool = []; // original-case logins, de-duped
-  const seen = new Set();
+  const rules = []; // { prefix, owners: [logins] }  (path rules only)
+  const poolSet = new Map(); // lc -> original-case
   for (const raw of text.split("\n")) {
     const line = raw.trim();
-    if (!line.startsWith("/")) continue; // skip comments, blanks, and the `*` line
-    for (const tok of line.split(/\s+/).slice(1)) {
-      if (tok.startsWith("@") && !tok.includes("/")) {
-        const login = tok.slice(1);
-        const key = login.toLowerCase();
-        if (!seen.has(key)) {
-          seen.add(key);
-          pool.push(login);
-        }
-      }
-    }
+    if (!line.startsWith("/")) continue;
+    const [pat, ...toks] = line.split(/\s+/);
+    const owners = toks
+      .filter((t) => t.startsWith("@") && !t.includes("/"))
+      .map((t) => t.slice(1));
+    owners.forEach((o) => poolSet.set(o.toLowerCase(), o));
+    // `/dir/` -> match files under `dir/`
+    rules.push({ prefix: pat.replace(/^\//, ""), owners });
+  }
+  const managed = new Set([...poolSet.keys()]); // everyone CODEOWNERS can manage
+
+  // --- Owners of the area(s) this PR touches (last matching rule wins per file).
+  const files = await github.paginate(github.rest.pulls.listFiles, {
+    owner,
+    repo,
+    pull_number: pr.number,
+    per_page: 100,
+  });
+  const areaOwners = new Map(); // lc -> original
+  for (const f of files) {
+    let match = null;
+    for (const r of rules) if (f.filename.startsWith(r.prefix)) match = r; // last wins
+    if (match) match.owners.forEach((o) => areaOwners.set(o.toLowerCase(), o));
   }
 
-  const author = (pr.user && pr.user.login ? pr.user.login : "").toLowerCase();
-  const candidates = pool.filter((u) => u.toLowerCase() !== author);
+  // Candidates: area owners, else the full pool. Never the author.
+  let candidates = [...(areaOwners.size ? areaOwners : poolSet).values()].filter(
+    (u) => u.toLowerCase() !== author
+  );
   if (candidates.length === 0) {
-    core.info("No eligible candidates in the CODEOWNERS pool; skipping.");
+    core.info("No eligible candidates; nothing to do.");
     return;
   }
 
-  // Current open-review load per candidate (stateless fairness signal).
+  // --- Global open-review load (stateless fairness signal).
   const openPRs = await github.paginate(github.rest.pulls.list, {
     owner,
     repo,
     state: "open",
     per_page: 100,
   });
-  const load = Object.fromEntries(candidates.map((u) => [u.toLowerCase(), 0]));
-  for (const p of openPRs) {
+  const load = new Map();
+  for (const p of openPRs)
     for (const r of p.requested_reviewers || []) {
       const l = (r.login || "").toLowerCase();
-      if (l in load) load[l] += 1;
+      load.set(l, (load.get(l) || 0) + 1);
     }
+  const loadOf = (u) => load.get(u.toLowerCase()) || 0;
+
+  // Helper: take the N lowest-load from a list, random tie-break within a tier.
+  const takeLowest = (list, n) => {
+    const byTier = {};
+    for (const u of list) (byTier[loadOf(u)] ||= []).push(u);
+    const out = [];
+    for (const k of Object.keys(byTier).map(Number).sort((a, b) => a - b)) {
+      const shuffled = byTier[k]
+        .map((v) => [Math.random(), v])
+        .sort((a, b) => a[0] - b[0])
+        .map(([, v]) => v);
+      for (const u of shuffled) if (out.length < n) out.push(u);
+      if (out.length >= n) break;
+    }
+    return out;
+  };
+
+  // Desired = 2 lowest-load from candidates; top up from the full pool if an
+  // area has fewer than 2 owners.
+  let desired = takeLowest(candidates, TARGET);
+  if (desired.length < TARGET) {
+    const have = new Set(desired.map((u) => u.toLowerCase()).concat(author));
+    const filler = [...poolSet.values()].filter((u) => !have.has(u.toLowerCase()));
+    desired = desired.concat(takeLowest(filler, TARGET - desired.length));
   }
+  const desiredLc = new Set(desired.map((u) => u.toLowerCase()));
 
-  // Lowest load first; random tie-break within the lowest tier.
-  const min = Math.min(...candidates.map((u) => load[u.toLowerCase()]));
-  const lowest = candidates.filter((u) => load[u.toLowerCase()] === min);
-  const pick = lowest[Math.floor(Math.random() * lowest.length)];
+  // --- Reconcile current requested reviewers to exactly `desired`.
+  const current = (pr.requested_reviewers || []).map((r) => r.login);
+  const currentLc = new Set(current.map((c) => c.toLowerCase()));
+  const toAdd = desired.filter((u) => !currentLc.has(u.toLowerCase()));
+  // Only remove CODEOWNERS-managed reviewers we didn't pick -- never humans
+  // added from outside the pool.
+  const toRemove = current.filter(
+    (u) => managed.has(u.toLowerCase()) && !desiredLc.has(u.toLowerCase())
+  );
 
-  try {
+  if (toAdd.length) {
     await github.rest.pulls.requestReviewers({
-      owner,
-      repo,
-      pull_number: pr.number,
-      reviewers: [pick],
+      owner, repo, pull_number: pr.number, reviewers: toAdd,
     });
-    core.info(`Assigned @${pick} (open-review load ${min}; pool of ${candidates.length}).`);
-  } catch (e) {
-    core.warning(`Could not request @${pick}: ${e.message}`);
   }
+  if (toRemove.length) {
+    await github.rest.pulls.removeRequestedReviewers({
+      owner, repo, pull_number: pr.number, reviewers: toRemove,
+    });
+  }
+  core.info(
+    `Reviewers -> [${desired.join(", ")}]` +
+      ` (area pool ${areaOwners.size || "∅→full"}, +${toAdd.length}/-${toRemove.length}).`
+  );
 };

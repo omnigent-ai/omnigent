@@ -1,15 +1,17 @@
 name: Auto-assign Reviewer
 
-# Repo-level round-robin reviewer assignment -- the "default" for PRs that
-# CODEOWNERS did not already route. No org team required (so no org-owner
-# setup, unlike GitHub's native team review assignment). The candidate pool is
-# derived from .github/CODEOWNERS at runtime, so maintainers not listed there
-# are excluded from rotation. See auto-assign-reviewer.js.
+# Repo-level reviewer assignment: assign EXACTLY 2 load-balanced reviewers per
+# PR, preferring the owners of the area(s) it touches. No org team required (so
+# no org-owner setup, unlike GitHub's native team review assignment). Ownership
+# is read from .github/CODEOWNERS at runtime; native CODEOWNERS would request
+# ALL area owners, so this action reconciles the request list down to its 2
+# balanced picks. Maintainers not listed in CODEOWNERS are never in rotation.
+# See auto-assign-reviewer.js.
 #
-# pull_request_target so it can request reviewers on fork PRs too (a fork's
+# pull_request_target so it can manage reviewers on fork PRs too (a fork's
 # pull_request token is read-only). Safe: it checks out only the trusted
-# default branch (.github), never PR head, and runs no PR code -- it just reads
-# CODEOWNERS and calls the reviewers API.
+# default branch (.github), never PR head, and runs no PR code -- it reads
+# CODEOWNERS + the changed-file list and calls the reviewers API.
 
 on:
   pull_request_target:
