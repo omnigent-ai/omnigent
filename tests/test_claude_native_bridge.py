@@ -5169,3 +5169,79 @@ def test_wait_for_claude_prompt_ready_surfaces_terminal_output_on_timeout(
     assert "did not become ready" in message
     assert "Last terminal output:" in message
     assert "JSON Parse error: Unrecognized token '<'" in message
+
+
+def test_prepare_bridge_dir_writes_owner_pid_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """prepare_bridge_dir records the creating pid for owner-pid-gated
+    pruning (O6)."""
+    import os
+
+    from omnigent.claude_native_bridge import prepare_bridge_dir
+
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge._BRIDGE_ROOT",
+        tmp_path / "claude-native",
+    )
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    bridge_dir = prepare_bridge_dir("conv_owner", workspace=tmp_path)
+    assert (bridge_dir / "owner.pid").read_text(encoding="utf-8").strip() == str(os.getpid())
+
+
+def test_cleanup_bridge_dir_removes_the_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cleanup_bridge_dir rmtrees the per-session dir (O6)."""
+    from omnigent.claude_native_bridge import cleanup_bridge_dir, prepare_bridge_dir
+
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge._BRIDGE_ROOT",
+        tmp_path / "claude-native",
+    )
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    bridge_dir = prepare_bridge_dir("conv_cleanup", workspace=tmp_path)
+    assert bridge_dir.exists()
+
+    assert cleanup_bridge_dir("conv_cleanup") is True
+    assert not bridge_dir.exists()
+    assert cleanup_bridge_dir("conv_cleanup") is False
+
+
+def test_prune_orphaned_bridge_dirs_only_dead_owners(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prune removes only provably-dead-owner dirs; live and unmarked
+    survive (owner-pid invariant, O6)."""
+    import os
+    import subprocess
+    import sys
+
+    from omnigent.claude_native_bridge import prune_orphaned_bridge_dirs
+
+    root = tmp_path / "claude-native"
+    root.mkdir(parents=True)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", root)
+
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    dead_dir = root / "deadowner"
+    dead_dir.mkdir()
+    (dead_dir / "owner.pid").write_text(str(dead.pid), encoding="utf-8")
+
+    live_dir = root / "liveowner"
+    live_dir.mkdir()
+    (live_dir / "owner.pid").write_text(str(os.getpid()), encoding="utf-8")
+
+    unmarked_dir = root / "unmarked"
+    unmarked_dir.mkdir()
+
+    pruned = prune_orphaned_bridge_dirs()
+
+    assert pruned == 1
+    assert not dead_dir.exists()
+    assert live_dir.exists()
+    assert unmarked_dir.exists()
