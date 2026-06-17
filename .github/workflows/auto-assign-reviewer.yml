@@ -38,6 +38,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
+      # Job-level permissions REPLACE the workflow-level block (they don't
+      # merge), so contents:read must be restated here for actions/checkout.
+      contents: read
       pull-requests: write   # request reviewers
     steps:
       # Trusted default branch only (.github sparse). Never the PR head, so no
