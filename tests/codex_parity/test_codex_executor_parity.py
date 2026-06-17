@@ -260,6 +260,8 @@ async def test_real_codex_uses_last_unknown_phase_message(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Regression: unknown-phase assistant messages should use the latest
+    # completed message as the final response, matching real Codex behavior.
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "source-codex-home"))
     (tmp_path / "source-codex-home").mkdir()
     sidecar = codex_responses_sidecar(
@@ -324,6 +326,8 @@ async def test_real_codex_commentary_only_does_not_become_final_response(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Regression: commentary should stream to the caller but should not be
+    # promoted into the completed turn response.
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "source-codex-home"))
     (tmp_path / "source-codex-home").mkdir()
     sidecar = codex_responses_sidecar(
@@ -346,12 +350,14 @@ async def test_real_codex_commentary_only_does_not_become_final_response(
 
 
 @pytest.mark.asyncio
-async def test_real_codex_failed_response_surfaces_retryable_error(
+async def test_real_codex_ignores_retry_progress_until_terminal_failure(
     codex_responses_sidecar,
     resolved_codex_bin: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Regression: real Codex emits retry-progress failures before the terminal
+    # error. CodexExecutor must keep waiting until Codex has exhausted retries.
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "source-codex-home"))
     (tmp_path / "source-codex-home").mkdir()
     sidecar = codex_responses_sidecar(
