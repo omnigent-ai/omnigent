@@ -2,8 +2,8 @@ name: Auto-assign Reviewer Test
 
 # Offline unit test for the reviewer-assignment logic: runs
 # auto-assign-reviewer.test.js (mocked GitHub client, real .github/reviewers +
-# .github/MAINTAINER). Triggers only when the assigner, its test, the reviewers
-# map, or the maintainer list change. Runs on `pull_request` (PR head checkout)
+# .github/MAINTAINER). Triggers only when the assigner, its test, or the
+# reviewers map change. Runs on `pull_request` (PR head checkout)
 # so it tests the PR's own version. No secrets, no network.
 
 on:
@@ -12,7 +12,6 @@ on:
       - .github/workflows/auto-assign-reviewer.js
       - .github/workflows/auto-assign-reviewer.test.js
       - .github/reviewers
-      - .github/MAINTAINER
   workflow_dispatch:
 
 permissions:
