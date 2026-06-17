@@ -218,6 +218,10 @@ def test_build_host_daemon_env_local_preserves_server_credentials(
     monkeypatch.setenv("OPENAI_BASE_URL", "https://example.databricks.com/serving-endpoints")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
     monkeypatch.setenv("OMNIGENT_DATABASE_URI", "postgresql://u:pw@h/db")
+    # Hindsight memory creds must survive this hop to reach the runner (the
+    # daemon→runner forward-list does the second hop).
+    monkeypatch.setenv("HINDSIGHT_API_KEY", "hsk-mem")
+    monkeypatch.setenv("HINDSIGHT_API_URL", "https://api.hindsight.vectorize.io")
     monkeypatch.setenv("GITHUB_TOKEN", "unrelated-github-secret")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "unrelated-aws-secret")
 
@@ -228,6 +232,8 @@ def test_build_host_daemon_env_local_preserves_server_credentials(
     assert env["OPENAI_BASE_URL"] == "https://example.databricks.com/serving-endpoints"
     assert env["ANTHROPIC_API_KEY"] == "test-anthropic-key"
     assert env["OMNIGENT_DATABASE_URI"] == "postgresql://u:pw@h/db"
+    assert env["HINDSIGHT_API_KEY"] == "hsk-mem"
+    assert env["HINDSIGHT_API_URL"] == "https://api.hindsight.vectorize.io"
     assert "GITHUB_TOKEN" not in env
     assert "AWS_SECRET_ACCESS_KEY" not in env
     assert empty_string_env["OPENAI_API_KEY"] == "test-key"

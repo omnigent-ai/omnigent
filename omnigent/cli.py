@@ -249,6 +249,12 @@ _LOCAL_DAEMON_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "GEMINI_API_KEY",
         "GOOGLE_API_KEY",
         "GROQ_API_KEY",
+        # Hindsight memory built-in tools authenticate runner-side; the key must
+        # survive the CLI→daemon hop to be forwarded on to the runner (the
+        # daemon→runner forward-list in connect.HARNESS_CREDENTIAL_ENV_VARS does
+        # the second hop). Same dual-list pattern as ANTHROPIC_/OPENAI_API_KEY.
+        "HINDSIGHT_API_KEY",
+        "HINDSIGHT_API_URL",
         "MISTRAL_API_KEY",
         "OMNIGENT_DATABASE_URI",
         "OPENAI_API_KEY",
