@@ -182,16 +182,16 @@ async def test_policy_verdict_event_handler(_turn_ctx: TurnContext) -> None:
 
 
 @pytest.mark.asyncio()
-async def test_evaluate_policy_timeout_returns_allow(
+async def test_evaluate_policy_timeout_returns_deny(
     _turn_ctx: TurnContext,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    ``evaluate_policy`` returns ALLOW after the timeout expires.
+    ``evaluate_policy`` returns DENY after the timeout expires.
 
     If the verdict never arrives (race condition, network hiccup,
-    evaluation_id mismatch), the executor must not hang forever.
-    Fail-open prevents silent session hangs.
+    evaluation_id mismatch), the executor must not hang forever and must not
+    bypass policy.
     """
     # Shrink timeout to 0.1s so the test runs fast.
     import omnigent.runtime.harnesses._scaffold as _scaffold_mod
@@ -202,12 +202,12 @@ async def test_evaluate_policy_timeout_returns_allow(
     # Start evaluation but never deliver the verdict.
     result = await ctx.evaluate_policy("poleval_timeout_001", "PHASE_LLM_REQUEST", {})
 
-    assert result.action == "POLICY_ACTION_ALLOW", (
-        "Timed-out policy evaluation should default to ALLOW (fail-open). "
-        "If DENY, the timeout path is returning the wrong default. "
+    assert result.action == "POLICY_ACTION_DENY", (
+        "Timed-out policy evaluation should default to DENY (fail-closed). "
+        "If ALLOW, the timeout path is bypassing policy. "
         "If this test hangs, the timeout isn't being applied."
     )
-    assert result.reason is None
+    assert result.reason == "Policy evaluation timed out."
 
 
 def test_policy_verdict_payload_frozen() -> None:

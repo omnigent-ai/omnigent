@@ -1409,6 +1409,19 @@ async def test_observed_and_dispatched_call_ids_match_for_openai_agents() -> Non
 
 
 @pytest.mark.asyncio
+async def test_executor_adapter_policy_evaluator_fails_closed_without_active_context() -> None:
+    """A policy evaluation outside an active turn must not allow by default."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+
+    verdict = await adapter._evaluate_policy("PHASE_TOOL_CALL", {"name": "Bash"})
+
+    assert verdict.action == "POLICY_ACTION_DENY"
+    assert verdict.reason == "Policy evaluation has no active turn context."
+
+
+@pytest.mark.asyncio
 async def test_executor_adapter_builds_config_from_request() -> None:
     """Forwards request controls but not agent name as executor model."""
     from omnigent.inner.executor import Executor, ExecutorConfig, Message, ToolSpec, TurnComplete

@@ -2697,6 +2697,16 @@ async def _session_labels_for_runner_spawn(
 # to dispatch locally. See designs/RUNNER_MCP.md §Explicit dispatch
 # marker.
 _RUNNER_DISPATCHED_FIELD = "omnigent_runner_dispatched"
+_POLICY_ACTION_ALLOW = "POLICY_ACTION_ALLOW"
+_POLICY_ACTION_DENY = "POLICY_ACTION_DENY"
+_POLICY_ACTION_ASK = "POLICY_ACTION_ASK"
+_POLICY_ACTION_UNSPECIFIED = "POLICY_ACTION_UNSPECIFIED"
+_VALID_POLICY_ACTIONS = {
+    _POLICY_ACTION_ALLOW,
+    _POLICY_ACTION_DENY,
+    _POLICY_ACTION_ASK,
+    _POLICY_ACTION_UNSPECIFIED,
+}
 
 
 def _encode_sse_event(event: dict[str, Any]) -> bytes:
@@ -2725,11 +2735,9 @@ async def _evaluate_policy_via_omnigent(
     the verdict back to the harness as a ``policy_verdict`` inbound
     event.
 
-    On any failure (AP unreachable, malformed response), defaults to
-    ``POLICY_ACTION_ALLOW`` so a transient Omnigent outage does not block
-    the agent's LLM call — fail-open is appropriate here because the
-    Omnigent server's own enforcement sites (REQUEST, TOOL_CALL, etc.)
-    provide the authoritative blocking gate.
+    On policy-service failure or malformed response, defaults to
+    ``POLICY_ACTION_DENY`` so a transient Omnigent outage cannot bypass a
+    policy gate.
 
     :param server_client: HTTP client pointed at the Omnigent server.
     :param harness_client: HTTP client pointed at the harness subprocess.
@@ -2741,8 +2749,7 @@ async def _evaluate_policy_via_omnigent(
         ``"PHASE_LLM_REQUEST"``.
     :param data: Event data dict for the policy engine.
     """
-    # Default verdict: allow. Used on error paths.
-    verdict_action = "POLICY_ACTION_ALLOW"
+    verdict_action = _POLICY_ACTION_DENY
     verdict_reason: str | None = None
     verdict_data: dict[str, Any] | None = None
 
@@ -2759,18 +2766,31 @@ async def _evaluate_policy_via_omnigent(
         )
         if ap_resp.status_code == 200:
             result = ap_resp.json()
-            verdict_action = result.get("result", "POLICY_ACTION_ALLOW")
-            verdict_reason = result.get("reason")
-            verdict_data = result.get("data")
+            result_action = result.get("result") if isinstance(result, dict) else None
+            if result_action in _VALID_POLICY_ACTIONS:
+                verdict_action = result_action
+                verdict_reason = result.get("reason")
+                result_data = result.get("data")
+                verdict_data = result_data if isinstance(result_data, dict) else None
+            else:
+                verdict_reason = "Policy evaluation returned an invalid verdict."
+                _logger.warning(
+                    "AP policy evaluate returned invalid verdict %r for %s; "
+                    "defaulting to DENY",
+                    result_action,
+                    evaluation_id,
+                )
         else:
+            verdict_reason = "Policy evaluation failed."
             _logger.warning(
-                "AP policy evaluate returned %d for %s; defaulting to ALLOW",
+                "AP policy evaluate returned %d for %s; defaulting to DENY",
                 ap_resp.status_code,
                 evaluation_id,
             )
-    except Exception:  # noqa: BLE001 — fail-open on Omnigent errors
+    except Exception:  # noqa: BLE001 - policy failures fail closed
+        verdict_reason = "Policy evaluation failed."
         _logger.warning(
-            "AP policy evaluate failed for %s; defaulting to ALLOW",
+            "AP policy evaluate failed for %s; defaulting to DENY",
             evaluation_id,
             exc_info=True,
         )

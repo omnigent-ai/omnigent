@@ -50,6 +50,7 @@ from fastapi import FastAPI
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import (
     _build_spawn_env_from_spec,
+    _evaluate_policy_via_omnigent,
     _forward_harness_response,
     _resolve_harness_config,
 )
@@ -4197,6 +4198,129 @@ async def test_scaffold_subagent_defers_terminal_delivery_while_continuation_buf
     assert entry is not None
     assert entry.status == "completed"
     assert entry.delivered is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("server_response", "expected_action", "expected_reason"),
+    [
+        pytest.param(
+            httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW"}),
+            "POLICY_ACTION_ALLOW",
+            None,
+            id="explicit-allow",
+        ),
+        pytest.param(
+            httpx.Response(200, json={"result": "POLICY_ACTION_DENY", "reason": "blocked"}),
+            "POLICY_ACTION_DENY",
+            "blocked",
+            id="explicit-deny",
+        ),
+        pytest.param(
+            httpx.Response(200, json={}),
+            "POLICY_ACTION_DENY",
+            "Policy evaluation returned an invalid verdict.",
+            id="missing-verdict",
+        ),
+        pytest.param(
+            httpx.Response(200, json={"result": "POLICY_ACTION_UNKNOWN"}),
+            "POLICY_ACTION_DENY",
+            "Policy evaluation returned an invalid verdict.",
+            id="unknown-verdict",
+        ),
+        pytest.param(
+            httpx.Response(503, json={"error": "unavailable"}),
+            "POLICY_ACTION_DENY",
+            "Policy evaluation failed.",
+            id="policy-service-error",
+        ),
+    ],
+)
+async def test_policy_eval_proxy_fails_closed_for_bad_verdicts(
+    server_response: httpx.Response,
+    expected_action: str,
+    expected_reason: str | None,
+) -> None:
+    """Runner policy proxy only allows valid explicit allow verdicts."""
+    delivered: list[dict[str, Any]] = []
+
+    def server_handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/sessions/conv_policy/policies/evaluate"
+        return server_response
+
+    def harness_handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/sessions/conv_policy/events"
+        delivered.append(json.loads(request.content))
+        return httpx.Response(204)
+
+    async with (
+        httpx.AsyncClient(
+            transport=httpx.MockTransport(server_handler),
+            base_url="http://server.test",
+        ) as server_client,
+        httpx.AsyncClient(
+            transport=httpx.MockTransport(harness_handler),
+            base_url="http://harness.test",
+        ) as harness_client,
+    ):
+        await _evaluate_policy_via_omnigent(
+            server_client=server_client,
+            harness_client=harness_client,
+            conversation_id="conv_policy",
+            evaluation_id="poleval_proxy_001",
+            phase="PHASE_TOOL_CALL",
+            data={"name": "Bash", "arguments": {"cmd": "rm -rf /tmp/x"}},
+        )
+
+    assert delivered == [
+        {
+            "type": "policy_verdict",
+            "evaluation_id": "poleval_proxy_001",
+            "action": expected_action,
+            **({"reason": expected_reason} if expected_reason is not None else {}),
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_policy_eval_proxy_fails_closed_when_policy_request_raises() -> None:
+    """Transport errors must not synthesize an allow verdict."""
+    delivered: list[dict[str, Any]] = []
+
+    def server_handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("policy service unavailable", request=request)
+
+    def harness_handler(request: httpx.Request) -> httpx.Response:
+        delivered.append(json.loads(request.content))
+        return httpx.Response(204)
+
+    async with (
+        httpx.AsyncClient(
+            transport=httpx.MockTransport(server_handler),
+            base_url="http://server.test",
+        ) as server_client,
+        httpx.AsyncClient(
+            transport=httpx.MockTransport(harness_handler),
+            base_url="http://harness.test",
+        ) as harness_client,
+    ):
+        await _evaluate_policy_via_omnigent(
+            server_client=server_client,
+            harness_client=harness_client,
+            conversation_id="conv_policy",
+            evaluation_id="poleval_proxy_error",
+            phase="PHASE_TOOL_CALL",
+            data={},
+        )
+
+    assert delivered == [
+        {
+            "type": "policy_verdict",
+            "evaluation_id": "poleval_proxy_error",
+            "action": "POLICY_ACTION_DENY",
+            "reason": "Policy evaluation failed.",
+        }
+    ]
 
 
 @pytest.mark.asyncio

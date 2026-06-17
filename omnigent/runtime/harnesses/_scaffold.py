@@ -639,11 +639,14 @@ class TurnContext:
             return await asyncio.wait_for(future, timeout=_POLICY_EVAL_TIMEOUT_S)
         except asyncio.TimeoutError:
             _logger.warning(
-                "Policy evaluation %s timed out after %ds; defaulting to ALLOW",
+                "Policy evaluation %s timed out after %ds; defaulting to DENY",
                 evaluation_id,
                 _POLICY_EVAL_TIMEOUT_S,
             )
-            return PolicyVerdictPayload(action="POLICY_ACTION_ALLOW")
+            return PolicyVerdictPayload(
+                action="POLICY_ACTION_DENY",
+                reason="Policy evaluation timed out.",
+            )
         finally:
             self._pending_policy_evaluations.pop(evaluation_id, None)
 

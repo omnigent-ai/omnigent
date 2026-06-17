@@ -602,8 +602,8 @@ class ExecutorAdapter(HarnessApp):
         Future until the runner delivers the verdict.
 
         The round-trip has a timeout (see ``_POLICY_EVAL_TIMEOUT_S``
-        in ``_scaffold.py``) so a stalled verdict defaults to ALLOW
-        instead of hanging the executor.
+        in ``_scaffold.py``) so a stalled verdict fails closed instead of
+        hanging the executor.
 
         :param phase: Proto-style phase string, e.g.
             ``"PHASE_LLM_REQUEST"`` or ``"PHASE_LLM_RESPONSE"``.
@@ -614,10 +614,13 @@ class ExecutorAdapter(HarnessApp):
         if ctx is None:
             _logger.warning(
                 "policy evaluator fired with no active turn context (phase=%s); "
-                "returning ALLOW by default",
+                "returning DENY by default",
                 phase,
             )
-            return PolicyVerdictPayload(action="POLICY_ACTION_ALLOW")
+            return PolicyVerdictPayload(
+                action="POLICY_ACTION_DENY",
+                reason="Policy evaluation has no active turn context.",
+            )
         evaluation_id = f"poleval_{secrets.token_hex(16)}"
         return await ctx.evaluate_policy(evaluation_id, phase, data)
 
