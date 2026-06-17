@@ -1276,6 +1276,23 @@ class SessionResourceRegistry:
                     session_id,
                 )
 
+        # O6: reap the conversation's native bridge dirs.  Bridge dirs are
+        # keyed by conversation id (bridge_dir_for_bridge_id), so the
+        # conversation-level reap is the right place.  Best-effort and
+        # isolated: a bridge cleanup failure must never propagate (this
+        # runs on the explicit-delete and harness-release paths).
+        from omnigent import claude_native_bridge as _claude_native_bridge
+        from omnigent import codex_native_bridge as _codex_native_bridge
+
+        for _bridge_module in (_codex_native_bridge, _claude_native_bridge):
+            try:
+                _bridge_module.cleanup_bridge_dir(session_id)
+            except Exception:
+                _logger.exception(
+                    "Error cleaning up native bridge dir for session=%s",
+                    session_id,
+                )
+
     def has_primary_env(self, session_id: str) -> bool:
         """Check if a primary env has been materialized.
 

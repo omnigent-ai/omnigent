@@ -1082,3 +1082,43 @@ def test_resolve_environment_runner_workspace_overrides_absolute_spec_cwd(
     # Compare via realpath because tmp_path on macOS goes through
     # /var → /private/var symlinks.
     assert os.path.realpath(env.cwd) == os.path.realpath(workspace)
+
+
+# ── O6: bridge-dir cleanup on conversation teardown ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_cleanup_session_removes_native_bridge_dirs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cleanup_session reaps the conversation's native bridge dirs (O6).
+
+    Bridge dirs are keyed by conversation id, so the conversation-level
+    reap is the right hook.  A bridge cleanup error must not propagate
+    out of cleanup_session.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import omnigent.claude_native_bridge as claude_bridge
+    import omnigent.codex_native_bridge as codex_bridge
+
+    cleaned: list[tuple[str, str]] = []
+
+    def _codex_cleanup(bridge_id: str) -> bool:
+        cleaned.append(("codex", bridge_id))
+        return True
+
+    def _claude_cleanup(bridge_id: str) -> bool:
+        cleaned.append(("claude", bridge_id))
+        raise RuntimeError("boom")  # must be swallowed by cleanup_session
+
+    monkeypatch.setattr(codex_bridge, "cleanup_bridge_dir", _codex_cleanup)
+    monkeypatch.setattr(claude_bridge, "cleanup_bridge_dir", _claude_cleanup)
+
+    registry = SessionResourceRegistry(terminal_registry=None)
+
+    await registry.cleanup_session("conv_bridge")
+
+    assert ("codex", "conv_bridge") in cleaned
+    assert ("claude", "conv_bridge") in cleaned
