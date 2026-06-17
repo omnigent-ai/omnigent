@@ -16,7 +16,7 @@ file may host several.
 Execution tiers (in priority order):
 
 1. **Container** — ``docker run`` or ``podman run`` with network
-   disabled. Used when ``sandbox.docker_image`` is configured.
+   disabled. Used when ``sandbox.container_image`` is configured.
    The runtime is selected via ``sandbox.container_runtime``.
 2. **srt + uv** — ``srt uv run --with ... -- python _runner.py``.
    Used when srt is on PATH, sandbox enabled, and tool has PEP 723
@@ -118,7 +118,7 @@ class LocalPythonTool(Tool):
         :param module_path: Absolute path to the tool file, e.g.
             ``Path("/tmp/cache/ag_abc/tools/python/my_tools.py")``.
         :param sandbox_config: Agent-level sandbox settings
-            (docker_image).
+            (container_image, container_runtime).
         :param srt_available: Whether ``srt`` is on PATH.
         :param uv_available: Whether ``uv`` is on PATH.
         :param sandbox_enabled: Runtime policy for srt sandboxing.
@@ -244,7 +244,7 @@ class LocalPythonTool(Tool):
         # chain, so the fd 3 pipe doesn't survive to the inner
         # Python process. Use the stdout protocol instead.
         srt_active = self._srt_available and self._sandbox_enabled
-        use_stdout = self._sandbox_config.docker_image is not None or srt_active
+        use_stdout = self._sandbox_config.container_image is not None or srt_active
         cmd = self._build_command(state_root=state_root)
         if use_stdout:
             return self._invoke_stdout(cmd, request, workspace=ctx.workspace)
@@ -351,7 +351,7 @@ class LocalPythonTool(Tool):
             concurrent ``invoke()`` calls.
         :returns: The command list for ``subprocess.Popen``.
         """
-        if self._sandbox_config.docker_image is not None:
+        if self._sandbox_config.container_image is not None:
             return self._build_docker_command()
 
         base = [sys.executable, _RUNNER_PATH]
@@ -442,7 +442,7 @@ class LocalPythonTool(Tool):
         the response to stdout instead of fd 3.
 
         Only called from :meth:`_build_command` under the
-        ``docker_image is not None`` branch, so the assert
+        ``container_image is not None`` branch, so the assert
         documents a caller-enforced invariant — a fail-loud
         check if that invariant ever drifts, rather than the
         previous ``image or ""`` fallback which would have
@@ -451,11 +451,11 @@ class LocalPythonTool(Tool):
 
         :returns: The container run command list.
         """
-        image = self._sandbox_config.docker_image
+        image = self._sandbox_config.container_image
         assert image is not None, (
-            "_build_docker_command called without a docker_image — "
+            "_build_docker_command called without a container_image — "
             "caller (_build_command) must gate on "
-            "``self._sandbox_config.docker_image is not None``"
+            "``self._sandbox_config.container_image is not None``"
         )
         runtime = self._sandbox_config.container_runtime
         return [

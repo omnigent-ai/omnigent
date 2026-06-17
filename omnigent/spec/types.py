@@ -772,15 +772,23 @@ class SandboxConfig:
     is enabled/enforced is a runtime decision — see
     ``RuntimeCaps.sandbox_enabled``.
 
-    :param docker_image: When set, tools run inside this container
-        instead of a local subprocess. The container runtime
-        provides its own isolation, e.g. ``"python:3.12-slim"``.
+    :param container_image: When set, tools run inside this
+        container instead of a local subprocess, e.g.
+        ``"python:3.12-slim"``.
+    :param docker_image: Deprecated alias for ``container_image``.
+        If both are set, ``container_image`` takes precedence.
     :param container_runtime: The container CLI to use, either
         ``"docker"`` (default) or ``"podman"``.
     """
 
+    container_image: str | None = None
     docker_image: str | None = None
     container_runtime: str = "docker"
+
+    def __post_init__(self) -> None:
+        if self.container_image is None and self.docker_image is not None:
+            self.container_image = self.docker_image
+        self.docker_image = self.container_image
 
 
 @dataclass
