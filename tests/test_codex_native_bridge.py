@@ -211,9 +211,7 @@ def test_prepare_bridge_dir_writes_owner_pid_marker(
 
     from omnigent.codex_native_bridge import prepare_bridge_dir
 
-    monkeypatch.setattr(
-        "omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "codex-native"
-    )
+    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "codex-native")
     bridge_dir = prepare_bridge_dir("bridge_owner")
     marker = bridge_dir / "owner.pid"
     assert marker.read_text(encoding="utf-8").strip() == str(os.getpid())
@@ -226,9 +224,7 @@ def test_cleanup_bridge_dir_removes_the_dir(
     """cleanup_bridge_dir rmtrees the per-session dir (O6)."""
     from omnigent.codex_native_bridge import cleanup_bridge_dir, prepare_bridge_dir
 
-    monkeypatch.setattr(
-        "omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "codex-native"
-    )
+    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "codex-native")
     bridge_dir = prepare_bridge_dir("bridge_cleanup")
     assert bridge_dir.exists()
 
@@ -255,9 +251,7 @@ def test_prune_orphaned_bridge_dirs_only_dead_owners(
         prune_orphaned_bridge_dirs,
     )
 
-    monkeypatch.setattr(
-        "omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "codex-native"
-    )
+    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "codex-native")
     root = bridge_root()
     root.mkdir(parents=True, exist_ok=True)
 
