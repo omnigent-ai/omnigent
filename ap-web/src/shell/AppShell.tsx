@@ -29,6 +29,7 @@ import {
   inventoryTerminals,
   isAgentTerminalKey,
   PANEL_NO_TERMINAL_KEY,
+  panelKeyIsStale,
   terminalTabKey,
   useTerminals,
 } from "@/hooks/useTerminals";
@@ -879,6 +880,19 @@ export function AppShell() {
     !terminalsAvailable &&
     sessionStatus !== "failed" &&
     (liveness.kind === "starting" || terminalPending);
+  // A user shell the terminal view targets can vanish out from under us —
+  // most often the user typing `exit`, which closes the PTY and drops the
+  // shell out of `terminals` (the resource.deleted delta). Nothing else
+  // clears the now-dangling `panelInitialKey`, so without this the main
+  // view stays pinned to the dead shell and `isShellView` stays true,
+  // hiding the Chat/Terminal pill — the session is stuck in terminal-only
+  // mode with no way back to chat (#479). Drop the key so the view falls
+  // back to chat.
+  useEffect(() => {
+    if (panelKeyIsStale(panelInitialKey, terminals)) {
+      setPanelInitialKey(null);
+    }
+  }, [panelInitialKey, terminals, setPanelInitialKey]);
   // A rail-opened shell (any open terminal key other than the agent's
   // own terminal) takes over the main view chrome-free:
   // ConnectionIndicator hides the Chat/Terminal pill while this is

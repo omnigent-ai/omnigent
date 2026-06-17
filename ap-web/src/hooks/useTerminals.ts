@@ -80,6 +80,27 @@ export function isAgentTerminalKey(terminalKey: string): boolean {
 }
 
 /**
+ * Whether *panelKey* (the currently open terminal-view key) no longer
+ * addresses a live terminal — most commonly because the user typed
+ * ``exit`` and the shell's PTY closed, dropping it out of *terminals*
+ * (the ``session.resource.deleted`` delta). Callers reset the view to
+ * Chat when this is true (#479): nothing else clears a dangling shell
+ * key, so the main view would stay pinned to the dead shell and, since
+ * ``isShellView`` stays true, the Chat/Terminal pill would stay hidden —
+ * the session looks stuck in terminal-only mode with no way back to chat.
+ *
+ * The closed (``null``) and list-only (``PANEL_NO_TERMINAL_KEY``) states
+ * are never stale, and the agent's own terminal is exempt: it can blink
+ * out of *terminals* on a transient runner reconnect and is excluded from
+ * ``isShellView`` anyway.
+ */
+export function panelKeyIsStale(panelKey: string | null, terminals: TerminalInfo[]): boolean {
+  if (panelKey === null || panelKey === PANEL_NO_TERMINAL_KEY) return false;
+  if (isAgentTerminalKey(panelKey)) return false;
+  return !terminals.some((t) => terminalTabKey(t) === panelKey);
+}
+
+/**
  * Project the terminal list down to the session's *inventory* — the
  * shells shown in the right-rail Shells tab, its count badge, and the
  * mobile menu entry.

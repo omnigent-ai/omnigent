@@ -15,6 +15,8 @@ import {
   fetchTerminals,
   inventoryTerminals,
   isAgentTerminalKey,
+  PANEL_NO_TERMINAL_KEY,
+  panelKeyIsStale,
   PENDING_RECONCILE_INTERVAL_MS,
   terminalInfoFromResource,
   terminalsReconcileInterval,
@@ -532,5 +534,27 @@ describe("isAgentTerminalKey", () => {
 
   it("treats a user shell as not-the-agent-terminal", () => {
     expect(isAgentTerminalKey("terminal:terminal_bash_s1")).toBe(false);
+  });
+});
+
+describe("panelKeyIsStale", () => {
+  const bash: TerminalInfo = { id: "terminal_bash_s1", name: "bash", session: "s1", running: true };
+  const repl: TerminalInfo = { id: "terminal_tui_main", name: "tui", session: "main", running: true };
+
+  it("is stale once the open user shell exits and drops out of the list (#479)", () => {
+    // Open shell present → not stale; after `exit` removes it → stale, so
+    // AppShell resets the view to chat instead of stranding it in the dead
+    // terminal with the Chat/Terminal pill hidden.
+    expect(panelKeyIsStale(terminalTabKey(bash), [bash])).toBe(false);
+    expect(panelKeyIsStale(terminalTabKey(bash), [])).toBe(true);
+  });
+
+  it("never flags the agent's own terminal (survives transient reconnects)", () => {
+    expect(panelKeyIsStale(terminalTabKey(repl), [])).toBe(false);
+  });
+
+  it("treats the closed and list-only states as not stale", () => {
+    expect(panelKeyIsStale(null, [])).toBe(false);
+    expect(panelKeyIsStale(PANEL_NO_TERMINAL_KEY, [])).toBe(false);
   });
 });
