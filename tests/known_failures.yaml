@@ -519,18 +519,6 @@ skips:
     cluster: repl-pexpect-cli
     mode: skip
 
-  - id: tests/e2e/omnigent/test_run_omnigent_supervisor.py::test_supervisor_atlassian_returns_jira_issue
-    reason: "Nightly bulk: run_omnigent supervisor; example yaml path / atlassian / google_drive."
-    issue: 532
-    cluster: subagent-supervisor-routing
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_run_omnigent_supervisor.py::test_supervisor_google_drive_returns_files
-    reason: "Nightly bulk: run_omnigent supervisor; example yaml path / atlassian / google_drive."
-    issue: 532
-    cluster: subagent-supervisor-routing
-    mode: skip
-
   - id: tests/e2e/omnigent/test_server_remote_omnigent_autonomous_flows.py::test_manual_server_remote_omnigent_notify_when_idle_does_not_hang_and_delivers
     reason: "Nightly bulk: server-remote-ap autonomous flows; pexpect timeout family."
     issue: 532
