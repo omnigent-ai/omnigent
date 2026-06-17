@@ -417,12 +417,14 @@ def _parse_sandbox_config(
     """
     Parse the ``tools.sandbox`` block from config.yaml.
 
-    Only agent-level settings (``docker_image``) are parsed here.
-    Whether sandboxing is enabled is a runtime decision, not an
-    agent config decision::
+    Only agent-level settings (``docker_image``,
+    ``container_runtime``) are parsed here. Whether sandboxing
+    is enabled is a runtime decision, not an agent config
+    decision::
 
         sandbox:
           docker_image: python:3.12-slim
+          container_runtime: podman  # optional, defaults to docker
 
     :param raw: The raw ``sandbox`` value from the ``tools``
         block. ``None`` means not specified (use defaults).
@@ -430,8 +432,14 @@ def _parse_sandbox_config(
     """
     if raw is None or not isinstance(raw, dict):
         return SandboxConfig()
+    runtime = raw.get("container_runtime", "docker")
+    if runtime not in ("docker", "podman"):
+        raise ValueError(
+            f"Unsupported container_runtime {runtime!r}; expected 'docker' or 'podman'."
+        )
     return SandboxConfig(
         docker_image=raw.get("docker_image"),
+        container_runtime=runtime,
     )
 
 

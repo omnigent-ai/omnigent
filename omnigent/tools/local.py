@@ -15,8 +15,9 @@ file may host several.
 
 Execution tiers (in priority order):
 
-1. **Docker** — ``docker run`` with network disabled. Used when
-   ``sandbox.docker_image`` is configured.
+1. **Container** — ``docker run`` or ``podman run`` with network
+   disabled. Used when ``sandbox.docker_image`` is configured.
+   The runtime is selected via ``sandbox.container_runtime``.
 2. **srt + uv** — ``srt uv run --with ... -- python _runner.py``.
    Used when srt is on PATH, sandbox enabled, and tool has PEP 723
    inline deps.
@@ -434,7 +435,7 @@ class LocalPythonTool(Tool):
 
     def _build_docker_command(self) -> list[str]:
         """
-        Build a ``docker run`` command for container execution.
+        Build a container ``run`` command (Docker or Podman).
 
         The container runs with network disabled, stdin piped,
         and ``_AP_RESPONSE_MODE=stdout`` so the runner writes
@@ -446,9 +447,9 @@ class LocalPythonTool(Tool):
         check if that invariant ever drifts, rather than the
         previous ``image or ""`` fallback which would have
         silently passed an empty string as the image name to
-        ``docker run``.
+        the container runtime.
 
-        :returns: The docker run command list.
+        :returns: The container run command list.
         """
         image = self._sandbox_config.docker_image
         assert image is not None, (
@@ -456,8 +457,9 @@ class LocalPythonTool(Tool):
             "caller (_build_command) must gate on "
             "``self._sandbox_config.docker_image is not None``"
         )
+        runtime = self._sandbox_config.container_runtime
         return [
-            "docker",
+            runtime,
             "run",
             "--rm",
             "-i",
@@ -468,9 +470,6 @@ class LocalPythonTool(Tool):
             image,
             "python",
             "-c",
-            # Inline the runner as a one-liner that reads stdin
-            # and writes to stdout. The full _runner.py is not
-            # available inside the container.
             (
                 "import sys,json,importlib.util,asyncio,os;"
                 "os.environ['_AP_RESPONSE_MODE']='stdout';"
