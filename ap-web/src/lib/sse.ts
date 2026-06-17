@@ -46,6 +46,7 @@ import type {
   SessionTerminalActivityEvent,
   SessionStatusEvent,
   SessionModelEvent,
+  SessionCodexPlanModeEvent,
   SessionReasoningEffortEvent,
   SessionAgentChangedEvent,
   SessionTodosEvent,
@@ -500,6 +501,17 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       conversationId,
       reasoningEffort,
     } satisfies SessionReasoningEffortEvent;
+  }
+  if (eventType === "session.codex_plan_mode") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const enabled = data.enabled;
+    if (typeof enabled !== "boolean") return null;
+    return {
+      type: "session_codex_plan_mode",
+      conversationId,
+      enabled,
+    } satisfies SessionCodexPlanModeEvent;
   }
   if (eventType === "session.agent_changed") {
     const conversationId = data.conversation_id;

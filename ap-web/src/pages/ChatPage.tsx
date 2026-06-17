@@ -125,6 +125,7 @@ import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { useForkDialog } from "@/shell/ForkDialogContext";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
+import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCliServerUrl } from "@/lib/host";
 import { SessionImage } from "@/components/SessionImage";
 
@@ -893,6 +894,7 @@ export function ChatPage() {
       showModels={modelPickerKind !== null}
       modelPickerKind={modelPickerKind}
       codexModelOptions={codexModelOptions}
+      showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
       costRoutingVerdict={costRoutingVerdict}
       costRoutingEligible={costRoutingEligible}
       subAgentLabel={subAgentLabel}
@@ -1117,6 +1119,8 @@ interface MainAgentSurfaceProps {
   modelPickerKind: NativeModelPickerKind | null;
   /** Codex app-server model options for codex-native sessions. */
   codexModelOptions: readonly CodexModelOption[];
+  /** Show the Codex Plan-mode toggle. */
+  showCodexPlanMode: boolean;
   /** Latest advisor verdict for the cost-routing pill; null when none. */
   costRoutingVerdict: CostRoutingVerdict | null;
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child). */
@@ -1189,6 +1193,7 @@ function MainAgentSurface({
   showModels,
   modelPickerKind,
   codexModelOptions,
+  showCodexPlanMode,
   costRoutingVerdict,
   costRoutingEligible,
   subAgentLabel,
@@ -1444,6 +1449,7 @@ function MainAgentSurface({
         showModels={showModels}
         modelPickerKind={modelPickerKind}
         codexModelOptions={codexModelOptions}
+        showCodexPlanMode={showCodexPlanMode}
         isTerminalFirst={isTerminalFirst}
         isNativeWrapper={isNativeWrapper}
         reconnectHint={liveness.kind === "runner_asleep"}
@@ -2507,6 +2513,8 @@ interface ComposerProps {
   modelPickerKind: NativeModelPickerKind | null;
   /** Codex app-server model options for codex-native sessions. */
   codexModelOptions: readonly CodexModelOption[];
+  /** Show the Codex Plan-mode toggle. */
+  showCodexPlanMode: boolean;
   /**
    * Terminal-first session (Chat/Terminal pill present). Presentation
    * only: tightens the composer's bottom padding to `pb-1.5` so it sits
@@ -2722,6 +2730,7 @@ function ComposerStatusLine() {
   const tokensUsed = useChatStore((s) => s.tokensUsed);
   const selectedEffort = useChatStore((s) => s.selectedEffort);
   const selectedModel = useChatStore((s) => s.selectedModel);
+  const codexPlanMode = useChatStore((s) => s.codexPlanMode);
   const llmModel = useChatStore((s) => s.llmModel);
   const codexModelOptions = useChatStore((s) => s.codexModelOptions);
   // Seeded from the session snapshot on bind (chatStore.sessionBindingPatch),
@@ -2733,10 +2742,11 @@ function ComposerStatusLine() {
   const modelEffortLabel = conversationId
     ? formatModelEffortStatusLabel(selectedModel ?? llmModel, selectedEffort, codexModelOptions)
     : null;
+  const showPlanMode = !!conversationId && codexPlanMode;
   // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
   const showRing =
     !!conversationId && contextWindow != null && contextWindow > 0 && tokensUsed != null;
-  if (!showBranch && !showRing && modelEffortLabel === null) return null;
+  if (!showBranch && !showPlanMode && !showRing && modelEffortLabel === null) return null;
 
   return (
     <div
@@ -2769,6 +2779,15 @@ function ComposerStatusLine() {
       </span>
       {/* Right: model/effort and context ring, never shrinks. */}
       <div className="flex min-w-0 shrink-0 items-center gap-3">
+        {showPlanMode && (
+          <span
+            data-testid="composer-plan-mode"
+            className="inline-flex items-center gap-1 text-xs font-medium text-foreground"
+          >
+            <FileTextIcon className="size-3.5 shrink-0" />
+            <span>Plan mode</span>
+          </span>
+        )}
         {modelEffortLabel && (
           <span
             data-testid="composer-model-effort"
@@ -2880,6 +2899,7 @@ export function Composer({
   showModels,
   modelPickerKind,
   codexModelOptions,
+  showCodexPlanMode,
   isTerminalFirst = false,
   isNativeWrapper = false,
   reconnectHint = false,
@@ -2891,6 +2911,7 @@ export function Composer({
   const [value, setValue] = useState("");
   const [files, setFiles] = useState<File[]>([]);
   const [commandError, setCommandError] = useState<string | null>(null);
+  const [planModeBusy, setPlanModeBusy] = useState(false);
   // Index of the highlighted item in the slash-command suggestions menu.
   // -1 means no item highlighted (menu closed or no matches). When the menu
   // opens with matches the reset logic below pre-selects the first item (0)
@@ -2928,6 +2949,7 @@ export function Composer({
 
   // Per-session cost-control switch, hydrated from the snapshot on bind.
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
+  const codexPlanMode = useChatStore((s) => s.codexPlanMode);
 
   // Preserve unsent text + file attachments per session so switching
   // tabs and coming back restores the draft. The drafts map lives at
@@ -3002,6 +3024,19 @@ export function Composer({
   const composerIsCommand = files.length === 0 && isSlashCommandText(value);
   const hasDraft = value.trim().length > 0 || files.length > 0;
   const showInterruptButton = isWorking && !hasDraft;
+  const toggleCodexPlanMode = async () => {
+    if (planModeBusy) return;
+    setCommandError(null);
+    setPlanModeBusy(true);
+    try {
+      await useChatStore.getState().setCodexPlanMode(!codexPlanMode);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setCommandError(`Could not ${codexPlanMode ? "exit" : "enter"} Plan mode: ${message}`);
+    } finally {
+      setPlanModeBusy(false);
+    }
+  };
   // Filtered matches — kept in sync with what SlashCommandMenu renders so
   // keyboard nav indexes into the same list.
   const menuMatches = menuOpen
@@ -3636,6 +3671,37 @@ export function Composer({
                 verdict={costRoutingVerdict}
               />
             )}
+            {showCodexPlanMode && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={codexPlanMode ? "secondary" : "ghost"}
+                    className={cn(
+                      "h-9 gap-1.5 px-2 text-xs md:h-8",
+                      codexPlanMode && "border border-ring/30 text-foreground",
+                    )}
+                    disabled={isReadOnly || planModeBusy}
+                    aria-pressed={codexPlanMode}
+                    aria-label={codexPlanMode ? "Exit Plan mode" : "Enter Plan mode"}
+                    data-testid="codex-plan-mode-toggle"
+                    data-active={codexPlanMode ? "true" : undefined}
+                    onClick={() => void toggleCodexPlanMode()}
+                  >
+                    {planModeBusy ? (
+                      <Loader2Icon className="size-3.5 animate-spin" />
+                    ) : (
+                      <FileTextIcon className="size-3.5" />
+                    )}
+                    <span>Plan</span>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  {codexPlanMode ? "Exit Plan mode" : "Enter Plan mode"}
+                </TooltipContent>
+              </Tooltip>
+            )}
             <AgentPicker
               agents={agents}
               isLoading={agentsLoading}
@@ -3929,6 +3995,12 @@ export function shouldShowEffortPicker(
   conv: { labels?: Record<string, string | null> | null } | null | undefined,
 ): boolean {
   return supportsEffortControl(conv);
+}
+
+export function shouldShowCodexPlanModeControl(
+  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+): boolean {
+  return isCodexNativeSession(conv);
 }
 
 /**

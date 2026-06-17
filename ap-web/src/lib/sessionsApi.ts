@@ -286,7 +286,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
 }
 
 async function readJsonOrThrow<T>(res: Response): Promise<T> {
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (!res.ok) throw await apiErrorFromResponse(res);
   return (await res.json()) as T;
 }
 
@@ -559,6 +559,7 @@ export async function updateSession(
   updates: {
     reasoningEffort?: string | null;
     modelOverride?: string | null;
+    codexPlanMode?: boolean;
     costControlModeOverride?: "on" | "off" | null;
     runnerId?: string;
     silent?: boolean;
@@ -570,6 +571,9 @@ export async function updateSession(
   }
   if ("modelOverride" in updates) {
     body.model_override = updates.modelOverride ?? "default";
+  }
+  if (updates.codexPlanMode !== undefined) {
+    body.codex_plan_mode = updates.codexPlanMode;
   }
   if ("costControlModeOverride" in updates) {
     body.cost_control_mode_override = updates.costControlModeOverride ?? null;

@@ -94,6 +94,7 @@ import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { isClaudeNativeModel } from "@/lib/claudeNativeModels";
 import { isCodexNativeModel } from "@/lib/codexNativeModels";
+import { codexPlanModeFromSession } from "@/lib/codexPlanMode";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { isNativeWrapper } from "@/lib/nativeCodingAgents";
 
@@ -296,6 +297,12 @@ export interface ChatState {
    */
   costControlModeOverride: "on" | "off" | null;
   /**
+   * Per-session Codex collaboration-mode flag. Hydrated from
+   * ``omnigent.codex_native.collaboration_mode`` on bind and updated by the
+   * web toggle or native Codex TUI events. False for non-Codex sessions.
+   */
+  codexPlanMode: boolean;
+  /**
    * True when older items exist before the loaded history window. Binds
    * hydrate only the most recent page (see `fetchSessionItemsPage`);
    * scroll-up `loadMoreHistory` pages older until this goes false.
@@ -471,6 +478,11 @@ export interface ChatState {
    * default. No-ops when there is no active conversation.
    */
   setCostControlMode: (mode: "on" | "off" | null) => Promise<void>;
+  /**
+   * Toggle Codex Plan mode for the active session. No-ops when there is no
+   * active conversation.
+   */
+  setCodexPlanMode: (enabled: boolean) => Promise<void>;
   /**
    * Fetch the next page of older messages and prepend them to `blocks`.
    *
@@ -674,6 +686,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   selectedModel: loadPickerPref(PICKER_PREF_MODEL_KEY),
   sessionModelOverride: null,
   costControlModeOverride: null,
+  codexPlanMode: false,
   hasMoreHistory: false,
   loadingMoreHistory: false,
   oldestItemId: null,
@@ -1154,6 +1167,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         // so they reset with the session and re-hydrate from the snapshot.
         sessionModelOverride: null,
         costControlModeOverride: null,
+        codexPlanMode: false,
         contextWindow: null,
         tokensUsed: null,
         sessionCostUsd: null,
@@ -1298,6 +1312,23 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // Roll back so the pill doesn't claim a state the server never persisted.
       if (get().conversationId === conversationId) {
         set({ costControlModeOverride: previous });
+      }
+      throw err;
+    }
+  },
+
+  setCodexPlanMode: async (enabled) => {
+    const { conversationId } = get();
+    if (!conversationId) return;
+    const previous = get().codexPlanMode;
+    set({ codexPlanMode: enabled });
+    try {
+      const session = await updateSession(conversationId, { codexPlanMode: enabled });
+      if (get().conversationId !== conversationId) return;
+      set({ codexPlanMode: codexPlanModeFromSession(session) });
+    } catch (err) {
+      if (get().conversationId === conversationId) {
+        set({ codexPlanMode: previous });
       }
       throw err;
     }
@@ -1571,6 +1602,7 @@ function sessionBindingPatch(
   | "sessionModelOverride"
   | "sessionHarness"
   | "costControlModeOverride"
+  | "codexPlanMode"
   | "contextWindow"
   | "gitBranch"
   | "skills"
@@ -1587,6 +1619,7 @@ function sessionBindingPatch(
     sessionModelOverride: session.modelOverride ?? null,
     sessionHarness: session.harness ?? null,
     costControlModeOverride: session.costControlModeOverride ?? null,
+    codexPlanMode: codexPlanModeFromSession(session),
     contextWindow: session.contextWindow ?? null,
     gitBranch: session.gitBranch ?? null,
     skills: session.skills ?? [],
@@ -3340,6 +3373,14 @@ export function handleSessionEvent(event: StreamEvent): void {
       // in the picker for the open session; the server persisted
       // reasoning_effort, so reload restores the same value.
       useChatStore.setState({ selectedEffort: event.reasoningEffort });
+      return;
+    case "session_codex_plan_mode":
+      // A Codex /plan switch made in either the web UI or native TUI.
+      // Guard by conversation id so a late frame from an aborted stream
+      // cannot paint Plan mode onto the newly-opened conversation.
+      useChatStore.setState((s) =>
+        s.conversationId === event.conversationId ? { codexPlanMode: event.enabled } : {},
+      );
       return;
     case "session_presence":
       // Full-state replacement — every presence event carries the

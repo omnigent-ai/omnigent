@@ -175,6 +175,8 @@ let sessionPendingInputs: Map<
 // Per-session cost-control switch the snapshot/PATCH handlers serve;
 // absent key = unset (the wire field comes back null).
 let sessionCostControlOverrides: Map<string, "on" | "off">;
+// Per-session labels the snapshot/PATCH handlers serve.
+let sessionLabels: Map<string, Record<string, string>>;
 
 /** Default fetch router: dispatch by URL. Tests override per-call as needed. */
 function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Response {
@@ -243,8 +245,10 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
       ? (JSON.parse(init.body as string) as {
           runner_id?: string;
           cost_control_mode_override?: "on" | "off" | null;
+          codex_plan_mode?: boolean;
         })
       : {};
+    const labels = { ...(sessionLabels.get(sessionId) ?? {}) };
     // Echo a cost-switch write back like the real server does, so the
     // store's canonical refresh sees the persisted value.
     if ("cost_control_mode_override" in body) {
@@ -254,6 +258,12 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
         sessionCostControlOverrides.set(sessionId, body.cost_control_mode_override);
       }
     }
+    if ("codex_plan_mode" in body && typeof body.codex_plan_mode === "boolean") {
+      labels["omnigent.codex_native.collaboration_mode"] = body.codex_plan_mode
+        ? "plan"
+        : "default";
+      sessionLabels.set(sessionId, labels);
+    }
     return mockResponse({
       id: sessionId,
       agent_id: "agent_xyz",
@@ -261,6 +271,7 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
       status: "idle",
       created_at: 0,
       items: sessionSnapshots.get(sessionId) ?? [],
+      labels,
       cost_control_mode_override: sessionCostControlOverrides.get(sessionId) ?? null,
     });
   }
@@ -272,6 +283,7 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
       status: "idle",
       created_at: 0,
       items: sessionSnapshots.get(sessionId) ?? [],
+      labels: sessionLabels.get(sessionId) ?? {},
       pending_elicitations: sessionPendingElicitations.get(sessionId) ?? [],
       pending_inputs: sessionPendingInputs.get(sessionId) ?? [],
       cost_control_mode_override: sessionCostControlOverrides.get(sessionId) ?? null,
@@ -334,6 +346,7 @@ beforeEach(() => {
   sessionPendingElicitations = new Map();
   sessionPendingInputs = new Map();
   sessionCostControlOverrides = new Map();
+  sessionLabels = new Map();
   initChatStore(client);
   useChatStore.setState({
     conversationId: null,
@@ -350,6 +363,7 @@ beforeEach(() => {
     loadingConversation: false,
     conversationLoadError: null,
     costControlModeOverride: null,
+    codexPlanMode: false,
     abortController: null,
   });
   fetchMock.mockReset();
@@ -3418,6 +3432,28 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     });
   });
 
+  describe("session.codex_plan_mode", () => {
+    it("reflects a Codex Plan-mode event for the active session", () => {
+      useChatStore.setState({ conversationId: "conv_abc", codexPlanMode: false });
+      handleSessionEvent({
+        type: "session_codex_plan_mode",
+        conversationId: "conv_abc",
+        enabled: true,
+      });
+      expect(useChatStore.getState().codexPlanMode).toBe(true);
+    });
+
+    it("ignores a Codex Plan-mode event from a different session", () => {
+      useChatStore.setState({ conversationId: "conv_open", codexPlanMode: false });
+      handleSessionEvent({
+        type: "session_codex_plan_mode",
+        conversationId: "conv_other",
+        enabled: true,
+      });
+      expect(useChatStore.getState().codexPlanMode).toBe(false);
+    });
+  });
+
   describe("session.input.consumed", () => {
     it("promotes the oldest pending user message into blocks (FIFO, plain append)", () => {
       const existingAssistant: AnyBlock = {
@@ -4629,6 +4665,7 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
 
   /** Override the snapshot GET so a test can inject labels + overrides. */
   function withSnapshot(id: string, overrides: SnapshotOverrides): void {
+    sessionLabels.set(id, { ...(overrides.labels ?? {}) });
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       if (url.split("?")[0] === `/v1/sessions/${id}` && (init?.method ?? "GET") === "GET") {
@@ -4852,6 +4889,78 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
 
     expect(patchCallsFor("conv_codex_supported")).toEqual([{ reasoning_effort: "high" }]);
     expect(useChatStore.getState().selectedEffort).toBe("high");
+  });
+
+  it("hydrates Codex Plan mode from the session label", async () => {
+    seedSession("conv_plan", []);
+    withSnapshot("conv_plan", {
+      labels: {
+        "omnigent.wrapper": "codex-native-ui",
+        "omnigent.codex_native.collaboration_mode": "plan",
+      },
+    });
+
+    await useChatStore.getState().switchTo("conv_plan");
+
+    expect(useChatStore.getState().codexPlanMode).toBe(true);
+  });
+
+  it("ignores Codex Plan mode labels on non-Codex sessions", async () => {
+    seedSession("conv_not_codex_plan", []);
+    withSnapshot("conv_not_codex_plan", {
+      labels: {
+        "omnigent.codex_native.collaboration_mode": "plan",
+      },
+    });
+
+    await useChatStore.getState().switchTo("conv_not_codex_plan");
+
+    expect(useChatStore.getState().codexPlanMode).toBe(false);
+  });
+
+  it("PATCHes Codex Plan mode and settles from the returned labels", async () => {
+    seedSession("conv_plan_toggle", []);
+    withSnapshot("conv_plan_toggle", { labels: { "omnigent.wrapper": "codex-native-ui" } });
+    await useChatStore.getState().switchTo("conv_plan_toggle");
+    fetchMock.mockClear();
+
+    await useChatStore.getState().setCodexPlanMode(true);
+
+    expect(patchCallsFor("conv_plan_toggle")).toEqual([{ codex_plan_mode: true }]);
+    expect(useChatStore.getState().codexPlanMode).toBe(true);
+  });
+
+  it("rolls back Codex Plan mode when the PATCH is rejected", async () => {
+    seedSession("conv_plan_failure", []);
+    withSnapshot("conv_plan_failure", { labels: { "omnigent.wrapper": "codex-native-ui" } });
+    await useChatStore.getState().switchTo("conv_plan_failure");
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.split("?")[0]!;
+      if (path === "/v1/sessions/conv_plan_failure" && init?.method === "PATCH") {
+        return mockResponse(
+          {
+            error: {
+              code: "runner_unavailable",
+              message: "Could not enter Plan mode: no live Codex runner is available.",
+            },
+          },
+          { ok: false, status: 503 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+    fetchMock.mockClear();
+
+    await expect(useChatStore.getState().setCodexPlanMode(true)).rejects.toThrow(
+      "Could not enter Plan mode",
+    );
+
+    expect(patchCallsFor("conv_plan_failure")).toEqual([{ codex_plan_mode: true }]);
+    expect(useChatStore.getState().codexPlanMode).toBe(false);
+    expect(sessionLabels.get("conv_plan_failure")).not.toHaveProperty(
+      "omnigent.codex_native.collaboration_mode",
+    );
   });
 
   it("server-side overrides win over sticky pref and skip the PATCH", async () => {

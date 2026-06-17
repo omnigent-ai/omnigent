@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { CodexModelOption } from "@/lib/types";
 
-import { effortLevelsForConv, shouldShowEffortPicker, shouldShowModelPicker } from "./ChatPage";
+import {
+  effortLevelsForConv,
+  shouldShowCodexPlanModeControl,
+  shouldShowEffortPicker,
+  shouldShowModelPicker,
+} from "./ChatPage";
 
 const CODEX_MODEL_OPTIONS: CodexModelOption[] = [
   {
@@ -141,5 +146,20 @@ describe("shouldShowEffortPicker", () => {
   it("returns false for unrelated wrapper values", () => {
     const conv = { labels: { "omnigent.wrapper": "nessie" } };
     expect(shouldShowEffortPicker(conv)).toBe(false);
+  });
+});
+
+describe("shouldShowCodexPlanModeControl", () => {
+  it("returns true only for codex-native wrapper sessions", () => {
+    expect(
+      shouldShowCodexPlanModeControl({ labels: { "omnigent.wrapper": "codex-native-ui" } }),
+    ).toBe(true);
+    expect(
+      shouldShowCodexPlanModeControl({
+        labels: { "omnigent.wrapper": "claude-code-native-ui" },
+      }),
+    ).toBe(false);
+    expect(shouldShowCodexPlanModeControl({ labels: { "omnigent.ui": "terminal" } })).toBe(false);
+    expect(shouldShowCodexPlanModeControl(null)).toBe(false);
   });
 });

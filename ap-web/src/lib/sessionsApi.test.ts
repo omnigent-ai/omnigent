@@ -409,6 +409,43 @@ describe("runner binding", () => {
     expect(JSON.parse(init.body as string)).toEqual({ model_override: "default" });
   });
 
+  it("PATCHes codex_plan_mode as a boolean", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_abc",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+        items: [],
+        labels: { "omnigent.codex_native.collaboration_mode": "plan" },
+      }),
+    );
+
+    const session = await updateSession("conv_abc", { codexPlanMode: true });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({ codex_plan_mode: true });
+    expect(session.labels?.["omnigent.codex_native.collaboration_mode"]).toBe("plan");
+  });
+
+  it("surfaces AP error messages from failed PATCHes", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse(
+        {
+          error: {
+            code: "runner_unavailable",
+            message: "Could not enter Plan mode: no live Codex runner is available.",
+          },
+        },
+        { ok: false, status: 503 },
+      ),
+    );
+
+    await expect(updateSession("conv_abc", { codexPlanMode: true })).rejects.toThrow(
+      "Could not enter Plan mode",
+    );
+  });
+
   it("PATCHes cost_control_mode_override as snake_case", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({

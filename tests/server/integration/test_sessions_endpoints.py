@@ -4748,6 +4748,7 @@ async def test_post_external_reasoning_effort_change_rejects_invalid_effort(
 
 async def test_post_external_codex_collaboration_mode_change_persists_label(
     client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     Codex collaboration mode mirrors into the session labels.
@@ -4756,6 +4757,11 @@ async def test_post_external_codex_collaboration_mode_change_persists_label(
     Persisting it as a label lets session snapshots report the current Codex
     mode without adding a Codex-specific conversation column.
     """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
 
@@ -4768,6 +4774,9 @@ async def test_post_external_codex_collaboration_mode_change_persists_label(
     )
 
     assert resp.status_code == 202, resp.text
+    assert [event["type"] for _, event in published] == ["session.codex_plan_mode"]
+    assert published[0][1]["conversation_id"] == session["id"]
+    assert published[0][1]["enabled"] is True
     snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
     assert snapshot["labels"]["omnigent.codex_native.collaboration_mode"] == "plan"
 
@@ -5725,6 +5734,180 @@ class _ForwardedEffort:
 
     url: str
     body: dict[str, Any] | None
+
+
+async def test_patch_codex_plan_mode_persists_label_and_forwards_event(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    PATCH ``codex_plan_mode`` persists the Codex mode and forwards it live.
+
+    The web UI toggle writes through the sessions PATCH route. The server must
+    persist the collaboration-mode label for reload, publish a live
+    ``session.codex_plan_mode`` event for connected clients, and forward a
+    harness-agnostic ``plan_mode_change`` control event to the runner so the
+    loaded Codex app-server switches modes immediately.
+    """
+    from omnigent.runtime import set_runner_client
+
+    captured: list[_ForwardedEffort] = []
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Record POSTs to /events; let snapshot/status reads pass through."""
+        if request.method != "POST":
+            return httpx.Response(204)
+        body: dict[str, Any] | None = None
+        if request.content:
+            body = json.loads(request.content)
+        captured.append(_ForwardedEffort(url=str(request.url), body=body))
+        return httpx.Response(204)
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+    set_runner_client(fake_runner)
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(
+            client,
+            agent["id"],
+            labels={
+                "omnigent.ui": "terminal",
+                "omnigent.wrapper": "codex-native-ui",
+            },
+        )
+        captured.clear()
+
+        resp = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"codex_plan_mode": True},
+        )
+    finally:
+        await fake_runner.aclose()
+        set_runner_client(None)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["labels"]["omnigent.codex_native.collaboration_mode"] == "plan"
+    plan_forwards = [f for f in captured if f.url.endswith(f"/v1/sessions/{session['id']}/events")]
+    assert len(plan_forwards) == 1, f"Expected one runner forward, got {captured!r}"
+    assert plan_forwards[0].body == {"type": "plan_mode_change", "enabled": True}
+    assert [event["type"] for _, event in published] == ["session.codex_plan_mode"]
+    assert published[0][1]["enabled"] is True
+
+
+@pytest.mark.parametrize("runner_status", [None, 503], ids=["no_runner", "runner_rejects"])
+async def test_patch_codex_plan_mode_requires_live_runner_before_persisting(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    runner_status: int | None,
+) -> None:
+    """
+    PATCH ``codex_plan_mode`` must not persist UI state before live success.
+
+    A Plan-mode toggle is only correct if Codex app-server accepts the
+    corresponding ``thread/settings/update`` through the runner. If no runner
+    is reachable, or the runner reports that the loaded Codex bridge cannot
+    apply the update, the route must fail and leave the collaboration label
+    absent so the web UI rolls back instead of showing a false Plan indicator.
+    """
+    from omnigent.runtime import set_runner_client
+
+    captured: list[_ForwardedEffort] = []
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+
+    fake_runner: httpx.AsyncClient | None = None
+    if runner_status is not None:
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            """
+            Record the plan-mode forward and reject it like a missing bridge.
+
+            :param request: Runner request received by the mock transport.
+            :returns: Runner response with ``runner_status``.
+            """
+            body: dict[str, Any] | None = None
+            if request.content:
+                body = json.loads(request.content)
+            captured.append(_ForwardedEffort(url=str(request.url), body=body))
+            return httpx.Response(
+                runner_status,
+                json={
+                    "error": "codex_native_settings_update_failed",
+                    "detail": "Codex-native plan-mode update requires a loaded Codex bridge.",
+                },
+            )
+
+        fake_runner = httpx.AsyncClient(
+            transport=httpx.MockTransport(_handler),
+            base_url="http://runner",
+        )
+
+    set_runner_client(fake_runner)
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(
+            client,
+            agent["id"],
+            labels={
+                "omnigent.ui": "terminal",
+                "omnigent.wrapper": "codex-native-ui",
+            },
+        )
+
+        resp = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"codex_plan_mode": True},
+        )
+        snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    finally:
+        if fake_runner is not None:
+            await fake_runner.aclose()
+        set_runner_client(None)
+
+    assert resp.status_code == 503, resp.text
+    assert "Could not enter Plan mode" in resp.text
+    assert "omnigent.codex_native.collaboration_mode" not in snapshot["labels"]
+    assert published == []
+    if runner_status is None:
+        assert captured == []
+    else:
+        plan_forwards = [
+            f for f in captured if f.url.endswith(f"/v1/sessions/{session['id']}/events")
+        ]
+        assert len(plan_forwards) == 1, f"Expected one rejected forward, got {captured!r}"
+        assert plan_forwards[0].body == {"type": "plan_mode_change", "enabled": True}
+
+
+async def test_patch_codex_plan_mode_rejects_non_codex_session(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    ``codex_plan_mode`` is rejected for sessions that are not Codex-native.
+
+    This keeps a Codex-specific UI control from becoming a generic label write
+    that could imply Plan mode on sessions whose runner cannot honor it.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"codex_plan_mode": True},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "codex_plan_mode is only supported" in resp.text
 
 
 @pytest.mark.parametrize(
