@@ -1359,6 +1359,7 @@ class _CodexAppServerSession:
         cwd: str,
         sandbox: str,
         reasoning_effort: str | None = None,
+        collaboration_mode: CodexParams | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
         await self.start()
         assert self._proc is not None
@@ -1400,6 +1401,8 @@ class _CodexAppServerSession:
         }
         if reasoning_effort:
             turn_params["effort"] = reasoning_effort
+        if collaboration_mode is not None:
+            turn_params["collaborationMode"] = collaboration_mode
         start_response = await self._request(
             "turn/start",
             turn_params,
@@ -2276,6 +2279,16 @@ class CodexExecutor(Executor):
         except ValueError as exc:
             yield ExecutorError(message=str(exc), retryable=False)
             return
+        raw_collaboration_mode = cfg.extra.get("codex_collaboration_mode")
+        if raw_collaboration_mode is not None and not isinstance(
+            raw_collaboration_mode, dict
+        ):
+            yield ExecutorError(
+                message="codex_collaboration_mode must be a JSON object",
+                retryable=False,
+            )
+            return
+        collaboration_mode: CodexParams | None = raw_collaboration_mode
 
         app_session = await self._ensure_app_session(
             state,
@@ -2295,6 +2308,7 @@ class CodexExecutor(Executor):
                 cwd=effective_cwd,
                 sandbox=sandbox_mode,
                 reasoning_effort=reasoning_effort,
+                collaboration_mode=collaboration_mode,
             ):
                 yield event
         except Exception as exc:  # noqa: BLE001 — executor boundary converts any error into an ExecutorError event

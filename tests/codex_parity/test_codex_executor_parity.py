@@ -126,6 +126,21 @@ def _executor(codex_bin: str, base_url: str, cwd: Path) -> CodexExecutor:
     )
 
 
+def _plan_mode_config(model: str = "mock-model") -> ExecutorConfig:
+    return ExecutorConfig(
+        extra={
+            "codex_collaboration_mode": {
+                "mode": "plan",
+                "settings": {
+                    "model": model,
+                    "reasoning_effort": None,
+                    "developer_instructions": None,
+                },
+            }
+        }
+    )
+
+
 async def _run_turn(
     executor: CodexExecutor,
     prompt: str,
@@ -251,6 +266,47 @@ async def test_real_codex_usage_and_model_override_cross_boundary(
         "cache_read_input_tokens": 3,
     }
     assert sidecar.requests(min_count=1)[0]["body"]["model"] == "mock-model-override"
+
+
+@pytest.mark.asyncio
+async def test_real_codex_plan_mode_strips_proposed_plan_from_final_response(
+    codex_responses_sidecar,
+    resolved_codex_bin: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "source-codex-home"))
+    (tmp_path / "source-codex-home").mkdir()
+    plan_block = "<proposed_plan>\n- Step 1\n- Step 2\n</proposed_plan>\n"
+    full_message = f"Intro\n{plan_block}Outro"
+    sidecar = codex_responses_sidecar(
+        [
+            [
+                ev_response_created("resp-plan"),
+                ev_message_item_added("msg-plan"),
+                ev_output_text_delta(full_message),
+                ev_assistant_message("msg-plan", full_message),
+                ev_completed("resp-plan"),
+            ]
+        ]
+    )
+    executor = _executor(resolved_codex_bin, sidecar.base_url, tmp_path / "workspace")
+    (tmp_path / "workspace").mkdir()
+
+    events = _assert_completed(
+        await _run_turn(
+            executor,
+            "please plan",
+            config=_plan_mode_config(),
+        )
+    )
+    await executor.close()
+
+    assert "".join(event.text for event in events if isinstance(event, TextChunk)) == (
+        "Intro\nOutro"
+    )
+    assert _only_completion(events).response == "Intro\nOutro"
+    assert "<collaboration_mode>" in str(sidecar.requests(min_count=1)[0]["body"])
 
 
 @pytest.mark.asyncio
