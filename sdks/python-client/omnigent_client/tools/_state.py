@@ -34,13 +34,13 @@ from typing import Any
 
 try:
     import fcntl as _fcntl
-except ImportError:  # pragma: no cover - exercised on Windows.
-    _fcntl = None
+except ImportError:  # pragma: no cover - exercised on native Windows
+    _fcntl = None  # type: ignore[assignment]
 
-try:
+if os.name == "nt":
     import msvcrt as _msvcrt
-except ImportError:  # pragma: no cover - exercised on POSIX.
-    _msvcrt = None
+else:  # pragma: no cover - exercised on POSIX
+    _msvcrt = None  # type: ignore[assignment]
 
 # Subdirectory segments reserved by the framework — JSON key files
 # live at ``{root}/{key}.json``. Keys must not contain path
@@ -87,10 +87,14 @@ class ToolState:
         path = self._path_for(key)
         if not path.exists():
             return default
-        # Shared lock: allow parallel reads on POSIX, block concurrent writers
-        # briefly so we see a complete JSON payload.
-        with path.open("r") as f, _file_lock(f, exclusive=False):
-            return json.loads(f.read() or "null")
+        with path.open("r") as f:
+            # Shared lock: allow parallel reads, block concurrent writers
+            # briefly so we see a complete JSON payload.
+            _lock_file(f, exclusive=False)
+            try:
+                return json.loads(f.read() or "null")
+            finally:
+                _unlock_file(f)
 
     def set(self, key: str, value: Any) -> None:
         """Replace (or create) the value at ``key``. JSON-serialized.
@@ -178,10 +182,14 @@ class ToolState:
         # we seek to 0 before read. Opening with ``r+`` would fail
         # when the file doesn't exist yet, which is a common first-
         # call case for a tool.
-        with thread_lock, path.open("a+") as f, _file_lock(f, exclusive=True):
-            value = _read_transaction_value(f, default)
-            yield value
-            _write_transaction_value(f, value)
+        with thread_lock, path.open("a+") as f:
+            _lock_file(f, exclusive=True)
+            try:
+                value = _read_transaction_value(f, default)
+                yield value
+                _write_transaction_value(f, value)
+            finally:
+                _unlock_file(f)
 
     # ── Internals ────────────────────────────────────────────
 
@@ -245,31 +253,31 @@ def _write_transaction_value(f: Any, value: Any) -> None:
     os.fsync(f.fileno())
 
 
-@contextmanager
-def _file_lock(f: Any, *, exclusive: bool) -> Iterator[None]:
-    """Lock an open state file for the duration of the context."""
+def _lock_file(f: Any, *, exclusive: bool) -> None:
+    """Acquire an advisory file lock for ``f``.
+
+    POSIX uses ``fcntl.flock``. Native Windows has no ``fcntl`` module, so it
+    locks one byte with ``msvcrt.locking``; that API is exclusive-only, which
+    is conservative for reads but preserves cross-process serialization.
+    """
     if _fcntl is not None:
-        mode = _fcntl.LOCK_EX if exclusive else _fcntl.LOCK_SH
-        _fcntl.flock(f, mode)
-        try:
-            yield
-        finally:
-            _fcntl.flock(f, _fcntl.LOCK_UN)
+        _fcntl.flock(f, _fcntl.LOCK_EX if exclusive else _fcntl.LOCK_SH)
         return
-
-    if _msvcrt is not None:
-        # Windows byte-range locks are exclusive only. Lock one stable byte at
-        # the start of the file; empty files still support this region.
-        f.seek(0)
-        _msvcrt.locking(f.fileno(), _msvcrt.LK_LOCK, 1)
-        try:
-            yield
-        finally:
-            f.seek(0)
-            _msvcrt.locking(f.fileno(), _msvcrt.LK_UNLCK, 1)
+    if _msvcrt is None:  # pragma: no cover - defensive for unusual platforms
         return
+    f.seek(0)
+    _msvcrt.locking(f.fileno(), _msvcrt.LK_LOCK, 1)
 
-    yield
+
+def _unlock_file(f: Any) -> None:
+    """Release a lock acquired by :func:`_lock_file`."""
+    if _fcntl is not None:
+        _fcntl.flock(f, _fcntl.LOCK_UN)
+        return
+    if _msvcrt is None:  # pragma: no cover - defensive for unusual platforms
+        return
+    f.seek(0)
+    _msvcrt.locking(f.fileno(), _msvcrt.LK_UNLCK, 1)
 
 
 def _get_thread_lock(path: Path) -> threading.Lock:

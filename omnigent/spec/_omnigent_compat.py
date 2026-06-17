@@ -17,8 +17,9 @@ deleting Omnigent support means:
    grep for ``_omnigent_compat`` to find them).
 3. Delete ``omnigent/spec/omnigent.py`` (the bidirectional
    translator).
-4. Delete ``omnigent/runtime/executors/omnigent.py`` (the
-   executor).
+4. The Omnigent executor module is already gone (it held an
+   experimental executor ABC that has since been removed), so
+   there is nothing left to delete here.
 5. Remove ``ExecutorSpec.config`` from
    ``omnigent/spec/types.py`` (the only field that couldn't
    move here because Python dataclasses don't support
@@ -80,7 +81,6 @@ OMNIGENT_HARNESSES = frozenset(
         "codex",
         "codex-native",
         "cursor",
-        "databricks_supervisor",
         "openai-agents",
         "open-responses",
         "pi",

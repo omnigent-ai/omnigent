@@ -111,7 +111,7 @@ def test_sdk_harnesses_require_no_cli(harness: str) -> None:
 
 @pytest.mark.parametrize(
     "harness",
-    ["claude-sdk", "codex", "openai-agents-sdk", "databricks_supervisor", "unknown"],
+    ["claude-sdk", "codex", "openai-agents-sdk", "unknown"],
 )
 def test_required_cli_none_for_sdk_or_unknown_harness(harness: str) -> None:
     """SDK-based / unknown harnesses need no CLI binary → ``None``.

@@ -49,6 +49,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 import click
 
+from omnigent.inner import ui
 from omnigent.onboarding.sandboxes.base import (
     RemoteCommandResult,
     RemoteProcess,
@@ -548,11 +549,12 @@ class E2BSandboxLauncher(SandboxLauncher):
         # The requested lifetime exceeds this account's maximum (e.g. a
         # Hobby account's 1 h cap vs the 24 h default) and E2B rejected it
         # rather than clamping — retry once at the cap.
-        click.secho(
+        ui.console.print(
             f"  → requested {timeout // 3600}h lifetime exceeds this E2B account's "
             f"maximum ({cap // 3600}h); retrying clamped to it (set "
             f"{MAX_LIFETIME_ENV_VAR} to request a specific lifetime).",
-            fg="yellow",
+            style="omni.warning",
+            markup=False,
         )
         try:
             return Sandbox.create(
@@ -598,10 +600,11 @@ class E2BSandboxLauncher(SandboxLauncher):
         try:
             handle.set_timeout(lifetime)
         except SandboxException as exc:
-            click.secho(
+            ui.console.print(
                 f"  → warning: could not extend the lifetime of '{sandbox_id}' "
                 f"({exc}); the sandbox will stop at its current timeout.",
-                fg="yellow",
+                style="omni.warning",
+                markup=False,
             )
         else:
             # set_timeout accepts an over-cap request without raising (unlike

@@ -114,8 +114,7 @@ class TextChunk(ExecutorEvent):
 class ReasoningChunk(ExecutorEvent):
     """Streaming reasoning / chain-of-thought output.
 
-    Mirrors :class:`omnigent.runtime.executors.base.ReasoningChunk` so the
-    workflow's ``_event_to_sse_dict`` can map either flavor onto the same
+    The workflow's ``_event_to_sse_dict`` maps this onto the
     ``response.reasoning_text.delta`` / ``response.reasoning.started`` SSE
     events.
 

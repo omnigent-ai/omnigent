@@ -1,0 +1,51 @@
+# Reviewer routing map -- area -> candidate reviewers.
+#
+# This is NOT a GitHub CODEOWNERS file. It deliberately lives at .github/reviewers
+# (a non-magic path) so GitHub's native CODEOWNERS feature does NOT auto-request
+# reviewers. All assignment is driven by .github/workflows/auto-assign-reviewer.yml,
+# which:
+#   - runs ONLY on fork PRs authored by a non-maintainer, and
+#   - assigns EXACTLY 2 load-balanced reviewers from the area(s) the PR touches
+#     (falling back to the full set of handles in this file for unowned paths).
+# So the per-area lists below are the CANDIDATE pool per area, not "everyone gets
+# requested". This is routing only -- it does not gate merge (that stays
+# Maintainer Approval + Merge Ready).
+#
+# Syntax is CODEOWNERS-like for familiarity: "<path-prefix>  @handle @handle".
+# Last matching line wins per file. Owners must be maintainers in
+# .github/MAINTAINER. Per-area owners are the top maintainers by COMBINED commit
+# count across both repos (databricks-eng/agent-framework full history +
+# omnigent-ai/omnigent), up to ~4 per area, excluding tree-wide mechanical
+# sweeps (>100 files) and non-maintainer contributors. Worth a periodic
+# sanity-check.
+
+# Repo automation / CI
+/.github/                    @PattaraS @serena-ruan @dhruv0811 @TomeHirata
+
+# Web UI
+/ap-web/                     @SabhyaC26 @serena-ruan @daniellok-db @hzub
+
+# Core agent runtime & harnesses
+/omnigent/inner/             @SabhyaC26 @TomeHirata @dhruv0811 @dbczumar
+/omnigent/runner/            @SabhyaC26 @TomeHirata @serena-ruan @fanzeyi
+/omnigent/runtime/           @TomeHirata @SabhyaC26 @dhruv0811 @ckcuslife-source
+/omnigent/server/            @dbczumar @dhruv0811 @ckcuslife-source @TomeHirata
+/omnigent/onboarding/        @SabhyaC26 @fanzeyi @dhruv0811 @bbqiu
+/omnigent/policies/          @TomeHirata @dhruv0811 @ckcuslife-source
+/omnigent/spec/              @SabhyaC26 @dhruv0811 @ckcuslife-source
+/omnigent/llms/              @PattaraS @ckcuslife-source
+/omnigent/host/              @fanzeyi @dhruv0811 @dbczumar
+/omnigent/sandbox/           @SabhyaC26
+/omnigent/db/                @fanzeyi @SabhyaC26
+/omnigent/stores/            @serena-ruan @TomeHirata @fanzeyi
+/omnigent/terminals/         @dbczumar @Edwinhe03 @fanzeyi
+/omnigent/tools/             @dbczumar @PattaraS @TomeHirata
+/omnigent/entities/          @daniellok-db @TomeHirata
+/omnigent/repl/              @dhruv0811 @dbczumar
+/omnigent/resources/         @fanzeyi @serena-ruan
+
+# Deploy targets
+/deploy/                     @dhruv0811 @PattaraS @dbczumar @SabhyaC26
+
+# Python / UI SDKs
+/sdks/                       @dbczumar @fanzeyi @SabhyaC26 @TomeHirata

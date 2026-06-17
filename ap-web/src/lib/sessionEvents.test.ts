@@ -1,4 +1,4 @@
-// Pin the wire envelopes for the four `session.*` SSE events.
+// Pin the wire envelopes for `session.*` SSE events.
 //
 // Each event in `omnigent/server/schemas.py` uses either a FLAT
 // envelope (`{type, ...fields}`) or a NESTED envelope (`{type, data:
@@ -11,13 +11,16 @@ import { describe, expect, it } from "vitest";
 import type {
   ElicitationRequest,
   SessionAgentChangedEvent,
+  SessionCollaborationModeEvent,
   SessionChangedFilesInvalidatedEvent,
   SessionChildSessionUpdatedEvent,
+  SessionModelOptionsEvent,
   SessionCreatedEvent,
   SessionInputConsumedEvent,
   SessionInterruptedEvent,
   SessionModelEvent,
   SessionPresenceEvent,
+  SessionReasoningEffortEvent,
   SessionResourceCreatedEvent,
   SessionResourceDeletedEvent,
   SessionSandboxStatusEvent,
@@ -1184,6 +1187,56 @@ describe("session.model (FLAT envelope)", () => {
   });
 });
 
+describe("session.reasoning_effort (FLAT envelope)", () => {
+  it("lifts conversation_id and effort", () => {
+    const events = parse("session.reasoning_effort", {
+      conversation_id: "conv_abc",
+      reasoning_effort: "medium",
+    });
+    expect(events).toHaveLength(1);
+    const ev = events[0] as SessionReasoningEffortEvent;
+    expect(ev.type).toBe("session_reasoning_effort");
+    expect(ev.conversationId).toBe("conv_abc");
+    expect(ev.reasoningEffort).toBe("medium");
+  });
+
+  it("lifts null effort clears", () => {
+    const events = parse("session.reasoning_effort", {
+      conversation_id: "conv_abc",
+      reasoning_effort: null,
+    });
+    expect(events).toHaveLength(1);
+    const ev = events[0] as SessionReasoningEffortEvent;
+    expect(ev.reasoningEffort).toBeNull();
+  });
+
+  it("rejects missing effort", () => {
+    expect(parse("session.reasoning_effort", { conversation_id: "conv_abc" })).toEqual([]);
+  });
+});
+
+describe("session.collaboration_mode (FLAT envelope)", () => {
+  it("lifts conversation_id and mode string", () => {
+    const events = parse("session.collaboration_mode", {
+      conversation_id: "conv_abc",
+      mode: "plan",
+    });
+    expect(events).toHaveLength(1);
+    const ev = events[0] as SessionCollaborationModeEvent;
+    expect(ev.type).toBe("session_collaboration_mode");
+    expect(ev.conversationId).toBe("conv_abc");
+    expect(ev.mode).toBe("plan");
+  });
+
+  it("rejects missing mode", () => {
+    expect(parse("session.collaboration_mode", { conversation_id: "conv_abc" })).toEqual([]);
+  });
+
+  it("rejects missing conversation_id", () => {
+    expect(parse("session.collaboration_mode", { mode: "plan" })).toEqual([]);
+  });
+});
+
 describe("session.agent_changed (FLAT envelope)", () => {
   it("lifts conversation_id, agent_id, and agent_name", () => {
     const events = parse("session.agent_changed", {
@@ -1406,6 +1459,26 @@ describe("session.skills (FLAT envelope)", () => {
     const out = parse("session.skills", {
       type: "session.skills",
       conversation_id: "",
+    });
+    expect(out).toEqual([]);
+  });
+});
+
+describe("session.model_options (FLAT envelope)", () => {
+  it("lifts conversation_id into the bare nudge", () => {
+    const out = parse("session.model_options", {
+      type: "session.model_options",
+      conversation_id: "conv_abc",
+    });
+    expect(out).toHaveLength(1);
+    const ev = out[0] as SessionModelOptionsEvent;
+    expect(ev.type).toBe("session_model_options");
+    expect(ev.conversationId).toBe("conv_abc");
+  });
+
+  it("rejects missing conversation_id", () => {
+    const out = parse("session.model_options", {
+      type: "session.model_options",
     });
     expect(out).toEqual([]);
   });
