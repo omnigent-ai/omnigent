@@ -4,6 +4,14 @@ metadata:
   name: omnigent
   annotations:
     cert-manager.io/cluster-issuer: letsencrypt-prod
+    # WebSocket tunnels (H4): the server holds long-lived WS connections for
+    # runner/host tunnels and live session updates. nginx upgrades WS
+    # automatically, but the default 60s proxy timeouts drop idle tunnels —
+    # raise them. proxy-body-size 0 = unlimited (artifact uploads).
+    # (These are ingress-nginx annotations; translate if you use another controller.)
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
 spec:
   ingressClassName: nginx
   tls:

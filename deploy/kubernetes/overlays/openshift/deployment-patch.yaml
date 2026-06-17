@@ -7,6 +7,13 @@ spec:
     spec:
       securityContext:
         runAsNonRoot: true
+        # The base pins uid/gid/fsGroup 10001 for vanilla k8s. OpenShift's
+        # restricted SCC assigns a uid from the namespace range and manages
+        # fsGroup itself, and REJECTS an out-of-range runAsUser — so null these
+        # (strategic-merge delete) to hand control back to the SCC.
+        runAsUser: null
+        runAsGroup: null
+        fsGroup: null
       containers:
         - name: omnigent
           securityContext:

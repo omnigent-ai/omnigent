@@ -176,6 +176,41 @@ jobs:
           provenance: false
           sbom: false
 
+      # Smoke-gate the host image before publishing. The native harness
+      # terminals (claude-native / codex-native / pi) fail-loud without the
+      # bwrap binary (omnigent/inner/bwrap_sandbox.py: shutil.which("bwrap")
+      # is None -> OSError), and deploy/islo/README.md guarantees the host
+      # target ships bubblewrap. Build with --load (cache hit off the server
+      # build) and verify bwrap is present + runnable before we push.
+      - name: Build host image (load for smoke test)
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          target: host
+          load: true
+          platforms: linux/amd64
+          tags: omnigent-host:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false
+
+      - name: Smoke test host image (bwrap installed + runnable)
+        run: |
+          set -euo pipefail
+          # Hard gate: the binary must exist and execute (matches the
+          # which("bwrap") check the sandbox does at runtime).
+          docker run --rm omnigent-host:smoke bwrap --version
+          # Best-effort functional check; nested unprivileged userns may be
+          # unavailable inside the CI container, so this is non-fatal.
+          if docker run --rm omnigent-host:smoke bwrap --ro-bind / / --dev /dev --proc /proc true; then
+            echo "bwrap functional: OK"
+          else
+            echo "note: bwrap present but nested-userns exec unavailable in CI (non-fatal)"
+          fi
+          echo "host image bwrap smoke: OK"
+
       # Host image: same Dockerfile, `host` target. Runs after the server build
       # so it reuses the shared builder-stage layers from the gha cache.
       - name: Build and push host image

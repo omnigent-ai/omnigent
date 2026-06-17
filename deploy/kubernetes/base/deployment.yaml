@@ -14,9 +14,31 @@ spec:
       labels:
         app: omnigent
     spec:
+      # Pod-level hardening (H2). The runtime image ships a non-root user
+      # (uid/gid 10001); fsGroup chowns the artifacts PVC to gid 10001 so the
+      # process can write it. The openshift overlay overrides runAsUser with an
+      # SCC-assigned uid (OpenShift manages fsGroup from the namespace range).
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: omnigent
+          # H1: pin a release for reproducible deploys — set a digest or version
+          # tag, e.g. via kustomize:  images: [{name: ghcr.io/omnigent-ai/omnigent-server,
+          # newTag: vX.Y.Z}] (or newName@sha256:<digest>). :latest is the dev default.
           image: ghcr.io/omnigent-ai/omnigent-server:latest
+          # Container hardening (H2) — safe regardless of run-as uid.
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
           ports:
             - containerPort: 8000
               name: http
@@ -35,6 +57,17 @@ spec:
             limits:
               memory: "1Gi"
               cpu: "1000m"
+          # Startup probe (H3): first-boot runs DB migrations; give it up to
+          # ~5 min (30 x 10s) before liveness/readiness begin, so a slow
+          # migrate isn't killed mid-flight. Liveness only starts once this
+          # succeeds.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
           livenessProbe:
             httpGet:
               path: /health
