@@ -297,24 +297,6 @@ skips:
     cluster: async-dispatch-inbox-sse
     mode: skip
 
-  - id: tests/e2e/test_archer_local_tool.py::test_archer_calls_word_count_tool
-    reason: "Local Python tool 'word_count' not registered on the archer agent in CI; tool-loading regression, not LLM flakiness. Failed all 3 retry attempts in PR #2053."
-    issue: 532
-    cluster: archer-live-llm
-    mode: skip
-
-  - id: tests/e2e/test_archer_output_files.py::test_archer_generates_chart_and_uploads
-    reason: "No file_citation annotation produced; upload_file/annotation pipeline regression, not LLM flakiness. Failed all 3 retry attempts in PR #2053."
-    issue: 532
-    cluster: files-uploads-attachments
-    mode: skip
-
-  - id: tests/e2e/test_archer_task_queue.py::test_archer_task_queue_persists_state_across_turns
-    reason: "GET /v1/sessions/{id}/items returns empty body (JSONDecodeError); server-side regression, not LLM flakiness. Failed all 3 retry attempts in PR #2053."
-    issue: 532
-    cluster: files-uploads-attachments
-    mode: skip
-
   - id: tests/e2e/test_decorated_tools_e2e.py::test_decorated_tools_varied_signatures_e2e
     reason: "Shard 1 bulk: decorated tools varied signatures. Triage under #532."
     issue: 532
@@ -929,13 +911,6 @@ skips:
     cluster: sandbox-deps-env
     mode: skip
 
-  # Cluster: steering — test_steering.py + test_archer_steering.py
-  # flipped together.
-  - id: tests/e2e/test_archer_steering.py::test_steering_during_auto_collect
-    reason: "Force-merge backlog (steering cluster). First observed failing at 4d60bca0 (2026-05-23T00:37:02Z, E2E)."
-    issue: 0
-    cluster: archer-live-llm
-    mode: skip
   # Cluster: cancel/history.
   - id: tests/e2e/test_cancel_history.py::test_cancel_appends_history_marker_and_followup_sees_it
     reason: "Force-merge backlog (cancel-history cluster). First observed failing at 2fe283bf (2026-05-23T00:08:54Z, E2E)."

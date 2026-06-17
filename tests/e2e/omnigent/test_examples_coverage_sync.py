@@ -94,8 +94,6 @@ _ALT_COVERED: frozenset[str] = frozenset(
         "agent_with_tools",
         # Covered by test_yaml_policies.py.
         "agent_with_policies",
-        # Covered by tests/e2e/test_archer_*.py (multiple files).
-        "archer",
         # Covered by tests/e2e/test_coder_subagent.py +
         # tests/e2e/test_chat_e2e.py.
         "coder",
@@ -184,6 +182,12 @@ _ALT_COVERED: frozenset[str] = frozenset(
     }
 )
 
+# ``archer`` is retained under tests/resources/examples only as a
+# shared uploaded-agent fixture for legacy e2e tests. It is no longer
+# a shipped/example agent and its dedicated Archer suite was deleted,
+# so it should not participate in the per-example coverage drift guard.
+_FIXTURE_ONLY_EXAMPLES: frozenset[str] = frozenset({"archer"})
+
 
 def test_every_agent_has_a_dedicated_test_file() -> None:
     """
@@ -212,7 +216,7 @@ def test_every_agent_has_a_dedicated_test_file() -> None:
     on_disk |= _scan_agent_root(repo_root / "examples", require_config_yaml=True)
     on_disk |= _scan_agent_root(
         repo_root / "tests" / "resources" / "examples", require_config_yaml=True
-    )
+    ) - _FIXTURE_ONLY_EXAMPLES
     # Test-only fixture agents under ``tests/resources/agents/`` —
     # any directory counts (single-file bundles are valid here).
     on_disk |= _scan_agent_root(
