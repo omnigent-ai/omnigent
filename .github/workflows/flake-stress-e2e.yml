@@ -135,6 +135,44 @@ jobs:
             echo "::error::extra_pytest_args contains disallowed characters; allowed: a-zA-Z0-9 . / _ : [ ] - = space"
             exit 1
           fi
+          # SECURITY (additional deny check, layered on the allowlist above):
+          # the run-pytest step deliberately OMITS --showlocals so the
+          # session-scoped llm_api_key fixture / env dicts can't be dumped
+          # into the JUnit <failure>/<system-out> CDATA. But the allowlist
+          # permits letters/hyphens/spaces, so a dispatcher could smuggle
+          # ``--showlocals`` / ``-l`` (or a pytest ini override that re-enables
+          # junit log capture, e.g. ``-o junit_logging=...``) through either
+          # free-form input and re-enable locals dumping. Uploaded ARTIFACTS
+          # are NOT secret-masked by GitHub (only logs are), so that would
+          # leak the gateway key. Reject those tokens in BOTH inputs.
+          # ``set -f`` so bracketed node-ids (``test_x[case1]``) are examined
+          # literally instead of glob-expanding during word-splitting.
+          set -f
+          for tok in $TEST_TARGET $EXTRA_ARGS; do
+            case "$tok" in
+              -l|--showlocals|--show-locals)
+                echo "::error::--showlocals/-l is forbidden: it dumps locals (incl. the llm_api_key) into the uploaded junit artifact, which GitHub does not secret-mask. Remove it from test_target/extra_pytest_args."
+                set +f; exit 1
+                ;;
+              -o|--override-ini|--override-ini=*)
+                echo "::error::pytest ini overrides (-o/--override-ini) are forbidden: they could re-enable junit log capture and leak secrets into the uploaded artifact."
+                set +f; exit 1
+                ;;
+              *junit_logging*)
+                echo "::error::junit_logging override is forbidden: it captures logs into the uploaded junit artifact and can leak secrets."
+                set +f; exit 1
+                ;;
+              --*)
+                : # other long options are already constrained by the allowlist
+                ;;
+              -*l*)
+                # single-dash short-flag bundle containing 'l' (e.g. -lv, -xvl) == -l
+                echo "::error::bundled short flag '$tok' contains -l (showlocals), which would leak secrets into the uploaded junit artifact; pass flags individually without -l."
+                set +f; exit 1
+                ;;
+            esac
+          done
+          set +f
           # Build JSON array [1,2,...,N] for the matrix.
           ARR=$(python3 -c "import json,os; print(json.dumps(list(range(1, int(os.environ['ATTEMPTS'])+1))))")
           echo "attempts_json=$ARR" >> "$GITHUB_OUTPUT"
@@ -261,7 +299,7 @@ jobs:
             --junitxml=artifacts/pytest-attempt-${{ matrix.attempt }}.xml \
             -v --tb=long --log-level=INFO -r a \
             $EXTRA_ARGS \
-            || { rc=$?; [ "$rc" -eq 5 ] && echo "::notice::No tests collected; treating as a pass." || exit "$rc"; }
+            || { rc=$?; if [ "$rc" -eq 5 ]; then echo "::error::No tests collected — check your test_target ('$TEST_TARGET'). A flake-stress run with a single user-specified target that collects nothing is almost always a typo'd selector, not a clean pass."; fi; exit "$rc"; }
 
       - name: Upload pytest artifacts
         if: always()
