@@ -156,9 +156,8 @@ the `_tool_executor` bridge called `context.call_tool`, which
 fell through to `await_tool_output` (the client-side tunneling
 path) and parked forever waiting for a client that doesn't exist.
 
-**Fix** (see `omnigent/runtime/executors/omnigent.py`):
-`_make_tool_executor_bridge` now takes the `AgentDef` and
-dispatches user tools directly:
+**Fix** (in the tool-executor bridge): the bridge takes the
+`AgentDef` and dispatches user tools directly:
 
 - `FunctionTool` → call `tool.callable(**args)` directly
   (sync: on the thread pool; async: awaited on the current loop).

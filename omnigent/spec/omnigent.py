@@ -1773,7 +1773,6 @@ def _translate_executor_from_def(
             f"whose prefix maps to a known harness.",
             code=ErrorCode.INVALID_INPUT,
         )
-    # Supervisor spawn-env reads spec.executor.profile, not config["profile"].
     return ExecutorSpec(
         type=OMNIGENT_EXECUTOR_TYPE,
         config=config,
