@@ -33,11 +33,14 @@ By trust tier (GitHub `author_association`):
   maintainer clicks **Approve and run**; after approval the gate's scan still
   applies.
 
-The scan inspects the PR diff for committed secrets, changes to privileged repo
-config (CI workflows, `.github/MAINTAINER`, `CODEOWNERS`, `.github/scripts`),
-CI-workflow misuse (`pull_request_target` + PR-head checkout, unpinned actions),
-and known code-execution / obfuscation patterns (semgrep, local ruleset). It
-only *statically* analyses the diff and runs with **no secrets** on fork PRs,
+The scan inspects the PR diff for committed secrets, secret-exfiltration shapes
+(a secret-named credential source plus a network sink in one file, an
+`os.environ` dump, a decode-then-exec, or a reverse shell), changes to
+privileged repo config (CI workflows, `.github/MAINTAINER`, `CODEOWNERS`,
+`.github/scripts`), CI-workflow misuse (`pull_request_target` + PR-head
+checkout, unpinned actions), and known code-execution / obfuscation patterns
+(semgrep, local ruleset). It only *statically* analyses the diff and runs with
+**no secrets** on fork PRs,
 and the scanner itself always runs from `main`, so a PR cannot weaken its own
 scan.
 

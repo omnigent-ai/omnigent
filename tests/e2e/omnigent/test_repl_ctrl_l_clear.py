@@ -4,8 +4,10 @@ Submits one prompt so the scrollback has identifiable text,
 presses ``Ctrl+L`` to clear the screen, then inspects the
 subsequent PTY render frame. The assertion looks for (a) the
 ANSI erase sequence that ``_clear_screen`` writes and (b) a
-follow-up ``state: sleeping`` status line showing the input area
-is still present and responsive.
+follow-up turn that completes — proving the input area is still
+present and responsive. Turn synchronization uses the visible
+``⠹ working`` line and the ``❯`` prompt rather than the
+truncated/CPR-suppressed ``state:`` badge (see test_repl_smoke).
 
 Scrolling back the rendered terminal is hard to do deterministically
 from pexpect — prompt-toolkit's Renderer tracks cursor position
@@ -39,10 +41,13 @@ from tests.e2e.omnigent._pexpect_harness import (
     clean_exit,
     spawn_omnigent_run,
     submit_prompt,
-    wait_for_ready,
 )
 from tests.e2e.omnigent._repl_test_helpers import drain_for
 from tests.e2e.omnigent._snapshot import compare_snapshot
+
+# Visible turn-synchronization markers (see test_repl_smoke).
+_RUNNING_MARKER = r"working"
+_COMPLETION_MARKER = r"❯ "
 
 _MODEL = resolve_model("databricks-gpt-5-mini", key=__name__)
 _HARNESS = "openai-agents"
@@ -100,12 +105,14 @@ def test_repl_ctrl_l_clears_screen(
         timeout=_SPAWN_TIMEOUT,
     )
     try:
-        wait_for_ready(child, timeout=_BOOT_TIMEOUT)
+        child.expect(_COMPLETION_MARKER, timeout=_BOOT_TIMEOUT)
         submit_prompt(child, _PROMPT)
         await_turn_complete(
             child,
             running_timeout=_RUNNING_TIMEOUT,
             completion_timeout=_COMPLETION_TIMEOUT,
+            running_marker=_RUNNING_MARKER,
+            completion_pattern=_COMPLETION_MARKER,
         )
         # Send Ctrl+L; then drain the render frames the REPL
         # emits in response. The drain captures BOTH the escape
@@ -119,15 +126,17 @@ def test_repl_ctrl_l_clears_screen(
         # early if the PTY idles before the budget elapses.
         post_clear_drain = drain_for(child, _POST_CLEAR_TIMEOUT)
         # Confirm the REPL is still alive and responsive by
-        # submitting a second prompt and requiring the status
-        # bar to oscillate back to ``state: sleeping``. If Ctrl+L
-        # had exited the app, this expect would raise EOF
-        # instead.
+        # submitting a second prompt and requiring the turn to
+        # start (``working``) and settle back at the ``❯`` prompt.
+        # If Ctrl+L had exited the app, this would raise EOF
+        # instead of completing a turn.
         submit_prompt(child, "say hi")
         post_prompt_turn = await_turn_complete(
             child,
             running_timeout=_RUNNING_TIMEOUT,
             completion_timeout=_COMPLETION_TIMEOUT,
+            running_marker=_RUNNING_MARKER,
+            completion_pattern=_COMPLETION_MARKER,
         )
         clean_exit(child, timeout=_EXIT_TIMEOUT)
         exit_code = child.exitstatus
@@ -143,11 +152,14 @@ def test_repl_ctrl_l_clears_screen(
         # Ctrl+L fires. Its absence means the handler didn't run
         # or was neutered.
         "screen_clear_sequence_written": _SCREEN_CLEAR_SEQ in post_clear_drain,
-        # If Ctrl+L had terminated the REPL, the follow-up
-        # prompt would fail and exit_code would be non-zero.
-        # The fact that a subsequent turn completes proves the
-        # input area is still live after the clear.
-        "repl_still_alive_after_clear": "Agent>" in post_prompt_turn.stripped,
+        # If Ctrl+L had terminated the REPL, the follow-up prompt
+        # would raise EOF and never complete a turn. A second turn
+        # that starts (``working``) and re-echoes its prompt with
+        # the ``❯`` marker proves the input area is still live
+        # after the clear. (Replaces the removed ``Agent>`` banner
+        # check.)
+        "repl_still_alive_after_clear": "❯" in post_prompt_turn.stripped
+        and "say hi" in post_prompt_turn.stripped,
     }
     diffs = compare_snapshot("test_repl_ctrl_l_clear", observed)
     assert diffs == [], (

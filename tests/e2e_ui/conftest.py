@@ -1524,7 +1524,12 @@ def custom_agent_session(
             respawned.wait(timeout=5)
 
 
-def _create_native_claude_session(base_url: str, runner_id: str) -> str:
+def _create_native_claude_session(
+    base_url: str,
+    runner_id: str,
+    *,
+    terminal_launch_args: list[str] | None = None,
+) -> str:
     """Register the ``claude-native`` wrapper agent and bind its session.
 
     Reuses the exact terminal-first spec ``omnigent claude`` ships
@@ -1543,6 +1548,13 @@ def _create_native_claude_session(base_url: str, runner_id: str) -> str:
 
     :param base_url: Spawned server base URL.
     :param runner_id: The token-bound runner id to bind.
+    :param terminal_launch_args: Pass-through ``claude`` CLI args persisted on
+        the session (``conversations.terminal_launch_args``); the runner threads
+        them into the terminal launch before its own bridge/MCP/hook wiring (see
+        ``_build_claude_native_base_args`` in ``omnigent/runner/app.py``). Used
+        by the plan-mode fixture to pass ``["--permission-mode", "plan"]`` so
+        Claude boots into plan mode and reaches for ``ExitPlanMode``. ``None``
+        launches with the production defaults.
     :returns: The new session/conversation id.
     """
     import json as _json
@@ -1573,9 +1585,12 @@ def _create_native_claude_session(base_url: str, runner_id: str) -> str:
         UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
         WRAPPER_LABEL_KEY: CLAUDE_NATIVE_WRAPPER_VALUE,
     }
+    metadata: dict[str, object] = {"labels": labels}
+    if terminal_launch_args:
+        metadata["terminal_launch_args"] = terminal_launch_args
     create = httpx.post(
         f"{base_url}/v1/sessions",
-        data={"metadata": _json.dumps({"labels": labels})},
+        data={"metadata": _json.dumps(metadata)},
         files={"bundle": ("claude-native-ui.tar.gz", buf.getvalue(), "application/gzip")},
         timeout=30.0,
     )
@@ -1613,6 +1628,66 @@ def native_claude_session(
             # Escalate to SIGKILL if the runner ignores SIGTERM, so a wedged
             # process can't raise in teardown and leak / fail unrelated tests
             # (matching terminal_session / seeded_session_pair).
+            try:
+                respawned.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned.kill()
+                respawned.wait(timeout=5)
+
+
+@pytest.fixture
+def native_claude_plan_session(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A native ``claude-native`` session launched in **plan mode**.
+
+    Identical to :func:`native_claude_session` except the session carries
+    ``terminal_launch_args=["--permission-mode", "plan", "--disallowedTools",
+    "AskUserQuestion"]`` so the runner boots Claude Code into plan mode *with
+    the AskUserQuestion tool removed*. In plan mode Claude researches a task and
+    then calls its built-in ``ExitPlanMode`` tool to present the plan for
+    approval; that call rides the native ``PermissionRequest`` hook to the
+    server, which stamps the ``exit_plan_mode`` extras and publishes an
+    elicitation the SPA renders as ``ExitPlanModeReview`` inside an
+    ``ApprovalCard``. Drives the Exit-Plan-Mode review e2e
+    (``approvals/test_exit_plan_mode.py``).
+
+    The ``--disallowedTools AskUserQuestion`` is the load-bearing flake fix:
+    given the deliberately under-specified plan prompt, Claude would otherwise
+    sometimes reach for its built-in ``AskUserQuestion`` tool first (to clarify
+    the comment text/location) instead of going straight to ``ExitPlanMode``,
+    surfacing the *wrong* approval card and timing the test out. Removing the
+    tool eliminates that degree of freedom structurally rather than relying on
+    the model's sampling. The AskUserQuestion render path keeps its own
+    dedicated coverage in ``approvals/test_ask_user_question.py``, so disabling
+    it here costs no coverage.
+
+    :param live_server: Spawned server fixture; its runner is reused.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``.
+    """
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    session_id = _create_native_claude_session(
+        live_server,
+        runner_id,
+        terminal_launch_args=[
+            "--permission-mode",
+            "plan",
+            # Remove AskUserQuestion so the under-specified plan prompt can only
+            # surface via ExitPlanMode (the card under test), never a clarifying
+            # question. See this fixture's docstring + test_exit_plan_mode.py.
+            "--disallowedTools",
+            "AskUserQuestion",
+        ],
+    )
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
             try:
                 respawned.wait(timeout=5)
             except subprocess.TimeoutExpired:

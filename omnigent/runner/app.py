@@ -49,6 +49,8 @@ from omnigent.llms.summarize import (
     build_summarization_prompt,
     extract_summary_text,
 )
+from omnigent.model_override import validate_model_override
+from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runner import pending_approvals
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
@@ -57,6 +59,8 @@ from omnigent.runner.resource_registry import (
     OMNIGENT_REPL_TERMINAL_ROLE,
     PI_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
+    TerminalExitEvent,
+    TerminalLifecycle,
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.spec.parser import discover_host_skills
@@ -583,8 +587,19 @@ async def _codex_native_launch_config(
     ):
         raise RuntimeError(f"Invalid terminal_launch_args for Codex session {session_id!r}.")
     model_override = snapshot.get("model_override")
-    if model_override is not None and (not isinstance(model_override, str) or not model_override):
-        raise RuntimeError(f"Invalid model_override for Codex session {session_id!r}.")
+    if model_override is not None:
+        if not isinstance(model_override, str) or not model_override:
+            raise RuntimeError(f"Invalid model_override for Codex session {session_id!r}.")
+        # Defense-in-depth: re-validate the persisted override at the runner
+        # boundary so a value that somehow bypassed server-side validation
+        # can never reach the Codex ``config.toml`` / ``--model`` argv as
+        # shell- or TOML-shaped input.
+        try:
+            validate_model_override(model_override)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Invalid model_override for Codex session {session_id!r}: {exc}"
+            ) from exc
     external_session_id = snapshot.get("external_session_id")
     if external_session_id is not None and (
         not isinstance(external_session_id, str) or not external_session_id
@@ -779,7 +794,7 @@ async def _auto_create_pi_terminal(
             cred_env, cred_args = pi_native_provider_launch(bridge_dir / "pi-agent", provider)
             pi_env.update(cred_env)
             pi_args.extend(cred_args)
-    terminal_view = await resource_registry.launch_terminal(
+    terminal_view = await resource_registry.launch_required_terminal(
         session_id=session_id,
         terminal_name="pi",
         session_key="main",
@@ -1161,7 +1176,7 @@ async def _auto_create_codex_terminal(
     # the listener and app-server here: the background forwarder task (which
     # otherwise owns their teardown) has not been created yet.
     try:
-        terminal_view = await resource_registry.launch_terminal(
+        terminal_view = await resource_registry.launch_auxiliary_terminal(
             session_id=session_id,
             terminal_name="codex",
             session_key="main",
@@ -2276,7 +2291,7 @@ async def _auto_create_claude_terminal(
         env_spec.scrollback,
     )
     try:
-        terminal_view = await resource_registry.launch_terminal(
+        terminal_view = await resource_registry.launch_required_terminal(
             session_id=session_id,
             terminal_name="claude",
             session_key="main",
@@ -2293,9 +2308,9 @@ async def _auto_create_claude_terminal(
         )
         raise
     # Surface the terminal on the live SSE stream so an already-connected
-    # web UI enables the Terminal toggle immediately. launch_terminal
-    # registers the resource and starts the activity watcher but does not
-    # publish; the tool / REST launch paths emit this same event via
+    # web UI enables the Terminal toggle immediately. The required-terminal
+    # launch helper registers the resource and starts the activity watcher but
+    # does not publish; the tool / REST launch paths emit this same event via
     # _emit_terminal_resource_event. Without it, this auto-created terminal
     # is only discovered on reconnect (snapshot-on-connect), so the toggle
     # stays gray until the user refreshes.
@@ -2447,7 +2462,7 @@ async def _auto_create_repl_terminal(
         # starts against the real attached terminal size.
         tmux_start_on_attach=True,
     )
-    terminal_view = await resource_registry.launch_terminal(
+    terminal_view = await resource_registry.launch_auxiliary_terminal(
         session_id=session_id,
         terminal_name=_REPL_TERMINAL_NAME,
         session_key=_REPL_TERMINAL_SESSION_KEY,
@@ -2476,8 +2491,8 @@ async def _auto_create_repl_terminal(
             session_id,
         )
     # Surface the terminal on the live SSE stream so an already-connected
-    # web UI enables the Terminal toggle immediately (launch_terminal
-    # registers the resource but does not publish — mirrors the
+    # web UI enables the Terminal toggle immediately (the auxiliary-terminal
+    # launch helper registers the resource but does not publish — mirrors the
     # claude-native auto-create path).
     from omnigent.entities.session_resources import session_resource_view_to_dict
 
@@ -2711,11 +2726,20 @@ async def _evaluate_policy_via_omnigent(
     the verdict back to the harness as a ``policy_verdict`` inbound
     event.
 
-    On any failure (AP unreachable, malformed response), defaults to
-    ``POLICY_ACTION_ALLOW`` so a transient Omnigent outage does not block
-    the agent's LLM call — fail-open is appropriate here because the
-    Omnigent server's own enforcement sites (REQUEST, TOOL_CALL, etc.)
-    provide the authoritative blocking gate.
+    On failure (AP unreachable, non-200, malformed response) the default
+    verdict is phase-aware:
+
+    - ``PHASE_LLM_REQUEST`` / ``PHASE_LLM_RESPONSE`` fail OPEN
+      (``POLICY_ACTION_ALLOW``) so a transient Omnigent outage does not
+      hang the turn — these gates are advisory.
+    - ``PHASE_TOOL_CALL`` fails CLOSED (``POLICY_ACTION_DENY``). For
+      connector-native MCP tools the harness ``can_use_tool`` callback
+      (which consumes this verdict) is the *only* enforcement point — the
+      call is never re-checked server-side — so a policy that cannot be
+      evaluated must not let the tool through.
+    - ``PHASE_TOOL_RESULT`` fails OPEN: by the result phase the tool has
+      already executed, so denying would only block an already-incurred
+      side effect.
 
     :param server_client: HTTP client pointed at the Omnigent server.
     :param harness_client: HTTP client pointed at the harness subprocess.
@@ -2727,9 +2751,19 @@ async def _evaluate_policy_via_omnigent(
         ``"PHASE_LLM_REQUEST"``.
     :param data: Event data dict for the policy engine.
     """
-    # Default verdict: allow. Used on error paths.
-    verdict_action = "POLICY_ACTION_ALLOW"
-    verdict_reason: str | None = None
+    # Default verdict on error / non-200 / timeout. Phase-aware: TOOL_CALL
+    # fails CLOSED (this round-trip is the authoritative gate for
+    # connector-native tools), while advisory LLM phases and TOOL_RESULT
+    # (the tool already ran) fail OPEN so a transient outage never hangs
+    # the turn.
+    _fail_closed = phase in FAIL_CLOSED_PHASES
+    _default_action = "POLICY_ACTION_DENY" if _fail_closed else "POLICY_ACTION_ALLOW"
+    verdict_action = _default_action
+    verdict_reason: str | None = (
+        f"Omnigent policy evaluation unavailable; failing closed for {phase}."
+        if _fail_closed
+        else None
+    )
     verdict_data: dict[str, Any] | None = None
 
     try:
@@ -2745,19 +2779,25 @@ async def _evaluate_policy_via_omnigent(
         )
         if ap_resp.status_code == 200:
             result = ap_resp.json()
-            verdict_action = result.get("result", "POLICY_ACTION_ALLOW")
+            # A well-formed 200 carries "result"; a malformed body that
+            # omits it falls back to _default_action — i.e. DENY on a
+            # tool-call phase. That's deliberate: a 200 we can't read is
+            # an unevaluable verdict, which fails closed like any other.
+            verdict_action = result.get("result", _default_action)
             verdict_reason = result.get("reason")
             verdict_data = result.get("data")
         else:
             _logger.warning(
-                "AP policy evaluate returned %d for %s; defaulting to ALLOW",
+                "AP policy evaluate returned %d for %s; defaulting to %s",
                 ap_resp.status_code,
                 evaluation_id,
+                _default_action,
             )
-    except Exception:  # noqa: BLE001 — fail-open on Omnigent errors
+    except Exception:  # noqa: BLE001 — fail-open (LLM phases) / fail-closed (tool phases)
         _logger.warning(
-            "AP policy evaluate failed for %s; defaulting to ALLOW",
+            "AP policy evaluate failed for %s; defaulting to %s",
             evaluation_id,
+            _default_action,
             exc_info=True,
         )
 
@@ -2864,6 +2904,21 @@ def _resolved_spec_workdir(entry: Any) -> Path | None:
     return entry.workdir if isinstance(entry, ResolvedSpec) else None
 
 
+def _resolved_workdir_for_spec(spec: Any, fallback: Path | None) -> Path | None:
+    """Return the bundle workdir for a possibly wrapped spec entry."""
+    return _resolved_spec_workdir(spec) or fallback
+
+
+def _is_spec_local_native_python_tool(spec: Any, tool_name: str) -> bool:
+    """Return whether *tool_name* is a spec-declared native python tool."""
+    unwrapped = _unwrap_resolved_spec(spec)
+    return any(
+        getattr(info, "name", None) == tool_name
+        and getattr(info, "language", None) in ("python", "omnigent-python-callable")
+        for info in getattr(unwrapped, "local_tools", [])
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class _SessionSnapshot:
     """One ``GET /v1/sessions/{id}`` projected for all runner readers.
@@ -2880,6 +2935,13 @@ class _SessionSnapshot:
     :param workspace: Server-stored workspace path, or ``None``.
     :param agent_id: Bound agent id, or ``None`` when not yet bound /
         the fetch failed, e.g. ``"ag_abc123"``.
+    :param sub_agent_name: For sub-agent sessions, the dispatched
+        sub-agent's name, e.g. ``"claude_code"`` — used to swap the
+        parent spec to the child's sub-spec so the child's harness
+        (e.g. ``claude-native``) is resolved instead of the parent's.
+        ``None`` for top-level sessions. Projected from the server
+        snapshot so the identity survives a runner reconnect / spec-cache
+        eviction (the in-memory ``_session_sub_agent_names`` map does not).
     """
 
     ok: bool
@@ -2887,6 +2949,7 @@ class _SessionSnapshot:
     created_at: float
     workspace: str | None
     agent_id: str | None
+    sub_agent_name: str | None = None
 
 
 def _spec_with_workdir_paths(spec: Any, workdir: Path | None) -> Any:
@@ -3838,6 +3901,9 @@ class _ChildParentMeta:
     :param last_task_status: Last child-rail task status fanned out, e.g.
         ``"completed"``. Tracked separately so ``idle`` → ``failed`` emits
         even though both states are non-busy.
+    :param last_error: Last child failure detail fanned out, used to emit a
+        new parent update when only the error changes, and to clear stale
+        errors on a later running/waiting edge.
     """
 
     parent_id: str
@@ -3846,6 +3912,7 @@ class _ChildParentMeta:
     session_name: str
     last_busy: bool | None = None
     last_task_status: str | None = None
+    last_error: tuple[str, str] | None = None
 
 
 # child_session_id -> :class:`_ChildParentMeta`. Populated at spawn (see
@@ -4317,6 +4384,9 @@ def create_runner_app(
         session_id: str,
         meta: _ChildParentMeta,
         status: str | None,
+        *,
+        error: dict[str, str] | None = None,
+        include_error: bool = False,
     ) -> dict[str, Any]:
         """
         Build the ``child`` object for a parent-stream status update.
@@ -4324,10 +4394,14 @@ def create_runner_app(
         :param session_id: Child session id, e.g. ``"conv_child123"``.
         :param meta: Registered child-to-parent fan-out metadata.
         :param status: Child session status, e.g. ``"running"``.
+        :param error: Failure detail from the ``session.status`` event.
+        :param include_error: Whether to include ``last_task_error`` in the
+            partial payload. ``True`` for failed edges and for activity edges
+            that clear a stale failure.
         :returns: Child summary payload for ``session.child_session.updated``.
         """
         busy = status in ("running", "waiting")
-        return {
+        child = {
             "id": session_id,
             "title": meta.title,
             "tool": meta.tool,
@@ -4335,12 +4409,41 @@ def create_runner_app(
             "busy": busy,
             "current_task_status": _session_status_to_task_status(status),
         }
+        if include_error:
+            child["last_task_error"] = error
+        return child
+
+    def _child_error_from_status_event(
+        status: str | None,
+        event: dict[str, Any],
+    ) -> dict[str, str] | None:
+        """
+        Extract typed failure details from a generic ``session.status`` event.
+
+        :param status: Status value from the event, e.g. ``"failed"``.
+        :param event: Published status event.
+        :returns: ``{"code": "...", "message": "..."}`` for failed events
+            with a valid error payload, otherwise ``None``.
+        """
+        if status != "failed":
+            return None
+        raw_error = event.get("error")
+        if not isinstance(raw_error, dict):
+            return None
+        raw_code = raw_error.get("code")
+        raw_message = raw_error.get("message")
+        if not isinstance(raw_code, str) or not isinstance(raw_message, str):
+            return None
+        if not raw_code or not raw_message:
+            return None
+        return {"code": raw_code, "message": raw_message}
 
     def _build_child_status_update(
         session_id: str,
         meta: _ChildParentMeta,
         status: str | None,
         *,
+        error: dict[str, str] | None = None,
         latest_assistant_text: str | None = None,
         allow_history_preview_fallback: bool = True,
     ) -> dict[str, Any] | None:
@@ -4350,6 +4453,7 @@ def create_runner_app(
         :param session_id: Child session id, e.g. ``"conv_child123"``.
         :param meta: Registered child-to-parent fan-out metadata.
         :param status: Child session status, e.g. ``"running"``.
+        :param error: Failure detail from a failed ``session.status`` edge.
         :param latest_assistant_text: Explicit preview text, e.g. ``"done"``.
         :param allow_history_preview_fallback: Whether to read runner history.
         :returns: Update event, or ``None`` when busy/task status did not change.
@@ -4358,11 +4462,24 @@ def create_runner_app(
             mark_subagent_work_started(session_id)
         busy = status in ("running", "waiting")
         task_status = _session_status_to_task_status(status)
-        if meta.last_busy == busy and meta.last_task_status == task_status:
+        error_signature = (error["code"], error["message"]) if error is not None else None
+        include_error = status in ("running", "waiting") or error is not None
+        if (
+            meta.last_busy == busy
+            and meta.last_task_status == task_status
+            and meta.last_error == error_signature
+        ):
             return None
         meta.last_busy = busy
         meta.last_task_status = task_status
-        child = _child_status_body(session_id, meta, status)
+        meta.last_error = error_signature
+        child = _child_status_body(
+            session_id,
+            meta,
+            status,
+            error=error,
+            include_error=include_error,
+        )
         if not busy:
             preview = _child_preview_from_status(
                 session_id,
@@ -4410,6 +4527,7 @@ def create_runner_app(
                 session_id,
                 meta,
                 status,
+                error=_child_error_from_status_event(status, event),
                 latest_assistant_text=latest_assistant_text,
                 allow_history_preview_fallback=allow_history_preview_fallback,
             )
@@ -4466,6 +4584,99 @@ def create_runner_app(
         )
 
     resource_registry.set_session_status_publisher(_publish_session_status)
+
+    def _format_terminal_command_for_failure(event: TerminalExitEvent) -> str:
+        """Format a launch command without exposing possibly secret argv."""
+        if event.command is None:
+            return "unknown"
+        if event.args_count is None or event.args_count == 0:
+            return event.command
+        noun = "arg" if event.args_count == 1 else "args"
+        return (
+            f"{event.command} ({event.args_count} {noun}; "
+            "argv omitted because terminal args may contain secrets)"
+        )
+
+    def _format_required_terminal_exit_output(event: TerminalExitEvent) -> str:
+        """Build the sub-agent failure text for a required terminal exit."""
+        command = _format_terminal_command_for_failure(event)
+        cwd = event.cwd or "unknown"
+        parts = [
+            "Required terminal exited unexpectedly; the session runtime is no longer available.",
+            "",
+            "Terminal diagnostics:",
+            f"terminal: {event.terminal_name}:{event.session_key}",
+            f"command: {command}",
+            f"cwd: {cwd}",
+        ]
+        if event.last_output:
+            parts.extend(["", "Last captured terminal output:", event.last_output])
+        else:
+            parts.extend(
+                [
+                    "",
+                    "Last captured terminal output: unavailable. The process exited before "
+                    "Omnigent captured a pane snapshot.",
+                ]
+            )
+        return "\n".join(parts)
+
+    def _release_failed_required_terminal_session(session_id: str) -> None:
+        """Release the harness subprocess for a session whose runtime died."""
+        if process_manager is None:
+            return
+
+        async def _release() -> None:
+            try:
+                await process_manager.release(session_id)
+            except Exception:
+                _logger.exception(
+                    "Failed to release harness subprocess after required terminal exit: "
+                    "session=%s",
+                    session_id,
+                )
+
+        task = asyncio.create_task(
+            _release(),
+            name=f"required-terminal-release:{session_id}",
+        )
+        task.add_done_callback(_background_tasks.discard)
+        _background_tasks.add(task)
+
+    def _publish_terminal_exit(event: TerminalExitEvent) -> None:
+        """Publish terminal-exit lifecycle effects from the resource registry."""
+        _publish_event(
+            event.session_id,
+            {
+                "type": "session.resource.deleted",
+                "resource_id": event.terminal_id,
+                "resource_type": "terminal",
+                "session_id": event.session_id,
+            },
+        )
+        if event.lifecycle != TerminalLifecycle.REQUIRED:
+            return
+
+        output = _format_required_terminal_exit_output(event)
+        _publish_event(
+            event.session_id,
+            {
+                "type": "session.status",
+                "status": "failed",
+                "error": {
+                    "code": "required_terminal_exited",
+                    "message": output,
+                },
+            },
+        )
+        _mark_subagent_terminal_and_wake(
+            event.session_id,
+            status="failed",
+            output=output,
+        )
+        _release_failed_required_terminal_session(event.session_id)
+
+    resource_registry.set_terminal_exit_publisher(_publish_terminal_exit)
 
     # The runner owns a filesystem registry when it has a local workspace
     # (the CLI workspace path). In practice runner_workspace is always set
@@ -4533,6 +4744,7 @@ def create_runner_app(
             created_at: float | None = None
             workspace: str | None = None
             agent_id: str | None = None
+            sub_agent_name: str | None = None
             try:
                 resp = await server_client.get(f"/v1/sessions/{session_id}")
                 status_code = resp.status_code
@@ -4545,6 +4757,16 @@ def create_runner_app(
                     raw_agent_id = body.get("agent_id")
                     if isinstance(raw_agent_id, str) and raw_agent_id:
                         agent_id = raw_agent_id
+                    # Sub-agent identity (SessionResponse.sub_agent_name).
+                    # Projected here so harness resolution can swap to the
+                    # child's sub-spec even after the in-memory
+                    # _session_sub_agent_names map is lost (reconnect /
+                    # cache eviction) — the bug that respawned a sub-agent's
+                    # claude-native harness as the parent's claude-sdk and
+                    # tore down its terminal ("Bridge closed").
+                    raw_sub_agent = body.get("sub_agent_name")
+                    if isinstance(raw_sub_agent, str) and raw_sub_agent:
+                        sub_agent_name = raw_sub_agent
             except Exception:  # noqa: BLE001 — best-effort; created_at falls back to wall time
                 pass
             snapshot = _SessionSnapshot(
@@ -4553,6 +4775,7 @@ def create_runner_app(
                 created_at=created_at if created_at is not None else time.time(),
                 workspace=workspace,
                 agent_id=agent_id,
+                sub_agent_name=sub_agent_name,
             )
             # Cache only a complete snapshot. A 200 with agent_id still
             # null means the agent has not bound yet; caching it would
@@ -6053,6 +6276,38 @@ def create_runner_app(
                     item_type,
                     exc_info=True,
                 )
+
+    async def _recover_sub_agent_name(conv_id: str) -> str | None:
+        """Resolve a session's sub-agent name, recovering it if lost.
+
+        The in-memory ``_session_sub_agent_names`` map is populated only on
+        ``POST /v1/sessions`` and wiped on a runner restart / cleared on
+        session delete. A continuation turn that reaches a harness-resolution
+        path after a tunnel reconnect therefore finds it empty and resolves
+        the PARENT harness for a child session — respawning the harness and
+        tearing down the child's native terminal ("Bridge closed").
+
+        This recovers the identity from the authoritative server snapshot
+        (``GET /v1/sessions/{id}`` -> ``sub_agent_name``) and backfills the
+        in-memory map so subsequent reads are cheap. Best-effort: a failed
+        lookup returns ``None`` (a top-level session, or the snapshot is
+        unavailable), preserving the prior behavior.
+
+        :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        :returns: The sub-agent name, or ``None`` for a top-level session
+            (or when it cannot be resolved).
+        """
+        cached = _session_sub_agent_names.get(conv_id)
+        if cached:
+            return cached
+        try:
+            snapshot = await _session_snapshot(conv_id)
+        except Exception:  # noqa: BLE001 — best-effort recovery
+            return None
+        name = snapshot.sub_agent_name if snapshot is not None else None
+        if name:
+            _session_sub_agent_names[conv_id] = name
+        return name
 
     def _session_harness_name(conv_id: str) -> str | None:
         """
@@ -8028,7 +8283,16 @@ def create_runner_app(
         # the child gets the sub-agent's prompt/tools, not the
         # parent's (which would cause infinite recursion via
         # sys_session_send).
-        _sa_name = _session_sub_agent_names.get(conv)
+        #
+        # Recover the name from the server snapshot when the in-memory map
+        # was lost (runner restart / tunnel reconnect): without this, a
+        # continuation turn for a claude-native sub-agent resolves the
+        # parent's claude-sdk harness, the process manager respawns, and the
+        # child's native terminal is torn down ("Bridge closed: terminal
+        # resource not found"). The snapshot carries sub_agent_name; this
+        # is the primary turn path (the harness baked into TurnDispatch
+        # below comes from the swapped spec, so it must be correct here).
+        _sa_name = await _recover_sub_agent_name(conv)
         if _sa_name and cached_spec is not None:
             from omnigent.runtime.workflow import _find_spec_by_name
 
@@ -8443,6 +8707,12 @@ def create_runner_app(
         spawn_env = dispatch.spawn_env if dispatch else body.get("spawn_env")
         if not harness_name:
             _agent_id = dispatch.agent_id if dispatch else body.get("agent_id")
+            # Recover the sub-agent name (server snapshot if the in-memory
+            # map was lost on reconnect) so a child session resolves its OWN
+            # harness, not the parent's. Without this a continuation turn for
+            # a claude-native sub-agent resolves the parent claude-sdk harness
+            # and respawns, killing the native terminal ("Bridge closed").
+            _sub_agent_name = await _recover_sub_agent_name(conv_id)
             try:
                 harness_name, spawn_env = await _resolve_harness_config(
                     agent_id=_agent_id,
@@ -8450,6 +8720,7 @@ def create_runner_app(
                     session_id=conv_id,
                     model_override=body.get("model_override"),
                     harness_override=body.get("harness_override"),
+                    sub_agent_name=_sub_agent_name,
                 )
             except (httpx.HTTPError, RuntimeError) as exc:
                 return JSONResponse(
@@ -8505,6 +8776,7 @@ def create_runner_app(
         _turn_agent_id = dispatch.agent_id if dispatch else body.get("agent_id")
         _has_mcp_hint = dispatch.has_mcp_servers if dispatch else body.get("has_mcp_servers")
         _turn_spec: Any = None
+        _turn_spec_entry: Any = None
         _turn_spec_resolved = False
         _mcp_schemas: list[dict[str, Any]] = []
         _mcp_tool_names: set[str] = set()
@@ -8516,6 +8788,7 @@ def create_runner_app(
             _turn_spec = _unwrap_resolved_spec(_turn_spec_entry)
             if _turn_spec is None:
                 _session_entry = _session_spec_cache.get(conv_id)
+                _turn_spec_entry = _session_entry
                 _turn_spec = _unwrap_resolved_spec(_session_entry)
             if _turn_spec is None and spec_resolver is not None:
                 try:
@@ -8539,6 +8812,7 @@ def create_runner_app(
                 else:
                     if _turn_spec is not None:
                         _spec_cache[_turn_agent_id] = _resolved_turn_spec
+                        _turn_spec_entry = _resolved_turn_spec
             _turn_spec_resolved = True
             _turn_mcp: Any = ProxyMcpManager(conv_id, server_client)
             if _eager_spec_error is None and _turn_spec is not None:
@@ -8559,9 +8833,9 @@ def create_runner_app(
             (typically ``_response_failed_event`` from inside the SSE
             generator).
             """
-            nonlocal _turn_spec, _turn_spec_resolved
+            nonlocal _turn_spec, _turn_spec_entry, _turn_spec_resolved
             if _turn_spec_resolved:
-                return _turn_spec, None
+                return _turn_spec_entry or _turn_spec, None
             _turn_spec_resolved = True
             # Session-level cache has the sub-agent's resolved spec
             # (set by _run_turn_bg) for child sessions. Check it
@@ -8569,14 +8843,16 @@ def create_runner_app(
             # sub-spec, not the root spec.
             session_cached = _session_spec_cache.get(conv_id)
             if session_cached is not None:
+                _turn_spec_entry = session_cached
                 _turn_spec = _unwrap_resolved_spec(session_cached)
-                return _turn_spec, None
+                return session_cached, None
             if not _turn_agent_id or spec_resolver is None:
                 return None, None
             cached = _spec_cache.get(_turn_agent_id)
             if cached is not None:
+                _turn_spec_entry = cached
                 _turn_spec = _unwrap_resolved_spec(cached)
-                return _turn_spec, None
+                return cached, None
             try:
                 resolved = await spec_resolver(_turn_agent_id, conv_id)
             except (httpx.HTTPError, RuntimeError) as exc:
@@ -8592,8 +8868,10 @@ def create_runner_app(
                 )
             if resolved is not None:
                 _spec_cache[_turn_agent_id] = resolved
+                _turn_spec_entry = resolved
                 _turn_spec = _unwrap_resolved_spec(resolved)
-            return _turn_spec, None
+                return resolved, None
+            return None, None
 
         async def proxy_stream():
             # If eager spec resolution failed (MCP path), emit the
@@ -8838,14 +9116,42 @@ def create_runner_app(
                                     _spec_for_dispatch_hint = _unwrap_resolved_spec(
                                         _session_spec_cache.get(conv_id)
                                     )
-                                    _is_spec_local = any(
-                                        getattr(info, "name", None) == tool_name
-                                        and getattr(info, "language", None)
-                                        in ("python", "omnigent-python-callable")
-                                        for info in getattr(
-                                            _spec_for_dispatch_hint, "local_tools", []
-                                        )
+                                    _is_spec_local = _is_spec_local_native_python_tool(
+                                        _spec_for_dispatch_hint,
+                                        tool_name,
                                     )
+                                    if (
+                                        not _is_spec_local
+                                        and not is_mcp
+                                        and not should_dispatch_locally(tool_name)
+                                    ):
+                                        # The cheap _session_spec_cache lookup above
+                                        # can miss for bundle-deployed agents with NO
+                                        # MCP servers (the eager MCP path never resolved
+                                        # their spec), leaving a native python tool
+                                        # mis-classified as client-side. Resolve once to
+                                        # recompute _is_spec_local so it dispatches
+                                        # locally against the bundle workdir.
+                                        #
+                                        # A hint-only resolution failure is NON-fatal:
+                                        # we keep the prior _is_spec_local=False and let
+                                        # the tool relay to the client exactly as base
+                                        # did, rather than aborting the turn with
+                                        # response.failed. Only the real dispatch path
+                                        # below surfaces resolver errors fatally, since
+                                        # it genuinely needs the spec to dispatch.
+                                        (
+                                            _spec_for_dispatch_hint_entry,
+                                            _lazy_hint_err,
+                                        ) = await _resolve_turn_spec_lazy()
+                                        if _lazy_hint_err is None:
+                                            _spec_for_dispatch_hint = _unwrap_resolved_spec(
+                                                _spec_for_dispatch_hint_entry
+                                            )
+                                            _is_spec_local = _is_spec_local_native_python_tool(
+                                                _spec_for_dispatch_hint,
+                                                tool_name,
+                                            )
                                     _should_dispatch = _should_dispatch_tool_locally(
                                         tool_name,
                                         dispatch=dispatch,
@@ -8860,7 +9166,7 @@ def create_runner_app(
                                         # failures surface as response.failed
                                         # SSE (see the response.failed contract).
                                         (
-                                            _spec_for_dispatch,
+                                            _spec_for_dispatch_entry,
                                             _lazy_err,
                                         ) = await _resolve_turn_spec_lazy()
                                         if _lazy_err is not None:
@@ -8869,6 +9175,22 @@ def create_runner_app(
                                                 {"message": _err_msg, "type": _err_type}
                                             )
                                             return
+                                        # Bundle-deployed agents carry their own
+                                        # workdir for spec-local native python
+                                        # tools (where tools/python/*.py live).
+                                        # Builtins / OS-env / relayed tools must
+                                        # keep the caller's runner workspace.
+                                        _dispatch_workdir = (
+                                            _resolved_workdir_for_spec(
+                                                _spec_for_dispatch_entry,
+                                                runner_workspace,
+                                            )
+                                            if _is_spec_local
+                                            else runner_workspace
+                                        )
+                                        _spec_for_dispatch = _unwrap_resolved_spec(
+                                            _spec_for_dispatch_entry
+                                        )
                                         # All tool calls go through AP:/mcp
                                         # (ProxyMcpManager in Omnigent mode), which
                                         # enforces TOOL_CALL + TOOL_RESULT
@@ -8892,12 +9214,13 @@ def create_runner_app(
                                                     harness_client=client,
                                                     server_client=server_client,
                                                     terminal_registry=terminal_registry,
+                                                    resource_registry=resource_registry,
                                                     agent_spec=_spec_for_dispatch,
                                                     conversation_id=conv_id,
                                                     task_id=_omnigent_task_id or _response_id,
                                                     agent_id=_agent_id_for_dispatch,
                                                     agent_name=body.get("model"),
-                                                    runner_workspace=runner_workspace,
+                                                    runner_workspace=_dispatch_workdir,
                                                     mcp_manager=_dispatch_mcp,
                                                     session_inbox=_session_inboxes.get(conv_id),
                                                     session_async_tasks=_session_async_tasks.get(
@@ -10022,7 +10345,12 @@ def create_runner_app(
             await _ensure_comment_relay_started(session_id, bridge_id=bridge_id)
 
         try:
-            resource_view = await resource_registry.launch_terminal(
+            launch_method = (
+                resource_registry.launch_required_terminal
+                if bridge_inject
+                else resource_registry.launch_auxiliary_terminal
+            )
+            resource_view = await launch_method(
                 session_id=session_id,
                 terminal_name=terminal_name,
                 session_key=session_key,
@@ -10929,6 +11257,29 @@ def create_runner_app(
                     f"session {session_id!r} was not found",
                     code=ErrorCode.NOT_FOUND,
                 )
+            # Sub-agent swap: the bound agent_id resolves to the PARENT
+            # spec, so cache the child's sub-spec for a sub-agent session.
+            # Otherwise _session_spec_cache (and _session_harness_name /
+            # _is_native_harness, which read it) report the parent harness —
+            # the misclassification that respawns a claude-native sub-agent
+            # as claude-sdk and tears down its terminal ("Bridge closed").
+            # The snapshot carries sub_agent_name; backfill the in-memory map
+            # so the dispatch-path swap is cheap too.
+            sub_agent_name = snapshot.sub_agent_name
+            if sub_agent_name:
+                _session_sub_agent_names[session_id] = sub_agent_name
+                from omnigent.runtime.workflow import _find_spec_by_name
+
+                parent_spec = _unwrap_resolved_spec(spec_entry)
+                if parent_spec is not None:
+                    sub_spec = _find_spec_by_name(parent_spec, sub_agent_name)
+                    if sub_spec is not None:
+                        workdir = _resolved_spec_workdir(spec_entry)
+                        spec_entry = (
+                            ResolvedSpec(spec=sub_spec, workdir=workdir)
+                            if workdir is not None
+                            else sub_spec
+                        )
             _session_spec_cache[session_id] = spec_entry
             return spec_entry
 
@@ -11631,28 +11982,37 @@ def create_runner_app(
                 # any name without ``__`` is definitively a runner-local tool.
                 # Policy enforcement is handled by the AP server.
                 spec_entry = _session_spec_cache.get(session_id)
+                spec_workdir = _resolved_spec_workdir(spec_entry)
                 spec = _unwrap_resolved_spec(spec_entry)
                 if spec is None and spec_resolver is not None:
                     _agent_id = _session_agent_ids.get(session_id)
                     if _agent_id:
                         try:
                             resolved = await spec_resolver(_agent_id, session_id)
+                            spec_workdir = _resolved_spec_workdir(resolved)
                             spec = _unwrap_resolved_spec(resolved)
                         except Exception:  # noqa: BLE001
                             pass
                 _agent_id_local = _session_agent_ids.get(session_id)
+                dispatch_workspace = (
+                    spec_workdir
+                    if spec_workdir is not None
+                    and _is_spec_local_native_python_tool(spec, tool_name)
+                    else runner_workspace
+                )
                 try:
                     output = await execute_tool(
                         tool_name=tool_name,
                         arguments=_json.dumps(arguments),
                         server_client=server_client,
                         terminal_registry=terminal_registry,
+                        resource_registry=resource_registry,
                         agent_spec=spec,
                         conversation_id=session_id,
                         task_id=session_id,
                         agent_id=_agent_id_local,
                         agent_name=getattr(spec, "name", None),
-                        runner_workspace=runner_workspace,
+                        runner_workspace=dispatch_workspace,
                         mcp_manager=None,
                         session_inbox=_session_inboxes.get(session_id),
                         session_async_tasks=_session_async_tasks.get(session_id),
@@ -12086,6 +12446,7 @@ async def _resolve_harness_config(
     session_id: str | None = None,
     model_override: str | None = None,
     harness_override: str | None = None,
+    sub_agent_name: str | None = None,
 ) -> tuple[str, dict[str, str] | None]:
     """Resolve harness type + spawn-env from the agent spec.
 
@@ -12097,6 +12458,15 @@ async def _resolve_harness_config(
     :param harness_override: Per-session brain-harness override (validated
         at session create, forwarded by the server in the message body),
         e.g. ``"pi"``. Replaces the spec's ``executor.config.harness``.
+    :param sub_agent_name: For a sub-agent session, the dispatched
+        sub-agent's name (e.g. ``"claude_code"``). The bound *agent_id*
+        resolves to the PARENT spec, so without this swap a child's turn
+        resolves the parent's harness (``claude-sdk``) and the process
+        manager respawns — tearing down the child's live ``claude-native``
+        terminal ("Bridge closed: terminal resource not found"). When set,
+        the parent spec is swapped to the matching sub-spec via
+        :func:`_find_spec_by_name` before harness derivation. ``None`` for
+        top-level sessions.
     :returns: ``(harness, spawn_env)``; a default for unresolved specs.
     """
     if agent_id and spec_resolver:
@@ -12104,6 +12474,17 @@ async def _resolve_harness_config(
         spec = _unwrap_resolved_spec(spec_entry)
         workdir = _resolved_spec_workdir(spec_entry)
         if spec is not None:
+            # Swap to the sub-agent's own spec so its harness (not the
+            # parent's) drives the turn. Mirrors the POST /v1/sessions and
+            # _run_turn_bg swaps; applied here so the harness-HTTP path is
+            # sub-agent-aware too, even after a reconnect drops the
+            # in-memory _session_sub_agent_names map.
+            if sub_agent_name:
+                from omnigent.runtime.workflow import _find_spec_by_name
+
+                sub_spec = _find_spec_by_name(spec, sub_agent_name)
+                if sub_spec is not None:
+                    spec = sub_spec
             harness = harness_override or spec.executor.config.get("harness") or spec.executor.type
             harness = canonicalize_harness(harness) or harness
             spawn_env = _build_spawn_env_from_spec(
