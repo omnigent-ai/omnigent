@@ -79,10 +79,13 @@ function MissingDependencyBanner({
       className="min-w-0 max-w-full overflow-hidden has-[>svg]:grid-cols-[auto_minmax(0,1fr)]"
     >
       <AlertCircleIcon />
-      <AlertTitle className="min-w-0 break-words [overflow-wrap:anywhere]">Missing dependency</AlertTitle>
+      <AlertTitle className="min-w-0 break-words [overflow-wrap:anywhere]">
+        Missing dependency
+      </AlertTitle>
       <AlertDescription className="min-w-0 max-w-full overflow-hidden">
         <p className="text-sm">
-          The <code className="font-mono">{packageName}</code> package is required to run this agent.
+          The <code className="font-mono">{packageName}</code> package is required to run this
+          agent.
         </p>
         <div className="mt-2">
           <CliCommandBlock command={installCommand} testIdPrefix="missing-dep-install" />
