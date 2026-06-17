@@ -747,11 +747,7 @@ skips:
     cluster: sandbox-deps-env
     mode: skip
 
-  # Cluster: related harness parametrizations broken
-  # across multiple unrelated test files (yaml hello world, real
-  # hello world, coding supervisor with forks). Likely a single
-  # gateway-routing or harness regression.
-  # Standalone failures — no obvious cluster yet, individual triage.
+  # Standalone failures — no obvious cluster yet.
   - id: tests/e2e/omnigent/test_compaction_sessions_native_e2e.py::test_compaction_fires_and_agent_retains_context
     reason: "Force-merge backlog (standalone). First observed failing at 801c389c (2026-05-23T00:35:30Z, E2E)."
     issue: 0
