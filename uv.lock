@@ -1606,6 +1606,23 @@ wheels = [
 ]
 
 [[package]]
+name = "hindsight-client"
+version = "0.8.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "aiohttp" },
+    { name = "aiohttp-retry" },
+    { name = "pydantic" },
+    { name = "python-dateutil" },
+    { name = "typing-extensions" },
+    { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/08/4e/f69ed24d930e6fc958eea3ffa86dffce5a0ed81128346235d68e28c1ca89/hindsight_client-0.8.1.tar.gz", hash = "sha256:d5fbd248a0245428dbb92a332c0f88cc432fe1b8477dc2e8a0dff0ff2582ec1c", size = 107822, upload-time = "2026-06-09T12:56:00.584Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fd/c2/fe0b792445686527d018d1274136c0356dcc6e0d8aef55c9c9337271870b/hindsight_client-0.8.1-py3-none-any.whl", hash = "sha256:6fc08474ebc24377e0630634519780308d19c31819b922bc252cce04519bbd49", size = 269298, upload-time = "2026-06-09T12:55:59.252Z" },
+]
+
+[[package]]
 name = "hpack"
 version = "4.1.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2745,6 +2762,7 @@ daytona = [
 ]
 dev = [
     { name = "filelock" },
+    { name = "hindsight-client" },
     { name = "mlflow" },
     { name = "mypy" },
     { name = "pathspec" },
@@ -2762,6 +2780,9 @@ dev = [
 ]
 e2b = [
     { name = "e2b" },
+]
+hindsight = [
+    { name = "hindsight-client" },
 ]
 modal = [
     { name = "modal" },
@@ -2796,6 +2817,8 @@ requires-dist = [
     { name = "ftfy", specifier = ">=6.0" },
     { name = "google-antigravity", marker = "extra == 'antigravity'", specifier = ">=0.1,<1" },
     { name = "google-auth", marker = "extra == 'vertex'", specifier = ">=2.0,<3" },
+    { name = "hindsight-client", marker = "extra == 'dev'", specifier = ">=0.4.0" },
+    { name = "hindsight-client", marker = "extra == 'hindsight'", specifier = ">=0.4.0" },
     { name = "httpx", specifier = ">=0.27,<1" },
     { name = "keyring", specifier = ">=24,<26" },
     { name = "mcp", specifier = ">=1.0,<2" },
@@ -2843,7 +2866,7 @@ requires-dist = [
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30,<1" },
 ]
-provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "vertex", "modal", "daytona", "cwsandbox", "e2b", "tracing", "agents-sdk", "antigravity", "cursor", "databricks", "dev"]
+provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "vertex", "modal", "daytona", "cwsandbox", "e2b", "tracing", "agents-sdk", "antigravity", "cursor", "hindsight", "databricks", "dev"]
 
 [[package]]
 name = "omnigent-client"
