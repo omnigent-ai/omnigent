@@ -31,6 +31,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch } from "@/lib/identity";
+import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { sandboxOptionLabel } from "@/lib/capabilities";
@@ -715,6 +716,7 @@ export function NewChatLandingScreen() {
 
   const [message, setMessage] = useState<string>("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const isComposingRef = useRef(false);
   // maxRows 9 = 180px of 20px lines, matching the composer's 200px
   // border-box max (180px content + 16px top / 4px bottom padding).
   useAutoGrowTextarea(textareaRef, message, 9);
@@ -1308,7 +1310,17 @@ export function NewChatLandingScreen() {
               ref={textareaRef}
               value={message}
               onChange={(e) => setMessage(e.target.value)}
+              onCompositionStart={() => {
+                isComposingRef.current = true;
+              }}
+              onCompositionEnd={() => {
+                isComposingRef.current = false;
+              }}
               onKeyDown={(e) => {
+                if (isImeCompositionKeyEvent(e, isComposingRef.current)) {
+                  return;
+                }
+
                 // While the skills menu is open, ArrowUp/Down navigate it and
                 // Enter/Tab complete the highlighted item — these take
                 // priority over submission (same UX as the in-session

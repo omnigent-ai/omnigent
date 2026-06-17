@@ -217,6 +217,50 @@ describe("NewChatLandingScreen create flow", () => {
     expect(navigateMock).not.toHaveBeenCalled();
   });
 
+  it("does not create a session when Enter confirms active IME composition", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    const input = screen.getByTestId("new-chat-landing-input");
+    fireEvent.compositionStart(input);
+    fireEvent.change(input, { target: { value: "オムニジェント" } });
+
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+    expect(navigateMock).not.toHaveBeenCalled();
+
+    fireEvent.compositionEnd(input);
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
+  });
+
+  it("does not create a session when Enter carries the IME keyCode 229 fallback", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    const input = screen.getByTestId("new-chat-landing-input");
+    fireEvent.change(input, { target: { value: "omnigent" } });
+
+    fireEvent.keyDown(input, { key: "Enter", keyCode: 229 });
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+    expect(navigateMock).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
+  });
+
   it("hands the sanitized message to the chatStore, not the create body", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,

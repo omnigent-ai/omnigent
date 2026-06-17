@@ -119,6 +119,34 @@ describe("Composer slash-command menu", () => {
     expect(onSend).toHaveBeenCalledWith("hello there", undefined);
   });
 
+  it("does not send when Enter confirms active IME composition", () => {
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onSend })} />);
+    const ta = textarea();
+    fireEvent.compositionStart(ta);
+    fireEvent.change(ta, { target: { value: "オムニジェント" } });
+
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(onSend).not.toHaveBeenCalled();
+
+    fireEvent.compositionEnd(ta);
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(onSend).toHaveBeenCalledWith("オムニジェント", undefined);
+  });
+
+  it("does not send when Enter carries the IME keyCode 229 fallback", () => {
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onSend })} />);
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "omnigent" } });
+
+    fireEvent.keyDown(ta, { key: "Enter", keyCode: 229 });
+    expect(onSend).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(onSend).toHaveBeenCalledWith("omnigent", undefined);
+  });
+
   it("ArrowDown moves the highlight to the next match", () => {
     render(<Composer {...composerProps()} />);
     const ta = textarea();

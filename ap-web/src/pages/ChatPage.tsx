@@ -36,6 +36,7 @@ import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { userColor, userColorTint, userInitials } from "@/lib/userBadge";
 import { useNavigate, useParams } from "@/lib/routing";
+import { isImeCompositionKeyEvent } from "@/lib/ime";
 import {
   Conversation,
   ConversationContent,
@@ -2919,6 +2920,7 @@ export function Composer({
   const [pickerOpenNonce, setPickerOpenNonce] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const isComposingRef = useRef(false);
   // Highlight overlay mirroring the textarea; scroll-synced so the tinted
   // `/skill` token stays aligned once the draft grows past the visible rows.
   const backdropRef = useRef<HTMLDivElement>(null);
@@ -3363,6 +3365,10 @@ export function Composer({
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (isImeCompositionKeyEvent(e, isComposingRef.current)) {
+      return;
+    }
+
     // When the suggestions menu is open, ArrowUp/Down navigate it and
     // Enter/Tab complete the highlighted item. These take priority over
     // history recall and normal submission.
@@ -3568,6 +3574,12 @@ export function Composer({
               // reset for that one tick.
               if (recallingRef.current) recallingRef.current = false;
               else resetCursor();
+            }}
+            onCompositionStart={() => {
+              isComposingRef.current = true;
+            }}
+            onCompositionEnd={() => {
+              isComposingRef.current = false;
             }}
             onKeyDown={handleKeyDown}
             onPaste={handlePaste}
