@@ -879,6 +879,20 @@ async def _auto_create_cursor_terminal(
             tmux_start_on_attach=False,
         ),
     )
+    # Advertise the tmux socket+target so the cursor-native harness executor can
+    # inject web-UI messages into this same pane (tmux paste), wiring the web
+    # chat box to the running TUI.
+    terminal_registry = resource_registry.terminal_registry
+    if terminal_registry is not None:
+        instance = terminal_registry.get(session_id, "cursor", "main")
+        if instance is not None and instance.running:
+            from omnigent.cursor_native_bridge import bridge_dir_for_session_id, write_tmux_target
+
+            write_tmux_target(
+                bridge_dir_for_session_id(session_id),
+                socket_path=instance.socket_path,
+                tmux_target=instance.tmux_target,
+            )
     publish_event(
         session_id,
         {
@@ -5251,6 +5265,10 @@ def create_runner_app(
                 from omnigent.pi_native_bridge import build_pi_native_spawn_env
 
                 spawn_env = build_pi_native_spawn_env(session_id)
+            if harness_name == "cursor-native" and spawn_env is None:
+                from omnigent.cursor_native_bridge import build_cursor_native_spawn_env
+
+                spawn_env = build_cursor_native_spawn_env(session_id)
             _session_spec_cache[session_id] = spec_entry
             from omnigent.llms.context_window import get_model_context_window
             from omnigent.runtime.workflow import _resolve_spec_model
@@ -9218,6 +9236,10 @@ def create_runner_app(
             from omnigent.pi_native_bridge import build_pi_native_spawn_env
 
             spawn_env = build_pi_native_spawn_env(conv_id)
+        if harness_name == "cursor-native" and spawn_env is None:
+            from omnigent.cursor_native_bridge import build_cursor_native_spawn_env
+
+            spawn_env = build_cursor_native_spawn_env(conv_id)
 
         agent_version = dispatch.agent_version if dispatch else body.get("agent_version")
         if agent_version is not None and conv_id in _version_cache:
@@ -13129,7 +13151,6 @@ def _build_spawn_env_from_spec(
             _build_antigravity_spawn_env,
             _build_claude_sdk_spawn_env,
             _build_codex_spawn_env,
-            _build_cursor_native_spawn_env,
             _build_cursor_spawn_env,
             _build_openai_agents_sdk_spawn_env,
             _build_pi_spawn_env,
@@ -13145,8 +13166,6 @@ def _build_spawn_env_from_spec(
             env = _build_openai_agents_sdk_spawn_env(spec)
         elif harness == "cursor":
             env = _build_cursor_spawn_env(spec, workdir=workdir)
-        elif harness == "cursor-native":
-            env = _build_cursor_native_spawn_env(spec, workdir=workdir)
         elif harness == "antigravity":
             env = _build_antigravity_spawn_env(spec)
         else:

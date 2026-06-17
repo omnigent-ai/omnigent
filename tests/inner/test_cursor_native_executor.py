@@ -1,181 +1,101 @@
-"""Unit tests for the cursor-native (ACP) harness's pure logic.
+"""Unit tests for the cursor-native (terminal-injection) harness.
 
-Covers the ``session/update`` → ExecutorEvent mapping, prompt building, the ACP
-client's pure request handlers, and harness registration. The live
-``cursor-agent acp`` round-trip is exercised by the per-harness e2e gate, not
-here, so these tests need no cursor-agent binary or network.
+Covers the executor's text extraction + capability flags, the tmux bridge's pure
+helpers (paste-payload encoding, bridge dir, spawn env, tmux.json round-trip),
+and harness registration. The live tmux injection is exercised by the e2e gate,
+not here, so these need no tmux or cursor-agent.
 """
 
 from __future__ import annotations
 
-from omnigent.inner.cursor_acp_client import (
-    _auto_allow_permission,
-    _read_text_file,
-    _write_text_file,
+from pathlib import Path
+
+from omnigent.cursor_native_bridge import (
+    BRIDGE_DIR_ENV_VAR,
+    REQUEST_SESSION_ID_ENV_VAR,
+    _paste_payload_bytes,
+    bridge_dir_for_session_id,
+    build_cursor_native_spawn_env,
+    read_tmux_info,
+    write_tmux_target,
 )
 from omnigent.inner.cursor_native_executor import (
     CursorNativeExecutor,
-    _build_prompt,
-    _update_to_events,
-)
-from omnigent.inner.executor import (
-    ReasoningChunk,
-    TextChunk,
-    ToolCallComplete,
-    ToolCallRequest,
-    ToolCallStatus,
+    _content_to_text,
+    _latest_user_text,
 )
 
 
-class TestUpdateToEvents:
-    def test_agent_message_chunk_becomes_text_chunk(self) -> None:
-        events = _update_to_events(
-            {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "hi"}}
-        )
-        assert events == [TextChunk(text="hi")]
+class TestContentExtraction:
+    def test_string_content(self) -> None:
+        assert _content_to_text("hello") == "hello"
 
-    def test_empty_message_chunk_yields_nothing(self) -> None:
-        assert (
-            _update_to_events(
-                {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": ""}}
-            )
-            == []
-        )
+    def test_input_text_blocks(self) -> None:
+        content = [
+            {"type": "input_text", "text": "one"},
+            {"type": "text", "text": "two"},
+            {"type": "input_image", "image_url": "data:..."},
+        ]
+        assert _content_to_text(content) == "one\n\ntwo"
 
-    def test_thought_chunk_becomes_reasoning(self) -> None:
-        events = _update_to_events(
-            {"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "ponder"}}
-        )
-        assert events == [ReasoningChunk(delta="ponder", event_type="reasoning_text")]
+    def test_empty_and_none(self) -> None:
+        assert _content_to_text(None) == ""
+        assert _content_to_text([]) == ""
 
-    def test_tool_call_becomes_request(self) -> None:
-        events = _update_to_events(
-            {
-                "sessionUpdate": "tool_call",
-                "toolCallId": "call_1",
-                "title": "read_file",
-                "rawInput": {"path": "a.txt"},
-            }
-        )
-        assert len(events) == 1
-        req = events[0]
-        assert isinstance(req, ToolCallRequest)
-        assert req.name == "read_file"
-        assert req.args == {"path": "a.txt"}
-        assert req.metadata == {"call_id": "call_1"}
-
-    def test_tool_call_update_completed_becomes_complete(self) -> None:
-        events = _update_to_events(
-            {
-                "sessionUpdate": "tool_call_update",
-                "toolCallId": "call_1",
-                "title": "read_file",
-                "status": "completed",
-                "content": "ok",
-            }
-        )
-        assert len(events) == 1
-        done = events[0]
-        assert isinstance(done, ToolCallComplete)
-        assert done.metadata == {"call_id": "call_1"}
-
-    def test_tool_call_update_failed_is_error_status(self) -> None:
-        events = _update_to_events(
-            {"sessionUpdate": "tool_call_update", "status": "failed", "title": "sh"}
-        )
-        assert len(events) == 1
-        done = events[0]
-        assert isinstance(done, ToolCallComplete)
-        assert done.status == ToolCallStatus.ERROR
-        assert done.error
-
-    def test_in_progress_tool_update_yields_nothing(self) -> None:
-        assert (
-            _update_to_events({"sessionUpdate": "tool_call_update", "status": "in_progress"}) == []
-        )
-
-    def test_unknown_update_yields_nothing(self) -> None:
-        assert _update_to_events({"sessionUpdate": "available_commands_update"}) == []
-        assert _update_to_events({"sessionUpdate": "plan"}) == []
-
-
-class TestBuildPrompt:
-    def test_first_turn_prepends_system_prompt(self) -> None:
-        prompt = _build_prompt(
-            [{"role": "user", "content": "hello"}],
-            is_first_turn=True,
-            system_prompt="You are helpful.",
-        )
-        assert prompt == "You are helpful.\n\nhello"
-
-    def test_later_turn_sends_only_latest_user_text(self) -> None:
-        prompt = _build_prompt(
-            [
-                {"role": "user", "content": "first"},
-                {"role": "assistant", "content": "ok"},
-                {"role": "user", "content": "second"},
-            ],
-            is_first_turn=False,
-            system_prompt="You are helpful.",
-        )
-        assert prompt == "second"
-
-    def test_first_turn_with_history_serializes_conversation(self) -> None:
-        prompt = _build_prompt(
-            [
-                {"role": "user", "content": "earlier"},
-                {"role": "assistant", "content": "noted"},
-                {"role": "user", "content": "now"},
-            ],
-            is_first_turn=True,
-            system_prompt="",
-        )
-        assert "Conversation so far:" in prompt
-        assert "earlier" in prompt and "now" in prompt
-
-    def test_no_user_message_first_turn_returns_system_prompt(self) -> None:
-        assert _build_prompt([], is_first_turn=True, system_prompt="SP") == "SP"
+    def test_latest_user_text(self) -> None:
+        messages = [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "second"},
+        ]
+        assert _latest_user_text(messages) == "second"
+        assert _latest_user_text([{"role": "assistant", "content": "x"}]) == ""
 
 
 class TestExecutorCapabilities:
-    def test_capability_flags(self) -> None:
-        ex = CursorNativeExecutor()
-        assert ex.supports_streaming() is True
-        assert ex.supports_tool_calling() is True
-        assert ex.handles_tools_internally() is True
-        assert ex.supports_live_message_queue() is False
-
-    def test_session_key_prefers_message_session_id(self) -> None:
-        ex = CursorNativeExecutor()
-        assert (
-            ex._session_key([{"role": "user", "content": "x", "session_id": "conv_1"}]) == "conv_1"
-        )
-        assert ex._session_key([]) == "__default__"
+    def test_capability_flags(self, tmp_path: Path) -> None:
+        ex = CursorNativeExecutor(bridge_dir=tmp_path)
+        # Output is shown by the embedded terminal, not streamed by the executor.
+        assert ex.supports_streaming() is False
+        # Web-UI messages can be injected mid-turn (steering).
+        assert ex.supports_live_message_queue() is True
 
 
-class TestAcpClientHandlers:
-    def test_auto_allow_prefers_allow_option(self) -> None:
-        out = _auto_allow_permission(
-            {
-                "options": [
-                    {"optionId": "reject", "kind": "reject_once"},
-                    {"optionId": "ok", "kind": "allow_once"},
-                ]
-            }
-        )
-        assert out == {"outcome": {"outcome": "selected", "optionId": "ok"}}
+class TestPastePayload:
+    def test_newlines_become_cr(self) -> None:
+        assert _paste_payload_bytes("a\nb") == b"a\rb"
+        assert _paste_payload_bytes("a\r\nb") == b"a\rb"
+        assert _paste_payload_bytes("a\rb") == b"a\rb"
 
-    def test_auto_allow_falls_back_to_first_option(self) -> None:
-        out = _auto_allow_permission({"options": [{"optionId": "only"}]})
-        assert out == {"outcome": {"outcome": "selected", "optionId": "only"}}
+    def test_tab_kept_other_control_dropped(self) -> None:
+        # tab kept (0x09), ESC (0x1b) and BEL (0x07) dropped.
+        assert _paste_payload_bytes("a\tb\x1b\x07c") == b"a\tbc"
 
-    def test_auto_allow_cancels_when_no_options(self) -> None:
-        assert _auto_allow_permission({"options": []}) == {"outcome": {"outcome": "cancelled"}}
+    def test_unicode_passthrough(self) -> None:
+        assert _paste_payload_bytes("café") == "café".encode()
 
-    def test_fs_roundtrip(self, tmp_path) -> None:
-        target = tmp_path / "sub" / "note.txt"
-        _write_text_file({"path": str(target), "content": "data"})
-        assert _read_text_file({"path": str(target)}) == {"content": "data"}
+
+class TestBridge:
+    def test_bridge_dir_is_deterministic_and_session_scoped(self) -> None:
+        a1 = bridge_dir_for_session_id("conv_a")
+        a2 = bridge_dir_for_session_id("conv_a")
+        b = bridge_dir_for_session_id("conv_b")
+        assert a1 == a2
+        assert a1 != b
+        assert "cursor-native" in str(a1)
+
+    def test_spawn_env_carries_bridge_dir_and_session(self) -> None:
+        env = build_cursor_native_spawn_env("conv_xyz")
+        assert env[BRIDGE_DIR_ENV_VAR] == str(bridge_dir_for_session_id("conv_xyz"))
+        assert env[REQUEST_SESSION_ID_ENV_VAR] == "conv_xyz"
+
+    def test_tmux_target_round_trip(self, tmp_path: Path) -> None:
+        write_tmux_target(tmp_path, socket_path=Path("/tmp/x/tmux.sock"), tmux_target="main")
+        info = read_tmux_info(tmp_path)
+        assert info == {"socket_path": "/tmp/x/tmux.sock", "tmux_target": "main"}
+
+    def test_read_tmux_info_missing(self, tmp_path: Path) -> None:
+        assert read_tmux_info(tmp_path) is None
 
 
 class TestRegistration:
@@ -192,8 +112,16 @@ class TestRegistration:
     def test_cursor_native_is_terminal_native(self) -> None:
         # cursor-native launches the cursor-agent TUI in an omnigent terminal
         # (like claude/codex/pi-native), so the runner must treat it as a native
-        # terminal harness (no Omnigent history replay; native message handling).
+        # terminal harness.
         from omnigent.harness_aliases import is_native_harness
 
         assert is_native_harness("cursor-native") is True
         assert is_native_harness("native-cursor") is True
+
+    def test_native_coding_agent_record(self) -> None:
+        from omnigent.native_coding_agents import native_coding_agent_for_harness
+
+        agent = native_coding_agent_for_harness("cursor-native")
+        assert agent is not None
+        assert agent.terminal_name == "cursor"
+        assert agent.display_name == "Cursor"
