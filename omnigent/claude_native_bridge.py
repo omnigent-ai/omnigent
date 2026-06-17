@@ -724,26 +724,32 @@ def prepare_bridge_dir(
 
 def ensure_claude_workspace_trusted(workspace: Path) -> None:
     """
-    Pre-accept Claude Code's first-run trust + onboarding prompts.
+    Pre-accept Claude Code's first-run trust, onboarding, and
+    bypass-permissions prompts.
 
-    Claude Code blocks on two TUI prompts the first time it launches in
-    a new context: a global onboarding flow (theme / login) gated by the
-    top-level ``hasCompletedOnboarding`` key in ``~/.claude.json``, and a
-    per-directory "Do you trust the files in this folder?" dialog gated
-    by ``projects["<abs cwd>"].hasTrustDialogAccepted``. Neither fires a
+    Claude Code blocks on up to three TUI prompts the first time it
+    launches in a new context: a global onboarding flow (theme / login)
+    gated by the top-level ``hasCompletedOnboarding`` key in
+    ``~/.claude.json``; a per-directory "Do you trust the files in this
+    folder?" dialog gated by ``projects["<abs cwd>"].hasTrustDialogAccepted``;
+    and — when the worker is launched in ``bypassPermissions`` mode
+    (``--dangerously-skip-permissions``) — a one-time "running in Bypass
+    Permissions mode" warning gated by the top-level
+    ``bypassPermissionsModeAccepted`` key. None of these fire a
     ``PermissionRequest`` hook, so on a host-spawned (web-UI-driven)
     session there is nobody at the terminal to answer them: Claude hangs
     and the web UI shows nothing. This is acute with
     per-session git worktrees, which hand Claude a brand-new —
     therefore untrusted — directory on every session.
 
-    Seed both gating keys idempotently so the launch never blocks. Only
-    those two keys are written; all other ``~/.claude.json`` state (the
+    Seed the gating keys idempotently so the launch never blocks. Only
+    these keys are written; all other ``~/.claude.json`` state (the
     user's own onboarding choices, project history, MCP config, OAuth
-    account) is preserved, and the file is left untouched when both keys
-    are already set. This deliberately does NOT skip per-tool permission
-    prompts — those still route to the web UI via the ``PermissionRequest``
-    hook; only the unhookable startup gates are pre-accepted.
+    account) is preserved, and the file is left untouched when they are
+    already set. Pre-accepting these gates does NOT enable bypass mode or
+    skip per-tool permission prompts — those still route to the web UI via
+    the ``PermissionRequest`` hook; only the unhookable startup gates are
+    pre-accepted.
 
     Concurrency: this is a read-modify-write of a file Claude itself also
     rewrites. It runs once, before the terminal is launched (so Claude is
@@ -777,6 +783,12 @@ def ensure_claude_workspace_trusted(workspace: Path) -> None:
     # has never run Claude Code interactively.
     if data.get("hasCompletedOnboarding") is not True:
         data["hasCompletedOnboarding"] = True
+        changed = True
+
+    # Global bypass-permissions gate: a headless bypassPermissions worker
+    # hangs on the one-time, unhookable "Bypass Permissions mode" warning.
+    if data.get("bypassPermissionsModeAccepted") is not True:
+        data["bypassPermissionsModeAccepted"] = True
         changed = True
 
     # Per-directory trust gate. Claude keys its ``projects`` map by the

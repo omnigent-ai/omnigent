@@ -4277,12 +4277,12 @@ def test_ensure_trusted_creates_config_when_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    A fresh host (no ``~/.claude.json``) gets both first-run gates set.
+    A fresh host (no ``~/.claude.json``) gets all first-run gates set.
 
     This is the core workspace-trust case: an ``omnigent host`` machine that
-    has never run Claude interactively. Both the global onboarding gate
-    and the per-workspace trust gate must be pre-accepted so Claude does
-    not block on its TUI prompts.
+    has never run Claude interactively. The global onboarding gate, the
+    global bypass-permissions gate, and the per-workspace trust gate must
+    all be pre-accepted so Claude does not block on its TUI prompts.
     """
     config_path = _redirect_home(monkeypatch, tmp_path / "home")
     workspace = tmp_path / "worktrees" / "feature-x"
@@ -4294,6 +4294,9 @@ def test_ensure_trusted_creates_config_when_missing(
     # Global onboarding gate — without this Claude shows the theme/login
     # flow on a never-onboarded machine.
     assert data["hasCompletedOnboarding"] is True
+    # Global bypass-permissions gate — without this a bypassPermissions
+    # worker hangs on the one-time "Bypass Permissions mode" warning.
+    assert data["bypassPermissionsModeAccepted"] is True
     # Per-directory trust gate, keyed by the RESOLVED absolute path —
     # without this Claude shows "Do you trust the files in this folder?".
     assert data["projects"][str(workspace.resolve())]["hasTrustDialogAccepted"] is True
@@ -4304,12 +4307,12 @@ def test_ensure_trusted_preserves_existing_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Seeding adds only the two gates; all other config is preserved.
+    Seeding adds only the gating keys; all other config is preserved.
 
     The file holds the user's OAuth account, MCP config, and per-project
     history. Clobbering any of it would be a regression, so this asserts
-    an unrelated top-level key and a sibling project entry survive
-    untouched while the new workspace's trust gate is added.
+    an unrelated top-level key and a sibling project entry survive untouched
+    while the bypass gate and the new workspace's trust gate are added.
     """
     config_path = _redirect_home(monkeypatch, tmp_path / "home")
     other_workspace = tmp_path / "repo"
@@ -4333,6 +4336,8 @@ def test_ensure_trusted_preserves_existing_state(
     data = json.loads(config_path.read_text())
     # Unrelated top-level state survives — proves we merge, not overwrite.
     assert data["oauthAccount"] == {"emailAddress": "user@example.com"}
+    # The bypass gate is added even on an already-onboarded host.
+    assert data["bypassPermissionsModeAccepted"] is True
     # The pre-existing sibling project is untouched, including its own
     # non-trust keys (a naive ``projects = {key: {...}}`` would drop it).
     assert data["projects"][str(other_workspace.resolve())] == {
@@ -4348,7 +4353,7 @@ def test_ensure_trusted_idempotent_does_not_rewrite(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    When both gates are already set, the file is left byte-for-byte alone.
+    When the gates are already set, the file is left byte-for-byte alone.
 
     The seed file is written in compact form; the helper's writer uses
     two-space indentation. So if the ``if not changed: return`` short-
@@ -4361,6 +4366,7 @@ def test_ensure_trusted_idempotent_does_not_rewrite(
     workspace.mkdir(parents=True)
     already = {
         "hasCompletedOnboarding": True,
+        "bypassPermissionsModeAccepted": True,
         "projects": {str(workspace.resolve()): {"hasTrustDialogAccepted": True}},
     }
     # Compact, no indentation — distinct from the helper's indent=2 output.
@@ -4371,6 +4377,40 @@ def test_ensure_trusted_idempotent_does_not_rewrite(
 
     # Byte-identical → the helper detected no change and never wrote.
     assert config_path.read_bytes() == before
+
+
+def test_ensure_trusted_adds_bypass_gate_to_already_trusted_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The bypass gate is seeded even when onboarding + trust are already set.
+
+    Regression test for the headless-worker hang: an already-onboarded host
+    that trusts the workspace still blocks a bypassPermissions worker on the
+    one-time warning, because ``bypassPermissionsModeAccepted`` is the only
+    missing gate. The unfixed helper writes nothing, so the assertion below
+    raises ``KeyError`` — i.e. this fails without the fix.
+    """
+    config_path = _redirect_home(monkeypatch, tmp_path / "home")
+    workspace = tmp_path / "worktrees" / "feature-bypass"
+    workspace.mkdir(parents=True)
+    config_path.write_text(
+        json.dumps(
+            {
+                "hasCompletedOnboarding": True,
+                "projects": {str(workspace.resolve()): {"hasTrustDialogAccepted": True}},
+            }
+        )
+    )
+
+    ensure_claude_workspace_trusted(workspace)
+
+    data = json.loads(config_path.read_text())
+    assert data["bypassPermissionsModeAccepted"] is True
+    # The already-set gates are left untouched.
+    assert data["hasCompletedOnboarding"] is True
+    assert data["projects"][str(workspace.resolve())]["hasTrustDialogAccepted"] is True
 
 
 @pytest.mark.parametrize(

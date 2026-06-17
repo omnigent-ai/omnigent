@@ -1926,10 +1926,10 @@ async def _auto_create_claude_terminal(
         session_id,
         bridge_dir,
     )
-    # Pre-accept Claude's first-run trust + onboarding TUI prompts for this
-    # workspace. They have no PermissionRequest hook, so on a host-spawned
-    # (web-UI-driven) session they would hang Claude in its terminal with
-    # nothing shown in the UI. Acute with per-session worktrees,
+    # Pre-accept Claude's first-run trust, onboarding, and bypass-permissions
+    # TUI prompts for this workspace. They have no PermissionRequest hook, so
+    # on a host-spawned (web-UI-driven) session they would hang Claude in its
+    # terminal with nothing shown in the UI. Acute with per-session worktrees,
     # which launch Claude in a brand-new, untrusted directory.
     ensure_claude_workspace_trusted(Path(workspace))
 
