@@ -189,9 +189,11 @@ class TestRegistration:
 
         assert "cursor-native" in OMNIGENT_HARNESSES
 
-    def test_cursor_native_not_treated_as_terminal_native(self) -> None:
-        # Branch A is a streaming (SDK-like) harness, so the runner must NOT
-        # apply native-terminal history handling to it.
+    def test_cursor_native_is_terminal_native(self) -> None:
+        # cursor-native launches the cursor-agent TUI in an omnigent terminal
+        # (like claude/codex/pi-native), so the runner must treat it as a native
+        # terminal harness (no Omnigent history replay; native message handling).
         from omnigent.harness_aliases import is_native_harness
 
-        assert is_native_harness("cursor-native") is False
+        assert is_native_harness("cursor-native") is True
+        assert is_native_harness("native-cursor") is True
