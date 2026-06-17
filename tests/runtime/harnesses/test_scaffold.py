@@ -25,6 +25,7 @@ mid-stream.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import shutil
@@ -39,6 +40,7 @@ import pytest
 
 from omnigent.errors import ErrorCode
 from omnigent.runtime.harnesses import _HARNESS_MODULES
+from omnigent.runtime.harnesses._scaffold import HarnessApp, TurnContext
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
 
@@ -121,6 +123,114 @@ def _make_side_client(socket_path: str) -> httpx.AsyncClient:
         transport=httpx.AsyncHTTPTransport(uds=socket_path),
         base_url="http://harness.local",
     )
+
+
+@pytest.mark.asyncio
+async def test_build_terminal_event_waits_for_run_task_failure() -> None:
+    """
+    Terminal synthesis must wait for the run task to fully settle.
+
+    The stream loop reaches ``_build_terminal_event`` after reading the
+    sentinel queued from ``run_turn``'s ``finally`` block. At that point the
+    task can still be in the last scheduling tick before its exception is
+    visible. Treating that as success emits the wrong terminal event; letting
+    the task exception escape makes the server surface a generic final-response
+    failure.
+    """
+
+    async def _late_failure() -> None:
+        await asyncio.sleep(0)
+        raise RuntimeError("terminal boom")
+
+    ctx = TurnContext("resp_late_failure", asyncio.Queue(), asyncio.Event())
+    task = asyncio.create_task(_late_failure())
+
+    terminal = await HarnessApp()._build_terminal_event(
+        ctx,
+        model="test-agent",
+        run_task=task,
+        sequence=7,
+    )
+
+    assert terminal.type == "response.failed"
+    assert terminal.sequence_number == 7
+    assert terminal.response.status == "failed"
+    assert terminal.response.error is not None
+    assert terminal.response.error.message == "terminal boom"
+
+
+@pytest.mark.asyncio
+async def test_build_terminal_event_handles_pending_task_cancellation() -> None:
+    """
+    A cancellation racing terminal synthesis should become response.cancelled.
+
+    This guards the cancel/terminal path: the builder should classify the
+    cancellation and return a terminal event instead of raising while reading
+    task state.
+    """
+
+    task_started = asyncio.Event()
+
+    async def _wait_forever() -> None:
+        task_started.set()
+        await asyncio.sleep(60)
+
+    ctx = TurnContext("resp_cancel_race", asyncio.Queue(), asyncio.Event())
+    task = asyncio.create_task(_wait_forever())
+    await task_started.wait()
+    ctx.cancelled.set()
+    task.cancel()
+
+    terminal = await HarnessApp()._build_terminal_event(
+        ctx,
+        model="test-agent",
+        run_task=task,
+        sequence=3,
+    )
+
+    assert terminal.type == "response.cancelled"
+    assert terminal.sequence_number == 3
+    assert terminal.response.status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_build_terminal_event_preserves_stream_task_cancellation() -> None:
+    """
+    Cancelling terminal synthesis itself must not become response.completed.
+
+    ``asyncio.shield(run_task)`` keeps the harness run task alive when the
+    stream task is cancelled, but the outer cancellation still needs to
+    propagate so teardown can cancel the run task through the normal path.
+    """
+
+    task_started = asyncio.Event()
+
+    async def _wait_forever() -> None:
+        task_started.set()
+        await asyncio.sleep(60)
+
+    ctx = TurnContext("resp_stream_cancel", asyncio.Queue(), asyncio.Event())
+    run_task = asyncio.create_task(_wait_forever())
+    await task_started.wait()
+    terminal_task = asyncio.create_task(
+        HarnessApp()._build_terminal_event(
+            ctx,
+            model="test-agent",
+            run_task=run_task,
+            sequence=5,
+        )
+    )
+
+    try:
+        await asyncio.sleep(0)
+        terminal_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await terminal_task
+        assert not run_task.done()
+    finally:
+        run_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await run_task
 
 
 @pytest.fixture

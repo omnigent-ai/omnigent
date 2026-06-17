@@ -32,7 +32,7 @@ import time
 import urllib.parse
 import weakref
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal, cast
 
@@ -418,6 +418,11 @@ _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK = "Codex"
 # reload for sessions where no Omnigent task carries usage (claude-native).
 _LAST_CONTEXT_TOKENS_LABEL_KEY: str = "omnigent.last_context_tokens"
 _LAST_CONTEXT_WINDOW_LABEL_KEY: str = "omnigent.last_context_window"
+# Labels read by ``_get_session_snapshot`` to surface the latest terminal /
+# runner task failure after the live ``session.status: failed`` SSE has gone
+# by. Empty string clears a stale value because labels are upsert-only.
+_LAST_TASK_ERROR_CODE_LABEL_KEY: str = "omnigent.last_task_error_code"
+_LAST_TASK_ERROR_MESSAGE_LABEL_KEY: str = "omnigent.last_task_error_message"
 
 # Todo-list update from the claude-native forwarder. Carries the raw
 # todo items captured from PostToolUse/TodoWrite hook events. Payload
@@ -4488,6 +4493,68 @@ def _publish_status(
     session_stream.publish(session_id, payload)
 
 
+async def _persist_session_status_error_labels(
+    session_id: str,
+    error: ErrorDetail | None,
+    conversation_store: ConversationStore,
+) -> None:
+    """
+    Persist or clear the reload-visible failure detail for a session status.
+
+    ``session.status`` is an SSE edge, so its ``error`` object disappears on
+    reload. Terminal-native sessions can fail before any transcript item is
+    written, so store the latest failure detail as runner-owned labels and let
+    snapshots project it as ``last_task_error``. Empty string clears stale
+    values because the label store is upsert-only.
+
+    :param session_id: Session/conversation identifier.
+    :param error: Failure detail from a ``session.status: failed`` edge, or
+        ``None`` to clear stale error labels on subsequent activity.
+    :param conversation_store: Store used to upsert labels.
+    """
+    updates = (
+        {
+            _LAST_TASK_ERROR_CODE_LABEL_KEY: error.code,
+            _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: error.message,
+        }
+        if error is not None
+        else {
+            _LAST_TASK_ERROR_CODE_LABEL_KEY: "",
+            _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: "",
+        }
+    )
+    try:
+        await asyncio.to_thread(conversation_store.set_labels, session_id, updates)
+    except Exception:
+        _logger.exception(
+            "Failed to persist session status error labels for %s",
+            session_id,
+        )
+
+
+def _last_task_error_from_labels(labels: Mapping[str, str]) -> dict[str, str] | None:
+    """
+    Project runner-owned failure labels into the typed API error shape.
+
+    Terminal/native runtimes can fail before they write any transcript item,
+    so the session-status relay stores the latest failure as durable labels.
+    This helper is the single server-side boundary where those internal labels
+    become public ``last_task_error`` data for snapshots and child summaries.
+
+    :param labels: Conversation labels, usually after closed-status projection.
+    :returns: ``{"code": "...", "message": "..."}``, or ``None`` when either
+        value is absent/cleared.
+    """
+    raw_error_code = labels.get(_LAST_TASK_ERROR_CODE_LABEL_KEY)
+    raw_error_message = labels.get(_LAST_TASK_ERROR_MESSAGE_LABEL_KEY)
+    if raw_error_code and raw_error_message:
+        return {
+            "code": raw_error_code,
+            "message": raw_error_message,
+        }
+    return None
+
+
 def _publish_runner_recovered_status(session_id: str) -> None:
     """
     Clear a stale failed session status after runner recovery.
@@ -7978,6 +8045,18 @@ async def _relay_runner_stream(
                                 if isinstance(raw_err, dict)
                                 else None
                             )
+                            if status == "failed" and status_error is not None:
+                                await _persist_session_status_error_labels(
+                                    session_id,
+                                    status_error,
+                                    conversation_store,
+                                )
+                            elif status == "running":
+                                await _persist_session_status_error_labels(
+                                    session_id,
+                                    None,
+                                    conversation_store,
+                                )
                             # PTY-activity status is a UI signal only. Terminal
                             # sub-agent delivery rides the Stop/StopFailure hook
                             # via external_session_status (the codex-shared path)
@@ -10852,6 +10931,10 @@ def _child_session_summary_from_conversation(
         busy = True
     else:
         busy = False
+    last_task_error = _last_task_error_from_labels(labels)
+    current_task_status = (
+        "failed" if cached_status == "failed" or last_task_error is not None else None
+    )
 
     # For Codex children, fall back to the prompt label as preview when the
     # real transcript has not arrived yet — avoids synthesizing a user message
@@ -10875,9 +10958,10 @@ def _child_session_summary_from_conversation(
         agent_id=conv.agent_id,
         agent_name=None,
         current_task_id=None,
-        current_task_status=None,
+        current_task_status=current_task_status,
         busy=busy,
         labels=labels,
+        last_task_error=last_task_error,
         last_message_preview=last_message_preview,
         # Surface the sub-agent's parked-elicitation count from the same
         # in-memory index that feeds the sidebar badge, so the Agents
@@ -16843,10 +16927,11 @@ def create_sessions_router(
         :class:`AgentObject`.
 
         Loads the agent spec from *cache* to populate ``mcp_servers``,
-        ``policies``, and ``skills``. If the cache is ``None``, the
-        spec is not cached, or the load fails, all are left as empty
-        lists rather than raising — the endpoint must not fail because
-        one spec can't be read.
+        ``policies``, ``skills``, and (when the stored row has none) the
+        ``description``. If the cache is ``None``, the spec is not
+        cached, or the load fails, those fall back to empty lists / the
+        stored value rather than raising — the endpoint must not fail
+        because one spec can't be read.
 
         :param agent: The runtime agent entity.
         :param cache: Agent cache, or ``None`` in test setups.
@@ -16859,12 +16944,19 @@ def create_sessions_router(
         # Harness/kind for the UI; None until the spec loads (mirrors the
         # GET /v1/agents catalog so both endpoints report it consistently).
         harness: str | None = None
+        # Prefer the stored entity's description; fall back to the spec's
+        # top-level description when the stored value is unset (single-file
+        # YAML agents don't persist it at registration today). Lets the
+        # new-session picker show a hover description without a migration.
+        description: str | None = agent.description
         if cache is not None:
             try:
                 loaded = cache.load(
                     agent.id, agent.bundle_location, expand_env=agent.session_id is None
                 )
                 harness = loaded.spec.executor.harness_kind
+                if description is None:
+                    description = loaded.spec.description
                 # Declared terminal names, in spec order — the Web UI
                 # gates its "new terminal" affordance on this list.
                 terminals = list(loaded.spec.terminals or {})
@@ -16910,7 +17002,7 @@ def create_sessions_router(
             id=agent.id,
             name=agent.name,
             version=agent.version,
-            description=agent.description,
+            description=description,
             created_at=agent.created_at,
             updated_at=agent.updated_at,
             harness=harness,
@@ -17454,6 +17546,7 @@ async def _get_session_snapshot(
     raw_label = conv.labels.get(_LAST_CONTEXT_TOKENS_LABEL_KEY)
     if isinstance(raw_label, str) and raw_label.isdigit():
         last_total_tokens = int(raw_label)
+    last_task_error = _last_task_error_from_labels(conv.labels)
     # Runner-crash durability: if the session's bound runner reported an
     # unexpected exit (host.runner_exited → RunnerExitReports), surface the
     # cause as last_task_error so a reload/late-open still renders the error

@@ -24,7 +24,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { capitalizeAgentName } from "@/lib/agentLabels";
 import { coercePolicyParams } from "@/lib/policyParams";
-import { agentBaseName } from "@/lib/forkHarness";
+import { agentRootName } from "@/lib/forkHarness";
 import { nativeCodingAgentForAgentName } from "@/lib/nativeCodingAgents";
 import { useChatStore } from "@/store/chatStore";
 
@@ -34,15 +34,16 @@ import { useChatStore } from "@/store/chatStore";
  * ``"polly"`` → ``"Polly"``). Keeps the chat surfaces consistent with
  * the new-chat picker's capitalization.
  *
- * Strips the `" (fork <id>)"` / `" (switch <id>)"` suffix the fork/switch
- * routes append to a cloned agent's name before resolving, so a clone of
- * a native wrapper (e.g. `"pi-native-ui (fork conv_ab12)"`) still maps to
- * its display name ("Pi") instead of falling through to the capitalized
- * raw slug ("Pi-native-ui …"). Mirrors how `useAvailableAgents` and the
- * fork/switch pickers already match clones back to their base agent.
+ * Strips EVERY `" (fork <id>)"` / `" (switch <id>)"` suffix the fork/switch
+ * routes append to a cloned agent's name before resolving (a fork of a fork
+ * nests them), so a clone of a native wrapper (e.g.
+ * `"pi-native-ui (fork conv_a) (fork conv_b)"`) still maps to its display
+ * name ("Pi") instead of falling through to the capitalized raw slug
+ * ("Pi-native-ui (fork conv_a) …"). Mirrors how `useAvailableAgents` and the
+ * fork/switch pickers match clones back to their root agent.
  */
 export function agentDisplayLabel(name: string): string {
-  const baseName = agentBaseName(name);
+  const baseName = agentRootName(name);
   const nativeAgent = nativeCodingAgentForAgentName(baseName);
   if (nativeAgent?.key === "claude") return "Claude";
   return nativeAgent?.displayName ?? capitalizeAgentName(baseName);

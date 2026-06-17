@@ -58,6 +58,11 @@ def test_valid_body_with_e2e_rationale() -> None:
     assert result.ok, result.errors
 
 
+def test_validate_pr_body_accepts_leading_bom() -> None:
+    result = module.validate_pr_body("\ufeff" + _valid_body())
+    assert result.ok, result.errors
+
+
 def test_requires_type_and_test_checkboxes() -> None:
     body = _valid_body(
         type_checkboxes="""
