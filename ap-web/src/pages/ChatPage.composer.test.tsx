@@ -1,7 +1,9 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import type { ElicitationBlock } from "@/lib/blocks";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { Composer } from "./ChatPage";
 import { SlashCommandMenu } from "@/components/SlashCommandMenu";
 
@@ -32,6 +34,9 @@ function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) 
     effortLevels: ["low", "medium", "high"] as const,
     showEffort: true,
     showModels: false,
+    modelPickerKind: null,
+    codexModelOptions: [],
+    showCodexPlanMode: false,
     ...overrides,
   };
 }
@@ -44,6 +49,10 @@ function textarea() {
 /** The currently highlighted menu row, or null when none is highlighted. */
 function activeRow(): HTMLElement | null {
   return document.querySelector('[data-active="true"]');
+}
+
+function renderWithTooltips(ui: ReactElement) {
+  return render(<TooltipProvider>{ui}</TooltipProvider>);
 }
 
 describe("Composer slash-command menu", () => {
@@ -276,14 +285,12 @@ describe("Composer slash-command submit routing", () => {
     expect(setModel).toHaveBeenCalledWith(null);
   });
 
-  it("treats /model as plaintext on codex-native sessions", () => {
-    // isNativeWrapper without showModels → showModel false: codex-native
-    // pins its model at launch and ignores model_override mid-session, so
-    // the command must NOT fire setModel — it falls through to a plaintext
-    // message. Keyed on the wrapper flag, not isTerminalFirst:
-    // terminal-first SDK sessions (embedded Omnigent REPL terminal) keep
-    // the in-process routing, and claude-native (showModels) routes to
-    // setModel — see the claude-native test below.
+  it("treats /model as plaintext on native-wrapper sessions without a model picker", () => {
+    // isNativeWrapper without showModels → showModel false: native wrappers
+    // need an explicit picker-backed propagation path. Without one, /model
+    // must NOT fire setModel — it falls through to a plaintext message.
+    // Terminal-first SDK sessions (embedded Omnigent REPL terminal) keep the
+    // in-process routing.
     const setModel = vi.fn().mockResolvedValue(undefined);
     useChatStore.setState({ setModel });
     const onSend = vi.fn();
@@ -311,6 +318,7 @@ describe("Composer slash-command submit routing", () => {
           isTerminalFirst: true,
           isNativeWrapper: true,
           showModels: true,
+          modelPickerKind: "claude",
         })}
       />,
     );
@@ -340,6 +348,7 @@ describe("Composer slash-command submit routing", () => {
           isTerminalFirst: true,
           isNativeWrapper: true,
           showModels: true,
+          modelPickerKind: "claude",
         })}
       />,
     );
@@ -351,6 +360,32 @@ describe("Composer slash-command submit routing", () => {
     expect(onSend).not.toHaveBeenCalled();
     // The picker only opens for the bare command, not the argument form.
     expect(screen.queryByTestId("model-picker-item")).toBeNull();
+  });
+
+  it("routes /model <name> to setModel on codex-native sessions", () => {
+    // Codex-native propagates the persisted override via Codex app-server
+    // `thread/settings/update`, so it follows the same picker-backed route
+    // as claude-native instead of sending plaintext into the terminal.
+    const setModel = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ setModel });
+    const onSend = vi.fn();
+    render(
+      <Composer
+        {...composerProps({
+          onSend,
+          isTerminalFirst: true,
+          isNativeWrapper: true,
+          showModels: true,
+          modelPickerKind: "codex",
+        })}
+      />,
+    );
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "/model gpt-5.4" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    expect(setModel).toHaveBeenCalledWith("gpt-5.4");
+    expect(onSend).not.toHaveBeenCalled();
   });
 });
 
@@ -374,7 +409,7 @@ describe("Composer effort slash-command visibility", () => {
     expect(screen.getByTestId("slash-menu-item-compact")).toBeInTheDocument();
   });
 
-  it("shows /model in suggestions for in-process sessions but hides it for codex-native", () => {
+  it("shows /model in suggestions for in-process and picker-backed native sessions", () => {
     // Type just "/" (like the /effort case) so the highlight overlay shows
     // only "/" — keeps the menu row the sole "/model" match.
     // Default (isTerminalFirst false) → /model offered.
@@ -392,24 +427,86 @@ describe("Composer effort slash-command visibility", () => {
     expect(screen.getByText("/model")).toBeInTheDocument();
     unmountSdk();
 
-    // codex-native (wrapper without the model picker) → /model suppressed
-    // (model pinned at launch, no mid-session override).
-    const { unmount: unmountCodex } = render(
+    // Native wrapper without the model picker → /model suppressed.
+    const { unmount: unmountNativeNoPicker } = render(
       <Composer {...composerProps({ isTerminalFirst: true, isNativeWrapper: true })} />,
     );
     fireEvent.change(textarea(), { target: { value: "/" } });
     expect(screen.queryByTestId("slash-menu-item-model")).toBeNull();
-    unmountCodex();
+    unmountNativeNoPicker();
 
-    // claude-native (wrapper WITH the model picker) → /model offered; it
-    // routes to setModel so the override propagates via the runner.
-    render(
+    // claude-native and codex-native (wrapper WITH the model picker) →
+    // /model offered; it routes to setModel so the override propagates via
+    // the runner.
+    const { unmount: unmountClaude } = render(
       <Composer
-        {...composerProps({ isTerminalFirst: true, isNativeWrapper: true, showModels: true })}
+        {...composerProps({
+          isTerminalFirst: true,
+          isNativeWrapper: true,
+          showModels: true,
+          modelPickerKind: "claude",
+        })}
       />,
     );
     fireEvent.change(textarea(), { target: { value: "/" } });
     expect(screen.getByTestId("slash-menu-item-model")).toBeInTheDocument();
+    unmountClaude();
+
+    render(
+      <Composer
+        {...composerProps({
+          isTerminalFirst: true,
+          isNativeWrapper: true,
+          showModels: true,
+          modelPickerKind: "codex",
+        })}
+      />,
+    );
+    fireEvent.change(textarea(), { target: { value: "/" } });
+    expect(screen.getByTestId("slash-menu-item-model")).toBeInTheDocument();
+  });
+});
+
+describe("Composer Codex Plan-mode control", () => {
+  const realSetCodexPlanMode = useChatStore.getState().setCodexPlanMode;
+
+  beforeEach(() => {
+    useChatStore.setState({
+      conversationId: "conv_test",
+      codexPlanMode: false,
+      skills: [],
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+    useChatStore.setState({ setCodexPlanMode: realSetCodexPlanMode, codexPlanMode: false });
+  });
+
+  it("toggles Codex Plan mode through the store action", async () => {
+    const setCodexPlanMode = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ setCodexPlanMode });
+
+    renderWithTooltips(<Composer {...composerProps({ showCodexPlanMode: true })} />);
+    fireEvent.click(screen.getByTestId("codex-plan-mode-toggle"));
+
+    await waitFor(() => expect(setCodexPlanMode).toHaveBeenCalledWith(true));
+  });
+
+  it("shows the active pressed state while Plan mode is enabled", () => {
+    useChatStore.setState({ codexPlanMode: true });
+
+    renderWithTooltips(<Composer {...composerProps({ showCodexPlanMode: true })} />);
+
+    const button = screen.getByTestId("codex-plan-mode-toggle");
+    expect(button).toHaveAttribute("aria-pressed", "true");
+    expect(button).toHaveAccessibleName("Exit Plan mode");
+  });
+
+  it("hides the control when the session is not Codex-native", () => {
+    render(<Composer {...composerProps({ showCodexPlanMode: false })} />);
+    expect(screen.queryByTestId("codex-plan-mode-toggle")).toBeNull();
   });
 });
 
@@ -664,6 +761,47 @@ describe("Composer pending elicitation", () => {
     fireEvent.change(ta, { target: { value: "status update please" } });
     fireEvent.keyDown(ta, { key: "Enter" });
     expect(onSend).toHaveBeenCalledWith("status update please", undefined);
+  });
+});
+
+// Clicking the floating "Reply" button adds a quote chip above the composer.
+// The caret must follow into the textarea so the user can type the reply
+// immediately — without this, the quote appears but focus stays on the page
+// and the user has to click the chat box first.
+describe("Composer reply-quote focus", () => {
+  beforeEach(() => {
+    useChatStore.setState({ conversationId: "conv_test", skills: [] });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("focuses the textarea when a reply quote is added", () => {
+    const { rerender } = render(<Composer {...composerProps({ replyQuotes: [] })} />);
+    const ta = textarea();
+    // The mount effect focuses on conversation bind; blur so the assertion
+    // proves the quote-add effect re-focused, not the leftover mount focus.
+    ta.blur();
+    expect(document.activeElement).not.toBe(ta);
+
+    rerender(<Composer {...composerProps({ replyQuotes: ["selected response text"] })} />);
+    expect(document.activeElement).toBe(ta);
+  });
+
+  it("does not steal focus when a quote is removed", () => {
+    // Removing a chip (the X button) shrinks the count — the effect only
+    // fires when the count grows, so focus must stay put.
+    const { rerender } = render(
+      <Composer {...composerProps({ replyQuotes: ["first", "second"] })} />,
+    );
+    const ta = textarea();
+    ta.blur();
+    expect(document.activeElement).not.toBe(ta);
+
+    rerender(<Composer {...composerProps({ replyQuotes: ["first"] })} />);
+    expect(document.activeElement).not.toBe(ta);
   });
 });
 

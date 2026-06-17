@@ -47,6 +47,7 @@ describe("AgentCard icon selection", () => {
     { name: "design-reviewer", harness: "codex", expected: "codex" },
     { name: "codex-native-ui", harness: "codex-native", expected: "codex" },
     { name: "claude-native-ui", harness: "claude-native", expected: "claude" },
+    { name: "pi-native-ui", harness: "pi-native", expected: "pi" },
     { name: "x", harness: "claude-sdk", expected: "claude" },
     { name: "pi", harness: "pi", expected: "pi" },
     // The pi match is exact: a harness merely containing "pi" stays generic.
@@ -105,5 +106,53 @@ describe("AgentCard compact mode", () => {
     // inline, and the card is not wrapped as a tooltip trigger.
     expect(card).toHaveTextContent("Multi-agent coding orchestrator.");
     expect(card).not.toHaveAttribute("data-slot", "tooltip-trigger");
+  });
+});
+
+describe("AgentCard hover mode", () => {
+  const withDescription = agent({
+    display_name: "Nessie",
+    description: "Multi-agent coding orchestrator.",
+  });
+
+  it("wraps the card in a hover flyout when hover is set and a description exists", () => {
+    // AddAgentDialog opts into the Cursor-style flyout. The card stays the
+    // full inline card AND becomes the hover-card trigger (asChild merges
+    // the slot marker onto the button), so hovering opens the flyout.
+    render(<AgentCard agent={withDescription} selected={false} onSelect={() => {}} hover />);
+    const card = screen.getByTestId("agent-card-ag_1");
+    expect(card).toHaveTextContent("Multi-agent coding orchestrator."); // inline kept
+    expect(card).toHaveAttribute("data-slot", "hover-card-trigger");
+  });
+
+  it("does not wrap when hover is set but the agent has no description", () => {
+    // AgentHoverCard no-ops without a description, so the card stays a
+    // plain button — no empty flyout opens.
+    render(
+      <AgentCard
+        agent={agent({ display_name: "Bare", description: null })}
+        selected={false}
+        onSelect={() => {}}
+        hover
+      />,
+    );
+    expect(screen.getByTestId("agent-card-ag_1")).not.toHaveAttribute(
+      "data-slot",
+      "hover-card-trigger",
+    );
+  });
+
+  it("prefers the compact tooltip over the hover flyout when both are set", () => {
+    // compact is checked first, so a compact card never also becomes a
+    // hover-card trigger — the doc contract that hover is ignored in
+    // compact mode.
+    render(
+      <TooltipProvider>
+        <AgentCard agent={withDescription} selected={false} onSelect={() => {}} compact hover />
+      </TooltipProvider>,
+    );
+    const card = screen.getByTestId("agent-card-ag_1");
+    expect(card).toHaveAttribute("data-slot", "tooltip-trigger");
+    expect(card).not.toHaveAttribute("data-slot", "hover-card-trigger");
   });
 });

@@ -132,6 +132,7 @@ const _SANDBOX_PROVIDER_NAMES: Record<string, string> = {
   modal: "Modal",
   lakebox: "Databricks",
   daytona: "Daytona",
+  e2b: "E2B",
 };
 
 /**

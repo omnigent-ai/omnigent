@@ -60,6 +60,8 @@ _POST_RETRY_DELAY_SECONDS = 0.1
 _POST_RETRY_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 _DELTA_FLUSH_INTERVAL_SECONDS = 0.05
 _DELTA_FLUSH_CHAR_THRESHOLD = 64
+_EXTERNAL_REASONING_EFFORT_CHANGE_TYPE = "external_reasoning_effort_change"
+_EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE = "external_codex_collaboration_mode_change"
 # Per-attempt client budget for the elicitation long-poll, slightly above
 # the server-side wait (``_CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S``) so
 # the server's own timeout (empty-body fail-ask) wins over a client cut.
@@ -201,6 +203,20 @@ class _CodexForwarderState:
         the resume/startup model so the spawn default is not echoed back as
         a change; only a later in-TUI ``/model`` switch is mirrored. ``None``
         until seeded.
+    :param effort: Latest known Codex reasoning effort for this thread, e.g.
+        ``"medium"``. ``None`` means Codex is using its model/default effort.
+    :param posted_effort: Last reasoning effort already mirrored to Omnigent
+        via ``external_reasoning_effort_change``. ``None`` is a valid mirrored
+        value, so ``posted_effort_known`` tracks whether the baseline has been
+        seeded.
+    :param posted_effort_known: Whether ``posted_effort`` has been mirrored at
+        least once. Without this, the initial ``None`` default would be
+        indistinguishable from "not yet posted".
+    :param collaboration_mode: Latest known Codex collaboration mode kind, e.g.
+        ``"plan"`` or ``"default"``.
+    :param posted_collaboration_mode: Last collaboration mode kind already
+        mirrored to Omnigent via
+        ``external_codex_collaboration_mode_change``.
     :param parent_session_id: Omnigent parent session id, e.g.
         ``"conv_parent"``. Set by ``supervise_forwarder`` so collab-agent
         helpers can register child sessions without extra parameter
@@ -243,6 +259,11 @@ class _CodexForwarderState:
 
     model: str | None = None
     posted_model: str | None = None
+    effort: str | None = None
+    posted_effort: str | None = None
+    posted_effort_known: bool = False
+    collaboration_mode: str | None = None
+    posted_collaboration_mode: str | None = None
     parent_session_id: str | None = None
     codex_client: CodexAppServerClient | None = None
     subagents_by_thread: dict[str, str] = field(default_factory=dict)
@@ -289,6 +310,8 @@ class _CodexForwarderState:
         settings = params.get("threadSettings")
         if isinstance(settings, dict):
             self._note_model_fields(settings)
+            self._note_effort_fields(settings)
+            self._note_collaboration_mode_fields(settings)
 
     def record_completed_plan(self, params: dict[str, Any]) -> None:
         """
@@ -572,6 +595,44 @@ class _CodexForwarderState:
         model = payload.get("model")
         if isinstance(model, str) and model:
             self.model = model
+
+    def _note_effort_fields(self, payload: dict[str, Any]) -> None:
+        """
+        Record reasoning effort from a Codex settings-like payload.
+
+        App-server's public ``ThreadSettings`` wire field is ``effort``. The
+        other two names are accepted because upstream docs and lower-level
+        snapshots use ``reasoningEffort`` / ``reasoning_effort`` when referring
+        to the same concept.
+
+        :param payload: Settings payload with ``effort`` or an equivalent
+            reasoning-effort key, e.g. ``{"effort": "medium"}``.
+        :returns: None.
+        """
+        for key in ("effort", "reasoningEffort", "reasoning_effort"):
+            if key not in payload:
+                continue
+            effort = payload[key]
+            if effort is None or (isinstance(effort, str) and effort):
+                self.effort = effort
+            return
+
+    def _note_collaboration_mode_fields(self, payload: dict[str, Any]) -> None:
+        """
+        Record Codex collaboration mode from a settings-like payload.
+
+        :param payload: Settings payload with ``collaborationMode``, e.g.
+            ``{"collaborationMode": {"mode": "plan", "settings": {...}}}``.
+        :returns: None.
+        """
+        raw_mode = payload.get("collaborationMode")
+        if not isinstance(raw_mode, dict):
+            raw_mode = payload.get("collaboration_mode")
+        if not isinstance(raw_mode, dict):
+            return
+        mode = raw_mode.get("mode")
+        if isinstance(mode, str) and mode:
+            self.collaboration_mode = mode
 
 
 @dataclass(frozen=True)
@@ -2236,6 +2297,65 @@ async def _sync_model_change(
         forwarder_state.posted_model = model
 
 
+async def _sync_reasoning_effort_change(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """
+    Mirror Codex's active reasoning effort to Omnigent session metadata.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param forwarder_state: Mutable forwarder state carrying the current
+        Codex effort and last-mirrored baseline.
+    :returns: None.
+    """
+    effort = forwarder_state.effort
+    if forwarder_state.posted_effort_known and effort == forwarder_state.posted_effort:
+        return
+    response = await _post_session_event(
+        client,
+        session_id,
+        event_type=_EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
+        data={"reasoning_effort": effort},
+    )
+    _log_failed_session_event_post(_EXTERNAL_REASONING_EFFORT_CHANGE_TYPE, response)
+    if response is not None and response.status_code < 400:
+        forwarder_state.posted_effort = effort
+        forwarder_state.posted_effort_known = True
+
+
+async def _sync_codex_collaboration_mode_change(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """
+    Mirror Codex's active collaboration mode kind to Omnigent labels.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param forwarder_state: Mutable forwarder state carrying the current
+        Codex collaboration mode and last-mirrored baseline.
+    :returns: None.
+    """
+    mode = forwarder_state.collaboration_mode
+    if not mode or mode == forwarder_state.posted_collaboration_mode:
+        return
+    response = await _post_session_event(
+        client,
+        session_id,
+        event_type=_EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
+        data={"mode": mode},
+    )
+    _log_failed_session_event_post(_EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE, response)
+    if response is not None and response.status_code < 400:
+        forwarder_state.posted_collaboration_mode = mode
+
+
 async def _maybe_handle_turn_event(
     client: httpx.AsyncClient,
     *,
@@ -2303,6 +2423,12 @@ async def _maybe_handle_turn_event(
         if forwarder_state is not None:
             forwarder_state.note_thread_settings_updated(params)
             await _sync_model_change(
+                client, session_id=session_id, forwarder_state=forwarder_state
+            )
+            await _sync_reasoning_effort_change(
+                client, session_id=session_id, forwarder_state=forwarder_state
+            )
+            await _sync_codex_collaboration_mode_change(
                 client, session_id=session_id, forwarder_state=forwarder_state
             )
         return True
@@ -4508,20 +4634,19 @@ def _session_usage_data_from_params(params: dict[str, Any]) -> dict[str, int] | 
     total = token_usage.get("total")
     if not isinstance(total, dict):
         return None
-    context_tokens = total.get("inputTokens")
+    cumulative_input_tokens = total.get("inputTokens")
     context_window = total.get("contextWindow")
     output_tokens = total.get("outputTokens")
     cached_input_tokens = total.get("cachedInputTokens")
     data: dict[str, int] = {}
-    if isinstance(context_tokens, int) and context_tokens >= 0:
-        data["context_tokens"] = context_tokens
+    if isinstance(cumulative_input_tokens, int) and cumulative_input_tokens >= 0:
         # Codex's ``tokenUsage.total`` is CUMULATIVE across the whole thread
         # (the CLI subtracts prior totals to recover per-turn deltas), so
         # ``total.inputTokens`` / ``outputTokens`` are the session's cumulative
         # token counts. Forward them as the cumulative fields the server prices
         # into ``total_cost_usd`` (SET semantics) — codex-native produces no
         # ``response.completed``, so the Omnigent relay never accounts its cost.
-        data["cumulative_input_tokens"] = context_tokens
+        data["cumulative_input_tokens"] = cumulative_input_tokens
         # Codex's ``inputTokens`` is INCLUSIVE of cached tokens
         # (``non_cached_input = input_tokens - cached_input_tokens`` in
         # codex-rs ``protocol.rs``). Forward the cumulative cached count so the
@@ -4530,6 +4655,18 @@ def _session_usage_data_from_params(params: dict[str, Any]) -> dict[str, int] | 
         # cumulative (SET) semantics as ``cumulative_input_tokens``.
         if isinstance(cached_input_tokens, int) and cached_input_tokens >= 0:
             data["cumulative_cache_read_input_tokens"] = cached_input_tokens
+    # ``context_tokens`` drives the context-window ring in the web UI. It
+    # must reflect the CURRENT context occupancy (how much of the window
+    # the latest turn consumed), NOT the cumulative total across all turns.
+    # Codex's ``tokenUsage.last`` carries the per-turn breakdown; fall back
+    # to ``total.inputTokens`` only when ``last`` is unavailable (first
+    # frame before a turn completes).
+    last = token_usage.get("last")
+    last_input = last.get("inputTokens") if isinstance(last, dict) else None
+    if isinstance(last_input, int) and last_input >= 0:
+        data["context_tokens"] = last_input
+    elif isinstance(cumulative_input_tokens, int) and cumulative_input_tokens >= 0:
+        data["context_tokens"] = cumulative_input_tokens
     if isinstance(output_tokens, int) and output_tokens >= 0:
         data["cumulative_output_tokens"] = output_tokens
     if isinstance(context_window, int) and context_window > 0:

@@ -722,6 +722,7 @@ class TerminalInstance:
     tmux_allow_passthrough: bool = False
     tmux_start_on_attach: bool = False
     running: bool = False
+    launch_cwd: str | None = None
     # Owned per-launch egress proxy. ``None`` when the sandbox
     # carries no ``egress_rules`` or the backend doesn't need a
     # spawn-time wrap (the ``none`` backend does nothing here). Cleaned
@@ -745,6 +746,7 @@ class TerminalInstance:
     # so a client attaching, detaching, focusing, clicking, or typing does
     # not read as agent activity. ``-inf`` until the first interaction.
     _last_client_interaction_at: float = field(default=float("-inf"), repr=False)
+    _last_pane_snapshot: str | None = field(default=None, repr=False)
 
     @property
     def tmux_target(self) -> str:
@@ -771,6 +773,23 @@ class TerminalInstance:
         :returns: None.
         """
         self._last_client_interaction_at = time.monotonic()
+
+    def last_pane_text(self) -> str | None:
+        """Return the last visible pane text captured for diagnostics.
+
+        The value is updated opportunistically by reads and watcher polls.
+        It is intentionally a snapshot, not a live tmux query, so callers can
+        still retrieve useful context after tmux has already disappeared.
+        """
+        snapshot = self._last_pane_snapshot
+        if snapshot is None:
+            return None
+        text = _strip_ansi(snapshot).strip()
+        return text or None
+
+    def _remember_pane_snapshot(self, snapshot: str) -> None:
+        """Store a pane capture for later exit diagnostics."""
+        self._last_pane_snapshot = snapshot
 
     def _tmux_base_cmd(self) -> list[str]:
         """
@@ -928,6 +947,7 @@ class TerminalInstance:
             )
 
         self.running = True
+        self.launch_cwd = effective_cwd
 
     async def send(
         self,
@@ -999,6 +1019,7 @@ class TerminalInstance:
                 )
             }
 
+        self._remember_pane_snapshot(result)
         return {
             "terminal": f"{self.name}:{self.session_key}",
             "screen": _strip_ansi(result),
@@ -1110,6 +1131,8 @@ class TerminalInstance:
     def start_idle_watcher(
         self,
         on_idle: Callable[[], None | Awaitable[None]],
+        *,
+        on_exit: Callable[[], None | Awaitable[None]] | None = None,
     ) -> None:
         """Start a background task that fires ``on_idle`` each time the pane
         becomes quiet (no change for ``_IDLE_THRESHOLD_SECONDS``).
@@ -1122,7 +1145,7 @@ class TerminalInstance:
             raise RuntimeError("Cannot start idle watcher before launch")
         if self._idle_task is not None and not self._idle_task.done():
             return
-        self._idle_task = asyncio.create_task(self._idle_watch_loop(on_idle))
+        self._idle_task = asyncio.create_task(self._idle_watch_loop(on_idle, on_exit=on_exit))
 
     async def _stop_idle_watcher(self) -> None:
         task = self._idle_task
@@ -1138,6 +1161,8 @@ class TerminalInstance:
     async def _idle_watch_loop(
         self,
         on_idle: Callable[[], None | Awaitable[None]],
+        *,
+        on_exit: Callable[[], None | Awaitable[None]] | None = None,
     ) -> None:
         """
         Asyncio polling loop driving an :class:`_IdleDetector`.
@@ -1148,15 +1173,16 @@ class TerminalInstance:
         """
         detector = _IdleDetector()
 
-        async def _fire() -> bool:
-            """Invoke on_idle. Returns False if the callback raised (watcher should exit)."""
+        async def _fire(callback: Callable[[], None | Awaitable[None]], kind: str) -> bool:
+            """Invoke a callback. Returns False if it raised and the watcher should exit."""
             try:
-                result = on_idle()
+                result = callback()
                 if asyncio.iscoroutine(result):
                     await result
             except Exception:
                 logger.exception(
-                    "idle-notification callback failed for terminal %s:%s",
+                    "%s-notification callback failed for terminal %s:%s",
+                    kind,
                     self.name,
                     self.session_key,
                 )
@@ -1176,10 +1202,14 @@ class TerminalInstance:
                     "-e",
                 )
             except RuntimeError:
-                # tmux server likely gone; stop watching quietly.
+                # tmux server likely gone.
+                self.running = False
+                if on_exit is not None:
+                    await _fire(on_exit, "exit")
                 return
 
-            if detector.tick(snapshot) and not await _fire():
+            self._remember_pane_snapshot(snapshot)
+            if detector.tick(snapshot) and not await _fire(on_idle, "idle"):
                 return
 
     def start_idle_watcher_thread(
@@ -1187,8 +1217,10 @@ class TerminalInstance:
         on_idle: Callable[[], None] | None = None,
         *,
         on_activity: Callable[[], None] | None = None,
+        on_exit: Callable[[], None] | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
+        replace: bool = False,
     ) -> None:
         """
         Start a daemon thread driving idle/activity edges from the pane.
@@ -1208,10 +1240,11 @@ class TerminalInstance:
         fires on every poll tick where the pane content changed — so at
         most once per *poll_interval_s*, which for the fast claude-native
         watcher (200ms) is up to ~5/sec while a pane redraws continuously.
+        ``on_exit`` fires once when the tmux session disappears unexpectedly.
         Any further rate-limiting of activity (e.g. the runner's
         one-pulse-per-second ``session.terminal.activity`` throttle) is
         the caller's responsibility, not this watcher's. At least one
-        callback should be provided; passing both is fine.
+        callback should be provided; passing several is fine.
 
         :param on_idle: Optional sync callback invoked once per idle
             edge, or ``None`` to skip idle detection. Must not block the
@@ -1220,6 +1253,9 @@ class TerminalInstance:
         :param on_activity: Optional sync callback invoked on each tick
             the pane changed (the runner-determined "PTY had output"
             signal). Same non-blocking contract as *on_idle*.
+        :param on_exit: Optional sync callback invoked when the watcher
+            observes that tmux has disappeared. Same non-blocking contract
+            as *on_idle*.
         :param idle_threshold_s: Per-watcher diff-track idle threshold in
             seconds passed to :class:`_IdleDetector`, e.g. ``1.0`` for the
             claude-native status watcher. ``None`` uses the module
@@ -1228,19 +1264,23 @@ class TerminalInstance:
             ``0.2`` for the claude-native status watcher (snappier
             running/idle transitions). ``None`` uses the module default
             :data:`_IDLE_POLL_INTERVAL_SECONDS`.
+        :param replace: When ``True``, replace any existing threaded watcher
+            so callbacks can be rebound after terminal ownership transfer.
         :raises RuntimeError: When the instance is not currently
             running (caller forgot to ``await launch`` first).
         """
         if not self.running:
             raise RuntimeError("Cannot start idle watcher before launch")
-        if on_idle is None and on_activity is None:
+        if on_idle is None and on_activity is None and on_exit is None:
             raise ValueError(
                 "start_idle_watcher_thread requires at least one of "
-                "on_idle / on_activity — a watcher with neither would poll "
+                "on_idle / on_activity / on_exit — a watcher with none would poll "
                 "tmux forever with no effect."
             )
         if self._idle_thread is not None and self._idle_thread.is_alive():
-            return
+            if not replace:
+                return
+            self._stop_idle_watcher_thread()
         stop_event = threading.Event()
         self._idle_stop_event = stop_event
         self._idle_thread = threading.Thread(
@@ -1249,6 +1289,7 @@ class TerminalInstance:
             kwargs={
                 "on_idle": on_idle,
                 "on_activity": on_activity,
+                "on_exit": on_exit,
                 "idle_threshold_s": idle_threshold_s,
                 "poll_interval_s": poll_interval_s,
             },
@@ -1263,6 +1304,7 @@ class TerminalInstance:
         *,
         on_idle: Callable[[], None] | None = None,
         on_activity: Callable[[], None] | None = None,
+        on_exit: Callable[[], None] | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
     ) -> None:
@@ -1283,6 +1325,8 @@ class TerminalInstance:
             :meth:`start_idle_watcher_thread`); skipped when ``None``.
         :param on_activity: Optional pane-changed callback; fired each
             tick the pane content changed. Skipped when ``None``.
+        :param on_exit: Optional callback fired when tmux disappears.
+            Skipped when ``None``.
         :param idle_threshold_s: Per-watcher diff-track idle threshold in
             seconds forwarded to :class:`_IdleDetector`, e.g. ``1.0``.
             ``None`` uses the module default.
@@ -1302,7 +1346,11 @@ class TerminalInstance:
                 return
             snapshot = self._capture_pane_for_idle_or_none()
             if snapshot is None:
+                self.running = False
+                if on_exit is not None:
+                    self._fire_watch_callback(on_exit, "exit")
                 return
+            self._remember_pane_snapshot(snapshot)
             # A pane change that lands within the recent-interaction window
             # is a client-driven repaint (attach/detach reflow, focus,
             # mouse, keystroke — stamped via note_client_interaction), not

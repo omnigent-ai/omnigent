@@ -72,10 +72,16 @@ def conversation_link_for_id(
     :returns: Web UI link, e.g. ``"/c/conv_abc123"`` or
         ``"http://127.0.0.1:6767/c/conv_abc123"``.
     """
-    path = f"/c/{quote(conversation_id, safe='')}"
     if base_url is None or not base_url.strip():
-        return path
-    return f"{base_url.strip().rstrip('/')}{path}"
+        return f"/c/{quote(conversation_id, safe='')}"
+    # Delegate to the shared builder so workspace-hosted servers get the
+    # API→UI mount swap (``/api/2.0/omnigent`` → ``/omnigent``) and the
+    # ``?o=<org>`` selector — keeping the terminal status-bar link in
+    # lockstep with the CLI's ``Web UI:`` link instead of pointing at the
+    # JSON API mount.
+    from omnigent.conversation_browser import conversation_url
+
+    return conversation_url(base_url.strip(), conversation_id)
 
 
 @dataclass(frozen=True)
@@ -199,8 +205,12 @@ class TerminalRegistry:
         key = (terminal_name, session_key)
         with self._lock:
             existing = self._by_conversation.get(conversation_id, {}).get(key)
-            if existing is not None and existing.running:
+        if existing is not None and existing.running:
+            if await existing.is_alive():
                 return existing
+            await self.close(conversation_id, terminal_name, session_key)
+        elif existing is not None:
+            await self.close(conversation_id, terminal_name, session_key)
 
         # Lock-free section: ``create_terminal_instance`` and
         # ``launch`` may take real time (tmux spawn). Holding the
@@ -217,6 +227,19 @@ class TerminalRegistry:
             conversation_link=self.conversation_link_for_id(conversation_id),
         )
         await created.instance.launch(cwd=created.cwd)
+        if not await created.instance.is_alive():
+            try:
+                await asyncio.wait_for(created.instance.close(), timeout=_CLOSE_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Newly launched terminal close timed out for %s:%s in conv %s",
+                    terminal_name,
+                    session_key,
+                    conversation_id,
+                )
+            raise RuntimeError(
+                f"terminal {terminal_name}:{session_key} exited before it became available"
+            )
 
         with self._lock:
             slot = self._by_conversation.setdefault(conversation_id, {})

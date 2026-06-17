@@ -1,16 +1,9 @@
 name: Lint
 
-# Runs the project's pre-commit hooks (ruff format/check, mypy, the
-# custom anti-pattern grep hooks, etc.) on every non-draft PR and on
-# push to main. Surfaces as the `Pre-commit checks` check on PRs,
-# which is one of the REQUIRED gate entries in `merge-ready.yml`.
-#
-# Triggers:
-#   pull_request    opened / synchronize / reopened / ready_for_review.
-#                   Draft PRs are skipped; the `ready_for_review`
-#                   trigger refires the workflow when the draft is
-#                   converted, so the check doesn't strand pending.
-#   push (main)     post-merge run on the default branch.
+# Runs the project's pre-commit hooks (ruff, mypy, custom anti-pattern grep
+# hooks, etc.) on every non-draft PR and on push to main. Surfaces as the
+# `Pre-commit checks` check, a REQUIRED gate entry in merge-ready.yml. Draft PRs
+# are skipped; `ready_for_review` refires so the check doesn't strand pending.
 
 on:
   pull_request:
@@ -23,14 +16,11 @@ permissions:
   contents: read
 
 env:
-  # No ap-web SPA build during `uv sync` (setup.py `_build_web_ui`):
-  # this job never serves the bundle, and the hardened runner's npm has
-  # no registry mirror so the build otherwise times out ~10min on public npm.
+  # No ap-web SPA build during `uv sync` (setup.py _build_web_ui): this job never
+  # serves the bundle, and the build otherwise times out on public npm.
   OMNIGENT_SKIP_WEB_UI: "true"
-  # Hardened runners have no outbound network to public PyPI; route
-  # both uv and pip through the Databricks proxy so PEP-517 build
-  # backends resolve. pre-commit installs hook repos via pip (not uv),
-  # so PIP_INDEX_URL is required even when only uv is in the workflow.
+  # Route uv and pip at PyPI. pre-commit installs hook repos via pip (not uv),
+  # so PIP_INDEX_URL is needed even though the workflow only invokes uv.
   UV_INDEX_URL: https://pypi.org/simple
   PIP_INDEX_URL: https://pypi.org/simple
 
@@ -39,11 +29,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Security precondition gate: untrusted PRs are held until the scan passes
+  # (security-gate.yml); trusted authors and non-PR events pass through.
+  gate:
+    uses: ./.github/workflows/security-gate.yml
+
   pre-commit:
     name: Pre-commit checks
-    # Skip on draft PRs; the `ready_for_review` trigger above re-fires
-    # the workflow when the draft is converted, so this won't strand
-    # the check pending on the eventual ready-for-review state.
+    needs: gate
     if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -57,11 +50,9 @@ jobs:
         with:
           python-version-file: ".python-version"
 
-      # Must run BEFORE any `uv` command: `uv sync` / `uv run` re-resolve
-      # the working tree against CI's own index (pypi.org) and would
-      # rewrite a committed proxy URL to canonical, masking it from the
-      # pre-commit hook below. This checks the committed file as-is
-      # (stdlib only, no venv needed).
+      # Must run BEFORE any `uv` command: `uv sync`/`uv run` would re-resolve and
+      # rewrite a committed proxy URL to canonical, masking it. Checks the
+      # committed file as-is (stdlib only, no venv).
       - name: Check uv.lock uses the public PyPI index
         run: python scripts/normalize_uv_lock_registry.py --check uv.lock
 
@@ -77,32 +68,42 @@ jobs:
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
 
       - name: Install dependencies
-        # `--locked` is the hard gate: it fails the job if `uv.lock` is
-        # out of sync with `pyproject.toml`, independent of the
-        # `uv-lock` pre-commit hook below (a bare `uv run pre-commit`
-        # would otherwise re-lock the working tree first and mask a
-        # stale committed lockfile). Fix locally with `uv lock`.
+        # `--locked` is the hard gate: fails if uv.lock is out of sync with
+        # pyproject.toml (a bare `uv run pre-commit` would re-lock first and mask
+        # a stale lockfile). Fix locally with `uv lock`.
         run: uv sync --locked --extra dev
 
-      - name: Run formatting, lint, and typing checks
-        run: uv run pre-commit run --all-files --show-diff-on-failure
-
+      # Sets up Node 20 and pins npm to the same major that regenerates
+      # the lockfile in the OSS-regen workflows, so the freshness gate
+      # below doesn't flake on npm version-skew churn.
       - name: Set up Node.js
-        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af  # v4
-        with:
-          node-version: "20"
-          cache: "npm"
-          cache-dependency-path: ap-web/package-lock.json
+        uses: ./.github/actions/setup-node
 
       - name: Install ap-web dependencies
         working-directory: ap-web
-        # registry.npmjs.org TLS handshakes flake (ECONNRESET) on this
-        # runner pool — same network policy that intercepts pypi.org —
-        # so route npm through the Databricks proxy. The public export
-        # rewrites this URL back to the npmjs default.
+        # Pin the npm registry to the npmjs default.
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: npm ci --legacy-peer-deps
+
+      # The npm equivalent of the `uv sync --locked` gate above. `npm ci`
+      # only checks the lockfile is CONSISTENT with package.json; it
+      # tolerates cosmetic drift (dev/extraneous flags, metadata) that a
+      # fresh resolution would rewrite. Regenerate the lockfile and fail
+      # if it differs from the committed one.
+      - name: Check ap-web/package-lock.json is up to date
+        working-directory: ap-web
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: |
+          npm install --package-lock-only --legacy-peer-deps --no-audit --no-fund
+          git diff --exit-code package-lock.json || {
+            echo "::error::ap-web/package-lock.json is out of date. Run 'npm install --package-lock-only --legacy-peer-deps' in ap-web/ and commit the result."
+            exit 1
+          }
+
+      - name: Run formatting, lint, and typing checks
+        run: uv run pre-commit run --all-files --show-diff-on-failure
 
       - name: Type-check ap-web
         working-directory: ap-web

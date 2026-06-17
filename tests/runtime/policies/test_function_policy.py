@@ -1128,3 +1128,99 @@ async def test_engine_last_data_wins_across_multiple_policies(
         f"Last policy's data must win; got {result.data!r}. "
         f"If 'first-transform', the engine kept the first data instead of the last."
     )
+
+
+# ── Gap 7: legacy (content, phase) callable shim ─────────────────────────────
+
+
+def test_resolve_function_policy_wraps_legacy_callable(tmp_path: Path) -> None:
+    """``resolve_function_policy`` detects and wraps a legacy
+    ``(content, phase)`` callable so it can run under the
+    agent-plane FunctionPolicy dispatch without becoming a no-op.
+
+    Before the fix, passing a legacy callable to
+    ``resolve_function_policy`` stored it unwrapped. The
+    evaluator would then receive ``(event_dict, config)`` instead
+    of ``(content, phase)`` — the phase check (``phase ==
+    "tool_call"``) always failed against a dict, silently
+    producing ALLOW regardless of the event."""
+    _install_module(
+        tmp_path,
+        "probe_legacy",
+        """
+        def deny_on_tool_call(content, phase):
+            if phase == "tool_call":
+                return {"action": "deny", "reason": "legacy denied"}
+            return {"action": "allow"}
+        """,
+    )
+    spec = FunctionPolicySpec(
+        name="p",
+        on=[PhaseSelector(phase=Phase.TOOL_CALL)],
+        function=FunctionRef(path="test_fn_policy_pkg.probe_legacy.deny_on_tool_call"),
+    )
+    policy = resolve_function_policy(spec)
+    assert isinstance(policy, FunctionPolicy)
+
+
+@pytest.mark.asyncio
+async def test_resolve_function_policy_legacy_callable_evaluates_correctly(
+    tmp_path: Path,
+) -> None:
+    """A legacy ``(content, phase)`` callable wrapped by
+    ``resolve_function_policy`` returns the right decision at
+    evaluation time — both the action and the reason survive
+    the ``_coerce_legacy_return`` path."""
+    _install_module(
+        tmp_path,
+        "probe_legacy_eval",
+        """
+        def deny_on_tool_call(content, phase):
+            if phase == "tool_call":
+                return {"action": "deny", "reason": "legacy denied"}
+            return {"action": "allow"}
+        """,
+    )
+    spec = FunctionPolicySpec(
+        name="p",
+        on=[PhaseSelector(phase=Phase.TOOL_CALL)],
+        function=FunctionRef(path="test_fn_policy_pkg.probe_legacy_eval.deny_on_tool_call"),
+    )
+    policy = resolve_function_policy(spec)
+    result = await policy.evaluate(
+        EvaluationContext(
+            phase=Phase.TOOL_CALL,
+            content={"name": "sleep", "arguments": {"seconds": 10}},
+        ),
+        {"labels": {}, "conversation_id": "c"},
+    )
+    assert result.action == PolicyAction.DENY
+    assert result.reason == "legacy denied"
+
+
+def test_resolve_function_policy_modern_callable_not_wrapped(tmp_path: Path) -> None:
+    """A modern ``(event)`` callable passes through
+    ``resolve_function_policy`` unchanged — its identity is
+    preserved and no legacy shim wrapper is injected."""
+    _install_module(
+        tmp_path,
+        "probe_modern",
+        """
+        from omnigent.policies.types import PolicyResult
+        from omnigent.spec.types import PolicyAction
+
+        def modern_allow(event):
+            return PolicyResult(action=PolicyAction.ALLOW)
+        """,
+    )
+    spec = FunctionPolicySpec(
+        name="p",
+        on=[PhaseSelector(phase=Phase.REQUEST)],
+        function=FunctionRef(path="test_fn_policy_pkg.probe_modern.modern_allow"),
+    )
+    policy = resolve_function_policy(spec)
+    assert isinstance(policy, FunctionPolicy)
+    # Modern callable must NOT be wrapped in a legacy shim.
+    # The shim produces an inner function named "_sync_shim" or
+    # "_async_shim"; the original function is named "modern_allow".
+    assert policy._callable.__name__ == "modern_allow"

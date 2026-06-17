@@ -31,7 +31,10 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from cel_expr_python import cel as _cel
+try:
+    from cel_expr_python import cel as _cel
+except ImportError:
+    _cel = None  # type: ignore[assignment]
 
 from omnigent.policies.schema import PolicyCallable, PolicyEvent, PolicyResponse
 
@@ -66,6 +69,12 @@ def cel_policy(
         :class:`PolicyCallable` contract.
     :raises ValueError: If the expression has CEL syntax errors.
     """
+    if _cel is None:
+        raise ImportError(
+            "cel-expr-python is required for CEL policies but is not installed. "
+            "Install it with: pip install cel-expr-python"
+        )
+
     env = _cel.NewEnv(variables={"event": _cel.Type.DYN})
     try:
         compiled = env.compile(expression)
@@ -120,54 +129,58 @@ def cel_policy(
 
 # ── Registry ─────────────────────────────────────────────────────────────────
 
-POLICY_REGISTRY: list[dict[str, Any]] = [
-    {
-        "handler": "omnigent.policies.builtins.cel.cel_policy",
-        "kind": "factory",
-        "name": "CEL Expression Policy",
-        "description": (
-            "Evaluate a CEL (Common Expression Language) expression against "
-            "every policy event. The expression receives the full event as "
-            '`event` and must return a map with `result` ("DENY", "ASK", or '
-            '"ALLOW") and optional `reason` keys. '
-            "CEL is non-Turing-complete and side-effect-free."
-        ),
-        "params_schema": {
-            "type": "object",
-            "properties": {
-                "expression": {
-                    "type": "string",
-                    "description": (
-                        "CEL expression. The `event` variable holds the PolicyEvent dict. "
-                        "Must return a map: "
-                        '{"result": "DENY"|"ASK"|"ALLOW", "reason": "..."}. '
-                        "Event fields: "
-                        'event.type ("request"|"tool_call"|"tool_result"|'
-                        '"response"|"llm_request"|"llm_response"|"output_logged"); '
-                        "event.target (tool name on tool_call/tool_result, null otherwise); "
-                        "event.data (phase-specific: string for request/response, "
-                        '{"name": str, "arguments": map} for tool_call, '
-                        '{"result": any} for tool_result, '
-                        '{"model": str, "messages_count": int, "tools_count": int,'
-                        ' "system_prompt_preview": str, "last_user_message": str}'
-                        " for llm_request); "
-                        "event.context.actor.run_as (user email); "
-                        "event.context.usage.total_cost_usd (session spend). "
-                        "Example: "
-                        'event.type == "tool_call" && event.data.name == "sys_os_shell" '
-                        '? {"result": "DENY", "reason": "Shell blocked."} '
-                        ': {"result": "ALLOW"}'
-                    ),
+POLICY_REGISTRY: list[dict[str, Any]] = (
+    []
+    if _cel is None
+    else [
+        {
+            "handler": "omnigent.policies.builtins.cel.cel_policy",
+            "kind": "factory",
+            "name": "CEL Expression Policy",
+            "description": (
+                "Evaluate a CEL (Common Expression Language) expression against "
+                "every policy event. The expression receives the full event as "
+                '`event` and must return a map with `result` ("DENY", "ASK", or '
+                '"ALLOW") and optional `reason` keys. '
+                "CEL is non-Turing-complete and side-effect-free."
+            ),
+            "params_schema": {
+                "type": "object",
+                "properties": {
+                    "expression": {
+                        "type": "string",
+                        "description": (
+                            "CEL expression. The `event` variable holds the PolicyEvent dict. "
+                            "Must return a map: "
+                            '{"result": "DENY"|"ASK"|"ALLOW", "reason": "..."}. '
+                            "Event fields: "
+                            'event.type ("request"|"tool_call"|"tool_result"|'
+                            '"response"|"llm_request"|"llm_response"|"output_logged"); '
+                            "event.target (tool name on tool_call/tool_result, null otherwise); "
+                            "event.data (phase-specific: string for request/response, "
+                            '{"name": str, "arguments": map} for tool_call, '
+                            '{"result": any} for tool_result, '
+                            '{"model": str, "messages_count": int, "tools_count": int,'
+                            ' "system_prompt_preview": str, "last_user_message": str}'
+                            " for llm_request); "
+                            "event.context.actor.run_as (user email); "
+                            "event.context.usage.total_cost_usd (session spend). "
+                            "Example: "
+                            'event.type == "tool_call" && event.data.name == "sys_os_shell" '
+                            '? {"result": "DENY", "reason": "Shell blocked."} '
+                            ': {"result": "ALLOW"}'
+                        ),
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": (
+                            "Fallback reason for DENY/ASK when the map omits a reason key."
+                        ),
+                        "default": "Denied by policy.",
+                    },
                 },
-                "reason": {
-                    "type": "string",
-                    "description": (
-                        "Fallback reason for DENY/ASK when the map omits a reason key."
-                    ),
-                    "default": "Denied by policy.",
-                },
+                "required": ["expression"],
             },
-            "required": ["expression"],
         },
-    },
-]
+    ]
+)

@@ -305,8 +305,8 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
     _seed_registry(registry, "conv_abc", stale)
 
     resource_registry = SessionResourceRegistry(terminal_registry=registry)
-    # Role stamped at auto-create time in production (launch_terminal's
-    # resource_role); seeded directly here to avoid spawning real tmux.
+    # Role stamped at auto-create time in production (resource_role);
+    # seeded directly here to avoid spawning real tmux.
     resource_registry._terminal_roles[("conv_abc", "terminal_tui_main")] = (
         OMNIGENT_REPL_TERMINAL_ROLE
     )
