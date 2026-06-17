@@ -67,7 +67,7 @@ What breaks if a regression goes in:
 
 Skip behaviour:
 
-- Profile from ``examples/databricks_supervisor/config.yaml`` missing
+- Profile from ``tests/resources/examples/databricks_supervisor/config.yaml`` missing
   from ``~/.databrickscfg`` → skip with config hint.
 - OAuth required on first use → skip with login instructions.
 
@@ -99,7 +99,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 # The example bundle is the single source of truth for the profile
 # and model. The e2e tests read them from here so there's no
 # separate env var to keep in sync.
-_EXAMPLE_BUNDLE = _REPO_ROOT / "examples" / "databricks_supervisor"
+_EXAMPLE_BUNDLE = _REPO_ROOT / "tests" / "resources" / "examples" / "databricks_supervisor"
 
 _DATABRICKSCFG_PATH = Path.home() / ".databrickscfg"
 
@@ -231,7 +231,7 @@ def _write_supervisor_bundle(
     :returns: Path to the bundle directory.
     """
     example_config = yaml.safe_load((_EXAMPLE_BUNDLE / "config.yaml").read_text())
-    model = example_config["llm"]["model"]
+    model = (example_config.get("llm") or {}).get("model") or example_config["executor"]["model"]
     bundle = tmp_path / "supervisor_bundle"
     bundle.mkdir()
     config: dict[str, object] = {
@@ -291,6 +291,7 @@ def _run_supervisor(
         "omnigent",
         "run",
         str(bundle),
+        "--no-session",
         "-p",
         user_prompt,
     ]

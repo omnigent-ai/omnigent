@@ -1359,6 +1359,24 @@ def test_build_spawn_env_applies_model_override(
     assert overridden["HARNESS_CLAUDE_SDK_MODEL"] == "claude-sonnet-4-6"
 
 
+def test_build_spawn_env_supports_databricks_supervisor() -> None:
+    """The runner builds the supervisor harness env instead of returning ``None``."""
+    spec = AgentSpec(
+        spec_version=1,
+        name="supervisor-test",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "databricks_supervisor"},
+            model="databricks-claude-sonnet-4-6",
+        ),
+    )
+
+    env = _build_spawn_env_from_spec(spec, "databricks_supervisor")
+
+    assert env is not None
+    assert env["HARNESS_SUPERVISOR_MODEL"] == "databricks-claude-sonnet-4-6"
+
+
 @pytest.mark.asyncio
 async def test_resolve_harness_config_applies_harness_override(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

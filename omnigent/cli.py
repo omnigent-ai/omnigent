@@ -3705,14 +3705,17 @@ class _DeployConfig(BaseModel):  # type: ignore[explicit-any]  # Pydantic extra=
         if absent.
     :param executor: The executor configuration block, or
         ``None`` if absent.
-    :param tools: The tools configuration block, or ``None``
-        if absent.
+    :param tools: The tools configuration block/list, or ``None``
+        if absent. Mapping-shaped tools are modeled after the standard
+        ``tools.builtins`` config; list-shaped tools are the Databricks
+        supervisor pass-through form and are intentionally accepted so
+        deploy-time env expansion does not reject otherwise valid bundles.
     """
 
     model_config = ConfigDict(extra="allow")
     llm: _LLMDeploy | None = None
     executor: _ExecutorDeploy | None = None
-    tools: _ToolsDeploy | None = None
+    tools: _ToolsDeploy | list[dict[str, Any]] | None = None  # type: ignore[explicit-any]
 
 
 def _expand_config_env_vars(  # type: ignore[explicit-any]  # raw is parsed YAML (heterogeneous values)
@@ -3767,7 +3770,7 @@ def _expand_config_env_vars(  # type: ignore[explicit-any]  # raw is parsed YAML
             raw["executor"]["auth"].update(expand_fn(auth_secrets))
             changed = True
 
-    if cfg.tools is not None and cfg.tools.builtins is not None:
+    if isinstance(cfg.tools, _ToolsDeploy) and cfg.tools.builtins is not None:
         changed = (
             _expand_builtin_env_vars(
                 raw["tools"]["builtins"],

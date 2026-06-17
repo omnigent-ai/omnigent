@@ -353,36 +353,6 @@ skips:
     cluster: repl-pexpect-cli
     mode: skip
 
-  - id: tests/e2e/omnigent/test_run_omnigent_coding_supervisor.py::test_run_omnigent_coding_supervisor_oneshot
-    reason: "Shard 3 bulk: coding supervisor one-shot. Triage under #532."
-    issue: 532
-    cluster: subagent-supervisor-routing
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_run_omnigent_coding_supervisor.py::test_run_omnigent_coding_supervisor_exposes_subagent_tools
-    reason: "Shard 3 bulk: coding supervisor subagent tools."
-    issue: 532
-    cluster: subagent-supervisor-routing
-    mode: skip
-
-  # Verified live on oss 2026-06-11: spawn / ambient_hint / parallel
-  # pass under the module's 600s signal-method timeout marker, but
-  # continuation failed 1 of 2 runs with a clean AssertionError (the
-  # sub-agent result never reached the parent via auto-wake within
-  # 240s; passed standalone in 47s). Flaky auto-wake delivery, needs
-  # product investigation before re-greening.
-  - id: tests/e2e/test_named_sub_agent_persistence.py::test_send_to_named_sub_agent_continuation_e2e
-    reason: "Flaky live: turn-2 sys_session_send result intermittently never auto-wakes the parent within 240s (#532)."
-    issue: 532
-    cluster: subagent-supervisor-routing
-    mode: skip
-
-  - id: tests/e2e/test_named_sub_agent_persistence.py::test_cross_parent_named_isolation_e2e
-    reason: "Wedges the e2e shard in CI: this test dispatches a sub-agent in TWO separate runner-bound sessions on the same runner, and the second session's async sub-agent dispatch / auto-wake contends with the first, hanging well past the shard's per-test timeout (the other 4 test_named_sub_agent_persistence tests pass after the #2534 session-flow migration; this two-concurrent-sessions-on-one-runner interaction needs separate investigation). Passes locally on oss in ~30s."
-    issue: 532
-    cluster: subagent-supervisor-routing
-    mode: skip
-
   - id: tests/e2e/test_policies_e2e.py::test_policy_gate_deny_persists_to_history
     reason: "Sessions API migration reaches inline INPUT DENY, but the synchronous DENY verdict is not persisted as an assistant sentinel in conversation_items; needs product-side persistence fix before unsuppressing."
     issue: 476
@@ -433,12 +403,6 @@ skips:
     reason: "Shard 3 bulk: sys-terminal basic round-trip. Same sys-terminal family."
     issue: 532
     cluster: terminal-d6
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_run_omnigent_example_agents.py::test_run_omnigent_example_yaml[agent_with_subagent_session]
-    reason: "Shard 3 bulk: run_omnigent example-yaml agent_with_subagent_session."
-    issue: 532
-    cluster: subagent-supervisor-routing
     mode: skip
 
   - id: tests/e2e/test_sys_terminal_e2e.py::test_sys_terminal_ten_parallel_dispatches_complete_e2e

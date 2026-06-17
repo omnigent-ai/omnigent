@@ -1226,6 +1226,37 @@ def test_expand_config_expands_builtin_tool_config(
     assert entry["name"] == "web_search_pplx"
 
 
+def test_expand_config_accepts_supervisor_tool_list() -> None:
+    """
+    ``_expand_config_env_vars`` accepts the Databricks supervisor
+    ``tools:`` list shape without trying to treat it as ``tools.builtins``.
+    """
+    from omnigent.spec import expand_env_vars
+
+    raw: dict[str, Any] = {
+        "spec_version": 1,
+        "executor": {
+            "type": "omnigent",
+            "model": "databricks-claude-sonnet-4-6",
+            "config": {"harness": "databricks_supervisor"},
+        },
+        "tools": [
+            {
+                "type": "uc_connection",
+                "uc_connection": {
+                    "name": "system_ai_agent_google_drive",
+                    "description": "Search team Google Drive",
+                },
+            }
+        ],
+    }
+
+    changed = _expand_config_env_vars(raw, expand_env_vars)
+
+    assert changed is False
+    assert raw["tools"][0]["uc_connection"]["name"] == "system_ai_agent_google_drive"
+
+
 def test_expand_config_expands_executor_connection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -12537,6 +12537,7 @@ def _build_spawn_env_from_spec(
             _build_claude_sdk_spawn_env,
             _build_codex_spawn_env,
             _build_cursor_spawn_env,
+            _build_databricks_supervisor_spawn_env,
             _build_openai_agents_sdk_spawn_env,
             _build_pi_spawn_env,
         )
@@ -12553,6 +12554,8 @@ def _build_spawn_env_from_spec(
             env = _build_cursor_spawn_env(spec, workdir=workdir)
         elif harness == "antigravity":
             env = _build_antigravity_spawn_env(spec)
+        elif harness == "databricks_supervisor":
+            env = _build_databricks_supervisor_spawn_env(spec)
         else:
             # Native terminal harnesses and unknown harnesses build env elsewhere.
             return None

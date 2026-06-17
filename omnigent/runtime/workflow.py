@@ -1416,6 +1416,42 @@ def _build_openai_agents_sdk_spawn_env(spec: AgentSpec) -> dict[str, str]:
     return env
 
 
+def _build_databricks_supervisor_spawn_env(spec: AgentSpec) -> dict[str, str]:
+    """Build the ``HARNESS_SUPERVISOR_*`` env-var dict.
+
+    The Databricks supervisor harness is an in-process harness like
+    openai-agents, but it uses its own env prefix and accepts a
+    pass-through list of Databricks-resident tools.
+
+    :param spec: The agent spec.
+    :returns: Spawn env consumed by ``databricks_supervisor_harness``.
+    """
+    env: dict[str, str] = {}
+    model = _resolve_spec_model(spec)
+    if model:
+        env["HARNESS_SUPERVISOR_MODEL"] = model
+    if spec.executor.supervisor_tools is not None:
+        env["HARNESS_SUPERVISOR_TOOLS_JSON"] = json.dumps(spec.executor.supervisor_tools)
+
+    if spec.executor.connection is not None:
+        env["HARNESS_SUPERVISOR_CONNECTION_JSON"] = json.dumps(spec.executor.connection)
+
+    spec_auth = spec.executor.auth
+    if isinstance(spec_auth, ApiKeyAuth):
+        connection = {"api_key": spec_auth.api_key}
+        if spec_auth.base_url:
+            connection["base_url"] = spec_auth.base_url
+        env["HARNESS_SUPERVISOR_CONNECTION_JSON"] = json.dumps(connection)
+    elif isinstance(spec_auth, DatabricksAuth):
+        env["HARNESS_SUPERVISOR_DATABRICKS_PROFILE"] = spec_auth.profile
+    elif spec.executor.profile:
+        env["HARNESS_SUPERVISOR_DATABRICKS_PROFILE"] = spec.executor.profile
+    elif spec.executor.config.get("profile"):
+        env["HARNESS_SUPERVISOR_DATABRICKS_PROFILE"] = str(spec.executor.config["profile"])
+
+    return env
+
+
 def _build_cursor_spawn_env(
     spec: AgentSpec,
     *,
