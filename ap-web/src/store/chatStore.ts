@@ -3768,12 +3768,21 @@ function applyChildSessionUpdated(
           ),
         )
       : {};
+  const errorOrNull = (v: unknown): ChildSessionInfo["last_task_error"] => {
+    if (!v || typeof v !== "object") return null;
+    const record = v as Record<string, unknown>;
+    if (typeof record.code !== "string" || typeof record.message !== "string") return null;
+    if (!record.code || !record.message) return null;
+    return { code: record.code, message: record.message };
+  };
   if (child.title !== undefined) patch.title = strOrNull(child.title);
   if (child.tool !== undefined) patch.tool = strOrNull(child.tool);
   if (child.session_name !== undefined) patch.session_name = strOrNull(child.session_name);
   if (child.labels !== undefined) patch.labels = strRecordOrEmpty(child.labels);
   if (child.current_task_status !== undefined)
     patch.current_task_status = strOrNull(child.current_task_status);
+  if (child.last_task_error !== undefined)
+    patch.last_task_error = errorOrNull(child.last_task_error);
   if (child.busy !== undefined) patch.busy = child.busy === true;
   if (child.last_message_preview !== undefined)
     patch.last_message_preview = strOrNull(child.last_message_preview);
@@ -3792,6 +3801,7 @@ function applyChildSessionUpdated(
       session_name: patch.session_name ?? null,
       labels: patch.labels ?? {},
       current_task_status: patch.current_task_status ?? null,
+      last_task_error: patch.last_task_error ?? null,
       busy: patch.busy ?? false,
       last_message_preview: patch.last_message_preview ?? null,
       pending_elicitations_count: patch.pending_elicitations_count ?? 0,

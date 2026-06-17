@@ -373,6 +373,15 @@ describe("agentDisplayLabel", () => {
     expect(agentDisplayLabel("codex-native-ui (switch conv_ab12)")).toBe("Codex");
   });
 
+  it("strips EVERY clone layer of a fork-of-a-fork before resolving", () => {
+    // A fork of a fork nests suffixes. A single-layer strip would leave
+    // "pi-native-ui (fork conv_a)" — no native match → the raw slug leaks
+    // into the model picker. agentRootName peels every layer to the root.
+    expect(agentDisplayLabel("pi-native-ui (fork conv_a) (fork conv_b)")).toBe("Pi");
+    expect(agentDisplayLabel("claude-native-ui (fork conv_a) (switch conv_b)")).toBe("Claude");
+    expect(agentDisplayLabel("polly (fork conv_a) (fork conv_b)")).toBe("Polly");
+  });
+
   it("capitalizes non-native names and strips their clone suffix", () => {
     expect(agentDisplayLabel("polly")).toBe("Polly");
     expect(agentDisplayLabel("polly (fork conv_ab12)")).toBe("Polly");

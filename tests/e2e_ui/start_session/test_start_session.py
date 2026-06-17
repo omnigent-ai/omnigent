@@ -356,12 +356,13 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
 
 
 def test_start_session_select_approval_mode(seeded_session: tuple[str, str]) -> None:
-    """Picking a non-default approval mode rides along to the create call.
+    """Picking a non-default approval preset rides along to the create call.
 
-    Selecting "Never" in the agent picker's Advanced settings menu
+    Selecting "Full access" in the agent picker's Advanced settings menu
     must (a) surface in the agent chip label as immediate feedback and
     (b) reach ``POST /v1/sessions`` as
-    ``terminal_launch_args: ["--ask-for-approval", "never"]``.
+    ``terminal_launch_args: ["--sandbox", "danger-full-access",
+    "--ask-for-approval", "never"]``.
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_approval_mode(base_url, session_id))
@@ -405,16 +406,16 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
             # Codex auto-selects (only built-in), so the Advanced chip —
             # gated on the Codex-native agent — is present.
             await page.get_by_test_id("new-chat-landing-advanced-chip").click()
-            # All three Codex approval modes render as radio rows.
-            for mode in ("untrusted", "on-request", "never"):
+            # All three Codex approval presets render as radio rows.
+            for mode in ("default", "full-access", "read-only"):
                 await expect(
                     page.get_by_test_id(f"new-chat-landing-approval-{mode}")
                 ).to_be_visible()
-            await page.get_by_test_id("new-chat-landing-approval-never").click()
+            await page.get_by_test_id("new-chat-landing-approval-full-access").click()
 
             # The chip label reflects the non-default pick immediately.
             await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_contain_text(
-                "Never"
+                "Full access"
             )
 
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
@@ -425,7 +426,12 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
             assert body["agent_id"] == "ag_codex_e2e", body
             assert body["host_id"] == _HOST_ID, body
             assert body["workspace"] == "/work/repo", body
-            assert body.get("terminal_launch_args") == ["--ask-for-approval", "never"], body
+            assert body.get("terminal_launch_args") == [
+                "--sandbox",
+                "danger-full-access",
+                "--ask-for-approval",
+                "never",
+            ], body
         finally:
             await browser.close()
 
@@ -760,5 +766,139 @@ async def _drive_add_worktree(base_url: str, session_id: str) -> None:
             assert body["host_id"] == _HOST_ID, body
             assert body["workspace"] == "/work/repo", body
             assert body.get("git") == {"branch_name": "feature/login", "base_branch": "main"}, body
+        finally:
+            await browser.close()
+
+
+# Session-bound agents the discovery scan returns. Both clone names below root
+# to the built-in "claude-native-ui", so the picker must drop both; the fork of
+# a fork (two nested suffixes) is the case a single-layer strip missed.
+_SINGLE_FORK_NAME = "claude-native-ui (fork ag_aaa11111)"
+_FORK_OF_FORK_NAME = "claude-native-ui (fork ag_aaa11111) (fork ag_bbb22222)"
+
+
+def _fork_scan_body() -> str:
+    """Stub body for the ``GET /v1/sessions?kind=any`` agent-discovery scan.
+
+    Returns four session-bound agents that exercise every branch of the
+    picker's shadow-dropping: the built-in's own row (dropped by id), a single
+    fork and a fork-of-fork of the built-in (both dropped by rooted name), and
+    one genuinely custom agent (must survive).
+    """
+    return json.dumps(
+        {
+            "object": "list",
+            "data": [
+                # Binds the built-in's own agent row — dropped by id.
+                {
+                    "id": "conv_native",
+                    "agent_id": "ag_claude_e2e",
+                    "agent_name": "claude-native-ui",
+                },
+                # Single fork of the built-in — dropped by name (one layer).
+                {"id": "conv_f1", "agent_id": "ag_fork1", "agent_name": _SINGLE_FORK_NAME},
+                # Fork of a fork — the regression: dropped only if EVERY clone
+                # layer is stripped before the built-in-name check.
+                {"id": "conv_ff", "agent_id": "ag_forkfork", "agent_name": _FORK_OF_FORK_NAME},
+                # A genuinely custom agent — must SURVIVE and be offered.
+                {"id": "conv_doc", "agent_id": "ag_doc", "agent_name": "doc-writer"},
+            ],
+            "has_more": False,
+        }
+    )
+
+
+def test_start_session_picker_drops_fork_of_fork_shadows(
+    seeded_session: tuple[str, str],
+) -> None:
+    """The landing picker hides fork-of-fork clones of a built-in agent.
+
+    The picker (``useAvailableAgents``) merges the built-in list
+    (``GET /v1/agents``) with session-scoped agents discovered by scanning the
+    caller's sessions (``GET /v1/sessions?kind=any``), dropping any discovered
+    agent whose clone name roots back to a built-in. A fork of a fork nests two
+    clone suffixes — ``"claude-native-ui (fork …) (fork …)"`` — so a single-
+    layer strip leaves ``"claude-native-ui (fork …)"``, which is not a built-in
+    name, and the clone leaked into the picker as a SECOND "Claude Code" row.
+
+    This drives that regression end to end against the rendered picker: only
+    the real built-in Claude Code and a genuinely custom agent are offered;
+    both the single-fork and the fork-of-fork clones are dropped.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_fork_of_fork_dedup(base_url, session_id))
+
+
+async def _drive_fork_of_fork_dedup(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+
+            async def handle_hosts(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_hosts_body()
+                )
+
+            async def handle_agents(route: Route) -> None:
+                # Sole built-in: claude-native-ui, display "Claude Code".
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_agents_body()
+                )
+
+            async def handle_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_fork_scan_body()
+                )
+
+            async def handle_enrich(route: Route) -> None:
+                # Only the surviving custom agent reaches the per-agent enrich
+                # fetch — the dropped shadows never get here.
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "id": "ag_doc",
+                            "object": "agent",
+                            "name": "doc-writer",
+                            "description": "Documentation specialist",
+                            "harness": "claude-sdk",
+                            "skills": [],
+                        }
+                    ),
+                )
+
+            await page.route("**/v1/hosts", handle_hosts)
+            await page.route("**/v1/agents", handle_agents)
+            # kind=any returns the fork + custom session-bound agents; the bare
+            # conversation-list GET still falls through to the real server.
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_scan)
+            # Per-agent enrich fetch for whichever agent survives the dedup.
+            await page.route(re.compile(r"/v1/sessions/[^/]+/agent$"), handle_enrich)
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            # Open the agent picker dropdown.
+            await page.get_by_test_id("new-chat-landing-agent-select").click()
+
+            # The real built-in Claude Code is offered...
+            await expect(
+                page.get_by_test_id("new-chat-landing-agent-ag_claude_e2e")
+            ).to_be_visible(timeout=30_000)
+            # ...the genuinely custom agent survives...
+            await expect(page.get_by_test_id("new-chat-landing-agent-ag_doc")).to_be_visible()
+            # ...and BOTH fork clones of the built-in are dropped. Pre-fix the
+            # fork-of-fork (ag_forkfork) rendered as a duplicate "Claude Code".
+            await expect(page.get_by_test_id("new-chat-landing-agent-ag_fork1")).to_have_count(0)
+            await expect(page.get_by_test_id("new-chat-landing-agent-ag_forkfork")).to_have_count(
+                0
+            )
+            # Exactly two options total: the built-in + the one custom agent —
+            # no duplicate "Claude Code" sneaks in via a leaked clone.
+            await expect(page.get_by_role("menuitem")).to_have_count(2)
         finally:
             await browser.close()
