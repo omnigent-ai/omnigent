@@ -39,15 +39,21 @@ Omnigent CodexExecutor
 
 The Rust sidecar exists because Codex's mock Responses API helpers are Rust
 test-support code in the public Codex repository. Rather than reimplementing
-that mock in Python, the sidecar links directly against:
+that mock in Python, the sidecar pulls the upstream test-support crate directly
+through Cargo:
 
 ```text
-third_party/codex/codex-rs/core/tests/common
+core_test_support = { git = "https://github.com/openai/codex.git", rev = "..." }
 ```
 
 That keeps the fake Responses wire format aligned with Codex upstream. Pytest
 still owns the test scenarios and assertions; the sidecar only starts WireMock,
 serves queued SSE fixtures, and reports captured requests.
+
+The revision is pinned in `tests/codex_parity/sidecar/Cargo.toml` so the parity
+harness is reproducible without requiring a checked-in Codex submodule. Updating
+the upstream fixture implementation is a normal Cargo dependency bump: change the
+Codex `rev`, refresh `Cargo.lock`, and run the parity tests.
 
 ## Fixture Flow
 
