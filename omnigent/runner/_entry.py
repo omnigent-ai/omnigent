@@ -923,6 +923,11 @@ def create_app(
     app.add_event_handler("startup", _start_pm)
     app.add_event_handler("shutdown", _stop_pm)
 
+    # Exposed so the periodic dead-peer sweep (Layer 3), wired in
+    # _run_tunnel_from_env, can drive the process-manager orphan sweep
+    # in-run (not just at boot).
+    app.state.process_manager = pm
+
     return app
 
 
@@ -1021,6 +1026,31 @@ async def _run_tunnel_from_env() -> None:
             ),
             name=f"runner-idle-monitor:{runner_id}",
         )
+    from omnigent.claude_native_bridge import (
+        prune_orphaned_bridge_dirs as _prune_claude_bridge_dirs,
+    )
+    from omnigent.codex_native_bridge import (
+        prune_orphaned_bridge_dirs as _prune_codex_bridge_dirs,
+    )
+    from omnigent.inner.terminal import reap_orphaned_terminals as _reap_orphaned_terminals
+
+    _pm = app.state.process_manager
+
+    async def _sweep_pass() -> None:
+        await _run_dead_peer_sweep_pass(
+            process_manager=_pm,
+            reap_orphaned_terminals=_reap_orphaned_terminals,
+            prune_codex_bridge_dirs=_prune_codex_bridge_dirs,
+            prune_claude_bridge_dirs=_prune_claude_bridge_dirs,
+        )
+
+    sweep_task = asyncio.create_task(
+        _run_dead_peer_sweep_monitor(
+            interval_s=_load_dead_peer_sweep_interval_s(),
+            run_pass=_sweep_pass,
+        ),
+        name=f"runner-dead-peer-sweep:{runner_id}",
+    )
     if parent_pid is not None:
         # Orphan guard runs on a dedicated daemon thread, not the event
         # loop: if the loop wedges during shutdown (harness mid-boot when
@@ -1037,6 +1067,7 @@ async def _run_tunnel_from_env() -> None:
     wait_tasks = {tunnel_task, stop_task}
     if idle_task is not None:
         wait_tasks.add(idle_task)
+    wait_tasks.add(sweep_task)
     try:
         done, _ = await asyncio.wait(
             wait_tasks,
@@ -1054,6 +1085,8 @@ async def _run_tunnel_from_env() -> None:
         if idle_task is not None:
             with contextlib.suppress(asyncio.CancelledError):
                 await idle_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await sweep_task
         await app.router.shutdown()
 
 
