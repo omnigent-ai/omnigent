@@ -667,6 +667,47 @@ describe("Composer pending elicitation", () => {
   });
 });
 
+// Clicking the floating "Reply" button adds a quote chip above the composer.
+// The caret must follow into the textarea so the user can type the reply
+// immediately — without this, the quote appears but focus stays on the page
+// and the user has to click the chat box first.
+describe("Composer reply-quote focus", () => {
+  beforeEach(() => {
+    useChatStore.setState({ conversationId: "conv_test", skills: [] });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("focuses the textarea when a reply quote is added", () => {
+    const { rerender } = render(<Composer {...composerProps({ replyQuotes: [] })} />);
+    const ta = textarea();
+    // The mount effect focuses on conversation bind; blur so the assertion
+    // proves the quote-add effect re-focused, not the leftover mount focus.
+    ta.blur();
+    expect(document.activeElement).not.toBe(ta);
+
+    rerender(<Composer {...composerProps({ replyQuotes: ["selected response text"] })} />);
+    expect(document.activeElement).toBe(ta);
+  });
+
+  it("does not steal focus when a quote is removed", () => {
+    // Removing a chip (the X button) shrinks the count — the effect only
+    // fires when the count grows, so focus must stay put.
+    const { rerender } = render(
+      <Composer {...composerProps({ replyQuotes: ["first", "second"] })} />,
+    );
+    const ta = textarea();
+    ta.blur();
+    expect(document.activeElement).not.toBe(ta);
+
+    rerender(<Composer {...composerProps({ replyQuotes: ["first"] })} />);
+    expect(document.activeElement).not.toBe(ta);
+  });
+});
+
 // The "Chatting with sub-agent …" tray peeks above the composer only when a
 // sub-agent label is passed (the active session is a child). It must name the
 // sub-agent so the composer reads as messaging the child, not the orchestrator.
