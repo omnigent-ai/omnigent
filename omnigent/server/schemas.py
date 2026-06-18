@@ -1851,6 +1851,24 @@ class SetCodexGoalRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class UpdateCodexGoalStatusRequest(BaseModel):
+    """
+    Request body for ``PATCH /v1/sessions/{id}/codex_goal/status``.
+
+    Codex app-server represents pause/resume as ``thread/goal/set`` status
+    updates. Omnigent exposes the two user-driven transitions explicitly:
+    ``"paused"`` pauses an active goal, and ``"active"`` resumes a paused,
+    blocked, or usage-limited goal.
+
+    :param status: Target Codex goal status, either ``"paused"`` or
+        ``"active"``.
+    """
+
+    status: Literal["active", "paused"]
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class ClearCodexGoalResponse(BaseModel):
     """
     Response body for ``DELETE /v1/sessions/{id}/codex_goal``.

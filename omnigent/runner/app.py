@@ -9836,6 +9836,37 @@ def create_runner_app(
             return _codex_native_goal_malformed_response("set", "invalid goal object")
         return JSONResponse({"goal": _codex_native_goal_to_api(goal)})
 
+    async def _handle_codex_native_goal_status(conv_id: str, *, status: str) -> Response:
+        """
+        Update the current Codex app-server goal status.
+
+        Codex models pause/resume as ``thread/goal/set`` calls with only the
+        status field. Objective and token-budget fields are omitted so Codex
+        keeps the existing goal text and budget.
+
+        :param conv_id: Session/conversation identifier, e.g.
+            ``"conv_abc123"``.
+        :param status: Codex status string, either ``"paused"`` or
+            ``"active"``.
+        :returns: 200 with the current goal, or 503 when no bridge is loaded
+            or Codex rejects the request.
+        """
+        result = await _codex_native_goal_request(
+            conv_id,
+            action="update status",
+            method="thread/goal/set",
+            params={"status": status},
+        )
+        if isinstance(result, JSONResponse):
+            return result
+        goal = result.get("goal")
+        if not isinstance(goal, dict):
+            return _codex_native_goal_malformed_response(
+                "update status",
+                "invalid goal object",
+            )
+        return JSONResponse({"goal": _codex_native_goal_to_api(goal)})
+
     async def _handle_codex_native_goal_clear(conv_id: str) -> Response:
         """
         Clear the current Codex app-server goal for a loaded thread.
@@ -13610,6 +13641,26 @@ def create_runner_app(
                 token_budget=token_budget,
                 token_budget_provided=token_budget_provided,
             )
+
+        if body_type == "goal_status":
+            if _session_harness_name(conversation_id) != "codex-native":
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_input",
+                        "detail": "Codex goal controls require a codex-native session",
+                    },
+                )
+            status = body.get("status") if isinstance(body, dict) else None
+            if status not in ("active", "paused"):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_input",
+                        "detail": "Body 'status' must be 'active' or 'paused'",
+                    },
+                )
+            return await _handle_codex_native_goal_status(conversation_id, status=status)
 
         if body_type == "goal_clear":
             # Clear is live-only for the same reason as goal_get.

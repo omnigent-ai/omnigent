@@ -6,8 +6,11 @@ from typing import Any
 
 import httpx
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
+from omnigent.entities import Conversation
+from omnigent.errors import OmnigentError
 from omnigent.inner.codex_executor import CodexExecutor
 from omnigent.inner.executor import (
     ExecutorConfig,
@@ -19,6 +22,7 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.server import app as app_module
+from omnigent.server.routes.sessions import create_sessions_router
 
 
 def ev_response_created(response_id: str) -> dict[str, Any]:
@@ -150,12 +154,108 @@ async def _run_turn(
 
 
 def _app_session_for_test(executor: CodexExecutor) -> Any:
-    states = list(executor._session_states.values())  # noqa: SLF001
+    states = list(executor._session_states.values())
     assert len(states) == 1
     app_session = states[0].app_session
     assert app_session is not None
     assert app_session.thread_id is not None
     return app_session
+
+
+class _CodexGoalConversationStore:
+    def __init__(self) -> None:
+        self._conversations = {
+            "conv_codex": Conversation(
+                id="conv_codex",
+                created_at=1,
+                updated_at=1,
+                root_conversation_id="conv_codex",
+                agent_id="ag_codex",
+                labels={
+                    "omnigent.ui": "terminal",
+                    "omnigent.wrapper": "codex-native-ui",
+                },
+            )
+        }
+
+    def get_conversation(self, conversation_id: str) -> Conversation | None:
+        return self._conversations.get(conversation_id)
+
+
+class _CodexGoalAgentStore:
+    def get(self, agent_id: str) -> None:
+        del agent_id
+        return
+
+
+class _CodexGoalRunnerClient:
+    def __init__(self) -> None:
+        self.post_json_calls: list[tuple[str, Any]] = []
+
+    async def post(
+        self,
+        url: str,
+        *,
+        json: Any = None,
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        del timeout
+        self.post_json_calls.append((url, json))
+        status = json["status"] if isinstance(json, dict) else "active"
+        return httpx.Response(
+            status_code=200,
+            json={
+                "goal": {
+                    "thread_id": "thread_goal_test",
+                    "objective": "Finish parity",
+                    "status": status,
+                    "token_budget": 40000,
+                    "tokens_used": 0,
+                    "time_used_seconds": 0,
+                }
+            },
+            request=httpx.Request("POST", url),
+        )
+
+
+class _CodexGoalRoutedRunner:
+    def __init__(self, client: _CodexGoalRunnerClient) -> None:
+        self.runner_id = "runner_goal_test"
+        self.client = client
+
+
+class _CodexGoalRunnerRouter:
+    def __init__(self, client: _CodexGoalRunnerClient) -> None:
+        self.client = client
+
+    def client_for_session_resources(self, session_id: str) -> _CodexGoalRoutedRunner:
+        assert session_id == "conv_codex"
+        return _CodexGoalRoutedRunner(self.client)
+
+
+def _codex_goal_api_app(runner_client: _CodexGoalRunnerClient) -> FastAPI:
+    app = FastAPI()
+
+    @app.exception_handler(OmnigentError)
+    async def _handle_omnigent_error(
+        request: Request,
+        exc: OmnigentError,
+    ) -> JSONResponse:
+        del request
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
+    app.include_router(
+        create_sessions_router(
+            _CodexGoalConversationStore(),  # type: ignore[arg-type]
+            _CodexGoalAgentStore(),  # type: ignore[arg-type]
+            runner_router=_CodexGoalRunnerRouter(runner_client),  # type: ignore[arg-type]
+        ),
+        prefix="/v1",
+    )
+    return app
 
 
 async def _codex_goal_request(
@@ -164,7 +264,7 @@ async def _codex_goal_request(
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     response = await asyncio.wait_for(
-        app_session._request(  # noqa: SLF001
+        app_session._request(
             method,
             {"threadId": app_session.thread_id, **(params or {})},
         ),
@@ -522,6 +622,22 @@ async def test_real_codex_goal_set_get_clear_round_trip(
         assert isinstance(goal["tokensUsed"], int)
         assert isinstance(goal["timeUsedSeconds"], int | float)
 
+        pause_result = await _codex_goal_request(
+            app_session,
+            "thread/goal/set",
+            {"status": "paused"},
+        )
+        assert pause_result.get("goal", {}).get("status") == "paused"
+        assert pause_result.get("goal", {}).get("objective") == objective
+
+        resume_result = await _codex_goal_request(
+            app_session,
+            "thread/goal/set",
+            {"status": "active"},
+        )
+        assert resume_result.get("goal", {}).get("status") == "active"
+        assert resume_result.get("goal", {}).get("objective") == objective
+
         get_result = await _codex_goal_request(app_session, "thread/goal/get")
         assert get_result.get("goal", {}).get("objective") == objective
 
@@ -532,6 +648,48 @@ async def test_real_codex_goal_set_get_clear_round_trip(
         assert get_after_clear.get("goal") is None
     finally:
         await executor.close()
+
+
+@pytest.mark.asyncio
+async def test_omnigent_codex_goal_status_api_forwards_pause_resume() -> None:
+    runner_client = _CodexGoalRunnerClient()
+    app = _codex_goal_api_app(runner_client)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        pause = await client.patch(
+            "/v1/sessions/conv_codex/codex_goal/status",
+            json={"status": "paused"},
+        )
+        resume = await client.patch(
+            "/v1/sessions/conv_codex/codex_goal/status",
+            json={"status": "active"},
+        )
+
+    assert pause.status_code == 200
+    assert pause.json()["goal"]["status"] == "paused"
+    assert resume.status_code == 200
+    assert resume.json()["goal"]["status"] == "active"
+    assert runner_client.post_json_calls == [
+        ("/v1/sessions/conv_codex/events", {"type": "goal_status", "status": "paused"}),
+        ("/v1/sessions/conv_codex/events", {"type": "goal_status", "status": "active"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_omnigent_codex_goal_status_api_rejects_codex_owned_statuses() -> None:
+    runner_client = _CodexGoalRunnerClient()
+    app = _codex_goal_api_app(runner_client)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.patch(
+            "/v1/sessions/conv_codex/codex_goal/status",
+            json={"status": "complete"},
+        )
+
+    assert response.status_code == 422
+    assert runner_client.post_json_calls == []
 
 
 @pytest.mark.asyncio
@@ -588,7 +746,7 @@ async def test_web_ui_api_prefix_miss_returns_json_not_spa_shell(tmp_path: Path)
     (web_ui_dist / "index.html").write_text("<!doctype html><div id='root'></div>")
 
     app = FastAPI()
-    app.mount("/", app_module._SPAStaticFiles(directory=web_ui_dist, html=True))  # noqa: SLF001
+    app.mount("/", app_module._SPAStaticFiles(directory=web_ui_dist, html=True))
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:

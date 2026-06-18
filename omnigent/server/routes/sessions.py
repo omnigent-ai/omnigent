@@ -250,6 +250,7 @@ from omnigent.server.schemas import (
     SessionUsageEvent,
     SetCodexGoalRequest,
     SkillSummary,
+    UpdateCodexGoalStatusRequest,
     UpdateSessionRequest,
 )
 from omnigent.session_lifecycle import (
@@ -14202,6 +14203,64 @@ def create_sessions_router(
         except ValueError as exc:
             raise OmnigentError(
                 "Could not set Codex goal: runner returned a malformed response.",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            ) from exc
+
+    @router.patch(
+        "/sessions/{session_id}/codex_goal/status",
+        response_model=CodexGoalResponse,
+    )
+    async def update_codex_goal_status(
+        request: Request,
+        session_id: str,
+        body: UpdateCodexGoalStatusRequest,
+    ) -> CodexGoalResponse:
+        """
+        Pause or resume the current Codex app-server goal.
+
+        Codex exposes this through ``thread/goal/set`` with only a status
+        field. The Omnigent API keeps that distinct from objective/budget
+        edits so callers can implement Pause/Resume controls without
+        resending the goal text.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier, e.g.
+            ``"conv_abc123"``.
+        :param body: Target status. ``"paused"`` pauses the goal and
+            ``"active"`` resumes it.
+        :returns: Current Codex goal state after the status update.
+        :raises OmnigentError: 400 for non-Codex sessions, 404 for missing
+            sessions, or 503 when no live Codex runner can update the goal.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id,
+            session_id,
+            LEVEL_EDIT,
+            permission_store,
+            conversation_store,
+        )
+        conv = await _require_codex_native_goal_session(session_id, conversation_store)
+        runner_payload = _require_codex_goal_runner_payload(
+            session_id,
+            action="update status",
+            runner_result=await _forward_codex_goal_event(
+                session_id=session_id,
+                conv=conv,
+                event={"type": "goal_status", "status": body.status},
+                request=request,
+                user_id=user_id,
+                runner_router=runner_router,
+                conversation_store=conversation_store,
+                permission_store=permission_store,
+                runner_exit_reports=runner_exit_reports,
+            ),
+        )
+        try:
+            return CodexGoalResponse.model_validate(runner_payload)
+        except ValueError as exc:
+            raise OmnigentError(
+                "Could not update Codex goal status: runner returned a malformed response.",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             ) from exc
 

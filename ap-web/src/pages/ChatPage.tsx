@@ -27,6 +27,8 @@ import {
   Loader2Icon,
   MessageSquareIcon,
   PaperclipIcon,
+  PauseCircleIcon,
+  PlayCircleIcon,
   SquareIcon,
   TargetIcon,
   TerminalIcon,
@@ -152,7 +154,9 @@ import {
   clearCodexGoal,
   getCodexGoal,
   setCodexGoal,
+  updateCodexGoalStatus,
   type CodexGoal,
+  type CodexGoalStatusUpdate,
 } from "@/lib/sessionsApi";
 
 const ATTACHED_RE = /\[Attached:[^\]]*\]\s*/g;
@@ -2974,6 +2978,18 @@ function formatCodexGoalStatus(status: CodexGoal["status"]): string {
   return status;
 }
 
+function canPauseCodexGoal(goal: CodexGoal | null): boolean {
+  return goal?.status === "active";
+}
+
+function canResumeCodexGoal(goal: CodexGoal | null): boolean {
+  return (
+    goal?.status === "paused" ||
+    goal?.status === "blocked" ||
+    goal?.status === "usageLimited"
+  );
+}
+
 /**
  * Render token and elapsed-time usage for a Codex goal.
  *
@@ -3122,9 +3138,13 @@ interface CodexGoalActionsProps {
   busy: boolean;
   saving: boolean;
   clearing: boolean;
+  statusUpdating: CodexGoalStatusUpdate | null;
   hasGoal: boolean;
+  goal: CodexGoal | null;
   onSave: () => void;
   onClear: () => void;
+  onPause: () => void;
+  onResume: () => void;
 }
 
 interface CodexGoalDialogState {
@@ -3133,11 +3153,14 @@ interface CodexGoalDialogState {
   loading: boolean;
   saving: boolean;
   clearing: boolean;
+  statusUpdating: CodexGoalStatusUpdate | null;
   error: string | null;
   setObjectiveDraft: (value: string) => void;
   setTokenBudgetDraft: (value: string) => void;
   saveGoal: () => Promise<void>;
   clearGoal: () => Promise<void>;
+  pauseGoal: () => Promise<void>;
+  resumeGoal: () => Promise<void>;
 }
 
 /**
@@ -3177,9 +3200,13 @@ function parseCodexGoalBudget(value: string): number | null {
  * @param props.busy - ``true`` while any goal operation is running.
  * @param props.saving - ``true`` while set/update is running.
  * @param props.clearing - ``true`` while clear is running.
+ * @param props.statusUpdating - Target status while Pause/Resume is running.
  * @param props.hasGoal - ``true`` when a current goal exists.
+ * @param props.goal - Current goal, or ``null`` when no status action applies.
  * @param props.onSave - Called to set or update the goal.
  * @param props.onClear - Called to clear the goal.
+ * @param props.onPause - Called to pause an active goal.
+ * @param props.onResume - Called to resume a paused/blocked/limited goal.
  * @returns Dialog footer actions.
  */
 function CodexGoalActions({
@@ -3187,10 +3214,16 @@ function CodexGoalActions({
   busy,
   saving,
   clearing,
+  statusUpdating,
   hasGoal,
+  goal,
   onSave,
   onClear,
+  onPause,
+  onResume,
 }: CodexGoalActionsProps) {
+  const showPause = canPauseCodexGoal(goal);
+  const showResume = canResumeCodexGoal(goal);
   return (
     <DialogFooter>
       <Button
@@ -3203,6 +3236,38 @@ function CodexGoalActions({
         {clearing ? <Loader2Icon className="size-3.5 animate-spin" /> : null}
         Clear
       </Button>
+      {showPause && (
+        <Button
+          type="button"
+          variant="outline"
+          onClick={onPause}
+          disabled={readOnly || busy}
+          data-testid="codex-goal-pause"
+        >
+          {statusUpdating === "paused" ? (
+            <Loader2Icon className="size-3.5 animate-spin" />
+          ) : (
+            <PauseCircleIcon className="size-3.5" />
+          )}
+          Pause
+        </Button>
+      )}
+      {showResume && (
+        <Button
+          type="button"
+          variant="outline"
+          onClick={onResume}
+          disabled={readOnly || busy}
+          data-testid="codex-goal-resume"
+        >
+          {statusUpdating === "active" ? (
+            <Loader2Icon className="size-3.5 animate-spin" />
+          ) : (
+            <PlayCircleIcon className="size-3.5" />
+          )}
+          Resume
+        </Button>
+      )}
       <Button
         type="button"
         onClick={onSave}
@@ -3236,6 +3301,7 @@ function useCodexGoalDialogState({
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [clearing, setClearing] = useState(false);
+  const [statusUpdating, setStatusUpdating] = useState<CodexGoalStatusUpdate | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const refreshGoal = useCallback(async () => {
@@ -3321,17 +3387,37 @@ function useCodexGoalDialogState({
     }
   };
 
+  const updateGoalStatus = async (status: CodexGoalStatusUpdate) => {
+    if (!conversationId) return;
+    setStatusUpdating(status);
+    setError(null);
+    try {
+      const response = await updateCodexGoalStatus(conversationId, status);
+      onGoalChange(response.goal);
+      setObjective(response.goal?.objective ?? "");
+      setTokenBudget(response.goal?.tokenBudget?.toString() ?? "");
+    } catch (err) {
+      const action = status === "paused" ? "pause" : "resume";
+      setError(codexGoalError(`Could not ${action} goal`, err));
+    } finally {
+      setStatusUpdating(null);
+    }
+  };
+
   return {
     objective,
     tokenBudget,
     loading,
     saving,
     clearing,
+    statusUpdating,
     error,
     setObjectiveDraft,
     setTokenBudgetDraft,
     saveGoal,
     clearGoal,
+    pauseGoal: () => updateGoalStatus("paused"),
+    resumeGoal: () => updateGoalStatus("active"),
   };
 }
 
@@ -3361,8 +3447,8 @@ function CodexGoalDialog({
     goal,
     onGoalChange,
   });
-  const { loading, saving, clearing } = state;
-  const busy = loading || saving || clearing;
+  const { loading, saving, clearing, statusUpdating } = state;
+  const busy = loading || saving || clearing || statusUpdating !== null;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -3392,9 +3478,13 @@ function CodexGoalDialog({
           busy={busy}
           saving={saving}
           clearing={clearing}
+          statusUpdating={statusUpdating}
           hasGoal={goal != null}
+          goal={goal}
           onSave={() => void state.saveGoal()}
           onClear={() => void state.clearGoal()}
+          onPause={() => void state.pauseGoal()}
+          onResume={() => void state.resumeGoal()}
         />
       </DialogContent>
     </Dialog>

@@ -843,7 +843,8 @@ a live subresource. Goal state is not mirrored into Omnigent labels or
 conversation rows; the server validates session access and forwards a
 generic goal control event to the bound runner, which calls Codex
 app-server (`thread/goal/get`, `thread/goal/set`, or
-`thread/goal/clear`). If no runner is currently registered, the server
+`thread/goal/clear`). Pause/resume use Codex `thread/goal/set` with
+only a `status` field. If no runner is currently registered, the server
 first tries to wake the session's existing host/workspace binding and
 initializes the relaunched runner before retrying the goal control. The
 caller cannot choose a new host or workspace through these routes.
@@ -903,6 +904,27 @@ Request body:
     Positive token budget forwarded to Codex as `tokenBudget`. Explicit
     `null` clears the Codex token budget. Omitting the field leaves the
     budget field absent from the forwarded app-server request.
+
+200 OK - same `{"goal": ...}` shape as `GET`.
+
+```
+PATCH /v1/sessions/{session_id}/codex_goal/status
+Content-Type: application/json
+
+{
+  "status": "paused"
+}
+```
+
+Auth: edit access to the session.
+
+Request body:
+
+  status (string, required)
+    `paused` pauses the active goal. `active` resumes a paused,
+    blocked, or usage-limited goal. Codex may report other lifecycle
+    statuses (`blocked`, `usageLimited`, `budgetLimited`, `complete`),
+    but those are Codex-owned states rather than separate user actions.
 
 200 OK - same `{"goal": ...}` shape as `GET`.
 

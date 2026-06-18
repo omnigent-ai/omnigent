@@ -251,6 +251,8 @@ export interface SetCodexGoalInput {
   tokenBudget?: number | null;
 }
 
+export type CodexGoalStatusUpdate = "active" | "paused";
+
 /**
  * Initial (and per-scroll-up-page) item count for conversation history
  * hydration. Bounds how many items the chat surface fetches, parses,
@@ -747,6 +749,29 @@ export async function setCodexGoal(
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+    },
+  );
+  return codexGoalResponseFromWire(await readJsonOrThrow<CodexGoalResponseWire>(res));
+}
+
+/**
+ * Pause or resume the Codex-native thread goal for a session.
+ *
+ * @param sessionId - Session identifier, e.g. ``"conv_abc123"``.
+ * @param status - Target Codex status: ``"paused"`` pauses and
+ * ``"active"`` resumes.
+ * @returns Updated Codex goal state.
+ */
+export async function updateCodexGoalStatus(
+  sessionId: string,
+  status: CodexGoalStatusUpdate,
+): Promise<CodexGoalResponse> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal/status`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status }),
     },
   );
   return codexGoalResponseFromWire(await readJsonOrThrow<CodexGoalResponseWire>(res));
