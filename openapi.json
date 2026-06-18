@@ -3924,6 +3924,30 @@
         ]
       }
     },
+    "/v1/claude-profiles": {
+      "get": {
+        "description": "List configured Claude Code account profiles.\n\nReturns ``{\"object\": \"list\", \"data\": [{name, display}, ...]}``\nread from the operator's ``claude_profiles`` config block.\nNames are the values the client sends back as\n``claude_profile`` on ``POST /v1/sessions``. No secrets are\nexposed.\n\n:param request: The incoming request, used to extract the\n    user identity for authentication.\n:returns: ``{\"object\": \"list\", \"data\": [...]}``.",
+        "operationId": "list_claude_profiles_v1_claude_profiles_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Claude Profiles V1 Claude Profiles Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Claude Profiles",
+        "tags": [
+          "claude_profiles"
+        ]
+      }
+    },
     "/v1/hosts": {
       "get": {
         "description": "List all hosts owned by the authenticated user.\n\nReturns both online and offline hosts, with live runner\ninformation for online hosts.\n\n:param request: The incoming request (for auth).\n:returns: ``{\"hosts\": [...]}`` with host details.",

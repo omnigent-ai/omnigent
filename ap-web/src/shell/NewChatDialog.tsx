@@ -1647,13 +1647,13 @@ export function NewChatLandingScreen() {
                               onValueChange={(h) => {
                                 // Picking the spec default clears the override so
                                 // the session tracks the spec.
-                                setPickedHarness(h === selectedAgentDefaultHarness ? null : h)
+                                setPickedHarness(h === selectedAgentDefaultHarness ? null : h);
                                 // The profile picker only applies to claude-sdk;
                                 // switching to any other harness would leave a
                                 // stale `pickedProfile` that the runner ignores
                                 // but that would still be sent on create. Drop it
                                 // so the field never carries a no-op value.
-                                if (h !== "claude-sdk") setPickedProfile(null)
+                                if (h !== "claude-sdk") setPickedProfile(null);
                               }}
                               host={harnessWarningHost}
                             />
