@@ -1088,8 +1088,8 @@ class ConversationStore(ABC):
             :data:`FORK_CARRY_HISTORY_LABEL_KEY` on the fork so a native
             target harness rebuilds its transcript (clone the source's
             native transcript, or build from the copied Omnigent items) instead
-            of starting fresh. Set by the route whenever the fork binds a
-            native target, regardless of the source's provider family.
+            of starting fresh. Set by the route only for native targets whose
+            harness can replay fork history.
         :param resume_source_native_session: When ``True`` (default), a
             full fork of a source with a native session stamps
             :data:`FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY` so the runner

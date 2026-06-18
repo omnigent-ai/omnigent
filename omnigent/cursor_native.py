@@ -28,7 +28,7 @@ import click
 import httpx
 import yaml
 
-from omnigent._native_resume_hint import echo_native_resume_hint
+from omnigent._native_resume_hint import echo_native_cold_resume_hint, echo_native_resume_hint
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._wrapper_labels import CURSOR_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY
@@ -82,13 +82,31 @@ class LaunchedCursorTerminal:
 
 @dataclass(frozen=True)
 class PreparedCursorTerminal:
-    """Prepared native Cursor terminal attachment details."""
+    """Prepared native Cursor terminal attachment details.
+
+    :param reattached: ``True`` when an existing, still-running session
+        terminal was reused (the live-reattach path: prior chat is
+        intact).
+    :param cold_resumed: ``True`` when resuming an existing Omnigent
+        session whose terminal had already exited, so a *fresh*
+        ``cursor-agent`` TUI was launched with none of the prior turns.
+        Cursor records no resumable chat id, so this is genuinely a new
+        chat - distinct from a brand-new session (``resolved_session_id
+        is None``) and from a live reattach. Drives the honest
+        cold-resume stderr hint. Note: cursor deliberately treats
+        ``cold_resumed`` and ``reattached`` as mutually exclusive (the
+        cold-resume path leaves ``reattached`` at its ``False`` default)
+        - unlike ``claude_native`` which models them independently. This
+        is safe because cursor never reads ``reattached`` for teardown
+        ownership; do not "fix" the apparent inconsistency.
+    """
 
     session_id: str
     terminal_id: str
     tmux_socket: Path | None
     tmux_target: str | None
     reattached: bool
+    cold_resumed: bool = False
 
 
 def _configured_cursor_command(env: Mapping[str, str]) -> str:
@@ -265,6 +283,8 @@ def _run_with_remote_server(
                 enabled=auto_open_conversation,
                 warn=lambda message: click.echo(message, err=True),
             )
+            if prepared.cold_resumed:
+                echo_native_cold_resume_hint(agent_label="Cursor")
             await _attach_terminal_resource(prepared)
             if resolved_session_id is None:
                 echo_native_resume_hint(
@@ -301,7 +321,12 @@ async def _prepare_cursor_terminal_via_daemon(
     persist_args = list(cursor_args)
     timeout = httpx.Timeout(30.0, read=120.0)
     async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
-        reattached = session_id is not None
+        # Resuming an existing session can either reattach to a live
+        # terminal (prior chat intact) or, if that terminal has exited,
+        # cold-start a fresh TUI. We only know which after probing for a
+        # running terminal below, so default both flags off here.
+        reattached = False
+        cold_resumed = False
         if session_id is None:
             if session_bundle is None:
                 raise click.ClickException("Creating a Cursor session requires a session bundle.")
@@ -338,6 +363,14 @@ async def _prepare_cursor_terminal_via_daemon(
                     tmux_target=existing_terminal.tmux_target,
                     reattached=True,
                 )
+            # Session exists but its terminal has exited. Cursor records no
+            # resumable chat id, so the launch below starts a fresh TUI with
+            # no prior turns. Flag it so the caller can say so honestly.
+            # Mutually exclusive with the reattach path above: we leave
+            # reattached at False here (unlike claude_native, which treats
+            # cold_resumed/reattached as independent). Safe because cursor
+            # never uses reattached for teardown ownership.
+            cold_resumed = True
             if persist_args:
                 _update_startup_progress(startup_progress, "Updating Cursor session...")
                 resp = await client.patch(
@@ -375,6 +408,7 @@ async def _prepare_cursor_terminal_via_daemon(
         tmux_socket=terminal.tmux_socket,
         tmux_target=terminal.tmux_target,
         reattached=reattached,
+        cold_resumed=cold_resumed,
     )
 
 
