@@ -296,6 +296,8 @@ class _AntigravitySessionState:
     :param agent_signature: ``(model, system_prompt, tool_signature)`` key; a
         change forces an agent rebuild. A model change thus resets the SDK
         conversation — fine since mid-session model switches are rare.
+        :meth:`interrupt_session` clears this to ``None`` so the next turn
+        rebuilds rather than reusing the cancelled conversation.
     :param pending_tools: Open tool calls keyed by call id, populated on
         :class:`ToolCallRequest` and drained by the ``PostToolCallHook``.
     :param active_queue: The current turn's event queue (the
@@ -427,6 +429,25 @@ class AntigravityExecutor(Executor):
         then raises ``AntigravityCancelledError`` or yields a ``CANCELED``
         step, which the consumer surfaces as :class:`TurnCancelled`.
 
+        A cancelled SDK conversation carries aborted state, so reusing it for
+        the next turn would resume from that broken state. Invalidating the
+        cached agent signature forces the next :meth:`run_turn` through
+        :meth:`_ensure_agent`'s rebuild path — the same teardown the
+        error / signature-change path uses — which closes the stale agent and
+        opens a fresh agent + conversation (re-seeding prior history) before it
+        sends. The close is deferred to that path rather than awaited here so
+        it cannot race the still-running producer task and turn a clean cancel
+        into an :class:`ExecutorError`.
+
+        This deliberately departs from the peer executors, which call
+        ``close_session()`` eagerly on interrupt (see
+        :meth:`CursorExecutor.interrupt_session` and
+        :meth:`ClaudeSDKExecutor.interrupt_session`). Antigravity cannot do the
+        same: an eager close would race the still-live turn's producer task and
+        convert a clean :class:`TurnCancelled` into an :class:`ExecutorError`,
+        so we only invalidate the signature here and defer the rebuild (and
+        close) to the next turn.
+
         :param session_key: The Omnigent session id to interrupt.
         :returns: ``True`` if a live conversation was asked to cancel,
             ``False`` when the session has no open conversation.
@@ -437,6 +458,9 @@ class AntigravityExecutor(Executor):
         state.interrupt_requested = True
         with contextlib.suppress(Exception):
             await state.conversation.cancel()
+        # Drop the cached signature (not the agent itself — _ensure_agent needs
+        # the live agent reference to close it) so the next turn rebuilds.
+        state.agent_signature = None
         return True
 
     async def run_turn(

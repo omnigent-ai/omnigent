@@ -35,6 +35,7 @@ from omnigent.inner.executor import (
     ToolCallComplete,
     ToolCallRequest,
     ToolCallStatus,
+    TurnCancelled,
     TurnComplete,
 )
 
@@ -766,6 +767,88 @@ async def test_mid_turn_error_status_drops_session(monkeypatch: pytest.MonkeyPat
     assert len(errors) == 1 and errors[0].retryable is True
     assert "model exploded" in errors[0].message
     # Session was dropped on the error, so turn 2 creates a fresh agent.
+    assert len(state["create_models"]) == 2
+    assert any(isinstance(e, TurnComplete) for e in turn2)
+
+
+async def test_mid_turn_expired_status_is_retryable_and_drops_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ``expired`` terminal status (Cursor-side timeout / usage cap / quota)
+    must surface as a retryable ExecutorError and drop the session — never a
+    TurnComplete committing whatever partial text streamed."""
+    scripts = [
+        {"messages": [_assistant("partial")], "status": "expired", "result": "quota hit"},
+        {"messages": [_assistant("recovered")], "result": "recovered"},
+    ]
+    state = _install_fake_sdk(monkeypatch, scripts)
+    executor = CursorExecutor(api_key="crsr_x")
+    try:
+        turn1 = [e async for e in executor.run_turn([_user("first")], [], "SYS")]
+        turn2 = [e async for e in executor.run_turn([_user("second")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    errors = [e for e in turn1 if isinstance(e, ExecutorError)]
+    assert len(errors) == 1 and errors[0].retryable is True
+    assert "expired" in errors[0].message
+    # No TurnComplete — the partial text must not be committed as a success.
+    assert not any(isinstance(e, TurnComplete) for e in turn1)
+    # Session was dropped on expiry, so turn 2 creates a fresh agent.
+    assert len(state["create_models"]) == 2
+    assert any(isinstance(e, TurnComplete) for e in turn2)
+
+
+async def test_mid_turn_cancelled_status_emits_turn_cancelled_and_drops_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``cancelled`` terminal status must surface as a TurnCancelled (not a
+    TurnComplete) and drop the session, so partial text isn't persisted as a
+    legitimate assistant message."""
+    scripts = [
+        {"messages": [_assistant("partial")], "status": "cancelled", "result": "stopped"},
+        {"messages": [_assistant("recovered")], "result": "recovered"},
+    ]
+    state = _install_fake_sdk(monkeypatch, scripts)
+    executor = CursorExecutor(api_key="crsr_x")
+    try:
+        turn1 = [e async for e in executor.run_turn([_user("first")], [], "SYS")]
+        turn2 = [e async for e in executor.run_turn([_user("second")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    cancels = [e for e in turn1 if isinstance(e, TurnCancelled)]
+    assert len(cancels) == 1
+    # Cancellation is not an error, and must not be committed as a completed turn.
+    assert not any(isinstance(e, ExecutorError) for e in turn1)
+    assert not any(isinstance(e, TurnComplete) for e in turn1)
+    # Session was dropped on cancellation, so turn 2 creates a fresh agent.
+    assert len(state["create_models"]) == 2
+    assert any(isinstance(e, TurnComplete) for e in turn2)
+
+
+async def test_mid_turn_unknown_non_finished_status_is_retryable_and_drops_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only ``finished`` is allowed to produce TurnComplete. If the SDK adds a
+    new terminal status, fail loud and retry instead of silently committing
+    partial streamed text as a successful assistant turn."""
+    scripts = [
+        {"messages": [_assistant("partial")], "status": "paused", "result": "new state"},
+        {"messages": [_assistant("recovered")], "result": "recovered"},
+    ]
+    state = _install_fake_sdk(monkeypatch, scripts)
+    executor = CursorExecutor(api_key="crsr_x")
+    try:
+        turn1 = [e async for e in executor.run_turn([_user("first")], [], "SYS")]
+        turn2 = [e async for e in executor.run_turn([_user("second")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    errors = [e for e in turn1 if isinstance(e, ExecutorError)]
+    assert len(errors) == 1 and errors[0].retryable is True
+    assert "non-finished status 'paused'" in errors[0].message
+    assert not any(isinstance(e, TurnComplete) for e in turn1)
     assert len(state["create_models"]) == 2
     assert any(isinstance(e, TurnComplete) for e in turn2)
 

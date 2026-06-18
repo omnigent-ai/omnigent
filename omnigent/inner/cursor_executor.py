@@ -67,6 +67,7 @@ from .executor import (
     ToolCallRequest,
     ToolCallStatus,
     ToolSpec,
+    TurnCancelled,
     TurnComplete,
     classify_tool_result,
 )
@@ -800,11 +801,32 @@ class CursorExecutor(Executor):
             yield ExecutorError(message=f"cursor-sdk turn failed: {exc}", retryable=True)
             return
 
+        # RunResult.status is Literal["finished", "error", "cancelled",
+        # "expired"]. Only "finished" should commit a TurnComplete; the other
+        # terminal statuses are surfaced as errors/cancellation and tear the
+        # session down (the agent/bridge may be in an inconsistent state).
         status = getattr(result, "status", "")
         if status == "error":
             await self.close_session(session_key)
             detail = getattr(result, "result", "") or "cursor-sdk run reported an error"
             yield ExecutorError(message=f"cursor-sdk run error: {detail}", retryable=True)
+            return
+        if status == "expired":
+            await self.close_session(session_key)
+            detail = getattr(result, "result", "") or "cursor-sdk run expired"
+            yield ExecutorError(message=f"cursor-sdk run expired: {detail}", retryable=True)
+            return
+        if status == "cancelled":
+            await self.close_session(session_key)
+            yield TurnCancelled(reason="cursor-sdk run cancelled")
+            return
+        if status != "finished":
+            await self.close_session(session_key)
+            detail = getattr(result, "result", "") or "cursor-sdk run finished with unknown status"
+            yield ExecutorError(
+                message=f"cursor-sdk run returned non-finished status {status!r}: {detail}",
+                retryable=True,
+            )
             return
 
         # Prefer the streamed text we accumulated (which carries the paragraph
