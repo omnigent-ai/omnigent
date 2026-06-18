@@ -581,20 +581,19 @@ def test_qwen_uses_openai_global_default(config_home: Path) -> None:
     A ``default: true`` openai provider routes the qwen harness.
 
     Qwen consumes the openai family (OpenAI-compatible wire), so it should
-    emit env vars keyed by "openai" in the gateway base URL JSON.
+    emit env vars for gateway configuration.
     """
     _write_config(config_home, _openai_default_config())
     spec = _make_spec(harness="qwen")
 
     env = _build_qwen_spawn_env(spec, workdir=None)
 
+    # qwen uses OpenAI-compatible provider routing via HARNESS_QWEN_GATEWAY
     assert env["HARNESS_QWEN_GATEWAY"] == "true"
-    # qwen keys the base-URL JSON by its family name ("openai").
-    assert env["HARNESS_QWEN_GATEWAY_BASE_URLS"] == (
-        '{"openai": "https://api.openai.com/v1"}'
-    )
-    assert env["HARNESS_QWEN_GATEWAY_HOST"] == "https://api.openai.com"
+    # The base URL host is the origin of the gateway endpoint
+    assert env["HARNESS_QWEN_GATEWAY_HOST"] == "https://openai.example.com"
     assert env["HARNESS_QWEN_GATEWAY_AUTH_COMMAND"] == "printf %s sk-oai-secret"
+    # Model comes from provider's default_model
     assert env["HARNESS_QWEN_MODEL"] == "gpt-default-model"
 
 
@@ -623,6 +622,7 @@ def test_qwen_falls_back_to_catalog_default_model(config_home: Path) -> None:
 
     catalog_default = default_chat_model("openai")
     assert catalog_default is not None
+    # qwen uses the single gateway base URL (not JSON object like pi)
     assert env["HARNESS_QWEN_GATEWAY_BASE_URL"] == "https://api.openai.com/v1"
     assert env["HARNESS_QWEN_MODEL"] == catalog_default
 

@@ -393,6 +393,8 @@ _PROVIDER_HARNESS_FAMILY: dict[AgentHarnessType, str] = {
     # the OpenAI-compatible wire (OpenRouter / LiteLLM / Databricks gateway),
     # so it consumes the ``openai`` family like openai-agents-sdk.
     "antigravity": OPENAI_FAMILY,
+    # Qwen Code routes through OpenAI-compatible providers (like Kimi v1).
+    "qwen": OPENAI_FAMILY,
 }
 
 # Maps harnesses that gate the vendor-neutral gateway transport on a
@@ -405,11 +407,19 @@ _HARNESS_GATEWAY_FLAG: dict[AgentHarnessType, str] = {
     "claude-sdk": "HARNESS_CLAUDE_SDK_GATEWAY",
     "codex": "HARNESS_CODEX_GATEWAY",
     "pi": "HARNESS_PI_GATEWAY",
+    "qwen": "HARNESS_QWEN_GATEWAY",
 }
 
 # Maps a generic-provider family to the key pi uses in its
 # ``HARNESS_PI_GATEWAY_BASE_URLS`` JSON object (pi's own family naming).
 _PI_FAMILY_KEY: dict[str, str] = {
+    ANTHROPIC_FAMILY: "claude",
+    OPENAI_FAMILY: "openai",
+}
+
+# Maps a generic-provider family to the key qwen uses in its
+# ``HARNESS_QWEN_GATEWAY_BASE_URLS`` JSON object.
+_QWEN_FAMILY_KEY: dict[str, str] = {
     ANTHROPIC_FAMILY: "claude",
     OPENAI_FAMILY: "openai",
 }
