@@ -19,7 +19,10 @@ dependency).
    worktree path>"})`. Use a short task-based title such as `auth-refactor` or
    `fix-sse-error`, never the raw vendor name. State the scope and that it must
    work only inside `.worktrees/<task_id>`. The worker drives the task to green
-   and opens its OWN PR for the branch. Record each handle's `conversation_id`
+   and opens its OWN PR for the branch. Every commit the worker authors must
+   end with a blank line followed by the exact co-sign trailer as its final
+   line — `Co-authored-by: omnigent-ci[bot] <294685417+omnigent-ci[bot]@users.noreply.github.com>`.
+   Record each handle's `conversation_id`
    in the registry. Emit the worktree + `sys_session_send` tool calls in THIS
    turn — never end a turn having only said you will dispatch; the dispatch
    calls and their announcement go in the same turn. Dispatch the whole
