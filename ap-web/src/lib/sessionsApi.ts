@@ -249,6 +249,7 @@ export interface CodexGoalResponse {
 export interface SetCodexGoalInput {
   objective: string;
   tokenBudget?: number | null;
+  status?: CodexGoalStatusUpdate | null;
 }
 
 export type CodexGoalStatusUpdate = "active" | "paused";
@@ -729,8 +730,9 @@ export async function getCodexGoal(sessionId: string): Promise<CodexGoalResponse
  * Set or replace the Codex-native thread goal for a session.
  *
  * @param sessionId - Session identifier, e.g. ``"conv_abc123"``.
- * @param goal - Objective text and optional token budget. ``tokenBudget:
- * null`` clears the Codex budget.
+ * @param goal - Objective text, optional token budget, and optional mode.
+ * ``tokenBudget: null`` clears the Codex budget. Omitting ``status`` leaves
+ * Codex's current lifecycle state unchanged.
  * @returns Updated Codex goal state.
  */
 export async function setCodexGoal(
@@ -742,6 +744,9 @@ export async function setCodexGoal(
   };
   if (goal.tokenBudget !== undefined) {
     body.token_budget = goal.tokenBudget;
+  }
+  if (goal.status !== undefined) {
+    body.status = goal.status;
   }
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`,

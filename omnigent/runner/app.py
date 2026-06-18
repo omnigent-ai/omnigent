@@ -9803,6 +9803,7 @@ def create_runner_app(
         objective: str,
         token_budget: int | None,
         token_budget_provided: bool,
+        status: str | None,
     ) -> Response:
         """
         Create or replace the current Codex app-server goal for a thread.
@@ -9815,6 +9816,8 @@ def create_runner_app(
         :param token_budget_provided: ``True`` when the caller supplied the
             budget field; lets direct runner callers clear the Codex budget
             with JSON ``null``.
+        :param status: Optional user-selected status, either ``"active"`` or
+            ``"paused"``. ``None`` leaves Codex's current status unchanged.
         :returns: 200 with the current goal, or 503 when no bridge is loaded
             or Codex rejects the request.
         """
@@ -9823,6 +9826,8 @@ def create_runner_app(
         }
         if token_budget_provided:
             params["tokenBudget"] = token_budget
+        if status is not None:
+            params["status"] = status
         result = await _codex_native_goal_request(
             conv_id,
             action="set",
@@ -13635,11 +13640,21 @@ def create_runner_app(
                         "detail": "Body 'token_budget' must be a positive integer or null",
                     },
                 )
+            status = body.get("status") if isinstance(body, dict) else None
+            if status is not None and status not in ("active", "paused"):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_input",
+                        "detail": "Body 'status' must be 'active' or 'paused'",
+                    },
+                )
             return await _handle_codex_native_goal_set(
                 conversation_id,
                 objective=objective.strip(),
                 token_budget=token_budget,
                 token_budget_provided=token_budget_provided,
+                status=status,
             )
 
         if body_type == "goal_status":

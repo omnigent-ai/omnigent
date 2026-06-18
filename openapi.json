@@ -3384,13 +3384,28 @@
       },
       "SetCodexGoalRequest": {
         "additionalProperties": false,
-        "description": "Request body for ``PUT /v1/sessions/{id}/codex_goal``.\n\n:param objective: Goal objective text, e.g.\n    ``\"Finish the migration and keep tests green\"``. Must be non-empty\n    after trimming and no longer than 4000 characters, matching Codex\n    app-server's goal contract.\n:param token_budget: Optional positive token budget, e.g. ``40000``.\n    Explicit JSON ``null`` clears the Codex goal budget; omitting the\n    field leaves it absent from the forwarded request.",
+        "description": "Request body for ``PUT /v1/sessions/{id}/codex_goal``.\n\n:param objective: Goal objective text, e.g.\n    ``\"Finish the migration and keep tests green\"``. Must be non-empty\n    after trimming and no longer than 4000 characters, matching Codex\n    app-server's goal contract.\n:param token_budget: Optional positive token budget, e.g. ``40000``.\n    Explicit JSON ``null`` clears the Codex goal budget; omitting the\n    field leaves it absent from the forwarded request.\n:param status: Optional user-selected goal status. ``\"active\"`` starts or\n    resumes the goal, and ``\"paused\"`` stores it paused. Omit this field\n    to preserve Codex's current lifecycle state.",
         "properties": {
           "objective": {
             "maxLength": 4000,
             "minLength": 1,
             "title": "Objective",
             "type": "string"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "enum": [
+                  "active",
+                  "paused"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
           },
           "token_budget": {
             "anyOf": [
@@ -5794,7 +5809,7 @@
         ]
       },
       "put": {
-        "description": "Set or replace the current Codex app-server goal.\n\n:param request: The incoming FastAPI request (for auth).\n:param session_id: Session/conversation identifier, e.g.\n    ``\"conv_abc123\"``.\n:param body: Goal objective and optional token budget.\n:returns: Current Codex goal state after the update.\n:raises OmnigentError: 400 for non-Codex sessions or blank\n    objectives, 404 for missing sessions, or 503 when no live Codex\n    runner can update the goal.",
+        "description": "Set or replace the current Codex app-server goal.\n\n:param request: The incoming FastAPI request (for auth).\n:param session_id: Session/conversation identifier, e.g.\n    ``\"conv_abc123\"``.\n:param body: Goal objective, optional token budget, and optional\n    user-selected status.\n:returns: Current Codex goal state after the update.\n:raises OmnigentError: 400 for non-Codex sessions or blank\n    objectives, 404 for missing sessions, or 503 when no live Codex\n    runner can update the goal.",
         "operationId": "set_codex_goal_v1_sessions__session_id__codex_goal_put",
         "parameters": [
           {

@@ -888,7 +888,8 @@ Content-Type: application/json
 
 {
   "objective": "Finish the migration and keep tests green",
-  "token_budget": 40000
+  "token_budget": 40000,
+  "status": "active"
 }
 ```
 
@@ -904,6 +905,10 @@ Request body:
     Positive token budget forwarded to Codex as `tokenBudget`. Explicit
     `null` clears the Codex token budget. Omitting the field leaves the
     budget field absent from the forwarded app-server request.
+
+  status (string or null, optional)
+    `active` starts or resumes the goal. `paused` stores the goal paused.
+    Omitting the field preserves Codex's current lifecycle state.
 
 200 OK - same `{"goal": ...}` shape as `GET`.
 

@@ -651,6 +651,37 @@ async def test_real_codex_goal_set_get_clear_round_trip(
 
 
 @pytest.mark.asyncio
+async def test_omnigent_codex_goal_set_api_forwards_mode_configuration() -> None:
+    runner_client = _CodexGoalRunnerClient()
+    app = _codex_goal_api_app(runner_client)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.put(
+            "/v1/sessions/conv_codex/codex_goal",
+            json={
+                "objective": "Finish parity",
+                "token_budget": 40000,
+                "status": "paused",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["goal"]["status"] == "paused"
+    assert runner_client.post_json_calls == [
+        (
+            "/v1/sessions/conv_codex/events",
+            {
+                "type": "goal_set",
+                "objective": "Finish parity",
+                "token_budget": 40000,
+                "status": "paused",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_omnigent_codex_goal_status_api_forwards_pause_resume() -> None:
     runner_client = _CodexGoalRunnerClient()
     app = _codex_goal_api_app(runner_client)

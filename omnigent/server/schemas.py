@@ -1843,10 +1843,14 @@ class SetCodexGoalRequest(BaseModel):
     :param token_budget: Optional positive token budget, e.g. ``40000``.
         Explicit JSON ``null`` clears the Codex goal budget; omitting the
         field leaves it absent from the forwarded request.
+    :param status: Optional user-selected goal status. ``"active"`` starts or
+        resumes the goal, and ``"paused"`` stores it paused. Omit this field
+        to preserve Codex's current lifecycle state.
     """
 
     objective: str = Field(min_length=1, max_length=4000)
     token_budget: int | None = Field(default=None, gt=0)
+    status: Literal["active", "paused"] | None = None
 
     model_config = ConfigDict(extra="forbid")
 

@@ -14156,7 +14156,8 @@ def create_sessions_router(
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session/conversation identifier, e.g.
             ``"conv_abc123"``.
-        :param body: Goal objective and optional token budget.
+        :param body: Goal objective, optional token budget, and optional
+            user-selected status.
         :returns: Current Codex goal state after the update.
         :raises OmnigentError: 400 for non-Codex sessions or blank
             objectives, 404 for missing sessions, or 503 when no live Codex
@@ -14183,6 +14184,8 @@ def create_sessions_router(
         }
         if "token_budget" in body.model_fields_set:
             event["token_budget"] = body.token_budget
+        if body.status is not None:
+            event["status"] = body.status
         runner_payload = _require_codex_goal_runner_payload(
             session_id,
             action="set",
