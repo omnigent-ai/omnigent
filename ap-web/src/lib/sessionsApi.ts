@@ -216,42 +216,88 @@ interface SessionItemsResponseWire {
   has_more: boolean;
 }
 
+/**
+ * Raw Codex app-server goal object forwarded by the AP route.
+ * The route preserves Codex's snake_case field names and open-ended
+ * status string; the UI converts this to `CodexGoal` at the API boundary.
+ */
 interface CodexGoalWire {
+  /** Codex thread id that owns the goal. */
   thread_id: string;
+  /** User-facing objective text currently stored in Codex. */
   objective: string;
+  /**
+   * Raw Codex goal status. Kept as `string` because Codex can return
+   * statuses that the browser may display but must not write directly.
+   */
   status: string;
+  /** Optional token cap; `null` means the goal has no token budget. */
   token_budget?: number | null;
+  /** Tokens Codex reports as consumed toward the current goal. */
   tokens_used: number;
+  /** Wall-clock seconds Codex reports as spent on the current goal. */
   time_used_seconds: number;
+  /** Codex-created timestamp, if the CLI version provides one. */
   created_at?: number | null;
+  /** Codex-updated timestamp, if the CLI version provides one. */
   updated_at?: number | null;
 }
 
+/** Wire response for goal read/set/status endpoints. */
 interface CodexGoalResponseWire {
+  /** Current goal, or `null` when Codex has no goal for the thread. */
   goal: CodexGoalWire | null;
 }
 
+/**
+ * Browser-facing Codex goal shape. This is the camelCase projection of
+ * `CodexGoalWire`; callers should not depend on raw app-server field names.
+ */
 export interface CodexGoal {
+  /** Codex thread id that owns the goal. */
   threadId: string;
+  /** User-facing objective text currently stored in Codex. */
   objective: string;
+  /**
+   * Raw Codex goal status. May include Codex-owned states like `blocked`,
+   * `usageLimited`, `budgetLimited`, or `complete`.
+   */
   status: string;
+  /** Optional token cap; `null` means the goal has no token budget. */
   tokenBudget: number | null;
+  /** Tokens Codex reports as consumed toward the current goal. */
   tokensUsed: number;
+  /** Wall-clock seconds Codex reports as spent on the current goal. */
   timeUsedSeconds: number;
+  /** Codex-created timestamp, if the CLI version provides one. */
   createdAt: number | null;
+  /** Codex-updated timestamp, if the CLI version provides one. */
   updatedAt: number | null;
 }
 
+/** API response for reading or mutating the current Codex goal. */
 export interface CodexGoalResponse {
+  /** Current goal, or `null` when Codex has no goal for the thread. */
   goal: CodexGoal | null;
 }
 
+/** Payload accepted by `PUT /v1/sessions/{id}/codex_goal`. */
 export interface SetCodexGoalInput {
+  /** New goal objective. The server rejects blank objectives. */
   objective: string;
+  /** Optional token cap; `null` clears the token budget. */
   tokenBudget?: number | null;
+  /**
+   * Optional user-writeable status to apply with the goal update.
+   * `null`/absent means preserve the current Codex status.
+   */
   status?: CodexGoalStatusUpdate | null;
 }
 
+/**
+ * Goal statuses the browser is allowed to write. Codex-owned terminal or
+ * limiter states are read-only and stay represented by `CodexGoal.status`.
+ */
 export type CodexGoalStatusUpdate = "active" | "paused";
 
 /**
