@@ -23,8 +23,6 @@ from typing import Any
 
 #: Env var carrying the bridge dir into the harness executor process.
 BRIDGE_DIR_ENV_VAR = "HARNESS_CURSOR_NATIVE_BRIDGE_DIR"
-#: Env var carrying the requesting Omnigent session id into the harness.
-REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CURSOR_NATIVE_REQUEST_SESSION_ID"
 
 _BRIDGE_ROOT = Path(os.environ.get("TMPDIR", "/tmp")) / f"omnigent-{os.getuid()}" / "cursor-native"
 _TMUX_FILE = "tmux.json"
@@ -62,7 +60,6 @@ def build_cursor_native_spawn_env(session_id: str) -> dict[str, str]:
     _ensure_dir(bridge_dir)
     return {
         BRIDGE_DIR_ENV_VAR: str(bridge_dir),
-        REQUEST_SESSION_ID_ENV_VAR: session_id,
     }
 
 

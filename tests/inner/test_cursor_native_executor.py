@@ -12,7 +12,6 @@ from pathlib import Path
 
 from omnigent.cursor_native_bridge import (
     BRIDGE_DIR_ENV_VAR,
-    REQUEST_SESSION_ID_ENV_VAR,
     _paste_payload_bytes,
     bridge_dir_for_session_id,
     build_cursor_native_spawn_env,
@@ -95,10 +94,13 @@ class TestBridge:
         assert a1 != b
         assert "cursor-native" in str(a1)
 
-    def test_spawn_env_carries_bridge_dir_and_session(self) -> None:
+    def test_spawn_env_carries_bridge_dir(self) -> None:
         env = build_cursor_native_spawn_env("conv_xyz")
         assert env[BRIDGE_DIR_ENV_VAR] == str(bridge_dir_for_session_id("conv_xyz"))
-        assert env[REQUEST_SESSION_ID_ENV_VAR] == "conv_xyz"
+        # The cursor bridge has no active-session concept (unlike claude/pi), so
+        # no request-session-id guard env is emitted — only the bridge dir.
+        assert "HARNESS_CURSOR_NATIVE_REQUEST_SESSION_ID" not in env
+        assert list(env) == [BRIDGE_DIR_ENV_VAR]
 
     def test_tmux_target_round_trip(self, tmp_path: Path) -> None:
         write_tmux_target(tmp_path, socket_path=Path("/tmp/x/tmux.sock"), tmux_target="main")

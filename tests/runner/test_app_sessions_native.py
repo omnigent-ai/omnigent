@@ -26,7 +26,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from omnigent import claude_native_bridge, codex_native_bridge
+from omnigent import claude_native_bridge, codex_native_bridge, cursor_native_bridge
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
     bridge_dir_for_bridge_id,
@@ -1099,6 +1099,59 @@ async def test_create_session_threads_resolved_bundle_dir_to_codex_spawn_env(
     assert env is not None
     assert env["HARNESS_CODEX_BUNDLE_DIR"] == str(bundle_dir)
     assert env["HARNESS_CODEX_SKILLS_FILTER"] == '["codex_e2e_xyz_greet_a3f9c2"]'
+
+
+@pytest.mark.asyncio
+async def test_create_session_threads_cursor_bridge_dir_without_dead_guard_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cursor-native session pre-spawn emits only the bridge dir env.
+
+    This locks the runner boundary, not just the bridge helper: the
+    session-creation route must pass a cursor-native bridge dir into the
+    harness process manager, while omitting the unread request-session-id
+    guard env. Inject/stop/interrupt paths use the bridge dir and tmux target;
+    none consume an active-session guard.
+    """
+    monkeypatch.setattr(cursor_native_bridge, "_BRIDGE_ROOT", tmp_path / "cursor-bridge")
+    spec = AgentSpec(
+        spec_version=1,
+        name="cursor-native-agent",
+        executor=ExecutorSpec(
+            config={"harness": "cursor-native", "model": "cursor-default"},
+        ),
+    )
+    harness_client = _ScriptedHarnessClient([])
+    pm = _FakeProcessManager(harness_client)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_cursor", "agent_id": "ag_cursor"},
+        )
+
+    assert resp.status_code == 201
+    assert pm.get_client_calls
+    conversation_id, harness, env = pm.get_client_calls[-1]
+    assert conversation_id == "conv_cursor"
+    assert harness == "cursor-native"
+    assert env == {
+        cursor_native_bridge.BRIDGE_DIR_ENV_VAR: str(
+            cursor_native_bridge.bridge_dir_for_session_id("conv_cursor")
+        )
+    }
+    assert "HARNESS_CURSOR_NATIVE_REQUEST_SESSION_ID" not in env
 
 
 @pytest.mark.parametrize(
