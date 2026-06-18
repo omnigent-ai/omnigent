@@ -30,6 +30,7 @@ from omnigent.runtime.workflow import (
     _build_codex_spawn_env,
     _build_openai_agents_sdk_spawn_env,
     _build_pi_spawn_env,
+    _build_qwen_spawn_env,
 )
 from omnigent.spec.types import (
     AgentSpec,
@@ -573,6 +574,57 @@ def test_openai_agents_falls_back_to_catalog_default_model(config_home: Path) ->
     assert catalog_default is not None
     assert env["HARNESS_OPENAI_AGENTS_GATEWAY_BASE_URL"] == "https://api.openai.com/v1"
     assert env["HARNESS_OPENAI_AGENTS_MODEL"] == catalog_default
+
+
+def test_qwen_uses_openai_global_default(config_home: Path) -> None:
+    """
+    A ``default: true`` openai provider routes the qwen harness.
+
+    Qwen consumes the openai family (OpenAI-compatible wire), so it should
+    emit env vars keyed by "openai" in the gateway base URL JSON.
+    """
+    _write_config(config_home, _openai_default_config())
+    spec = _make_spec(harness="qwen")
+
+    env = _build_qwen_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_QWEN_GATEWAY"] == "true"
+    # qwen keys the base-URL JSON by its family name ("openai").
+    assert env["HARNESS_QWEN_GATEWAY_BASE_URLS"] == (
+        '{"openai": "https://api.openai.com/v1"}'
+    )
+    assert env["HARNESS_QWEN_GATEWAY_HOST"] == "https://api.openai.com"
+    assert env["HARNESS_QWEN_GATEWAY_AUTH_COMMAND"] == "printf %s sk-oai-secret"
+    assert env["HARNESS_QWEN_MODEL"] == "gpt-default-model"
+
+
+def test_qwen_falls_back_to_catalog_default_model(config_home: Path) -> None:
+    """
+    An openai ``key`` provider with no ``models.default`` resolves the
+    catalog default for the qwen harness.
+
+    Proves the analogous fallback in :func:`_build_qwen_spawn_env`.
+    """
+    from omnigent.onboarding.providers import default_chat_model
+
+    config: dict[str, object] = {
+        "providers": {
+            "openai": {
+                "kind": "key",
+                "default": True,
+                "openai": _key_family_no_model("https://api.openai.com/v1", "sk-oai-secret"),
+            }
+        }
+    }
+    _write_config(config_home, config)
+    spec = _make_spec(harness="qwen")
+
+    env = _build_qwen_spawn_env(spec, workdir=None)
+
+    catalog_default = default_chat_model("openai")
+    assert catalog_default is not None
+    assert env["HARNESS_QWEN_GATEWAY_BASE_URL"] == "https://api.openai.com/v1"
+    assert env["HARNESS_QWEN_MODEL"] == catalog_default
 
 
 def test_pi_falls_back_to_catalog_default_model(config_home: Path) -> None:

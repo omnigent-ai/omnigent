@@ -13461,6 +13461,7 @@ _HARNESS_MODEL_ENV_KEY: dict[str, str] = {
     # (claude-native, codex-native) it honors the spec model via a launch
     # ``--model`` arg in _auto_create_cursor_terminal, not via an env var.
     "antigravity": "HARNESS_ANTIGRAVITY_MODEL",
+    "qwen": "HARNESS_QWEN_MODEL",
 }
 
 
@@ -13494,6 +13495,7 @@ def _build_spawn_env_from_spec(
             _build_cursor_spawn_env,
             _build_openai_agents_sdk_spawn_env,
             _build_pi_spawn_env,
+            _build_qwen_spawn_env,
         )
 
         if harness == "claude-sdk":
@@ -13508,6 +13510,8 @@ def _build_spawn_env_from_spec(
             env = _build_cursor_spawn_env(spec, workdir=workdir)
         elif harness == "antigravity":
             env = _build_antigravity_spawn_env(spec)
+        elif harness == "qwen":
+            env = _build_qwen_spawn_env(spec, workdir=workdir)
         else:
             # Native terminal harnesses and unknown harnesses build env elsewhere.
             return None
