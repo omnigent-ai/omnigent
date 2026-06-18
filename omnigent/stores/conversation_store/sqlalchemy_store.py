@@ -2159,8 +2159,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param carry_history_into_native: When ``True``, stamp
             :data:`FORK_CARRY_HISTORY_LABEL_KEY` on the fork so a native
             target harness rebuilds its transcript instead of starting
-            fresh. Set by the route whenever the fork binds a native
-            target, regardless of the source's provider family.
+            fresh. Set by the route only for native targets whose harness can
+            replay fork history.
         :param resume_source_native_session: When ``True`` (default), a
             full fork of a source with a native session stamps
             :data:`FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY` so the runner
