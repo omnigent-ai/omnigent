@@ -11,9 +11,10 @@ For AI-written descriptions:
 
 <!--
 Link the issue this PR addresses with a closing keyword so GitHub auto-links it
-(and closes it on merge): e.g. `Closes #123`. One issue per PR -- if another open
-PR already closes the same issue, the newer one is auto-closed as a duplicate.
-Use `N/A` for chores/docs with no associated issue.
+(and closes it on merge): e.g. `Closes #123`. One issue per PR. If an older,
+still-open community PR already closes the same issue, the newer one may be
+auto-closed as a duplicate (maintainer PRs are exempt). Use `N/A` for
+chores/docs with no associated issue.
 -->
 
 Closes #

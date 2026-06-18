@@ -130,8 +130,12 @@ module.exports = async ({ context, github }) => {
 
       console.log(`Issue #${issueNumber} has ${prs.length} PRs`);
 
-      // Sort PRs by creation date (oldest first).
-      prs.sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+      // Sort PRs by creation date (oldest first). Break ties on PR number
+      // (lower = opened earlier) so "keep the oldest" is deterministic when two
+      // PRs share a createdAt timestamp.
+      prs.sort(
+        (a, b) => new Date(a.createdAt) - new Date(b.createdAt) || a.number - b.number
+      );
 
       // Keep the oldest PR, close the rest as duplicates.
       const [keeper, ...duplicates] = prs;
@@ -157,11 +161,13 @@ module.exports = async ({ context, github }) => {
           labels: [DUPLICATE_LABEL],
         });
 
+        // pr.author is null for deleted/ghost accounts; fall back gracefully.
+        const author = pr.author?.login ?? "contributor";
         await github.rest.issues.createComment({
           owner,
           repo,
           issue_number: pr.number,
-          body: duplicateMessage(pr.author.login, issueNumber, keeper.number),
+          body: duplicateMessage(author, issueNumber, keeper.number),
         });
 
         closedCount++;
