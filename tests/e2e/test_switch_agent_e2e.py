@@ -1,24 +1,18 @@
 """E2E tests for in-place agent switch — ``POST /v1/sessions/{id}/switch-agent``.
 
-Real server + runner + LLM. Unlike fork (which branches into a NEW session),
-switch rebinds the SAME session to a different agent and continues there. The
-core guarantee is that the new agent picks up the prior conversation: an SDK
-target replays the Omnigent transcript as context, so a code word planted
+Real server + runner + LLM (or mock LLM). Unlike fork (which branches into a
+NEW session), switch rebinds the SAME session to a different agent and continues
+there. The core guarantee is that the new agent picks up the prior conversation:
+an SDK target replays the Omnigent transcript as context, so a code word planted
 before the switch must be recalled after it — on the same session id.
 
-Both the source (``claude-coder``) and the switch TARGET
-(``sdk-chat-builtin``) are gateway-wired under ``--profile``: the source via
-:func:`upload_agent`'s model rewrite, the built-in target via
-:func:`tests.e2e.conftest._materialize_builtin_sdk_chat_spec`, which seeds a
-profile-aware copy (model mapped + ``executor.profile`` stamped) instead of
-the on-disk OAuth spec. So the post-switch turn authenticates through the
-Databricks gateway and runs on hosted CI without a Claude login. (Without
-``--profile`` — the local api.openai.com path — the built-in falls back to
-the verbatim ``claude`` CLI OAuth spec.)
+In mock mode the source and target are both inline ``openai-agents`` agents
+pointed at the mock LLM server; each gets its own keyed response queue so the
+test controls exactly what each agent says.
 
 Usage::
 
-    pytest tests/e2e/test_switch_agent_e2e.py --llm-api-key $PAT --profile oss -v
+    pytest tests/e2e/test_switch_agent_e2e.py -v --timeout=60 --no-skip-known
 """
 
 from __future__ import annotations
@@ -30,11 +24,14 @@ import time
 import uuid
 
 import httpx
+import pytest
 import yaml
 
 from tests.e2e.conftest import (
     create_runner_bound_session,
     poll_session_until_terminal,
+    register_inline_agent,
+    reset_mock_llm,
     send_user_message_to_session,
 )
 from tests.e2e.helpers import final_assistant_text
@@ -72,6 +69,7 @@ def test_switch_agent_in_place_carries_history(
     http_client: httpx.Client,
     claude_coder_agent: str,
     live_runner_id: str,
+    using_mock_llm: bool,
 ) -> None:
     """A switched agent recalls a code word planted before the switch.
 
@@ -83,11 +81,22 @@ def test_switch_agent_in_place_carries_history(
     bound agent actually changed, proving this is an in-place switch and not a
     fork.
 
+    Requires a real LLM: the switch endpoint only binds built-in agents, and
+    the ``sdk-chat-builtin`` built-in uses ``claude-sdk`` which authenticates
+    via the Claude CLI's OAuth session (not mockable through ``OPENAI_BASE_URL``).
+
     :param http_client: HTTP client pointed at the live server.
     :param claude_coder_agent: The uploaded claude-sdk source agent name.
     :param live_runner_id: The server fixture's runner id.
+    :param using_mock_llm: Whether mock LLM is active.
     :returns: None.
     """
+    if using_mock_llm:
+        pytest.skip(
+            "switch-agent only binds built-in agents; sdk-chat-builtin uses "
+            "claude-sdk which requires a real LLM (not mockable via OPENAI_BASE_URL)"
+        )
+
     marker = f"SWITCHWORD_{uuid.uuid4().hex[:6].upper()}"
 
     # 1. Source session (claude-sdk) on the server's runner; plant a word.
@@ -144,8 +153,8 @@ def test_switch_agent_in_place_carries_history(
 
 def test_switch_agent_unknown_target_is_rejected(
     http_client: httpx.Client,
-    claude_coder_agent: str,
     live_runner_id: str,
+    mock_llm_server_url: str,
 ) -> None:
     """Switching to a non-existent agent is rejected and leaves the session.
 
@@ -153,12 +162,26 @@ def test_switch_agent_unknown_target_is_rejected(
     returns 404 and the session's bound agent is unchanged (no half-switch).
 
     :param http_client: HTTP client pointed at the live server.
-    :param claude_coder_agent: The uploaded claude-sdk source agent name.
     :param live_runner_id: The server fixture's runner id.
+    :param mock_llm_server_url: Mock LLM server URL.
     :returns: None.
     """
+    uid = uuid.uuid4().hex[:6]
+    model = f"mock-switch-unk-{uid}"
+
+    reset_mock_llm(mock_llm_server_url)
+    agent_name = register_inline_agent(
+        http_client,
+        name=f"switch-unk-{uid}",
+        harness="openai-agents",
+        model=model,
+        profile="",
+        prompt="Placeholder agent for unknown-target switch test.",
+        mock_llm_base_url=f"{mock_llm_server_url}/v1",
+    )
+
     session_id = create_runner_bound_session(
-        http_client, agent_name=claude_coder_agent, runner_id=live_runner_id
+        http_client, agent_name=agent_name, runner_id=live_runner_id
     )
     original_agent_id = _bound_agent(http_client, session_id)["id"]
 

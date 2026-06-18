@@ -141,7 +141,7 @@ def test_codex_native_yolo_false_string_opts_out_of_bypass() -> None:
 
 @pytest.mark.parametrize(
     "harness",
-    ["claude-sdk", "codex", "openai-agents", "databricks_supervisor"],
+    ["claude-sdk", "codex", "openai-agents"],
 )
 def test_non_native_harness_with_bypass_fields_is_ignored(harness: str) -> None:
     """

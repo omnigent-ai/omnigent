@@ -22,6 +22,7 @@ of this package.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 import httpx
@@ -38,6 +39,7 @@ from tests.e2e.conftest import (  # noqa: F401  (re-exported pytest fixtures)
     llm_api_key,
     mock_llm_server_url,
     register_inline_agent,
+    reset_mock_llm,
     using_mock_llm,
 )
 from tests.integration.model_selection import resolve_default_model
@@ -82,9 +84,57 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         for item in items:
             item.add_marker(marker)
         return
+    # Gate ``mock_only`` tests out of the real-LLM Integration jobs. The
+    # only correct signal for "mock mode" is the absence of a real
+    # ``--llm-api-key`` (``_is_mock_mode`` / the ``using_mock_llm``
+    # fixture). The ``mock_llm_server_url`` fixture is "always started
+    # regardless of --llm-api-key" so a ``mock_llm_server_url is None``
+    # guard inside a test is dead code that never skips. Scripted
+    # tool-call tests (fixed mock queue) cannot run against a real LLM,
+    # which would 401 on the mock base URL or fail the scripted-marker
+    # assertions; skip them centrally here instead.
+    if not _is_mock_mode(config):
+        skip_mock_only = pytest.mark.skip(
+            reason="mock_only test: requires mock-LLM mode (no --llm-api-key)"
+        )
+        for item in items:
+            if item.get_closest_marker("mock_only") is not None:
+                item.add_marker(skip_mock_only)
     if config.getoption("--harness") == "codex":
         for item in items:
             item.add_marker(pytest.mark.flaky(reruns=2, reruns_delay=5))
+
+
+@pytest.fixture(autouse=True, scope="function")
+def _reset_mock_llm_between_tests(
+    mock_llm_server_url: str | None,  # noqa: F811
+) -> Iterator[None]:
+    """Clear the shared mock-LLM queues before and after every test.
+
+    The ``mock_llm_server_url`` fixture is session-scoped: the mock
+    server's keyed response queues, captured requests, and gates
+    persist across every test in a shard. ``_ResponseQueue.next()``
+    silently returns a default ``"Mock LLM response"`` when exhausted
+    and ``resolve_queue`` falls back to the ``"default"`` queue on a key
+    miss, so a queue left non-empty (or keyed for another agent) by one
+    test leaks scripted responses into its siblings — the recurring
+    cause of ``test_smoke`` / ``test_multi_turn`` / ``test_sharing``
+    breaking when run alongside the scripted round-trip tests.
+
+    Resetting before *and* after each test makes every integration test
+    start from a clean queue without a per-file opt-in fixture.
+    ``reset_mock_llm`` is a no-op when the URL is ``None`` (real-LLM
+    mode never starts the server fixture lazily) and the server is
+    always up in mock mode, so calling it unconditionally is safe in
+    both modes.
+
+    :param mock_llm_server_url: Mock server URL, or ``None`` in real mode.
+    """
+    reset_mock_llm(mock_llm_server_url)
+    try:
+        yield
+    finally:
+        reset_mock_llm(mock_llm_server_url)
 
 
 @pytest.fixture(scope="session")
@@ -169,6 +219,7 @@ def journey_session(
     live_runner_id: str,  # noqa: F811  (pytest fixture, not the import)
     harness_name: str,
     model_name: str,
+    using_mock_llm: bool,  # noqa: F811
     request: pytest.FixtureRequest,
     mock_llm_server_url: str | None,  # noqa: F811
 ) -> JourneySession:
@@ -181,6 +232,7 @@ def journey_session(
     :param live_runner_id: Runner to bind the session to.
     :param harness_name: Harness under test.
     :param model_name: Resolved model for this test.
+    :param using_mock_llm: Whether mock LLM mode is active.
     :param request: Pytest fixture request (for ``--profile``).
     :param mock_llm_server_url: Mock LLM server URL, or ``None``.
     :returns: The registered agent + bound session.
@@ -196,7 +248,9 @@ def journey_session(
             "exactly and literally. When asked to reply with a token, "
             "reply with the token text only."
         ),
-        mock_llm_base_url=f"{mock_llm_server_url}/v1" if mock_llm_server_url else None,
+        mock_llm_base_url=(
+            f"{mock_llm_server_url}/v1" if using_mock_llm and mock_llm_server_url else None
+        ),
     )
     session_id = create_runner_bound_session(
         http_client, agent_name=agent_name, runner_id=live_runner_id

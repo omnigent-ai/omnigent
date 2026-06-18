@@ -24,8 +24,8 @@ class RuntimeCaps:
     :param sandbox_enabled: Whether to use ``srt`` sandboxing for
         local tool execution when available on PATH. ``True`` by
         default. This is a runtime security policy — agents cannot
-        opt out. The agent spec only controls ``docker_image``
-        (what container to use).
+        opt out. The agent spec only controls ``container_image``
+        (what container to use) and ``container_runtime``.
     :param default_policies: Server-wide policies appended after
         per-agent policies on every session. Loaded from the
         ``policies:`` key in the server ``--config`` YAML

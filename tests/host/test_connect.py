@@ -1016,6 +1016,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         "DATABRICKS_TOKEN": "dapi-secret",
         "AWS_SECRET_ACCESS_KEY": "aws-secret",
         "SOME_RANDOM_VAR": "x",
+        "OMNIGENT_CLAUDE_SDK_NO_SANDBOX": "1",
     }
 
     env = _build_runner_env(
@@ -1044,6 +1045,11 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     # needs it to allow --dangerously-skip-permissions under root in
     # sandbox containers. Only the baked host image ever sets it.
     assert env["IS_SANDBOX"] == "1"
+    # The claude-sdk sandbox bypass flag forwards — it is read inside the
+    # harness, so a bare ``OMNIGENT_CLAUDE_SDK_NO_SANDBOX=1 omnigent run …``
+    # must reach the runner without also forcing
+    # ``OMNIGENT_RUNNER_ENV_PASSTHROUGH=OMNIGENT_CLAUDE_SDK_NO_SANDBOX``.
+    assert env["OMNIGENT_CLAUDE_SDK_NO_SANDBOX"] == "1"
     # Non-harness secrets are stripped — the point of the allowlist.
     assert "DATABRICKS_TOKEN" not in env
     assert "AWS_SECRET_ACCESS_KEY" not in env

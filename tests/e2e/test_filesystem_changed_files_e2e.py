@@ -46,6 +46,7 @@ import uuid
 from pathlib import Path
 
 import httpx
+import pytest
 
 from tests.e2e.conftest import build_agent_bundle
 from tests.e2e.helpers import POLL_INTERVAL_S
@@ -324,6 +325,7 @@ def test_filesystem_changes_appear_after_agent_write(
     http_client: httpx.Client,
     live_runner_id: str,
     databricks_workspace_host: str | None,
+    using_mock_llm: bool,
 ) -> None:
     """Agent write surfaces in the directory listing with a non-null status.
 
@@ -347,6 +349,8 @@ def test_filesystem_changes_appear_after_agent_write(
     :param databricks_workspace_host: Workspace host URL when the
         test suite routes LLM calls through Databricks model serving.
     """
+    if using_mock_llm:
+        pytest.skip("requires real LLM (agent sys_os_write)")
     # Use a UUID suffix so parallel test runs don't collide.
     filename = f"e2e_workspace_test_{uuid.uuid4().hex[:8]}.md"
     file_content = "Hello from the workspace e2e test"
@@ -436,6 +440,7 @@ def test_diff_endpoint_shows_git_diff_for_modified_file(
     http_client: httpx.Client,
     live_runner_id: str,
     databricks_workspace_host: str | None,
+    using_mock_llm: bool,
 ) -> None:
     """The diff endpoint returns the git HEAD content as ``before`` and the modified
     content as ``after`` for a file that exists in the git repo.
@@ -459,6 +464,8 @@ def test_diff_endpoint_shows_git_diff_for_modified_file(
     :param databricks_workspace_host: Workspace host URL when the
         test suite routes LLM calls through Databricks model serving.
     """
+    if using_mock_llm:
+        pytest.skip("requires real LLM (agent sys_os_write + git diff)")
     import subprocess
 
     # Use a file that is already tracked in git so ``git show HEAD`` has content.

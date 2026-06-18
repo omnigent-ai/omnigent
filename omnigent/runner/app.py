@@ -1179,14 +1179,24 @@ async def _auto_create_codex_terminal(
     # claude-native, whose terminal IS the agent process. On failure, close
     # the listener and app-server here: the background forwarder task (which
     # otherwise owns their teardown) has not been created yet.
+    # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
+    # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
+    # and ``parent_os_env`` below, launch_terminal falls back to
+    # _default_sandbox_for_platform (linux_bwrap), overriding the YAML config.
+    agent_os_env = _agent_os_env_from_spec(agent_spec)
     try:
         terminal_view = await resource_registry.launch_auxiliary_terminal(
             session_id=session_id,
             terminal_name="codex",
             session_key="main",
             resource_role=CODEX_NATIVE_TERMINAL_ROLE,
+            parent_os_env=agent_os_env,
             spec=TerminalEnvSpec(
-                os_env=OSEnvSpec(type="caller_process", cwd=workspace),
+                os_env=OSEnvSpec(
+                    type="caller_process",
+                    cwd=workspace,
+                    sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
+                ),
                 command=app_server.codex_path,
                 # Fresh sessions pass no thread id so the TUI creates the
                 # thread and the background task adopts it. Resume sessions
@@ -1574,6 +1584,29 @@ def _codex_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -
     return model if isinstance(model, str) and model else None
 
 
+def _agent_os_env_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> Any | None:
+    """
+    Read the agent's ``os_env`` from a resolved agent spec.
+
+    The auto-created native terminals (codex/claude) must inherit the
+    agent's ``os_env`` so its ``sandbox`` (e.g. ``type: none``),
+    ``egress_rules`` and ``env_passthrough`` are honoured. Without this
+    the terminal is built with a fresh ``OSEnvSpec`` carrying no sandbox,
+    and ``launch_terminal`` falls back to ``_default_sandbox_for_platform``
+    (``linux_bwrap`` / ``darwin_seatbelt``) — overriding the YAML config.
+    Mirrors :func:`create_session_terminal`, which resolves the spec once
+    and threads its ``os_env`` through as the inheritance parent.
+
+    :param agent_spec: Agent spec object, or a resolved wrapper carrying a
+        ``spec`` attribute. ``None`` means no spec was available.
+    :returns: The agent's ``os_env`` spec, or ``None``.
+    """
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    if spec is None:
+        return None
+    return getattr(spec, "os_env", None)
+
+
 def _is_runner_owned_codex_terminal(
     resource_registry: SessionResourceRegistry,
     resource: SessionResourceView,
@@ -1848,6 +1881,7 @@ async def _auto_create_claude_terminal(
     server_client: httpx.AsyncClient,
     bundle_dir: Path | None = None,
     agent_name: str | None = None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
     skills_filter: str | list[str] = "all",
 ) -> SessionResourceView:
     """
@@ -1877,6 +1911,11 @@ async def _auto_create_claude_terminal(
     :param agent_name: Agent display name for the bundle's plugin
         manifest, e.g. ``"researcher"``. ``None`` falls back to the
         bundle directory's basename.
+    :param agent_spec: Optional resolved agent spec for the session. Its
+        ``os_env`` (sandbox / egress_rules / env_passthrough) is threaded
+        through as the terminal's inheritance parent so the YAML sandbox
+        config (e.g. ``type: none``) is honoured instead of being
+        overridden by ``_default_sandbox_for_platform``.
     :param skills_filter: The agent spec's ``skills_filter`` (``"all"``
         / ``"none"`` / list of skill names), threaded to
         :func:`augment_claude_args`. Defaults to ``"all"``.
@@ -2259,8 +2298,17 @@ async def _auto_create_claude_terminal(
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
     )
 
+    # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
+    # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
+    # and ``parent_os_env`` below, launch_terminal falls back to
+    # _default_sandbox_for_platform (linux_bwrap), overriding the YAML config.
+    agent_os_env = _agent_os_env_from_spec(agent_spec)
     env_spec = TerminalEnvSpec(
-        os_env=OSEnvSpec(type="caller_process", cwd=workspace),
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=workspace,
+            sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
+        ),
         command="claude",
         args=list(claude_args),
         # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL
@@ -2300,6 +2348,7 @@ async def _auto_create_claude_terminal(
             terminal_name="claude",
             session_key="main",
             spec=env_spec,
+            parent_os_env=agent_os_env,
             # Mark this as the claude-native agent terminal so its pane
             # activity drives the session's PTY-derived working status.
             resource_role=CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -2408,6 +2457,7 @@ async def _auto_create_repl_terminal(
     publish_event: Callable[[str, dict[str, Any]], None],
     *,
     server_client: httpx.AsyncClient,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
 ) -> SessionResourceView:
     """
     Auto-create an Omnigent REPL terminal for a runner-hosted SDK session.
@@ -2453,8 +2503,17 @@ async def _auto_create_repl_terminal(
     started_at = time.monotonic()
     workspace = os.environ.get("OMNIGENT_RUNNER_WORKSPACE", str(Path.cwd()))
     server_url = os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767")
+    # Inherit the agent's os_env so its sandbox (e.g. ``type: none``) is honoured;
+    # without sandbox= here and parent_os_env below, launch_terminal falls back to
+    # _default_sandbox_for_platform (linux_bwrap), which fails in a hardened
+    # container. Mirrors the #175 fix on the codex/claude auto-create paths.
+    agent_os_env = _agent_os_env_from_spec(agent_spec)
     env_spec = TerminalEnvSpec(
-        os_env=OSEnvSpec(type="caller_process", cwd=workspace),
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=workspace,
+            sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
+        ),
         # The runner's interpreter is the venv with omnigent installed;
         # ``python -m omnigent`` avoids depending on the console script
         # being on the tmux pane's PATH.
@@ -2471,6 +2530,7 @@ async def _auto_create_repl_terminal(
         terminal_name=_REPL_TERMINAL_NAME,
         session_key=_REPL_TERMINAL_SESSION_KEY,
         spec=env_spec,
+        parent_os_env=agent_os_env,
         # Runner-private marker the attach WebSocket uses to recreate
         # this terminal when its tmux session has died (the REPL exited
         # or crashed) instead of rejecting the attach.
@@ -2956,6 +3016,32 @@ class _SessionSnapshot:
     sub_agent_name: str | None = None
 
 
+# Language constant the omnigent YAML translator stamps on callable-backed
+# tools (omnigent/spec/omnigent.py:OMNIGENT_TOOL_LANGUAGE). Duplicated rather
+# than imported to avoid pulling the heavy translator module in for one
+# string — same rationale as omnigent/tools/local_callable.py.
+_OMNIGENT_CALLABLE_LANGUAGE = "omnigent-python-callable"
+
+
+def _looks_like_file_path(path: str) -> bool:
+    """
+    Return whether *path* is a filesystem path rather than a dotted import.
+
+    File-based local tools are discovered as ``tools/python/foo.py`` /
+    ``tools/typescript/foo.ts`` — always carrying a path separator and a
+    source extension (see :func:`omnigent.spec.parser._discover_local_tools`).
+    Callable-backed tools store a dotted import path (``pkg.mod.func``) in the
+    same field — no separator, no source extension. This structural test is
+    the primary guard so a rename of the callable-tool *language* string can
+    never reintroduce the workdir-mangling bug.
+
+    :param path: A :class:`LocalToolInfo` ``path`` value.
+    :returns: ``True`` when *path* is a file path safe to resolve onto the
+        workdir; ``False`` for dotted import paths.
+    """
+    return "/" in path or os.sep in path or path.endswith((".py", ".ts"))
+
+
 def _spec_with_workdir_paths(spec: Any, workdir: Path | None) -> Any:
     if workdir is None or spec is None:
         return spec
@@ -2966,7 +3052,18 @@ def _spec_with_workdir_paths(spec: Any, workdir: Path | None) -> Any:
     changed = False
     for info in local_tools:
         path = getattr(info, "path", None)
-        if path and not Path(path).is_absolute():
+        # Only resolve genuine file paths onto the workdir. Callable-backed
+        # tools store a dotted import path (``pkg.mod.func``) in the same
+        # field; joining that to the workdir corrupts it, the import fails,
+        # the tool never registers, and any tool_call policy narrowed to it
+        # can never fire. The structural file-vs-dotted check is the primary
+        # guard; the language check is belt-and-suspenders.
+        if (
+            path
+            and getattr(info, "language", None) != _OMNIGENT_CALLABLE_LANGUAGE
+            and _looks_like_file_path(path)
+            and not Path(path).is_absolute()
+        ):
             resolved_tools.append(dataclasses.replace(info, path=str((workdir / path).resolve())))
             changed = True
         else:
@@ -4625,8 +4722,12 @@ def create_runner_app(
             )
         return "\n".join(parts)
 
-    def _release_failed_required_terminal_session(session_id: str) -> None:
-        """Release the harness subprocess for a session whose runtime died."""
+    def _release_required_terminal_session(session_id: str) -> None:
+        """Release the harness subprocess after its required terminal exited.
+
+        Pure subprocess cleanup — publishes no ``failed`` lifecycle events, so
+        it is safe on both the crash and the clean-shutdown paths.
+        """
         if process_manager is None:
             return
 
@@ -4661,6 +4762,13 @@ def create_runner_app(
         if event.lifecycle != TerminalLifecycle.REQUIRED:
             return
 
+        # Exit while idle = the turn already finished and the pane shut down
+        # cleanly, so don't flip the chat to ``failed`` (the spurious-"failed"
+        # bug). Still release the harness; liveness surfaces the offline runner.
+        if event.session_was_idle:
+            _release_required_terminal_session(event.session_id)
+            return
+
         output = _format_required_terminal_exit_output(event)
         _publish_event(
             event.session_id,
@@ -4678,7 +4786,7 @@ def create_runner_app(
             status="failed",
             output=output,
         )
-        _release_failed_required_terminal_session(event.session_id)
+        _release_required_terminal_session(event.session_id)
 
     resource_registry.set_terminal_exit_publisher(_publish_terminal_exit)
 
@@ -5260,6 +5368,7 @@ def create_runner_app(
                             server_client=server_client,
                             bundle_dir=_native_bundle_dir,
                             agent_name=_native_agent_name,
+                            agent_spec=_native_spec,
                             skills_filter=_native_skills_filter,
                         )
                     except Exception as exc:
@@ -5413,11 +5522,16 @@ def create_runner_app(
                 if not _has_repl_terminal:
                     _publish_terminal_pending(_publish_event, session_id, True)
                     try:
+                        repl_agent_spec = await _resolve_session_agent_spec(session_id)
+                    except OmnigentError:
+                        repl_agent_spec = None
+                    try:
                         await _auto_create_repl_terminal(
                             session_id,
                             resource_registry,
                             _publish_event,
                             server_client=server_client,
+                            agent_spec=repl_agent_spec,
                         )
                     except Exception:
                         # Unlike the native branches, the REPL terminal is a
@@ -9657,6 +9771,13 @@ def create_runner_app(
             message_body = dict(body)
             message_body["conversation_id"] = conversation_id
 
+            # A new message means a turn is (about to be) in flight. Mark the
+            # native session running now so a pane crash before the PTY
+            # watcher's first ``running`` edge isn't misread as a clean
+            # shutdown against the prior turn's stale ``idle`` memo.
+            if _is_native_harness(conversation_id):
+                resource_registry.note_session_turn_started(conversation_id)
+
             # Take an arrival slot, then wait at the FIFO gate so this
             # conversation's messages reach the turn-vs-buffer decision in
             # arrival order regardless of content-resolution latency
@@ -10448,11 +10569,13 @@ def create_runner_app(
                     claude_terminal_id,
                 )
                 try:
+                    claude_agent_spec = await _resolve_session_agent_spec(session_id)
                     terminal_view = await _auto_create_claude_terminal(
                         session_id,
                         resource_registry,
                         _publish_event,
                         server_client=server_client,
+                        agent_spec=claude_agent_spec,
                     )
                 except Exception as exc:
                     _logger.exception(
@@ -10865,11 +10988,16 @@ def create_runner_app(
                 # the entry unconditionally and tears the instance down.
                 await registry.close(session_id, _REPL_TERMINAL_NAME, _REPL_TERMINAL_SESSION_KEY)
                 try:
+                    repl_agent_spec = await _resolve_session_agent_spec(session_id)
+                except OmnigentError:
+                    repl_agent_spec = None
+                try:
                     await _auto_create_repl_terminal(
                         session_id,
                         resource_registry,
                         _publish_event,
                         server_client=server_client,
+                        agent_spec=repl_agent_spec,
                     )
                 except Exception:
                     # Broad catch, same rationale as the session-create

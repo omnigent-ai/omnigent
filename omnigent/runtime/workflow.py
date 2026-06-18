@@ -1027,6 +1027,8 @@ def _build_claude_sdk_spawn_env(
             env["HARNESS_CLAUDE_SDK_API_KEY_HELPER"] = (
                 f"printf %s {shlex.quote(auth_from_spec.api_key)}"
             )
+            if auth_from_spec.base_url:
+                env["HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"] = auth_from_spec.base_url
             profile = None
         else:
             # Legacy path: executor.config["profile"] or executor.profile.

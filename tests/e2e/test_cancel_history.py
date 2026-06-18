@@ -17,6 +17,7 @@ import time
 from typing import Any
 
 import httpx
+import pytest
 
 from tests.e2e.conftest import (
     create_runner_bound_session,
@@ -175,6 +176,7 @@ def test_cancel_appends_history_marker_and_followup_sees_it(
     http_client: httpx.Client,
     archer_agent: str,
     live_runner_id: str,
+    using_mock_llm: bool,
 ) -> None:
     """
     Cancel an archer response and verify the follow-up sees the
@@ -199,6 +201,13 @@ def test_cancel_appends_history_marker_and_followup_sees_it(
     - If the marker text is missing or malformed, the follow-up
       LLM won't know a cancellation happened.
     """
+    if using_mock_llm:
+        pytest.skip(
+            "cancel-with-followup requires real streaming generation; "
+            "the mock gate/interrupt interaction does not reliably "
+            "reproduce the cancellation flow"
+        )
+
     # Step 1: open a session, send a broad question that will take time.
     session_id = create_runner_bound_session(
         http_client, agent_name=archer_agent, runner_id=live_runner_id
@@ -263,6 +272,7 @@ def test_cancel_mid_tool_call_followup_succeeds(
     http_client: httpx.Client,
     archer_agent: str,
     live_runner_id: str,
+    using_mock_llm: bool,
 ) -> None:
     """
     Cancel a response while tools are executing, then verify the
@@ -280,6 +290,12 @@ def test_cancel_mid_tool_call_followup_succeeds(
       every subsequent message in the conversation fails with
       ``[llm] failed``.
     """
+    if using_mock_llm:
+        pytest.skip(
+            "cancel-mid-tool-call requires real tool execution (web_search) "
+            "that the mock LLM cannot orchestrate"
+        )
+
     # Step 1: open session; ask archer to use tools (web_search triggers tool calls).
     session_id = create_runner_bound_session(
         http_client, agent_name=archer_agent, runner_id=live_runner_id

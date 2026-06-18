@@ -71,19 +71,52 @@ def _strip_ansi(text: str) -> str:
 
 
 @pytest.fixture(scope="module")
-def repl_env(llm_api_key: str) -> dict[str, str]:
+def repl_env(llm_api_key: str, tmp_path_factory: pytest.TempPathFactory) -> dict[str, str]:
     """
     Build the env dict for ``omnigent chat`` — OPENAI_API_KEY plus
     whatever PYTHONPATH the outer shell already provides (so
     ``omnigent`` + ``omnigent_client`` resolve to this
     worktree, not the sibling editable install).
 
+    Redirects ``HOME`` to a temp dir seeded with
+    ``.omnigent/config.yaml`` so the spawned interactive REPL starts
+    cleanly under pexpect:
+
+    - ``tui.theme`` is persisted, so the REPL's first-launch theme
+      picker (``_repl._load_startup_theme`` → ``startup_theme_picker``,
+      which reads ``$HOME/.omnigent/config.yaml`` — NOT
+      ``OMNIGENT_CONFIG_HOME``) is skipped. Under pexpect's pty stdin
+      is a tty, so without a persisted theme the arrow-key picker blocks
+      and the welcome banner never appears (the CI failure, where
+      ``$HOME`` is fresh).
+    - ``auto_open_conversation: false`` stops the interactive REPL from
+      opening a browser tab per run (``--no-open`` is not a valid
+      ``run`` flag; config is the supported path). ``OMNIGENT_CONFIG_HOME``
+      points at the same dir so the CLI reads it too.
+
+    Because ``HOME`` is redirected, ``DATABRICKS_CONFIG_FILE`` is pinned
+    to the real ``~/.databrickscfg`` so ``--profile`` lookups still
+    resolve, and ``OMNIGENT_SKIP_ONBOARD`` guards against any other
+    first-run prompt (these tests exercise REPL approval, not onboarding).
+
     :param llm_api_key: The API key for the LLM.
+    :param tmp_path_factory: Pytest temp-path factory for the fake HOME.
     :returns: Env mapping for ``pexpect.spawn``.
     """
+    real_databrickscfg = Path.home() / ".databrickscfg"
+    fake_home = tmp_path_factory.mktemp("repl_home")
+    config_home = fake_home / ".omnigent"
+    config_home.mkdir(parents=True, exist_ok=True)
+    (config_home / "config.yaml").write_text(
+        "auto_open_conversation: false\ntui:\n  theme: dark\n"
+    )
     env: dict[str, str] = {
         **os.environ,
         "OPENAI_API_KEY": llm_api_key,
+        "HOME": str(fake_home),
+        "OMNIGENT_CONFIG_HOME": str(config_home),
+        "DATABRICKS_CONFIG_FILE": str(real_databrickscfg),
+        "OMNIGENT_SKIP_ONBOARD": "1",
         # Force ANSI on — pexpect captures everything, stripping
         # happens per-assertion via _strip_ansi.
         "TERM": "xterm-256color",
@@ -131,9 +164,18 @@ def _wait_for_prompt_ready(
     ``omnigent chat <path>`` starts a local server, waits for
     health, then launches the REPL. The welcome block
     (TimedFormatter renders the agent name with dashes →
-    spaces) is the signal the prompt is live. Using a
-    generous timeout — agent upload + DBOS boot add latency
-    on cold starts.
+    spaces) renders BEFORE prompt_toolkit's input loop is
+    live — matching only the banner and sending immediately
+    races the submit ahead of the input loop, so the
+    keystroke is dropped and the turn never starts.
+
+    The reliable input-readiness signal is the bottom status
+    toolbar, which renders ``· ready`` (with ``state:
+    sleeping``) once prompt_toolkit's application is running
+    and idle. Waiting for that after the banner makes the
+    subsequent ``child.send(...)`` land in the live input
+    loop. Using a generous timeout — agent upload + DBOS boot
+    add latency on cold starts.
 
     :param child: Active pexpect child.
     :param timeout: Max seconds to wait.
@@ -143,6 +185,38 @@ def _wait_for_prompt_ready(
         other fixtures.
     """
     child.expect(welcome_pattern, timeout=timeout)
+    # The banner is not input-readiness. Wait for the status
+    # toolbar's ``· ready`` (idle ``state: sleeping``) marker
+    # so the next send() lands in prompt_toolkit's live loop
+    # instead of racing ahead of it.
+    child.expect(r"·\s*ready", timeout=timeout)
+
+
+def _wait_for_turn_complete(child: Any, timeout: float = 45.0) -> None:
+    """
+    Block until the current turn has finished streaming.
+
+    The REPL's bottom toolbar is the turn-state oracle: it reads
+    ``state: running`` (animated spinner) while a handler task is
+    in flight and flips back to ``state: sleeping`` (``· ready``)
+    once the turn fully lands. The older tests waited on a
+    ``\\d+\\.\\d+s`` decimal "elapsed" footer, but the current REPL
+    never renders one — the only elapsed readout is the integer
+    ``streaming… Ns`` segment that disappears on completion. Waiting
+    for that stale pattern times out even though the turn finished,
+    which is the second half of the REPL-pexpect quarantine family.
+
+    A single ``· ready`` expect is enough: every send/approve site
+    leaves the toolbar in ``state: running`` (the turn is dispatched,
+    or an approval is pending), so the next ``· ready`` is the
+    post-turn idle settle — never a stale pre-turn toolbar. Keeping it
+    to one expect also preserves ``child.before`` as the full
+    span of the turn's rendered output, which several callers scan.
+
+    :param child: Active pexpect child.
+    :param timeout: Max seconds to wait for the turn to settle.
+    """
+    child.expect(r"·\s*ready", timeout=timeout)
 
 
 def _read_pending(child: Any, seconds: float = 0.2) -> str:
@@ -355,7 +429,7 @@ def test_repl_two_turns_fires_one_approval_per_turn(
         child.expect("approved", timeout=5)
         # Wait for the turn to fully land — the stream-done
         # elapsed-time label is the cleanest signal.
-        child.expect(r"\d+\.\d+s", timeout=30)
+        _wait_for_turn_complete(child, timeout=30)
 
         # Drain anything queued so the next expect starts
         # from a clean slate. Generous wait because the REPL
@@ -397,7 +471,7 @@ def test_repl_two_turns_fires_one_approval_per_turn(
         # Approve and confirm one-and-done.
         child.send("y" + "\r")
         child.expect("approved", timeout=5)
-        child.expect(r"\d+\.\d+s", timeout=30)
+        _wait_for_turn_complete(child, timeout=30)
 
         # Final sweep: no extra approval banners after the
         # two we expected.
@@ -460,7 +534,7 @@ def test_repl_approve_always_caches_for_later_turns(
         # Echo line confirms the REPL parsed "a" as
         # APPROVE_ALWAYS, not as a generic non-"y" refusal.
         child.expect("approved always", timeout=5)
-        child.expect(r"\d+\.\d+s", timeout=30)
+        _wait_for_turn_complete(child, timeout=30)
 
         # Drain between turns so the next buffer is clean.
         _read_pending(child, seconds=1.5)
@@ -473,7 +547,7 @@ def test_repl_approve_always_caches_for_later_turns(
         # output — banner (if any) + auto-approved line (if
         # any) + LLM response + elapsed-time prefix.
         child.send("follow up please" + "\r")
-        child.expect(r"\d+\.\d+s", timeout=45)
+        _wait_for_turn_complete(child, timeout=45)
         turn_two_raw = child.before or ""
         if isinstance(turn_two_raw, bytes):
             turn_two_raw = turn_two_raw.decode("utf-8", errors="replace")
@@ -556,7 +630,7 @@ def test_repl_tool_call_approval_allows_tool_to_run(
         child.send("y" + "\r")
         child.expect("approved", timeout=5)
         # Wait for turn completion (elapsed-time marker).
-        child.expect(r"\d+\.\d+s", timeout=45)
+        _wait_for_turn_complete(child, timeout=45)
         full_turn = child.before or ""
         if isinstance(full_turn, bytes):
             full_turn = full_turn.decode("utf-8", errors="replace")
@@ -611,7 +685,7 @@ def test_repl_tool_call_refusal_blocks_tool(
         # the blocked sentinel as the tool output, then
         # either reports the denial or stops. Elapsed-time
         # marker signals the turn ended.
-        child.expect(r"\d+\.\d+s", timeout=60)
+        _wait_for_turn_complete(child, timeout=60)
         full_turn = child.before or ""
         if isinstance(full_turn, bytes):
             full_turn = full_turn.decode("utf-8", errors="replace")
@@ -710,7 +784,7 @@ def test_repl_subagent_ask_tunnels_approval_to_root(
         child.expect("approved", timeout=5)
         # Let the full turn complete — sub-agent runs, returns,
         # parent summarizes, turn ends.
-        child.expect(r"\d+\.\d+s", timeout=90)
+        _wait_for_turn_complete(child, timeout=90)
         full_turn = child.before or ""
         if isinstance(full_turn, bytes):
             full_turn = full_turn.decode("utf-8", errors="replace")
@@ -788,7 +862,7 @@ def test_repl_label_driven_ask_approves(
         # (condition checks the pre-evaluation snapshot).
         child.send("hello BANANA_TRIGGER" + "\r")
         # The LLM still replies normally. Wait for turn end.
-        child.expect(r"\d+\.\d+s", timeout=45)
+        _wait_for_turn_complete(child, timeout=45)
         turn_one = child.before or ""
         if isinstance(turn_one, bytes):
             turn_one = turn_one.decode("utf-8", errors="replace")
@@ -816,7 +890,7 @@ def test_repl_label_driven_ask_approves(
         child.send("y" + "\r")
         child.expect("approved", timeout=5)
         # Turn 2 completes — LLM replies normally.
-        child.expect(r"\d+\.\d+s", timeout=45)
+        _wait_for_turn_complete(child, timeout=45)
     finally:
         try:
             child.send("/quit" + "\r")
@@ -856,7 +930,7 @@ def test_repl_label_driven_ask_refuse_shows_sentinel(
         )
         # Turn 1: taint.
         child.send("hi BANANA_TRIGGER" + "\r")
-        child.expect(r"\d+\.\d+s", timeout=45)
+        _wait_for_turn_complete(child, timeout=45)
         _read_pending(child, seconds=1.0)
 
         # Turn 2: ASK fires, user refuses.
@@ -864,7 +938,7 @@ def test_repl_label_driven_ask_refuse_shows_sentinel(
         child.expect("approval required", timeout=45)
         child.send("n" + "\r")
         child.expect("refused", timeout=5)
-        child.expect(r"\d+\.\d+s", timeout=45)
+        _wait_for_turn_complete(child, timeout=45)
         full_turn = child.before or ""
         if isinstance(full_turn, bytes):
             full_turn = full_turn.decode("utf-8", errors="replace")
@@ -932,7 +1006,7 @@ def test_repl_output_ask_approve_surfaces_llm_reply(
         )
         child.send("y" + "\r")
         child.expect("approved", timeout=5)
-        child.expect(r"\d+\.\d+s", timeout=45)
+        _wait_for_turn_complete(child, timeout=45)
         full_turn = child.before or ""
         if isinstance(full_turn, bytes):
             full_turn = full_turn.decode("utf-8", errors="replace")
@@ -991,7 +1065,7 @@ def test_repl_output_ask_refuse_replaces_reply_with_sentinel(
         child.expect("approval required", timeout=45)
         child.send("n" + "\r")
         child.expect("refused", timeout=5)
-        child.expect(r"\d+\.\d+s", timeout=45)
+        _wait_for_turn_complete(child, timeout=45)
         full_turn = child.before or ""
         if isinstance(full_turn, bytes):
             full_turn = full_turn.decode("utf-8", errors="replace")
@@ -1062,7 +1136,7 @@ def test_repl_tool_result_ask_approve_surfaces_tool_output(
         )
         child.send("y" + "\r")
         child.expect("approved", timeout=5)
-        child.expect(r"\d+\.\d+s", timeout=45)
+        _wait_for_turn_complete(child, timeout=45)
         full_turn = child.before or ""
         if isinstance(full_turn, bytes):
             full_turn = full_turn.decode("utf-8", errors="replace")
@@ -1114,7 +1188,7 @@ def test_repl_tool_result_ask_refuse_replaces_output(
         child.expect("approval required", timeout=45)
         child.send("n" + "\r")
         child.expect("refused", timeout=5)
-        child.expect(r"\d+\.\d+s", timeout=60)
+        _wait_for_turn_complete(child, timeout=60)
         full_turn = child.before or ""
         if isinstance(full_turn, bytes):
             full_turn = full_turn.decode("utf-8", errors="replace")
@@ -1188,7 +1262,7 @@ def test_repl_subagent_tool_call_ask_tunnels_to_root(
         )
         child.send("y" + "\r")
         child.expect("approved", timeout=5)
-        child.expect(r"\d+\.\d+s", timeout=120)
+        _wait_for_turn_complete(child, timeout=120)
         full_turn = child.before or ""
         if isinstance(full_turn, bytes):
             full_turn = full_turn.decode("utf-8", errors="replace")

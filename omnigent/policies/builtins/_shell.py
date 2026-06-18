@@ -37,19 +37,27 @@ def split_command_segments(command: str) -> list[str]:
     """
     Split a shell command on chaining operators into individual segments.
 
-    Splits on ``&&``, ``||``, ``;``, ``|`` and newlines so that
-    ``git add . && git push`` is evaluated as two segments. This is a naive
-    split that does not honor operators appearing inside quotes — acceptable
-    because the commands these policies gate do not embed these operators in
-    quoted args in practice, and a mis-split only ever produces an extra
-    ignored segment.
+    Splits on ``&&``, ``||``, ``;``, ``|``, a single ``&`` (the background
+    operator, also a command separator), and newlines so that
+    ``git add . && git push`` is evaluated as two segments. The ``&&``
+    alternative is matched before the single-``&`` character class, so a
+    ``&&`` is consumed whole rather than split into two empty halves. This is
+    a naive split that does not honor operators appearing inside quotes —
+    acceptable because the commands these policies gate do not embed these
+    operators in quoted args in practice, and a mis-split only ever produces
+    an extra ignored segment.
+
+    Splitting on a lone ``&`` matters for the gate: without it, a benign
+    leading command could hide a gated one behind a background operator
+    (``echo hi & git push`` would be one un-split segment whose head is
+    ``echo``, slipping the ``git push`` past detection).
 
     :param command: The raw shell command string, e.g.
         ``"cd /repo && npm test"``.
     :returns: List of trimmed, non-empty segments, e.g.
         ``["cd /repo", "npm test"]``.
     """
-    parts = re.split(r"&&|\|\||[;|\n]", command)
+    parts = re.split(r"&&|\|\||[;|\n&]", command)
     return [seg.strip() for seg in parts if seg.strip()]
 
 

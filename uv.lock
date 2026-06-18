@@ -2766,6 +2766,9 @@ e2b = [
 modal = [
     { name = "modal" },
 ]
+openshell = [
+    { name = "openshell" },
+]
 tracing = [
     { name = "mlflow" },
 ]
@@ -2809,6 +2812,7 @@ requires-dist = [
     { name = "openai", specifier = ">=1.0,<3" },
     { name = "openai-agents", specifier = ">=0.0.17" },
     { name = "openai-agents", marker = "extra == 'agents-sdk'", specifier = ">=0.1,<1" },
+    { name = "openshell", marker = "extra == 'openshell'", specifier = ">=0.0.7,<1" },
     { name = "opentelemetry-distro", marker = "extra == 'databricks'", specifier = ">=0,<1" },
     { name = "opentelemetry-exporter-otlp-proto-grpc", specifier = ">=1.20,<2" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.20,<2" },
@@ -2843,7 +2847,7 @@ requires-dist = [
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30,<1" },
 ]
-provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "vertex", "modal", "daytona", "cwsandbox", "e2b", "tracing", "agents-sdk", "antigravity", "cursor", "databricks", "dev"]
+provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "vertex", "modal", "daytona", "cwsandbox", "e2b", "openshell", "tracing", "agents-sdk", "antigravity", "cursor", "databricks", "dev"]
 
 [[package]]
 name = "omnigent-client"
@@ -2917,6 +2921,22 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/e3/48/ba0ad614c66d88100d61b9ddaf0793022a425b5b958c0139c2f1c7473764/openai_agents-0.17.4.tar.gz", hash = "sha256:6af9afd4b40de23493c9ab285c28cd4e8fd088240af6e96e2dee45826ad568fd", size = 5409840, upload-time = "2026-05-26T08:55:10.459Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a0/89/adf09ec269d4de1c7be37c747d8488aac51b58d5589a9c1dd55f3c1e8e05/openai_agents-0.17.4-py3-none-any.whl", hash = "sha256:feea8264c9812bba7c526a01f6efd4f8c0efdb348c2233c36ff9c292a9d465af", size = 842963, upload-time = "2026-05-26T08:55:08.767Z" },
+]
+
+[[package]]
+name = "openshell"
+version = "0.0.59"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cloudpickle" },
+    { name = "grpcio" },
+    { name = "httpx" },
+    { name = "protobuf" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6a/b6/999900082742355cae6ed09db7d7a60ec9db1fdb858427a7af7a9a18667d/openshell-0.0.59-py3-none-macosx_13_0_arm64.whl", hash = "sha256:37c8384c655959bfc3b92ee8c0399fa2fa867fd56253f93d9ef3959d8a2e2aa1", size = 16035032, upload-time = "2026-06-09T20:07:48.427Z" },
+    { url = "https://files.pythonhosted.org/packages/7e/97/e7b63bbf1a35a194d0bbb3303d0430956ef2a58448080b766118fdd58d63/openshell-0.0.59-py3-none-manylinux_2_39_aarch64.whl", hash = "sha256:41ce707edb16b02ae63e20945242814e6708f4609b48e0123db3b61393cf8c4f", size = 19477386, upload-time = "2026-06-09T20:08:20.632Z" },
+    { url = "https://files.pythonhosted.org/packages/3d/04/12f49e4f6d4fc1f63538c61152b9487ea007220c1bb18588ac40a9459057/openshell-0.0.59-py3-none-manylinux_2_39_x86_64.whl", hash = "sha256:8dd7d719d528af1cdff322f8a326d2f69ac85f56e7fee0b63c84537175c75ab4", size = 20267425, upload-time = "2026-06-09T20:08:48.811Z" },
 ]
 
 [[package]]

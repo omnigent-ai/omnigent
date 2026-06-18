@@ -736,11 +736,18 @@ export function ChatPage() {
   // badges from the sidebar/Agents rail. An open-but-untitled session
   // (no synthesized title yet) reads as "New session" to match its
   // sidebar row; the landing page (no active session) stays "Omnigent".
+  // Sub-agent (child) sessions are absent from the sidebar list, so
+  // ``activeConv`` is null and the title would otherwise read "New session";
+  // name the tab after the sub-agent instead, mirroring the header.
+  const subAgentTabTitle =
+    activeSession?.parentSessionId != null
+      ? (boundAgentBySession?.name ?? boundAgentName ?? subAgentLabel ?? null)
+      : null;
   useEffect(() => {
     const fallback = urlConvId ? UNTITLED_CONVERSATION_LABEL : "Omnigent";
-    const base = truncateTitle(activeConv?.title ?? fallback);
+    const base = truncateTitle(activeConv?.title ?? subAgentTabTitle ?? fallback);
     document.title = showsWorking ? `● ${base}` : base;
-  }, [activeConv?.title, showsWorking, urlConvId]);
+  }, [activeConv?.title, subAgentTabTitle, showsWorking, urlConvId]);
 
   const codexModelOptions = useChatStore((s) => s.codexModelOptions);
   const selectedModel = useChatStore((s) => s.selectedModel);

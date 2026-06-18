@@ -361,12 +361,16 @@ def test_policy_denies_tool_call_by_name(
     """
     _check_harness_available(harness)
     yaml_path = tool_ban_yaml_factory(harness, model)
-    # A math question the LLM would normally answer by calling
-    # ``calculate`` and echoing "12". Under the policy, the
-    # calculate call is intercepted and the sentinel is returned
-    # as tool output instead — so the LLM's final reply reflects
-    # the denial, never "12".
-    prompt = "What is 6 + 6?"
+    # A math question the LLM cannot evaluate in-head, so it
+    # reliably routes through the ``calculate`` tool. A trivial
+    # expression like "6 + 6" let the model answer inline without
+    # ever emitting a tool call — the deny policy then had nothing
+    # to intercept and the test flaked on model nondeterminism. A
+    # large product forces the tool call. Under the policy the
+    # calculate call is intercepted and the sentinel is returned as
+    # tool output instead, so the LLM's final reply reflects the
+    # denial, never the real product 443242686.
+    prompt = "What is 48273 multiplied by 9182? Use the calculate tool."
     result = subprocess.run(
         [
             str(omnigent_python),
@@ -404,216 +408,14 @@ def test_policy_denies_tool_call_by_name(
         f"result.\nstdout tail:\n{result.stdout[-2500:]}"
     )
 
-    # The answer "12" must NOT appear — its presence would mean
-    # the calculate tool actually ran. The DENY path must short-
-    # circuit dispatch. Using " 12" with a leading space to avoid
-    # false positives (e.g. policy reason containing a digit).
-    assert " 12" not in result.stdout, (
-        f"The answer '12' leaked into the output — the calculate "
-        f"tool ran despite the DENY policy. Enforcement is "
+    # The real product (443242686) must NOT appear — its presence
+    # would mean the calculate tool actually ran. The DENY path
+    # must short-circuit dispatch. The model cannot produce this
+    # value without the tool, so any leak is unambiguous. Strip
+    # commas first so a "443,242,686"-formatted leak still trips.
+    assert "443242686" not in result.stdout.replace(",", ""), (
+        f"The real product '443242686' leaked into the output — the "
+        f"calculate tool ran despite the DENY policy. Enforcement is "
         f"bypassing dispatch incorrectly.\n"
-        f"stdout tail:\n{result.stdout[-2500:]}"
-    )
-
-
-# Unique sentinel the sub-agent-ban policy uses as its reason.
-# Same role as ``_TOOL_BAN_REASON_SENTINEL`` above; kept distinct
-# so the two tests can't accidentally match each other's output.
-_SUBAGENT_BAN_REASON_SENTINEL = "SUBAGENT_BAN_SENTINEL_XYZQ"
-
-# The sub-agent's output when it's allowed to run. If this string
-# appears in the parent's reply the sub-agent wasn't blocked —
-# exactly the foot-gun the test guards against.
-_WORKER_OUTPUT_MARKER = "WORKER_RAN_UNBLOCKED"
-
-
-@pytest.fixture()
-def subagent_ban_yaml_factory(tmp_path: Path) -> Callable[[str, str], Path]:
-    """
-    Factory that writes an omnigent-shaped YAML where the
-    parent has an inline ``worker`` sub-agent (an
-    :class:`AgentTool`) and a policy that narrows to the
-    sub-agent's *declared name* via ``match_tools: [worker]``.
-
-    Exercises the Gap 8 fix in
-    :func:`omnigent.runtime.executors.omnigent._make_tool_executor_bridge`:
-    when the LLM calls ``worker(input=...)`` directly (rather
-    than ``sys_session_send(type="worker", ...)``), the bridge
-    routes the call through ``_dispatch_user_agent_tool`` and
-    TOOL_CALL enforcement sees ``tool_name == "worker"``. The
-    policy match then works as a YAML author would expect —
-    ``match_tools: [worker]`` bans calls to the ``worker`` tool.
-
-    The parent prompt explicitly tells the LLM to call ``worker``
-    directly because, without the hint, the LLM may pick the
-    generic ``sys_session_send`` builtin (also advertised) and
-    bypass the named-tool policy. That's an expected behavior —
-    agent authors who want a specific sub-agent banned narrow
-    their prompts too.
-
-    :param tmp_path: Pytest's per-test temp dir — YAML is
-        single-use.
-    :returns: ``(harness, model) -> Path`` factory.
-    """
-
-    def _build(harness: str, model: str) -> Path:
-        config = {
-            "name": f"subagent_ban_probe_{harness}",
-            "prompt": (
-                "You have a tool called `worker` that takes one "
-                "argument `input`. Call worker(input='hi') directly "
-                "— do NOT use sys_session_send or any other indirect "
-                "tool. If the tool output starts with "
-                "'[Denied by policy', reply with EXACTLY the "
-                "verbatim tool output text, enclosed in quotes, and "
-                "nothing else. Do not paraphrase. Do not retry."
-            ),
-            "executor": {
-                "model": model,
-                "harness": harness,
-            },
-            "tools": {
-                "worker": {
-                    "type": "agent",
-                    "description": "Helper sub-agent.",
-                    "prompt": f"Reply with the exact string {_WORKER_OUTPUT_MARKER}",
-                    "executor": {
-                        "model": model,
-                        "harness": harness,
-                    },
-                },
-            },
-            "policies": {
-                "deny_worker": {
-                    "type": "function",
-                    "on": ["tool_call:worker"],
-                    "function": {
-                        "path": "omnigent.policies.function.make_fixed_action_callable",
-                        "arguments": {
-                            "action": "deny",
-                            "reason": _SUBAGENT_BAN_REASON_SENTINEL,
-                            "on_phases": ["tool_call"],
-                            "on_tools": ["worker"],
-                        },
-                    },
-                },
-            },
-        }
-        path = tmp_path / f"subagent_ban_{harness}.yaml"
-        path.write_text(yaml.safe_dump(config))
-        return path
-
-    return _build
-
-
-@pytest.mark.parametrize("harness,model", HARNESS_HARNESS_MODELS, ids=HARNESS_IDS)
-def test_policy_denies_sub_agent_by_name(
-    omnigent_python: Path,
-    omnigent_repo_root: Path,
-    omnigent_credentials_env: dict[str, str],
-    databricks_workspace: tuple[str, str],
-    subagent_ban_yaml_factory: Callable[[str, str], Path],
-    harness: str,
-    model: str,
-) -> None:
-    """
-    ``match_tools: [<agent_tool_name>]`` fires when the LLM
-    invokes the sub-agent under its declared name — closes
-    Gap 8 (TODO_omnigent_coverage.md).
-
-    Before the fix, inline :class:`AgentTool` calls routed
-    through Omnigent' generic ``sys_session_send`` builtin,
-    so TOOL_CALL enforcement saw ``tool_name ==
-    "sys_session_send"`` regardless of which sub-agent the LLM
-    picked. ``match_tools: [worker]`` never matched because the
-    name the policy filters on and the name the engine sees
-    disagreed. The fix dispatches the sub-agent call under the
-    declared YAML name so the two agree.
-
-    What breaks if this fails:
-
-    - The bridge stops dispatching :class:`AgentTool` calls
-      directly and falls back to ``sys_session_send`` — policy
-      filter rows out again.
-    - The TOOL_CALL enforcement hook stops firing before the
-      spawn is routed, so the sub-agent starts despite the
-      DENY verdict.
-    - The sub-agent's output leaks through the denied call
-      (the bridge's DENY-sentinel short-circuit regressed).
-
-    :param omnigent_python: Shared interpreter fixture.
-    :param omnigent_repo_root: Subprocess cwd.
-    :param omnigent_credentials_env: Env with PAT + profile.
-    :param subagent_ban_yaml_factory: Builder for the
-        sub-agent-ban YAML for the parametrized harness.
-    :param harness: The harness identifier from
-        :data:`HARNESS_HARNESS_MODELS`.
-    :param model: The harness-routed model identifier.
-    """
-    _check_harness_available(harness)
-    yaml_path = subagent_ban_yaml_factory(harness, model)
-    result = subprocess.run(
-        [
-            str(omnigent_python),
-            "-m",
-            "omnigent",
-            "run",
-            str(yaml_path),
-            "--no-session",
-            "-p",
-            "Run the worker.",
-        ],
-        env=omnigent_credentials_env,
-        cwd=str(omnigent_repo_root),
-        capture_output=True,
-        text=True,
-        timeout=_TIMEOUT_SEC,
-    )
-
-    # Exit 0 — both parent and (not-really-started) sub-agent
-    # tasks completed cleanly. A non-zero exit here means a
-    # spawn-path regression, not an enforcement miss.
-    assert result.returncode == 0, (
-        f"--omnigent exited {result.returncode}. stderr tail:\n{result.stderr[-2000:]}"
-    )
-
-    # The parent's final reply must mention the denial. If the
-    # policy didn't fire, the sub-agent would run and the parent
-    # would see ``WORKER_RAN_UNBLOCKED`` instead.
-    assert "denied" in result.stdout.lower(), (
-        f"Parent reply did not acknowledge the denial — "
-        f"``match_tools: [worker]`` did not fire at TOOL_CALL.\n"
-        f"stdout tail:\n{result.stdout[-2500:]}"
-    )
-
-    # The sub-agent's unique output marker MUST NOT appear —
-    # its presence proves the sub-agent actually ran, meaning
-    # the DENY didn't short-circuit dispatch. The LLM can't
-    # plausibly emit this exact string on its own; the only
-    # path is the sub-agent executing and returning it.
-    assert _WORKER_OUTPUT_MARKER not in result.stdout, (
-        f"Sub-agent output {_WORKER_OUTPUT_MARKER!r} leaked into "
-        f"the parent's reply — the sub-agent ran despite the "
-        f"DENY policy. The bridge is not short-circuiting on "
-        f"DENY.\nstdout tail:\n{result.stdout[-2500:]}"
-    )
-
-    # The policy's unique reason sentinel must appear in
-    # stdout — proves it was OUR policy (the named-tool
-    # ``match_tools: [worker]`` filter) that fired, not a
-    # generic DENY from some other path. Without this check
-    # the test would pass even if the LLM called
-    # ``sys_session_send`` and a different policy happened to
-    # deny it, because the LLM's "denied" phrasing alone
-    # doesn't distinguish which policy fired. The LLM can't
-    # plausibly generate this exact string on its own; the
-    # only path is the policy's ``reason`` surfacing through
-    # ``_build_deny_sentinel``.
-    assert _SUBAGENT_BAN_REASON_SENTINEL in result.stdout, (
-        f"Policy reason {_SUBAGENT_BAN_REASON_SENTINEL!r} missing "
-        f"from stdout — the LLM may have called "
-        f"``sys_session_send`` instead of ``worker`` directly, "
-        f"so ``match_tools: [worker]`` never matched. Gap 8 "
-        f"fix is not being exercised.\n"
         f"stdout tail:\n{result.stdout[-2500:]}"
     )

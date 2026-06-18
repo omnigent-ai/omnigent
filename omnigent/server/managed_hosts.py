@@ -32,7 +32,7 @@ stores into ``create_app``):
    ``<data_dir>/config.yaml``)::
 
        sandbox:
-         provider: modal          # lakebox | modal | daytona | islo
+         provider: modal          # lakebox|modal|daytona|cwsandbox|islo|openshell
          server_url: https://omnigent.example.com
          modal:                   # optional block
            image: docker.io/me/omnigent-host:latest  # default: official image
@@ -54,6 +54,11 @@ stores into ``create_app``):
            vcpus: 2
            memory_mb: 4096
            disk_gb: 20
+         openshell:               # optional block (provider: openshell)
+           image: docker.io/me/omnigent-host:latest  # default: official image
+           env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES injected
+                                             # as sandbox env
+           cluster: my-gateway              # optional OpenShell gateway name
 
    The image defaults to the official prebaked host image
    (``ghcr.io/omnigent-ai/omnigent-host:latest``; see
@@ -65,9 +70,13 @@ stores into ``create_app``):
    launcher reads ``DAYTONA_API_KEY`` (plus optional
    ``DAYTONA_API_URL`` / ``DAYTONA_TARGET``), and the Islo launcher
    reads ``ISLO_API_KEY`` (plus optional ``ISLO_BASE_URL``) from the
-   server process environment. ``modal``, ``daytona``, and ``islo``
-   have managed-launch support; ``lakebox`` parses but rejects at
-   launch.
+   server process environment. The OpenShell launcher needs no API key:
+   it connects to the gateway made active with ``openshell gateway
+   select`` (``$OPENSHELL_GATEWAY`` / ``~/.config/openshell/active_gateway``,
+   or ``sandbox.openshell.cluster``), so the server process needs
+   OpenShell gateway access. ``modal``, ``daytona``, ``cwsandbox``,
+   ``islo``, and ``openshell`` have managed-launch support; ``lakebox``
+   parses but rejects at launch.
 
 2. **Direct construction** (embedding deployments): build
    :class:`ManagedSandboxConfig` with a custom
@@ -121,10 +130,10 @@ _logger = logging.getLogger(__name__)
 # ManagedSandboxConfig directly are not constrained by either set —
 # their launcher factory IS the support.)
 SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
-    {"lakebox", "modal", "daytona", "cwsandbox", "islo", "e2b"}
+    {"lakebox", "modal", "daytona", "cwsandbox", "islo", "e2b", "openshell"}
 )
 PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
-    {"modal", "daytona", "cwsandbox", "islo", "e2b"}
+    {"modal", "daytona", "cwsandbox", "islo", "e2b", "openshell"}
 )
 
 # How long a managed launch waits for the sandboxed host to register
@@ -156,6 +165,13 @@ DAYTONA_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 # deleted by managed-session teardown; use the same 7-day policy bound
 # as Daytona for long-lived hosts and stale-token cleanup.
 ISLO_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
+
+# Launch-token lifetime for the YAML openshell path. OpenShell sandboxes
+# run until deleted (no platform lifetime cap), so the bound is policy,
+# not platform: the same 7-day window as Daytona/Islo keeps a long-lived
+# sandbox re-authenticating across tunnel reconnects while still expiring
+# tokens of sandboxes nobody deleted. A relaunch mints a fresh token.
+OPENSHELL_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 
 # The cwsandbox launch-token TTL is NOT a constant: CW Sandbox's lifetime is
 # operator-overridable (OMNIGENT_CWSANDBOX_MAX_LIFETIME_S), so the TTL is
@@ -628,6 +644,13 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
         # outlives the (operator-overridable) sandbox lifetime — mirrors
         # the cwsandbox path.
         token_ttl_s = managed_token_ttl_s()
+    elif provider == "openshell":
+        launcher_factory = _openshell_launcher_factory(
+            image=_parse_provider_image(raw, "openshell"),
+            env=_parse_provider_env(raw, "openshell"),
+            cluster=_parse_provider_string(raw, "openshell", "cluster"),
+        )
+        token_ttl_s = OPENSHELL_MANAGED_TOKEN_TTL_S
     else:
         launcher_factory = _unsupported_launcher_factory(provider)
         # Never consulted (the factory rejects before any token is
@@ -983,6 +1006,36 @@ def _islo_launcher_factory(
             memory_mb=memory_mb,
             disk_gb=disk_gb,
         )
+
+    return _build
+
+
+def _openshell_launcher_factory(
+    *,
+    image: str | None,
+    env: list[str] | None,
+    cluster: str | None,
+) -> Callable[[], SandboxLauncher]:
+    """
+    Build the launcher factory for the YAML ``provider: openshell`` path.
+
+    :param image: Registry image reference with omnigent pre-installed,
+        e.g. ``"docker.io/me/omnigent-host:latest"``, or ``None`` to use
+        the official prebaked host image (env-overridable).
+    :param env: Names of server-process environment variables injected
+        into every sandbox, e.g. ``["OPENAI_API_KEY", "GIT_TOKEN"]``, or
+        ``None`` to resolve from the launcher's env-var fallback.
+    :param cluster: OpenShell gateway name to connect to, or ``None`` to
+        use the active gateway (``$OPENSHELL_GATEWAY`` /
+        ``~/.config/openshell/active_gateway``).
+    :returns: A factory producing parameterized OpenShell launchers.
+    """
+
+    def _build() -> SandboxLauncher:
+        """Construct the OpenShell launcher (lazy SDK import inside)."""
+        from omnigent.onboarding.sandboxes.openshell import OpenShellSandboxLauncher
+
+        return OpenShellSandboxLauncher(image=image, env=env, cluster=cluster)
 
     return _build
 

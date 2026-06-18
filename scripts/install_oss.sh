@@ -40,7 +40,7 @@ ESC=$(printf '\033')
 RESET=
 BOLD=
 DIM=
-CYAN=
+MAGENTA=
 GREEN=
 YELLOW=
 RED=
@@ -54,11 +54,28 @@ init_style() {
     RESET="${ESC}[0m"
     BOLD="${ESC}[1m"
     DIM="${ESC}[2m"
-    CYAN="${ESC}[36m"
+    # Brand accent — Otto's magenta-pink (#F43BA6), matching the Python CLI
+    # palette in omnigent/inner/ui.py so the installer and the tool agree.
+    MAGENTA="${ESC}[38;2;244;59;166m"
     GREEN="${ESC}[32m"
     YELLOW="${ESC}[33m"
     RED="${ESC}[31m"
   fi
+}
+
+# The Otto + "omnigent" wordmark lockup, printed once at the top of an
+# interactive install. Mirrors omnigent.inner.wordmark.lockup_lines(); the
+# whole lockup is painted in the brand magenta (flat — no gradient in sh).
+# Skipped off a TTY (use_terminal_ui) so piped/CI installs stay clean.
+print_banner() {
+  use_terminal_ui || return 0
+  printf '\n'
+  printf '%s  ⠀⠀⠀⢠⣿⡄⠀⠀⠀   ██████╗ ███╗   ███╗███╗   ██╗██╗ ██████╗ ███████╗███╗   ██╗████████╗%s\n' "$MAGENTA" "$RESET"
+  printf '%s  ⢴⣶⣶⠉⣿⠉⣶⣶⡦  ██╔═══██╗████╗ ████║████╗  ██║██║██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝%s\n' "$MAGENTA" "$RESET"
+  printf '%s  ⠀⠙⣿⣶⣿⣶⣿⠋⠀  ██║   ██║██╔████╔██║██╔██╗ ██║██║██║  ███╗█████╗  ██╔██╗ ██║   ██║%s\n' "$MAGENTA" "$RESET"
+  printf '%s  ⠀⢠⣿⡿⠿⢿⣿⡄⠀  ╚██████╔╝██║ ╚═╝ ██║██║ ╚████║██║╚██████╔╝███████╗██║ ╚████║   ██║%s\n' "$MAGENTA" "$RESET"
+  printf '%s  ⠀⠈⠁⠀⠀⠀⠈⠁⠀   ╚═════╝ ╚═╝     ╚═╝╚═╝  ╚═══╝╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝%s\n' "$MAGENTA" "$RESET"
+  printf '%s  all your agents, one cli%s\n\n' "$DIM" "$RESET"
 }
 
 usage() {
@@ -66,7 +83,7 @@ usage() {
 }
 
 step() {
-  printf '%s==>%s %s\n' "$CYAN" "$RESET" "$1"
+  printf '%s==>%s %s\n' "$MAGENTA" "$RESET" "$1"
 }
 
 verbose() {
@@ -124,7 +141,7 @@ run_with_spinner() {
   frame=0
   while [ ! -f "$status_file" ]; do
     spinner="$(spinner_frame "$frame")"
-    printf '\r\033[K%s%s%s %s%s%s' "$CYAN" "$spinner" "$RESET" "$BOLD" "$label" "$RESET"
+    printf '\r\033[K%s%s%s %s%s%s' "$MAGENTA" "$spinner" "$RESET" "$BOLD" "$label" "$RESET"
     frame=$((frame + 1))
     sleep 0.1
   done
@@ -593,7 +610,7 @@ print_next_steps() {
 
   printf '\n%sOmnigent installed successfully.%s\n\n' "$BOLD" "$RESET"
   printf 'Start chatting — first run sets up a model and a local web UI:\n'
-  printf '  %s%somnigent%s\n\n' "$command_prefix" "$CYAN" "$RESET"
+  printf '  %s%somnigent%s\n\n' "$command_prefix" "$MAGENTA" "$RESET"
   printf 'Or launch a specific coding harness:\n'
   printf '  %somnigent claude          # Claude Code\n' "$command_prefix"
   printf '  %somnigent codex           # Codex\n\n' "$command_prefix"
@@ -607,6 +624,7 @@ print_next_steps() {
 main() {
   init_style
   parse_args "$@"
+  print_banner
   normalize_repo_url
   check_platform
   check_prerequisites

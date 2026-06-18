@@ -826,6 +826,58 @@
 .tiptap-md-content .ProseMirror li {
   margin: 0.25em 0;
 }
+/* GitHub-style task lists (`- [ ]` / `- [x]`), rendered by
+   @tiptap/extension-list's TaskList/TaskItem (registered in
+   MarkdownRichTextViewer.tsx). TaskList renders <ul data-type="taskList">;
+   each item is drawn by TaskItem's node-view as
+   <li data-checked><label><input type=checkbox><span></span></label><div>…</div></li>
+   — note the live editor DOM carries data-checked on the <li> but NOT
+   data-type (that only appears on the static renderHTML/clipboard path), so we
+   target items as `ul[data-type="taskList"] > li`. The data-attribute selector
+   out-specifies the plain ul/li rules above: drop the inherited disc marker and
+   lay the checkbox out beside the content instead of stacking on top of it. */
+.tiptap-md-content .ProseMirror ul[data-type="taskList"] {
+  list-style: none;
+  padding-left: 0;
+  margin: 0.5em 0;
+}
+.tiptap-md-content .ProseMirror ul[data-type="taskList"] > li {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5em;
+  margin: 0.25em 0;
+}
+/* The checkbox lives in a contenteditable=false <label>. Give the label the
+   height of one content line (paragraph line-height: 1.7) and center the
+   checkbox within it, so it sits on the first text line at any font size
+   instead of relying on a fixed margin nudge. */
+.tiptap-md-content .ProseMirror ul[data-type="taskList"] > li > label {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  height: 1.7em;
+  user-select: none;
+}
+.tiptap-md-content .ProseMirror ul[data-type="taskList"] > li > label input[type="checkbox"] {
+  width: 0.95em;
+  height: 0.95em;
+  margin: 0;
+  cursor: pointer;
+  accent-color: var(--primary);
+}
+/* Content column: the <div> wraps the item's paragraph(s). Collapse the
+   paragraph's default vertical margin so a single-line item hugs the checkbox. */
+.tiptap-md-content .ProseMirror ul[data-type="taskList"] > li > div {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.tiptap-md-content .ProseMirror ul[data-type="taskList"] > li > div > p {
+  margin: 0;
+}
+/* Nested checklists tuck under their parent item, not the page margin. */
+.tiptap-md-content .ProseMirror ul[data-type="taskList"] > li ul[data-type="taskList"] {
+  margin: 0.25em 0 0;
+}
 .tiptap-md-content .ProseMirror blockquote {
   border-left: 3px solid var(--border);
   padding-left: 1em;

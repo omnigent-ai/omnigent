@@ -72,12 +72,14 @@ class _ResolvedConfig:
 
 @dataclass(frozen=True)
 class _BuiltApp:
-    """The bind address resolved alongside the built app.
+    """The FastAPI app plus resolved bind settings.
 
-    ``build_app`` resolves HOST/PORT as a side effect of wiring the app
-    (they feed ``detect_base_url`` for accounts mode), so it returns
-    them here for ``main()`` to hand to ``uvicorn.run`` — keeping a
-    single config-resolution pass.
+    ``_resolve_config`` handles config loading, database URL normalization,
+    artifact directory setup, auth defaults, and HOST/PORT resolution before
+    migrations run. ``main()`` then runs migrations explicitly and calls
+    ``build_app`` to construct the app from that resolved config. Returning
+    HOST/PORT with the app keeps the handoff to ``uvicorn.run`` explicit
+    without requiring a second config-resolution pass.
     """
 
     app: FastAPI

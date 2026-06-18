@@ -1,4 +1,4 @@
-"""E2E tests for ``POST /v1/sessions/{id}/fork`` against a real LLM.
+"""E2E tests for ``POST /v1/sessions/{id}/fork`` (mock LLM).
 
 Exercises the fork flows the route/store unit tests can only mock:
 
@@ -11,7 +11,8 @@ Exercises the fork flows the route/store unit tests can only mock:
    and cannot produce codeword 2).
 3. **Fork + agent switch** (``agent_id``) — fork into a different
    built-in agent and verify the clone binds the target agent while
-   still carrying the source history.
+   still carrying the source history. (Skipped under mock LLM — needs
+   a built-in claude-sdk agent target.)
 
 All flows route through runner-bound sessions (the alpha runner-state
 contract), mirroring how the Web UI drives the fork: create → fork →
@@ -19,19 +20,23 @@ contract), mirroring how the Web UI drives the fork: create → fork →
 
 Usage::
 
-    pytest tests/e2e/test_sessions_fork_e2e.py \
-        --llm-api-key $LLM_API_KEY -v
+    pytest tests/e2e/test_sessions_fork_e2e.py -v
 """
 
 from __future__ import annotations
 
+import uuid
 from typing import Any
 
 import httpx
+import pytest
 
 from tests.e2e.conftest import (
+    configure_mock_llm,
     create_runner_bound_session,
     poll_session_until_terminal,
+    register_inline_agent,
+    reset_mock_llm,
     send_user_message_to_session,
 )
 
@@ -113,6 +118,30 @@ def _first_assistant_response_id(client: httpx.Client, session_id: str) -> str:
     raise AssertionError(f"no assistant message found in session {session_id!r}")
 
 
+def _register_mock_fork_agent(
+    client: httpx.Client,
+    mock_llm_server_url: str,
+    *,
+    prefix: str,
+) -> tuple[str, str]:
+    """Register an inline agent for mock-mode fork tests.
+
+    :returns: ``(agent_name, model)`` — the model doubles as the
+        keyed-queue key on the mock LLM server.
+    """
+    model = f"mock-fork-{prefix}-{uuid.uuid4().hex[:6]}"
+    agent_name = register_inline_agent(
+        client,
+        name=f"fork-{prefix}-{uuid.uuid4().hex[:6]}",
+        harness="openai-agents",
+        model=model,
+        profile="",
+        prompt="You are a terse assistant. When asked to recall, repeat codewords exactly.",
+        mock_llm_base_url=f"{mock_llm_server_url}/v1",
+    )
+    return agent_name, model
+
+
 def _seed_two_codeword_turns(
     client: httpx.Client,
     *,
@@ -173,8 +202,8 @@ def _fork_session(
 
 def test_full_fork_replays_whole_history(
     http_client: httpx.Client,
-    coder_agent: str,
     live_runner_id: str,
+    mock_llm_server_url: str,
 ) -> None:
     """
     A full fork (no truncation) carries BOTH turns into the clone's
@@ -188,8 +217,21 @@ def test_full_fork_replays_whole_history(
       first turn (e.g. history-prompt building skips pre-fork items) →
       the agent can't produce the codewords (second assertion).
     """
+    reset_mock_llm(mock_llm_server_url)
+    agent_name, model = _register_mock_fork_agent(http_client, mock_llm_server_url, prefix="full")
+    # Two seed turns ("OK" each), then a post-fork recall turn.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"text": "OK"},
+            {"text": "OK"},
+            {"text": f"Your projects are {_CODEWORD_1} and {_CODEWORD_2}."},
+        ],
+        key=model,
+    )
+
     source_id = _seed_two_codeword_turns(
-        http_client, agent_name=coder_agent, runner_id=live_runner_id
+        http_client, agent_name=agent_name, runner_id=live_runner_id
     )
 
     fork = _fork_session(http_client, source_id, runner_id=live_runner_id)
@@ -223,8 +265,8 @@ def test_full_fork_replays_whole_history(
 
 def test_fork_from_middle_truncates_context(
     http_client: httpx.Client,
-    coder_agent: str,
     live_runner_id: str,
+    mock_llm_server_url: str,
 ) -> None:
     """
     Forking at the FIRST assistant response drops the second turn.
@@ -244,8 +286,22 @@ def test_fork_from_middle_truncates_context(
       produce codeword 2 (it is NOT in the truncated context, so a
       correct fork cannot emit that exact token pair).
     """
+    reset_mock_llm(mock_llm_server_url)
+    agent_name, model = _register_mock_fork_agent(http_client, mock_llm_server_url, prefix="mid")
+    # Two seed turns ("OK" each), then a post-fork recall turn
+    # that only mentions codeword 1 (codeword 2 was truncated).
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"text": "OK"},
+            {"text": "OK"},
+            {"text": f"Your project is {_CODEWORD_1}."},
+        ],
+        key=model,
+    )
+
     source_id = _seed_two_codeword_turns(
-        http_client, agent_name=coder_agent, runner_id=live_runner_id
+        http_client, agent_name=agent_name, runner_id=live_runner_id
     )
     first_response_id = _first_assistant_response_id(http_client, source_id)
 
@@ -311,6 +367,7 @@ def test_fork_with_agent_switch_carries_history(
     http_client: httpx.Client,
     claude_coder_agent: str,
     live_runner_id: str,
+    using_mock_llm: bool,
 ) -> None:
     """
     Forking with ``agent_id`` binds the TARGET agent and keeps history.
@@ -327,6 +384,12 @@ def test_fork_with_agent_switch_carries_history(
     - The switch path drops the copied items → the codeword is missing
       from the fork's items / the agent can't recall it.
     """
+    if using_mock_llm:
+        pytest.skip(
+            "fork-with-agent-switch requires a built-in claude-sdk agent "
+            "as target; the mock LLM cannot drive the claude-sdk harness"
+        )
+
     source_id = create_runner_bound_session(
         http_client, agent_name=claude_coder_agent, runner_id=live_runner_id
     )

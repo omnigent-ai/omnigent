@@ -1591,6 +1591,7 @@ class TestStreamEventStreaming(unittest.TestCase):
             class ClaudeSDKClient:
                 def __init__(self, options):
                     captured_options["allowed_tools"] = getattr(options, "allowed_tools", None)
+                    captured_options["system_prompt"] = getattr(options, "system_prompt", None)
 
                 async def connect(self):
                     return None
@@ -1626,10 +1627,14 @@ class TestStreamEventStreaming(unittest.TestCase):
                                 },
                             }
                         ],
-                        "",
+                        "Delegate through `sys_session_send`.",
                     )
                 ]
             self.assertIn("mcp__omnigent__sys_session_send", captured_options["allowed_tools"])
+            self.assertIn(
+                "use `mcp__omnigent__sys_session_send` when instructions say `sys_session_send`",
+                captured_options["system_prompt"],
+            )
             self.assertIsInstance(events[-1], TurnComplete)
 
         _run(_t())
