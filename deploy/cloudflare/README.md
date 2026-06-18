@@ -13,11 +13,9 @@ URL (or your domain), and the container sleeps when idle.
 > [!NOTE]
 > This path uses a small SQLAlchemy dialect shim (`sitecustomize.py`) because
 > Cloudflare D1 isn't yet first-class in Omnigent. It works end to end — it's how
-> this directory was validated — and the normal on-boot migrations run unmodified
-> (no schema-bootstrap step). See [What's still rough](#whats-still-rough) for the
-> one upstream change that would remove the shim. The R2 artifact store, by
-> contrast, already uses a first-class backend (`S3ArtifactStore`) added alongside
-> this directory.
+> this directory was validated — and the normal on-boot migrations run unmodified.
+> The R2 artifact store, by contrast, already uses a first-class backend
+> (`S3ArtifactStore`) added alongside this directory.
 
 ## How it works
 
@@ -63,8 +61,7 @@ browser ───────────────►  Worker (src/index.js)
 
 ## Prerequisites
 
-- A Cloudflare account on the **Workers Paid** plan (~$5/mo) — Containers
-  require it.
+- A Cloudflare account on the **Workers Paid** plan — Containers require it.
 - **Docker** running locally (`wrangler deploy` builds the image).
 - **Node** (for `wrangler`).
 - `wrangler login` (or a `CLOUDFLARE_API_TOKEN`).
@@ -171,42 +168,3 @@ note your data, force a fresh container (`npx wrangler deploy` again, or let it
 idle to sleep), and confirm it's still there — agents still load, sessions still
 exist. The database lives in D1 and the artifacts in R2; the container holds
 nothing durable.
-
-## What's still rough
-
-This deployment leans on one D1-specific workaround:
-
-**The D1 dialect shim** (`sitecustomize.py`). The third-party
-`sqlalchemy-cloudflare-d1` dialect subclasses the generic `DefaultDialect` and
-hand-reimplements SQLite's SQL compilation and reflection incompletely. The shim
-re-registers `cloudflare_d1` as a proper `SQLiteDialect` subclass — keeping only
-the HTTP transport and D1 type processors — so DDL and reflection come from
-SQLite and the **normal on-boot Alembic migrations run unmodified** (no
-schema-bootstrap step). Upstream, the same wins come from fixing the dialect's
-compilation and reflection directly — the composite-primary-key half is filed as
-[CollierKing/sqlalchemy-cloudflare-d1#26](https://github.com/CollierKing/sqlalchemy-cloudflare-d1/pull/26);
-with the dialect's reflection also complete, this shim would drop to a few lines
-(an Alembic impl registration plus the "D1 has no `temp` schema" overrides).
-
-The R2 artifact store has **no** such workaround — it uses the native
-`S3ArtifactStore` backend (selected by `OMNIGENT_ARTIFACT_URI`), so the same
-backend works for AWS S3, MinIO, etc. too.
-
-Known runtime limitations:
-
-- **Single replica only.** `max_instances: 1` — the runner registry is
-  in-memory. Don't raise it.
-- **Cold starts.** At `instances: 0` the container sleeps and the next request
-  pays a boot cold start (~10s on `basic`). Bump `instance_type` to `standard`
-  for more vCPU if that matters.
-- **Image requirement.** The S3 artifact backend ships in the
-  `deploy/docker/entrypoint.py` change alongside this directory; the published
-  `omnigent-server` image must include it (build from this branch until it's
-  released).
-
-## Cost
-
-Workers Paid is ~$5/mo and includes a container allowance that a small,
-mostly-idle server fits inside. D1 and R2 both have free tiers comfortably
-above what a single server uses. Past the allowance, containers bill per second
-of actual run time — so scale-to-zero keeps an idle deployment cheap.
