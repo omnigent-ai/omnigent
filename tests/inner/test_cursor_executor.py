@@ -82,6 +82,9 @@ def _install_fake_sdk(
             for iu in self._script.get("interaction_updates", []):
                 yield SimpleNamespace(sdk_message=None, interaction_update=iu)
 
+        async def cancel(self) -> None:
+            pass  # no-op for tests
+
         async def wait(self) -> Any:
             return SimpleNamespace(
                 status=self._script.get("status", "finished"),
@@ -262,7 +265,7 @@ def test_sdk_message_to_events_unwraps_envelope_on_completion_and_error() -> Non
     done = _sdk_message_to_events(_envelope("completed", [{"type": "text", "text": "ok"}]))
     assert isinstance(done[0], ToolCallComplete)
     assert done[0].name == "sys_session_send"  # unwrapped, not "mcp"
-    assert done[0].metadata == {"call_id": "c1"}
+    assert done[0].metadata == {"call_id": "c1", "is_bridged": True}
 
     err = _sdk_message_to_events(_envelope("error", "boom"))
     assert isinstance(err[0], ToolCallComplete)
@@ -861,3 +864,180 @@ def test_normalize_cursor_usage_zero_tokens_preserved() -> None:
     assert result["input_tokens"] == 0
     assert result["output_tokens"] == 0
     assert result["total_tokens"] == 0
+
+
+# ---------------------------------------------------------------------------
+# PHASE_TOOL_CALL policy for native tools
+# ---------------------------------------------------------------------------
+
+
+def test_sdk_message_to_events_marks_native_tool_not_bridged() -> None:
+    """A plain (non-MCP-wrapped) tool call has ``is_bridged=False`` in metadata."""
+    events = _sdk_message_to_events(_tool("bash", "t1", "running", args={"cmd": "ls"}))
+    assert len(events) == 1
+    assert isinstance(events[0], ToolCallRequest)
+    assert events[0].metadata["is_bridged"] is False
+
+    # Completed status too.
+    done = _sdk_message_to_events(
+        _tool("bash", "t1", "completed", args={"cmd": "ls"}, result="ok")
+    )
+    assert isinstance(done[0], ToolCallComplete)
+    assert done[0].metadata["is_bridged"] is False
+
+
+def test_sdk_message_to_events_marks_mcp_tool_bridged() -> None:
+    """An MCP-wrapped tool call has ``is_bridged=True`` in metadata."""
+    envelope = SimpleNamespace(
+        type="tool_call",
+        name="mcp",
+        call_id="c1",
+        status="running",
+        args={
+            "providerIdentifier": "custom-user-tools",
+            "toolName": "sys_session_send",
+            "args": {"session": "s1"},
+        },
+        result=None,
+    )
+    events = _sdk_message_to_events(envelope)
+    assert isinstance(events[0], ToolCallRequest)
+    assert events[0].metadata["is_bridged"] is True
+
+    # Completed too.
+    envelope_done = SimpleNamespace(
+        type="tool_call",
+        name="mcp",
+        call_id="c1",
+        status="completed",
+        args={
+            "providerIdentifier": "custom-user-tools",
+            "toolName": "sys_session_send",
+            "args": {"session": "s1"},
+        },
+        result="ok",
+    )
+    done = _sdk_message_to_events(envelope_done)
+    assert isinstance(done[0], ToolCallComplete)
+    assert done[0].metadata["is_bridged"] is True
+
+
+async def test_run_turn_native_tool_denied_by_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A native tool call triggers PHASE_TOOL_CALL. On DENY the run emits
+    ToolCallRequest then ExecutorError and the turn ends."""
+    script = {
+        "messages": [
+            _assistant("Let me run that."),
+            _tool("bash", "t1", "running", args={"cmd": "rm -rf /"}),
+        ],
+        "status": "finished",
+        "result": "",
+    }
+    _install_fake_sdk(monkeypatch, [script])
+    executor = CursorExecutor(api_key="crsr_x")
+    executor._policy_evaluator = _policy("PHASE_TOOL_CALL")
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    # The ToolCallRequest is emitted so observers see what was attempted.
+    reqs = [e for e in events if isinstance(e, ToolCallRequest)]
+    assert len(reqs) == 1
+    assert reqs[0].name == "bash"
+
+    # Then an ExecutorError with the denial reason.
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert len(errors) == 1
+    assert "denied by policy" in errors[0].message
+    assert "bash" in errors[0].message
+
+    # ToolCallRequest appears before ExecutorError, and nothing follows the error.
+    req_idx = next(i for i, e in enumerate(events) if isinstance(e, ToolCallRequest))
+    err_idx = next(i for i, e in enumerate(events) if isinstance(e, ExecutorError))
+    assert req_idx < err_idx
+    assert err_idx == len(events) - 1  # error is the last event
+
+    # No TurnComplete — the turn was aborted.
+    assert not any(isinstance(e, TurnComplete) for e in events)
+
+
+async def test_run_turn_bridged_tool_skips_tool_call_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bridged (MCP-wrapped) tool does NOT trigger PHASE_TOOL_CALL — it's
+    already gated server-side via the dispatch bridge."""
+    # Build an MCP-envelope tool call (bridged).
+    mcp_running = SimpleNamespace(
+        type="tool_call",
+        name="mcp",
+        call_id="c1",
+        status="running",
+        args={
+            "providerIdentifier": "custom-user-tools",
+            "toolName": "sys_session_send",
+            "args": {"session": "s1", "message": "go"},
+        },
+        result=None,
+    )
+    mcp_done = SimpleNamespace(
+        type="tool_call",
+        name="mcp",
+        call_id="c1",
+        status="completed",
+        args={
+            "providerIdentifier": "custom-user-tools",
+            "toolName": "sys_session_send",
+            "args": {"session": "s1", "message": "go"},
+        },
+        result="ok",
+    )
+    script = {
+        "messages": [_assistant("Dispatching."), mcp_running, mcp_done, _assistant("Done.")],
+        "status": "finished",
+        "result": "Done.",
+    }
+    _install_fake_sdk(monkeypatch, [script])
+
+    # Wire a policy that denies PHASE_TOOL_CALL — if it fires, the turn would abort.
+    executor = CursorExecutor(api_key="crsr_x")
+    executor._policy_evaluator = _policy("PHASE_TOOL_CALL")
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    # Verify the bridged tool call was actually observed (not silently dropped).
+    reqs = [e for e in events if isinstance(e, ToolCallRequest)]
+    assert len(reqs) == 1 and reqs[0].name == "sys_session_send"
+
+    # The turn completes normally — the bridged tool was NOT policy-gated here.
+    assert any(isinstance(e, TurnComplete) for e in events)
+    assert not any(isinstance(e, ExecutorError) for e in events)
+
+
+async def test_run_turn_native_tool_allowed_by_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When PHASE_TOOL_CALL returns ALLOW, the turn proceeds normally."""
+    script = {
+        "messages": [
+            _assistant("Running."),
+            _tool("bash", "t1", "running", args={"cmd": "echo hi"}),
+            _tool("bash", "t1", "completed", result="hi"),
+            _assistant("Done."),
+        ],
+        "status": "finished",
+        "result": "Done.",
+    }
+    _install_fake_sdk(monkeypatch, [script])
+    executor = CursorExecutor(api_key="crsr_x")
+    executor._policy_evaluator = _policy(None)  # never denies
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    assert any(isinstance(e, TurnComplete) for e in events)
+    assert not any(isinstance(e, ExecutorError) for e in events)
+    # The tool call went through.
+    reqs = [e for e in events if isinstance(e, ToolCallRequest)]
+    assert len(reqs) == 1 and reqs[0].name == "bash"

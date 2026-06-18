@@ -61,11 +61,11 @@ jobs:
           # workflow RUN with conclusion=action_required and NO check-run, so the
           # poll below never sees it and spins the full ~6 min before failing
           # open. Detect the held state and proceed now (same fail-open outcome);
-          # the gate re-runs on the next push or e2e-approved label event.
+          # the gate re-runs on the next push or maintainer approval event.
           held=$(gh api "repos/$REPO/actions/runs?head_sha=$HEAD_SHA&event=pull_request" \
             --jq '[.workflow_runs[] | select(.name=="Security Scan")] | sort_by(.created_at) | last | .conclusion' 2>/dev/null || echo "")
           if [ "$held" = "action_required" ]; then
-            echo "::warning::Security Scan is awaiting maintainer approval (action_required); proceeding (fail-open). It will re-gate on the next push or the e2e-approved label event."
+            echo "::warning::Security Scan is awaiting maintainer approval (action_required); proceeding (fail-open). It will re-gate on the next push or maintainer approval event."
             exit 0
           fi
           q='[.check_runs[] | select(.name=="Security Scan")] | sort_by(.started_at) | last'

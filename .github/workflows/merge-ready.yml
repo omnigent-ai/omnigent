@@ -108,6 +108,7 @@ jobs:
       - name: Check out scripts
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
+          ref: main             # trusted gate scripts; never the PR head
           sparse-checkout: .github/scripts/merge-ready
           persist-credentials: false
 
@@ -180,13 +181,22 @@ jobs:
           echo "pr=$PR"   >> "$GITHUB_OUTPUT"
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
-      - name: Read PR labels
+      - name: Load maintainers
+        id: maintainers
+        if: steps.ctx.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: bash .github/scripts/merge-ready/load-maintainers.sh
+
+      - name: Read PR labels and fork approval state
         id: labels
         if: steps.ctx.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR: ${{ steps.ctx.outputs.pr }}
+          MAINTAINERS: ${{ steps.maintainers.outputs.list }}
         run: |
           INFO=$(gh pr view "$PR" --repo "$REPO" --json labels,isCrossRepository)
           NAMES=$(echo "$INFO" | jq -r '.labels[].name')
@@ -195,15 +205,38 @@ jobs:
           else
             echo "automerge=false" >> "$GITHUB_OUTPUT"
           fi
-          # A fork PR without the maintainer-only `e2e-approved` label never
-          # runs e2e (the fork pull_request run is an empty matrix), so the gate
-          # message nudges a maintainer to apply it. Same-repo PRs run e2e with
-          # secrets directly and need no label.
-          if [[ "$(echo "$INFO" | jq -r '.isCrossRepository')" == "true" ]] \
-             && ! echo "$NAMES" | grep -qx "e2e-approved"; then
-            echo "fork_needs_e2e_label=true" >> "$GITHUB_OUTPUT"
+          # A fork PR without a maintainer's approving review or the
+          # `e2e-approved` label never runs e2e (the fork pull_request run is
+          # an empty matrix), so the gate blocks until one of these is present.
+          # Same-repo PRs run e2e with secrets directly and need no gate.
+          IS_FORK=$(echo "$INFO" | jq -r '.isCrossRepository')
+          echo "is_fork=$IS_FORK" >> "$GITHUB_OUTPUT"
+          if [[ "$IS_FORK" == "true" ]]; then
+            # Check path 1: maintainer approval via PR review.
+            MAINTAINERS_LC=$(echo "${MAINTAINERS:-}" | tr '[:upper:]' '[:lower:]')
+            APPROVERS=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
+              --jq '[.[] | select(.state != "COMMENTED")] | group_by(.user.login) | map(max_by(.submitted_at)) | .[] | select(.state == "APPROVED") | .user.login')
+            HAS_GATE=false
+            for u in $APPROVERS; do
+              u_lc=$(echo "$u" | tr '[:upper:]' '[:lower:]')
+              for m in $MAINTAINERS_LC; do
+                if [[ "$m" == "$u_lc" ]]; then
+                  HAS_GATE=true
+                  break 2
+                fi
+              done
+            done
+            # Check path 2: e2e-approved label.
+            if [[ "$HAS_GATE" == "false" ]] && echo "$NAMES" | grep -qx "e2e-approved"; then
+              HAS_GATE=true
+            fi
+            if [[ "$HAS_GATE" == "false" ]]; then
+              echo "fork_needs_e2e_approval=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "fork_needs_e2e_approval=false" >> "$GITHUB_OUTPUT"
+            fi
           else
-            echo "fork_needs_e2e_label=false" >> "$GITHUB_OUTPUT"
+            echo "fork_needs_e2e_approval=false" >> "$GITHUB_OUTPUT"
           fi
 
       # post_red gates posting a red status: /merge needs it, automerge opts
@@ -233,6 +266,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           SHA: ${{ steps.ctx.outputs.sha }}
+          IS_FORK: ${{ steps.labels.outputs.is_fork }}
         run: bash .github/scripts/merge-ready/evaluate-checks.sh
 
       - name: Compute gate outcome
@@ -243,7 +277,7 @@ jobs:
         env:
           EVAL: ${{ steps.eval.outcome }}
           FAILED: ${{ steps.eval.outputs.failed }}
-          FORK_NEEDS_E2E_LABEL: ${{ steps.labels.outputs.fork_needs_e2e_label }}
+          FORK_NEEDS_E2E_APPROVAL: ${{ steps.labels.outputs.fork_needs_e2e_approval }}
         run: bash .github/scripts/merge-ready/compute-gate.sh
 
       # Skipped when post_red is false AND gate is red: leaves prior

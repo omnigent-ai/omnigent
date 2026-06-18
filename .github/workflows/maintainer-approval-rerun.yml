@@ -20,8 +20,10 @@ concurrency:
 
 jobs:
   record:
-    # Only approvals can flip the check green; skip everything else.
-    if: github.event.review.state == 'approved'
+    # Approvals flip the check green; dismissals and changes-requested flip
+    # it red and revoke the fork-e2e mirror. Skip COMMENTED reviews (they
+    # don't change review state).
+    if: github.event.review.state != 'commented'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
