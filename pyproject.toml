@@ -101,6 +101,10 @@ openai-agents = []
 all = ["databricks-sdk>=0.56.0,<1"]
 # From omnigent.
 bedrock = ["boto3>=1.30,<2", "botocore>=1.30,<2"]
+# S3-compatible artifact store (AWS S3, Cloudflare R2, MinIO, …). Selected
+# with ``OMNIGENT_ARTIFACT_URI=s3://bucket/prefix``; the store imports boto3
+# lazily, so only users of this backend need the extra.
+s3 = ["boto3>=1.30,<2", "botocore>=1.30,<2"]
 vertex = ["google-auth>=2.0,<3"]
 # Modal sandbox launcher (`omnigent sandbox --provider modal`). The
 # launcher module ships in the base package and imports the SDK lazily,
@@ -202,6 +206,13 @@ dev = [
     # gitwildmatch glob matching for repo tooling manifests. Declared
     # explicitly rather than relied on transitively (via mypy).
     "pathspec>=0.12",
+    # Cloud-service mocks for the artifact-store / Cloudflare integration
+    # tests: moto is the standard S3-compatible mock (used for R2), respx is
+    # the standard HTTPX mock (used to back the Cloudflare D1 REST API with an
+    # in-memory SQLite), and boto3 backs the S3 artifact store under test.
+    "moto[s3]>=5,<6",
+    "respx>=0.21,<1",
+    "boto3>=1.30,<2",
 ]
 
 [project.scripts]

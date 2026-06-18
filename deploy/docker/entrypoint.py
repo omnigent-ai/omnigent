@@ -66,6 +66,10 @@ class _ResolvedConfig:
     cfg: dict[str, Any]
     database_url: str
     artifact_dir: Path
+    # When set (an ``s3://bucket[/prefix]`` URI), the artifact store is remote
+    # (S3/R2) and ``artifact_dir`` is only a local scratch dir (cookie secret,
+    # on-disk cache). ``None`` -> the local filesystem store at ``artifact_dir``.
+    artifact_store_uri: str | None
     host: str
     port: int
 
@@ -146,12 +150,22 @@ def _resolve_config() -> _ResolvedConfig:
     port = int(cfg.get("port") or os.environ.get("PORT") or _DEFAULT_PORT)
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
+    # Optional remote artifact store (S3 / Cloudflare R2 / MinIO / …). When set,
+    # the artifact STORE is remote and durable; artifact_dir stays local for the
+    # cookie secret and on-disk cache. Mirrors how DATABASE_URL selects the DB.
+    artifact_store_uri = cfg.get("artifact_store_uri") or os.environ.get("OMNIGENT_ARTIFACT_URI")
+    if artifact_store_uri and not artifact_store_uri.startswith("s3://"):
+        raise RuntimeError(
+            "OMNIGENT_ARTIFACT_URI (or `artifact_store_uri:` in config) must be an "
+            f"'s3://bucket[/prefix]' URI, got: {artifact_store_uri!r}"
+        )
+
     logger.info(
         "Config: HOST=%s PORT=%d DB=%s ARTIFACTS=%s",
         host,
         port,
         database_url.split("@", 1)[-1] if "@" in database_url else database_url,
-        artifact_dir,
+        artifact_store_uri or artifact_dir,
     )
 
     # Containerized / remote deploys default to authenticated auth.
@@ -209,6 +223,7 @@ def _resolve_config() -> _ResolvedConfig:
         cfg=cfg,
         database_url=database_url,
         artifact_dir=artifact_dir,
+        artifact_store_uri=artifact_store_uri,
         host=host,
         port=port,
     )
@@ -238,6 +253,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     from omnigent.runtime.caps import RuntimeCaps
     from omnigent.server.managed_hosts import parse_sandbox_config
     from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+    from omnigent.stores.artifact_store import ArtifactStore
     from omnigent.stores.artifact_store.local import LocalArtifactStore
     from omnigent.stores.comment_store.sqlalchemy_store import (
         SqlAlchemyCommentStore,
@@ -263,7 +279,14 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     # typo should not surface as a runtime 502 on the first managed
     # session); the startup catch-all below logs it.
     sandbox_config = parse_sandbox_config(cfg.get("sandbox"))
-    artifact_store = LocalArtifactStore(str(artifact_dir))
+    if resolved_config.artifact_store_uri:
+        # Remote, durable artifact store (S3/R2/MinIO/…) — survives an
+        # ephemeral or multi-replica deploy. artifact_dir stays local for cache.
+        from omnigent.stores.artifact_store.s3 import S3ArtifactStore
+
+        artifact_store: ArtifactStore = S3ArtifactStore(resolved_config.artifact_store_uri)
+    else:
+        artifact_store = LocalArtifactStore(str(artifact_dir))
 
     agent_cache = AgentCache(
         artifact_store=artifact_store,
