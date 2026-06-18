@@ -1547,6 +1547,11 @@ class _ChildParentMeta:
     :param last_error: Last child failure detail fanned out, used to emit a
         new parent update when only the error changes, and to clear stale
         errors on a later running/waiting edge.
+    :param claude_profile: The Claude Code account profile this child was
+        assigned by the fan-out pool (issue #692), or ``None`` when fan-out
+        is off. Surfaced in the live ``session.child_session.updated`` event
+        so the operator can see which budget each in-flight sub-agent
+        consumes. ``None`` for a reused/continued child (no fresh spawn).
     """
 
     parent_id: str
@@ -1556,6 +1561,7 @@ class _ChildParentMeta:
     last_busy: bool | None = None
     last_task_status: str | None = None
     last_error: tuple[str, str] | None = None
+    claude_profile: str | None = None
 
 
 # child_session_id -> :class:`_ChildParentMeta`. Populated at spawn (see
@@ -1570,6 +1576,7 @@ def register_child_session(
     title: str,
     tool: str,
     session_name: str,
+    claude_profile: str | None = None,
 ) -> None:
     """
     Record a child→parent mapping for SSE status/preview fan-out.
@@ -1580,12 +1587,16 @@ def register_child_session(
     :param title: Child title, ``"{tool}:{session_name}"``.
     :param tool: Sub-agent type, e.g. ``"researcher"``.
     :param session_name: Sub-agent instance name, e.g. ``"auth"``.
+    :param claude_profile: The fan-out-assigned profile name (issue #692),
+        or ``None`` when fan-out is off / this is a reused child. Threaded
+        onto the meta for live-event telemetry.
     """
     _child_session_parents[child_session_id] = _ChildParentMeta(
         parent_id=parent_session_id,
         title=title,
         tool=tool,
         session_name=session_name,
+        claude_profile=claude_profile,
     )
 
 
@@ -2040,6 +2051,11 @@ def create_runner_app(
             "busy": busy,
             "current_task_status": _session_status_to_task_status(status),
         }
+        # Surface the fan-out-assigned profile (issue #692) so the operator
+        # can see which budget each in-flight sub-agent consumes. Omitted
+        # when fan-out is off / this is a reused child (no fresh spawn).
+        if meta.claude_profile is not None:
+            child["claude_profile"] = meta.claude_profile
         if include_error:
             child["last_task_error"] = error
         return child
@@ -3300,6 +3316,13 @@ def create_runner_app(
         _session_sub_agent_names.pop(session_id, None)
         unregister_child_session(session_id)
         unregister_subagent_work_for_session(session_id)
+        # Drop the per-parent round-robin claude-profile fan-out index so the
+        # module-global map cannot outlive the session tree (issue #692).
+        from omnigent.runner.tool_dispatch import (
+            unregister_fanout_rr_index_for_session,
+        )
+
+        unregister_fanout_rr_index_for_session(session_id)
         if filesystem_registry is not None:
             filesystem_registry.unregister_conversation(session_id)
         for _task, evt in _session_async_tasks.pop(session_id, {}).values():

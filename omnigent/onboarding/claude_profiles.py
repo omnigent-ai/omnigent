@@ -24,6 +24,12 @@ injects as ``CLAUDE_CONFIG_DIR`` on the spawned CLI subprocess):
         - name: personal
           display: "Personal"
           config_dir: ~/.omnigent/claude-profiles/personal
+      # Optional: profiles the runner fans sub-agent work across
+      # concurrently (issue #692). Each sub-agent spawn is assigned
+      # one profile round-robin from this list, so N sub-agents run
+      # across N budgets in parallel instead of all on active_default.
+      # Names must match a profile above; unknown names are dropped.
+      fanout_pool: [work, personal]
 
 Modeled on the dedicated ``cursor:`` / ``antigravity:`` config blocks (see
 :mod:`omnigent.onboarding.cursor_auth`): a per-feature top-level block
@@ -61,6 +67,7 @@ _logger = logging.getLogger(__name__)
 CLAUDE_PROFILES_CONFIG_KEY = "claude_profiles"
 _PROFILES_FIELD = "profiles"
 _ACTIVE_DEFAULT_FIELD = "active_default"
+_FANOUT_POOL_FIELD = "fanout_pool"
 _NAME_FIELD = "name"
 _DISPLAY_FIELD = "display"
 _CONFIG_DIR_FIELD = "config_dir"
@@ -254,3 +261,42 @@ def claude_profiles_list(
         declared order. ``display`` falls back to ``name`` when unset.
     """
     return [{"name": p.name, "display": p.display or p.name} for p in load_claude_profiles(config)]
+
+
+def load_claude_fanout_pool(
+    config: dict[str, object] | None = None,
+) -> list[str]:
+    """Load the configured claude-profile fan-out pool (issue #692).
+
+    The ``fanout_pool:`` entry under the ``claude_profiles:`` block names the
+    profiles the runner fans sub-agent work across concurrently. When a parent
+    agent spawns a sub-agent, the runner assigns one profile from this pool
+    (round-robin per parent, see :mod:`omnigent.runner.tool_dispatch`) and
+    injects it as the child session's ``claude_profile``, so N sub-agents run
+    across N budgets in parallel instead of all on ``active_default``.
+
+    Names must resolve to a configured :class:`ClaudeProfile`; unknown names
+    are silently dropped (a partial pool is still useful, and a typo should
+    not break every spawn). Declared order is preserved so round-robin is
+    deterministic and testable.
+
+    :param config: A pre-loaded config mapping; ``None`` loads the global
+        config via :func:`load_config`.
+    :returns: The validated pool profile names in declared order. ``[]`` when
+        the block or ``fanout_pool:`` entry is absent, not a list, or lists
+        only unknown names — i.e. fan-out is simply disabled and sub-agents
+        keep today's behavior (all on ``active_default``).
+    """
+    cfg = load_config() if config is None else config
+    block = cfg.get(CLAUDE_PROFILES_CONFIG_KEY)
+    if not isinstance(block, dict):
+        return []
+    raw_pool = block.get(_FANOUT_POOL_FIELD)
+    if not isinstance(raw_pool, list):
+        return []
+    configured = {p.name for p in load_claude_profiles(cfg)}
+    pool: list[str] = []
+    for name in raw_pool:
+        if isinstance(name, str) and name and name in configured and name not in pool:
+            pool.append(name)
+    return pool

@@ -18,6 +18,7 @@ from omnigent.onboarding.claude_profiles import (
     active_default_claude_profile,
     claude_profile_by_name,
     claude_profiles_list,
+    load_claude_fanout_pool,
     load_claude_profiles,
     resolve_claude_profile_config_dir,
 )
@@ -27,11 +28,14 @@ def _config(
     *,
     profiles: list[dict[str, str]] | None = None,
     active_default: str | None = None,
+    fanout_pool: list[str] | None = None,
 ) -> dict[str, object]:
     """Build a ``claude_profiles`` config block inline."""
     block: dict[str, object] = {"profiles": profiles or []}
     if active_default is not None:
         block["active_default"] = active_default
+    if fanout_pool is not None:
+        block["fanout_pool"] = fanout_pool
     return {"claude_profiles": block}
 
 
@@ -258,3 +262,82 @@ def test_load_reads_global_config_respecting_config_home(
     assert [p.name for p in profiles] == ["work"]
     assert active_default_claude_profile() == "work"
     assert resolve_claude_profile_config_dir("work") == "/tmp/work"
+
+
+# ── load_claude_fanout_pool (issue #692) ─────────────────────────────
+
+
+def test_fanout_pool_returns_declared_order() -> None:
+    """Pool names load in declared order so round-robin is deterministic."""
+    cfg = _config(
+        profiles=[
+            {"name": "work", "config_dir": "/tmp/work"},
+            {"name": "personal", "config_dir": "/tmp/personal"},
+            {"name": "clientb", "config_dir": "/tmp/clientb"},
+        ],
+        fanout_pool=["work", "personal", "clientb"],
+    )
+    assert load_claude_fanout_pool(cfg) == ["work", "personal", "clientb"]
+
+
+def test_fanout_pool_drops_unknown_names() -> None:
+    """A name not backed by a configured profile is silently dropped
+    (a partial pool is still useful; a typo must not break every spawn)."""
+    cfg = _config(
+        profiles=[
+            {"name": "work", "config_dir": "/tmp/work"},
+            {"name": "personal", "config_dir": "/tmp/personal"},
+        ],
+        fanout_pool=["work", "ghost", "personal"],
+    )
+    assert load_claude_fanout_pool(cfg) == ["work", "personal"]
+
+
+def test_fanout_pool_dedupes_repeated_names() -> None:
+    """A repeated name appears once (round-robin must not double-assign)."""
+    cfg = _config(
+        profiles=[
+            {"name": "work", "config_dir": "/tmp/work"},
+            {"name": "personal", "config_dir": "/tmp/personal"},
+        ],
+        fanout_pool=["work", "work", "personal"],
+    )
+    assert load_claude_fanout_pool(cfg) == ["work", "personal"]
+
+
+def test_fanout_pool_empty_when_block_absent() -> None:
+    """No ``claude_profiles`` block → empty pool → fan-out disabled (today's behavior)."""
+    assert load_claude_fanout_pool({}) == []
+
+
+def test_fanout_pool_empty_when_field_absent() -> None:
+    """Block present but no ``fanout_pool:`` → empty pool (fan-out off)."""
+    cfg = _config(profiles=[{"name": "work", "config_dir": "/tmp/work"}])
+    assert load_claude_fanout_pool(cfg) == []
+
+
+def test_fanout_pool_empty_when_not_a_list() -> None:
+    """A malformed ``fanout_pool`` (e.g. a bare string) is ignored, not fatal."""
+    block: dict[str, object] = {
+        "profiles": [{"name": "work", "config_dir": "/tmp/work"}],
+        "fanout_pool": "work",  # not a list — ignored
+    }
+    assert load_claude_fanout_pool({"claude_profiles": block}) == []
+
+
+def test_fanout_pool_drops_non_string_entries() -> None:
+    """Non-string entries (numbers, nulls) are dropped; valid siblings survive."""
+    block: dict[str, object] = {
+        "profiles": [{"name": "work", "config_dir": "/tmp/work"}],
+        "fanout_pool": ["work", 123, None, ""],  # only "work" is a valid name
+    }
+    assert load_claude_fanout_pool({"claude_profiles": block}) == ["work"]
+
+
+def test_fanout_pool_empty_when_all_names_unknown() -> None:
+    """A pool of only unknown names → empty (fan-out disabled, not an error)."""
+    cfg = _config(
+        profiles=[{"name": "work", "config_dir": "/tmp/work"}],
+        fanout_pool=["ghost1", "ghost2"],
+    )
+    assert load_claude_fanout_pool(cfg) == []
