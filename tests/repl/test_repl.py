@@ -11,6 +11,7 @@ tab) or an unrelated tool result to skip.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from prompt_toolkit.document import Document
@@ -1623,6 +1624,145 @@ def test_build_startup_header_creds_line_includes_pi_surface(tmp_path, monkeypat
     # explicit pi-scoped Databricks default, not the subscription.
     assert header.credential is not None
     assert "Databricks" in header.credential
+
+
+# ── Antigravity: Gemini-native /model + startup-header readouts ──
+
+
+def test_model_readout_antigravity_names_gemini_not_openai(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``/model`` for an antigravity harness names the Gemini key, not OpenAI.
+
+    The regression this guards: ``harness_family("antigravity")`` is ``"openai"``,
+    so the readout used to resolve the OpenAI default provider and (a) show an
+    OpenAI credential on the Active line and (b) list OpenAI providers under
+    "Also configured" — for a Gemini-native agent that can never use them. Even
+    with an OpenAI provider configured as the default, the readout must name the
+    ``antigravity:`` block's Gemini key and list NO in-surface alternatives.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.setenv("MY_GEMINI", "AIza-test")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-oai")
+    config = {
+        "antigravity": {"api_key_ref": "env:MY_GEMINI"},
+        "providers": {
+            "openai": {
+                "kind": "key",
+                "default": True,
+                "openai": {"base_url": "https://api.openai.com/v1", "api_key": "$OPENAI_API_KEY"},
+            }
+        },
+    }
+    lines = _build_model_readout_lines(config, "antigravity", "gemini-2.0-flash")
+    joined = "\n".join(lines)
+    assert "Active:" in lines[0]
+    assert "gemini-2.0-flash" in lines[0]
+    assert "Antigravity" in lines[0]  # the Gemini-native credential is named
+    assert "env:MY_GEMINI" in lines[0]
+    # No OpenAI credential or "Also configured" provider alternatives leak in.
+    assert "OpenAI" not in joined
+    assert "Also configured" not in joined
+
+
+def test_model_readout_antigravity_dangling_ref_reads_unconfigured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``/model`` for antigravity reads NOT configured for a dangling key ref.
+
+    Mirrors what ``_build_antigravity_spawn_env`` actually threads: a dangling
+    ``env:MISSING`` ref (whose var is unset) resolves to no key, so the spawn
+    path runs with no credential. The readout must therefore show "no model
+    configured" rather than printing the dangling ref as an active credential —
+    otherwise it advertises a phantom credential the worker never receives.
+
+    An OpenAI provider is configured as the default precisely to pin the
+    regression: pre-fix, the antigravity readout resolved the family default
+    (``harness_family("antigravity") == "openai"``) and would report THAT
+    OpenAI credential as active for a Gemini-native, no-key agent. The fix
+    special-cases antigravity to its dedicated (dangling → unresolved) Gemini
+    ref, so the readout is honestly unconfigured.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-oai")
+    for var in ("GEMINI_API_KEY", "ANTIGRAVITY_API_KEY", "MISSING_GEMINI"):
+        monkeypatch.delenv(var, raising=False)
+    config = {
+        "antigravity": {"api_key_ref": "env:MISSING_GEMINI"},
+        "providers": {
+            "openai": {
+                "kind": "key",
+                "default": True,
+                "openai": {"base_url": "https://api.openai.com/v1", "api_key": "$OPENAI_API_KEY"},
+            }
+        },
+    }
+    lines = _build_model_readout_lines(config, "antigravity", None)
+    joined = "\n".join(lines)
+    assert "no model configured" in joined
+    # The dangling ref must NOT appear as an active credential source.
+    assert "env:MISSING_GEMINI" not in joined
+    # And crucially the OpenAI default must NOT be reported as the credential.
+    assert "OpenAI" not in joined
+
+
+def test_build_startup_header_antigravity_surface_resolves_gemini(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The multi-surface header resolves the antigravity surface to its Gemini key.
+
+    A claude-sdk brain with an antigravity sub-agent surfaces
+    ``["anthropic", "antigravity"]``. The antigravity segment must read its
+    dedicated Gemini credential ("Gemini → 🔑 Antigravity API Key"), NOT the
+    OpenAI provider default. A regression that resolved it via the plain
+    per-family lookup would render the OpenAI credential (or "openai") in the
+    Gemini segment.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("MY_GEMINI", "AIza-test")
+    for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    (tmp_path / "config.yaml").write_text(
+        "antigravity:\n"
+        "  api_key_ref: env:MY_GEMINI\n"
+        "providers:\n"
+        "  anth:\n"
+        "    kind: subscription\n"
+        "    cli: claude\n"
+        "    default: anthropic\n"
+    )
+    header = _build_startup_header("claude-sdk", "An agent.", ["anthropic", "antigravity"])
+    assert header.creds_line is not None
+    assert "Gemini → 🔑 Antigravity API Key" in header.creds_line
+    # The Gemini segment must not leak an OpenAI credential.
+    assert "OpenAI" not in header.creds_line
+    assert "Gemini → not configured" not in header.creds_line
+
+
+def test_build_startup_header_antigravity_surface_unconfigured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The antigravity header segment reads 'not configured' with no Gemini key.
+
+    The complement: with no Gemini credential (block ref dangling / absent and
+    no ambient var), the antigravity surface reads "Gemini → not configured"
+    rather than fabricating the OpenAI provider default.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "ANTIGRAVITY_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n  anth:\n    kind: subscription\n    cli: claude\n    default: anthropic\n"
+    )
+    header = _build_startup_header("claude-sdk", "An agent.", ["anthropic", "antigravity"])
+    assert header.creds_line is not None
+    assert "Gemini → not configured" in header.creds_line
 
 
 # ── Ctrl+O overlay: paginated conversation_items fetch ──────

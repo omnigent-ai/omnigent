@@ -392,18 +392,19 @@ _CLI_HARNESSES: dict[str, dict[str, str]] = {
 
 # Pure-Python harnesses (no CLI binary needed, but require a Python package).
 # Need API credentials (env var or Databricks profile).
+#
+# NB: ``antigravity`` is intentionally absent. The supervisor sub-step routes
+# every non-``_CLI_HARNESSES`` choice through ``_prompt_openai_agents_config``,
+# which hard-codes ``harness="openai-agents"`` — offering Antigravity here
+# would silently produce an openai-agents supervisor spec. Antigravity is also
+# Gemini-native (Gemini API key or Vertex AI, never an OpenAI gateway), so it
+# needs its own credential flow before it can be offered as a supervisor.
 _API_HARNESSES: dict[str, dict[str, str]] = {
     "openai-agents": {
         "display": "OpenAI Agents",
         "description": "OpenAI API or any OpenAI-compatible endpoint",
         "package": "agents",
         "install": "pip install openai-agents",
-    },
-    "antigravity": {
-        "display": "Antigravity (Gemini)",
-        "description": "Antigravity / Gemini API key, or an OpenAI-compatible gateway",
-        "package": "google.antigravity",
-        "install": "pip install google-antigravity",
     },
 }
 

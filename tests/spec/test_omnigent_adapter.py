@@ -2190,6 +2190,81 @@ def test_use_responses_absent_omits_key_from_executor_config() -> None:
     assert "use_responses" not in spec.executor.config
 
 
+def test_antigravity_vertex_config_propagates_to_executor_config() -> None:
+    """
+    ``executor.config`` vertex/project/location in an omnigent YAML land on
+    ``spec.executor.config`` after ``agent_def_to_agent_spec``.
+
+    Like ``use_responses``, none of these are fields on the inner
+    ``ExecutorSpec`` dataclass (``omnigent.inner.datamodel``), so the omnigent
+    YAML loader silently drops them. We must read them from the raw YAML dict
+    and carry them forward explicitly.
+
+    What breaks if this fails: ``_build_antigravity_spawn_env`` finds
+    ``config.get("vertex")`` falsy, so it never sets ``HARNESS_ANTIGRAVITY_VERTEX``
+    / ``_PROJECT`` / ``_LOCATION``. The documented Vertex config shape
+    (``executor.config.vertex/project/location``) then silently does nothing for
+    users who follow the docs — the harness falls back to ambient Gemini creds.
+    """
+    agent_def, raw_yaml = _build_agent_def_with_raw_yaml()
+    raw_yaml["executor"] = {
+        "model": "gemini-2.0-flash",
+        "harness": "antigravity",
+        "vertex": True,
+        "project": "my-gcp-project",
+        "location": "us-central1",
+    }
+    spec = agent_def_to_agent_spec(agent_def, raw_yaml=raw_yaml)
+    assert spec.executor.config.get("vertex") is True
+    assert spec.executor.config.get("project") == "my-gcp-project"
+    assert spec.executor.config.get("location") == "us-central1"
+
+
+def test_antigravity_vertex_config_reaches_spawn_env() -> None:
+    """
+    A carried-through Vertex ``executor.config`` produces the
+    ``HARNESS_ANTIGRAVITY_VERTEX`` / ``_PROJECT`` / ``_LOCATION`` spawn env.
+
+    End-to-end guard tying the adapter carry-through to the consumer: the keys
+    must not only survive translation but also reach
+    ``_build_antigravity_spawn_env``, which is what the docs promise.
+    """
+    from omnigent.runtime.workflow import _build_antigravity_spawn_env
+
+    agent_def, raw_yaml = _build_agent_def_with_raw_yaml()
+    raw_yaml["executor"] = {
+        "model": "gemini-2.0-flash",
+        "harness": "antigravity",
+        "vertex": True,
+        "project": "my-gcp-project",
+        "location": "us-central1",
+    }
+    spec = agent_def_to_agent_spec(agent_def, raw_yaml=raw_yaml)
+    env = _build_antigravity_spawn_env(spec)
+    assert env["HARNESS_ANTIGRAVITY_VERTEX"] == "1"
+    assert env["HARNESS_ANTIGRAVITY_PROJECT"] == "my-gcp-project"
+    assert env["HARNESS_ANTIGRAVITY_LOCATION"] == "us-central1"
+
+
+def test_antigravity_vertex_config_absent_omits_keys_from_executor_config() -> None:
+    """
+    When the omnigent YAML omits vertex/project/location, none of the keys
+    appear in ``spec.executor.config`` (a non-Vertex executor stays untouched).
+
+    ``_build_antigravity_spawn_env`` keys off ``config.get("vertex")``; a missing
+    key leaves the api-key / ambient path in force.
+    """
+    agent_def, raw_yaml = _build_agent_def_with_raw_yaml()
+    raw_yaml["executor"] = {
+        "model": "gemini-2.0-flash",
+        "harness": "antigravity",
+    }
+    spec = agent_def_to_agent_spec(agent_def, raw_yaml=raw_yaml)
+    assert "vertex" not in spec.executor.config
+    assert "project" not in spec.executor.config
+    assert "location" not in spec.executor.config
+
+
 def test_unknown_policy_type_rejected_with_clear_message() -> None:
     """
     A policy with an unrecognized ``type:`` value fails with an

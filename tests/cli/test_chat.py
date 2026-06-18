@@ -2827,6 +2827,48 @@ def test_spec_used_families_multi_vendor_directory_agent(tmp_path) -> None:
     assert _spec_used_families(root) == ["anthropic", "openai"]
 
 
+def test_spec_used_families_antigravity_is_own_surface_not_openai(tmp_path: Path) -> None:
+    """An antigravity sub-agent contributes a ``google``-native surface, not openai.
+
+    The regression this guards: ``harness_family("antigravity")`` is ``"openai"``
+    (a family-keyed lookup convenience), so the walk used to fold a Gemini-native
+    antigravity sub-agent into the ``openai`` surface. The multi-surface startup
+    header would then resolve that surface to the OpenAI provider default and
+    print an OpenAI credential for a Gemini-native worker. The walk must instead
+    contribute antigravity's own surface (``"antigravity"``), which
+    ``_build_startup_header`` special-cases to the dedicated Gemini credential.
+    """
+    root = tmp_path / "orchestrator"
+    (root / "agents" / "gemini_worker").mkdir(parents=True)
+    (root / "config.yaml").write_text(
+        "spec_version: 1\n"
+        "name: orchestrator\n"
+        "prompt: orchestrate\n"
+        "executor:\n"
+        "  type: omnigent\n"
+        "  config:\n"
+        "    harness: claude-sdk\n"
+        "tools:\n"
+        "  agents:\n"
+        "    - gemini_worker\n"
+    )
+    (root / "agents" / "gemini_worker" / "config.yaml").write_text(
+        "spec_version: 1\n"
+        "name: gemini_worker\n"
+        "prompt: work\n"
+        "executor:\n"
+        "  type: omnigent\n"
+        "  config:\n"
+        "    harness: antigravity\n"
+    )
+
+    families = _spec_used_families(root)
+    # The orchestrator's anthropic surface plus antigravity's OWN surface.
+    assert families == ["anthropic", "antigravity"]
+    # Crucially the Gemini-native worker is NOT folded into the openai surface.
+    assert "openai" not in families
+
+
 def test_spec_used_families_degrades_gracefully() -> None:
     """``_spec_used_families`` returns ``[]`` for the no-spec / standalone cases.
 

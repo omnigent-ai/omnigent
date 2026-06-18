@@ -54,6 +54,16 @@ ANTHROPIC_FAMILY = "anthropic"
 OPENAI_FAMILY = "openai"
 _VALID_FAMILIES = (ANTHROPIC_FAMILY, OPENAI_FAMILY)
 
+# Gemini family token for the Gemini-native antigravity harness. It is
+# deliberately NOT in :data:`_VALID_FAMILIES`: no ``providers:`` entry carries
+# a ``google:`` block (antigravity's key lives in the dedicated ``antigravity:``
+# block), so this is purely a same-family marker for the fork/switch model-carry
+# decision — keeping antigravity distinct from ``openai`` there so a cross-family
+# switch correctly resets the provider-bound model id. (Matches the ``"google"``
+# vendor token used elsewhere — see ``llms/context_window.py``,
+# ``configure_models`` labels — and ``harnessFamily`` in ``ap-web``.)
+GOOGLE_FAMILY = "google"
+
 # The pi harness's *default scope*. pi is not a model family — a provider
 # entry never carries a ``pi:`` block — but defaults are scoped per harness
 # surface, and pi consumes both families, so it gets its own scope name a
@@ -129,8 +139,15 @@ _HARNESS_FAMILY: dict[str, str] = {
     # normally maps it down via _provider_harness_name; accept both spellings
     # here so callers that pass the spec/CLI spelling directly resolve too.
     "openai-agents-sdk": OPENAI_FAMILY,
-    # Antigravity is Gemini-native but routes generic-provider traffic over
-    # the OpenAI-compatible wire, so it consumes the ``openai`` family.
+    # Antigravity is Gemini-native — a direct Gemini API key or Vertex AI,
+    # never an OpenAI gateway (the antigravity guard in
+    # ``configure_agent_harness_with_provider`` rejects generic providers for
+    # it). This ``openai`` entry exists ONLY so the shared family-keyed
+    # lookups (harness install-key resolution, the SDK-readiness set) find a
+    # value; NO gateway routing occurs. Credential-readout call sites
+    # (``describe_active_credential`` and the multi-surface startup header)
+    # special-case antigravity so they don't report an OpenAI credential for
+    # this Gemini-native harness.
     "antigravity": OPENAI_FAMILY,
 }
 
@@ -146,9 +163,10 @@ _EXECUTOR_TYPE_HARNESS_ALIASES: dict[str, str] = {
 def provider_family_for_harness(harness: str | None) -> str | None:
     """Return the provider family a harness consumes, or ``None``.
 
-    Maps a harness identifier to ``"anthropic"`` / ``"openai"``. Accepts both
-    the canonical ids keyed in :data:`_HARNESS_FAMILY` and the executor-type
-    spellings :attr:`AgentSpec.harness_kind` returns for SDK harnesses
+    Maps a harness identifier to ``"anthropic"`` / ``"openai"`` /
+    ``"google"`` (Gemini-native antigravity). Accepts both the canonical ids
+    keyed in :data:`_HARNESS_FAMILY` and the executor-type spellings
+    :attr:`AgentSpec.harness_kind` returns for SDK harnesses
     (``"claude_sdk"`` → ``"claude-sdk"``, ``"agents_sdk"`` →
     ``"openai-agents"``).
 
@@ -157,14 +175,23 @@ def provider_family_for_harness(harness: str | None) -> str | None:
     a fork into a native target can carry history (same-family only): a model
     id is provider-bound, so it only transfers within the same family.
 
+    Antigravity is reported as :data:`GOOGLE_FAMILY`, NOT ``openai`` (its
+    :data:`_HARNESS_FAMILY` entry, which exists only for family-keyed config
+    lookups): it is Gemini-native, so a switch to/from it crosses provider
+    families and the provider-bound model id must reset. This mirrors
+    ``harnessFamily`` in ``ap-web/src/lib/forkHarness.ts`` so the client-side
+    reset hint and the server-side carry decision agree.
+
     :param harness: A harness id, e.g. ``"claude-native"`` or
         ``"claude_sdk"``; ``None`` returns ``None``.
-    :returns: ``"anthropic"`` / ``"openai"``, else ``None`` when the harness
-        is unknown.
+    :returns: ``"anthropic"`` / ``"openai"`` / ``"google"``, else ``None``
+        when the harness is unknown.
     """
     if harness is None:
         return None
     canonical = canonicalize_harness(harness) or harness
+    if canonical == "antigravity":
+        return GOOGLE_FAMILY
     canonical = _EXECUTOR_TYPE_HARNESS_ALIASES.get(canonical, canonical)
     return harness_family(canonical)
 
@@ -1060,6 +1087,62 @@ def _source_descriptor(family: FamilyConfig) -> str:
     )
 
 
+def _describe_antigravity_credential(
+    config: dict[str, object],
+    model_override: str | None,
+) -> ResolvedCredential | None:
+    """Describe the Gemini credential for the antigravity harness readout.
+
+    Antigravity is Gemini-native, so its credential lives in the dedicated
+    ``antigravity:`` config block (``keychain:`` / ``env:`` reference) or an
+    ambient ``GEMINI_API_KEY`` / ``ANTIGRAVITY_API_KEY`` — never a
+    ``providers:`` family. Mirrors the key-resolution order of
+    ``_build_antigravity_spawn_env`` (excluding per-spec Vertex / global
+    ``auth:``, which the harness-level readout can't see). The reported
+    :attr:`~ResolvedCredential.kind` is ``"key"`` with no ``family`` /
+    ``base_url`` (the SDK has no OpenAI-compatible endpoint), and the model is
+    whatever the session pinned (no provider default to fall back on).
+
+    The configured reference is *resolved* before it is reported: a dangling
+    ``env:MISSING`` / keychain reference (whose secret no longer exists) reads
+    as not-configured, matching what ``_build_antigravity_spawn_env`` would
+    actually thread (it uses :func:`resolve_antigravity_api_key`, which omits an
+    unresolvable ref). Reporting an unresolved ref would overclaim an active
+    credential the spawn path silently drops.
+
+    :param config: The parsed config mapping (the ``antigravity:`` block).
+    :param model_override: The in-session ``/model`` override, or ``None``.
+    :returns: A :class:`ResolvedCredential` describing the Gemini key, or
+        ``None`` when no key is configured (or its reference is dangling) and
+        none is ambient.
+    """
+    from omnigent.onboarding.antigravity_auth import (
+        ANTIGRAVITY_ENV_VARS,
+        antigravity_api_key_ref,
+        resolve_antigravity_api_key,
+    )
+
+    # Resolve, don't just read: a configured-but-dangling ref must not be
+    # reported as active, since the spawn path would drop it (see docstring).
+    ref = antigravity_api_key_ref(config)
+    if ref is not None and resolve_antigravity_api_key(config) is None:
+        ref = None
+    if ref is None:
+        ambient = next((var for var in ANTIGRAVITY_ENV_VARS if os.environ.get(var)), None)
+        if ambient is None:
+            return None
+        ref = f"env:{ambient}"
+    return ResolvedCredential(
+        # Literal (== KEY_KIND) so it types as ProviderKind, not bare str.
+        provider_name="antigravity",
+        kind="key",
+        family=None,
+        model=model_override,
+        source=ref,
+        base_url=None,
+    )
+
+
 def describe_active_credential(
     config: dict[str, object],
     harness: str,
@@ -1085,6 +1168,13 @@ def describe_active_credential(
     :raises OmnigentError: If the resolved provider is malformed, or more
         than one default serves the family.
     """
+    if canonicalize_harness(harness) == "antigravity":
+        # Antigravity is Gemini-native: its credential is NOT a ``providers:``
+        # entry (its family-keyed default would be the OpenAI one, which it
+        # can never use). Describe the Gemini key from the dedicated
+        # ``antigravity:`` block / ambient env var, or Vertex AI, instead.
+        return _describe_antigravity_credential(config, model_override)
+
     provider = default_provider_for_harness(config, harness)
     if provider is None:
         return None

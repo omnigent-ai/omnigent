@@ -21,6 +21,10 @@ Enumeration is deterministic per provider kind:
   ``"openai-compatible"``).
 - ``subscription`` → a curated static list (source ``"static"``,
   ``verified: false`` — CLI logins expose no listing API).
+- a runnable-but-non-enumerable provider (a Gemini-native antigravity
+  worker holding a credential) → source ``"runnable"`` with an empty
+  list and a note saying the worker can run but its models cannot be
+  listed here.
 - anything unresolvable → source ``"none"`` with an explanatory note,
   which doubles as a dead-worker preflight signal.
 """
@@ -102,11 +106,15 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, str] = {
 }
 
 # Preferred inline family per single-family harness (pi consumes both).
+# NB: ``antigravity`` is intentionally absent — it is Gemini-native and never
+# reaches the generic-provider entry path (_resolve_model_provider_unsafe
+# routes it to _legacy_antigravity_provider), so a lookup here would mean a
+# routing bug. Leaving it out makes that bug fail loud (KeyError) rather than
+# silently advertise OpenAI-family models the worker can never run.
 _KEY_AUTH_FAMILY: dict[str, str] = {
     "claude-sdk": ANTHROPIC_FAMILY,
     "codex": OPENAI_FAMILY,
     "openai-agents-sdk": OPENAI_FAMILY,
-    "antigravity": OPENAI_FAMILY,
 }
 
 # Multi-family providers (pi): anthropic first, matching _apply_provider_to_pi.
@@ -135,7 +143,8 @@ class ModelListing:
     """A worker's enumerated model list plus its provenance.
 
     :param source: Where the list came from — ``"gateway"``,
-        ``"openai-compatible"``, ``"anthropic-api"``, ``"static"``, or
+        ``"openai-compatible"``, ``"anthropic-api"``, ``"static"``,
+        ``"runnable"`` (runnable worker with no enumerable listing), or
         ``"none"``.
     :param verified: ``True`` when the list was fetched live from the
         provider; ``False`` for static/curated or empty listings.
@@ -170,6 +179,14 @@ class ResolvedModelProvider:
     :param cli: ``"claude"`` / ``"codex"`` for ``kind="subscription"``.
     :param detail: Non-secret descriptor of how the provider resolved,
         e.g. ``"provider 'openrouter'"`` — used in listing notes.
+    :param runnable: Whether a dispatch to this worker can actually run,
+        even when its models cannot be enumerated. Only meaningful for
+        ``kind="none"``: ``True`` marks a configured-but-non-enumerable
+        provider (e.g. a Gemini-native antigravity worker with an api-key
+        / Vertex / ambient credential — runnable, but with no listing
+        endpoint), distinguishing it from a genuinely unusable worker
+        (``False`` — no credential resolved). Enumerable kinds leave it
+        ``False`` since their runnability is implied by a live listing.
     """
 
     kind: str
@@ -180,6 +197,7 @@ class ResolvedModelProvider:
     auth_command: str | None = None
     cli: str | None = None
     detail: str = ""
+    runnable: bool = False
 
 
 # Unfiltered listings keyed by provider identity. TTLCache is not thread-safe
@@ -319,6 +337,15 @@ def _resolve_model_provider_unsafe(spec: Any, harness: str | None) -> ResolvedMo
     fallthrough (see :func:`_provider_from_legacy_auth`) — the builders
     diverge in which legacy auth fields they actually consume.
 
+    Antigravity is the exception: it is Gemini-native and
+    :func:`~omnigent.runtime.workflow.configure_agent_harness_with_provider`
+    rejects it, so its spawn-env builder NEVER consumes a generic
+    ``providers:`` entry. Routing it through ``_resolve_provider_for_build``
+    (which would resolve a named/default provider into an
+    :data:`~omnigent.onboarding.provider_config.OPENAI_FAMILY` entry) would
+    advertise OpenAI-family/gateway models the worker can never run, so it
+    skips step 1 and mirrors ``_build_antigravity_spawn_env`` directly.
+
     :param spec: The worker's (sub-)agent spec.
     :param harness: The worker's harness id, e.g. ``"pi"``.
     :returns: A :class:`ResolvedModelProvider`.
@@ -333,6 +360,13 @@ def _resolve_model_provider_unsafe(spec: Any, harness: str | None) -> ResolvedMo
             kind=NONE_KIND,
             detail=f"harness {harness or 'unknown'!r} has no model-provider resolution",
         )
+
+    if harness_type == "antigravity":
+        # Gemini-native: the generic-provider path is precluded by the
+        # antigravity guard in configure_agent_harness_with_provider, so the
+        # spawn-env builder only ever resolves an api_key / Vertex / ambient
+        # key. Mirror that directly and never consult _resolve_provider_for_build.
+        return _legacy_antigravity_provider(spec)
 
     entry = _resolve_provider_for_build(spec, harness_type=harness_type)  # type: ignore[arg-type]  # AgentHarnessType narrowed by the map above
     if entry is not None:
@@ -356,13 +390,11 @@ def _provider_from_legacy_auth(spec: Any, harness_type: str) -> ResolvedModelPro
     """
     if harness_type == "claude-sdk":
         return _legacy_claude_sdk_provider(spec)
-    if harness_type in ("openai-agents-sdk", "antigravity"):
-        # Both resolve spec/global ``auth:`` api-key blocks via this branch.
-        # NB: the antigravity spawn-env builder (unlike openai-agents) ignores
-        # ``config["profile"]`` — it's Gemini-native with no Databricks/gateway
-        # path — so for a profile-only antigravity spec this readout can
-        # over-report; api-key (and Vertex) specs resolve correctly.
+    if harness_type == "openai-agents-sdk":
         return _legacy_openai_agents_provider(spec)
+    # NB: antigravity never reaches here — _resolve_model_provider_unsafe
+    # routes it to _legacy_antigravity_provider directly (it is Gemini-native
+    # and shares none of the gateway/Databricks legacy auth these branches read).
     return _legacy_profile_only_provider(spec, harness_type)
 
 
@@ -468,6 +500,86 @@ def _legacy_openai_agents_provider(spec: Any) -> ResolvedModelProvider:  # type:
     if prefix is not None:
         return prefix
     return ResolvedModelProvider(kind=NONE_KIND, detail="no model provider configured")
+
+
+def _legacy_antigravity_provider(spec: Any) -> ResolvedModelProvider:  # type: ignore[explicit-any]  # structural spec stubs in tests
+    """Mirror ``_build_antigravity_spawn_env``'s Gemini-native auth resolution.
+
+    Antigravity is Gemini-native: its spawn-env builder consumes ONLY a
+    direct API key — spec ``executor.auth`` api_key (``base_url`` dropped),
+    the ``antigravity:`` config block, the legacy global ``auth:`` api_key,
+    or an ambient ``GEMINI_API_KEY`` / ``ANTIGRAVITY_API_KEY`` — or opts into
+    Vertex AI via ``executor.config`` vertex/project/location. It never reads
+    a ``DatabricksAuth``, ``executor.profile`` / ``config["profile"]``, or a
+    generic ``providers:`` entry, and has no OpenAI-compatible ``base_url``.
+
+    There is no Gemini model-listing endpoint wired into this catalog (and no
+    base URL to fetch from), so this always resolves to ``kind="none"`` — the
+    dispatch gate then passes the spec's model through unchanged and
+    ``sys_list_models`` reports the worker as non-enumerable rather than
+    fabricating an OpenAI-family list the worker can never run.
+
+    The :attr:`~ResolvedModelProvider.runnable` flag is what keeps that
+    "non-enumerable" honest: a worker with a credential (api-key / Vertex /
+    ambient) CAN run — it just cannot list its models — so it is marked
+    ``runnable=True`` and the listing renders as runnable-without-a-listing.
+    A worker with no Gemini credential anywhere is genuinely unusable, so it
+    stays ``runnable=False`` (the dead-worker preflight signal).
+
+    :param spec: The worker's (sub-)agent spec.
+    :returns: A :class:`ResolvedModelProvider` with ``kind="none"``;
+        ``runnable=True`` when a Gemini credential resolved.
+    """
+    from omnigent.spec.types import ApiKeyAuth
+
+    config = spec.executor.config
+    if config.get("vertex"):
+        return ResolvedModelProvider(
+            kind=NONE_KIND,
+            detail="antigravity Vertex AI (Gemini-native; no enumerable model listing)",
+            runnable=True,
+        )
+
+    spec_auth = spec.executor.auth
+    if isinstance(spec_auth, ApiKeyAuth) and spec_auth.api_key:
+        return ResolvedModelProvider(
+            kind=NONE_KIND,
+            detail="antigravity api_key auth (Gemini-native; no enumerable model listing)",
+            runnable=True,
+        )
+    if spec_auth is None and _antigravity_ambient_key_present():
+        return ResolvedModelProvider(
+            kind=NONE_KIND,
+            detail="antigravity ambient Gemini key (Gemini-native; no enumerable model listing)",
+            runnable=True,
+        )
+    return ResolvedModelProvider(
+        kind=NONE_KIND,
+        detail="no Gemini credential configured for the antigravity harness",
+    )
+
+
+def _antigravity_ambient_key_present() -> bool:
+    """Return whether ``_build_antigravity_spawn_env`` would find a fallback key.
+
+    Mirrors the builder's no-spec-auth fallback chain: the dedicated
+    ``antigravity:`` config block, then the legacy global ``auth:`` api_key,
+    then an ambient ``GEMINI_API_KEY`` / ``ANTIGRAVITY_API_KEY``.
+
+    :returns: ``True`` when any of those resolves a key.
+    """
+    from omnigent.onboarding.antigravity_auth import (
+        ANTIGRAVITY_ENV_VARS,
+        resolve_antigravity_api_key,
+    )
+    from omnigent.runtime.workflow import _load_global_auth
+    from omnigent.spec.types import ApiKeyAuth
+
+    if resolve_antigravity_api_key() is not None:
+        return True
+    if isinstance(_load_global_auth(), ApiKeyAuth):
+        return True
+    return any(os.environ.get(var) for var in ANTIGRAVITY_ENV_VARS)
 
 
 def _legacy_profile_only_provider(spec: Any, harness_type: str) -> ResolvedModelProvider:  # type: ignore[explicit-any]  # structural spec stubs in tests
@@ -696,6 +808,20 @@ def _listing_for_provider(
     :returns: The provider's :class:`ModelListing`.
     """
     if provider.kind == NONE_KIND:
+        if provider.runnable:
+            # Runnable, but with no listing endpoint (e.g. a Gemini-native
+            # antigravity worker holding a credential): dispatches CAN run, the
+            # models just cannot be enumerated. Report that, not "cannot run."
+            return ModelListing(
+                source="runnable",
+                verified=False,
+                models=(),
+                note=(
+                    f"{provider.detail} — dispatches to this worker can run, but "
+                    "its models cannot be enumerated here (no listing endpoint); "
+                    "pass the worker's own model id through unchanged"
+                ),
+            )
         return ModelListing(
             source=NONE_KIND,
             verified=False,

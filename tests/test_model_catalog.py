@@ -417,6 +417,194 @@ def test_resolve_provider_global_auth_consumed_by_claude_sdk_not_codex(
     assert codex.kind == "none"
 
 
+# ── Antigravity: Gemini-native, never an OpenAI-family provider ────
+
+
+def test_resolve_provider_antigravity_named_provider_does_not_overreport(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An antigravity spec naming an OpenAI provider resolves to ``none``.
+
+    The regression this guards: antigravity used to share the generic
+    ``_resolve_provider_for_build`` path, so a ``ProviderAuth`` (or a
+    configured default) resolved to an ``openai``-family ``key`` entry and
+    ``sys_list_models`` advertised OpenAI/gateway models the Gemini-native
+    spawn path can never reach (``configure_agent_harness_with_provider``
+    rejects the antigravity harness outright). It must now report ``none``.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    from omnigent.spec.types import ProviderAuth
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-oai")
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n"
+        "  litellm:\n"
+        "    kind: gateway\n"
+        "    openai:\n"
+        "      base_url: https://gw.example.com/v1\n"
+        "      api_key: $OPENAI_API_KEY\n",
+    )
+    spec = _worker_spec("antigravity", auth=ProviderAuth(name="litellm"))
+    provider = resolve_model_provider(spec, "antigravity")
+    assert provider.kind == "none", provider
+    assert "antigravity" in provider.detail
+
+
+def test_resolve_provider_antigravity_default_provider_does_not_overreport(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A configured OpenAI default never resolves for an antigravity worker.
+
+    A default ``openai`` provider must NOT be adopted by antigravity (it has
+    no spec auth), since its spawn path can't consume it.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-oai")
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n"
+        "  openai:\n"
+        "    kind: key\n"
+        "    default: true\n"
+        "    openai:\n"
+        "      base_url: https://api.openai.com/v1\n"
+        "      api_key: $OPENAI_API_KEY\n",
+    )
+    provider = resolve_model_provider(_worker_spec("antigravity"), "antigravity")
+    assert provider.kind == "none", provider
+
+
+def test_resolve_provider_antigravity_api_key_resolves_without_openai_family(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An antigravity spec ``api_key`` resolves to ``none`` (no listing endpoint).
+
+    The Gemini key IS the credential the spawn path threads, but there is no
+    enumerable Gemini listing endpoint, so the catalog reports ``none`` with a
+    detail that records the credential — never an ``openai`` family / base_url.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    _isolate_config(monkeypatch, tmp_path, "")
+    spec = _worker_spec("antigravity", auth=ApiKeyAuth(api_key="AIza-test"))
+    provider = resolve_model_provider(spec, "antigravity")
+    assert provider.kind == "none"
+    assert provider.family is None
+    assert provider.base_url is None
+    assert "api_key" in provider.detail
+
+
+def test_resolve_provider_antigravity_vertex_resolves_to_none_with_detail(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An antigravity Vertex spec reports ``none`` with a Vertex detail.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    _isolate_config(monkeypatch, tmp_path, "")
+    spec = AgentSpec(
+        spec_version=1,
+        name="worker",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "antigravity", "vertex": True}),
+    )
+    provider = resolve_model_provider(spec, "antigravity")
+    assert provider.kind == "none"
+    assert "Vertex" in provider.detail
+
+
+def test_resolve_provider_antigravity_unconfigured_is_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With no Gemini credential anywhere, antigravity resolves to ``none``.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    for var in ("GEMINI_API_KEY", "ANTIGRAVITY_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    _isolate_config(monkeypatch, tmp_path, "")
+    provider = resolve_model_provider(_worker_spec("antigravity"), "antigravity")
+    assert provider.kind == "none"
+    assert "no Gemini credential" in provider.detail
+
+
+# ── Antigravity: runnable-but-non-enumerable vs. genuinely unusable ──
+
+
+def test_antigravity_api_key_listing_is_runnable_not_dead(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A configured antigravity (api-key) worker reads as runnable, not dead.
+
+    The regression this guards: ``_listing_for_provider`` used to render every
+    ``kind="none"`` provider — including a Gemini-native antigravity worker
+    holding a credential — as "cannot run here," telling orchestrators a valid
+    worker was unusable. A worker with an api-key CAN run; only its models are
+    non-enumerable. The listing must say so (``source="runnable"``) and never
+    emit the dead-worker signal.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    _isolate_config(monkeypatch, tmp_path, "")
+    spec = _worker_spec("antigravity", auth=ApiKeyAuth(api_key="AIza-test"))
+    listing = list_models_for_worker(spec, "antigravity")
+    assert listing.source == "runnable"
+    assert listing.models == ()
+    assert "can run" in listing.note
+    assert "cannot run here" not in listing.note
+
+
+def test_antigravity_vertex_listing_is_runnable_not_dead(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A configured antigravity Vertex worker also reads as runnable.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    _isolate_config(monkeypatch, tmp_path, "")
+    spec = AgentSpec(
+        spec_version=1,
+        name="worker",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "antigravity", "vertex": True}),
+    )
+    listing = list_models_for_worker(spec, "antigravity")
+    assert listing.source == "runnable"
+    assert listing.models == ()
+    assert "cannot run here" not in listing.note
+
+
+def test_antigravity_unconfigured_listing_reads_as_dead(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A keyless antigravity worker still reads as unusable (dead-worker signal).
+
+    The complement to the runnable cases: with no Gemini credential anywhere,
+    the worker genuinely cannot run, so the listing must keep the
+    ``source="none"`` "cannot run here" preflight signal.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    for var in ("GEMINI_API_KEY", "ANTIGRAVITY_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    _isolate_config(monkeypatch, tmp_path, "")
+    listing = list_models_for_worker(_worker_spec("antigravity"), "antigravity")
+    assert listing.source == "none"
+    assert listing.models == ()
+    assert "cannot run here" in listing.note
+
+
 # ── Enumeration per provider kind ──────────────────────────
 
 

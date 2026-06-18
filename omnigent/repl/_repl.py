@@ -378,6 +378,18 @@ def _build_startup_header(
     if len(families) > 1:
         parts: list[str] = []
         for fam in families:
+            if fam == "antigravity":
+                # Gemini-native surface: resolve its dedicated credential, not a
+                # ``providers:`` family default (which would be the OpenAI one
+                # it can never use). describe_active_credential special-cases it.
+                cred = describe_active_credential(config, "antigravity")
+                if cred is None:
+                    label = "not configured"
+                else:
+                    cred_text = credential_label(cred.kind, cred.provider_name)
+                    label = f"{_header_glyph(cred.kind)} {cred_text}".strip()
+                parts.append(f"Gemini → {label}")
+                continue
             # Effective per-surface default — for the pi surface this is
             # what the pi harness would actually route through (explicit
             # pi scope, else the cross-family fallback).
@@ -4114,6 +4126,7 @@ def _build_model_readout_lines(
         ``["Active:  claude-sonnet-4-6  ·  🔑 Anthropic API Key  ·  $ANTHROPIC_API_KEY",
         "Also configured:  🧱 Databricks", "  /model <name> changes the model. …"]``.
     """
+    from omnigent.harness_aliases import canonicalize_harness
     from omnigent.onboarding.configure_models import (
         credential_label,
         kind_glyph,
@@ -4164,6 +4177,13 @@ def _build_model_readout_lines(
     # "Claude"), a key names the vendor + "API Key", Databricks names itself.
     provider_label = f"{glyph} {credential_label(cred.kind, cred.provider_name)}".strip()
     lines.append(f"Active:  {model_label}  ·  {provider_label}  ·  {cred.source}")
+
+    # Antigravity is Gemini-native: no ``providers:`` entry can serve it, so
+    # there are no in-surface provider alternatives to list (its ``openai``
+    # _HARNESS_FAMILY entry is for family-keyed lookups only). Stop after the
+    # Active line — listing OpenAI providers here would be misleading.
+    if canonicalize_harness(harness) == "antigravity":
+        return lines
 
     # List the OTHER configured providers that serve THIS harness's family,
     # so the user only sees relevant alternatives (a Codex run shouldn't list

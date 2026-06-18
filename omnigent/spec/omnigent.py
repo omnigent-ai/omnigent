@@ -1759,6 +1759,19 @@ def _translate_executor_from_def(
         use_responses_raw = raw_executor.get("use_responses")
         if use_responses_raw is not None:
             config["use_responses"] = bool(use_responses_raw)
+        # The antigravity harness opts into Vertex AI via
+        # ``executor.config`` vertex/project/location, which
+        # ``_build_antigravity_spawn_env`` reads to thread
+        # ``HARNESS_ANTIGRAVITY_VERTEX`` / ``_PROJECT`` / ``_LOCATION``.
+        # Like ``use_responses``, none of these are fields on the
+        # omnigent inner ExecutorSpec (the loader drops unknown keys), so
+        # recover them from the raw YAML and carry them forward — without
+        # this, the documented Vertex config shape would never reach the
+        # spawn-env builder. Each key is preserved only when present, so a
+        # non-Vertex executor's config stays untouched.
+        for _vertex_key in ("vertex", "project", "location"):
+            if _vertex_key in raw_executor:
+                config[_vertex_key] = raw_executor[_vertex_key]
         # ``auth:`` is also not in the omnigent datamodel — parse it
         # directly from the raw YAML so YAML-declared auth is not
         # silently dropped and overridden by the global config default.

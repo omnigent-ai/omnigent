@@ -18,8 +18,18 @@
 // (see _codex_rollout_records_from_session_items in omnigent/codex_native.py
 // and tests/e2e/test_host_cross_family_fork_e2e.py).
 
-/** Provider family a harness consumes, or null when unknown. */
-export function harnessFamily(harness: string | null | undefined): "anthropic" | "openai" | null {
+/**
+ * Provider family a harness consumes, or null when unknown.
+ *
+ * Antigravity is Gemini-native, so it reports its own `"google"` family —
+ * distinct from anthropic/openai. This both classifies it as a known SDK
+ * target (so `forkTargetCarriesHistory` offers it) and keeps the
+ * cross-family check honest: switching to/from antigravity is a family
+ * change, so the dialog warns that model settings reset.
+ */
+export function harnessFamily(
+  harness: string | null | undefined,
+): "anthropic" | "openai" | "google" | null {
   if (!harness) return null;
   switch (harness) {
     case "claude-native":
@@ -34,6 +44,12 @@ export function harnessFamily(harness: string | null | undefined): "anthropic" |
     case "openai-agents-sdk":
     case "agents_sdk":
       return "openai";
+    // Gemini-native SDK harness. Includes the server-emitted alias spellings
+    // (`harness_kind` returns whatever `config["harness"]` was set to).
+    case "antigravity":
+    case "agy":
+    case "google-antigravity":
+      return "google";
     default:
       return null;
   }

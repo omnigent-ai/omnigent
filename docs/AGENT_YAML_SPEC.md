@@ -84,10 +84,11 @@ executor:
     api_key: ${GEMINI_API_KEY}     # or ANTIGRAVITY_API_KEY
 ```
 
-To route through OpenRouter / a gateway, declare a key/gateway provider in
-`~/.omnigent/config.yaml` and reference it (`auth: {type: provider, name: …}`),
-or set `auth.base_url` to the OpenAI-compatible endpoint alongside the key.
-For Databricks, use `auth: {type: databricks, profile: …}`.
+For Vertex AI, set `executor.config` `vertex: true` (plus `project` / `location`)
+and authenticate with Google Cloud ADC instead of an API key. Because the SDK
+is Gemini-native, there is no OpenAI-compatible gateway, `provider`, or
+Databricks routing for this harness — a `databricks` / `provider` auth or an
+`auth.base_url` is ignored, so do not use one.
 
 CLI flags such as `--harness` and `--model` can override or supply missing
 executor values for a run. Databricks credentials come from the spec's

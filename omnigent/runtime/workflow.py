@@ -379,10 +379,12 @@ _PROVIDER_HARNESS_FAMILY: dict[AgentHarnessType, str] = {
     "claude-sdk": ANTHROPIC_FAMILY,
     "codex": OPENAI_FAMILY,
     "openai-agents-sdk": OPENAI_FAMILY,
-    # Antigravity is Gemini-native but routes generic-provider traffic over
-    # the OpenAI-compatible wire (OpenRouter / LiteLLM / Databricks gateway),
-    # so it consumes the ``openai`` family like openai-agents-sdk.
-    "antigravity": OPENAI_FAMILY,
+    # NB: ``antigravity`` is intentionally absent. It is Gemini-native (a
+    # direct API key or Vertex AI) with no OpenAI-compatible ``base_url``, so
+    # it cannot consume a generic provider / gateway — the guard at the top of
+    # ``configure_agent_harness_with_provider`` rejects it before either reader
+    # of this map runs. Omitting it makes a future routing bug fail loud
+    # (KeyError) rather than silently route Gemini traffic over an OpenAI wire.
 }
 
 # Maps harnesses that gate the vendor-neutral gateway transport on a

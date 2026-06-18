@@ -3559,8 +3559,13 @@ def _spec_used_families(agent_yaml: Path | None) -> list[str]:
     def _walk(node: AgentSpec) -> None:
         """Accumulate the surface for *node*'s harness and recurse into sub-agents."""
         harness = canonicalize_harness(node.executor.harness_kind) or node.executor.harness_kind
-        fam = harness_family(harness)
-        if fam is not None:
+        if harness == "antigravity":
+            # Antigravity is Gemini-native: its ``openai`` _HARNESS_FAMILY entry
+            # is for family-keyed lookups only (no OpenAI gateway routing), so it
+            # must NOT fold into the openai surface here — it contributes its own
+            # surface, which the header resolves to the Gemini credential.
+            families.add("antigravity")
+        elif (fam := harness_family(harness)) is not None:
             families.add(fam)
         elif harness == PI_SURFACE:
             # pi spans both model families, so it has no single family —
