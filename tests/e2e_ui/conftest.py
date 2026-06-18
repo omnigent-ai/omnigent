@@ -1871,3 +1871,141 @@ def native_codex_session(
             except subprocess.TimeoutExpired:
                 respawned.kill()
                 respawned.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# ``native_cursor_session`` is the sibling native-CLI fixture for the
+# ``cursor-native`` ("Cursor") wrapper: it spins up a real Cursor wrapper
+# session — the same terminal-first spec ``omnigent cursor`` ships — and yields
+# ``(base_url, session_id)``. The runner auto-launches ``cursor-agent`` in the
+# session terminal on bind (``_auto_create_cursor_terminal`` in
+# ``omnigent/runner/app.py``), exactly like the claude/codex fixtures.
+#
+# Two things differ from claude/codex, both stemming from cursor-agent owning
+# its own auth/approval:
+#
+# * **Auth has NO Databricks-gateway path.** cursor-agent talks only to
+#   Cursor's backend, so it does not derive auth from the runner's gateway
+#   credentials the way Claude Code / Codex do. It authenticates from the
+#   ambient ``cursor-agent login`` (``$HOME/.cursor``, inherited by the runner)
+#   or an ambient ``CURSOR_API_KEY``. The render-parity test is therefore gated
+#   to skip when neither the binary nor a usable login is present (CI does not
+#   provision a Cursor account by default), so it stays green there while
+#   running for real wherever Cursor is logged in.
+# * **``-f`` (force/trust) is passed as a launch arg.** cursor-agent blocks on a
+#   per-directory "Workspace Trust" prompt and per-tool approval prompts; in a
+#   runner-owned tmux pane there is no one to answer them, so the TUI would
+#   hang. ``-f`` (Cursor's force/yolo flag) clears both. It is threaded through
+#   ``terminal_launch_args`` exactly as the plan-mode claude fixture threads
+#   ``--permission-mode``.
+# ---------------------------------------------------------------------------
+
+
+def _create_native_cursor_session(base_url: str, runner_id: str) -> str:
+    """Register the ``cursor-native`` wrapper agent and bind its session.
+
+    Reuses the exact terminal-first spec ``omnigent cursor`` ships
+    (:func:`omnigent.cursor_native._materialize_cursor_agent_spec`) so the
+    fixture never drifts from production, and stamps the same wrapper /
+    terminal-first labels (``omnigent.wrapper`` + ``omnigent.ui = terminal``)
+    the CLI writes. The spec carries no ``spec_version``, so it is bundled
+    under a ``*.yaml`` arcname to route through the omnigent compat translator
+    (which preserves ``executor.harness`` + ``terminals:``); a ``config.yaml``
+    arcname would hit the strict parser and reject it.
+
+    Binding the session to the runner triggers the runner's cursor-native
+    auto-bootstrap (:func:`omnigent.runner.app._auto_create_cursor_terminal`):
+    it launches ``cursor-agent`` in the session terminal — with the ``-f``
+    force/trust arg threaded via ``terminal_launch_args`` so the unattended
+    tmux pane never blocks on Cursor's workspace-trust / per-tool prompts — and
+    starts the forwarder that mirrors the TUI transcript back as conversation
+    items.
+
+    :param base_url: Spawned server base URL.
+    :param runner_id: The token-bound runner id to bind.
+    :returns: The new session/conversation id.
+    """
+    import json as _json
+    import tempfile
+
+    from omnigent._wrapper_labels import (
+        CURSOR_NATIVE_WRAPPER_VALUE,
+        UI_MODE_LABEL_KEY,
+        UI_MODE_TERMINAL_VALUE,
+        WRAPPER_LABEL_KEY,
+    )
+    from omnigent.cursor_native import _materialize_cursor_agent_spec
+
+    with tempfile.TemporaryDirectory() as _tmp:
+        spec_path = _materialize_cursor_agent_spec(Path(_tmp))
+        yaml_text = spec_path.read_text()
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        data = yaml_text.encode()
+        # Non-config.yaml arcname → omnigent compat translator (the spec has
+        # no spec_version), matching the terminal_session fixture.
+        info = tarfile.TarInfo("cursor-native-ui.yaml")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+
+    labels = {
+        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
+        WRAPPER_LABEL_KEY: CURSOR_NATIVE_WRAPPER_VALUE,
+    }
+    # Pin a real workspace on THIS session (like the codex fixture): the
+    # forwarder keys cursor's chat store by ``md5(cwd)``, so the TUI needs a
+    # concrete launch cwd. The repo root is a valid dir on the runner's
+    # filesystem. ``-f`` trusts that dir + auto-approves tools so the
+    # unattended pane never hangs on an approval prompt.
+    metadata = {
+        "labels": labels,
+        "workspace": str(_REPO_ROOT),
+        "terminal_launch_args": ["-f"],
+    }
+    create = httpx.post(
+        f"{base_url}/v1/sessions",
+        data={"metadata": _json.dumps(metadata)},
+        files={"bundle": ("cursor-native-ui.tar.gz", buf.getvalue(), "application/gzip")},
+        timeout=30.0,
+    )
+    create.raise_for_status()
+    session_id = str(create.json()["session_id"])
+    _bind_session_runner(base_url, session_id, runner_id)
+    return session_id
+
+
+@pytest.fixture
+def native_cursor_session(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A runner-bound session on the real ``cursor-native`` ("Cursor") wrapper.
+
+    The runner auto-launches ``cursor-agent`` in the session terminal on bind
+    (ambient ``cursor-agent login`` / ``CURSOR_API_KEY`` auth + ``-f`` trust
+    handled runner-side), so the SPA's Terminal view attaches to a live Cursor
+    TUI and its Chat view renders the same canonical transcript. Drives the
+    native cursor render-parity suite.
+
+    :param live_server: Spawned server fixture; its runner is reused.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``.
+    """
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    session_id = _create_native_cursor_session(live_server, runner_id)
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
+            # Escalate to SIGKILL if the runner ignores SIGTERM, so a wedged
+            # process can't raise in teardown and leak / fail unrelated tests
+            # (matching terminal_session / seeded_session_pair).
+            try:
+                respawned.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned.kill()
+                respawned.wait(timeout=5)
