@@ -247,6 +247,150 @@ def sse_streaming_text(text: str, model: str = "mock-model") -> str:
     return "".join(events)
 
 
+# ── Anthropic Messages API SSE builders ─────────────────
+
+
+def anthropic_sse_text_response(
+    text: str,
+    model: str = "mock-model",
+) -> str:
+    """Build Anthropic Messages API SSE stream for a text response.
+
+    Emits: ``message_start``, ``content_block_start``,
+    ``content_block_delta`` (text), ``content_block_stop``,
+    ``message_delta``, ``message_stop``.
+    """
+    msg_id = f"msg_{_uuid_mod.uuid4().hex[:12]}"
+    output_tokens = max(5, len(text.split()))
+
+    events: list[str] = []
+
+    def _evt(evt_type: str, data: dict) -> None:
+        events.append(f"event: {evt_type}\ndata: {json.dumps(data)}\n\n")
+
+    _evt(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": model,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 10, "output_tokens": 0},
+            },
+        },
+    )
+    _evt(
+        "content_block_start",
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        },
+    )
+    _evt(
+        "content_block_delta",
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": text},
+        },
+    )
+    _evt(
+        "content_block_stop",
+        {
+            "type": "content_block_stop",
+            "index": 0,
+        },
+    )
+    _evt(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "usage": {"output_tokens": output_tokens},
+        },
+    )
+    _evt("message_stop", {"type": "message_stop"})
+    return "".join(events)
+
+
+def anthropic_sse_tool_call_response(
+    tool_calls: list[dict[str, str]],
+    model: str = "mock-model",
+) -> str:
+    """Build Anthropic Messages API SSE stream for tool use blocks."""
+    msg_id = f"msg_{_uuid_mod.uuid4().hex[:12]}"
+    events: list[str] = []
+
+    def _evt(evt_type: str, data: dict) -> None:
+        events.append(f"event: {evt_type}\ndata: {json.dumps(data)}\n\n")
+
+    _evt(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": model,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 10, "output_tokens": 0},
+            },
+        },
+    )
+    for idx, tc in enumerate(tool_calls):
+        tool_id = tc.get("call_id", f"toolu_{_uuid_mod.uuid4().hex[:12]}")
+        _evt(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": tool_id,
+                    "name": tc["name"],
+                    "input": {},
+                },
+            },
+        )
+        _evt(
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": idx,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": tc.get("arguments", "{}"),
+                },
+            },
+        )
+        _evt(
+            "content_block_stop",
+            {
+                "type": "content_block_stop",
+                "index": idx,
+            },
+        )
+    _evt(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+            "usage": {"output_tokens": 5},
+        },
+    )
+    _evt("message_stop", {"type": "message_stop"})
+    return "".join(events)
+
+
 # ── Response queue state ─────────────────────────────────
 
 
@@ -397,6 +541,57 @@ async def create_response(
         sse_body = sse_streaming_text(qr.text)
     else:
         sse_body = sse_text_response(qr.text)
+
+    async def _generate() -> AsyncIterator[str]:
+        yield sse_body
+
+    return StreamingResponse(
+        _generate(),
+        media_type="text/event-stream",
+    )
+
+
+@app.post("/v1/messages", response_model=None)
+async def create_message(
+    request: Request,
+) -> StreamingResponse | JSONResponse:
+    """Anthropic Messages API endpoint for claude-sdk harness.
+
+    Same keyed-queue routing as ``/v1/responses`` but returns
+    Anthropic SSE format (``message_start``, ``content_block_*``,
+    ``message_delta``, ``message_stop``).
+    """
+    body = await request.body()
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        parsed = {"raw": body.decode(errors="replace")}
+
+    async with _state._lock:
+        _state.request_count += 1
+        _state.captured_requests.append(parsed)
+        model = parsed.get("model") if isinstance(parsed, dict) else None
+        queue = _state.resolve_queue(model)
+        qr = queue.next()
+
+    if qr.error is not None:
+        return JSONResponse(
+            status_code=qr.status_code,
+            content={
+                "type": "error",
+                "error": {"type": "mock_error", "message": qr.error},
+            },
+        )
+
+    if qr.block:
+        qr._pending.set()
+        _state.pending_gates.append(qr)
+        await qr._gate.wait()
+
+    if qr.tool_calls:
+        sse_body = anthropic_sse_tool_call_response(qr.tool_calls)
+    else:
+        sse_body = anthropic_sse_text_response(qr.text)
 
     async def _generate() -> AsyncIterator[str]:
         yield sse_body
