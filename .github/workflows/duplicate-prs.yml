@@ -1,0 +1,42 @@
+name: Duplicate PRs
+
+# Closes duplicate community PRs that reference the same issue: when more than
+# one open PR (created in the last 14 days) closes the same issue, the oldest is
+# kept and the newer ones are closed, labeled `duplicate`, and commented on.
+# Maintainer-authored PRs are never touched. Runs on a daily schedule (and on
+# demand) rather than per-PR, so a freshly opened PR is only flagged once a real
+# duplicate exists. Never checks out or runs PR code -- it reads PR metadata via
+# the API using only the default-branch script. See duplicate-prs.js.
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+permissions: {}
+
+jobs:
+  duplicate-prs:
+    if: github.repository == 'omnigent-ai/omnigent'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    timeout-minutes: 10
+    steps:
+      # Trusted default branch only (.github sparse). Never the PR head, so no
+      # PR-authored code runs.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd  # v8.0.0
+        with:
+          retries: 3
+          script: |
+            const script = require(".github/workflows/duplicate-prs.js");
+            await script({ context, github });
