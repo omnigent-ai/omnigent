@@ -3,8 +3,12 @@
 import asyncio
 import json
 import os
+import shutil
 import socket
+import tempfile
+import textwrap
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -27,6 +31,7 @@ from omnigent.inner.pi_executor import (
     _generate_extension_js,
     _pi_provider_for_model,
     _PiRpcSession,
+    _safe_dumps,
     _sanitize_schema,
     _ToolServer,
 )
@@ -515,6 +520,89 @@ class TestToolServer(unittest.TestCase):
         finally:
             probe.close()
 
+    async def _run_generated_bridge_tool(
+        self,
+        *,
+        port: int,
+        token: str,
+        timeout: float = 5.0,
+    ) -> dict:
+        """Run the generated JS extension under Node and execute one tool.
+
+        This is intentionally cross-runtime: Python starts the real loopback
+        server, while Node loads the generated Pi extension, captures the
+        registered tool, and calls its ``execute`` method. It exercises the
+        same JSONL/TCP boundary Pi uses without needing a live Pi process.
+        """
+        node_path = shutil.which("node")
+        if node_path is None:
+            self.skipTest("node is required for generated Pi bridge e2e tests")
+
+        schema = [
+            {
+                "name": "exotic",
+                "description": "exercise generated bridge",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            extension_path = tmp_path / "omnigent_tools.js"
+            runner_path = tmp_path / "run_bridge.js"
+            extension_path.write_text(_generate_extension_js(port, schema, token))
+            runner_path.write_text(
+                textwrap.dedent(
+                    """
+                    const extension = require(process.argv[2]);
+                    let registered;
+                    const fakePi = {
+                      on() {},
+                      registerTool(tool) { registered = tool; },
+                    };
+
+                    (async () => {
+                      extension(fakePi);
+                      if (!registered) {
+                        throw new Error("tool was not registered");
+                      }
+                      const result = await registered.execute(
+                        "call-1",
+                        { input: "hello" },
+                        undefined,
+                        undefined,
+                        {}
+                      );
+                      process.stdout.write(JSON.stringify(result));
+                    })().catch((err) => {
+                      process.stderr.write(err && err.stack ? err.stack : String(err));
+                      process.exit(1);
+                    });
+                    """
+                )
+            )
+
+            proc = await asyncio.create_subprocess_exec(
+                node_path,
+                str(runner_path),
+                str(extension_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            except asyncio.TimeoutError:
+                proc.kill()
+                stdout, stderr = await proc.communicate()
+                stderr_text = stderr.decode("utf-8", errors="replace")
+                self.fail(f"generated Pi bridge did not resolve within {timeout}s: {stderr_text}")
+            self.assertEqual(
+                proc.returncode,
+                0,
+                stderr.decode("utf-8", errors="replace"),
+            )
+            return json.loads(stdout.decode("utf-8"))
+
     def test_start_and_stop(self):
         async def _test():
             server = _ToolServer()
@@ -603,6 +691,128 @@ class TestToolServer(unittest.TestCase):
 
             writer.close()
             await server.stop()
+
+        _run(_test())
+
+    def test_non_json_serializable_result_returns_error_frame(self):
+        """A tool result ``json.dumps`` can't encode yields an error frame.
+
+        Regression for F03: serialization happens on the response path
+        *outside* ``_execute``'s try, so a tool returning a ``datetime`` (or
+        ``set``) used to raise ``TypeError`` there, close the socket with zero
+        bytes, and hang the JS ``callTool`` promise — wedging the whole turn.
+        The handler must instead always write a valid frame: here an
+        ``{"error": ...}`` envelope, correlated by ``id``, delivered well
+        within the timeout (proving it did not hang).
+        """
+
+        async def _test():
+            server = _ToolServer()
+            await server.start()
+
+            async def executor(name, args):
+                # A dict carrying values json.dumps rejects by default.
+                return {"when": datetime(2026, 6, 18, 12, 0, 0), "tags": {1, 2, 3}}
+
+            server._tool_executor = executor
+
+            reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+            request = (
+                json.dumps({"id": "req6", "token": server.token, "tool": "exotic", "args": {}})
+                + "\n"
+            )
+            writer.write(request.encode())
+            await writer.drain()
+
+            # The key assertion is that a frame arrives at all (no hang): a
+            # short timeout would fire if the response path crashed/closed.
+            response_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+            self.assertTrue(response_line, "tool server closed without writing a frame (hang)")
+            response = json.loads(response_line)
+            self.assertEqual(response["id"], "req6")
+            self.assertIn("unserializable tool result", response["error"])
+            self.assertNotIn("result", response)
+
+            writer.close()
+            await server.stop()
+
+        _run(_test())
+
+    def test_safe_dumps_with_non_serializable_req_id_does_not_raise(self):
+        """``_safe_dumps`` never raises, even on a non-serializable ``req_id``.
+
+        The fallback envelope serializes ``req_id`` too, so a future caller
+        passing an id ``json.dumps`` can't encode (here a ``datetime``) must
+        still yield a valid frame rather than re-raising the very crash the
+        guard exists to prevent. The id is stringified in that envelope.
+        """
+        bad_id = datetime(2026, 6, 18, 12, 0, 0)
+        out = _safe_dumps({"id": bad_id, "result": {"k": "v"}}, bad_id)  # type: ignore[arg-type]
+        payload = json.loads(out)
+        self.assertEqual(payload["id"], str(bad_id))
+        self.assertIn("unserializable tool result", payload["error"])
+        self.assertNotIn("result", payload)
+
+    def test_generated_bridge_returns_error_for_unserializable_tool_result(self):
+        """End-to-end: Node bridge + Python server return an error result.
+
+        The previous unit test proves the TCP server writes an error frame.
+        This test follows the actual Pi bridge path too: generated JS running
+        in Node receives that frame and returns a Pi tool result with
+        ``isError=true`` instead of hanging or throwing.
+        """
+
+        async def _test():
+            server = _ToolServer()
+            await server.start()
+
+            async def executor(name, args):
+                return {"when": datetime(2026, 6, 18, 12, 0, 0), "tags": {1, 2, 3}}
+
+            server._tool_executor = executor
+            try:
+                result = await self._run_generated_bridge_tool(
+                    port=server.port,
+                    token=server.token,
+                )
+            finally:
+                await server.stop()
+
+            self.assertTrue(result["isError"])
+            self.assertEqual(result["content"][0]["type"], "text")
+            payload = json.loads(result["content"][0]["text"])
+            self.assertIn("unserializable tool result", payload["error"])
+
+        _run(_test())
+
+    def test_generated_bridge_resolves_on_bare_socket_close(self):
+        """End-to-end: a zero-byte close resolves the generated JS callTool.
+
+        This exercises the defense-in-depth close handler. If the generated
+        bridge only resolved on ``data`` or ``error`` events, the Node process
+        would hang here until ``wait_for`` timed out.
+        """
+
+        async def _test():
+            async def close_without_response(reader, writer):
+                await reader.readline()
+                writer.close()
+                await writer.wait_closed()
+
+            server = await asyncio.start_server(close_without_response, "127.0.0.1", 0)
+            port = server.sockets[0].getsockname()[1]
+            try:
+                result = await self._run_generated_bridge_tool(
+                    port=port,
+                    token="close-token",
+                )
+            finally:
+                server.close()
+                await server.wait_closed()
+
+            self.assertTrue(result["isError"])
+            payload = json.loads(result["content"][0]["text"])
+            self.assertIn("closed connection without a response", payload["error"])
 
         _run(_test())
 
