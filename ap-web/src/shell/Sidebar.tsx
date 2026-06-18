@@ -17,6 +17,7 @@ import {
   CircleStopIcon,
   GitBranchIcon,
   InboxIcon,
+  ListChecksIcon,
   Loader2Icon,
   MoreHorizontalIcon,
   PanelRightOpenIcon,
@@ -25,6 +26,8 @@ import {
   PinOffIcon,
   SearchIcon,
   ShareIcon,
+  SquareIcon,
+  SquareCheckBigIcon,
   Trash2Icon,
   XIcon,
 } from "lucide-react";
@@ -47,6 +50,9 @@ import {
 import {
   type Conversation,
   useArchiveConversation,
+  useBulkArchiveConversations,
+  useBulkDeleteConversations,
+  useBulkStopSessions,
   useConversations,
   usePinnedConversationBackfill,
   useRenameConversation,
@@ -132,6 +138,30 @@ export function Sidebar({ open, onClose }: SidebarProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("");
   const [pinnedConversationIds, setPinnedConversationIds] = useState(readPinnedConversationIds);
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+
+  const toggleSelected = useCallback((id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const selectAll = useCallback((conversations: Conversation[]) => {
+    setSelectedIds(new Set(conversations.map((c) => c.id)));
+  }, []);
+
+  const deselectAll = useCallback(() => {
+    setSelectedIds(new Set());
+  }, []);
+
+  const exitSelectionMode = useCallback(() => {
+    setSelectionMode(false);
+    setSelectedIds(new Set());
+  }, []);
 
   // Debounce search input so we don't fire a server request on every
   // keystroke. 300 ms is fast enough to feel responsive.
@@ -325,16 +355,39 @@ export function Sidebar({ open, onClose }: SidebarProps) {
             )}
           </Link>
         </Button>
-        <div className="relative mt-3">
-          <SearchIcon className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2.5 size-3.5 text-muted-foreground" />
-          <input
-            type="search"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            aria-label="Search sessions"
-            placeholder="Search sessions"
-            className="min-h-8 w-full rounded-full border border-input pr-3 pl-8 text-sm transition placeholder:text-muted-foreground focus-visible:outline-1"
-          />
+        <div className="relative mt-3 flex items-center gap-1.5">
+          <div className="relative flex-1">
+            <SearchIcon className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2.5 size-3.5 text-muted-foreground" />
+            <input
+              type="search"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              aria-label="Search sessions"
+              placeholder="Search sessions"
+              className="min-h-8 w-full rounded-full border border-input pr-3 pl-8 text-sm transition placeholder:text-muted-foreground focus-visible:outline-1"
+            />
+          </div>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant={selectionMode ? "secondary" : "ghost"}
+                size="icon-sm"
+                aria-label={selectionMode ? "Exit selection mode" : "Select sessions"}
+                data-testid="toggle-selection-mode"
+                className="shrink-0 rounded-full"
+                onClick={() => {
+                  if (selectionMode) exitSelectionMode();
+                  else setSelectionMode(true);
+                }}
+              >
+                <ListChecksIcon className="size-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">
+              {selectionMode ? "Exit selection" : "Select sessions"}
+            </TooltipContent>
+          </Tooltip>
         </div>
       </div>
 
@@ -342,7 +395,7 @@ export function Sidebar({ open, onClose }: SidebarProps) {
           scrollbars, the list's scrollbar appearing/disappearing (e.g. while
           a Radix menu locks scrolling) resizes every row — titles gain/lose
           a character. Reserving the gutter keeps row width constant. */}
-      <nav className="flex-1 overflow-y-auto px-3 pb-3 [scrollbar-gutter:stable]">
+      <nav className="relative flex-1 overflow-y-auto px-3 pb-3 [scrollbar-gutter:stable]">
         <ConversationList
           conversationsQuery={conversationsQuery}
           onRowClick={onNavClick}
@@ -350,8 +403,25 @@ export function Sidebar({ open, onClose }: SidebarProps) {
           pinnedConversationIds={pinnedConversationIds}
           onPinnedConversationIdsChange={setPinnedConversationIds}
           onTogglePinned={togglePinnedConversation}
+          selectionMode={selectionMode}
+          selectedIds={selectedIds}
+          onToggleSelected={toggleSelected}
         />
       </nav>
+
+      {selectionMode && (
+        <BulkActionBar
+          selectedIds={selectedIds}
+          allConversations={
+            (conversationsQuery.data?.pages ?? []).flatMap((page) => page.data)
+          }
+          onSelectAll={() =>
+            selectAll((conversationsQuery.data?.pages ?? []).flatMap((page) => page.data))
+          }
+          onDeselectAll={deselectAll}
+          onDone={exitSelectionMode}
+        />
+      )}
 
       {/* Account footer. Sibling *after* the flex-1 nav so it pins to the
           bottom of the sidebar column. Renders nothing (no border, no
@@ -369,6 +439,9 @@ interface ConversationListProps {
   pinnedConversationIds: string[];
   onPinnedConversationIdsChange: (ids: string[]) => void;
   onTogglePinned: (conversationId: string) => void;
+  selectionMode: boolean;
+  selectedIds: Set<string>;
+  onToggleSelected: (conversationId: string) => void;
 }
 
 // permission_level null (no ACL row / legacy) or >= 4 both mean owner.
@@ -383,6 +456,9 @@ function ConversationList({
   pinnedConversationIds,
   onPinnedConversationIdsChange,
   onTogglePinned,
+  selectionMode,
+  selectedIds,
+  onToggleSelected,
 }: ConversationListProps) {
   // All loaded conversations from the single paginated list (for pinned
   // backfill, normalization, and the flat session list).
@@ -517,6 +593,9 @@ function ConversationList({
               onToggleCollapsed={toggleSectionCollapsed}
               onRowClick={onRowClick}
               onTogglePinned={onTogglePinned}
+              selectionMode={selectionMode}
+              selectedIds={selectedIds}
+              onToggleSelected={onToggleSelected}
             />
           )}
           {sections.sessions.length > 0 && (
@@ -528,6 +607,9 @@ function ConversationList({
               onToggleCollapsed={toggleSectionCollapsed}
               onRowClick={onRowClick}
               onTogglePinned={onTogglePinned}
+              selectionMode={selectionMode}
+              selectedIds={selectedIds}
+              onToggleSelected={onToggleSelected}
             />
           )}
           {sections.shared.length > 0 && (
@@ -539,12 +621,11 @@ function ConversationList({
               onToggleCollapsed={toggleSectionCollapsed}
               onRowClick={onRowClick}
               onTogglePinned={onTogglePinned}
+              selectionMode={selectionMode}
+              selectedIds={selectedIds}
+              onToggleSelected={onToggleSelected}
             />
           )}
-          {/* Archived sessions, grouped at the very bottom (below "Shared
-              with me"). Collapsible + persisted like the other sections; this
-              is also the surface that makes the per-row "Unarchive" action
-              reachable again. */}
           {sections.archived.length > 0 && (
             <ConversationSection
               title="Archived"
@@ -554,6 +635,9 @@ function ConversationList({
               onToggleCollapsed={toggleSectionCollapsed}
               onRowClick={onRowClick}
               onTogglePinned={onTogglePinned}
+              selectionMode={selectionMode}
+              selectedIds={selectedIds}
+              onToggleSelected={onToggleSelected}
             />
           )}
           {/* Pagination extends the Recent list, so the button hides with
@@ -591,25 +675,26 @@ function ConversationSection({
   onToggleCollapsed,
   onRowClick,
   onTogglePinned,
+  selectionMode,
+  selectedIds,
+  onToggleSelected,
 }: {
-  // Section header, e.g. "Recent". Untitled sections render as a bare
-  // list and cannot collapse (there is no header to click).
   title?: string;
   conversations: Conversation[];
   pinnedConversationIds: string[];
-  /** Titles currently collapsed; an untitled section can't collapse. */
   collapsedSections: string[];
   onToggleCollapsed: (sectionTitle: string) => void;
   onRowClick: (e: MouseEvent<HTMLAnchorElement>) => void;
   onTogglePinned: (conversationId: string) => void;
+  selectionMode: boolean;
+  selectedIds: Set<string>;
+  onToggleSelected: (conversationId: string) => void;
 }) {
   const collapsed = title != null && collapsedSections.includes(title);
   return (
     <section>
       {title && (
         <h2>
-          {/* Full-width header button = a comfortable touch target on the
-              mobile drawer, where a chevron-sized hit area would be fiddly. */}
           <button
             type="button"
             aria-expanded={!collapsed}
@@ -617,9 +702,6 @@ function ConversationSection({
             className="group flex w-full items-center gap-1 rounded-md px-2 py-1 text-left text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
           >
             {title}
-            {/* Chevron trails the label (Codex/Cursor-style). Hidden until
-                hover when expanded; always visible when collapsed so the
-                hidden content stays discoverable. */}
             <ChevronRightIcon
               className={cn(
                 "size-3.5 shrink-0 transition-transform",
@@ -638,6 +720,9 @@ function ConversationSection({
               isPinned={pinnedConversationIds.includes(conv.id)}
               onClick={onRowClick}
               onTogglePinned={onTogglePinned}
+              selectionMode={selectionMode}
+              isSelected={selectedIds.has(conv.id)}
+              onToggleSelected={onToggleSelected}
             />
           ))}
         </ul>
@@ -651,11 +736,17 @@ function ConversationRow({
   isPinned,
   onClick,
   onTogglePinned,
+  selectionMode,
+  isSelected,
+  onToggleSelected,
 }: {
   conversation: Conversation;
   isPinned: boolean;
   onClick: (e: MouseEvent<HTMLAnchorElement>) => void;
   onTogglePinned: (conversationId: string) => void;
+  selectionMode: boolean;
+  isSelected: boolean;
+  onToggleSelected: (conversationId: string) => void;
 }) {
   // `useParams` reads from the active matched route. On `/`, the param is
   // undefined; on `/c/:conversationId`, it carries the active id.
@@ -827,35 +918,40 @@ function ConversationRow({
   return (
     <li className="group relative">
       <Link
-        to={`/c/${conversation.id}`}
+        to={selectionMode ? "#" : `/c/${conversation.id}`}
         className={cn(
-          // Right padding reserves room for the trailing controls so long
-          // titles truncate before colliding with them. On desktop the time
-          // marker shares a slot with the hover controls (pin + kebab,
-          // swapped in on hover), so reserve room for both (pr-16). On
-          // mobile there's no hover, so the marker, pin, and kebab are all
-          // visible side by side — reserve pr-28 to clear the marker that
-          // sits left of them. The wide "Needs response" tag replaces the
-          // timestamp in that slot, so reserve extra room for it
-          // (pr-44 / md:pr-28). flex-col stacks the name row over the
-          // git-branch subtitle row.
-          "relative flex w-full flex-col gap-0.5 rounded-md px-4 py-2 text-left text-sm hover:bg-muted",
-          sessionState?.kind === "awaiting" ? "pr-44 md:pr-28" : "pr-28 md:pr-16",
-          isActive && "bg-muted font-semibold",
+          "relative flex w-full flex-col gap-0.5 rounded-md py-2 text-left text-sm hover:bg-muted",
+          selectionMode ? "pl-9 pr-4" : "px-4",
+          !selectionMode && (sessionState?.kind === "awaiting" ? "pr-44 md:pr-28" : "pr-28 md:pr-16"),
+          isActive && !selectionMode && "bg-muted font-semibold",
+          selectionMode && isSelected && "bg-primary/5",
         )}
-        onClick={onClick}
-        // Double-click renames inline (a quick alternative to the kebab's
-        // Rename item). The first click of the gesture still selects/navigates
-        // the row natively; the dblclick then swaps in the edit field. Gated on
-        // edit permission so a viewer-only row stays read-only. preventDefault
-        // suppresses the browser's double-click text selection on the title.
+        onClick={(e) => {
+          if (selectionMode) {
+            e.preventDefault();
+            e.stopPropagation();
+            onToggleSelected(conversation.id);
+            return;
+          }
+          onClick(e);
+        }}
         onDoubleClick={(e) => {
+          if (selectionMode) return;
           if (!canEdit) return;
           e.preventDefault();
           setIsEditing(true);
         }}
         title={conversation.title ?? conversation.id}
       >
+        {selectionMode && (
+          <span className="-translate-y-1/2 absolute top-1/2 left-2.5 flex items-center">
+            {isSelected ? (
+              <SquareCheckBigIcon className="size-4 text-primary" />
+            ) : (
+              <SquareIcon className="size-4 text-muted-foreground" />
+            )}
+          </span>
+        )}
         {/* Row 1: the session name. Status markers (working, needs-approval,
             unseen) render in the trailing time-marker slot below, replacing
             the timestamp — not inline here. Leading icons (agent type, pin,
@@ -878,21 +974,14 @@ function ConversationRow({
           </span>
         )}
       </Link>
-      {/* Time-marker slot. On desktop it shares the controls' slot (right-2)
-          and fades out on hover/focus so the pin + kebab can take over in
-          place. On mobile there is no hover, so it sits to the left of the
-          always-visible pin + kebab (right-[4.5rem]) and stays put — they
-          read side by side. When the session has a state badge (working dot,
-          "Needs response", unseen dot), the badge takes this slot INSTEAD of
-          the timestamp — the row shows one trailing marker, never both. */}
-      {sessionState !== null ? (
+      {!selectionMode && sessionState !== null ? (
         // pointer-events-none keeps clicks falling through to the row, so
         // the badge's hover tooltip is intentionally inert here; screen
         // readers still get the badge's own role="img" aria-label.
         <span className={TIME_MARKER_SLOT_CLASS}>
           <SessionStateBadge state={sessionState} />
         </span>
-      ) : (
+      ) : !selectionMode ? (
         <span
           className={cn(TIME_MARKER_SLOT_CLASS, "text-xs tabular-nums text-muted-foreground")}
           aria-label={absoluteTime(conversation.updated_at * 1000)}
@@ -900,13 +989,8 @@ function ConversationRow({
         >
           {relativeTime(conversation.updated_at * 1000)}
         </span>
-      )}
-      {/* Quick pin/unpin — the sole pin affordance now (removed from the
-          kebab menu). Sits just left of the kebab. On mobile (no hover) it's
-          always visible alongside the kebab; on desktop it reveals on
-          hover/focus, and stays surfaced while the kebab menu is open so it
-          doesn't vanish when the row's controls are otherwise visible. */}
-      <Button
+      ) : null}
+      {!selectionMode && <Button
         type="button"
         variant="ghost"
         size="icon-sm"
@@ -925,8 +1009,8 @@ function ConversationRow({
         }}
       >
         {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
-      </Button>
-      <DropdownMenu>
+      </Button>}
+      {!selectionMode && <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Button
             type="button"
@@ -1082,7 +1166,7 @@ function ConversationRow({
             </Tooltip>
           )}
         </DropdownMenuContent>
-      </DropdownMenu>
+      </DropdownMenu>}
       <PermissionsModal sessionId={conversation.id} open={shareOpen} onOpenChange={setShareOpen} />
       <Dialog
         open={deleteOpen}
@@ -1371,6 +1455,280 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
         <XIcon className="size-3.5" />
       </Button>
     </div>
+  );
+}
+
+function BulkActionBar({
+  selectedIds,
+  allConversations,
+  onSelectAll,
+  onDeselectAll,
+  onDone,
+}: {
+  selectedIds: Set<string>;
+  allConversations: Conversation[];
+  onSelectAll: () => void;
+  onDeselectAll: () => void;
+  onDone: () => void;
+}) {
+  const navigate = useNavigate();
+  const { conversationId: activeId } = useParams<{ conversationId: string }>();
+  const bulkArchive = useBulkArchiveConversations();
+  const bulkDelete = useBulkDeleteConversations();
+  const bulkStop = useBulkStopSessions();
+
+  const selectedConversations = useMemo(
+    () => allConversations.filter((c) => selectedIds.has(c.id)),
+    [allConversations, selectedIds],
+  );
+
+  const ownedSelected = useMemo(
+    () => selectedConversations.filter((c) => isOwnedByViewer(c)),
+    [selectedConversations],
+  );
+
+  const stoppableSelected = useMemo(
+    () =>
+      ownedSelected.filter(
+        (c) =>
+          isSessionStoppable({ labels: c.labels, hostId: c.host_id, runnerId: c.runner_id }) &&
+          c.status === "running",
+      ),
+    [ownedSelected],
+  );
+
+  const archivedSelected = useMemo(
+    () => ownedSelected.filter((c) => c.archived === true),
+    [ownedSelected],
+  );
+
+  const nonArchivedSelected = useMemo(
+    () => ownedSelected.filter((c) => c.archived !== true),
+    [ownedSelected],
+  );
+
+  const count = selectedIds.size;
+  const allSelected = count > 0 && count === allConversations.length;
+  const isBusy = bulkArchive.isPending || bulkDelete.isPending || bulkStop.isPending;
+
+  const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
+
+  function handleArchive() {
+    if (nonArchivedSelected.length === 0) return;
+    bulkArchive.mutate(
+      { ids: nonArchivedSelected.map((c) => c.id), archived: true },
+      {
+        onSuccess: () => {
+          onDeselectAll();
+        },
+      },
+    );
+  }
+
+  function handleUnarchive() {
+    if (archivedSelected.length === 0) return;
+    bulkArchive.mutate(
+      { ids: archivedSelected.map((c) => c.id), archived: false },
+      {
+        onSuccess: () => {
+          onDeselectAll();
+        },
+      },
+    );
+  }
+
+  function handleDelete() {
+    const ids = ownedSelected.map((c) => c.id);
+    if (ids.length === 0) return;
+    setConfirmDeleteOpen(false);
+    bulkDelete.mutate(ids, {
+      onSuccess: () => {
+        if (activeId && ids.includes(activeId)) navigate("/", { replace: true });
+        onDeselectAll();
+      },
+      onError: (err: any) => {
+        if (activeId && err?.succeeded?.includes(activeId)) navigate("/", { replace: true });
+      },
+    });
+  }
+
+  function handleStop() {
+    if (stoppableSelected.length === 0) return;
+    bulkStop.mutate(
+      stoppableSelected.map((c) => c.id),
+      {
+        onSuccess: () => {
+          onDeselectAll();
+        },
+      },
+    );
+  }
+
+  return (
+    <>
+      <div className="flex flex-col gap-2 border-t border-border bg-card px-3 py-2">
+        <div className="flex items-center justify-between">
+          <span className="text-xs font-medium text-muted-foreground">
+            {count === 0 ? "None selected" : `${count} selected`}
+          </span>
+          <div className="flex items-center gap-1">
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="h-6 px-2 text-xs"
+              onClick={allSelected ? onDeselectAll : onSelectAll}
+            >
+              {allSelected ? "Deselect all" : "Select all"}
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="h-6 px-2 text-xs"
+              onClick={onDone}
+            >
+              Done
+            </Button>
+          </div>
+        </div>
+
+        {count > 0 && (
+          <div className="flex items-center gap-1.5">
+            {nonArchivedSelected.length > 0 && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-7 gap-1.5 text-xs"
+                    disabled={isBusy}
+                    onClick={handleArchive}
+                    data-testid="bulk-archive"
+                  >
+                    {bulkArchive.isPending ? (
+                      <Loader2Icon className="size-3 animate-spin" />
+                    ) : (
+                      <ArchiveIcon className="size-3" />
+                    )}
+                    Archive
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Archive {nonArchivedSelected.length} session(s)</TooltipContent>
+              </Tooltip>
+            )}
+            {archivedSelected.length > 0 && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-7 gap-1.5 text-xs"
+                    disabled={isBusy}
+                    onClick={handleUnarchive}
+                    data-testid="bulk-unarchive"
+                  >
+                    {bulkArchive.isPending ? (
+                      <Loader2Icon className="size-3 animate-spin" />
+                    ) : (
+                      <ArchiveRestoreIcon className="size-3" />
+                    )}
+                    Unarchive
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Unarchive {archivedSelected.length} session(s)</TooltipContent>
+              </Tooltip>
+            )}
+            {stoppableSelected.length > 0 && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-7 gap-1.5 text-xs text-destructive"
+                    disabled={isBusy}
+                    onClick={handleStop}
+                    data-testid="bulk-stop"
+                  >
+                    {bulkStop.isPending ? (
+                      <Loader2Icon className="size-3 animate-spin" />
+                    ) : (
+                      <CircleStopIcon className="size-3" />
+                    )}
+                    Stop
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Stop {stoppableSelected.length} session(s)</TooltipContent>
+              </Tooltip>
+            )}
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-7 gap-1.5 text-xs text-destructive"
+                  disabled={isBusy || ownedSelected.length === 0}
+                  onClick={() => setConfirmDeleteOpen(true)}
+                  data-testid="bulk-delete"
+                >
+                  {bulkDelete.isPending ? (
+                    <Loader2Icon className="size-3 animate-spin" />
+                  ) : (
+                    <Trash2Icon className="size-3" />
+                  )}
+                  Delete
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>
+                {ownedSelected.length > 0
+                  ? `Delete ${ownedSelected.length} session(s)`
+                  : "No owned sessions selected"}
+              </TooltipContent>
+            </Tooltip>
+          </div>
+        )}
+
+        {(bulkArchive.isError || bulkDelete.isError || bulkStop.isError) && (
+          <p className="text-xs text-destructive" role="alert">
+            Some actions failed. Retry or dismiss.
+          </p>
+        )}
+      </div>
+
+      <Dialog open={confirmDeleteOpen} onOpenChange={setConfirmDeleteOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Delete {ownedSelected.length} session(s)?</DialogTitle>
+            <DialogDescription>
+              This will permanently delete the selected sessions and all their history. This cannot
+              be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="border-t-0 bg-transparent">
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => setConfirmDeleteOpen(false)}
+              disabled={bulkDelete.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              onClick={handleDelete}
+              disabled={bulkDelete.isPending}
+            >
+              Delete {ownedSelected.length} session(s)
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
   );
 }
 
