@@ -4423,7 +4423,8 @@ _DEFAULT_HARNESS_PROMPTS = {
         "You are Cursor, running through Omnigent. Help the user with software engineering tasks."
     ),
     "qwen": (
-        "You are Qwen Code, running through Omnigent. Help the user with software engineering tasks."
+        "You are Qwen Code, running through Omnigent. "
+        "Help the user with software engineering tasks."
     ),
 }
 _DEFAULT_HARNESS_PROMPT = "You are a helpful coding agent running through Omnigent."
