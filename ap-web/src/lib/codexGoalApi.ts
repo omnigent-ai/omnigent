@@ -141,9 +141,7 @@ function codexGoalResponseFromWire(wire: CodexGoalResponseWire): CodexGoalRespon
  * @returns The current goal, or ``goal: null`` when Codex has none.
  */
 export async function getCodexGoal(sessionId: string): Promise<CodexGoalResponse> {
-  const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`,
-  );
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`);
   return codexGoalResponseFromWire(await readJsonOrThrow<CodexGoalResponseWire>(res));
 }
 
@@ -169,14 +167,11 @@ export async function setCodexGoal(
   if (goal.status !== undefined) {
     body.status = goal.status;
   }
-  const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`,
-    {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    },
-  );
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
   return codexGoalResponseFromWire(await readJsonOrThrow<CodexGoalResponseWire>(res));
 }
 
@@ -210,11 +205,8 @@ export async function updateCodexGoalStatus(
  * @returns Whether Codex removed an existing goal.
  */
 export async function clearCodexGoal(sessionId: string): Promise<{ cleared: boolean }> {
-  const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`,
-    {
-      method: "DELETE",
-    },
-  );
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`, {
+    method: "DELETE",
+  });
   return readJsonOrThrow<{ cleared: boolean }>(res);
 }

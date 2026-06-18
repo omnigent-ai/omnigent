@@ -17,11 +17,7 @@ export function canPauseCodexGoal(goal: CodexGoal | null): boolean {
 }
 
 export function canResumeCodexGoal(goal: CodexGoal | null): boolean {
-  return (
-    goal?.status === "paused" ||
-    goal?.status === "blocked" ||
-    goal?.status === "usageLimited"
-  );
+  return goal?.status === "paused" || goal?.status === "blocked" || goal?.status === "usageLimited";
 }
 
 export function isCodexGoalUserMode(status: CodexGoal["status"] | null | undefined): boolean {
