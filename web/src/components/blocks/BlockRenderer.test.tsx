@@ -148,7 +148,8 @@ describe("BlockRenderer dispatch", () => {
     const pkg = container.querySelector("code.font-mono");
     expect(pkg?.textContent).toBe("google-antigravity");
     // The install command renders as a copyable action (CliCommandBlock),
-    // not as raw error text — trailing period stripped so the copy is clean.
+    // not as raw error text — the antigravity message's trailing period is
+    // stripped so the copied command is clean.
     const command = screen.getByTestId("missing-dep-install-command");
     expect(command.textContent).toBe(
       "pip install google-antigravity (or pip install 'omnigent[antigravity]')",
@@ -173,6 +174,20 @@ describe("BlockRenderer dispatch", () => {
     render(<BlockRenderer items={items} sessionStatus="idle" />);
     // Generic raw banner still handles non-dependency errors unchanged.
     expect(screen.getByText(/Authentication failed/)).toBeDefined();
+    expect(screen.queryByText("Missing dependency")).toBeNull();
+    expect(screen.queryByTestId("missing-dep-install-command")).toBeNull();
+  });
+
+  it("falls back to the error code when the message is empty (#548)", () => {
+    // Guards the fallback path adjacent to the missing-dep early-return: an
+    // error block with no message must NOT route to the missing-dep banner
+    // (the regex needs "requires the '...'") and must render the code in the
+    // body instead of a blank panel.
+    const items: RenderItem[] = [
+      { kind: "error", itemId: null, source: "execution", code: "executor_error", message: "" },
+    ];
+    render(<BlockRenderer items={items} sessionStatus="idle" />);
+    expect(screen.getByText("executor_error")).toBeDefined();
     expect(screen.queryByText("Missing dependency")).toBeNull();
     expect(screen.queryByTestId("missing-dep-install-command")).toBeNull();
   });
