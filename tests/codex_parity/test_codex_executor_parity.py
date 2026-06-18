@@ -6,13 +6,15 @@ from typing import Any
 import pytest
 
 from omnigent.inner.codex_executor import CodexExecutor
-from omnigent.inner.executor import ExecutorConfig
-from omnigent.inner.executor import ExecutorError
-from omnigent.inner.executor import TextChunk
-from omnigent.inner.executor import ToolCallComplete
-from omnigent.inner.executor import ToolCallRequest
-from omnigent.inner.executor import ToolCallStatus
-from omnigent.inner.executor import TurnComplete
+from omnigent.inner.executor import (
+    ExecutorConfig,
+    ExecutorError,
+    TextChunk,
+    ToolCallComplete,
+    ToolCallRequest,
+    ToolCallStatus,
+    TurnComplete,
+)
 
 
 def ev_response_created(response_id: str) -> dict[str, Any]:
@@ -416,7 +418,7 @@ async def test_real_codex_dynamic_tool_round_trip(
         return {"result": "42"}
 
     # Parity harness wires the current executor hook directly.
-    executor._tool_executor = tool_executor  # noqa: SLF001
+    executor._tool_executor = tool_executor
     tools = [
         {
             "name": "calculate",

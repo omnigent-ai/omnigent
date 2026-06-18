@@ -12,8 +12,7 @@ import queue
 import shutil
 import subprocess
 import threading
-from collections.abc import Callable
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
