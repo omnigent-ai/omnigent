@@ -178,18 +178,6 @@ skips:
   # timeout lets the rest of the shard complete). Same bulk-first,
   # triage-later approach as PRs #475/#482/#554/#606.
 
-  - id: tests/e2e/omnigent/test_run_omnigent_coding_supervisor.py::test_run_omnigent_coding_supervisor_oneshot
-    reason: "Shard 3 bulk: coding supervisor one-shot. Triage under #532."
-    issue: 532
-    cluster: subagent-supervisor-routing
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_run_omnigent_coding_supervisor.py::test_run_omnigent_coding_supervisor_exposes_subagent_tools
-    reason: "Shard 3 bulk: coding supervisor subagent tools."
-    issue: 532
-    cluster: subagent-supervisor-routing
-    mode: skip
-
   # Verified live on oss 2026-06-11: spawn / ambient_hint / parallel
   # pass under the module's 600s signal-method timeout marker, but
   # continuation failed 1 of 2 runs with a clean AssertionError (the
@@ -197,14 +185,13 @@ skips:
   # 240s; passed standalone in 47s). Flaky auto-wake delivery, needs
   # product investigation before re-greening.
   - id: tests/e2e/test_named_sub_agent_persistence.py::test_send_to_named_sub_agent_continuation_e2e
-    reason: "Flaky live: turn-2 sys_session_send result intermittently never auto-wakes the parent within 240s (#532)."
-    issue: 532
+    reason: "Sub-agent result-delivery race (#682): turn-2 sys_session_send result intermittently never auto-wakes the parent. Passed 0/20 in flake-stress run 27765495452 but kept quarantined because the underlying auto-wake race (#682) is unfixed and main has no e2e reruns."
+    issue: 682
     cluster: subagent-supervisor-routing
     mode: skip
-
-  - id: tests/e2e/test_named_sub_agent_persistence.py::test_cross_parent_named_isolation_e2e
-    reason: "Wedges the e2e shard in CI: this test dispatches a sub-agent in TWO separate runner-bound sessions on the same runner, and the second session's async sub-agent dispatch / auto-wake contends with the first, hanging well past the shard's per-test timeout (the other 4 test_named_sub_agent_persistence tests pass after the #2534 session-flow migration; this two-concurrent-sessions-on-one-runner interaction needs separate investigation). Passes locally on oss in ~30s."
-    issue: 532
+  - id: tests/e2e/omnigent/test_run_omnigent_example_agents.py::test_run_omnigent_example_yaml[agent_with_subagent_session]
+    reason: "Sub-agent result-delivery race (#682): the example agent's worker (calc 11*11 -> 'result=121') result intermittently isn't drained from the inbox before the parent replies. Flaked 1/30 in flake-stress run 27767641403 — kept quarantined under the unfixed auto-wake race (#682); main has no e2e reruns."
+    issue: 682
     cluster: subagent-supervisor-routing
     mode: skip
 
@@ -234,18 +221,6 @@ skips:
     reason: "Flaky on gateway flake-stress (7/8 pass); intermittent tool/harness behavior, keep suppressed until stable."
     issue: 532
     cluster: run-ap-examples-harness
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_run_omnigent_example_agents.py::test_run_omnigent_example_yaml[agent_with_subagent_session]
-    reason: "Shard 3 bulk: run_omnigent example-yaml agent_with_subagent_session."
-    issue: 532
-    cluster: subagent-supervisor-routing
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_run_omnigent_example_agents.py::test_run_omnigent_example_yaml[coding_supervisor_with_forks]
-    reason: "Shard 3 bulk: run_omnigent example-yaml coding_supervisor_with_forks."
-    issue: 532
-    cluster: subagent-supervisor-routing
     mode: skip
 
   - id: tests/e2e/omnigent/test_repl_inline_tool_streaming.py::test_repl_inline_tool_call_and_result_streaming
@@ -507,7 +482,7 @@ skips:
     cluster: files-uploads-attachments
     mode: skip
   - id: tests/e2e/omnigent/test_run_omnigent_coding_supervisor.py::test_run_omnigent_coding_supervisor_codex_shell_not_disabled
-    reason: "Flaky e2e: codex worker doesn't read fixture file — shell_tool regression or supervisor delegation failure."
+    reason: "Consistent real failure (40/40 in flake-stress run 27765495452): codex worker doesn't read the fixture file — codex shell_tool / supervisor-delegation regression, NOT a flake."
     issue: 0
     cluster: subagent-supervisor-routing
     mode: skip
