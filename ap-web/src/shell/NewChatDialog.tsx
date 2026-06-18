@@ -70,7 +70,7 @@ import { AgentRowTooltip } from "@/components/AgentHoverCard";
 // returns agents newest-registered first (agent_store.list sorts by
 // created_at desc), so pin the order users expect; any agent not listed
 // here falls after, in server order.
-const AGENT_DISPLAY_ORDER = ["Claude Code", "Codex", "Pi", "Cursor", "Polly", "Debby"];
+const AGENT_DISPLAY_ORDER = ["Claude Code", "Codex", "Cursor", "Pi", "Polly", "Debby"];
 
 // Built-in agents (by name slug) — the long-lived agents the server
 // ships out of the box. The picker groups these first, then a divider,

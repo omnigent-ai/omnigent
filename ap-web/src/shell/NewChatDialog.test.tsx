@@ -611,6 +611,48 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByText("No agents")).toBeTruthy();
   });
 
+  it("orders Cursor above Pi in the built-in agent picker", () => {
+    mockAgents([
+      {
+        id: "a_pi",
+        name: "pi-native-ui",
+        display_name: "Pi",
+        description: null,
+        harness: "pi-native",
+        skills: [],
+      },
+      {
+        id: "a_cursor",
+        name: "cursor-native-ui",
+        display_name: "Cursor",
+        description: null,
+        harness: "cursor-native",
+        skills: [],
+      },
+      {
+        id: "a_codex",
+        name: "codex-native-ui",
+        display_name: "Codex",
+        description: null,
+        harness: "codex-native",
+        skills: [],
+      },
+      {
+        id: "a_claude",
+        name: "claude-native-ui",
+        display_name: "Claude Code",
+        description: null,
+        harness: "claude-native",
+        skills: [],
+      },
+    ]);
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    const cursor = screen.getByTestId("new-chat-landing-agent-a_cursor");
+    const pi = screen.getByTestId("new-chat-landing-agent-a_pi");
+    expect(cursor.compareDocumentPosition(pi) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   it("seeds the working directory from the host's most-recent path", async () => {
     renderLanding();
     // host_1's recent ("/Users/corey/repo") seeds the field; the chip shows
