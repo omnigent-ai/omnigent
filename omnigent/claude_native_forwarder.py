@@ -10,6 +10,7 @@ import logging
 import os
 import tempfile
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -1631,7 +1632,7 @@ async def _forward_session_cost(
     # lower transcript read (e.g. just after a rotation) and suppresses
     # steady-state churn. The two fields advance independently (policy_cost
     # moves mid-turn while display_cost/S is frozen).
-    payload: dict[str, float] = {}
+    payload: dict[str, float | str] = {}
     if display_cost is not None and (
         dedupe.posted_cost is None or display_cost > dedupe.posted_cost
     ):
@@ -1642,6 +1643,17 @@ async def _forward_session_cost(
         payload["policy_cost_usd"] = policy_cost
     if not payload:
         return
+    # Tag a display-cost (S) advance with the active model captured by the
+    # statusLine wrapper (``{"model": "claude-opus-4-8", ...}`` in context.json).
+    # claude-native sends no token counts with its cost, so the server has
+    # nothing to attribute the cost to per-model without this — leaving it out
+    # of the TOKEN USAGE breakdown while the session total still counts it. Sent
+    # only when the display cost moves: that is the value being attributed
+    # (``policy_cost_usd``-only mid-turn posts carry no new display cost).
+    if "cumulative_cost_usd" in payload and isinstance(status_state, dict):
+        model = status_state.get("model")
+        if isinstance(model, str) and model:
+            payload["model"] = model
     try:
         await _post_external_session_usage(
             client,
@@ -3159,7 +3171,7 @@ async def _post_external_session_usage(
     client: httpx.AsyncClient,
     *,
     session_id: str,
-    usage: dict[str, float] | None,
+    usage: Mapping[str, float | str] | None,
     context_window: int | None = None,
 ) -> None:
     """
@@ -3170,7 +3182,9 @@ async def _post_external_session_usage(
 
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
-    :param usage: ``message.usage`` snapshot, or ``None`` to skip.
+    :param usage: ``message.usage`` snapshot, or ``None`` to skip. Values are
+        numeric counters/costs, plus an optional ``model`` string tagging the
+        cost with the active model for per-model attribution.
     :param context_window: Resolved window in tokens, or ``None`` to
         leave the server's persisted value untouched.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
