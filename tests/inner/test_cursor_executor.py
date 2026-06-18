@@ -65,6 +65,7 @@ def _install_fake_sdk(
         "create_models": [],
         "create_api_keys": [],
         "custom_tools": [],
+        "custom_tool_results": [],
         "launch_kwargs": [],
         "sent": [],
         "closed": 0,
@@ -92,6 +93,9 @@ def _install_fake_sdk(
             )
 
     class _FakeAgent:
+        def __init__(self, custom_tools: dict[str, Any]) -> None:
+            self._custom_tools = custom_tools
+
         async def send(self, prompt: str, **kwargs: Any) -> _FakeRun:
             state["sent"].append(prompt)
             script = scripts.pop(0)
@@ -102,6 +106,14 @@ def _install_fake_sdk(
             if on_delta and "interaction_updates" in script:
                 for iu in script["interaction_updates"]:
                     on_delta(iu)
+            for call in script.get("custom_tool_calls", []):
+                tool = self._custom_tools[call["name"]]
+                result = await asyncio.to_thread(
+                    tool.execute,
+                    call.get("args", {}),
+                    call.get("ctx"),
+                )
+                state["custom_tool_results"].append(result)
             return _FakeRun(script)
 
         # AsyncAgent exposes close() (a CloseAgent RPC + tool unregister).
@@ -133,7 +145,7 @@ def _install_fake_sdk(
             state["custom_tools"].append(dict(local.custom_tools or {}))
             if create_exc is not None:
                 raise create_exc
-            return _FakeAgent()
+            return _FakeAgent(dict(local.custom_tools or {}))
 
     class _FakeCustomTool:
         def __init__(
@@ -557,6 +569,126 @@ async def test_custom_tool_execute_success_dict_is_not_flagged() -> None:
     result = await asyncio.to_thread(_bridged_execute(ok), {}, None)
     assert isinstance(result, str)
     assert json.loads(result) == {"ok": True, "value": 42}
+
+
+@pytest.mark.parametrize(
+    ("tool_result", "expected_text"),
+    [
+        ({"cancelled": True, "reason": "user aborted"}, "user aborted"),
+        ({"content": [{"error": "inner failure"}]}, "inner failure"),
+        ({"result": {"blocked": True, "reason": "nested policy"}}, "nested policy"),
+    ],
+)
+async def test_run_turn_custom_tool_callback_flags_classifier_failures_as_iserror(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_result: dict[str, Any],
+    expected_text: str,
+) -> None:
+    """End-to-end executor coverage for the Cursor SDK custom-tool callback.
+
+    The fake SDK drives ``run_turn`` through agent creation, registered custom
+    tools, the off-loop sync ``execute`` callback, and ``_encode_tool_result``.
+    That pins the bridge contract that Cursor receives an SDK ``isError``
+    payload for every non-SUCCESS shape recognized by ``classify_tool_result``.
+    """
+    script = {
+        "messages": [_assistant("Done.")],
+        "custom_tool_calls": [
+            {"name": "sys_session_send", "args": {"message": "go"}},
+        ],
+        "status": "finished",
+        "result": "Done.",
+    }
+    state = _install_fake_sdk(monkeypatch, [script])
+    tools = [
+        {
+            "name": "sys_session_send",
+            "description": "dispatch",
+            "parameters": {"type": "object"},
+        }
+    ]
+
+    async def fake_tool_executor(name: str, args: dict[str, Any]) -> Any:
+        assert name == "sys_session_send"
+        assert args == {"message": "go"}
+        return tool_result
+
+    executor = CursorExecutor(api_key="crsr_x")
+    executor._tool_executor = fake_tool_executor
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], tools, "SYS")]
+    finally:
+        await executor.close()
+
+    assert any(isinstance(e, TurnComplete) for e in events)
+    assert len(state["custom_tool_results"]) == 1
+    encoded = state["custom_tool_results"][0]
+    assert isinstance(encoded, dict) and encoded["isError"] is True
+    assert expected_text in encoded["content"][0]["text"]
+
+
+async def test_custom_tool_execute_flags_cancelled_dict_with_iserror() -> None:
+    """A cancelled result ({"cancelled": True}) is non-SUCCESS per
+    ``classify_tool_result`` and must surface as an error - the old top-level
+    error/blocked check let it through as an apparently-successful result."""
+
+    async def cancelled(name: str, args: dict[str, Any]) -> Any:
+        return {"cancelled": True, "reason": "user aborted"}
+
+    result = await asyncio.to_thread(_bridged_execute(cancelled), {}, None)
+    assert isinstance(result, dict) and result["isError"] is True
+    assert "user aborted" in result["content"][0]["text"]
+
+
+async def test_custom_tool_execute_flags_nested_error_with_iserror() -> None:
+    """An error nested inside a ``content`` envelope (not a top-level ``error``
+    key) is classified non-SUCCESS and must surface as an error - parity with
+    ``classify_tool_result``, which the top-level-only check diverged from."""
+
+    async def nested(name: str, args: dict[str, Any]) -> Any:
+        return {"content": [{"error": "inner failure"}]}
+
+    result = await asyncio.to_thread(_bridged_execute(nested), {}, None)
+    assert isinstance(result, dict) and result["isError"] is True
+    assert "inner failure" in result["content"][0]["text"]
+
+
+async def test_custom_tool_execute_flags_nested_blocked_with_iserror() -> None:
+    """A policy block nested under ``result`` is surfaced as an error, matching
+    ``classify_tool_result``'s recursion into envelope keys."""
+
+    async def nested(name: str, args: dict[str, Any]) -> Any:
+        return {"result": {"blocked": True, "reason": "nested policy"}}
+
+    result = await asyncio.to_thread(_bridged_execute(nested), {}, None)
+    assert isinstance(result, dict) and result["isError"] is True
+    assert "nested policy" in result["content"][0]["text"]
+
+
+async def test_custom_tool_execute_flags_top_level_list_error_with_iserror() -> None:
+    """A top-level list whose element carries an ``error`` is classified
+    non-SUCCESS — ``classify_tool_result`` recurses through list elements, so the
+    list-shaped payload must surface as an error too."""
+
+    async def list_err(name: str, args: dict[str, Any]) -> Any:
+        return [{"error": "list element failure"}]
+
+    result = await asyncio.to_thread(_bridged_execute(list_err), {}, None)
+    assert isinstance(result, dict) and result["isError"] is True
+    assert "list element failure" in result["content"][0]["text"]
+
+
+async def test_custom_tool_execute_flags_nested_list_error_with_iserror() -> None:
+    """An error inside a list nested under an envelope key (``content``) is
+    classified non-SUCCESS, matching ``classify_tool_result``'s recursion through
+    both envelope keys and list elements."""
+
+    async def nested_list(name: str, args: dict[str, Any]) -> Any:
+        return {"content": [{"error": "nested list failure"}]}
+
+    result = await asyncio.to_thread(_bridged_execute(nested_list), {}, None)
+    assert isinstance(result, dict) and result["isError"] is True
+    assert "nested list failure" in result["content"][0]["text"]
 
 
 async def test_custom_tool_execute_times_out_to_iserror(monkeypatch: pytest.MonkeyPatch) -> None:
