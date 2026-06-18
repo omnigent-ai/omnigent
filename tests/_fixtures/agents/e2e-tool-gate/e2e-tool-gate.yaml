@@ -4,7 +4,7 @@ description: |
   ``echo`` tool.
 
 executor:
-  model: gpt-4o
+  model: gpt-5.4
 
 prompt: |
   # E2E tool-gate agent

@@ -5,7 +5,7 @@ description: |
   turn pauses on a y/n approval prompt in ``omnigent chat``.
 
 executor:
-  model: gpt-4o
+  model: gpt-5.4-mini
 
 prompt: |
   # Ask-demo agent
