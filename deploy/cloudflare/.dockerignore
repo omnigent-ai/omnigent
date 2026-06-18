@@ -1,0 +1,8 @@
+# Trim the Docker build context. `wrangler deploy` builds the container image
+# from this directory, but the Dockerfile only needs sitecustomize.py — keep
+# node deps, wrangler state, and Python caches out of the context sent to the
+# Docker daemon.
+node_modules/
+.wrangler/
+__pycache__/
+*.pyc

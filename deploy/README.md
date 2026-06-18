@@ -64,6 +64,12 @@ deploy/
 │   ├── modal_app.py
 │   └── README.md
 │
+├── cloudflare/        ← Cloudflare Containers + D1 + R2 (serverless, scale-to-zero)
+│   ├── Dockerfile        server image + D1 dialect
+│   ├── src/index.js      the Worker that fronts the container
+│   ├── wrangler.jsonc
+│   └── README.md
+│
 ├── trycloudflare/     ← Cloudflare quick tunnel (public URL for a LOCAL server)
 │   └── README.md
 │
@@ -99,6 +105,7 @@ deploy/
 | Run on any host you already have (VPS, home server, on-prem) | Docker compose | [`docker/README.md`](docker/README.md): copy the compose stack, `./bootstrap.sh`, then `docker compose up -d` |
 | Deploy to Fly.io | Fly | [`fly/README.md`](fly/README.md): `fly deploy`, SQLite on a volume |
 | Deploy to Modal (durable artifact Volume) | Modal | [`modal/README.md`](modal/README.md): `modal deploy`, BYO Neon Postgres |
+| Deploy serverless (scale-to-zero, no VM/Postgres to manage) | Cloudflare Containers + D1 + R2 | [`cloudflare/README.md`](cloudflare/README.md): `wrangler deploy` |
 | Stand up a quick demo (no DB to provision) | HF Spaces | [`hf-spaces/README.md`](hf-spaces/README.md): Docker Space, SQLite |
 | Share a server running on your **laptop**: demo it to teammates, or let remote runners & cloud sandboxes connect back to it (nothing to deploy) | Cloudflare quick tunnel | `cloudflared tunnel --url http://localhost:6767` |
 | Cloud Run / Kubernetes / other | Docker image | [`docker/README.md`](docker/README.md), then point your platform at the image |
