@@ -5090,15 +5090,11 @@ async def test_assistant_item_held_until_its_deltas_forward(tmp_path: Path) -> N
     """
     An assistant item whose deltas haven't fully forwarded is deferred.
 
-    The transcript record and the deltas file have independent writers,
-    so the record can hit disk a poll before the message's chunks
-    (commit-before-delta). If the item posted first, the client would
-    render the committed text AND build a late `live:` preview from the
-    trailing chunks — the duplicate-bubble bug. This drives the real
-    race through both forwarders: with only a non-final chunk forwarded
-    the item must be held (no `external_conversation_item` POST, cursor
-    unadvanced); once the final chunk forwards and the joined text
-    byte-equals the item's, the item posts AFTER the deltas.
+    Drives the real commit-before-delta race: with only a non-final chunk
+    forwarded the item is held (no POST, cursor unadvanced); once the final
+    chunk forwards and the joined text byte-equals the item's, it posts
+    AFTER the deltas. Posting first would dupe (committed text + a late
+    ``live:`` preview from the trailing chunks).
     """
     bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
     transcript_path = tmp_path / "session.jsonl"
@@ -5184,12 +5180,10 @@ async def test_assistant_item_posts_after_hold_timeout(
     """
     An item whose deltas never arrive posts once the hold timeout expires.
 
-    Deltas are best-effort (the hook can drop them; a multi-text-block
-    message's per-block item text never byte-equals the whole-message
-    stream), so the hold must be bounded or such messages would never
-    persist. Past ``_ASSISTANT_ITEM_DELTA_HOLD_S`` the item posts even
-    with no matching stream — safe, because with no forwarded deltas
-    there is no live preview to duplicate.
+    Deltas are best-effort (dropped chunks, multi-block messages that never
+    byte-match), so the hold must be bounded or such items would never
+    persist. Past ``_ASSISTANT_ITEM_DELTA_HOLD_S`` it posts with no match —
+    safe, since no forwarded deltas means no live preview to duplicate.
     """
     bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
     transcript_path = tmp_path / "session.jsonl"
@@ -5251,9 +5245,8 @@ async def test_assistant_item_not_held_without_deltas_file(tmp_path: Path) -> No
     """
     A session whose MessageDisplay hook never fired is never held.
 
-    With no deltas file there can be no live preview, hence no
-    duplicate — holding would only add latency to every assistant
-    message. The item must post on the first poll.
+    No deltas file means no live preview, hence no duplicate — holding
+    would only add latency. The item posts on the first poll.
     """
     bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
     transcript_path = tmp_path / "session.jsonl"
@@ -5282,13 +5275,10 @@ async def test_assistant_item_stays_held_until_true_final_chunk(tmp_path: Path) 
     """
     The commit stays held while a NON-final chunk lands after it.
 
-    Per-chunk hooks are independent subprocesses, so any chunk — not just
-    the final one — can be forwarded AFTER the commit is already ready and
-    held (the observed ``D D C D`` race where the trailing ``D`` is not the
-    final chunk). The hold must wait for the message's ``final`` chunk to
-    byte-match, NOT release on "another delta arrived"; otherwise the late
-    non-final chunk would build a second ``live:`` preview after the commit
-    already rendered.
+    Any chunk, not just the final one, can land after the commit (the
+    observed ``D D C D`` race). The hold must wait for the ``final`` chunk
+    to byte-match, NOT release on "another delta arrived" — else the late
+    non-final chunk builds a second ``live:`` preview after the commit.
     """
     bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
     transcript_path = tmp_path / "session.jsonl"
@@ -5362,11 +5352,9 @@ async def test_assistant_item_held_when_final_seen_but_chunk_missing(tmp_path: P
     """
     Seeing the ``final`` chunk is not enough — the join must byte-equal.
 
-    If a middle chunk was dropped (or not yet forwarded), the concatenated
-    forwarded text does not equal the commit text, so the item must stay
-    held even though ``final`` was seen — never released on the ``final``
-    flag alone. This is why the release gate requires BOTH ``entry.final``
-    and the byte-equal check.
+    A dropped middle chunk leaves the joined text != commit text, so the
+    item stays held despite ``final`` being seen. This is why the release
+    gate requires BOTH ``entry.final`` and the byte-equal check.
     """
     bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
     transcript_path = tmp_path / "session.jsonl"
@@ -5414,10 +5402,9 @@ async def test_two_identical_text_items_each_match_own_stream(tmp_path: Path) ->
     """
     Two assistant messages with identical text are matched by count.
 
-    Consume-once: the first commit pops one matching stream, the second
-    pops the other — both post, neither blocks nor steals from the other,
-    and the ordering state ends empty. Identical text renders identically,
-    so which physical stream a commit consumes does not matter.
+    Consume-once: the first commit pops one stream, the second pops the
+    other — both post, ordering ends empty. Identical text renders
+    identically, so which physical stream a commit consumes doesn't matter.
     """
     bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
     transcript_path = tmp_path / "session.jsonl"
@@ -5468,12 +5455,9 @@ async def test_without_hold_commit_posts_before_final_delta(tmp_path: Path) -> N
     """
     Break-the-feature guard: with the hold disabled the bug reproduces.
 
-    ``ordering=None`` disables the hold (the pre-fix behaviour). In the
-    inverted race the commit then posts immediately, landing BEFORE the
-    message's final delta — the exact ordering that builds a duplicate
-    ``live:`` preview. Paired with
-    ``test_assistant_item_held_until_its_deltas_forward`` (hold on → commit
-    posts AFTER its deltas), this pins the hold as the thing that fixes it.
+    ``ordering=None`` (pre-fix behaviour): the commit posts immediately,
+    BEFORE the final delta — the exact order that dupes the ``live:``
+    preview. Paired with the hold-on test, this pins the hold as the fix.
     """
     bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
     transcript_path = tmp_path / "session.jsonl"
