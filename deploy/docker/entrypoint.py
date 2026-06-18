@@ -44,6 +44,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from fastapi import FastAPI
 
+    from omnigent.stores.artifact_store import ArtifactStore
+
 logging.basicConfig(level=logging.INFO, stream=sys.stderr, force=True)
 logger = logging.getLogger("omnigent-docker")
 
@@ -229,6 +231,29 @@ def _resolve_config() -> _ResolvedConfig:
     )
 
 
+def _select_artifact_store(resolved_config: _ResolvedConfig) -> ArtifactStore:
+    """
+    Pick the artifact store implementation from the resolved config.
+
+    An ``s3://bucket[/prefix]`` ``artifact_store_uri`` selects the remote,
+    durable :class:`~omnigent.stores.artifact_store.s3.S3ArtifactStore` (AWS S3,
+    Cloudflare R2, MinIO, …), which survives an ephemeral or multi-replica
+    deploy. Otherwise the local-filesystem store at ``artifact_dir`` is used.
+    Mirrors how ``DATABASE_URL`` selects the database backend.
+
+    :param resolved_config: The resolved startup configuration.
+    :returns: The selected
+        :class:`~omnigent.stores.artifact_store.ArtifactStore`.
+    """
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+
+    if resolved_config.artifact_store_uri:
+        from omnigent.stores.artifact_store.s3 import S3ArtifactStore
+
+        return S3ArtifactStore(resolved_config.artifact_store_uri)
+    return LocalArtifactStore(str(resolved_config.artifact_dir))
+
+
 def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     """Resolve config if needed, wire the stores, and build the app.
 
@@ -253,8 +278,6 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     from omnigent.runtime.caps import RuntimeCaps
     from omnigent.server.managed_hosts import parse_sandbox_config
     from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
-    from omnigent.stores.artifact_store import ArtifactStore
-    from omnigent.stores.artifact_store.local import LocalArtifactStore
     from omnigent.stores.comment_store.sqlalchemy_store import (
         SqlAlchemyCommentStore,
     )
@@ -279,14 +302,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     # typo should not surface as a runtime 502 on the first managed
     # session); the startup catch-all below logs it.
     sandbox_config = parse_sandbox_config(cfg.get("sandbox"))
-    if resolved_config.artifact_store_uri:
-        # Remote, durable artifact store (S3/R2/MinIO/…) — survives an
-        # ephemeral or multi-replica deploy. artifact_dir stays local for cache.
-        from omnigent.stores.artifact_store.s3 import S3ArtifactStore
-
-        artifact_store: ArtifactStore = S3ArtifactStore(resolved_config.artifact_store_uri)
-    else:
-        artifact_store = LocalArtifactStore(str(artifact_dir))
+    artifact_store = _select_artifact_store(resolved_config)
 
     agent_cache = AgentCache(
         artifact_store=artifact_store,
