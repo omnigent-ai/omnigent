@@ -222,7 +222,9 @@ jobs:
           enable-cache: true
 
       - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          toolchain: stable
 
       - name: Cache Rust build
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4
