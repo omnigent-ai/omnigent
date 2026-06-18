@@ -233,7 +233,7 @@ jobs:
           key: codex-parity-sidecar-${{ runner.os }}-${{ hashFiles('tests/codex_parity/sidecar/Cargo.lock') }}
 
       - name: Set up Node
-        uses: actions/setup-node@49933ea5288caeca8642195f572a2b2b8a0a21f2  # v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version: 20
 
