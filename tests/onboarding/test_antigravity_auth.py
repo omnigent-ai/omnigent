@@ -46,8 +46,9 @@ def _write_config(tmp_path: Path, block: dict[str, object]) -> None:
 
 
 def test_looks_like_gemini_api_key() -> None:
-    """The soft prefix check accepts ``AIza`` keys and rejects others."""
+    """The soft prefix check accepts ``AIza`` / ``AQ`` keys and rejects others."""
     assert looks_like_gemini_api_key("AIzaSyAbC123")
+    assert looks_like_gemini_api_key("AQ.AbC123")
     assert not looks_like_gemini_api_key("sk-ant-123")
     assert not looks_like_gemini_api_key("")
 

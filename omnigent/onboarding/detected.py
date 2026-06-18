@@ -22,6 +22,8 @@ Two surfaces:
 
 from __future__ import annotations
 
+import os
+
 from omnigent.onboarding.ambient import DetectedProvider, detect_providers
 from omnigent.onboarding.configure_models import (
     build_cli_config_provider_entry,
@@ -154,6 +156,19 @@ def _synthesize_entry(det: DetectedProvider) -> dict[str, object] | None:
             base_url, wire_api = vendor.base_url, vendor.wire_api
         else:
             base_url, wire_api = default_base_url_for_family(det.family), None
+            # An ``OPENAI_API_KEY`` detection honors a companion
+            # ``OPENAI_BASE_URL`` (the same convention the OpenAI SDK reads,
+            # matching the interactive wizard / non-interactive onboarding /
+            # ``provider_selection._read_credentials_from_env``). Without
+            # this, an env key pointed at an OpenAI-compatible gateway (e.g.
+            # the Databricks AI gateway) is synthesized against
+            # ``api.openai.com`` and every request 401s — the credential is a
+            # gateway token, not an OpenAI key. Scoped to the openai family's
+            # canonical vendor (not a third-party endpoint, handled above).
+            if det.family == OPENAI_FAMILY and env_var == "OPENAI_API_KEY":
+                env_base_url = os.environ.get("OPENAI_BASE_URL")
+                if env_base_url:
+                    base_url = env_base_url
         # No pinned model — the spec / catalog default picks it; /model then
         # shows "(no model pinned)" rather than a fabricated one.
         return build_key_provider_entry(det.family, base_url, api_key_ref, None, wire_api=wire_api)

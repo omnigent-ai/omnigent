@@ -9,8 +9,9 @@ name: E2E Tests
 #                       `parallelism` (pytest `-n` worker count).
 #   pull_request        PR gate for SAME-REPO PRs only. Fork PRs skip
 #                       here (no secrets) and run via the fork-e2e/**
-#                       push after fork-e2e-mirror.yml mirrors them. The
-#                       four shard checks are required by merge-ready.yml.
+#                       push after a maintainer approves the PR and
+#                       fork-e2e-mirror.yml mirrors them. The four shard
+#                       checks are required by merge-ready.yml.
 #   push (fork-e2e/**)  e2e run for mirrored fork PRs (trusted branch,
 #                       so secrets flow).
 
