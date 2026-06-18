@@ -12,6 +12,16 @@ name: Rerun Security Gate Run
 # e2e-approved-driven mirror plumbing with branch side effects, not a
 # gate-mirroring check.
 #
+# RACE GUARD: the label event fires this relay AND the Security Scan re-run
+# concurrently. Before re-running anything we WAIT for the Security Scan check on
+# the head SHA to settle and only proceed once it is passing. Otherwise we would
+# re-run gate workflows while the scan is still failing / not yet recreated --
+# they would just re-mirror a non-passing check and fail again, and (as seen on
+# PR #556) those re-runs left runs in-progress that the decisive relay could no
+# longer re-run ("could not re-run", GitHub rejects rerun of an in-flight run),
+# stranding stale failing checks. Waiting for scan success makes the relay
+# deterministic: every gate it re-runs polls an already-completed passing scan.
+#
 # The triggering run may have been initiated by an untrusted fork PR, so the
 # recorded artifact is treated as untrusted input (the PR number is GitHub-
 # provided, but it is still sanitised to digits). No PR code is checked out.
@@ -79,6 +89,33 @@ jobs:
           # that a later push could have superseded.
           SHA="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha')"
           echo "PR #$PR_NUMBER head $SHA"
+
+          # Race guard: re-running gate workflows is only useful once the
+          # Security Scan has actually flipped to passing for this SHA. The
+          # label event triggers this relay AND the scan re-run together, so wait
+          # for the latest Security Scan check to complete; bail unless it passed.
+          # (A non-passing scan means the gate failures are correct -- nothing to
+          # re-run; and re-running now would strand in-progress runs the relay
+          # can't later re-run. See the header.)
+          echo "Waiting for the Security Scan check on $SHA to settle..."
+          scan_q='[.check_runs[] | select(.name=="Security Scan")] | sort_by(.started_at) | last'
+          scan_conclusion=""
+          for _ in $(seq 1 72); do   # up to ~6 min (72 * 5s)
+            scan_status=$(gh api "repos/$REPO/commits/$SHA/check-runs" --jq "$scan_q | .status" 2>/dev/null || echo "")
+            if [ "$scan_status" = "completed" ]; then
+              scan_conclusion=$(gh api "repos/$REPO/commits/$SHA/check-runs" --jq "$scan_q | .conclusion" 2>/dev/null || echo "")
+              break
+            fi
+            sleep 5
+          done
+          case "$scan_conclusion" in
+            success | skipped | neutral)
+              echo "Security Scan is '$scan_conclusion' -- proceeding to re-run failed gates." ;;
+            "")
+              echo "Security Scan did not complete in time; nothing to re-run."; exit 0 ;;
+            *)
+              echo "Security Scan is '$scan_conclusion' (not passing); gate failures are correct -- nothing to re-run."; exit 0 ;;
+          esac
 
           # Every workflow whose first job is the reusable Security Gate. We
           # re-run one only when its LATEST run for this SHA is a completed
