@@ -209,9 +209,7 @@ jobs:
           # `e2e-approved` label never runs e2e (the fork pull_request run is
           # an empty matrix), so the gate blocks until one of these is present.
           # Same-repo PRs run e2e with secrets directly and need no gate.
-          IS_FORK=$(echo "$INFO" | jq -r '.isCrossRepository')
-          echo "is_fork=$IS_FORK" >> "$GITHUB_OUTPUT"
-          if [[ "$IS_FORK" == "true" ]]; then
+          if [[ "$(echo "$INFO" | jq -r '.isCrossRepository')" == "true" ]]; then
             # Check path 1: maintainer approval via PR review.
             MAINTAINERS_LC=$(echo "${MAINTAINERS:-}" | tr '[:upper:]' '[:lower:]')
             APPROVERS=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
@@ -266,7 +264,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           SHA: ${{ steps.ctx.outputs.sha }}
-          IS_FORK: ${{ steps.labels.outputs.is_fork }}
         run: bash .github/scripts/merge-ready/evaluate-checks.sh
 
       - name: Compute gate outcome
