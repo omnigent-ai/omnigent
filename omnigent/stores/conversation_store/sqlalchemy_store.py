@@ -32,6 +32,7 @@ from omnigent.db.db_models import (
     SqlUserDailyCost,
 )
 from omnigent.db.utils import (
+    _supports_fts5,
     delete_fts_by_conversation,
     ensure_fts_table,
     extract_search_text,
@@ -1172,12 +1173,12 @@ class SqlAlchemyConversationStore(ConversationStore):
             objects in relevance order.
         """
         with self._session() as session:
-            # Dialect-specific search: SQLite has FTS5 virtual tables
-            # (MATCH + rank), PostgreSQL doesn't. ILIKE on the JSON
-            # data column is a functional fallback. Proper tsvector
-            # indexing is a future optimization (tracked in GAPS.md).
-            is_sqlite = self._engine.dialect.name == "sqlite"
-            if is_sqlite:
+            # Dialect-specific search: the SQLite family (SQLite + D1) has
+            # FTS5 virtual tables (MATCH + rank); PostgreSQL doesn't. ILIKE on
+            # the JSON data column is a functional fallback there. Proper
+            # tsvector indexing is a future optimization (tracked in GAPS.md).
+            use_fts = _supports_fts5(self._engine.dialect.name)
+            if use_fts:
                 if conversation_id is not None:
                     stmt = text(
                         "SELECT item_id FROM conversation_items_fts "
