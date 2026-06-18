@@ -31,6 +31,8 @@ NATIVE_HARNESSES: frozenset[str] = frozenset(
         "native-codex",
         "pi-native",
         "native-pi",
+        "cursor-native",
+        "native-cursor",
     }
 )
 

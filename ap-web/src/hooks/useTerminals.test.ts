@@ -477,6 +477,12 @@ describe("inventoryTerminals", () => {
     session: "main",
     running: true,
   };
+  const cursorPane: TerminalInfo = {
+    id: "terminal_cursor_main",
+    name: "cursor",
+    session: "main",
+    running: true,
+  };
   const bash: TerminalInfo = {
     id: "terminal_bash_s1",
     name: "bash",
@@ -489,6 +495,13 @@ describe("inventoryTerminals", () => {
     // the pi pane leaked into the Shells inventory and (via isShellView) hid
     // the Chat/Terminal pill in Terminal view — stranding the user.
     expect(inventoryTerminals([piPane, bash], true)).toEqual([bash]);
+  });
+
+  it("drops the cursor vendor pane for native Cursor sessions", () => {
+    // Regression: terminal_cursor_main was missing from AGENT_TERMINAL_IDS,
+    // same failure mode as the pi pane above — leaked into Shells and hid
+    // the Chat/Terminal pill in Terminal view.
+    expect(inventoryTerminals([cursorPane, bash], true)).toEqual([bash]);
   });
 
   it("drops the embedded REPL terminal for terminal-first SDK sessions", () => {
@@ -528,6 +541,8 @@ describe("isAgentTerminalKey", () => {
     // pi-native: missing here is what hid the Chat/Terminal pill in
     // Terminal view (isShellView wrongly true) for Pi sessions.
     expect(isAgentTerminalKey("terminal:terminal_pi_main")).toBe(true);
+    // cursor-native: same regression class as pi above.
+    expect(isAgentTerminalKey("terminal:terminal_cursor_main")).toBe(true);
   });
 
   it("treats a user shell as not-the-agent-terminal", () => {

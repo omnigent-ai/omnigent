@@ -243,6 +243,15 @@ def _dispatch_wrapper(
             pi_args=(),
         )
         return True
+    if native_agent.key == "cursor":
+        from omnigent.cursor_native import run_cursor_native
+
+        run_cursor_native(
+            server=server,
+            session_id=session_id,
+            cursor_args=(),
+        )
+        return True
     return False
 
 
