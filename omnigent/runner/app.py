@@ -855,6 +855,15 @@ async def _auto_create_cursor_terminal(
     from omnigent.cursor_native import resolve_cursor_executable
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
+    # Stamp the launch time before the TUI starts. cursor creates the chat's
+    # on-disk store lazily on the first message, so its ``meta.json``
+    # ``createdAtMs`` is always >= this — which lets the forwarder discover
+    # *this* session's chat by recency under ``~/.cursor/chats/<md5(cwd)>``.
+    launch_epoch_ms = int(time.time() * 1000)
+    # Tear down any forwarder left from a prior terminal for this session before
+    # re-creating, so the old and new tasks can't both mirror (double-posting).
+    await _cancel_auto_forwarder_task(session_id)
+
     # ``_pi_native_launch_config`` is a generic session-snapshot reader
     # (workspace + terminal_launch_args); reused here, not Pi-specific.
     launch_config = await _pi_native_launch_config(
@@ -900,7 +909,42 @@ async def _auto_create_cursor_terminal(
             "resource": session_resource_view_to_dict(terminal_view),
         },
     )
-    _logger.info("Auto-created cursor terminal for session %s", session_id)
+
+    # Mirror the Cursor TUI's conversation back into the Omnigent session so the
+    # chat view (message bubbles, derived title, working spinner) tracks the
+    # embedded terminal. Host-spawned sessions have no CLI client to start this,
+    # so the runner owns it — the cursor analog of the claude/codex transcript
+    # forwarders. Reuses the runner's own server URL + refresh-capable auth.
+    from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
+
+    server_url = os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767")
+    _auth_factory = _make_auth_token_factory()
+    _auth_token = _auth_factory() if _auth_factory is not None else None
+    _runner_headers = {"Authorization": f"Bearer {_auth_token}"} if _auth_token else {}
+    _runner_auth = _RunnerDatabricksAuth(_auth_factory)
+
+    from omnigent.cursor_native_bridge import bridge_dir_for_session_id
+    from omnigent.cursor_native_forwarder import supervise_cursor_forwarder
+
+    _forwarder_task = asyncio.create_task(
+        supervise_cursor_forwarder(
+            base_url=server_url,
+            headers=_runner_headers,
+            session_id=session_id,
+            bridge_dir=bridge_dir_for_session_id(session_id),
+            agent_name="cursor-native-ui",
+            workspace=workspace,
+            launch_epoch_ms=launch_epoch_ms,
+            auth=_runner_auth,
+        ),
+        name=f"cursor-forwarder-{session_id}",
+    )
+    _register_auto_forwarder_task(session_id, _forwarder_task)
+    _logger.info(
+        "Auto-created cursor terminal + forwarder for session %s; forwarder_task=%s",
+        session_id,
+        _forwarder_task.get_name(),
+    )
     return terminal_view
 
 
@@ -6573,9 +6617,14 @@ def create_runner_app(
         terminal observer already owns that edge.
 
         Terminal-backed sessions do not all have the same safe edge source.
-        For claude-native, the PTY-activity watcher owns ``running`` and
-        ``idle`` because a runner turn only types into Claude Code's pane.
-        For codex-native, the runner may publish ``running`` when it accepts
+        For claude-native, pi-native, and cursor-native, the PTY-activity
+        watcher owns ``running`` and ``idle`` because a runner turn only types
+        into the agent's own pane and ``run_turn`` returns the instant the
+        message is injected — the model turn then runs entirely in the TUI.
+        Publishing the turn-lifecycle ``idle`` here would race ahead of (and
+        clobber) the watcher's ``running``, dropping the web "Working…" spinner
+        the moment the message is sent. For codex-native, the runner may
+        publish ``running`` when it accepts
         a web turn for dispatch, but the Codex app-server forwarder owns
         ``idle`` because the runner's injection task returns as soon as Codex
         accepts the message, while the user-visible model turn may still be
@@ -6599,7 +6648,7 @@ def create_runner_app(
         # source — fall through and publish. Suppress only once we positively
         # know the harness/edge is terminal-owned.
         harness = _session_harness_name(conv_id)
-        if status != "failed" and harness in {"claude-native", "pi-native"}:
+        if status != "failed" and harness in {"claude-native", "pi-native", "cursor-native"}:
             return
         if status == "idle" and harness == "codex-native":
             return
@@ -7291,6 +7340,9 @@ def create_runner_app(
                 },
             )
         await _teardown_session_terminals(conv_id)
+        # Stop mirroring: the chat store is now frozen, so the forwarder has
+        # nothing left to post — cancel it so it isn't left polling a dead pane.
+        await _cancel_auto_forwarder_task(conv_id)
         _publish_event(conv_id, {"type": "session.status", "status": "idle"})
         delivery_ack = _mark_subagent_terminal_and_wake(
             conv_id,
