@@ -55,6 +55,7 @@ from omnigent.inner.executor import (
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
+    TurnCancelled,
     TurnComplete,
 )
 from omnigent.inner.tracing import TracingContext, is_tracing_enabled
@@ -439,6 +440,14 @@ class ExecutorAdapter(HarnessApp):
                         if tctx is not None and agent_span is not None:
                             tctx.end_agent_span(agent_span, response=response_text)
                             agent_span = None
+                        return
+                    if isinstance(event, TurnCancelled):
+                        ctx.cancelled.set()
+                        if tctx is not None and agent_span is not None:
+                            from omnigent.runtime.telemetry import record_cancellation
+
+                            record_cancellation(agent_span)
+                            tctx.end_agent_span(agent_span, response=None, status="ERROR")
                         return
                     if isinstance(event, ExecutorError):
                         if tctx is not None and agent_span is not None:

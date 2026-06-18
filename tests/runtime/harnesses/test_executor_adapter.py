@@ -154,6 +154,12 @@ def use_error(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
+def use_cancelled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MockExecutor that yields a provider-side TurnCancelled."""
+    monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "cancelled")
+
+
+@pytest.fixture
 def use_capture_messages(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     """Capturing executor: records the messages it received as JSON.
 
@@ -378,6 +384,31 @@ async def test_executor_error_terminates_with_response_failed(
     # via the RuntimeError wrap in the adapter; the scaffold
     # builds an ErrorDetail with the exception's str().
     assert "mock error" in error_detail["message"]
+
+
+async def test_turn_cancelled_terminates_with_response_cancelled(
+    use_cancelled: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """TurnCancelled -> response.cancelled terminal event.
+
+    Provider-side cancellation is not driven by an inbound interrupt event, so
+    the adapter must mark the turn context cancelled itself. Otherwise the
+    scaffold sees a clean return and emits response.completed.
+    """
+    conv_id = "conv_cancelled"
+    client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    events: list[_ParsedSSEEvent] = []
+    async with client.stream(
+        "POST", f"/v1/sessions/{conv_id}/events", json=_start_turn_body()
+    ) as response:
+        async for event in _stream_iter(response):
+            events.append(event)
+
+    assert events[-1].event == "response.cancelled"
+    terminal_response = events[-1].data["response"]
+    assert terminal_response["status"] == "cancelled"
+    assert terminal_response.get("error") is None
 
 
 # ── Error-code classification ──────────────────────────────────
