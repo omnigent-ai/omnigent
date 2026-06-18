@@ -92,7 +92,7 @@ request path, selected headers, and JSON body.
 
 ## Coverage
 
-Current executor-observable parity targets:
+`test_codex_executor_parity.py` covers executor-observable turn behavior:
 
 - `sdk/python/tests/test_app_server_run.py`
   - mock Responses request path/model/input
@@ -105,20 +105,77 @@ Current executor-observable parity targets:
   - text delta routing and completed-turn response
 - selected request-routing behavior from `codex-rs/core/tests/suite/*`
   - dynamic tool call/result round trip through real Codex app-server
-- Codex app-server goal operations
+
+`test_codex_goal.py` covers the Codex goal contract Omnigent relies on:
+
+- upstream app-server goal operations
   - `thread/goal/set` + `thread/goal/get` + `thread/goal/clear` round trip
+  - pause/resume through `thread/goal/set` status-only updates
   - explicit `tokenBudget: null` preservation
   - idempotent `thread/goal/clear`
   - `budgetLimited` preservation when setting the same objective
   - persisted `blocked` and `usageLimited` goal statuses
-  - Omnigent AP rejection of Codex-owned statuses as user-writeable modes
-  - Omnigent AP pass-through of Codex-owned statuses returned by the runner
+- Omnigent AP goal routes
+  - `PUT /v1/sessions/{id}/codex_goal` forwards objective, budget, and mode
+  - `PATCH /v1/sessions/{id}/codex_goal/status` forwards pause/resume
+  - Codex-owned terminal statuses are rejected as user-writeable inputs
+  - Codex-owned terminal statuses returned by the runner are preserved
+  - API-shaped misses return JSON 404s instead of the SPA shell
+
+That is comprehensive for the goal surface Omnigent owns because it exercises
+both sides of the integration: real Codex app-server JSON-RPC for every
+goal state transition we depend on, and Omnigent's public HTTP route mapping
+for every browser control we expose. It intentionally does not copy Codex TUI
+slash-menu/status rendering tests; Omnigent does not embed that TUI path. It
+also does not duplicate Codex's internal goal-extension accounting tests except
+where the app-server result is part of Omnigent's public contract.
 
 Not yet represented here: upstream SDK-only app-server tests for lifecycle,
 login, approvals, steer/interrupt, local/remote image input, and skill input.
 Those APIs do not have a direct Omnigent `CodexExecutor` surface yet, so they
 need either executor-facing analogs or a separate SDK compatibility harness
 before they can be one-for-one parity tests.
+
+## Updating From Codex Upstream
+
+The upstream Codex fixture dependency is pinned in
+`tests/codex_parity/sidecar/Cargo.toml`:
+
+```toml
+core_test_support = { git = "https://github.com/openai/codex.git", rev = "..." }
+```
+
+To refresh the harness:
+
+1. Update that `rev` to the Codex commit you want to validate against.
+2. Refresh `tests/codex_parity/sidecar/Cargo.lock` by building or testing the
+   sidecar.
+3. Inspect the pinned Codex checkout under Cargo's git cache, usually
+   `~/.cargo/git/checkouts/codex-*/<rev>/`.
+4. Compare these upstream files against the local parity files:
+   - `sdk/python/tests/test_app_server_run.py`
+   - `sdk/python/tests/test_app_server_streaming.py`
+   - `sdk/python/tests/test_app_server_goal_operations.py`
+   - `sdk/python/tests/test_client_rpc_methods.py`
+   - `codex-rs/app-server/tests/suite/v2/thread_resume.rs`
+   - `codex-rs/ext/goal/tests/goal_extension_backend.rs`
+   - `codex-rs/prompts/src/goals_tests.rs`
+5. Port new app-server public-contract goal cases into
+   `tests/codex_parity/test_codex_goal.py`. Keep TUI-only cases classified as
+   intentionally excluded unless Omnigent starts exposing that path.
+6. Run the focused goal file, then the full parity suite:
+
+```bash
+pytest tests/codex_parity/test_codex_goal.py \
+  --codex-parity \
+  --codex-bin "$(which codex)" \
+  -q
+
+pytest tests/codex_parity \
+  --codex-parity \
+  --codex-bin "$(which codex)" \
+  -q
+```
 
 ## Running
 
