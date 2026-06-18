@@ -10,13 +10,14 @@ URL (or your domain), and the container sleeps when idle.
 > which is a quick tunnel that exposes a server running on **your laptop**.
 > Here the server itself runs **on Cloudflare**.
 
-> [!WARNING]
-> This path needs a couple of workarounds today (a SQLAlchemy dialect shim and
-> a one-time schema bootstrap) because Cloudflare D1 isn't yet first-class in
-> Omnigent. It works end to end — it's how this directory was validated — but
-> see [What's still rough](#whats-still-rough) for the upstream changes that
-> would remove the rough edges. The R2 artifact store, by contrast, uses a
-> first-class backend (`S3ArtifactStore`) added alongside this directory.
+> [!NOTE]
+> This path uses a small SQLAlchemy dialect shim (`sitecustomize.py`) because
+> Cloudflare D1 isn't yet first-class in Omnigent. It works end to end — it's how
+> this directory was validated — and the normal on-boot migrations run unmodified
+> (no schema-bootstrap step). See [What's still rough](#whats-still-rough) for the
+> one upstream change that would remove the shim. The R2 artifact store, by
+> contrast, already uses a first-class backend (`S3ArtifactStore`) added alongside
+> this directory.
 
 ## How it works
 
@@ -40,8 +41,8 @@ browser ───────────────►  Worker (src/index.js)
 - **Worker** — a thin front that proxies every request to **one** container
   instance (Omnigent keeps an in-memory runner registry, so it's single-replica).
 - **Container** — the official `ghcr.io/omnigent-ai/omnigent-server` image plus
-  the D1 SQLAlchemy dialect, a shim that makes that dialect behave like SQLite,
-  and `boto3` (this directory's `Dockerfile`).
+  the D1 SQLAlchemy dialect, a shim that re-registers it as a proper SQLite
+  dialect, and `boto3` (this directory's `Dockerfile`).
 - **D1** is the database. The server reaches it through the
   `sqlalchemy-cloudflare-d1` dialect, which speaks D1's HTTP API — so
   `DATABASE_URL` is `cloudflare_d1://<account>:<api-token>@<database-id>`.
@@ -55,10 +56,9 @@ browser ───────────────►  Worker (src/index.js)
 | File | Purpose |
 |---|---|
 | `Dockerfile` | derived image: server + D1 dialect + shim + boto3 |
-| `sitecustomize.py` | shim that makes the D1 dialect behave like SQLite (auto-loaded) |
+| `sitecustomize.py` | shim re-registering `cloudflare_d1` as a SQLite dialect (auto-loaded) |
 | `src/index.js` | the Worker that proxies to the container |
 | `wrangler.jsonc` | Worker + Container + Durable Object config |
-| `bootstrap-d1.py` | one-time D1 schema initializer (see step 5) |
 | `package.json` | `wrangler` + `@cloudflare/containers` |
 
 ## Prerequisites
@@ -66,7 +66,7 @@ browser ───────────────►  Worker (src/index.js)
 - A Cloudflare account on the **Workers Paid** plan (~$5/mo) — Containers
   require it.
 - **Docker** running locally (`wrangler deploy` builds the image).
-- **Node** (for `wrangler`) and **Python 3** (only for the one-time bootstrap).
+- **Node** (for `wrangler`).
 - `wrangler login` (or a `CLOUDFLARE_API_TOKEN`).
 
 ```bash
@@ -119,20 +119,7 @@ python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdi
 ```
 </details>
 
-### 5. Initialize the D1 schema (one time)
-
-The server's on-boot migration doesn't fully run on D1 yet (see
-[What's still rough](#whats-still-rough)), so build the schema once:
-
-```bash
-docker build -t omnigent-cf .
-docker run --rm -i \
-  -e DATABASE_URL="cloudflare_d1://<ACCOUNT_ID>:<D1_API_TOKEN>@<DATABASE_ID>" \
-  --entrypoint /opt/venv/bin/python omnigent-cf - < bootstrap-d1.py
-# -> "D1 schema bootstrapped to <rev>: 13 tables [...]"
-```
-
-### 6. Configure and set secrets
+### 5. Configure and set secrets
 
 In `wrangler.jsonc`, set `AWS_ENDPOINT_URL_S3` to your account's R2 endpoint
 (`https://<ACCOUNT_ID>.r2.cloudflarestorage.com`). Then set the four secrets:
@@ -149,7 +136,7 @@ npx wrangler secret put AWS_ACCESS_KEY_ID
 npx wrangler secret put AWS_SECRET_ACCESS_KEY
 ```
 
-### 7. Deploy
+### 6. Deploy
 
 ```bash
 npx wrangler deploy
@@ -162,7 +149,11 @@ The container cold-starts on the first request (~10s), then stays warm:
 curl https://omnigent.<your-subdomain>.workers.dev/health   # {"status":"ok"}
 ```
 
-### 8. First admin + connect a host
+On a brand-new D1, the **first** boot runs all migrations before the server
+starts listening (~1 minute against D1's REST API), so the first few requests
+may return a 5xx while it migrates — just retry. Later boots are fast.
+
+### 7. First admin + connect a host
 
 Open the URL and the Setup screen claims the first admin (username + password).
 Then connect a machine to actually run agents (the server is just the control
@@ -183,19 +174,17 @@ nothing durable.
 
 ## What's still rough
 
-This deployment leans on two D1-specific workarounds. Both are the subject of
-upstream changes that would let you drop them:
+This deployment leans on one D1-specific workaround:
 
-1. **The D1 dialect shim** (`sitecustomize.py`). The third-party
-   `sqlalchemy-cloudflare-d1` dialect subclasses `DefaultDialect` instead of
-   `SQLiteDialect`, so it mis-compiles DDL and has incomplete reflection. The
-   shim patches it to behave like SQLite. The real fix is upstream in the
-   dialect (subclass `SQLiteDialect`); then the shim shrinks to nothing.
-2. **The one-time schema bootstrap** (`bootstrap-d1.py`). Because the dialect's
-   reflection is incomplete, the on-boot Alembic migration can't run a
-   `drop_constraint` step on D1, so we build the schema with `create_all` +
-   stamp instead. Fixing the dialect's reflection (#1) makes normal migrations
-   work and removes this step.
+**The D1 dialect shim** (`sitecustomize.py`). The third-party
+`sqlalchemy-cloudflare-d1` dialect subclasses the generic `DefaultDialect` and
+hand-reimplements SQLite's SQL compilation and reflection incompletely. The shim
+re-registers `cloudflare_d1` as a proper `SQLiteDialect` subclass — keeping only
+the HTTP transport and D1 type processors — so DDL and reflection come from
+SQLite and the **normal on-boot Alembic migrations run unmodified** (no
+schema-bootstrap step). The clean fix is the same change upstream: make the
+dialect subclass `SQLiteDialect`. Then the shim drops to a few lines (an Alembic
+impl registration plus the "D1 has no `temp` schema" reflection overrides).
 
 The R2 artifact store has **no** such workaround — it uses the native
 `S3ArtifactStore` backend (selected by `OMNIGENT_ARTIFACT_URI`), so the same

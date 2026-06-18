@@ -19,13 +19,14 @@ USER root
 RUN /opt/venv/bin/pip install --no-cache-dir \
         "sqlalchemy-cloudflare-d1==0.3.10" "boto3>=1.30,<2"
 
-# Shim: make the D1 dialect behave like SQLite (auto-loaded at startup).
+# Shim: re-register the D1 dialect as a proper SQLite subclass (auto-loaded).
 COPY sitecustomize.py ${SITE}/sitecustomize.py
 RUN /opt/venv/bin/python -c "\
 import sitecustomize; \
 from sqlalchemy import create_engine; \
-e = create_engine('cloudflare_d1://a:b@c'); \
+from sqlalchemy.dialects.sqlite.base import SQLiteDialect; \
 from alembic.ddl.impl import _impls; \
+e = create_engine('cloudflare_d1://a:b@c'); \
+assert isinstance(e.dialect, SQLiteDialect); \
 assert 'cloudflare_d1' in _impls; \
-assert e.dialect.ddl_compiler.__name__ == 'SQLiteDDLCompiler'; \
 print('D1 dialect + shim OK')"

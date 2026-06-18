@@ -1,35 +1,39 @@
 """Auto-loaded shim that makes Omnigent work against Cloudflare D1.
 
-Python imports ``sitecustomize`` at interpreter startup, so any process
-launched with this directory on the path (it is dropped into site-packages by
-the Dockerfile) applies these fixes before Omnigent builds an engine or runs
-migrations.
+D1 is SQLite reached over an HTTP REST API. The third-party
+``sqlalchemy-cloudflare-d1`` dialect subclasses the *generic* ``DefaultDialect``
+and then hand-reimplements SQLite's SQL compilation and schema reflection —
+incompletely. That breaks DDL (a composite primary key emits two ``PRIMARY
+KEY`` clauses, which D1 rejects; reserved words like ``key`` go unquoted) and
+migrations (``get_unique_constraints`` is unimplemented; ``get_foreign_keys``
+drops keys reflection needs).
 
-D1 is SQLite-over-HTTP, but the third-party ``sqlalchemy-cloudflare-d1``
-dialect subclasses ``DefaultDialect`` (not ``SQLiteDialect``), so several
-things break. Every fix below is "treat cloudflare_d1 exactly like sqlite,"
-which is correct because D1 *is* SQLite. The clean long-term fix is to make the
-dialect subclass ``SQLiteDialect`` upstream; until then this shim carries it.
+The fix is to subclass SQLAlchemy's real ``SQLiteDialect`` and keep only the
+*transport*: the HTTP DBAPI, the URL parser, and the D1 type processors (which
+base64-encode blobs and ISO-format dates for the JSON REST API — SQLite's file
+DBAPI does this natively, D1's API does not). Everything above the transport —
+DDL compiler, type compiler, identifier quoting, and full reflection — is then
+inherited from SQLite, correctly. This is the change that belongs upstream in
+the dialect package (just change its base class); until it ships, sitecustomize
+re-registers a corrected dialect here. Python imports ``sitecustomize`` at
+interpreter startup, so it runs before Omnigent builds an engine.
 
-  1. Alembic's ddl-impl registry (``alembic.ddl.impl._impls``) is keyed by
-     dialect name with no fallback -> ``KeyError('cloudflare_d1')`` in
-     ``MigrationContext.__init__`` (online AND offline). Register a SQLite-
-     behavior impl under that name.
-  2. The dialect uses generic (DefaultDialect) SQL/DDL compilers, so e.g. a
-     composite primary key emits BOTH an inline column ``PRIMARY KEY`` and a
-     table-level ``PRIMARY KEY (...)`` -> D1 rejects it ("more than one primary
-     key"), and reserved words like ``key`` go unquoted. Point the dialect at
-     SQLite's compilers so every table compiles byte-identical to native sqlite.
-  3. ``get_foreign_keys()`` omits ``referred_schema`` / ``name`` keys that
-     SQLAlchemy reflection accesses with ``dict[...]`` -> ``KeyError`` during
-     the table reflection ``batch_alter_table`` performs. D1 has no schemas.
-  4. ``get_unique_constraints()`` is unimplemented (base ``Dialect`` raises
-     ``NotImplementedError``), but migrations call it directly. Implement it the
-     SQLite way (``PRAGMA index_list`` with origin ``'u'``).
+Two small adaptations remain, both expressing facts about D1 rather than SQLite
+shortcomings:
+
+  * **Alembic.** Its DDL-impl registry (``alembic.ddl.impl._impls``) is keyed by
+    ``dialect.name`` with no inheritance fallback, so the (correctly named)
+    ``cloudflare_d1`` dialect ``KeyError``s in ``MigrationContext.__init__``.
+    Register SQLite's impl under that name.
+  * **No ``temp`` schema.** D1 exposes a single ``main`` schema and forbids the
+    ``temp`` schema (``SQLITE_AUTH``). SQLite's reflection probes ``temp``
+    (``PRAGMA temp.*``, ``sqlite_temp_master``, ``PRAGMA database_list``); the
+    three touchpoints are overridden to read only ``main``.
 """
 
 import sys
 
+# ── Alembic: register a DDL impl for the cloudflare_d1 name ──────────────
 try:
     from alembic.ddl.sqlite import SQLiteImpl
 
@@ -38,52 +42,77 @@ try:
 except Exception as exc:  # noqa: BLE001 -- defensive: never block server startup
     print(f"[d1-shim] could not register Alembic impl: {exc}", file=sys.stderr)
 
+# ── Dialect: re-register cloudflare_d1 as a real SQLite subclass ─────────
 try:
-    from sqlalchemy.dialects.sqlite.base import (
-        SQLiteCompiler,
-        SQLiteDDLCompiler,
-        SQLiteIdentifierPreparer,
-        SQLiteTypeCompiler,
-    )
-    from sqlalchemy_cloudflare_d1.dialect import CloudflareD1Dialect
+    from sqlalchemy import exc as _sa_exc
+    from sqlalchemy.dialects import registry
+    from sqlalchemy.dialects.sqlite.base import SQLiteDialect
+    from sqlalchemy_cloudflare_d1.dialect import CloudflareD1Dialect as _UpstreamD1
 
-    # D1 == SQLite: borrow SQLite's full compilation machinery.
-    CloudflareD1Dialect.ddl_compiler = SQLiteDDLCompiler
-    CloudflareD1Dialect.statement_compiler = SQLiteCompiler
-    CloudflareD1Dialect.type_compiler = SQLiteTypeCompiler
-    CloudflareD1Dialect.preparer = SQLiteIdentifierPreparer
+    # SQLiteDialect.__init__ reads self.dbapi.sqlite_version_info to gate
+    # features. D1 runs a modern SQLite; advertise it (the live version is also
+    # read in _get_server_version_info below).
+    _D1_SQLITE_VERSION = (3, 45, 0)
+    _dbapi = _UpstreamD1.import_dbapi()
+    if not hasattr(_dbapi, "sqlite_version_info"):
+        _dbapi.sqlite_version_info = _D1_SQLITE_VERSION
+        _dbapi.sqlite_version = ".".join(str(p) for p in _D1_SQLITE_VERSION)
 
-    # Reflection: inject the keys SQLAlchemy requires (D1 has no schemas).
-    _orig_get_fks = CloudflareD1Dialect.get_foreign_keys
+    class CloudflareD1Dialect(SQLiteDialect):
+        """The cloudflare_d1 dialect: SQLite behavior over D1's HTTP transport."""
 
-    def _get_fks_with_schema(self, connection, table_name, schema=None, **kw):
-        fks = _orig_get_fks(self, connection, table_name, schema=schema, **kw)
-        for fk in fks:
-            fk.setdefault("referred_schema", None)
-            fk.setdefault("name", None)
-        return fks
+        name = "cloudflare_d1"
+        driver = "httpx"
+        default_paramstyle = "qmark"
+        supports_statement_cache = True
 
-    CloudflareD1Dialect.get_foreign_keys = _get_fks_with_schema
+        # D1's JSON REST API needs the transport type processors (blob->base64,
+        # date/time->ISO); layer them over SQLite's defaults.
+        colspecs = {**SQLiteDialect.colspecs, **_UpstreamD1.colspecs}  # noqa: RUF012
 
-    # Reflection: implement get_unique_constraints the SQLite way.
-    if not getattr(CloudflareD1Dialect, "_d1_unique_patched", False):
-        from sqlalchemy import text as _text
+        # ── transport (from the upstream dialect) ──
+        @classmethod
+        def import_dbapi(cls):
+            return _UpstreamD1.import_dbapi()
 
-        def _get_unique_constraints(self, connection, table_name, schema=None, **kw):  # noqa: ARG001 -- SQLAlchemy reflection signature
-            prep = self.identifier_preparer.quote_identifier
-            out = []
-            for row in connection.execute(_text(f"PRAGMA index_list({prep(table_name)})")):
-                _, idx_name, unique, origin = row[0], row[1], row[2], row[3]
-                if not unique or origin != "u":  # 'u' == a UNIQUE constraint
-                    continue
-                cols = [
-                    r[2] for r in connection.execute(_text(f"PRAGMA index_info({prep(idx_name)})"))
-                ]
-                name = None if idx_name.startswith("sqlite_autoindex_") else idx_name
-                out.append({"name": name, "column_names": cols})
-            return out
+        create_connect_args = _UpstreamD1.create_connect_args
 
-        CloudflareD1Dialect.get_unique_constraints = _get_unique_constraints
-        CloudflareD1Dialect._d1_unique_patched = True
+        # D1 has no isolation levels — keep these no-ops so SQLite's
+        # PRAGMA read_uncommitted machinery never runs over the REST API.
+        def get_isolation_level(self, dbapi_connection):  # noqa: ARG002
+            return None
+
+        def set_isolation_level(self, dbapi_connection, level):
+            pass
+
+        def _get_server_version_info(self, connection):
+            try:
+                v = connection.exec_driver_sql("SELECT sqlite_version()").scalar()
+                return tuple(int(x) for x in str(v).split("."))
+            except Exception:  # noqa: BLE001
+                return _D1_SQLITE_VERSION
+
+        # ── D1 has a single "main" schema and forbids "temp" ──
+        def get_schema_names(self, connection, **kw):  # noqa: ARG002
+            return ["main"]
+
+        def _get_table_sql(self, connection, table_name, schema=None, **kw):  # noqa: ARG002
+            schema_expr = f"{self.identifier_preparer.quote_identifier(schema)}." if schema else ""
+            s = (
+                f"SELECT sql FROM {schema_expr}sqlite_master "
+                "WHERE name = ? AND type in ('table', 'view')"
+            )
+            value = connection.exec_driver_sql(s, (table_name,)).scalar()
+            if value is None and not self._is_sys_table(table_name):
+                raise _sa_exc.NoSuchTableError(f"{schema_expr}{table_name}")
+            return value
+
+        def _get_table_pragma(self, connection, pragma, table_name, schema=None):
+            quote = self.identifier_preparer.quote_identifier
+            prefix = f"{quote(schema)}." if schema is not None else "main."
+            cursor = connection.exec_driver_sql(f"PRAGMA {prefix}{pragma}({quote(table_name)})")
+            return cursor.fetchall() if not cursor._soft_closed else []
+
+    registry.register("cloudflare_d1", __name__, "CloudflareD1Dialect")
 except Exception as exc:  # noqa: BLE001 -- defensive: never block server startup
-    print(f"[d1-shim] could not patch D1 compilers: {exc}", file=sys.stderr)
+    print(f"[d1-shim] could not register D1 dialect: {exc}", file=sys.stderr)
