@@ -716,6 +716,7 @@ async def test_sys_tools_exposed_as_callables_routing_through_executor(
     This is what lets an Antigravity agent drive Omnigent's sys / sub-agent
     tools under policy (needed to run Polly / Debby).
     """
+    pytest.importorskip("google.antigravity")  # opt-in SDK extra; absent in default CI lanes
     captured = _install_fake_sdk(monkeypatch, scripts=[[_text_step("done")]])
     executor = AntigravityExecutor()
 
@@ -777,6 +778,7 @@ async def test_sys_tool_schema_reaches_sdk_proto_losslessly(
     * **Enums and nested objects survive.** Both were silently dropped (flattened
       to a bare ``{"type": ...}``) by the synthesis path.
     """
+    pytest.importorskip("google.antigravity")  # opt-in SDK extra; absent in default CI lanes
     captured = _install_fake_sdk(monkeypatch, scripts=[[_text_step("done")]])
     executor = AntigravityExecutor()
 
@@ -839,6 +841,7 @@ async def test_tool_schema_passed_verbatim_and_empty_fallback(
     untouched. When a spec omits (or mis-types) ``parameters``, the executor
     substitutes an empty-object schema — mirroring ``cursor_executor``.
     """
+    pytest.importorskip("google.antigravity")  # opt-in SDK extra; absent in default CI lanes
     _install_fake_sdk(monkeypatch, scripts=[[_text_step("done")]])
     executor = AntigravityExecutor()
 
@@ -915,6 +918,7 @@ async def test_tool_schema_change_rebuilds_agent_registration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A schema-only ToolSpec change must reopen the SDK agent for re-registration."""
+    pytest.importorskip("google.antigravity")  # opt-in SDK extra; absent in default CI lanes
     captured = _install_fake_sdk(
         monkeypatch, scripts=[[_text_step("one-reply")], [_text_step("two-reply")]]
     )
