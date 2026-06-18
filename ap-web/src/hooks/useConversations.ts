@@ -445,13 +445,15 @@ export function useBulkArchiveConversations() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async ({ ids, archived }: { ids: string[]; archived: boolean }) => {
-      const results = await Promise.allSettled(
-        ids.map((id) => archiveConversation(id, archived)),
-      );
+      const results = await Promise.allSettled(ids.map((id) => archiveConversation(id, archived)));
       const failed: string[] = [];
       for (let i = 0; i < results.length; i++) {
         if (results[i].status === "rejected") failed.push(ids[i]);
-        else markConversationSeen(ids[i], (results[i] as PromiseFulfilledResult<Conversation>).value.updated_at);
+        else
+          markConversationSeen(
+            ids[i],
+            (results[i] as PromiseFulfilledResult<Conversation>).value.updated_at,
+          );
       }
       if (failed.length > 0) throw { failed, total: ids.length };
       return results
