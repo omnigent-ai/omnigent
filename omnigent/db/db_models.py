@@ -361,6 +361,13 @@ class SqlConversation(Base):
     # AgentSpec instead of the parent's. Replaces task.agent_name
     # from the removed task store. None for top-level sessions.
     sub_agent_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Monotonic allocator for the next item position in this conversation.
+    # append() reads and advances this instead of scanning
+    # MAX(SqlConversationItem.position) on every write, making position
+    # assignment O(1) and collision-free under the conversation lock. New rows
+    # start at 0 (column default); NULL marks a row created before this column
+    # existed, which append() backfills via a one-time scan on its next write.
+    next_position: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
     external_session_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # JSON-serialized mutable per-conversation key/value store
     # used by policy callables to accumulate state across turns.

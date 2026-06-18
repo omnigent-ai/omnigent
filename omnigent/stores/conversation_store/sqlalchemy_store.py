@@ -495,9 +495,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         row to escalate the transaction to ``RESERVED``. SQLite
         starts transactions as ``DEFERRED`` (read-only) by
         default — concurrent ``append()`` calls would otherwise
-        both run the ``select(max(position))`` query without
-        holding any write lock, both compute the same ``max_pos``,
-        and both try to INSERT at ``max_pos + 1`` → UNIQUE
+        both read the same ``next_position`` counter (or, for a
+        pre-counter conversation, the same ``max(position)``) without
+        holding any write lock, both allocate the same position, and
+        both try to INSERT it → UNIQUE
         constraint failure on
         ``ix_conversation_items_conversation_id_position``.
         Reproduced 2026-04-30 in the user's 20-shell scenario:
@@ -508,8 +509,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         escalates this transaction to ``RESERVED`` immediately,
         so a second concurrent transaction blocks on
         ``busy_timeout`` (20s, set in :func:`make_managed_session_maker`)
-        rather than racing the SELECT, and re-reads ``max_pos``
-        with the up-to-date state once the holder commits.
+        rather than racing the read, and re-reads the up-to-date
+        ``next_position`` counter (or, for a pre-counter conversation,
+        ``max(position)``) once the holder commits.
 
         :param session: The active SQLAlchemy session.
         :param conversation_id: The conversation to lock,
@@ -1377,15 +1379,34 @@ class SqlAlchemyConversationStore(ConversationStore):
             if conv_row is not None:
                 conv_row.updated_at = now
 
-            # coalesce to -1 so the first appended item gets position 0.
-            max_pos = session.execute(
-                select(func.coalesce(func.max(SqlConversationItem.position), -1)).where(
-                    SqlConversationItem.conversation_id == conversation_id
+            # Allocate item positions from the conversation's maintained
+            # next_position counter instead of running a MAX(position) aggregate
+            # on every append. Reading + advancing the counter under
+            # _lock_conversation keeps allocation O(1), drops a query per write,
+            # and stays collision-free. The aggregate is an index lookup on this
+            # schema (ix_conversation_items_conversation_id_position), but a
+            # maintained counter avoids the per-append round-trip regardless and
+            # scales to backends where that same allocation is a full scan.
+            #
+            # Backwards compatibility: conversations created before this counter
+            # existed have next_position = NULL; fall back to a one-time
+            # MAX(position) scan (coalesce to -1 so the first item gets 0), then
+            # persist the counter below so every later append is scan-free.
+            if conv_row is not None and conv_row.next_position is not None:
+                next_pos = conv_row.next_position
+            else:
+                next_pos = (
+                    session.execute(
+                        select(func.coalesce(func.max(SqlConversationItem.position), -1)).where(
+                            SqlConversationItem.conversation_id == conversation_id
+                        )
+                    ).scalar_one()
+                    + 1
                 )
-            ).scalar_one()
 
             for item in items:
-                max_pos += 1
+                position = next_pos
+                next_pos += 1
                 data_dict = item.data.model_dump(exclude_none=True)
                 # Strip NUL bytes before they reach a Postgres text
                 # column, which rejects them outright. Tool output can
@@ -1400,7 +1421,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     response_id=item.response_id,
                     created_at=now,
                     status="completed",  # items are final on append
-                    position=max_pos,
+                    position=position,
                     type=item.type,
                     data=data,
                     search_text=search,
@@ -1419,6 +1440,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                         created_by=item.created_by,
                     )
                 )
+
+            # Persist the advanced counter so the next append reads it instead
+            # of scanning; this also lazily backfills a pre-counter conversation.
+            if conv_row is not None:
+                conv_row.next_position = next_pos
 
         return persisted
 
@@ -2263,6 +2289,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                     new_conv.id,
                     src_item.search_text or "",
                 )
+
+            # The clone copied len(source_items) items at dense positions
+            # 0..N-1, so its position allocator starts at N. Seed it from the
+            # snapshot (not the source row's counter) so the fork is correct
+            # even when the source predates the counter.
+            new_conv.next_position = len(source_items)
 
             # Bind the cloned agent to the forked session atomically.
             if agent_id is not None:
