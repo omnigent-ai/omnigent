@@ -21,10 +21,20 @@ import time
 from pathlib import Path
 from typing import Any
 
+from omnigent.native_bridge_security import ensure_secure_dir as _ensure_secure_dir_under
+
 #: Env var carrying the bridge dir into the harness executor process.
 BRIDGE_DIR_ENV_VAR = "HARNESS_CURSOR_NATIVE_BRIDGE_DIR"
 
-_BRIDGE_ROOT = Path(os.environ.get("TMPDIR", "/tmp")) / f"omnigent-{os.getuid()}" / "cursor-native"
+# Root for the per-process cursor bridge tree. Namespaced by uid so other
+# Unix users on the same host cannot read the tmux target or pre-create the
+# parent as a symlink to redirect the bridge tree. The trusted parent
+# (``$TMPDIR``/``/tmp``) is shared; everything under ``_BRIDGE_ROOT_PARENT``
+# must be owned by the current uid and not be a symlink — see
+# :func:`_ensure_secure_dir`.
+_TRUSTED_PARENT = Path(os.environ.get("TMPDIR", "/tmp"))
+_BRIDGE_ROOT_PARENT = _TRUSTED_PARENT / f"omnigent-{os.getuid()}"
+_BRIDGE_ROOT = _BRIDGE_ROOT_PARENT / "cursor-native"
 _TMUX_FILE = "tmux.json"
 _TMUX_READY_TIMEOUT_S = 30.0
 _TMUX_SEND_TIMEOUT_S = 10.0
@@ -47,17 +57,23 @@ def bridge_dir_for_session_id(session_id: str) -> Path:
     return _BRIDGE_ROOT / digest
 
 
-def _ensure_dir(path: Path) -> None:
-    """Create *path* (and parents) with owner-only permissions."""
-    path.mkdir(parents=True, exist_ok=True)
-    with contextlib.suppress(OSError):
-        os.chmod(path, 0o700)
+def _ensure_secure_dir(target: Path) -> None:
+    """Create or validate *target* as an owner-only directory chain.
+
+    Walks ancestors from the shared trusted parent (``$TMPDIR``/``/tmp``)
+    down to *target*, rejecting symlinks and foreign-owned ancestors and
+    enforcing ``0o700`` — the cursor analog of
+    :func:`omnigent.claude_native_bridge._ensure_secure_dir`. A plain
+    ``mkdir(parents=True)`` would silently follow a pre-created symlinked
+    ancestor and redirect the bridge tree (which records the tmux target).
+    """
+    _ensure_secure_dir_under(target, trusted_parent=_TRUSTED_PARENT)
 
 
 def build_cursor_native_spawn_env(session_id: str) -> dict[str, str]:
     """Build the ``HARNESS_CURSOR_NATIVE_*`` env the harness executor reads."""
     bridge_dir = bridge_dir_for_session_id(session_id)
-    _ensure_dir(bridge_dir)
+    _ensure_secure_dir(bridge_dir)
     return {
         BRIDGE_DIR_ENV_VAR: str(bridge_dir),
     }
@@ -71,7 +87,7 @@ def write_tmux_target(
     pid: int | None = None,
 ) -> None:
     """Advertise the tmux socket + target for the running Cursor terminal."""
-    _ensure_dir(bridge_dir)
+    _ensure_secure_dir(bridge_dir)
     payload: dict[str, Any] = {
         "socket_path": str(socket_path),
         "tmux_target": tmux_target,

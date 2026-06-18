@@ -36,7 +36,6 @@ import queue
 import re
 import secrets
 import shlex
-import stat
 import sys
 import tempfile
 import threading
@@ -52,6 +51,8 @@ from typing import TYPE_CHECKING, Any
 from urllib import error, request
 
 from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
+from omnigent.native_bridge_security import absolute_syntactic_path as _absolute_syntactic_path
+from omnigent.native_bridge_security import ensure_secure_dir as _ensure_secure_dir_under
 
 if TYPE_CHECKING:
     from omnigent.llms.context_window import ModelPricing
@@ -163,21 +164,6 @@ _TERMINAL_FAILURE_TAIL_LINES = 12
 _TERMINAL_FAILURE_TAIL_CHARS = 800
 
 ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[Any]]
-
-
-def _absolute_syntactic_path(path: Path) -> Path:
-    """
-    Return an absolute path without following symlinks.
-
-    Security validation needs to inspect symlinked ancestors with
-    ``lstat``. ``Path.resolve`` would follow an existing symlink before
-    that inspection, so this helper only expands ``~`` and normalizes
-    ``.`` / ``..`` components.
-
-    :param path: Path to normalize, e.g. ``Path("~/.omnigent/x")``.
-    :returns: Absolute path with syntactic normalization applied.
-    """
-    return Path(os.path.abspath(os.fspath(path.expanduser())))
 
 
 def _trusted_parent_for_bridge_dir(target: Path) -> Path:
@@ -597,33 +583,7 @@ def _ensure_secure_dir(target: Path) -> None:
     """
     target = _absolute_syntactic_path(target)
     trusted_parent = _trusted_parent_for_bridge_dir(target)
-    ancestors: list[Path] = []
-    cur = target
-    while cur != trusted_parent and cur != cur.parent:
-        ancestors.append(cur)
-        cur = cur.parent
-    if cur != trusted_parent:
-        raise RuntimeError(f"bridge dir {target!s} is not under trusted parent {trusted_parent!s}")
-    ancestors.reverse()
-    my_uid = os.getuid()
-    for ancestor in ancestors:
-        try:
-            os.mkdir(ancestor, mode=0o700)
-            continue
-        except FileExistsError:
-            pass
-        st = os.lstat(ancestor)
-        if stat.S_ISLNK(st.st_mode):
-            raise RuntimeError(f"refusing to use bridge ancestor {ancestor!s}: is a symlink")
-        if not stat.S_ISDIR(st.st_mode):
-            raise RuntimeError(f"refusing to use bridge ancestor {ancestor!s}: not a directory")
-        if st.st_uid != my_uid:
-            raise RuntimeError(
-                f"refusing to use bridge ancestor {ancestor!s}: owned by uid "
-                f"{st.st_uid}, not current user ({my_uid})"
-            )
-        if (st.st_mode & 0o077) != 0:
-            os.chmod(ancestor, 0o700)
+    _ensure_secure_dir_under(target, trusted_parent=trusted_parent)
 
 
 def bridge_dir_for_bridge_id(bridge_id: str) -> Path:
