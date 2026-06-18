@@ -918,6 +918,12 @@ class MCPServerConfig:
     command: str | None = None
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict, repr=False)
+    # Optional per-server tool allow-list: only these tool names are exposed to
+    # the model; others are filtered at registration (server/mcp_pool.py,
+    # runner/mcp_manager.py). ``None`` exposes all. Applies to both transports
+    # and mirrors ``MCPTool.tools`` / the YAML ``tools:`` whitelist documented
+    # in docs/AGENT_YAML_SPEC.md.
+    tools: list[str] | None = None
     description: str | None = None
     # Per-tool timeout/retry overrides. None = inherit from
     # tools.timeout / tools.retry.
