@@ -6,8 +6,8 @@ from typing import Any
 
 import httpx
 
+import omnigent.opencode_native_forwarder as fwd_mod
 from omnigent.opencode_native_client import OpenCodeEvent
-from omnigent.opencode_native_forwarder import OpenCodeNativeForwarder
 
 _SESSION = "ses_1"
 
@@ -42,8 +42,8 @@ def _forwarder(
     server: _RecordingServerClient,
     opencode: _FakeOpenCodeClient,
     **kwargs: Any,
-) -> OpenCodeNativeForwarder:
-    return OpenCodeNativeForwarder(
+) -> fwd_mod.OpenCodeNativeForwarder:
+    return fwd_mod.OpenCodeNativeForwarder(
         session_id="conv_1",
         opencode_session_id=_SESSION,
         opencode_client=opencode,  # type: ignore[arg-type]
@@ -283,9 +283,8 @@ async def test_run_reconnects_until_cap() -> None:
         raise httpx.ReadError("dropped", request=httpx.Request("GET", "http://x/event"))
 
     fwd._consume_once = failing_consume  # type: ignore[method-assign]
-    # Patch sleep so the backoff doesn't slow the test.
-    import omnigent.opencode_native_forwarder as fwd_mod
 
+    # Patch sleep so the backoff doesn't slow the test.
     async def _no_sleep(_seconds: float) -> None:
         return None
 

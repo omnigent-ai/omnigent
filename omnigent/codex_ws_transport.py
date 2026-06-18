@@ -38,6 +38,12 @@ _logger = logging.getLogger(__name__)
 # ``close`` (``omnigent.codex_native_app_server.CodexAppServerClient``).
 CodexClientFactory = Callable[[], Any]
 
+# Public surface of this transport module. ``CodexClientFactory`` is the
+# documented annotation for ``CodexWsTransport(client_factory=...)``; export
+# it so the alias reads as intended public API (its only other use is a
+# PEP 563 stringified annotation, which static analysis can't see as a load).
+__all__ = ["CodexClientFactory", "CodexWsTransport"]
+
 
 def _prompt_to_input_items(prompt: NativePrompt) -> list[dict[str, Any]]:
     """

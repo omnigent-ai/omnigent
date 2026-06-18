@@ -39,6 +39,12 @@ _logger = logging.getLogger(__name__)
 
 ClientFactory = Callable[[], OpenCodeClient]
 
+# Public surface of this transport module. ``ClientFactory`` is the documented
+# annotation for ``OpenCodeHttpTransport(client_factory=...)``; export it so the
+# alias reads as intended public API (its only other use is a PEP 563 stringified
+# annotation, which static analysis can't see as a load).
+__all__ = ["ClientFactory", "OpenCodeHttpTransport", "build_prompt_payload"]
+
 
 def build_prompt_payload(prompt: NativePrompt) -> dict[str, Any]:
     """
