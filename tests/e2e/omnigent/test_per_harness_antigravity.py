@@ -64,6 +64,7 @@ normalization (#297) — those land with their own PRs and are tested there.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import uuid
 from pathlib import Path
@@ -101,6 +102,8 @@ _ERROR_MARKERS: tuple[str, ...] = (
 # ~10-60s; 200s keeps headroom on a contended CI host without letting a hung run
 # pin the suite forever.
 _RUN_TIMEOUT_SEC = 200
+_TOOL_SCHEMA_PRODUCT = "443242686"
+_TOOL_SCHEMA_RESULT_MARKER = f"schema-tool-result={_TOOL_SCHEMA_PRODUCT}"
 
 # Minimal antigravity-native agent spec. Single-file legacy form (``name`` /
 # ``prompt`` / ``executor``) — the form ``omnigent run <file>`` accepts without a
@@ -190,6 +193,33 @@ def antigravity_spec(tmp_path: Path) -> Path:
     """
     spec_path = tmp_path / "agent.yaml"
     spec_path.write_text(_AGENT_YAML, encoding="utf-8")
+    return spec_path
+
+
+@pytest.fixture
+def antigravity_tool_schema_spec(tmp_path: Path) -> Path:
+    """Materialize an antigravity spec with a structured-argument function tool."""
+    spec_path = tmp_path / "agent_with_calculate_tool.yaml"
+    spec_path.write_text(
+        """\
+name: antigravity_tool_schema_e2e
+prompt: |
+  You have a calculate tool. When the user asks for arithmetic, use the tool.
+  The calculate tool requires exactly one argument named expression.
+
+executor:
+  harness: antigravity
+
+tools:
+  calculate:
+    type: function
+    description: |
+      Evaluate a basic arithmetic expression. Pass exactly one argument named
+      expression containing the expression string.
+    callable: tests.resources.examples._shared.tool_functions.calculate
+""",
+        encoding="utf-8",
+    )
     return spec_path
 
 
@@ -383,6 +413,60 @@ def test_per_harness_antigravity_smoke(
         model=None,
     )
     _assert_clean_assistant_reply(fake_home / ".omnigent" / "chat.db", result, label="smoke")
+
+
+def test_per_harness_antigravity_tool_parameter_schema_bridge(
+    omnigent_python: Path,
+    omnigent_repo_root: Path,
+    antigravity_tool_schema_spec: Path,
+    tmp_path: Path,
+) -> None:
+    """A real antigravity turn can call a ToolSpec-backed structured-arg tool.
+
+    This is the live e2e counterpart to
+    ``test_sys_tool_schema_threaded_into_sdk_function_declaration``: it drives
+    ``omnigent run --harness antigravity`` through the production YAML ->
+    ToolSpec -> Antigravity SDK registration path, then asks the model to call a
+    ``calculate(expression: str)`` tool. If the registered SDK callable loses
+    the ToolSpec parameter schema, the model commonly calls the tool with the
+    wrong argument shape or no argument at all; the expected tool lifecycle line
+    and final result marker then do not appear.
+    """
+    skip_reason = _antigravity_skip_reason(omnigent_python)
+    if skip_reason is not None:
+        pytest.skip(skip_reason)
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    env = _antigravity_env(dict(os.environ), fake_home)
+
+    result = _run_one_shot(
+        omnigent_python=omnigent_python,
+        omnigent_repo_root=omnigent_repo_root,
+        spec_path=antigravity_tool_schema_spec,
+        env=env,
+        prompt=(
+            "Use the calculate tool to compute 48273 multiplied by 9182. "
+            f"Do not solve it mentally. After the tool returns, reply exactly "
+            f"'{_TOOL_SCHEMA_RESULT_MARKER}' and nothing else."
+        ),
+        model=_PINNED_MODEL,
+    )
+    joined = _assert_clean_assistant_reply(
+        fake_home / ".omnigent" / "chat.db", result, label="tool-schema"
+    )
+
+    assert "calculate" in result.stdout.lower(), (
+        "Antigravity did not render a calculate tool lifecycle line; the model "
+        "likely did not call the structured-argument tool.\n\n"
+        f"stdout:\n{result.stdout[-2500:]!r}\n\nstderr:\n{result.stderr[-2500:]!r}"
+    )
+    assert _TOOL_SCHEMA_RESULT_MARKER in joined.replace(",", "").lower(), (
+        "Antigravity did not persist the expected calculate-tool result marker. "
+        "If the ToolSpec parameter schema was not registered with the SDK, the "
+        "model may have called calculate with a malformed argument object.\n\n"
+        f"assistant transcript:\n{joined!r}\n\nstdout:\n{result.stdout[-2500:]!r}"
+    )
 
 
 @pytest.mark.parametrize(

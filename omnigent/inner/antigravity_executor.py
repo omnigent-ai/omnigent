@@ -44,6 +44,7 @@ import contextlib
 import importlib
 import inspect
 import json
+import keyword
 import logging
 import time
 import uuid
@@ -141,9 +142,9 @@ def _attach_schema_signature(fn: _ToolCallable, schema: _StrAnyDict | None) -> N
     the model sees real argument names, types, and required fields. The runtime
     body stays ``*args/**kwargs`` — this only changes what introspection reports.
 
-    Properties whose names are not valid Python identifiers are skipped (they
-    cannot become :class:`inspect.Parameter` names); the callable still accepts
-    them at call time via ``**kwargs``.
+    Properties whose names are not valid Python parameter names are skipped
+    (they cannot become :class:`inspect.Parameter` names); the callable still
+    accepts them at call time via ``**kwargs``.
 
     :param fn: The tool callable to annotate (mutated in place).
     :param schema: The ToolSpec ``parameters`` JSON-Schema, or ``None``.
@@ -160,7 +161,7 @@ def _attach_schema_signature(fn: _ToolCallable, schema: _StrAnyDict | None) -> N
     params: list[inspect.Parameter] = []
     annotations: _StrAnyDict = {}
     for pname, pspec in props.items():
-        if not isinstance(pname, str) or not pname.isidentifier():
+        if not isinstance(pname, str) or not pname.isidentifier() or keyword.iskeyword(pname):
             continue
         ptype = pspec.get("type") if isinstance(pspec, dict) else None
         annotation = _JSON_TYPE_TO_PY.get(ptype, str) if isinstance(ptype, str) else str
@@ -459,13 +460,27 @@ class AntigravityExecutor(Executor):
 
     @staticmethod
     def _tool_signature(tools: list[ToolSpec]) -> str:
-        """Stable cache key for a tool set (names only — enough to detect change).
+        """Stable cache key for the SDK tool-registration surface.
 
         :param tools: Omnigent tool specs for the turn.
-        :returns: Deterministic JSON string of the sorted tool names.
+        :returns: Deterministic JSON string of the registered tool declarations.
         """
-        names = sorted(str(tool.get("name", "")) for tool in tools)
-        return json.dumps(names, separators=(",", ":"))
+        declarations: list[_StrAnyDict] = []
+        for tool in tools:
+            name = tool.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            description = tool.get("description")
+            params = tool.get("parameters")
+            declarations.append(
+                {
+                    "name": name,
+                    "description": description if isinstance(description, str) else "",
+                    "parameters": params if isinstance(params, dict) else {},
+                }
+            )
+        declarations.sort(key=lambda item: str(item["name"]))
+        return json.dumps(declarations, sort_keys=True, separators=(",", ":"), default=str)
 
     async def close_session(self, session_key: str) -> None:
         """Close and drop the SDK agent for *session_key*, if any.

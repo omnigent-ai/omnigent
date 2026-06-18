@@ -297,6 +297,38 @@ async def _drain(
     return events
 
 
+_ANNOTATION_TO_JSON_TYPE: dict[type, str] = {
+    str: "string",
+    int: "integer",
+    float: "number",
+    bool: "boolean",
+    dict: "object",
+    list: "array",
+}
+
+
+def _sdk_parameter_schema_from_callable(fn: Any) -> dict[str, Any]:
+    """Mirror the SDK's inspect.signature-based function-declaration step."""
+    sig = inspect.signature(fn)
+    properties: dict[str, dict[str, str]] = {}
+    required: list[str] = []
+    for pname, param in sig.parameters.items():
+        if param.kind not in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            continue
+        json_type = _ANNOTATION_TO_JSON_TYPE.get(param.annotation, "string")
+        properties[pname] = {"type": json_type}
+        if param.default is inspect.Parameter.empty:
+            required.append(pname)
+
+    schema: dict[str, Any] = {"type": "object", "properties": properties}
+    if required:
+        schema["required"] = required
+    return schema
+
+
 def _text_step(delta: str) -> _YieldStep:
     return _YieldStep(
         _FakeStep(
@@ -788,8 +820,79 @@ async def test_sys_tool_schema_threaded_into_sdk_function_declaration(
     # JSON-Schema types map onto Python annotations.
     assert sig.parameters["cmd"].annotation is str
     assert sig.parameters["timeout"].annotation is int
+    assert _sdk_parameter_schema_from_callable(sdk_tool) == {
+        "type": "object",
+        "properties": {
+            "cmd": {"type": "string"},
+            "timeout": {"type": "integer"},
+        },
+        "required": ["cmd"],
+    }
     # Schema is metadata only — the callable still routes through the bridge.
     assert await sdk_tool(cmd="ls") == {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_tool_schema_mapping_handles_primitives_and_invalid_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Schema signature synthesis maps JSON primitives and skips invalid params."""
+    _install_fake_sdk(monkeypatch, scripts=[[_text_step("done")]])
+    executor = AntigravityExecutor()
+
+    async def _fake_tool_executor(name: str, args: dict[str, Any]) -> dict[str, Any]:
+        return {"ok": True}
+
+    executor._tool_executor = _fake_tool_executor
+    sdk_tools = executor._build_sdk_tools(
+        [
+            {
+                "name": "sys_mixed",
+                "description": "mixed args",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "count": {"type": "integer"},
+                        "ratio": {"type": "number"},
+                        "enabled": {"type": "boolean"},
+                        "payload": {"type": "object"},
+                        "items": {"type": "array"},
+                        "unknown": {"type": "null"},
+                        "bad-name": {"type": "string"},
+                        "class": {"type": "string"},
+                        "loose": "not-a-property-schema",
+                    },
+                    "required": ["text", "count", "bad-name", "class", 7],
+                },
+            },
+            {
+                "name": "sys_empty",
+                "description": "invalid schema",
+                "parameters": {"type": "object", "properties": []},
+            },
+        ]
+    )
+
+    mixed_schema = _sdk_parameter_schema_from_callable(sdk_tools[0])
+    assert mixed_schema == {
+        "type": "object",
+        "properties": {
+            "text": {"type": "string"},
+            "count": {"type": "integer"},
+            "ratio": {"type": "number"},
+            "enabled": {"type": "boolean"},
+            "payload": {"type": "object"},
+            "items": {"type": "array"},
+            "unknown": {"type": "string"},
+            "loose": {"type": "string"},
+        },
+        "required": ["text", "count"],
+    }
+    assert _sdk_parameter_schema_from_callable(sdk_tools[1]) == {
+        "type": "object",
+        "properties": {},
+    }
 
 
 @pytest.mark.asyncio
@@ -822,6 +925,57 @@ async def test_agent_reused_across_turns_same_session(monkeypatch: pytest.Monkey
     # the cached agent (and its SDK conversation state) was reused.
     assert len(captured["agents"]) == 1
     assert captured["agents"][0].conversation.sends == ["one", "two"]
+
+
+@pytest.mark.asyncio
+async def test_tool_schema_change_rebuilds_agent_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A schema-only ToolSpec change must reopen the SDK agent for re-registration."""
+    captured = _install_fake_sdk(
+        monkeypatch, scripts=[[_text_step("one-reply")], [_text_step("two-reply")]]
+    )
+    executor = AntigravityExecutor()
+
+    async def _fake_tool_executor(name: str, args: dict[str, Any]) -> dict[str, Any]:
+        return {"ok": True}
+
+    executor._tool_executor = _fake_tool_executor
+    first_tools = [
+        {
+            "name": "sys_shell",
+            "description": "Run a shell command",
+            "parameters": {
+                "type": "object",
+                "properties": {"cmd": {"type": "string"}},
+                "required": ["cmd"],
+            },
+        }
+    ]
+    second_tools = [
+        {
+            "name": "sys_shell",
+            "description": "Run a shell command",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        }
+    ]
+
+    await _drain(
+        executor, [{"role": "user", "content": "one", "session_id": "s1"}], first_tools
+    )
+    await _drain(
+        executor, [{"role": "user", "content": "two", "session_id": "s1"}], second_tools
+    )
+
+    assert len(captured["agents"]) == 2
+    first_tool = captured["configs"][0].tools[0]
+    second_tool = captured["configs"][1].tools[0]
+    assert list(inspect.signature(first_tool).parameters) == ["cmd"]
+    assert list(inspect.signature(second_tool).parameters) == ["command"]
 
 
 @pytest.mark.asyncio
