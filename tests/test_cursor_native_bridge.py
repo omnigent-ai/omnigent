@@ -9,6 +9,7 @@ claude-native validates its bearer-token tree.
 
 from __future__ import annotations
 
+import os
 import stat
 from pathlib import Path
 
@@ -46,6 +47,52 @@ def test_spawn_env_refuses_symlinked_ancestor(
 
     # Confirm nothing was created inside the attacker-controlled directory
     # — the refusal happened before any per-session dir was made.
+    assert list(attacker_dir.iterdir()) == []
+
+
+def test_spawn_env_refuses_symlinked_intermediate_ancestor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A symlink at the *production* ``omnigent-<uid>`` ancestor is refused.
+
+    The real bridge tree is ``$TMPDIR/omnigent-<uid>/cursor-native/<hash>``,
+    so the trusted parent and the leaf's immediate parent are *not* the same
+    directory — there's an intermediate ``omnigent-<uid>`` level in between.
+    The other symlink test collapses that chain (its ``_BRIDGE_ROOT`` is a
+    direct child of ``_TRUSTED_PARENT``), so a regression that only stat'd
+    the leaf's immediate parent would still pass it. This test reproduces
+    the multi-level layout and poisons the *intermediate* ancestor, which
+    only a true ancestor walk from the trusted parent down can catch.
+
+    A regression that checked just the leaf's immediate parent
+    (``cursor-native``, here a real, locked-down dir) would silently follow
+    the symlink and redirect the bridge tree (including the tmux target it
+    records) into the attacker-controlled directory.
+    """
+    # Reproduce the real layout: tmp_path (trusted) -> omnigent-<uid>
+    # (intermediate) -> cursor-native (root) -> <hash> (leaf). Only the
+    # intermediate level is replaced with an attacker symlink; everything
+    # below it would be perfectly fine if the walk stopped at the leaf's
+    # immediate parent.
+    intermediate_name = f"omnigent-{os.getuid()}"
+    attacker_dir = tmp_path / "attacker-controlled"
+    attacker_dir.mkdir(mode=0o700)
+    intermediate = tmp_path / intermediate_name
+    intermediate.symlink_to(attacker_dir, target_is_directory=True)
+
+    monkeypatch.setattr("omnigent.cursor_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.cursor_native_bridge._BRIDGE_ROOT",
+        intermediate / "cursor-native",
+    )
+
+    with pytest.raises(RuntimeError, match="symlink"):
+        build_cursor_native_spawn_env("conv_abc")
+
+    # The refusal must happen at the intermediate symlink, before anything
+    # is created through it inside the attacker-controlled directory.
     assert list(attacker_dir.iterdir()) == []
 
 
