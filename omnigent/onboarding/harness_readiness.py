@@ -140,7 +140,11 @@ def harness_is_configured(harness: str) -> bool:
         from omnigent.onboarding.cursor_auth import cursor_api_key_configured
 
         return cursor_api_key_configured() or bool(os.environ.get("CURSOR_API_KEY"))
-    if canonical not in _HARNESS_FAMILY and canonical not in _PI_HARNESSES and canonical not in _QWEN_HARNESSES:
+    if (
+        canonical not in _HARNESS_FAMILY
+        and canonical not in _PI_HARNESSES
+        and canonical not in _QWEN_HARNESSES
+    ):
         # Unknown harness — the daemon has no install metadata for it, so
         # it can't assess readiness. Fail open (custom/newer harnesses,
         # version skew).
