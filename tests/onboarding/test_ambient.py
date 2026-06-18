@@ -657,10 +657,25 @@ def test_vertex_claude_detected_with_all_env_vars(
         ("missing-use-vertex", {"ANTHROPIC_VERTEX_PROJECT_ID": "p", "CLOUD_ML_REGION": "r"}),
         ("missing-project-id", {"CLAUDE_CODE_USE_VERTEX": "1", "CLOUD_ML_REGION": "r"}),
         ("missing-region", {"CLAUDE_CODE_USE_VERTEX": "1", "ANTHROPIC_VERTEX_PROJECT_ID": "p"}),
-        ("use-vertex-false", {"CLAUDE_CODE_USE_VERTEX": "0", "ANTHROPIC_VERTEX_PROJECT_ID": "p", "CLOUD_ML_REGION": "r"}),
-        ("use-vertex-blank", {"CLAUDE_CODE_USE_VERTEX": "", "ANTHROPIC_VERTEX_PROJECT_ID": "p", "CLOUD_ML_REGION": "r"}),
+        (
+            "use-vertex-false",
+            {
+                "CLAUDE_CODE_USE_VERTEX": "0",
+                "ANTHROPIC_VERTEX_PROJECT_ID": "p",
+                "CLOUD_ML_REGION": "r",
+            },
+        ),
+        (
+            "use-vertex-blank",
+            {
+                "CLAUDE_CODE_USE_VERTEX": "",
+                "ANTHROPIC_VERTEX_PROJECT_ID": "p",
+                "CLOUD_ML_REGION": "r",
+            },
+        ),
     ],
 )
+
 def test_vertex_claude_not_detected_when_incomplete(
     clean_env, monkeypatch: pytest.MonkeyPatch, label: str, env: dict[str, str]
 ) -> None:
