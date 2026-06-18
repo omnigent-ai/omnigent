@@ -213,6 +213,9 @@ dev = [
     "moto[s3]>=5,<6",
     "respx>=0.21,<1",
     "boto3>=1.30,<2",
+    # The Cloudflare D1 SQLAlchemy dialect, exercised by the D1 FTS integration
+    # test (tests/db/test_d1_fts_dialect.py) via respx + sqlite3.
+    "sqlalchemy-cloudflare-d1==0.3.10",
 ]
 
 [project.scripts]
