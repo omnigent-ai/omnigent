@@ -78,17 +78,7 @@ skips:
     cluster: repl-pexpect-cli
     mode: skip
 
-  - id: tests/e2e/test_async_tools_e2e.py::test_async_tool_real_llm_e2e
-    reason: "Shard 0 bulk: async tool real-LLM assertion failure. Triage under #532."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
-    mode: skip
 
-  - id: tests/e2e/test_client_tool_cancellation_message_e2e.py::test_cancelled_client_tool_persists_system_message_in_conversation
-    reason: "Shard 0 bulk: client-tool cancellation persistence assertion fails. Triage under #532."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
-    mode: skip
 
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_tool_call_refusal_blocks_tool
     reason: "Shard 0 bulk: REPL approval pexpect-timeout family (same as other test_repl_approval_e2e entries)."
@@ -106,11 +96,6 @@ skips:
     reason: "Shard 0 bulk: REPL approval pexpect-timeout family."
     issue: 532
     cluster: repl-pexpect-cli
-    mode: skip
-  - id: tests/e2e/test_sys_async_inbox_e2e.py::test_sys_cancel_async_aborts_in_flight_dispatch_e2e
-    reason: "Shard 0 bulk: sys async-inbox cancel mid-dispatch. Triage under #532."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
     mode: skip
 
   # ── Shard 1 bulk quarantine (2026-05-15) ──
@@ -152,17 +137,7 @@ skips:
     issue: 532
     cluster: repl-pexpect-cli
     mode: skip
-  - id: tests/e2e/test_sys_async_inbox_e2e.py::test_sys_call_async_dispatch_marker_reaches_llm_e2e
-    reason: "Shard 1 bulk: sys async-inbox marker delivery."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
-    mode: skip
 
-  - id: tests/e2e/test_sys_async_inbox_harness_e2e.py::test_sys_read_inbox_harness_path_returns_drained_marker_e2e
-    reason: "Shard 1 bulk: sys async-inbox harness drain."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
-    mode: skip
 
   # ── Shard 1 errors (collection / fixture-level, not test body) ──
   - id: tests/e2e/omnigent/test_example_agent_with_os_env_fork.py::test_agent_with_os_env_fork_one_shot
@@ -207,11 +182,6 @@ skips:
     cluster: runner-wedge-subprocess-fanout
     mode: skip
 
-  - id: tests/e2e/test_async_tools_e2e.py::test_async_tool_failure_surfaces_e2e
-    reason: "Shard 3 bulk: async-tool failure surfacing."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
-    mode: skip
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_output_ask_refuse_replaces_reply_with_sentinel
     reason: "Shard 3 bulk: REPL output ask-refuse family."
     issue: 532
@@ -240,17 +210,7 @@ skips:
     issue: 532
     cluster: repl-pexpect-cli
     mode: skip
-  - id: tests/e2e/test_sys_async_inbox_e2e.py::test_sys_read_inbox_str_branch_routes_without_crash_e2e
-    reason: "Shard 3 bulk: sys async-inbox str-branch routing."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
-    mode: skip
 
-  - id: tests/e2e/test_sys_async_inbox_harness_e2e.py::test_sys_call_async_harness_path_returns_handle_e2e
-    reason: "Shard 3 bulk: sys async-inbox harness path returns handle."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
-    mode: skip
 
   - id: tests/e2e/test_steering_during_async_drain_e2e.py::test_steering_breaks_blocked_async_drain
     reason: "Shard 3 bulk: steering breaks blocked async drain."
@@ -258,19 +218,9 @@ skips:
     cluster: steering-cancel-compaction-state
     mode: skip
 
-  - id: tests/e2e/test_sub_agent_async_client_tool_routing_e2e.py::test_sub_agent_async_client_tool_signal_routes_to_worker_drain
-    reason: "Shard 3 bulk: sub-agent async client-tool signal routing."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
-    mode: skip
 
   # ── Shard 3 errors (collection / fixture-level) ──
 
-  - id: tests/e2e/test_async_tools_e2e.py::test_mixed_sync_and_async_tools_e2e
-    reason: "Follow-up: delayed_echo marker missing; inbox empty when test expected the async result."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
-    mode: skip
 
   - id: tests/e2e/omnigent/test_repl_session_lifecycle.py::test_repl_effort_command_persists_session_metadata
     reason: "Nightly bulk: REPL session-lifecycle / pexpect cluster."
@@ -300,11 +250,6 @@ skips:
     reason: "Nightly bulk: server-remote-ap autonomous flows; pexpect timeout family."
     issue: 532
     cluster: repl-pexpect-cli
-    mode: skip
-  - id: tests/e2e/test_claude_coder_client_tools.py::test_claude_sdk_parks_client_tool_call
-    reason: "Nightly bulk: claude-coder client-tool park."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
     mode: skip
 
   # ── Bulk-quarantine round 3 (2026-05-18, run 26017551154) ──
