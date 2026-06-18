@@ -2265,6 +2265,28 @@ def test_clean_codex_env_includes_databricks_bearer(monkeypatch) -> None:
     assert "DATABRICKS_TOKEN" not in env
 
 
+def test_clean_codex_env_includes_omnigent_session_marker(monkeypatch) -> None:
+    """The ``OMNIGENT`` session marker survives the codex env scrub.
+
+    The marker (set once on the runner) must reach the codex CLI so the
+    shell commands codex runs can detect they are inside an Omnigent
+    session, like ``CLAUDE_CODE`` / ``CODEX``.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.inner.codex_executor import _clean_codex_env
+    from omnigent.runner.identity import (
+        OMNIGENT_SESSION_ENV_VALUE,
+        OMNIGENT_SESSION_ENV_VAR,
+    )
+
+    monkeypatch.setenv(OMNIGENT_SESSION_ENV_VAR, OMNIGENT_SESSION_ENV_VALUE)
+
+    env = _clean_codex_env()
+
+    assert env.get(OMNIGENT_SESSION_ENV_VAR) == OMNIGENT_SESSION_ENV_VALUE
+
+
 # ---------------------------------------------------------------------------
 # Tests for _to_codex_input_items — input_file → inline text conversion
 # ---------------------------------------------------------------------------

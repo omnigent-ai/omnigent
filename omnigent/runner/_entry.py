@@ -642,7 +642,12 @@ def create_app(
     :returns: A runner FastAPI app exposing the harness-contract subset.
     """
     from omnigent.runner.app import create_runner_app
-    from omnigent.runner.identity import RUNNER_ID_ENV_VAR, get_stable_runner_id
+    from omnigent.runner.identity import (
+        OMNIGENT_SESSION_ENV_VALUE,
+        OMNIGENT_SESSION_ENV_VAR,
+        RUNNER_ID_ENV_VAR,
+        get_stable_runner_id,
+    )
     from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 
     server_url = _server_url_from_env()
@@ -652,6 +657,14 @@ def create_app(
     # restarts (§5 "Persistence" in RUNNER.md).
     _runner_id = get_stable_runner_id()
     os.environ[RUNNER_ID_ENV_VAR] = _runner_id
+    # Stamp the Omnigent session marker into the runner's environment so
+    # every process this runner spawns can detect it is running inside an
+    # Omnigent agent session, the way Claude Code sets CLAUDE_CODE and
+    # Codex sets CODEX. Harness workers inherit it (the process manager
+    # merges os.environ), native CLI terminals copy os.environ, and the
+    # claude-sdk SDK merges os.environ. The deny-by-default env scrubbers
+    # (os_env, codex, pi) allowlist it so it survives their scrub.
+    os.environ[OMNIGENT_SESSION_ENV_VAR] = OMNIGENT_SESSION_ENV_VALUE
 
     # Keep the harness manager on its default /tmp/omnigent root.
     # Nesting harness UDS paths under caller-provided temp dirs can

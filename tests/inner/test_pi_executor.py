@@ -2623,6 +2623,28 @@ def test_clean_pi_env_passes_pi_and_proxy_config(monkeypatch) -> None:
     assert env.get("NODE_EXTRA_CA_CERTS") == "/etc/ssl/corp-ca.pem"
 
 
+def test_clean_pi_env_includes_omnigent_session_marker(monkeypatch) -> None:
+    """The ``OMNIGENT`` session marker survives the Pi env scrub.
+
+    The marker (set once on the runner) must reach the Pi CLI so the
+    shell commands Pi runs can detect they are inside an Omnigent
+    session, like ``CLAUDE_CODE`` / ``CODEX``.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.inner.pi_executor import _clean_pi_env
+    from omnigent.runner.identity import (
+        OMNIGENT_SESSION_ENV_VALUE,
+        OMNIGENT_SESSION_ENV_VAR,
+    )
+
+    monkeypatch.setenv(OMNIGENT_SESSION_ENV_VAR, OMNIGENT_SESSION_ENV_VALUE)
+
+    env = _clean_pi_env()
+
+    assert env.get(OMNIGENT_SESSION_ENV_VAR) == OMNIGENT_SESSION_ENV_VALUE
+
+
 def test_rpc_start_spawns_with_exact_env(monkeypatch) -> None:
     """``_PiRpcSession.start`` passes the caller's env dict verbatim.
 
