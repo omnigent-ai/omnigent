@@ -164,6 +164,16 @@ def resolve_cursor_api_key(config: dict[str, object] | None = None) -> str | Non
     spawn-env builder and the setup readout — can fall back to an inherited
     ``CURSOR_API_KEY`` instead of crashing a run.
 
+    An empty / all-whitespace resolved value also reads as ``None``: the
+    shared ``resolve_secret`` ``env:`` branch only raises on an *unset*
+    variable, so a configured ``env:CURSOR_API_KEY`` pointing at an empty
+    (``CURSOR_API_KEY=""``) or whitespace-only var resolves to ``""``. Folding
+    that to ``None`` here keeps :func:`cursor_api_key_configured` and the
+    spawn-env builder in agreement — both treat such a value as unset rather
+    than reporting "key set" for a credential the runtime won't forward.
+    (``keychain:`` values are stripped at store time, so only the ``env:``
+    path needs this runtime guard; we apply it uniformly for simplicity.)
+
     :param config: A pre-loaded config mapping; ``None`` loads the global
         config.
     :returns: The plaintext Cursor API key, or ``None`` when none is
@@ -173,9 +183,10 @@ def resolve_cursor_api_key(config: dict[str, object] | None = None) -> str | Non
     if ref is None:
         return None
     try:
-        return resolve_secret(ref)
+        resolved = resolve_secret(ref)
     except OmnigentError:
         return None
+    return resolved if resolved.strip() else None
 
 
 def cursor_api_key_configured(config: dict[str, object] | None = None) -> bool:

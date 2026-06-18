@@ -1476,10 +1476,12 @@ def _build_cursor_spawn_env(
         from omnigent.onboarding.cursor_auth import resolve_cursor_api_key
 
         stored_key = resolve_cursor_api_key()
-        if stored_key is not None:
+        if stored_key:
             env["HARNESS_CURSOR_API_KEY"] = stored_key
-        elif os.environ.get("CURSOR_API_KEY"):
-            env["HARNESS_CURSOR_API_KEY"] = os.environ["CURSOR_API_KEY"]
+        else:
+            ambient_key = os.environ.get("CURSOR_API_KEY")
+            if ambient_key and ambient_key.strip():
+                env["HARNESS_CURSOR_API_KEY"] = ambient_key.strip()
     # Always set so the wrap doesn't fall back to ``"all"`` and override an
     # explicit ``skills: none`` from the spec (parity with the peer builders).
     env["HARNESS_CURSOR_SKILLS_FILTER"] = json.dumps(spec.skills_filter)

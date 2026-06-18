@@ -8200,7 +8200,12 @@ def _set_cursor_api_key() -> str | None:
     )
     from omnigent.onboarding.interactive import prompt_text
 
-    detected = os.environ.get("CURSOR_API_KEY")
+    # Strip surrounding whitespace before validating/forwarding so a key
+    # exported with a trailing newline (a common ``export $(…)`` mishap)
+    # validates and resolves cleanly — matching the pasted-key branch's
+    # ``.strip()`` below and the strip in ``resolve_secret``'s ``env:`` branch.
+    raw_detected = os.environ.get("CURSOR_API_KEY")
+    detected = raw_detected.strip() if raw_detected else None
     if detected and click.confirm(
         "Detected CURSOR_API_KEY in the environment — use it?", default=True
     ):

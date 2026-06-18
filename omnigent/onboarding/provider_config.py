@@ -414,7 +414,10 @@ def resolve_secret(ref: str) -> str:
                 f"'env:{var}'. Set the variable in the environment.",
                 code=ErrorCode.INVALID_INPUT,
             )
-        return value
+        # Strip surrounding whitespace: a key exported with a stray trailing
+        # newline (e.g. ``export KEY=$(cat file)``) must not be forwarded
+        # verbatim to a harness/SDK, where the padding fails auth.
+        return value.strip()
     # Bare inline reference, e.g. "$ANTHROPIC_API_KEY" or a literal value.
     expanded = os.path.expandvars(ref)
     check_unresolved_env_vars(ref, expanded)
