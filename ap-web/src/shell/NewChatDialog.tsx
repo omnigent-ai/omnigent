@@ -103,6 +103,10 @@ const AGENT_PICKER_DESCRIPTIONS: Record<string, string> = {
 // out — other agents keep the "/" menu as the only skill surface.
 const SKILL_PILL_AGENTS = new Set(["polly", "debby"]);
 
+// Temporarily hidden (#3021): re-enable cost routing controls by setting this
+// flag and restoring the server-side launch wiring.
+const SHOW_COST_CONTROL = false;
+
 // Claude Code's `claude --permission-mode` choices (v2.1). Claude-native
 // sessions only. "default" is Claude's own default and sends no flag; any
 // other value is passed through as `--permission-mode <value>` via the
@@ -1511,8 +1515,7 @@ export function NewChatLandingScreen() {
               <div className="flex items-center gap-0.5">
                 {/* Polly-only surface — cost control is a polly feature, so
                     the toggle is hidden unless the selected agent is polly. */}
-                {/* Temporarily hidden (#3021): re-enable by removing the false gate. */}
-                {false && selectedAgent?.name === "polly" && (
+                {SHOW_COST_CONTROL && selectedAgent?.name === "polly" && (
                   // Mode-only variant: no verdict can exist before the session does.
                   <IntelligentModelControl value={costControlMode} onChange={setCostControlMode} />
                 )}
