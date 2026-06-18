@@ -3920,6 +3920,18 @@ _RESUME_PICKER_SENTINEL = "__resume_picker__"
         f"{_CLAUDE_STARTUP_PROFILE_ENV_VAR}=1."
     ),
 )
+@click.option(
+    "--command",
+    "claude_command",
+    default=None,
+    metavar="CMD",
+    help=(
+        "Claude Code CLI executable to run. "
+        "Defaults to ``claude``. Use this when a wrapper binary replaces the "
+        "``claude`` CLI while preserving its interface (e.g. a custom launcher "
+        "that injects auth or environment before delegating to ``claude``)."
+    ),
+)
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
 def claude(
     server: str | None,
@@ -3928,6 +3940,7 @@ def claude(
     register_host: bool,
     use_claude_config: bool,
     profile_startup: bool,
+    claude_command: str | None,
     claude_args: tuple[str, ...],
 ) -> None:
     # Param docs live in comments — Click uses the docstring for --help.
@@ -4000,6 +4013,7 @@ def claude(
         use_claude_config=use_claude_config,
         auto_open_conversation=auto_open_conversation,
         startup_profiler=startup_profiler,
+        **({"command": claude_command} if claude_command else {}),
     )
 
 
