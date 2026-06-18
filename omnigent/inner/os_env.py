@@ -1064,6 +1064,8 @@ def _read_impl(
     if limit is not None:
         if not isinstance(limit, int) or limit < 1:
             return {"error": "limit must be >= 1"}
+    if max_binary_bytes is not None and max_binary_bytes < 1:
+        return {"error": "max_binary_bytes must be >= 1"}
 
     raw = path.read_bytes()
     try:
@@ -1079,7 +1081,8 @@ def _read_impl(
                 "encoding": "base64",
                 "content": "",
                 "total_bytes": total,
-                "truncated": total > 0,
+                # Not truncated — the content was deliberately not inlined.
+                "truncated": False,
                 "note": (
                     f"Binary file not inlined ({total} bytes). "
                     "View or download it via the file viewer."

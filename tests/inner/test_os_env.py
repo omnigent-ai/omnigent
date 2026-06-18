@@ -109,7 +109,8 @@ def test_read_impl_binary_descriptor_for_agent(tmp_path: Path) -> None:
     assert result["encoding"] == "base64"
     assert result["content"] == ""
     assert result["total_bytes"] == len(_BINARY)
-    assert result["truncated"] is True
+    # Not truncated — the payload was deliberately omitted, not cut short.
+    assert result["truncated"] is False
     assert "note" in result
 
 

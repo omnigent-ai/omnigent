@@ -102,6 +102,14 @@ function ImageViewer({ data, path }: { data: FileContentResponse; path: string }
   // Create the object URL in an effect and revoke it on cleanup so the blob is
   // released when the file changes or the viewer unmounts (avoids a leak).
   useEffect(() => {
+    // A truncated image is a partial (corrupt) byte stream — mounting it would
+    // flash a broken-image icon before onError fires. Skip the blob and go
+    // straight to the error/banner UI.
+    if (data.truncated) {
+      setUrl(null);
+      setErrored(true);
+      return;
+    }
     setErrored(false);
     const objectUrl = URL.createObjectURL(fileContentToBlob(data));
     setUrl(objectUrl);
