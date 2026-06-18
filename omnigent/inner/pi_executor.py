@@ -990,34 +990,44 @@ class _PiRpcSession:
         self._read_task = None
         self._stderr_task = None
         if self.process is not None:
-            pid = self.process.pid
-            if os.name == "posix" and pid is not None:
-                # Signal the whole process group (pgid == child pid, created
-                # via start_new_session at spawn) so the launcher, pi node CLI,
-                # and any descendants it spawned are torn down — not just the
-                # direct child.  Mirrors codex_executor._terminate_process_tree.
-                with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-                    os.killpg(pid, signal.SIGTERM)
-            else:
-                with contextlib.suppress(ProcessLookupError, Exception):
-                    self.process.terminate()
-            try:
-                await asyncio.wait_for(self.process.wait(), timeout=2.0)
-            except (asyncio.TimeoutError, ProcessLookupError, RuntimeError):
-                # RuntimeError can happen when the subprocess was created on a
-                # different event loop (e.g. test fixtures that call close() in
-                # a fresh loop).  Fall back to a SIGKILL of the group.
+            if self.process.returncode is None:
+                pid = self.process.pid
+                group_signal_sent = False
                 if os.name == "posix" and pid is not None:
-                    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-                        os.killpg(pid, signal.SIGKILL)
-                else:
-                    with contextlib.suppress(ProcessLookupError):
-                        self.process.kill()
-                # Reap the killed child so its returncode is set and no zombie
-                # lingers under non-default child watchers (F07).  Guarded so a
-                # wrong-event-loop RuntimeError cannot abort the rest of close().
-                with contextlib.suppress(Exception):
-                    await self.process.wait()
+                    try:
+                        # Signal the whole process group (pgid == child pid,
+                        # created via start_new_session at spawn) so the
+                        # launcher, pi node CLI, and any descendants it spawned
+                        # are torn down, not just the direct child. Mirrors
+                        # codex_executor._terminate_process_tree.
+                        os.killpg(pid, signal.SIGTERM)
+                        group_signal_sent = True
+                    except (ProcessLookupError, PermissionError, OSError):
+                        pass
+                if not group_signal_sent:
+                    with contextlib.suppress(ProcessLookupError, Exception):
+                        self.process.terminate()
+                try:
+                    await asyncio.wait_for(self.process.wait(), timeout=2.0)
+                except (asyncio.TimeoutError, ProcessLookupError, RuntimeError):
+                    # RuntimeError can happen when the subprocess was created on a
+                    # different event loop (e.g. test fixtures that call close() in
+                    # a fresh loop).  Fall back to a SIGKILL of the group.
+                    group_kill_sent = False
+                    if os.name == "posix" and pid is not None:
+                        try:
+                            os.killpg(pid, signal.SIGKILL)
+                            group_kill_sent = True
+                        except (ProcessLookupError, PermissionError, OSError):
+                            pass
+                    if not group_kill_sent:
+                        with contextlib.suppress(ProcessLookupError):
+                            self.process.kill()
+                    # Reap the killed child so its returncode is set and no zombie
+                    # lingers under non-default child watchers (F07). Guarded so a
+                    # wrong-event-loop RuntimeError cannot abort the rest of close().
+                    with contextlib.suppress(Exception):
+                        await self.process.wait()
             close_subprocess_transport(self.process)
             self.process = None
         if self._tmp_dir is not None:

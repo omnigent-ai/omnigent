@@ -5,7 +5,9 @@ import json
 import logging
 import os
 import shutil
+import signal
 import socket
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -13,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import psutil
 import pytest
 
 from omnigent.inner.databricks_executor import DatabricksCredentials
@@ -48,6 +51,25 @@ def _run(coro):
     finally:
         loop.run_until_complete(loop.shutdown_asyncgens())
         loop.close()
+
+
+async def _wait_until(predicate, *, timeout: float = 3.0, interval: float = 0.02) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not predicate():
+        if loop.time() >= deadline:
+            raise AssertionError("timed out waiting for condition")
+        await asyncio.sleep(interval)
+
+
+def _pid_is_running(pid: int) -> bool:
+    try:
+        status = psutil.Process(pid).status()
+    except psutil.NoSuchProcess:
+        return False
+    except psutil.AccessDenied:
+        return True
+    return status != psutil.STATUS_ZOMBIE
 
 
 # ---------------------------------------------------------------------------
@@ -1172,6 +1194,77 @@ class TestPiRpcSession(unittest.TestCase):
             self.assertIsNone(rpc.process)
 
         _run(_test())
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group teardown is POSIX-only")
+def test_rpc_close_terminates_real_process_group_descendants(tmp_path: Path) -> None:
+    """Close a real launcher -> child tree and assert the child receives SIGTERM.
+
+    This covers the F08 failure mode more directly than mocks: without
+    start_new_session + killpg, close() only terminates the launcher and the
+    grandchild keeps running without writing the SIGTERM marker.
+    """
+
+    grandchild_pid_file = tmp_path / "grandchild.pid"
+    grandchild_term_file = tmp_path / "grandchild.sigterm"
+    child_code = f"""
+import os
+import signal
+import time
+
+pid_file = {str(grandchild_pid_file)!r}
+term_file = {str(grandchild_term_file)!r}
+
+def on_term(signum, frame):
+    with open(term_file, "w", encoding="utf-8") as fh:
+        fh.write("sigterm")
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, on_term)
+with open(pid_file, "w", encoding="utf-8") as fh:
+    fh.write(str(os.getpid()))
+while True:
+    time.sleep(1)
+"""
+    launcher = tmp_path / "fake_pi_launcher.py"
+    launcher.write_text(
+        f"""#!{sys.executable}
+import subprocess
+import sys
+import time
+
+subprocess.Popen([sys.executable, "-c", {child_code!r}])
+while True:
+    time.sleep(1)
+""",
+        encoding="utf-8",
+    )
+    launcher.chmod(0o755)
+
+    async def _test() -> None:
+        rpc = _PiRpcSession()
+        grandchild_pid: int | None = None
+        try:
+            await rpc.start(str(launcher), env=os.environ.copy(), cwd=str(tmp_path))
+            await _wait_until(grandchild_pid_file.exists)
+            grandchild_pid = int(grandchild_pid_file.read_text(encoding="utf-8"))
+
+            assert rpc.process is not None
+            assert os.getpgid(rpc.process.pid) == rpc.process.pid
+            assert os.getpgid(grandchild_pid) == rpc.process.pid
+
+            await rpc.close()
+            await _wait_until(grandchild_term_file.exists)
+            await _wait_until(
+                lambda: grandchild_pid is not None and not _pid_is_running(grandchild_pid)
+            )
+        finally:
+            if rpc.process is not None:
+                await rpc.close()
+            if grandchild_pid is not None and _pid_is_running(grandchild_pid):
+                os.kill(grandchild_pid, signal.SIGKILL)
+
+    _run(_test())
 
 
 # ---------------------------------------------------------------------------
@@ -2849,10 +2942,11 @@ def test_rpc_start_spawns_with_exact_env(monkeypatch) -> None:
     from omnigent.inner import pi_executor as pi_mod
 
     monkeypatch.setenv("FAKE_HOST_SECRET", "PWNED")
-    captured: dict[str, dict[str, str]] = {}
+    captured: dict[str, object] = {}
 
     async def _fake_spawn(*args, **kwargs):
         captured["env"] = kwargs["env"]
+        captured["start_new_session"] = kwargs["start_new_session"]
         return _FakeProcess(stdout_lines=[], stderr_lines=[])
 
     monkeypatch.setattr(pi_mod, "_create_subprocess_exec", _fake_spawn)
@@ -2869,6 +2963,7 @@ def test_rpc_start_spawns_with_exact_env(monkeypatch) -> None:
 
     # Exactly the executor-built env — nothing merged from os.environ.
     assert captured["env"] == {"PATH": "/usr/bin", "PI_CODING_AGENT_DIR": "/tmp/pi-agent"}
+    assert captured["start_new_session"] == (os.name == "posix")
 
 
 def test_redact_argv_for_log_hides_system_prompt() -> None:
