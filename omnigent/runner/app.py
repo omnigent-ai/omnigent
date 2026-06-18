@@ -108,6 +108,18 @@ _SUBAGENT_DELIVERY_UNTRACKED = "untracked"
 _SUBAGENT_DELIVERY_MISSING_WORK_ENTRY = "missing_work_entry"
 _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX = "missing_parent_inbox"
 _NATIVE_TERMINAL_START_FAILED_CODE = "native_terminal_start_failed"
+# Read budget for runner→server POSTs that can PARK behind a human-approval
+# ASK gate: policy evaluation (``_evaluate_policy_via_omnigent``) and sub-agent
+# wake-notice delivery (``_deliver_subagent_wake_post``). Both are gated at the
+# recipient's REQUEST/LLM/TOOL phase, which can hold for the deciding policy's
+# ``ask_timeout`` (default one day). Held at one day (86400s) — matching that
+# default — so the POST WAITS for the real verdict instead of severing the
+# parked gate at a short read timeout. A 30s cut previously fail-closed to DENY
+# (and the wake POST retried into duplicate approval cards). Fast connect (30s)
+# so an unreachable server still fails out promptly into the caller's
+# fail-open/retry path. Guarded by tests/test_ask_timeout_infinite.py.
+_ASK_GATE_DELIVERY_READ_TIMEOUT_S: float = 86400.0
+_ASK_GATE_DELIVERY_TIMEOUT = httpx.Timeout(_ASK_GATE_DELIVERY_READ_TIMEOUT_S, connect=30.0)
 # Terminal resource hosting the framework's own TUI (the Omnigent REPL,
 # ``omnigent attach``) for runner-hosted SDK sessions — the SDK mirror of
 # the claude-/codex-native embedded terminals. Resource id derives as
@@ -2970,7 +2982,18 @@ async def _evaluate_policy_via_omnigent(
                     "data": data,
                 },
             },
-            timeout=30.0,
+            # A TOOL_CALL/LLM_REQUEST/REQUEST ASK parks server-side in
+            # ``_hold_native_ask_gate`` until a human resolves it (up to the
+            # deciding policy's ``ask_timeout``, default one day). A 30s read
+            # budget here severed that long-poll after 30s — the server saw an
+            # UPSTREAM DISCONNECT and failed the gate closed (DENY), so the
+            # main (claude-sdk) agent's approval card auto-resolved while
+            # native sub-agents (whose hooks already wait the full day) parked
+            # correctly. Hold the read budget at one day to match the native
+            # hooks' ``_EVALUATE_POLICY_TIMEOUT_S``; the server's ``ask_timeout``
+            # remains the single real cap. Fast connect so an unreachable
+            # server still fails out promptly into the fail-open path below.
+            timeout=_ASK_GATE_DELIVERY_TIMEOUT,
         )
         if ap_resp.status_code == 200:
             result = ap_resp.json()
@@ -4016,7 +4039,17 @@ async def _deliver_subagent_wake_post(
                         "content": [{"type": "input_text", "text": notice}],
                     },
                 },
-                timeout=30.0,
+                # The server gates this injected wake at the parent's REQUEST
+                # phase, which can PARK on a human ASK (e.g. session_cost_budget)
+                # for up to the deciding policy's ``ask_timeout`` (default one
+                # day). A 30s read budget severed that park after 30s → the
+                # TimeoutError below retried → each retry re-posted the notice
+                # and parked ANOTHER gate → duplicate approval cards, and the
+                # gate never cleanly blocked. Hold the read budget at one day so
+                # this POST waits for the real verdict (one held connection, one
+                # card); fast connect so an unreachable parent runner still
+                # fails out into the bounded retry below.
+                timeout=_ASK_GATE_DELIVERY_TIMEOUT,
             )
             # Treat a non-2xx RESPONSE (e.g. a genuine 503 JSONResponse) as a
             # failure — httpx does not raise on status by itself.
