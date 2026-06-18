@@ -23,6 +23,7 @@ import type {
   ReasoningDelta,
   ReasoningStarted,
   ReasoningSummaryDelta,
+  ReasoningSummaryPartDone,
   ResponseCancelled,
   ResponseCompleted,
   ResponseCreated,
@@ -333,6 +334,9 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     if (typeof delta === "string")
       return { type: "reasoning_summary_delta", delta } satisfies ReasoningSummaryDelta;
     return null;
+  }
+  if (eventType === "response.reasoning_summary_part.done") {
+    return { type: "reasoning_summary_part_done" } satisfies ReasoningSummaryPartDone;
   }
 
   // Output items.

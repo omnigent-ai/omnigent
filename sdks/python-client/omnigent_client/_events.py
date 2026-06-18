@@ -116,6 +116,17 @@ class ReasoningSummaryDelta:
     delta: str
 
 
+@dataclass
+class ReasoningSummaryPartDone:
+    """``response.reasoning_summary_part.done`` — a summary paragraph ended.
+
+    The Responses API delimits successive reasoning-summary paragraphs
+    with this boundary; the ``ReasoningSummaryDelta`` fragments within a
+    part carry no trailing newline. The reducer uses it to flush the
+    held tail and insert a paragraph separator (issue #654).
+    """
+
+
 # ── Parsed output items ─────────────────────────────────
 
 
@@ -326,6 +337,7 @@ StreamEvent = (
     | ReasoningStarted
     | ReasoningDelta
     | ReasoningSummaryDelta
+    | ReasoningSummaryPartDone
     | ToolCall
     | ToolResult
     | NativeToolCall

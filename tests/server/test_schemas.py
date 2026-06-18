@@ -35,6 +35,7 @@ from omnigent.server.schemas import (
     OutputTextDeltaEvent,
     QueuedEvent,
     ReasoningStartedEvent,
+    ReasoningSummaryPartDoneEvent,
     ReasoningSummaryTextDeltaEvent,
     ReasoningTextDeltaEvent,
     ResponseObject,
@@ -80,6 +81,24 @@ def test_reasoning_summary_text_delta_roundtrip() -> None:
         "type": "response.reasoning_summary_text.delta",
         "delta": "Will use search",
     }
+
+
+def test_reasoning_summary_part_done_roundtrip() -> None:
+    """ReasoningSummaryPartDoneEvent has no fields beyond type (issue #654)."""
+    event = ReasoningSummaryPartDoneEvent(type="response.reasoning_summary_part.done")
+    assert event.model_dump(exclude_none=True) == {
+        "type": "response.reasoning_summary_part.done",
+    }
+
+
+def test_reasoning_summary_part_done_parses_through_union() -> None:
+    """A reasoning-summary part boundary POSTed by a producer (e.g. a
+    custom Codex harness forwarding the Responses stream) is recognized
+    by the discriminated union and not dropped as unknown."""
+    parsed = TypeAdapter(ServerStreamEvent).validate_python(
+        {"type": "response.reasoning_summary_part.done"}
+    )
+    assert isinstance(parsed, ReasoningSummaryPartDoneEvent)
 
 
 def test_output_item_done_roundtrip() -> None:

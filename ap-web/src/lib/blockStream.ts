@@ -443,6 +443,28 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       return;
     }
 
+    case "reasoning_summary_part_done": {
+      // A summary part (paragraph) finished. Codex reasoning summaries
+      // stream as one continuous run of reasoning_summary_delta with no
+      // newline and no fresh reasoning_started between parts; the
+      // boundary arrives out-of-band here. Flush this part's held tail
+      // and insert a separator so the next part renders on its own line
+      // instead of glued onto this one ("…names.I have…"). See issue
+      // #654. Mirrors the reasoning_started-between-parts branch above.
+      // No-op outside reasoning or before any content streamed (no
+      // leading separator).
+      if (state.inReasoning && (state.reasoningAccumulated || state.reasoningChunksEmitted)) {
+        yield {
+          type: "reasoning_chunk",
+          ctx: ctx(state),
+          text: state.reasoningAccumulated + "\n\n",
+        } satisfies ReasoningChunk;
+        state.reasoningAccumulated = "";
+        state.reasoningChunksEmitted = true;
+      }
+      return;
+    }
+
     // ── Text ────────────────────────────────────────
     case "text_delta": {
       yield* closeReasoning(state);

@@ -114,6 +114,18 @@ export interface ReasoningSummaryDelta {
   delta: string;
 }
 
+/**
+ * `response.reasoning_summary_part.done` — a summary paragraph ended.
+ *
+ * The Responses API delimits successive reasoning-summary paragraphs
+ * with this boundary; the `reasoning_summary_delta` fragments within a
+ * part carry no trailing newline. The reducer uses it to flush the
+ * held tail and insert a paragraph separator (issue #654).
+ */
+export interface ReasoningSummaryPartDone {
+  type: "reasoning_summary_part_done";
+}
+
 // ── Parsed output items ─────────────────────────────────
 
 /** A tool call from `output_item.done` (type `function_call`). */
@@ -756,6 +768,7 @@ export type StreamEvent =
   | ReasoningStarted
   | ReasoningDelta
   | ReasoningSummaryDelta
+  | ReasoningSummaryPartDone
   | ToolCall
   | ToolResult
   | NativeToolCall

@@ -20,6 +20,7 @@ from omnigent_client._events import (
     ReasoningDelta,
     ReasoningStarted,
     ReasoningSummaryDelta,
+    ReasoningSummaryPartDone,
     ResponseCompleted,
     ResponseCreated,
     ResponseInProgress,
@@ -264,6 +265,42 @@ async def test_consecutive_reasoning_blocks_are_separated(
     joined = "".join(b.text for b in blocks if isinstance(b, ReasoningChunk))
     assert "First thought.\n\nSecond thought." in joined, joined
     assert "First thought.Second thought." not in joined, joined
+
+
+@pytest.mark.asyncio()
+async def test_reasoning_summary_part_done_separates_and_flushes(
+    block_stream: BlockStream,
+) -> None:
+    """
+    Issue #654: Codex reasoning-summary paragraphs stream as one
+    continuous run of ``ReasoningSummaryDelta`` with no newline in the
+    text and no fresh ``ReasoningStarted`` between parts. The paragraph
+    boundary arrives out-of-band as
+    ``response.reasoning_summary_part.done``. Without handling it, part
+    one's trailing fragment ("names.") stays buffered and renders late,
+    glued onto part two ("names.I have..."). The boundary must flush the
+    held tail AND insert a "\\n\\n" separator.
+    """
+    session = FakeSession(
+        [
+            ResponseCreated(response=_make_response()),
+            ReasoningSummaryDelta(delta="drilling into folder names."),
+            ReasoningSummaryPartDone(),
+            ReasoningSummaryDelta(delta="I have the runner now."),
+            TextDelta(delta="Answer"),
+            MessageDone(content=[]),
+            ResponseCompleted(response=_make_response()),
+        ]
+    )
+
+    blocks = [b async for b in block_stream.stream(session, "test")]  # type: ignore[arg-type]
+    chunks = [b for b in blocks if isinstance(b, ReasoningChunk)]
+    joined = "".join(b.text for b in chunks)
+    # Symptom 2: a paragraph separator lands between the two parts.
+    assert "names.\n\nI have the runner now." in joined, joined
+    assert "names.I have" not in joined, joined
+    # Symptom 1: part one's tail flushes AT the boundary, not late.
+    assert any(b.text == "names.\n\n" for b in chunks), [b.text for b in chunks]
 
 
 @pytest.mark.asyncio()
