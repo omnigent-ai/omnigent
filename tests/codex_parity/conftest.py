@@ -6,6 +6,7 @@ mocking only the upstream Responses API with Codex's own WireMock helpers.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import queue
@@ -80,8 +81,7 @@ def _codex_bins(config: pytest.Config) -> list[str]:
     explicit = [str(Path(value)) for value in config.getoption("--codex-bin")]
     env_value = os.environ.get("CODEX_TEST_BINS", "").strip()
     from_env = [value for value in env_value.split(os.pathsep) if value]
-    bins = explicit or from_env or ["codex"]
-    return bins
+    return explicit or from_env or ["codex"]
 
 
 def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
@@ -99,8 +99,7 @@ def resolved_codex_bin(codex_bin: str) -> str:
     version = subprocess.run(
         [resolved, "--version"],
         text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         check=False,
     )
     if version.returncode != 0:
@@ -124,10 +123,8 @@ class CodexResponsesSidecar:
     def close(self) -> None:
         if self._proc.poll() is not None:
             return
-        try:
+        with contextlib.suppress(Exception):
             self._command({"op": "shutdown"})
-        except Exception:
-            pass
         try:
             self._proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
