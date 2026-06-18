@@ -22,7 +22,7 @@ import sys
 import termios
 import tty
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -122,6 +122,17 @@ _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
 # UI, so a wrapped terminal must stay pinned to the one session the UI thinks
 # it is showing.
 _CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV = "CLAUDE_CODE_DISABLE_AGENT_VIEW"
+# Devcontainer-convention flag Claude Code checks to decide whether it is
+# running inside a managed sandbox. When set, Claude Code skips the one-time
+# interactive "Bypass Permissions mode" acceptance modal that otherwise blocks
+# the very first launch under ``--permission-mode bypassPermissions`` /
+# ``--dangerously-skip-permissions``. The sandbox host Docker image bakes this
+# in, but laptops / local runners never set it -- so without forcing it on the
+# claude-native terminal env, a bypass-mode launch on a local runner hangs
+# forever on the accept screen (the tmux bridge drives Claude non-interactively
+# and never answers the modal). See omnigent/host/connect.py's
+# ``_RUNNER_ENV_ALLOWLIST`` note.
+_CLAUDE_CODE_IS_SANDBOX_ENV = "IS_SANDBOX"
 # Claude Code env vars that pin each model-tier alias to a provider-specific
 # model ID.  When set, the /model picker shows these IDs as options rather
 # than normalising to canonical Anthropic names (which the Databricks gateway
@@ -270,8 +281,37 @@ class ClaudeNativeUcodeConfig:
     model: str | None = None
 
 
+def _claude_args_request_bypass_permissions(claude_args: Sequence[str] | None) -> bool:
+    """
+    Report whether a claude-native launch runs in bypass-permissions mode.
+
+    Bypass mode is what triggers Claude Code's one-time interactive accept
+    modal. It is requested either by ``--dangerously-skip-permissions`` or by
+    ``--permission-mode bypassPermissions`` (space or ``=`` joined form).
+
+    :param claude_args: The fully-assembled ``claude`` CLI args, e.g.
+        ``("--permission-mode", "bypassPermissions")``. ``None`` or empty
+        means no bypass flag was requested.
+    :returns: ``True`` when a bypass-permissions flag is present.
+    """
+    if not claude_args:
+        return False
+    args = list(claude_args)
+    for idx, arg in enumerate(args):
+        if arg == "--dangerously-skip-permissions":
+            return True
+        if arg == "--permission-mode" and idx + 1 < len(args):
+            if args[idx + 1] == "bypassPermissions":
+                return True
+        if arg == "--permission-mode=bypassPermissions":
+            return True
+    return False
+
+
 def build_native_claude_terminal_env(
     claude_config: ClaudeNativeUcodeConfig | None,
+    *,
+    claude_args: Sequence[str] | None = None,
 ) -> dict[str, str]:
     """
     Build env overrides for a native Claude Code terminal process.
@@ -280,9 +320,19 @@ def build_native_claude_terminal_env(
     loads them on demand, and disables Claude Code's agent view so the
     terminal stays pinned to the session the Omnigent UI is showing.
 
+    When the launch runs in bypass-permissions mode, also sets the
+    devcontainer-convention :data:`_CLAUDE_CODE_IS_SANDBOX_ENV` flag so
+    Claude Code skips its one-time interactive "Bypass Permissions mode"
+    acceptance modal. The tmux bridge drives Claude non-interactively and
+    never answers that modal, so without this flag a bypass-mode launch on
+    a local / non-sandbox runner hangs forever on the accept screen.
+
     :param claude_config: Optional provider/ucode launch config, e.g.
         one carrying ``{"ANTHROPIC_BASE_URL": "https://example.com"}``.
         ``None`` means use Claude Code's own native auth.
+    :param claude_args: The fully-assembled ``claude`` CLI args, used only
+        to detect bypass-permissions mode. ``None`` skips the
+        ``IS_SANDBOX`` opt-in (e.g. a non-bypass launch).
     :returns: Environment overrides for the terminal process, e.g.
         ``{"ENABLE_TOOL_SEARCH": "true"}``.
     """
@@ -294,6 +344,8 @@ def build_native_claude_terminal_env(
         terminal_env.update(claude_config.env)
         terminal_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "true"
         terminal_env[_CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV] = "1"
+    if _claude_args_request_bypass_permissions(claude_args):
+        terminal_env[_CLAUDE_CODE_IS_SANDBOX_ENV] = "1"
     return terminal_env
 
 
@@ -3869,7 +3921,7 @@ def _claude_terminal_request(
         "cwd": str(Path.cwd().resolve()),
         "scrollback": _CLAUDE_TERMINAL_SCROLLBACK_LINES,
     }
-    spec["env"] = build_native_claude_terminal_env(claude_config)
+    spec["env"] = build_native_claude_terminal_env(claude_config, claude_args=args)
     if claude_config is not None:
         # The runner's terminal layer inherits the parent process env.
         # Remove provider/session variables that can override the

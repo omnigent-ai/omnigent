@@ -196,6 +196,66 @@ def test_claude_terminal_request_preserves_user_model_arg() -> None:
     assert args.count("--model") == 1
 
 
+@pytest.mark.parametrize(
+    ("claude_args", "expect_sandbox"),
+    [
+        # The three bypass spellings each suppress the one-time accept
+        # modal. Without IS_SANDBOX the tmux-driven launch hangs on it.
+        (("--permission-mode", "bypassPermissions"), True),
+        (("--permission-mode=bypassPermissions",), True),
+        (("--dangerously-skip-permissions",), True),
+        # Non-bypass modes never show the modal, so IS_SANDBOX must NOT be
+        # forced on (it would relax Claude's sandbox posture needlessly).
+        (("--permission-mode", "acceptEdits"), False),
+        ((), False),
+        (None, False),
+    ],
+    ids=[
+        "bypass-space",
+        "bypass-joined",
+        "skip-permissions",
+        "accept-edits",
+        "empty",
+        "none",
+    ],
+)
+def test_build_native_claude_terminal_env_seeds_is_sandbox_for_bypass(
+    claude_args: tuple[str, ...] | None,
+    expect_sandbox: bool,
+) -> None:
+    """
+    Bypass-permissions launches force the IS_SANDBOX devcontainer flag.
+
+    Claude Code (v2.1.181) shows a one-time interactive "Bypass Permissions
+    mode" acceptance modal the first time bypass mode is used unless
+    IS_SANDBOX is set. The claude-native harness drives Claude through a
+    tmux pane non-interactively and never answers that modal, so on a local
+    / non-sandbox runner the worker hangs forever. Forcing IS_SANDBOX in the
+    terminal env is what keeps the launch from stalling on the accept
+    screen; a regression here re-introduces the hang.
+    """
+    env = claude_native.build_native_claude_terminal_env(None, claude_args=claude_args)
+    assert env.get("IS_SANDBOX") == ("1" if expect_sandbox else None)
+
+
+def test_claude_terminal_request_seeds_is_sandbox_for_bypass_permissions() -> None:
+    """
+    A bypass-mode terminal request carries IS_SANDBOX into the launch env.
+
+    End-to-end check on the ``omnigent claude`` launch boundary: the
+    fully-assembled terminal spec must expose IS_SANDBOX so Claude Code
+    skips its bypass-permissions accept modal. Without it the tmux bridge
+    never answers the modal and the worker never reports back.
+    """
+    body = claude_native._claude_terminal_request(
+        ("--permission-mode", "bypassPermissions"),
+        command="claude",
+        bridge_dir=Path("/tmp/omnigent-test-bridge"),
+        claude_config=None,
+    )
+    assert body["spec"]["env"].get("IS_SANDBOX") == "1"
+
+
 def test_ucode_config_for_profile_reads_allowlisted_claude_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

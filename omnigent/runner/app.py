@@ -2314,7 +2314,7 @@ async def _auto_create_claude_terminal(
         # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL
         # etc.) when derived. Empty provider config still forces
         # ENABLE_TOOL_SEARCH=true so MCP schemas are loaded on demand.
-        env=build_native_claude_terminal_env(claude_config),
+        env=build_native_claude_terminal_env(claude_config, claude_args=claude_args),
         # Strip the ambient Databricks-SDK profile selection from
         # the Claude tmux env. Claude's MCP servers inherit this env,
         # and several construct ``WorkspaceClient`` without pinning
