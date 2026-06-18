@@ -132,9 +132,22 @@ def _normalize_cursor_usage(raw: dict[str, Any], model: str) -> dict[str, Any]:
         "model": model,
     }
     # Carry cache breakdown if the backend reports it.
+    # The Cursor backend sends cacheReadTokens / cacheWriteTokens;
+    # map to the Omnigent-standard cache_read_input_tokens /
+    # cache_creation_input_tokens names.
     for dst, *sources in (
-        ("cache_read_input_tokens", "cacheReadInputTokens", "cache_read_input_tokens"),
-        ("cache_creation_input_tokens", "cacheCreationInputTokens", "cache_creation_input_tokens"),
+        (
+            "cache_read_input_tokens",
+            "cacheReadTokens",
+            "cacheReadInputTokens",
+            "cache_read_input_tokens",
+        ),
+        (
+            "cache_creation_input_tokens",
+            "cacheWriteTokens",
+            "cacheCreationInputTokens",
+            "cache_creation_input_tokens",
+        ),
     ):
         for src in sources:
             val = raw.get(src)
@@ -624,7 +637,19 @@ class CursorExecutor(Executor):
         separate_next_text = False
         turn_usage: dict[str, Any] | None = None
         try:
-            run = await state.agent.send(prompt)
+            # Pass SendOptions with on_delta so the backend sends
+            # interaction updates (including TurnEndedUpdate with usage).
+            # Without enableDeltas the backend omits them entirely.
+            from cursor_sdk import SendOptions as _SendOptions  # lazy: optional dep
+
+            def _capture_delta(update: Any) -> None:  # type: ignore[explicit-any]
+                nonlocal turn_usage
+                if getattr(update, "type", None) == "turn-ended":
+                    raw = getattr(update, "usage", None)
+                    if isinstance(raw, dict) and raw:
+                        turn_usage = _normalize_cursor_usage(raw, model)
+
+            run = await state.agent.send(prompt, options=_SendOptions(on_delta=_capture_delta))
             async for stream_event in run.events():
                 if stream_event.sdk_message is not None:
                     for event in _sdk_message_to_events(stream_event.sdk_message):

@@ -267,6 +267,8 @@ _LOCAL_DAEMON_ENV_PREFIXES: tuple[str, ...] = (
     "ANTHROPIC_DEFAULT_",
     "AZURE_OPENAI_",
     "DATABRICKS_",
+    "MLFLOW_",
+    "OTEL_",
     "OMNIGENT_",
     "OPENAI_",
 )

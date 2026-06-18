@@ -141,12 +141,6 @@ skips:
     cluster: repl-pexpect-cli
     mode: skip
 
-  - id: tests/e2e/test_client_tool_sse_status_e2e.py::test_client_side_tool_inline_sse_carries_action_required
-    reason: "Shard 1 bulk: SSE action_required signaling. Triage under #532."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
-    mode: skip
-
   - id: tests/e2e/test_decorated_tools_e2e.py::test_decorated_tools_varied_signatures_e2e
     reason: "openai-agents harness test hits platform.openai.com directly and 401s under the Databricks gateway profile (dapi PAT rejected as OpenAI key); needs gateway-routing/base_url fix before it can run in CI. Passes only with a real OPENAI_API_KEY locally."
     issue: 532
@@ -166,12 +160,6 @@ skips:
 
   - id: tests/e2e/test_sys_async_inbox_harness_e2e.py::test_sys_read_inbox_harness_path_returns_drained_marker_e2e
     reason: "Shard 1 bulk: sys async-inbox harness drain."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
-    mode: skip
-
-  - id: tests/e2e/test_tool_dispatch_workflow_client_side_e2e.py::test_harness_routes_client_side_tool_through_dispatch_workflow
-    reason: "Shard 1 bulk: tool-dispatch workflow client-side."
     issue: 532
     cluster: async-dispatch-inbox-sse
     mode: skip
@@ -340,12 +328,6 @@ skips:
     mode: skip
   - id: tests/e2e/test_claude_coder_client_tools.py::test_claude_sdk_parks_client_tool_call
     reason: "Nightly bulk: claude-coder client-tool park."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
-    mode: skip
-
-  - id: tests/e2e/test_web_search_async_dispatch_e2e.py::test_web_search_async_dispatch_completes_on_non_openai_model
-    reason: "Nightly bulk: web-search async dispatch (409 conflict)."
     issue: 532
     cluster: async-dispatch-inbox-sse
     mode: skip

@@ -92,9 +92,17 @@ def _install_fake_sdk(
             )
 
     class _FakeAgent:
-        async def send(self, prompt: str) -> _FakeRun:
+        async def send(self, prompt: str, **kwargs: Any) -> _FakeRun:
             state["sent"].append(prompt)
-            return _FakeRun(scripts.pop(0))
+            script = scripts.pop(0)
+            # Invoke on_delta for interaction_updates (mirrors real SDK
+            # which dispatches TurnEndedUpdate via on_delta, not events).
+            options = kwargs.get("options")
+            on_delta = getattr(options, "on_delta", None) if options else None
+            if on_delta and "interaction_updates" in script:
+                for iu in script["interaction_updates"]:
+                    on_delta(iu)
+            return _FakeRun(script)
 
         # AsyncAgent exposes close() (a CloseAgent RPC + tool unregister).
         async def close(self) -> None:
@@ -140,11 +148,16 @@ def _install_fake_sdk(
             self.cwd = cwd
             self.custom_tools = custom_tools
 
+    class _FakeSendOptions:
+        def __init__(self, on_delta: Any = None, **_kw: Any) -> None:
+            self.on_delta = on_delta
+
     fake = types.ModuleType("cursor_sdk")
     fake.AsyncClient = _FakeClient  # type: ignore[attr-defined]
     fake.AsyncAgent = _FakeAsyncAgent  # type: ignore[attr-defined]
     fake.CustomTool = _FakeCustomTool  # type: ignore[attr-defined]
     fake.LocalAgentOptions = _FakeLocalAgentOptions  # type: ignore[attr-defined]
+    fake.SendOptions = _FakeSendOptions  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "cursor_sdk", fake)
     return state
 
