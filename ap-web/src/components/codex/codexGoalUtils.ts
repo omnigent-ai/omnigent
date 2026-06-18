@@ -1,4 +1,4 @@
-import type { CodexGoal, CodexGoalStatusUpdate } from "@/lib/sessionsApi";
+import type { CodexGoal, CodexGoalStatusUpdate } from "@/lib/codexGoalApi";
 
 export type CodexGoalModeDraft = CodexGoalStatusUpdate | "keep";
 

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { getCodexGoal, type CodexGoal } from "@/lib/sessionsApi";
+import { getCodexGoal, type CodexGoal } from "@/lib/codexGoalApi";
 
 interface UseCodexGoalStateResult {
   goal: CodexGoal | null;

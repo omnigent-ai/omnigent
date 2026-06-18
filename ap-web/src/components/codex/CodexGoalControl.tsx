@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { TargetIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import type { CodexGoal } from "@/lib/sessionsApi";
+import type { CodexGoal } from "@/lib/codexGoalApi";
 import { cn } from "@/lib/utils";
 import { CodexGoalDialog } from "./CodexGoalDialog";
 import { formatCodexGoalStatus } from "./codexGoalUtils";

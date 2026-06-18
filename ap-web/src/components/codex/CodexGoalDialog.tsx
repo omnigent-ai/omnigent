@@ -17,7 +17,7 @@ import {
   updateCodexGoalStatus,
   type CodexGoal,
   type CodexGoalStatusUpdate,
-} from "@/lib/sessionsApi";
+} from "@/lib/codexGoalApi";
 import { cn } from "@/lib/utils";
 import {
   canPauseCodexGoal,
