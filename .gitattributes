@@ -1,0 +1,2 @@
+# Treat the AppIcon bundle's contents as binary and never merge them.
+ap-web/electron/icons/AppIcon.icon/** binary -merge
