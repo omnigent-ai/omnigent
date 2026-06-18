@@ -22,6 +22,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.native_coding_agents import (
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
+    ISAAC_NATIVE_CODING_AGENT,
     PI_NATIVE_CODING_AGENT,
 )
 from omnigent.resources import examples as _examples_resources
@@ -76,6 +77,7 @@ _WEB_UI_GZIP_MINIMUM_SIZE = 1024
 _CLAUDE_NATIVE_AGENT_NAME = CLAUDE_NATIVE_CODING_AGENT.agent_name
 _CODEX_NATIVE_AGENT_NAME = CODEX_NATIVE_CODING_AGENT.agent_name
 _PI_NATIVE_AGENT_NAME = PI_NATIVE_CODING_AGENT.agent_name
+_ISAAC_NATIVE_AGENT_NAME = ISAAC_NATIVE_CODING_AGENT.agent_name
 _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
@@ -350,6 +352,7 @@ def _ensure_default_agents(
     _ensure_default_claude_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_codex_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_pi_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_isaac_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_debby_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_polly_agent(agent_store, artifact_store, agent_cache)
     _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
@@ -551,6 +554,49 @@ def _ensure_default_pi_agent(
         agent_cache,
         name=_PI_NATIVE_AGENT_NAME,
         bundle_bytes=_build_pi_native_bundle(),
+    )
+
+
+def _build_isaac_native_bundle() -> bytes:
+    """
+    Build a gzipped tarball of the isaac-native-ui agent spec.
+
+    :returns: Gzipped tarball bytes suitable for the artifact store.
+    """
+    import tempfile
+
+    from omnigent.isaac_native import _materialize_isaac_agent_spec
+    from omnigent.spec import materialize_bundle
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        spec_path = _materialize_isaac_agent_spec(Path(tmpdir))
+        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
+        return _tar_gz_dir(bundle_dir)
+
+
+def _ensure_default_isaac_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """
+    Register or refresh the isaac-native-ui agent.
+
+    Called during server lifespan startup so the Web UI can offer Isaac as a
+    built-in native-terminal agent. Content-aware via
+    :func:`_ensure_builtin_agent`: a new wheel with a changed spec refreshes
+    the row in place rather than being ignored.
+
+    :param agent_store: Store for agent metadata.
+    :param artifact_store: Store for agent bundles.
+    :param agent_cache: Cache for loaded agent specs.
+    """
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=_ISAAC_NATIVE_AGENT_NAME,
+        bundle_bytes=_build_isaac_native_bundle(),
     )
 
 

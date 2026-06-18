@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from omnigent._wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE,
     CODEX_NATIVE_WRAPPER_VALUE,
+    ISAAC_NATIVE_WRAPPER_VALUE,
     PI_NATIVE_WRAPPER_VALUE,
     UI_MODE_LABEL_KEY,
     UI_MODE_TERMINAL_VALUE,
@@ -65,10 +66,20 @@ PI_NATIVE_CODING_AGENT = NativeCodingAgent(
     terminal_name="pi",
 )
 
+ISAAC_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="isaac",
+    display_name="Isaac",
+    agent_name="isaac-native-ui",
+    harness="isaac-native",
+    wrapper_label=ISAAC_NATIVE_WRAPPER_VALUE,
+    terminal_name="isaac",
+)
+
 NATIVE_CODING_AGENTS: tuple[NativeCodingAgent, ...] = (
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
     PI_NATIVE_CODING_AGENT,
+    ISAAC_NATIVE_CODING_AGENT,
 )
 
 _BY_AGENT_NAME = {agent.agent_name: agent for agent in NATIVE_CODING_AGENTS}

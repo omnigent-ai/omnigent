@@ -12,6 +12,13 @@ describe("nativeCodingAgentForHarness", () => {
     expect(nativeCodingAgentForHarness("pi-native")?.key).toBe("pi");
   });
 
+  it("resolves the canonical isaac-native harness to the Isaac spec", () => {
+    const spec = nativeCodingAgentForHarness("isaac-native");
+    expect(spec?.key).toBe("isaac");
+    expect(spec?.agentName).toBe("isaac-native-ui");
+    expect(spec?.displayName).toBe("Isaac");
+  });
+
   // The server's harness_kind returns the raw executor.config.harness, so a
   // `native-pi` agent must fold to the same spec — else fork/switch into it
   // would miss the terminal-first wrapper labels and render as chat.

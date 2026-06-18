@@ -49,3 +49,7 @@ CODEX_NATIVE_WRAPPER_VALUE = "codex-native-ui"
 # Value the ``omnigent pi`` wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 PI_NATIVE_WRAPPER_VALUE = "pi-native-ui"
+
+# Value the ``omnigent isaac`` wrapper writes into
+# ``conversations.labels[WRAPPER_LABEL_KEY]``.
+ISAAC_NATIVE_WRAPPER_VALUE = "isaac-native-ui"

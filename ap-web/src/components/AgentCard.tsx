@@ -26,6 +26,8 @@ function iconForAgent(agent: AvailableAgent): ComponentType<SVGProps<SVGSVGEleme
   if (nativeAgent?.iconKind === "claude") return ClaudeIcon;
   if (nativeAgent?.iconKind === "codex") return CodexIcon;
   if (nativeAgent?.iconKind === "pi") return PiIcon;
+  // Isaac has no branded glyph yet — fall back to the generic bot.
+  if (nativeAgent?.iconKind === "isaac") return BotIcon;
   // A null harness (spec couldn't load) flows through to the bot fallback.
   if (agent.harness?.includes("codex")) return CodexIcon;
   if (agent.harness?.includes("claude")) return ClaudeIcon;

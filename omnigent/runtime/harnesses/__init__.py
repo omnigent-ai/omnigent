@@ -49,6 +49,11 @@ _HARNESS_MODULES: dict[str, str] = {
     "pi": "omnigent.inner.pi_harness",
     # Native Pi TUI bridge used by ``omnigent pi``.
     "pi-native": "omnigent.inner.pi_native_harness",
+    # Native Isaac terminal mirror used by ``omnigent isaac``. Isaac is an
+    # external Claude Code wrapper CLI; this harness only mirrors its terminal
+    # (no app-server, forwarder, or message injection), so the executor is a
+    # no-op stub.
+    "isaac-native": "omnigent.inner.isaac_native_harness",
     # Step 4e: openai-agents harness wrap. See
     # omnigent/inner/openai_agents_sdk_harness.py. Registry
     # key is the Omnigent-side spelling (``openai-agents``,

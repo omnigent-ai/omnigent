@@ -20,8 +20,9 @@ export interface ActiveChatOverride {
 export const CLAUDE_NATIVE_DEFAULT_LABEL = "Claude Code";
 export const CODEX_NATIVE_DEFAULT_LABEL = "Codex";
 export const PI_NATIVE_DEFAULT_LABEL = "Pi";
+export const ISAAC_NATIVE_DEFAULT_LABEL = "Isaac";
 
-export type ConversationIconKind = "claude" | "codex" | "pi" | "nessie" | null;
+export type ConversationIconKind = "claude" | "codex" | "pi" | "isaac" | "nessie" | null;
 
 // Display label for a session with no title and no native-wrapper name —
 // shown in the sidebar row and as the browser tab title fallback.

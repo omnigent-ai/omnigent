@@ -19,6 +19,7 @@ from __future__ import annotations
 from omnigent._wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE,
     CODEX_NATIVE_WRAPPER_VALUE,
+    ISAAC_NATIVE_WRAPPER_VALUE,
     PI_NATIVE_WRAPPER_VALUE,
     WRAPPER_LABEL_KEY,
 )
@@ -140,3 +141,21 @@ def test_pi_native_wrapper_constants_match_registry() -> None:
     assert PI_NATIVE_CODING_AGENT.harness == "pi-native"
     assert PI_NATIVE_CODING_AGENT.wrapper_label == PI_NATIVE_WRAPPER_VALUE
     assert PI_NATIVE_CODING_AGENT.terminal_name == "pi"
+
+
+def test_isaac_native_wrapper_constants_match_isaac_native_module() -> None:
+    """``omnigent.isaac_native`` imports the same key/value pair."""
+    from omnigent import isaac_native
+
+    assert isaac_native._WRAPPER_LABEL_KEY == WRAPPER_LABEL_KEY
+    assert isaac_native._WRAPPER_LABEL_VALUE == ISAAC_NATIVE_WRAPPER_VALUE
+
+
+def test_isaac_native_wrapper_constants_match_registry() -> None:
+    """The native coding-agent registry owns the Isaac wrapper metadata."""
+    from omnigent.native_coding_agents import ISAAC_NATIVE_CODING_AGENT
+
+    assert ISAAC_NATIVE_CODING_AGENT.agent_name == "isaac-native-ui"
+    assert ISAAC_NATIVE_CODING_AGENT.harness == "isaac-native"
+    assert ISAAC_NATIVE_CODING_AGENT.wrapper_label == ISAAC_NATIVE_WRAPPER_VALUE
+    assert ISAAC_NATIVE_CODING_AGENT.terminal_name == "isaac"

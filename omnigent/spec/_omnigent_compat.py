@@ -81,6 +81,7 @@ OMNIGENT_HARNESSES = frozenset(
         "codex",
         "codex-native",
         "cursor",
+        "isaac-native",
         "openai-agents",
         "open-responses",
         "pi",
