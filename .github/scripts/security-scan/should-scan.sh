@@ -22,10 +22,17 @@
 #
 # Maintainer escape hatch: an untrusted PR can be waived by the
 # `skip-security-scan` label alone. Applying a label requires GitHub Triage
-# permission, which on this repo is only granted to write/admin collaborators --
-# a fork author can never apply one -- so the label IS the maintainer gate and no
-# separate approval is required. (Anyone who can apply the label can already push
-# code to the repo, so the waiver grants no privilege they don't already have.)
+# permission (or higher), which a fork author never has, so the label IS the
+# maintainer gate and no separate approval is required.
+#
+# ACCEPTED RISK (repo policy, not GitHub-enforced): GitHub allows the Triage role
+# to be granted independently of Write, so in principle a triage-only collaborator
+# could self-waive. We accept this because this repo grants Triage only to
+# write/admin collaborators -- everyone who can apply the label can already push
+# code, so the waiver grants no privilege they don't already have. This invariant
+# lives in repo settings, not in code; if Triage is ever granted without Write,
+# revisit (e.g. re-add a maintainer-list check). See the PR for the full rationale.
+#
 # The label is read from the API (trusted), and this script always runs from
 # `main`, so a PR cannot edit the decision. The waiver is only evaluated when the
 # lookup vars (GH_TOKEN/REPO/PR) are passed (the scan does; the per-workflow
@@ -50,8 +57,9 @@ emit() {
 }
 
 # 0 = the skip label is present; 1 otherwise. Label-only: applying the label
-# already requires Triage permission (write/admin collaborators), so its mere
-# presence is the maintainer gate. Fails closed on any gap (missing token, etc).
+# already requires Triage permission (or higher), so its mere presence is the
+# maintainer gate (see the accepted-risk note in the header). Fails closed on any
+# gap (missing token, etc).
 has_skip_label() {
   [[ -n "${GH_TOKEN:-}" && -n "${REPO:-}" && -n "${PR:-}" ]] || return 1
 
@@ -106,7 +114,7 @@ case "${AUTHOR_ASSOCIATION:-}" in
     if author_is_maintainer; then
       emit false "trusted author (maintainer; author_association=${AUTHOR_ASSOCIATION:-unknown})"
     elif has_skip_label; then
-      emit false "'$SKIP_LABEL' waiver (label applied by a Triage+ maintainer)"
+      emit false "'$SKIP_LABEL' waiver (label requires a Triage+ collaborator to apply)"
     else
       emit true "untrusted author (author_association=${AUTHOR_ASSOCIATION:-unknown})"
     fi
