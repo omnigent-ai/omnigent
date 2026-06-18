@@ -8,7 +8,7 @@ description: |
   module.
 
 executor:
-  model: gpt-5.4
+  model: databricks-gpt-5-4
 
 prompt: |
   # E2E sub-agent-tool-gate parent
@@ -25,7 +25,7 @@ tools:
       Sub-agent with a LOCAL Python tool and a TOOL_CALL ASK
       policy. (Tool dropped in AP→Omnigent conversion.)
     executor:
-      model: gpt-5.4
+      model: databricks-gpt-5-4
     prompt: |
       # Toolworker sub-agent
 

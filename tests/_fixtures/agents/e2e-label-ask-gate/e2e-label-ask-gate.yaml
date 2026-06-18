@@ -3,7 +3,7 @@ description: |
   E2E fixture: label-driven ASK composition.
 
 executor:
-  model: gpt-5.4-mini
+  model: databricks-gpt-5-4-mini
 
 prompt: |
   # E2E label-ask-gate agent

@@ -3,7 +3,7 @@ description: |
   E2E fixture: OUTPUT-phase policy enforcement.
 
 executor:
-  model: gpt-5.4
+  model: databricks-gpt-5-4
 
 prompt: |
   # E2E output-gate agent
