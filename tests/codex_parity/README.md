@@ -108,6 +108,11 @@ Current executor-observable parity targets:
 - Codex app-server goal operations
   - `thread/goal/set` + `thread/goal/get` + `thread/goal/clear` round trip
   - explicit `tokenBudget: null` preservation
+  - idempotent `thread/goal/clear`
+  - `budgetLimited` preservation when setting the same objective
+  - persisted `blocked` and `usageLimited` goal statuses
+  - Omnigent AP rejection of Codex-owned statuses as user-writeable modes
+  - Omnigent AP pass-through of Codex-owned statuses returned by the runner
 
 Not yet represented here: upstream SDK-only app-server tests for lifecycle,
 login, approvals, steer/interrupt, local/remote image input, and skill input.

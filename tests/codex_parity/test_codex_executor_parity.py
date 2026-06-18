@@ -189,7 +189,8 @@ class _CodexGoalAgentStore:
 
 
 class _CodexGoalRunnerClient:
-    def __init__(self) -> None:
+    def __init__(self, *, response_status: str | None = None) -> None:
+        self.response_status = response_status
         self.post_json_calls: list[tuple[str, Any]] = []
 
     async def post(
@@ -201,7 +202,10 @@ class _CodexGoalRunnerClient:
     ) -> httpx.Response:
         del timeout
         self.post_json_calls.append((url, json))
-        status = json["status"] if isinstance(json, dict) else "active"
+        requested_status = json.get("status") if isinstance(json, dict) else None
+        status = self.response_status or (
+            requested_status if isinstance(requested_status, str) else "active"
+        )
         return httpx.Response(
             status_code=200,
             json={
@@ -642,10 +646,13 @@ async def test_real_codex_goal_set_get_clear_round_trip(
         assert get_result.get("goal", {}).get("objective") == objective
 
         clear_result = await _codex_goal_request(app_session, "thread/goal/clear")
-        assert isinstance(clear_result.get("cleared"), bool)
+        assert clear_result.get("cleared") is True
 
         get_after_clear = await _codex_goal_request(app_session, "thread/goal/get")
         assert get_after_clear.get("goal") is None
+
+        clear_again = await _codex_goal_request(app_session, "thread/goal/clear")
+        assert clear_again.get("cleared") is False
     finally:
         await executor.close()
 
@@ -724,6 +731,56 @@ async def test_omnigent_codex_goal_status_api_rejects_codex_owned_statuses() -> 
 
 
 @pytest.mark.asyncio
+async def test_omnigent_codex_goal_set_api_rejects_codex_owned_statuses() -> None:
+    runner_client = _CodexGoalRunnerClient()
+    app = _codex_goal_api_app(runner_client)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.put(
+            "/v1/sessions/conv_codex/codex_goal",
+            json={
+                "objective": "Finish parity",
+                "status": "complete",
+            },
+        )
+
+    assert response.status_code == 422
+    assert runner_client.post_json_calls == []
+
+
+@pytest.mark.asyncio
+async def test_omnigent_codex_goal_api_preserves_codex_owned_response_statuses() -> None:
+    runner_client = _CodexGoalRunnerClient(response_status="budgetLimited")
+    app = _codex_goal_api_app(runner_client)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.put(
+            "/v1/sessions/conv_codex/codex_goal",
+            json={
+                "objective": "Finish parity",
+                "token_budget": 40000,
+                "status": "active",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["goal"]["status"] == "budgetLimited"
+    assert runner_client.post_json_calls == [
+        (
+            "/v1/sessions/conv_codex/events",
+            {
+                "type": "goal_set",
+                "objective": "Finish parity",
+                "token_budget": 40000,
+                "status": "active",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_real_codex_goal_set_preserves_null_token_budget(
     codex_responses_sidecar,
     resolved_codex_bin: str,
@@ -757,6 +814,108 @@ async def test_real_codex_goal_set_preserves_null_token_budget(
         goal = set_result.get("goal")
         assert isinstance(goal, dict)
         assert goal["tokenBudget"] is None
+    finally:
+        await executor.close()
+
+
+@pytest.mark.asyncio
+async def test_real_codex_goal_set_preserves_budget_limited_same_objective(
+    codex_responses_sidecar,
+    resolved_codex_bin: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "source-codex-home"))
+    (tmp_path / "source-codex-home").mkdir()
+    sidecar = codex_responses_sidecar(
+        [
+            [
+                ev_response_created("resp-goal-budget-limited"),
+                ev_assistant_message("msg-goal-budget-limited", "thread ready"),
+                ev_completed("resp-goal-budget-limited"),
+            ]
+        ]
+    )
+    executor = _executor(resolved_codex_bin, sidecar.base_url, tmp_path / "workspace")
+    (tmp_path / "workspace").mkdir()
+
+    try:
+        _assert_completed(await _run_turn(executor, "bootstrap a goal thread"))
+        app_session = _app_session_for_test(executor)
+        objective = "Keep polishing"
+
+        limited_result = await _codex_goal_request(
+            app_session,
+            "thread/goal/set",
+            {
+                "objective": objective,
+                "status": "budgetLimited",
+                "tokenBudget": 10,
+            },
+        )
+        limited_goal = limited_result.get("goal")
+        assert isinstance(limited_goal, dict)
+        assert limited_goal["status"] == "budgetLimited"
+
+        replacement_result = await _codex_goal_request(
+            app_session,
+            "thread/goal/set",
+            {"objective": objective},
+        )
+        replacement_goal = replacement_result.get("goal")
+        assert isinstance(replacement_goal, dict)
+        assert replacement_goal["objective"] == objective
+        assert replacement_goal["status"] == "budgetLimited"
+        assert replacement_goal["tokenBudget"] == 10
+        assert replacement_goal["tokensUsed"] == 0
+        assert replacement_goal["timeUsedSeconds"] == 0
+    finally:
+        await executor.close()
+
+
+@pytest.mark.parametrize("wire_status", ["blocked", "usageLimited"])
+@pytest.mark.asyncio
+async def test_real_codex_goal_set_persists_resumable_stopped_statuses(
+    wire_status: str,
+    codex_responses_sidecar,
+    resolved_codex_bin: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "source-codex-home"))
+    (tmp_path / "source-codex-home").mkdir()
+    sidecar = codex_responses_sidecar(
+        [
+            [
+                ev_response_created(f"resp-goal-{wire_status}"),
+                ev_assistant_message(f"msg-goal-{wire_status}", "thread ready"),
+                ev_completed(f"resp-goal-{wire_status}"),
+            ]
+        ]
+    )
+    executor = _executor(resolved_codex_bin, sidecar.base_url, tmp_path / "workspace")
+    (tmp_path / "workspace").mkdir()
+
+    try:
+        _assert_completed(await _run_turn(executor, "bootstrap a goal thread"))
+        app_session = _app_session_for_test(executor)
+
+        set_result = await _codex_goal_request(
+            app_session,
+            "thread/goal/set",
+            {
+                "objective": "Keep polishing",
+                "status": wire_status,
+            },
+        )
+        goal = set_result.get("goal")
+        assert isinstance(goal, dict)
+        assert goal["status"] == wire_status
+
+        get_result = await _codex_goal_request(app_session, "thread/goal/get")
+        persisted_goal = get_result.get("goal")
+        assert isinstance(persisted_goal, dict)
+        assert persisted_goal["status"] == wire_status
     finally:
         await executor.close()
 
