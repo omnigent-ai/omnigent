@@ -132,6 +132,12 @@ def _synthesize_entry(det: DetectedProvider) -> dict[str, object] | None:
             return None
         return build_cli_config_provider_entry("codex", det.model_provider, det.display_name)
 
+    if det.name == "vertex-claude":
+        # Claude Code on Vertex AI — the CLI authenticates via its own env
+        # vars and GCP ADC.  A subscription entry makes the native-claude
+        # resolver skip gateway routing, letting the CLI use Vertex natively.
+        return build_subscription_provider_entry("claude")
+
     if det.family is None:
         # An env key we detect but can't route to a harness (e.g. Gemini).
         return None
