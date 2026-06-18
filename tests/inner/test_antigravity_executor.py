@@ -1003,6 +1003,63 @@ async def test_close_session_closes_agent(monkeypatch: pytest.MonkeyPatch) -> No
     assert agent.closed is True
 
 
+@pytest.mark.asyncio
+async def test_open_agent_failure_leaves_no_session_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed agent build registers no dead, agent-less ``_session_states`` row.
+
+    Otherwise every turn on an un-buildable host (bad creds / missing glibc /
+    SDK drift) would accumulate a permanent empty entry that close_session never
+    reaps.
+    """
+    _install_fake_sdk(monkeypatch, scripts=[[_text_step("ok")]])
+    executor = AntigravityExecutor()
+
+    async def _boom(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("agent construction failed")
+
+    monkeypatch.setattr(executor, "_open_agent", _boom)
+
+    events = await _drain(executor, [{"role": "user", "content": "hi", "session_id": "s1"}])
+    assert any(isinstance(e, ExecutorError) for e in events)
+    assert executor._session_states == {}
+
+
+@pytest.mark.asyncio
+async def test_conversation_access_failure_reaps_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If ``agent.conversation`` raises after ``__aenter__``, the entered agent
+    (and its native subprocess) is torn down rather than orphaned, and no
+    session state is registered."""
+    _install_fake_sdk(monkeypatch, scripts=[[_text_step("ok")]])
+    executor = AntigravityExecutor()
+
+    class _BadConversationAgent:
+        def __init__(self) -> None:
+            self.closed = False
+
+        @property
+        def conversation(self) -> Any:
+            raise RuntimeError("conversation unavailable")
+
+        async def __aexit__(self, *_args: object) -> None:
+            self.closed = True
+
+    bad_agent = _BadConversationAgent()
+
+    async def _open(*_args: Any, **_kwargs: Any) -> Any:
+        return bad_agent
+
+    monkeypatch.setattr(executor, "_open_agent", _open)
+
+    events = await _drain(executor, [{"role": "user", "content": "hi", "session_id": "s1"}])
+    assert any(isinstance(e, ExecutorError) for e in events)
+    assert bad_agent.closed is True  # _close_agent reaped the entered agent
+    assert executor._session_states == {}
+
+
 # ── Interrupt (cancellation) tests — real deterministic sync gates ──────
 
 

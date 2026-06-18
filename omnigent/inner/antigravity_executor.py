@@ -777,8 +777,12 @@ class AntigravityExecutor(Executor):
         signature = (model, system_prompt, self._tool_signature(tools))
         state = self._session_states.get(session_key)
         if state is None:
+            # A brand-new session's state is NOT registered until the agent is
+            # fully built below, so a construction failure (bad creds, a host
+            # without the SDK's required glibc, SDK drift) leaves no dead,
+            # agent-less entry accumulating in ``_session_states`` turn after
+            # turn. A reused session is already registered.
             state = _AntigravitySessionState()
-            self._session_states[session_key] = state
 
         if state.agent is not None and state.agent_signature == signature:
             return state, False
@@ -791,9 +795,23 @@ class AntigravityExecutor(Executor):
         agent = await self._open_agent(
             state, model=model, system_prompt=system_prompt, tools=tools
         )
+        # Record the opened agent on the state BEFORE the (failure-prone)
+        # conversation access: ``_open_agent`` has already entered the agent's
+        # async context, which spawns the native ``localharness`` subprocess, so
+        # if anything after this point raises, the agent must still be reachable
+        # by ``close()`` / ``close_session()`` for teardown — otherwise that
+        # subprocess orphans. If wiring the conversation fails, reap it here.
         state.agent = agent
-        state.conversation = agent.conversation
+        try:
+            state.conversation = agent.conversation
+        except Exception:
+            await self._close_agent(agent)
+            state.agent = None
+            state.conversation = None
+            raise
         state.agent_signature = signature
+        # Register only once the agent is fully built (see the no-state branch).
+        self._session_states[session_key] = state
         return state, True
 
     async def _open_agent(
