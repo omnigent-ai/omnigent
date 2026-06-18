@@ -203,12 +203,34 @@ function startInboxPoller(pi, config, handleInterrupt) {
             deliverAttempts.set(key, attempts);
             continue;
           }
-          // Cap reached: surface a failure (a silent drop would be invisible)
-          // and consume the file to stop the spin.
+          // Cap reached: surface the dropped follow-up without faking a turn
+          // failure. The runner treats external_session_status:failed as
+          // terminal for native sub-agents, so use a non-content conversation
+          // error item and consume the file to stop the spin. Include the
+          // message id and a short content preview so an operator can identify
+          // what was lost (data loss; the file is unlinked below).
           deliverAttempts.delete(key);
+          const droppedId = id ?? "(no id)";
+          const preview =
+            typeof payload.content === "string"
+              ? payload.content.length > 80
+                ? `${payload.content.slice(0, 80)}…`
+                : payload.content
+              : "";
           postEvent(config, {
-            type: "external_session_status",
-            data: { status: "failed", response_id: `pi-deliver-failed-${Date.now()}` },
+            type: "external_conversation_item",
+            data: {
+              response_id: `pi-deliver-dropped-${Date.now()}`,
+              item_type: "error",
+              item_data: {
+                source: "execution",
+                code: "pi_followup_delivery_dropped",
+                message:
+                  `Omnigent: a queued follow-up message (id ${droppedId}) could ` +
+                  `not be delivered to Pi after ${MAX_DELIVER_ATTEMPTS} attempts ` +
+                  `and was dropped. Content preview: ${JSON.stringify(preview)}`,
+              },
+            },
           });
           try {
             fs.unlinkSync(fullPath);
