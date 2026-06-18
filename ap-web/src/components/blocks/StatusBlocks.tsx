@@ -18,13 +18,15 @@ interface ErrorBannerProps {
 }
 
 /**
- * Detect the shared "<Executor> requires the '<pkg>' package. Install it
- * with: <cmd>" pattern the inner executors raise when an optional harness
+ * Detect the "<Executor> requires the '<pkg>' package. Install it with:
+ * <cmd>" convention the inner executors raise when an optional harness
  * dependency is missing (antigravity, claude-agent-sdk, cursor-sdk,
- * openai-agents, databricks-sdk, mlflow, …). The message is copy-pasted
- * across executors, so this is a stable convention. Returns null when the
- * message isn't that shape so the banner falls back to the generic raw
- * rendering. #548
+ * openai-agents, databricks-sdk, mlflow, …). This "Format A" shape is the
+ * common one. A few executors use a "Format B" shape ("The '<pkg>' package
+ * is required for <Executor>. Install it with: …") or an unquoted variant
+ * (cel-expr-python); those aren't matched here and fall back to the generic
+ * banner — tracked as a follow-up. Returns null when the message isn't
+ * that shape so the banner falls back to the generic raw rendering. #548
  */
 const MISSING_DEP_RE = /requires the '([^']+)' package\. Install it with:\s*(.+)$/;
 function parseMissingDependency(
@@ -38,7 +40,8 @@ function parseMissingDependency(
   // `.match(` — which reads identically — keeps the PR's Security Scan green. #548
   const m = message.match(MISSING_DEP_RE);
   if (!m) return null;
-  // Some executors trail the command with a period; strip one so the
+  // The antigravity executor trails its install command with a period (it
+  // appends a parenthetical alternative ending "...') ."); strip one so the
   // copied install command doesn't carry it.
   return { packageName: m[1], installCommand: m[2].replace(/\.$/, "").trim() };
 }
