@@ -89,11 +89,14 @@ _HEARTBEAT_INTERVAL_S = 15.0
 _SHUTDOWN_GRACE_S = 4.5
 
 # Timeout for the policy evaluation round-trip (harness → runner →
-# Omnigent server → runner → harness). Fail-open on expiry so a stalled
-# round-trip doesn't hang the executor indefinitely. Must be ≥
-# DEFAULT_POLICY_CLASSIFIER_TIMEOUT (30 s) since PromptPolicy
-# classifiers make their own LLM call on the Omnigent server side.
-_POLICY_EVAL_TIMEOUT_S = 35.0
+# Omnigent server → runner → harness). Held at one day (86400s) — matching
+# the deciding policy's default ``ask_timeout``: a TOOL_CALL/REQUEST ASK parks
+# server-side until a human answers, and this gate must block until the
+# verdict arrives rather than auto-resolve on a short cut (the cost-policy
+# bug). The server caps the real wait via the policy's ``ask_timeout``. On the
+# (now rare) expiry the fallback below is phase-aware — TOOL_CALL fails CLOSED
+# (DENY), advisory LLM/TOOL_RESULT phases fail OPEN (ALLOW).
+_POLICY_EVAL_TIMEOUT_S = 86400.0
 
 # Per-turn IDLE watchdog: max gap WITHOUT progress before a wedged
 # ``run_turn`` becomes ``response.failed`` (vs heartbeating forever).

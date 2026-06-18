@@ -5847,3 +5847,79 @@ async def test_fetch_session_snapshot_raises_diagnosable_error_on_html_body() ->
     message = str(excinfo.value)
     assert "conv_abc123" in message
     assert "text/html" in message
+
+
+@pytest.mark.asyncio
+async def test_forward_session_cost_tags_display_advance_with_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A display-cost (S) advance is tagged with the statusLine's active model.
+
+    claude-native sends no token counts with its cost, so the server has
+    nothing to attribute the cost to in the per-model TOKEN USAGE view without
+    a ``model`` tag — it would drop the cost from that view. The forwarder
+    rides the statusLine model (captured in context.json) on the payload
+    whenever the display cost advances. A policy-only mid-turn re-post (S
+    frozen, only the gate estimate C advancing) carries NO model: there is no
+    new display cost to attribute, so tagging it would be meaningless churn.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    parent = tmp_path / "sess.jsonl"
+    parent.write_text("parent", encoding="utf-8")
+
+    status_box = {"value": 0.01}
+    monkeypatch.setattr(
+        forwarder,
+        "read_claude_context_state",
+        lambda _bridge: {"total_cost_usd": status_box["value"], "model": "claude-opus-4-8"},
+    )
+    estimate_box = {"value": 0.65}
+    monkeypatch.setattr(
+        forwarder,
+        "_session_cost_estimate",
+        lambda **_kwargs: estimate_box["value"],
+    )
+    subagent_state = forwarder.SubagentForwardState(
+        subagents={
+            "aaa": forwarder.SubagentEntry(subagent_id="aaa", child_conversation_id="conv_child")
+        }
+    )
+    dedupe = forwarder._ForwardDedupeState()
+    posted: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("type") == "external_session_usage":
+            posted.append(body["data"])
+        return httpx.Response(200, json={})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+
+        async def run() -> None:
+            await forwarder._forward_session_cost(
+                client=client,
+                session_id="conv_parent",
+                bridge_dir=bridge_dir,
+                parent_transcript_path=parent,
+                subagent_state=subagent_state,
+                dedupe=dedupe,
+                cost_cache={},
+            )
+
+        # Display cost advances → the model rides along for per-model attribution.
+        await run()
+        assert posted == [
+            {
+                "cumulative_cost_usd": pytest.approx(0.01),
+                "policy_cost_usd": pytest.approx(0.65),
+                "model": "claude-opus-4-8",
+            }
+        ]
+
+        # Mid-turn: S frozen, only C (policy) advances → policy-only re-post
+        # carries NO model (no new display cost to attribute).
+        estimate_box["value"] = 0.90
+        await run()
+        assert posted[-1] == {"policy_cost_usd": pytest.approx(0.90)}
