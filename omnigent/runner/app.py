@@ -52,7 +52,7 @@ from omnigent.llms.summarize import (
 from omnigent.model_override import validate_model_override
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runner import pending_approvals
-from omnigent.runner.codex_goal import CodexGoalRunner
+from omnigent.runner.codex.goal import CodexGoalRunner
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
