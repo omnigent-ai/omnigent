@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from omnigent._native_resume_hint import format_native_resume_command
+import pytest
+
+from omnigent._native_resume_hint import (
+    echo_native_cold_resume_hint,
+    format_native_resume_command,
+)
 
 
 def test_format_native_resume_command_includes_remote_context() -> None:
@@ -24,3 +29,25 @@ def test_format_native_resume_command_includes_remote_context() -> None:
     )
 
     assert command == ("omnigent claude --server https://example.databricks.com --resume conv_abc")
+
+
+def test_cold_resume_hint_is_honest_on_stderr(capsys: pytest.CaptureFixture[str]) -> None:
+    """
+    The cold-resume hint must tell the user, on stderr, that prior turns
+    are gone.
+
+    Cursor cannot reattach to a chat once its terminal exits, so resume
+    cold-starts a fresh TUI. If the hint were silent (or printed an
+    upbeat "resumed!" line), the user would reasonably assume their
+    earlier conversation came back and be misled. The message therefore
+    has to state both facts: the terminal was not running, and the prior
+    chat was not restored. It must go to stderr so it never pollutes the
+    TUI's stdout.
+    """
+    echo_native_cold_resume_hint(agent_label="Cursor")
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Terminal not running" in captured.err
+    assert "fresh Cursor session" in captured.err
+    assert "prior chat not restored" in captured.err
