@@ -1386,3 +1386,138 @@ async def test_interrupt_session_unknown_returns_false(monkeypatch: pytest.Monke
     _install_fake_sdk(monkeypatch, scripts=[])
     executor = AntigravityExecutor()
     assert await executor.interrupt_session("never-started") is False
+
+
+class _RebuildConversation:
+    """Conversation that blocks-then-cancels on turn 1, then runs clean on turn 2.
+
+    The first conversation (``blocking=True``) streams one delta and parks on a
+    gate until ``cancel()`` releases it, then raises the SDK cancellation error
+    — modelling an interrupted in-flight turn. The second conversation
+    (``blocking=False``) is the fresh one a post-interrupt rebuild must open and
+    runs a normal turn to completion. Each records its own ``sends`` so a test
+    can prove the second turn went to the *new* conversation, not the cancelled
+    one.
+    """
+
+    def __init__(self, gate: asyncio.Event, *, blocking: bool) -> None:
+        self._gate = gate
+        self._blocking = blocking
+        self.sends: list[str] = []
+        self.cancel_called = 0
+
+    async def send(self, prompt: Any, **_kw: Any) -> None:
+        self.sends.append(prompt)
+
+    async def receive_steps(self) -> Any:
+        if self._blocking:
+            yield _FakeStep(
+                step_type=_StepType.TEXT_RESPONSE,
+                status=_StepStatus.ACTIVE,
+                content_delta="streaming",
+            )
+            await self._gate.wait()  # parked until cancel() releases us
+            raise _AntigravityCancelledError("cancelled")
+        yield _FakeStep(
+            step_type=_StepType.TEXT_RESPONSE,
+            status=_StepStatus.ACTIVE,
+            content_delta="second-reply",
+        )
+        yield _FakeStep(step_type=_StepType.FINISH, status=_StepStatus.DONE)
+
+    async def cancel(self) -> None:
+        self.cancel_called += 1
+        self._gate.set()
+
+
+def _install_rebuild_sdk(monkeypatch: pytest.MonkeyPatch, gate: asyncio.Event) -> dict[str, Any]:
+    """Install a fake SDK: first agent blocks-then-cancels, later agents run clean."""
+    captured: dict[str, Any] = {"agents": [], "conversations": []}
+
+    class _RebuildAgent:
+        def __init__(self, config: Any, *, blocking: bool) -> None:
+            self.config = config
+            self._conversation = _RebuildConversation(gate, blocking=blocking)
+            self.closed = False
+            captured["conversations"].append(self._conversation)
+
+        @property
+        def conversation(self) -> _RebuildConversation:
+            return self._conversation
+
+        async def __aenter__(self) -> _RebuildAgent:
+            return self
+
+        async def __aexit__(self, *_a: object) -> None:
+            self.closed = True
+
+    class _FakeHooks:
+        PostToolCallHook = _FakePostToolCallHook
+
+    class _FakeTypes:
+        AntigravityCancelledError = _AntigravityCancelledError
+
+    class _FakeModule:
+        LocalAgentConfig = _FakeLocalAgentConfig
+        hooks = _FakeHooks
+        types = _FakeTypes
+
+        @staticmethod
+        def Agent(config: Any) -> _RebuildAgent:
+            # Only the very first agent blocks (the turn we interrupt); the
+            # rebuilt agent runs a normal turn.
+            agent = _RebuildAgent(config, blocking=not captured["agents"])
+            captured["agents"].append(agent)
+            return agent
+
+    monkeypatch.setattr(ag, "_ensure_antigravity_sdk", lambda: _FakeModule())
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_next_turn_rebuilds_after_interrupt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """After an interrupt, the next turn rebuilds rather than reusing the cancelled convo.
+
+    Regression guard for F12: ``interrupt_session`` -> ``conversation.cancel()``
+    left the cancelled SDK conversation cached, so the next turn resumed from
+    aborted state. The fix invalidates the cached agent signature on interrupt
+    so the next ``run_turn`` closes the stale agent and opens a fresh
+    agent + conversation. Same model / system_prompt / tools across both turns,
+    so without the fix the agent would be reused (1 agent) and the second send
+    would land on the cancelled conversation.
+    """
+    gate = asyncio.Event()
+    first_text = asyncio.Event()
+    captured = _install_rebuild_sdk(monkeypatch, gate)
+    executor = AntigravityExecutor()
+
+    # Turn 1: drive until the first delta (provably mid-flight), then interrupt.
+    collected: list[Any] = []
+    task = asyncio.create_task(_drive_until_first_text(executor, collected, first_text))
+    await asyncio.wait_for(first_text.wait(), timeout=5)
+    assert await executor.interrupt_session("s1") is True
+    await asyncio.wait_for(task, timeout=5)
+
+    # The interrupt produced a clean cancel (not an error) and cancelled the
+    # live conversation.
+    assert any(isinstance(e, TurnCancelled) for e in collected)
+    assert not any(isinstance(e, ExecutorError) for e in collected)
+    cancelled_conv = captured["conversations"][0]
+    assert cancelled_conv.cancel_called == 1
+
+    # Turn 2 on the SAME session/signature must NOT reuse the cancelled agent.
+    events = await _drain(executor, [{"role": "user", "content": "next", "session_id": "s1"}])
+
+    # A fresh agent was built (2 total) and the stale one was torn down — the
+    # exact rebuild path a signature change uses. Reuse (the bug) would be 1.
+    assert len(captured["agents"]) == 2
+    assert captured["agents"][0].closed is True
+    # The second turn went to the NEW conversation; the cancelled one never saw
+    # the follow-up prompt (no stale-state reuse).
+    new_conv = captured["conversations"][1]
+    assert new_conv.sends == ["next"]
+    assert "next" not in cancelled_conv.sends
+    # And the fresh turn completed normally.
+    completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert len(completes) == 1
+    assert completes[0].response == "second-reply"
