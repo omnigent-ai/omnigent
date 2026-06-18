@@ -57,13 +57,16 @@ from __future__ import annotations
 
 import os
 import shutil
+import time
 import uuid
 from pathlib import Path
 
 import httpx
 import pytest
 
+from omnigent.cursor_native_bridge import bridge_dir_for_session_id, kill_session
 from tests.e2e._native_resume_helpers import (
+    PtyHandle,
     cli_env,
     inject_user_message,
     omnigent_console_script,
@@ -102,6 +105,23 @@ _CWD_MARKER_FILE = "CWD_MARKER.txt"
 _CONV_ID_TIMEOUT = 120.0
 _TERMINAL_READY_TIMEOUT = 90.0
 _REPLY_TIMEOUT = 180.0
+_COLD_RESUME_HINT = (
+    "Terminal not running - starting a fresh Cursor session (prior chat not restored)."
+)
+
+
+def _wait_for_output_contains(handle: PtyHandle, needle: str, *, timeout: float) -> str:
+    """Poll a PTY handle until *needle* appears in its decoded output."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        output = handle.output()
+        if needle in output:
+            return output
+        time.sleep(0.2)
+    output = handle.output()
+    raise AssertionError(
+        f"did not see {needle!r} within {timeout}s; output tail:\n{output[-2000:]}"
+    )
 
 
 def test_cursor_native_cli_smoke(
@@ -236,3 +256,96 @@ def test_cursor_native_cli_runs_in_launch_cwd(
                 ) from exc
     finally:
         handle.terminate()
+
+
+def test_cursor_native_cli_resume_warns_when_terminal_was_killed(
+    resume_test_server: str,
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+) -> None:
+    """Live reattach stays quiet, but cold resume tells the truth.
+
+    This is the e2e guard for the UX bug in ``CURSOR_NATIVE_AUDIT_FIXES.md``
+    item #2. A second ``omnigent cursor --resume <conv>`` while the original
+    tmux pane is still alive should attach to the live terminal and must not
+    print the cold-resume warning. After killing that tmux session, the same
+    resume command necessarily starts a fresh ``cursor-agent`` TUI with no
+    prior Cursor chat, so the CLI must print the honest stderr hint before it
+    attaches.
+
+    :param resume_test_server: Base URL of the allow-list-free test server.
+    :param tmp_path: Per-test temp dir; its ``pwd`` subdir is the launch cwd.
+    :param request: Pytest request - reads ``--profile`` for the test server.
+    """
+    profile = request.config.getoption("--profile")
+    assert profile, "this test requires --profile (e.g. --profile oss) for the test server"
+
+    pwd_dir = tmp_path / "pwd"
+    pwd_dir.mkdir()
+
+    omni = str(omnigent_console_script())
+    base = [omni, "cursor", "--server", resume_test_server]
+    primary = spawn_cli_background(
+        [*base, _FORCE_FLAG],
+        env=cli_env(profile=profile),
+        cwd=str(pwd_dir),
+    )
+    try:
+        conversation_id = wait_for_conversation_id(primary, timeout=_CONV_ID_TIMEOUT)
+        with httpx.Client(base_url=resume_test_server, timeout=30) as client:
+            wait_for_terminal_ready(
+                client,
+                conversation_id=conversation_id,
+                harness="cursor",
+                timeout=_TERMINAL_READY_TIMEOUT,
+            )
+
+        live_resume = spawn_cli_background(
+            [*base, "--resume", conversation_id, _FORCE_FLAG],
+            env=cli_env(profile=profile),
+            cwd=str(pwd_dir),
+        )
+        try:
+            _wait_for_output_contains(
+                live_resume,
+                f"/c/{conversation_id}",
+                timeout=_CONV_ID_TIMEOUT,
+            )
+            # The cold-resume hint is printed immediately after the Web UI line
+            # and before the blocking tmux attach. Wait briefly past that point
+            # before asserting absence, so this catches a misplaced hint on live
+            # reattach rather than racing ahead of it.
+            time.sleep(2.0)
+            live_output = live_resume.output()
+            assert _COLD_RESUME_HINT not in live_output, (
+                "live cursor-native resume incorrectly printed the cold-resume hint; "
+                "it should be a true reattach while the terminal is running."
+            )
+        finally:
+            live_resume.terminate()
+
+        kill_session(bridge_dir_for_session_id(conversation_id), timeout_s=30.0)
+        primary.terminate()
+
+        cold_resume = spawn_cli_background(
+            [*base, "--resume", conversation_id, _FORCE_FLAG],
+            env=cli_env(profile=profile),
+            cwd=str(pwd_dir),
+        )
+        try:
+            _wait_for_output_contains(
+                cold_resume,
+                _COLD_RESUME_HINT,
+                timeout=_CONV_ID_TIMEOUT,
+            )
+            with httpx.Client(base_url=resume_test_server, timeout=30) as client:
+                wait_for_terminal_ready(
+                    client,
+                    conversation_id=conversation_id,
+                    harness="cursor",
+                    timeout=_TERMINAL_READY_TIMEOUT,
+                )
+        finally:
+            cold_resume.terminate()
+    finally:
+        primary.terminate()
