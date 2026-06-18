@@ -189,6 +189,7 @@ from omnigent.server.routes._content_type import (
     require_json_or_multipart_content_type,
 )
 from omnigent.server.routes._host_worktree import CreatedWorktree
+from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.schemas import (
     AgentObject,
     ChildSessionSummary,
@@ -12085,7 +12086,14 @@ def create_sessions_router(
         # CSRF hardening: this route dispatches on Content-Type (JSON vs
         # multipart bundled-create), so reject text/plain and other simple
         # types up front while still allowing both legitimate body shapes.
-        dependencies=[Depends(require_json_or_multipart_content_type)],
+        # The multipart shape is CORS-safelisted, so the content-type guard
+        # alone can't stop a cross-site bundle upload — require_trusted_origin
+        # closes that gap (allows absent Origin for non-browser SDK/runner
+        # clients; in local mode a present Origin must be loopback).
+        dependencies=[
+            Depends(require_json_or_multipart_content_type),
+            Depends(require_trusted_origin),
+        ],
     )
     async def create_session(
         request: Request,
@@ -15224,6 +15232,12 @@ def create_sessions_router(
         "/sessions/{session_id}/resources/files",
         status_code=201,
         response_model=None,
+        # CSRF hardening: this route only accepts multipart/form-data, which
+        # is CORS-safelisted, so a content-type guard can't stop a cross-site
+        # upload. require_trusted_origin closes the gap (allows absent Origin
+        # for the non-browser SDK/runner clients; in local mode a present
+        # Origin must be loopback).
+        dependencies=[Depends(require_trusted_origin)],
     )
     async def upload_session_file(
         request: Request,

@@ -41,6 +41,7 @@ import httpx
 import pytest
 import yaml
 
+from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from tests._model_pools import current_attempt, resolve_model
 from tests.e2e._harness_probes import skip_if_harness_cli_missing
 from tests.e2e.helpers import HEALTH_TIMEOUT_S, POLL_INTERVAL_S, lookup_databricks_host
@@ -660,7 +661,16 @@ def http_client(live_server: str) -> Iterator[httpx.Client]:
     :param live_server: The server base URL.
     :returns: An ``httpx.Client`` with long timeout.
     """
-    with httpx.Client(base_url=live_server, timeout=300) as client:
+    # Announce this as a first-party non-browser client via the sentinel
+    # Origin, exactly like the real SDK / runner. The multipart session
+    # routes are behind require_trusted_origin; sending the sentinel keeps
+    # these tests passing on their own merit rather than leaning on the
+    # guard's (temporary) fail-open-on-absent-Origin behavior.
+    with httpx.Client(
+        base_url=live_server,
+        timeout=300,
+        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+    ) as client:
         yield client
 
 
@@ -711,6 +721,9 @@ def upload_agent(
                 "application/gzip",
             ),
         },
+        # First-party sentinel Origin so the multipart create passes the
+        # require_trusted_origin guard regardless of which client is passed.
+        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
     )
     if resp.status_code == 409:
         return agent_dir.name
@@ -804,6 +817,9 @@ def register_inline_agent(
         "/v1/sessions",
         data={"metadata": _json.dumps({})},
         files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+        # First-party sentinel Origin so the multipart create passes the
+        # require_trusted_origin guard regardless of which client is passed.
+        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
     )
     # 409 = already registered by a prior parametrize row against the
     # same session-scoped server; treat as success. Explicit raise (not
@@ -1240,7 +1256,13 @@ def create_runner_bound_session(
     :returns: The session/conversation id, e.g. ``"conv_abc"``.
     """
     agent_id = lookup_agent_id(client, agent_name)
-    resp = client.post("/v1/sessions", json={"agent_id": agent_id})
+    # First-party sentinel Origin so the create passes the
+    # require_trusted_origin guard regardless of which client is passed.
+    resp = client.post(
+        "/v1/sessions",
+        json={"agent_id": agent_id},
+        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+    )
     resp.raise_for_status()
     session_id = str(resp.json()["id"])
     resp = client.patch(

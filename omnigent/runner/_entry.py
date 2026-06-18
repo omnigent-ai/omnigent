@@ -642,7 +642,11 @@ def create_app(
     :returns: A runner FastAPI app exposing the harness-contract subset.
     """
     from omnigent.runner.app import create_runner_app
-    from omnigent.runner.identity import RUNNER_ID_ENV_VAR, get_stable_runner_id
+    from omnigent.runner.identity import (
+        OMNIGENT_INTERNAL_WS_ORIGIN,
+        RUNNER_ID_ENV_VAR,
+        get_stable_runner_id,
+    )
     from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 
     server_url = _server_url_from_env()
@@ -674,6 +678,13 @@ def create_app(
     server_client = httpx.AsyncClient(
         base_url=server_url,
         auth=_RunnerDatabricksAuth(auth_token_factory),
+        # Announce the runner as a first-party non-browser client via the
+        # sentinel Origin. The server's require_trusted_origin CSRF guard on
+        # the multipart routes (POST /v1/sessions bundle create, file upload
+        # — both reached from tool_dispatch over this client) requires a
+        # trusted Origin; the runner sends none otherwise, so the sentinel is
+        # what lets sys_session_create / sys_upload_file through.
+        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
         timeout=httpx.Timeout(5.0, read=None),
         # NOTE: ``follow_redirects`` deliberately stays False.
         # ``_RunnerDatabricksAuth.auth_flow`` needs to *see* the
