@@ -182,9 +182,11 @@ hand-reimplements SQLite's SQL compilation and reflection incompletely. The shim
 re-registers `cloudflare_d1` as a proper `SQLiteDialect` subclass — keeping only
 the HTTP transport and D1 type processors — so DDL and reflection come from
 SQLite and the **normal on-boot Alembic migrations run unmodified** (no
-schema-bootstrap step). The clean fix is the same change upstream: make the
-dialect subclass `SQLiteDialect`. Then the shim drops to a few lines (an Alembic
-impl registration plus the "D1 has no `temp` schema" reflection overrides).
+schema-bootstrap step). Upstream, the same wins come from fixing the dialect's
+compilation and reflection directly — the composite-primary-key half is filed as
+[CollierKing/sqlalchemy-cloudflare-d1#26](https://github.com/CollierKing/sqlalchemy-cloudflare-d1/pull/26);
+with the dialect's reflection also complete, this shim would drop to a few lines
+(an Alembic impl registration plus the "D1 has no `temp` schema" overrides).
 
 The R2 artifact store has **no** such workaround — it uses the native
 `S3ArtifactStore` backend (selected by `OMNIGENT_ARTIFACT_URI`), so the same
