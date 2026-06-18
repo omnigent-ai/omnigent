@@ -217,6 +217,50 @@ describe("NewChatLandingScreen create flow", () => {
     expect(navigateMock).not.toHaveBeenCalled();
   });
 
+  it("does not create a session when Enter confirms active IME composition", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    const input = screen.getByTestId("new-chat-landing-input");
+    fireEvent.compositionStart(input);
+    fireEvent.change(input, { target: { value: "オムニジェント" } });
+
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+    expect(navigateMock).not.toHaveBeenCalled();
+
+    fireEvent.compositionEnd(input);
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
+  });
+
+  it("does not create a session when Enter carries the IME keyCode 229 fallback", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    const input = screen.getByTestId("new-chat-landing-input");
+    fireEvent.change(input, { target: { value: "omnigent" } });
+
+    fireEvent.keyDown(input, { key: "Enter", keyCode: 229 });
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+    expect(navigateMock).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
+  });
+
   it("hands the sanitized message to the chatStore, not the create body", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,
@@ -433,13 +477,14 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Open the footer tray's Advanced menu (Radix opens on pointerdown) and
-    // pick a non-default mode. The create call proves the choice travels as
-    // a `--permission-mode <mode>` pair in terminal_launch_args.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
+    // Open the agent picker (Radix opens on pointerdown), slide into Advanced
+    // settings, and pick a non-default mode. The create call proves the choice
+    // travels as a `--permission-mode <mode>` pair in terminal_launch_args.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-advanced-entry"));
     fireEvent.click(screen.getByTestId("new-chat-landing-permission-bypassPermissions"));
     // A non-default pick is suffixed onto the pill so the changed mode
-    // stays visible while the radios live in the Advanced menu.
+    // stays visible while the radios live in the Advanced settings sub-page.
     expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
       "Claude Code (Bypass permissions)",
     );
@@ -490,8 +535,9 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Open the footer tray's Advanced menu and pick "Full access".
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
+    // Open the agent picker, step into Advanced settings, and pick "Full access".
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-advanced-entry"));
     fireEvent.click(screen.getByTestId("new-chat-landing-approval-full-access"));
     // A non-default pick is suffixed onto the pill.
     expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
@@ -531,9 +577,9 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.terminal_launch_args).toBeUndefined();
   });
 
-  it("posts harness_override when a brain harness is picked from the Advanced menu", async () => {
-    // polly's spec declares claude-sdk; the Advanced menu offers the
-    // override set.
+  it("posts harness_override when a brain harness is picked from the Advanced sub-page", async () => {
+    // polly's spec declares claude-sdk; the Advanced settings sub-page offers
+    // the override set.
     setAgents([
       agent({ id: "ag_polly", name: "polly", display_name: "Polly", harness: "claude-sdk" }),
     ]);
@@ -544,8 +590,9 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Open the footer tray's Advanced menu and pick Pi.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
+    // Open the agent picker, slide into Advanced settings, and pick Pi.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-advanced-entry"));
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-pi"));
     // The composer pill reflects the pick before any session exists.
     expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Polly (Pi)");
@@ -573,7 +620,7 @@ describe("NewChatLandingScreen create flow", () => {
     renderLanding();
     await waitForWorkspaceSeed();
     // With no explicit pick the pill shows just the agent name — the spec
-    // default is not suffixed (it lives in the Advanced menu's radios).
+    // default is not suffixed (it lives in the Advanced settings sub-page).
     expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Polly");
     expect(screen.getByTestId("new-chat-landing-agent-select").textContent).not.toContain(
       "Claude SDK",
@@ -600,10 +647,14 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Pick Pi, then change mind back to the spec default (Claude SDK).
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
+    // Pick Pi, then change mind back to the spec default (Claude SDK). Each
+    // radio pick closes the menu, so reopen and re-enter Advanced settings in
+    // between.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-advanced-entry"));
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-pi"));
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-advanced-entry"));
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-claude-sdk"));
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));

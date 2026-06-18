@@ -294,8 +294,9 @@ jobs:
           ## Instructions
           Review the diff against the PR description. Report:
           1. **Blocking issues** — bugs, security problems, correctness errors, data loss risks.
-          2. **Non-blocking suggestions** — style, naming, performance, test coverage gaps.
-          3. **Summary** — one-paragraph overall assessment.
+          2. **Security analysis** — carefully check the security implications of the changes. Look for injection vulnerabilities (SQL, command, template), authentication/authorization bypasses, secret exposure, unsafe deserialization, path traversal, SSRF, and any change that weakens an existing security boundary. Flag even subtle issues.
+          3. **Non-blocking suggestions** — style, naming, performance, test coverage gaps.
+          4. **Summary** — one-paragraph overall assessment.
 
           Be concise. Do not restate the diff. Focus on what matters.
 
@@ -358,24 +359,11 @@ jobs:
             echo "<sub>Automated review by Polly · [workflow run](${RUN_URL})</sub>"
           } > /tmp/comment.md
 
-          # Upsert: edit the existing Polly comment if one exists, otherwise create.
-          # Uses a hidden HTML marker for robust matching across heading changes.
-          # Match the hidden marker first; fall back to the heading text for
-          # comments created before the marker was introduced (one-time transition).
-          existing_id=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
-            --paginate --jq '.[] | select(.body | (contains("<!-- polly-review-bot -->") or contains("Polly AI Review"))) | .id' \
-            | tail -1)
-
-          if [ -n "$existing_id" ]; then
-            # Use -F to read body from file via jq-style @-prefixed path.
-            gh api "repos/${REPO}/issues/comments/${existing_id}" \
-              -X PATCH \
-              -F "body=@/tmp/comment.md" > /dev/null
-            echo "Updated existing comment ${existing_id}"
-          else
-            gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/comment.md
-            echo "Created new comment"
-          fi
+          # Post a fresh comment for every review run, so each trigger (push,
+          # `/review` comment, or maintainer approval) is visible in the thread
+          # and notifies watchers — no in-place upsert of a prior comment.
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/comment.md
+          echo "Created new comment"
 
       - name: Upload logs on failure
         if: failure()

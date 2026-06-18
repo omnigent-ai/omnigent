@@ -328,8 +328,10 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
                 state="visible", timeout=30_000
             )
             # Claude Code auto-selects (only built-in, ranked first), so the
-            # Advanced chip — gated on the Claude-native agent — is present.
-            await page.get_by_test_id("new-chat-landing-advanced-chip").click()
+            # agent picker's Advanced settings entry — gated on the
+            # Claude-native agent — is present; open the picker and slide in.
+            await page.get_by_test_id("new-chat-landing-agent-select").click()
+            await page.get_by_test_id("new-chat-landing-advanced-entry").click()
             # All six Claude permission modes render as radio rows.
             for mode in ("default", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions"):
                 await expect(
@@ -403,9 +405,11 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            # Codex auto-selects (only built-in), so the Advanced chip —
-            # gated on the Codex-native agent — is present.
-            await page.get_by_test_id("new-chat-landing-advanced-chip").click()
+            # Codex auto-selects (only built-in), so the agent picker's Advanced
+            # settings entry — gated on the Codex-native agent — is present;
+            # open the picker and step in.
+            await page.get_by_test_id("new-chat-landing-agent-select").click()
+            await page.get_by_test_id("new-chat-landing-advanced-entry").click()
             # All three Codex approval presets render as radio rows.
             for mode in ("default", "full-access", "read-only"):
                 await expect(
@@ -492,9 +496,11 @@ async def _drive_select_harness(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            # Polly auto-selects (ranked ahead of Debby), so the Advanced chip —
-            # present because Polly declares a harness — opens the harness group.
-            await page.get_by_test_id("new-chat-landing-advanced-chip").click()
+            # Polly auto-selects (ranked ahead of Debby), so the agent picker's
+            # Advanced settings entry — present because Polly declares a harness
+            # — opens the harness group; open the picker and slide in.
+            await page.get_by_test_id("new-chat-landing-agent-select").click()
+            await page.get_by_test_id("new-chat-landing-advanced-entry").click()
             # All four brain harnesses render as radio rows, in registry order.
             for harness in ("claude-sdk", "openai-agents", "codex", "pi"):
                 await expect(
@@ -1018,8 +1024,13 @@ async def _drive_fork_of_fork_dedup(base_url: str, session_id: str) -> None:
             await expect(page.get_by_test_id("new-chat-landing-agent-ag_forkfork")).to_have_count(
                 0
             )
-            # Exactly two options total: the built-in + the one custom agent —
-            # no duplicate "Claude Code" sneaks in via a leaked clone.
-            await expect(page.get_by_role("menuitem")).to_have_count(2)
+            # Exactly two AGENT rows: the built-in + the one custom agent — no
+            # duplicate "Claude Code" sneaks in via a leaked clone. Scoped to
+            # the agent rows (the "ag_" id prefix) so the picker's "Advanced
+            # settings" entry — a sibling menuitem for the auto-selected Claude
+            # Code agent — doesn't inflate the count.
+            await expect(
+                page.locator('[data-testid^="new-chat-landing-agent-ag_"]')
+            ).to_have_count(2)
         finally:
             await browser.close()

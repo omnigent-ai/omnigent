@@ -86,7 +86,7 @@ jobs:
           # `labeled` trigger is in-progress/green and skipped -- no double-run.
           WORKFLOWS=(
             "Lint" "CI" "E2E Tests" "E2E UI Tests" "Integration Tests"
-            "ap-web Tests" "Copilot Review Request" "Polly AI Review"
+            "ap-web Tests" "Polly AI Review"
           )
 
           for wf in "${WORKFLOWS[@]}"; do

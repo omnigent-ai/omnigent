@@ -78,6 +78,9 @@ deploy/
 ├── e2b/               ← E2B sandbox-provider guide (boots from a pre-built
 │   └── README.md         E2B template); NOT a server deploy target.
 │
+├── openshell/         ← NVIDIA OpenShell sandbox-provider guide (self-hosted
+│   └── README.md         gRPC gateway, on-prem/air-gapped); NOT a server target.
+│
 └── docker/            ← common Docker image + compose stack
     ├── Dockerfile         multi-stage slim image (node web build → python builder → runtime)
     ├── docker-compose.yaml   omnigent + postgres for any Docker host

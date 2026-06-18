@@ -63,7 +63,7 @@ _TIMEOUT_SEC = 30
 #   commit a081406 ("stdio MCP: finish the round-trip");
 #   :class:`MCPServerConfig` round-trips through the reverse
 #   translator as :class:`MCPTool`. No longer rejected.
-# - **`tools.sandbox.docker_image`**: still rejected, but no
+# - **`tools.sandbox.container_image`**: still rejected, but no
 #   example YAML in the repo declares it, so there's nothing to
 #   parametrize over today. The drift-guard intent (a yaml
 #   author silently loses sandbox isolation) survives in the

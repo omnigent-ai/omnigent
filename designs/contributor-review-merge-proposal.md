@@ -5,7 +5,7 @@ Define how contributor (fork) PRs get **reviewed, approved, and merged** — kee
 
 ## TL;DR
 - **Every contributor PR keeps a maintainer approval before merge** — independent of PR size. Merge safety doesn't scale down with diff size, and the surveyed OSS projects don't relax it for small PRs either.
-- **Automation does the heavy lifting *before* the human looks:** security-scan gate, an auto-triggered AI review (Copilot / Polly / Debby), standard CI, and a test-coverage check promoted to required (it's report-only today). By the time a maintainer opens the PR, the mechanical questions are already answered.
+- **Automation does the mechanical pass so the human only does judgement:** security-scan gate, an AI review (Polly — run by a maintainer `/review` comment or PR approval; Copilot optional via one-click), standard CI, and a test-coverage check promoted to required (it's report-only today). On a fork PR the maintainer *kicks these off* on first touch — approving the held CI runs and posting `/review` — rather than them all firing automatically on open (fork PRs can't get repo secrets on `pull_request`). The mechanical questions are answered before the maintainer's *judgement* pass, just not before they first open the PR.
 - **The maintainer's residual job is narrow and judgement-only:** (1) is this safe (catch malicious code the scan missed)? (2) do we actually want this change? Nothing else should require human attention.
 - **Reviewer assignment is explicit** — round-robin by default, CODEOWNERS-routed where domain knowledge matters — so PRs don't stall unowned.
 - **A separate abuse track keeps spam/malicious PRs out of review** — auto-flag, reversible auto-close, and a maintainer-confirmed denylist to skip CI from repeat offenders. Detection is automated; the ban stays a maintainer action.
@@ -44,13 +44,13 @@ Recommended: **CODEOWNERS first, round-robin for the remainder.** Add a stale-PR
 
 ---
 
-## Make the human review cheap: automation before eyes
-The goal is that when a maintainer opens a contributor PR, every *mechanical* question is already answered, leaving only judgement. Four pre-human gates:
+## Make the human review cheap: automation does the mechanical pass
+The goal is that the maintainer's review reduces to judgement, with every *mechanical* question already answered by automation. On a fork PR the maintainer triggers these on first touch — approve the held CI runs and post `/review` — rather than them all firing automatically on `opened` (fork PRs get no repo secrets on `pull_request`; see the AI-review row). Once running, four checks do the mechanical pass:
 
 | Check | Mechanism | Status today | Action |
 |---|---|---|---|
-| **Security scan** | `security-gate.yml` deterministic diff scan (secrets, sensitive paths, workflow misuse, semgrep) | Exists | Keep; defense-in-depth, not a guarantee — the maintainer is the backstop for what it misses |
-| **AI review** | Auto-trigger Copilot review (or Polly / Debby) on PR open | Not wired up | Add — auto-request on `opened`/`synchronize` so a first-pass line review is waiting before the maintainer looks |
+| **Security scan** | `security-gate.yml` deterministic diff scan (secrets, sensitive paths, workflow misuse, semgrep) | Exists | Keep; defense-in-depth, not a guarantee — the maintainer is the backstop for what it misses. Runs automatically (it's the gate) |
+| **AI review** | **Polly** (`polly-review.yml`) reviews with full secrets, maintainer-triggered two ways: a `/review` comment, or **PR approval** (the `polly-review-on-approval.yml` → `polly-review-approval-dispatch.yml` relay dispatches it). Copilot is optional, on-demand via the maintainer's one-click **Reviewers → Copilot** button | Wired up | Keep Polly. It **can't** auto-run on a fork `pull_request` (no secrets), so it's maintainer-triggered (comment or approval); either path runs trusted (default-branch checkout + diff via API, never executing PR code) and posts a fresh comment per run. Copilot is a one-click manual add (no workflow) and only yields a review once the org enables "allow unlicensed contributors" |
 | **Test coverage** | `code-coverage.yml` | Report-only | **Promote to a required check** with a threshold (e.g. no net coverage regression on changed lines), so untested contributions are bounced automatically |
 | **Standard CI** | `ci.yml` / lint / e2e (per CI proposal) | Exists | Keep as required |
 
@@ -62,7 +62,8 @@ With those green, the maintainer's review collapses to two judgement calls only:
 Everything else — style, obvious bugs, missing tests, secret leaks — should be caught and reported by automation *before* this point.
 
 ### Notes / open questions on automation
-- **AI review tool choice** (Copilot vs Polly vs Debby) — pick one to start; they're not mutually exclusive but stacking adds noise. Recommend trialing one on a sample of recent contributor PRs first.
+- **AI review tool** — **Polly** is the implemented reviewer (cross-vendor, runs on our infra via the LLM gateway). Copilot stays available as an optional one-click manual reviewer; we **removed** the auto-request workflow (`copilot-review.yml`) as redundant — it produced a misleading always-green check and did nothing until the org *"allow unlicensed contributors"* policy is enabled, which the one-click button covers anyway. Debby is a possible future alternative.
+- **AI review trigger on forks** — the secret-bearing Polly review can't fire automatically on a fork `pull_request` (GitHub withholds repo secrets), so it's maintainer-triggered two ways: (1) an `OWNER`/`MEMBER`/`COLLABORATOR` posts a `/review` comment (the `issue_comment` run executes in the trusted base context); or (2) a maintainer **approves** the fork PR, which a two-stage relay turns into a review — `polly-review-on-approval.yml` records the PR number on the read-only review event, then `polly-review-approval-dispatch.yml` (privileged, on `workflow_run`) re-validates *fork + maintainer-approval* from trusted API data and `MAINTAINER@main` before dispatching `polly-review.yml`. Both paths check out the default branch and fetch the diff via API, never executing PR code, and each run posts a fresh review comment. If we want Polly to auto-run on every fork PR with no maintainer action, switch its trigger to `pull_request_target` (same trusted pattern the security gate uses) — at the cost of a full review spinning up on every fork push.
 - **Coverage threshold tuning** — start lenient (no regression on *changed* lines) to avoid false-bouncing legitimate refactors; tighten later. Coverage on fork PRs already flows through the artifact path (`code-coverage.yml` consumes data, never runs PR code), so promotion to required is mechanically safe.
 - **AI review must not gate merge** — it's advisory input to the human, never a required status (it's non-deterministic and prompt-injectable from PR content).
 
@@ -98,7 +99,7 @@ Keep abuse handling *out* of the normal review pipeline so spam/malicious PRs do
 ## Recommendation
 1. **Keep maintainer approval required on every contributor PR before merge** — no size-based exemption (`maintainer-approval.yml` already enforces this; document the size-independence explicitly).
 2. **Add reviewer routing** — CODEOWNERS for owned subsystems + round-robin fallback + stale-PR nudges.
-3. **Front-load automation** — auto-trigger an AI review on open, and **promote coverage to a required check** with a changed-lines threshold, so the human review reduces to "is it safe?" and "do we want it?".
+3. **Front-load automation** — AI review via a maintainer `/review` comment (Polly; auto-Copilot where org policy allows), and **promote coverage to a required check** with a changed-lines threshold, so the human review reduces to "is it safe?" and "do we want it?".
 4. **Offer a contributor → collaborator ladder** — promote proven, high-trust contributors to write access (deliberate, documented, reversible) so they leave the fork path; this removes fork friction but keeps branch protection and the approval gate.
 5. **Stand up the abuse track** — auto-flag + reversible auto-close + maintainer-confirmed denylist, kept separate from normal review.
 

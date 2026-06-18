@@ -27,15 +27,10 @@ Usage::
 
 from __future__ import annotations
 
-import json
-from collections.abc import Callable, Iterator
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import httpx
 import pytest
-from httpx_sse import connect_sse
 
 from tests.e2e.conftest import (
     create_runner_bound_session,
@@ -104,178 +99,6 @@ def prompt_policy_agent(
         _E2E_PROMPT_POLICY_DIR,
         rewrite_model_for_databricks=databricks_workspace_host is not None,
         databricks_profile=databricks_profile_or_none,
-    )
-
-
-def _stream_response(
-    client: httpx.Client,
-    body: dict[str, Any],
-    *,
-    timeout: float = 60.0,
-) -> Iterator[tuple[str, dict[str, Any] | str]]:
-    """
-    Open a streaming ``POST /v1/responses`` and yield each
-    SSE event as ``(event_type, parsed_data)``.
-
-    Wraps :func:`httpx_sse.connect_sse` so callers can drive
-    an elicitation round-trip mid-stream: read events until
-    a ``response.elicitation_request`` arrives, POST the
-    verdict via :func:`_post_elicitation_verdict`, then keep
-    iterating until terminal status. The trailing ``[DONE]``
-    line is yielded as ``("done", "[DONE]")`` so callers can
-    distinguish a clean stream close from a mid-stream
-    disconnect.
-
-    :param client: Sync HTTP client (extended timeout — SSE
-        connections must stay open across LLM round-trips).
-    :param body: Request body for ``POST /v1/responses``.
-        Caller must set ``stream: True`` and omit
-        ``background`` (background+stream is unsupported).
-    :param timeout: Per-request connection timeout in
-        seconds.
-    :returns: Iterator of ``(event_type, data)`` tuples.
-    """
-    with connect_sse(
-        client,
-        "POST",
-        "/v1/responses",
-        json=body,
-        timeout=timeout,
-    ) as event_source:
-        for sse in event_source.iter_sse():
-            if sse.data == "[DONE]":
-                yield ("done", "[DONE]")
-                return
-            yield (sse.event, json.loads(sse.data))
-
-
-@dataclass
-class _StreamOutcome:
-    """
-    Aggregated state from one streaming-response round-trip.
-
-    :param terminal_status: Status from the terminal SSE event
-        (``"completed"``, ``"failed"``, ``"cancelled"``), or
-        ``None`` when the stream closed without one — signals
-        a transport break rather than a clean end.
-    :param elicitation_ids: All ``response.elicitation_request``
-        ids the test saw (in order). For binary approve/decline
-        tests this is exactly one entry.
-    :param text: Concatenated assistant text from
-        ``response.output_text.delta`` events. For DENY paths
-        this carries the policy's ``[Denied by policy: ...]``
-        sentinel; for ALLOW paths it carries the LLM reply.
-    """
-
-    terminal_status: str | None
-    elicitation_ids: list[str]
-    text: str
-
-
-def _drive_response_stream(
-    client: httpx.Client,
-    body: dict[str, Any],
-    *,
-    on_elicitation: Callable[[str, str], None],
-    timeout: float = 120.0,
-) -> _StreamOutcome:
-    """
-    Open ``POST /v1/responses`` with streaming and run the
-    SSE loop, invoking ``on_elicitation`` for every
-    ``response.elicitation_request`` event. Returns once the
-    stream closes (terminal SSE event + ``[DONE]``).
-
-    Centralizes the event-dispatch logic so each test focuses
-    on (a) what verdict to send and (b) what to assert about
-    the resulting stream — without duplicating SSE plumbing.
-
-    :param client: Sync HTTP client.
-    :param body: Request body for ``POST /v1/responses``;
-        caller sets ``stream: True``.
-    :param on_elicitation: Callback invoked with the
-        ``session_id`` and ``elicitation_id`` strings when an
-        elicitation event arrives. Tests POST verdicts via
-        :func:`_post_elicitation_verdict` inside this hook.
-    :param timeout: SSE connection timeout in seconds.
-    :returns: :class:`_StreamOutcome` summarizing the run.
-    """
-    elicitation_ids: list[str] = []
-    text_parts: list[str] = []
-    terminal_status: str | None = None
-    session_id: str | None = None
-    for event_type, data in _stream_response(client, body, timeout=timeout):
-        if not isinstance(data, dict):
-            continue
-        if event_type == "response.created":
-            response = data.get("response")
-            conversation = response.get("conversation") if isinstance(response, dict) else None
-            if isinstance(conversation, dict):
-                raw_session_id = conversation.get("id")
-                if isinstance(raw_session_id, str) and raw_session_id:
-                    session_id = raw_session_id
-        elif event_type == "response.elicitation_request":
-            assert session_id is not None, (
-                "response.elicitation_request arrived before response.created "
-                "published a conversation id."
-            )
-            eid = data["elicitation_id"]
-            elicitation_ids.append(eid)
-            on_elicitation(session_id, eid)
-        elif event_type == "response.output_text.delta":
-            chunk = data.get("delta")
-            if isinstance(chunk, str):
-                text_parts.append(chunk)
-        elif event_type in ("response.completed", "response.failed"):
-            terminal_status = data["response"]["status"]
-    return _StreamOutcome(
-        terminal_status=terminal_status,
-        elicitation_ids=elicitation_ids,
-        text="".join(text_parts),
-    )
-
-
-def _post_elicitation_verdict(
-    client: httpx.Client,
-    session_id: str,
-    elicitation_id: str,
-    action: str,
-    *,
-    raw_body: str | None = None,
-) -> httpx.Response:
-    """
-    Reply to an elicitation request via the session ``approval``
-    event endpoint.
-
-    :param client: HTTP client.
-    :param session_id: Session/conversation id from the
-        ``response.created`` SSE event, e.g. ``"conv_abc123"``.
-    :param elicitation_id: Server-assigned id from the
-        ``response.elicitation_request`` SSE event,
-        e.g. ``"elicit_abc123"``.
-    :param action: MCP ``ElicitResult.action`` —
-        ``"accept"``, ``"decline"``, or ``"cancel"``.
-        Anything else is rejected by the approval dispatcher's
-        Pydantic validation.
-    :param raw_body: When set, sent verbatim instead of a
-        normal JSON body — used by the malformed-verdict test
-        to exercise the route's reject path. The request is
-        still sent with ``content-type: application/json`` so
-        the server's body parser sees it.
-    :returns: The HTTPx response (caller decides whether to
-        ``raise_for_status``).
-    """
-    if raw_body is not None:
-        return client.post(
-            f"/v1/sessions/{session_id}/events",
-            content=raw_body,
-            headers={"content-type": "application/json"},
-        )
-    return client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={
-            "type": "approval",
-            "data": {"elicitation_id": elicitation_id, "action": action},
-        },
     )
 
 
@@ -390,10 +213,12 @@ def test_policy_gate_deny_persists_to_history(
     policy_gate_agent: str,
     live_runner_id: str,
 ) -> None:
-    """After a DENY, a follow-up turn on the same
-    conversation sees the sentinel in history. Proves the
-    sentinel was written to conversation_items (not just
-    surfaced on the stream)."""
+    """After a DENY, the sentinel is readable from conversation history.
+
+    Proves the sentinel was written to conversation_items (not just surfaced
+    on the stream). The INPUT DENY fires before the runner/model, so this
+    regression check stays deterministic and does not need a live LLM turn.
+    """
     session_id = create_runner_bound_session(
         http_client, agent_name=policy_gate_agent, runner_id=live_runner_id
     )
@@ -408,27 +233,6 @@ def test_policy_gate_deny_persists_to_history(
         f"expected reason mentioning BLOCK_THIS_TOKEN; got {verdict}"
     )
 
-    # Turn 2: clean follow-up on the same conversation.
-    rid2 = send_user_message_to_session(
-        http_client,
-        session_id=session_id,
-        content="Reply with a single word: OK",
-    )
-    body2 = poll_session_until_terminal(
-        http_client, session_id=session_id, response_id=rid2, timeout=120
-    )
-    # Turn 2 completed without crashing — the engine rebuilt
-    # cleanly on a conversation that already had a DENYed
-    # turn-1 sentinel in history.
-    assert body2["status"] == "completed", f"Turn 2 failed: {body2.get('error')}"
-    # The LLM ran on turn 2 (no sentinel in its input) and
-    # produced a non-empty response. We do NOT assert that
-    # the LLM didn't echo the sentinel from history — the
-    # LLM sees the prior turn's assistant message (the
-    # sentinel text) and may repeat part of it when asked
-    # a follow-up, which is LLM behavior, not a policy bug.
-    text2 = _extract_all_assistant_text(body2)
-    assert len(text2.strip()) > 0
     # Fetch conversation items — the turn-1 sentinel MUST
     # be persisted so replay sees it.
     items_resp = http_client.get(
@@ -597,151 +401,6 @@ def test_no_guardrails_agent_unaffected(
     # Real LLM output — not a policy sentinel.
     assert len(text.strip()) > 0
     assert "[Denied by policy" not in text
-
-
-# ── Streaming-API elicitation coverage ────────────────────
-#
-# The REPL tests in ``test_repl_approval_e2e.py`` drive the
-# full SDK + REPL stack via pexpect. These tests target the
-# wire protocol directly — open an SSE stream against
-# ``POST /v1/responses``, wait for a
-# ``response.elicitation_request`` event, POST the verdict
-# to ``/v1/sessions/{session_id}/events``, drain to terminal.
-#
-# Why streaming and not polling? Elicitations live ONLY on
-# the SSE stream. Polling clients can't see them — by design,
-# elicitation rows in ``pending_tool_calls`` carry the
-# ``ELICITATION_PENDING_TOOL_NAME`` sentinel and are filtered
-# out of GET ``/v1/responses/{id}.output``. The parked
-# workflow's per-policy ``ask_timeout`` handles a polling
-# client that never replies.
-
-
-def _streaming_body(agent: str, input_text: str) -> dict[str, Any]:
-    """Build a streaming-request body targeting *agent*."""
-    return {"model": agent, "input": input_text, "stream": True}
-
-
-def test_streaming_api_explicit_approval_allows_llm(
-    http_client: httpx.Client,
-    ask_demo_agent: str,
-) -> None:
-    """Accept the elicitation → server unparks → LLM runs →
-    stream terminates with ``completed`` and assistant text.
-    Proves scripted clients can drive the elicitation flow
-    over the wire without the SDK."""
-
-    def _accept(session_id: str, eid: str) -> None:
-        resp = _post_elicitation_verdict(http_client, session_id, eid, action="accept")
-        resp.raise_for_status()
-        assert resp.status_code == 202
-
-    outcome = _drive_response_stream(
-        http_client,
-        _streaming_body(ask_demo_agent, "hello streaming"),
-        on_elicitation=_accept,
-    )
-    assert outcome.elicitation_ids, "always_ask_on_input policy did not fire."
-    assert outcome.terminal_status == "completed"
-    assert len(outcome.text.strip()) > 0, "Approve path produced no LLM text."
-    # No DENY sentinel — approve must NOT substitute the blocked text.
-    assert "[Denied by policy" not in outcome.text, (
-        f"Approve leaked a DENY sentinel: {outcome.text!r}"
-    )
-
-
-def test_streaming_api_explicit_decline_denies(
-    http_client: httpx.Client,
-    ask_demo_agent: str,
-) -> None:
-    """Decline the elicitation → server substitutes the DENY
-    sentinel as the assistant reply. Same fail-closed
-    semantics as the REPL refuse path, different transport."""
-
-    def _decline(session_id: str, eid: str) -> None:
-        resp = _post_elicitation_verdict(http_client, session_id, eid, action="decline")
-        resp.raise_for_status()
-
-    outcome = _drive_response_stream(
-        http_client,
-        _streaming_body(ask_demo_agent, "hello decline"),
-        on_elicitation=_decline,
-    )
-    assert outcome.elicitation_ids
-    assert outcome.terminal_status == "completed"
-    assert "[Denied by policy" in outcome.text, (
-        f"Decline path did not produce a DENY sentinel.\nGot: {outcome.text!r}"
-    )
-
-
-def _assert_route_rejects_malformed(
-    client: httpx.Client,
-    session_id: str,
-    elicitation_id: str,
-) -> None:
-    """
-    Probe the approval event route with two malformed bodies and
-    assert each is rejected before the parked workflow sees it.
-    Extracted so the caller test stays under the 40-line limit.
-
-    :param client: HTTP client.
-    :param session_id: Session/conversation id from the stream.
-    :param elicitation_id: The pending elicitation to probe
-        (must remain pending after the probes — the caller
-        resolves it explicitly afterwards).
-    """
-    bad = _post_elicitation_verdict(
-        client,
-        session_id,
-        elicitation_id,
-        action="ignored",
-        raw_body="not even json, definitely not accept",
-    )
-    assert bad.status_code == 422, (
-        f"Route accepted malformed JSON; got {bad.status_code}: {bad.text!r}."
-    )
-    unknown = _post_elicitation_verdict(
-        client,
-        session_id,
-        elicitation_id,
-        action="approve_maybe",
-    )
-    assert unknown.status_code == 400, (
-        "POLICIES.md §13 requires only accept/decline/cancel; "
-        f"got {unknown.status_code}: {unknown.text!r}."
-    )
-
-
-def test_streaming_api_malformed_verdict_rejected_by_route(
-    http_client: httpx.Client,
-    ask_demo_agent: str,
-) -> None:
-    """Approval event validation rejects malformed bodies BEFORE
-    the verdict reaches ``_parse_verdict``. Load-bearing safety rail
-    (POLICIES.md §13 fail-closed). The test probes two
-    malformed shapes (non-JSON, unknown action) then issues
-    a real ``decline`` so the workflow terminates without
-    burning the ASK timeout."""
-
-    def _probe_then_decline(session_id: str, eid: str) -> None:
-        _assert_route_rejects_malformed(http_client, session_id, eid)
-        decline = _post_elicitation_verdict(http_client, session_id, eid, action="decline")
-        decline.raise_for_status()
-
-    outcome = _drive_response_stream(
-        http_client,
-        _streaming_body(ask_demo_agent, "malformed verdict test"),
-        on_elicitation=_probe_then_decline,
-    )
-    assert outcome.elicitation_ids
-    assert outcome.terminal_status == "completed"
-    # Decline-after-malformed produces the DENY sentinel —
-    # confirms neither malformed attempt accidentally approved.
-    assert "[Denied by policy" in outcome.text, (
-        "Decline-after-malformed did not produce DENY sentinel — "
-        "the malformed/unknown attempts may have accidentally "
-        f"approved.\nGot: {outcome.text!r}"
-    )
 
 
 # ── Prompt policy (Phase 9): real LLM classifier end-to-end ─

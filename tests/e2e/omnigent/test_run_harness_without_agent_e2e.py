@@ -199,7 +199,6 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "cursor",
         "antigravity",
     }
-    # ``supervisor`` is registered in ``_HARNESS_MODULES`` but is not
-    # a coding-agent harness accepted by the ``run --harness`` compat
-    # allowlist, so the intersection above naturally excludes it.
+    # The intersection above keeps this expectation tied to the actual
+    # runtime registry instead of duplicating the harness list here.
     assert {probe.harness for probe in HARNESS_PROBES} == expected_live_harnesses

@@ -22,6 +22,7 @@ from omnigent.server.routes.sessions import (
     _build_skill_slash_command_policy_body,
     _evaluate_input_policy,
     _evaluate_tool_call_policy,
+    _persist_policy_deny_sentinel,
 )
 from omnigent.server.schemas import SessionEventInput
 from omnigent.spec import AgentSpec
@@ -84,11 +85,16 @@ class _FakeConversationStore:
             ci = ConversationItem(
                 id=f"item_{i}",
                 type=getattr(item, "type", "function_call"),
-                data=FunctionCallData(
-                    agent="test-agent",
-                    name="sys_os_shell",
-                    arguments="{}",
-                    call_id="call_1",
+                response_id=getattr(item, "response_id", "turn_1"),
+                data=getattr(
+                    item,
+                    "data",
+                    FunctionCallData(
+                        agent="test-agent",
+                        name="sys_os_shell",
+                        arguments="{}",
+                        call_id="call_1",
+                    ),
                 ),
                 created_at=1,
                 status="completed",
@@ -804,6 +810,35 @@ async def test_input_ask_declined_denies():
     # through (the dangerous direction).
     assert result["verdict"] == "deny"
     assert result["reason"] == "Deleting files requires approval"
+
+
+@pytest.mark.asyncio
+async def test_input_policy_deny_sentinel_persists_as_assistant_history():
+    """INPUT policy DENY stores the deny sentinel for later history reads."""
+    conv_store = _FakeConversationStore()
+    agent_store = _FakeAgentStore(agent=_make_agent())
+    conv = conv_store.get_conversation("sess_1")
+
+    await _persist_policy_deny_sentinel(
+        "sess_1",
+        conv,
+        "Request contains BLOCK_THIS_TOKEN",
+        conv_store,
+        agent_store,
+    )
+
+    assert len(conv_store.appended_items) == 1
+    item = conv_store.appended_items[0]
+    assert item.type == "message"
+    assert item.response_id.startswith("deny_")
+    assert item.data.role == "assistant"
+    assert item.data.agent == "test-agent"
+    assert item.data.content == [
+        {
+            "type": "output_text",
+            "text": "[Denied by policy: Request contains BLOCK_THIS_TOKEN]",
+        }
+    ]
 
 
 # ── OUTPUT policy tests (step 5.7) ──────────────────────────

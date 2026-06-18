@@ -15,10 +15,11 @@ Local usage::
     # run against a freshly built SPA + spawned server
     uv run pytest tests/e2e_ui -v
 
-    # iterate against an already-running dev server
+    # iterate against an already-running server (dev hosts/ports need opt-in)
     cd ap-web && npm run dev &
     omnigent server --agent examples/hello_world.yaml &
-    uv run pytest tests/e2e_ui --ui-base-url http://127.0.0.1:5173
+    OMNIGENT_E2E_ALLOW_DEV_BASE_URL=1 \
+      uv run pytest tests/e2e_ui --ui-base-url http://127.0.0.1:5173
 
 ``omnigent server`` is documented at ``omnigent/cli.py:server``:
 it spins up uvicorn with the Omnigent app and spawns an out-of-process
@@ -41,13 +42,17 @@ import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import filelock
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests.e2e_ui.url_safety import DEV_PORTS, unsafe_ui_base_url_reason
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+_ALLOW_DEV_BASE_URL_ENV = "OMNIGENT_E2E_ALLOW_DEV_BASE_URL"
 
 
 def open_right_rail(page: Page) -> None:
@@ -192,8 +197,8 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=None,
         help=(
             "Skip both the SPA build and the server spawn; point Playwright "
-            "at this URL instead. Useful when iterating with `npm run dev` + "
-            "a long-lived `omnigent server` process."
+            "at this URL instead. Refuses known dev hosts/ports unless "
+            f"{_ALLOW_DEV_BASE_URL_ENV}=1 is set."
         ),
     )
     parser.addoption(
@@ -220,6 +225,64 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         type=int,
         default=None,
         help="1-indexed shard this run executes (requires --splits).",
+    )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Fail fast on unsafe e2e-ui harness options.
+
+    :param config: Pytest config with repo and pytest-playwright options.
+    """
+    base_url = config.getoption("--ui-base-url")
+    if base_url:
+        _validate_ui_base_url(base_url)
+
+    if os.environ.get("CI") and config.getoption("--headed", default=False):
+        raise pytest.UsageError(
+            "tests/e2e_ui must run headless in CI. Remove --headed; headed "
+            "browser windows are only allowed for local debugging."
+        )
+
+
+@pytest.fixture(scope="session")
+def browser_type_launch_args(
+    browser_type_launch_args: dict[str, Any],
+    pytestconfig: pytest.Config,
+) -> dict[str, Any]:
+    """Default UI e2e browser launches to headless, with CI enforcement."""
+    launch_args = {**browser_type_launch_args}
+    if os.environ.get("CI"):
+        launch_args["headless"] = True
+    elif not pytestconfig.getoption("--headed", default=False):
+        launch_args.setdefault("headless", True)
+    return launch_args
+
+
+@pytest.fixture
+def browser_context_args(
+    browser_context_args: dict[str, Any],
+) -> dict[str, Any]:
+    """Return a new context options dict for each test.
+
+    pytest-playwright already creates a fresh context for its function-scoped
+    ``context`` and ``page`` fixtures. Keeping this wrapper function-scoped
+    makes that contract explicit and prevents accidental mutable option reuse.
+    """
+    return {**browser_context_args}
+
+
+def _validate_ui_base_url(base_url: str) -> None:
+    reason = unsafe_ui_base_url_reason(base_url)
+    if reason is None or os.environ.get(_ALLOW_DEV_BASE_URL_ENV) == "1":
+        return
+    dev_ports = ", ".join(str(port) for port in sorted(DEV_PORTS))
+    raise pytest.UsageError(
+        f"Refusing --ui-base-url={base_url!r}: {reason}. Reusing a dev or "
+        "production-like server is unsafe because e2e UI tests share that "
+        "server's database, artifacts, and runner state. Omit --ui-base-url "
+        "to let the fixture spawn an isolated server on a random port. If "
+        "you intentionally want to reuse this server for local debugging, "
+        f"set {_ALLOW_DEV_BASE_URL_ENV}=1. Refused dev ports: {dev_ports}."
     )
 
 
@@ -318,9 +381,17 @@ def _find_free_port() -> int:
 
     :returns: An available port number.
     """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    max_attempts = 100
+    for _ in range(max_attempts):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        if port not in DEV_PORTS:
+            return port
+    raise RuntimeError(
+        f"Could not find a free e2e UI port outside dev ports "
+        f"{sorted(DEV_PORTS)} after {max_attempts} attempts"
+    )
 
 
 @pytest.fixture(scope="session")
