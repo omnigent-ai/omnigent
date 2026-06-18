@@ -251,6 +251,12 @@ jobs:
       - name: Install dependencies
         run: uv sync --extra all --extra dev
 
+      - name: Build parity sidecar
+        run: |
+          cargo build \
+            --manifest-path tests/codex_parity/sidecar/Cargo.toml \
+            --target-dir .tmp-codex-parity-target
+
       - name: Run codex parity tests
         shell: bash
         env:
