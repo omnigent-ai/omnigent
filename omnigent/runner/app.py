@@ -56,6 +56,7 @@ from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
+    ISAAC_NATIVE_TERMINAL_ROLE,
     OMNIGENT_REPL_TERMINAL_ROLE,
     PI_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
@@ -545,6 +546,84 @@ async def _pi_native_launch_config(
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class _IsaacNativeLaunchConfig:
+    """
+    Persisted launch config needed for runner-owned Isaac terminal setup.
+
+    :param workspace: Workspace cwd for the Isaac TUI.
+    :param terminal_launch_args: User pass-through Isaac CLI args.
+    """
+
+    workspace: Path
+    terminal_launch_args: list[str] | None
+
+
+def _isaac_session_workspace(session_workspace: str | None) -> Path:
+    """
+    Resolve the cwd for a runner-owned Isaac terminal.
+
+    :param session_workspace: Session ``workspace`` from the server snapshot.
+    :returns: Workspace path for the terminal cwd.
+    """
+    raw = session_workspace or _required_runner_env("OMNIGENT_RUNNER_WORKSPACE")
+    return Path(raw.strip()).expanduser().resolve()
+
+
+async def _isaac_native_launch_config(
+    *,
+    session_id: str,
+    server_client: httpx.AsyncClient | None,
+) -> _IsaacNativeLaunchConfig:
+    """
+    Fetch and validate persisted Isaac launch config for a session.
+
+    :param session_id: Session/conversation id.
+    :param server_client: Runner Omnigent server client.
+    :returns: Parsed launch config.
+    """
+    if server_client is None:
+        raise RuntimeError("server_client is required for runner-owned Isaac terminals.")
+    try:
+        resp = await server_client.get(
+            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+            timeout=10.0,
+        )
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"Could not fetch Isaac launch config for {session_id!r}.") from exc
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"Could not fetch Isaac launch config for {session_id!r}: "
+            f"GET /v1/sessions returned {resp.status_code}."
+        )
+    try:
+        snapshot = resp.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Could not fetch Isaac launch config for {session_id!r}: invalid JSON."
+        ) from exc
+    if not isinstance(snapshot, dict):
+        raise RuntimeError(
+            f"Could not fetch Isaac launch config for {session_id!r}: "
+            "snapshot was not a JSON object."
+        )
+    terminal_launch_args = snapshot.get("terminal_launch_args")
+    if terminal_launch_args is not None and not (
+        isinstance(terminal_launch_args, list)
+        and all(isinstance(arg, str) for arg in terminal_launch_args)
+    ):
+        raise RuntimeError(f"Invalid terminal_launch_args for Isaac session {session_id!r}.")
+    session_workspace = snapshot.get("workspace")
+    if session_workspace is not None and (
+        not isinstance(session_workspace, str) or not session_workspace
+    ):
+        raise RuntimeError(f"Invalid workspace for Isaac session {session_id!r}.")
+    return _IsaacNativeLaunchConfig(
+        workspace=_isaac_session_workspace(session_workspace),
+        terminal_launch_args=terminal_launch_args,
+    )
+
+
 async def _codex_native_launch_config(
     *,
     session_id: str,
@@ -719,6 +798,56 @@ def _build_pi_native_args(
     return args
 
 
+def _isaac_args_have_worktree(args: list[str]) -> bool:
+    """
+    Return whether user Isaac args already control worktree selection.
+
+    When the user passes their own worktree-related flag, Omnigent must not
+    inject ``--skip-worktree-selection`` on top — the explicit choice wins.
+
+    :param args: User pass-through Isaac CLI args.
+    :returns: ``True`` when Omnigent should not add ``--skip-worktree-selection``.
+    """
+    worktree_flags = {
+        "--worktree",
+        "--quicktree",
+        "--branch",
+        "--pr",
+        "--ref",
+        "--skip-worktree-selection",
+        "--cloud",
+    }
+    for arg in args:
+        if arg in worktree_flags:
+            return True
+        if arg.startswith(tuple(f"{flag}=" for flag in worktree_flags)):
+            return True
+    return False
+
+
+def _build_isaac_native_args(
+    *,
+    terminal_launch_args: list[str] | None,
+) -> list[str]:
+    """
+    Build Isaac CLI args for a runner-owned native TUI session.
+
+    Isaac runs interactively in the pane (it is a live mirror), so no
+    ``-p``/``--print`` pipe mode is passed. ``--skip-worktree-selection`` is
+    prepended so the pane doesn't hang on Isaac's interactive worktree dialog,
+    unless the user is already driving worktree selection themselves.
+
+    :param terminal_launch_args: User pass-through Isaac args.
+    :returns: Complete Isaac arg vector excluding the executable.
+    """
+    user_args = list(terminal_launch_args or [])
+    args: list[str] = []
+    if not _isaac_args_have_worktree(user_args):
+        args.append("--skip-worktree-selection")
+    args.extend(user_args)
+    return args
+
+
 async def _auto_create_pi_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -825,6 +954,65 @@ async def _auto_create_pi_terminal(
         session_id,
         pi_extension,
     )
+    return terminal_view
+
+
+async def _auto_create_isaac_terminal(
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+    publish_event: Callable[[str, dict[str, Any]], None],
+    *,
+    server_client: httpx.AsyncClient | None,
+) -> SessionResourceView:
+    """
+    Auto-create an Isaac terminal for an isaac-native session.
+
+    Pure terminal mirror: the runner hosts the live ``isaac`` CLI in a tmux
+    pane and the Web UI mirrors it. There is no extension bridge, no provider
+    injection, and no spawn env — Isaac talks to its own backend.
+
+    :param session_id: Session/conversation identifier.
+    :param resource_registry: Session resource registry for launching the
+        terminal.
+    :param publish_event: Runner session event publisher.
+    :param server_client: Runner Omnigent server client.
+    :returns: Created terminal resource view.
+    """
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+    from omnigent.isaac_native import resolve_isaac_executable
+
+    launch_config = await _isaac_native_launch_config(
+        session_id=session_id,
+        server_client=server_client,
+    )
+    workspace = str(launch_config.workspace)
+    isaac_command = resolve_isaac_executable()
+    isaac_args = _build_isaac_native_args(
+        terminal_launch_args=launch_config.terminal_launch_args,
+    )
+    terminal_view = await resource_registry.launch_required_terminal(
+        session_id=session_id,
+        terminal_name="isaac",
+        session_key="main",
+        resource_role=ISAAC_NATIVE_TERMINAL_ROLE,
+        spec=TerminalEnvSpec(
+            os_env=OSEnvSpec(type="caller_process", cwd=workspace),
+            command=isaac_command,
+            args=isaac_args,
+            env={},
+            scrollback=100_000,
+            tmux_allow_passthrough=True,
+            tmux_start_on_attach=False,
+        ),
+    )
+    publish_event(
+        session_id,
+        {
+            "type": "session.resource.created",
+            "resource": session_resource_view_to_dict(terminal_view),
+        },
+    )
+    _logger.info("Auto-created isaac terminal for session %s", session_id)
     return terminal_view
 
 
@@ -4336,6 +4524,7 @@ def create_runner_app(
     _session_comment_relays: dict[str, Any] = {}
     _codex_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _pi_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    _isaac_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     # Per-session lock guarding the claude-native terminal auto-create in
     # ``create_session``. Two ``POST /v1/sessions`` calls can land
     # concurrently on a host-launched runner — ``_on_runner_connect``
@@ -5497,6 +5686,38 @@ def create_runner_app(
                     finally:
                         _publish_terminal_pending(_publish_event, session_id, False)
 
+        if harness_name == "isaac-native":
+            _isaac_ensure_lock = _isaac_terminal_ensure_locks.setdefault(
+                session_id, asyncio.Lock()
+            )
+            async with _isaac_ensure_lock:
+                _tr = resource_registry.terminal_registry
+                _has_isaac_terminal = (
+                    _tr is not None and _tr.get(session_id, "isaac", "main") is not None
+                )
+                if not _has_isaac_terminal:
+                    _publish_terminal_pending(_publish_event, session_id, True)
+                    try:
+                        await _auto_create_isaac_terminal(
+                            session_id,
+                            resource_registry,
+                            _publish_event,
+                            server_client=server_client,
+                        )
+                    except Exception as exc:
+                        _logger.exception(
+                            "Failed to auto-create isaac terminal for %s",
+                            session_id,
+                        )
+                        _publish_native_terminal_start_error(
+                            _publish_event,
+                            session_id,
+                            "Isaac",
+                            exc,
+                        )
+                    finally:
+                        _publish_terminal_pending(_publish_event, session_id, False)
+
         # Auto-bootstrap the Omnigent REPL terminal for non-native
         # (SDK-harness) top-level sessions: host the framework's own TUI
         # (``omnigent attach``) in a tmux pane so the web UI can embed it
@@ -5763,6 +5984,7 @@ def create_runner_app(
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
+        _isaac_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
 
@@ -6485,7 +6707,7 @@ def create_runner_app(
         # source — fall through and publish. Suppress only once we positively
         # know the harness/edge is terminal-owned.
         harness = _session_harness_name(conv_id)
-        if status != "failed" and harness in {"claude-native", "pi-native"}:
+        if status != "failed" and harness in {"claude-native", "pi-native", "isaac-native"}:
             return
         if status == "idle" and harness == "codex-native":
             return
@@ -10673,6 +10895,40 @@ def create_runner_app(
                 content=session_resource_view_to_dict(terminal_view),
             )
 
+        if (
+            body.get("ensure_native_terminal")
+            and terminal_name == "isaac"
+            and session_key == "main"
+        ):
+            isaac_terminal_id = terminal_resource_id("isaac", "main")
+            ensure_lock = _isaac_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
+            async with ensure_lock:
+                existing = await resource_registry.get_terminal_resource(
+                    session_id, isaac_terminal_id
+                )
+                if existing is not None:
+                    return JSONResponse(
+                        status_code=200,
+                        content=session_resource_view_to_dict(existing),
+                    )
+                try:
+                    terminal_view = await _auto_create_isaac_terminal(
+                        session_id,
+                        resource_registry,
+                        _publish_event,
+                        server_client=server_client,
+                    )
+                except Exception as exc:
+                    _logger.exception(
+                        "Isaac terminal ensure failed for session=%s",
+                        session_id,
+                    )
+                    return _native_terminal_start_error_response(exc, "Isaac")
+            return JSONResponse(
+                status_code=200,
+                content=session_resource_view_to_dict(terminal_view),
+            )
+
         from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
         cwd_override = body.get("cwd")
@@ -12147,6 +12403,7 @@ def create_runner_app(
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
+        _isaac_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         await resource_registry.cleanup_session(session_id)
         return JSONResponse(
@@ -12199,6 +12456,7 @@ def create_runner_app(
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
+        _isaac_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         # Close terminals with ``session.resource.deleted`` events BEFORE
         # cleanup_session — cleanup_conversation would silently pop them

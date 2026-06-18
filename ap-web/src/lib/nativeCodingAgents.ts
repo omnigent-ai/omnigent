@@ -4,7 +4,7 @@ export const WRAPPER_LABEL_KEY = "omnigent.wrapper";
 export const UI_MODE_LABEL_KEY = "omnigent.ui";
 export const UI_MODE_TERMINAL_VALUE = "terminal";
 
-export type NativeCodingAgentIconKind = "claude" | "codex" | "pi";
+export type NativeCodingAgentIconKind = "claude" | "codex" | "pi" | "isaac";
 export type NativeCodingAgentCapability = "permissionMode" | "approvalMode";
 
 export interface NativeCodingAgentSpec {
@@ -47,6 +47,15 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "Pi",
     iconKind: "pi",
     sortRank: 30,
+  },
+  {
+    key: "isaac",
+    agentName: "isaac-native-ui",
+    harness: "isaac-native",
+    wrapperLabel: "isaac-native-ui",
+    displayName: "Isaac",
+    iconKind: "isaac",
+    sortRank: 40,
   },
 ] as const satisfies readonly NativeCodingAgentSpec[];
 

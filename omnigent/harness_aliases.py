@@ -9,6 +9,7 @@ from __future__ import annotations
 HARNESS_ALIASES: dict[str, str] = {
     "claude": "claude-sdk",
     "native-pi": "pi-native",
+    "native-isaac": "isaac-native",
     # The SDK package / runtime dispatch spelling; specs use "openai-agents".
     "openai-agents-sdk": "openai-agents",
     # User-facing spellings for the Google Antigravity SDK harness; the
@@ -31,6 +32,8 @@ NATIVE_HARNESSES: frozenset[str] = frozenset(
         "native-codex",
         "pi-native",
         "native-pi",
+        "isaac-native",
+        "native-isaac",
     }
 )
 

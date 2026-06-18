@@ -45,9 +45,11 @@ from omnigent.runner.app import (
     _agent_os_env_from_spec,
     _auto_create_claude_terminal,
     _auto_create_codex_terminal,
+    _auto_create_isaac_terminal,
     _auto_create_pi_terminal,
     _auto_create_repl_terminal,
     _deliver_subagent_wake_post,
+    _IsaacNativeLaunchConfig,
     _log_terminal_lookup_miss,
     _PiNativeLaunchConfig,
     _publish_native_terminal_start_error,
@@ -61,6 +63,7 @@ from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
+    ISAAC_NATIVE_TERMINAL_ROLE,
     OMNIGENT_REPL_TERMINAL_ROLE,
     PI_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
@@ -10514,6 +10517,96 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     assert captured["session_key"] == "main"
     assert captured["resource_role"] == PI_NATIVE_TERMINAL_ROLE
     assert captured["spec"].command == "pi"
+    # The fresh terminal is surfaced on the live stream for the Terminal toggle.
+    assert any(evt.get("type") == "session.resource.created" for evt in published)
+
+
+@pytest.mark.asyncio
+async def test_auto_create_isaac_terminal_launches_required_terminal_with_skip_worktree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Isaac-native auto-create launches a *required* mirror terminal.
+
+    Isaac is a pure terminal mirror (parity with pi-native): the runtime *is*
+    the terminal process, so the auto-create must use ``launch_required_terminal``
+    and tag the resource with :data:`ISAAC_NATIVE_TERMINAL_ROLE` — that role is
+    what gates the PTY-derived status badge (a mirror has no event forwarder, so
+    the badge is the only working/idle signal). The fake registry exposes ONLY
+    ``launch_required_terminal``, so a stale call site fails here in CI rather
+    than in production.
+
+    Also guards Isaac's one binary-arg rule: ``--skip-worktree-selection`` is
+    prepended (the user passed no worktree flag) so the pane doesn't hang on
+    Isaac's interactive worktree dialog. Neither a real ``isaac`` install nor a
+    host daemon is needed — only the launch lifecycle is under test.
+
+    :param tmp_path: Pytest-provided temporary directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    import omnigent.isaac_native as isaac_native
+
+    # The launch lifecycle — not the binary — is under test; stub the resolver
+    # so CI needs no real ``isaac`` (the dbexec wrapper can't run on a runner).
+    monkeypatch.setattr(isaac_native, "resolve_isaac_executable", lambda: "isaac")
+
+    # Skip the GET /v1/sessions round-trip: hand the flow a ready launch config.
+    async def _fake_launch_config(**_kwargs: Any) -> _IsaacNativeLaunchConfig:
+        return _IsaacNativeLaunchConfig(
+            workspace=tmp_path,
+            terminal_launch_args=None,
+        )
+
+    monkeypatch.setattr(
+        "omnigent.runner.app._isaac_native_launch_config", _fake_launch_config
+    )
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        """Records the launch; exposes ONLY the required-terminal launch API."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+        ) -> SessionResourceView:
+            """Record the launch and return a terminal resource view."""
+            captured["terminal_name"] = terminal_name
+            captured["session_key"] = session_key
+            captured["resource_role"] = resource_role
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_isaac_main",
+                type="terminal",
+                session_id=session_id,
+                name="isaac:main",
+                metadata={"terminal_name": "isaac", "session_key": "main", "running": True},
+            )
+
+    published: list[dict[str, Any]] = []
+
+    await _auto_create_isaac_terminal(
+        "conv_isaac",
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, evt: published.append(evt),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    # Required lifecycle + correct mirror identity (gates the status badge).
+    assert captured["terminal_name"] == "isaac"
+    assert captured["session_key"] == "main"
+    assert captured["resource_role"] == ISAAC_NATIVE_TERMINAL_ROLE
+    assert captured["spec"].command == "isaac"
+    # Worktree dialog is auto-skipped when the user passes no worktree flag.
+    assert "--skip-worktree-selection" in captured["spec"].args
     # The fresh terminal is surfaced on the live stream for the Terminal toggle.
     assert any(evt.get("type") == "session.resource.created" for evt in published)
 

@@ -80,6 +80,7 @@ const BUILTIN_AGENTS = new Set([
   "claude-native-ui", // Claude Code
   "codex-native-ui", // Codex
   "pi-native-ui", // Pi
+  "isaac-native-ui", // Isaac
   "polly",
   "debby",
 ]);
