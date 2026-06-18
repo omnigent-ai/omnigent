@@ -246,11 +246,15 @@ async def test_send_and_read_after_close_report_not_running(
     socket.
     """
     instance = await reg.launch("conv_a", "bash", "s1", _bash_spec(tmp_path))
-    assert await instance.is_alive()
+    alive = await instance.is_alive()
+    assert alive
 
-    assert await reg.close("conv_a", "bash", "s1") is True
+    close_result = await reg.close("conv_a", "bash", "s1")
+    assert close_result is True
     assert instance.running is False
-    assert await instance.is_alive() is False
+    alive_after_close = await instance.is_alive()
+    assert alive_after_close is False
 
-    assert "error" in await instance.send(text="echo too_late", keys="Enter")
+    send_result = await instance.send(text="echo too_late", keys="Enter")
+    assert "error" in send_result
     assert "error" in await instance.read()
