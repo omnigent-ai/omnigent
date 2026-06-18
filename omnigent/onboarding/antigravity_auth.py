@@ -99,19 +99,26 @@ _API_KEY_FIELD = "api_key"
 # spawn-env builder falls back to them when no key is configured.
 ANTIGRAVITY_ENV_VARS: tuple[str, ...] = ("GEMINI_API_KEY", "ANTIGRAVITY_API_KEY")
 
-# Gemini / Google API-key prefix (e.g. ``AIzaSy…``). Used for a *soft* paste
+# Gemini / Google API-key prefixes. Legacy keys start with ``AIza`` (e.g.
+# ``AIzaSy…``); newer Google API keys start with ``AQ``. Used for a *soft* paste
 # check — a non-matching key may be forced through, so a prefix change never
 # locks anyone out.
-ANTIGRAVITY_API_KEY_PREFIX = "AIza"
+ANTIGRAVITY_API_KEY_PREFIXES = ("AIza", "AQ")
+
+# Human-readable form of the accepted prefixes, e.g. ``'AIza' or 'AQ'``.
+ANTIGRAVITY_API_KEY_PREFIX_HINT = " or ".join(
+    f"'{p}'" for p in ANTIGRAVITY_API_KEY_PREFIXES
+)
 
 
 def looks_like_gemini_api_key(value: str) -> bool:
     """Return whether *value* looks like a Gemini / Google API key.
 
-    :param value: A pasted candidate, e.g. ``"AIzaSyAbC123"``.
-    :returns: ``True`` when it starts with :data:`ANTIGRAVITY_API_KEY_PREFIX`.
+    :param value: A pasted candidate, e.g. ``"AIzaSyAbC123"`` or ``"AQ…"``.
+    :returns: ``True`` when it starts with one of
+        :data:`ANTIGRAVITY_API_KEY_PREFIXES`.
     """
-    return value.startswith(ANTIGRAVITY_API_KEY_PREFIX)
+    return value.startswith(ANTIGRAVITY_API_KEY_PREFIXES)
 
 
 def antigravity_api_key_ref(config: dict[str, object] | None = None) -> str | None:
