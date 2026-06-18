@@ -1069,6 +1069,7 @@ async def test_ensure_session_writes_hooks_json(
     correct preToolUse config pointing at the hook script."""
     _install_fake_sdk(monkeypatch, [{"messages": [_assistant("ok")], "result": "ok"}])
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:6767")
+    monkeypatch.setattr("sys.argv", ["runner", "--conversation-id", "conv_test123"])
     cwd = str(tmp_path)
     executor = CursorExecutor(api_key="crsr_x", cwd=cwd)
     _ = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
@@ -1084,7 +1085,7 @@ async def test_ensure_session_writes_hooks_json(
     assert hooks[0]["timeout"] == 30
     cmd = hooks[0]["command"]
     assert "_OMNIGENT_SERVER_URL=http://127.0.0.1:6767" in cmd
-    assert "_OMNIGENT_SESSION_ID=conv1" in cmd
+    assert "_OMNIGENT_SESSION_ID=conv_test123" in cmd
     assert "cursor_policy_hook.py" in cmd
 
     await executor.close()
@@ -1118,6 +1119,7 @@ async def test_hooks_json_cleaned_up_on_close(
         [{"messages": [_assistant("ok")], "result": "ok"}],
     )
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:6767")
+    monkeypatch.setattr("sys.argv", ["runner", "--conversation-id", "conv_cleanup"])
     cwd = str(tmp_path)
     executor = CursorExecutor(api_key="crsr_x", cwd=cwd)
     _ = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]

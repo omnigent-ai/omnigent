@@ -356,6 +356,21 @@ def _encode_tool_result(result: Any) -> Any:  # type: ignore[explicit-any]
 # ---------------------------------------------------------------------------
 
 
+def _get_conversation_id() -> str | None:
+    """Extract the ``--conversation-id`` value from the CLI args.
+
+    The harness subprocess is launched by :mod:`process_manager` with
+    ``--conversation-id conv_<hex>`` on the command line. This is the
+    canonical server-side conversation ID (with ``conv_`` prefix) that
+    the policy evaluation endpoint expects.
+    """
+    argv = sys.argv
+    for i, arg in enumerate(argv):
+        if arg == "--conversation-id" and i + 1 < len(argv):
+            return argv[i + 1]
+    return None
+
+
 def _write_cursor_hooks(cwd: str, hook_script_path: str, server_url: str, session_id: str) -> Path:
     """Write ``.cursor/hooks.json`` to the workspace for preToolUse policy enforcement.
 
@@ -569,7 +584,6 @@ class CursorExecutor(Executor):
         state: _CursorSessionState,
         model: str,
         tools: list[ToolSpec],
-        session_key: str,
     ) -> None:
         """Launch the local bridge and create the SDK agent if not already live.
 
@@ -582,9 +596,6 @@ class CursorExecutor(Executor):
         PHASE_TOOL_CALL policies are enforced on ALL Cursor native tools --
         including those that execute silently without emitting ``tool_call``
         SDK messages.
-
-        :param session_key: The conversation/session ID, baked into the hooks
-            command so the hook script can call the server's policy endpoint.
         """
         if state.agent is not None:
             return
@@ -602,10 +613,14 @@ class CursorExecutor(Executor):
         # Write .cursor/hooks.json for preToolUse policy enforcement.
         # RUNNER_SERVER_URL is inherited by the harness subprocess via
         # _build_harness_spawn_env (process_manager.py).
+        # The conversation_id comes from the --conversation-id CLI arg
+        # passed by the process_manager — NOT from the executor's
+        # session_key (which is an internal UUID without the conv_ prefix).
         server_url = os.environ.get("RUNNER_SERVER_URL", "")
-        if server_url and session_key != "__default__":
+        conv_id = _get_conversation_id()
+        if server_url and conv_id:
             hook_script = str(Path(__file__).with_name("cursor_policy_hook.py"))
-            state.hooks_file = _write_cursor_hooks(cwd, hook_script, server_url, session_key)
+            state.hooks_file = _write_cursor_hooks(cwd, hook_script, server_url, conv_id)
 
         client = await AsyncClient.launch_bridge(workspace=cwd)
         try:
@@ -659,7 +674,7 @@ class CursorExecutor(Executor):
         state.tools_fingerprint = tools_fp
 
         try:
-            await self._ensure_session(state, model, tools, session_key)
+            await self._ensure_session(state, model, tools)
         except Exception as exc:  # noqa: BLE001 — surfaced as ExecutorError (CancelledError propagates)
             await self.close_session(session_key)
             yield ExecutorError(message=f"Failed to start cursor-sdk agent: {exc}")
