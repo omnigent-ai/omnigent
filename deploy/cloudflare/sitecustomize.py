@@ -27,6 +27,7 @@ dialect subclass ``SQLiteDialect`` upstream; until then this shim carries it.
      ``NotImplementedError``), but migrations call it directly. Implement it the
      SQLite way (``PRAGMA index_list`` with origin ``'u'``).
 """
+
 import sys
 
 try:
@@ -34,7 +35,7 @@ try:
 
     class CloudflareD1Impl(SQLiteImpl):  # auto-registers via __dialect__
         __dialect__ = "cloudflare_d1"
-except Exception as exc:  # pragma: no cover - never block startup
+except Exception as exc:  # noqa: BLE001 -- defensive: never block server startup
     print(f"[d1-shim] could not register Alembic impl: {exc}", file=sys.stderr)
 
 try:
@@ -68,20 +69,21 @@ try:
     if not getattr(CloudflareD1Dialect, "_d1_unique_patched", False):
         from sqlalchemy import text as _text
 
-        def _get_unique_constraints(self, connection, table_name, schema=None, **kw):
+        def _get_unique_constraints(self, connection, table_name, schema=None, **kw):  # noqa: ARG001 -- SQLAlchemy reflection signature
             prep = self.identifier_preparer.quote_identifier
             out = []
             for row in connection.execute(_text(f"PRAGMA index_list({prep(table_name)})")):
                 _, idx_name, unique, origin = row[0], row[1], row[2], row[3]
                 if not unique or origin != "u":  # 'u' == a UNIQUE constraint
                     continue
-                cols = [r[2] for r in connection.execute(
-                    _text(f"PRAGMA index_info({prep(idx_name)})"))]
+                cols = [
+                    r[2] for r in connection.execute(_text(f"PRAGMA index_info({prep(idx_name)})"))
+                ]
                 name = None if idx_name.startswith("sqlite_autoindex_") else idx_name
                 out.append({"name": name, "column_names": cols})
             return out
 
         CloudflareD1Dialect.get_unique_constraints = _get_unique_constraints
         CloudflareD1Dialect._d1_unique_patched = True
-except Exception as exc:  # pragma: no cover - never block startup
+except Exception as exc:  # noqa: BLE001 -- defensive: never block server startup
     print(f"[d1-shim] could not patch D1 compilers: {exc}", file=sys.stderr)

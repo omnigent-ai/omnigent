@@ -23,6 +23,7 @@ the shim are all present:
 (The upstream changes discussed in the README would make this step unnecessary —
 the normal on-boot migration would just work.)
 """
+
 import os
 
 from sqlalchemy import inspect, text
@@ -37,8 +38,10 @@ head = db_utils._get_head_db_revision(url)
 Base.metadata.create_all(bind=engine)  # checkfirst=True; pure DDL, no reflection
 with engine.begin() as conn:
     conn.execute(
-        text("CREATE TABLE IF NOT EXISTS alembic_version "
-             "(version_num VARCHAR(32) NOT NULL PRIMARY KEY)")
+        text(
+            "CREATE TABLE IF NOT EXISTS alembic_version "
+            "(version_num VARCHAR(32) NOT NULL PRIMARY KEY)"
+        )
     )
     conn.execute(text("DELETE FROM alembic_version"))
     conn.execute(text("INSERT INTO alembic_version (version_num) VALUES (:v)"), {"v": head})
