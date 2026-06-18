@@ -270,14 +270,23 @@ def test_trace_id_from_response_id_wrong_prefix() -> None:
         telemetry.trace_id_from_response_id("conv_" + _RESP_HEX)
 
 
-def test_trace_id_from_response_id_wrong_length() -> None:
+def test_trace_id_from_response_id_short_hex_zero_padded() -> None:
     """
-    An ID with a hex suffix shorter than 32 chars raises ValueError.
-    Guards against accidentally passing a truncated ID or some
-    non-UUID4 value.
+    A short hex suffix (< 32 chars) is zero-padded to 32 chars.
+    Harness-allocated response IDs use 24-char hex; the padding
+    produces a valid 128-bit W3C trace ID.
     """
-    with pytest.raises(ValueError, match="32 hex chars"):
-        telemetry.trace_id_from_response_id("resp_abcdef")
+    result = telemetry.trace_id_from_response_id("resp_abcdef")
+    assert result == "abcdef" + "0" * 26
+    assert len(result) == 32
+
+
+def test_trace_id_from_response_id_too_long() -> None:
+    """
+    A hex suffix longer than 32 chars raises ValueError.
+    """
+    with pytest.raises(ValueError, match="at most"):
+        telemetry.trace_id_from_response_id("resp_" + "a" * 33)
 
 
 def test_trace_id_from_response_id_invalid_hex() -> None:
