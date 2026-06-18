@@ -49,6 +49,7 @@ _SDK_HARNESSES: frozenset[str] = frozenset(
 # ``_HARNESS_FAMILY`` entry — pi uses the ``PI_SURFACE`` sentinel — so they must
 # be gated explicitly or they fail open like an unknown harness.
 _PI_HARNESSES: frozenset[str] = frozenset({PI_SURFACE, "pi-native"})
+_CURSOR_NATIVE_HARNESSES: frozenset[str] = frozenset({"cursor-native", "native-cursor"})
 
 
 def _canonical_harness(harness: str) -> str:
@@ -100,6 +101,8 @@ def harness_is_configured(harness: str) -> bool:
     canonical = _canonical_harness(harness)
     if canonical in _SDK_HARNESSES:
         return True
+    if canonical in _CURSOR_NATIVE_HARNESSES:
+        return harness_cli_installed(CURSOR_KEY)
     if canonical == CURSOR_KEY:
         # Cursor runs in-process via ``cursor-sdk`` and authenticates with a
         # ``CURSOR_API_KEY`` (a ``cursor-agent login`` does not apply). So,
@@ -142,5 +145,6 @@ def configured_harness_map() -> dict[str, bool]:
     spellings.update(_EXECUTOR_TYPE_HARNESS_ALIASES)
     spellings.update(HARNESS_ALIASES)
     spellings.update(_PI_HARNESSES)
+    spellings.update(_CURSOR_NATIVE_HARNESSES)
     spellings.add(CURSOR_KEY)
     return {spelling: harness_is_configured(spelling) for spelling in spellings}
