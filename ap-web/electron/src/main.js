@@ -1677,13 +1677,23 @@ function registerIpc() {
       title,
       body: String(params?.body ?? ""),
     });
+    // In-app path the SPA wants opened on click (e.g. "/c/conv_abc"). Captured
+    // here so the click handler can tell the renderer where to route.
+    const navigatePath = typeof params?.navigatePath === "string" ? params.navigatePath : "";
     // Focus the window that fired the notification (so a click lands on the
     // right one in a multi-window setup), falling back to any open window.
+    // Then tell that window's SPA to navigate to the notification's
+    // conversation — focusing alone left the user on whatever chat was open.
     notification.on("click", () => {
       const win = BrowserWindow.fromWebContents(event.sender) ?? activeWindow();
       if (win) {
         if (win.isMinimized()) win.restore();
         win.focus();
+      }
+      // Route only the originating window (it owns that conversation's state);
+      // guard against a sender reloaded/closed since the toast was posted.
+      if (navigatePath && !event.sender.isDestroyed()) {
+        event.sender.send("omnigent:notification-activated", navigatePath);
       }
     });
     notification.show();

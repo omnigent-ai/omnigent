@@ -27,13 +27,28 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   },
   /**
    * Fire an OS notification. Resolves true when shown, false otherwise.
-   * @param {{title: string, body?: string}} params
+   * @param {{title: string, body?: string, navigatePath?: string}} params
    */
   notify: (params) =>
     ipcRenderer.invoke("omnigent:notify", {
       title: params?.title,
       body: params?.body,
+      navigatePath: params?.navigatePath,
     }),
+  /**
+   * Subscribe to OS-notification clicks. The main process sends the in-app
+   * path the clicked notification carried, which we forward to the SPA so it
+   * can route there. Returns an unsubscribe function.
+   * @param {(path: string) => void} callback
+   * @returns {() => void}
+   */
+  onNotificationActivated: (callback) => {
+    const listener = (_event, path) => {
+      if (typeof path === "string" && path) callback(path);
+    };
+    ipcRenderer.on("omnigent:notification-activated", listener);
+    return () => ipcRenderer.removeListener("omnigent:notification-activated", listener);
+  },
   /**
    * Title-bar server picker data: the window's current server origin and the
    * recently-connected server URLs (most recent first). Resolves null on
