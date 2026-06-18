@@ -66,6 +66,10 @@ _STATE_FILE = "cursor_forwarder.json"
 # and prepends a large ``<user_info>…`` context dump as a separate user blob.
 # We forward only the former (unwrapped) and skip the latter.
 _USER_QUERY_RE = re.compile(r"<user_query>(.*?)</user_query>", re.DOTALL)
+# The executor injects ``[Attached: <path>]`` markers for web-UI attachments
+# before pasting into the TUI; cursor stores them inside the user_query, so
+# strip them from the mirrored bubble (the path is an internal bridge detail).
+_ATTACHMENT_MARKER_RE = re.compile(r"\[Attached:[^\]]*\]")
 
 
 @dataclass
@@ -99,9 +103,15 @@ def _read_state(bridge_dir: Path) -> _ForwardState:
     )
 
 
-def _write_state(bridge_dir: Path, state: _ForwardState) -> None:
-    """Atomically persist the forward cursor (tmp write + rename)."""
-    with contextlib.suppress(OSError):
+def _write_state(bridge_dir: Path, state: _ForwardState) -> bool:
+    """Atomically persist the forward cursor (tmp write + rename).
+
+    :returns: ``True`` on success. A failure is logged (not silently swallowed)
+        and returns ``False`` — the in-memory cursor still guards against
+        within-process re-posting; only a crash before a successful persist
+        could re-post, so a persistent write failure is worth surfacing.
+    """
+    try:
         bridge_dir.mkdir(parents=True, exist_ok=True)
         tmp = bridge_dir / (_STATE_FILE + ".tmp")
         tmp.write_text(
@@ -109,6 +119,24 @@ def _write_state(bridge_dir: Path, state: _ForwardState) -> None:
             encoding="utf-8",
         )
         os.replace(tmp, bridge_dir / _STATE_FILE)
+        return True
+    except OSError:
+        _logger.warning(
+            "cursor forwarder could not persist state to %s", bridge_dir, exc_info=True
+        )
+        return False
+
+
+def clear_cursor_bridge_state(bridge_dir: Path) -> None:
+    """Remove the persisted forward cursor so a re-created terminal starts clean.
+
+    Mirrors codex's ``clear_bridge_state``: the runner calls this when it
+    re-creates a cursor terminal, so a stale ``store_path``/``last_rowid`` from a
+    prior terminal can't make the new forwarder resume the wrong chat or carry a
+    stale high-water rowid.
+    """
+    with contextlib.suppress(OSError):
+        (bridge_dir / _STATE_FILE).unlink()
 
 
 def _cursor_chats_root() -> Path:
@@ -137,9 +165,11 @@ def _discover_store(workspace: str, launch_epoch_ms: int) -> Path | None:
     cursor names each workspace's chat dir ``md5(<cwd>)`` and each chat
     ``<chat-id>`` with a ``meta.json`` carrying ``createdAtMs``. The TUI creates
     the dir lazily on the first message, so we pick the newest chat created at or
-    after this session's launch — first under the exact ``md5(workspace)`` dir,
-    then (in case cursor normalizes the path differently than we hash it) across
-    every workspace dir as a fallback.
+    after this session's launch under the exact ``md5(workspace)`` dir. If that
+    dir has nothing (a path-hash mismatch), we fall back to other workspace dirs
+    but bind ONLY when exactly one chat across them qualifies — never guessing
+    among multiple, so a concurrent session or unrelated workspace can't be
+    mirrored by mistake.
 
     :param workspace: The session's working directory, exactly as passed to the
         cursor TUI.
@@ -150,19 +180,28 @@ def _discover_store(workspace: str, launch_epoch_ms: int) -> Path | None:
     root = _cursor_chats_root()
     floor_ms = launch_epoch_ms - _DISCOVERY_SKEW_MS
     exact_dir = root / _workspace_hash(workspace)
-    best, best_created = _scan_hash_dir(exact_dir, floor_ms, None, -1)
+    # The reliable case: the workspace is realpath-normalized on both the launch
+    # and forwarder sides, so cursor's own ``md5(cwd)`` dir == ``exact_dir``.
+    best, _best_created = _scan_hash_dir(exact_dir, floor_ms, None, -1)
     if best is not None:
         return best
-    # Fallback (only when the exact hash dir yielded nothing, so it can't shadow
-    # a precise match): cursor may normalize the path differently than we hash
-    # it — scan every workspace dir for the newest chat created since launch.
+    # Fallback ONLY for a path-hash mismatch: scan the other workspace dirs, but
+    # bind only when EXACTLY ONE chat across them qualifies. With two candidates
+    # we can't tell which session owns which (concurrent sessions, or an
+    # unrelated workspace), so we return None and retry rather than risk
+    # mirroring the wrong conversation — silent cross-talk is worse than a brief
+    # delay.
     if not root.is_dir():
         return None
+    matches: list[Path] = []
     for hash_dir in sorted(root.iterdir()):
         if hash_dir == exact_dir or not hash_dir.is_dir():
             continue
-        best, best_created = _scan_hash_dir(hash_dir, floor_ms, best, best_created)
-    return best
+        for chat_dir in hash_dir.iterdir():
+            store = chat_dir / "store.db"
+            if store.is_file() and _chat_created_ms(chat_dir) >= floor_ms:
+                matches.append(store)
+    return matches[0] if len(matches) == 1 else None
 
 
 def _scan_hash_dir(
@@ -210,7 +249,8 @@ def _unwrap_user_query(text: str) -> str | None:
     match = _USER_QUERY_RE.search(text)
     if match is None:
         return None
-    return _strip_control_chars(match.group(1)).strip() or None
+    inner = _ATTACHMENT_MARKER_RE.sub("", _strip_control_chars(match.group(1)))
+    return inner.strip() or None
 
 
 @dataclass

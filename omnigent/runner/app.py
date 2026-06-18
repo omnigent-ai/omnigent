@@ -861,8 +861,14 @@ async def _auto_create_cursor_terminal(
     # *this* session's chat by recency under ``~/.cursor/chats/<md5(cwd)>``.
     launch_epoch_ms = int(time.time() * 1000)
     # Tear down any forwarder left from a prior terminal for this session before
-    # re-creating, so the old and new tasks can't both mirror (double-posting).
+    # re-creating, so the old and new tasks can't both mirror (double-posting),
+    # and drop the prior terminal's stale forward cursor so the new forwarder
+    # can't resume the wrong chat / a stale rowid (mirrors codex's clear_bridge_state).
     await _cancel_auto_forwarder_task(session_id)
+    from omnigent.cursor_native_bridge import bridge_dir_for_session_id
+    from omnigent.cursor_native_forwarder import clear_cursor_bridge_state
+
+    clear_cursor_bridge_state(bridge_dir_for_session_id(session_id))
 
     # ``_pi_native_launch_config`` is a generic session-snapshot reader
     # (workspace + terminal_launch_args); reused here, not Pi-specific.
@@ -870,7 +876,10 @@ async def _auto_create_cursor_terminal(
         session_id=session_id,
         server_client=server_client,
     )
-    workspace = str(launch_config.workspace)
+    # Canonicalize the workspace (resolve symlinks / trailing slashes) so the
+    # cursor TUI's cwd and the forwarder hash the SAME path — cursor keys its
+    # chat store dir on ``md5(cwd)``, and a mismatch would hide the store.
+    workspace = os.path.realpath(str(launch_config.workspace))
     cursor_command = resolve_cursor_executable()
     cursor_args = list(launch_config.terminal_launch_args or [])
     terminal_view = await resource_registry.launch_required_terminal(
@@ -917,19 +926,21 @@ async def _auto_create_cursor_terminal(
     # forwarders. Reuses the runner's own server URL + refresh-capable auth.
     from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
 
-    server_url = os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767")
-    _auth_factory = _make_auth_token_factory()
-    _auth_token = _auth_factory() if _auth_factory is not None else None
-    _runner_headers = {"Authorization": f"Bearer {_auth_token}"} if _auth_token else {}
-    _runner_auth = _RunnerDatabricksAuth(_auth_factory)
+    # Fail loud if the server URL isn't in the env (matches codex's
+    # ``_required_runner_env``): silently defaulting to ``localhost:6767`` would
+    # make every mirror POST miss on a remote deploy, leaving the web
+    # conversation permanently empty.
+    server_url = _required_runner_env("RUNNER_SERVER_URL")
+    # Authorization rides solely on the refresh-capable auth (no static header
+    # snapshot that would expire mid-session), matching the runner's server_client.
+    _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
 
-    from omnigent.cursor_native_bridge import bridge_dir_for_session_id
     from omnigent.cursor_native_forwarder import supervise_cursor_forwarder
 
     _forwarder_task = asyncio.create_task(
         supervise_cursor_forwarder(
             base_url=server_url,
-            headers=_runner_headers,
+            headers={},
             session_id=session_id,
             bridge_dir=bridge_dir_for_session_id(session_id),
             agent_name="cursor-native-ui",

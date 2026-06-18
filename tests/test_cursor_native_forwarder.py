@@ -62,6 +62,10 @@ class TestUnwrapUserQuery:
     def test_empty_query_is_skipped(self) -> None:
         assert fwd._unwrap_user_query("<user_query>\n  \n</user_query>") is None
 
+    def test_strips_injected_attachment_markers(self) -> None:
+        raw = "<user_query>\n[Attached: /tmp/x/img.png]\ndescribe this\n</user_query>"
+        assert fwd._unwrap_user_query(raw) == "describe this"
+
 
 class TestContentText:
     def test_string_content(self) -> None:
@@ -210,14 +214,27 @@ class TestDiscoverStore:
     ) -> None:
         monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: tmp_path)
         # The chat lives under a DIFFERENT hash than md5(queried workspace)
-        # (cursor normalized the path); the cross-dir fallback still finds it.
+        # (cursor normalized the path); with a SINGLE qualifying chat the
+        # fallback unambiguously binds it.
         other = self._seed_chat(tmp_path, "/some/other/path", "c", 5_000)
         assert fwd._discover_store("/queried/workspace", launch_epoch_ms=4_000) == other
+
+    def test_ambiguous_fallback_returns_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: tmp_path)
+        # Two qualifying chats under different non-exact dirs → we can't tell
+        # which session owns which, so bind nothing (avoid silent cross-talk).
+        self._seed_chat(tmp_path, "/path/a", "c1", 5_000)
+        self._seed_chat(tmp_path, "/path/b", "c2", 6_000)
+        assert fwd._discover_store("/queried/workspace", launch_epoch_ms=4_000) is None
 
 
 class TestStateRoundTrip:
     def test_write_then_read(self, tmp_path: Path) -> None:
-        fwd._write_state(tmp_path, fwd._ForwardState(store_path="/x/store.db", last_rowid=7))
+        assert fwd._write_state(
+            tmp_path, fwd._ForwardState(store_path="/x/store.db", last_rowid=7)
+        )
         got = fwd._read_state(tmp_path)
         assert got.store_path == "/x/store.db"
         assert got.last_rowid == 7
@@ -226,6 +243,13 @@ class TestStateRoundTrip:
         got = fwd._read_state(tmp_path)
         assert got.store_path is None
         assert got.last_rowid == 0
+
+    def test_clear_removes_state(self, tmp_path: Path) -> None:
+        fwd._write_state(tmp_path, fwd._ForwardState(store_path="/x/store.db", last_rowid=7))
+        fwd.clear_cursor_bridge_state(tmp_path)
+        assert fwd._read_state(tmp_path).store_path is None
+        # idempotent: clearing an absent state must not raise
+        fwd.clear_cursor_bridge_state(tmp_path)
 
 
 class _RecordingClient:
