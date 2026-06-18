@@ -52,6 +52,7 @@ from omnigent.llms.summarize import (
 from omnigent.model_override import validate_model_override
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runner import pending_approvals
+from omnigent.runner.codex_goal import CodexGoalRunner
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
@@ -9421,6 +9422,12 @@ def create_runner_app(
             return None
         return state
 
+    codex_goal_runner = CodexGoalRunner(
+        bridge_state_for_session=_codex_native_bridge_state_for_session,
+        client_safe_error_detail=_client_safe_error_detail,
+        logger=_logger,
+    )
+
     async def _handle_codex_native_interrupt(conv_id: str) -> Response:
         """
         Stop a codex-native turn via Codex app-server ``turn/interrupt``.
@@ -9646,253 +9653,6 @@ def create_runner_app(
                 },
             },
         )
-
-    def _codex_native_goal_to_api(goal: dict[str, Any]) -> dict[str, Any]:
-        """
-        Convert a Codex app-server goal object to Omnigent API field names.
-
-        Codex app-server speaks camelCase JSON-RPC fields. The AP/UI session
-        API uses snake_case, so normalize the goal at the runner boundary
-        before returning it through ``/events``.
-
-        :param goal: Codex ``ThreadGoal`` object, e.g.
-            ``{"threadId": "thr_123", "objective": "...", "status": "active"}``.
-        :returns: Snake-case goal dict for AP, e.g.
-            ``{"thread_id": "thr_123", "objective": "..."}``.
-        :raises KeyError: If Codex omits a required goal field.
-        """
-        return {
-            "thread_id": goal["threadId"],
-            "objective": goal["objective"],
-            "status": goal["status"],
-            "token_budget": goal.get("tokenBudget"),
-            "tokens_used": goal["tokensUsed"],
-            "time_used_seconds": goal["timeUsedSeconds"],
-            "created_at": goal.get("createdAt"),
-            "updated_at": goal.get("updatedAt"),
-        }
-
-    def _codex_goal_result(response: dict[str, Any], *, action: str) -> dict[str, Any]:
-        """
-        Extract a JSON-RPC ``result`` object from a Codex goal response.
-
-        :param response: JSON-RPC response envelope returned by
-            :meth:`CodexAppServerClient.request`, e.g. ``{"result": {"goal": None}}``.
-        :param action: Human-readable operation for error text, e.g.
-            ``"read"``.
-        :returns: The ``result`` object.
-        :raises ValueError: If the envelope does not contain a result object.
-        """
-        result = response.get("result")
-        if not isinstance(result, dict):
-            raise ValueError(f"Codex goal {action} returned no result object")
-        return result
-
-    def _codex_native_goal_bridge_error(action: str) -> JSONResponse:
-        """
-        Build the standard no-bridge response for Codex goal operations.
-
-        :param action: Human-readable operation, e.g. ``"read"``.
-        :returns: 503 JSON response for AP/UI callers.
-        """
-        return JSONResponse(
-            status_code=503,
-            content={
-                "error": "codex_native_goal_failed",
-                "detail": (f"Codex-native goal {action} requires a loaded Codex bridge."),
-            },
-        )
-
-    def _codex_native_goal_malformed_response(action: str, detail: str) -> JSONResponse:
-        """
-        Build the standard malformed-response error for Codex goal operations.
-
-        :param action: Human-readable operation, e.g. ``"read"``.
-        :param detail: Specific malformed field, e.g. ``"invalid goal object"``.
-        :returns: 503 JSON response for AP/UI callers.
-        """
-        return JSONResponse(
-            status_code=503,
-            content={
-                "error": "codex_native_goal_failed",
-                "detail": f"Codex-native goal {action} returned {detail}.",
-            },
-        )
-
-    async def _codex_native_goal_request(
-        conv_id: str,
-        *,
-        action: str,
-        method: str,
-        params: dict[str, Any],
-    ) -> dict[str, Any] | JSONResponse:
-        """
-        Execute one Codex app-server goal JSON-RPC request.
-
-        :param conv_id: Session/conversation identifier, e.g.
-            ``"conv_abc123"``.
-        :param action: Human-readable operation for logs/errors, e.g.
-            ``"read"``.
-        :param method: Codex app-server method, e.g. ``"thread/goal/get"``.
-        :param params: JSON-RPC params excluding no fields, e.g.
-            ``{"threadId": "thr_123"}``.
-        :returns: The JSON-RPC ``result`` object, or a 503 response when no
-            bridge is loaded or Codex rejects the request.
-        """
-        from omnigent.codex_native_app_server import client_for_transport
-
-        state = await _codex_native_bridge_state_for_session(conv_id, action=f"goal {action}")
-        if state is None:
-            return _codex_native_goal_bridge_error(action)
-        codex_client = client_for_transport(
-            state.socket_path,
-            client_name="omnigent-codex-native-runner",
-        )
-        try:
-            await codex_client.connect()
-            return _codex_goal_result(
-                await codex_client.request(method, {"threadId": state.thread_id, **params}),
-                action=action,
-            )
-        except Exception as exc:  # noqa: BLE001 - surface app-server goal failures to AP.
-            _logger.warning(
-                "Codex-native %s failed for session=%s",
-                method,
-                conv_id,
-                exc_info=True,
-            )
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "codex_native_goal_failed",
-                    "detail": _client_safe_error_detail(
-                        exc,
-                        context=f"codex-native goal {action}",
-                    ),
-                },
-            )
-        finally:
-            with contextlib.suppress(Exception):
-                await codex_client.close()
-
-    async def _handle_codex_native_goal_get(conv_id: str) -> Response:
-        """
-        Read the current Codex app-server goal for a loaded thread.
-
-        :param conv_id: Session/conversation identifier, e.g.
-            ``"conv_abc123"``.
-        :returns: 200 with ``{"goal": ...}``, ``{"goal": null}``, or 503 when
-            no bridge is loaded or Codex rejects the request.
-        """
-        result = await _codex_native_goal_request(
-            conv_id,
-            action="read",
-            method="thread/goal/get",
-            params={},
-        )
-        if isinstance(result, JSONResponse):
-            return result
-        goal = result.get("goal")
-        if goal is not None and not isinstance(goal, dict):
-            return _codex_native_goal_malformed_response("read", "invalid goal object")
-        return JSONResponse({"goal": None if goal is None else _codex_native_goal_to_api(goal)})
-
-    async def _handle_codex_native_goal_set(
-        conv_id: str,
-        *,
-        objective: str,
-        token_budget: int | None,
-        token_budget_provided: bool,
-        status: str | None,
-    ) -> Response:
-        """
-        Create or replace the current Codex app-server goal for a thread.
-
-        :param conv_id: Session/conversation identifier, e.g.
-            ``"conv_abc123"``.
-        :param objective: Goal objective text, e.g.
-            ``"Finish the migration and keep tests green"``.
-        :param token_budget: Optional token budget, e.g. ``40000``.
-        :param token_budget_provided: ``True`` when the caller supplied the
-            budget field; lets direct runner callers clear the Codex budget
-            with JSON ``null``.
-        :param status: Optional user-selected status, either ``"active"`` or
-            ``"paused"``. ``None`` leaves Codex's current status unchanged.
-        :returns: 200 with the current goal, or 503 when no bridge is loaded
-            or Codex rejects the request.
-        """
-        params: dict[str, Any] = {
-            "objective": objective,
-        }
-        if token_budget_provided:
-            params["tokenBudget"] = token_budget
-        if status is not None:
-            params["status"] = status
-        result = await _codex_native_goal_request(
-            conv_id,
-            action="set",
-            method="thread/goal/set",
-            params=params,
-        )
-        if isinstance(result, JSONResponse):
-            return result
-        goal = result.get("goal")
-        if not isinstance(goal, dict):
-            return _codex_native_goal_malformed_response("set", "invalid goal object")
-        return JSONResponse({"goal": _codex_native_goal_to_api(goal)})
-
-    async def _handle_codex_native_goal_status(conv_id: str, *, status: str) -> Response:
-        """
-        Update the current Codex app-server goal status.
-
-        Codex models pause/resume as ``thread/goal/set`` calls with only the
-        status field. Objective and token-budget fields are omitted so Codex
-        keeps the existing goal text and budget.
-
-        :param conv_id: Session/conversation identifier, e.g.
-            ``"conv_abc123"``.
-        :param status: Codex status string, either ``"paused"`` or
-            ``"active"``.
-        :returns: 200 with the current goal, or 503 when no bridge is loaded
-            or Codex rejects the request.
-        """
-        result = await _codex_native_goal_request(
-            conv_id,
-            action="update status",
-            method="thread/goal/set",
-            params={"status": status},
-        )
-        if isinstance(result, JSONResponse):
-            return result
-        goal = result.get("goal")
-        if not isinstance(goal, dict):
-            return _codex_native_goal_malformed_response(
-                "update status",
-                "invalid goal object",
-            )
-        return JSONResponse({"goal": _codex_native_goal_to_api(goal)})
-
-    async def _handle_codex_native_goal_clear(conv_id: str) -> Response:
-        """
-        Clear the current Codex app-server goal for a loaded thread.
-
-        :param conv_id: Session/conversation identifier, e.g.
-            ``"conv_abc123"``.
-        :returns: 200 with ``{"cleared": bool}``, or 503 when no bridge is
-            loaded or Codex rejects the request.
-        """
-        result = await _codex_native_goal_request(
-            conv_id,
-            action="clear",
-            method="thread/goal/clear",
-            params={},
-        )
-        if isinstance(result, JSONResponse):
-            return result
-        cleared = result.get("cleared")
-        if not isinstance(cleared, bool):
-            return _codex_native_goal_malformed_response("clear", "invalid cleared flag")
-        return JSONResponse({"cleared": cleared})
 
     async def _codex_native_model_options(conv_id: str) -> list[dict[str, Any]]:
         """
@@ -13592,102 +13352,14 @@ def create_runner_app(
                 )
             return Response(status_code=204)
 
-        if body_type == "goal_get":
-            # Codex goal state is owned by Codex app-server. A goal read is
-            # therefore an explicit live control, not a best-effort metadata
-            # notification.
-            if _session_harness_name(conversation_id) == "codex-native":
-                return await _handle_codex_native_goal_get(conversation_id)
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": "invalid_input",
-                    "detail": "Codex goal controls require a codex-native session",
-                },
-            )
-
-        if body_type == "goal_set":
-            # The AP route validates this too, but direct runner callers should
-            # get a clear 400 instead of an app-server validation error.
-            if _session_harness_name(conversation_id) != "codex-native":
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "error": "invalid_input",
-                        "detail": "Codex goal controls require a codex-native session",
-                    },
-                )
-            objective = body.get("objective") if isinstance(body, dict) else None
-            if not isinstance(objective, str) or not objective.strip():
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "error": "invalid_input",
-                        "detail": "Body 'objective' must be a non-empty string",
-                    },
-                )
-            token_budget_provided = isinstance(body, dict) and "token_budget" in body
-            token_budget = body.get("token_budget") if token_budget_provided else None
-            if token_budget is not None and (
-                isinstance(token_budget, bool)
-                or not isinstance(token_budget, int)
-                or token_budget <= 0
-            ):
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "error": "invalid_input",
-                        "detail": "Body 'token_budget' must be a positive integer or null",
-                    },
-                )
-            status = body.get("status") if isinstance(body, dict) else None
-            if status is not None and status not in ("active", "paused"):
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "error": "invalid_input",
-                        "detail": "Body 'status' must be 'active' or 'paused'",
-                    },
-                )
-            return await _handle_codex_native_goal_set(
-                conversation_id,
-                objective=objective.strip(),
-                token_budget=token_budget,
-                token_budget_provided=token_budget_provided,
-                status=status,
-            )
-
-        if body_type == "goal_status":
-            if _session_harness_name(conversation_id) != "codex-native":
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "error": "invalid_input",
-                        "detail": "Codex goal controls require a codex-native session",
-                    },
-                )
-            status = body.get("status") if isinstance(body, dict) else None
-            if status not in ("active", "paused"):
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "error": "invalid_input",
-                        "detail": "Body 'status' must be 'active' or 'paused'",
-                    },
-                )
-            return await _handle_codex_native_goal_status(conversation_id, status=status)
-
-        if body_type == "goal_clear":
-            # Clear is live-only for the same reason as goal_get.
-            if _session_harness_name(conversation_id) == "codex-native":
-                return await _handle_codex_native_goal_clear(conversation_id)
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": "invalid_input",
-                    "detail": "Codex goal controls require a codex-native session",
-                },
-            )
+        codex_goal_response = await codex_goal_runner.handle_event(
+            conversation_id,
+            body_type,
+            body,
+            session_harness_name=_session_harness_name,
+        )
+        if codex_goal_response is not None:
+            return codex_goal_response
 
         if body_type == "compact":
             # Omnigent server forwards explicit /compact here. claude-native
