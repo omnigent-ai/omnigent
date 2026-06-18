@@ -44,7 +44,10 @@ jobs:
     name: Rerun Security Gate
     if: github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # >= the race guard's max wait (~6 min, below) PLUS the artifact download and
+    # the per-workflow rerun loop, so a slow Security Scan can never cancel the
+    # job mid-wait and strand the gate re-runs this relay exists to issue.
+    timeout-minutes: 10
     permissions:
       actions: write        # gh run rerun + read workflow runs/artifacts
       pull-requests: read   # resolve the PR head SHA
