@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from omnigent.inner.os_env import build_helper_env
+import base64
+from pathlib import Path
+
+from omnigent.inner.os_env import _read_impl, build_helper_env
 from omnigent.inner.sandbox import SandboxPolicy
 from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
 
@@ -81,3 +84,62 @@ def test_build_helper_env_active_drops_binding_token() -> None:
     assert RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR not in env
     assert "bug-binding-token-secret" not in env.values()
     assert env["PATH"] == "/usr/bin"  # PATH is in the default allowlist
+
+
+# ---------------------------------------------------------------------------
+# _read_impl — binary file handling
+# ---------------------------------------------------------------------------
+
+_BINARY = b"\x89PNG\r\n\x1a\n\x00\x01\x02\xff"
+
+
+def test_read_impl_binary_descriptor_for_agent(tmp_path: Path) -> None:
+    """With no byte cap (agent ``sys_os_read`` path) binary is not inlined.
+
+    The base64 payload would be useless to the model and could saturate the
+    context window, so only a descriptor is returned.
+
+    :returns: None.
+    """
+    f = tmp_path / "logo.png"
+    f.write_bytes(_BINARY)
+
+    result = _read_impl(f, offset=1, limit=2_000)
+
+    assert result["encoding"] == "base64"
+    assert result["content"] == ""
+    assert result["total_bytes"] == len(_BINARY)
+    assert result["truncated"] is True
+    assert "note" in result
+
+
+def test_read_impl_binary_inlined_within_cap(tmp_path: Path) -> None:
+    """A byte cap larger than the file inlines the whole payload, untruncated.
+
+    :returns: None.
+    """
+    f = tmp_path / "logo.png"
+    f.write_bytes(_BINARY)
+
+    result = _read_impl(f, offset=1, limit=2_000, max_binary_bytes=10 * 1024 * 1024)
+
+    assert result["encoding"] == "base64"
+    assert base64.b64decode(result["content"]) == _BINARY
+    assert result["total_bytes"] == len(_BINARY)
+    assert result["truncated"] is False
+
+
+def test_read_impl_binary_truncated_at_cap(tmp_path: Path) -> None:
+    """A byte cap smaller than the file truncates and flags it.
+
+    :returns: None.
+    """
+    f = tmp_path / "logo.png"
+    f.write_bytes(_BINARY)
+
+    result = _read_impl(f, offset=1, limit=2_000, max_binary_bytes=4)
+
+    assert base64.b64decode(result["content"]) == _BINARY[:4]
+    assert result["returned_bytes"] == 4
+    assert result["total_bytes"] == len(_BINARY)
+    assert result["truncated"] is True

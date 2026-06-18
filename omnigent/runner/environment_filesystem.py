@@ -11,6 +11,7 @@ filesystem service.
 
 from __future__ import annotations
 
+import base64
 import os
 import re
 import stat
@@ -521,18 +522,35 @@ class CallerProcessFilesystem:
         if not validated:
             raise InvalidPath("Cannot read the environment root")
 
+        byte_cap = max_bytes or _MAX_READ_BYTES
+
         result = await _run_os_env_async(
             self._os_env.read,
             validated,
             limit=limit,
+            # Inline binary content up to the byte cap so it can be served to
+            # the viewer / download. (The agent read path omits this and gets a
+            # descriptor only — see ``_read_impl``.)
+            max_binary_bytes=byte_cap,
         )
         if "error" in result:
             raise FilesystemPathNotFound(f"Path {path!r} not found")
 
+        # Binary files come back base64-encoded with encoding="base64", already
+        # capped to ``byte_cap`` by the helper, which also reports truncation.
+        if result.get("encoding") == "base64":
+            data = base64.b64decode(result.get("content", ""))
+            return FileContent(
+                path=path,
+                data=data,
+                bytes=len(data),
+                encoding=None,
+                truncated=bool(result.get("truncated")),
+            )
+
         content_str = result.get("content", "")
         data = content_str.encode("utf-8")
 
-        byte_cap = max_bytes or _MAX_READ_BYTES
         byte_truncated = len(data) > byte_cap
         if byte_truncated:
             data = data[:byte_cap]

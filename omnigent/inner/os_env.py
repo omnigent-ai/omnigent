@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import base64
 import contextlib
 import json
 import os
@@ -743,6 +744,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
         path: str,
         offset: int = 1,
         limit: int | None = None,
+        max_binary_bytes: int | None = None,
     ) -> OpResult:
         if offset < 1:
             return {"error": "offset must be >= 1"}
@@ -755,6 +757,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
                 "path": path,
                 "offset": offset,
                 "limit": limit,
+                "max_binary_bytes": max_binary_bytes,
             },
         )
         return cast(OpResult, result)
@@ -891,10 +894,13 @@ def _handle_helper_request(
             return {"error": str(exc)}
         offset_raw = request.get("offset", 1)
         offset = offset_raw if isinstance(offset_raw, int) else 1
+        max_binary_raw = request.get("max_binary_bytes")
+        max_binary_bytes = max_binary_raw if isinstance(max_binary_raw, int) else None
         return _read_impl(
             path,
             offset,
             request.get("limit"),
+            max_binary_bytes=max_binary_bytes,
         )
 
     if op == "write":
@@ -1014,18 +1020,44 @@ def _assert_write_allowed(policy: SandboxPolicy, path: Path) -> None:
     raise PermissionError(f"Write access to '{path}' is blocked by sandbox.")
 
 
-def _read_impl(path: Path, offset: int, limit: JsonValue) -> OpResult:
+def _read_impl(
+    path: Path,
+    offset: int,
+    limit: JsonValue,
+    max_binary_bytes: int | None = None,
+) -> OpResult:
     """
-    Read lines from a text file.
+    Read a file as UTF-8 text, or as base64-encoded bytes when it is binary.
+
+    The file is read as raw bytes and a strict UTF-8 decode is attempted.
+    Files that decode cleanly are returned as text with the usual
+    line-oriented ``offset``/``limit`` windowing. Files that do *not* decode
+    (images, archives, fonts, …) cannot be line-windowed, so they are capped
+    by *bytes* instead.
+
+    For binary files the behaviour depends on ``max_binary_bytes``:
+
+    * ``None`` (the default, used by the agent ``sys_os_read`` tool) — the
+      base64 payload is **not** inlined. A model cannot decode base64, and a
+      multi-MB blob would saturate the context window, so only a descriptor
+      (``total_bytes`` + a ``note``) is returned.
+    * a positive int (used by the filesystem service that feeds the web
+      viewer / downloads) — up to that many raw bytes are base64-encoded and
+      returned, with ``truncated`` set when the file was larger.
 
     :param path: Absolute path of the file to read.
-    :param offset: 1-based line number to start reading from.
+    :param offset: 1-based line number to start reading from (text only).
     :param limit: Maximum number of lines to return, or ``None`` for no
         limit (return all lines from *offset* to end of file).  Callers
         that want the default agent-tool cap should pass
-        :data:`_DEFAULT_READ_LIMIT` explicitly.
-    :returns: An :class:`OpResult` dict with ``path``, ``content``,
-        ``offset``, ``limit``, ``returned_lines``, and ``total_lines``.
+        :data:`_DEFAULT_READ_LIMIT` explicitly.  Ignored for binary files.
+    :param max_binary_bytes: Byte cap for binary files (see above). ``None``
+        returns a descriptor only.
+    :returns: For text, an :class:`OpResult` with ``encoding="utf-8"``,
+        ``content``, ``offset``, ``limit``, ``returned_lines``, and
+        ``total_lines``.  For binary, ``encoding="base64"``, ``total_bytes``,
+        ``truncated`` and either ``content`` (the base64 string, byte-capped
+        callers) or a ``note`` (descriptor-only callers).
     """
     if offset < 1:
         return {"error": "offset must be >= 1"}
@@ -1033,7 +1065,36 @@ def _read_impl(path: Path, offset: int, limit: JsonValue) -> OpResult:
         if not isinstance(limit, int) or limit < 1:
             return {"error": "limit must be >= 1"}
 
-    text = path.read_text(encoding="utf-8", errors="replace")
+    raw = path.read_bytes()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        # Binary file: base64 cannot be line-windowed, so cap by bytes.
+        total = len(raw)
+        if max_binary_bytes is None:
+            # Agent tool path: return a descriptor only — inlining base64 the
+            # model cannot use would waste (and risk saturating) the context.
+            return {
+                "path": str(path),
+                "encoding": "base64",
+                "content": "",
+                "total_bytes": total,
+                "truncated": total > 0,
+                "note": (
+                    f"Binary file not inlined ({total} bytes). "
+                    "View or download it via the file viewer."
+                ),
+            }
+        payload = raw[:max_binary_bytes]
+        return {
+            "path": str(path),
+            "content": base64.b64encode(payload).decode("ascii"),
+            "encoding": "base64",
+            "total_bytes": total,
+            "returned_bytes": len(payload),
+            "truncated": len(payload) < total,
+        }
+
     lines = text.splitlines(keepends=True)
     start = offset - 1
     effective_limit = len(lines) if limit is None else limit
@@ -1042,6 +1103,7 @@ def _read_impl(path: Path, offset: int, limit: JsonValue) -> OpResult:
     return {
         "path": str(path),
         "content": content,
+        "encoding": "utf-8",
         "offset": offset,
         "limit": effective_limit,
         "returned_lines": max(0, resolved_limit - start),

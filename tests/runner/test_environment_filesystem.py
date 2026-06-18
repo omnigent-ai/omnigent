@@ -29,6 +29,9 @@ def workspace(tmp_path: Path) -> Path:
     (ws / "hello.txt").write_text("hello world")
     (ws / "src").mkdir()
     (ws / "src" / "main.py").write_text("print('hi')")
+    # A binary file (PNG signature + a NUL) that is not valid UTF-8, used to
+    # exercise the base64 binary-read path.
+    (ws / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x01\x02\xff")
     return ws
 
 
@@ -165,6 +168,29 @@ async def test_read_file_content(
     assert body["content"] == "hello world"
     assert body["encoding"] == "utf-8"
     assert body["bytes"] == 11
+
+
+@pytest.mark.asyncio
+async def test_read_binary_file_content(
+    client: httpx.AsyncClient,
+) -> None:
+    """A non-UTF-8 file is returned whole as base64, not truncated text."""
+    import base64
+
+    raw = b"\x89PNG\r\n\x1a\n\x00\x01\x02\xff"
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/logo.png"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["encoding"] == "base64"
+    assert body["content_type"] == "image/png"
+    # The base64 payload round-trips to the exact original bytes — no
+    # UTF-8 replacement-char corruption.
+    assert base64.b64decode(body["content"]) == raw
+    assert body["bytes"] == len(raw)
+    assert body["truncated"] is False
 
 
 @pytest.mark.asyncio
