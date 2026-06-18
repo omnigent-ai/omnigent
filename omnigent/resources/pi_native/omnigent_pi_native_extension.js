@@ -242,6 +242,7 @@ module.exports = function (pi) {
   let sequence = 0;
   let turnOrdinal = 0;
   let activeResponseId = null;
+  let agentRunning = false;
   let latestContext = null;
   let pendingInterruptUntil = 0;
   const postedToolCalls = new Set();
@@ -288,10 +289,10 @@ module.exports = function (pi) {
     // throw), so an interrupt that arrives with no live turn must NOT arm the
     // replay window — otherwise the 30s window poisons the next legitimately
     // started turn (F18). Only arm when a turn is genuinely in-flight: prefer
-    // the SDK's isIdle(), and fall back to activeResponseId (null between/before
-    // turns) on SDK versions that don't expose it.
+    // the SDK's isIdle(), and fall back to the agent loop state on SDK versions
+    // that don't expose it.
     const idle = safeIsIdle(ctx);
-    const turnIsIdle = idle === null ? !activeResponseId : idle;
+    const turnIsIdle = idle === null ? !agentRunning : idle;
     if (turnIsIdle) return false;
     const accepted = interruptActiveContext(ctx);
     if (!accepted) return false;
@@ -420,10 +421,11 @@ module.exports = function (pi) {
     rememberContext(ctx);
     // A brand-new agent loop must never inherit a replay window armed before it
     // began (e.g. a spuriously-armed window from an interrupt that landed while
-    // idle). A legitimate mid-turn interrupt arms AFTER this point (in
-    // turn_start onward) within the same loop, so clearing here does not regress
-    // it; agent_end also clears once the loop completes. See F18.
+    // idle). A legitimate interrupt that arrives after this point belongs to
+    // this loop and can still arm/replay; agent_end clears once the loop
+    // completes. See F18.
     clearPendingInterrupt();
+    agentRunning = true;
     setOmnigentStatus(config, ctx, "running");
     activeResponseId = null;
     turnOrdinal = 0;
@@ -443,6 +445,7 @@ module.exports = function (pi) {
   pi.on("agent_end", async (_event, ctx) => {
     rememberContext(ctx);
     clearPendingInterrupt();
+    agentRunning = false;
     setOmnigentStatus(config, ctx, "idle");
     activeResponseId = null;
     await postEvent(config, {

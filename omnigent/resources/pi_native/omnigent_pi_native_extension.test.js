@@ -190,8 +190,37 @@ async function testMidTurnInterruptStillAborts() {
   );
 }
 
+async function testAgentLoopInterruptFallbackNoIsIdleBeforeTurnStart() {
+  // No isIdle(), and an interrupt lands after agent_start but before
+  // turn_start. Older SDKs without isIdle() still need to treat this as part of
+  // the live agent loop, not as an idle interrupt to drop.
+  const h = makeHarness();
+  const turnCtx = makeCtx({}); // no isIdle method
+  await h.handlers.session_start({}, turnCtx); // starts the inbox poller
+  await h.handlers.agent_start({}, turnCtx);
+
+  await deliverInterrupt(h);
+
+  assert(
+    "agent-loop interrupt aborts before turn_start (active loop fallback)",
+    turnCtx.abortCount >= 1,
+    `abortCount=${turnCtx.abortCount}`,
+  );
+
+  await h.handlers.turn_start({ turnIndex: 1 }, turnCtx);
+  const toolResult = await h.handlers.tool_call(
+    { toolCallId: "t1", toolName: "do_thing", input: {} },
+    turnCtx,
+  );
+  assert(
+    "agent-loop interrupt before turn_start replays to block tool_call",
+    !!toolResult && toolResult.block === true,
+    JSON.stringify(toolResult),
+  );
+}
+
 async function testMidTurnInterruptFallbackNoIsIdle() {
-  // No isIdle() but a turn is active (activeResponseId set) -> must still arm.
+  // No isIdle() but an agent loop is active -> must still arm.
   const h = makeHarness();
   const turnCtx = makeCtx({}); // no isIdle method
   await h.handlers.session_start({}, turnCtx); // starts the inbox poller
@@ -248,6 +277,7 @@ async function testAgentStartClearsStaleWindow() {
     await testIdleInterruptDoesNotPoisonNextTurn();
     await testIdleInterruptFallbackNoIsIdle();
     await testMidTurnInterruptStillAborts();
+    await testAgentLoopInterruptFallbackNoIsIdleBeforeTurnStart();
     await testMidTurnInterruptFallbackNoIsIdle();
     await testAgentStartClearsStaleWindow();
   } finally {
