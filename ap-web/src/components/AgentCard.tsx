@@ -14,8 +14,8 @@ import { AgentHoverCard } from "@/components/AgentHoverCard";
  *
  * Named agents win first (nessie runs on the claude-sdk harness, so a
  * harness check would mislabel it with the Claude glyph), then harness/kind
- * so any Claude-, Codex-, or pi-backed agent gets the right glyph regardless
- * of its registered name, then a generic bot.
+ * so any Claude-, Codex-, pi-, or qwen-backed agent gets the right glyph
+ * regardless of its registered name, then a generic bot.
  *
  * @param agent - The catalog entry to render.
  * @returns The icon component to render for the agent.
@@ -29,6 +29,7 @@ function iconForAgent(agent: AvailableAgent): ComponentType<SVGProps<SVGSVGEleme
   // A null harness (spec couldn't load) flows through to the bot fallback.
   if (agent.harness?.includes("codex")) return CodexIcon;
   if (agent.harness?.includes("claude")) return ClaudeIcon;
+  if (agent.harness?.includes("qwen")) return BotIcon; // Qwen falls back to generic bot
   // Exact match — a substring check would false-match e.g. "openapi".
   if (agent.harness === "pi") return PiIcon;
   return BotIcon;
@@ -39,10 +40,9 @@ function iconForAgent(agent: AvailableAgent): ComponentType<SVGProps<SVGSVGEleme
  *
  * Shared by the new-session picker (NewChatDialog) and the "Add agent"
  * picker (AddAgentDialog) so both render the agent catalog identically.
- * Claude and Codex agents reuse their own glyphs, matched by harness/kind
- * so a custom-registered Codex reviewer (not named "codex-native-ui")
- * still gets the Codex glyph; nessie matches by name. Everything else
- * falls back to a generic bot icon.
+ * Claude, Codex, pi, and qwen agents reuse their own glyphs, matched by
+ * harness/kind so a custom-registered qwen reviewer still gets the bot icon;
+ * nessie matches by name. Everything else falls back to a generic bot icon.
  *
  * @param agent - The catalog entry to render.
  * @param selected - Whether this card is the current selection.
