@@ -267,6 +267,8 @@ _LOCAL_DAEMON_ENV_PREFIXES: tuple[str, ...] = (
     "ANTHROPIC_DEFAULT_",
     "AZURE_OPENAI_",
     "DATABRICKS_",
+    "MLFLOW_",
+    "OTEL_",
     "OMNIGENT_",
     "OPENAI_",
 )
@@ -1158,6 +1160,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "claude",
         "codex",
         "config",
+        "cursor",
         "debby",
         "debug",
         "host",
@@ -3917,6 +3920,18 @@ _RESUME_PICKER_SENTINEL = "__resume_picker__"
         f"{_CLAUDE_STARTUP_PROFILE_ENV_VAR}=1."
     ),
 )
+@click.option(
+    "--command",
+    "claude_command",
+    default=None,
+    metavar="CMD",
+    help=(
+        "Claude Code CLI executable to run. "
+        "Defaults to ``claude``. Use this when a wrapper binary replaces the "
+        "``claude`` CLI while preserving its interface (e.g. a custom launcher "
+        "that injects auth or environment before delegating to ``claude``)."
+    ),
+)
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
 def claude(
     server: str | None,
@@ -3925,6 +3940,7 @@ def claude(
     register_host: bool,
     use_claude_config: bool,
     profile_startup: bool,
+    claude_command: str | None,
     claude_args: tuple[str, ...],
 ) -> None:
     # Param docs live in comments — Click uses the docstring for --help.
@@ -3997,6 +4013,7 @@ def claude(
         use_claude_config=use_claude_config,
         auto_open_conversation=auto_open_conversation,
         startup_profiler=startup_profiler,
+        **({"command": claude_command} if claude_command else {}),
     )
 
 
@@ -4199,6 +4216,86 @@ def pi(
     )
 
 
+@cli.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+@click.option(
+    "--server",
+    default=None,
+    help=(
+        "Remote omnigent URL. Ensures the host daemon, asks the "
+        "daemon-spawned runner to launch the Cursor TUI, and attaches this TTY. "
+        'Pass --server "" to auto-spawn a persistent local server in the '
+        "background and use that instead of a remote one."
+    ),
+)
+@click.option(
+    "-r",
+    "--resume",
+    "resume",
+    is_flag=False,
+    flag_value=_RESUME_PICKER_SENTINEL,
+    default=None,
+    help=(
+        "Resume a prior Omnigent conversation. With a conversation id "
+        "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
+        "opens an interactive picker scoped to cursor-native sessions."
+    ),
+)
+@click.option(
+    "--session",
+    "session_id",
+    metavar="SESSION_ID",
+    default=None,
+    hidden=True,
+    help="Deprecated alias for ``--resume <id>``; kept for one release.",
+)
+@click.argument("cursor_args", nargs=-1, type=click.UNPROCESSED)
+def cursor(
+    server: str | None,
+    resume: str | None,
+    session_id: str | None,
+    cursor_args: tuple[str, ...],
+) -> None:
+    """Launch the Cursor TUI in an Omnigent terminal.
+
+    \b
+    Examples:
+      omnigent cursor
+      omnigent cursor --resume conv_abc123
+      omnigent cursor --resume                 # interactive picker
+    """
+    choice = _split_resume_value(resume)
+    if session_id is not None and (choice.picker or choice.conversation_id is not None):
+        raise click.UsageError(
+            "--session and --resume are mutually exclusive; "
+            "prefer --resume (--session is deprecated).",
+        )
+
+    from omnigent.cursor_native import run_cursor_native
+
+    cfg = _load_effective_config()
+    if server is None:
+        server = cfg.get("server")
+    auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
+
+    server = _ensure_backend(server)
+    resolved_session_id = (
+        choice.conversation_id if choice.conversation_id is not None else session_id
+    )
+
+    run_cursor_native(
+        server=server,
+        session_id=resolved_session_id,
+        resume_picker=choice.picker,
+        cursor_args=cursor_args,
+        auto_open_conversation=auto_open_conversation,
+    )
+
+
 def _run_bundled_agent(name: str, run_args: tuple[str, ...]) -> None:
     """Forward a bundled-agent subcommand to ``run`` on its packaged path.
 
@@ -4337,7 +4434,7 @@ def resume(
 _HARNESS_CHOICES_HELP = (
     "'claude' (alias for 'claude-sdk'), 'claude-sdk', 'codex', "
     "'cursor', "
-    "'openai-agents', 'open-responses', or 'pi'"
+    "'openai-agents', 'open-responses', 'pi', or 'antigravity'"
 )
 _HARNESS_HELP = f"Harness to use for a local agent: {_HARNESS_CHOICES_HELP}."
 _RUN_HARNESS_HELP = (
@@ -8103,7 +8200,12 @@ def _set_cursor_api_key() -> str | None:
     )
     from omnigent.onboarding.interactive import prompt_text
 
-    detected = os.environ.get("CURSOR_API_KEY")
+    # Strip surrounding whitespace before validating/forwarding so a key
+    # exported with a trailing newline (a common ``export $(…)`` mishap)
+    # validates and resolves cleanly — matching the pasted-key branch's
+    # ``.strip()`` below and the strip in ``resolve_secret``'s ``env:`` branch.
+    raw_detected = os.environ.get("CURSOR_API_KEY")
+    detected = raw_detected.strip() if raw_detected else None
     if detected and click.confirm(
         "Detected CURSOR_API_KEY in the environment — use it?", default=True
     ):

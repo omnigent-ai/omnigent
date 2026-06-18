@@ -46,8 +46,9 @@ import contextlib
 import json
 import logging
 import os
+import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypeAlias
 
@@ -66,6 +67,7 @@ from .executor import (
     ToolCallRequest,
     ToolCallStatus,
     ToolSpec,
+    TurnCancelled,
     TurnComplete,
     classify_tool_result,
 )
@@ -332,16 +334,28 @@ def _tool_error_payload(text: str) -> dict[str, Any]:  # type: ignore[explicit-a
 def _encode_tool_result(result: Any) -> Any:  # type: ignore[explicit-any]
     """Encode a bridged-tool result for the SDK custom-tool return.
 
-    A dict carrying a truthy ``error`` or ``blocked`` is a dispatch failure or a
-    policy block (the shapes ``_bridge_one_dispatch`` / the policy layer return):
-    surface it as an ``isError`` payload so the model sees a failure — parity with
-    the claude-sdk handler, which the cursor harness otherwise diverged from by
-    delivering errors as ordinary, apparently-successful results. Everything else
-    returns its text: a ``str`` passthrough (the SDK wraps it as success), else
-    JSON.
+    A result that :func:`classify_tool_result` flags as anything other than
+    SUCCESS — a dispatch failure (``error``), a policy block (``blocked``), a
+    cancellation (``cancelled``), or any of those nested inside a
+    ``content`` / ``result`` / ``output`` / ``text`` envelope (or under a list
+    element) — is surfaced as an ``isError`` payload so the model sees a
+    failure. This pins the encoded result to the same ``classify_tool_result``
+    verdict the executor already reports for the observed ``ToolCallComplete``
+    event (see ``_sdk_message_to_events``), rather than the top-level-only
+    ``error`` / ``blocked`` check this used to share with the claude-sdk
+    handler. (The claude-sdk handler still uses that narrower top-level check,
+    so this is *not* parity with it.) Everything else returns its text: a
+    ``str`` passthrough (the SDK wraps it as success), else JSON.
+
+    Trade-off: because ``classify_tool_result`` maps ``{"cancelled": True}`` to
+    CANCELLED (not SUCCESS), a benign cancellation result — e.g. a successful
+    ``sys_cancel_async`` returning ``{"cancelled": True, ...}`` — is encoded as
+    ``isError``. This is intentional: a non-SUCCESS verdict is treated as a
+    failure here regardless of how benign the cancellation is.
     """
-    if isinstance(result, dict) and (result.get("error") or result.get("blocked")):
-        return _tool_error_payload(json.dumps(result, default=str))
+    if classify_tool_result(result).status != ToolCallStatus.SUCCESS:
+        encoded = result if isinstance(result, str) else json.dumps(result, default=str)
+        return _tool_error_payload(encoded)
     if isinstance(result, str):
         return result
     try:
@@ -355,6 +369,63 @@ def _encode_tool_result(result: Any) -> Any:  # type: ignore[explicit-any]
 # ---------------------------------------------------------------------------
 
 
+def _get_conversation_id() -> str | None:
+    """Extract the ``--conversation-id`` value from the CLI args.
+
+    The harness subprocess is launched by :mod:`process_manager` with
+    ``--conversation-id conv_<hex>`` on the command line. This is the
+    canonical server-side conversation ID (with ``conv_`` prefix) that
+    the policy evaluation endpoint expects.
+    """
+    argv = sys.argv
+    for i, arg in enumerate(argv):
+        if arg == "--conversation-id" and i + 1 < len(argv):
+            return argv[i + 1]
+    return None
+
+
+def _write_cursor_hooks(cwd: str, hook_script_path: str, server_url: str, session_id: str) -> Path:
+    """Write ``.cursor/hooks.json`` and a wrapper shell script for preToolUse policy enforcement.
+
+    The Cursor SDK hook executor runs the command directly (not via a shell),
+    so inline ``env VAR=val`` doesn't work.  Instead we write a tiny shell
+    wrapper that exports the env vars and execs the Python hook script.
+
+    :param cwd: Workspace root directory.
+    :param hook_script_path: Absolute path to ``cursor_policy_hook.py``.
+    :param server_url: Omnigent server URL, e.g. ``"http://127.0.0.1:6767"``.
+    :param session_id: Conversation / session ID for policy evaluation.
+    :returns: The path to the written ``hooks.json`` file.
+    """
+    hooks_dir = Path(cwd) / ".cursor"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    hooks_file = hooks_dir / "hooks.json"
+
+    # Write a wrapper script that sets env vars and execs the hook.
+    wrapper = hooks_dir / "omnigent-hook.sh"
+    wrapper.write_text(
+        f"#!/bin/sh\n"
+        f"export _OMNIGENT_SERVER_URL='{server_url}'\n"
+        f"export _OMNIGENT_SESSION_ID='{session_id}'\n"
+        f"exec '{sys.executable}' '{hook_script_path}'\n"
+    )
+    wrapper.chmod(0o755)
+    command = str(wrapper)
+    config = {
+        "version": 1,
+        "hooks": {
+            "preToolUse": [
+                {
+                    "command": command,
+                    "timeout": 30,
+                }
+            ]
+        },
+    }
+    hooks_file.write_text(json.dumps(config, indent=2))
+    return hooks_file
+
+
 @dataclass
 class _CursorSessionState:
     """Per-Omnigent-conversation SDK session state."""
@@ -365,6 +436,7 @@ class _CursorSessionState:
     model: str | None = None
     tools_fingerprint: str | None = None
     has_sent_prompt: bool = False
+    hooks_file: Path | None = field(default=None, repr=False)
 
 
 class CursorExecutor(Executor):
@@ -562,13 +634,22 @@ class CursorExecutor(Executor):
     # -- session lifecycle --------------------------------------------------
 
     async def _ensure_session(
-        self, state: _CursorSessionState, model: str, tools: list[ToolSpec]
+        self,
+        state: _CursorSessionState,
+        model: str,
+        tools: list[ToolSpec],
     ) -> None:
         """Launch the local bridge and create the SDK agent if not already live.
 
         On any bring-up failure the partially-created client is closed before
         propagating, so a bad ``CURSOR_API_KEY`` / launch error can't orphan a
         bridge subprocess.
+
+        Before agent creation, writes ``.cursor/hooks.json`` to the workspace
+        with a ``preToolUse`` hook pointing at :mod:`cursor_policy_hook` so
+        PHASE_TOOL_CALL policies are enforced on ALL Cursor native tools --
+        including those that execute silently without emitting ``tool_call``
+        SDK messages.
         """
         if state.agent is not None:
             return
@@ -581,13 +662,30 @@ class CursorExecutor(Executor):
             ) from exc
 
         loop = asyncio.get_running_loop()
-        cwd = self._cwd or os.getcwd()
+        cwd = os.path.abspath(self._cwd or os.getcwd())
+
+        # Write .cursor/hooks.json for preToolUse policy enforcement.
+        # RUNNER_SERVER_URL is inherited by the harness subprocess via
+        # _build_harness_spawn_env (process_manager.py).
+        # The conversation_id comes from the --conversation-id CLI arg
+        # passed by the process_manager — NOT from the executor's
+        # session_key (which is an internal UUID without the conv_ prefix).
+        server_url = os.environ.get("RUNNER_SERVER_URL", "")
+        conv_id = _get_conversation_id()
+        if server_url and conv_id:
+            hook_script = str(Path(__file__).with_name("cursor_policy_hook.py"))
+            state.hooks_file = _write_cursor_hooks(cwd, hook_script, server_url, conv_id)
+
         client = await AsyncClient.launch_bridge(workspace=cwd)
         try:
-            local = LocalAgentOptions(
-                cwd=cwd,
-                custom_tools=self._make_custom_tools(tools, loop) or None,
-            )
+            local_kwargs: dict[str, Any] = {
+                "cwd": cwd,
+                "custom_tools": self._make_custom_tools(tools, loop) or None,
+            }
+            # Tell the SDK to read project-level settings (including hooks.json).
+            if state.hooks_file is not None:
+                local_kwargs["setting_sources"] = ["project"]
+            local = LocalAgentOptions(**local_kwargs)
             agent = await AsyncAgent.create(
                 client=client,
                 model=model,
@@ -739,11 +837,32 @@ class CursorExecutor(Executor):
             yield ExecutorError(message=f"cursor-sdk turn failed: {exc}", retryable=True)
             return
 
+        # RunResult.status is Literal["finished", "error", "cancelled",
+        # "expired"]. Only "finished" should commit a TurnComplete; the other
+        # terminal statuses are surfaced as errors/cancellation and tear the
+        # session down (the agent/bridge may be in an inconsistent state).
         status = getattr(result, "status", "")
         if status == "error":
             await self.close_session(session_key)
             detail = getattr(result, "result", "") or "cursor-sdk run reported an error"
             yield ExecutorError(message=f"cursor-sdk run error: {detail}", retryable=True)
+            return
+        if status == "expired":
+            await self.close_session(session_key)
+            detail = getattr(result, "result", "") or "cursor-sdk run expired"
+            yield ExecutorError(message=f"cursor-sdk run expired: {detail}", retryable=True)
+            return
+        if status == "cancelled":
+            await self.close_session(session_key)
+            yield TurnCancelled(reason="cursor-sdk run cancelled")
+            return
+        if status != "finished":
+            await self.close_session(session_key)
+            detail = getattr(result, "result", "") or "cursor-sdk run finished with unknown status"
+            yield ExecutorError(
+                message=f"cursor-sdk run returned non-finished status {status!r}: {detail}",
+                retryable=True,
+            )
             return
 
         # Prefer the streamed text we accumulated (which carries the paragraph
@@ -778,6 +897,16 @@ class CursorExecutor(Executor):
         if state.client is not None:
             await _safe_close(state.client)
             state.client = None
+        # Best-effort cleanup of hooks.json and the wrapper script.
+        if state.hooks_file is not None:
+            try:
+                state.hooks_file.unlink(missing_ok=True)
+                # Also remove the wrapper shell script alongside hooks.json.
+                wrapper = state.hooks_file.parent / "omnigent-hook.sh"
+                wrapper.unlink(missing_ok=True)
+            except OSError:
+                pass
+            state.hooks_file = None
 
     async def close_session(self, session_key: str) -> None:
         state = self._session_states.pop(session_key, None)

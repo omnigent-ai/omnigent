@@ -13,9 +13,13 @@ from __future__ import annotations
 
 import importlib
 import sys
+from pathlib import Path
 from typing import NoReturn
 
 import pytest
+
+from omnigent.stores.artifact_store.local import LocalArtifactStore
+from omnigent.stores.artifact_store.s3 import S3ArtifactStore
 
 _ENTRYPOINT_MODULE = "deploy.docker.entrypoint"
 _BOOT_MODULES = (
@@ -79,3 +83,73 @@ def test_entrypoint_imports_without_side_effects(
     # build_app()/main() rather than being imported or executed at module import.
     for module_name in _BOOT_MODULES:
         assert module_name not in sys.modules
+
+
+# ── artifact-store resolution + selection ────────────────────────────────
+# OMNIGENT_ARTIFACT_URI=s3://… selects the remote S3ArtifactStore (durable on an
+# ephemeral/multi-replica deploy); anything else falls back to local. The URI is
+# validated up front (must be s3://), mirroring how DATABASE_URL picks the DB.
+
+
+@pytest.fixture
+def _entrypoint_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Minimal env for ``_resolve_config``: a DB URL and a tmp artifact dir,
+    auth disabled so it doesn't mint accounts secrets, and no ambient
+    artifact-store URI (each test sets it as needed)."""
+    # Point config at an empty file so the resolver doesn't read the developer's
+    # ambient ~/.omnigent/config.yaml (keeps the test hermetic; CI has none).
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("{}\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config_file))
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/omnigent")
+    monkeypatch.setenv("ARTIFACT_DIR", str(tmp_path / "artifacts"))
+    monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
+    monkeypatch.delenv("OMNIGENT_ARTIFACT_URI", raising=False)
+
+
+def test_resolve_config_captures_s3_artifact_uri(
+    _entrypoint_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from deploy.docker.entrypoint import _resolve_config
+
+    monkeypatch.setenv("OMNIGENT_ARTIFACT_URI", "s3://my-bucket/artifacts")
+    assert _resolve_config().artifact_store_uri == "s3://my-bucket/artifacts"
+
+
+def test_resolve_config_defaults_to_no_remote_store(_entrypoint_env: None) -> None:
+    from deploy.docker.entrypoint import _resolve_config
+
+    assert _resolve_config().artifact_store_uri is None
+
+
+def test_resolve_config_rejects_non_s3_artifact_uri(
+    _entrypoint_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from deploy.docker.entrypoint import _resolve_config
+
+    monkeypatch.setenv("OMNIGENT_ARTIFACT_URI", "gs://my-bucket")
+    with pytest.raises(RuntimeError, match="s3://"):
+        _resolve_config()
+
+
+@pytest.mark.parametrize(
+    ("artifact_store_uri", "expected_type"),
+    [
+        ("s3://my-bucket/artifacts", S3ArtifactStore),
+        (None, LocalArtifactStore),
+    ],
+)
+def test_select_artifact_store(
+    tmp_path: Path, artifact_store_uri: str | None, expected_type: type
+) -> None:
+    from deploy.docker.entrypoint import _ResolvedConfig, _select_artifact_store
+
+    resolved = _ResolvedConfig(
+        cfg={},
+        database_url="postgresql://u:p@localhost/omnigent",
+        artifact_dir=tmp_path,
+        artifact_store_uri=artifact_store_uri,
+        host="0.0.0.0",
+        port=8000,
+    )
+    assert isinstance(_select_artifact_store(resolved), expected_type)
