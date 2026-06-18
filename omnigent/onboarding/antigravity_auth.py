@@ -106,9 +106,7 @@ ANTIGRAVITY_ENV_VARS: tuple[str, ...] = ("GEMINI_API_KEY", "ANTIGRAVITY_API_KEY"
 ANTIGRAVITY_API_KEY_PREFIXES = ("AIza", "AQ")
 
 # Human-readable form of the accepted prefixes, e.g. ``'AIza' or 'AQ'``.
-ANTIGRAVITY_API_KEY_PREFIX_HINT = " or ".join(
-    f"'{p}'" for p in ANTIGRAVITY_API_KEY_PREFIXES
-)
+ANTIGRAVITY_API_KEY_PREFIX_HINT = " or ".join(f"'{p}'" for p in ANTIGRAVITY_API_KEY_PREFIXES)
 
 
 def looks_like_gemini_api_key(value: str) -> bool:
