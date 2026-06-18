@@ -119,6 +119,7 @@ describe("useAvailableAgents", () => {
         description: null,
         harness: "codex-native",
         skills: [],
+        default_workspace: null,
       },
     ]);
     const urls = fetchMock.mock.calls.map((c) => c[0] as string);
@@ -179,6 +180,9 @@ describe("useAvailableAgents", () => {
             name: "databricks_coding_agent",
             description: "A coding agent",
             harness: "codex",
+            // os_env.cwd pass-through (#509): the new-session picker
+            // defaults the workspace field to this value.
+            default_workspace: "/opt/custom",
           },
         ],
         has_more: false,
@@ -207,6 +211,7 @@ describe("useAvailableAgents", () => {
         description: null,
         harness: "claude-native",
         skills: [],
+        default_workspace: null,
       },
       {
         id: "ag_pi_native",
@@ -215,6 +220,7 @@ describe("useAvailableAgents", () => {
         description: null,
         harness: "pi-native",
         skills: [],
+        default_workspace: null,
       },
       {
         id: "ag_kiro_native",
@@ -223,6 +229,7 @@ describe("useAvailableAgents", () => {
         description: null,
         harness: "kiro-native",
         skills: [],
+        default_workspace: null,
       },
       {
         id: "ag_agy_native",
@@ -231,6 +238,7 @@ describe("useAvailableAgents", () => {
         description: null,
         harness: "antigravity-native",
         skills: [],
+        default_workspace: null,
       },
       {
         id: "ag_opencode_native",
@@ -239,6 +247,7 @@ describe("useAvailableAgents", () => {
         description: null,
         harness: "opencode-native",
         skills: [],
+        default_workspace: null,
       },
       {
         id: "ag_nessie",
@@ -247,6 +256,7 @@ describe("useAvailableAgents", () => {
         description: "Multi-agent coding orchestrator.",
         harness: "nessie",
         skills: [{ name: "review-pr", description: "Review a pull request" }],
+        default_workspace: null,
       },
       {
         id: "ag_debby",
@@ -255,6 +265,7 @@ describe("useAvailableAgents", () => {
         description: "A two-headed brainstorming partner.",
         harness: "claude-sdk",
         skills: [],
+        default_workspace: null,
       },
       {
         id: "ag_yaml",
@@ -263,6 +274,7 @@ describe("useAvailableAgents", () => {
         description: "A coding agent",
         harness: "codex",
         skills: [],
+        default_workspace: "/opt/custom",
       },
     ]);
   });
@@ -379,6 +391,7 @@ describe("useAvailableAgents", () => {
         description: null,
         harness: "claude-native",
         skills: [],
+        default_workspace: null,
       },
       {
         id: "ag_doc",
@@ -448,6 +461,7 @@ describe("useAvailableAgents", () => {
         description: null,
         harness: "codex-native",
         skills: [],
+        default_workspace: null,
       },
       {
         id: "ag_claude",
@@ -456,6 +470,7 @@ describe("useAvailableAgents", () => {
         description: null,
         harness: "claude-native",
         skills: [],
+        default_workspace: null,
       },
       {
         id: "ag_kiro",
@@ -464,6 +479,7 @@ describe("useAvailableAgents", () => {
         description: null,
         harness: "kiro-native",
         skills: [],
+        default_workspace: null,
       },
       {
         id: "ag_session_kiro",
@@ -739,6 +755,7 @@ describe("prefetchAvailableAgentDetails", () => {
         harness: "claude-sdk",
         sessionId: "conv_3",
         skills: [{ name: "humanizer", description: "Remove AI writing patterns" }],
+        default_workspace: null,
       },
     ]);
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/conv_3/agent");

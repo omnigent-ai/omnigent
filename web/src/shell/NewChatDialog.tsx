@@ -2509,6 +2509,13 @@ export function NewChatLandingScreen() {
     generateBranchName,
   ]);
 
+  // Tracks whether the user has manually picked a working directory from the
+  // file browser. Once set, the agent-cwd default below stops firing so a
+  // manual pick is never clobbered — not by switching agents, and not by a
+  // host switch that re-seeds the field. The intent the user expressed with
+  // that pick is respected for the life of the composer (#509).
+  const workspaceTouchedRef = useRef(false);
+
   // A pick only wins while it exists in the list — a persisted id whose
   // agent has since been unregistered (or hidden) falls back to the default.
   // The pending custom agent sentinel also wins when set.
@@ -2536,6 +2543,20 @@ export function NewChatLandingScreen() {
         : agentList.find((a) => a.id === effectiveAgentId),
     [agentList, effectiveAgentId, pendingAgent],
   );
+  // The selected agent's configured working directory (spec.os_env.cwd), if
+  // any. Defaulting the workspace field to it (below) saves the user from
+  // having to already know the agent's required path (#509). Agents without
+  // an os_env.cwd (and older servers that don't expose the field) report
+  // null, leaving the host-seeded value in place.
+  const defaultWorkspace = selectedAgent?.default_workspace ?? null;
+  useEffect(() => {
+    if (workspaceTouchedRef.current) return;
+    // Only an absolute path is acceptable to the backend, so a relative
+    // cwd (e.g. ".") is ignored — the host-seeded value stays.
+    if (defaultWorkspace && isValidWorkspace(defaultWorkspace)) {
+      setWorkspace(defaultWorkspace);
+    }
+  }, [defaultWorkspace]);
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
@@ -4501,7 +4522,13 @@ export function NewChatLandingScreen() {
                         initialPath={
                           isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined
                         }
-                        onNavigate={setWorkspace}
+                        onNavigate={(path) => {
+                          // The user manually chose a directory — pin the
+                          // field so a later agent switch's cwd default
+                          // doesn't clobber it (#509).
+                          workspaceTouchedRef.current = true;
+                          setWorkspace(path);
+                        }}
                         // Warn when browsing into a directory other live agents
                         // occupy. Suppressed only when a NEW isolated worktree
                         // will be created (no shared-dir conflict then). When

@@ -43,6 +43,13 @@ export interface AvailableAgent {
   // session-discovered agents (custom uploads); absent on catalog agents
   // whose full data is already present from GET /v1/agents.
   sessionId?: string;
+  // The agent's default working directory from spec.os_env.cwd, or
+  // null when the agent declares none. The new-session picker defaults
+  // the workspace field to this when the agent is selected (without
+  // clobbering a user-edited value), so a user need not already know
+  // the agent's required path (#509). Absent on older servers —
+  // treated as null so the host-seeded value is left in place.
+  default_workspace?: string | null;
 }
 
 const DISPLAY_NAMES: Record<string, string> = {
@@ -95,6 +102,7 @@ interface BuiltinAgentWire {
   // older servers, where every catalog row degrades to a protected entry.
   builtin?: boolean;
   created_at?: number | null;
+  default_workspace?: string | null;
 }
 
 interface BuiltinAgentsListWire {
@@ -139,6 +147,7 @@ async function fetchBuiltinAgents(): Promise<AvailableAgent[]> {
     description: a.description ?? null,
     harness: a.harness ?? null,
     skills: a.skills ?? [],
+    default_workspace: a.default_workspace ?? null,
     // Omit rather than set to undefined so toEqual comparisons aren't
     // sensitive to absent-vs-undefined. Logic that reads builtin treats
     // undefined as "protected" (same as true), so omission is safe.
@@ -198,6 +207,7 @@ interface AgentObjectWire {
   description?: string | null;
   harness?: string | null;
   skills?: { name: string; description: string }[];
+  default_workspace?: string | null;
 }
 
 /**
@@ -247,6 +257,7 @@ export async function prefetchAvailableAgentDetails(
               description: json.description ?? null,
               harness: json.harness ?? null,
               skills: json.skills ?? [],
+              default_workspace: json.default_workspace ?? null,
             },
       );
       // If enrichment reveals this agent is a native coding agent (e.g. a
