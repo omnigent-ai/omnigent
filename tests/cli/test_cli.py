@@ -606,6 +606,143 @@ def test_first_run_plan_and_polly_command_agree_on_bundled_path(
     assert plan.agent == _bundled_example_path("polly")
 
 
+def _write_isolated_provider_config(
+    config_home: Path,
+    providers: dict[str, object],
+) -> Path:
+    """Write an isolated ``~/.omnigent/config.yaml`` with *providers*.
+
+    :param config_home: Directory to use as ``$OMNIGENT_CONFIG_HOME``.
+    :param providers: The raw ``providers:`` mapping to write.
+    :returns: The written config file path.
+    """
+    config_home.mkdir(parents=True, exist_ok=True)
+    config_path = config_home / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"providers": providers}))
+    return config_path
+
+
+@pytest.mark.parametrize("shorthand", ["polly", "debby"])
+def test_bundled_agent_launches_with_first_available_credential(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    shorthand: str,
+) -> None:
+    """Polly/Debby launch with the first available credential (#334).
+
+    With a Claude (``anthropic``) credential configured but NOT marked
+    ``default: true``, the shorthand must mark it the default for the
+    brain's family and proceed to launch — rather than requiring the user
+    to pick/configure a specific default up front. Both shorthands share
+    the ``_run_bundled_agent`` path and the ``claude-sdk`` brain, so the
+    fallback fires identically for each.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    # No ambient credentials — the explicit provider below is the only one.
+    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    _write_isolated_provider_config(
+        tmp_path,
+        {
+            "anthropic_key": {
+                "kind": "key",
+                "anthropic": {
+                    "base_url": "https://api.anthropic.invalid/v1",
+                    "api_key_ref": "env:ANTHROPIC_KEY",
+                },
+            }
+        },
+    )
+    dispatch = Mock()
+    monkeypatch.setattr("omnigent.cli._dispatch_run", dispatch)
+
+    result = CliRunner().invoke(cli, [shorthand])
+
+    assert result.exit_code == 0, result.output
+    # The first available credential was promoted to the anthropic default.
+    saved = yaml.safe_load((tmp_path / "config.yaml").read_text())
+    provider = saved["providers"]["anthropic_key"]
+    assert provider.get("default") in (True, ["anthropic"], "anthropic")
+    # And the launch proceeded (the brain credential resolved).
+    dispatch.assert_called_once()
+    assert dispatch.call_args.kwargs["target"] == _bundled_example_path(shorthand)
+
+
+def test_bundled_agent_leaves_existing_default_credential_alone(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An existing explicit default is not re-written on bundled launch (#334).
+
+    When a ``default: true`` credential is already configured for the
+    brain's family, the shorthand must NOT touch the config — the fallback
+    only fires when no default exists.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    config_path = _write_isolated_provider_config(
+        tmp_path,
+        {
+            "anthropic_key": {
+                "kind": "key",
+                "default": True,
+                "anthropic": {
+                    "base_url": "https://api.anthropic.invalid/v1",
+                    "api_key_ref": "env:ANTHROPIC_KEY",
+                },
+            }
+        },
+    )
+    before = config_path.read_text()
+    dispatch = Mock()
+    monkeypatch.setattr("omnigent.cli._dispatch_run", dispatch)
+
+    result = CliRunner().invoke(cli, ["polly"])
+
+    assert result.exit_code == 0, result.output
+    assert config_path.read_text() == before  # unchanged — default already set
+    dispatch.assert_called_once()
+
+
+def test_bundled_agent_no_credential_does_not_write_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """No available credential → no config write; the launch still dispatches (#334).
+
+    When nothing serves the brain's family, the shorthand must not fabricate
+    a default (the harness raises its own launch error downstream). The
+    config is left untouched and ``run`` is still forwarded so that error
+    surfaces in the normal launch path rather than as a silent no-op.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    # An OpenAI-only credential — the claude-sdk brain needs anthropic.
+    config_path = _write_isolated_provider_config(
+        tmp_path,
+        {
+            "openai_key": {
+                "kind": "key",
+                "openai": {
+                    "base_url": "https://api.openai.invalid/v1",
+                    "api_key_ref": "env:OPENAI_KEY",
+                },
+            }
+        },
+    )
+    before = config_path.read_text()
+    dispatch = Mock()
+    monkeypatch.setattr("omnigent.cli._dispatch_run", dispatch)
+
+    result = CliRunner().invoke(cli, ["polly"])
+
+    assert result.exit_code == 0, result.output
+    assert config_path.read_text() == before  # no default fabricated
+    dispatch.assert_called_once()
+
+
 def test_start_cli_runner_process_uses_token_bound_runner_id(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

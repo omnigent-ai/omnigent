@@ -4199,6 +4199,98 @@ def pi(
     )
 
 
+def _bundled_agent_brain_harness(name: str) -> str | None:
+    """Return the canonical brain harness of a bundled agent, or ``None``.
+
+    Reads the brain harness (``executor.config.harness``, falling back to
+    ``executor.harness`` / ``executor.type``) from the bundled agent's
+    ``config.yaml`` — e.g. polly's and debby's ``claude-sdk`` brain — so
+    credential fallback can target the model family the brain actually
+    runs on. Mirrors :func:`_peek_default_agent_harness`'s YAML-reading
+    style.
+
+    :param name: Bundled example directory name, e.g. ``"polly"``.
+    :returns: The canonical harness id, e.g. ``"claude-sdk"``, or ``None``
+        when the bundle is missing/unreadable or declares no brain harness.
+    """
+    config_path = Path(_bundled_example_path(name)) / "config.yaml"
+    if not config_path.is_file():
+        return None
+    try:
+        raw = yaml.safe_load(config_path.read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    executor = raw.get("executor")
+    if not isinstance(executor, dict):
+        return None
+    declared: object = None
+    config_block = executor.get("config")
+    if isinstance(config_block, dict):
+        declared = config_block.get("harness")
+    if not isinstance(declared, str) or not declared:
+        declared = executor.get("harness") or executor.get("type")
+    if not isinstance(declared, str) or not declared:
+        return None
+    return canonicalize_harness(declared) or declared
+
+
+def _ensure_bundled_agent_brain_credential(name: str) -> None:
+    """Ensure the bundled agent's brain harness has a credential to launch with.
+
+    Polly and Debby launch with the *first available* credential for their
+    brain's model family rather than requiring a specific one to be marked
+    ``default: true`` up front — so users can start without manually
+    picking/configuring one. When no default provider is configured for the
+    agent's brain harness, pick the first available credential serving that
+    family and mark it the default so the downstream ``run`` resolves it.
+
+    No-op when a default is already configured, or when no credential is
+    available for the family (the harness raises its own launch error then).
+    Only an explicit default (or none) is touched — an existing default is
+    never overridden. Marking the first available credential the default
+    mirrors :func:`_add_provider_entry`'s "a first provider just works"
+    adoption (see :func:`omnigent.setup`).
+
+    :param name: Bundled example directory name, e.g. ``"polly"``.
+    """
+    from omnigent.onboarding.detected import effective_config_with_detected
+    from omnigent.onboarding.provider_config import (
+        default_provider_for_harness,
+        harness_family,
+        load_config,
+        load_providers,
+        provider_families,
+        set_default_provider,
+    )
+
+    brain_harness = _bundled_agent_brain_harness(name)
+    if brain_harness is None:
+        return
+    family = harness_family(brain_harness)
+    if family is None:
+        return
+    config = effective_config_with_detected(load_config())
+    if default_provider_for_harness(config, brain_harness) is not None:
+        return
+    # No default for the brain's family. Fall back to the first available
+    # credential serving it (explicit or ambient-detected), so a launch
+    # works without the user manually picking/configuring one.
+    for entry_name, entry in load_providers(config).items():
+        if family not in provider_families(entry):
+            continue
+        # The merged config may include ambient-detected providers not on
+        # disk; only persist a default for an explicit on-disk entry.
+        # ``effective_config_with_detected`` already marks a detected
+        # provider the default for a family lacking one, so this guard is
+        # belt-and-suspenders against drift in that invariant.
+        block = _load_global_config().get("providers")
+        if isinstance(block, dict) and entry_name in block:
+            _save_global_config({"providers": set_default_provider(block, entry_name, family)})
+        return
+
+
 def _run_bundled_agent(name: str, run_args: tuple[str, ...]) -> None:
     """Forward a bundled-agent subcommand to ``run`` on its packaged path.
 
@@ -4217,6 +4309,9 @@ def _run_bundled_agent(name: str, run_args: tuple[str, ...]) -> None:
     :param run_args: Unparsed pass-through CLI args for ``run``,
         e.g. ``("-p", "review the last commit")``.
     """
+    # Polly/Debby launch with the first available credential for their
+    # brain's family when no specific one is configured up front (#334).
+    _ensure_bundled_agent_brain_credential(name)
     # standalone_mode=False propagates ClickExceptions to main()'s handler
     # (CLI diagnostics logging + setup hint) instead of exiting inline,
     # matching the outer `cli(args=argv, standalone_mode=False)` dispatch.
