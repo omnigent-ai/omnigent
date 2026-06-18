@@ -520,6 +520,7 @@ function setupLandingMocks() {
       display_name: "Claude Code",
       description: null,
       harness: "claude-native",
+      model: null,
       skills: [],
     },
     {
@@ -528,6 +529,7 @@ function setupLandingMocks() {
       display_name: "Codex",
       description: null,
       harness: "codex-native",
+      model: null,
       skills: [],
     },
   ]);
@@ -1078,6 +1080,7 @@ describe("NewChatLandingScreen skills menu", () => {
       display_name: "Skilled Agent",
       description: null,
       harness: "claude-sdk",
+      model: null,
       skills: [
         { name: "review-pr", description: "Review a pull request" },
         { name: "cross-review", description: "Cross-vendor review" },
@@ -1157,6 +1160,7 @@ describe("NewChatLandingScreen skills menu", () => {
         display_name: "Claude Code",
         description: null,
         harness: "claude-native",
+        model: null,
         skills: [{ name: "review-pr", description: "Review a pull request" }],
       },
     ]);
@@ -1184,6 +1188,7 @@ describe("NewChatLandingScreen skill pills", () => {
       display_name: "Debby",
       description: "Multi-agent debate",
       harness: "claude-sdk",
+      model: null,
       skills: [
         { name: "debate", description: "Have both heads argue it out" },
         { name: "compare", description: "Side-by-side answers from both heads" },
@@ -1216,6 +1221,7 @@ describe("NewChatLandingScreen skill pills", () => {
         display_name: "Skilled Agent",
         description: null,
         harness: "claude-sdk",
+        model: null,
         skills: [{ name: "review-pr", description: "Review a pull request" }],
       },
     ]);
@@ -1234,6 +1240,7 @@ describe("NewChatLandingScreen skill pills", () => {
         display_name: "Claude Code",
         description: null,
         harness: "claude-native",
+        model: null,
         skills: [],
       },
       debbyAgent(),

@@ -53,6 +53,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
     skills: list[SkillSummary] = []
     terminals: list[str] = []
     harness: str | None = None
+    model: str | None = None
     # Prefer the stored entity's description; fall back to the spec's
     # top-level description when the stored value is unset (single-file
     # YAML agents don't persist it at registration today). Lets the
@@ -89,6 +90,12 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         # Kind for the Add Agent picker (Codex vs Claude). Stays None
         # when the bundle can't be loaded (the except below).
         harness = loaded.spec.executor.harness_kind
+        # Resolved default model for the Add Agent picker (lets the UI
+        # show + override the agent's model, flowed as model_override on
+        # session create). spec.llm is None only when no model is
+        # declared anywhere; the parser syncs executor.model into it.
+        if loaded.spec.llm is not None:
+            model = loaded.spec.llm.model
     except Exception:  # noqa: BLE001 — spec load failure must not break the list
         _logger.debug(
             "Failed to load spec for agent %s; mcp_servers/skills will be empty",
@@ -103,6 +110,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         created_at=agent.created_at,
         updated_at=agent.updated_at,
         harness=harness,
+        model=model,
         mcp_servers=mcp_servers,
         skills=skills,
         terminals=terminals,

@@ -125,6 +125,7 @@ describe("useAvailableAgents", () => {
             name: "databricks_coding_agent",
             description: "A coding agent",
             harness: "codex",
+            model: "databricks-gpt-5-5",
           },
         ],
         has_more: false,
@@ -152,6 +153,7 @@ describe("useAvailableAgents", () => {
         display_name: "Claude Code",
         description: null,
         harness: "claude-native",
+        model: null,
         skills: [],
       },
       {
@@ -160,6 +162,7 @@ describe("useAvailableAgents", () => {
         display_name: "Pi",
         description: null,
         harness: "pi-native",
+        model: null,
         skills: [],
       },
       {
@@ -168,6 +171,7 @@ describe("useAvailableAgents", () => {
         display_name: "Nessie",
         description: "Multi-agent coding orchestrator.",
         harness: "nessie",
+        model: null,
         skills: [{ name: "review-pr", description: "Review a pull request" }],
       },
       {
@@ -176,6 +180,7 @@ describe("useAvailableAgents", () => {
         display_name: "Debby",
         description: "A two-headed brainstorming partner.",
         harness: "claude-sdk",
+        model: null,
         skills: [],
       },
       {
@@ -184,6 +189,7 @@ describe("useAvailableAgents", () => {
         display_name: "Databricks_coding_agent",
         description: "A coding agent",
         harness: "codex",
+        model: "databricks-gpt-5-5",
         skills: [],
       },
     ]);
@@ -287,6 +293,7 @@ describe("useAvailableAgents", () => {
         name: "doc-writer",
         description: "Documentation specialist",
         harness: "claude-sdk",
+        model: "databricks-gpt-5-4",
         skills: [{ name: "humanizer", description: "Remove AI writing patterns" }],
       }),
       // Reached only if the fork-of-fork leaks (i.e. the fix regressed):
@@ -317,6 +324,7 @@ describe("useAvailableAgents", () => {
         display_name: "Claude Code",
         description: null,
         harness: "claude-native",
+        model: null,
         skills: [],
       },
       {
@@ -325,6 +333,7 @@ describe("useAvailableAgents", () => {
         display_name: "Doc-writer",
         description: "Documentation specialist",
         harness: "claude-sdk",
+        model: "databricks-gpt-5-4",
         skills: [{ name: "humanizer", description: "Remove AI writing patterns" }],
       },
     ]);
@@ -393,6 +402,7 @@ describe("useAvailableAgents", () => {
         display_name: "Elise_working_agent",
         description: "Elise's agent",
         harness: "claude-sdk",
+        model: null,
         skills: [],
       },
       {
@@ -401,6 +411,7 @@ describe("useAvailableAgents", () => {
         display_name: "Doc-writer",
         description: null,
         harness: "codex",
+        model: null,
         skills: [],
       },
     ]);
@@ -448,6 +459,7 @@ describe("useAvailableAgents", () => {
         display_name: "Doc-writer",
         description: null,
         harness: null,
+        model: null,
         skills: [],
       },
     ]);

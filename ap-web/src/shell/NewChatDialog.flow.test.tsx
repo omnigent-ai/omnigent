@@ -80,6 +80,7 @@ function agent(overrides: Partial<AvailableAgent> = {}): AvailableAgent {
     display_name: "Hello World",
     description: null,
     harness: null,
+    model: null,
     skills: [],
     ...overrides,
   };
