@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import enum
-import inspect
+import json
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -297,36 +297,21 @@ async def _drain(
     return events
 
 
-_ANNOTATION_TO_JSON_TYPE: dict[type, str] = {
-    str: "string",
-    int: "integer",
-    float: "number",
-    bool: "boolean",
-    dict: "object",
-    list: "array",
-}
+def _sdk_advertised_schema(sdk_tool: Any) -> dict[str, Any]:
+    """Return the JSON Schema the REAL SDK advertises for *sdk_tool* to the model.
 
+    Pins the actual SDK contract rather than a hand-rolled mirror: feeds the
+    executor's registered tool (a ``ToolWithSchema``) through the same
+    ``callable_to_tool_proto`` the local connection uses to build the model-facing
+    tool proto, and parses the ``parameters_json_schema`` it emits. For a
+    ``ToolWithSchema`` this is ``json.dumps(fn.input_schema)`` verbatim, so the
+    optional/required split, enums, nested objects, and array item types survive
+    intact — exactly what the model sees.
+    """
+    from google.antigravity.connections.local.local_connection import callable_to_tool_proto
 
-def _sdk_parameter_schema_from_callable(fn: Any) -> dict[str, Any]:
-    """Mirror the SDK's inspect.signature-based function-declaration step."""
-    sig = inspect.signature(fn)
-    properties: dict[str, dict[str, str]] = {}
-    required: list[str] = []
-    for pname, param in sig.parameters.items():
-        if param.kind not in (
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            inspect.Parameter.KEYWORD_ONLY,
-        ):
-            continue
-        json_type = _ANNOTATION_TO_JSON_TYPE.get(param.annotation, "string")
-        properties[pname] = {"type": json_type}
-        if param.default is inspect.Parameter.empty:
-            required.append(pname)
-
-    schema: dict[str, Any] = {"type": "object", "properties": properties}
-    if required:
-        schema["required"] = required
-    return schema
+    proto = callable_to_tool_proto(sdk_tool)
+    return json.loads(proto.parameters_json_schema)
 
 
 def _text_step(delta: str) -> _YieldStep:
@@ -756,15 +741,18 @@ async def test_sys_tools_exposed_as_callables_routing_through_executor(
     sdk_tools = captured["configs"][0].tools
     assert sdk_tools is not None and len(sdk_tools) == 1
     sdk_tool = sdk_tools[0]
-    # LocalAgentConfig.tools is list[Callable]; the SDK reads __name__/__doc__.
+    # Each tool is a ToolWithSchema wrapper; the SDK reads __name__/__doc__ off it
+    # and dispatches via __call__(**kwargs) -> fn(**kwargs).
     assert callable(sdk_tool)
     assert sdk_tool.__name__ == "sys_shell"
     assert sdk_tool.__doc__ == "Run a shell command"
 
-    # Invoking the callable (kwargs form) routes back through the bridge.
+    # Invoking the wrapper (kwargs form, the SDK's call convention) routes back
+    # through the bridge. ToolWithSchema.__call__ returns the inner coroutine.
     assert await sdk_tool(cmd="ls") == {"ok": True}
-    # Single-dict argument form also works (SDK arg-shape tolerance).
-    assert await sdk_tool({"cmd": "pwd"}) == {"ok": True}
+    # The underlying bridge callable also tolerates a single positional dict /
+    # JSON string (defensive against arg-shape drift), reached via .fn.
+    assert await sdk_tool.fn({"cmd": "pwd"}) == {"ok": True}
     assert calls == [
         {"name": "sys_shell", "args": {"cmd": "ls"}},
         {"name": "sys_shell", "args": {"cmd": "pwd"}},
@@ -772,15 +760,22 @@ async def test_sys_tools_exposed_as_callables_routing_through_executor(
 
 
 @pytest.mark.asyncio
-async def test_sys_tool_schema_threaded_into_sdk_function_declaration(
+async def test_sys_tool_schema_reaches_sdk_proto_losslessly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The ToolSpec ``parameters`` schema reaches the SDK via the callable's signature.
+    """The ToolSpec ``parameters`` schema reaches the SDK proto VERBATIM.
 
-    The SDK builds each tool's model-facing function declaration by
-    introspecting the callable (``inspect.signature``); a bare ``*args/**kwargs``
-    body would advertise no arguments. Assert a ``sys_*`` tool's registered
-    callable exposes its real JSON-Schema arguments (names, types, required).
+    Registering each tool as a ``ToolWithSchema`` makes
+    ``callable_to_tool_proto`` emit ``json.dumps(input_schema)`` directly, so the
+    schema the model sees is byte-for-byte what Omnigent advertised. This pins
+    the real SDK contract (not a hand-rolled signature mirror) and proves the
+    two bugs the prior signature-synthesis path had are fixed:
+
+    * **Optional params stay optional.** ``timeout`` has no default and is NOT in
+      ``required``; the synthesis path wrongly advertised every optional primitive
+      as required.
+    * **Enums and nested objects survive.** Both were silently dropped (flattened
+      to a bare ``{"type": ...}``) by the synthesis path.
     """
     captured = _install_fake_sdk(monkeypatch, scripts=[[_text_step("done")]])
     executor = AntigravityExecutor()
@@ -790,19 +785,23 @@ async def test_sys_tool_schema_threaded_into_sdk_function_declaration(
 
     executor._tool_executor = _fake_tool_executor
 
-    tool_specs = [
-        {
-            "name": "sys_shell",
-            "description": "Run a shell command",
-            "parameters": {
+    schema = {
+        "type": "object",
+        "properties": {
+            "cmd": {"type": "string", "description": "the command"},
+            "timeout": {"type": "integer"},
+            "mode": {"type": "string", "enum": ["fast", "safe"]},
+            "env": {
                 "type": "object",
-                "properties": {
-                    "cmd": {"type": "string"},
-                    "timeout": {"type": "integer"},
-                },
-                "required": ["cmd"],
+                "properties": {"KEY": {"type": "string"}},
+                "required": ["KEY"],
             },
-        }
+            "paths": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["cmd"],
+    }
+    tool_specs = [
+        {"name": "sys_shell", "description": "Run a shell command", "parameters": schema}
     ]
 
     await _drain(executor, [{"role": "user", "content": "go", "session_id": "s1"}], tool_specs)
@@ -811,32 +810,35 @@ async def test_sys_tool_schema_threaded_into_sdk_function_declaration(
     assert sdk_tools is not None and len(sdk_tools) == 1
     sdk_tool = sdk_tools[0]
 
-    # The SDK derives the function declaration from inspect.signature(...).
-    sig = inspect.signature(sdk_tool)
-    assert list(sig.parameters) == ["cmd", "timeout"]
-    # Required field has no default; optional field defaults (so it is not required).
-    assert sig.parameters["cmd"].default is inspect.Parameter.empty
-    assert sig.parameters["timeout"].default is None
-    # JSON-Schema types map onto Python annotations.
-    assert sig.parameters["cmd"].annotation is str
-    assert sig.parameters["timeout"].annotation is int
-    assert _sdk_parameter_schema_from_callable(sdk_tool) == {
+    # The real SDK proto carries the schema verbatim — the whole point.
+    advertised = _sdk_advertised_schema(sdk_tool)
+    assert advertised == schema
+    # Spell out the load-bearing properties the synthesis path got wrong.
+    assert advertised["required"] == ["cmd"]  # timeout/mode/env/paths NOT required
+    assert advertised["properties"]["mode"]["enum"] == ["fast", "safe"]  # enum kept
+    assert advertised["properties"]["env"] == {  # nested object kept whole
         "type": "object",
-        "properties": {
-            "cmd": {"type": "string"},
-            "timeout": {"type": "integer"},
-        },
-        "required": ["cmd"],
+        "properties": {"KEY": {"type": "string"}},
+        "required": ["KEY"],
     }
-    # Schema is metadata only — the callable still routes through the bridge.
+    assert advertised["properties"]["paths"]["items"] == {"type": "string"}  # array items kept
+
+    # Schema is advertising only — the wrapper still routes calls through the bridge.
     assert await sdk_tool(cmd="ls") == {"ok": True}
 
 
 @pytest.mark.asyncio
-async def test_tool_schema_mapping_handles_primitives_and_invalid_entries(
+async def test_tool_schema_passed_verbatim_and_empty_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Schema signature synthesis maps JSON primitives and skips invalid params."""
+    """ToolSpec ``parameters`` are wrapped verbatim; a missing schema falls back.
+
+    The executor no longer rewrites the schema (the old synthesis path mangled
+    types/required/enums). It hands ``parameters`` straight to
+    ``ToolWithSchema.input_schema``, so an arbitrarily rich schema survives
+    untouched. When a spec omits (or mis-types) ``parameters``, the executor
+    substitutes an empty-object schema — mirroring ``cursor_executor``.
+    """
     _install_fake_sdk(monkeypatch, scripts=[[_text_step("done")]])
     executor = AntigravityExecutor()
 
@@ -844,55 +846,36 @@ async def test_tool_schema_mapping_handles_primitives_and_invalid_entries(
         return {"ok": True}
 
     executor._tool_executor = _fake_tool_executor
-    sdk_tools = executor._build_sdk_tools(
-        [
-            {
-                "name": "sys_mixed",
-                "description": "mixed args",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "text": {"type": "string"},
-                        "count": {"type": "integer"},
-                        "ratio": {"type": "number"},
-                        "enabled": {"type": "boolean"},
-                        "payload": {"type": "object"},
-                        "items": {"type": "array"},
-                        "unknown": {"type": "null"},
-                        "bad-name": {"type": "string"},
-                        "class": {"type": "string"},
-                        "loose": "not-a-property-schema",
-                    },
-                    "required": ["text", "count", "bad-name", "class", 7],
-                },
-            },
-            {
-                "name": "sys_empty",
-                "description": "invalid schema",
-                "parameters": {"type": "object", "properties": []},
-            },
-        ]
-    )
-
-    mixed_schema = _sdk_parameter_schema_from_callable(sdk_tools[0])
-    assert mixed_schema == {
+    rich_schema = {
         "type": "object",
         "properties": {
             "text": {"type": "string"},
-            "count": {"type": "integer"},
+            "count": {"type": "integer", "minimum": 0},
             "ratio": {"type": "number"},
             "enabled": {"type": "boolean"},
-            "payload": {"type": "object"},
-            "items": {"type": "array"},
-            "unknown": {"type": "string"},
-            "loose": {"type": "string"},
+            "payload": {"type": "object", "properties": {"k": {"type": "string"}}},
+            "items": {"type": "array", "items": {"type": "integer"}},
+            "mode": {"type": "string", "enum": ["a", "b"]},
         },
         "required": ["text", "count"],
     }
-    assert _sdk_parameter_schema_from_callable(sdk_tools[1]) == {
-        "type": "object",
-        "properties": {},
-    }
+    sdk_tools = executor._build_sdk_tools(
+        [
+            {"name": "sys_rich", "description": "rich args", "parameters": rich_schema},
+            {"name": "sys_no_params", "description": "no schema"},  # parameters omitted
+        ]
+    )
+
+    # Rich schema: identical on the wrapper AND in the SDK-emitted proto — nothing
+    # is rewritten, narrowed, or dropped (formats, enums, nesting, minimum kept).
+    assert sdk_tools[0].input_schema == rich_schema
+    assert _sdk_advertised_schema(sdk_tools[0]) == rich_schema
+
+    # Omitted parameters → empty-object schema (advertises a no-arg tool), the
+    # same fallback cursor_executor uses.
+    empty_fallback = {"type": "object", "properties": {}}
+    assert sdk_tools[1].input_schema == empty_fallback
+    assert _sdk_advertised_schema(sdk_tools[1]) == empty_fallback
 
 
 @pytest.mark.asyncio
@@ -964,18 +947,16 @@ async def test_tool_schema_change_rebuilds_agent_registration(
         }
     ]
 
-    await _drain(
-        executor, [{"role": "user", "content": "one", "session_id": "s1"}], first_tools
-    )
-    await _drain(
-        executor, [{"role": "user", "content": "two", "session_id": "s1"}], second_tools
-    )
+    await _drain(executor, [{"role": "user", "content": "one", "session_id": "s1"}], first_tools)
+    await _drain(executor, [{"role": "user", "content": "two", "session_id": "s1"}], second_tools)
 
     assert len(captured["agents"]) == 2
+    # The rebuilt agent re-registers the tool with the NEW schema — the cache key
+    # widening (description + parameters) makes a schema-only change rebuild.
     first_tool = captured["configs"][0].tools[0]
     second_tool = captured["configs"][1].tools[0]
-    assert list(inspect.signature(first_tool).parameters) == ["cmd"]
-    assert list(inspect.signature(second_tool).parameters) == ["command"]
+    assert list(first_tool.input_schema["properties"]) == ["cmd"]
+    assert list(second_tool.input_schema["properties"]) == ["command"]
 
 
 @pytest.mark.asyncio

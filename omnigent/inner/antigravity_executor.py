@@ -44,7 +44,6 @@ import contextlib
 import importlib
 import inspect
 import json
-import keyword
 import logging
 import time
 import uuid
@@ -118,67 +117,25 @@ ToolExecutor: TypeAlias = Callable[  # type: ignore[explicit-any]
 ]
 
 
-# JSON-Schema primitive type -> Python annotation, used to synthesize an
-# introspectable signature on the tool callable (the SDK derives the
-# model-facing function declaration via ``inspect.signature``).
-_JSON_TYPE_TO_PY: dict[str, type] = {
-    "string": str,
-    "integer": int,
-    "number": float,
-    "boolean": bool,
-    "object": dict,
-    "array": list,
-}
+def _tool_with_schema_cls() -> type:
+    """Return the SDK's ``ToolWithSchema`` wrapper class.
 
+    Resolved lazily (the optional ``google-antigravity`` package may be absent at
+    import time). ``ToolWithSchema(fn, input_schema=<dict>)`` carries the tool's
+    JSON Schema VERBATIM into the SDK: ``callable_to_tool_proto`` short-circuits
+    on it and emits ``parameters_json_schema=json.dumps(fn.input_schema)``,
+    preserving the exact ``required`` set, enums, nested objects, formats, and
+    descriptions — none of which survive the SDK's ``inspect.signature`` /
+    pydantic fallback for a bare callable.
 
-def _attach_schema_signature(fn: _ToolCallable, schema: _StrAnyDict | None) -> None:
-    """Give *fn* an introspectable signature derived from a JSON-Schema.
-
-    The Antigravity SDK builds each tool's model-facing function declaration by
-    introspecting the callable (``inspect.signature``), so a bare
-    ``*args/**kwargs`` body advertises a tool with no argument schema. This
-    attaches a synthesized :class:`inspect.Signature` (and matching
-    ``__annotations__``) reflecting the ToolSpec's ``parameters`` properties so
-    the model sees real argument names, types, and required fields. The runtime
-    body stays ``*args/**kwargs`` — this only changes what introspection reports.
-
-    Properties whose names are not valid Python parameter names are skipped
-    (they cannot become :class:`inspect.Parameter` names); the callable still
-    accepts them at call time via ``**kwargs``.
-
-    :param fn: The tool callable to annotate (mutated in place).
-    :param schema: The ToolSpec ``parameters`` JSON-Schema, or ``None``.
+    :returns: The ``ToolWithSchema`` class from ``google.antigravity``.
+    :raises ImportError: If ``google-antigravity`` is not installed (surfaced on
+        the first turn, the same place the rest of the SDK is imported).
     """
-    props = schema.get("properties") if isinstance(schema, dict) else None
-    if not isinstance(props, dict) or not props:
-        return
-    required_raw = schema.get("required") if isinstance(schema, dict) else None
-    required: set[str] = (
-        {r for r in required_raw if isinstance(r, str)}
-        if isinstance(required_raw, list)
-        else set()
-    )
-    params: list[inspect.Parameter] = []
-    annotations: _StrAnyDict = {}
-    for pname, pspec in props.items():
-        if not isinstance(pname, str) or not pname.isidentifier() or keyword.iskeyword(pname):
-            continue
-        ptype = pspec.get("type") if isinstance(pspec, dict) else None
-        annotation = _JSON_TYPE_TO_PY.get(ptype, str) if isinstance(ptype, str) else str
-        annotations[pname] = annotation
-        default = inspect.Parameter.empty if pname in required else None
-        params.append(
-            inspect.Parameter(
-                pname,
-                inspect.Parameter.KEYWORD_ONLY,
-                default=default,
-                annotation=annotation,
-            )
-        )
-    if not params:
-        return
-    fn.__signature__ = inspect.Signature(params)  # type: ignore[attr-defined]
-    fn.__annotations__ = annotations
+    _ensure_antigravity_sdk()
+    from google.antigravity.tools.tool_runner import ToolWithSchema
+
+    return ToolWithSchema
 
 
 def _ensure_antigravity_sdk() -> ModuleType:
@@ -986,20 +943,28 @@ class AntigravityExecutor(Executor):
         return _OmnigentToolCompleteHook()
 
     def _build_sdk_tools(self, tools: list[ToolSpec]) -> list[SDKTool]:
-        """Build SDK tools (plain callables) from Omnigent tool specs.
+        """Build SDK tools from Omnigent tool specs as ``ToolWithSchema`` wrappers.
 
-        The SDK introspects each callable's ``__name__`` / ``__doc__`` for its
-        function declaration. Each routes through :attr:`_tool_executor`, so
-        the agent reaches Omnigent's tool registry under policy. Returns ``[]``
-        when there are no tools or no executor bridge yet (the agent then runs
-        with its native + MCP tools only).
+        Each tool's ToolSpec ``parameters`` JSON Schema is handed to the SDK
+        VERBATIM via ``ToolWithSchema(fn, input_schema=...)``, so the model sees
+        the exact schema Omnigent advertises — correct ``required`` set, enums,
+        nested objects, array item types, formats, and descriptions all preserved
+        (the SDK's ``callable_to_tool_proto`` emits ``json.dumps(fn.input_schema)``
+        directly for a ``ToolWithSchema``). This mirrors
+        ``cursor_executor._make_custom_tools(input_schema=...)``. Each wrapped
+        callable still routes invocations through :attr:`_tool_executor`, so the
+        agent reaches Omnigent's tool registry under policy.
+
+        Returns ``[]`` when there are no tools or no executor bridge yet (the
+        agent then runs with its native + MCP tools only).
 
         :param tools: Omnigent tool specs (``name`` / ``description`` /
             ``parameters``).
-        :returns: A list of named async callables, or ``[]``.
+        :returns: A list of ``ToolWithSchema`` instances, or ``[]``.
         """
         if not tools or self._tool_executor is None:
             return []
+        tool_with_schema_cls = _tool_with_schema_cls()
         sdk_tools: list[SDKTool] = []
         for tool in tools:
             name = tool.get("name")
@@ -1008,25 +973,28 @@ class AntigravityExecutor(Executor):
             description = tool.get("description")
             description = description if isinstance(description, str) else ""
             params = tool.get("parameters")
-            schema = params if isinstance(params, dict) else None
-            sdk_tools.append(self._make_tool_callable(name, description, schema))
+            # Hand the ToolSpec's parameter schema to the SDK verbatim. Fall back
+            # to an empty-object schema (mirrors cursor) when a spec omits it.
+            schema: _StrAnyDict = (
+                params if isinstance(params, dict) else {"type": "object", "properties": {}}
+            )
+            fn = self._make_tool_callable(name, description)
+            sdk_tools.append(tool_with_schema_cls(fn, input_schema=schema))
         return sdk_tools
 
-    def _make_tool_callable(
-        self, tool_name: str, description: str, schema: _StrAnyDict | None = None
-    ) -> _ToolCallable:
-        """Build a named async callable the SDK can register as a tool.
+    def _make_tool_callable(self, tool_name: str, description: str) -> _ToolCallable:
+        """Build a named async callable that bridges an SDK tool call to Omnigent.
 
         Accepts the SDK's arg shape (kwargs, a single dict, or a JSON string)
         and forwards to :attr:`_tool_executor`. Its ``__name__`` / ``__doc__``
-        are set so the SDK's function-declaration introspection picks up the
-        name and description, and (when *schema* is given) a synthesized
-        ``__signature__`` so the SDK advertises the tool's real argument schema
-        rather than an empty ``*args/**kwargs`` declaration.
+        are set so the wrapping ``ToolWithSchema`` carries the right name and
+        description to the SDK's function declaration; the argument schema is
+        supplied separately and losslessly via ``ToolWithSchema.input_schema``
+        (see :meth:`_build_sdk_tools`), not derived from this callable's
+        signature.
 
         :param tool_name: The Omnigent tool name, e.g. ``"sys_shell"``.
         :param description: Human-readable tool description for the model.
-        :param schema: The ToolSpec ``parameters`` JSON-Schema, or ``None``.
         :returns: An async callable bound to *tool_name*.
         """
 
@@ -1046,14 +1014,11 @@ class AntigravityExecutor(Executor):
                     tool_args = {"input": args[0]}
             return await self._tool_executor(tool_name, tool_args)
 
-        # The SDK builds the function declaration from these.
+        # ToolWithSchema copies these onto itself; the SDK reads name/description
+        # from the wrapper for the function declaration.
         _invoke.__name__ = tool_name
         _invoke.__qualname__ = tool_name
         _invoke.__doc__ = description or tool_name
-        # Thread the ToolSpec's parameter schema into an introspectable
-        # signature so the model sees real argument names/types, not an
-        # empty *args/**kwargs declaration.
-        _attach_schema_signature(_invoke, schema)
         return _invoke
 
     def _build_local_agent_config(
@@ -1102,8 +1067,6 @@ class AntigravityExecutor(Executor):
         :returns: The set of accepted field names, or ``None`` when the
             signature can't be introspected.
         """
-        import inspect
-
         try:
             params = inspect.signature(config_cls).parameters
         except (TypeError, ValueError):
