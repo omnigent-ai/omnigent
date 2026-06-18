@@ -181,6 +181,7 @@ class FakeSandboxLauncher(SandboxLauncher):
         # constructed the launcher with (captured by the
         # ctor-monkeypatch shims).
         self.image: str | None = None
+        self.template: str | None = None
         self.secrets: list[str] | None = None
         self.env: list[str] | None = None
         self.base_url: str | None = None
@@ -190,6 +191,7 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.vcpus: int | None = None
         self.memory_mb: int | None = None
         self.disk_gb: int | None = None
+        self.cluster: str | None = None
         self.prepared = False
         self.provisioned_names: list[str] = []
         self.commands: list[str] = []
@@ -384,6 +386,66 @@ def install_fake_islo_launcher(
     monkeypatch.setattr(islo_mod, "IsloSandboxLauncher", _ctor)
 
 
+def install_fake_e2b_launcher(
+    monkeypatch: Any,  # pytest.MonkeyPatch — Any avoids importing pytest in a helpers module
+    fake: FakeSandboxLauncher,
+) -> None:
+    """
+    Substitute the fake for ``E2BSandboxLauncher`` at its public seam.
+
+    The managed flow constructs ``E2BSandboxLauncher(template=…, env=…)``;
+    the shim records the template name and env names on the fake and
+    hands the fake back, so production code runs unmodified against it.
+
+    :param monkeypatch: The test's ``pytest.MonkeyPatch``.
+    :param fake: The fake launcher to substitute.
+    """
+    import omnigent.onboarding.sandboxes.e2b as e2b_mod
+
+    def _ctor(*, template: str | None = None, env: list[str] | None = None) -> FakeSandboxLauncher:
+        """Stand-in constructor recording the construction wiring."""
+        fake.template = template
+        fake.env = env
+        # Report the e2b provider so managed-host teardown's provider match
+        # (launcher.provider vs host.sandbox_provider) exercises the real path
+        # instead of the FakeSandboxLauncher default ("modal").
+        fake.provider = "e2b"  # type: ignore[misc]  # shadow the ClassVar per-instance
+        return fake
+
+    monkeypatch.setattr(e2b_mod, "E2BSandboxLauncher", _ctor)
+
+
+def install_fake_openshell_launcher(
+    monkeypatch: Any,  # pytest.MonkeyPatch — Any avoids importing pytest in a helpers module
+    fake: FakeSandboxLauncher,
+) -> None:
+    """
+    Substitute the fake for ``OpenShellSandboxLauncher`` at its public seam.
+
+    The managed flow constructs ``OpenShellSandboxLauncher(image=…,
+    env=…, cluster=…)``; the shim records those constructor args on the
+    fake and hands it back, so production code runs unmodified against it.
+
+    :param monkeypatch: The test's ``pytest.MonkeyPatch``.
+    :param fake: The fake launcher to substitute.
+    """
+    import omnigent.onboarding.sandboxes.openshell as openshell_mod
+
+    def _ctor(
+        *,
+        image: str | None = None,
+        env: list[str] | None = None,
+        cluster: str | None = None,
+    ) -> FakeSandboxLauncher:
+        """Stand-in constructor recording the construction wiring."""
+        fake.image = image
+        fake.env = env
+        fake.cluster = cluster
+        return fake
+
+    monkeypatch.setattr(openshell_mod, "OpenShellSandboxLauncher", _ctor)
+
+
 async def wait_for_completion(
     client: httpx.AsyncClient,
     response_id: str,
@@ -399,15 +461,6 @@ async def wait_for_completion(
             return body
         await asyncio.sleep(0.1)
     raise AssertionError(f"Response {response_id} did not reach terminal status")
-
-
-@dataclass
-class ApiResponse:
-    """Result of an API call — avoids returning positional tuples."""
-
-    status_code: int
-    # Any: JSON response bodies are inherently heterogeneous dicts.
-    body: dict[str, Any]
 
 
 class FakeRunnerWebSocket:
@@ -519,8 +572,7 @@ def build_agent_bundle(
         "spec_version": 1,
         "name": name,
         # LLM config is required for the real workflow to execute.
-        # The model value must match the agent name used in
-        # create_test_response(model=...).
+        # The model value must match the agent name used by tests.
         "llm": {
             "model": name,
             # api_key is required by spec validation; the workflow
@@ -725,53 +777,6 @@ async def create_test_session(
     snapshot = await client.get(f"/v1/sessions/{session_id}")
     assert snapshot.status_code == 200, f"session snapshot failed: {snapshot.text}"
     return snapshot.json()
-
-
-async def create_test_response(
-    client: httpx.AsyncClient,
-    model: str = "test-agent",
-    input_text: str = "Hello",
-    background: bool = True,
-    stream: bool = False,
-    instructions: str | None = None,
-    previous_response_id: str | None = None,
-    store: bool | None = None,
-    conversation: dict[str, str] | None = None,
-    reasoning: dict[str, str] | None = None,
-    tools: list[dict[str, Any]] | None = None,
-) -> ApiResponse:
-    """
-    Create a response via the API and return an ApiResponse.
-
-    Defaults to background=True so the endpoint returns immediately
-    without blocking on task completion.
-
-    :param tools: Optional list of client-side tool schemas in
-        standard OpenAI function format, e.g.
-        ``[{"type": "function", "function": {"name": "get_weather", ...}}]``.
-    """
-    payload: dict[str, Any] = {
-        "model": model,
-        "input": input_text,
-        "background": background,
-        "stream": stream,
-    }
-    if instructions is not None:
-        payload["instructions"] = instructions
-    if previous_response_id is not None:
-        payload["previous_response_id"] = previous_response_id
-    if store is not None:
-        payload["store"] = store
-    if conversation is not None:
-        payload["conversation"] = conversation
-    if reasoning is not None:
-        payload["reasoning"] = reasoning
-    if tools is not None:
-        payload["tools"] = tools
-    resp = await client.post("/v1/responses", json=payload)
-    body = resp.json()
-    assert "id" in body, f"POST /v1/responses returned {resp.status_code}: {body}"
-    return ApiResponse(status_code=resp.status_code, body=body)
 
 
 class CapturingRunnerClient:

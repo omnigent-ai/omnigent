@@ -6,6 +6,8 @@ import {
   MonitorCloudIcon,
   CircleHelpIcon,
   ChevronDownIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
   GitBranchIcon,
   ArrowUpIcon,
   FileTextIcon,
@@ -31,6 +33,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch } from "@/lib/identity";
+import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { sandboxOptionLabel } from "@/lib/capabilities";
@@ -44,8 +47,14 @@ import { getOmnigentHostConfig } from "@/lib/host";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
 import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
 import { cn } from "@/lib/utils";
+import {
+  isNativeCodingAgent,
+  nativeAgentHasCapability,
+  nativeAgentSortRank,
+  nativeWrapperLabelsForAgent,
+} from "@/lib/nativeCodingAgents";
 import { useHosts, type Host } from "@/hooks/useHosts";
-import { useAvailableAgents } from "@/hooks/useAvailableAgents";
+import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
@@ -57,12 +66,25 @@ import { SkillPills } from "@/components/SkillPills";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { IntelligentModelControl, type CostControlMode } from "@/components/CostRoutingControl";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { AgentRowTooltip } from "@/components/AgentHoverCard";
 
 // Preferred display order for the built-in agent picker. The server
 // returns agents newest-registered first (agent_store.list sorts by
 // created_at desc), so pin the order users expect; any agent not listed
 // here falls after, in server order.
-const AGENT_DISPLAY_ORDER = ["Claude Code", "Codex", "Polly"];
+const AGENT_DISPLAY_ORDER = ["Claude Code", "Codex", "Pi", "Polly", "Debby"];
+
+// Built-in agents (by name slug) — the long-lived agents the server
+// ships out of the box. The picker groups these first, then a divider,
+// then custom (user-registered) agents. GET /v1/agents doesn't yet
+// distinguish the two, so this is a frontend allowlist for now.
+const BUILTIN_AGENTS = new Set([
+  "claude-native-ui", // Claude Code
+  "codex-native-ui", // Codex
+  "pi-native-ui", // Pi
+  "polly",
+  "debby",
+]);
 
 // Hidden on the new-session picker only (superseded by polly; older
 // deployments still carry a seeded nessie row this filter keeps out).
@@ -103,6 +125,40 @@ const CLAUDE_NATIVE_PERMISSION_MODES: { value: string; label: string; descriptio
     value: "bypassPermissions",
     label: "Bypass permissions",
     description: "Runs everything; no prompts or safety checks",
+  },
+];
+
+// Codex approval presets matching the `/permissions` TUI popup.
+// Each preset bundles a sandbox profile + approval policy, mirroring
+// codex-rs/utils/approval-presets/src/lib.rs. "default" is the auto
+// preset (workspace-write + on-request) and sends no flags so the
+// runner uses Codex's built-in default.
+// Keep in sync with `codex --help` and
+// https://developers.openai.com/codex/agent-approvals-security
+const CODEX_NATIVE_DEFAULT_APPROVAL_MODE = "default";
+const CODEX_NATIVE_APPROVAL_MODES: {
+  value: string;
+  label: string;
+  description: string;
+  args: string[];
+}[] = [
+  {
+    value: "default",
+    label: "Default",
+    description: "Read/edit/run in workspace; approval for external edits or network",
+    args: [],
+  },
+  {
+    value: "full-access",
+    label: "Full access",
+    description: "Edit any file and access the internet without approval",
+    args: ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
+  },
+  {
+    value: "read-only",
+    label: "Read only",
+    description: "Read files only; approval required for edits, commands, or network",
+    args: ["--sandbox", "read-only", "--ask-for-approval", "on-request"],
   },
 ];
 
@@ -507,8 +563,8 @@ function PermissionModeOptions({
             onPointerEnter={() => setPreviewed(mode.value)}
             // pl only — the kit's pr-8 reserves room for the
             // absolutely-positioned check.
-            // text-xs matches the other footer-tray menus (host picker).
-            className="rounded-sm pl-2 py-1 text-xs"
+            // text-sm for legibility in the Advanced menu.
+            className="rounded-sm pl-2 py-1 text-sm"
           >
             {mode.label}
           </DropdownMenuRadioItem>
@@ -519,7 +575,53 @@ function PermissionModeOptions({
         data-testid="new-chat-landing-permission-detail"
         // One reserved line, not two: reserving the longest blurb's wrapped
         // second line left a permanent blank row under one-line blurbs.
-        className="min-h-5 px-2 pt-0.5 pb-1 text-xs leading-relaxed text-muted-foreground"
+        className="min-h-5 px-2 pt-0.5 pb-1 text-sm leading-relaxed text-muted-foreground"
+      >
+        {detail}
+      </p>
+    </>
+  );
+}
+
+/**
+ * Codex approval-mode radio rows, rendered inside the Advanced settings
+ * menu in the composer footer. Mirror of {@link PermissionModeOptions}
+ * for the Codex-native agent.
+ *
+ * @param value Currently selected mode, e.g. ``"suggest"``.
+ * @param onValueChange Selection callback (receives the mode value).
+ */
+function ApprovalModeOptions({
+  value,
+  onValueChange,
+}: {
+  value: string;
+  onValueChange: (mode: string) => void;
+}) {
+  const [previewed, setPreviewed] = useState<string | null>(null);
+  const detail = CODEX_NATIVE_APPROVAL_MODES.find(
+    (m) => m.value === (previewed ?? value),
+  )?.description;
+  return (
+    <>
+      <DropdownMenuRadioGroup value={value} onValueChange={onValueChange}>
+        {CODEX_NATIVE_APPROVAL_MODES.map((mode) => (
+          <DropdownMenuRadioItem
+            key={mode.value}
+            value={mode.value}
+            data-testid={`new-chat-landing-approval-${mode.value}`}
+            onFocus={() => setPreviewed(mode.value)}
+            onPointerEnter={() => setPreviewed(mode.value)}
+            className="rounded-sm pl-2 py-1 text-sm"
+          >
+            {mode.label}
+          </DropdownMenuRadioItem>
+        ))}
+      </DropdownMenuRadioGroup>
+      <DropdownMenuSeparator />
+      <p
+        data-testid="new-chat-landing-approval-detail"
+        className="min-h-5 px-2 pt-0.5 pb-1 text-sm leading-relaxed text-muted-foreground"
       >
         {detail}
       </p>
@@ -547,7 +649,7 @@ function BrainHarnessOptions({
 }) {
   return (
     <>
-      <div className="px-2 pt-1.5 pb-0.5 text-[11px] font-medium text-muted-foreground">
+      <div className="px-2 pt-1.5 pb-0.5 text-xs font-medium text-muted-foreground">
         Agent Harness
       </div>
       <DropdownMenuRadioGroup value={value} onValueChange={onValueChange}>
@@ -558,8 +660,8 @@ function BrainHarnessOptions({
             data-testid={`new-chat-landing-harness-${id}`}
             // pl only — the kit's pr-8 reserves room for the
             // absolutely-positioned check.
-            // text-xs matches the other footer-tray menus (host picker).
-            className="rounded-sm pl-2 py-1 text-xs"
+            // text-sm for legibility in the Advanced menu.
+            className="rounded-sm pl-2 py-1 text-sm"
           >
             <span className="flex-1">{label}</span>
             {harnessUnconfiguredOnHost(id, host) && (
@@ -578,6 +680,26 @@ function BrainHarnessOptions({
   );
 }
 
+/**
+ * True when ``agent`` exposes per-agent knobs in the picker's Advanced
+ * settings sub-page: an overridable brain harness (bundle agents like
+ * polly / debby), Claude Code's permission mode, or Codex's approval mode.
+ *
+ * Drives both the "Advanced settings" row's visibility and whether picking
+ * the agent keeps the menu open (so the user can step into the sub-page)
+ * instead of closing it like a plain agent pick.
+ */
+function agentHasAdvancedSettings(
+  agent: Pick<AvailableAgent, "name" | "harness"> | null | undefined,
+): boolean {
+  const hasOverridableHarness = agent?.harness != null && agent.harness in BRAIN_HARNESS_LABELS;
+  return (
+    hasOverridableHarness ||
+    nativeAgentHasCapability(agent, "permissionMode") ||
+    nativeAgentHasCapability(agent, "approvalMode")
+  );
+}
+
 export function NewChatLandingScreen() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -589,17 +711,34 @@ export function NewChatLandingScreen() {
   const { data: directorySessions } = useDirectorySessions(true);
 
   const agentList = useMemo(() => {
-    const rank = (name: string) => {
+    const displayRank = (name: string) => {
       const i = AGENT_DISPLAY_ORDER.indexOf(name);
       return i === -1 ? AGENT_DISPLAY_ORDER.length : i;
     };
     return [...(agents ?? [])]
       .filter((a) => !NEW_SESSION_HIDDEN_AGENTS.has(a.name))
-      .sort((a, b) => rank(a.display_name) - rank(b.display_name));
+      .sort(
+        (a, b) =>
+          nativeAgentSortRank(a) - nativeAgentSortRank(b) ||
+          displayRank(a.display_name) - displayRank(b.display_name),
+      );
   }, [agents]);
+
+  // Split the picker into built-in agents (shipped out of the box) and
+  // custom (user-registered) agents so the menu can group them with a
+  // divider between, mirroring the permission-mode separator below.
+  const builtinAgents = useMemo(
+    () => agentList.filter((a) => BUILTIN_AGENTS.has(a.name)),
+    [agentList],
+  );
+  const customAgents = useMemo(
+    () => agentList.filter((a) => !BUILTIN_AGENTS.has(a.name)),
+    [agentList],
+  );
 
   const [message, setMessage] = useState<string>("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const isComposingRef = useRef(false);
   // maxRows 9 = 180px of 20px lines, matching the composer's 200px
   // border-box max (180px content + 16px top / 4px bottom padding).
   useAutoGrowTextarea(textareaRef, message, 9);
@@ -687,6 +826,10 @@ export function NewChatLandingScreen() {
   const [permissionMode, setPermissionMode] = useState<string>(
     CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
   );
+  // Approval mode for Codex (codex --approval-mode). Only meaningful for
+  // the codex-native wrapper; ignored otherwise. Lives in the footer
+  // tray's Advanced settings menu.
+  const [approvalMode, setApprovalMode] = useState<string>(CODEX_NATIVE_DEFAULT_APPROVAL_MODE);
   // Per-session brain-harness override for bundle agents (polly / debby).
   // null = the agent spec's declared harness (no override sent); cleared on
   // every agent switch so a pick never leaks across agents.
@@ -701,6 +844,15 @@ export function NewChatLandingScreen() {
   const [createError, setCreateError] = useState<string | null>(null);
   // "Connect a host" instructions modal, opened from the host dropdown.
   const [connectOpen, setConnectOpen] = useState(false);
+
+  // Agent picker dropdown. Controlled so picking an agent that has Advanced
+  // settings can keep the menu open instead of dismissing it. `agentMenuView`
+  // swaps the popover's contents in place between the agent list and the
+  // selected agent's Advanced settings — one surface, so it works on mobile
+  // (no off-screen flyout). Only the active view is mounted, so the popover
+  // auto-sizes to it and its items are the only ones in the focus order.
+  const [agentMenuOpen, setAgentMenuOpen] = useState(false);
+  const [agentMenuView, setAgentMenuView] = useState<"agents" | "advanced">("agents");
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
 
@@ -761,11 +913,12 @@ export function NewChatLandingScreen() {
   const effectiveAgentId =
     (agentList.some((a) => a.id === pickedAgentId) ? pickedAgentId : agentList[0]?.id) ?? null;
   const selectedAgent = agentList.find((a) => a.id === effectiveAgentId);
-  const isClaudeNativeAgent = selectedAgent?.name === "claude-native-ui";
+  const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
+  const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   // Native-terminal agents interpret slash commands inside their own CLI
   // (the runner injects the text verbatim), so the landing composer must
   // not intercept them — no skills menu, no slash_command routing.
-  const isNativeTerminalAgent = isClaudeNativeAgent || selectedAgent?.name === "codex-native-ui";
+  const isNativeTerminalAgent = isNativeCodingAgent(selectedAgent);
   const selectedHost = allHosts.find((h) => h.host_id === selectedHostId);
   // Warn-only readiness signal for the agent picker: only meaningful when
   // a connected host is selected (a sandbox provisions its own tooling).
@@ -911,6 +1064,8 @@ export function NewChatLandingScreen() {
   // radios live in the footer tray's Advanced settings menu.
   const permissionModeLabel =
     CLAUDE_NATIVE_PERMISSION_MODES.find((m) => m.value === permissionMode)?.label ?? permissionMode;
+  const approvalModeLabel =
+    CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.label ?? approvalMode;
   // Effective brain harness for the selected agent: the user's pick, else
   // the spec's declared harness. null for non-overridable agents (native
   // wrappers, agents whose spec failed to load).
@@ -918,17 +1073,89 @@ export function NewChatLandingScreen() {
     selectedAgent?.harness != null && selectedAgent.harness in BRAIN_HARNESS_LABELS
       ? selectedAgent.harness
       : null;
-  // The label suffixes the permission mode / harness only when the user
-  // explicitly changed it in the Advanced menu — defaults read as just the
-  // agent name. pickedHarness is non-null only for an explicit non-default
-  // pick (re-picking the spec default clears it).
+  // The label suffixes the permission/approval mode / harness only when the
+  // user explicitly changed it in the Advanced menu — defaults read as just
+  // the agent name. pickedHarness is non-null only for an explicit
+  // non-default pick (re-picking the spec default clears it).
   const agentLabel = selectedAgent
-    ? isClaudeNativeAgent && permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
+    ? supportsPermissionMode && permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
       ? `${selectedAgent.display_name} (${permissionModeLabel})`
-      : pickedHarness != null
-        ? `${selectedAgent.display_name} (${BRAIN_HARNESS_LABELS[pickedHarness] ?? pickedHarness})`
-        : selectedAgent.display_name
+      : supportsApprovalMode && approvalMode !== CODEX_NATIVE_DEFAULT_APPROVAL_MODE
+        ? `${selectedAgent.display_name} (${approvalModeLabel})`
+        : pickedHarness != null
+          ? `${selectedAgent.display_name} (${BRAIN_HARNESS_LABELS[pickedHarness] ?? pickedHarness})`
+          : selectedAgent.display_name
     : "Select agent";
+
+  /**
+   * Render one agent row in the picker dropdown.
+   *
+   * The short blurb (from AGENT_PICKER_DESCRIPTIONS, hardcoded for a
+   * few agents) renders NEXT TO the name in lighter text, and only
+   * when one exists — agents without a blurb show just their name in
+   * the menu. The full spec description is never shown inline; it
+   * surfaces on hover via AgentRowTooltip, and the closed-state button
+   * label (agentLabel) shows only the name.
+   */
+  const renderAgentRow = (agent: AvailableAgent) => {
+    const blurb = AGENT_PICKER_DESCRIPTIONS[agent.name];
+    return (
+      <DropdownMenuItem
+        key={agent.id}
+        data-testid={`new-chat-landing-agent-${agent.id}`}
+        data-active={agent.id === effectiveAgentId ? "true" : undefined}
+        onSelect={(e) => {
+          // Switching agents drops the harness override so a
+          // pick never leaks across agents.
+          if (agent.id !== effectiveAgentId) setPickedHarness(null);
+          setPickedAgentId(agent.id);
+          // Explicit picks persist; auto-defaults never do.
+          writeLastAgentId(agent.id);
+          // Agents with Advanced settings keep the menu open so the user
+          // can step into the sub-view; plain agents close on pick.
+          if (agentHasAdvancedSettings(agent)) e.preventDefault();
+        }}
+        className="items-start gap-2 rounded-sm px-2 py-1.5 text-sm data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
+      >
+        {/* Cursor-style flyout to the right of the row. The tooltip wraps
+            the row's inner content (a host <div>), NOT the menu item:
+            DropdownMenuItem is a plain function component (no forwardRef),
+            so TooltipTrigger's `asChild` ref can't attach to it under
+            React 18 — the flyout wouldn't open and it logs ref warnings.
+            Wrapping the <div> keeps refs working and the item a direct
+            roving-focus child of DropdownMenuContent. No-ops when the
+            agent has no description. */}
+        <AgentRowTooltip agent={agent}>
+          <div className="flex min-w-0 flex-1 items-baseline gap-2.5">
+            <span className="truncate">{agent.display_name}</span>
+            {blurb && (
+              <span className="truncate text-[11px] text-muted-foreground/70">{blurb}</span>
+            )}
+          </div>
+        </AgentRowTooltip>
+        {/* Compact right-aligned readiness pill; the full
+            remediation text lives in the composer warning. */}
+        {harnessUnconfiguredOnHost(agent.harness, harnessWarningHost) && (
+          <Badge
+            variant="outline"
+            className="ml-auto self-center border-amber-300 bg-amber-50 text-[11px] text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
+            data-testid={`new-chat-landing-agent-warning-${agent.id}`}
+          >
+            needs setup
+          </Badge>
+        )}
+      </DropdownMenuItem>
+    );
+  };
+
+  // Never strand the user on an empty Advanced page: if the selected agent
+  // loses its knobs (e.g. the agent list refreshes and it disappears), fall
+  // back to the agent list.
+  useEffect(() => {
+    if (agentMenuView === "advanced" && !agentHasAdvancedSettings(selectedAgent)) {
+      setAgentMenuView("agents");
+    }
+  }, [agentMenuView, selectedAgent]);
 
   function selectHost(hostId: string) {
     // Re-selecting the current host is a no-op. Clearing the workspace here
@@ -966,7 +1193,9 @@ export function NewChatLandingScreen() {
     try {
       const trimmedBranch = branchName.trim();
       const agent = agentList.find((a) => a.id === effectiveAgentId);
-      const isClaudeNative = agent?.name === "claude-native-ui";
+      const nativeLabels = nativeWrapperLabelsForAgent(agent);
+      const agentSupportsPermissionMode = nativeAgentHasCapability(agent, "permissionMode");
+      const agentSupportsApprovalMode = nativeAgentHasCapability(agent, "approvalMode");
       const res = await authenticatedFetch("/v1/sessions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -994,17 +1223,15 @@ export function NewChatLandingScreen() {
           // `omnigent.wrapper` selects which CLI bridge the runner launches.
           // The values are the registered wrapper ids the runner keys off —
           // they must match the wrapper registry, not the agent display name.
-          labels: isClaudeNative
-            ? { "omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui" }
-            : agent?.name === "codex-native-ui"
-              ? { "omnigent.ui": "terminal", "omnigent.wrapper": "codex-native-ui" }
-              : undefined,
-          // Permission mode → `claude --permission-mode <mode>`, persisted as
+          labels: nativeLabels,
+          // Permission / approval mode → CLI flag pair, persisted as
           // terminal_launch_args. Omitted for the default and non-native agents.
           terminal_launch_args:
-            isClaudeNative && permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
+            agentSupportsPermissionMode && permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
               ? ["--permission-mode", permissionMode]
-              : undefined,
+              : agentSupportsApprovalMode && approvalMode !== CODEX_NATIVE_DEFAULT_APPROVAL_MODE
+                ? (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.args ?? [])
+                : undefined,
           // Cost-control switch from the "Cost Optimized" pill; polly-only
           // (cost control is a polly feature) and omitted when unset so the
           // session defers to the spec default.
@@ -1076,8 +1303,8 @@ export function NewChatLandingScreen() {
     // the hero reads better optically.
     <div className="flex flex-1 items-center justify-center" data-testid="new-chat-landing">
       {/* Padding lives inside the 840px cap, so the composer renders at
-          840 − 80 = 760px max. */}
-      <div className="flex w-full max-w-[840px] flex-col items-center gap-8 px-10 pt-8 pb-16">
+          840 − 32 = 808px max; the parent flex centers it on wider screens. */}
+      <div className="flex w-full max-w-[840px] flex-col items-center gap-8 px-4 pt-8 pb-16">
         <div className="flex flex-col items-center gap-3.5 sm:flex-row">
           <OttoEyes className="h-18 w-auto shrink-0" />
           <h1 className="text-center text-3xl font-medium tracking-[-0.03em] text-foreground sm:text-left">
@@ -1126,7 +1353,17 @@ export function NewChatLandingScreen() {
               ref={textareaRef}
               value={message}
               onChange={(e) => setMessage(e.target.value)}
+              onCompositionStart={() => {
+                isComposingRef.current = true;
+              }}
+              onCompositionEnd={() => {
+                isComposingRef.current = false;
+              }}
               onKeyDown={(e) => {
+                if (isImeCompositionKeyEvent(e, isComposingRef.current)) {
+                  return;
+                }
+
                 // While the skills menu is open, ArrowUp/Down navigate it and
                 // Enter/Tab complete the highlighted item — these take
                 // priority over submission (same UX as the in-session
@@ -1209,7 +1446,7 @@ export function NewChatLandingScreen() {
               ref={fileInputRef}
               type="file"
               multiple
-              accept="image/*,application/pdf,text/*"
+              accept="image/*,application/pdf,text/*,application/json"
               className="hidden"
               data-testid="new-chat-landing-file-input"
               onChange={(e) => {
@@ -1279,7 +1516,14 @@ export function NewChatLandingScreen() {
                   <IntelligentModelControl value={costControlMode} onChange={setCostControlMode} />
                 )}
                 {agentList.length > 0 ? (
-                  <DropdownMenu>
+                  <DropdownMenu
+                    open={agentMenuOpen}
+                    onOpenChange={(open) => {
+                      setAgentMenuOpen(open);
+                      // Always reopen on the agent list, never on the Advanced view.
+                      if (!open) setAgentMenuView("agents");
+                    }}
+                  >
                     <DropdownMenuTrigger asChild>
                       <Button
                         type="button"
@@ -1294,51 +1538,115 @@ export function NewChatLandingScreen() {
                         <ChevronDownIcon className="size-3.5 opacity-60" />
                       </Button>
                     </DropdownMenuTrigger>
-                    {/* side=bottom documents the intent: the menu is a short
-                        agent list (harness / permission settings live in the
-                        footer tray's Advanced menu), so it should always drop
-                        downward like the other composer menus. */}
+                    {/* side=bottom documents the intent: a short agent list
+                        that should always drop downward like the other composer
+                        menus. The contents swap in place between the agent list
+                        and the selected agent's Advanced settings — only the
+                        active view is mounted, so the popover sizes to it. */}
                     <DropdownMenuContent
                       align="end"
                       side="bottom"
-                      className="max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-64 max-w-[calc(100vw-2rem)] overflow-y-auto p-1"
+                      className="max-h-[var(--radix-dropdown-menu-content-available-height)] w-64 max-w-[calc(100vw-2rem)] overflow-y-auto p-1"
                     >
-                      {agentList.map((agent) => (
-                        <DropdownMenuItem
-                          key={agent.id}
-                          data-testid={`new-chat-landing-agent-${agent.id}`}
-                          data-active={agent.id === effectiveAgentId ? "true" : undefined}
-                          onSelect={() => {
-                            // Switching agents drops the harness override so a
-                            // pick never leaks across agents.
-                            if (agent.id !== effectiveAgentId) setPickedHarness(null);
-                            setPickedAgentId(agent.id);
-                            // Explicit picks persist; auto-defaults never do.
-                            writeLastAgentId(agent.id);
-                          }}
-                          className="items-start gap-2 rounded-sm px-2 py-1.5 text-sm data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
-                        >
-                          <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-                            <span className="truncate">{agent.display_name}</span>
-                            {(AGENT_PICKER_DESCRIPTIONS[agent.name] ?? agent.description) && (
-                              <span className="truncate text-xs text-muted-foreground">
-                                {AGENT_PICKER_DESCRIPTIONS[agent.name] ?? agent.description}
-                              </span>
-                            )}
-                          </div>
-                          {/* Compact right-aligned readiness pill; the full
-                              remediation text lives in the composer warning. */}
-                          {harnessUnconfiguredOnHost(agent.harness, harnessWarningHost) && (
-                            <Badge
-                              variant="outline"
-                              className="ml-auto self-center border-amber-300 bg-amber-50 text-[11px] text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
-                              data-testid={`new-chat-landing-agent-warning-${agent.id}`}
-                            >
-                              needs setup
-                            </Badge>
+                      {agentMenuView === "advanced" ? (
+                        <>
+                          {/* Advanced settings for the selected agent: the
+                              brain-harness override (bundle agents), Claude Code's
+                              permission mode, and Codex's approval mode. */}
+                          <DropdownMenuItem
+                            data-testid="new-chat-landing-advanced-back"
+                            onSelect={(e) => {
+                              // Step back to the list instead of closing the menu.
+                              e.preventDefault();
+                              setAgentMenuView("agents");
+                            }}
+                            className="gap-1.5 rounded-sm px-2 py-1.5 text-sm font-medium"
+                          >
+                            <ChevronLeftIcon className="size-4 shrink-0 opacity-70" />
+                            <span>Back</span>
+                          </DropdownMenuItem>
+                          <DropdownMenuSeparator />
+                          {selectedAgentDefaultHarness != null && (
+                            <BrainHarnessOptions
+                              value={pickedHarness ?? selectedAgentDefaultHarness}
+                              onValueChange={(h) =>
+                                // Picking the spec default clears the override so
+                                // the session tracks the spec.
+                                setPickedHarness(h === selectedAgentDefaultHarness ? null : h)
+                              }
+                              host={harnessWarningHost}
+                            />
                           )}
-                        </DropdownMenuItem>
-                      ))}
+                          {/* Permission mode (Claude Code only) — claude-native
+                            has no overridable harness, so the two sections never
+                            co-render today; the separator covers a future agent
+                            with both. */}
+                          {supportsPermissionMode && (
+                            <>
+                              {selectedAgentDefaultHarness != null && <DropdownMenuSeparator />}
+                              <div className="px-2 pt-1.5 pb-0.5 text-xs font-medium text-muted-foreground">
+                                Permission mode
+                              </div>
+                              <PermissionModeOptions
+                                value={permissionMode}
+                                onValueChange={setPermissionMode}
+                              />
+                            </>
+                          )}
+                          {/* Approval mode (Codex only) — codex-native has no
+                            overridable harness, so the two sections never
+                            co-render today; the separator covers a future agent
+                            with both. */}
+                          {supportsApprovalMode && (
+                            <>
+                              {(selectedAgentDefaultHarness != null || supportsPermissionMode) && (
+                                <DropdownMenuSeparator />
+                              )}
+                              <div className="px-2 pt-1.5 pb-0.5 text-xs font-medium text-muted-foreground">
+                                Approval mode
+                              </div>
+                              <ApprovalModeOptions
+                                value={approvalMode}
+                                onValueChange={setApprovalMode}
+                              />
+                            </>
+                          )}
+                        </>
+                      ) : (
+                        <>
+                          {/* Built-in agents first, then a divider, then any
+                              custom (user-registered) agents. renderAgentRow is
+                              defined once and reused for both groups. The divider
+                              only renders when BOTH groups are non-empty, so a
+                              deployment with only custom agents (or only built-ins)
+                              never shows a leading/dangling separator. */}
+                          {builtinAgents.map((agent) => renderAgentRow(agent))}
+                          {builtinAgents.length > 0 && customAgents.length > 0 && (
+                            <DropdownMenuSeparator />
+                          )}
+                          {customAgents.map((agent) => renderAgentRow(agent))}
+                          {/* Advanced settings entry — only for the selected agent
+                              that exposes knobs. Swaps to the Advanced view rather
+                              than closing the menu. */}
+                          {agentHasAdvancedSettings(selectedAgent) && (
+                            <>
+                              <DropdownMenuSeparator />
+                              <DropdownMenuItem
+                                data-testid="new-chat-landing-advanced-entry"
+                                onSelect={(e) => {
+                                  e.preventDefault();
+                                  setAgentMenuView("advanced");
+                                }}
+                                className="gap-2 rounded-sm px-2 py-1.5 text-sm text-muted-foreground"
+                              >
+                                <SettingsIcon className="size-4 shrink-0 opacity-70" />
+                                <span className="flex-1">Advanced settings</span>
+                                <ChevronRightIcon className="size-3.5 shrink-0 opacity-60" />
+                              </DropdownMenuItem>
+                            </>
+                          )}
+                        </>
+                      )}
                     </DropdownMenuContent>
                   </DropdownMenu>
                 ) : (
@@ -1653,57 +1961,6 @@ export function NewChatLandingScreen() {
                     </div>
                   </PopoverContent>
                 </Popover>
-              )}
-
-              {/* Advanced settings chip — per-agent knobs that don't warrant
-                their own chip: the brain-harness override (bundle agents)
-                and Claude Code's permission mode. Hidden when the selected
-                agent has neither. */}
-              {(selectedAgentDefaultHarness != null || isClaudeNativeAgent) && (
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <button
-                      type="button"
-                      className="flex h-6 items-center gap-1.5 rounded-full px-3 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
-                      data-testid="new-chat-landing-advanced-chip"
-                    >
-                      <SettingsIcon className="size-4 shrink-0" />
-                      <span className="truncate">Advanced</span>
-                      <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
-                    </button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent
-                    align="start"
-                    className="max-h-[var(--radix-dropdown-menu-content-available-height)] w-64 max-w-[calc(100vw-2rem)] overflow-y-auto p-1"
-                  >
-                    {selectedAgentDefaultHarness != null && (
-                      <BrainHarnessOptions
-                        value={pickedHarness ?? selectedAgentDefaultHarness}
-                        onValueChange={(h) =>
-                          // Picking the spec default clears the override so the
-                          // session tracks the spec.
-                          setPickedHarness(h === selectedAgentDefaultHarness ? null : h)
-                        }
-                        host={harnessWarningHost}
-                      />
-                    )}
-                    {/* Permission mode (Claude Code only) — claude-native has no
-                      overridable harness, so the two sections never co-render
-                      today; the separator covers a future agent with both. */}
-                    {isClaudeNativeAgent && (
-                      <>
-                        {selectedAgentDefaultHarness != null && <DropdownMenuSeparator />}
-                        <div className="px-2 pt-1.5 pb-0.5 text-[11px] font-medium text-muted-foreground">
-                          Permission mode
-                        </div>
-                        <PermissionModeOptions
-                          value={permissionMode}
-                          onValueChange={setPermissionMode}
-                        />
-                      </>
-                    )}
-                  </DropdownMenuContent>
-                </DropdownMenu>
               )}
             </div>
           </div>

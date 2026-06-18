@@ -75,6 +75,12 @@ deploy/
 ├── islo/              ← Islo sandbox-provider guide (gateway credential
 │   └── README.md         injection); NOT a server deploy target.
 │
+├── e2b/               ← E2B sandbox-provider guide (boots from a pre-built
+│   └── README.md         E2B template); NOT a server deploy target.
+│
+├── openshell/         ← NVIDIA OpenShell sandbox-provider guide (self-hosted
+│   └── README.md         gRPC gateway, on-prem/air-gapped); NOT a server target.
+│
 └── docker/            ← common Docker image + compose stack
     ├── Dockerfile         multi-stage slim image (node web build → python builder → runtime)
     ├── docker-compose.yaml   omnigent + postgres for any Docker host
@@ -195,13 +201,13 @@ omnigent run path/to/agent.yaml --server https://your-host
 
 Don't want a laptop to be the host? Run the host in a cloud sandbox instead.
 
-**From the CLI (Modal, Daytona, or Islo).** Install the provider extra when
-needed (`pip install 'omnigent[modal]'` or `'omnigent[daytona]'`; Islo uses the
-built-in HTTP client), authenticate (`modal token new`, `DAYTONA_API_KEY`, or
-`ISLO_API_KEY`), then:
+**From the CLI (Modal, Daytona, Islo, or E2B).** Install the provider extra when
+needed (`pip install 'omnigent[modal]'`, `'omnigent[daytona]'`, or
+`'omnigent[e2b]'`; Islo uses the built-in HTTP client), authenticate
+(`modal token new`, `DAYTONA_API_KEY`, `ISLO_API_KEY`, or `E2B_API_KEY`), then:
 
 ```bash
-omnigent sandbox create --provider modal     # or --provider daytona / islo
+omnigent sandbox create --provider modal     # or --provider daytona / islo / e2b
 omnigent sandbox connect --provider modal --sandbox-id <id> --server https://your-host
 ```
 
@@ -209,9 +215,12 @@ omnigent sandbox connect --provider modal --sandbox-id <id> --server https://you
 > Modal caps sandbox lifetime at 24 hours. Re-run `create` + `connect` to
 > roll the host onto a fresh sandbox. Daytona and Islo have no Omnigent-imposed
 > lifetime cap; Daytona free-tier orgs restrict egress to an allowlist; see
-> [`daytona/README.md`](daytona/README.md) for the relay workaround.
+> [`daytona/README.md`](daytona/README.md) for the relay workaround. E2B
+> shares Modal's 24-hour cap **and** boots from a pre-built E2B *template*
+> rather than a registry image — build it once first; see
+> [`e2b/README.md`](e2b/README.md).
 
-**Server-managed (Modal, Daytona, or Islo).** With *managed hosts*, creating a
+**Server-managed (Modal, Daytona, Islo, or E2B).** With *managed hosts*, creating a
 session with `"host_type": "managed"` (e.g.
 `POST /v1/sessions {"agent_id": ..., "host_type": "managed"}`) makes the
 server provision a sandbox, start a host in it, and run the session there.
@@ -228,7 +237,7 @@ sandbox:
 Modal credentials come from the server's environment (`MODAL_TOKEN_ID` /
 `MODAL_TOKEN_SECRET`, or a mounted `~/.modal.toml`), not the config file.
 Daytona reads `DAYTONA_API_KEY`; Islo reads `ISLO_API_KEY` (and optional
-`ISLO_BASE_URL`) from the server environment.
+`ISLO_BASE_URL`); E2B reads `E2B_API_KEY` from the server environment.
 Each sandbox authenticates back with a server-minted, per-launch token, so
 no user credentials ever enter the sandbox.
 

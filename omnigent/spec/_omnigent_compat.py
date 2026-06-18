@@ -17,8 +17,9 @@ deleting Omnigent support means:
    grep for ``_omnigent_compat`` to find them).
 3. Delete ``omnigent/spec/omnigent.py`` (the bidirectional
    translator).
-4. Delete ``omnigent/runtime/executors/omnigent.py`` (the
-   executor).
+4. The Omnigent executor module is already gone (it held an
+   experimental executor ABC that has since been removed), so
+   there is nothing left to delete here.
 5. Remove ``ExecutorSpec.config`` from
    ``omnigent/spec/types.py`` (the only field that couldn't
    move here because Python dataclasses don't support
@@ -74,18 +75,22 @@ OMNIGENT_EXECUTOR_TYPE = "omnigent"
 # 'open-responses'" error.
 OMNIGENT_HARNESSES = frozenset(
     {
+        "antigravity",
         "claude-native",
         "claude-sdk",
         "codex",
         "codex-native",
-        "databricks_supervisor",
+        "cursor",
         "openai-agents",
         "open-responses",
         "pi",
+        "pi-native",
     },
 )
 # User-facing aliases accepted in specs and normalized before runtime dispatch.
-OMNIGENT_HARNESS_ALIASES = frozenset({"claude", "openai-agents-sdk"})
+OMNIGENT_HARNESS_ALIASES = frozenset(
+    {"claude", "native-pi", "openai-agents-sdk", "agy", "google-antigravity"}
+)
 _OMNIGENT_ACCEPTED_HARNESSES = OMNIGENT_HARNESSES | OMNIGENT_HARNESS_ALIASES
 
 

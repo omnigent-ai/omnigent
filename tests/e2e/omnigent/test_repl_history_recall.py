@@ -17,6 +17,11 @@ render tick.
   recalled text is stored in the buffer but not redrawn in the
   input window.
 
+Turn synchronization uses the visible ``⠹ working`` activity
+line and the ``❯`` input prompt rather than the bottom-right
+``state:`` badge, which is truncated/CPR-suppressed under a PTY
+(see ``test_repl_smoke`` for the full rationale).
+
 Design reference: ``designs/OMNIGENT_INTEGRATION.md`` §Phase 0
 REPL pexpect suite — "History recall".
 """
@@ -33,10 +38,13 @@ from tests.e2e.omnigent._pexpect_harness import (
     spawn_omnigent_run,
     strip_ansi,
     submit_prompt,
-    wait_for_ready,
 )
 from tests.e2e.omnigent._repl_test_helpers import drain_for
 from tests.e2e.omnigent._snapshot import compare_snapshot
+
+# Visible turn-synchronization markers (see test_repl_smoke).
+_RUNNING_MARKER = r"working"
+_COMPLETION_MARKER = r"❯ "
 
 _MODEL = resolve_model("databricks-gpt-5-mini", key=__name__)
 _HARNESS = "openai-agents"
@@ -89,29 +97,32 @@ def test_repl_history_recall_up_arrow(
         timeout=_SPAWN_TIMEOUT,
     )
     try:
-        wait_for_ready(child, timeout=_BOOT_TIMEOUT)
+        child.expect(_COMPLETION_MARKER, timeout=_BOOT_TIMEOUT)
         submit_prompt(child, _PROMPT_ONE)
         await_turn_complete(
             child,
             running_timeout=_RUNNING_TIMEOUT,
             completion_timeout=_COMPLETION_TIMEOUT,
+            running_marker=_RUNNING_MARKER,
+            completion_pattern=_COMPLETION_MARKER,
         )
         submit_prompt(child, _PROMPT_TWO)
         await_turn_complete(
             child,
             running_timeout=_RUNNING_TIMEOUT,
             completion_timeout=_COMPLETION_TIMEOUT,
+            running_marker=_RUNNING_MARKER,
+            completion_pattern=_COMPLETION_MARKER,
         )
-        # REPL is now back in ``state: sleeping`` with an empty
+        # REPL is now back at the idle ``❯`` prompt with an empty
         # input buffer. Press Up to recall _PROMPT_TWO into the
         # input area, then wait for a redraw cycle so the new
         # input-area frame is flushed to the PTY.
         child.send("\x1b[A")  # ANSI escape for Up arrow
         # Drain any buffered render output until the stream
-        # idles. We can't wait for ``state: sleeping`` again
-        # (it's already there) — drain_for collects whatever
-        # prompt-toolkit painted in response to the keystroke
-        # across however many render frames it spans.
+        # idles — drain_for collects whatever prompt-toolkit
+        # painted in response to the keystroke across however
+        # many render frames it spans.
         recall_drain = drain_for(child, _RECALL_TIMEOUT)
         clean_exit(child, timeout=_EXIT_TIMEOUT)
         exit_code = child.exitstatus

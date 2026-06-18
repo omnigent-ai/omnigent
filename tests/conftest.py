@@ -201,6 +201,28 @@ def pytest_configure(config: pytest.Config) -> None:
         worker = os.environ.get("PYTEST_XDIST_WORKER", "main")
         _PROGRESS_LOG_PATH = os.path.join(log_dir, f"progress-{worker}.log")
 
+    _run_test_environment_guardrails(config)
+
+
+def _run_test_environment_guardrails(config: pytest.Config) -> None:
+    """Enforce test-environment guardrails at session start.
+
+    Hard-fail: :func:`check_test_environment` raises on anything that
+    looks like a real (non-test) DB or a base URL aimed at a dev/prod host
+    or port. Set ``OMNIGENT_DISABLE_TEST_GUARDRAILS=1`` to temporarily
+    downgrade violations to warn-only for deliberate integration runs.
+
+    The resolved DB URI mirrors how a run would pick one: an explicit
+    ``OMNIGENT_DATABASE_URI`` wins (so pointing the suite at a real DB
+    warns loudly), else we fall back to the per-worker tmp MLflow SQLite
+    set just above — a representative throwaway DB that passes cleanly.
+    """
+    from omnigent.testing.guardrails import check_test_environment
+
+    db_uri = os.environ.get("OMNIGENT_DATABASE_URI") or os.environ.get("MLFLOW_TRACKING_URI", "")
+    base_url = config.getoption("--omnigent-server-url", default=None)
+    check_test_environment(db_uri=db_uri, base_url=base_url, warn_only=False)
+
 
 def pytest_unconfigure(config: pytest.Config) -> None:
     """Remove the per-worker MLflow tmpdir created in pytest_configure.

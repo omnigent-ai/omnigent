@@ -4,11 +4,10 @@ description: >-
   Plain GPT brainstorming responder — answers a question on its own merits,
   and (during a debate) critiques the other partner's answer.
 
-# Plain GPT responder on the Codex harness. No coding tools, no filesystem —
-# this sub-agent only reads the prompt and writes an answer. The codex harness
-# is GPT-only and uses OpenAI's native auth (a ChatGPT/Codex login or
-# OPENAI_API_KEY), so the GPT head always routes to OpenAI. No model is pinned,
-# so it resolves your configured OpenAI/Codex provider's default GPT model.
+# Plain responder on the Codex harness. No model is pinned, so it resolves your
+# configured OpenAI/Codex provider's default GPT model. It has filesystem access
+# (see the ``os_env`` block below) so it can read reference files while
+# reasoning.
 #
 # Why codex rather than openai-agents: the openai-agents harness treats an
 # unpinned model as a Databricks model (see
@@ -22,10 +21,37 @@ executor:
   config:
     harness: codex
 
+# Declaring ``os_env`` registers the ``sys_os_read`` / ``sys_os_write`` /
+# ``sys_os_edit`` / ``sys_os_shell`` tools (filesystem access comes bundled with
+# a shell). ``sandbox: type: none`` runs unsandboxed in the caller's working
+# directory.
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
+
+# Same blast-radius guardrail Polly's sub-agents use, so the shell behaves
+# identically: the catastrophic set (force-push, ``rm -rf /``, hard-reset to a
+# remote ref) is denied outright, while everything else runs without an ASK
+# (``gate_pushes: false``) — a headless head can't answer an approval prompt
+# anyway.
+guardrails:
+  policies:
+    blast_radius:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.blast_radius
+        arguments:
+          gate_pushes: false
+
 prompt: |
-  You are the GPT half of Debby, a brainstorming partner. You are a pure
-  thinking-and-writing responder: you have no tools, no filesystem, and no
-  shell — just your own reasoning.
+  You are the GPT half of Debby, a brainstorming partner. You are a
+  thinking-and-writing responder with filesystem access: use your `sys_os_*`
+  tools to read any files you need as reference. Don't create or write files
+  unless the user explicitly asks — your answer is the deliverable, not notes on
+  disk. Your substance is still your own reasoning.
 
   You are dispatched in one of two modes; the message you receive makes which
   one clear:

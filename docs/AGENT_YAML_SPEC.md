@@ -49,7 +49,7 @@ resolved from the YAML file's directory.
 
 ```yaml
 executor:
-  harness: claude-sdk        # claude-sdk, openai-agents, codex, etc.
+  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, pi, antigravity, ...
   model: databricks-claude-opus-4-7
   auth:
     type: databricks
@@ -58,6 +58,36 @@ executor:
 
 Set the Databricks profile under `executor.auth`. The older top-level
 `executor.profile` shorthand is legacy and should not be used in new specs.
+
+The `cursor` harness (Cursor's `cursor-agent`) is the exception: it talks
+only to Cursor's own backend and has no custom API base-URL, so the Databricks
+gateway / `auth.type: databricks` does not apply. Authenticate it with
+`CURSOR_API_KEY` (or a prior `cursor-agent login`), optionally pinned via
+`auth: {type: api_key, api_key: ${CURSOR_API_KEY}}`, and choose a Cursor model
+id (e.g. `auto`, `gpt-5`) rather than a `databricks-*` id.
+
+### Antigravity (Gemini)
+
+`harness: antigravity` runs the agent through Google's
+[Antigravity SDK](https://pypi.org/project/google-antigravity/)
+(`pip install "omnigent[antigravity]"`). It defaults to **Gemini 3.5 Flash**
+and can also drive Claude / GPT-OSS. Authenticate with an Antigravity /
+Gemini API key, or Vertex AI (`project` / `location`) — the SDK is
+Gemini-native and has no OpenAI-compatible gateway / Databricks path.
+
+```yaml
+executor:
+  harness: antigravity         # aliases: agy, google-antigravity
+  model: gemini-3.5-flash
+  auth:
+    type: api_key
+    api_key: ${GEMINI_API_KEY}     # or ANTIGRAVITY_API_KEY
+```
+
+To route through OpenRouter / a gateway, declare a key/gateway provider in
+`~/.omnigent/config.yaml` and reference it (`auth: {type: provider, name: …}`),
+or set `auth.base_url` to the OpenAI-compatible endpoint alongside the key.
+For Databricks, use `auth: {type: databricks, profile: …}`.
 
 CLI flags such as `--harness` and `--model` can override or supply missing
 executor values for a run. Databricks credentials come from the spec's
@@ -148,6 +178,20 @@ tools:
 
 For client-provided tools, use `runtime: client` and do not set `callable`.
 
+### Tool sandbox containers
+
+Local Python tools can run inside a container image by declaring a sandbox image.
+Use `container_image` for new specs; `docker_image` remains accepted as a
+deprecated alias for backwards compatibility. Set `container_runtime: podman` to
+run the image with Podman instead of Docker.
+
+```yaml
+tools:
+  sandbox:
+    container_image: python:3.12-slim
+    container_runtime: podman  # optional; defaults to docker
+```
+
 ### Sub-agent tool
 
 ```yaml
@@ -164,6 +208,19 @@ tools:
     os_env: inherit
     pass_history: true
     max_sessions: 2
+```
+
+Each sub-agent picks its own `executor.harness` and `model`, so an orchestrator
+can mix harnesses by role — e.g. a `cursor` coder with a `claude-sdk`
+reviewer:
+
+```yaml
+tools:
+  coder:
+    type: agent
+    executor:
+      harness: cursor      # Cursor model id (e.g. gpt-5, auto), not a databricks-* id
+      model: gpt-5
 ```
 
 Use `tools.<name>: inherit` to inherit a tool from a parent agent, or

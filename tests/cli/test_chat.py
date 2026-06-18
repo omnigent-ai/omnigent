@@ -3146,6 +3146,23 @@ def _item_assistant(text: str, *, status: str = "completed") -> dict[str, object
     }
 
 
+def _item_error(message: str) -> dict[str, object]:
+    """
+    Build a persisted terminal ``error`` item (harness start-failure shape).
+
+    :param message: The error text, e.g.
+        ``"inner executor error: Failed to start cursor-sdk agent: ..."``.
+    :returns: An item dict matching the flat API shape for an error item.
+    """
+    return {
+        "type": "error",
+        "status": "completed",
+        "source": "execution",
+        "code": "RuntimeError",
+        "message": message,
+    }
+
+
 class _FakeSessionsNamespace:
     """
     Minimal stand-in for ``client.sessions`` used by the reconcile tests.
@@ -3352,6 +3369,36 @@ async def test_query_sessions_once_reraises_when_no_persisted_text(
     client = _FakeAPClient([_item_user("say hi")])
     with pytest.raises(ClientOmnigentError, match="auth misconfigured"):
         await _run_one_shot(client, _raise_genuine_failure, monkeypatch)
+
+
+async def test_query_sessions_once_surfaces_persisted_error_when_no_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A turn that produced no assistant text but persisted a terminal error
+    (e.g. cursor's invalid-model start failure) surfaces that error instead of
+    returning None. If this fails, headless ``-p`` renders a failed turn as a
+    silent, exit-0 empty success.
+    """
+    client = _FakeAPClient(
+        [
+            _item_user("say hi"),
+            _item_error("inner executor error: Failed to start cursor-sdk agent: bad model"),
+        ]
+    )
+    with pytest.raises(ClientOmnigentError, match="Failed to start cursor-sdk agent"):
+        await _run_one_shot(client, _return_empty, monkeypatch)
+
+
+async def test_query_sessions_once_returns_none_when_no_text_and_no_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No assistant text and no persisted error item → None (the caller prints
+    nothing). Guards against the error-surfacing path raising spuriously when a
+    turn genuinely produced nothing and recorded no error.
+    """
+    client = _FakeAPClient([_item_user("unanswered")])
+    result = await _run_one_shot(client, _return_empty, monkeypatch)
+    assert result is None
 
 
 async def test_query_sessions_once_returns_text_without_reconcile_on_success(

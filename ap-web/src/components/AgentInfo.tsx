@@ -24,22 +24,29 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { capitalizeAgentName } from "@/lib/agentLabels";
 import { coercePolicyParams } from "@/lib/policyParams";
+import { agentRootName } from "@/lib/forkHarness";
+import { nativeCodingAgentForAgentName } from "@/lib/nativeCodingAgents";
 import { useChatStore } from "@/store/chatStore";
-
-/** Trigger-pill display aliases for native agents. */
-export const AGENT_DISPLAY_NAMES: Record<string, string> = {
-  "claude-native-ui": "Claude",
-  "codex-native-ui": "Codex",
-};
 
 /**
  * Display label for an agent name: the wrapper alias when mapped, else
  * the name capital-first (server agent names are lowercase slugs, e.g.
  * ``"polly"`` → ``"Polly"``). Keeps the chat surfaces consistent with
  * the new-chat picker's capitalization.
+ *
+ * Strips EVERY `" (fork <id>)"` / `" (switch <id>)"` suffix the fork/switch
+ * routes append to a cloned agent's name before resolving (a fork of a fork
+ * nests them), so a clone of a native wrapper (e.g.
+ * `"pi-native-ui (fork conv_a) (fork conv_b)"`) still maps to its display
+ * name ("Pi") instead of falling through to the capitalized raw slug
+ * ("Pi-native-ui (fork conv_a) …"). Mirrors how `useAvailableAgents` and the
+ * fork/switch pickers match clones back to their root agent.
  */
 export function agentDisplayLabel(name: string): string {
-  return AGENT_DISPLAY_NAMES[name] ?? capitalizeAgentName(name);
+  const baseName = agentRootName(name);
+  const nativeAgent = nativeCodingAgentForAgentName(baseName);
+  if (nativeAgent?.key === "claude") return "Claude";
+  return nativeAgent?.displayName ?? capitalizeAgentName(baseName);
 }
 
 /** Compact pill row listing MCP servers attached to an agent. */

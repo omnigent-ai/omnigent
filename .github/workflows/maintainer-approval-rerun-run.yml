@@ -1,12 +1,11 @@
 name: Maintainer Approval Rerun Run
 
-# Privileged half of the approval re-run relay. Triggered by the
-# completion of maintainer-approval-rerun.yml, this runs from the base
-# repo on `workflow_run`, so it gets a writable token (`actions: write`)
-# even when the underlying PR is from a fork, and is not held behind the
-# fork-approval gate. It reads the PR number recorded by the bridge and
-# re-runs the failed Maintainer Approval check on the PR head, which
-# re-evaluates the (now-present) approval and turns the check green.
+# Privileged half of the approval re-run relay. Triggered by the completion of
+# maintainer-approval-rerun.yml, this runs from the base repo on `workflow_run`,
+# so it gets a writable token (`actions: write`) even for fork PRs and isn't held
+# behind the fork-approval gate. It reads the recorded PR number and re-runs the
+# failed Maintainer Approval check on the PR head, re-evaluating the now-present
+# approval to turn the check green.
 
 on:
   workflow_run:

@@ -50,6 +50,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server.schemas import (
     CompletedEvent,
@@ -638,12 +639,26 @@ class TurnContext:
         try:
             return await asyncio.wait_for(future, timeout=_POLICY_EVAL_TIMEOUT_S)
         except asyncio.TimeoutError:
+            # Phase-aware default: advisory LLM phases and TOOL_RESULT (the
+            # tool already ran) fail OPEN so a missing verdict never hangs the
+            # turn, but TOOL_CALL is the authoritative gate for
+            # connector-native tools and fails CLOSED.
+            _fail_closed = phase in FAIL_CLOSED_PHASES
+            _action = "POLICY_ACTION_DENY" if _fail_closed else "POLICY_ACTION_ALLOW"
             _logger.warning(
-                "Policy evaluation %s timed out after %ds; defaulting to ALLOW",
+                "Policy evaluation %s timed out after %ds; defaulting to %s",
                 evaluation_id,
                 _POLICY_EVAL_TIMEOUT_S,
+                _action,
             )
-            return PolicyVerdictPayload(action="POLICY_ACTION_ALLOW")
+            return PolicyVerdictPayload(
+                action=_action,
+                reason=(
+                    f"Policy evaluation timed out; failing closed for {phase}."
+                    if _fail_closed
+                    else None
+                ),
+            )
         finally:
             self._pending_policy_evaluations.pop(evaluation_id, None)
 
@@ -1503,9 +1518,29 @@ class HarnessApp:
             minimal — AP's persistence path constructs the
             authoritative ResponseObject.
         """
-        # ``run_task.exception()`` is ``None`` on clean return, an
-        # exception instance otherwise.
-        exception = run_task.exception() if run_task.done() and not run_task.cancelled() else None
+        # The sentinel that gets us here is queued from ``run_turn``'s
+        # ``finally`` block, so the streaming side can observe it before the
+        # task is fully terminal. Wait for that last scheduling tick before
+        # inspecting task state; otherwise a cancel/error race can make the
+        # terminal-event builder raise while trying to classify the result.
+        exception: BaseException | None = None
+        if not run_task.done():
+            try:
+                await asyncio.shield(run_task)
+            except asyncio.CancelledError:
+                if not run_task.done():
+                    raise
+            except Exception as exc:
+                exception = exc
+        if exception is None and run_task.done() and not run_task.cancelled():
+            try:
+                # ``run_task.exception()`` is ``None`` on clean return, an
+                # exception instance otherwise. It can still raise
+                # CancelledError for cancellation races; classify that as a
+                # cancelled terminal instead of letting terminal synthesis fail.
+                exception = run_task.exception()
+            except asyncio.CancelledError:
+                exception = None
         cancelled = run_task.cancelled() or ctx.cancelled.is_set()
         if cancelled:
             status_value = "cancelled"

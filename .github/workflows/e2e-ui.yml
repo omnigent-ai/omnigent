@@ -1,28 +1,22 @@
 name: E2E UI Tests
 
-# Runs the Playwright UI suite against a freshly built ap-web
-# SPA + a hello_world test agent, split across a 3-shard matrix
-# (pytest-shard, same pattern as e2e.yml) so wall-clock stays low
-# enough to gate PRs on as the suite grows. Lives in its own
-# workflow rather than as a sibling job in nightly.yml because the
-# setup (Node + npm + Playwright + SPA build) is structurally
-# disjoint from the inner-only legs and would bloat that workflow's
-# matrix.
+# Runs the Playwright UI suite against a freshly built ap-web SPA + a
+# hello_world test agent, split across a 3-shard matrix. Separate from
+# nightly.yml because the Node + Playwright + SPA-build setup is disjoint
+# from the inner-only legs.
 #
 # Triggers:
-#   pull_request        opened / synchronize / reopened /
-#                       ready_for_review. SAME-REPO PRs only; draft
-#                       PRs and fork PRs skip the job (forks run via
-#                       the fork-e2e/** push after approval, mirrored
-#                       by fork-e2e-mirror.yml).
-#   push (fork-e2e/**)  the UI suite for mirrored fork PRs -- a trusted
-#                       base-repo branch, so secrets flow.
+#   pull_request        SAME-REPO PRs only; draft / fork PRs skip the job
+#                       (forks run via the fork-e2e/** push after approval).
+#   push (fork-e2e/**)  UI suite for mirrored fork PRs (trusted, secrets flow).
 #   schedule            09:00 UTC daily, alongside nightly.yml.
-#   workflow_dispatch   manual run. Input `branch` selects a non-main
-#                       ref.
+#   workflow_dispatch   manual run. Input `branch` selects a non-main ref.
 
 on:
   pull_request:
+    # No labeled/unlabeled: a skip-security-scan waiver re-runs this workflow's
+    # Security Gate via rerun-security-gate.yml, so label churn need not re-run
+    # the heavy Playwright suite. (#399 added these for the gate; superseded.)
     types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches:
@@ -40,49 +34,43 @@ permissions:
   contents: read
 
 concurrency:
-  # PR re-syncs share a group by PR number so old runs cancel.
-  # workflow_dispatch with a branch input shares a group so manual
-  # re-dispatches against the same branch cancel. Push and schedule
-  # events key by SHA so back-to-back merges to `main` each get
-  # their own run -- needed for per-commit regression visibility.
+  # PRs key by number, dispatch by branch (so re-runs cancel); push /
+  # schedule key by SHA so each merge to `main` gets its own run.
   group: e2e-ui-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.inputs.branch || github.sha }}
   cancel-in-progress: true
 
 env:
-  # No SPA build during `uv sync` (setup.py `_build_web_ui`): this
-  # workflow builds the bundle itself in a dedicated `npm ci && npm run
-  # build` step, so the setup.py build would be a redundant ~10min that
-  # also hits public npm (no registry mirror here).
+  # No SPA build during `uv sync`: this workflow builds the bundle in a
+  # dedicated step, so the setup.py build would be a redundant npm hit.
   OMNIGENT_SKIP_WEB_UI: "true"
   # Scrub harness credentials the test server must not pick up.
-  # OPENAI_API_KEY / OPENAI_BASE_URL are intentionally NOT scrubbed here
-  # — the "Run UI e2e tests" step sets them to the freshly-minted
-  # Databricks bearer + workspace serving-endpoints URL so the spawned
-  # hello_world agent (openai-agents harness against Databricks Model
-  # Serving) can authenticate. The previous shape scrubbed both and
-  # expected the agent to fall back to ~/.databrickscfg, but the SDK's
-  # default-profile lookup didn't resolve our OAuth M2M config in CI,
-  # which is what was failing the LLM calls.
+  # OPENAI_API_KEY / OPENAI_BASE_URL are NOT scrubbed here -- the "Run UI
+  # e2e tests" step sets them to the Databricks bearer + serving-endpoints
+  # URL so the spawned openai-agents hello_world agent can authenticate
+  # (the ~/.databrickscfg fallback didn't resolve our OAuth M2M in CI).
   ANTHROPIC_API_KEY: ""
   DATABRICKS_TOKEN: ""
   CODEX: ""
   CLAUDE_CODE: ""
   # Match e2e.yml's proxy choice.
   UV_INDEX_URL: https://pypi.org/simple
-  # GitHub-hosted runners default to TERM=dumb, which makes the
-  # terminal-attach test's PTY shell error out on "clear". Set a real
-  # terminfo so the spawned PTY (and any nested tools that probe TERM)
-  # can resolve clear/cursor sequences. Inherited by the agent server
-  # subprocess via the conftest's env={**os.environ, ...} plumbing.
+  # Runners default to TERM=dumb, which breaks the PTY shell's "clear".
+  # A real terminfo lets the spawned PTY resolve clear/cursor sequences;
+  # inherited by the agent server via the conftest's env plumbing.
   TERM: xterm-256color
 
 jobs:
-  # Compute the shard matrix once. A skipped run (draft, or a fork's
-  # pull_request) yields an EMPTY matrix -> zero shard jobs -> no skipped
-  # check-runs with an unexpanded ${{ matrix.* }} name. Shared with e2e.yml
-  # via .github/scripts/ci/e2e-shard-matrix.sh (only NUM_SHARDS differs).
+  # Security gate: untrusted PRs wait on the deterministic scan
+  # (security-gate.yml); trusted authors and non-PR events pass instantly.
+  gate:
+    uses: ./.github/workflows/security-gate.yml
+
+  # Compute the shard matrix once. A skipped run (draft / fork pull_request)
+  # yields an EMPTY matrix -> zero shard jobs -> no skipped placeholder check.
+  # Shared with e2e.yml via e2e-shard-matrix.sh (only NUM_SHARDS differs).
   setup:
     name: setup
+    needs: gate
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -91,10 +79,8 @@ jobs:
       - name: Check out CI scripts
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
-          # Triggering ref (not pinned to main): the script must exist on the
-          # running ref, and it is not a security gate -- it only shards tests
-          # and can't expose secrets (fork pull_request has none), so the PR's
-          # own copy is fine.
+          # Triggering ref (not main): the script must exist on it, and it
+          # only shards tests -- no secrets exposure, so the PR's copy is fine.
           sparse-checkout: .github/scripts/ci
           persist-credentials: false
       - name: Compute shard matrix
@@ -108,23 +94,18 @@ jobs:
 
   e2e-ui:
     name: E2E UI Tests (shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
-    # Draft PRs and fork pull_request events resolve to an EMPTY matrix in
-    # `setup` (forks can't read the LLM_API_KEY / GATEWAY_BASE_URL secrets on a
-    # pull_request; they run via the fork-e2e/** mirror push instead), so this
-    # job produces zero shard runs for them -- and thus no skipped placeholder
-    # check. The `ready_for_review` trigger re-fires when a draft is converted.
+    # Draft / fork pull_request events resolve to an EMPTY matrix in `setup`
+    # (forks run via the fork-e2e/** mirror push), so no shard runs for them.
+    # `ready_for_review` re-fires when a draft is converted.
     needs: setup
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
-      # One red shard shouldn't cancel siblings; we want every shard's
-      # signal so reviewers can see whether the failure is broad or
-      # localized to one chunk.
+      # One red shard shouldn't cancel siblings -- we want every shard's signal.
       fail-fast: false
       max-parallel: 3
-      # Shards from `setup`; [] when the run is skipped. Shard check names are
-      # in .github/scripts/merge-ready/required.sh -- keep in sync with the
-      # NUM_SHARDS in this workflow's setup job when changing the count.
+      # Shards from `setup`; [] when skipped. Shard check names live in
+      # merge-ready/required.sh -- keep in sync with NUM_SHARDS above.
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
 
     steps:
@@ -139,11 +120,7 @@ jobs:
           python-version-file: ".python-version"
 
       - name: Set up Node 20
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
-        with:
-          node-version: "20"
-          cache: "npm"
-          cache-dependency-path: ap-web/package-lock.json
+        uses: ./.github/actions/setup-node
 
       - name: Install uv
         uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
@@ -161,19 +138,16 @@ jobs:
       - name: Install project + dev extras
         run: uv sync --extra all --extra dev
 
-      - name: Install bubblewrap
-        # The UI tests boot a real server and open terminals, which run
-        # under os_env. An agent/terminal that omits `os_env.sandbox.type`
-        # defaults to `linux_bwrap` on Linux and fails loud at runtime if
-        # `bwrap` is missing (rather than silently running unsandboxed), so
-        # the terminal never launches and the right-panel terminal assertion
-        # fails. Install `bubblewrap` like ci.yml / e2e.yml. The apparmor
-        # sysctl mirrors ci.yml: Ubuntu 24.04 blocks unprivileged user
-        # namespaces by default, which `bwrap`'s `unshare(CLONE_NEWUSER)`
-        # needs.
+      - name: Install bubblewrap + tmux
+        # bubblewrap: the UI tests open terminals under os_env, whose
+        # linux_bwrap backend fails loud if `bwrap` is missing. The apparmor
+        # sysctl mirrors ci.yml (Ubuntu 24.04 blocks unprivileged user
+        # namespaces, which bwrap's unshare(CLONE_NEWUSER) needs).
+        # tmux: the claude-native render-parity test drives Claude Code
+        # through a tmux pane, so `tmux` must be on PATH.
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap
+          sudo apt-get install -y bubblewrap tmux
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Cache Playwright browsers
@@ -189,17 +163,10 @@ jobs:
           uv run playwright install --with-deps chromium
 
       - name: Build ap-web SPA
-        # Build BEFORE pytest. Vite's emptyOutDir clobbers the
-        # static dir, so we never want this happening under xdist
-        # workers or interleaved with the running server.
-        #
-        # The lockfile already pins the dependency tree. `--legacy-peer-deps`
-        # prevents npm from spending the whole job re-resolving the known
-        # React 19 peer-dependency conflict under @emoji-mart/react.
-        #
-        # registry.npmjs.org TLS handshakes flake (ECONNRESET) on this
-        # runner pool — route npm through the Databricks proxy. The
-        # public export rewrites this URL back to the npmjs default.
+        # Build BEFORE pytest: Vite's emptyOutDir clobbers the static dir,
+        # so never run it under xdist or alongside the live server.
+        # --legacy-peer-deps avoids re-resolving the known React 19 peer
+        # conflict under @emoji-mart/react.
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
@@ -207,24 +174,92 @@ jobs:
           npm ci --legacy-peer-deps --no-audit --no-fund
           npm run build
 
+      # Native coding-agent harness enablement: the next steps let the
+      # native render-parity tests boot a real Claude Code / Codex CLI. The
+      # rest of the e2e-ui suite (openai-agents) ignores them.
+      - name: Install Claude Code CLI
+        # claude-code 2.1.170, NOT the 2.1.124 in .github/ci-deps: 2.1.124
+        # doesn't recognise the hook events the native bridge configures and
+        # shows a blocking startup modal that swallows the first message.
+        # --ignore-scripts then run install.cjs explicitly (audited: platform
+        # detect + same-tree hardlink, no network/exec) and put its bin on PATH.
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/.cc-cli" && cd "${GITHUB_WORKSPACE}/.cc-cli"
+          npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.170
+          node node_modules/@anthropic-ai/claude-code/install.cjs
+          echo "${GITHUB_WORKSPACE}/.cc-cli/node_modules/.bin" >> "$GITHUB_PATH"
 
+      - name: Install Codex CLI
+        # @openai/codex at the .github/ci-deps pin (same build as e2e.yml's
+        # codex leg). `scripts: null` means no postinstall, so --ignore-scripts
+        # is a safety no-op; the native binary ships in the package and goes on
+        # PATH for the codex render-parity test's tmux pane.
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/.codex-cli" && cd "${GITHUB_WORKSPACE}/.codex-cli"
+          npm install --ignore-scripts --no-audit --no-fund @openai/codex@0.128.0-alpha.1
+          echo "${GITHUB_WORKSPACE}/.codex-cli/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Configure native-claude/codex gateway provider
+        # The native CLIs derive their gateway auth from omnigent provider
+        # config. Register the Databricks gateway as the default for both
+        # anthropic (Claude Code) and openai (Codex); the token reaches each
+        # CLI via an env:LLM_API_KEY ref, so no literal secret hits disk.
+        env:
+          GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          mkdir -p "$HOME/.omnigent"
+          # The Anthropic Messages surface and the Codex Responses surface live
+          # at different paths off the same workspace host. GATEWAY_BASE_URL is
+          # <host>/serving-endpoints (the OpenAI-compatible surface); strip that
+          # suffix to recover the bare host for the codex /ai-gateway path.
+          host="${GATEWAY_BASE_URL%/serving-endpoints}"
+          cat > "$HOME/.omnigent/config.yaml" <<EOF
+          providers:
+            databricks-gateway:
+              kind: gateway
+              default: [anthropic, openai]
+              anthropic:
+                # Databricks serves the Anthropic Messages surface at
+                # <host>/serving-endpoints/anthropic (see
+                # omnigent/inner/pi_executor.py: claude_base_url). GATEWAY_BASE_URL
+                # is <host>/serving-endpoints (the OpenAI-compatible surface), so
+                # the /anthropic suffix is required — without it Claude Code POSTs
+                # to .../serving-endpoints/v1/messages and gets no reply.
+                base_url: "${GATEWAY_BASE_URL}/anthropic"
+                api_key_ref: "env:LLM_API_KEY"
+                # The default model id is read from models.default (not a
+                # top-level default_model key). Without it the provider
+                # resolves model=None, Claude Code launches with no --model and
+                # falls back to its built-in 'claude-sonnet-4-6', which the
+                # Databricks gateway rejects (the endpoint name is the
+                # 'databricks-' prefixed id).
+                models:
+                  default: databricks-claude-sonnet-4-6
+              openai:
+                # Databricks serves the Codex Responses surface at
+                # <host>/ai-gateway/codex/v1 (see omnigent/inner/codex_executor.py:
+                # _databricks_codex_base_url), NOT the /serving-endpoints
+                # OpenAI-compatible surface. wire_api must be 'responses' — codex
+                # >= 0.137 rejects 'chat' at config load.
+                base_url: "${host}/ai-gateway/codex/v1"
+                api_key_ref: "env:LLM_API_KEY"
+                wire_api: responses
+                # The codex model id the e2e codex leg pins (tests/_model_pools).
+                models:
+                  default: databricks-gpt-5-4-mini
+          EOF
 
       - name: Run UI e2e tests
-        # --ui-skip-build: the SPA was already built in the previous
-        # step, so skip the fixture's own npm ci + build pass.
-        #
-        # pytest-playwright defaults --tracing/--screenshot/--video all
-        # to "off", so without these flags test-results/ stays empty
-        # and the failure-upload step has nothing to grab. retain-on-failure
-        # keeps the CI cost ~zero on green runs while giving us a full
-        # trace + video to step through when something breaks.
-        #
-        # OPENAI_API_KEY / OPENAI_BASE_URL are propagated by the
-        # conftest's live_server fixture (env={**os.environ, ...}) into
-        # the spawned `omnigent server --agent` subprocess, where the
-        # openai-agents harness picks them up as the Databricks Model
-        # Serving endpoint + bearer (see
-        # omnigent/inner/openai_agents_sdk_executor.py:387).
+        # --ui-skip-build: the SPA was built in the previous step.
+        # --tracing/--screenshot/--video default to off; retain-on-failure
+        # keeps green runs cheap while capturing artifacts on failures.
+        # OPENAI_API_KEY / OPENAI_BASE_URL flow into the spawned server via
+        # the conftest's live_server fixture for the openai-agents harness.
         env:
           OPENAI_API_KEY: ${{ env.LLM_API_KEY }}
           OPENAI_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
@@ -238,14 +273,10 @@ jobs:
           if [[ "$NIGHTLY_FULL" != "true" ]]; then
             EXTRA_ARGS+=(-m "not nightly")
           fi
-          # --splits/--group partition the suite across the matrix entries
-          # via a round-robin strided slice (see pytest_collection_modifyitems
-          # in tests/e2e_ui/conftest.py). Unlike pytest-shard's hash-bucketing
-          # -- which was blind to runtime and left one shard ~5min while
-          # others ran ~2min -- striding scatters each heavy file's cases
-          # one-per-shard, evening out wall-clock with no extra dependency
-          # and no durations file to maintain. --group is 1-indexed, so we
-          # map the 0-indexed matrix shard_id with +1.
+          # --splits/--group partition the suite via a strided slice (see
+          # pytest_collection_modifyitems in tests/e2e_ui/conftest.py), which
+          # evens out wall-clock better than pytest-shard's hash-bucketing.
+          # --group is 1-indexed, so map the 0-indexed shard_id with +1.
           uv run pytest tests/e2e_ui \
             -v --tb=long --showlocals --log-level=INFO -r a \
             --ui-skip-build \
@@ -262,18 +293,35 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          # Shard suffix keeps the matrix's parallel uploads from
-          # colliding on the same artifact name (v4 409s on dupes).
+          # Shard suffix avoids the matrix's parallel uploads colliding (v4
+          # 409s on dupe names).
           name: e2e-ui-playwright-${{ github.run_id }}-shard${{ matrix.shard_id }}
-          # ``playwright-report/`` is the JS-runner's HTML report dir and
-          # is never produced by pytest-playwright — left in the path
-          # list for forward-compat (``if-no-files-found: ignore`` keeps
-          # it silent when absent).
+          # `playwright-report/` is the JS-runner's HTML dir, never produced
+          # by pytest-playwright -- kept for forward-compat (ignore-if-absent).
           path: |
             test-results/
             playwright-report/
           retention-days: 3
           if-no-files-found: ignore
+
+      - name: Dump Claude transcript on failure
+        # Claude Code's transcript JSONL lives under ~/.claude/projects (a
+        # hidden dir the artifact glob misses); stage it under /tmp. NOT
+        # copying ~/.claude.json: its apiKeyHelper embeds the gateway token.
+        if: failure()
+        run: |
+          mkdir -p /tmp/claude-home-dump
+          cp -r "$HOME/.claude/projects" /tmp/claude-home-dump/ 2>/dev/null || true
+
+      - name: Dump Codex transcript on failure
+        # Codex's per-session rollout JSONLs live under the bridged CODEX_HOME
+        # at ~/.omnigent/codex-native/<hash>/codex-home/sessions; stage only
+        # the *.jsonl. NOT copying config.toml: its auth command embeds the token.
+        if: failure()
+        run: |
+          mkdir -p /tmp/codex-home-dump
+          find "$HOME/.omnigent/codex-native" -name '*.jsonl' -print0 2>/dev/null \
+            | xargs -0 -I{} cp --parents {} /tmp/codex-home-dump/ 2>/dev/null || true
 
       - name: Upload server logs on failure
         id: upload_server_logs
@@ -281,22 +329,21 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: e2e-ui-server-logs-${{ github.run_id }}-shard${{ matrix.shard_id }}
-          # The conftest's ``live_server`` fixture writes server.log
-          # under ``tmp_path_factory.mktemp("e2e_ui_server")``, which
-          # resolves to ``/tmp/pytest-of-runner/pytest-*/e2e_ui_server*/``
-          # on GitHub-hosted runners. The previous glob targeted
-          # ``e2e_ui_logs*``, which never matched, so the artifact was
-          # always empty.
-          path: /tmp/pytest-of-runner/**/e2e_ui_server*/server.log
+          # server.log + runner.log from the live_server fixture's tmp dir,
+          # plus the native bridge dirs and the Claude / Codex transcripts
+          # staged above -- all needed to triage a native render-parity failure.
+          path: |
+            /tmp/pytest-of-runner/**/e2e_ui_server*/server.log
+            /tmp/pytest-of-runner/**/e2e_ui_server*/runner.log
+            /tmp/omnigent-*/claude-native/**
+            /tmp/claude-home-dump/**
+            /tmp/codex-home-dump/**
           retention-days: 3
           if-no-files-found: ignore
 
       - name: Surface failure artifacts on job summary
-        # GH groups artifact uploads inside the step they ran in, which
-        # means triagers have to expand the right step + scroll to find
-        # the download link. Writing to GITHUB_STEP_SUMMARY puts a flat,
-        # always-visible Markdown block at the top of the job summary
-        # page with direct links to every artifact this job produced.
+        # Write a flat, always-visible block of artifact download links to
+        # GITHUB_STEP_SUMMARY (GH otherwise buries them inside each step).
         if: failure()
         env:
           PLAYWRIGHT_URL: ${{ steps.upload_playwright.outputs.artifact-url }}

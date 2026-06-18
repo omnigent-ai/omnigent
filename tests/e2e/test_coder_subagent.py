@@ -188,31 +188,15 @@ def test_coder_spawns_parallel_subagents(
     sample_code_dir: Path,
 ) -> None:
     """
-    Coder agent spawns BOTH reviewer and researcher sub-agents in
-    parallel by emitting TWO ``sys_session_send`` tool_calls in a
-    single LLM response.
+    Coder agent spawns BOTH reviewer and researcher sub-agents.
 
-    Note on the parallel-spawn semantics: the ``sys_session_send``
-    tool dispatches one sub-agent per call. Parallel spawning is
-    achieved by the LLM emitting MULTIPLE tool_calls in the same
-    response, which Omnigent dispatches concurrently. This is a behavior
-    change from the historical batch-spawn ``spawn_sub_agents``
-    (plural) tool that took a list — that tool no longer exists.
-
-    Scope: this test asserts the parallel-SPAWN intent (two
-    ``sys_session_send`` calls in one dispatch turn, naming both
-    sub-agents). It deliberately does NOT wait for the async
-    sub-agents to finish and merge their results into a final
-    message. ``sys_session_send`` is async, so the dispatch turn
-    goes idle before the children complete; asserting on the merged
-    output races the sub-agents and, when combined with the auto-wake
-    notice debounce (only the first child of a fan-out posts a wake
-    notice) and the 180s e2e per-test cap, previously wedged the
-    whole CI shard. Concurrent completion + auto-collect + merge is
-    covered elsewhere: ``test_coder_spawns_reviewer_and_collects``
-    (single sub-agent, tunneled tools, collect + merge) and
-    ``test_subagent_autowake_e2e`` (auto-wake continuation surfaces a
-    sub-agent result).
+    Scope: this test asserts durable delegation behavior, not the
+    nondeterministic LLM scheduling detail of whether both
+    ``sys_session_send`` calls are emitted in one response or across
+    sequential turns. Omnigent dispatches each ``sys_session_send``
+    asynchronously; the meaningful invariant is that the completed root
+    turn delegated to both requested sub-agents instead of doing the work
+    directly or dropping one branch.
     """
     result = _run_with_tunneling(
         http_client,
@@ -237,22 +221,16 @@ def test_coder_spawns_parallel_subagents(
 
     output = result["output"]
 
-    # Two sys_session_send tool_calls — one per sub-agent. The
-    # parallel-spawn pattern emits N tool_calls in the same LLM
-    # response, not one call with a list.
     spawn_calls = [
         item
         for item in output
         if item.get("type") == "function_call" and item.get("name") == "sys_session_send"
     ]
     assert len(spawn_calls) >= 2, (
-        f"Expected at least 2 sys_session_send tool_calls (one per "
-        f"sub-agent); got {len(spawn_calls)}. LLM may have spawned "
-        "sequentially across multiple turns instead of in parallel."
+        f"Expected at least 2 sys_session_send tool_calls (one per sub-agent); "
+        f"got {len(spawn_calls)}. Output: {output}"
     )
 
-    # Check across the spawn calls' arguments — both sub-agents
-    # should be addressed somewhere in the call set.
     all_spawn_args = " ".join(c.get("arguments", "") for c in spawn_calls)
     assert "reviewer" in all_spawn_args, (
         f"sys_session_send calls didn't include reviewer: {all_spawn_args}"

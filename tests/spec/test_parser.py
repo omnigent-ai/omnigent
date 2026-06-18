@@ -1072,6 +1072,45 @@ def test_parse_inline_mcp_skips_standard_tools_keys(tmp_path: Path) -> None:
     assert spec.mcp_servers[0].name == "real_mcp"
 
 
+def test_parse_tools_sandbox_docker_image_alias(tmp_path: Path) -> None:
+    """Legacy ``tools.sandbox.docker_image`` remains a valid image alias."""
+    config = {
+        "spec_version": 1,
+        "name": "legacy-docker-image",
+        "tools": {
+            "sandbox": {
+                "docker_image": "python:3.12-slim",
+                "container_runtime": "podman",
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    assert spec.tools.sandbox.container_image == "python:3.12-slim"
+    assert spec.tools.sandbox.docker_image == "python:3.12-slim"
+    assert spec.tools.sandbox.container_runtime == "podman"
+
+
+def test_parse_tools_sandbox_container_image_precedence(tmp_path: Path) -> None:
+    """Preferred ``container_image`` wins when both image keys exist."""
+    config = {
+        "spec_version": 1,
+        "name": "container-image-precedence",
+        "tools": {
+            "sandbox": {
+                "container_image": "python:3.12-slim",
+                "docker_image": "python:3.11-slim",
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    assert spec.tools.sandbox.container_image == "python:3.12-slim"
+    assert spec.tools.sandbox.docker_image == "python:3.12-slim"
+
+
 def test_parse_inline_mcp_skips_non_mcp_type_entries(tmp_path: Path) -> None:
     """
     Tools-block entries whose ``type`` is not ``"mcp"`` are silently
@@ -2546,55 +2585,6 @@ def test_parse_os_env_start_in_scratch_with_sandbox_none_rejected(
         parse(tmp_path)
 
 
-# ── Supervisor executor parser tests ──────────────────────────────
-
-
-def _write_supervisor_config(
-    tmp_path: Path,
-    *,
-    extra_executor: dict[str, object] | None = None,
-    llm_extra: dict[str, object] | None = None,
-    tools: list[dict[str, object]] | None = None,
-) -> None:
-    """
-    Write a minimal supervisor-harness config.yaml under *tmp_path*.
-
-    Uses ``executor.type: omnigent`` with
-    ``config.harness: databricks_supervisor``.
-
-    :param tmp_path: pytest-provided temporary directory.
-    :param extra_executor: Additional keys to merge into the
-        ``executor:`` block, e.g. ``{"profile": "dev"}``.
-        Default ``None``.
-    :param llm_extra: Additional keys to merge into the ``llm:``
-        block on top of ``{"model": "...", "connection":
-        {"api_key": "..."}}``. Default ``None``.
-    :param tools: Top-level ``tools:`` list to write. Default
-        ``None`` (no tools key).
-    """
-    executor: dict[str, object] = {
-        "type": "omnigent",
-        "config": {"harness": "databricks_supervisor"},
-    }
-    if extra_executor is not None:
-        executor.update(extra_executor)
-    llm: dict[str, object] = {
-        "model": "databricks-claude-sonnet-4-6",
-        "connection": {"api_key": "sk-test"},
-    }
-    if llm_extra is not None:
-        llm.update(llm_extra)
-    config: dict[str, object] = {
-        "spec_version": 1,
-        "name": "sup-agent",
-        "executor": executor,
-        "llm": llm,
-    }
-    if tools is not None:
-        config["tools"] = tools
-    (tmp_path / "config.yaml").write_text(yaml.dump(config))
-
-
 def test_executor_profile_field_lifted_from_yaml(tmp_path: Path) -> None:
     """
     Top-level ``executor.profile`` lifts into the concrete
@@ -2628,324 +2618,22 @@ def test_executor_profile_field_lifted_from_yaml(tmp_path: Path) -> None:
     assert spec.executor.config.get("profile") == "dev"
 
 
-def test_executor_profile_field_supervisor(tmp_path: Path) -> None:
-    """
-    ``executor.profile`` lifts into ``ExecutorSpec.profile`` for
-    the supervisor harness. Since the executor type is
-    ``"omnigent"``, profile is also mirrored into
-    ``executor.config["profile"]``.
-
-    :param tmp_path: pytest-provided temporary directory.
-    """
-    _write_supervisor_config(tmp_path, extra_executor={"profile": "prod"})
+def test_executor_profile_field_lifted_for_non_omnigent(tmp_path: Path) -> None:
+    """``executor.profile`` lifts into ``ExecutorSpec.profile`` for all executor types."""
+    config = {
+        "spec_version": 1,
+        "name": "agent",
+        "executor": {"type": "claude_sdk", "profile": "prod"},
+        "llm": {"model": "databricks-claude-sonnet-4-6"},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
     spec = parse(tmp_path)
     assert spec.executor.profile == "prod"
-    assert spec.executor.config.get("harness") == "databricks_supervisor"
-    assert spec.executor.config.get("profile") == "prod"
+    assert "profile" not in spec.executor.config
 
 
-def test_supervisor_harness_accepted(tmp_path: Path) -> None:
-    """
-    Minimal supervisor harness YAML parses without error and produces
-    ``executor.type == "omnigent"`` with
-    ``config.harness == "databricks_supervisor"`` and no tools.
-
-    :param tmp_path: pytest-provided temporary directory.
-    """
-    _write_supervisor_config(tmp_path)
-    spec = parse(tmp_path)
-    assert spec.executor.type == "omnigent"
-    assert spec.executor.config.get("harness") == "databricks_supervisor"
-    # No tools declared → empty list (NOT None) so downstream
-    # readers don't have to special-case the missing-key form
-    # vs the empty-list form.
-    assert spec.executor.supervisor_tools == []
-    assert spec.llm is not None
-    assert spec.llm.model == "databricks-claude-sonnet-4-6"
-
-
-def test_supervisor_typed_tools_pass_through_verbatim(tmp_path: Path) -> None:
-    """
-    All five typed supervisor tool shapes parse and round-trip
-    verbatim into ``executor.supervisor_tools``.
-
-    The parser must NOT normalize these into a function-tool
-    shape — the supervisor executor consumes them as-is.
-
-    :param tmp_path: pytest-provided temporary directory.
-    """
-    # Nested shape — the real Databricks Supervisor API rejects
-    # flat tool entries.
-    tools: list[dict[str, object]] = [
-        {
-            "type": "genie_space",
-            "genie_space": {
-                "id": "space-abc",
-                "description": "Sales analytics",
-            },
-        },
-        {
-            "type": "uc_function",
-            "uc_function": {
-                "name": "main.search",
-                "description": "Search the catalog",
-            },
-        },
-        {
-            "type": "uc_connection",
-            "uc_connection": {
-                "name": "system_ai_agent_google_drive",
-                "description": "Google Drive connection",
-            },
-        },
-        {
-            "type": "app",
-            "app": {
-                "name": "my-app",
-                "description": "Custom app",
-            },
-        },
-        {
-            "type": "knowledge_assistant",
-            "knowledge_assistant": {
-                "knowledge_assistant_id": "ka-123",
-                "description": "Knowledge assistant",
-            },
-        },
-    ]
-    _write_supervisor_config(tmp_path, tools=tools)
-    spec = parse(tmp_path)
-    assert spec.executor.supervisor_tools is not None
-    # Length must match input — a missing or extra entry would
-    # mean the parser dropped or duplicated a tool, which the
-    # supervisor executor would silently surface as a mismatched
-    # tool surface to the LLM.
-    assert len(spec.executor.supervisor_tools) == 5
-
-    # Per-entry verbatim equality (NESTED form) — each input dict
-    # must round-trip with the exact same outer ``type`` plus the
-    # nested sub-dict carrying the per-type config. Wrong values
-    # would mean the parser is normalizing the typed dicts (e.g.
-    # flattening, dropping unknown keys, or coercing types).
-    expected_first = {
-        "type": "genie_space",
-        "genie_space": {
-            "id": "space-abc",
-            "description": "Sales analytics",
-        },
-    }
-    assert spec.executor.supervisor_tools[0] == expected_first
-
-    expected_second = {
-        "type": "uc_function",
-        "uc_function": {
-            "name": "main.search",
-            "description": "Search the catalog",
-        },
-    }
-    assert spec.executor.supervisor_tools[1] == expected_second
-
-    expected_third = {
-        "type": "uc_connection",
-        "uc_connection": {
-            "name": "system_ai_agent_google_drive",
-            "description": "Google Drive connection",
-        },
-    }
-    assert spec.executor.supervisor_tools[2] == expected_third
-
-    expected_fourth = {
-        "type": "app",
-        "app": {
-            "name": "my-app",
-            "description": "Custom app",
-        },
-    }
-    assert spec.executor.supervisor_tools[3] == expected_fourth
-
-    expected_fifth = {
-        "type": "knowledge_assistant",
-        "knowledge_assistant": {
-            "knowledge_assistant_id": "ka-123",
-            "description": "Knowledge assistant",
-        },
-    }
-    assert spec.executor.supervisor_tools[4] == expected_fifth
-
-
-def test_supervisor_rejects_unknown_tool_type(tmp_path: Path) -> None:
-    """
-    A tool whose ``type`` is not in the supported set fails loud
-    with a message that names the supported types.
-
-    :param tmp_path: pytest-provided temporary directory.
-    """
-    _write_supervisor_config(
-        tmp_path,
-        tools=[
-            {
-                "type": "web_search",
-                "description": "Search the web",
-            }
-        ],
-    )
-    # The error must list every supported type (7 of them) so a
-    # spec author can pick one without checking the source. The
-    # parser sorts the supported set alphabetically, which is the
-    # order asserted here. We spot-check three rather than every
-    # entry to keep the assertion readable.
-    with pytest.raises(
-        OmnigentError,
-        match=r"genie_space.*knowledge_assistant.*uc_function",
-    ):
-        parse(tmp_path)
-
-
-def test_supervisor_genie_space_requires_id_and_description(
-    tmp_path: Path,
-) -> None:
-    """
-    A ``genie_space`` tool whose nested sub-dict is missing ``id``
-    or ``description`` fails loud naming the missing field(s).
-
-    :param tmp_path: pytest-provided temporary directory.
-    """
-    # Missing ``id`` inside the nested sub-dict.
-    _write_supervisor_config(
-        tmp_path,
-        tools=[{"type": "genie_space", "genie_space": {"description": "abc"}}],
-    )
-    with pytest.raises(OmnigentError, match=r"missing required field.*'id'"):
-        parse(tmp_path)
-
-    # Missing ``description``.
-    _write_supervisor_config(
-        tmp_path,
-        tools=[{"type": "genie_space", "genie_space": {"id": "space-abc"}}],
-    )
-    with pytest.raises(OmnigentError, match=r"missing required field.*'description'"):
-        parse(tmp_path)
-
-
-def test_supervisor_uc_function_requires_name_and_description(
-    tmp_path: Path,
-) -> None:
-    """
-    A ``uc_function`` tool whose nested sub-dict is missing ``name``
-    or ``description`` fails loud naming the missing field(s).
-
-    :param tmp_path: pytest-provided temporary directory.
-    """
-    _write_supervisor_config(
-        tmp_path,
-        tools=[{"type": "uc_function", "uc_function": {"description": "abc"}}],
-    )
-    with pytest.raises(OmnigentError, match=r"missing required field.*'name'"):
-        parse(tmp_path)
-
-    _write_supervisor_config(
-        tmp_path,
-        tools=[{"type": "uc_function", "uc_function": {"name": "main.search"}}],
-    )
-    with pytest.raises(OmnigentError, match=r"missing required field.*'description'"):
-        parse(tmp_path)
-
-
-def test_supervisor_uc_connection_requires_name_and_description(
-    tmp_path: Path,
-) -> None:
-    """
-    A ``uc_connection`` tool whose nested sub-dict is missing
-    ``name`` or ``description`` fails loud naming the missing
-    field(s).
-
-    :param tmp_path: pytest-provided temporary directory.
-    """
-    _write_supervisor_config(
-        tmp_path,
-        tools=[{"type": "uc_connection", "uc_connection": {"description": "abc"}}],
-    )
-    with pytest.raises(OmnigentError, match=r"missing required field.*'name'"):
-        parse(tmp_path)
-
-    _write_supervisor_config(
-        tmp_path,
-        tools=[
-            {"type": "uc_connection", "uc_connection": {"name": "google_drive"}},
-        ],
-    )
-    with pytest.raises(OmnigentError, match=r"missing required field.*'description'"):
-        parse(tmp_path)
-
-
-def test_supervisor_app_requires_name_and_description(tmp_path: Path) -> None:
-    """
-    An ``app`` tool whose nested sub-dict is missing ``name`` or
-    ``description`` fails loud naming the missing field(s).
-
-    :param tmp_path: pytest-provided temporary directory.
-    """
-    _write_supervisor_config(
-        tmp_path,
-        tools=[{"type": "app", "app": {"description": "abc"}}],
-    )
-    with pytest.raises(OmnigentError, match=r"missing required field.*'name'"):
-        parse(tmp_path)
-
-    _write_supervisor_config(
-        tmp_path,
-        tools=[{"type": "app", "app": {"name": "my-app"}}],
-    )
-    with pytest.raises(OmnigentError, match=r"missing required field.*'description'"):
-        parse(tmp_path)
-
-
-def test_supervisor_knowledge_assistant_requires_id_and_description(
-    tmp_path: Path,
-) -> None:
-    """
-    A ``knowledge_assistant`` tool whose nested sub-dict is missing
-    ``knowledge_assistant_id`` or ``description`` fails loud naming
-    the missing field(s).
-
-    :param tmp_path: pytest-provided temporary directory.
-    """
-    _write_supervisor_config(
-        tmp_path,
-        tools=[
-            {
-                "type": "knowledge_assistant",
-                "knowledge_assistant": {"description": "abc"},
-            }
-        ],
-    )
-    with pytest.raises(OmnigentError, match=r"missing required field.*'knowledge_assistant_id'"):
-        parse(tmp_path)
-
-    _write_supervisor_config(
-        tmp_path,
-        tools=[
-            {
-                "type": "knowledge_assistant",
-                "knowledge_assistant": {"knowledge_assistant_id": "ka-1"},
-            }
-        ],
-    )
-    with pytest.raises(OmnigentError, match=r"missing required field.*'description'"):
-        parse(tmp_path)
-
-
-def test_existing_executor_types_still_parse(tmp_path: Path) -> None:
-    """
-    Both the legacy ``omnigent`` executor and the default
-    ``llm`` executor minimal YAMLs continue to parse cleanly,
-    confirming the supervisor additions did not regress
-    pre-existing executor types.
-
-    :param tmp_path: pytest-provided temporary directory.
-    """
-    # ``omnigent`` minimal — harness is required by the
-    # validator but the parser should accept it without error.
+def test_omnigent_and_default_executor_minimal_configs_still_parse(tmp_path: Path) -> None:
+    """Both legacy ``omnigent`` and default minimal YAMLs continue to parse cleanly."""
     omni_config = {
         "spec_version": 1,
         "name": "omni-agent",
@@ -2960,14 +2648,8 @@ def test_existing_executor_types_still_parse(tmp_path: Path) -> None:
     (omni_dir / "config.yaml").write_text(yaml.dump(omni_config))
     omni_spec = parse(omni_dir)
     assert omni_spec.executor.type == "omnigent"
-    # config["harness"] preserved verbatim; supervisor_tools is
-    # None for non-supervisor harnesses so downstream code can
-    # discriminate by ``is None``.
     assert omni_spec.executor.config.get("harness") == "claude-sdk"
-    assert omni_spec.executor.supervisor_tools is None
 
-    # ``llm`` minimal (default executor type) — no executor
-    # block at all is the most common shape.
     llm_config = {
         "spec_version": 1,
         "name": "llm-agent",
@@ -2980,114 +2662,8 @@ def test_existing_executor_types_still_parse(tmp_path: Path) -> None:
     llm_dir.mkdir()
     (llm_dir / "config.yaml").write_text(yaml.dump(llm_config))
     llm_spec = parse(llm_dir)
-    # Default ExecutorSpec applies — type "omnigent", no
-    # supervisor_tools, no profile.
     assert llm_spec.executor.type == "omnigent"
-    assert llm_spec.executor.supervisor_tools is None
     assert llm_spec.executor.profile is None
-
-
-def test_supervisor_tools_expand_env_vars_in_nested_config(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """
-    ``${VAR}`` references inside the nested per-tool config dict
-    expand against the process environment at parse time. Without
-    this, a YAML like ``genie_space.id: ${GENIE_SPACE_ID}`` would
-    pass the literal string to the gateway which rejects it.
-
-    :param tmp_path: pytest temp dir.
-    :param monkeypatch: used to set ``GENIE_SPACE_ID`` and
-        ``UC_FUNCTION_NAME`` for the test.
-    """
-    monkeypatch.setenv("GENIE_SPACE_ID", "real-space-id-from-env")
-    monkeypatch.setenv("UC_FUNCTION_NAME", "main.search.fn")
-    _write_supervisor_config(
-        tmp_path,
-        tools=[
-            {
-                "type": "genie_space",
-                "genie_space": {
-                    "id": "${GENIE_SPACE_ID}",
-                    "description": "Sales analytics",
-                },
-            },
-            {
-                "type": "uc_function",
-                "uc_function": {
-                    "name": "${UC_FUNCTION_NAME}",
-                    "description": "Custom UC fn",
-                },
-            },
-        ],
-    )
-
-    spec = parse(tmp_path)
-
-    assert spec.executor.supervisor_tools is not None
-    nested_genie = spec.executor.supervisor_tools[0]["genie_space"]
-    nested_fn = spec.executor.supervisor_tools[1]["uc_function"]
-    # The literal ${VAR} string must NOT survive into the parsed
-    # spec; the gateway would reject it (verified empirically when
-    # probing — `${UC_FUNCTION_NAME:-...}` came back as
-    # INVALID_PARAMETER_VALUE: name must be in catalog.schema.fn
-    # format).
-    assert nested_genie["id"] == "real-space-id-from-env"
-    assert nested_fn["name"] == "main.search.fn"
-
-
-def test_supervisor_tools_unresolved_env_var_fails_loud(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """
-    A ``${VAR}`` reference that doesn't resolve at parse time
-    fails loud rather than passing the literal text to the gateway.
-    Catches typos and forgotten env exports before the run starts.
-    """
-    # Make sure the env var is NOT set
-    monkeypatch.delenv("DEFINITELY_UNSET_VAR_XYZ", raising=False)
-    _write_supervisor_config(
-        tmp_path,
-        tools=[
-            {
-                "type": "genie_space",
-                "genie_space": {
-                    "id": "${DEFINITELY_UNSET_VAR_XYZ}",
-                    "description": "x",
-                },
-            },
-        ],
-    )
-
-    with pytest.raises(OmnigentError) as excinfo:
-        parse(tmp_path)
-    msg = str(excinfo.value)
-    # The error decorates with the offending tool index/type so the
-    # user knows which YAML field to fix.
-    assert "tools[0]" in msg
-    assert "genie_space" in msg
-    assert "DEFINITELY_UNSET_VAR_XYZ" in msg
-
-
-def test_supervisor_rejects_tools_that_are_not_a_list(tmp_path: Path) -> None:
-    """
-    A top-level ``tools:`` block written as a mapping (the legacy
-    shape used by every other executor type) fails loud when the
-    supervisor harness is selected rather than silently landing as
-    an empty list.
-
-    :param tmp_path: pytest-provided temporary directory.
-    """
-    _write_supervisor_config(
-        tmp_path,
-        tools=[],  # placeholder overridden below
-    )
-    # Overwrite with a mapping-shaped tools block instead of a list.
-    raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
-    raw["tools"] = {"agents": ["foo"]}
-    (tmp_path / "config.yaml").write_text(yaml.dump(raw))
-    with pytest.raises(OmnigentError, match=r"tools must be a YAML list"):
-        parse(tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -3279,3 +2855,357 @@ def test_parse_executor_auth_api_key_base_url_absent(
 
     assert isinstance(spec.executor.auth, ApiKeyAuth)
     assert spec.executor.auth.base_url is None
+
+
+# ── credential_proxy parser tests ─────────────────────────────────
+
+
+def _credential_proxy_config(entries: list[dict[str, object]]) -> dict[str, object]:
+    """
+    Build a minimal agent config carrying a ``credential_proxy`` block.
+
+    :param entries: The ``credential_proxy`` list to embed under
+        ``os_env.sandbox``.
+    :returns: A config dict ready to ``yaml.dump`` for :func:`parse`.
+    """
+    return {
+        "spec_version": 1,
+        "name": "cred-proxy",
+        "os_env": {
+            "type": "caller_process",
+            "cwd": ".",
+            "sandbox": {
+                "type": "linux_bwrap",
+                "egress_rules": [
+                    "* github.com/**",
+                    "* api.github.com/**",
+                    "* corp.example.com/**",
+                    "* git.example.com/**",
+                    "* bearer.example.com/**",
+                    "* basic.example.com/**",
+                ],
+                "credential_proxy": entries,
+            },
+        },
+    }
+
+
+def test_parse_credential_proxy_all_four_types(tmp_path: Path) -> None:
+    """All four ``credential_proxy`` types normalize to host bindings.
+
+    What breaks if this fails: the YAML the user writes wouldn't reach
+    the runtime as the right per-host scheme/injection, so the egress
+    proxy wouldn't swap credentials (or would swap the wrong scheme).
+    """
+    config = _credential_proxy_config(
+        [
+            {"type": "gh_basic", "source": {"env": "GH_PAT"}},
+            {
+                "type": "git_https",
+                "target": "git.example.com/org/repo.git",
+                "source": {"env": "GH_PAT"},
+            },
+            {
+                "type": "https_bearer",
+                "target": "bearer.example.com/rest",
+                "source": {"env": "CORP"},
+                "env": "CORP_TOKEN",
+            },
+            {
+                "type": "https_basic",
+                "targets": ["basic.example.com"],
+                "source": {"file": "/tmp/secret"},
+                "username": "svc",
+            },
+        ]
+    )
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    proxy = spec.os_env.sandbox.credential_proxy
+    assert proxy is not None
+    by = {(e.host, e.scheme): e for e in proxy.entries}
+
+    # gh_basic -> github.com (basic, swap-on-access) and api.github.com
+    # (token + GH_TOKEN/GITHUB_TOKEN injection because gh gates locally).
+    gh_git = by[("github.com", "basic")]
+    assert gh_git.inject_env == []  # swap-on-access: nothing injected for git
+    gh_api = by[("api.github.com", "token")]
+    assert gh_api.inject_env == ["GH_TOKEN", "GITHUB_TOKEN"]
+
+    # git_https -> swap-on-access Basic for its bound host (nothing injected).
+    git_https = by[("git.example.com", "basic")]
+    assert git_https.inject_env == []
+
+    # https_bearer with an explicit ``env`` opts into placeholder injection.
+    bearer = by[("bearer.example.com", "bearer")]
+    assert bearer.inject_env == ["CORP_TOKEN"]
+    assert bearer.source.kind == "env" and bearer.source.env == "CORP"
+
+    # https_basic keeps the explicit username and a file source; with no
+    # ``env`` it is pure swap-on-access (inject_env empty).
+    basic = by[("basic.example.com", "basic")]
+    assert basic.username == "svc"
+    assert basic.inject_env == []
+    assert basic.source.kind == "file" and basic.source.path == "/tmp/secret"
+
+
+def test_parse_credential_proxy_rejects_duplicate_host(tmp_path: Path) -> None:
+    """Two entries binding the same host fail loudly at parse time.
+
+    The egress proxy keys its swap-on-access table by host, so a
+    duplicate-host config would silently drop one credential (last
+    wins). Rejecting it up front prevents a nondeterministic,
+    hard-to-debug "wrong scheme on the wire" outcome. Here ``gh_basic``
+    already binds ``github.com`` and the explicit ``git_https`` binds it
+    again.
+    """
+    config = _credential_proxy_config(
+        [
+            {"type": "gh_basic", "source": {"env": "GH_PAT"}},
+            {"type": "git_https", "target": "github.com", "source": {"env": "GH_PAT"}},
+        ]
+    )
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=r"binds host 'github.com' more than once"):
+        parse(tmp_path)
+
+
+def test_parse_credential_proxy_git_https_default_username(tmp_path: Path) -> None:
+    """``git_https`` defaults the Basic username to ``x-access-token``.
+
+    A wrong default would make GitHub reject the Basic auth even though
+    the token is valid.
+    """
+    config = _credential_proxy_config(
+        [{"type": "git_https", "target": "github.com", "source": {"env": "GH_PAT"}}]
+    )
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    entry = spec.os_env.sandbox.credential_proxy.entries[0]
+    assert entry.username == "x-access-token"
+
+
+def test_parse_credential_proxy_https_env_optional(tmp_path: Path) -> None:
+    """``https_*`` without ``env`` parses as a swap-on-access binding.
+
+    The ``env`` field is the opt-in injection shim, not a requirement.
+    Omitting it must yield a valid entry with an empty ``inject_env`` so
+    the proxy attaches the credential on access. If ``env`` were still
+    treated as required, parsing would raise instead.
+    """
+    config = _credential_proxy_config(
+        [{"type": "https_bearer", "target": "corp.example.com", "source": {"env": "CORP"}}]
+    )
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    entry = spec.os_env.sandbox.credential_proxy.entries[0]
+    assert entry.host == "corp.example.com"
+    assert entry.scheme == "bearer"
+    assert entry.inject_env == []
+
+
+@pytest.mark.parametrize(
+    "entries,match",
+    [
+        # Unknown ``type`` — caught by the pydantic ``Literal``.
+        ([{"type": "bogus", "source": {"env": "X"}}], r"type: Input should be"),
+        # Missing ``source`` — pydantic ``Field required``.
+        ([{"type": "https_bearer", "target": "h.example.com"}], r"source: Field required"),
+        # ``source`` as a bare string (the old surface) is now rejected —
+        # it must be a nested ``{env|file|command: ...}`` mapping.
+        (
+            [{"type": "https_bearer", "target": "h.example.com", "source": "env:X", "env": "T"}],
+            r"source:.*valid dictionary",
+        ),
+        # Two source keys set — exactly one is allowed.
+        (
+            [
+                {
+                    "type": "https_bearer",
+                    "target": "h.example.com",
+                    "source": {"env": "X", "file": "/tmp/s"},
+                }
+            ],
+            r"exactly one of 'env', 'file', or 'command'",
+        ),
+        # Malformed ``env`` injection-shim name.
+        (
+            [
+                {
+                    "type": "https_bearer",
+                    "target": "h.example.com",
+                    "source": {"env": "X"},
+                    "env": "not a valid name",
+                }
+            ],
+            r"env must be a POSIX",
+        ),
+        # Both ``target`` and ``targets`` set.
+        (
+            [
+                {
+                    "type": "https_bearer",
+                    "target": "h.example.com",
+                    "targets": ["h2.example.com"],
+                    "source": {"env": "X"},
+                    "env": "T",
+                }
+            ],
+            r"exactly one of 'target' or 'targets'",
+        ),
+        # Host fails DNS-safety validation (still enforced post-pydantic).
+        (
+            [{"type": "git_https", "target": "bad_host!", "source": {"env": "X"}}],
+            r"must be an exact DNS hostname",
+        ),
+        # Unknown key — ``extra="forbid"`` rejects typos.
+        (
+            [
+                {
+                    "type": "https_bearer",
+                    "target": "h.example.com",
+                    "source": {"env": "X"},
+                    "bogus": 1,
+                }
+            ],
+            r"bogus: Extra inputs are not permitted",
+        ),
+    ],
+)
+def test_parse_credential_proxy_fail_loud(
+    tmp_path: Path, entries: list[dict[str, object]], match: str
+) -> None:
+    """Malformed ``credential_proxy`` entries fail loudly at parse time.
+
+    Each case proves a specific misconfiguration is rejected up front
+    rather than silently producing a half-wired (insecure) policy.
+    """
+    config = _credential_proxy_config(entries)
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=match):
+        parse(tmp_path)
+
+
+def test_parse_credential_proxy_requires_egress_rules(tmp_path: Path) -> None:
+    """``credential_proxy`` without ``egress_rules`` is rejected.
+
+    The MITM proxy (driven by egress_rules) is what performs the swap and
+    blocks placeholder leaks; without it the feature would be a no-op that
+    injects placeholders the agent can't use — fail loud instead.
+    """
+    config = {
+        "spec_version": 1,
+        "name": "cred-proxy-no-egress",
+        "os_env": {
+            "type": "caller_process",
+            "cwd": ".",
+            "sandbox": {
+                "type": "linux_bwrap",
+                "credential_proxy": [
+                    {"type": "git_https", "target": "github.com", "source": {"env": "X"}}
+                ],
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=r"requires os_env.sandbox.egress_rules"):
+        parse(tmp_path)
+
+
+def test_parse_credential_proxy_requires_hard_backend(tmp_path: Path) -> None:
+    """``credential_proxy`` requires a network-isolating backend.
+
+    On ``linux_landlock`` (no hard network deny) the egress proxy isn't
+    the only path out, so binding credentials there is unsafe — rejected.
+
+    We deliberately OMIT ``egress_rules`` here so the egress-rules backend
+    guard doesn't fire first: that isolates the credential_proxy-specific
+    backend check (parser.py:1117). The ``match`` asserts the
+    credential_proxy message, not the egress one — so deleting the
+    credential_proxy backend guard (falling through to the
+    "requires egress_rules" error with its different text) would fail
+    this test.
+    """
+    config = {
+        "spec_version": 1,
+        "name": "cred-proxy-soft-backend",
+        "os_env": {
+            "type": "caller_process",
+            "cwd": ".",
+            "sandbox": {
+                "type": "linux_landlock",
+                "credential_proxy": [
+                    {"type": "git_https", "target": "github.com", "source": {"env": "X"}}
+                ],
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=r"credential_proxy requires sandbox.type"):
+        parse(tmp_path)
+
+
+def test_parse_credential_proxy_gh_basic_rejected_on_macos(tmp_path: Path) -> None:
+    """``gh_basic`` is rejected on macOS (``darwin_seatbelt``).
+
+    ``gh_basic`` wires the GitHub CLI, a Go binary, and Go on macOS verifies
+    TLS via the system keychain and ignores ``SSL_CERT_FILE`` — the var the
+    egress MITM proxy uses to publish its CA — so every ``gh`` call would fail
+    at runtime with an opaque ``certificate is not trusted`` error. We fail
+    loud at parse time instead. The ``match`` asserts the macOS-specific
+    message (not the backend/egress guards, which pass here since
+    ``darwin_seatbelt`` + ``egress_rules`` are both present), so removing the
+    macOS guard would let the spec parse and fail this test.
+    """
+    config = {
+        "spec_version": 1,
+        "name": "cred-proxy-gh-macos",
+        "os_env": {
+            "type": "caller_process",
+            "cwd": ".",
+            "sandbox": {
+                "type": "darwin_seatbelt",
+                "egress_rules": ["* github.com/**", "* api.github.com/**"],
+                "credential_proxy": [{"type": "gh_basic", "source": {"env": "GH_PAT"}}],
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=r"gh_basic' does not work on macOS"):
+        parse(tmp_path)
+
+
+def test_parse_credential_proxy_https_primitive_allowed_on_macos(tmp_path: Path) -> None:
+    """The generic primitives are NOT rejected on macOS.
+
+    The macOS guard must fire ONLY for the Go-based ``gh_basic`` preset (the
+    ``token`` scheme). ``https_bearer`` (and ``https_basic`` / ``git_https``)
+    are consumed by curl/python/git, which trust ``SSL_CERT_FILE`` on macOS, so
+    they must still parse on ``darwin_seatbelt``. This guards against the guard
+    being too broad and breaking the primitives that DO work.
+    """
+    config = {
+        "spec_version": 1,
+        "name": "cred-proxy-bearer-macos",
+        "os_env": {
+            "type": "caller_process",
+            "cwd": ".",
+            "sandbox": {
+                "type": "darwin_seatbelt",
+                "egress_rules": ["* corp.example.com/**"],
+                "credential_proxy": [
+                    {
+                        "type": "https_bearer",
+                        "target": "corp.example.com/rest",
+                        "source": {"env": "CORP"},
+                        "env": "CORP_TOKEN",
+                    }
+                ],
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    proxy = spec.os_env.sandbox.credential_proxy
+    assert proxy is not None
+    assert proxy.entries[0].scheme == "bearer"

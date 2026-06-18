@@ -112,6 +112,58 @@ def test_session_start_hook_emits_conversation_url_system_message(
     assert read_transcript_path(bridge_dir) == transcript_path
 
 
+def test_session_start_hook_maps_workspace_hosted_server_to_ui_mount(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    SessionStart links to the SPA mount for workspace-hosted servers.
+
+    ``ap_server_url`` is the API proxy base (``/api/2.0/omnigent``);
+    pointing the "Open this session" message there returns JSON, not
+    the web UI. The message must land on the ``/omnigent`` SPA mount
+    with the ``?o=<org>`` selector — matching the CLI's ``Web UI:``
+    line and the tmux status bar.
+    """
+    from omnigent.cli_auth import store_databricks_auth
+
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(
+        "omnigent.cli_auth._token_file_path",
+        lambda: tmp_path / "auth_tokens.json",
+    )
+    server = "https://example.databricks.com/api/2.0/omnigent"
+    store_databricks_auth(
+        server,
+        "https://example.databricks.com",
+        org_id="2850744067564480",
+    )
+    bridge_dir = prepare_bridge_dir(
+        "conv_abc",
+        bridge_id="bridge_shared",
+        workspace=tmp_path,
+    )
+    build_hook_settings(bridge_dir, ap_server_url=server)
+    payload = {
+        "hook_event_name": "SessionStart",
+        "transcript_path": str(tmp_path / "session.jsonl"),
+    }
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    exit_code = claude_native_hook.main(["--bridge-dir", str(bridge_dir)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert json.loads(captured.out) == {
+        "systemMessage": (
+            "Open this session in Omnigent: "
+            "https://example.databricks.com/omnigent/c/conv_abc?o=2850744067564480"
+        )
+    }
+
+
 def test_clear_session_start_hook_rotates_before_printing_conversation_url(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -976,6 +1028,18 @@ def test_build_hook_settings_registers_policy_hooks_when_omnigent_server_url_set
     # The last entry is the catch-all policy evaluation hook.
     policy_entry_cmd = post_tool_use_entries[-1]["hooks"][0]["command"]
     assert "evaluate-policy" in policy_entry_cmd
+    # UserPromptSubmit carries the forwarder's status hook PLUS the policy
+    # hook appended as a catch-all. For native sessions this is the sole
+    # REQUEST-phase gate (the server-level _evaluate_input_policy skips
+    # native message events), so a missing policy hook here means native
+    # prompts reach the model with no request-phase policy.
+    user_prompt_entries = hooks["UserPromptSubmit"]
+    user_prompt_cmds = [h["command"] for entry in user_prompt_entries for h in entry["hooks"]]
+    assert any("evaluate-policy" in cmd for cmd in user_prompt_cmds), (
+        f"UserPromptSubmit policy hook not registered; got {user_prompt_cmds!r}"
+    )
+    # The forwarder's status hook must survive (the policy hook is appended).
+    assert any("evaluate-policy" not in cmd for cmd in user_prompt_cmds)
 
 
 def test_build_hook_settings_registers_message_display_hook(
@@ -1157,6 +1221,71 @@ def test_evaluate_policy_pre_tool_use_converts_and_returns_deny(
     assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert result["hookSpecificOutput"]["permissionDecisionReason"] == "Blocked by policy"
     assert captured.err == ""
+
+
+def test_evaluate_policy_stamps_live_model_from_context_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The hook stamps the statusLine-captured live model into the request.
+
+    The statusLine wrapper writes the active model id into ``context.json``
+    on every render. The hook must stamp it (and ``harness``) onto the
+    evaluation request so the cost-budget gate sees the CURRENT model at gate
+    time — not the lagging ``model_override`` mirror. Regression guard for a
+    cheap-model session getting blocked over budget because the model was
+    unresolved (None) and the gate failed closed.
+    """
+    posted: dict[str, object] = {}
+
+    class _FakeHttpxClient:
+        """Sync HTTP client stub capturing the posted EvaluationRequest."""
+
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            """Record constructor inputs. :returns: None."""
+            del headers, timeout
+
+        def __enter__(self) -> _FakeHttpxClient:
+            """:returns: This fake client."""
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            """:returns: None."""
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> object:
+            """Record the request and return an ALLOW verdict. :returns: response."""
+            import httpx
+
+            posted["json"] = json
+            return httpx.Response(
+                200,
+                text='{"result":"POLICY_ACTION_ALLOW"}',
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FakeHttpxClient)
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
+    write_active_session_id(bridge_dir, "conv_active")
+    build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
+    # The statusLine wrapper's capture: the live model the user is on.
+    (bridge_dir / "context.json").write_text(
+        json.dumps({"model": "claude-sonnet-4-6"}), encoding="utf-8"
+    )
+    payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {}}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    exit_code = claude_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)])
+
+    assert exit_code == 0
+    context = posted["json"]["event"]["context"]
+    # The live model + harness must ride the request so the cost gate doesn't
+    # fail closed on an unresolved model.
+    assert context["model"] == "claude-sonnet-4-6"
+    assert context["harness"] == "claude-native"
 
 
 def test_evaluate_policy_post_tool_use_converts_and_returns_context(

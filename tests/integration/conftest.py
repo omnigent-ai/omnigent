@@ -36,7 +36,9 @@ from tests.e2e.conftest import (  # noqa: F401  (re-exported pytest fixtures)
     live_runner_id,
     live_server,
     llm_api_key,
+    mock_llm_server_url,
     register_inline_agent,
+    using_mock_llm,
 )
 from tests.integration.model_selection import resolve_default_model
 
@@ -46,8 +48,20 @@ from tests.integration.model_selection import resolve_default_model
 _SUPPORTED_HARNESSES = frozenset({"claude-sdk", "codex", "openai-agents"})
 
 
+def _is_mock_mode(config: pytest.Config) -> bool:
+    """Return True when no real ``--llm-api-key`` was provided.
+
+    :param config: Pytest config object.
+    :returns: Whether mock LLM mode is active.
+    """
+    return config.getoption("--llm-api-key") is None
+
+
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """Gate the whole directory on ``--integration`` (real LLM + harness CLIs).
+
+    When running in mock mode (no ``--llm-api-key``), the gate is
+    lifted so the tests run without ``--integration``.
 
     On the codex harness, also rerun each journey up to 2x: codex
     multi-turn dispatch flakes in bursts (empty failed turns, the
@@ -61,8 +75,10 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     :param config: Pytest config object.
     :param items: Collected test items.
     """
-    if not config.getoption("--integration"):
-        marker = pytest.mark.skip(reason="Integration tests require --integration flag")
+    if not config.getoption("--integration") and not _is_mock_mode(config):
+        marker = pytest.mark.skip(
+            reason="Integration tests require --integration flag or mock mode (omit --llm-api-key)"
+        )
         for item in items:
             item.add_marker(marker)
         return
@@ -75,12 +91,18 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 def harness_name(request: pytest.FixtureRequest) -> str:
     """The harness under test, from ``--harness``; fails loud on the default.
 
+    In mock mode (no ``--llm-api-key``), defaults to ``"openai-agents"``
+    when ``--harness`` is not explicitly set.
+
     :param request: Pytest fixture request.
     :returns: e.g. ``"claude-sdk"``.
-    :raises pytest.UsageError: When ``--harness`` is absent or unsupported.
+    :raises pytest.UsageError: When ``--harness`` is absent or unsupported
+        and not in mock mode.
     """
     harness: str = request.config.getoption("--harness")
     if harness not in _SUPPORTED_HARNESSES:
+        if _is_mock_mode(request.config):
+            return "openai-agents"
         raise pytest.UsageError(
             f"tests/integration/ requires an explicit --harness from "
             f"{sorted(_SUPPORTED_HARNESSES)}; got {harness!r}."
@@ -92,7 +114,8 @@ def harness_name(request: pytest.FixtureRequest) -> str:
 def model_name(request: pytest.FixtureRequest, harness_name: str) -> str:
     """Resolve the model: param > ``model`` marker > ``--model``.
 
-    Mirrors ``tests/inner/conftest.py``: explicit choices skip
+    In mock mode, defaults to ``"mock-model"``. Mirrors
+    ``tests/inner/conftest.py``: explicit choices skip
     :mod:`tests._model_pools` spreading but still rotate on
     ``llm_flaky`` reruns. The workflow ``--model`` default is spread
     when ``OMNIGENT_TEST_MODEL_SPREAD`` is on, except for Codex: that
@@ -102,6 +125,8 @@ def model_name(request: pytest.FixtureRequest, harness_name: str) -> str:
     :param harness_name: Harness under test, e.g. ``"codex"``.
     :returns: e.g. ``"databricks-claude-sonnet-4-6"``.
     """
+    if _is_mock_mode(request.config):
+        return "mock-model"
     if hasattr(request, "param") and request.param is not None:
         return _model_pools.resolve_model(request.param, spread=False)
     marker = request.node.get_closest_marker("model")
@@ -111,13 +136,18 @@ def model_name(request: pytest.FixtureRequest, harness_name: str) -> str:
 
 
 @pytest.fixture(autouse=True)
-def _skip_when_cli_missing(harness_name: str) -> None:
+def _skip_when_cli_missing(request: pytest.FixtureRequest, harness_name: str) -> None:
     """Skip when the harness's CLI binary isn't installed locally.
 
+    In mock mode, the harness CLI is not needed — the mock server
+    handles all LLM calls directly, so this check is skipped.
     nightly.yml installs claude/codex; local machines may not have both.
 
+    :param request: Pytest fixture request.
     :param harness_name: The harness under test.
     """
+    if _is_mock_mode(request.config):
+        return
     skip_if_harness_cli_missing(harness_name)
 
 
@@ -140,6 +170,7 @@ def journey_session(
     harness_name: str,
     model_name: str,
     request: pytest.FixtureRequest,
+    mock_llm_server_url: str | None,  # noqa: F811
 ) -> JourneySession:
     """Register a fresh inline agent + session for one journey test.
 
@@ -151,6 +182,7 @@ def journey_session(
     :param harness_name: Harness under test.
     :param model_name: Resolved model for this test.
     :param request: Pytest fixture request (for ``--profile``).
+    :param mock_llm_server_url: Mock LLM server URL, or ``None``.
     :returns: The registered agent + bound session.
     """
     agent_name = register_inline_agent(
@@ -163,6 +195,11 @@ def journey_session(
             "You are a terse test assistant. Follow instructions "
             "exactly and literally. When asked to reply with a token, "
             "reply with the token text only."
+        ),
+        mock_llm_base_url=(
+            f"{mock_llm_server_url}/v1"
+            if _is_mock_mode(request.config) and mock_llm_server_url
+            else None
         ),
     )
     session_id = create_runner_bound_session(

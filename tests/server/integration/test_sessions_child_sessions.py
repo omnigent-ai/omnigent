@@ -9,10 +9,11 @@ through the spawn workflow) — the route depends only on
 and the relay-fed ``_session_status_cache``, so direct seeding gives
 fast, deterministic coverage of every response field.
 
-The tasks table has been removed. ``current_task_id``, ``current_task_status``,
-and ``agent_name`` (previously derived from task rows) are now always
-``None``. ``agent_id`` is populated from the conversation row's
-``agent_id`` column.
+The tasks table has been removed. ``current_task_id`` and ``agent_name``
+(previously derived from task rows) are now always ``None``.
+``current_task_status`` is derived from session lifecycle state when
+available, and is otherwise ``None``. ``agent_id`` is populated from the
+conversation row's ``agent_id`` column.
 """
 
 from __future__ import annotations
@@ -206,6 +207,7 @@ async def test_child_sessions_returns_seeded_child_with_full_shape(
     assert row["agent_name"] is None
     assert row["current_task_id"] is None
     assert row["current_task_status"] is None
+    assert row["last_task_error"] is None
     # No cache entry → busy=False.
     assert row["busy"] is False
 
@@ -215,6 +217,51 @@ async def test_child_sessions_returns_seeded_child_with_full_shape(
     # No outstanding elicitations → 0 (the index is empty for a freshly
     # seeded child that never published an elicitation_request).
     assert row["pending_elicitations_count"] == 0
+
+
+async def test_child_sessions_surfaces_durable_failure_error(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A child with runner-owned failure labels is visibly failed.
+
+    Terminal/native harnesses can fail before a transcript item exists. The
+    session-status relay persists that failure as labels; the child summary
+    must project them as typed ``last_task_error`` so clients do not parse
+    internal labels or render the row as idle.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=session["id"],
+        title="researcher:auth",
+        agent_id=session["agent_id"],
+    )
+    conv_store.set_labels(
+        child.id,
+        {
+            sessions_module._LAST_TASK_ERROR_CODE_LABEL_KEY: "required_terminal_exited",
+            sessions_module._LAST_TASK_ERROR_MESSAGE_LABEL_KEY: (
+                "Required terminal exited unexpectedly"
+            ),
+        },
+    )
+
+    resp = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
+
+    assert resp.status_code == 200
+    row = resp.json()["data"][0]
+    assert row["busy"] is False
+    assert row["current_task_status"] == "failed"
+    assert row["last_task_error"] == {
+        "code": "required_terminal_exited",
+        "message": "Required terminal exited unexpectedly",
+    }
 
 
 # ── Pending elicitation count ─────────────────────────────
