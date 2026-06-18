@@ -29,7 +29,6 @@ import uuid
 from typing import Any
 
 import httpx
-import pytest
 
 from tests.e2e.conftest import (
     configure_mock_llm,
@@ -368,14 +367,21 @@ def test_fork_with_agent_switch_carries_history(
     claude_coder_agent: str,
     live_runner_id: str,
     using_mock_llm: bool,
+    mock_llm_server_url: str,
 ) -> None:
     """
     Forking with ``agent_id`` binds the TARGET agent and keeps history.
 
-    Forks a claude-coder-seeded session into the seeded
+    Forks a source-agent-seeded session into the seeded
     ``sdk-chat-builtin`` built-in (same provider family — the
     history-preserving switch the Web UI's picker offers). SDK targets
     replay the copied transcript as context.
+
+    In mock mode the source agent is an inline ``openai-agents`` agent
+    pointed at the mock LLM server, and the ``sdk-chat-builtin`` built-in
+    is wired to the mock server via ``executor.auth.base_url`` (seeded in
+    ``conftest._materialize_builtin_sdk_chat_spec``). The mock server
+    keys responses by model name so each agent gets its own queue.
 
     **What breaks if wrong:**
 
@@ -385,13 +391,41 @@ def test_fork_with_agent_switch_carries_history(
       from the fork's items / the agent can't recall it.
     """
     if using_mock_llm:
-        pytest.skip(
-            "fork-with-agent-switch requires a built-in claude-sdk agent "
-            "as target; the mock LLM cannot drive the claude-sdk harness"
+        uid = uuid.uuid4().hex[:6]
+        source_model = f"mock-fork-switch-src-{uid}"
+        source_agent = register_inline_agent(
+            http_client,
+            name=f"fork-switch-src-{uid}",
+            harness="openai-agents",
+            model=source_model,
+            profile="",
+            prompt="You are a terse assistant.",
+            mock_llm_base_url=f"{mock_llm_server_url}/v1",
         )
+        # Target: the sdk-chat-builtin built-in uses model
+        # "claude-sonnet-4-20250514" — key the mock queue on that.
+        target_model = "claude-sonnet-4-20250514"
+        reset_mock_llm(mock_llm_server_url)
+        configure_mock_llm(
+            mock_llm_server_url,
+            [{"text": "OK"}],
+            key=source_model,
+        )
+        # The claude-sdk harness replays the forked transcript as context
+        # when binding the switched fork, which sends an initial
+        # /v1/messages request before the user's recall turn. Queue two
+        # responses: a throwaway for the replay and the codeword for the
+        # actual recall.
+        configure_mock_llm(
+            mock_llm_server_url,
+            [{"text": "OK"}, {"text": _CODEWORD_1}],
+            key=target_model,
+        )
+    else:
+        source_agent = claude_coder_agent
 
     source_id = create_runner_bound_session(
-        http_client, agent_name=claude_coder_agent, runner_id=live_runner_id
+        http_client, agent_name=source_agent, runner_id=live_runner_id
     )
     response_id = send_user_message_to_session(
         http_client,

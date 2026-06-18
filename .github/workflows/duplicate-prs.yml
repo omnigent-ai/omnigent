@@ -3,14 +3,14 @@ name: Duplicate PRs
 # Closes duplicate community PRs that reference the same issue: when more than
 # one open PR (created in the last 14 days) closes the same issue, the oldest is
 # kept and the newer ones are closed, labeled `duplicate`, and commented on.
-# Maintainer-authored PRs are never touched. Runs on a daily schedule (and on
-# demand) rather than per-PR, so a freshly opened PR is only flagged once a real
+# Maintainer-authored PRs are never touched. Runs every 4 hours (and on demand)
+# rather than per-PR, so a freshly opened PR is only flagged once a real
 # duplicate exists. Never checks out or runs PR code -- it reads PR metadata via
 # the API using only the default-branch script. See duplicate-prs.js.
 
 on:
   schedule:
-    - cron: "0 0 * * *"
+    - cron: "0 */4 * * *"
   workflow_dispatch:
 
 defaults:

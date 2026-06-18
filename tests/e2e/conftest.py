@@ -479,6 +479,7 @@ def live_server(
         tmp_path_factory.mktemp("e2e_builtin_agents"),
         databricks_workspace_host=databricks_workspace_host,
         profile=request.config.getoption("--profile") or None,
+        mock_llm_server_url=mock_llm_server_url if using_mock_llm else None,
     )
     env = {
         **os.environ,
@@ -927,6 +928,7 @@ def _materialize_builtin_sdk_chat_spec(
     *,
     databricks_workspace_host: str | None,
     profile: str | None,
+    mock_llm_server_url: str | None = None,
 ) -> Path:
     """
     Write a profile-aware copy of ``sdk-chat-builtin.yaml`` to seed as a built-in.
@@ -945,6 +947,11 @@ def _materialize_builtin_sdk_chat_spec(
     tests look up, and no ``os_env`` is added (the os_env-reset test relies
     on the target declaring none).
 
+    In mock mode (``mock_llm_server_url`` set), injects an ``auth`` block
+    so the claude-sdk executor routes ``ANTHROPIC_BASE_URL`` at the mock
+    server. The Anthropic SDK appends ``/v1/messages`` to the base URL, so
+    the base URL must NOT include ``/v1``.
+
     :param dest_dir: Directory to write the materialized spec into, e.g. a
         ``tmp_path_factory.mktemp(...)`` dir.
     :param databricks_workspace_host: Workspace host URL, or ``None`` when
@@ -952,11 +959,22 @@ def _materialize_builtin_sdk_chat_spec(
     :param profile: The ``--profile`` value to stamp onto the executor,
         e.g. ``"default"``; ignored when *databricks_workspace_host* is
         ``None``.
+    :param mock_llm_server_url: Mock LLM server base URL, e.g.
+        ``"http://127.0.0.1:12345"``. When set, the built-in's executor
+        gets an ``auth`` block pointing at this URL (without ``/v1``).
     :returns: Path to the written ``sdk-chat-builtin.yaml``.
     """
     config = yaml.safe_load(_SDK_CHAT_BUILTIN_SPEC.read_text())
     if databricks_workspace_host is not None:
         _rewrite_yaml_models(config, profile, spread_key=_SDK_CHAT_BUILTIN_SPEC.stem)
+    if mock_llm_server_url is not None:
+        # The Anthropic SDK appends /v1/messages to base_url, so do NOT
+        # include /v1 here — the mock server serves POST /v1/messages.
+        config.setdefault("executor", {})["auth"] = {
+            "type": "api_key",
+            "api_key": "mock-key",
+            "base_url": mock_llm_server_url,
+        }
     dest = dest_dir / _SDK_CHAT_BUILTIN_SPEC.name
     dest.write_text(yaml.safe_dump(config, sort_keys=False))
     return dest
