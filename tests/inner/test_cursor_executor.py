@@ -23,6 +23,7 @@ import pytest
 from omnigent.inner.cursor_executor import (
     CursorExecutor,
     _build_cursor_prompt,
+    _normalize_cursor_usage,
     _resolve_model,
     _sdk_message_to_events,
 )
@@ -75,9 +76,14 @@ def _install_fake_sdk(
         def __init__(self, script: dict[str, Any]) -> None:
             self._script = script
 
-        async def messages(self) -> Any:
+        async def events(self) -> Any:
             for message in self._script.get("messages", []):
-                yield message
+                yield SimpleNamespace(sdk_message=message, interaction_update=None)
+            for iu in self._script.get("interaction_updates", []):
+                yield SimpleNamespace(sdk_message=None, interaction_update=iu)
+
+        async def cancel(self) -> None:
+            pass  # no-op for tests
 
         async def wait(self) -> Any:
             return SimpleNamespace(
@@ -86,9 +92,17 @@ def _install_fake_sdk(
             )
 
     class _FakeAgent:
-        async def send(self, prompt: str) -> _FakeRun:
+        async def send(self, prompt: str, **kwargs: Any) -> _FakeRun:
             state["sent"].append(prompt)
-            return _FakeRun(scripts.pop(0))
+            script = scripts.pop(0)
+            # Invoke on_delta for interaction_updates (mirrors real SDK
+            # which dispatches TurnEndedUpdate via on_delta, not events).
+            options = kwargs.get("options")
+            on_delta = getattr(options, "on_delta", None) if options else None
+            if on_delta and "interaction_updates" in script:
+                for iu in script["interaction_updates"]:
+                    on_delta(iu)
+            return _FakeRun(script)
 
         # AsyncAgent exposes close() (a CloseAgent RPC + tool unregister).
         async def close(self) -> None:
@@ -134,11 +148,16 @@ def _install_fake_sdk(
             self.cwd = cwd
             self.custom_tools = custom_tools
 
+    class _FakeSendOptions:
+        def __init__(self, on_delta: Any = None, **_kw: Any) -> None:
+            self.on_delta = on_delta
+
     fake = types.ModuleType("cursor_sdk")
     fake.AsyncClient = _FakeClient  # type: ignore[attr-defined]
     fake.AsyncAgent = _FakeAsyncAgent  # type: ignore[attr-defined]
     fake.CustomTool = _FakeCustomTool  # type: ignore[attr-defined]
     fake.LocalAgentOptions = _FakeLocalAgentOptions  # type: ignore[attr-defined]
+    fake.SendOptions = _FakeSendOptions  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "cursor_sdk", fake)
     return state
 
@@ -259,7 +278,7 @@ def test_sdk_message_to_events_unwraps_envelope_on_completion_and_error() -> Non
     done = _sdk_message_to_events(_envelope("completed", [{"type": "text", "text": "ok"}]))
     assert isinstance(done[0], ToolCallComplete)
     assert done[0].name == "sys_session_send"  # unwrapped, not "mcp"
-    assert done[0].metadata == {"call_id": "c1"}
+    assert done[0].metadata == {"call_id": "c1", "is_bridged": True}
 
     err = _sdk_message_to_events(_envelope("error", "boom"))
     assert isinstance(err[0], ToolCallComplete)
@@ -732,3 +751,306 @@ def test_build_cursor_prompt_serializes_single_user_history() -> None:
     prompt = _build_cursor_prompt(messages, is_first_turn=True, system_prompt="SYS")
     assert "Conversation so far:" in prompt
     assert "earlier context" in prompt and "follow up" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Usage / cost tracking
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_cursor_usage_camel_case() -> None:
+    raw = {"inputTokens": 100, "outputTokens": 50, "totalTokens": 150}
+    result = _normalize_cursor_usage(raw, "cursor-fast")
+    assert result == {
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "total_tokens": 150,
+        "model": "cursor-fast",
+    }
+
+
+def test_normalize_cursor_usage_snake_case() -> None:
+    raw = {"input_tokens": 200, "output_tokens": 80}
+    result = _normalize_cursor_usage(raw, "auto")
+    assert result["input_tokens"] == 200
+    assert result["output_tokens"] == 80
+    assert result["total_tokens"] == 280  # computed from in + out
+
+
+def test_normalize_cursor_usage_includes_cache_fields() -> None:
+    raw = {
+        "inputTokens": 500,
+        "outputTokens": 100,
+        "totalTokens": 600,
+        "cacheReadInputTokens": 300,
+        "cacheCreationInputTokens": 50,
+    }
+    result = _normalize_cursor_usage(raw, "auto")
+    assert result["cache_read_input_tokens"] == 300
+    assert result["cache_creation_input_tokens"] == 50
+
+
+async def test_run_turn_captures_usage_from_turn_ended_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a TurnEndedUpdate with usage appears in the event stream, the
+    TurnComplete event carries the normalized usage dict and
+    _notify_usage_from_dict is called."""
+    turn_ended = SimpleNamespace(
+        type="turn-ended",
+        usage={"inputTokens": 1000, "outputTokens": 200, "totalTokens": 1200},
+    )
+    script = {
+        "messages": [_assistant("Hello")],
+        "interaction_updates": [turn_ended],
+        "status": "finished",
+        "result": "Hello",
+    }
+    _install_fake_sdk(monkeypatch, [script])
+
+    notified: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "omnigent.inner.cursor_executor._notify_usage_from_dict",
+        lambda *, model, usage: notified.append({"model": model, "usage": usage}),
+    )
+
+    executor = CursorExecutor(api_key="crsr_x")
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert len(completes) == 1
+    usage = completes[0].usage
+    assert usage is not None
+    assert usage["input_tokens"] == 1000
+    assert usage["output_tokens"] == 200
+    assert usage["total_tokens"] == 1200
+    assert usage["model"] == "auto"
+
+    # _notify_usage_from_dict was called with the same data.
+    assert len(notified) == 1
+    assert notified[0]["model"] == "auto"
+    assert notified[0]["usage"] == usage
+
+
+async def test_run_turn_usage_none_when_no_turn_ended_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a TurnEndedUpdate, usage stays None (backward-compatible)."""
+    script = {
+        "messages": [_assistant("Hi")],
+        "status": "finished",
+        "result": "Hi",
+    }
+    _install_fake_sdk(monkeypatch, [script])
+
+    notified: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "omnigent.inner.cursor_executor._notify_usage_from_dict",
+        lambda *, model, usage: notified.append({"model": model, "usage": usage}),
+    )
+
+    executor = CursorExecutor(api_key="crsr_x")
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert len(completes) == 1
+    assert completes[0].usage is None
+    assert notified == []  # not called when there is no usage
+
+
+def test_normalize_cursor_usage_camel_takes_priority_over_snake() -> None:
+    raw = {"inputTokens": 100, "input_tokens": 999, "outputTokens": 50, "output_tokens": 888}
+    result = _normalize_cursor_usage(raw, "auto")
+    assert result["input_tokens"] == 100
+    assert result["output_tokens"] == 50
+
+
+def test_normalize_cursor_usage_zero_tokens_preserved() -> None:
+    raw = {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0}
+    result = _normalize_cursor_usage(raw, "auto")
+    assert result["input_tokens"] == 0
+    assert result["output_tokens"] == 0
+    assert result["total_tokens"] == 0
+
+
+# ---------------------------------------------------------------------------
+# PHASE_TOOL_CALL policy for native tools
+# ---------------------------------------------------------------------------
+
+
+def test_sdk_message_to_events_marks_native_tool_not_bridged() -> None:
+    """A plain (non-MCP-wrapped) tool call has ``is_bridged=False`` in metadata."""
+    events = _sdk_message_to_events(_tool("bash", "t1", "running", args={"cmd": "ls"}))
+    assert len(events) == 1
+    assert isinstance(events[0], ToolCallRequest)
+    assert events[0].metadata["is_bridged"] is False
+
+    # Completed status too.
+    done = _sdk_message_to_events(
+        _tool("bash", "t1", "completed", args={"cmd": "ls"}, result="ok")
+    )
+    assert isinstance(done[0], ToolCallComplete)
+    assert done[0].metadata["is_bridged"] is False
+
+
+def test_sdk_message_to_events_marks_mcp_tool_bridged() -> None:
+    """An MCP-wrapped tool call has ``is_bridged=True`` in metadata."""
+    envelope = SimpleNamespace(
+        type="tool_call",
+        name="mcp",
+        call_id="c1",
+        status="running",
+        args={
+            "providerIdentifier": "custom-user-tools",
+            "toolName": "sys_session_send",
+            "args": {"session": "s1"},
+        },
+        result=None,
+    )
+    events = _sdk_message_to_events(envelope)
+    assert isinstance(events[0], ToolCallRequest)
+    assert events[0].metadata["is_bridged"] is True
+
+    # Completed too.
+    envelope_done = SimpleNamespace(
+        type="tool_call",
+        name="mcp",
+        call_id="c1",
+        status="completed",
+        args={
+            "providerIdentifier": "custom-user-tools",
+            "toolName": "sys_session_send",
+            "args": {"session": "s1"},
+        },
+        result="ok",
+    )
+    done = _sdk_message_to_events(envelope_done)
+    assert isinstance(done[0], ToolCallComplete)
+    assert done[0].metadata["is_bridged"] is True
+
+
+async def test_run_turn_native_tool_denied_by_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A native tool call triggers PHASE_TOOL_CALL. On DENY the run emits
+    ToolCallRequest then ExecutorError and the turn ends."""
+    script = {
+        "messages": [
+            _assistant("Let me run that."),
+            _tool("bash", "t1", "running", args={"cmd": "rm -rf /"}),
+        ],
+        "status": "finished",
+        "result": "",
+    }
+    _install_fake_sdk(monkeypatch, [script])
+    executor = CursorExecutor(api_key="crsr_x")
+    executor._policy_evaluator = _policy("PHASE_TOOL_CALL")
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    # The ToolCallRequest is emitted so observers see what was attempted.
+    reqs = [e for e in events if isinstance(e, ToolCallRequest)]
+    assert len(reqs) == 1
+    assert reqs[0].name == "bash"
+
+    # Then an ExecutorError with the denial reason.
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert len(errors) == 1
+    assert "denied by policy" in errors[0].message
+    assert "bash" in errors[0].message
+
+    # ToolCallRequest appears before ExecutorError, and nothing follows the error.
+    req_idx = next(i for i, e in enumerate(events) if isinstance(e, ToolCallRequest))
+    err_idx = next(i for i, e in enumerate(events) if isinstance(e, ExecutorError))
+    assert req_idx < err_idx
+    assert err_idx == len(events) - 1  # error is the last event
+
+    # No TurnComplete — the turn was aborted.
+    assert not any(isinstance(e, TurnComplete) for e in events)
+
+
+async def test_run_turn_bridged_tool_skips_tool_call_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bridged (MCP-wrapped) tool does NOT trigger PHASE_TOOL_CALL — it's
+    already gated server-side via the dispatch bridge."""
+    # Build an MCP-envelope tool call (bridged).
+    mcp_running = SimpleNamespace(
+        type="tool_call",
+        name="mcp",
+        call_id="c1",
+        status="running",
+        args={
+            "providerIdentifier": "custom-user-tools",
+            "toolName": "sys_session_send",
+            "args": {"session": "s1", "message": "go"},
+        },
+        result=None,
+    )
+    mcp_done = SimpleNamespace(
+        type="tool_call",
+        name="mcp",
+        call_id="c1",
+        status="completed",
+        args={
+            "providerIdentifier": "custom-user-tools",
+            "toolName": "sys_session_send",
+            "args": {"session": "s1", "message": "go"},
+        },
+        result="ok",
+    )
+    script = {
+        "messages": [_assistant("Dispatching."), mcp_running, mcp_done, _assistant("Done.")],
+        "status": "finished",
+        "result": "Done.",
+    }
+    _install_fake_sdk(monkeypatch, [script])
+
+    # Wire a policy that denies PHASE_TOOL_CALL — if it fires, the turn would abort.
+    executor = CursorExecutor(api_key="crsr_x")
+    executor._policy_evaluator = _policy("PHASE_TOOL_CALL")
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    # Verify the bridged tool call was actually observed (not silently dropped).
+    reqs = [e for e in events if isinstance(e, ToolCallRequest)]
+    assert len(reqs) == 1 and reqs[0].name == "sys_session_send"
+
+    # The turn completes normally — the bridged tool was NOT policy-gated here.
+    assert any(isinstance(e, TurnComplete) for e in events)
+    assert not any(isinstance(e, ExecutorError) for e in events)
+
+
+async def test_run_turn_native_tool_allowed_by_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When PHASE_TOOL_CALL returns ALLOW, the turn proceeds normally."""
+    script = {
+        "messages": [
+            _assistant("Running."),
+            _tool("bash", "t1", "running", args={"cmd": "echo hi"}),
+            _tool("bash", "t1", "completed", result="hi"),
+            _assistant("Done."),
+        ],
+        "status": "finished",
+        "result": "Done.",
+    }
+    _install_fake_sdk(monkeypatch, [script])
+    executor = CursorExecutor(api_key="crsr_x")
+    executor._policy_evaluator = _policy(None)  # never denies
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    assert any(isinstance(e, TurnComplete) for e in events)
+    assert not any(isinstance(e, ExecutorError) for e in events)
+    # The tool call went through.
+    reqs = [e for e in events if isinstance(e, ToolCallRequest)]
+    assert len(reqs) == 1 and reqs[0].name == "bash"

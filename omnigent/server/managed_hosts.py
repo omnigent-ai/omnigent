@@ -1473,15 +1473,10 @@ def _start_host_in_sandbox(
             (HOST_NAME_ENV_VAR, host_name),
         )
     )
-    launcher.run(
+    launcher.run_background(
         sandbox_id,
-        # setsid + nohup + redirects detach the host from the exec
-        # session: the exec's bash exits immediately (the trailing echo
-        # gives it a clean foreground completion) while the host keeps
-        # running for the sandbox's lifetime.
-        f"{env_prefix} setsid nohup omnigent host "
-        f"--server {shlex.quote(server_url)} "
-        f"> {_HOST_LOG_PATH} 2>&1 < /dev/null & echo launched",
+        f"{env_prefix} omnigent host --server {shlex.quote(server_url)}",
+        log_path=_HOST_LOG_PATH,
     )
     return workspace
 

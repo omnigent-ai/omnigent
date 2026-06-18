@@ -154,6 +154,13 @@ _PASTED_PLACEHOLDER_PREFIX = "[Pasted text"
 # whether the draft is rendered in the input box. Short enough to fit
 # on the prompt row of a default 80-column detached pane.
 _DRAFT_NEEDLE_MAX_CHARS = 24
+# When Claude Code's input prompt never renders (it failed to boot), the
+# readiness gate attaches the tail of the captured pane to its error so
+# the real cause — often Claude Code's own startup crash, e.g. a
+# ``JSON Parse error`` from an HTML page served to its API client —
+# surfaces in the web UI error banner instead of only in the terminal.
+_TERMINAL_FAILURE_TAIL_LINES = 12
+_TERMINAL_FAILURE_TAIL_CHARS = 800
 
 ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[Any]]
 
@@ -2779,6 +2786,32 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
     return bool(needle) and needle in tail
 
 
+def _format_terminal_failure_tail(pane: str) -> str:
+    r"""
+    Format the tail of a captured tmux pane for a failure message.
+
+    When Claude Code's input prompt never renders, its own on-screen
+    output — often a startup error or stack trace (e.g. a ``JSON Parse
+    error`` raised when its API client receives an HTML page instead of
+    JSON) — is the only signal of the real cause. The readiness gate
+    raises into the web UI's error banner, so attaching this tail
+    surfaces that cause without the user having to open the terminal.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: A ``" Last terminal output:\n<tail>"`` block — the last
+        :data:`_TERMINAL_FAILURE_TAIL_LINES` non-blank lines, capped at
+        :data:`_TERMINAL_FAILURE_TAIL_CHARS` characters — or ``""`` when
+        the pane has no visible text.
+    """
+    lines = [line.rstrip() for line in pane.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    tail = "\n".join(lines[-_TERMINAL_FAILURE_TAIL_LINES:])
+    if len(tail) > _TERMINAL_FAILURE_TAIL_CHARS:
+        tail = "…" + tail[-_TERMINAL_FAILURE_TAIL_CHARS:]
+    return f" Last terminal output:\n{tail}"
+
+
 def _wait_for_claude_prompt_ready(
     socket_path: str,
     tmux_target: str,
@@ -2807,16 +2840,25 @@ def _wait_for_claude_prompt_ready(
     :param timeout_s: Seconds to wait for the prompt, e.g. ``30.0``.
     :returns: None.
     :raises RuntimeError: If the prompt never renders within
-        *timeout_s* (Claude failed to boot).
+        *timeout_s* (Claude failed to boot). The message carries the
+        tail of the captured pane (see :func:`_format_terminal_failure_tail`)
+        so Claude Code's own startup output surfaces in the caller's error.
     """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if _claude_prompt_rendered(_capture_pane(socket_path, tmux_target)):
             return
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    # Timed out: Claude Code never rendered its input prompt. Capture the
+    # pane one last time and attach its tail so the real cause — often a
+    # startup crash like a ``JSON Parse error`` — surfaces in the web UI
+    # error banner this raises into, instead of only a generic timeout
+    # the user has to open the terminal to diagnose.
+    pane = _capture_pane(socket_path, tmux_target)
     raise RuntimeError(
         f"Claude Code terminal did not become ready within {timeout_s}s "
         "(input prompt never rendered). The message was not delivered."
+        + _format_terminal_failure_tail(pane)
     )
 
 

@@ -111,6 +111,7 @@ jobs:
               --ignore=tests/onboarding
               --ignore=tests/spec
               --ignore=tests/llms
+              --ignore=tests/codex_parity
 
     steps:
       - name: Check out repo
@@ -199,6 +200,83 @@ jobs:
           path: artifacts/
           retention-days: 14
           include-hidden-files: true  # the per-shard .coverage.<group> dotfile
+
+  codex-parity:
+    name: Pytest (codex-parity)
+    needs: gate
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version-file: ".python-version"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@8d55fbecc275b1c35dbe060458839f8d30439ccf  # v3
+        with:
+          enable-cache: true
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust build
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4
+        with:
+          path: .tmp-codex-parity-target
+          key: codex-parity-sidecar-${{ runner.os }}-${{ hashFiles('tests/codex_parity/sidecar/Cargo.lock') }}
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: 20
+
+      - name: Install codex CLI
+        run: |
+          npm install --ignore-scripts --prefix .github/ci-deps
+          echo "${GITHUB_WORKSPACE}/.github/ci-deps/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Cache virtualenv
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
+
+      - name: Install dependencies
+        run: uv sync --extra all --extra dev
+
+      - name: Build parity sidecar
+        run: |
+          cargo build \
+            --manifest-path tests/codex_parity/sidecar/Cargo.toml \
+            --target-dir .tmp-codex-parity-target
+
+      - name: Run codex parity tests
+        shell: bash
+        env:
+          PYTHONFAULTHANDLER: "1"
+        run: |
+          mkdir -p artifacts
+          env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u DATABRICKS_TOKEN \
+            uv run pytest tests/codex_parity/ \
+              --codex-parity \
+              --timeout=300 \
+              --junitxml=artifacts/pytest-codex-parity.xml \
+              -v --tb=long --showlocals --log-level=INFO -r a
+
+      - name: Upload pytest artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: pytest-codex-parity-${{ github.run_id }}
+          path: artifacts/
+          retention-days: 14
 
   coverage-report:
     name: Coverage report

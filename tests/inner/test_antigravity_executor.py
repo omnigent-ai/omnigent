@@ -350,12 +350,14 @@ async def test_streaming_maps_text_reasoning_and_usage(monkeypatch: pytest.Monke
     assert len(completes) == 1
     # Final text is the accumulation of the streamed deltas.
     assert completes[0].response == "Hello world"
-    # Usage maps the SDK's UsageMetadata field names onto Omnigent's keys.
+    # Usage maps the SDK's UsageMetadata field names onto Omnigent's keys and
+    # stamps the resolved model so the scaffold can price the turn.
     assert completes[0].usage == {
         "input_tokens": 11,
         "output_tokens": 7,
         "total_tokens": 18,
         "cache_read_input_tokens": 2,
+        "model": "gemini-3-pro",
     }
 
 

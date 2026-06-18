@@ -776,6 +776,18 @@ def _resolve_gateway_env(
         corresponding base URL or auth command.
     """
     host = host_override.rstrip("/") if host_override else None
+    if host is None and base_url_override is not None and auth_command_override is not None:
+        # Generic-provider gateway: explicit base_url + auth command,
+        # no Databricks host or profile required (e.g. ApiKeyAuth with
+        # a mock LLM server URL).
+        return {
+            "ANTHROPIC_BASE_URL": base_url_override,
+            "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": str(
+                auth_refresh_interval_ms or _GATEWAY_AUTH_REFRESH_MS
+            ),
+            "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+            _CLAUDE_API_KEY_HELPER_ENV_KEY: auth_command_override,
+        }
     if host is None:
         try:
             from .databricks_executor import _read_databrickscfg

@@ -4,10 +4,18 @@ Drives Cursor via :mod:`cursor_sdk` over a local bridge — one persistent
 ``AsyncAgent`` per Omnigent conversation, created on a
 :meth:`cursor_sdk.AsyncClient.launch_bridge` client and reused turn to turn.
 Each ``run_turn`` issues one ``agent.send`` and translates the streamed
-``run.messages()`` (``SDKMessage`` objects) into ExecutorEvents:
+``run.events()`` (``RunStreamEvent`` objects) into ExecutorEvents:
 assistant text → :class:`TextChunk`, thinking → :class:`ReasoningChunk`,
 tool calls → :class:`ToolCallRequest` / :class:`ToolCallComplete`, completing
 on the run's terminal :class:`cursor_sdk.RunResult`.
+
+Policy enforcement covers three phases: PHASE_LLM_REQUEST (pre-send),
+PHASE_LLM_RESPONSE (post-response), and PHASE_TOOL_CALL (native tools).
+Cursor's native tools execute inside the Cursor process so they cannot be
+pre-blocked, but when a non-bridged tool call is observed the executor
+evaluates PHASE_TOOL_CALL and cancels the run on DENY.  Bridged Omnigent
+tools (MCP-wrapped) are already gated server-side via the dispatch bridge
+and are skipped to avoid double evaluation.
 
 Crucially, Omnigent's spec-declared tools (``sys_session_send`` et al.) are
 bridged into Cursor **in-process** via the SDK's ``custom_tools``: each
@@ -34,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import json
 import logging
 import os
@@ -41,6 +50,8 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeAlias
+
+from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 
 from .datamodel import OSEnvSpec
 from .executor import (
@@ -98,6 +109,52 @@ def _resolve_model(model: str | None) -> str:
             )
         return _DEFAULT_CURSOR_MODEL
     return model
+
+
+def _first_of(d: dict[str, Any], *keys: str, default: int = 0) -> int:
+    """Return the value of the first key present (and not None) in *d*."""
+    for k in keys:
+        v = d.get(k)
+        if v is not None:
+            return int(v)
+    return default
+
+
+def _normalize_cursor_usage(raw: dict[str, Any], model: str) -> dict[str, Any]:
+    """Map Cursor SDK usage fields to the standard Omnigent usage dict."""
+    in_tok = _first_of(raw, "inputTokens", "input_tokens")
+    out_tok = _first_of(raw, "outputTokens", "output_tokens")
+    total = _first_of(raw, "totalTokens", "total_tokens", default=in_tok + out_tok)
+    usage: dict[str, Any] = {
+        "input_tokens": in_tok,
+        "output_tokens": out_tok,
+        "total_tokens": total,
+        "model": model,
+    }
+    # Carry cache breakdown if the backend reports it.
+    # The Cursor backend sends cacheReadTokens / cacheWriteTokens;
+    # map to the Omnigent-standard cache_read_input_tokens /
+    # cache_creation_input_tokens names.
+    for dst, *sources in (
+        (
+            "cache_read_input_tokens",
+            "cacheReadTokens",
+            "cacheReadInputTokens",
+            "cache_read_input_tokens",
+        ),
+        (
+            "cache_creation_input_tokens",
+            "cacheWriteTokens",
+            "cacheCreationInputTokens",
+            "cache_creation_input_tokens",
+        ),
+    ):
+        for src in sources:
+            val = raw.get(src)
+            if val is not None:
+                usage[dst] = val
+                break
+    return usage
 
 
 def _tools_fingerprint(tools: list[ToolSpec]) -> str:
@@ -225,9 +282,16 @@ def _sdk_message_to_events(message: Any) -> list[ExecutorEvent]:  # type: ignore
             name = str(args.get("toolName") or name)
             inner = args.get("args")
             args = inner if isinstance(inner, dict) else {}
+            is_bridged = True
+        else:
+            is_bridged = False
         call_id = getattr(message, "call_id", None)
         if status == "running":
-            events.append(ToolCallRequest(name=name, args=args, metadata={"call_id": call_id}))
+            events.append(
+                ToolCallRequest(
+                    name=name, args=args, metadata={"call_id": call_id, "is_bridged": is_bridged}
+                )
+            )
         elif status in ("completed", "error"):
             result = getattr(message, "result", None)
             classification = classify_tool_result(result)
@@ -242,7 +306,7 @@ def _sdk_message_to_events(message: Any) -> list[ExecutorEvent]:  # type: ignore
                     status=tool_status,
                     result=result,
                     error=error,
-                    metadata={"call_id": call_id},
+                    metadata={"call_id": call_id, "is_bridged": is_bridged},
                 )
             )
         return events
@@ -342,9 +406,10 @@ class CursorExecutor(Executor):
         # Installed by the runtime adapter; routes a bridged-tool call back into
         # Omnigent's session (policy gating, sub-agent dispatch, logging).
         self._tool_executor: ToolExecutor | None = None
-        # Installed by the runtime adapter; evaluates PHASE_LLM_REQUEST /
-        # PHASE_LLM_RESPONSE policies (the same round-trip pi / claude-sdk use).
-        # ``None`` on single-process / pre-turn paths (then policy is a no-op).
+        # Installed by the runtime adapter; evaluates PHASE_LLM_REQUEST,
+        # PHASE_LLM_RESPONSE, and PHASE_TOOL_CALL policies (the same round-trip
+        # pi / claude-sdk use). ``None`` on single-process / pre-turn paths
+        # (then policy is a no-op).
         self._policy_evaluator: Callable[[str, dict[str, Any]], Awaitable[Any]] | None = None
 
     def supports_streaming(self) -> bool:
@@ -373,6 +438,24 @@ class CursorExecutor(Executor):
             if isinstance(meta, dict) and meta.get("session_id"):
                 return str(meta["session_id"])
         return "__default__"
+
+    # -- native-tool policy gate --------------------------------------------
+
+    async def _evaluate_native_tool_policy(
+        self, name: str, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Evaluate PHASE_TOOL_CALL policy for a Cursor native tool.
+
+        Returns ``{"block": bool, "reason": str}``.
+        """
+        evaluator = self._policy_evaluator
+        if evaluator is None:
+            return {"block": False, "reason": ""}
+        verdict = await evaluator("PHASE_TOOL_CALL", {"name": name, "arguments": args})
+        action = getattr(verdict, "action", None)
+        if action == "POLICY_ACTION_DENY":
+            return {"block": True, "reason": getattr(verdict, "reason", "") or "blocked by policy"}
+        return {"block": False, "reason": ""}
 
     # -- custom-tool bridge -------------------------------------------------
 
@@ -552,29 +635,66 @@ class CursorExecutor(Executor):
         # Streamed deltas of a single response (no tool between) still
         # concatenate seamlessly, so this never splits one sentence.
         separate_next_text = False
+        turn_usage: dict[str, Any] | None = None
         try:
-            run = await state.agent.send(prompt)
-            async for message in run.messages():
-                for event in _sdk_message_to_events(message):
-                    if isinstance(event, TextChunk):
-                        if separate_next_text and response_text and event.text:
-                            # Guarantee a blank-line (paragraph) boundary between
-                            # pre- and post-tool narration, regardless of any single
-                            # trailing/leading newline the two blocks already carry
-                            # (a lone space or "\n" must still become a blank line).
-                            trailing = len(response_text) - len(response_text.rstrip("\n"))
-                            leading = len(event.text) - len(event.text.lstrip("\n"))
-                            if trailing + leading < 2:
-                                pad = "\n" * (2 - trailing - leading)
-                                event = TextChunk(text=pad + event.text)
-                        separate_next_text = False
-                        response_text += event.text
-                    elif isinstance(event, ToolCallRequest):
-                        tool_calls += 1
-                        separate_next_text = True
-                    elif isinstance(event, ToolCallComplete):
-                        separate_next_text = True
-                    yield event
+            # Pass SendOptions with on_delta so the backend sends
+            # interaction updates (including TurnEndedUpdate with usage).
+            # Without enableDeltas the backend omits them entirely.
+            from cursor_sdk import SendOptions as _SendOptions  # lazy: optional dep
+
+            def _capture_delta(update: Any) -> None:  # type: ignore[explicit-any]
+                nonlocal turn_usage
+                if getattr(update, "type", None) == "turn-ended":
+                    raw = getattr(update, "usage", None)
+                    if isinstance(raw, dict) and raw:
+                        turn_usage = _normalize_cursor_usage(raw, model)
+
+            run = await state.agent.send(prompt, options=_SendOptions(on_delta=_capture_delta))
+            async for stream_event in run.events():
+                if stream_event.sdk_message is not None:
+                    for event in _sdk_message_to_events(stream_event.sdk_message):
+                        if isinstance(event, TextChunk):
+                            if separate_next_text and response_text and event.text:
+                                # Guarantee a blank-line (paragraph) boundary between
+                                # pre- and post-tool narration, regardless of any single
+                                # trailing/leading newline the two blocks already carry
+                                # (a lone space or "\n" must still become a blank line).
+                                trailing = len(response_text) - len(response_text.rstrip("\n"))
+                                leading = len(event.text) - len(event.text.lstrip("\n"))
+                                if trailing + leading < 2:
+                                    pad = "\n" * (2 - trailing - leading)
+                                    event = TextChunk(text=pad + event.text)
+                            separate_next_text = False
+                            response_text += event.text
+                        elif isinstance(event, ToolCallRequest):
+                            tool_calls += 1
+                            separate_next_text = True
+                            # Evaluate PHASE_TOOL_CALL for native tools.
+                            # Bridged tools are already gated by the
+                            # dispatch bridge — skip to avoid double eval.
+                            if not event.metadata.get("is_bridged") and policy_eval is not None:
+                                gate = await self._evaluate_native_tool_policy(
+                                    event.name, event.args if isinstance(event.args, dict) else {}
+                                )
+                                if gate["block"]:
+                                    # Cancel the run to prevent further
+                                    # native tool use.
+                                    with contextlib.suppress(Exception):
+                                        await run.cancel()
+                                    yield event  # emit so observers see what was attempted
+                                    reason = gate["reason"]
+                                    msg = f"Native tool {event.name!r} denied by policy: {reason}"
+                                    yield ExecutorError(message=msg)
+                                    return
+                        elif isinstance(event, ToolCallComplete):
+                            separate_next_text = True
+                        yield event
+                # Capture usage from TurnEndedUpdate interaction updates.
+                iu = stream_event.interaction_update
+                if iu is not None and getattr(iu, "type", None) == "turn-ended":
+                    raw_usage = getattr(iu, "usage", None)
+                    if isinstance(raw_usage, dict) and raw_usage:
+                        turn_usage = _normalize_cursor_usage(raw_usage, model)
             result = await run.wait()
         except asyncio.CancelledError:
             raise
@@ -611,8 +731,9 @@ class CursorExecutor(Executor):
                 yield ExecutorError(message=f"LLM response denied by policy: {reason}")
                 return
 
-        # The SDK RunResult carries no token counts, so the turn is left unpriced.
-        yield TurnComplete(response=final, usage=None)
+        if turn_usage:
+            _notify_usage_from_dict(model=model, usage=turn_usage)
+        yield TurnComplete(response=final, usage=turn_usage)
 
     async def _close_state(self, state: _CursorSessionState) -> None:
         if state.agent is not None:

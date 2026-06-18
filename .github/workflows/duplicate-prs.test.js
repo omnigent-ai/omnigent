@@ -90,13 +90,48 @@ function assert(name, cond, detail) {
   ]);
   assert("distinct issues -> no closures", r.closed.length === 0, JSON.stringify(r));
 
-  // 4. Maintainer (MEMBER) duplicate is ignored; community duplicate closed.
+  // 4a. Maintainer PR (older) is the keeper -> newer community duplicate closes.
   r = await run([
     pr({ number: 1, createdAt: "2026-06-01T00:00:00Z", issues: [9], assoc: "MEMBER" }),
     pr({ number: 2, createdAt: "2026-06-02T00:00:00Z", issues: [9] }),
   ]);
-  assert("maintainer PR excluded -> only its lone community PR remains, no closures",
-    r.closed.length === 0, JSON.stringify(r));
+  assert("maintainer keeper -> newer community duplicate is closed",
+    JSON.stringify(r.closed) === JSON.stringify([2]), JSON.stringify(r));
+
+  // 4b. Community PR (older) keeper, maintainer PR (newer) duplicate -> the
+  //     maintainer PR is flagged (heads-up comment + label) but never closed.
+  r = await run([
+    pr({ number: 1, createdAt: "2026-06-01T00:00:00Z", issues: [9] }),
+    pr({ number: 2, createdAt: "2026-06-02T00:00:00Z", issues: [9], assoc: "MEMBER" }),
+  ]);
+  assert("maintainer duplicate is flagged, not closed",
+    r.closed.length === 0 &&
+    JSON.stringify(r.labeled) === JSON.stringify([2]) &&
+    r.commented.length === 1 &&
+    r.commented[0].issue_number === 2 &&
+    r.commented[0].body.includes("won't be auto-closed"),
+    JSON.stringify(r));
+
+  // 4c. Two maintainer PRs on one issue -> neither is closed; the newer one is
+  //     flagged with the heads-up comment.
+  r = await run([
+    pr({ number: 1, createdAt: "2026-06-01T00:00:00Z", issues: [9], assoc: "OWNER" }),
+    pr({ number: 2, createdAt: "2026-06-02T00:00:00Z", issues: [9], assoc: "COLLABORATOR" }),
+  ]);
+  assert("two maintainer PRs -> none closed, newer flagged",
+    r.closed.length === 0 &&
+    JSON.stringify(r.labeled) === JSON.stringify([2]) &&
+    r.commented.length === 1 && r.commented[0].issue_number === 2,
+    JSON.stringify(r));
+
+  // 4d. Mixed group: maintainer keeper + two community duplicates -> both close.
+  r = await run([
+    pr({ number: 1, createdAt: "2026-06-01T00:00:00Z", issues: [9], assoc: "MEMBER" }),
+    pr({ number: 2, createdAt: "2026-06-02T00:00:00Z", issues: [9] }),
+    pr({ number: 3, createdAt: "2026-06-03T00:00:00Z", issues: [9] }),
+  ]);
+  assert("maintainer keeper + 2 community dupes -> both community closed",
+    JSON.stringify(r.closed) === JSON.stringify([2, 3]), JSON.stringify(r));
 
   // 5. Already-labeled duplicate is skipped (filtered before grouping).
   r = await run([

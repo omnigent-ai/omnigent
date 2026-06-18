@@ -65,19 +65,8 @@ skips:
     issue: 532
     cluster: files-uploads-attachments
     mode: skip
-  - id: tests/e2e/test_repl_approval_e2e.py::test_repl_refusal_shows_deny_sentinel
-    reason: "Pexpect timeout waiting for 'approval required' regex. Same REPL-pexpect timeout family as the earlier test_repl_* entries."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
 
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_tool_call_approval_allows_tool_to_run
-    reason: "Same REPL approval pexpect-timeout family."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
-
-  - id: tests/e2e/test_repl_approval_e2e.py::test_repl_label_driven_ask_refuse_shows_sentinel
     reason: "Same REPL approval pexpect-timeout family."
     issue: 532
     cluster: repl-pexpect-cli
@@ -87,12 +76,6 @@ skips:
     reason: "Same REPL approval pexpect-timeout family."
     issue: 532
     cluster: repl-pexpect-cli
-    mode: skip
-
-  - id: tests/e2e/test_sys_terminal_e2e.py::test_sys_terminal_send_keys_drives_interactive_e2e
-    reason: "Drives the removed /v1/responses route; re-home to the sessions API in a later batch."
-    issue: 532
-    cluster: terminal-d6
     mode: skip
 
   - id: tests/e2e/test_async_tools_e2e.py::test_async_tool_real_llm_e2e
@@ -158,28 +141,10 @@ skips:
     cluster: repl-pexpect-cli
     mode: skip
 
-  - id: tests/e2e/test_client_tool_sse_status_e2e.py::test_client_side_tool_inline_sse_carries_action_required
-    reason: "Shard 1 bulk: SSE action_required signaling. Triage under #532."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
-    mode: skip
-
   - id: tests/e2e/test_decorated_tools_e2e.py::test_decorated_tools_varied_signatures_e2e
     reason: "openai-agents harness test hits platform.openai.com directly and 401s under the Databricks gateway profile (dapi PAT rejected as OpenAI key); needs gateway-routing/base_url fix before it can run in CI. Passes only with a real OPENAI_API_KEY locally."
     issue: 532
     cluster: run-ap-examples-harness
-    mode: skip
-
-  - id: tests/e2e/test_repl_approval_e2e.py::test_repl_approve_always_caches_for_later_turns
-    reason: "Shard 1 bulk: REPL approval pexpect-timeout family."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
-
-  - id: tests/e2e/test_repl_approval_e2e.py::test_repl_label_driven_ask_approves
-    reason: "Shard 1 bulk: REPL approval pexpect-timeout family."
-    issue: 532
-    cluster: repl-pexpect-cli
     mode: skip
 
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_tool_result_ask_refuse_replaces_output
@@ -199,12 +164,6 @@ skips:
     cluster: async-dispatch-inbox-sse
     mode: skip
 
-  - id: tests/e2e/test_tool_dispatch_workflow_client_side_e2e.py::test_harness_routes_client_side_tool_through_dispatch_workflow
-    reason: "Shard 1 bulk: tool-dispatch workflow client-side."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
-    mode: skip
-
   # ── Shard 1 errors (collection / fixture-level, not test body) ──
   - id: tests/e2e/omnigent/test_example_agent_with_os_env_fork.py::test_agent_with_os_env_fork_one_shot
     reason: "Shards 0/1 bulk: agent_with_os_env_fork one-shot exits 0 with no stdout."
@@ -218,24 +177,6 @@ skips:
   # mode hung on test_run_omnigent_rate_limit_approval; xdist + per-test
   # timeout lets the rest of the shard complete). Same bulk-first,
   # triage-later approach as PRs #475/#482/#554/#606.
-
-  - id: tests/e2e/omnigent/test_run_omnigent_rate_limit_approval.py::test_run_omnigent_rate_limit_approval_round_trip
-    reason: "Shard 3 bulk: pexpect timeout waiting for 'approval required'; hung the whole pytest process under single-worker thread-timeout."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
-
-  - id: tests/e2e/test_repl_approval_e2e.py::test_repl_single_approval_allows_llm_response
-    reason: "Shard 3 bulk: REPL approval pexpect family."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
-
-  - id: tests/e2e/test_repl_approval_e2e.py::test_repl_two_turns_fires_one_approval_per_turn
-    reason: "Shard 3 bulk: REPL approval pexpect family."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
 
   - id: tests/e2e/omnigent/test_run_omnigent_coding_supervisor.py::test_run_omnigent_coding_supervisor_oneshot
     reason: "Shard 3 bulk: coding supervisor one-shot. Triage under #532."
@@ -295,22 +236,10 @@ skips:
     cluster: run-ap-examples-harness
     mode: skip
 
-  - id: tests/e2e/test_sys_terminal_e2e.py::test_sys_terminal_basic_round_trip_e2e
-    reason: "Shard 3 bulk: sys-terminal basic round-trip. Same sys-terminal family."
-    issue: 532
-    cluster: terminal-d6
-    mode: skip
-
   - id: tests/e2e/omnigent/test_run_omnigent_example_agents.py::test_run_omnigent_example_yaml[agent_with_subagent_session]
     reason: "Shard 3 bulk: run_omnigent example-yaml agent_with_subagent_session."
     issue: 532
     cluster: subagent-supervisor-routing
-    mode: skip
-
-  - id: tests/e2e/test_sys_terminal_e2e.py::test_sys_terminal_ten_parallel_dispatches_complete_e2e
-    reason: "Shard 3 bulk: sys-terminal 10-parallel-dispatch. Same family."
-    issue: 532
-    cluster: terminal-d6
     mode: skip
 
   - id: tests/e2e/omnigent/test_run_omnigent_example_agents.py::test_run_omnigent_example_yaml[coding_supervisor_with_forks]
@@ -336,12 +265,6 @@ skips:
     issue: 532
     cluster: repl-pexpect-cli
     mode: skip
-  - id: tests/e2e/test_d6_parallel_fan_out_e2e.py::test_async_client_tools_fan_out_in_parallel
-    reason: "Shard 3 bulk: D6 parallel client-tool fan-out. Same D6 server-side terminal-event family."
-    issue: 532
-    cluster: terminal-d6
-    mode: skip
-
   - id: tests/e2e/test_sys_async_inbox_e2e.py::test_sys_read_inbox_str_branch_routes_without_crash_e2e
     reason: "Shard 3 bulk: sys async-inbox str-branch routing."
     issue: 532
@@ -374,25 +297,7 @@ skips:
     cluster: async-dispatch-inbox-sse
     mode: skip
 
-  - id: tests/e2e/test_sys_terminal_e2e.py::test_sys_terminal_full_workflow_e2e
-    reason: "Follow-up: sys-terminal full workflow. sys-terminal cluster."
-    issue: 532
-    cluster: terminal-d6
-    mode: skip
-
   - id: tests/e2e/omnigent/test_repl_session_lifecycle.py::test_repl_effort_command_persists_session_metadata
-    reason: "Nightly bulk: REPL session-lifecycle / pexpect cluster."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_repl_session_lifecycle.py::test_repl_full_session_lifecycle
-    reason: "Nightly bulk: REPL session-lifecycle / pexpect cluster."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_repl_session_lifecycle.py::test_repl_local_mode_launches_runner_subprocess
     reason: "Nightly bulk: REPL session-lifecycle / pexpect cluster."
     issue: 532
     cluster: repl-pexpect-cli
@@ -410,12 +315,6 @@ skips:
     cluster: repl-pexpect-cli
     mode: skip
 
-  - id: tests/e2e/omnigent/test_run_omnigent_coding_supervisor.py::test_run_omnigent_coding_supervisor_interactive_enters_repl
-    reason: "Nightly bulk: run_omnigent CLI cluster."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
-
   - id: tests/e2e/omnigent/test_server_remote_omnigent_autonomous_flows.py::test_manual_server_remote_omnigent_notify_when_idle_does_not_hang_and_delivers
     reason: "Nightly bulk: server-remote-ap autonomous flows; pexpect timeout family."
     issue: 532
@@ -429,12 +328,6 @@ skips:
     mode: skip
   - id: tests/e2e/test_claude_coder_client_tools.py::test_claude_sdk_parks_client_tool_call
     reason: "Nightly bulk: claude-coder client-tool park."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
-    mode: skip
-
-  - id: tests/e2e/test_web_search_async_dispatch_e2e.py::test_web_search_async_dispatch_completes_on_non_openai_model
-    reason: "Nightly bulk: web-search async dispatch (409 conflict)."
     issue: 532
     cluster: async-dispatch-inbox-sse
     mode: skip
@@ -608,11 +501,6 @@ skips:
     issue: 0
     cluster: steering-cancel-compaction-state
     mode: skip
-  - id: tests/e2e/omnigent/test_repl_session_lifecycle.py::test_repl_reasoning_effort_threads_through
-    reason: "Force-merge backlog (standalone). First observed failing at 305e9bb9 (2026-05-23T06:06:59Z, E2E)."
-    issue: 0
-    cluster: repl-pexpect-cli
-    mode: skip
   - id: tests/e2e/test_filesystem_changed_files_e2e.py::test_filesystem_changes_appear_after_agent_write
     reason: "Force-merge backlog (standalone). First observed failing at 305e9bb9 (2026-05-23T06:06:59Z, E2E)."
     issue: 0
@@ -685,4 +573,10 @@ skips:
     reason: "openai-agents empty-output/crash resurfaced on the gateway (#2707)."
     issue: 2707
     cluster: openai-agents-empty-output
+    mode: skip
+
+  - id: tests/e2e/omnigent/test_repl_session_lifecycle.py::test_repl_local_mode_launches_runner_subprocess
+    reason: "CI-only failure: 'No runner subprocess found under <pid>' — the test asserts the runner is a direct child in the process tree, which holds locally (macOS) but not in CI's Linux container/daemon process model. Passes 0/30 in CI flake-stress while its 4 session-lifecycle siblings pass. Needs a CI-robust runner-detection fix (likely tied to the daemon-reuse lifecycle work)."
+    issue: 532
+    cluster: repl-pexpect-cli
     mode: skip

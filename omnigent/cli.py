@@ -267,6 +267,8 @@ _LOCAL_DAEMON_ENV_PREFIXES: tuple[str, ...] = (
     "ANTHROPIC_DEFAULT_",
     "AZURE_OPENAI_",
     "DATABRICKS_",
+    "MLFLOW_",
+    "OTEL_",
     "OMNIGENT_",
     "OPENAI_",
 )
@@ -8269,13 +8271,14 @@ def _set_antigravity_api_key() -> str | None:
     Offers an existing ``GEMINI_API_KEY`` / ``ANTIGRAVITY_API_KEY`` first
     (recorded as an ``env:`` ref, so the secret stays in the environment), else
     reads it with a hidden prompt and stores it under ``keychain:antigravity``.
-    The ``AIza`` prefix is checked softly (a wrong paste is caught but can be
-    forced). The key is never echoed.
+    The key prefix (``AIza`` or ``AQ``) is checked softly (a wrong paste is
+    caught but can be forced). The key is never echoed.
 
     :returns: A status string for the menu, or ``None`` if the user aborted.
     """
     from omnigent.onboarding import secrets as secret_store
     from omnigent.onboarding.antigravity_auth import (
+        ANTIGRAVITY_API_KEY_PREFIX_HINT,
         ANTIGRAVITY_ENV_VARS,
         ANTIGRAVITY_SECRET_NAME,
         antigravity_api_key_settings,
@@ -8289,7 +8292,9 @@ def _set_antigravity_api_key() -> str | None:
     ):
         detected = os.environ[detected_var]
         if not looks_like_gemini_api_key(detected) and not click.confirm(
-            f"${detected_var} doesn't start with 'AIza'. Use it anyway?", default=False
+            f"${detected_var} doesn't start with {ANTIGRAVITY_API_KEY_PREFIX_HINT}. "
+            "Use it anyway?",
+            default=False,
         ):
             return None
         _save_global_config(antigravity_api_key_settings(f"env:{detected_var}"))
@@ -8299,7 +8304,8 @@ def _set_antigravity_api_key() -> str | None:
     if not pasted:
         return None
     if not looks_like_gemini_api_key(pasted) and not click.confirm(
-        "That doesn't start with 'AIza'. Store it anyway?", default=False
+        f"That doesn't start with {ANTIGRAVITY_API_KEY_PREFIX_HINT}. Store it anyway?",
+        default=False,
     ):
         return None
     secret_store.store_secret(ANTIGRAVITY_SECRET_NAME, pasted)

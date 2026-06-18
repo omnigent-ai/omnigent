@@ -19,6 +19,7 @@ from omnigent.claude_native_bridge import (
     record_hook_event,
     write_active_session_id,
 )
+from tests.native_hook_helpers import make_failing_client
 
 
 @pytest.fixture(autouse=True)
@@ -1709,3 +1710,79 @@ def test_ask_user_question_hook_returns_deny_without_updated_input(
     assert "updatedInput" not in hs, (
         "updatedInput must not appear on a deny response — there are no answers to inject"
     )
+
+
+@pytest.mark.parametrize("mode", ["connect_error", "non_2xx", "empty_body", "malformed_json"])
+def test_evaluate_policy_pre_tool_use_fails_closed_when_verdict_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    mode: str,
+) -> None:
+    """
+    A governed PreToolUse call denies when no usable verdict is returned.
+
+    For native harnesses this hook is the sole TOOL_CALL enforcement point,
+    so a server outage / non-2xx / empty / malformed response must fail
+    CLOSED (deny) instead of "no opinion" — the bypass reported in #536.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(claude_native_hook.httpx, "Client", make_failing_client(mode))
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
+    write_active_session_id(bridge_dir, "conv_active")
+    build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "rm -rf /"},
+    }
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    exit_code = claude_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    result = json.loads(captured.out)
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny", result
+    assert result["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+            "tool_output": "ok",
+        },
+        {"hook_event_name": "UserPromptSubmit", "prompt": "hello"},
+    ],
+)
+def test_evaluate_policy_non_tool_call_phases_fail_open_on_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    payload: dict[str, object],
+) -> None:
+    """
+    Off the tool-call gate, an unobtainable verdict stays fail-open.
+
+    PostToolUse runs after the tool executed and the request gate is
+    advisory, so neither denies on a transport error — mirroring the
+    runner-side ``FAIL_CLOSED_PHASES`` (PR #163).
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(claude_native_hook.httpx, "Client", make_failing_client("connect_error"))
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
+    write_active_session_id(bridge_dir, "conv_active")
+    build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    exit_code = claude_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.out == ""
