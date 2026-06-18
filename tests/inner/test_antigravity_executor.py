@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import enum
+import inspect
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -736,6 +737,59 @@ async def test_sys_tools_exposed_as_callables_routing_through_executor(
         {"name": "sys_shell", "args": {"cmd": "ls"}},
         {"name": "sys_shell", "args": {"cmd": "pwd"}},
     ]
+
+
+@pytest.mark.asyncio
+async def test_sys_tool_schema_threaded_into_sdk_function_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ToolSpec ``parameters`` schema reaches the SDK via the callable's signature.
+
+    The SDK builds each tool's model-facing function declaration by
+    introspecting the callable (``inspect.signature``); a bare ``*args/**kwargs``
+    body would advertise no arguments. Assert a ``sys_*`` tool's registered
+    callable exposes its real JSON-Schema arguments (names, types, required).
+    """
+    captured = _install_fake_sdk(monkeypatch, scripts=[[_text_step("done")]])
+    executor = AntigravityExecutor()
+
+    async def _fake_tool_executor(name: str, args: dict[str, Any]) -> dict[str, Any]:
+        return {"ok": True}
+
+    executor._tool_executor = _fake_tool_executor
+
+    tool_specs = [
+        {
+            "name": "sys_shell",
+            "description": "Run a shell command",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cmd": {"type": "string"},
+                    "timeout": {"type": "integer"},
+                },
+                "required": ["cmd"],
+            },
+        }
+    ]
+
+    await _drain(executor, [{"role": "user", "content": "go", "session_id": "s1"}], tool_specs)
+
+    sdk_tools = captured["configs"][0].tools
+    assert sdk_tools is not None and len(sdk_tools) == 1
+    sdk_tool = sdk_tools[0]
+
+    # The SDK derives the function declaration from inspect.signature(...).
+    sig = inspect.signature(sdk_tool)
+    assert list(sig.parameters) == ["cmd", "timeout"]
+    # Required field has no default; optional field defaults (so it is not required).
+    assert sig.parameters["cmd"].default is inspect.Parameter.empty
+    assert sig.parameters["timeout"].default is None
+    # JSON-Schema types map onto Python annotations.
+    assert sig.parameters["cmd"].annotation is str
+    assert sig.parameters["timeout"].annotation is int
+    # Schema is metadata only — the callable still routes through the bridge.
+    assert await sdk_tool(cmd="ls") == {"ok": True}
 
 
 @pytest.mark.asyncio
