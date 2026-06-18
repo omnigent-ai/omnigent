@@ -675,7 +675,6 @@ def test_vertex_claude_detected_with_all_env_vars(
         ),
     ],
 )
-
 def test_vertex_claude_not_detected_when_incomplete(
     clean_env, monkeypatch: pytest.MonkeyPatch, label: str, env: dict[str, str]
 ) -> None:
