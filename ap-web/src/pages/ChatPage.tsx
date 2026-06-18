@@ -1771,6 +1771,12 @@ export function JumpToTopButton({
   const [atTop, setAtTop] = useState(true);
   const [hovering, setHovering] = useState(false);
   const [jumping, setJumping] = useState(false);
+  // Reveal the pill while the user is scrolling up, then fade it back out once
+  // they pause — so it's reachable without having to find the top hover band.
+  const [scrolledUp, setScrolledUp] = useState(false);
+
+  // How long the pill lingers after the last upward scroll before fading out.
+  const SCROLL_REVEAL_MS = 2000;
 
   // Pixels below the conversation's top edge that count as "hovering the top".
   // Comfortably clears the pill (anchored at the fade border, ~50px) so moving
@@ -1795,23 +1801,38 @@ export function JumpToTopButton({
     };
   }, [containerEl]);
 
-  // Track whether the loaded window is scrolled to its very top.
+  // Track whether the loaded window is scrolled to its very top, and reveal the
+  // pill whenever the user scrolls up (auto-hiding after they pause).
   const scrollEl = scroller?.el ?? null;
   useEffect(() => {
     if (!scrollEl) return;
+    let lastTop = scrollEl.scrollTop;
+    let hideTimer: ReturnType<typeof setTimeout> | undefined;
     const onScroll = () => {
-      const next = scrollEl.scrollTop <= 1;
+      const top = scrollEl.scrollTop;
+      const next = top <= 1;
       setAtTop((prev) => (prev === next ? prev : next));
+      // Upward scroll (and not already pinned to the top): show the pill and
+      // (re)arm the idle timer that fades it out once scrolling settles.
+      if (top < lastTop - 1 && top > 1) {
+        setScrolledUp(true);
+        clearTimeout(hideTimer);
+        hideTimer = setTimeout(() => setScrolledUp(false), SCROLL_REVEAL_MS);
+      }
+      lastTop = top;
     };
     onScroll();
     scrollEl.addEventListener("scroll", onScroll, { passive: true });
-    return () => scrollEl.removeEventListener("scroll", onScroll);
+    return () => {
+      clearTimeout(hideTimer);
+      scrollEl.removeEventListener("scroll", onScroll);
+    };
   }, [scrollEl]);
 
   // Somewhere to go: older pages exist, or we're scrolled down within the
   // loaded window. At the very first message there's nothing to jump to.
   const canJump = hasMoreHistory || !atTop;
-  const visible = jumping || (hovering && canJump);
+  const visible = jumping || ((hovering || scrolledUp) && canJump);
 
   const jumpToTop = useCallback(async () => {
     if (!scroller) return;

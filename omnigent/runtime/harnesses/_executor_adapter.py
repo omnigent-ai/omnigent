@@ -36,6 +36,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import secrets
 import uuid
 from collections import deque
@@ -56,6 +57,7 @@ from omnigent.inner.executor import (
     ToolCallRequest,
     TurnComplete,
 )
+from omnigent.inner.tracing import TracingContext, is_tracing_enabled
 from omnigent.runtime.harnesses._scaffold import HarnessApp, PolicyVerdictPayload, TurnContext
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server.schemas import (
@@ -103,6 +105,34 @@ _OBSERVED_TOOL_CALL_STATUS = "in_progress"
 #    ToolCallComplete — the dispatch's PATCH handler emits the
 #    paired output. Keeps the dedup story symmetric.
 _MCP_TOOL_NAME_PREFIX = "mcp__"
+
+
+def _finalize_trace_status(response_id: str) -> None:
+    """PATCH the trace status to OK on the MLflow server.
+
+    OTLP-ingested traces stay "In progress" because the server has
+    no signal that all spans have arrived. This call explicitly
+    marks the trace as complete after the OTel provider is flushed.
+    """
+    try:
+        from omnigent.runtime.telemetry import trace_id_from_response_id
+
+        trace_id = trace_id_from_response_id(response_id)
+        request_id = f"tr-{trace_id}"
+
+        tracking_uri = os.environ.get("MLFLOW_TRACKING_URI") or os.environ.get(
+            "OTEL_EXPORTER_OTLP_ENDPOINT", ""
+        )
+        if not tracking_uri:
+            return
+        import httpx
+
+        httpx.Client(timeout=5).patch(
+            f"{tracking_uri.rstrip('/')}/api/2.0/mlflow/traces/{request_id}",
+            json={"status": "OK"},
+        ).close()
+    except Exception:
+        _logger.debug("failed to finalize trace status", exc_info=True)
 
 
 def _strip_mcp_tool_prefix(name: str) -> str:
@@ -212,6 +242,10 @@ class ExecutorAdapter(HarnessApp):
         # suppress-observed mitigation that introduced the
         # end-of-turn ordering regression this queue resolves.
         self._pending_mcp_call_ids: deque[str] = deque()
+        # Per-session tracing context. Created lazily on the first
+        # turn when tracing is enabled; reused across turns so the
+        # span parent chain stays rooted on the session's executor.
+        self._tracing_ctx: TracingContext | None = None
 
     async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
         """
@@ -301,6 +335,24 @@ class ExecutorAdapter(HarnessApp):
         # previous turn. Clearing makes each turn's correlation
         # window self-contained.
         self._pending_mcp_call_ids.clear()
+
+        # --- Tracing setup ------------------------------------------------
+        # Create a TracingContext per turn when tracing is enabled.
+        # The trace_context_for_response wrapper derives the W3C
+        # trace ID from the response_id so operators can look up
+        # traces by response ID without a mapping table.
+        tracing = is_tracing_enabled()
+        if tracing and self._tracing_ctx is None:
+            self._tracing_ctx = TracingContext()
+        tctx = self._tracing_ctx if tracing else None
+        agent_span = None
+        # Active tool span for correlating ToolCallRequest → ToolCallComplete.
+        _active_tool_span = None
+        _active_tool_parent = None
+
+        user_message = _extract_last_user_message(request.input)
+        # --- End tracing setup --------------------------------------------
+
         # Watcher for mid-turn steering injections. The scaffold
         # routes incoming steering events with
         # ``previous_response_id == ctx.response_id`` onto
@@ -316,29 +368,97 @@ class ExecutorAdapter(HarnessApp):
             name=f"executor-adapter-injection-watch:{ctx.response_id}",
         )
         try:
-            async for event in executor.run_turn(
-                messages=messages,
-                tools=tools,
-                system_prompt=system_prompt,
-                config=config,
-            ):
-                if ctx.cancelled.is_set():
-                    # Cancellation arrived mid-stream — stop emitting
-                    # further events and ask the inner executor to
-                    # interrupt. The scaffold's terminal event handler
-                    # will emit response.cancelled on return.
-                    await executor.interrupt_session(self._session_key)
-                    return
-                self._translate_event(event, ctx)
-                if isinstance(event, TurnComplete):
-                    # Scaffold emits response.completed automatically
-                    # when run_turn returns; nothing more to do.
-                    return
-                if isinstance(event, ExecutorError):
-                    # Re-raise so the scaffold's terminal-event path
-                    # surfaces response.failed with the underlying
-                    # error message.
-                    raise RuntimeError(f"inner executor error: {event.message}")
+            # Wrap the executor loop in the trace context so all
+            # MLflow spans share the response-derived trace ID.
+            # The context manager is built outside the `with` so we
+            # can fall back to nullcontext if the response_id format
+            # doesn't match (e.g. 24-char hex vs expected 32).
+            trace_cm: contextlib.AbstractContextManager[None] = contextlib.nullcontext()
+            if tctx:
+                try:
+                    from omnigent.runtime.telemetry import trace_context_for_response
+
+                    trace_cm = trace_context_for_response(response_id=ctx.response_id)
+                except Exception:
+                    _logger.debug("trace_context_for_response unavailable", exc_info=True)
+            with trace_cm:
+                if tctx is not None:
+                    agent_span = tctx.start_agent_span(
+                        agent_name=request.model or "unknown",
+                        user_message=user_message,
+                        model=request.model_override or request.model,
+                    )
+
+                response_text: str | None = None
+                async for event in executor.run_turn(
+                    messages=messages,
+                    tools=tools,
+                    system_prompt=system_prompt,
+                    config=config,
+                ):
+                    if ctx.cancelled.is_set():
+                        if tctx is not None and agent_span is not None:
+                            from omnigent.runtime.telemetry import record_cancellation
+
+                            record_cancellation(agent_span)
+                            tctx.end_agent_span(agent_span, response=None, status="ERROR")
+                            agent_span = None
+                        await executor.interrupt_session(self._session_key)
+                        return
+                    # --- Tracing: emit spans per event ---
+                    if tctx is not None:
+                        if isinstance(event, ToolCallRequest):
+                            _active_tool_parent = tctx._current_span
+                            _active_tool_span = tctx.start_tool_span(
+                                _strip_mcp_tool_prefix(event.name),
+                                event.args or {},
+                            )
+                        elif isinstance(event, ToolCallComplete):
+                            if _active_tool_span is not None:
+                                tctx.end_tool_span(
+                                    _active_tool_span,
+                                    result=event.result,
+                                    status="ERROR" if event.error else "OK",
+                                    error=event.error,
+                                    duration_ms=event.duration_ms,
+                                    parent_span=_active_tool_parent,
+                                )
+                                _active_tool_span = None
+                                _active_tool_parent = None
+                        elif isinstance(event, TurnComplete):
+                            response_text = event.response
+                            if event.usage is not None:
+                                from omnigent.runtime.telemetry import record_llm_usage
+
+                                # Record usage on the agent span for
+                                # aggregate visibility.
+                                record_llm_usage(agent_span, event.usage)
+                    # --- End tracing ---
+                    self._translate_event(event, ctx)
+                    if isinstance(event, TurnComplete):
+                        if tctx is not None and agent_span is not None:
+                            tctx.end_agent_span(agent_span, response=response_text)
+                            agent_span = None
+                        return
+                    if isinstance(event, ExecutorError):
+                        if tctx is not None and agent_span is not None:
+                            tctx.end_agent_span(
+                                agent_span,
+                                response=None,
+                                status="ERROR",
+                                error=event.message,
+                            )
+                            agent_span = None
+                        raise RuntimeError(f"inner executor error: {event.message}")
+        except BaseException:
+            # End agent span on unhandled exceptions so it's not
+            # left open (which would leak on the OTel provider).
+            if tctx is not None and agent_span is not None:
+                tctx.end_agent_span(
+                    agent_span, response=None, status="ERROR", error="unhandled exception"
+                )
+                agent_span = None
+            raise
         finally:
             # Stop the injection watcher and let it drain so a
             # late ``next_injection`` doesn't fire after we've
@@ -348,6 +468,22 @@ class ExecutorAdapter(HarnessApp):
             injection_watcher.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await injection_watcher
+            # Flush the OTel provider and finalize the trace status
+            # on the MLflow server. Without the flush, the
+            # BatchSpanProcessor may not have exported the final
+            # spans. Without the PATCH, the OTLP-ingested trace
+            # stays "In progress" because the server has no
+            # signal that all spans have arrived.
+            if tctx is not None:
+                try:
+                    from opentelemetry import trace as otel_trace
+
+                    provider = otel_trace.get_tracer_provider()
+                    if hasattr(provider, "force_flush"):
+                        provider.force_flush(timeout_millis=5000)
+                except Exception:
+                    pass
+                _finalize_trace_status(ctx.response_id)
             # Clear the per-turn pointers so a stray late callback
             # (e.g. one fired after the SDK's stream closed) sees
             # ``None`` and returns an explicit error rather than
@@ -1239,6 +1375,45 @@ async def _bridge_one_dispatch(
     if isinstance(parsed, dict):
         return parsed
     return {"result": parsed}
+
+
+def _extract_last_user_message(
+    input_value: str | list[dict[str, Any]],
+) -> str:
+    """Extract the last user message text from a request input.
+
+    Handles both conversation-history shape (list of message items
+    with ``role``/``content``) and single-turn shape (plain string
+    or content-block list). Used by tracing to populate the agent
+    span's ``user_message`` input.
+
+    :param input_value: The request's ``input`` field.
+    :returns: The text of the last user message, or empty string.
+    """
+    if isinstance(input_value, str):
+        return input_value
+    # Conversation-history shape: find last user message
+    last_user_text = ""
+    for item in input_value:
+        role = item.get("role")
+        if role == "user":
+            content = item.get("content")
+            if isinstance(content, str):
+                last_user_text = content
+            elif isinstance(content, list):
+                parts = []
+                for block in content:
+                    text = block.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+                if parts:
+                    last_user_text = "\n".join(parts)
+        # Single-turn content-block shape (no role key)
+        elif role is None:
+            text = item.get("text")
+            if isinstance(text, str):
+                last_user_text = text
+    return last_user_text
 
 
 def _extract_user_text(

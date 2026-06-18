@@ -1024,25 +1024,35 @@ def _build_claude_sdk_spawn_env(
             # _extra_env so it reaches settings.apiKeyHelper at turn time.
             # shlex.quote ensures the key is shell-safe even when it contains
             # special characters.
-            env["HARNESS_CLAUDE_SDK_API_KEY_HELPER"] = (
-                f"printf %s {shlex.quote(auth_from_spec.api_key)}"
-            )
+            _key_cmd = f"printf %s {shlex.quote(auth_from_spec.api_key)}"
+            env["HARNESS_CLAUDE_SDK_API_KEY_HELPER"] = _key_cmd
+            if auth_from_spec.base_url:
+                env["HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"] = auth_from_spec.base_url
+                # The gateway auth command is required by
+                # _resolve_gateway_env when no Databricks profile is
+                # present.  Reuse the same printf command so the
+                # executor resolves ANTHROPIC_BASE_URL correctly.
+                env["HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"] = _key_cmd
             profile = None
         else:
             # Legacy path: executor.config["profile"] or executor.profile.
             # DEPRECATED: use executor.auth: {type: databricks, profile: …} instead.
             profile = spec.executor.config.get("profile") or spec.executor.profile or None
 
-        # Enable Databricks routing when an explicit profile is set OR
-        # the model starts with ``databricks-``
-        # (mirrors the legacy :func:`should_use_databricks_for_claude` heuristic).
-        # Without the model-prefix check, ``databricks-*`` models run with no
-        # profile configured hit ``api.anthropic.com`` and get a confusing
-        # "model not found" error.
-        use_databricks = bool(profile) or (
-            model is not None and model.startswith(("databricks-", "databricks/"))
+        # Enable gateway routing when:
+        # 1. An explicit Databricks profile is set, OR
+        # 2. The model starts with ``databricks-``, OR
+        # 3. An ApiKeyAuth with a custom ``base_url`` is declared (e.g.
+        #    pointing at a mock LLM server).
+        # Without the gateway flag the executor ignores
+        # ``HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL`` and falls through to
+        # ``api.anthropic.com``.
+        use_gateway = (
+            bool(profile)
+            or (model is not None and model.startswith(("databricks-", "databricks/")))
+            or (isinstance(auth_from_spec, ApiKeyAuth) and bool(auth_from_spec.base_url))
         )
-        if use_databricks:
+        if use_gateway:
             env["HARNESS_CLAUDE_SDK_GATEWAY"] = "true"
             if profile:
                 env["HARNESS_CLAUDE_SDK_DATABRICKS_PROFILE"] = str(profile)

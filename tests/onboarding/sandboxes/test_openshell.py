@@ -57,9 +57,13 @@ class _FakeOpenShellAPI:
     closed: bool = False
     exec_result: _FakeExecResult = field(default_factory=_FakeExecResult)
     created_name: str = "petname-test"
+    background_calls: list[tuple[str, list[str]]] = field(default_factory=list)
     foreground_calls: list[tuple[str, list[str]]] = field(default_factory=list)
     foreground_exit_code: int = 0
     foreground_raises: BaseException | None = None
+
+    def exec_background(self, name: str, command: list[str], *, timeout: int) -> None:
+        self.background_calls.append((name, list(command)))
 
     def create_sandbox(self, *, image: str, env: dict[str, str]) -> str:
         self.create_kwargs.append({"image": image, "env": env})
@@ -211,6 +215,26 @@ def test_run_no_check_allows_nonzero(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.stderr == "boom\n"
 
 
+def test_run_background_uses_exec_background(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``run_background`` routes through ``exec_background`` instead of detaching."""
+    fake = _FakeOpenShellAPI()
+    launcher = OpenShellSandboxLauncher()
+    monkeypatch.setattr(launcher, "_openshell", lambda: fake)
+
+    result = launcher.run_background(
+        "sb-1", "ENV=val omnigent host --server https://s", log_path="/tmp/host.log"
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == "launched\n"
+    [(name, command)] = fake.background_calls
+    assert name == "sb-1"
+    assert command[:2] == ["bash", "-lc"]
+    assert "omnigent host --server https://s" in command[2]
+    assert "> /tmp/host.log 2>&1 < /dev/null" in command[2]
+    assert fake.exec_calls == []
+
+
 def test_put_uploads_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """``put`` streams the file's bytes to ``cat`` over the exec channel."""
     fake = _FakeOpenShellAPI()
@@ -318,6 +342,7 @@ class _SDKState:
 
     connect_error: bool = False
     delete_not_found: bool = False
+    delete_not_found_via_sandbox_error: bool = False
     created_spec: Any = None
     waited: tuple[str, int | None] | None = None
     got: list[str] = field(default_factory=list)
@@ -414,6 +439,8 @@ def sdk(monkeypatch: pytest.MonkeyPatch) -> _SDKState:
             state.deleted.append(name)
             if state.delete_not_found:
                 raise _NotFound(_StatusCode.NOT_FOUND)
+            if state.delete_not_found_via_sandbox_error:
+                raise _SandboxError("sandbox not found")
 
         def close(self) -> None:
             state.closed = True
@@ -508,6 +535,16 @@ def test_client_execute_pins_sandbox_home(sdk: _SDKState) -> None:
 def test_client_delete_ignores_not_found(sdk: _SDKState) -> None:
     """Deleting a missing sandbox is treated as success (idempotent)."""
     sdk.delete_not_found = True
+    client = _OpenShellClient()
+
+    client.delete_sandbox("gone-sandbox")
+
+    assert sdk.deleted == ["gone-sandbox"]
+
+
+def test_client_delete_ignores_sandbox_error_not_found(sdk: _SDKState) -> None:
+    """Deleting via SandboxError with 'not found' is treated as success."""
+    sdk.delete_not_found_via_sandbox_error = True
     client = _OpenShellClient()
 
     client.delete_sandbox("gone-sandbox")

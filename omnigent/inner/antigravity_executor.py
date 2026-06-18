@@ -544,6 +544,11 @@ class AntigravityExecutor(Executor):
             yield TurnCancelled(reason="user_cancelled", phase="model")
             return
         usage = self._extract_usage(state.last_usage)
+        # Stamp the resolved model onto the usage dict so the scaffold can
+        # price the turn via the MLflow catalog (same pattern as the
+        # claude-sdk and openai-agents-sdk executors).
+        if usage is not None:
+            usage["model"] = model
         # Notify in-process usage subscribers (and the auto-recorder) before the
         # terminal event, matching the peer SDK executors so antigravity turns
         # are not invisible to usage observers. No-op for an empty usage dict.
