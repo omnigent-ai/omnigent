@@ -170,7 +170,13 @@ jobs:
             )
             if [ "${gate_failed:-0}" -gt 0 ]; then
               echo "• $wf: Security Gate failed in run $id -- re-running"
-              gh run rerun "$id" || echo "::warning::$wf: could not re-run $id"
+              # `--repo` is REQUIRED: unlike the `gh api "repos/$REPO/..."` calls
+              # above (repo is in the URL path), `gh run rerun` resolves the repo
+              # from -R / GH_REPO / the local git remote. This job has no checkout,
+              # so without -R it dies client-side ("failed to determine base repo:
+              # ... not a git repository") and never reaches GitHub -- the silent
+              # failure that stranded Lint/Integration/E2E UI on #556 and #644.
+              gh run rerun "$id" --repo "$REPO" || echo "::warning::$wf: could not re-run $id"
             else
               echo "• $wf: run $id failed but not at the Security Gate -- skipping"
             fi
