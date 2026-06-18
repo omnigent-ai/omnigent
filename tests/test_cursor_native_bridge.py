@@ -109,9 +109,7 @@ def test_spawn_env_restricts_filesystem_permissions(
     here would be invisible without an explicit stat assertion.
     """
     monkeypatch.setattr("omnigent.cursor_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr(
-        "omnigent.cursor_native_bridge._BRIDGE_ROOT", tmp_path / "cursor-native"
-    )
+    monkeypatch.setattr("omnigent.cursor_native_bridge._BRIDGE_ROOT", tmp_path / "cursor-native")
 
     env = build_cursor_native_spawn_env("conv_abc")
     bridge_dir = Path(env["HARNESS_CURSOR_NATIVE_BRIDGE_DIR"])
@@ -123,6 +121,4 @@ def test_spawn_env_restricts_filesystem_permissions(
     )
     # The intermediate cursor-native root must be locked down too.
     root_mode = stat.S_IMODE((tmp_path / "cursor-native").stat().st_mode)
-    assert root_mode == 0o700, (
-        f"bridge root has mode {oct(root_mode)}; expected 0o700"
-    )
+    assert root_mode == 0o700, f"bridge root has mode {oct(root_mode)}; expected 0o700"
