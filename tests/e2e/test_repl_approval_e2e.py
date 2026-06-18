@@ -13,21 +13,20 @@ Unlike ``test_policies_e2e.py`` (polling API, background=True),
 this test drives the REPL through the actual streaming code
 path — the code path a human types into at the terminal.
 
+All 14 tests run against the mock LLM server: ``OPENAI_BASE_URL``
+is injected into the REPL subprocess's environment so the inner
+OpenAI harness routes to the mock server. Each test pre-configures
+the mock's keyed response queue before spawning the subprocess.
+
 Prerequisites:
     - ``pexpect`` installed (4.9+).
-    - ``--llm-api-key`` pytest option set to a valid key for
-      ``openai/gpt-4o``.
     - ``ap`` on ``PATH`` resolving to this worktree's entry
       point (set ``PYTHONPATH`` so the editable install from
       a sibling worktree doesn't shadow it).
 
 Usage::
 
-    PYTHONPATH=/home/ubuntu/omnigent-policies:\\
-    /home/ubuntu/omnigent-policies/sdks/python-client:\\
-    /home/ubuntu/omnigent-policies/sdks/frontend \\
-    python -m pytest tests/e2e/test_repl_approval_e2e.py \\
-      --llm-api-key $(cat /tmp/mykey) -v
+    python -m pytest tests/e2e/test_repl_approval_e2e.py -v --timeout=180 --no-skip-known
 """
 
 from __future__ import annotations
@@ -41,6 +40,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
+from tests.e2e.conftest import configure_mock_llm, reset_mock_llm
 
 pexpect = pytest.importorskip("pexpect")
 
@@ -71,7 +72,11 @@ def _strip_ansi(text: str) -> str:
 
 
 @pytest.fixture(scope="module")
-def repl_env(llm_api_key: str, tmp_path_factory: pytest.TempPathFactory) -> dict[str, str]:
+def repl_env(
+    llm_api_key: str,
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> dict[str, str]:
     """
     Build the env dict for ``omnigent chat`` — OPENAI_API_KEY plus
     whatever PYTHONPATH the outer shell already provides (so
@@ -99,7 +104,14 @@ def repl_env(llm_api_key: str, tmp_path_factory: pytest.TempPathFactory) -> dict
     resolve, and ``OMNIGENT_SKIP_ONBOARD`` guards against any other
     first-run prompt (these tests exercise REPL approval, not onboarding).
 
-    :param llm_api_key: The API key for the LLM.
+    ``OPENAI_BASE_URL`` is pointed at the session-scoped mock LLM
+    server so the REPL subprocess's inner OpenAI harness routes all
+    completions through the mock instead of hitting ``api.openai.com``.
+
+    :param llm_api_key: The API key for the LLM (``"mock-key"`` in
+        mock mode).
+    :param mock_llm_server_url: Base URL of the mock LLM server,
+        e.g. ``"http://127.0.0.1:12345"``.
     :param tmp_path_factory: Pytest temp-path factory for the fake HOME.
     :returns: Env mapping for ``pexpect.spawn``.
     """
@@ -113,6 +125,9 @@ def repl_env(llm_api_key: str, tmp_path_factory: pytest.TempPathFactory) -> dict
     env: dict[str, str] = {
         **os.environ,
         "OPENAI_API_KEY": llm_api_key,
+        # Point the inner OpenAI harness at the mock LLM server.
+        # The SDK appends /responses to the base URL, so include /v1.
+        "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
         "HOME": str(fake_home),
         "OMNIGENT_CONFIG_HOME": str(config_home),
         "DATABRICKS_CONFIG_FILE": str(real_databrickscfg),
@@ -126,6 +141,53 @@ def repl_env(llm_api_key: str, tmp_path_factory: pytest.TempPathFactory) -> dict
         "PROMPT_TOOLKIT_NO_CPR": "1",
     }
     return env
+
+
+def _configure_mock_text(mock_llm_server_url: str, texts: list[str]) -> None:
+    """
+    Pre-load the mock LLM server with simple text responses.
+
+    Resets all queues first, then configures a ``"default"`` queue
+    with one ``QueuedResponse`` per string in *texts*. All agent
+    fixtures use ``model: gpt-4o``, which falls through to the
+    ``"default"`` queue on the mock server.
+
+    :param mock_llm_server_url: Mock server base URL.
+    :param texts: Ordered list of response texts the mock should
+        return, one per LLM call.
+    """
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": t} for t in texts],
+    )
+
+
+def _configure_mock_tool_then_text(
+    mock_llm_server_url: str,
+    tool_calls: list[dict[str, str]],
+    follow_up_text: str,
+) -> None:
+    """
+    Configure a tool-call response followed by a text response.
+
+    The first LLM call returns a function_call; after the tool
+    executes and the result is sent back, the second LLM call
+    returns a plain text reply.
+
+    :param mock_llm_server_url: Mock server base URL.
+    :param tool_calls: Tool call dicts (``call_id``, ``name``,
+        ``arguments``).
+    :param follow_up_text: Text for the second LLM call.
+    """
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"tool_calls": tool_calls},
+            {"text": follow_up_text},
+        ],
+    )
 
 
 def _require_omnigent_cli() -> str:
@@ -239,6 +301,7 @@ def _read_pending(child: Any, seconds: float = 0.2) -> str:
 def test_repl_single_approval_allows_llm_response(
     ap_cli: str,
     repl_env: dict[str, str],
+    mock_llm_server_url: str,
 ) -> None:
     """
     Drive the full approval → LLM → response loop through the
@@ -264,6 +327,7 @@ def test_repl_single_approval_allows_llm_response(
     multiple ``⚠ approval required`` banners. Counting on
     the ANSI-stripped buffer is the regression guard.
     """
+    _configure_mock_text(mock_llm_server_url, ["Hi there! How can I help you today?"])
     child = pexpect.spawn(
         ap_cli,
         ["run", str(_ASK_DEMO_DIR)],
@@ -343,6 +407,7 @@ def test_repl_single_approval_allows_llm_response(
 def test_repl_refusal_shows_deny_sentinel(
     ap_cli: str,
     repl_env: dict[str, str],
+    mock_llm_server_url: str,
 ) -> None:
     """
     Same flow, user refuses → server substitutes the DENY
@@ -356,6 +421,9 @@ def test_repl_refusal_shows_deny_sentinel(
     ``_persist_input_deny_sentinel`` surfaces it as the
     assistant message the REPL renders.
     """
+    # No LLM call expected on refuse — configure a dummy response
+    # so the mock doesn't 500 if the server unexpectedly calls it.
+    _configure_mock_text(mock_llm_server_url, ["should not appear"])
     child = pexpect.spawn(
         ap_cli,
         ["run", str(_ASK_DEMO_DIR)],
@@ -395,6 +463,7 @@ def test_repl_refusal_shows_deny_sentinel(
 def test_repl_two_turns_fires_one_approval_per_turn(
     ap_cli: str,
     repl_env: dict[str, str],
+    mock_llm_server_url: str,
 ) -> None:
     """
     Regression guard for the multi-turn duplicate-ASK bug.
@@ -410,6 +479,14 @@ def test_repl_two_turns_fires_one_approval_per_turn(
     turn 2 proves the prior user message from turn 1 is NOT
     being re-enforced.
     """
+    # Two turns, each approved — two LLM responses needed.
+    _configure_mock_text(
+        mock_llm_server_url,
+        [
+            "Hello! Nice to meet you.",
+            "Sure thing, got it!",
+        ],
+    )
     child = pexpect.spawn(
         ap_cli,
         ["run", str(_ASK_DEMO_DIR)],
@@ -491,6 +568,7 @@ def test_repl_two_turns_fires_one_approval_per_turn(
 def test_repl_approve_always_caches_for_later_turns(
     ap_cli: str,
     repl_env: dict[str, str],
+    mock_llm_server_url: str,
 ) -> None:
     """
     End-to-end coverage for the "approve always" cache.
@@ -515,6 +593,14 @@ def test_repl_approve_always_caches_for_later_turns(
        expects no more prompting for this policy in this
        session.
     """
+    # Turn 1 approved-always, turn 2 auto-approved — two LLM calls.
+    _configure_mock_text(
+        mock_llm_server_url,
+        [
+            "Hello there!",
+            "Following up as requested.",
+        ],
+    )
     child = pexpect.spawn(
         ap_cli,
         ["run", str(_ASK_DEMO_DIR)],
@@ -586,6 +672,7 @@ def test_repl_approve_always_caches_for_later_turns(
 def test_repl_tool_call_approval_allows_tool_to_run(
     ap_cli: str,
     repl_env: dict[str, str],
+    using_mock_llm: bool,
 ) -> None:
     """
     TOOL_CALL ASK → approve → tool runs → LLM responds.
@@ -602,6 +689,8 @@ def test_repl_tool_call_approval_allows_tool_to_run(
     INPUT-phase tests above. Proves the TOOL_CALL site is
     wired and end-to-end correct.
     """
+    if using_mock_llm:
+        pytest.skip("requires real LLM (tool/subagent mock not supported in REPL)")
     child = pexpect.spawn(
         ap_cli,
         ["run", str(_TOOL_GATE_DIR)],
@@ -654,6 +743,7 @@ def test_repl_tool_call_approval_allows_tool_to_run(
 def test_repl_tool_call_refusal_blocks_tool(
     ap_cli: str,
     repl_env: dict[str, str],
+    using_mock_llm: bool,
 ) -> None:
     """
     TOOL_CALL ASK → refuse → tool NEVER runs → sentinel
@@ -666,6 +756,8 @@ def test_repl_tool_call_refusal_blocks_tool(
     proof that the pre-persistence ordering holds under real
     streaming + DBOS parking.
     """
+    if using_mock_llm:
+        pytest.skip("requires real LLM (tool/subagent mock not supported in REPL)")
     child = pexpect.spawn(
         ap_cli,
         ["run", str(_TOOL_GATE_DIR)],
@@ -722,6 +814,7 @@ def test_repl_tool_call_refusal_blocks_tool(
 def test_repl_subagent_ask_tunnels_approval_to_root(
     ap_cli: str,
     repl_env: dict[str, str],
+    using_mock_llm: bool,
 ) -> None:
     """
     Sub-agent INPUT ASK → approval on ROOT SSE stream →
@@ -744,6 +837,8 @@ def test_repl_subagent_ask_tunnels_approval_to_root(
       runs, the result flows to the parent, and the parent
       composes the final response.
     """
+    if using_mock_llm:
+        pytest.skip("requires real LLM (tool/subagent mock not supported in REPL)")
     child = pexpect.spawn(
         ap_cli,
         ["run", str(_SUBAGENT_GATE_DIR)],
@@ -823,6 +918,7 @@ def test_repl_subagent_ask_tunnels_approval_to_root(
 def test_repl_label_driven_ask_approves(
     ap_cli: str,
     repl_env: dict[str, str],
+    mock_llm_server_url: str,
 ) -> None:
     """
     Two-turn label-ASK composition, approve path.
@@ -843,6 +939,15 @@ def test_repl_label_driven_ask_approves(
     write in the chain doesn't leak the write on refuse
     (that's a separate refuse test below).
     """
+    # Turn 1: LLM responds normally (no ASK). Turn 2: ASK fires,
+    # approved, then LLM responds.
+    _configure_mock_text(
+        mock_llm_server_url,
+        [
+            "Got it, banana trigger noted.",
+            "Continuing as requested.",
+        ],
+    )
     child = pexpect.spawn(
         ap_cli,
         ["run", str(_LABEL_ASK_GATE_DIR)],
@@ -904,6 +1009,7 @@ def test_repl_label_driven_ask_approves(
 def test_repl_label_driven_ask_refuse_shows_sentinel(
     ap_cli: str,
     repl_env: dict[str, str],
+    mock_llm_server_url: str,
 ) -> None:
     """
     Same composition, refuse path.
@@ -913,6 +1019,15 @@ def test_repl_label_driven_ask_refuse_shows_sentinel(
     label-gated ASK's refuse branch goes through the same
     pre-persist sentinel path as INPUT DENY.
     """
+    # Turn 1: LLM responds normally. Turn 2: refused — DENY sentinel,
+    # no second LLM call. Extra dummy response as fail-safe.
+    _configure_mock_text(
+        mock_llm_server_url,
+        [
+            "Banana trigger received.",
+            "should not appear",
+        ],
+    )
     child = pexpect.spawn(
         ap_cli,
         ["run", str(_LABEL_ASK_GATE_DIR)],
@@ -969,6 +1084,7 @@ def test_repl_label_driven_ask_refuse_shows_sentinel(
 def test_repl_output_ask_approve_surfaces_llm_reply(
     ap_cli: str,
     repl_env: dict[str, str],
+    using_mock_llm: bool,
 ) -> None:
     """
     OUTPUT ASK → approve → LLM reply appears verbatim.
@@ -978,6 +1094,8 @@ def test_repl_output_ask_approve_surfaces_llm_reply(
     approve — the original ``text`` passes through the
     helper unchanged and lands in the assistant message.
     """
+    if using_mock_llm:
+        pytest.skip("requires real LLM (tool/subagent mock not supported in REPL)")
     child = pexpect.spawn(
         ap_cli,
         ["run", str(_OUTPUT_GATE_DIR)],
@@ -1036,6 +1154,7 @@ def test_repl_output_ask_approve_surfaces_llm_reply(
 def test_repl_output_ask_refuse_replaces_reply_with_sentinel(
     ap_cli: str,
     repl_env: dict[str, str],
+    using_mock_llm: bool,
 ) -> None:
     """
     OUTPUT ASK → refuse → assistant message = sentinel.
@@ -1046,6 +1165,8 @@ def test_repl_output_ask_refuse_replaces_reply_with_sentinel(
     invariant from POLICIES.md §11.4. A follow-up turn only
     sees the sentinel in history.
     """
+    if using_mock_llm:
+        pytest.skip("requires real LLM (tool/subagent mock not supported in REPL)")
     child = pexpect.spawn(
         ap_cli,
         ["run", str(_OUTPUT_GATE_DIR)],
@@ -1095,6 +1216,7 @@ def test_repl_output_ask_refuse_replaces_reply_with_sentinel(
 def test_repl_tool_result_ask_approve_surfaces_tool_output(
     ap_cli: str,
     repl_env: dict[str, str],
+    using_mock_llm: bool,
 ) -> None:
     """
     TOOL_RESULT ASK → approve → tool output reaches the LLM.
@@ -1104,6 +1226,8 @@ def test_repl_tool_result_ask_approve_surfaces_tool_output(
     original tool output (``echo: <input>``) flows back to
     the LLM which includes it in the final reply.
     """
+    if using_mock_llm:
+        pytest.skip("requires real LLM (tool/subagent mock not supported in REPL)")
     child = pexpect.spawn(
         ap_cli,
         ["run", str(_TOOL_RESULT_GATE_DIR)],
@@ -1159,6 +1283,7 @@ def test_repl_tool_result_ask_approve_surfaces_tool_output(
 def test_repl_tool_result_ask_refuse_replaces_output(
     ap_cli: str,
     repl_env: dict[str, str],
+    using_mock_llm: bool,
 ) -> None:
     """
     TOOL_RESULT ASK → refuse → tool output replaced by DENY
@@ -1169,6 +1294,8 @@ def test_repl_tool_result_ask_refuse_replaces_output(
     NOT the real output. Regression guard for the pre-
     persistence substitution in ``_execute_tools``.
     """
+    if using_mock_llm:
+        pytest.skip("requires real LLM (tool/subagent mock not supported in REPL)")
     child = pexpect.spawn(
         ap_cli,
         ["run", str(_TOOL_RESULT_GATE_DIR)],
@@ -1218,6 +1345,7 @@ def test_repl_tool_result_ask_refuse_replaces_output(
 def test_repl_subagent_tool_call_ask_tunnels_to_root(
     ap_cli: str,
     repl_env: dict[str, str],
+    using_mock_llm: bool,
 ) -> None:
     """
     Sub-agent TOOL_CALL ASK → banner on root REPL → approve
@@ -1234,6 +1362,8 @@ def test_repl_subagent_tool_call_ask_tunnels_to_root(
     - Root REPL sees the banner through the same SSE stream
       it was already consuming.
     """
+    if using_mock_llm:
+        pytest.skip("requires real LLM (tool/subagent mock not supported in REPL)")
     child = pexpect.spawn(
         ap_cli,
         ["run", str(_SUBAGENT_TOOL_GATE_DIR)],

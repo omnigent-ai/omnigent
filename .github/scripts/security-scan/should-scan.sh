@@ -13,7 +13,7 @@
 # (FIRST_TIME_CONTRIBUTOR / NONE).
 #
 # This gate is independent of fork-e2e/should-mirror.sh: that one gates secret-
-# bearing e2e on the maintainer-applied `e2e-approved` label, whereas this gate
+# bearing e2e on a maintainer's approving PR review, whereas this gate
 # decides whether to inspect for attacks and so errs toward scanning more (it
 # scans returning CONTRIBUTORs that the label gate would not by itself run).
 #

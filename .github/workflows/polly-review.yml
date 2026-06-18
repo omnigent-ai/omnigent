@@ -303,7 +303,9 @@ jobs:
           IMPORTANT: Your output will be posted directly as a PR comment. Output
           ONLY the final structured review — no coordination messages, no status
           updates about dispatching sub-agents, no "waiting for results" narration.
-          Start your response with the review content itself.
+          Begin your response with the exact marker <!-- POLLY_REVIEW_START -->
+          on its own line, then the review content. Nothing before the marker
+          will be shown.
           """
           pathlib.Path("/tmp/review_prompt.txt").write_text(prompt)
           PYEOF
@@ -327,6 +329,23 @@ jobs:
             2>polly-stderr.log \
             | tee /tmp/polly_output.txt \
             || { echo "::warning::Polly review exited non-zero"; cat polly-stderr.log; }
+
+          # Strip any sub-agent coordination preamble that leaks before
+          # the actual review.  Primary: look for the sentinel we asked the
+          # model to emit.  Fallback: first markdown heading or standalone
+          # horizontal rule.
+          python3 -c "
+          import re, pathlib
+          raw = pathlib.Path('/tmp/polly_output.txt').read_text()
+          sentinel = '<!-- POLLY_REVIEW_START -->'
+          idx = raw.find(sentinel)
+          if idx >= 0:
+              cleaned = raw[idx + len(sentinel):].lstrip('\n')
+          else:
+              m = re.search(r'^(#{1,6} |---\s*$)', raw, re.MULTILINE)
+              cleaned = raw[m.start():] if m else raw
+          pathlib.Path('/tmp/polly_output.txt').write_text(cleaned)
+          "
 
           # Use a collision-resistant random delimiter so model output
           # containing "REVIEW_EOF" cannot truncate the output.

@@ -82,6 +82,9 @@ def _install_fake_sdk(
             for iu in self._script.get("interaction_updates", []):
                 yield SimpleNamespace(sdk_message=None, interaction_update=iu)
 
+        async def cancel(self) -> None:
+            pass  # no-op for tests
+
         async def wait(self) -> Any:
             return SimpleNamespace(
                 status=self._script.get("status", "finished"),
@@ -89,9 +92,17 @@ def _install_fake_sdk(
             )
 
     class _FakeAgent:
-        async def send(self, prompt: str) -> _FakeRun:
+        async def send(self, prompt: str, **kwargs: Any) -> _FakeRun:
             state["sent"].append(prompt)
-            return _FakeRun(scripts.pop(0))
+            script = scripts.pop(0)
+            # Invoke on_delta for interaction_updates (mirrors real SDK
+            # which dispatches TurnEndedUpdate via on_delta, not events).
+            options = kwargs.get("options")
+            on_delta = getattr(options, "on_delta", None) if options else None
+            if on_delta and "interaction_updates" in script:
+                for iu in script["interaction_updates"]:
+                    on_delta(iu)
+            return _FakeRun(script)
 
         # AsyncAgent exposes close() (a CloseAgent RPC + tool unregister).
         async def close(self) -> None:
@@ -137,11 +148,16 @@ def _install_fake_sdk(
             self.cwd = cwd
             self.custom_tools = custom_tools
 
+    class _FakeSendOptions:
+        def __init__(self, on_delta: Any = None, **_kw: Any) -> None:
+            self.on_delta = on_delta
+
     fake = types.ModuleType("cursor_sdk")
     fake.AsyncClient = _FakeClient  # type: ignore[attr-defined]
     fake.AsyncAgent = _FakeAsyncAgent  # type: ignore[attr-defined]
     fake.CustomTool = _FakeCustomTool  # type: ignore[attr-defined]
     fake.LocalAgentOptions = _FakeLocalAgentOptions  # type: ignore[attr-defined]
+    fake.SendOptions = _FakeSendOptions  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "cursor_sdk", fake)
     return state
 
@@ -262,7 +278,7 @@ def test_sdk_message_to_events_unwraps_envelope_on_completion_and_error() -> Non
     done = _sdk_message_to_events(_envelope("completed", [{"type": "text", "text": "ok"}]))
     assert isinstance(done[0], ToolCallComplete)
     assert done[0].name == "sys_session_send"  # unwrapped, not "mcp"
-    assert done[0].metadata == {"call_id": "c1"}
+    assert done[0].metadata == {"call_id": "c1", "is_bridged": True}
 
     err = _sdk_message_to_events(_envelope("error", "boom"))
     assert isinstance(err[0], ToolCallComplete)
@@ -861,3 +877,413 @@ def test_normalize_cursor_usage_zero_tokens_preserved() -> None:
     assert result["input_tokens"] == 0
     assert result["output_tokens"] == 0
     assert result["total_tokens"] == 0
+
+
+# ---------------------------------------------------------------------------
+# PHASE_TOOL_CALL policy for native tools
+# ---------------------------------------------------------------------------
+
+
+def test_sdk_message_to_events_marks_native_tool_not_bridged() -> None:
+    """A plain (non-MCP-wrapped) tool call has ``is_bridged=False`` in metadata."""
+    events = _sdk_message_to_events(_tool("bash", "t1", "running", args={"cmd": "ls"}))
+    assert len(events) == 1
+    assert isinstance(events[0], ToolCallRequest)
+    assert events[0].metadata["is_bridged"] is False
+
+    # Completed status too.
+    done = _sdk_message_to_events(
+        _tool("bash", "t1", "completed", args={"cmd": "ls"}, result="ok")
+    )
+    assert isinstance(done[0], ToolCallComplete)
+    assert done[0].metadata["is_bridged"] is False
+
+
+def test_sdk_message_to_events_marks_mcp_tool_bridged() -> None:
+    """An MCP-wrapped tool call has ``is_bridged=True`` in metadata."""
+    envelope = SimpleNamespace(
+        type="tool_call",
+        name="mcp",
+        call_id="c1",
+        status="running",
+        args={
+            "providerIdentifier": "custom-user-tools",
+            "toolName": "sys_session_send",
+            "args": {"session": "s1"},
+        },
+        result=None,
+    )
+    events = _sdk_message_to_events(envelope)
+    assert isinstance(events[0], ToolCallRequest)
+    assert events[0].metadata["is_bridged"] is True
+
+    # Completed too.
+    envelope_done = SimpleNamespace(
+        type="tool_call",
+        name="mcp",
+        call_id="c1",
+        status="completed",
+        args={
+            "providerIdentifier": "custom-user-tools",
+            "toolName": "sys_session_send",
+            "args": {"session": "s1"},
+        },
+        result="ok",
+    )
+    done = _sdk_message_to_events(envelope_done)
+    assert isinstance(done[0], ToolCallComplete)
+    assert done[0].metadata["is_bridged"] is True
+
+
+async def test_run_turn_native_tool_denied_by_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A native tool call triggers PHASE_TOOL_CALL. On DENY the run emits
+    ToolCallRequest then ExecutorError and the turn ends."""
+    script = {
+        "messages": [
+            _assistant("Let me run that."),
+            _tool("bash", "t1", "running", args={"cmd": "rm -rf /"}),
+        ],
+        "status": "finished",
+        "result": "",
+    }
+    _install_fake_sdk(monkeypatch, [script])
+    executor = CursorExecutor(api_key="crsr_x")
+    executor._policy_evaluator = _policy("PHASE_TOOL_CALL")
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    # The ToolCallRequest is emitted so observers see what was attempted.
+    reqs = [e for e in events if isinstance(e, ToolCallRequest)]
+    assert len(reqs) == 1
+    assert reqs[0].name == "bash"
+
+    # Then an ExecutorError with the denial reason.
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert len(errors) == 1
+    assert "denied by policy" in errors[0].message
+    assert "bash" in errors[0].message
+
+    # ToolCallRequest appears before ExecutorError, and nothing follows the error.
+    req_idx = next(i for i, e in enumerate(events) if isinstance(e, ToolCallRequest))
+    err_idx = next(i for i, e in enumerate(events) if isinstance(e, ExecutorError))
+    assert req_idx < err_idx
+    assert err_idx == len(events) - 1  # error is the last event
+
+    # No TurnComplete — the turn was aborted.
+    assert not any(isinstance(e, TurnComplete) for e in events)
+
+
+async def test_run_turn_bridged_tool_skips_tool_call_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bridged (MCP-wrapped) tool does NOT trigger PHASE_TOOL_CALL — it's
+    already gated server-side via the dispatch bridge."""
+    # Build an MCP-envelope tool call (bridged).
+    mcp_running = SimpleNamespace(
+        type="tool_call",
+        name="mcp",
+        call_id="c1",
+        status="running",
+        args={
+            "providerIdentifier": "custom-user-tools",
+            "toolName": "sys_session_send",
+            "args": {"session": "s1", "message": "go"},
+        },
+        result=None,
+    )
+    mcp_done = SimpleNamespace(
+        type="tool_call",
+        name="mcp",
+        call_id="c1",
+        status="completed",
+        args={
+            "providerIdentifier": "custom-user-tools",
+            "toolName": "sys_session_send",
+            "args": {"session": "s1", "message": "go"},
+        },
+        result="ok",
+    )
+    script = {
+        "messages": [_assistant("Dispatching."), mcp_running, mcp_done, _assistant("Done.")],
+        "status": "finished",
+        "result": "Done.",
+    }
+    _install_fake_sdk(monkeypatch, [script])
+
+    # Wire a policy that denies PHASE_TOOL_CALL — if it fires, the turn would abort.
+    executor = CursorExecutor(api_key="crsr_x")
+    executor._policy_evaluator = _policy("PHASE_TOOL_CALL")
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    # Verify the bridged tool call was actually observed (not silently dropped).
+    reqs = [e for e in events if isinstance(e, ToolCallRequest)]
+    assert len(reqs) == 1 and reqs[0].name == "sys_session_send"
+
+    # The turn completes normally — the bridged tool was NOT policy-gated here.
+    assert any(isinstance(e, TurnComplete) for e in events)
+    assert not any(isinstance(e, ExecutorError) for e in events)
+
+
+async def test_run_turn_native_tool_allowed_by_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When PHASE_TOOL_CALL returns ALLOW, the turn proceeds normally."""
+    script = {
+        "messages": [
+            _assistant("Running."),
+            _tool("bash", "t1", "running", args={"cmd": "echo hi"}),
+            _tool("bash", "t1", "completed", result="hi"),
+            _assistant("Done."),
+        ],
+        "status": "finished",
+        "result": "Done.",
+    }
+    _install_fake_sdk(monkeypatch, [script])
+    executor = CursorExecutor(api_key="crsr_x")
+    executor._policy_evaluator = _policy(None)  # never denies
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    assert any(isinstance(e, TurnComplete) for e in events)
+    assert not any(isinstance(e, ExecutorError) for e in events)
+    # The tool call went through.
+    reqs = [e for e in events if isinstance(e, ToolCallRequest)]
+    assert len(reqs) == 1 and reqs[0].name == "bash"
+
+
+# ---------------------------------------------------------------------------
+# preToolUse hook: .cursor/hooks.json writing and cleanup
+# ---------------------------------------------------------------------------
+
+
+async def test_ensure_session_writes_hooks_json(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """After _ensure_session, .cursor/hooks.json exists in the workspace with the
+    correct preToolUse config pointing at the hook script."""
+    _install_fake_sdk(monkeypatch, [{"messages": [_assistant("ok")], "result": "ok"}])
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:6767")
+    monkeypatch.setattr("sys.argv", ["runner", "--conversation-id", "conv_test123"])
+    cwd = str(tmp_path)
+    executor = CursorExecutor(api_key="crsr_x", cwd=cwd)
+    _ = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+
+    # Assert BEFORE close (close cleans up the file).
+    hooks_file = tmp_path / ".cursor" / "hooks.json"
+    assert hooks_file.exists()
+    config = json.loads(hooks_file.read_text())
+    assert "hooks" in config
+    assert "preToolUse" in config["hooks"]
+    hooks = config["hooks"]["preToolUse"]
+    assert len(hooks) == 1
+    assert hooks[0]["timeout"] == 30
+    cmd = hooks[0]["command"]
+    # The command points to the wrapper shell script, not the Python hook directly.
+    assert "omnigent-hook.sh" in cmd
+
+    # Verify the wrapper script exists and contains the env vars + exec.
+    wrapper = tmp_path / ".cursor" / "omnigent-hook.sh"
+    assert wrapper.exists()
+    wrapper_text = wrapper.read_text()
+    assert "_OMNIGENT_SERVER_URL='http://127.0.0.1:6767'" in wrapper_text
+    assert "_OMNIGENT_SESSION_ID='conv_test123'" in wrapper_text
+    assert "cursor_policy_hook.py" in wrapper_text
+
+    await executor.close()
+    # Both files are cleaned up on close.
+    assert not hooks_file.exists()
+    assert not wrapper.exists()
+
+
+async def test_hooks_json_not_written_without_server_url(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """Without RUNNER_SERVER_URL in env, no hooks.json is written."""
+    _install_fake_sdk(monkeypatch, [{"messages": [_assistant("ok")], "result": "ok"}])
+    monkeypatch.delenv("RUNNER_SERVER_URL", raising=False)
+    cwd = str(tmp_path)
+    executor = CursorExecutor(api_key="crsr_x", cwd=cwd)
+    try:
+        _ = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    hooks_file = tmp_path / ".cursor" / "hooks.json"
+    assert not hooks_file.exists()
+
+
+async def test_hooks_json_cleaned_up_on_close(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """hooks.json is removed when the session is closed."""
+    _install_fake_sdk(
+        monkeypatch,
+        [{"messages": [_assistant("ok")], "result": "ok"}],
+    )
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:6767")
+    monkeypatch.setattr("sys.argv", ["runner", "--conversation-id", "conv_cleanup"])
+    cwd = str(tmp_path)
+    executor = CursorExecutor(api_key="crsr_x", cwd=cwd)
+    _ = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+
+    hooks_file = tmp_path / ".cursor" / "hooks.json"
+    wrapper = tmp_path / ".cursor" / "omnigent-hook.sh"
+    assert hooks_file.exists()
+    assert wrapper.exists()
+
+    await executor.close()
+    assert not hooks_file.exists()
+    assert not wrapper.exists()
+
+
+# ---------------------------------------------------------------------------
+# cursor_policy_hook.py unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_cursor_policy_hook_allow(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hook script returns allow when the server responds with ALLOW."""
+    import io
+    from unittest.mock import patch
+
+    monkeypatch.setenv("_OMNIGENT_SERVER_URL", "http://localhost:6767")
+    monkeypatch.setenv("_OMNIGENT_SESSION_ID", "conv_test")
+
+    stdin_data = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}})
+    server_response = json.dumps({"result": "POLICY_ACTION_ALLOW", "reason": ""}).encode()
+
+    from omnigent.inner import cursor_policy_hook
+
+    fake_resp = io.BytesIO(server_response)
+    fake_resp.read = fake_resp.read  # type: ignore[assignment]
+    fake_resp.__enter__ = lambda s: s  # type: ignore[attr-defined]
+    fake_resp.__exit__ = lambda s, *a: None  # type: ignore[attr-defined]
+
+    stdout = io.StringIO()
+    with (
+        patch.object(sys, "stdin", io.StringIO(stdin_data)),
+        patch.object(sys, "stdout", stdout),
+        patch("urllib.request.urlopen", return_value=fake_resp),
+    ):
+        cursor_policy_hook.main()
+
+    result = json.loads(stdout.getvalue())
+    assert result["permission"] == "allow"
+
+
+def test_cursor_policy_hook_deny(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hook script returns deny when the server responds with DENY."""
+    import io
+    from unittest.mock import patch
+
+    monkeypatch.setenv("_OMNIGENT_SERVER_URL", "http://localhost:6767")
+    monkeypatch.setenv("_OMNIGENT_SESSION_ID", "conv_test")
+
+    stdin_data = json.dumps({"tool_name": "Bash", "tool_input": {"command": "rm -rf /"}})
+    server_response = json.dumps(
+        {"result": "POLICY_ACTION_DENY", "reason": "dangerous command"}
+    ).encode()
+
+    from omnigent.inner import cursor_policy_hook
+
+    fake_resp = io.BytesIO(server_response)
+    fake_resp.__enter__ = lambda s: s  # type: ignore[attr-defined]
+    fake_resp.__exit__ = lambda s, *a: None  # type: ignore[attr-defined]
+
+    stdout = io.StringIO()
+    with (
+        patch.object(sys, "stdin", io.StringIO(stdin_data)),
+        patch.object(sys, "stdout", stdout),
+        patch("urllib.request.urlopen", return_value=fake_resp),
+    ):
+        cursor_policy_hook.main()
+
+    result = json.loads(stdout.getvalue())
+    assert result["permission"] == "deny"
+    assert "dangerous command" in result["agent_message"]
+    assert "Bash" in result["agent_message"]
+
+
+def test_cursor_policy_hook_network_error_fails_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On network error, the hook script fails open (allows)."""
+    import io
+    from unittest.mock import patch
+
+    monkeypatch.setenv("_OMNIGENT_SERVER_URL", "http://localhost:6767")
+    monkeypatch.setenv("_OMNIGENT_SESSION_ID", "conv_test")
+
+    stdin_data = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}})
+
+    from omnigent.inner import cursor_policy_hook
+
+    stdout = io.StringIO()
+    with (
+        patch.object(sys, "stdin", io.StringIO(stdin_data)),
+        patch.object(sys, "stdout", stdout),
+        patch("urllib.request.urlopen", side_effect=OSError("connection refused")),
+    ):
+        cursor_policy_hook.main()
+
+    result = json.loads(stdout.getvalue())
+    assert result["permission"] == "allow"
+
+
+def test_cursor_policy_hook_no_env_fails_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without server URL / session ID env vars, the hook allows."""
+    import io
+    from unittest.mock import patch
+
+    monkeypatch.delenv("_OMNIGENT_SERVER_URL", raising=False)
+    monkeypatch.delenv("_OMNIGENT_SESSION_ID", raising=False)
+
+    from omnigent.inner import cursor_policy_hook
+
+    stdout = io.StringIO()
+    with (
+        patch.object(sys, "stdin", io.StringIO("{}")),
+        patch.object(sys, "stdout", stdout),
+    ):
+        cursor_policy_hook.main()
+
+    result = json.loads(stdout.getvalue())
+    assert result["permission"] == "allow"
+
+
+def test_cursor_policy_hook_ask_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ASK verdict (unresolved approval) fails closed with deny."""
+    import io
+    from unittest.mock import patch
+
+    monkeypatch.setenv("_OMNIGENT_SERVER_URL", "http://localhost:6767")
+    monkeypatch.setenv("_OMNIGENT_SESSION_ID", "conv_test")
+
+    stdin_data = json.dumps({"tool_name": "Write", "tool_input": {}})
+    server_response = json.dumps(
+        {"result": "POLICY_ACTION_ASK", "reason": "needs approval"}
+    ).encode()
+
+    from omnigent.inner import cursor_policy_hook
+
+    fake_resp = io.BytesIO(server_response)
+    fake_resp.__enter__ = lambda s: s  # type: ignore[attr-defined]
+    fake_resp.__exit__ = lambda s, *a: None  # type: ignore[attr-defined]
+
+    stdout = io.StringIO()
+    with (
+        patch.object(sys, "stdin", io.StringIO(stdin_data)),
+        patch.object(sys, "stdout", stdout),
+        patch("urllib.request.urlopen", return_value=fake_resp),
+    ):
+        cursor_policy_hook.main()
+
+    result = json.loads(stdout.getvalue())
+    assert result["permission"] == "deny"
+    assert "requires approval" in result["agent_message"]
