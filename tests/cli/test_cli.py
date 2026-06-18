@@ -20,11 +20,15 @@ from click import ClickException
 from click.testing import CliRunner, Result
 
 from omnigent.cli import (
+    _DEFAULT_HARNESS_PROMPT,
+    _DEFAULT_HARNESS_PROMPTS,
     _GLOBAL_CONFIG_KEYS,
+    _HARNESS_CHOICES_HELP,
     _adopt_ambient_credentials,
     _announce_auto_configured_credentials,
     _bundle,
     _bundled_example_path,
+    _default_harness_prompt,
     _dispatch_run,
     _ensure_sqlite_parent_dir,
     _expand_config_env_vars,
@@ -44,6 +48,7 @@ from omnigent.cli import (
     _resolve_first_run_plan,
     _save_global_config,
     _start_cli_runner_process,
+    _validate_harness,
     _warn_missing_harness_dependencies,
     cli,
 )
@@ -1979,6 +1984,132 @@ def test_materialize_harness_launcher_file_writes_omnigent_yaml() -> None:
     # turn through the Databricks gateway. A "profile" key here means the
     # removed baking behavior came back.
     assert "profile" not in raw["executor"], raw["executor"]
+
+
+def test_harness_choices_help_lists_cursor_and_antigravity() -> None:
+    """The ``--harness`` choices help advertises both SDK harnesses.
+
+    ``_HARNESS_CHOICES_HELP`` is the user-facing discoverability surface for
+    ``omnigent run --harness`` / the bare-harness launch. Cursor was wired in
+    with its feature PR; antigravity (a peer in-process SDK harness, accepted by
+    ``_validate_harness`` via ``OMNIGENT_HARNESSES``) must be advertised the
+    same way so the two have parity. Pin every choice the help advertises (the
+    canonical harness ids plus the ``claude`` alias) so a future edit can't
+    silently drop one.
+    """
+    for harness in (
+        "antigravity",
+        "claude",
+        "claude-sdk",
+        "codex",
+        "cursor",
+        "openai-agents",
+        "open-responses",
+        "pi",
+    ):
+        assert f"'{harness}'" in _HARNESS_CHOICES_HELP, _HARNESS_CHOICES_HELP
+
+
+def test_harness_choices_help_orders_by_setup_flow() -> None:
+    """The ``--harness`` help lists choices in the ``omnigent setup`` order.
+
+    Source of truth for the order is ``_run_configure_harnesses_interactive``:
+    it builds the menu as ``families = [ANTHROPIC_FAMILY, OPENAI_FAMILY,
+    PI_SURFACE]`` (Claude, Codex, Pi) followed by the Cursor then Antigravity
+    rows. The help string mirrors that family-then-SDK sequence so the two
+    surfaces read the same. Assert the representative ids appear in that order
+    (without pinning exact punctuation/spacing, which would be brittle).
+    """
+    order = ["claude-sdk", "codex", "pi", "cursor", "antigravity"]
+    positions = [_HARNESS_CHOICES_HELP.index(f"'{harness}'") for harness in order]
+    assert positions == sorted(positions), (order, positions, _HARNESS_CHOICES_HELP)
+
+
+@pytest.mark.parametrize(
+    ("harness", "brand"),
+    [
+        ("antigravity", "Antigravity"),
+        ("cursor", "Cursor"),
+    ],
+)
+def test_default_harness_prompt_branded_for_cursor_and_antigravity(
+    harness: str, brand: str
+) -> None:
+    """Both SDK harnesses get a branded bare-launch prompt, not the fallback.
+
+    Mirrors the claude-sdk/codex entries: a no-AGENT launch of either harness
+    should introduce itself by name rather than fall back to the generic
+    ``_DEFAULT_HARNESS_PROMPT``.
+    """
+    prompt = _default_harness_prompt(harness)
+    assert prompt != _DEFAULT_HARNESS_PROMPT
+    assert brand in prompt
+    assert harness in _DEFAULT_HARNESS_PROMPTS
+
+
+@pytest.mark.parametrize(
+    "harness",
+    ["cursor", "antigravity", "agy", "google-antigravity"],
+)
+def test_validate_harness_accepts_cursor_and_antigravity(harness: str) -> None:
+    """``_validate_harness`` accepts cursor, antigravity, and the agy aliases.
+
+    These are registered in ``OMNIGENT_HARNESSES`` (canonical ids) and
+    ``HARNESS_ALIASES`` (``agy`` / ``google-antigravity`` → ``antigravity``),
+    so the CLI must not reject them as unsupported.
+    """
+    _validate_harness(harness)  # must not raise
+
+
+def test_materialize_harness_launcher_file_antigravity_uses_branded_prompt() -> None:
+    """A bare antigravity launch materializes a branded, family-less spec.
+
+    Parity check with the claude launcher test above: the antigravity harness
+    has no ``providers:`` family, so its launcher carries just ``harness`` /
+    ``model`` (no profile) and — unlike claude-sdk/codex/pi — no ``os_env``
+    block (antigravity is not in ``_OS_ENV_HARNESSES``). The ``agy`` alias
+    resolves to the canonical ``antigravity`` spelling for the file + executor.
+    """
+    generated = _materialize_harness_launcher_file(
+        harness="agy",
+        model="gemini-3-flash",
+        system_prompt=None,
+    )
+
+    assert generated.name == "antigravity.yaml"
+    raw = yaml.safe_load(generated.read_text())
+    assert raw == {
+        "name": "agy",
+        "prompt": _DEFAULT_HARNESS_PROMPTS["antigravity"],
+        "executor": {
+            "harness": "antigravity",
+            "model": "gemini-3-flash",
+        },
+    }
+
+
+@pytest.mark.parametrize("harness", ["cursor", "antigravity", "agy"])
+def test_run_with_agent_accepts_cursor_and_antigravity(
+    monkeypatch: pytest.MonkeyPatch, harness: str
+) -> None:
+    """``--harness cursor|antigravity|agy`` clears validation and dispatches.
+
+    Proves the two SDK harnesses (and the ``agy`` alias) are selectable through
+    the run CLI exactly like ``openai-agents-sdk`` — validation passes and the
+    run is dispatched; the canonical rewrite happens later at override
+    materialization.
+    """
+    monkeypatch.setattr("omnigent.cli._load_global_config", dict)
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(
+        cli,
+        ["run", "tests/resources/examples/hello_world.yaml", "--harness", harness],
+    )
+
+    assert result.exit_code == 0, result.output
+    run_chat.assert_called_once()
 
 
 def test_run_without_agent_drops_into_configure_when_unconfigured(
