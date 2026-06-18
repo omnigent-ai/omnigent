@@ -383,6 +383,52 @@ policies:
         - databricks-claude-opus-4-6
 ```
 
+### MCP Interceptor (external PDP)
+
+#### `mcp_interceptor`
+
+Delegates tool-call verdicts to an external **Policy Decision Point (PDP)** that
+speaks the **MCP Interceptor** JSON-RPC protocol
+([experimental-ext-interceptors](https://github.com/modelcontextprotocol/experimental-ext-interceptors)).
+Instead of deciding locally, this policy forwards each `tools/call` to the PDP's
+`interceptor/invoke` method and maps the returned `ValidationResult` back:
+
+| ValidationResult | Omnigent verdict |
+|------------------|------------------|
+| `valid: true` (no error/warn) | ALLOW |
+| `severity: "error"` | DENY |
+| `severity: "warn"` or non-error `valid: false` | configurable via `on_notify` (default ASK) |
+
+Use this when an organisation already authors and audits tool-call policy in a
+central service and wants Omnigent agents to enforce those same rules without
+re-implementing them as built-ins.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `endpoint` | string | (required) | PDP URL that accepts the JSON-RPC POST, e.g. `https://your-pdp.example.com/api/interceptor` |
+| `interceptor_name` | string | `"default"` | Interceptor to invoke on the PDP |
+| `api_key` | string | `null` | Literal bearer token (prefer `api_key_env`) |
+| `api_key_env` | string | `null` | Env var holding the bearer token; takes precedence over `api_key` |
+| `on_notify` | string | `"ask"` | Verdict for an advisory result (severity `warn`): `allow`, `ask`, or `deny` |
+| `fail_open` | boolean | `false` | Allow (`true`) or deny (`false`) when the PDP is unreachable or returns a bad response |
+| `timeout_s` | number | `10` | Per-request timeout in seconds |
+| `phases` | string[] | `["tool_call"]` | Event types to forward: subset of `["tool_call", "tool_result"]` |
+
+On a PDP error, timeout, or malformed body the policy **fails closed** (DENY) by
+default, matching Omnigent's fail-closed posture for `TOOL_CALL`. Set
+`fail_open: true` only when availability matters more than enforcement.
+
+```yaml
+policies:
+  interceptor_pdp:
+    type: function
+    handler: omnigent.policies.builtins.mcp_interceptor.mcp_interceptor
+    factory_params:
+      endpoint: https://your-pdp.example.com/api/interceptor
+      api_key_env: MCP_INTERCEPTOR_TOKEN
+      on_notify: ask
+```
+
 ---
 
 ## Writing custom policies

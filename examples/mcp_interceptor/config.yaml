@@ -1,0 +1,63 @@
+# MCP Interceptor — live PDP enforcement demo
+#
+# An omnigent agent whose tool calls are validated by a LIVE Policy Decision
+# Point (PDP) that speaks the MCP Interceptor JSON-RPC protocol, via the built-in
+# `mcp_interceptor` policy. Every tool the agent invokes is POSTed to the PDP's
+# `interceptor/validate` method; a `block` verdict becomes a DENY and the tool
+# never runs.
+#
+# How to run it live: see README.md in this directory.
+#   omnigent run examples/mcp_interceptor
+#
+# No model is pinned, so the claude-sdk harness runs on whatever Claude provider
+# you configured (`omnigent setup`) — a Claude Code subscription (~/.claude), an
+# Anthropic API key, an OpenAI-compatible gateway, or a Databricks workspace. To
+# pin one, add `model: <id>` under `executor.config`.
+
+spec_version: 1
+name: mcp-interceptor-demo
+description: Agent whose tool calls are governed by a live MCP Interceptor PDP.
+
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+
+prompt: |
+  You have shell access. To answer a question about the current time, run the
+  shell command `date`. If a tool call is denied by policy (the tool output
+  begins with "[Denied by policy"), tell the user in one short sentence that it
+  was blocked and quote the policy reason verbatim. Do not retry.
+
+# Native OS tools (shell/file) — NOT a `type: function` tool. The claude-sdk
+# harness does not currently surface YAML FunctionTools to the model, whereas
+# native os_env tools (sys_os_shell, ...) ARE exposed AND route through the
+# policy engine. See README.md > "Why native os_env tools".
+#
+# SECURITY: sandbox.type=none gives the agent unsandboxed shell on the host.
+# Acceptable HERE only because the policy denies the call (nothing runs). For
+# real workloads use a real sandbox (linux_bwrap / docker).
+os_env:
+  type: caller_process
+  cwd: /tmp
+  sandbox:
+    type: none
+
+guardrails:
+  policies:
+    interceptor_pdp:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.policies.builtins.mcp_interceptor.mcp_interceptor
+        arguments:
+          # Your PDP endpoint — replace with your own deployment.
+          endpoint: https://your-pdp.example.com/api/interceptor
+          # Bearer token read from this env var (keeps the secret out of the file).
+          api_key_env: MCP_INTERCEPTOR_TOKEN
+          # The interceptor to invoke on the PDP (deployment-specific). Omit to
+          # use the policy default; override per your PDP.
+          # interceptor_name: default
+          # notify -> deny here so the headless run yields a clean terminal verdict.
+          on_notify: deny
+          timeout_s: 20

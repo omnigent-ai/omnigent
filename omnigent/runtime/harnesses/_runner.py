@@ -317,6 +317,24 @@ def main(argv: list[str] | None = None) -> None:
         the live process arguments. Tests pass an explicit list.
     """
     args = _parse_args(argv if argv is not None else sys.argv[1:])
+    # Initialize agent-plane telemetry in the harness subprocess. The server
+    # (cli.py / app.py) and runner (runner/_entry.py) each call telemetry.init()
+    # in their own process, but the claude-sdk executor's tool-call gate — which
+    # emits the TOOL span carrying the policy decision (gen_ai.tool.name +
+    # gen_ai.agent.name) — runs HERE, inside the
+    # per-conversation harness subprocess. Without this call mlflow tracing is
+    # never enabled in this process, so mlflow.start_span() is a no-op and those
+    # spans are silently dropped (see _start_tool_call_span in
+    # omnigent.inner.claude_sdk_executor). OTEL_*/MLFLOW_* env vars are inherited
+    # from the runner via _build_harness_spawn_env, so init() wires the OTLP
+    # exporter just as it does in the parent. Best-effort: never block harness
+    # startup on telemetry.
+    try:
+        from omnigent.runtime import telemetry
+
+        telemetry.init()
+    except Exception:  # pragma: no cover - defensive; init() is already guarded
+        pass
     app = _load_harness_app(args.harness, args.module, args.conversation_id)
     if args.parent_pid is not None:
         _set_pdeathsig()

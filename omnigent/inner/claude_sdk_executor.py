@@ -1055,6 +1055,151 @@ def _resolve_skills_option(
     return None
 
 
+def _start_tool_call_span(tool_name, tool_input, agent_name):  # type: ignore[no-untyped-def]
+    """Best-effort MLflow TOOL span for one tool-call decision.
+
+    Emits a span carrying GenAI semantic-convention attributes — crucially
+    ``gen_ai.tool.name`` AND ``gen_ai.agent.name`` on the SAME span, which is
+    the agent->tool lineage edge downstream consumers derive.
+    No-op when mlflow/tracing is unavailable. The runner's ``telemetry.init()``
+    wires the OTLP exporter, so with ``OTEL_EXPORTER_OTLP_ENDPOINT`` set these
+    spans export to the configured collector (e.g. the Databricks native OTLP
+    endpoint).
+    """
+    import contextlib
+
+    try:
+        import json
+        import uuid
+
+        import mlflow
+    except Exception:  # noqa: BLE001 — best-effort tracing, never break the run
+        return contextlib.nullcontext(None)
+    try:
+        args_json = json.dumps(tool_input, default=str)[:4000]
+    except Exception:  # noqa: BLE001 — best-effort tracing, never break the run
+        args_json = str(tool_input)[:4000]
+    attrs = {
+        "gen_ai.operation.name": "execute_tool",
+        "gen_ai.tool.name": tool_name,
+        "gen_ai.tool.call.id": uuid.uuid4().hex,
+        "gen_ai.tool.arguments": args_json,
+    }
+    if agent_name:
+        attrs["gen_ai.agent.name"] = agent_name
+    try:
+        return mlflow.start_span(
+            name=f"execute_tool {tool_name}", span_type="TOOL", attributes=attrs
+        )
+    except Exception:  # noqa: BLE001 — best-effort tracing, never break the run
+        return contextlib.nullcontext(None)
+
+
+def _record_tool_span_decision(span, status):  # type: ignore[no-untyped-def]
+    """Mark a tool-call span's outcome.
+
+    A policy block is recorded as an OTLP ERROR span status (the tool call was
+    denied and never ran). The downstream "blocked" disposition is derived from
+    the policy decision itself, not from a span attribute.
+    """
+    if span is None:
+        return
+    try:
+        if status == "block":
+            span.set_status("ERROR")
+    except Exception:  # noqa: BLE001 — best-effort tracing, never break the run
+        pass
+
+
+def _flush_traces():  # type: ignore[no-untyped-def]
+    """Best-effort force-flush of the OTLP span exporter.
+
+    Ensures spans export even when the runner is an ephemeral per-run process
+    torn down before the batch processor's normal flush interval. No-op when
+    OTel/mlflow isn't present or no exporter is configured.
+    """
+    try:
+        from opentelemetry import trace as _ot
+
+        _ot.get_tracer_provider().force_flush(5000)
+    except Exception:  # noqa: BLE001 — best-effort tracing, never break the run
+        pass
+
+
+def _start_llm_turn_span(model, agent_name):  # type: ignore[no-untyped-def]
+    """Best-effort MLflow LLM span for one model turn.
+
+    Mirrors :func:`_start_tool_call_span` but for the LLM call itself, so
+    downstream tracing sees the agent's model usage (model id, token usage, agent
+    attribution) via the SAME OTLP pipeline as the tool-call spans — no
+    LLM gateway required, preserving the local Claude subscription. Carries
+    GenAI semantic-convention attributes; ``gen_ai.agent.name`` ties the
+    call back to the agent. No-op when mlflow/tracing is unavailable.
+    """
+    import contextlib
+
+    try:
+        import mlflow
+    except Exception:  # noqa: BLE001 — best-effort tracing, never break the run
+        return contextlib.nullcontext(None)
+    attrs = {
+        "gen_ai.operation.name": "chat",
+    }
+    if model:
+        attrs["gen_ai.request.model"] = model
+    if agent_name:
+        attrs["gen_ai.agent.name"] = agent_name
+    try:
+        return mlflow.start_span(name="chat", span_type="LLM", attributes=attrs)
+    except Exception:  # noqa: BLE001 — best-effort tracing, never break the run
+        return contextlib.nullcontext(None)
+
+
+def _record_llm_turn(span, model, usage, response_text=None):  # type: ignore[no-untyped-def]
+    """Annotate an LLM turn span with model, token usage, and (optionally) output.
+
+    Token usage is recorded via :func:`telemetry.record_llm_usage`, which
+    stores it under ``mlflow.chat.tokenUsage`` and is translated to the
+    ``gen_ai.usage.*`` attributes on OTLP export. Output text is captured
+    only when ``OMNIGENT_OTEL_CAPTURE_CONTENT`` is enabled, mirroring the
+    rest of the runtime's content-capture policy.
+    """
+    if span is None:
+        return
+    try:
+        from omnigent.runtime import telemetry as _tel
+    except Exception:  # noqa: BLE001 — best-effort tracing, never break the run
+        _tel = None  # type: ignore[assignment]
+    try:
+        if model:
+            span.set_attribute("gen_ai.response.model", model)
+        if isinstance(usage, dict) and usage:
+            # mlflow-native consolidated usage (mlflow.chat.tokenUsage), for
+            # mlflow consumers.
+            if _tel is not None:
+                with suppress(Exception):
+                    _tel.record_llm_usage(span, usage)
+            # Explicit OTel GenAI semantic-convention attributes — many OTLP
+            # ingestion backends read these to surface token counts (they do not
+            # parse mlflow's consolidated mlflow.chat.tokenUsage).
+            _usage_attrs = {
+                "input_tokens": "gen_ai.usage.input_tokens",
+                "output_tokens": "gen_ai.usage.output_tokens",
+                "total_tokens": "gen_ai.usage.total_tokens",
+                "cache_read_input_tokens": "gen_ai.usage.cache_read_input_tokens",
+                "cache_creation_input_tokens": "gen_ai.usage.cache_creation_input_tokens",
+            }
+            for _key, _attr in _usage_attrs.items():
+                _val = usage.get(_key)
+                if isinstance(_val, (int, float)) and _val:
+                    with suppress(Exception):
+                        span.set_attribute(_attr, int(_val))
+        if response_text and _tel is not None and _tel.should_capture_content():
+            span.set_attribute("gen_ai.completion", str(response_text)[:4000])
+    except Exception:  # noqa: BLE001 — best-effort tracing, never break the run
+        pass
+
+
 class ClaudeSDKExecutor(Executor):
     """Execute agent turns using the Claude Agent SDK.
 
@@ -1805,15 +1950,26 @@ class ClaudeSDKExecutor(Executor):
         """
         from claude_agent_sdk import PermissionResultAllow
 
-        policy_result = await self._evaluate_tool_call_policy(tool_name, tool_input)
-        if policy_result is not None:
-            # Hard DENY from policy — block before execution.
-            return policy_result
-        # Policy allowed (or no policy gate). Under bypassPermissions we
-        # never prompt; otherwise defer to the elicitation gate.
-        if self._permission_mode == "bypassPermissions" or self._elicitation_handler is None:
-            return PermissionResultAllow()
-        return await self._can_use_tool_for_permission(tool_name, tool_input, perm_ctx)
+        try:
+            with _start_tool_call_span(tool_name, tool_input, self._agent_name) as _span:
+                policy_result = await self._evaluate_tool_call_policy(tool_name, tool_input)
+                if policy_result is not None:
+                    # Hard DENY from policy — block before execution.
+                    _record_tool_span_decision(_span, "block")
+                    return policy_result
+                _record_tool_span_decision(_span, "allow")
+                # Policy allowed (or no policy gate). Under bypassPermissions we
+                # never prompt; otherwise defer to the elicitation gate.
+                if (
+                    self._permission_mode == "bypassPermissions"
+                    or self._elicitation_handler is None
+                ):
+                    return PermissionResultAllow()
+                return await self._can_use_tool_for_permission(tool_name, tool_input, perm_ctx)
+        finally:
+            # Export the span now — the per-run runner may be torn down before
+            # the batch processor's normal flush, losing the trace otherwise.
+            _flush_traces()
 
     async def run_turn(
         self,
@@ -2489,6 +2645,19 @@ class ClaudeSDKExecutor(Executor):
         if terminal_error:
             yield ExecutorError(message=terminal_error)
             return
+
+        # Emit an LLM span for this turn so downstream tracing sees the agent's
+        # model usage (model id + token usage + agent attribution) through the
+        # same OTLP pipeline as the tool-call spans — no LLM gateway required, the
+        # local Claude subscription is preserved. Placed before the
+        # LLM_RESPONSE policy gate so the call is recorded even if the response
+        # is subsequently policy-denied. Best-effort: a no-op when tracing is
+        # unavailable, and never blocks the turn result.
+        try:
+            with _start_llm_turn_span(observed_model or model, self._agent_name) as _llm_span:
+                _record_llm_turn(_llm_span, observed_model or model, turn_usage, response_text)
+        finally:
+            _flush_traces()
 
         # ── LLM_RESPONSE policy evaluation ───────────────────────
         # Evaluate after the stream completes but before TurnComplete

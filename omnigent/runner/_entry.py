@@ -965,6 +965,18 @@ def main() -> None:
         datefmt="%Y-%m-%dT%H:%M:%S%z",
         stream=sys.stderr,
     )
+    # Initialize tracing in the runner process too. The agent workflow — and
+    # the MLflow spans it emits (agent turn, tool_call policy enforcement, tool
+    # dispatch) — runs HERE, not in the server, so the runner must set up OTLP
+    # export itself. Guard on a configured endpoint: telemetry.init() imports
+    # MLflow and reconfigures logging as a side effect, so calling it with
+    # nothing to export would pollute the runner's stderr (and pay the MLflow
+    # import cost) for no benefit. The runner inherits OTEL_* via the spawn env
+    # (cli.py _start_cli_runner_process: env={**os.environ, ...}).
+    if os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip():
+        from omnigent.runtime import telemetry
+
+        telemetry.init()
     try:
         asyncio.run(_run_tunnel_from_env())
     except RuntimeError as exc:
