@@ -187,17 +187,7 @@ skips:
     cluster: repl-pexpect-cli
     mode: skip
 
-  - id: tests/e2e/omnigent/test_server_remote_omnigent_autonomous_flows.py::test_manual_server_remote_omnigent_notify_when_idle_does_not_hang_and_delivers
-    reason: "Nightly bulk: server-remote-ap autonomous flows; pexpect timeout family."
-    issue: 523
-    cluster: repl-pexpect-cli
-    mode: skip
 
-  - id: tests/e2e/omnigent/test_server_remote_omnigent_autonomous_flows.py::test_manual_server_remote_omnigent_sys_timer_set_does_not_hang_and_fires
-    reason: "Nightly bulk: server-remote-ap autonomous flows; pexpect timeout family."
-    issue: 523
-    cluster: repl-pexpect-cli
-    mode: skip
 
   # ── Bulk-quarantine round 3 (2026-05-18, run 26017551154) ──
   # 20 tests across all 4 shards. Agent setup migrated from
@@ -345,9 +335,3 @@ skips:
   # family but only rarely flaky (2/20). Heavy e2e turns that can wedge the
   # loadscope shard, so skip (not xfail).
   # ──────────────────────────────────────────────────────────────
-
-  - id: tests/e2e/omnigent/test_repl_session_lifecycle.py::test_repl_local_mode_launches_runner_subprocess
-    reason: "CI-only failure: 'No runner subprocess found under <pid>' — the test asserts the runner is a direct child in the process tree, which holds locally (macOS) but not in CI's Linux container/daemon process model. Passes 0/30 in CI flake-stress while its 4 session-lifecycle siblings pass. Needs a CI-robust runner-detection fix (likely tied to the daemon-reuse lifecycle work)."
-    issue: 523
-    cluster: repl-pexpect-cli
-    mode: skip
