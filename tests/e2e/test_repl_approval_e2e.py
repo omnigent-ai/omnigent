@@ -732,25 +732,35 @@ def test_repl_approve_always_caches_for_later_turns(
 def test_repl_tool_call_approval_allows_tool_to_run(
     ap_cli: str,
     repl_env: dict[str, str],
-    using_mock_llm: bool,
+    mock_llm_server_url: str,
 ) -> None:
     """
     TOOL_CALL ASK → approve → tool runs → LLM responds.
 
-    The ``e2e-tool-gate`` fixture's AGENTS.md instructs the
-    LLM to call the ``echo`` tool for every user message.
-    The policy ``ask_before_echo`` ASKs on every
-    ``tool_call:echo``. After the user approves, the tool
-    runs and its output (prefixed ``echo:``) flows back to
-    the LLM, which includes it in the final reply.
+    The mock LLM is scripted (like the TOOL_RESULT tests) to emit
+    an ``echo`` ``function_call`` on the first call, then a plain
+    text follow-up on the second. The ``ask_before_echo`` policy
+    ASKs on every ``tool_call:echo``. After the user approves, the
+    tool runs and its output (prefixed ``echo:``) flows back to the
+    LLM in the follow-up call.
 
     The banner's ``phase`` field must be ``tool_call`` — not
     ``input`` — which is the critical distinction from the
     INPUT-phase tests above. Proves the TOOL_CALL site is
     wired and end-to-end correct.
     """
-    if using_mock_llm:
-        pytest.skip("requires real LLM (tool/subagent mock not supported in REPL)")
+    follow_up = "tool-call-approve-followup-marker"
+    _configure_mock_tool_then_text(
+        mock_llm_server_url,
+        [
+            {
+                "call_id": "tc1",
+                "name": "echo",
+                "arguments": json.dumps({"message": "testing123"}),
+            }
+        ],
+        follow_up,
+    )
     child = pexpect.spawn(
         ap_cli,
         ["run", str(_TOOL_GATE_DIR)],
@@ -778,17 +788,22 @@ def test_repl_tool_call_approval_allows_tool_to_run(
         )
         child.send("y" + "\r")
         child.expect("approved", timeout=5)
-        # Wait for turn completion (elapsed-time marker).
-        _wait_for_turn_complete(child, timeout=45)
-        full_turn = child.before or ""
-        if isinstance(full_turn, bytes):
-            full_turn = full_turn.decode("utf-8", errors="replace")
-        full_turn = _strip_ansi(full_turn)
-        # The echo tool runs; its output prefix 'echo:' should
-        # reach the LLM's reply (the AGENTS.md tells it to
-        # include the tool's output).
-        assert "echo:" in full_turn or "testing123" in full_turn, (
-            f"Tool output did not make it into the LLM's reply.\nCaptured:\n{full_turn[:1500]}"
+        # Sync on the post-tool follow-up reply — it only renders after the
+        # LLM's second call, proving the tool round-trip completed.
+        child.expect(follow_up, timeout=120)
+        # The echo tool runs; its output prefix 'echo:' should reach the
+        # LLM's function_call_output on the follow-up call.
+        reqs = get_mock_requests(mock_llm_server_url)
+        outputs = [
+            item.get("output", "")
+            for req in reqs
+            for item in (req.get("input") or [])
+            if isinstance(item, dict) and item.get("type") == "function_call_output"
+        ]
+        joined = " ".join(str(o) for o in outputs)
+        assert "echo: testing123" in joined, (
+            "Tool output did not reach the LLM's function_call_output after "
+            f"approval.\nfunction_call_outputs: {joined[:800]}"
         )
     finally:
         try:
@@ -803,7 +818,7 @@ def test_repl_tool_call_approval_allows_tool_to_run(
 def test_repl_tool_call_refusal_blocks_tool(
     ap_cli: str,
     repl_env: dict[str, str],
-    using_mock_llm: bool,
+    mock_llm_server_url: str,
 ) -> None:
     """
     TOOL_CALL ASK → refuse → tool NEVER runs → sentinel
@@ -814,10 +829,21 @@ def test_repl_tool_call_refusal_blocks_tool(
     conversation — ``_enforce_tool_result_policy`` substitutes
     ``[Denied by policy: ...]``. This test is the end-to-end
     proof that the pre-persistence ordering holds under real
-    streaming + DBOS parking.
+    streaming + DBOS parking. The mock LLM is scripted to emit
+    the ``echo`` ``function_call`` so the TOOL_CALL ASK fires.
     """
-    if using_mock_llm:
-        pytest.skip("requires real LLM (tool/subagent mock not supported in REPL)")
+    follow_up = "tool-call-refuse-followup-marker"
+    _configure_mock_tool_then_text(
+        mock_llm_server_url,
+        [
+            {
+                "call_id": "tc2",
+                "name": "echo",
+                "arguments": json.dumps({"message": "testing456"}),
+            }
+        ],
+        follow_up,
+    )
     child = pexpect.spawn(
         ap_cli,
         ["run", str(_TOOL_GATE_DIR)],
@@ -833,22 +859,31 @@ def test_repl_tool_call_refusal_blocks_tool(
         child.expect("approval required", timeout=45)
         child.send("n" + "\r")
         child.expect("refused", timeout=5)
-        # Wait for the turn to complete. The LLM sees
-        # the blocked sentinel as the tool output, then
-        # either reports the denial or stops. Elapsed-time
-        # marker signals the turn ended.
-        _wait_for_turn_complete(child, timeout=60)
-        full_turn = child.before or ""
-        if isinstance(full_turn, bytes):
-            full_turn = full_turn.decode("utf-8", errors="replace")
-        full_turn = _strip_ansi(full_turn)
-        # The sentinel must appear in the tool output path —
-        # this is the regression guard for the pre-persist
-        # ordering invariant.
-        assert "Denied by policy" in full_turn, (
-            "Tool result sentinel did not appear in the turn — "
-            "pre-persistence enforcement may have regressed.\n"
-            f"Captured:\n{full_turn[:1500]}"
+        # Sync on the post-tool follow-up reply — the LLM only makes its
+        # second call after the (blocked) tool round-trip completes.
+        child.expect(follow_up, timeout=120)
+        # On a TOOL_CALL-phase refusal the tool never runs: its
+        # function_call_output is a denial marker, NOT the raw echo
+        # output. (The ``[Denied by policy: ...]`` sentinel is the
+        # separate TOOL_RESULT substitution path.) The regression
+        # guard: a denial is recorded AND the raw echo output must
+        # NEVER reach the conversation.
+        reqs = get_mock_requests(mock_llm_server_url)
+        outputs = [
+            item.get("output", "")
+            for req in reqs
+            for item in (req.get("input") or [])
+            if isinstance(item, dict) and item.get("type") == "function_call_output"
+        ]
+        joined = " ".join(str(o) for o in outputs)
+        assert "denied" in joined.lower(), (
+            "Tool-call denial marker did not appear in the LLM's "
+            "function_call_output — refusal enforcement may have "
+            f"regressed.\nfunction_call_outputs: {joined[:800]}"
+        )
+        assert "echo: testing456" not in joined, (
+            "Raw tool output leaked to the LLM despite refusal — the tool "
+            f"ran when it must not have.\nfunction_call_outputs: {joined[:800]}"
         )
     finally:
         try:

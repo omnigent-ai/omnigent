@@ -28,20 +28,8 @@
 # want to debug a skipped test locally, comment out its block.
 skips:
 
-  - id: tests/e2e/test_repl_approval_e2e.py::test_repl_tool_call_approval_allows_tool_to_run
-    reason: "REPL policy-ASK banner does not surface for TOOL_CALL-phase ASK (#763): expect('approval required') times out 60/60 in run 27802341342. INPUT-phase ASKs surface fine; the tool_call elicitation->REPL path does not."
-    issue: 763
-    cluster: repl-policy-ask-surfacing
-    mode: skip
-
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_subagent_tool_call_ask_tunnels_to_root
     reason: "Broken fixture independent of the ASK path: the spawned toolworker sub-agent has no `echo` callable registered (live: 'Tool echo not found in agent Omnigent', 3/3), so the TOOL_CALL ASK never runs — the tool errors before policy matters. Needs the sub-agent local-tool bridge fixed; interactive mid-flight ASK tracked by #765."
-    issue: 763
-    cluster: repl-policy-ask-surfacing
-    mode: skip
-
-  - id: tests/e2e/test_repl_approval_e2e.py::test_repl_tool_call_refusal_blocks_tool
-    reason: "REPL policy-ASK banner does not surface for TOOL_CALL-phase ASK (#763): expect('approval required') times out 60/60 in run 27802341342. INPUT-phase ASKs surface fine; the tool_call elicitation->REPL path does not."
     issue: 763
     cluster: repl-policy-ask-surfacing
     mode: skip
