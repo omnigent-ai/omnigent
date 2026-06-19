@@ -1422,23 +1422,7 @@ class _SessionsChatReplAdapter:
         if session.agent_name:
             self._agent_name = session.agent_name
         self._bound_runner_id = session.runner_id
-        # When the server owns the runner lifecycle (no client-side
-        # recovery callback — the daemon/host-bound path), a dead
-        # runner is relaunched server-side on the next message dispatch
-        # under a BRAND-NEW runner_id (a fresh binding token). The
-        # snapshot then reports that new id. Adopt it as our own so the
-        # next bind check sees ``_runner_id`` and ``_bound_runner_id``
-        # in sync. Without this, ``_runner_id`` stays frozen at the
-        # launch-time runner; once that runner idle-times-out and is
-        # relaunched, this metadata refresh moves ``_bound_runner_id``
-        # to the new id while ``_runner_id`` lags, so every subsequent
-        # ``_bind_runner_if_needed`` PATCHes the session back onto the
-        # now-deregistered original runner and the server rejects it
-        # with "runner '<id>' is not registered". The client-recovery
-        # path (``runner_recover`` set) owns ``_runner_id`` itself and
-        # must not have it clobbered here. Guard on a non-empty
-        # snapshot id so a not-yet-bound fresh session (runner_id None)
-        # doesn't wipe the launch-time runner we still need to bind.
+        # Don't clobber a runner if it is revived after timeout
         if self._runner_recover is None and session.runner_id:
             self._runner_id = session.runner_id
         self._reasoning_effort = session.reasoning_effort
