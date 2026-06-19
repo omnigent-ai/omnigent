@@ -36,8 +36,8 @@ skips:
   # (last STARTING on gw3 with no END). Pexpect REPL + sub-agent
   # spawn pattern.
   - id: tests/e2e/omnigent/test_run_omnigent_ctrl_g_subagent_dedup.py::test_run_omnigent_ctrl_g_deduplicates_subagent_across_spawn_and_send
-    reason: "Wedges hardened CI runner (#426)."
-    issue: 426
+    reason: "Wedges hardened CI runner."
+    issue: 671
     cluster: runner-wedge-subprocess-fanout
     mode: skip
 
@@ -49,26 +49,26 @@ skips:
   # reap the test's spawned children fast enough, accumulating until
   # the host wedges.
   - id: tests/e2e/omnigent/test_run_omnigent_os_env_inherit.py::test_run_omnigent_propagates_os_env_inherit_to_spawned_worker[claude-sdk]
-    reason: "Wedges hardened CI runner via os_env subprocess fanout (#426)."
-    issue: 426
+    reason: "Wedges hardened CI runner via os_env subprocess fanout."
+    issue: 671
     cluster: runner-wedge-subprocess-fanout
     mode: skip
 
   - id: tests/e2e/omnigent/test_run_omnigent_twelve_shells.py::test_twelve_parallel_shells_complete_under_ap
-    reason: "Wedges hardened CI runner via 12 parallel pty shells (#426)."
-    issue: 426
+    reason: "Wedges hardened CI runner via 12 parallel pty shells."
+    issue: 671
     cluster: runner-wedge-subprocess-fanout
     mode: skip
 
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_tool_call_approval_allows_tool_to_run
     reason: "Same REPL approval pexpect-timeout family."
-    issue: 532
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
 
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_subagent_tool_call_ask_tunnels_to_root
     reason: "Same REPL approval pexpect-timeout family."
-    issue: 532
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
 
@@ -76,19 +76,19 @@ skips:
 
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_tool_call_refusal_blocks_tool
     reason: "Shard 0 bulk: REPL approval pexpect-timeout family (same as other test_repl_approval_e2e entries)."
-    issue: 532
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
 
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_subagent_ask_tunnels_approval_to_root
     reason: "Shard 0 bulk: REPL approval pexpect-timeout family."
-    issue: 532
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
 
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_tool_result_ask_approve_surfaces_tool_output
     reason: "Shard 0 bulk: REPL approval pexpect-timeout family."
-    issue: 532
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
 
@@ -98,37 +98,37 @@ skips:
   # first to unblock e2e PR gating, triage individually under #532.
 
   - id: tests/e2e/omnigent/test_example_secure_research_agent_os_env.py::test_secure_research_agent_os_env_one_shot
-    reason: "Shard 1 bulk: secure_research_agent os-env one-shot. Triage under #532."
-    issue: 532
+    reason: "Shard 1 bulk: secure_research_agent os-env one-shot. Triage pending."
+    issue: 675
     cluster: sandbox-deps-env
     mode: skip
   - id: tests/e2e/omnigent/test_run_omnigent_os_env_inherit.py::test_run_omnigent_propagates_os_env_inherit_to_spawned_worker[openai-agents]
-    reason: "Shard 1 bulk: os_env propagation, same family as the [claude-sdk] variant in #426."
-    issue: 426
+    reason: "Shard 1 bulk: os_env propagation, same family as the [claude-sdk] variant."
+    issue: 671
     cluster: runner-wedge-subprocess-fanout
     mode: skip
 
   - id: tests/e2e/omnigent/test_run_harness_without_agent_e2e.py::test_run_harness_without_agent_live_repl_round_trip[claude-sdk]
     reason: "Shard 1 bulk: no-AGENT harness round-trip claude-sdk."
-    issue: 532
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
 
   - id: tests/e2e/omnigent/test_run_harness_without_agent_e2e.py::test_run_harness_without_agent_live_repl_round_trip[openai-agents]
     reason: "Shard 1 bulk: no-AGENT harness round-trip openai-agents, same family."
-    issue: 532
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
 
   - id: tests/e2e/test_decorated_tools_e2e.py::test_decorated_tools_varied_signatures_e2e
     reason: "openai-agents harness test hits platform.openai.com directly and 401s under the Databricks gateway profile (dapi PAT rejected as OpenAI key); needs gateway-routing/base_url fix before it can run in CI. Passes only with a real OPENAI_API_KEY locally."
-    issue: 532
+    issue: 676
     cluster: run-ap-examples-harness
     mode: skip
 
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_tool_result_ask_refuse_replaces_output
     reason: "Shard 1 bulk: REPL approval pexpect-timeout family."
-    issue: 532
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
 
@@ -136,7 +136,7 @@ skips:
   # ── Shard 1 errors (collection / fixture-level, not test body) ──
   - id: tests/e2e/omnigent/test_example_agent_with_os_env_fork.py::test_agent_with_os_env_fork_one_shot
     reason: "Shards 0/1 bulk: agent_with_os_env_fork one-shot exits 0 with no stdout."
-    issue: 532
+    issue: 675
     cluster: sandbox-deps-env
     mode: skip
   - id: tests/e2e/test_claude_coder_sandbox.py::test_write_blocked_outside_workspace
@@ -171,42 +171,42 @@ skips:
 
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_output_ask_approve_surfaces_llm_reply
     reason: "Shard 3 bulk: REPL output ask-approve family."
-    issue: 532
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
 
   - id: tests/e2e/omnigent/test_run_omnigent_os_env_inherit.py::test_run_omnigent_propagates_os_env_inherit_to_spawned_worker[codex]
-    reason: "Shard 3 bulk: os_env propagation, codex variant. Same #426 family."
-    issue: 426
+    reason: "Shard 3 bulk: os_env propagation, codex variant. Same runner-wedge family."
+    issue: 671
     cluster: runner-wedge-subprocess-fanout
     mode: skip
 
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_output_ask_refuse_replaces_reply_with_sentinel
     reason: "Shard 3 bulk: REPL output ask-refuse family."
-    issue: 532
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
   - id: tests/e2e/omnigent/test_run_omnigent_example_agents.py::test_run_omnigent_example_yaml[agent_with_tools_calculate]
     reason: "Flaky on gateway flake-stress (7/8 pass); intermittent tool/harness behavior, keep suppressed until stable."
-    issue: 532
+    issue: 677
     cluster: run-ap-examples-harness
     mode: skip
 
   - id: tests/e2e/omnigent/test_repl_inline_tool_streaming.py::test_repl_inline_tool_call_and_result_streaming
     reason: "Shard 3 bulk: REPL inline tool-call streaming."
-    issue: 532
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
 
   - id: tests/e2e/omnigent/test_run_omnigent_quiet_startup.py::test_run_prompt_mode_is_headless_for_local_agent
     reason: "fixture uses claude-sdk harness which 401s on the gateway (~/.databrickscfg auth); needs a gateway-compatible harness/model."
-    issue: 532
+    issue: 676
     cluster: run-ap-examples-harness
     mode: skip
 
   - id: tests/e2e/omnigent/test_run_harness_without_agent_e2e.py::test_run_harness_without_agent_live_repl_round_trip[codex]
     reason: "Shard 3 bulk: no-AGENT harness round-trip, codex variant; same family as [claude-sdk], [openai-agents]."
-    issue: 532
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
 
@@ -223,31 +223,31 @@ skips:
 
   - id: tests/e2e/omnigent/test_repl_session_lifecycle.py::test_repl_effort_command_persists_session_metadata
     reason: "Nightly bulk: REPL session-lifecycle / pexpect cluster."
-    issue: 532
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
 
   - id: tests/e2e/omnigent/test_repl_session_lifecycle.py::test_repl_recover_after_runner_death
     reason: "Nightly bulk: REPL session-lifecycle / pexpect cluster."
-    issue: 532
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
 
   - id: tests/e2e/omnigent/test_repl_session_lifecycle.py::test_repl_resume_reuses_daemon_runner
     reason: "Nightly bulk: REPL session-lifecycle / pexpect cluster."
-    issue: 532
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
 
   - id: tests/e2e/omnigent/test_server_remote_omnigent_autonomous_flows.py::test_manual_server_remote_omnigent_notify_when_idle_does_not_hang_and_delivers
     reason: "Nightly bulk: server-remote-ap autonomous flows; pexpect timeout family."
-    issue: 532
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
 
   - id: tests/e2e/omnigent/test_server_remote_omnigent_autonomous_flows.py::test_manual_server_remote_omnigent_sys_timer_set_does_not_hang_and_fires
     reason: "Nightly bulk: server-remote-ap autonomous flows; pexpect timeout family."
-    issue: 532
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
 
@@ -259,7 +259,7 @@ skips:
 
   - id: tests/e2e/test_filesystem_changed_files_e2e.py::test_diff_endpoint_shows_git_diff_for_modified_file
     reason: "Failing deterministically on `main` and across multiple feature branches: 3 of 5 most recent E2E runs reported `Agent turn failed with status 'failed'. The workspace-file-writer agent did not complete successfully.` Likely a regression in the workspace-file-writer agent spec or its dispatch; needs owner investigation before un-quarantining."
-    issue: 532
+    issue: 673
     cluster: files-uploads-attachments
     mode: skip
 
@@ -273,55 +273,55 @@ skips:
 
   - id: tests/e2e/omnigent/test_repl_multiline.py::test_repl_multiline_ctrl_j_insert
     reason: "Kept suppressed as a known shard-load/worker-killer heavy pexpect test pending a dedicated round."
-    issue: 532
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
 
   - id: tests/e2e/omnigent/test_repl_ctrl_g_overview.py::test_repl_ctrl_g_overview_toggle
     reason: "REPL pexpect TIMEOUT post-path-fix: openai-agents+gpt-5-mini turn exceeds 60s pexpect deadline on ai-oss. Original skip reason still applies after #1141."
-    issue: 532
+    issue: 523
     cluster: model-gateway-compat
     mode: skip
 
   - id: tests/e2e/omnigent/test_repl_model_e2e.py::test_repl_model_command_show_set_reset
     reason: "REPL pexpect TIMEOUT post-path-fix: /model success line not appearing in pexpect after Rich markup output. Needs REPL output-capture investigation."
-    issue: 532
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
 
   - id: tests/e2e/omnigent/test_repl_overview_terminal_visibility.py::test_repl_overview_terminal_visibility
     reason: "REPL pexpect TIMEOUT post-path-fix. Same family as test_repl_ctrl_g_overview."
-    issue: 532
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
 
   - id: tests/e2e/omnigent/test_repl_overview_subagent_visibility.py::test_repl_overview_subagent_visibility[claude-sdk]
     reason: "Suspected worker-death contributor on shard 0 alongside test_repl_multiline_ctrl_j_insert. Investigate together."
-    issue: 532
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
 
   - id: tests/e2e/omnigent/test_repl_overview_subagent_visibility.py::test_repl_overview_subagent_visibility[codex]
     reason: "Same family as the [claude-sdk] variant; suspected worker-death contributor on shard 0."
-    issue: 532
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
 
   - id: tests/e2e/omnigent/test_yaml_hello_world.py::test_yaml_agent_with_tools[claude-sdk]
     reason: "Tool-call lifecycle markers ('◦ calculate' / '• calculate') not rendering to stdout after path fix; harness answers '3 + 4 = 7' directly without invoking the calculate tool, so the snapshot's stdout-contains-'calculate' check fails. Investigate per-harness tool surfacing."
-    issue: 532
+    issue: 677
     cluster: repl-pexpect-cli
     mode: skip
 
   - id: tests/e2e/omnigent/test_yaml_hello_world.py::test_yaml_agent_with_tools[codex]
     reason: "Same tool-call-rendering issue as the [claude-sdk] variant: codex says 'I'll compute it with the calculator tool now.7' but no '◦ calculate' lifecycle marker appears in stdout."
-    issue: 532
+    issue: 677
     cluster: run-ap-examples-harness
     mode: skip
 
   - id: tests/e2e/omnigent/test_yaml_hello_world.py::test_yaml_agent_with_tools[openai-agents]
     reason: "Flaky on gateway flake-stress (7/8 pass); intermittent tool-call lifecycle rendering, keep suppressed until stable."
-    issue: 532
+    issue: 677
     cluster: run-ap-examples-harness
     mode: skip
 
@@ -389,17 +389,17 @@ skips:
   # Standalone failures — no obvious cluster yet.
   - id: tests/e2e/omnigent/test_compaction_sessions_native_e2e.py::test_compaction_fires_and_agent_retains_context
     reason: "Force-merge backlog (standalone). First observed failing at 801c389c (2026-05-23T00:35:30Z, E2E)."
-    issue: 0
+    issue: 679
     cluster: steering-cancel-compaction-state
     mode: skip
   - id: tests/e2e/test_filesystem_changed_files_e2e.py::test_filesystem_changes_appear_after_agent_write
     reason: "Force-merge backlog (standalone). First observed failing at 305e9bb9 (2026-05-23T06:06:59Z, E2E)."
-    issue: 0
+    issue: 673
     cluster: files-uploads-attachments
     mode: skip
   - id: tests/e2e/omnigent/test_run_omnigent_coding_supervisor.py::test_run_omnigent_coding_supervisor_codex_shell_not_disabled
     reason: "Consistent real failure (40/40 in flake-stress run 27765495452): codex worker doesn't read the fixture file — codex shell_tool / supervisor-delegation regression, NOT a flake."
-    issue: 0
+    issue: 678
     cluster: subagent-supervisor-routing
     mode: skip
 
@@ -440,12 +440,12 @@ skips:
     mode: skip
   - id: tests/e2e/test_subagent_autowake_e2e.py::test_subagent_completion_auto_wakes_parent_on_a_second_round
     reason: "Pre-existing unsuppressed flake: gw0 worker crash under full e2e shard (xdist/loadscope); surfaced alongside #421 but independent of it. Heavy subagent autowake e2e."
-    issue: 0
+    issue: 671
     cluster: async-dispatch-inbox-sse
     mode: skip
 
   - id: tests/e2e/omnigent/test_repl_session_lifecycle.py::test_repl_local_mode_launches_runner_subprocess
     reason: "CI-only failure: 'No runner subprocess found under <pid>' — the test asserts the runner is a direct child in the process tree, which holds locally (macOS) but not in CI's Linux container/daemon process model. Passes 0/30 in CI flake-stress while its 4 session-lifecycle siblings pass. Needs a CI-robust runner-detection fix (likely tied to the daemon-reuse lifecycle work)."
-    issue: 532
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
