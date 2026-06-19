@@ -385,3 +385,58 @@ def test_load_omnigent_yaml_threads_executor_extra_max_tokens_to_llm_extra(
 
     assert spec.llm is not None
     assert spec.llm.extra["max_tokens"] == 65536
+
+
+def test_load_omnigent_yaml_unknown_harness_hints_at_version_skew(
+    tmp_path: Path,
+) -> None:
+    """
+    An unrecognized harness is most often a client-older-than-server skew:
+    the server emitted a harness this runner's allowlist doesn't know yet.
+    The synthesized-spec error must append a disclaimer pointing the operator
+    at that version skew rather than implying the spec itself is malformed.
+    """
+    yaml_text = textwrap.dedent("""\
+        name: skew-test
+        prompt: You are a helpful assistant.
+
+        executor:
+          harness: totally-made-up-harness
+          model: databricks-claude-sonnet-4
+    """)
+    (tmp_path / "skew-test.yaml").write_text(yaml_text)
+
+    with pytest.raises(OmnigentError) as excinfo:
+        load_omnigent_yaml(tmp_path / "skew-test.yaml")
+
+    message = str(excinfo.value)
+    assert "executor.config.harness" in message
+    assert "this client (runner) may be older than the server" in message
+
+
+def test_load_omnigent_yaml_missing_harness_omits_version_skew_hint(
+    tmp_path: Path,
+) -> None:
+    """
+    The version-skew hint is gated on a harness *enum mismatch*, not on any
+    ``executor.config.harness`` failure. A *missing* harness is a plain
+    authoring mistake — the synthesized-spec error still fires (same path),
+    but it must NOT imply the client is older than the server, since no
+    unrecognized harness value is involved.
+    """
+    yaml_text = textwrap.dedent("""\
+        name: no-harness-test
+        prompt: You are a helpful assistant.
+    """)
+    (tmp_path / "no-harness-test.yaml").write_text(yaml_text)
+
+    with pytest.raises(OmnigentError) as excinfo:
+        load_omnigent_yaml(tmp_path / "no-harness-test.yaml")
+
+    message = str(excinfo.value)
+    # Assert the exact "required when ..." variant (not just the field path):
+    # this keeps the test from passing vacuously if the default executor type
+    # ever stops routing a harness-less spec through the missing-harness branch.
+    assert "executor.config.harness" in message
+    assert "required when" in message
+    assert "this client (runner) may be older than the server" not in message
