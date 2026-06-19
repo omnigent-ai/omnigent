@@ -33,9 +33,10 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-# Files land in ``<repo-root>/<session_id>/`` (the hello_world agent spec uses
-# ``os_env.cwd: .``), so clean that per-session dir up in teardown.
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+# The hello_world agent spec uses ``os_env.cwd: .``, so the runner writes
+# seeded files into the server process's cwd — the repo root (this file is
+# ``<repo>/tests/e2e_ui/files/...``, so the repo root is ``parents[3]``).
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 # Must stay in sync with ``HTML_PREVIEW_SANDBOX`` in
 # ``ap-web/src/shell/codeViewerHelpers.ts``. ``allow-scripts`` re-enables JS

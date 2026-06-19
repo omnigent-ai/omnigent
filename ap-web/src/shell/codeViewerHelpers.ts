@@ -281,6 +281,11 @@ export function openHtmlArtifactInNewTab(
 ): boolean {
   const win = opener.open("about:blank", "_blank");
   if (!win) return false; // popup blocked by the browser
+  // Sever the back-reference to us (defense in depth): the shell tab never
+  // needs its `opener`, and nulling it removes any tab-nabbing vector if the
+  // tab is ever navigated away. Safe because the tab is same-origin (about:blank
+  // inherits our origin), so we can still touch its document below.
+  win.opener = null;
   const doc = win.document;
   doc.title = filename;
   doc.body.style.margin = "0";
