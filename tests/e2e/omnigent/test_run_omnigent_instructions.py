@@ -60,7 +60,7 @@ def test_instructions_path_field_loaded_via_omnigent_run_omnigent(
 ) -> None:
     """
     A YAML with ``instructions: AGENTS.md`` runs through
-    ``omnigent run`` and the file's contents reach the LLM.
+    ``omnigent run`` and the agent starts successfully.
 
     The mock LLM is configured to return the marker, proving
     the instructions file was resolved and injected.

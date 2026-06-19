@@ -44,7 +44,6 @@ from __future__ import annotations
 import io
 from pathlib import Path
 
-from tests._model_pools import resolve_model
 from tests.e2e.omnigent._pexpect_harness import (
     clean_exit,
     spawn_omnigent_run,
@@ -60,7 +59,7 @@ _YAML_REL = "tests/resources/examples/rate_limited_search_agent.yaml"
 # harness — it lives in the AP-side approval event route — and
 # openai-agents has the most reliable ``-p`` / REPL paths under
 # the e2e fixtures' test-profile credentials.
-_MODEL = resolve_model("databricks-gpt-5-mini", key=__name__)
+_MODEL = "mock-model"
 _HARNESS = "openai-agents"
 
 # Cold boot + 4 LLM-driven tool calls + ASK round-trip + final
@@ -87,8 +86,8 @@ _FOUR_SEARCH_PROMPT = (
 def test_run_omnigent_rate_limit_approval_round_trip(
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    omnigent_credentials_env: dict[str, str],
-    databricks_workspace: tuple[str, str],
+    mock_credentials_env: dict[str, str],
+    mock_llm_server_url: str,
 ) -> None:
     """
     Drive the rate-limit-search agent's ASK approval through a
@@ -108,24 +107,68 @@ def test_run_omnigent_rate_limit_approval_round_trip(
     ``[Denied by policy: ...]`` sentinel ~30s later when the
     parked workflow's ``ask_timeout`` fires.
 
+    The mock LLM is configured to issue 4 ``search_web`` tool
+    calls (octopus, cat, dog, elephant) in sequence so the
+    rate-limit policy triggers on the 4th, exercising the full
+    ASK → approve → run approval flow deterministically.
+
     :param omnigent_python: Path to the worktree's
-        ``.venv/bin/python`` from
-        :func:`tests.e2e.omnigent.conftest.omnigent_python`.
+        ``.venv/bin/python``.
     :param omnigent_repo_root: Repo root the subprocess uses as
-        cwd so YAML ``callable:`` entries (e.g.
-        ``tests.resources.examples._shared.search_rate_limit_policy.rate_limit_search``)
-        resolve on sys.path.
-    :param omnigent_credentials_env: ``os.environ``-derived dict
-        with ``OPENAI_API_KEY`` / ``OPENAI_BASE_URL`` / profile
-        wired up; stale ``ANTHROPIC_API_KEY`` / ``CODEX`` /
-        ``CLAUDE_CODE`` entries are stripped.
-    :param databricks_workspace: ``(profile, host)`` pair from
-        :func:`tests.e2e.omnigent.conftest.databricks_workspace`.
-        Selects the profile the AP-side claude-sdk MCP
-        server reads from ``~/.databrickscfg`` (via the env /
-        config-home auth block — the omnigent CLI no longer
-        accepts ``--profile``).
+        cwd so YAML ``callable:`` entries resolve on sys.path.
+    :param mock_credentials_env: Mock-LLM env vars pointing at
+        the mock server.
+    :param mock_llm_server_url: Mock server URL for configuring
+        response queues.
     """
+    from tests.e2e.omnigent.conftest import configure_mock_llm
+
+    # Issue 4 search_web tool calls in sequence (3 allowed, 4th hits ASK).
+    # After each tool result the mock server needs another response.
+    # Sequence: call 1 → call 2 → call 3 → call 4 (ASK fires here,
+    # approval is typed by the test, then call 4 runs) → final text.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "c1",
+                        "name": "search_web",
+                        "arguments": '{"query": "octopus"}',
+                    }
+                ]
+            },
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "c2",
+                        "name": "search_web",
+                        "arguments": '{"query": "cat"}',
+                    }
+                ]
+            },
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "c3",
+                        "name": "search_web",
+                        "arguments": '{"query": "dog"}',
+                    }
+                ]
+            },
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "c4",
+                        "name": "search_web",
+                        "arguments": '{"query": "elephant"}',
+                    }
+                ]
+            },
+            {"text": "I searched for octopus, cat, dog, and elephant."},
+        ],
+    )
     yaml_path = omnigent_repo_root / _YAML_REL
 
     child = spawn_omnigent_run(
@@ -133,7 +176,7 @@ def test_run_omnigent_rate_limit_approval_round_trip(
         yaml_path=yaml_path,
         model=_MODEL,
         harness=_HARNESS,
-        env=omnigent_credentials_env,
+        env=mock_credentials_env,
         cwd=omnigent_repo_root,
         timeout=_SPAWN_TIMEOUT,
     )
