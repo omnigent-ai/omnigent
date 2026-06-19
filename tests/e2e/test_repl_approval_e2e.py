@@ -234,9 +234,7 @@ def _configure_mock_subagent_spawn(
             {
                 "call_id": "sa1",
                 "name": "sys_session_send",
-                "arguments": json.dumps(
-                    {"agent": sub_agent_name, "title": "t", "args": message}
-                ),
+                "arguments": json.dumps({"agent": sub_agent_name, "title": "t", "args": message}),
             }
         ]
     }
@@ -1336,8 +1334,11 @@ def test_repl_tool_result_ask_does_not_prompt_in_repl(
         )
         child.send("pineapple" + "\r")
         # The turn must complete without ever parking on a banner —
-        # `· ready` is the post-turn idle settle.
-        _wait_for_turn_complete(child, timeout=60)
+        # `· ready` is the post-turn idle settle. 120s headroom: REPL turns
+        # can exceed 60s under concurrent-worker contention on 2-vCPU CI
+        # runners (the #523 pexpect boot/turn-starvation family); the pytest
+        # cap is --timeout=180, so 120 stays within budget.
+        _wait_for_turn_complete(child, timeout=120)
         full_turn = child.before or ""
         if isinstance(full_turn, bytes):
             full_turn = full_turn.decode("utf-8", errors="replace")
@@ -1439,7 +1440,9 @@ def test_repl_tool_result_ask_passes_output_through(
         # Polling get_mock_requests right after `· ready` can race the mock
         # server's request recording (~3% flake observed) — expecting the
         # follow-up text first makes the round-trip recording deterministic.
-        child.expect(follow_up, timeout=60)
+        # 120s headroom for REPL turn latency under CI worker contention
+        # (#523 family); within the --timeout=180 pytest cap.
+        child.expect(follow_up, timeout=120)
         full_turn = _strip_ansi((child.before or "") + follow_up)
         assert "approval required" not in full_turn, (
             "A TOOL_RESULT-phase approval banner surfaced — interactive "
