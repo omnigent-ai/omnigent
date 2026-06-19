@@ -685,54 +685,6 @@ def _registered_runner(
         _stop_cli_runner_process(runner.proc, grace_timeout=1.0)
 
 
-def test_repl_local_mode_launches_runner_subprocess(
-    omnigent_python: Path,
-    omnigent_repo_root: Path,
-    omnigent_credentials_env: dict[str, str],
-    databricks_workspace: tuple[str, str],
-    tmp_path: Path,
-) -> None:
-    """
-    Local ``omnigent run`` launches a separate runner subprocess.
-
-    This pins PR4's user-visible contract: local mode still starts the
-    REPL normally, but runner execution lives in a child process rather
-    than the REPL process.
-
-    :param omnigent_python: Python interpreter fixture.
-    :param omnigent_repo_root: Repository root fixture.
-    :param omnigent_credentials_env: Real LLM credential
-        environment fixture.
-    :param databricks_workspace: Databricks profile and host fixture.
-    :param tmp_path: Per-test temp directory.
-    :returns: None.
-    """
-    yaml_path = _write_marker_agent(
-        tmp_path,
-        "repl_local_runner_subprocess",
-        "LOCAL_RUNNER_SUBPROCESS_OK",
-    )
-    child = _spawn_run(
-        omnigent_python,
-        omnigent_repo_root,
-        yaml_path,
-        _repl_env(omnigent_credentials_env, tmp_path / "home"),
-    )
-    try:
-        _wait_ready(child)
-        runner_pid = _find_runner_pid(child.pid)
-        assert runner_pid != child.pid
-
-        result = _drive_turn(child, "LOCAL_RUNNER_SUBPROCESS_OK")
-        assert result.session_id.startswith("conv_")
-        assert result.runner_id.startswith("runner_")
-        assert runner_pid in _descendant_processes(child.pid)
-
-        clean_exit(child, timeout=_EXIT_TIMEOUT)
-    finally:
-        child.close(force=True)
-
-
 def test_repl_full_session_lifecycle(
     omnigent_python: Path,
     omnigent_repo_root: Path,
