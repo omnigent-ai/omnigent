@@ -332,8 +332,10 @@ jobs:
 
           # Strip any sub-agent coordination preamble that leaks before
           # the actual review.  Primary: look for the sentinel we asked the
-          # model to emit.  Fallback: first markdown heading or standalone
-          # horizontal rule.
+          # model to emit.  Fallback: first markdown heading.  If neither is
+          # found the output is intermediate narration (subagents timed out
+          # before synthesis) — write empty string so the post step is skipped
+          # and raw coordination messages are never posted as a PR comment.
           python3 -c "
           import re, pathlib
           raw = pathlib.Path('/tmp/polly_output.txt').read_text()
@@ -342,8 +344,8 @@ jobs:
           if idx >= 0:
               cleaned = raw[idx + len(sentinel):].lstrip('\n')
           else:
-              m = re.search(r'^(#{1,6} |---\s*$)', raw, re.MULTILINE)
-              cleaned = raw[m.start():] if m else raw
+              m = re.search(r'^#{1,6} ', raw, re.MULTILINE)
+              cleaned = raw[m.start():] if m else ''
           pathlib.Path('/tmp/polly_output.txt').write_text(cleaned)
           "
 
