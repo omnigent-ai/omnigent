@@ -72,11 +72,6 @@ skips:
     mode: skip
 
 
-  - id: tests/e2e/omnigent/test_repl_model_e2e.py::test_repl_model_command_show_set_reset
-    reason: "REPL pexpect TIMEOUT post-path-fix: /model success line not appearing in pexpect after Rich markup output. Needs REPL output-capture investigation."
-    issue: 523
-    cluster: repl-pexpect-cli
-    mode: skip
 
   - id: tests/e2e/omnigent/test_repl_overview_terminal_visibility.py::test_repl_overview_terminal_visibility
     reason: "REPL pexpect TIMEOUT post-path-fix. Same family as test_repl_ctrl_o_overview (opens the debug overview)."
