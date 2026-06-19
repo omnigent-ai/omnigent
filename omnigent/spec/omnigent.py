@@ -1098,20 +1098,6 @@ def agent_def_to_agent_spec(
             )
             agent_tool_names.append(tool_name)
         elif isinstance(tool, AgentTool):
-            # Extract the raw executor dict for this tool so auth.base_url
-            # (and other raw-YAML-only fields like use_responses) propagate
-            # into the child spec. The omnigent AgentTool dataclass does not
-            # model auth, so parsing silently drops it; reading back from the
-            # raw YAML dict is the only way to recover it.
-            raw_tool_executor: dict[str, Any] | None = None
-            if raw_yaml is not None:
-                raw_tools = raw_yaml.get("tools")
-                if isinstance(raw_tools, dict):
-                    raw_tool = raw_tools.get(tool_name)
-                    if isinstance(raw_tool, dict):
-                        _candidate = raw_tool.get("executor")
-                        if isinstance(_candidate, dict):
-                            raw_tool_executor = _candidate
             sub_agents.append(
                 _agent_tool_to_sub_spec(
                     tool_name,
@@ -1126,7 +1112,6 @@ def agent_def_to_agent_spec(
                     # "supervisor delegates terminal work to
                     # workers" pattern.
                     parent_terminals=agent_def.terminals,
-                    raw_executor=raw_tool_executor,
                 ),
             )
             agent_tool_names.append(tool_name)
@@ -1331,7 +1316,6 @@ def _agent_tool_to_sub_spec(
     parent_harness: str | None = None,
     parent_os_env: OSEnvSpec | None = None,
     parent_terminals: dict[str, TerminalEnvSpec] | None = None,
-    raw_executor: dict[str, Any] | None = None,
 ) -> AgentSpec:
     """
     Translate an omnigent inline :class:`AgentTool` (sub-agent
@@ -1452,7 +1436,6 @@ def _agent_tool_to_sub_spec(
             oa_executor,
             parent_profile=parent_profile,
             parent_harness=parent_harness,
-            raw_executor=raw_executor,
         ),
         os_env=sub_os_env,
         terminals=sub_terminals,
@@ -1782,14 +1765,18 @@ def _translate_executor_from_def(
     # ``spec.executor.config["use_responses"]`` to set
     # ``HARNESS_OPENAI_AGENTS_USE_RESPONSES``, which controls
     # whether the inner executor uses /responses or /chat/completions.
-    auth: ApiKeyAuth | DatabricksAuth | None = None
+    # ``use_responses`` is carried via raw_executor when present
     if raw_executor is not None:
         use_responses_raw = raw_executor.get("use_responses")
         if use_responses_raw is not None:
             config["use_responses"] = bool(use_responses_raw)
-        # ``auth:`` is also not in the omnigent datamodel — parse it
-        # directly from the raw YAML so YAML-declared auth is not
-        # silently dropped and overridden by the global config default.
+    # ``auth`` is now parsed by the loader into OmniExecutorSpec.auth;
+    # fall back to raw_executor for the top-level agent path that still
+    # goes through _translate_executor_from_def(raw_executor=...).
+    auth: ApiKeyAuth | DatabricksAuth | None = None
+    if oa_executor is not None and oa_executor.auth is not None:
+        auth = oa_executor.auth  # type: ignore[assignment]
+    elif raw_executor is not None:
         from omnigent.spec.parser import _parse_executor_auth
 
         auth = _parse_executor_auth(raw_executor)
