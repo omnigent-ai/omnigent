@@ -75,7 +75,7 @@ def _connect_env(base_env: Mapping[str, str], home: Path) -> dict[str, str]:
     keeping the test from touching the developer's real local server.
 
     :param base_env: Fixture-provided credentials environment, e.g.
-        ``omnigent_credentials_env``.
+        ``mock_credentials_env``.
     :param home: Isolated HOME for this test's runtime data.
     :returns: Environment dict for ``pexpect.spawn``.
     """
@@ -258,8 +258,7 @@ def _prespawn_persistent_server(
 def test_host_ctrl_c_yes_stops_local_server(
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    omnigent_credentials_env: dict[str, str],
-    databricks_workspace: tuple[str, str],
+    mock_credentials_env: dict[str, str],
     tmp_path: Path,
 ) -> None:
     """
@@ -267,13 +266,12 @@ def test_host_ctrl_c_yes_stops_local_server(
 
     :param omnigent_python: Python interpreter fixture.
     :param omnigent_repo_root: Repo root fixture (subprocess cwd).
-    :param omnigent_credentials_env: Real credential environment fixture.
-    :param databricks_workspace: ``(profile, host)`` fixture.
+    :param mock_credentials_env: Mock-LLM credential environment fixture.
     :param tmp_path: Per-test temp directory.
     :returns: None.
     """
     home = tmp_path / "home"
-    env = _connect_env(omnigent_credentials_env, home)
+    env = _connect_env(mock_credentials_env, home)
     child = _spawn_connect(omnigent_python, omnigent_repo_root, env)
     server_pid = -1
     try:
@@ -307,8 +305,7 @@ def test_host_ctrl_c_yes_stops_local_server(
 def test_host_ctrl_c_no_leaves_local_server_running(
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    omnigent_credentials_env: dict[str, str],
-    databricks_workspace: tuple[str, str],
+    mock_credentials_env: dict[str, str],
     tmp_path: Path,
 ) -> None:
     """
@@ -320,13 +317,12 @@ def test_host_ctrl_c_no_leaves_local_server_running(
 
     :param omnigent_python: Python interpreter fixture.
     :param omnigent_repo_root: Repo root fixture (subprocess cwd).
-    :param omnigent_credentials_env: Real credential environment fixture.
-    :param databricks_workspace: ``(profile, host)`` fixture.
+    :param mock_credentials_env: Mock-LLM credential environment fixture.
     :param tmp_path: Per-test temp directory.
     :returns: None.
     """
     home = tmp_path / "home"
-    env = _connect_env(omnigent_credentials_env, home)
+    env = _connect_env(mock_credentials_env, home)
     child = _spawn_connect(omnigent_python, omnigent_repo_root, env)
     server_pid = -1
     try:
@@ -359,8 +355,7 @@ def test_host_ctrl_c_no_leaves_local_server_running(
 def test_host_ctrl_c_reused_server_shows_no_prompt(
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    omnigent_credentials_env: dict[str, str],
-    databricks_workspace: tuple[str, str],
+    mock_credentials_env: dict[str, str],
     tmp_path: Path,
 ) -> None:
     """
@@ -374,13 +369,12 @@ def test_host_ctrl_c_reused_server_shows_no_prompt(
 
     :param omnigent_python: Python interpreter fixture.
     :param omnigent_repo_root: Repo root fixture (subprocess cwd).
-    :param omnigent_credentials_env: Real credential environment fixture.
-    :param databricks_workspace: ``(profile, host)`` fixture.
+    :param mock_credentials_env: Mock-LLM credential environment fixture.
     :param tmp_path: Per-test temp directory.
     :returns: None.
     """
     home = tmp_path / "home"
-    env = _connect_env(omnigent_credentials_env, home)
+    env = _connect_env(mock_credentials_env, home)
 
     # Bring the server up first, independently of connect, with a config
     # signature that matches what connect will compute — so connect reuses it.

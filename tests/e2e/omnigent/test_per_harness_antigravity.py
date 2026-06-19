@@ -22,6 +22,16 @@ backend-native SDK harness): because a Gemini key is not provisioned on CI, the
 test **skips** (rather than fails) when no key is present, so the e2e shards stay
 green; it runs for real wherever a key is configured.
 
+**Why this test cannot use the mock LLM server:** The ``google-antigravity``
+SDK has no OpenAI-compatible ``base_url`` and no Databricks-gateway path.
+Setting ``OPENAI_BASE_URL`` to the mock server has no effect on this harness —
+the SDK always connects directly to Google's Gemini backend using the Gemini
+API key. There is no intercept point equivalent to ``OPENAI_BASE_URL`` in the
+Gemini SDK, so the mock-LLM approach used by other harness tests (e.g.
+``test_per_harness_openai_agents.py``) cannot be applied here. The
+``pytest.skip`` in :func:`_antigravity_skip_reason` gates each test cleanly
+when the SDK or key is absent.
+
 **Prerequisites (skipped cleanly when absent):**
 - ``google.antigravity`` importable in the Omnigent venv (the ``antigravity``
   extra — ``pip install 'omnigent[antigravity]'``).

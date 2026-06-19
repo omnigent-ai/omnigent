@@ -39,6 +39,15 @@ Three properties are covered, all against STABLE-on-main behavior:
   / ``omnigent_credentials_env`` — a missing key is a clean SKIP so the e2e
   shards stay green, and it runs for real wherever a key is present.
 
+**Why this test cannot use the mock LLM server:** The ``google-antigravity``
+SDK has no OpenAI-compatible ``base_url`` and no Databricks-gateway path.
+Setting ``OPENAI_BASE_URL`` to the mock server has no effect on this harness —
+the SDK always connects directly to Google's Gemini backend. Furthermore,
+assertions 2 and 3 verify the lifecycle of a real native ``localharness``
+binary process; a mock LLM could not exercise this at all. The ``pytest.skip``
+in the :func:`antigravity_runnable` fixture gates cleanly when the SDK or key
+is absent.
+
 .. note::
    **glibc >= ~2.36 caveat.** The native ``localharness`` binary is linked
    against a recent glibc (needs ``GLIBC_ABI_DT_RELR``). On an older host (e.g.
