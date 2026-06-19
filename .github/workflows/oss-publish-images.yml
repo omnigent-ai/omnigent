@@ -164,6 +164,7 @@ jobs:
 
       # No build-args: the Dockerfile ARGs default to public registries.
       - name: Build and push
+        id: build-server
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
         with:
           context: .
@@ -179,6 +180,7 @@ jobs:
       # Host image: same Dockerfile, `host` target. Runs after the server build
       # so it reuses the shared builder-stage layers from the gha cache.
       - name: Build and push host image
+        id: build-host
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
         with:
           context: .
@@ -191,6 +193,55 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: false
           sbom: true
+    outputs:
+      server-digest: ${{ steps.build-server.outputs.digest }}
+      host-digest: ${{ steps.build-host.outputs.digest }}
+
+  generate-sbom:
+    # Runs in a separate job with read-only permissions so the Syft
+    # install script cannot influence the image push. Scans the
+    # already-pushed images by digest (immutable).
+    needs: build-and-push
+    permissions:
+      contents: read
+      packages: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Log in to GHCR (read-only)
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@fc46e51fd3cb168ffb36c6d1915723c47db58abb  # v0.17.7
+
+      - name: Generate server SBOM
+        run: |
+          set -euo pipefail
+          syft "ghcr.io/omnigent-ai/omnigent-server@${{ needs.build-and-push.outputs.server-digest }}" \
+            -o cyclonedx-json=server-sbom.cdx.json \
+            -o spdx-json=server-sbom.spdx.json
+
+      - name: Generate host SBOM
+        run: |
+          set -euo pipefail
+          syft "ghcr.io/omnigent-ai/omnigent-host@${{ needs.build-and-push.outputs.host-digest }}" \
+            -o cyclonedx-json=host-sbom.cdx.json \
+            -o spdx-json=host-sbom.spdx.json
+
+      - name: Upload SBOMs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: sbom
+          path: |
+            server-sbom.cdx.json
+            server-sbom.spdx.json
+            host-sbom.cdx.json
+            host-sbom.spdx.json
+          retention-days: 90
 
   promote-nightly:
     # Daily cron (or a manual force_nightly dispatch): move :latest-nightly to
