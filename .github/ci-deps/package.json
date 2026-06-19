@@ -5,6 +5,6 @@
   "description": "Pinned npm CLIs the e2e workflow installs (claude-code, codex).",
   "dependencies": {
     "@anthropic-ai/claude-code": "2.1.124",
-    "@openai/codex": "0.128.0-alpha.1"
+    "@openai/codex": "0.139.0"
   }
 }
