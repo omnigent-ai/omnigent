@@ -2502,6 +2502,14 @@ async def _auto_create_claude_terminal(
         # configuration rather than inheriting it from the runner.
         env_unset=["DATABRICKS_CONFIG_PROFILE"],
         scrollback=50000,
+        # Keep the private tmux server alive if the `claude` CLI exits (e.g. a
+        # sub-agent worker whose CLI exits right after rendering its prompt on
+        # some hosts — #540). Without this, that exit reaps the server and every
+        # later control command (send-keys / model / effort / interrupt / stop)
+        # fails with "no server running", and the delegated message is silently
+        # lost. With it, the dead pane persists (capturable for diagnostics) and
+        # the watcher reports the exit deterministically via `#{pane_dead}`.
+        keep_alive_after_exit=True,
     )
     _logger.info(
         "Claude terminal tmux launch requested: session=%s command=%s args_count=%d "
