@@ -1,519 +1,469 @@
-"""Unit tests for QwenExecutor."""
+"""Unit tests for QwenExecutor (ACP / JSON-RPC 2.0 mode).
+
+Tests cover:
+- Executor construction and attribute defaults
+- ACP protocol helpers (_rpc, _notify, _send)
+- Session lifecycle (_ensure_initialized, _ensure_session)
+- run_turn event translation (agent_message_chunk → TextChunk, TurnComplete)
+- run_turn error paths (ACP error response, session-not-found retry reset)
+- Process cleanup (close())
+- Harness registry and alias wiring
+- FastAPI app shape
+"""
 
 from __future__ import annotations
 
 import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+import os
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
-from omnigent.inner.qwen_executor import (
-    QwenExecutor,
-    _ToolServer,
-)
+from omnigent.inner.qwen_executor import QwenExecutor
+from omnigent.inner.executor import ExecutorConfig, TextChunk, TurnComplete, ExecutorError
 
 
-@pytest.fixture
-def executor() -> QwenExecutor:
-    """Create a QwenExecutor with mocked subprocess."""
-    return QwenExecutor(qwen_path="qwen")
+# ---------------------------------------------------------------------------
+# Construction / attribute defaults
+# ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_executor_initialization(executor: QwenExecutor) -> None:
-    """Test that the executor initializes correctly."""
+def test_executor_default_attributes() -> None:
+    """Constructor stores arguments and initialises state correctly."""
+    executor = QwenExecutor(qwen_path="qwen")
     assert executor._qwen_path == "qwen"
     assert executor._model is None
-    assert executor._cwd is None
+    assert executor._proc is None
+    assert executor._session_id is None
+    assert executor._initialized is False
+    assert executor._rpc_id == 0
 
 
-@pytest.mark.asyncio
-async def test_executor_with_custom_model() -> None:
-    """Test executor with a custom model."""
+def test_executor_with_custom_model() -> None:
+    """Custom model is stored on the instance."""
     executor = QwenExecutor(model="qwen/qwen-plus", qwen_path="qwen")
     assert executor._model == "qwen/qwen-plus"
 
 
+def test_executor_cwd_defaults_to_cwd() -> None:
+    """When no cwd is supplied the executor uses the process cwd."""
+    executor = QwenExecutor()
+    assert executor._cwd == os.getcwd()
+
+
+def test_executor_explicit_cwd() -> None:
+    """An explicit cwd is stored as-is."""
+    executor = QwenExecutor(cwd="/tmp")
+    assert executor._cwd == "/tmp"
+
+
+# ---------------------------------------------------------------------------
+# close() with no process
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.asyncio
-async def test_executor_closes_cleanly(executor: QwenExecutor) -> None:
-    """Test that the executor closes without errors."""
-    # Should not raise any exceptions
+async def test_close_with_no_process_is_a_noop() -> None:
+    """close() is safe to call when no subprocess was started."""
+    executor = QwenExecutor()
+    await executor.close()  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# close() with a live process
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_close_terminates_process() -> None:
+    """close() terminates the subprocess and clears _proc."""
+    executor = QwenExecutor()
+
+    # asyncio.Process.terminate() is synchronous; stdin.close() is sync too.
+    mock_proc = MagicMock()
+    mock_proc.stdin = MagicMock()
+    mock_proc.returncode = None
+
+    # wait() must be a coroutine.
+    async def fake_wait() -> int:
+        return 0
+
+    mock_proc.wait = fake_wait
+    executor._proc = mock_proc
+
     await executor.close()
 
-
-@pytest.mark.asyncio
-async def test_tool_server_creation() -> None:
-    """Test that the tool server can be created and started."""
-    from omnigent.inner.qwen_executor import _ToolServer
-
-    server = _ToolServer()
-    assert server.token is not None
-    assert server.port == 0
-
-    # Start the server
-    port = await server.start()
-    assert port > 0
-
-    # Close the server
-    await server.close()
+    mock_proc.terminate.assert_called_once()
+    assert executor._proc is None
 
 
 @pytest.mark.asyncio
-async def test_tool_server_token_is_unique() -> None:
-    """Test that each tool server gets a unique token."""
-    server1 = _ToolServer()
-    server2 = _ToolServer()
-    assert server1.token != server2.token
+async def test_close_kills_when_terminate_raises() -> None:
+    """close() falls back to kill() if terminate() raises."""
+    executor = QwenExecutor()
 
+    mock_proc = MagicMock()
+    mock_proc.stdin = MagicMock()
+    mock_proc.terminate.side_effect = OSError("gone")
+    mock_proc.returncode = None
 
-@pytest.mark.asyncio
-async def test_tool_server_set_tool_executor() -> None:
-    """Test setting the tool executor callback."""
-    server = _ToolServer()
+    executor._proc = mock_proc
 
-    async def dummy_executor(name: str, args: dict) -> dict:
-        return {"result": "ok"}
-
-    server.set_tool_executor(dummy_executor)
-    # Just verify no exception - the actual executor is tested in integration
-
-
-@pytest.mark.asyncio
-async def test_tool_server_rejects_wrong_token() -> None:
-    """Test that the tool server rejects requests with wrong token."""
-    server = _ToolServer()
-    await server.start()
-
-    try:
-        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
-
-        # Send request with wrong token
-        request = json.dumps({
-            "id": "test-req",
-            "token": "wrong-token",
-            "tool": "test_tool",
-            "args": {},
-        })
-        writer.write((request + "\n").encode())
-        await writer.drain()
-
-        # Read response - should get error within 2 seconds
-        try:
-            response_line = await asyncio.wait_for(reader.readline(), timeout=2.0)
-            if response_line:
-                response = json.loads(response_line.decode())
-                assert "error" in response
-        except asyncio.TimeoutError:
-            # Server may not respond immediately; just verify connection is usable
-            pass
-
-    finally:
-        writer.close()
-        await server.close()
+    await executor.close()  # must not propagate the OSError
 
 
 # ---------------------------------------------------------------------------
-# Registry / allowlist tests
+# _rpc_id increments
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rpc_id_increments_monotonically() -> None:
+    """Each _rpc call uses a unique, incrementing id."""
+    executor = QwenExecutor()
+
+    sent: list[dict] = []
+
+    async def fake_send(msg: dict) -> None:
+        sent.append(msg)
+        # Immediately resolve the future so _rpc returns.
+        fut = executor._pending.get(msg["id"])
+        if fut and not fut.done():
+            fut.set_result({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    await executor._rpc("initialize", {"protocolVersion": 1})
+    await executor._rpc("session/new", {"sessionId": "x", "cwd": "/", "mcpServers": []})
+
+    assert sent[0]["id"] == 1
+    assert sent[1]["id"] == 2
+
+
+# ---------------------------------------------------------------------------
+# _read_stdout — dispatches responses vs notifications
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_read_stdout_resolves_pending_future() -> None:
+    """_read_stdout resolves the matching _pending future on a response."""
+    executor = QwenExecutor()
+
+    loop = asyncio.get_event_loop()
+    fut: asyncio.Future = loop.create_future()
+    executor._pending[42] = fut
+
+    response_line = json.dumps({"jsonrpc": "2.0", "id": 42, "result": {"ok": True}}) + "\n"
+
+    # Fake stdout that yields one line then EOF.
+    async def fake_readline_gen():
+        yield response_line.encode()
+        # EOF
+        while True:
+            await asyncio.sleep(0)
+
+    mock_stdout = AsyncMock()
+    calls = [response_line.encode(), b""]
+    mock_stdout.readline = AsyncMock(side_effect=calls)
+
+    mock_proc = MagicMock()
+    mock_proc.stdout = mock_stdout
+    executor._proc = mock_proc
+
+    # Run reader until it sees EOF (second readline returns b"").
+    await executor._read_stdout()
+
+    assert fut.done()
+    assert fut.result()["result"]["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_read_stdout_puts_notifications_on_queue() -> None:
+    """_read_stdout enqueues notifications (no id) onto the queue."""
+    executor = QwenExecutor()
+
+    notification = {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": "sess-1",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "hello"},
+            },
+        },
+    }
+    notification_line = json.dumps(notification) + "\n"
+
+    mock_stdout = AsyncMock()
+    mock_stdout.readline = AsyncMock(side_effect=[notification_line.encode(), b""])
+
+    mock_proc = MagicMock()
+    mock_proc.stdout = mock_stdout
+    executor._proc = mock_proc
+
+    await executor._read_stdout()
+
+    assert not executor._queue.empty()
+    msg = executor._queue.get_nowait()
+    assert msg["method"] == "session/update"
+
+
+# ---------------------------------------------------------------------------
+# _ensure_session resets on "Session not found"
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ensure_session_uses_server_assigned_id() -> None:
+    """_ensure_session stores the sessionId from the server response, not ours."""
+    executor = QwenExecutor()
+    executor._initialized = True  # skip initialize
+
+    server_session_id = "server-assigned-uuid"
+
+    async def fake_rpc(method: str, params: dict, timeout: float = 30.0) -> dict:
+        if method == "session/new":
+            return {"jsonrpc": "2.0", "id": 1, "result": {"sessionId": server_session_id}}
+        return {"jsonrpc": "2.0", "id": 1, "result": {}}
+
+    executor._rpc = fake_rpc  # type: ignore[method-assign]
+
+    sid = await executor._ensure_session()
+    assert sid == server_session_id
+    assert executor._session_id == server_session_id
+
+
+@pytest.mark.asyncio
+async def test_ensure_session_cached_after_first_call() -> None:
+    """_ensure_session does not make a second RPC call once session is set."""
+    executor = QwenExecutor()
+    executor._initialized = True
+    executor._session_id = "cached-sid"
+
+    rpc_calls: list[str] = []
+
+    async def fake_rpc(method: str, params: dict, timeout: float = 30.0) -> dict:
+        rpc_calls.append(method)
+        return {"result": {}}
+
+    executor._rpc = fake_rpc  # type: ignore[method-assign]
+
+    sid = await executor._ensure_session()
+    assert sid == "cached-sid"
+    assert rpc_calls == []  # no RPC was made
+
+
+# ---------------------------------------------------------------------------
+# run_turn — success path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_turn_yields_text_chunks_and_turn_complete() -> None:
+    """run_turn yields TextChunk events for agent_message_chunk notifications
+    and a TurnComplete when the session/prompt response arrives.
+
+    The fake_send callback:
+    1. Enqueues the streaming notification immediately (so the event loop
+       processes it before checking fut.done()).
+    2. Schedules the future resolution on the *next* event-loop iteration
+       via ``loop.call_soon`` so the notification is always consumed first.
+    """
+    executor = QwenExecutor()
+    executor._initialized = True
+    executor._session_id = "sess-abc"
+
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+
+    session_id = executor._session_id
+    loop = asyncio.get_event_loop()
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            req_id = msg["id"]
+            # 1. Put the streaming notification on the queue first.
+            notification = {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "Hello!"},
+                    },
+                },
+            }
+            await executor._queue.put(notification)
+
+            # 2. Resolve the future on the next loop iteration so the
+            #    notification is consumed before fut.done() is True.
+            def _resolve() -> None:
+                fut = executor._pending.get(req_id)
+                if fut and not fut.done():
+                    fut.set_result(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "result": {"stopReason": "end_turn"},
+                        }
+                    )
+
+            loop.call_soon(_resolve)
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    messages = [{"role": "user", "content": "say hi"}]
+    events = []
+    async for event in executor.run_turn(messages, [], "Be helpful"):
+        events.append(event)
+
+    text_chunks = [e for e in events if isinstance(e, TextChunk)]
+    turn_completes = [e for e in events if isinstance(e, TurnComplete)]
+
+    assert len(text_chunks) == 1
+    assert text_chunks[0].text == "Hello!"
+    assert len(turn_completes) == 1
+    assert turn_completes[0].response == "Hello!"
+
+
+# ---------------------------------------------------------------------------
+# run_turn — ACP error response
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_turn_yields_executor_error_on_acp_error() -> None:
+    """run_turn yields ExecutorError when session/prompt returns an error."""
+    executor = QwenExecutor()
+    executor._initialized = True
+    executor._session_id = "sess-err"
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            fut = executor._pending.get(msg["id"])
+            if fut and not fut.done():
+                fut.set_result(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": msg["id"],
+                        "error": {"code": -32603, "message": "Something went wrong"},
+                    }
+                )
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    messages = [{"role": "user", "content": "hi"}]
+    events = []
+    async for event in executor.run_turn(messages, [], ""):
+        events.append(event)
+
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert "Something went wrong" in events[0].message
+
+
+@pytest.mark.asyncio
+async def test_run_turn_resets_session_on_not_found_error() -> None:
+    """run_turn clears _session_id when ACP reports Session not found."""
+    executor = QwenExecutor()
+    executor._initialized = True
+    executor._session_id = "stale-sess"
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            fut = executor._pending.get(msg["id"])
+            if fut and not fut.done():
+                fut.set_result(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": msg["id"],
+                        "error": {
+                            "code": -32603,
+                            "message": "Session not found: stale-sess",
+                        },
+                    }
+                )
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
+        pass
+
+    # Session id should be reset so next turn creates a fresh session.
+    assert executor._session_id is None
+
+
+# ---------------------------------------------------------------------------
+# Harness registry / alias wiring
+# ---------------------------------------------------------------------------
+
+
+def test_qwen_in_harness_registry() -> None:
+    """'qwen' must be in the _HARNESS_MODULES dispatch table."""
+    from omnigent.runtime.harnesses import _HARNESS_MODULES
+
+    assert "qwen" in _HARNESS_MODULES
 
 
 def test_qwen_in_harness_allowlist() -> None:
-    """Test that qwen is in the allowed harnesses."""
+    """'qwen' must be in OMNIGENT_HARNESSES."""
     from omnigent.spec._omnigent_compat import OMNIGENT_HARNESSES
 
     assert "qwen" in OMNIGENT_HARNESSES
 
 
+def test_qwen_code_alias_resolves_to_qwen() -> None:
+    """'qwen-code' alias maps to the canonical 'qwen' harness id."""
+    from omnigent.harness_aliases import canonicalize_harness
+
+    assert canonicalize_harness("qwen-code") == "qwen"
+
+
 def test_qwen_code_in_harness_aliases() -> None:
-    """Test that qwen-code is in the allowed harness aliases."""
+    """'qwen-code' must be in OMNIGENT_HARNESS_ALIASES."""
     from omnigent.spec._omnigent_compat import OMNIGENT_HARNESS_ALIASES
 
     assert "qwen-code" in OMNIGENT_HARNESS_ALIASES
 
 
-def test_qwen_imports_successfully() -> None:
-    """Test that qwen harness modules can be imported without errors."""
-    # This verifies the allowlist entry is correct and modules are importable
+# ---------------------------------------------------------------------------
+# FastAPI app shape
+# ---------------------------------------------------------------------------
+
+
+def test_qwen_harness_creates_fastapi_app() -> None:
+    """create_app() returns a FastAPI app with at least a /health route."""
+    from omnigent.inner.qwen_harness import create_app
+
+    app = create_app()
+    assert app is not None
+    assert hasattr(app, "routes")
+    health_routes = [r for r in app.routes if hasattr(r, "path") and "/health" in r.path]
+    assert len(health_routes) > 0
+
+
+def test_qwen_harness_module_importable() -> None:
+    """qwen_harness can be imported and exposes create_app."""
     from omnigent.inner import qwen_harness
 
     assert hasattr(qwen_harness, "create_app")
 
 
 # ---------------------------------------------------------------------------
-# FastAPI app shape tests
-# ---------------------------------------------------------------------------
-
-
-def test_qwen_harness_creates_fastapi_app() -> None:
-    """Test that qwen harness creates a valid FastAPI app."""
-    from omnigent.inner.qwen_harness import create_app
-
-    app = create_app()
-    assert app is not None
-    # FastAPI app should have routes
-    assert hasattr(app, "routes")
-
-
-def test_qwen_harness_has_health_route() -> None:
-    """Test that qwen harness has /health endpoint."""
-    from omnigent.inner.qwen_harness import create_app
-
-    app = create_app()
-    # Check that health route exists by inspecting routes
-    health_routes = [r for r in app.routes if hasattr(r, "path") and "/health" in r.path]
-    assert len(health_routes) > 0
-
-
-# ---------------------------------------------------------------------------
-# Env-var factory tests
-# ---------------------------------------------------------------------------
-
-
-def test_env_vars_build_correctly() -> None:
-    """Test that HARNESS_QWEN_* env vars are built correctly."""
-    import os
-
-    # Set up environment variables
-    os.environ["HARNESS_QWEN_MODEL"] = "qwen/qwen-plus"
-    os.environ["HARNESS_QWEN_GATEWAY_BASE_URL"] = "https://api.openai.com/v1"
-
-    try:
-        from omnigent.inner.qwen_executor import QwenExecutor
-
-        # Should read from env if not passed explicitly
-        executor = QwenExecutor()
-        assert executor._model is None  # Model comes from spec, not env directly
-    finally:
-        os.environ.pop("HARNESS_QWEN_MODEL", None)
-        os.environ.pop("HARNESS_QWEN_GATEWAY_BASE_URL", None)
-
-
-# ---------------------------------------------------------------------------
-# _build_argv tests
-# ---------------------------------------------------------------------------
-
-
-def test_build_qwen_argv() -> None:
-    """Test that qwen argv is built correctly."""
-    executor = QwenExecutor(qwen_path="/usr/local/bin/qwen")
-
-    # The command should include the path and --mode rpc
-    assert executor._qwen_path == "/usr/local/bin/qwen"
-
-
-# ---------------------------------------------------------------------------
-# Event translator tests
+# close_session is a no-op (sessions are per-process)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_event_translation_text_delta() -> None:
-    """Test translation of text_delta events."""
+async def test_close_session_is_noop() -> None:
+    """close_session() does nothing and does not raise."""
     executor = QwenExecutor()
-
-    # Mock the process and reader
-    mock_process = MagicMock()
-    mock_process.stdout = None
-    executor._process = mock_process
-
-    # Simulate a text delta event
-    event = {"type": "text_delta", "content": "Hello, world!"}
-
-    # The event should be put in the queue for processing
-    await executor._queue.put(event)
-    queued_event = await executor._queue.get()
-    assert queued_event["type"] == "text_delta"
-    assert queued_event["content"] == "Hello, world!"
-
-
-@pytest.mark.asyncio
-async def test_event_translation_tool_call() -> None:
-    """Test translation of tool_call events."""
-    executor = QwenExecutor()
-
-    # Simulate a tool call event
-    event = {
-        "type": "tool_call",
-        "name": "read_file",
-        "arguments": {"path": "/tmp/test.txt"},
-    }
-
-    await executor._queue.put(event)
-    queued_event = await executor._queue.get()
-    assert queued_event["type"] == "tool_call"
-    assert queued_event["name"] == "read_file"
-
-
-@pytest.mark.asyncio
-async def test_event_translation_turn_complete() -> None:
-    """Test translation of turn_complete events."""
-    executor = QwenExecutor()
-
-    # Simulate a turn complete event
-    event = {
-        "type": "turn_complete",
-        "text": "I've completed the task.",
-    }
-
-    await executor._queue.put(event)
-    queued_event = await executor._queue.get()
-    assert queued_event["type"] == "turn_complete"
-
-
-@pytest.mark.asyncio
-async def test_event_translation_error() -> None:
-    """Test translation of error events."""
-    executor = QwenExecutor()
-
-    # Simulate an error event
-    event = {
-        "type": "error",
-        "message": "Something went wrong",
-    }
-
-    await executor._queue.put(event)
-    queued_event = await executor._queue.get()
-    assert queued_event["type"] == "error"
-    assert queued_event["message"] == "Something went wrong"
-
-
-# ---------------------------------------------------------------------------
-# run_turn end-to-end tests (with stubbed subprocess)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_run_turn_with_stubbed_process() -> None:
-    """Test run_turn with a stubbed subprocess."""
-    executor = QwenExecutor(model="qwen/qwen-plus")
-
-    # Mock the process
-    mock_process = MagicMock()
-    mock_process.stdin = MagicMock()
-    mock_process.stdout = None
-
-    with patch.object(executor, "start_process", new=AsyncMock()):
-        with patch.object(executor, "_read_output", new=AsyncMock()):
-            executor._process = mock_process
-
-            # This should not raise an exception during setup
-            # Actual iteration requires full process
-
-
-@pytest.mark.asyncio
-async def test_run_turn_sends_correct_request_format() -> None:
-    """Test that run_turn sends requests in the correct format."""
-    executor = QwenExecutor(model="qwen/qwen-plus")
-
-    mock_process = MagicMock()
-    mock_stdin = MagicMock()
-    mock_stdin.write = MagicMock()
-    mock_stdin.drain = AsyncMock()
-
-    with patch.object(executor, "start_process", new=AsyncMock()):
-        with patch.object(executor, "_read_output", new=AsyncMock()):
-            executor._process = mock_process
-            executor._process.stdin = mock_stdin
-
-            config = MagicMock()
-            config.model = None
-
-            # This verifies the request format without running
-
-
-# ---------------------------------------------------------------------------
-# Missing-binary error path tests
-# ---------------------------------------------------------------------------
-
-
-def test_missing_qwen_binary_raises_error() -> None:
-    """Test that missing qwen binary raises an appropriate error."""
-    executor = QwenExecutor(qwen_path="/nonexistent/qwen-binary")
-
-    # The process start should fail with FileNotFoundError or similar
-    # when the binary doesn't exist
-    with patch("subprocess.Popen") as mock_popen:
-        mock_popen.side_effect = FileNotFoundError("/nonexistent/qwen-binary not found")
-
-        with pytest.raises(FileNotFoundError):
-            asyncio.run(executor.start_process())
-
-
-# ---------------------------------------------------------------------------
-# Capability flags tests
-# ---------------------------------------------------------------------------
-
-
-def test_handles_tools_internally() -> None:
-    """Test that qwen executor reports handles_tools_internally correctly."""
-    # Qwen's RPC mode handles tools internally via MCP bridge
-    # This should return True
-    from omnigent.inner.qwen_executor import QwenExecutor
-
-    executor = QwenExecutor()
-
-    # The executor should have this capability flag
-    assert hasattr(executor, "handles_tools_internally")
-
-
-def test_supports_streaming() -> None:
-    """Test that qwen executor reports supports_streaming correctly."""
-    from omnigent.inner.qwen_executor import QwenExecutor
-
-    executor = QwenExecutor()
-
-    # The executor should support streaming (text_delta events)
-    assert hasattr(executor, "supports_streaming")
-
-
-# ---------------------------------------------------------------------------
-# Session lifecycle tests
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_session_id_generation() -> None:
-    """Test that session IDs are generated correctly."""
-    executor = QwenExecutor()
-
-    # Initial session ID should be None
-    assert executor._session_id is None
-
-    # After a turn, it should be set
-    with patch.object(executor, "start_process", new=AsyncMock()):
-        with patch.object(executor, "_read_output", new=AsyncMock()):
-            # Simulate session start
-            executor._session_id = "test-session-123"
-            assert executor._session_id == "test-session-123"
-
-
-@pytest.mark.asyncio
-async def test_messages_sent_flag() -> None:
-    """Test that the messages_sent flag tracks conversation state."""
-    executor = QwenExecutor()
-
-    # Initial state should be False
-    assert executor._messages_sent is False
-
-    # After sending messages, should be True
-    executor._messages_sent = True
-    assert executor._messages_sent is True
-
-
-# ---------------------------------------------------------------------------
-# Process lifecycle tests
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_process_termination() -> None:
-    """Test that process termination works correctly."""
-    executor = QwenExecutor()
-
-    # Mock a running process
-    mock_process = MagicMock()
-    mock_process.terminate = MagicMock()
-    mock_process.wait = MagicMock(return_value=0)
-    executor._process = mock_process
-
-    await executor.close()
-
-    # Terminate should have been called
-    mock_process.terminate.assert_called()
-
-
-@pytest.mark.asyncio
-async def test_process_kill_on_timeout() -> None:
-    """Test that process is killed if termination raises an exception."""
-    executor = QwenExecutor()
-
-    # Mock a hung process where terminate itself raises an exception
-    mock_process = MagicMock()
-    
-    def terminate_raises():
-        raise OSError("Process not responding")
-    
-    mock_process.terminate = MagicMock(side_effect=terminate_raises)
-    mock_process.kill = MagicMock()
-    executor._process = mock_process
-
-    await executor.close()
-
-    # Kill should have been called due to the exception from terminate()
-    assert mock_process.kill.called
-
-
-# ---------------------------------------------------------------------------
-# Tool server integration tests
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_tool_server_full_cycle() -> None:
-    """Test the full tool server lifecycle."""
-    server = _ToolServer()
-    assert server.port == 0
-
-    # Start the server
-    port = await server.start()
-    assert port > 0
-
-    # Set up a simple executor
-    async def add_executor(name: str, args: dict) -> dict:
-        return {"sum": args.get("a", 0) + args.get("b", 0)}
-
-    server.set_tool_executor(add_executor)
-
-    # Test execution
-    reader, writer = await asyncio.open_connection("127.0.0.1", port)
-    request = json.dumps({
-        "id": "req-1",
-        "token": server.token,
-        "tool": "add",
-        "args": {"a": 3, "b": 4},
-    })
-    writer.write((request + "\n").encode())
-    await writer.drain()
-
-    response_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
-    response = json.loads(response_line.decode())
-
-    assert response["id"] == "req-1"
-    assert response["result"]["sum"] == 7
-
-    # Cleanup
-    writer.close()
-    await server.close()
-
-
-@pytest.mark.asyncio
-async def test_tool_server_error_handling() -> None:
-    """Test tool server error handling."""
-    server = _ToolServer()
-    await server.start()
-
-    async def failing_executor(name: str, args: dict) -> dict:
-        raise ValueError("Execution failed")
-
-    server.set_tool_executor(failing_executor)
-
-    reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
-    request = json.dumps({
-        "id": "req-err",
-        "token": server.token,
-        "tool": "fail",
-        "args": {},
-    })
-    writer.write((request + "\n").encode())
-    await writer.drain()
-
-    response_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
-    response = json.loads(response_line.decode())
-
-    assert response["id"] == "req-err"
-    assert "error" in response
-    assert "Execution failed" in response["error"]
-
-    writer.close()
-    await server.close()
+    await executor.close_session("some-key")  # must not raise

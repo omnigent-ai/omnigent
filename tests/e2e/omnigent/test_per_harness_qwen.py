@@ -8,10 +8,10 @@ in later phases to prove the integration preserves behavior for
 the qwen harness.
 
 **What breaks if this fails:**
-- Omnigent' ``QwenExecutor`` regresses (the ``qwen --mode rpc``
-  subprocess lifecycle, the JSONL event protocol).
-- The ``qwen`` CLI binary disappears from PATH or its
-  ``--mode rpc`` subcommand changes its startup contract.
+- Omnigent' ``QwenExecutor`` regresses (the ``qwen --acp``
+  subprocess lifecycle, the ACP JSON-RPC 2.0 event protocol).
+- The ``qwen`` CLI binary disappears from PATH or changes its
+  ``--acp`` startup contract.
 - ``omnigent.cli._run_agent`` for the ``-p`` one-shot path
   stops printing assistant text to stdout on turn complete.
 
@@ -42,7 +42,7 @@ _PROMPT = "say hi in 5 words"
 # response or a pure error banner.
 _MIN_ASSISTANT_CHARS = 4
 
-# Subprocess timeout. Qwen RPC mode spawns its own subprocess;
+# Subprocess timeout. Qwen ACP mode spawns its own subprocess;
 # 120s should be enough for init + first turn.
 _RUN_TIMEOUT_SEC = 120
 
