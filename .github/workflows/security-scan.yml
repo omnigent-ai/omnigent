@@ -22,22 +22,16 @@ name: Security Scan
 
 on:
   pull_request:
-    # labeled/unlabeled so applying or removing the maintainer skip label
-    # (skip-security-scan) re-runs the scan and flips this check.
+    # labeled/unlabeled so applying or removing the skip label
+    # (skip-security-scan) re-runs the scan and flips this check. The waiver is
+    # label-only (should-scan.sh): applying it needs Triage permission, so the
+    # label alone is the maintainer gate -- no separate approval, hence no
+    # pull_request_review trigger.
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
-  # A maintainer's approval is the OTHER half of the skip-security-scan waiver
-  # (the label alone is not maintainer-effective -- see should-scan.sh). Without
-  # this trigger a PR that is labeled FIRST and approved LATER never re-runs, so
-  # the stale failing check sticks. `submitted` flips the check once a maintainer
-  # approves; `dismissed` re-gates if that approval is later removed. should-scan.sh
-  # already accepts the pull_request_review payload (same pull_request +
-  # author_association fields), so no script change is needed.
-  pull_request_review:
-    types: [submitted, dismissed]
 
 permissions:
   contents: read
-  pull-requests: read   # read PR labels + reviews for the maintainer skip waiver
+  pull-requests: read   # read PR labels for the skip waiver
 
 concurrency:
   group: security-scan-${{ github.event.pull_request.number }}
@@ -53,7 +47,7 @@ jobs:
       UV_INDEX_URL: https://pypi.org/simple
     steps:
       - name: Check out scanner from main
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           ref: main             # trusted; never the PR head
           sparse-checkout: |
@@ -74,7 +68,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           AUTHOR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
-          # For the maintainer-effective skip-security-scan waiver (read-only).
+          # For the skip-security-scan label waiver + author check (read-only).
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
@@ -121,7 +115,7 @@ jobs:
 
       - name: Check out PR head for static analysis
         if: ${{ steps.gate.outputs.scan == 'true' }}
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}  # untrusted: only statically scanned
           path: pr
@@ -162,14 +156,14 @@ jobs:
 
       # Surfaced on ANY detector failure above (sensitive-path / secret / exfil
       # / workflow-misuse / semgrep): the detectors say WHAT they found; this
-      # says HOW a maintainer can waive it. The waiver needs BOTH a maintainer
-      # approval AND the label -- the label alone is not maintainer-effective
-      # (see should-scan.sh). Either action re-runs this scan via the labeled /
-      # pull_request_review triggers above.
+      # says HOW a maintainer can waive it. The waiver is label-only: applying
+      # the 'skip-security-scan' label needs Triage permission, so the label is
+      # itself the maintainer gate (see should-scan.sh). Applying it re-runs this
+      # scan via the labeled trigger above.
       - name: Explain the maintainer waiver (on failure)
         if: ${{ failure() }}
         run: |
-          MSG="A maintainer can skip the Security Scan by approving this PR AND applying the 'skip-security-scan' label (the label alone is not enough -- the author must be a maintainer or a maintainer must have approved). Either action re-runs this scan automatically."
+          MSG="A maintainer can skip the Security Scan by applying the 'skip-security-scan' label (this requires Triage permission, so a fork author cannot self-waive). Applying the label re-runs this scan automatically."
           echo "::error::$MSG"
           {
             echo "### Security Scan failed"

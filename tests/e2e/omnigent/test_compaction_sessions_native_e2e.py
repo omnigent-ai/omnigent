@@ -1,9 +1,32 @@
 """E2e compaction test for the sessions-native path.
 
 Uses pexpect to run multiple turns within a single ``omnigent run``
-session. With ``AP_CONTEXT_WINDOW_OVERRIDE=4096`` and
-``trigger_threshold=0.05`` (204 token budget), proactive compaction
-fires after the first verbose turn.
+session. With ``AP_CONTEXT_WINDOW_OVERRIDE=256`` the compaction budget
+(``0.8 * window`` ≈ 204 tokens) is tiny, so proactive compaction fires
+after the first verbose turn. The override is a runner-side budget knob
+only; it does not cap the harness API call, so the model still produces
+full verbose replies that grow the persisted history past the budget.
+
+Boot/turn synchronization and auth go through the shared
+``_pexpect_harness`` helpers (the same path every green REPL e2e test
+uses):
+
+- ``spawn_omnigent_run`` seeds a TUI theme so the first-run interactive
+  theme picker (which blocks on raw keypresses a pexpect child never
+  sends) doesn't sit in front of the REPL prompt, and symlinks the
+  Databricks auth files into the isolated test HOME so the openai-agents
+  harness authenticates (without this it 401s with "Invalid Token" /
+  "Credential was not sent" and never produces an assistant turn, so
+  history never grows and compaction can't fire).
+- ``wait_for_ready`` / ``await_turn_complete`` match the visible ``❯``
+  prompt and ``working`` activity line rather than the bottom-toolbar
+  ``state: sleeping`` badge, which prompt-toolkit fragments across
+  CPR/cursor-move sequences under a PTY (a literal ``sleeping`` substring
+  never appears, so a naive wait hangs until the boot timeout).
+
+``OMNIGENT_DATA_DIR`` isolates the runtime data dir (``chat.db`` + the
+per-test local server) so the test can inspect the persisted compaction
+item without touching the developer's ``~/.omnigent``.
 
 Run with::
 
@@ -12,20 +35,18 @@ Run with::
 
 from __future__ import annotations
 
-import contextlib
-import os
-import re
-import shutil
 import sqlite3
 import time
 from pathlib import Path
 
-import pexpect
-import pytest
-
 from tests._model_pools import resolve_model
-
-_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07")
+from tests.e2e.omnigent._pexpect_harness import (
+    await_turn_complete,
+    clean_exit,
+    spawn_omnigent_run,
+    submit_prompt,
+    wait_for_ready,
+)
 
 _COMPACTION_AGENT_YAML = """\
 name: compaction-e2e-test
@@ -33,7 +54,6 @@ description: Agent for e2e compaction testing.
 
 executor:
   harness: openai-agents
-  profile: oss
 
 prompt: |
   You are a test assistant. Reply with detailed, verbose answers
@@ -43,67 +63,22 @@ prompt: |
 _MODEL = resolve_model("databricks-gpt-5-4-mini", key=__name__)
 _HARNESS = "openai-agents"
 _BOOT_TIMEOUT = 120.0
+_RUNNING_TIMEOUT = 30.0
 _TURN_TIMEOUT = 300.0
+_EXIT_TIMEOUT = 20.0
 
-
-def _strip(text: str) -> str:
-    """Remove ANSI escape codes."""
-    return _ANSI_RE.sub("", text)
-
-
-def _drain_until(
-    child: pexpect.spawn,
-    pattern: str,
-    timeout: float,
-) -> str:
-    """
-    Read from the PTY until *pattern* appears in the ANSI-stripped
-    accumulated output, or *timeout* elapses.
-
-    :param child: Live pexpect child.
-    :param pattern: Substring to find (case-insensitive).
-    :param timeout: Max seconds.
-    :returns: The accumulated ANSI-stripped output.
-    """
-    deadline = time.monotonic() + timeout
-    accumulated = ""
-    pat_lower = pattern.lower()
-    while time.monotonic() < deadline:
-        try:
-            chunk = child.read_nonblocking(size=100000, timeout=3)
-            accumulated += chunk
-        except (pexpect.TIMEOUT, pexpect.EOF):
-            pass
-        clean = _strip(accumulated)
-        if pat_lower in clean.lower():
-            return clean
-    pytest.fail(
-        f"Pattern {pattern!r} not found within {timeout}s. Output: {_strip(accumulated)[:500]!r}"
-    )
-    return ""
-
-
-def _send_and_wait(
-    child: pexpect.spawn,
-    prompt_text: str,
-    timeout: float,
-) -> str:
-    """
-    Send a prompt via CR and wait for 'sleeping' (turn complete).
-
-    :param child: Live pexpect child.
-    :param prompt_text: User message.
-    :param timeout: Max seconds for the turn.
-    :returns: ANSI-stripped output captured during the turn.
-    """
-    child.send(prompt_text)
-    child.send("\r")
-    return _drain_until(child, "sleeping", timeout)
+# Visible turn-synchronization markers (see _pexpect_harness and
+# test_repl_history_recall for the rationale). ``working`` is the
+# spinner activity line printed while a turn runs; ``❯ `` is the idle
+# input prompt the REPL returns to when the turn completes.
+_RUNNING_MARKER = r"working"
+_COMPLETION_MARKER = r"❯ "
 
 
 def test_compaction_fires_and_agent_retains_context(
     omnigent_python: Path,
     omnigent_repo_root: Path,
+    omnigent_credentials_env: dict[str, str],
     tmp_path: Path,
 ) -> None:
     """
@@ -114,108 +89,112 @@ def test_compaction_fires_and_agent_retains_context(
     the compaction item won't appear in the DB. If the summary
     doesn't capture prior context, turn 3 can't reference it.
     """
-    fake_home = tmp_path / "home"
-    fake_home.mkdir()
     yaml_path = tmp_path / "compaction-e2e-test.yaml"
     yaml_path.write_text(_COMPACTION_AGENT_YAML)
-    real_cfg = Path.home() / ".databrickscfg"
-    if real_cfg.exists():
-        shutil.copy2(str(real_cfg), str(fake_home / ".databrickscfg"))
+    # Isolated runtime data dir: chat.db and the per-test local server's
+    # pidfile both resolve under here (omnigent.host.local_server
+    # ._local_data_dir honors OMNIGENT_DATA_DIR), so the test inspects
+    # its own DB and gets a fresh server instead of reusing a shared one.
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
 
-    env = dict(os.environ)
-    for stale in (
-        "ANTHROPIC_API_KEY",
-        "DATABRICKS_TOKEN",
-        "CLAUDE_CODE",
-        "CODEX",
-    ):
-        env.pop(stale, None)
-    env["HOME"] = str(fake_home)
-    env["OMNIGENT_SKIP_ONBOARD"] = "1"
-    env["OMNIGENT_NO_UPDATE_CHECK"] = "1"
-    env["AP_CONTEXT_WINDOW_OVERRIDE"] = "256"
-    env["TERM"] = "xterm-256color"
-    env["LINES"] = "40"
-    env["COLUMNS"] = "120"
+    env = dict(omnigent_credentials_env)
+    # Tiny context window so the compaction budget (0.8 * window ≈ 51
+    # tokens) is exceeded by the very first turn's history — even the
+    # user prompt alone is ~75 tokens. A larger budget (the old 256 →
+    # 204) made firing depend on how verbose the model happened to be
+    # that run, which flaked ~40% of CI attempts. This is a runner-side
+    # budget knob only; it does not cap the harness API call, so the
+    # model still produces full replies for the context-retention check.
+    env["AP_CONTEXT_WINDOW_OVERRIDE"] = "64"
+    env["OMNIGENT_DATA_DIR"] = str(data_dir)
 
-    child = pexpect.spawn(
-        str(omnigent_python),
-        [
-            "-m",
-            "omnigent",
-            "run",
-            str(yaml_path),
-            "--model",
-            _MODEL,
-            "--harness",
-            _HARNESS,
-            # Databricks routing comes from the YAML's ``executor.profile:
-            # oss`` (the ``--profile`` CLI flag was removed).
-            "--no-log",
-        ],
+    child = spawn_omnigent_run(
+        omnigent_python=omnigent_python,
+        yaml_path=yaml_path,
+        model=_MODEL,
+        harness=_HARNESS,
         env=env,
-        cwd=str(omnigent_repo_root),
-        encoding="utf-8",
+        cwd=omnigent_repo_root,
         timeout=_TURN_TIMEOUT,
-        dimensions=(40, 120),
+        no_log=True,
+        # Keep sessions on: the test asserts on the persisted chat.db,
+        # which only the sessions path writes.
+        no_session=False,
     )
     try:
-        _drain_until(child, "sleeping", _BOOT_TIMEOUT)
+        wait_for_ready(child, timeout=_BOOT_TIMEOUT)
 
-        out1 = _send_and_wait(
+        submit_prompt(
             child,
             (
                 "List exactly 20 countries. For each country, write the capital city, "
                 "the population, the official language, the currency, and a famous "
                 "landmark with a 3-sentence description. Number them 1 through 20."
             ),
-            _TURN_TIMEOUT,
         )
-        assert len(out1) > 100, f"Turn 1 too short: {out1[:100]!r}"
+        turn1 = await_turn_complete(
+            child,
+            running_timeout=_RUNNING_TIMEOUT,
+            completion_timeout=_TURN_TIMEOUT,
+            running_marker=_RUNNING_MARKER,
+            completion_pattern=_COMPLETION_MARKER,
+        )
+        assert len(turn1.stripped) > 100, f"Turn 1 too short: {turn1.stripped[:100]!r}"
 
-        out2 = _send_and_wait(
+        submit_prompt(
             child,
             (
                 "Now list 20 MORE countries not in the previous list, same detailed "
                 "format with capital, population, language, currency, and landmark."
             ),
-            _TURN_TIMEOUT,
         )
-        assert len(out2) > 100, f"Turn 2 too short: {out2[:100]!r}"
+        turn2 = await_turn_complete(
+            child,
+            running_timeout=_RUNNING_TIMEOUT,
+            completion_timeout=_TURN_TIMEOUT,
+            running_marker=_RUNNING_MARKER,
+            completion_pattern=_COMPLETION_MARKER,
+        )
+        assert len(turn2.stripped) > 100, f"Turn 2 too short: {turn2.stripped[:100]!r}"
 
-        out3 = _send_and_wait(
+        submit_prompt(
             child,
             "What was the very first thing I asked you? Reply in one sentence.",
-            _TURN_TIMEOUT,
+        )
+        turn3 = await_turn_complete(
+            child,
+            running_timeout=_RUNNING_TIMEOUT,
+            completion_timeout=_TURN_TIMEOUT,
+            running_marker=_RUNNING_MARKER,
+            completion_pattern=_COMPLETION_MARKER,
         )
 
         # Wait for the server's relay to persist items before exit.
         time.sleep(5)
-        child.sendcontrol("d")
-        with contextlib.suppress(pexpect.TIMEOUT):
-            child.expect(pexpect.EOF, timeout=15)
+        clean_exit(child, timeout=_EXIT_TIMEOUT)
     finally:
         if not child.closed:
             child.close(force=True)
 
     # Verify compaction item was persisted to the DB.
-    db_path = fake_home / ".omnigent" / "chat.db"
+    db_path = data_dir / "chat.db"
     assert db_path.is_file(), f"DB not found at {db_path}"
     with sqlite3.connect(str(db_path)) as conn:
         compaction_rows = conn.execute(
             "SELECT type FROM conversation_items WHERE type = 'compaction'"
         ).fetchall()
-    # At least 1 compaction item: proactive compaction fired after
-    # turn 1's history exceeded the 102-token budget (128 * 0.8).
-    # 0 means _proactive_compact_if_needed didn't fire or the POST
-    # to the server didn't persist the item.
+    # At least 1 compaction item: proactive compaction fired after a
+    # verbose turn's history exceeded the tiny token budget. 0 means
+    # _proactive_compact_if_needed didn't fire or the POST to the
+    # server didn't persist the item.
     assert len(compaction_rows) >= 1, (
         f"Expected >= 1 compaction item in DB. Found {len(compaction_rows)}."
     )
 
     # Verify turn 3 references prior context — proves the
     # compacted summary preserved meaningful context.
-    combined = out3.lower()
+    combined = turn3.stripped.lower()
     assert any(
         kw in combined for kw in ["countr", "capital", "landmark", "list", "nation", "asked"]
-    ), f"Turn 3 doesn't reference prior context. Response: {out3[:300]!r}"
+    ), f"Turn 3 doesn't reference prior context. Response: {turn3.stripped[:300]!r}"

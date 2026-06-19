@@ -77,7 +77,7 @@ jobs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - name: Check out CI scripts
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           # Triggering ref (not main): the script must exist on it, and it
           # only shards tests -- no secrets exposure, so the PR's copy is fine.
@@ -110,7 +110,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           ref: ${{ github.event.inputs.branch || github.ref }}
 
@@ -200,7 +200,7 @@ jobs:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
           mkdir -p "${GITHUB_WORKSPACE}/.codex-cli" && cd "${GITHUB_WORKSPACE}/.codex-cli"
-          npm install --ignore-scripts --no-audit --no-fund @openai/codex@0.128.0-alpha.1
+          npm install --ignore-scripts --no-audit --no-fund @openai/codex@0.139.0
           echo "${GITHUB_WORKSPACE}/.codex-cli/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Configure native-claude/codex gateway provider

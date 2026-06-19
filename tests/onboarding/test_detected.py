@@ -9,6 +9,8 @@ mocks) so a regression in field handling surfaces here.
 
 from __future__ import annotations
 
+import pytest
+
 from omnigent.onboarding.ambient import DetectedProvider
 from omnigent.onboarding.detected import (
     effective_config_with_detected,
@@ -70,6 +72,40 @@ def test_synthesize_env_key_openrouter_uses_vendor_endpoint_and_chat_wire() -> N
     # Chat wire is required — Responses would 404 against OpenRouter.
     assert openai_block["wire_api"] == "chat"
     assert openai_block["api_key_ref"] == "env:OPENROUTER_API_KEY"
+
+
+def test_synthesize_env_key_openai_honors_openai_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A detected ``OPENAI_API_KEY`` adopts a companion ``OPENAI_BASE_URL``.
+
+    The OpenAI SDK reads ``OPENAI_BASE_URL`` to target an OpenAI-compatible
+    gateway (e.g. the Databricks AI gateway). Ambient detection must honor
+    it; otherwise the env key is synthesized against ``api.openai.com`` and
+    every request 401s — the credential is a gateway token, not an OpenAI
+    key. This is the regression guard for that intermittent multi-turn 401.
+    """
+    gateway = "https://example.cloud.databricks.com/ai-gateway/openai/v1"
+    monkeypatch.setenv("OPENAI_BASE_URL", gateway)
+    det = DetectedProvider(
+        name="openai", kind="key", family=OPENAI_FAMILY, source="$OPENAI_API_KEY"
+    )
+    entries = synthesize_detected_entries([det])
+    openai_block = entries["openai"]["openai"]
+    assert openai_block["base_url"] == gateway
+    assert openai_block["api_key_ref"] == "env:OPENAI_API_KEY"
+
+
+def test_synthesize_env_key_openai_without_base_url_uses_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Absent ``OPENAI_BASE_URL``, a detected OpenAI key keeps the vendor default."""
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    det = DetectedProvider(
+        name="openai", kind="key", family=OPENAI_FAMILY, source="$OPENAI_API_KEY"
+    )
+    entries = synthesize_detected_entries([det])
+    assert entries["openai"]["openai"]["base_url"] == "https://api.openai.com/v1"
 
 
 def test_synthesize_subscription_cli() -> None:
