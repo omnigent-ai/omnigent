@@ -8813,3 +8813,38 @@ def test_mint_codex_thread_id_is_uuidv7() -> None:
     parsed = _uuid.UUID(minted)
     assert parsed.version == 7
     assert codex_native._CODEX_THREAD_ID_RE.fullmatch(minted)
+
+
+def test_command_execution_appends_sandbox_bypass_guidance_on_namespace_error() -> None:
+    """A codex shell command that fails because codex's own command sandbox
+    cannot start (no unprivileged user namespaces in a hardened container) gets
+    actionable recovery guidance appended, instead of surfacing only the opaque
+    ``bwrap: No permissions to create new namespace`` output (issue #657)."""
+    item = {
+        "command": "/bin/zsh -lc 'echo hi'",
+        "aggregatedOutput": (
+            "bwrap: No permissions to create new namespace, likely because the "
+            "kernel does not allow non-privileged user namespaces.\n"
+        ),
+        "exitCode": 1,
+    }
+    tool_call = codex_native_forwarder._command_execution_tool_call("call_1", item)
+    assert tool_call is not None
+    # The raw bwrap output and the exit code are preserved verbatim...
+    assert "No permissions to create new namespace" in tool_call.output
+    assert "[exit code: 1]" in tool_call.output
+    # ...with actionable recovery guidance appended (the "Full access" preset
+    # and the config sandbox_mode workaround).
+    assert "Full access" in tool_call.output
+    assert "danger-full-access" in tool_call.output
+
+
+def test_command_execution_leaves_normal_output_untouched() -> None:
+    """A successful command keeps its output verbatim — the guidance only fires
+    on the sandbox-namespace failure, never on ordinary output (issue #657)."""
+    item = {"command": "pwd", "aggregatedOutput": "/repo\n", "exitCode": 0}
+    tool_call = codex_native_forwarder._command_execution_tool_call("call_1", item)
+    assert tool_call is not None
+    assert tool_call.output == "/repo\n"
+    assert "Full access" not in tool_call.output
+    assert "danger-full-access" not in tool_call.output
