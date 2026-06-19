@@ -64,8 +64,14 @@ def test_coding_supervisor_with_forks_one_shot(
         response queues.
     :param harness: The harness identifier from
         :data:`HARNESS_HARNESS_MODELS`.
-    :param model: The harness-routed model identifier.
+    :param model: Unused — replaced by a per-harness mock key below.
+        The real model from :data:`HARNESS_HARNESS_MODELS` would put
+        the ``pi`` harness into gateway mode (pi inspects the
+        ``databricks-*`` model name and switches to real-gateway auth,
+        ignoring the mock's ``OPENAI_BASE_URL``); a ``mock-*`` key keeps
+        every harness routed through the mock LLM server.
     """
+    del model  # replaced by mock_model below
     if harness == "claude-sdk":
         require_claude_sdk()
         if which("claude") is None:
@@ -79,6 +85,10 @@ def test_coding_supervisor_with_forks_one_shot(
         if which("pi") is None:
             pytest.skip("pi harness prerequisite missing: 'pi' CLI not on PATH.")
 
+    # Per-harness mock key so concurrent harness rows get isolated mock
+    # response queues, and so ``pi`` stays in mock mode rather than
+    # gateway-routing a ``databricks-*`` model name.
+    mock_model = f"mock-coding-supervisor-{harness}"
     # Pre-seed the mock queue with enough canned replies to cover the
     # supervisor turn plus both worker sub-agent turns and any auto-wake.
     reset_mock_llm(mock_llm_server_url)
@@ -90,7 +100,7 @@ def test_coding_supervisor_with_forks_one_shot(
             {"text": "Worker B finished."},
             {"text": "Both workers done. Summary: OK."},
         ],
-        key=model,
+        key=mock_model,
     )
     result = run_one_shot(
         omnigent_python=omnigent_python,
@@ -98,6 +108,6 @@ def test_coding_supervisor_with_forks_one_shot(
         omnigent_credentials_env=mock_credentials_env,
         example_name="coding_supervisor_with_forks",
         harness=harness,
-        model=model,
+        model=mock_model,
     )
     assert_completed_one_shot(result, "coding_supervisor_with_forks")

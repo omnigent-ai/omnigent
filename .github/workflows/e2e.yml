@@ -159,8 +159,9 @@ jobs:
         # --ignore-scripts to block postinstall on every package. The
         # claude-code stub binary needs its install.cjs (audited:
         # platform detect + same-tree hardlink, no network/exec) so we run
-        # that one explicitly; codex has no postinstall; pi is intentionally
-        # absent (its e2e rows skip via skip_if_harness_cli_missing).
+        # that one explicitly; codex and pi have no install scripts and
+        # ship prebuilt CLIs, so --ignore-scripts + the PATH line below
+        # make them runnable directly.
         #
         # bubblewrap: the linux_bwrap sandbox backend fails loud if `bwrap`
         # is missing, and the e2e runner runs real agents with os_env. The
