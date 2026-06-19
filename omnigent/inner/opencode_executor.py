@@ -30,9 +30,12 @@ The SDK client is built from the announced ``http://127.0.0.1:<port>`` URL.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
 import os
+import re
 import shutil
 from collections.abc import AsyncIterator
 from typing import Any
@@ -314,3 +317,93 @@ def _translate_part_event(
         return events
 
     return []
+
+
+_LISTEN_RE = re.compile(r"listening on (http://\S+)")
+
+
+def _parse_listen_url(line: str) -> str | None:
+    """Extract the base URL OpenCode announces on stdout.
+
+    :param line: A stdout line, e.g.
+        ``"opencode server listening on http://127.0.0.1:4096"``.
+    :returns: The URL, or ``None`` when the line isn't the announce line.
+    """
+    match = _LISTEN_RE.search(line)
+    return match.group(1) if match else None
+
+
+class _OpenCodeServer:
+    """Owns one ``opencode serve`` subprocess + its ``AsyncOpencode`` client."""
+
+    def __init__(self) -> None:
+        self._proc: asyncio.subprocess.Process | None = None
+        self._stderr_task: asyncio.Task[None] | None = None
+        self.base_url: str | None = None
+        self.client: Any | None = None
+
+    async def start(self, *, cwd: str | None, extra_env: dict[str, str]) -> None:
+        """Spawn ``opencode serve``, discover its URL, build the SDK client.
+
+        :param cwd: Working directory for the server (``--dir`` equivalent).
+        :param extra_env: Extra env vars (e.g. ``OPENCODE_CONFIG_CONTENT``).
+        :raises RuntimeError: If the server doesn't announce a URL in time.
+        """
+        from opencode_ai import AsyncOpencode  # lazy: optional dep
+
+        binary = _resolve_opencode_binary()
+        env = dict(os.environ)
+        env.update(extra_env)
+        self._proc = await asyncio.create_subprocess_exec(
+            binary, "serve", "--port", "0", "--hostname", "127.0.0.1", "--print-logs",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=cwd or None,
+            env=env,
+        )
+        assert self._proc.stdout is not None
+        assert self._proc.stderr is not None
+        self._stderr_task = asyncio.create_task(self._drain_stderr())
+
+        async def _await_url() -> str:
+            assert self._proc is not None and self._proc.stdout is not None
+            while True:
+                line_bytes = await self._proc.stdout.readline()
+                if not line_bytes:
+                    raise RuntimeError("opencode serve exited before announcing a URL")
+                url = _parse_listen_url(line_bytes.decode("utf-8", "replace"))
+                if url:
+                    return url
+
+        try:
+            self.base_url = await asyncio.wait_for(_await_url(), timeout=_SERVER_BOOT_TIMEOUT_S)
+        except (asyncio.TimeoutError, RuntimeError) as exc:
+            await self.close()
+            raise RuntimeError(f"opencode serve failed to start: {exc}") from exc
+        self.client = AsyncOpencode(base_url=self.base_url)
+
+    async def _drain_stderr(self) -> None:
+        assert self._proc is not None and self._proc.stderr is not None
+        while True:
+            chunk = await self._proc.stderr.read(4096)
+            if not chunk:
+                return
+
+    async def close(self) -> None:
+        """Close the SDK client and terminate the server subprocess."""
+        if self.client is not None:
+            with contextlib.suppress(Exception):
+                await self.client.close()
+            self.client = None
+        if self._proc is not None and self._proc.returncode is None:
+            self._proc.terminate()
+            try:
+                await asyncio.wait_for(self._proc.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                self._proc.kill()
+                await self._proc.wait()
+        if self._stderr_task is not None:
+            self._stderr_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._stderr_task
+        self._proc = None
