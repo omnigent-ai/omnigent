@@ -553,7 +553,12 @@ class CallerProcessFilesystem:
 
         byte_truncated = len(data) > byte_cap
         if byte_truncated:
-            data = data[:byte_cap]
+            # Truncate on a valid UTF-8 boundary: a naive ``data[:byte_cap]``
+            # can split a multi-byte codepoint, leaving invalid UTF-8 that
+            # raises ``UnicodeDecodeError`` (500) when the API response path
+            # later decodes it. Dropping the partial trailing codepoint keeps
+            # ``data`` decodable.
+            data = data[:byte_cap].decode("utf-8", "ignore").encode("utf-8")
 
         # Also flag truncation when the line cap was hit.
         returned_lines = result.get("returned_lines")

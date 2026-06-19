@@ -17,6 +17,7 @@ from omnigent.entities.environment_filesystem import FilesystemPathNotFound
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import create_os_environment
 from omnigent.runner import create_runner_app
+from omnigent.runner.environment_filesystem import CallerProcessFilesystem
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from tests.runner.helpers import NullServerClient
 
@@ -191,6 +192,32 @@ async def test_read_binary_file_content(
     assert base64.b64decode(body["content"]) == raw
     assert body["bytes"] == len(raw)
     assert body["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_read_text_byte_cap_truncates_on_utf8_boundary(
+    workspace: Path,
+) -> None:
+    """A byte cap that lands mid-codepoint still yields decodable UTF-8.
+
+    Slicing the raw UTF-8 byte string at an arbitrary cap can split a
+    multi-byte codepoint, leaving invalid bytes that raise
+    ``UnicodeDecodeError`` (500) when the response path later decodes them.
+    The read path must truncate on a valid boundary instead.
+    """
+    # "é" is 2 bytes (0xC3 0xA9) in UTF-8; a 1-byte cap lands mid-codepoint.
+    (workspace / "accents.txt").write_text("aé")
+
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(workspace), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert os_env is not None
+    fs = CallerProcessFilesystem(os_env)
+
+    content = await fs.read("accents.txt", max_bytes=2)
+    assert content.truncated is True
+    # The partial trailing codepoint is dropped, leaving decodable bytes.
+    assert content.data.decode("utf-8") == "a"
 
 
 @pytest.mark.asyncio
