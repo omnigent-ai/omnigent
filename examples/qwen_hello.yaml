@@ -3,7 +3,7 @@
 # Quick start:
 #
 #   1. Install Qwen Code:
-#      npm install -g @qwen/qwen-code
+#      npm install -g @qwen-code/qwen-code
 #      qwen login  # authenticate if needed
 #
 #   2. Configure a provider in ~/.omnigent/config.yaml (or set API key):
@@ -16,15 +16,14 @@
 #            api_key: sk-...
 #
 #   3. Run it:
-#      cd omnigent
-#      python -m omnigent examples/qwen_hello.yaml --prompt "Hello!"
+#      omnigent run examples/qwen_hello.yaml --prompt "Hello!"
 #
 #   4. Or run interactively:
-#      python -m omnigent examples/qwen_hello.yaml
+#      omnigent run examples/qwen_hello.yaml
 #
 # The model name below uses a typical Qwen Code model.
 # If you want to use a different model, override with --model:
-#      python -m omnigent examples/qwen_hello.yaml --model qwen/qwen-2.5-coder
+#      omnigent run examples/qwen_hello.yaml --model qwen/qwen-2.5-coder
 
 name: qwen_hello
 prompt: You are Qwen Code, running through Omnigent. Help the user with software engineering tasks.
