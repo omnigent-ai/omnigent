@@ -45,6 +45,7 @@ import {
   indexToLine,
   isBinaryPath,
   lineOverlapsSelection,
+  withBlankLinkTarget,
 } from "./codeViewerHelpers";
 import { renderLineTokens } from "./codeViewerRendering";
 import { TruncatedBanner } from "./TruncatedBanner";
@@ -392,8 +393,12 @@ export function CodeViewer({
         <MarkdownPreview content={content} />
       ) : (
         <iframe
-          srcDoc={content}
-          sandbox=""
+          srcDoc={withBlankLinkTarget(content)}
+          // Keep the preview script-less and origin-less (no allow-scripts /
+          // allow-same-origin). allow-popups lets a `target="_blank"` link
+          // actually open; allow-popups-to-escape-sandbox means the opened
+          // tab is a normal page, not itself sandboxed.
+          sandbox="allow-popups allow-popups-to-escape-sandbox"
           title="HTML preview"
           className="w-full h-full border-0"
         />

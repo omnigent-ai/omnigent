@@ -250,6 +250,34 @@ export function getSelectionOffsets(
   return { start_index, end_index };
 }
 
+/**
+ * Inject `<base target="_blank">` into an HTML-artifact preview so that
+ * links open in a new tab instead of trying to navigate the sandboxed
+ * preview iframe (which silently does nothing). A link that already names
+ * its own target keeps it — the injected `<base>` only supplies the default
+ * for links that don't set one.
+ *
+ * The tag is placed just after the opening `<head>` when one exists, else
+ * after `<html>`, else prepended — so it precedes any `<a>` and wins as the
+ * document default. Returns `html` unchanged when a `<base>` is already
+ * present (authored documents that set their own default are left alone).
+ */
+export function withBlankLinkTarget(html: string): string {
+  if (/<base\b/i.test(html)) return html;
+  const baseTag = '<base target="_blank">';
+  const headMatch = html.match(/<head\b[^>]*>/i);
+  if (headMatch) {
+    const at = headMatch.index! + headMatch[0].length;
+    return html.slice(0, at) + baseTag + html.slice(at);
+  }
+  const htmlMatch = html.match(/<html\b[^>]*>/i);
+  if (htmlMatch) {
+    const at = htmlMatch.index! + htmlMatch[0].length;
+    return html.slice(0, at) + baseTag + html.slice(at);
+  }
+  return baseTag + html;
+}
+
 /** Return the 1-based line number that contains `index` in `rawLines`. */
 export function indexToLine(index: number, rawLines: string[]): number {
   let remaining = index;

@@ -213,3 +213,25 @@ describe("CodeViewer truncated preview", () => {
     expect(screen.queryByText(/too large to load fully/)).toBeNull();
   });
 });
+
+describe("CodeViewer HTML preview link handling", () => {
+  // Regression for #777: links in a rendered HTML artifact did nothing on
+  // click because the preview iframe had sandbox="" (no popups) and links
+  // carried no target. The preview must inject a new-tab default and allow
+  // popups, while still withholding scripts and same-origin.
+  it("injects a new-tab base default and a popup-allowing sandbox", () => {
+    const { container } = renderViewer(
+      '<html><head></head><body><a href="https://example.com">x</a></body></html>',
+      true,
+      "report.html",
+      { viewMode: "preview" },
+    );
+    const iframe = container.querySelector('iframe[title="HTML preview"]');
+    expect(iframe).not.toBeNull();
+    expect(iframe!.getAttribute("srcdoc")).toContain('<base target="_blank">');
+    const sandbox = iframe!.getAttribute("sandbox") ?? "";
+    expect(sandbox).toContain("allow-popups");
+    expect(sandbox).not.toContain("allow-scripts");
+    expect(sandbox).not.toContain("allow-same-origin");
+  });
+});

@@ -5,6 +5,7 @@ import {
   indexToLine,
   isBinaryPath,
   lineOverlapsSelection,
+  withBlankLinkTarget,
 } from "./codeViewerHelpers";
 
 // ---------------------------------------------------------------------------
@@ -66,6 +67,44 @@ describe("detectLang", () => {
     expect(detectLang("App.vue")).toBe("vue");
     expect(detectLang("schema.graphql")).toBe("graphql");
     expect(detectLang("Program.cs")).toBe("csharp");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// withBlankLinkTarget — make HTML-artifact preview links open in a new tab
+// ---------------------------------------------------------------------------
+
+describe("withBlankLinkTarget", () => {
+  it('injects <base target="_blank"> just inside an existing <head>', () => {
+    const html =
+      '<html><head><title>x</title></head><body><a href="/p">p</a></body></html>';
+    const out = withBlankLinkTarget(html);
+    expect(out).toBe(
+      '<html><head><base target="_blank"><title>x</title></head><body><a href="/p">p</a></body></html>',
+    );
+    // The <base> precedes the first link so it wins as the document default.
+    expect(out.indexOf("<base")).toBeLessThan(out.indexOf("<a "));
+  });
+
+  it("falls back to just after <html> when there is no <head>", () => {
+    const out = withBlankLinkTarget('<html><body><a href="/p">p</a></body></html>');
+    expect(out).toBe('<html><base target="_blank"><body><a href="/p">p</a></body></html>');
+  });
+
+  it("prepends when the fragment has neither <head> nor <html>", () => {
+    expect(withBlankLinkTarget('<a href="/p">p</a>')).toBe(
+      '<base target="_blank"><a href="/p">p</a>',
+    );
+  });
+
+  it("matches <head>/<html> case-insensitively and keeps attributes", () => {
+    const out = withBlankLinkTarget('<HTML><HEAD lang="en"></HEAD></HTML>');
+    expect(out).toBe('<HTML><HEAD lang="en"><base target="_blank"></HEAD></HTML>');
+  });
+
+  it("leaves a document that already declares its own <base> unchanged", () => {
+    const html = '<head><base href="/app/" target="_self"></head>';
+    expect(withBlankLinkTarget(html)).toBe(html);
   });
 });
 
