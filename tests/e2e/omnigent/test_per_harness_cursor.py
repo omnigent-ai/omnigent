@@ -22,6 +22,14 @@ key is not provisioned on CI, the test **skips** (rather than fails) when
 ``CURSOR_API_KEY`` is absent so the e2e shards stay green; it runs for real
 wherever a key is present.
 
+**Why this test cannot use the mock LLM server:** The ``cursor-sdk`` connects
+directly to Cursor's proprietary backend using ``CURSOR_API_KEY`` — it does not
+honour ``OPENAI_BASE_URL`` the way the ``openai-agents`` harness does. There is
+no OpenAI-compatible shim path in the Cursor SDK, so pointing
+``OPENAI_BASE_URL`` at the mock server has no effect. This harness can only be
+exercised with a real Cursor API key; the ``pytest.skip`` below gates the test
+cleanly when the key is absent.
+
 **What breaks if this fails (with prerequisites present):**
 - ``CursorExecutor`` regresses (the ``SDKMessage`` → ExecutorEvent translation,
   the ``custom_tools`` tool bridge, persistent-agent reuse, or the system-prompt
