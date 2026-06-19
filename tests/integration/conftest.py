@@ -60,19 +60,12 @@ def _is_mock_mode(config: pytest.Config) -> bool:
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Gate the whole directory on ``--integration`` (real LLM + harness CLIs).
+    """Gate the whole directory on mock mode (no ``--llm-api-key``).
 
-    When running in mock mode (no ``--llm-api-key``), the gate is
-    lifted so the tests run without ``--integration``.
-
-    On the codex harness, also rerun each journey up to 2x: codex
-    multi-turn dispatch flakes in bursts (empty failed turns, the
-    legacy class; burn-in failures were codex-only
-    while claude-sdk / openai-agents stayed clean). Reruns resolve a
-    different pool model per attempt via tests/_model_pools rotation.
-    Per-attempt runtime stays under the CI --timeout=180 cap (turn
-    polls are capped at 50s in helpers.run_turn), so a rerun never
-    follows a thread-timeout hard kill.
+    All tests run against the mock LLM server. Without ``--llm-api-key``
+    the ``--integration`` flag is not required. If someone passes a real
+    ``--llm-api-key`` without ``--integration`` the tests are skipped so
+    they don't accidentally hit real credentials.
 
     :param config: Pytest config object.
     :param items: Collected test items.
@@ -83,26 +76,6 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         )
         for item in items:
             item.add_marker(marker)
-        return
-    # Gate ``mock_only`` tests out of the real-LLM Integration jobs. The
-    # only correct signal for "mock mode" is the absence of a real
-    # ``--llm-api-key`` (``_is_mock_mode`` / the ``using_mock_llm``
-    # fixture). The ``mock_llm_server_url`` fixture is "always started
-    # regardless of --llm-api-key" so a ``mock_llm_server_url is None``
-    # guard inside a test is dead code that never skips. Scripted
-    # tool-call tests (fixed mock queue) cannot run against a real LLM,
-    # which would 401 on the mock base URL or fail the scripted-marker
-    # assertions; skip them centrally here instead.
-    if not _is_mock_mode(config):
-        skip_mock_only = pytest.mark.skip(
-            reason="mock_only test: requires mock-LLM mode (no --llm-api-key)"
-        )
-        for item in items:
-            if item.get_closest_marker("mock_only") is not None:
-                item.add_marker(skip_mock_only)
-    if config.getoption("--harness") == "codex":
-        for item in items:
-            item.add_marker(pytest.mark.flaky(reruns=2, reruns_delay=5))
 
 
 @pytest.fixture(autouse=True, scope="function")

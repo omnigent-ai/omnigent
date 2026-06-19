@@ -49,20 +49,9 @@ from collections.abc import Iterator
 from typing import Any
 
 import httpx
-import pytest
 
 from tests.e2e.conftest import configure_mock_llm, send_user_message_to_session
 from tests.integration.conftest import JourneySession
-
-# The mock LLM is scripted with a fixed tool-call sequence, so these
-# tests cannot run against a real LLM (it would 401 on the mock base URL
-# and could never reproduce the scripted call_ids/markers). The central
-# gate in ``tests/integration/conftest.py`` skips ``mock_only`` tests
-# when a real ``--llm-api-key`` is supplied (the real-LLM Integration
-# jobs). This replaces the dead ``if mock_llm_server_url is None: skip``
-# guards: that fixture is always started regardless of --llm-api-key, so
-# the guard never fired in any job.
-pytestmark = pytest.mark.mock_only
 
 _COMPUTE_TOOL: dict[str, Any] = {
     "type": "function",

@@ -2,7 +2,7 @@
 
 Kept separate from the multi-turn journeys so the nightly leg still
 reports basic harness health even when a longer journey is red for
-content reasons. Runs with either a real LLM or the mock LLM server.
+content reasons.
 """
 
 from __future__ import annotations

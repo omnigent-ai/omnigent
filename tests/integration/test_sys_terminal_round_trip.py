@@ -73,23 +73,6 @@ from tests.e2e.conftest import (
     send_user_message_to_session,
 )
 
-# The mock LLM is scripted with a fixed tool-call sequence (queues keyed
-# by the agent model name), so these tests cannot run against a real LLM
-# — it would 401 on the mock base URL and could never reproduce the
-# scripted call_ids/markers. The central gate in
-# ``tests/integration/conftest.py`` skips ``mock_only`` tests when a real
-# ``--llm-api-key`` is supplied (the real-LLM Integration jobs). This
-# replaces the dead ``if mock_llm_server_url is None: skip`` guards: that
-# fixture is always started regardless of --llm-api-key, so the guard
-# never fired in any job.
-#
-# Cross-test queue isolation is handled centrally too: the autouse
-# ``_reset_mock_llm_between_tests`` fixture in
-# ``tests/integration/conftest.py`` resets the shared mock-LLM server
-# before and after every integration test, so this file no longer needs
-# its own per-file reset fixture.
-pytestmark = pytest.mark.mock_only
-
 
 def _list_session_items(client: httpx.Client, session_id: str) -> list[dict[str, Any]]:
     """Return all persisted items for a session in one paginated snapshot.
