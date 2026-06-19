@@ -403,7 +403,7 @@ export function Sidebar({ open, onClose }: SidebarProps) {
             selectAll((conversationsQuery.data?.pages ?? []).flatMap((page) => page.data))
           }
           onDeselectAll={deselectAll}
-          onClear={exitSelectionMode}
+          onClear={deselectAll}
         />
       )}
 
@@ -1598,6 +1598,7 @@ function BulkActionBar({
               variant="ghost"
               size="sm"
               className="h-6 px-2 text-xs"
+              disabled={count === 0}
               onClick={onClear}
             >
               Clear
@@ -1720,6 +1721,10 @@ function BulkActionBar({
               be undone.
             </DialogDescription>
           </DialogHeader>
+          <p className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/5 p-3 text-xs text-muted-foreground">
+            <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0 text-warning" />
+            Branches are not cleaned up. Use single-session delete for branch surgery.
+          </p>
           <DialogFooter className="border-t-0 bg-transparent">
             <Button
               type="button"
