@@ -34,14 +34,6 @@ skips:
     cluster: repl-policy-ask-surfacing
     mode: skip
 
-
-
-  - id: tests/e2e/omnigent/test_example_secure_research_agent_os_env.py::test_secure_research_agent_os_env_one_shot
-    reason: "Secure_research_agent os-env one-shot. Triage pending."
-    issue: 675
-    cluster: sandbox-deps-env
-    mode: skip
-
   - id: tests/e2e/omnigent/test_run_harness_without_agent_e2e.py::test_run_harness_without_agent_live_repl_round_trip[claude-sdk]
     reason: "No-AGENT `omnigent run --harness` live round-trip hangs >180s in CI -> pytest-timeout thread-kill -> xdist worker crash; claude-sdk fails 30/30 in flake-stress 27808074172. Auth is NOT the cause: CI sets DATABRICKS_BEARER and the harness auth-commands short-circuit on it, so the hang is post-auth in the round-trip. Environment-wide, not harness-specific (codex + openai-agents siblings hang identically). The test's _COMPLETION_TIMEOUT=240 also exceeds the e2e --timeout=180 cap. Not locally reproducible (oss OAuth + macOS PTY diverge from CI); needs CI-env debugging."
     issue: 523
