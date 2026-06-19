@@ -16,7 +16,7 @@ The current implementation routes Qwen through OpenAI-compatible providers
 
 ### Multimodal Support
 
-The RPC mode executor should expose multimodal capabilities when available:
+The ACP executor should expose multimodal capabilities when available:
 
 - [ ] Add image input support for Qwen's vision models
 - [ ] Expose `handles_tools_internally()` capability flag properly
@@ -30,38 +30,43 @@ Currently uses the same terminal attachment as other SDK harnesses:
 - [ ] Add native TUI glyph/icon for agent picker
 - [ ] Support native terminal session management
 
-### Advanced RPC Features
+### Advanced ACP Features
 
-The RPC mode design enables mid-turn interrupt and tool exposure:
+The ACP (Agent Communication Protocol) design enables mid-turn interrupt and
+tool exposure via JSON-RPC 2.0 over stdin/stdout (`qwen --acp`):
 
-- [ ] Implement mid-turn interrupt handling over the RPC bridge
-- [ ] Expose tools directly through MCP instead of internal routing
-- [ ] Add reconnect logic for dropped RPC connections
-- [ ] Support port binding configuration (currently auto-assigned)
+- [ ] Implement mid-turn interrupt handling (ACP `session/cancel` notification)
+- [ ] Expose Omnigent tools to Qwen via MCP (register as ACP MCP servers)
+- [ ] Add reconnect logic if the subprocess exits unexpectedly
+- [ ] Support `session/load` for multi-turn resume across runs
 
 ### Test Coverage
 
 Expand test suite to match Kimi's 38-test coverage:
 
-- [ ] Registry/allowlist tests (import guards)
-- [ ] FastAPI app shape tests (/health, /v1/sessions/{id}/events routes)
+- [ ] Registry/allowlist tests (import guards) ✅ done
+- [ ] FastAPI app shape tests (/health, /v1/sessions/{id}/events routes) ✅ done
 - [ ] Env-var factory tests (HARNESS_QWEN_* → executor kwargs)
-- [ ] _build_argv tests (every flag passed to qwen)
-- [ ] Event translator tests (all event types parsed)
-- [ ] run_turn end-to-end with stubbed subprocess
+- [ ] _build_qwen_argv tests (ACP flags passed to qwen)
+- [ ] Event translator tests (all ACP session update types parsed) ✅ done
+- [ ] run_turn end-to-end with stubbed ACP subprocess ✅ done
 - [ ] Missing-binary error path tests
-- [ ] Capability flags tests (handles_tools_internally, supports_streaming)
+- [ ] ACP session-not-found auto-reset test ✅ done
 
 ## Known Limitations
 
-### RPC Mode Complexity
+### ACP Protocol Constraints
 
-Qwen's choice of `qwen --mode rpc` (long-lived subprocess + tool bridge over TCP)
-is structurally more ambitious than per-turn subprocess models. This introduces:
+Qwen uses `qwen --acp` (ACP / JSON-RPC 2.0 over stdin/stdout). Key notes:
 
-- More places to get wrong: auth, lifecycle, reconnect, port binding, token handling
-- Requires more comprehensive error handling and recovery
-- Testing complexity is higher than simpler subprocess models
+- Tool calls Qwen makes internally are handled by Qwen itself — the current
+  executor observes `tool_call` notifications but does not intercept them.
+  Future work: register Omnigent tools as ACP MCP servers so they route
+  through Omnigent's policy/recording stack.
+- Qwen assigns its own `sessionId` in the `session/new` response; the id we
+  propose is treated as a hint only.
+- Permissions requests (`session/request_permission`) are currently
+  auto-approved. Proper integration with Omnigent's policy layer is deferred.
 
 ### Databricks Gateway Path
 
@@ -74,18 +79,22 @@ but may need refinement based on real-world usage:
 
 ## Implementation Notes
 
-### RPC Bridge Design
+### ACP Protocol Design
 
-The RPC mode uses a TCP socket bridge for tool calls. Key considerations:
+The executor uses `qwen --acp` (Agent Communication Protocol, JSON-RPC 2.0
+over newline-delimited JSON on stdin/stdout). The session lifecycle is:
 
-1. **Port binding**: Currently auto-assigned; consider configurable range
-2. **Auth token**: Should be passed securely to the Qwen subprocess
-3. **Lifecycle management**: Ensure clean shutdown of both subprocess and bridge
-4. **Reconnect logic**: Handle dropped connections gracefully
+1. `initialize` — capability handshake (one-time per subprocess)
+2. `session/new { cwd, mcpServers }` — create a session; server returns its
+   own `sessionId`
+3. `session/prompt { sessionId, prompt: [{type,text}] }` — send a user turn;
+   streaming `session/update` notifications flow back, final response resolves
+   the request
+4. The subprocess is kept alive across turns (no per-turn respawn)
 
 ### Model Override Behavior
 
-Qwen's per-session model override (`--model`) should work identically to other
+Qwen's per-session model override should work identically to other
 SDK harnesses:
 
 - Spec model → provider default → catalog default (precedence)
