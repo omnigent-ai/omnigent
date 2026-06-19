@@ -20,11 +20,11 @@ on:
     - cron: "0 9 * * *"
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
-    paths-ignore: ['ap-web/**']
+    paths-ignore: ['ap-web/**', 'tests/e2e_ui/**']
   push:
     branches:
       - 'fork-e2e/**'
-    paths-ignore: ['ap-web/**']
+    paths-ignore: ['ap-web/**', 'tests/e2e_ui/**']
   workflow_dispatch:
     inputs:
       branch:
