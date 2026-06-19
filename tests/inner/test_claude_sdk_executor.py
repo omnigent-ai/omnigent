@@ -3376,3 +3376,73 @@ class TestToolCallPolicyGate(unittest.TestCase):
             self.assertIsNone(captured["can_use_tool"])
 
         _run(_t())
+
+
+# ---------------------------------------------------------------------------
+# Tests: in-place /compact on a live SDK session (compact_session)
+# ---------------------------------------------------------------------------
+
+
+class _FakeSdkMessage:
+    """Minimal stand-in for a claude_agent_sdk SystemMessage (carries .data)."""
+
+    def __init__(self, data):
+        self.data = data
+
+
+class TestCompactSession(unittest.TestCase):
+    def _make_executor(self):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        return ClaudeSDKExecutor()
+
+    def test_no_live_session_returns_no_session(self):
+        executor = self._make_executor()
+        result = _run(executor.compact_session("missing"))
+        self.assertEqual(result["status"], "no_session")
+
+    def test_reports_boundary_metadata(self):
+        from omnigent.inner.claude_sdk_executor import _ClaudeClientState
+
+        executor = self._make_executor()
+
+        async def _receive():
+            yield _FakeSdkMessage({"subtype": "status", "status": "compacting"})
+            yield _FakeSdkMessage(
+                {
+                    "subtype": "compact_boundary",
+                    "compact_metadata": {
+                        "trigger": "manual",
+                        "pre_tokens": 40590,
+                        "post_tokens": 7496,
+                    },
+                }
+            )
+
+        client = Mock()
+        client.query = AsyncMock()
+        client.receive_response = Mock(return_value=_receive())
+        executor._clients["s1"] = _ClaudeClientState(client=client, model="claude-opus-4-8")
+
+        result = _run(executor.compact_session("s1"))
+
+        # It must drive the slash command, not a normal prompt.
+        client.query.assert_awaited_once()
+        self.assertEqual(client.query.call_args.args[0], "/compact")
+        # And surface the compact_boundary metadata.
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["pre_tokens"], 40590)
+        self.assertEqual(result["post_tokens"], 7496)
+        self.assertEqual(result["trigger"], "manual")
+
+    def test_query_failure_returns_error(self):
+        from omnigent.inner.claude_sdk_executor import _ClaudeClientState
+
+        executor = self._make_executor()
+        client = Mock()
+        client.query = AsyncMock(side_effect=RuntimeError("boom"))
+        executor._clients["s1"] = _ClaudeClientState(client=client, model="m")
+
+        result = _run(executor.compact_session("s1"))
+        self.assertEqual(result["status"], "error")
+        self.assertIn("boom", result["error"])

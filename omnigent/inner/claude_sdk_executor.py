@@ -1487,6 +1487,54 @@ class ClaudeSDKExecutor(Executor):
             await self._gateway_shim.aclose()
             self._gateway_shim = None
 
+    async def compact_session(self, session_key: str) -> dict[str, Any]:
+        """
+        Trigger an in-place ``/compact`` on the live SDK session.
+
+        The Claude Agent SDK has no first-class ``compact()`` control request
+        (see anthropics/claude-agent-sdk-python#23), but the SDK-spawned
+        ``claude`` CLI routes a user message whose content is ``/compact``
+        through the same slash-command dispatcher the interactive terminal
+        uses. This actually shrinks the model's real context in place (no
+        teardown / reseed, prompt cache preserved) — the SDK analog of
+        ``_handle_claude_native_compact`` injecting ``/compact`` into the tmux
+        pane. Success is reported by the SDK as a ``compact_boundary`` system
+        event carrying ``compact_metadata`` (``pre_tokens`` / ``post_tokens`` /
+        ``trigger``). Verified against claude-agent-sdk 0.2.94.
+
+        Must be called between turns (the live client must be idle).
+
+        :param session_key: The SDK session identifier to compact.
+        :returns: A result dict with ``status`` one of ``"success"`` /
+            ``"no_session"`` / ``"error"``; on success also includes
+            ``pre_tokens``, ``post_tokens``, and ``trigger`` from the
+            ``compact_boundary`` event.
+        """
+        state = self._clients.get(session_key)
+        if state is None:
+            # No live session yet — nothing to compact in place. The caller
+            # (runner) can fall back to its server-side transcript compaction.
+            return {"status": "no_session"}
+        try:
+            await state.client.query("/compact", session_id=session_key)
+            result: dict[str, Any] = {"status": "unknown"}
+            async for message in state.client.receive_response():
+                data = getattr(message, "data", None)
+                if isinstance(data, dict) and data.get("subtype") == "compact_boundary":
+                    meta = data.get("compact_metadata") or {}
+                    result = {
+                        "status": "success",
+                        "pre_tokens": meta.get("pre_tokens"),
+                        "post_tokens": meta.get("post_tokens"),
+                        "trigger": meta.get("trigger"),
+                    }
+            return result
+        except Exception as exc:  # noqa: BLE001 — surface failure to the caller
+            logger.warning(
+                "Claude SDK /compact failed for session %s: %s", session_key, exc
+            )
+            return {"status": "error", "error": str(exc)}
+
     async def interrupt_session(self, session_key: str) -> bool:
         state = self._clients.get(session_key)
         if state is None:
