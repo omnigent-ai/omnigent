@@ -398,3 +398,16 @@ Polly at [`examples/polly/`](https://github.com/omnigent-ai/omnigent/tree/main/e
 ## Contributing
 
 Contributions are welcome. See [CONTRIBUTING.md](https://github.com/omnigent-ai/omnigent/blob/main/CONTRIBUTING.md) for how to set up your environment, run the checks, and open a pull request.
+
+### Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=omnigent-ai/omnigent&type=Date)](https://www.star-history.com/#omnigent-ai/omnigent&Date)
+
+### Contributors
+
+Thanks to all of our amazing contributors!
+
+<a href="https://github.com/omnigent-ai/omnigent/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=omnigent-ai/omnigent" />
+</a>
+
