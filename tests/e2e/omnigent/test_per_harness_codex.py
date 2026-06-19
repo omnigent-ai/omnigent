@@ -1,49 +1,45 @@
 """Phase 0 characterization test — codex harness, one-shot prompt.
 
 Runs ``omnigent run hello_world.yaml --harness codex --model
-<codex-compatible-model> -p "..."`` as a real subprocess and
-snapshots structural observations (exit code, stderr cleanliness,
-assistant text length). Captured against current Omnigent;
-re-run unchanged in later phases to prove the integration
-preserves behavior for the codex harness.
+<mock-model> -p "..."`` as a real subprocess against the mock LLM
+server and snapshots structural observations (exit code, stderr
+cleanliness, assistant text length).
 
 **What breaks if this fails:**
 - Omnigent' ``CodexExecutor`` regresses (``codex app-server``
   subprocess orchestration, App Server JSON-RPC protocol, the
-  message-stream translation in ``codex_executor.run_turn``, or
-  the Databricks config-override generation in
-  ``_databricks_codex_config_overrides``).
+  message-stream translation in ``codex_executor.run_turn``).
 - The ``codex`` CLI binary disappears from PATH or its
   ``app-server`` subcommand changes its startup contract.
-- ``omnigent.databricks_executor._read_databrickscfg`` regresses
-  for the PAT path — ``CodexExecutor`` transitively depends on it
-  to resolve the Databricks host + token for the model proxy.
 - ``omnigent.cli._run_agent`` for the ``-p`` one-shot path
   stops printing assistant text to stdout on turn complete.
 
 Design reference: ``designs/OMNIGENT_INTEGRATION.md`` §Phase 0
 per-harness suite.
+
+**Serial execution note:** These tests are designed for serial
+execution — do NOT run them under pytest-xdist or any parallel
+runner that shares the mock LLM server process. Each test uses a
+UUID-keyed model name, so concurrent tests use separate queues and
+queue cross-contamination is impossible even without ``reset_mock_llm``.
+The ``reset_mock_llm`` call is kept as a safety guard to clear any
+leftover state from prior test runs in the same session, but it
+would wipe another test's queue if two tests ran simultaneously.
 """
 
 from __future__ import annotations
 
 import subprocess
+import uuid
 from pathlib import Path
 from shutil import which
 from typing import Any
 
 import pytest
 
-from tests._model_pools import resolve_model
 from tests.e2e.omnigent._snapshot import compare_snapshot
+from tests.e2e.omnigent.conftest import configure_mock_llm, reset_mock_llm
 
-# Model + harness are hardcoded because the test name advertises
-# "codex harness"; a per-harness characterization test is
-# meaningless without pinning the harness under test.
-# databricks-gpt-5-4-mini is the gateway model documented in the
-# repo-level CLAUDE.md as the safe default for OpenAI-flavored
-# harnesses (codex is an OpenAI-native coding agent).
-_MODEL = resolve_model("databricks-gpt-5-4-mini", key=__name__)
 _HARNESS = "codex"
 _PROMPT = "say hi in 5 words"
 
@@ -77,44 +73,45 @@ def codex_available() -> bool:
 def test_per_harness_codex_one_shot(
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    omnigent_credentials_env: dict[str, str],
-    patched_databrickscfg: None,
+    mock_credentials_env: dict[str, str],
+    mock_llm_server_url: str,
     codex_available: bool,
 ) -> None:
     """
     ``omnigent run hello_world.yaml --harness codex -p <prompt>``
     exits 0 and emits a non-trivial assistant reply.
 
-    Uses ``patched_databrickscfg`` because ``CodexExecutor`` routes
-    model calls through a Databricks-specific config override set
-    constructed from ``~/.databrickscfg`` via
-    ``_read_databrickscfg`` — OAuth-profile tokens silently 403
-    the codex app-server's model requests. This matches the
-    claude-sdk pattern; the workaround is documented in
-    ``OMNIGENT_INTEGRATION.md`` as the pre-phase-1 baseline and
-    disappears once the ``databricks-sdk`` rewrite lands.
+    Uses the mock LLM server (via ``OPENAI_BASE_URL`` in
+    ``mock_credentials_env``) so the test runs without real API
+    credentials or a Databricks workspace. The codex executor
+    honors ``OPENAI_BASE_URL`` for its app-server model routing.
 
     :param omnigent_python: Interpreter with omnigent
         installed and importable.
     :param omnigent_repo_root: Cwd for the subprocess so the
         YAML spec and example tool modules resolve on sys.path.
-    :param omnigent_credentials_env: Env vars with
-        ``OPENAI_API_KEY`` / ``OPENAI_BASE_URL`` /
-        ``DATABRICKS_CONFIG_PROFILE`` populated from
-        ``--llm-api-key``.
-    :param patched_databrickscfg: Fixture that rewrites
-        ``~/.databrickscfg`` to PAT form for the test and
-        restores it on teardown.
+    :param mock_credentials_env: Env vars pointing at the mock
+        LLM server.
+    :param mock_llm_server_url: Base URL of the mock server for
+        configuring canned responses.
     :param codex_available: True when the ``codex`` CLI is
-        present. On False the test fails with an explicit reason
-        per CLAUDE.md rule 30 (no silent skips).
+        present. On False the test skips — codex is a genuine
+        proprietary binary that CI typically lacks.
     """
     if not codex_available:
-        pytest.fail(
+        pytest.skip(
             "codex harness prerequisite missing: the 'codex' CLI "
             "binary must be installed on PATH (install via "
-            "'npm i -g @openai/codex')."
+            "'npm i -g @openai/codex'). Skipping — binary absent."
         )
+
+    model = f"mock-harness-codex-{uuid.uuid4().hex[:8]}"
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "Hello there, how are you today?"}],
+        key=model,
+    )
 
     yaml_path = omnigent_repo_root / "tests" / "resources" / "examples" / "hello_world.yaml"
 
@@ -126,7 +123,7 @@ def test_per_harness_codex_one_shot(
             "run",
             str(yaml_path),
             "--model",
-            _MODEL,
+            model,
             "--harness",
             _HARNESS,
             "-p",
@@ -134,7 +131,7 @@ def test_per_harness_codex_one_shot(
             "--no-log",
             "--no-session",
         ],
-        env=omnigent_credentials_env,
+        env=mock_credentials_env,
         cwd=str(omnigent_repo_root),
         capture_output=True,
         text=True,
@@ -164,8 +161,8 @@ def test_per_harness_codex_one_shot(
     }
 
     # Full stderr surfaced on failure so CI logs show WHY the run
-    # went wrong (e.g. 403 auth, missing binary) — stderr here is
-    # opaque unless we dump it in the failure message.
+    # went wrong (e.g. missing binary) — stderr here is opaque
+    # unless we dump it in the failure message.
     diffs = compare_snapshot("test_per_harness_codex", observed)
     assert diffs == [], (
         "Snapshot mismatch for codex run:\n"
