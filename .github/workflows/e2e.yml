@@ -273,3 +273,40 @@ jobs:
           # `warn` not `ignore`: every shard makes LLM calls, so a missing
           # tokens file means the recorder broke.
           if-no-files-found: warn
+
+  # Explicitly re-dispatch Merge Ready (same-repo PR or fork-e2e push): the
+  # workflow_run hop is brittle and was dropped on #751/#792. No checkout,
+  # actions:write only; GITHUB_TOKEN workflow_dispatch is exempt from recursion.
+  merge-ready-rerun:
+    name: Merge Ready rerun
+    needs: e2e
+    if: >-
+      always()
+      && needs.e2e.result != 'skipped'
+      && (
+        (github.event_name == 'pull_request'
+          && github.event.pull_request.head.repo.full_name == github.repository)
+        || (github.event_name == 'push'
+          && startsWith(github.ref_name, 'fork-e2e/pr-'))
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      REF_NAME: ${{ github.ref_name }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Re-dispatch Merge Ready
+        run: |
+          set -euo pipefail
+          # same-repo PR -> event number; fork-e2e push -> parse fork-e2e/pr-<N>
+          PR="${PR_NUMBER:-${REF_NAME##*/pr-}}"
+          if ! [[ "$PR" =~ ^[0-9]+$ ]]; then
+            echo "::notice::could not resolve PR number (ref='$REF_NAME'); nothing to do."
+            exit 0
+          fi
+          echo "Re-dispatching merge-ready.yml for PR #$PR after $GITHUB_WORKFLOW."
+          gh workflow run merge-ready.yml --repo "$REPO" -f pr="$PR"
