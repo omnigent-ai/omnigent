@@ -136,7 +136,13 @@ def test_html_preview_open_in_new_tab_button(
     page: Page,
     seeded_html: tuple[str, str],
 ) -> None:
-    """The "Open in new tab" button pops the artifact out as a standalone page."""
+    """The "Open in new tab" button pops the artifact into an isolated, sandboxed tab.
+
+    Security regression guard: the artifact must render inside a *sandboxed*
+    (opaque-origin) iframe in an app-controlled blank tab — NOT at the app's own
+    origin (which a ``blob:``/``data:`` URL would do, exposing the app's storage
+    and credentialed API to untrusted artifact JS).
+    """
     base_url, session_id = seeded_html
     page.set_viewport_size({"width": 1600, "height": 900})
     page.goto(f"{base_url}/c/{session_id}?file={_HTML_PATH}")
@@ -148,16 +154,44 @@ def test_html_preview_open_in_new_tab_button(
     open_btn = file_viewer.get_by_role("button", name="Open in new tab")
     expect(open_btn).to_be_visible()
 
-    # The button builds a text/html blob URL and window.open()s it. Use
-    # context.expect_page (not page.expect_popup) because the open uses
-    # ``noopener``, so the new page may surface on the context, not the opener.
+    # The button opens a blank, app-controlled tab and injects a sandboxed
+    # iframe. Capture the new page on the context.
     with page.context.expect_page() as new_page_info:
         open_btn.click()
     popped = new_page_info.value
     popped.wait_for_load_state("domcontentloaded")
 
-    # It's a client-side blob URL (no upload), rendered with no sandbox at all.
-    assert popped.url.startswith("blob:")
-    # The same script runs in the standalone page too.
-    expect(popped.locator("#js-status")).to_have_text("js-ran", timeout=10_000)
+    # The shell tab itself is a blank, app-controlled document — the artifact is
+    # never the top-level page (which would put it at the app's origin).
+    assert popped.url == "about:blank"
+
+    # The artifact lives only inside a sandboxed iframe whose sandbox matches the
+    # in-app preview and, critically, withholds ``allow-same-origin``.
+    shell_iframe = popped.locator("iframe")
+    expect(shell_iframe).to_be_visible(timeout=10_000)
+    sandbox = shell_iframe.get_attribute("sandbox")
+    assert sandbox == _EXPECTED_SANDBOX
+    assert "allow-same-origin" not in (sandbox or "")
+
+    # Scripts still run inside the popped iframe (#778 holds in the pop-out too).
+    preview = popped.frame_locator("iframe")
+    expect(preview.locator("#js-status")).to_have_text("js-ran", timeout=10_000)
+
+    # Isolation proof: the iframe has an opaque origin and cannot reach the
+    # parent document — so artifact JS can't touch the app's storage/cookies/API.
+    child_frame = shell_iframe.element_handle().content_frame()
+    assert child_frame is not None
+    assert child_frame.evaluate("() => window.origin") == "null"
+    parent_access_blocked = child_frame.evaluate(
+        """() => {
+            try {
+                void window.parent.document.cookie;
+                return false;
+            } catch (e) {
+                return true;
+            }
+        }"""
+    )
+    assert parent_access_blocked
+
     popped.close()

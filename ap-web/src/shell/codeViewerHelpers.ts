@@ -221,6 +221,14 @@ export const HTML_PREVIEW_SANDBOX =
  * quirks mode and change how the artifact renders, so we insert *inside* the
  * existing `<head>`/`<html>` when present and only fall back to prepending for
  * bare fragments that have no doctype to displace.
+ *
+ * The matcher is a deliberately simple regex, NOT a full HTML parser: parsing
+ * and re-serializing untrusted artifact content could subtly alter how it
+ * renders. The known trade-off is that a `<head>` literal appearing earlier in
+ * the source (e.g. inside a comment or a script string) is matched textually.
+ * That only ever mis-places the base tag *inside the sandboxed preview* — it
+ * can break that one artifact's own link-targeting, never the host app's
+ * security — so it's an accepted limitation rather than a bug to parse around.
  */
 export function prepareHtmlPreviewDoc(html: string): string {
   const baseTag = '<base target="_blank">';

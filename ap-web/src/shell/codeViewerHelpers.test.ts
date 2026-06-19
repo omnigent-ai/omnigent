@@ -200,6 +200,29 @@ describe("prepareHtmlPreviewDoc", () => {
     const out = prepareHtmlPreviewDoc("<HEAD></HEAD>");
     expect(out).toContain(`<HEAD>${BASE}`);
   });
+
+  it("preserves an existing <base href>; the injected target tag wins by order", () => {
+    // Browsers use the first <base> for each attribute, so injecting our
+    // `target` tag ahead of the artifact's keeps its `href` intact while still
+    // forcing links to a new tab.
+    const html = '<head><base href="https://cdn.example.com/"></head>';
+    const out = prepareHtmlPreviewDoc(html);
+    expect(out).toBe(`<head>${BASE}<base href="https://cdn.example.com/"></head>`);
+    expect(out.indexOf(BASE)).toBeLessThan(out.indexOf("<base href"));
+  });
+
+  it("injects exactly one base tag per call (no duplicates)", () => {
+    const out = prepareHtmlPreviewDoc("<head></head>");
+    expect(out.match(/<base target="_blank">/g)).toHaveLength(1);
+  });
+
+  it("documents the matcher limitation: a <head> literal in earlier markup is matched textually", () => {
+    // A simple regex (not a full parser) matches the first <head> string, even
+    // inside a comment. This only mis-places the harmless base tag inside the
+    // sandboxed preview — never a security issue — so we lock in the behavior.
+    const out = prepareHtmlPreviewDoc("<!-- <head> --><html><head></head></html>");
+    expect(out).toBe(`<!-- <head>${BASE} --><html><head></head></html>`);
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -77,7 +77,13 @@ import { cn } from "@/lib/utils";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { type ChangedSort, compareChangedFiles } from "./FlatFileList";
 import { CodeViewer } from "./CodeViewer";
-import { detectLang, MONACO_SPLIT_BREAKPOINT, type SaveStatus } from "./codeViewerHelpers";
+import {
+  HTML_PREVIEW_SANDBOX,
+  MONACO_SPLIT_BREAKPOINT,
+  type SaveStatus,
+  detectLang,
+  prepareHtmlPreviewDoc,
+} from "./codeViewerHelpers";
 import { CommentsPanel, type ActiveSelection } from "./CommentsPanel";
 
 // Monaco diff is heavy (~MBs + worker); load it only when the diff view is
@@ -464,17 +470,35 @@ function FileViewerBody({
     triggerBrowserDownload(fileContentToBlob(data), path.split("/").pop() ?? path);
   }, [fileQuery.data, path]);
 
-  // Open the HTML artifact as a standalone page in a real browser tab, where it
-  // renders with no sandbox — scripts and links behave exactly as they would
-  // for a normal web page. A blob URL keeps it client-side (no upload). The URL
-  // is revoked after a delay so the new tab has time to load it first.
+  // Open the HTML artifact in its own browser tab WITHOUT handing its
+  // (untrusted, agent-generated) scripts the app's own origin.
+  //
+  // We open a blank, same-origin tab we fully control and render the artifact
+  // inside a *sandboxed* iframe — the same opaque-origin isolation the in-app
+  // preview uses. A `blob:` or `data:` document would instead run the artifact
+  // AT the app's origin, where its JS could read the app's storage and issue
+  // credentialed same-origin requests to our API (see the #777/#778 security
+  // review). The sandboxed-iframe shell gives full-window rendering with none
+  // of that exposure: the artifact gets an opaque origin and cannot reach this
+  // shell tab, its `window.opener`, or the host app.
   const openHtmlInNewTab = useCallback(() => {
     const data = fileQuery.data;
-    if (!data || typeof URL.createObjectURL !== "function") return;
-    const url = URL.createObjectURL(new Blob([data.content], { type: "text/html" }));
-    window.open(url, "_blank", "noopener");
-    window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
-  }, [fileQuery.data]);
+    if (!data) return;
+    const win = window.open("about:blank", "_blank");
+    if (!win) return; // popup blocked
+    const doc = win.document;
+    doc.title = path.split("/").pop() ?? path;
+    doc.body.style.margin = "0";
+    // Sandbox is set via setAttribute just below; the static rule can't see it.
+    // oxlint-disable-next-line iframe-missing-sandbox
+    const frame = doc.createElement("iframe");
+    // No `allow-same-origin`: the artifact runs in an opaque origin, isolated
+    // from this shell tab and the host app.
+    frame.setAttribute("sandbox", HTML_PREVIEW_SANDBOX);
+    frame.srcdoc = prepareHtmlPreviewDoc(data.content);
+    frame.style.cssText = "position:fixed;inset:0;height:100%;width:100%;border:0";
+    doc.body.appendChild(frame);
+  }, [fileQuery.data, path]);
 
   const copyFileLink = useCallback(() => {
     if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) return;
