@@ -4049,6 +4049,101 @@ async def test_external_session_usage_records_per_model_breakdown(
     assert bucket["total_cost_usd"] == pytest.approx(0.42)
 
 
+async def test_external_session_usage_cost_only_attributes_to_model(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A claude-native COST-ONLY broadcast attributes its cost to ``by_model``.
+
+    claude-native forwards Claude Code's statusLine total (S) with NO token
+    counts, tagging it with the active ``model``. Before this fix the per-model
+    view was gated on tokens, so a cost-only broadcast dropped its cost from
+    ``by_model`` entirely — the TOKEN USAGE panel undercounted the session
+    total by every native (sub-)agent's spend while the flat ``total_cost_usd``
+    still included it. The cost must now land in the model's bucket so the
+    per-model costs reconcile with the flat total (the UI's no-drop invariant).
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_session_usage",
+            "data": {"cumulative_cost_usd": 0.42, "model": "claude-opus-4-8"},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+
+    usage = _read_session_usage(db_uri, session["id"])
+    bucket = usage["by_model"]["claude-opus-4-8"]
+    # Cost attributed to the model; no token counts (claude-native reports none).
+    assert bucket["total_cost_usd"] == pytest.approx(0.42)
+    assert "input_tokens" not in bucket
+    # Per-model cost reconciles with the flat session total — the exact gap
+    # this fix closes ($Session-cost == sum of per-model costs).
+    assert bucket["total_cost_usd"] == pytest.approx(usage["total_cost_usd"])
+
+
+async def test_external_session_usage_cost_only_falls_back_to_model_override(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Cost-only attribution falls back to the session's ``model_override``.
+
+    claude-native's cost broadcast omits ``model`` until the statusLine has
+    captured it, but the forwarder mirrors the in-pane active model to
+    ``model_override`` each poll. The native write path must consult it (as the
+    relay path does) so the cost is still attributed per-model rather than
+    silently dropped from the TOKEN USAGE view.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    # Simulate the forwarder having mirrored the active model to model_override.
+    SqlAlchemyConversationStore(db_uri).update_conversation(
+        session["id"], model_override="claude-sonnet-4-6"
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_session_usage",
+            "data": {"cumulative_cost_usd": 0.10},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+
+    usage = _read_session_usage(db_uri, session["id"])
+    assert usage["by_model"]["claude-sonnet-4-6"]["total_cost_usd"] == pytest.approx(0.10)
+
+
+async def test_external_session_usage_policy_cost_only_skips_attribution(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A ``policy_cost_usd``-only mid-turn post records no per-model bucket.
+
+    Mid-sub-agent-run the displayed statusLine total is frozen, so the
+    forwarder posts only the advancing enforcement cost (no
+    ``cumulative_cost_usd``, no tokens). There is no DISPLAY cost to attribute,
+    so attribution is skipped — only the priced display cost flows into
+    ``by_model`` (and the badge), keeping the per-model view = the flat
+    ``total_cost_usd`` rather than the higher in-flight gate estimate.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_usage", "data": {"policy_cost_usd": 0.50}},
+    )
+    assert resp.status_code == 202, resp.text
+
+    usage = _read_session_usage(db_uri, session["id"])
+    assert "by_model" not in usage
+    assert usage.get("policy_cost_usd") == pytest.approx(0.50)
+
+
 async def test_external_session_usage_event_carries_priced_cost(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

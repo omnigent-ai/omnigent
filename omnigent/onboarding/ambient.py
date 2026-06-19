@@ -584,6 +584,24 @@ def detect_providers() -> list[DetectedProvider]:
             )
         )
 
+    # 1b. Claude Code on Vertex AI — the CLI reads three env vars for GCP auth.
+    # Detected separately from plain API keys because Vertex uses GCP ADC
+    # (no Anthropic key), so none of the PROVIDER_ENV_VARS entries cover it.
+    _vertex_truthy = ("1", "true", "yes")
+    if (
+        os.environ.get("CLAUDE_CODE_USE_VERTEX", "").strip().lower() in _vertex_truthy
+        and os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID", "").strip()
+        and os.environ.get("CLOUD_ML_REGION", "").strip()
+    ):
+        detected.append(
+            DetectedProvider(
+                name="vertex-claude",
+                kind=KEY_KIND,
+                family=ANTHROPIC_FAMILY,
+                source="$CLAUDE_CODE_USE_VERTEX",
+            )
+        )
+
     # 2. Claude CLI login. Like codex (below), existence alone is not enough —
     #    an empty / logged-out ``.credentials.json`` carries no usable login.
     #    On macOS the credential lives in the Keychain rather than the file, so

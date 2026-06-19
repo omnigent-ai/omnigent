@@ -49,6 +49,7 @@ run-omnigents.sh
 *.db-shm
 # Persisted artifacts from ad-hoc runs.
 artifacts/
+.tmp-codex-parity-target/
 
 # Playwright test run output (screenshots, traces, videos).
 test-results/

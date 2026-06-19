@@ -83,6 +83,11 @@ _SIMPLE_JSON_ACCEPT = "application/vnd.pypi.simple.v1+json"
 # Keep the background index lookup snappy. It runs detached so it never
 # blocks the CLI, but a tight timeout still bounds the orphan's lifetime.
 _INDEX_TIMEOUT_SECONDS = 3.0
+# The foreground ``omni upgrade`` is user-initiated and worth waiting on, so it
+# uses a more forgiving timeout (and one retry) than the background refresh — a
+# briefly slow mirror shouldn't make ``omni upgrade --check`` spuriously report
+# "couldn't reach the index".
+_UPGRADE_INDEX_TIMEOUT_SECONDS = 10.0
 # The placeholder that PEP 610 tooling (pip, newer uv) writes into
 # ``direct_url.json`` in place of a URL's userinfo. See
 # ``_unredact_ssh_userinfo`` for why we have to repair it.
@@ -269,6 +274,15 @@ def _run_installed_wheel_check() -> None:
         # would have caught this if .git/ were reachable; there's no
         # PyPI release to compare an editable install against, so bail.
         return
+    if info.vcs_url:
+        # A git/VCS install tracks a moving ref, not a PyPI release. Its
+        # version string (e.g. a frozen ``0.1.0`` on an unbumped ``main``)
+        # is not comparable to the latest PyPI version: the nag would fire
+        # forever even on a build that is *ahead* of the latest release,
+        # and reinstalling the ref can never change that version. The
+        # ``omni upgrade`` git path re-pulls the ref and reports commit
+        # deltas instead; the passive PyPI nag is simply wrong here.
+        return
 
     cache = _read_cache()
     if (
@@ -445,19 +459,29 @@ def _index_from_pip_config() -> str:
     return ""
 
 
-def fetch_latest_version(include_prereleases: bool = False) -> str | None:
+def fetch_latest_version(
+    include_prereleases: bool = False,
+    *,
+    timeout: float = _INDEX_TIMEOUT_SECONDS,
+    attempts: int = 1,
+) -> str | None:
     """Fetch the latest ``omnigent`` release from the configured index.
 
     Queries the Simple Repository API of the resolved index
     (:func:`_resolve_index_url`) — PEP 691 JSON when the index serves it,
-    PEP 503 HTML otherwise. Network call with a tight timeout, swallowing
-    every error so the update check can never break (or slow) the CLI;
-    intended for the detached background refresh, not the hot path.
+    PEP 503 HTML otherwise. Swallows every error so the update check can never
+    break the CLI. The background refresh uses the defaults (one snappy try);
+    the foreground ``omni upgrade`` passes a longer *timeout* and *attempts=2*
+    so a momentarily slow mirror doesn't spuriously read as "unreachable".
 
     :param include_prereleases: When ``False`` (default), pre-releases and
         dev releases are excluded so we never nag about a non-final build.
         When ``True`` (``omni upgrade --pre`` / TestPyPI rc validation),
         they are considered too.
+    :param timeout: Per-request timeout in seconds.
+    :param attempts: Total number of tries; a transient connection/timeout
+        error retries until they are exhausted. A definitive non-200 response
+        is never retried. Values < 1 are treated as 1.
     :returns: The latest matching version string (e.g. ``"0.2.0"`` or, with
         pre-releases, ``"0.2.0rc1"``), or ``None`` on any network / parse
         error, a non-200 response, or when no matching release is found.
@@ -466,16 +490,19 @@ def fetch_latest_version(include_prereleases: bool = False) -> str | None:
     from packaging.utils import canonicalize_name
 
     url = f"{_resolve_index_url()}/{canonicalize_name(_DIST_NAME)}/"
-    try:
-        resp = httpx.get(
-            url,
-            headers={"Accept": _SIMPLE_JSON_ACCEPT},
-            timeout=_INDEX_TIMEOUT_SECONDS,
-            follow_redirects=True,
-        )
-    except httpx.HTTPError:
-        return None
-    if resp.status_code != 200:
+    resp = None
+    for _ in range(max(1, attempts)):
+        try:
+            resp = httpx.get(
+                url,
+                headers={"Accept": _SIMPLE_JSON_ACCEPT},
+                timeout=timeout,
+                follow_redirects=True,
+            )
+            break  # got a response (any status) — don't retry a definitive reply
+        except httpx.HTTPError:
+            resp = None  # transient (timeout / connection reset) — retry if any left
+    if resp is None or resp.status_code != 200:
         return None
 
     versions = _parse_simple_versions(resp)
@@ -1362,3 +1389,117 @@ def upgrade_command_for_installed() -> _UpgradeSuggestion | None:
     if info is None:
         return None
     return _build_upgrade_suggestion(info)
+
+
+def _probe_installed_distribution() -> tuple[str | None, str | None]:
+    """Read the freshly-installed version and VCS commit in a subprocess.
+
+    ``omni upgrade`` swaps the on-disk install while *this* process is
+    running, but the running interpreter already imported the old
+    ``omnigent`` and cached its metadata — re-reading in-process returns the
+    *pre-upgrade* version. A fresh ``sys.executable`` subprocess loads the
+    new metadata from disk, so it reports what the upgrade actually
+    produced. This is what lets ``omni upgrade`` verify the install really
+    advanced instead of trusting the installer's exit code (a no-op upgrade
+    — pinned spec, cooldown, stale index cache, or a git ref that can't move
+    the version — exits 0 without changing anything).
+
+    The version is read via ``importlib.metadata`` (no ``omnigent`` import,
+    so it survives even a broken upgrade); the commit is read from the
+    install's PEP 610 ``direct_url.json`` by re-running this module's own
+    detector, and is empty for registry installs.
+
+    :returns: ``(version, commit_sha)`` of the now-installed distribution.
+        Either element is ``None`` when it can't be determined (subprocess
+        failure, frozen interpreter with no ``sys.executable``, or — for the
+        commit — a non-VCS install).
+    """
+    if not sys.executable:
+        return None, None
+    probe = (
+        "import importlib.metadata as m\n"
+        "try:\n"
+        "    print(m.version('omnigent'))\n"
+        "except Exception:\n"
+        "    print('')\n"
+        "try:\n"
+        "    from omnigent.update_check import _read_installed_wheel_info as r\n"
+        "    i = r()\n"
+        "    print((i.commit_sha or '') if i is not None else '')\n"
+        "except Exception:\n"
+        "    print('')\n"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            # A metadata lookup is sub-second; the git timeout is reused only as
+            # a generous upper bound so a wedged interpreter can't hang the CLI.
+            timeout=_GIT_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+    if result.returncode != 0:
+        return None, None
+    lines = result.stdout.splitlines()
+    version = lines[0].strip() if lines and lines[0].strip() else None
+    commit = lines[1].strip() if len(lines) >= 2 and lines[1].strip() else None
+    return version, commit
+
+
+def _split_vcs_url(vcs_url: str) -> tuple[str, str | None]:
+    """Split a ``git+<url>[@<rev>]`` into ``(repo_url, revision)``.
+
+    Drops the ``git+`` prefix uv/pip prepend and separates a trailing
+    ``@<rev>`` (branch / tag / sha) when present. An ``@`` that is *userinfo*
+    (``git@host`` in an SSH URL) is NOT a revision: only an ``@`` after the
+    final ``/`` — i.e. past the repo path — is treated as one.
+
+    :param vcs_url: e.g. ``"git+https://host/org/repo.git@main"``.
+    :returns: ``(repo_url, revision_or_None)``, e.g.
+        ``("https://host/org/repo.git", "main")``.
+    """
+    url = vcs_url[4:] if vcs_url.startswith("git+") else vcs_url
+    # Drop a PEP 508 / pip URL fragment (``#egg=...`` / ``#subdirectory=...``).
+    # It is never part of the remote URL or the ref, and leaving it on would
+    # make ``git ls-remote`` query a nonexistent ref and silently return None.
+    url = url.split("#", 1)[0]
+    at = url.rfind("@")
+    if at > url.rfind("/"):  # '@' past the final path segment → revision suffix
+        return url[:at], (url[at + 1 :] or None)
+    return url, None
+
+
+def _remote_git_head(vcs_url: str) -> str | None:
+    """Return the remote commit a ``git+`` install's ref points at, or ``None``.
+
+    Runs ``git ls-remote`` against the bare repo URL for the install's
+    revision (or ``HEAD`` when none was pinned), so ``omni upgrade`` can tell
+    whether a git install is behind its tracked ref *before* re-pulling.
+    Best-effort with a tight timeout: any failure (offline, auth, bad URL, no
+    ``git`` binary) yields ``None`` so ``--check`` degrades to "can't
+    determine" rather than crashing.
+
+    :param vcs_url: A normalized VCS URL, e.g.
+        ``"git+https://github.com/omnigent-ai/omnigent.git"`` or
+        ``"git+https://…/omnigent.git@main"``.
+    :returns: The 40-char commit SHA the ref resolves to, or ``None``.
+    """
+    url, ref = _split_vcs_url(vcs_url)
+    if not url:
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", url, ref or "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT_SECONDS,
+            check=True,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    first = result.stdout.split("\n", 1)[0].strip()
+    sha = first.split("\t", 1)[0].strip() if first else ""
+    return sha or None

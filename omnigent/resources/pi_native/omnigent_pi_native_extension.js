@@ -203,12 +203,34 @@ function startInboxPoller(pi, config, handleInterrupt) {
             deliverAttempts.set(key, attempts);
             continue;
           }
-          // Cap reached: surface a failure (a silent drop would be invisible)
-          // and consume the file to stop the spin.
+          // Cap reached: surface the dropped follow-up without faking a turn
+          // failure. The runner treats external_session_status:failed as
+          // terminal for native sub-agents, so use a non-content conversation
+          // error item and consume the file to stop the spin. Include the
+          // message id and a short content preview so an operator can identify
+          // what was lost (data loss; the file is unlinked below).
           deliverAttempts.delete(key);
+          const droppedId = id ?? "(no id)";
+          const preview =
+            typeof payload.content === "string"
+              ? payload.content.length > 80
+                ? `${payload.content.slice(0, 80)}…`
+                : payload.content
+              : "";
           postEvent(config, {
-            type: "external_session_status",
-            data: { status: "failed", response_id: `pi-deliver-failed-${Date.now()}` },
+            type: "external_conversation_item",
+            data: {
+              response_id: `pi-deliver-dropped-${Date.now()}`,
+              item_type: "error",
+              item_data: {
+                source: "execution",
+                code: "pi_followup_delivery_dropped",
+                message:
+                  `Omnigent: a queued follow-up message (id ${droppedId}) could ` +
+                  `not be delivered to Pi after ${MAX_DELIVER_ATTEMPTS} attempts ` +
+                  `and was dropped. Content preview: ${JSON.stringify(preview)}`,
+              },
+            },
           });
           try {
             fs.unlinkSync(fullPath);
@@ -222,9 +244,11 @@ function startInboxPoller(pi, config, handleInterrupt) {
         // always consume the file (below). If there is no live turn to abort
         // right now, the interrupt is simply dropped — leaving the file would
         // re-read it every tick forever and, once a later turn creates an
-        // abortable context, abort that unrelated turn. requestInterrupt arms
-        // the pendingInterrupt window when it does catch a running turn, so a
-        // turn starting just after this still gets aborted via replay.
+        // abortable context, abort that unrelated turn. requestInterrupt only
+        // arms the pendingInterrupt window when it catches a genuinely running
+        // turn (idle interrupts are dropped, not armed — see F18), so a turn
+        // already in flight still gets aborted via replay without poisoning the
+        // next freshly-started turn.
         if (typeof handleInterrupt === "function") handleInterrupt();
       }
       if (id !== null) rememberSeen(id);
@@ -240,6 +264,13 @@ module.exports = function (pi) {
   let sequence = 0;
   let turnOrdinal = 0;
   let activeResponseId = null;
+  // Dedicated loop-state flag, set on agent_start / cleared on agent_end. Used
+  // as the no-isIdle() fallback for requestInterrupt instead of
+  // !activeResponseId: agent_start resets activeResponseId to null and only
+  // turn_start assigns it, so an interrupt landing in that gap (after
+  // agent_start, before turn_start) would look idle by activeResponseId yet the
+  // loop is genuinely running — agentRunning arms it correctly. See F18.
+  let agentRunning = false;
   let latestContext = null;
   let pendingInterruptUntil = 0;
   const postedToolCalls = new Set();
@@ -270,7 +301,29 @@ module.exports = function (pi) {
     return true;
   }
 
+  function safeIsIdle(ctx) {
+    // Returns true/false from the SDK's isIdle(), or null when the signal is
+    // unavailable (older SDK) or throws, so the caller can fall back.
+    // Deliberately returns null (not true) on throw so callers fall back to loop
+    // state (!agentRunning) rather than blindly treating the agent as idle.
+    if (!ctx || typeof ctx.isIdle !== "function") return null;
+    try {
+      return ctx.isIdle();
+    } catch (_err) {
+      return null;
+    }
+  }
+
   function requestInterrupt(ctx) {
+    // ctx.abort() is a silent no-op when the Pi agent is idle (it does NOT
+    // throw), so an interrupt that arrives with no live turn must NOT arm the
+    // replay window — otherwise the 30s window poisons the next legitimately
+    // started turn (F18). Only arm when a turn is genuinely in-flight: prefer
+    // the SDK's isIdle(), and fall back to the agent loop state on SDK versions
+    // that don't expose it.
+    const idle = safeIsIdle(ctx);
+    const turnIsIdle = idle === null ? !agentRunning : idle;
+    if (turnIsIdle) return false;
     const accepted = interruptActiveContext(ctx);
     if (!accepted) return false;
     pendingInterruptUntil = Date.now() + pendingInterruptMs;
@@ -396,7 +449,13 @@ module.exports = function (pi) {
 
   pi.on("agent_start", async (_event, ctx) => {
     rememberContext(ctx);
-    replayPendingInterrupt(ctx);
+    // A brand-new agent loop must never inherit a replay window armed before it
+    // began (e.g. a spuriously-armed window from an interrupt that landed while
+    // idle). A legitimate interrupt that arrives after this point belongs to
+    // this loop and can still arm/replay; agent_end clears once the loop
+    // completes. See F18.
+    clearPendingInterrupt();
+    agentRunning = true;
     setOmnigentStatus(config, ctx, "running");
     activeResponseId = null;
     turnOrdinal = 0;
@@ -416,6 +475,7 @@ module.exports = function (pi) {
   pi.on("agent_end", async (_event, ctx) => {
     rememberContext(ctx);
     clearPendingInterrupt();
+    agentRunning = false;
     setOmnigentStatus(config, ctx, "idle");
     activeResponseId = null;
     await postEvent(config, {

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "omnigent"
-version = "0.1.0"
+version = "0.2.0.dev0"
 description = "Omnigent: declarative agent authoring and runtime framework"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -25,8 +25,8 @@ dependencies = [
     # one version, so a published `omnigent==X` must resolve the SDK wheels
     # built alongside it (release-omnigent.yml verifies these pins match the
     # release tag). Local/editable installs still resolve via tool.uv.sources.
-    "omnigent-client==0.1.0",
-    "omnigent-ui-sdk==0.1.0",
+    "omnigent-client==0.2.0.dev0",
+    "omnigent-ui-sdk==0.2.0.dev0",
     # Merged from omnigent + omnigent.
     "pyyaml>=6.0,<7",
     "openai>=1.0,<3",
@@ -101,6 +101,10 @@ openai-agents = []
 all = ["databricks-sdk>=0.56.0,<1"]
 # From omnigent.
 bedrock = ["boto3>=1.30,<2", "botocore>=1.30,<2"]
+# S3-compatible artifact store (AWS S3, Cloudflare R2, MinIO, …). Selected
+# with ``OMNIGENT_ARTIFACT_URI=s3://bucket/prefix``; the store imports boto3
+# lazily, so only users of this backend need the extra.
+s3 = ["boto3>=1.30,<2", "botocore>=1.30,<2"]
 vertex = ["google-auth>=2.0,<3"]
 # Modal sandbox launcher (`omnigent sandbox --provider modal`). The
 # launcher module ships in the base package and imports the SDK lazily,
@@ -118,6 +122,10 @@ cwsandbox = ["cwsandbox>=0.24,<1"]
 # server-managed `sandbox.provider: e2b`).
 # Same lazy-import posture as above.
 e2b = ["e2b>=2.26,<3"]
+# NVIDIA OpenShell launcher (`omnigent sandbox --provider openshell`).
+# Self-hosted gRPC gateway; the SDK pulls grpcio + protobuf. Same
+# lazy-import posture as above. Pre-1.0 SDK: pin minor.
+openshell = ["openshell>=0.0.7,<1"]
 # MLflow tracing is opt-in: tracing is disabled by default and the
 # server degrades gracefully when mlflow is absent, so the (heavy) mlflow
 # dependency only installs for users who want it (`omnigent[tracing]`).
@@ -198,6 +206,16 @@ dev = [
     # gitwildmatch glob matching for repo tooling manifests. Declared
     # explicitly rather than relied on transitively (via mypy).
     "pathspec>=0.12",
+    # Cloud-service mocks for the artifact-store / Cloudflare integration
+    # tests: moto is the standard S3-compatible mock (used for R2), respx is
+    # the standard HTTPX mock (used to back the Cloudflare D1 REST API with an
+    # in-memory SQLite), and boto3 backs the S3 artifact store under test.
+    "moto[s3]>=5,<6",
+    "respx>=0.21,<1",
+    "boto3>=1.30,<2",
+    # The Cloudflare D1 SQLAlchemy dialect, exercised by the D1 FTS integration
+    # test (tests/db/test_d1_fts_dialect.py) via respx + sqlite3.
+    "sqlalchemy-cloudflare-d1==0.3.10",
 ]
 
 [project.scripts]
@@ -274,6 +292,7 @@ markers = [
     "llm_flaky(reruns=2, reruns_delay=1): rerun a nondeterministic real-LLM test on failure, rotating to a different model each attempt (tests/_model_pools.py). Never apply to heavy e2e tests that can hit the CI --timeout=180 cap (rerun + loadscope can crash the shard).",
     "in_process_sessions: run a server integration test with the legacy in-process sessions path instead of sessions-native runner dispatch.",
     "nightly: runs only in the scheduled/dispatch pass of its suite; PR and push runs exclude it via -m 'not nightly'. Remove the marker to promote a burned-in test to the PR gate.",
+    "mock_only: tests/integration test that only works in mock-LLM mode (no --llm-api-key). Skipped by tests/integration/conftest.py when a real --llm-api-key is supplied (the real-LLM Integration jobs). Use for tests whose mock LLM is scripted with a fixed tool-call sequence — a real LLM cannot reproduce the scripted markers.",
 ]
 
 [tool.coverage.run]
@@ -488,6 +507,17 @@ ignore_missing_imports = true
 # modal above.
 [[tool.mypy.overrides]]
 module = "e2b.*"
+ignore_missing_imports = true
+
+# openshell is an optional dep (the `openshell` extra); same lazy-import
+# posture as modal above. grpc rides in via the openshell SDK and is not
+# a base dependency, so its imports are unresolved in the default env too.
+[[tool.mypy.overrides]]
+module = "openshell.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "grpc.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

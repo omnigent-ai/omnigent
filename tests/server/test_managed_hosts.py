@@ -18,6 +18,7 @@ from omnigent.server.managed_hosts import (
     DAYTONA_MANAGED_TOKEN_TTL_S,
     ISLO_MANAGED_TOKEN_TTL_S,
     MODAL_MANAGED_TOKEN_TTL_S,
+    OPENSHELL_MANAGED_TOKEN_TTL_S,
     ManagedSandboxConfig,
     RepoWorkspace,
     launch_managed_host,
@@ -38,6 +39,7 @@ from tests.server.helpers import (
     install_fake_e2b_launcher,
     install_fake_islo_launcher,
     install_fake_modal_launcher,
+    install_fake_openshell_launcher,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -326,6 +328,56 @@ def test_parse_e2b_template_rejects_non_string(monkeypatch: pytest.MonkeyPatch) 
         )
 
 
+def test_parse_valid_openshell_config_builds_parameterized_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The documented openshell YAML shape parses into a config whose
+    factory constructs OpenShell launchers carrying image, env names,
+    and the optional gateway cluster.
+    """
+    cfg = parse_sandbox_config(
+        {
+            "provider": "openshell",
+            "server_url": "https://srv.example.com/",
+            "openshell": {
+                "image": "docker.io/me/omnigent-host:latest",
+                "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
+                "cluster": "my-gateway",
+            },
+        }
+    )
+    assert cfg is not None
+    assert cfg.server_url == "https://srv.example.com"
+    assert cfg.token_ttl_s == OPENSHELL_MANAGED_TOKEN_TTL_S
+    assert cfg.managed_launch_supported is True
+    assert cfg.provider == "openshell"
+    fake = FakeSandboxLauncher()
+    install_fake_openshell_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.image == "docker.io/me/omnigent-host:latest"
+    assert fake.env == ["OPENAI_API_KEY", "GIT_TOKEN"]
+    assert fake.cluster == "my-gateway"
+
+
+def test_parse_openshell_without_section_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    `provider: openshell` + `server_url` is a complete config: optional
+    constructor fields reach the launcher as None so its env-var
+    fallbacks / official-image default / active-gateway apply.
+    """
+    cfg = parse_sandbox_config({"provider": "openshell", "server_url": "https://s.example.com"})
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_openshell_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.image is None
+    assert fake.env is None
+    assert fake.cluster is None
+
+
 @pytest.mark.parametrize(
     ("raw", "expected_fragment"),
     [
@@ -382,6 +434,23 @@ def test_parse_e2b_template_rejects_non_string(monkeypatch: pytest.MonkeyPatch) 
         (
             {"provider": "islo", "server_url": "https://s", "islo": {"memory_mb": "large"}},
             "sandbox.islo.memory_mb",
+        ),
+        # openshell section present but malformed.
+        (
+            {"provider": "openshell", "server_url": "https://s", "openshell": "x"},
+            "sandbox.openshell",
+        ),
+        (
+            {"provider": "openshell", "server_url": "https://s", "openshell": {"image": "  "}},
+            "sandbox.openshell.image",
+        ),
+        (
+            {"provider": "openshell", "server_url": "https://s", "openshell": {"env": ["", "X"]}},
+            "sandbox.openshell.env",
+        ),
+        (
+            {"provider": "openshell", "server_url": "https://s", "openshell": {"cluster": "  "}},
+            "sandbox.openshell.cluster",
         ),
     ],
 )

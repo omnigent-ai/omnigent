@@ -21,6 +21,7 @@ import { AlertTriangleIcon, Check, Copy, MessageSquareOffIcon } from "lucide-rea
 import { useEditor, EditorContent } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import { Table, TableRow, TableCell, TableHeader } from "@tiptap/extension-table";
+import { TaskItem, TaskList } from "@tiptap/extension-list";
 import { Markdown } from "@tiptap/markdown";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
@@ -265,6 +266,15 @@ function MarkdownRichTextViewerInner({
       // markdown handlers would shadow the GitHub-flavored replacements
       // below (duplicate extension names: first wins).
       StarterKit.configure({ link: false, blockquote: false }),
+      // Task lists (GitHub `- [ ]` / `- [x]`). StarterKit ships
+      // BulletList/OrderedList/ListItem but NOT TaskList/TaskItem, so without
+      // these two the markdown parser drops the checkbox and renders a plain
+      // bullet. Registering them (a) makes @tiptap/markdown pick up TaskList's
+      // built-in `- [ ]` marked tokenizer so the syntax parses into checkbox
+      // items, and (b) round-trips back to identical markdown via their
+      // built-in renderMarkdown. nested:true lets Tab indent sub-checklists.
+      TaskList,
+      TaskItem.configure({ nested: true }),
       Table.configure({ resizable: true }),
       TableRow,
       TableCell,

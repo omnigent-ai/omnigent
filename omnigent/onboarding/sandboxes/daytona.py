@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 import click
 
+from omnigent.inner import ui
 from omnigent.onboarding.sandboxes.base import (
     DEFAULT_HOST_IMAGE,
     RemoteCommandResult,
@@ -407,11 +408,12 @@ class DaytonaSandboxLauncher(SandboxLauncher):
         try:
             handle.set_autostop_interval(_AUTO_STOP_DISABLED)
         except daytona.DaytonaError as exc:
-            click.secho(
+            ui.console.print(
                 f"  → warning: could not disable idle auto-stop on "
                 f"'{sandbox_id}' ({exc}); the sandbox may stop after "
                 "Daytona's idle timeout.",
-                fg="yellow",
+                style="omni.warning",
+                markup=False,
             )
         else:
             click.echo("  → idle auto-stop disabled (sandbox lives until deleted)")

@@ -97,18 +97,13 @@ def owner_session(
     live_server: str,
     live_runner_id: str,
     mock_llm_server_url: str | None,
-    request: pytest.FixtureRequest,
 ) -> Iterator[_OwnedSession]:
     """A runner-bound session owned by the ``local`` identity.
 
-    A dedicated headerless client (not the shared ``http_client``)
-    keeps per-test connection lifecycles independent. Per-test unique
-    agent names keep grants and sessions from bleeding between tests
-    on the shared session-scoped server.
+    Always uses mock LLM via an inline agent.
     """
     suffix = uuid.uuid4().hex[:6]
-    is_mock = request.config.getoption("--llm-api-key") is None
-    model = f"mock-share-{suffix}" if is_mock else "databricks-gpt-5-4-mini"
+    model = f"mock-share-{suffix}"
     owner = httpx.Client(base_url=live_server, timeout=300)
     reset_mock_llm(mock_llm_server_url)
     agent_name = register_inline_agent(
@@ -116,11 +111,9 @@ def owner_session(
         name=f"sharing-e2e-{suffix}",
         harness="openai-agents",
         model=model,
-        profile=request.config.getoption("--profile"),
+        profile="",
         prompt="You are a terse assistant. Follow instructions exactly.",
-        mock_llm_base_url=(
-            f"{mock_llm_server_url}/v1" if is_mock and mock_llm_server_url else None
-        ),
+        mock_llm_base_url=(f"{mock_llm_server_url}/v1" if mock_llm_server_url else None),
     )
     session_id = create_runner_bound_session(
         owner, agent_name=agent_name, runner_id=live_runner_id

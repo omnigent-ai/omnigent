@@ -34,6 +34,14 @@ _POST_TOOL_USE = "PostToolUse"
 # direct-terminal prompts). It can block the prompt before the model runs.
 _USER_PROMPT_SUBMIT = "UserPromptSubmit"
 
+# Reason surfaced when a tool call is denied because its policy verdict
+# could not be obtained (server unreachable / non-2xx / empty or malformed
+# body). Mirrors the runner-side fail-closed default in
+# ``omnigent.runner.app._evaluate_policy_via_omnigent`` (PR #163).
+_EVAL_UNAVAILABLE_REASON = (
+    "Omnigent policy evaluation unavailable; failing closed for this tool call."
+)
+
 
 def hook_payload_to_evaluation_request(
     hook_event: str,
@@ -217,4 +225,47 @@ def evaluation_response_to_hook_output(
             }
         return None
 
+    return None
+
+
+def fail_closed_hook_output(hook_event: str) -> dict[str, object] | None:
+    """
+    Build the fail-closed hook output for an unobtainable policy verdict.
+
+    Called by the per-harness hooks when the ``/policies/evaluate``
+    round-trip cannot produce a usable verdict for an *already-governed*
+    session — the server is unreachable, returns a non-2xx status, or
+    returns an empty / malformed body. Without this the hooks emitted "no
+    opinion" on those paths, silently letting the gated tool run: for
+    native harnesses this hook is the sole enforcement point (it gates
+    Bash / Write / Edit / the native Skill tool / connector-native
+    ``mcp__*`` tools), so a transient outage disabled all DENY/ASK
+    enforcement.
+
+    The default is phase-aware, matching
+    :data:`omnigent.policies.types.FAIL_CLOSED_PHASES` (the runner-side
+    precedent from PR #163) — but expressed in hook-event terms so the
+    lightweight hook subprocess need not import the policy package:
+
+    - ``PreToolUse`` (``PHASE_TOOL_CALL``) fails CLOSED → ``deny``. This is
+      the authoritative pre-execution gate; an unevaluable policy must not
+      let the call through.
+    - ``UserPromptSubmit`` (``PHASE_REQUEST``) and ``PostToolUse``
+      (``PHASE_TOOL_RESULT``) fail OPEN → ``None``. The request gate is
+      advisory (the tool-call gate still catches dangerous actions) and by
+      the result phase the tool has already executed, so denying would only
+      block an already-incurred side effect.
+
+    :param hook_event: Hook event name, e.g. ``"PreToolUse"``.
+    :returns: A ``permissionDecision: "deny"`` hook output for
+        ``PreToolUse``; ``None`` for every other event (fail open).
+    """
+    if hook_event == _PRE_TOOL_USE:
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": _PRE_TOOL_USE,
+                "permissionDecision": "deny",
+                "permissionDecisionReason": _EVAL_UNAVAILABLE_REASON,
+            },
+        }
     return None
