@@ -406,4 +406,6 @@ class _OpenCodeServer:
             self._stderr_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._stderr_task
+            self._stderr_task = None
         self._proc = None
+        self.base_url = None
