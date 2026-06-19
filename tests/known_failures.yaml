@@ -335,11 +335,6 @@ skips:
   # red together).
 
   # Standalone failures — no obvious cluster yet.
-  - id: tests/e2e/omnigent/test_compaction_sessions_native_e2e.py::test_compaction_fires_and_agent_retains_context
-    reason: "Not a compaction bug: the pexpect `omnigent run` child never finishes booting -- it stays on 'Starting the local server...' and never reaches the 'sleeping' ready state within the 120s _BOOT_TIMEOUT (fails at line 163, before any compaction assertion runs). Boot-starvation, same family as the repl-pexpect-cli tests, so repointed off the compaction tracker (#679, mis-filed) to #523. Fails 30/30 in flake-stress run 27799636357 (main, --no-skip-known, 2 workers, 2026-06-19)."
-    issue: 523
-    cluster: repl-pexpect-cli
-    mode: skip
   - id: tests/e2e/test_filesystem_changed_files_e2e.py::test_filesystem_changes_appear_after_agent_write
     reason: "Migrated to mock LLM but underlying infrastructure issue persists: the main e2e runner fixture does not set OMNIGENT_RUNNER_WORKSPACE, so the filesystem changes tracking does not detect agent writes. Needs OMNIGENT_RUNNER_WORKSPACE wiring in the e2e runner fixture."
     issue: 673
