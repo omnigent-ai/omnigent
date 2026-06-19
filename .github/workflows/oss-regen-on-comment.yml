@@ -42,7 +42,7 @@ jobs:
       # Checkout main only for load-maintainers.sh; the PR branch is checked
       # out later (regen job), after authorization passes.
       - name: Checkout (for the maintainer script)
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Load maintainers from .github/MAINTAINER
         id: maint
@@ -114,7 +114,7 @@ jobs:
       # build backends, which must not find a push token on disk. The App token
       # is minted only after `uv lock` and enters only at the push step.
       - name: Checkout the PR branch
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           ref: ${{ needs.authorize.outputs.head }}
           persist-credentials: false
