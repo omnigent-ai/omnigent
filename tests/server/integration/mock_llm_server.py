@@ -157,6 +157,49 @@ def sse_text_response(text: str, model: str = "mock-model") -> str:
     return "".join(events)
 
 
+def json_text_response(text: str, model: str = "mock-model") -> dict:
+    """
+    Build a non-streaming Responses API JSON body for a text response.
+
+    Used when the request does NOT include ``stream: true`` — for example,
+    the cost-advisor judge calls ``responses.create`` without streaming and
+    the OpenAI adapter calls ``_send_request`` which expects a plain JSON dict.
+
+    :param text: The assistant response text.
+    :param model: Model name to include in the response.
+    :returns: Responses API response dict.
+    """
+    resp_id = _response_id()
+    msg_id = f"msg_{resp_id}"
+    output_tokens = max(5, len(text.split()))
+    now = _time_mod.time()
+    return {
+        "id": resp_id,
+        "object": "response",
+        "status": "completed",
+        "model": model,
+        "output": [
+            {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": text}],
+            }
+        ],
+        "parallel_tool_calls": True,
+        "tools": [],
+        "tool_choice": "auto",
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": output_tokens,
+            "total_tokens": 10 + output_tokens,
+        },
+        "created_at": now,
+        "completed_at": now,
+    }
+
+
 def sse_tool_call_response(
     tool_calls: list[dict[str, str]],
     model: str = "mock-model",
@@ -608,6 +651,19 @@ async def create_response(
         _state.pending_gates.append(qr)
         await qr._gate.wait()
 
+    # When the request does not include ``stream: true``, return a plain
+    # JSON body (non-streaming Responses API format).  This supports callers
+    # like the cost-advisor judge that call ``responses.create`` without
+    # streaming and use ``_send_request`` which calls ``resp.json()``.
+    # Tool-call responses and native-item responses are streaming-only; fall
+    # through to SSE for those.
+    is_streaming = isinstance(parsed, dict) and parsed.get("stream")
+    if not is_streaming and not qr.tool_calls and not qr.native_items:
+        model_name = (
+            parsed.get("model", "mock-model") if isinstance(parsed, dict) else "mock-model"
+        )
+        return JSONResponse(content=json_text_response(qr.text or "", model=model_name))
+
     # Build SSE body
     if qr.tool_calls:
         sse_body = sse_tool_call_response(qr.tool_calls)
@@ -676,6 +732,79 @@ async def create_message(
         _generate(),
         media_type="text/event-stream",
     )
+
+
+@app.post("/v1/chat/completions", response_model=None)
+async def create_chat_completion(
+    request: Request,
+) -> StreamingResponse | JSONResponse:
+    """OpenAI Chat Completions API endpoint (for pi and legacy harnesses).
+
+    Returns a non-streaming JSON response in Chat Completions format,
+    routing through the same keyed queue as /v1/responses.
+    """
+    body = await request.body()
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        parsed = {"raw": body.decode(errors="replace")}
+
+    async with _state._lock:
+        _state.request_count += 1
+        _state.captured_requests.append(parsed)
+        model = parsed.get("model") if isinstance(parsed, dict) else None
+        queue = _state.resolve_queue(model)
+        qr = queue.next()
+
+    if qr.error is not None:
+        return JSONResponse(
+            status_code=qr.status_code,
+            content={"error": {"message": qr.error, "type": "mock_error"}},
+        )
+
+    if qr.block:
+        qr._pending.set()
+        _state.pending_gates.append(qr)
+        await qr._gate.wait()
+
+    text = qr.text if not qr.tool_calls else ""
+    resp_id = _response_id()
+    body_json = {
+        "id": f"chatcmpl-{resp_id}",
+        "object": "chat.completion",
+        "model": model or "mock-model",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": max(5, len(text.split())),
+            "total_tokens": 15,
+        },
+    }
+    if parsed.get("stream"):
+        chunk = {
+            "id": f"chatcmpl-{resp_id}",
+            "object": "chat.completion.chunk",
+            "model": model or "mock-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": text},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+        async def _stream() -> AsyncIterator[str]:
+            yield f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n"
+
+        return StreamingResponse(_stream(), media_type="text/event-stream")
+    return JSONResponse(content=body_json)
 
 
 @app.get("/v1/models")

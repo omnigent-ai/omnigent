@@ -127,7 +127,7 @@ jobs:
       # out untrusted PR code in a privileged workflow.
       - name: Check out repo
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
@@ -181,7 +181,7 @@ jobs:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
           mkdir -p "${GITHUB_WORKSPACE}/.codex-cli" && cd "${GITHUB_WORKSPACE}/.codex-cli"
-          npm install --ignore-scripts --no-audit --no-fund @openai/codex@0.128.0-alpha.1
+          npm install --ignore-scripts --no-audit --no-fund @openai/codex@0.139.0
           echo "${GITHUB_WORKSPACE}/.codex-cli/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Set LLM credentials
@@ -332,8 +332,10 @@ jobs:
 
           # Strip any sub-agent coordination preamble that leaks before
           # the actual review.  Primary: look for the sentinel we asked the
-          # model to emit.  Fallback: first markdown heading or standalone
-          # horizontal rule.
+          # model to emit.  Fallback: first markdown heading.  If neither is
+          # found the output is intermediate narration (subagents timed out
+          # before synthesis) — write empty string so the post step is skipped
+          # and raw coordination messages are never posted as a PR comment.
           python3 -c "
           import re, pathlib
           raw = pathlib.Path('/tmp/polly_output.txt').read_text()
@@ -342,8 +344,8 @@ jobs:
           if idx >= 0:
               cleaned = raw[idx + len(sentinel):].lstrip('\n')
           else:
-              m = re.search(r'^(#{1,6} |---\s*$)', raw, re.MULTILINE)
-              cleaned = raw[m.start():] if m else raw
+              m = re.search(r'^#{1,6} ', raw, re.MULTILINE)
+              cleaned = raw[m.start():] if m else ''
           pathlib.Path('/tmp/polly_output.txt').write_text(cleaned)
           "
 

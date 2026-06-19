@@ -322,8 +322,29 @@ def load_omnigent_yaml(path: Path, *, enforce_handler_allowlist: bool = False) -
     result = validate(spec)
     if not result.valid:
         errors = "; ".join(f"{e.path}: {e.message}" for e in result.errors)
-        raise OmnigentError(
-            f"invalid agent spec synthesized from omnigent YAML: {errors}",
-            code=ErrorCode.INVALID_INPUT,
-        )
+        message = f"invalid agent spec synthesized from omnigent YAML: {errors}"
+        # An unrecognized harness *value* usually means this client
+        # (the omnigent runner validating the spec) is older than the
+        # server that produced it: the server knows a harness this
+        # runner's allowlist doesn't. Surface that so the operator
+        # checks for a version skew before assuming the spec is wrong.
+        #
+        # The ``"must be one of"`` prefix is the wording emitted by
+        # ``validate_omnigent_executor`` (same module) for an
+        # out-of-allowlist harness. It deliberately does NOT match the
+        # sibling "required when executor.type is 'omnigent' — must be
+        # one of ..." message for a *missing* harness, which is a plain
+        # authoring mistake, not a version skew. Producer and matcher
+        # live in this file, so the coupling stays local; if that
+        # message is reworded, update both together.
+        if any(
+            e.path == "executor.config.harness" and e.message.startswith("must be one of")
+            for e in result.errors
+        ):
+            message += (
+                "\n\nNote: if this harness is valid on a newer Omnigent server, "
+                "this client (runner) may be older than the server that produced "
+                "the spec — upgrade the runner to pick up newer harnesses."
+            )
+        raise OmnigentError(message, code=ErrorCode.INVALID_INPUT)
     return spec

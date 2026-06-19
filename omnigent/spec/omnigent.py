@@ -1367,6 +1367,17 @@ def _agent_tool_to_sub_spec(
         resolved os_env is also ``None`` and the sub-agent boots
         without filesystem access (matching legacy behavior when
         the parent itself has no os_env).
+    :param raw_executor: The raw ``executor:`` dict for this inline
+        AgentTool taken directly from the parent's YAML (before
+        omnigent' dataclass parsing dropped unknown keys). When set,
+        fields the omnigent :class:`~omnigent.inner.datamodel.ExecutorSpec`
+        datamodel does not expose — ``auth`` and ``use_responses`` —
+        are read from this dict and forwarded into the child's
+        :class:`ExecutorSpec` via :func:`_translate_executor_from_def`.
+        Without this, an ``executor.auth`` block declared on an inline
+        AgentTool is silently ignored, causing child sub-agents to fall
+        back to the ambient ``OPENAI_BASE_URL`` rather than the explicitly
+        declared mock/gateway URL.
     :returns: A nested :class:`AgentSpec` representing the
         sub-agent.
     """
@@ -1754,14 +1765,18 @@ def _translate_executor_from_def(
     # ``spec.executor.config["use_responses"]`` to set
     # ``HARNESS_OPENAI_AGENTS_USE_RESPONSES``, which controls
     # whether the inner executor uses /responses or /chat/completions.
-    auth: ApiKeyAuth | DatabricksAuth | None = None
+    # ``use_responses`` is carried via raw_executor when present
     if raw_executor is not None:
         use_responses_raw = raw_executor.get("use_responses")
         if use_responses_raw is not None:
             config["use_responses"] = bool(use_responses_raw)
-        # ``auth:`` is also not in the omnigent datamodel — parse it
-        # directly from the raw YAML so YAML-declared auth is not
-        # silently dropped and overridden by the global config default.
+    # ``auth`` is now parsed by the loader into OmniExecutorSpec.auth;
+    # fall back to raw_executor for the top-level agent path that still
+    # goes through _translate_executor_from_def(raw_executor=...).
+    auth: ApiKeyAuth | DatabricksAuth | None = None
+    if oa_executor is not None and oa_executor.auth is not None:
+        auth = oa_executor.auth  # type: ignore[assignment]
+    elif raw_executor is not None:
         from omnigent.spec.parser import _parse_executor_auth
 
         auth = _parse_executor_auth(raw_executor)
