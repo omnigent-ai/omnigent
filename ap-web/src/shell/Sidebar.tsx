@@ -1517,8 +1517,7 @@ function BulkActionBar({
   );
 
   const allSelectedSameArchiveGroup =
-    ownedSelected.length > 0 &&
-    (archivedSelected.length === 0 || nonArchivedSelected.length === 0);
+    ownedSelected.length > 0 && (archivedSelected.length === 0 || nonArchivedSelected.length === 0);
 
   const count = selectedIds.size;
   const allSelected = count > 0 && count === allConversations.length;
