@@ -69,21 +69,21 @@ skips:
 
 
   - id: tests/e2e/omnigent/test_repl_overview_terminal_visibility.py::test_repl_overview_terminal_visibility
-    reason: "REPL pexpect TIMEOUT post-path-fix. Same family as test_repl_ctrl_o_overview (opens the debug overview)."
+    reason: "Blocked on the tool-call lifecycle-marker rendering gap (same family as #677), NOT a stale marker. Probed live 2026-06-20: after the prompt that should fire sys_terminal_launch, the turn runs to idle WITHOUT rendering the sync line '• sys_terminal_launch (Nms)' the test waits on -> expect times out. Compounding: this test uses the open-responses harness, which did not execute the mock tool-call at all and under which Ctrl+O opened no overview. Also needs the Ctrl+G->Ctrl+O keybinding fix (necessary but insufficient). Needs the tool-call-marker render (and open-responses tool execution) fixed first."
     issue: 523
-    cluster: repl-pexpect-cli
+    cluster: repl-toolcall-marker-render
     mode: skip
 
   - id: tests/e2e/omnigent/test_repl_overview_subagent_visibility.py::test_repl_overview_subagent_visibility[claude-sdk]
-    reason: "Suspected worker-death contributor on shard 0 alongside test_repl_multiline_ctrl_j_insert. Investigate together."
+    reason: "Blocked on the tool-call lifecycle-marker rendering gap (same family as #677): the test syncs on the supervisor's 'sys_session_send (<worker>:' tool-call line, which does not render (probed live 2026-06-20 via the [codex] sibling: no tool-call marker surfaces after submit, and Ctrl+O then opens no overview). Also needs the Ctrl+G->Ctrl+O keybinding fix (necessary but insufficient), and the claude_worker sub-agent needs the claude CLI on a mock-served path. claude-sdk row also can't run locally (claude is a shell alias). Needs the tool-call-marker render fixed first."
     issue: 523
-    cluster: repl-pexpect-cli
+    cluster: repl-toolcall-marker-render
     mode: skip
 
   - id: tests/e2e/omnigent/test_repl_overview_subagent_visibility.py::test_repl_overview_subagent_visibility[codex]
-    reason: "Same family as the [claude-sdk] variant; suspected worker-death contributor on shard 0."
+    reason: "Blocked on the tool-call lifecycle-marker rendering gap (same family as #677): probed live 2026-06-20 — after the delegate prompt the supervisor turn does not render the 'sys_session_send (codex_worker:' sync line the test waits on, and a follow-up Ctrl+O opens no overview. Also needs the Ctrl+G->Ctrl+O keybinding fix (necessary but insufficient), plus the codex_worker sub-agent on a mock-served path. Needs the tool-call-marker render fixed first."
     issue: 523
-    cluster: repl-pexpect-cli
+    cluster: repl-toolcall-marker-render
     mode: skip
 
   - id: tests/e2e/omnigent/test_yaml_hello_world.py::test_yaml_agent_with_tools[pi]
