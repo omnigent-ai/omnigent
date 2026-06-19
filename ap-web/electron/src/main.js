@@ -1677,6 +1677,9 @@ function registerIpc() {
       title,
       body: String(params?.body ?? ""),
     });
+    // In-app path the SPA wants opened on click (e.g. "/c/conv_abc"). Captured
+    // here so the click handler can tell the renderer where to route.
+    const navigatePath = typeof params?.navigatePath === "string" ? params.navigatePath : "";
     // Focus the window that fired the notification (so a click lands on the
     // right one in a multi-window setup), falling back to any open window.
     notification.on("click", () => {
@@ -1684,6 +1687,17 @@ function registerIpc() {
       if (win) {
         if (win.isMinimized()) win.restore();
         win.focus();
+      }
+      // Route only the originating window (it owns that conversation's state).
+      // isDestroyed() and send() aren't atomic — the window can close between
+      // them — so the try/catch absorbs the benign "Object has been destroyed"
+      // throw instead of crashing the main process from this async callback.
+      if (navigatePath && !event.sender.isDestroyed()) {
+        try {
+          event.sender.send("omnigent:notification-activated", navigatePath);
+        } catch {
+          // Sender went away after the notification was posted; nothing to do.
+        }
       }
     });
     notification.show();

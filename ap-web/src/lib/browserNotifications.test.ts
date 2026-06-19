@@ -127,4 +127,29 @@ describe("showNotification", () => {
     expect(onClick).toHaveBeenCalledOnce();
     expect(instances[0].close).toHaveBeenCalledOnce();
   });
+
+  it("hands off to the native shell (with navigatePath) instead of a web toast", () => {
+    // Under the Electron shell, showNotification routes to the OS notification
+    // and forwards navigatePath (not the onClick closure, which can't cross
+    // IPC) so the shell can open the conversation on click. No web toast.
+    installNotification("granted");
+    const electronNotify = vi.fn().mockResolvedValue(true);
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      setBadgeCount: vi.fn(),
+      notify: electronNotify,
+    };
+    try {
+      const result = showNotification({ title: "X", body: "done", navigatePath: "/c/a" });
+      expect(result).toBeNull();
+      expect(instances).toHaveLength(0);
+      expect(electronNotify).toHaveBeenCalledWith({
+        title: "X",
+        body: "done",
+        navigatePath: "/c/a",
+      });
+    } finally {
+      delete (window as unknown as Record<string, unknown>).omnigentDesktop;
+    }
+  });
 });

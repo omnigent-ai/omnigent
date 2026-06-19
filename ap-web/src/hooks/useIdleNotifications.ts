@@ -35,7 +35,7 @@ import {
   requestNotificationPermission,
   showNotification,
 } from "@/lib/browserNotifications";
-import { isNativeShell, setBadgeCount } from "@/lib/nativeBridge";
+import { isNativeShell, onNativeNotificationActivated, setBadgeCount } from "@/lib/nativeBridge";
 import { fetchLastAssistantText } from "@/lib/lastAssistantText";
 import {
   buildElicitationMap,
@@ -124,6 +124,21 @@ export function useIdleNotifications(activeConversationId?: string): void {
   const activeIdRef = useRef<string | undefined>(activeConversationId);
   activeIdRef.current = activeConversationId;
 
+  // Keep the latest `navigate` readable from the once-mounted native-click
+  // listener below without re-subscribing whenever the router identity changes.
+  const navigateRef = useRef(navigate);
+  navigateRef.current = navigate;
+
+  // Desktop shell only: clicking an OS notification can't run the web
+  // `onClick` closure (it never crosses the IPC boundary), so the shell sends
+  // back the notification's in-app path and we route to it here — making a
+  // native toast click open its conversation, matching the browser path.
+  useEffect(() => {
+    return onNativeNotificationActivated((path) => navigateRef.current(path));
+    // navigateRef is stable; the listener is mounted once for the app's life.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Send the badge count when it differs from the last one sent. No-op in a
   // plain browser (`setBadgeCount` is inert outside the desktop shell).
   const pushBadge = (count: number) => {
@@ -209,13 +224,18 @@ function notify(
   body: string,
   navigate: ReturnType<typeof useNavigate>,
 ): void {
+  const path = `/c/${conversation.id}`;
   showNotification({
     title: conversationDisplayLabel(conversation),
     body,
     // Tag by id so a later update for the same session replaces its
     // toast instead of stacking duplicates.
     tag: `omnigent:session:${conversation.id}`,
-    onClick: () => navigate(`/c/${conversation.id}`),
+    // Browser path: run navigation directly on click. Desktop shell path:
+    // `navigatePath` is forwarded over IPC and routed on click instead, since
+    // this closure can't cross the process boundary.
+    onClick: () => navigate(path),
+    navigatePath: path,
   });
 }
 
