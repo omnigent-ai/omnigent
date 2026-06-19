@@ -108,11 +108,6 @@ skips:
 
 
   # ── Shard 1 errors (collection / fixture-level, not test body) ──
-  - id: tests/e2e/omnigent/test_example_agent_with_os_env_fork.py::test_agent_with_os_env_fork_one_shot
-    reason: "Shards 0/1 bulk: agent_with_os_env_fork one-shot exits 0 with no stdout."
-    issue: 675
-    cluster: sandbox-deps-env
-    mode: skip
   - id: tests/e2e/test_claude_coder_sandbox.py::test_write_blocked_outside_workspace
     reason: "Distinct from the bwrap CLI-path fix (this PR): the claude-sdk Write tool is NOT blocked from creating files outside the workspace, while edit/read/glob enforcement IS (those 4 sandbox tests pass 30/30 in flake-stress run 27796759300). write_blocked fails 30/30 — a real write-path sandbox-enforcement gap. Needs its own fix."
     issue: 0
