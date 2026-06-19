@@ -1,4 +1,4 @@
-"""E2E test: share-and-collaborate user journey.
+"""E2E test: share-and-collaborate user journey (mock LLM).
 
 Exercises the full collaboration lifecycle between two users (Alice and
 Bob) against the real server with header auth:
@@ -15,8 +15,7 @@ codes: 403 for insufficient permissions and 404 for revoked access
 
 Usage::
 
-    pytest tests/e2e/test_journey_collaboration.py \
-        --llm-api-key $LLM_API_KEY --profile <name> -v
+    pytest tests/e2e/test_journey_collaboration.py -v
 """
 
 from __future__ import annotations
@@ -24,12 +23,13 @@ from __future__ import annotations
 import uuid
 
 import httpx
-import pytest
 
 from tests.e2e.conftest import (
+    configure_mock_llm,
     create_runner_bound_session,
     poll_session_until_terminal,
     register_inline_agent,
+    reset_mock_llm,
     send_user_message_to_session,
 )
 
@@ -63,16 +63,18 @@ def _client_for(base_url: str, email: str) -> httpx.Client:
     )
 
 
-@pytest.mark.llm_flaky(reruns=2)
 def test_share_collaborate_revoke_journey(
     live_server: str,
     live_runner_id: str,
-    request: pytest.FixtureRequest,
+    mock_llm_server_url: str,
 ) -> None:
     """Full collaboration lifecycle: share, comment, address, downgrade, revoke."""
     suffix = uuid.uuid4().hex[:6]
     alice_email = f"alice-{suffix}@e2e.test"
     bob_email = f"bob-{suffix}@e2e.test"
+
+    model = f"mock-collab-{suffix}"
+    reset_mock_llm(mock_llm_server_url)
 
     # The live runner is owned by the headerless ``local`` identity, so the
     # session must also be created by a headerless client to satisfy the
@@ -87,13 +89,14 @@ def test_share_collaborate_revoke_journey(
             owner,
             name=f"collab-journey-{suffix}",
             harness="openai-agents",
-            model="databricks-gpt-5-4-mini",
-            profile=request.config.getoption("--profile"),
+            model=model,
+            profile="",
             prompt=(
                 "You are a terse assistant. Follow instructions exactly. "
                 "When asked to address comments, call list_comments to see them, "
                 "then call update_comment for each one setting status to 'addressed'."
             ),
+            mock_llm_base_url=f"{mock_llm_server_url}/v1",
         )
         session_id = create_runner_bound_session(
             owner, agent_name=agent_name, runner_id=live_runner_id
@@ -105,6 +108,18 @@ def test_share_collaborate_revoke_journey(
 
         # ── 2. Alice works with the agent ───────────────────────────────
         marker = f"collab-marker-{uuid.uuid4().hex[:8]}"
+
+        # Mock queue: turn 1 echoes the marker, turn 2 confirms
+        # comment addressing (Alice addresses via API, not LLM).
+        configure_mock_llm(
+            mock_llm_server_url,
+            [
+                {"text": marker},
+                {"text": "I have noted the comment. Done."},
+            ],
+            key=model,
+        )
+
         response_id = send_user_message_to_session(
             alice,
             session_id=session_id,
@@ -155,22 +170,15 @@ def test_share_collaborate_revoke_journey(
         assert bob_comments[0]["created_by"] == bob_email
         assert bob_comments[0]["status"] == "draft"
 
-        # ── 7. Alice asks the agent to address the comment ──────────────
-        response_id = send_user_message_to_session(
-            alice,
-            session_id=session_id,
-            content=(
-                "I left a review comment on app.py. "
-                "Please do the following steps in order:\n"
-                "1. Call list_comments to see the open comments on app.py.\n"
-                "2. Call update_comment for each comment, setting status to 'addressed'.\n"
-                "3. Confirm you addressed all comments."
-            ),
+        # ── 7. Alice addresses the comment via the API ──────────────────
+        # (With mock LLM the agent can't dynamically discover the
+        # comment ID, so we drive the update_comment API directly.
+        # The permission/collaboration lifecycle is the real SUT.)
+        update_resp = alice.patch(
+            f"/v1/sessions/{session_id}/comments/{comment_id}",
+            json={"status": "addressed"},
         )
-        body = poll_session_until_terminal(
-            alice, session_id=session_id, response_id=response_id, timeout=120
-        )
-        assert body["status"] == "completed", f"Agent turn failed: {body.get('error')}"
+        update_resp.raise_for_status()
 
         # ── 8. Verify comment is addressed ──────────────────────────────
         comments_resp = alice.get(f"/v1/sessions/{session_id}/comments")
