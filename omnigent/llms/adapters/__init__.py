@@ -98,8 +98,16 @@ def _create_adapter(provider: str, **kwargs: Any) -> BaseAdapter:
 
         return DatabricksAdapter(**kwargs)
 
+    if provider == "litellm":
+        # Unified adapter over LiteLLM's 100+ providers. Imported lazily
+        # so the optional ``litellm`` dependency is only needed when used.
+        from omnigent.llms.adapters.litellm import LiteLLMAdapter
+
+        return LiteLLMAdapter()
+
     all_providers = sorted(
-        openai_compat_providers.keys() | {"anthropic", "gemini", "bedrock", "vertex", "databricks"}
+        openai_compat_providers.keys()
+        | {"anthropic", "gemini", "bedrock", "vertex", "databricks", "litellm"}
     )
     raise OmnigentError(
         f"Unknown provider {provider!r}. Supported: {all_providers}",

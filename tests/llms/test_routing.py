@@ -60,6 +60,16 @@ from omnigent.llms.routing import RoutedModel, infer_harness_from_model, parse_m
             "moonshot/kimi-k2-instruct",
             RoutedModel(provider="moonshot", model="kimi-k2-instruct"),
         ),
+        (
+            "litellm/gpt-4o",
+            RoutedModel(provider="litellm", model="gpt-4o"),
+        ),
+        # LiteLLM model strings carry their own ``provider/model`` suffix;
+        # the split-on-first-slash keeps the remainder intact for LiteLLM.
+        (
+            "litellm/anthropic/claude-3-5-sonnet",
+            RoutedModel(provider="litellm", model="anthropic/claude-3-5-sonnet"),
+        ),
     ],
 )
 def test_parse_with_provider_prefix(
