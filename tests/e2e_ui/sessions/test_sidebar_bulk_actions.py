@@ -71,13 +71,14 @@ def test_selection_mode_toggle(
     expect(toggle).to_have_attribute("aria-label", "Exit selection mode")
 
     # The row should now show a checkbox icon (unchecked square).
-    checkbox_unchecked = row.locator("svg.lucide-square")
+    row_link = row.locator(f'a[href="/c/{session_id}"]')
+    checkbox_unchecked = row_link.locator("svg.lucide-square")
     expect(checkbox_unchecked).to_be_visible()
 
     # Click the row to select it — should NOT navigate away.
-    row.locator("a").click()
+    row_link.click()
     # The checked icon appears instead of the unchecked one.
-    checkbox_checked = row.locator("svg.lucide-square-check-big")
+    checkbox_checked = row_link.locator("svg.lucide-square-check-big")
     expect(checkbox_checked).to_be_visible()
 
     # BulkActionBar shows "1 selected".
@@ -88,15 +89,15 @@ def test_selection_mode_toggle(
     expect(page.get_by_text("None selected")).to_be_visible()
 
     # Still in selection mode — checkbox icons remain visible (unchecked).
-    expect(row.locator("svg.lucide-square")).to_be_visible()
+    expect(row_link.locator("svg.lucide-square")).to_be_visible()
 
     # Exit selection mode via the toggle button.
     toggle.click()
     expect(toggle).to_have_attribute("aria-label", "Select sessions")
 
     # Checkbox icons should be gone.
-    expect(row.locator("svg.lucide-square")).to_have_count(0)
-    expect(row.locator("svg.lucide-square-check-big")).to_have_count(0)
+    expect(row_link.locator("svg.lucide-square")).to_have_count(0)
+    expect(row_link.locator("svg.lucide-square-check-big")).to_have_count(0)
 
     # BulkActionBar text should be gone.
     expect(page.get_by_text("None selected")).to_have_count(0)
@@ -127,7 +128,7 @@ def test_bulk_archive_moves_session_to_archived(
 
     # Enter selection mode and select the row.
     page.get_by_test_id("toggle-selection-mode").click()
-    row.locator("a").click()
+    row.locator(f'a[href="/c/{session_id}"]').click()
     expect(page.get_by_text("1 selected")).to_be_visible()
 
     # Click Archive.
@@ -184,7 +185,7 @@ def test_bulk_delete_removes_sessions(
 
     # Enter selection mode and select the row.
     page.get_by_test_id("toggle-selection-mode").click()
-    row.locator("a").click()
+    row.locator(f'a[href="/c/{session_id}"]').click()
     expect(page.get_by_text("1 selected")).to_be_visible()
 
     # Click Delete — should open confirmation dialog.
