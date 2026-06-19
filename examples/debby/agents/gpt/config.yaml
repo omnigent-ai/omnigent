@@ -12,9 +12,9 @@ description: >-
 # ChatGPT subscription). It has filesystem access (see the ``os_env`` block
 # below) so it can read reference files while reasoning.
 #
-# Why codex-native: it runs the real Codex CLI, which authenticates through the
-# Codex CLI login (your ChatGPT subscription) rather than an OPENAI_API_KEY in
-# the environment. The point of leaving the model unpinned is to avoid the
+# Why codex-native: it runs the real Codex CLI. In Debby's intended setup it
+# authenticates through the Codex CLI login (your ChatGPT subscription), so no
+# OPENAI_API_KEY is required. The point of leaving the model unpinned is to avoid the
 # openai-agents footgun: that harness treats an unpinned model as a Databricks
 # model (see omnigent/inner/openai_agents_sdk_executor.py — `is_databricks_model
 # = model is None`) and silently routes an unpinned "GPT" head to ambient

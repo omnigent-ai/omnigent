@@ -35,8 +35,10 @@ def test_debby_gpt_head_uses_codex_native_not_openai_agents() -> None:
     If this flips back to ``openai-agents`` with no pinned model, Debby's GPT
     head falls back to ambient Databricks credentials for any user with a
     Databricks profile configured — the exact bug this example was fixed for.
-    codex-native has no such default (it would still honor an explicitly
-    configured Databricks provider, which this guard separately rules out).
+    codex-native has no such default. This per-head guard only rules out a
+    per-head Databricks auth declaration and a pinned Databricks model — it does
+    not (and cannot) prevent a globally-configured or ambient Databricks
+    provider.
     """
     spec = parse(_DEBBY_DIR)
     by_name = {sub.name: sub for sub in spec.sub_agents}
