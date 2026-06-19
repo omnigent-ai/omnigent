@@ -285,6 +285,56 @@ def omnigent_credentials_env(
     return env
 
 
+@pytest.fixture(scope="session")
+def mock_credentials_env(
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> dict[str, str]:
+    """
+    Environment dict for subprocess invocations against the mock LLM.
+
+    Mirrors :func:`omnigent_credentials_env` but wires
+    ``OPENAI_BASE_URL`` to the session-scoped mock LLM server
+    instead of a real Databricks workspace. Tests that used to
+    require ``--llm-api-key`` can use this fixture to run
+    deterministically with canned responses.
+
+    :param mock_llm_server_url: Base URL of the mock LLM server,
+        e.g. ``"http://127.0.0.1:12345"``.
+    :param tmp_path_factory: Pytest factory for a session-scoped
+        config home.
+    :returns: A dict suitable for ``subprocess.Popen(env=...)``.
+    """
+    env = dict(os.environ)
+    env["OPENAI_BASE_URL"] = f"{mock_llm_server_url}/v1"
+    env["OPENAI_API_KEY"] = "mock-key"
+    # Strip vars that could interfere with the mock path.
+    for stale in (
+        "ANTHROPIC_API_KEY",
+        "DATABRICKS_TOKEN",
+        "CLAUDE_CODE",
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_EXECPATH",
+        "CODEX",
+        "DATABRICKS_CONFIG_PROFILE",
+    ):
+        env.pop(stale, None)
+    env["OMNIGENT_SKIP_ONBOARD"] = "1"
+    env["OMNIGENT_NO_UPDATE_CHECK"] = "1"
+    config_home = tmp_path_factory.mktemp("omnigent-mock-e2e-config")
+    (config_home / "config.yaml").write_text(
+        "auth:\n  type: api_key\n",
+        encoding="utf-8",
+    )
+    env["OMNIGENT_CONFIG_HOME"] = str(config_home)
+    repo = str(_OMNIGENT_REPO)
+    omnigent_path = str(_OMNIGENT_REPO / "omnigent")
+    existing_pp = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (repo, omnigent_path, existing_pp) if p)
+    return env
+
+
 @pytest.fixture
 def patched_databrickscfg(
     llm_api_key: str,
@@ -449,52 +499,3 @@ def reset_mock_llm(mock_llm_server_url: str) -> None:
     """Clear all keyed queues, captured requests, and gates."""
     resp = httpx.post(f"{mock_llm_server_url}/mock/reset", timeout=5.0)
     resp.raise_for_status()
-
-
-@pytest.fixture(scope="session")
-def mock_credentials_env(
-    mock_llm_server_url: str,
-    tmp_path_factory: pytest.TempPathFactory,
-) -> dict[str, str]:
-    """
-    Environment dict for subprocess invocations of ``omnigent``
-    that point at the mock LLM server instead of a real LLM.
-
-    Drop-in replacement for ``omnigent_credentials_env`` in tests
-    that can run against canned responses.
-
-    :param mock_llm_server_url: Base URL of the mock server.
-    :param tmp_path_factory: Pytest factory for a session-scoped
-        config home.
-    :returns: A dict suitable for ``subprocess.Popen(env=...)``.
-    """
-    env = dict(os.environ)
-    env["OPENAI_BASE_URL"] = f"{mock_llm_server_url}/v1"
-    env["OPENAI_API_KEY"] = "mock-key"
-    # Strip stale / conflicting auth vars — same as the real
-    # omnigent_credentials_env fixture does.
-    for stale in (
-        "ANTHROPIC_API_KEY",
-        "DATABRICKS_TOKEN",
-        "CLAUDE_CODE",
-        "CLAUDECODE",
-        "CLAUDE_CODE_ENTRYPOINT",
-        "CLAUDE_CODE_EXECPATH",
-        "CODEX",
-    ):
-        env.pop(stale, None)
-    env["OMNIGENT_SKIP_ONBOARD"] = "1"
-    env["OMNIGENT_NO_UPDATE_CHECK"] = "1"
-    config_home = tmp_path_factory.mktemp("omnigent-mock-config")
-    (config_home / "config.yaml").write_text(
-        "auth:\n  type: api_key\n",
-        encoding="utf-8",
-    )
-    env["OMNIGENT_CONFIG_HOME"] = str(config_home)
-    env["OMNIGENT_REMOTE_AUTH_TOKEN"] = "mock-key"
-    # PYTHONPATH — same worktree-first logic as the real fixture.
-    repo = str(_OMNIGENT_REPO)
-    omnigent_path = str(_OMNIGENT_REPO / "omnigent")
-    existing_pp = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = os.pathsep.join(p for p in (repo, omnigent_path, existing_pp) if p)
-    return env

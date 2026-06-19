@@ -2523,6 +2523,7 @@ def _start_cli_runner_process(
     log_dir: str | Path | None = None,
     prewarm_spec_path: str | Path | None = None,
     isolate_session: bool = False,
+    extra_env: dict[str, str] | None = None,
 ) -> _CliRunnerProcess:
     """Start the out-of-process runner used by CLI server flows.
 
@@ -2567,6 +2568,10 @@ def _start_cli_runner_process(
         enables per-session workspace isolation so each
         session gets its own subdirectory. ``False`` (default)
         lets the agent see the project root directly.
+    :param extra_env: Optional mapping of additional environment
+        variables overlaid on top of ``os.environ`` for the runner
+        subprocess. Used by tests to route the runner at a mock LLM
+        server instead of the ambient API endpoint.
     :returns: The spawned runner process metadata.
     :raises click.ClickException: If the runner exits immediately.
     """
@@ -2595,6 +2600,7 @@ def _start_cli_runner_process(
         resolved_runner_id = token_bound_runner_id(binding_token)
     env = {
         **os.environ,
+        **(extra_env or {}),
         "RUNNER_SERVER_URL": server_url,
         RUNNER_ID_ENV_VAR: resolved_runner_id,
         RUNNER_PARENT_PID_ENV_VAR: str(os.getpid()),
