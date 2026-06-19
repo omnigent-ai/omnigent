@@ -27,7 +27,12 @@ from __future__ import annotations
 import os
 
 from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
-from omnigent.onboarding.harness_install import CURSOR_KEY, PI_KEY, harness_cli_installed
+from omnigent.onboarding.harness_install import (
+    CURSOR_KEY,
+    GOOSE_KEY,
+    PI_KEY,
+    harness_cli_installed,
+)
 from omnigent.onboarding.provider_config import (
     _EXECUTOR_TYPE_HARNESS_ALIASES,
     _HARNESS_FAMILY,
@@ -57,6 +62,12 @@ _PI_HARNESSES: frozenset[str] = frozenset({PI_SURFACE, "pi-native"})
 # a ``CURSOR_API_KEY`` instead. Without these entries they'd fail open like an
 # unknown harness, letting a binary-less launch die inside the executor.
 _CURSOR_NATIVE_HARNESSES: frozenset[str] = frozenset({"cursor-native", "native-cursor"})
+
+# Native Goose harnesses. Boot the ``goose session`` TUI (``omni goose``) and
+# can't launch without the ``goose`` binary on ``PATH`` — gate on it, like the
+# other native CLI harnesses. Goose owns its own auth (``goose configure``), so
+# there is no SDK variant or key to gate on.
+_GOOSE_NATIVE_HARNESSES: frozenset[str] = frozenset({"goose-native", "native-goose"})
 
 
 def _canonical_harness(harness: str) -> str:
@@ -114,6 +125,11 @@ def harness_is_configured(harness: str) -> bool:
         # state surfaces at run time; the daemon gates only on binary presence,
         # mirroring the other native harnesses.)
         return harness_cli_installed(CURSOR_KEY)
+    if canonical in _GOOSE_NATIVE_HARNESSES:
+        # Native Goose (``omni goose``) wraps the ``goose`` CLI — gate on that
+        # binary. Auth/provider state surfaces at run time via Goose's own
+        # config; the daemon gates only on binary presence.
+        return harness_cli_installed(GOOSE_KEY)
     if canonical == CURSOR_KEY:
         # Cursor runs in-process via ``cursor-sdk`` and authenticates with a
         # ``CURSOR_API_KEY`` (a ``cursor-agent login`` does not apply). So,
