@@ -199,3 +199,118 @@ def _build_opencode_config_content(
     if mcp_servers:
         payload["mcp"] = mcp_servers
     return payload
+
+
+class _PartTracker:
+    """Per-turn state for diffing streamed parts.
+
+    OpenCode re-sends the full part on every ``message.part.updated``; this
+    tracks the last-seen text length per part id (for text/reasoning deltas)
+    and which tool parts have already emitted a ``ToolCallRequest``.
+    """
+
+    def __init__(self) -> None:
+        self._text_len: dict[str, int] = {}
+        self._tool_requested: set[str] = set()
+        self._tool_completed: set[str] = set()
+
+    def text_delta(self, part_id: str, full_text: str) -> str:
+        """Return only the unseen suffix of *full_text* for *part_id*."""
+        seen = self._text_len.get(part_id, 0)
+        if len(full_text) <= seen:
+            return ""
+        self._text_len[part_id] = len(full_text)
+        return full_text[seen:]
+
+    def mark_tool_requested(self, part_id: str) -> bool:
+        """Return ``True`` the first time a tool part id is seen."""
+        if part_id in self._tool_requested:
+            return False
+        self._tool_requested.add(part_id)
+        return True
+
+    def mark_tool_completed(self, part_id: str) -> bool:
+        """Return ``True`` the first time a tool part completes/errors."""
+        if part_id in self._tool_completed:
+            return False
+        self._tool_completed.add(part_id)
+        return True
+
+
+def _tokens_to_usage(tokens: dict[str, Any]) -> dict[str, Any]:
+    """Map an OpenCode ``tokens`` object onto the Omnigent usage map.
+
+    :param tokens: ``{"input", "output", "reasoning", "cache": {"read","write"}}``.
+    :returns: ``{"input_tokens","output_tokens","total_tokens",
+        "cache_read_input_tokens","cache_creation_input_tokens"}``.
+    """
+    cache = tokens.get("cache") or {}
+    inp = int(tokens.get("input", 0) or 0)
+    out = int(tokens.get("output", 0) or 0)
+    return {
+        "input_tokens": inp,
+        "output_tokens": out,
+        "total_tokens": inp + out,
+        "cache_read_input_tokens": int(cache.get("read", 0) or 0),
+        "cache_creation_input_tokens": int(cache.get("write", 0) or 0),
+    }
+
+
+def _translate_part_event(
+    part: dict[str, Any],
+    tracker: _PartTracker,
+    *,
+    emit_reasoning: bool,
+) -> list[ExecutorEvent]:
+    """Translate one ``message.part.updated`` part dict into inner events.
+
+    :param part: The part, dumped to a dict (snake_case keys; ``callID`` alias
+        preserved as ``callID`` or ``call_id``).
+    :param tracker: Per-turn diff state.
+    :param emit_reasoning: When ``False``, reasoning parts are dropped.
+    :returns: Zero or more inner :class:`ExecutorEvent` instances.
+    """
+    ptype = part.get("type")
+    pid = part.get("id") or ""
+
+    if ptype == "text":
+        delta = tracker.text_delta(pid, part.get("text") or "")
+        return [TextChunk(text=delta)] if delta else []
+
+    if ptype == "reasoning":
+        if not emit_reasoning:
+            return []
+        delta = tracker.text_delta(pid, part.get("text") or "")
+        return [ReasoningChunk(delta=delta, event_type="reasoning_text")] if delta else []
+
+    if ptype == "tool":
+        tool_name = part.get("tool")
+        if not isinstance(tool_name, str) or not tool_name:
+            return []
+        call_id = part.get("callID") or part.get("call_id") or pid
+        state = part.get("state") or {}
+        status_str = state.get("status")
+        events: list[ExecutorEvent] = []
+        metadata = {"call_id": call_id}
+        if tracker.mark_tool_requested(pid):
+            events.append(
+                ToolCallRequest(
+                    name=tool_name,
+                    args=state.get("input") if isinstance(state.get("input"), dict) else {},
+                    metadata=dict(metadata),
+                )
+            )
+        if status_str in {"completed", "error"} and tracker.mark_tool_completed(pid):
+            status = ToolCallStatus.ERROR if status_str == "error" else ToolCallStatus.SUCCESS
+            events.append(
+                ToolCallComplete(
+                    name=tool_name,
+                    status=status,
+                    result=state.get("output"),
+                    error=state.get("error") if status == ToolCallStatus.ERROR else None,
+                    metadata=dict(metadata),
+                )
+            )
+        return events
+
+    return []
