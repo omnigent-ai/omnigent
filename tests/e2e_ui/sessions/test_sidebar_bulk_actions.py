@@ -21,9 +21,9 @@ import httpx
 from playwright.sync_api import Locator, Page, expect
 
 
-def _row(page: Page, session_id: str) -> Locator:
-    """Locate the sidebar row (``<li>``) for *session_id* by its href."""
-    return page.locator("li").filter(has=page.locator(f'a[href="/c/{session_id}"]'))
+def _row_link(page: Page, session_id: str) -> Locator:
+    """Locate the sidebar row link for *session_id* by its href."""
+    return page.locator(f'a[href="/c/{session_id}"]')
 
 
 def _set_title(base_url: str, session_id: str, title: str) -> None:
@@ -60,7 +60,7 @@ def test_selection_mode_toggle(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    row = _row(page, session_id)
+    row = _row_link(page, session_id)
     expect(row).to_be_visible()
 
     toggle = page.get_by_test_id("toggle-selection-mode")
@@ -71,15 +71,12 @@ def test_selection_mode_toggle(
     expect(toggle).to_have_attribute("aria-label", "Exit selection mode")
 
     # The row should now show a checkbox icon (unchecked square).
-    row_link = row.locator(f'a[href="/c/{session_id}"]')
-    checkbox_unchecked = row_link.locator("svg.lucide-square")
-    expect(checkbox_unchecked).to_be_visible()
+    expect(row.locator("svg.lucide-square")).to_be_visible()
 
     # Click the row to select it — should NOT navigate away.
-    row_link.click()
+    row.click()
     # The checked icon appears instead of the unchecked one.
-    checkbox_checked = row_link.locator("svg.lucide-square-check-big")
-    expect(checkbox_checked).to_be_visible()
+    expect(row.locator("svg.lucide-square-check-big")).to_be_visible()
 
     # BulkActionBar shows "1 selected".
     expect(page.get_by_text("1 selected")).to_be_visible()
@@ -89,15 +86,15 @@ def test_selection_mode_toggle(
     expect(page.get_by_text("None selected")).to_be_visible()
 
     # Still in selection mode — checkbox icons remain visible (unchecked).
-    expect(row_link.locator("svg.lucide-square")).to_be_visible()
+    expect(row.locator("svg.lucide-square")).to_be_visible()
 
     # Exit selection mode via the toggle button.
     toggle.click()
     expect(toggle).to_have_attribute("aria-label", "Select sessions")
 
     # Checkbox icons should be gone.
-    expect(row_link.locator("svg.lucide-square")).to_have_count(0)
-    expect(row_link.locator("svg.lucide-square-check-big")).to_have_count(0)
+    expect(row.locator("svg.lucide-square")).to_have_count(0)
+    expect(row.locator("svg.lucide-square-check-big")).to_have_count(0)
 
     # BulkActionBar text should be gone.
     expect(page.get_by_text("None selected")).to_have_count(0)
@@ -123,12 +120,12 @@ def test_bulk_archive_moves_session_to_archived(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    row = _row(page, session_id)
+    row = _row_link(page, session_id)
     expect(row).to_be_visible()
 
     # Enter selection mode and select the row.
     page.get_by_test_id("toggle-selection-mode").click()
-    row.locator(f'a[href="/c/{session_id}"]').click()
+    row.click()
     expect(page.get_by_text("1 selected")).to_be_visible()
 
     # Click Archive.
@@ -180,12 +177,12 @@ def test_bulk_delete_removes_sessions(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    row = _row(page, session_id)
+    row = _row_link(page, session_id)
     expect(row).to_be_visible()
 
     # Enter selection mode and select the row.
     page.get_by_test_id("toggle-selection-mode").click()
-    row.locator(f'a[href="/c/{session_id}"]').click()
+    row.click()
     expect(page.get_by_text("1 selected")).to_be_visible()
 
     # Click Delete — should open confirmation dialog.
@@ -236,7 +233,7 @@ def test_select_all_and_deselect_all(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    row = _row(page, session_id)
+    row = _row_link(page, session_id)
     expect(row).to_be_visible()
 
     # Enter selection mode.
