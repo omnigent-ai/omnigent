@@ -284,6 +284,7 @@ class SandboxBackend(ABC):
         policy: SandboxPolicy,
         cwd: Path,
         chdir: Path | None = None,
+        target: str | None = None,
     ) -> list[str]:
         """
         Wrap *argv* with whatever launcher the backend needs at spawn
@@ -311,10 +312,18 @@ class SandboxBackend(ABC):
             ``None``, the helper starts in *cwd*. When set (e.g. for
             ``OSEnvSpec.start_in_scratch``), the launcher chdirs
             there on entry. In-process backends may ignore this.
+        :param target: Absolute path to the binary that the launcher
+            will exec as its final target (e.g. the ``claude`` CLI).
+            When set, the backend must ensure this path is reachable
+            inside the sandbox namespace — for bwrap this means
+            bind-mounting the target's directory chain just as it does
+            for ``argv[0]`` (the Python interpreter). ``None`` when
+            the target is already covered by the default mounts (e.g.
+            ``/usr/bin/something``).
         :returns: The (possibly wrapped) argv. The default
             implementation returns *argv* unchanged.
         """
-        del policy, cwd, chdir
+        del policy, cwd, chdir, target
         return argv
 
 
@@ -637,6 +646,7 @@ def run_launcher(encoded_sandbox: str, target_path: str, argv: list[str]) -> int
                 launcher_argv,
                 sandbox,
                 Path(os.getcwd()),
+                target=target_path,
             )
         )
         os.environ[_LAUNCHER_WRAPPED_ENV] = "1"
