@@ -762,9 +762,20 @@ class SandboxConfig:
 
     container_image: str | None = None
     docker_image: str | None = None
-    container_runtime: str = "docker"
+    container_runtime: Literal["docker", "podman"] = "docker"
+
+    _ALLOWED_RUNTIMES = frozenset({"docker", "podman"})
 
     def __post_init__(self) -> None:
+        if self.container_runtime not in self._ALLOWED_RUNTIMES:
+            raise ValueError(
+                f"container_runtime must be one of {sorted(self._ALLOWED_RUNTIMES)}, "
+                f"got {self.container_runtime!r}"
+            )
+        # Resolve the deprecated docker_image alias: if only
+        # docker_image was provided, promote it to container_image.
+        # Then sync docker_image to container_image so both fields
+        # always agree after construction.
         if self.container_image is None and self.docker_image is not None:
             self.container_image = self.docker_image
         self.docker_image = self.container_image
