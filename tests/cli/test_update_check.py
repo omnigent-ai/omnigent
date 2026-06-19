@@ -1294,6 +1294,71 @@ def test_fetch_latest_version_pep691_json(monkeypatch: pytest.MonkeyPatch) -> No
     assert captured["headers"] == {"Accept": "application/vnd.pypi.simple.v1+json"}
 
 
+def test_fetch_latest_version_retries_transient_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``attempts=2`` retries a transient connection error, then succeeds.
+
+    Regression: the foreground ``omni upgrade`` shouldn't report the index as
+    unreachable on a single momentary blip against a slow mirror.
+    """
+    import httpx
+
+    from omnigent.update_check import fetch_latest_version
+
+    _clear_index_env(monkeypatch)
+    calls = {"n": 0}
+
+    def _get(url: str, **_kw: object) -> _FakeResp:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ConnectError("transient")
+        return _FakeResp(json_body={"versions": ["0.1.0", "0.2.0"]})
+
+    monkeypatch.setattr(httpx, "get", _get)
+
+    assert fetch_latest_version(attempts=2) == "0.2.0"
+    assert calls["n"] == 2  # retried exactly once
+
+
+def test_fetch_latest_version_no_retry_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The background path (default ``attempts=1``) makes a single try."""
+    import httpx
+
+    from omnigent.update_check import fetch_latest_version
+
+    _clear_index_env(monkeypatch)
+    calls = {"n": 0}
+
+    def _get(url: str, **_kw: object) -> _FakeResp:
+        calls["n"] += 1
+        raise httpx.ConnectError("transient")
+
+    monkeypatch.setattr(httpx, "get", _get)
+
+    assert fetch_latest_version() is None
+    assert calls["n"] == 1
+
+
+def test_fetch_latest_version_does_not_retry_non_200(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A definitive non-200 reply is not retried, even with ``attempts=2``."""
+    import httpx
+
+    from omnigent.update_check import fetch_latest_version
+
+    _clear_index_env(monkeypatch)
+    calls = {"n": 0}
+
+    def _get(url: str, **_kw: object) -> _FakeResp:
+        calls["n"] += 1
+        return _FakeResp(status_code=503)
+
+    monkeypatch.setattr(httpx, "get", _get)
+
+    assert fetch_latest_version(attempts=2) is None
+    assert calls["n"] == 1
+
+
 def test_fetch_latest_version_from_files_when_no_versions_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1977,3 +2042,87 @@ def test_format_version_omits_sha_when_build_info_has_empty_sha(
     # Critical: no orphan comma or empty parens from the missing SHA.
     assert "(, " not in out
     assert "()" not in out
+
+
+# --- VCS (git) install handling: passive notice + URL parsing -----------------
+
+
+def test_split_vcs_url_strips_prefix_and_separates_revision() -> None:
+    """``git+<url>@<rev>`` splits into the bare repo URL and the revision."""
+    from omnigent.update_check import _split_vcs_url
+
+    assert _split_vcs_url("git+https://github.com/o/omnigent.git") == (
+        "https://github.com/o/omnigent.git",
+        None,
+    )
+    assert _split_vcs_url("git+https://github.com/o/omnigent.git@main") == (
+        "https://github.com/o/omnigent.git",
+        "main",
+    )
+
+
+def test_split_vcs_url_strips_pip_fragment() -> None:
+    """A ``#egg=`` / ``#subdirectory=`` fragment is dropped from URL and ref.
+
+    Left on, the fragment would ride along into ``git ls-remote`` and match no
+    ref, silently making the commit comparison indeterminate.
+    """
+    from omnigent.update_check import _split_vcs_url
+
+    assert _split_vcs_url("git+https://github.com/o/omnigent.git#egg=omnigent") == (
+        "https://github.com/o/omnigent.git",
+        None,
+    )
+    assert _split_vcs_url("git+https://github.com/o/omnigent.git@main#subdirectory=pkg") == (
+        "https://github.com/o/omnigent.git",
+        "main",
+    )
+
+
+def test_split_vcs_url_ssh_userinfo_is_not_a_revision() -> None:
+    """An ``@`` in SSH userinfo (``git@host``) must not be read as a revision."""
+    from omnigent.update_check import _split_vcs_url
+
+    assert _split_vcs_url("git+ssh://git@github.com/o/omnigent.git") == (
+        "ssh://git@github.com/o/omnigent.git",
+        None,
+    )
+    # …but a real trailing revision still parses, even with SSH userinfo.
+    assert _split_vcs_url("git+ssh://git@github.com/o/omnigent.git@v1") == (
+        "ssh://git@github.com/o/omnigent.git",
+        "v1",
+    )
+
+
+def test_wheel_check_skips_vcs_install(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A git/VCS install is never nagged about a PyPI version.
+
+    Its version string is frozen at the source branch's (e.g. an unbumped
+    ``main`` still saying ``0.1.0``), so a PyPI-version comparison would
+    fire forever — even on a build that is *ahead* of the latest release.
+    The passive notice must bail for vcs installs just like editable ones.
+    """
+    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
+    _point_cache_at(tmp_path, monkeypatch)
+    _write_cache(
+        _CacheEntry(
+            last_check_epoch=time.time(),
+            commits_behind=0,
+            kind="wheel",
+            latest_version="0.2.0",  # strictly newer than the dist's 0.1.0
+        )
+    )
+    dist = _write_fake_dist_info(
+        tmp_path,
+        installer="uv",
+        direct_url={"url": _FAKE_GIT_URL, "vcs_info": {"vcs": "git", "commit_id": _FAKE_COMMIT}},
+    )
+    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+
+    _run_installed_wheel_check()
+
+    assert capsys.readouterr().err == ""
