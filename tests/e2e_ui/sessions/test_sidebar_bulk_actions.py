@@ -5,7 +5,7 @@ button next to the search box. Once active, each conversation row renders
 a checkbox (``SquareCheckBigIcon`` / ``SquareIcon``); clicking the row
 toggles selection instead of navigating. A ``BulkActionBar`` appears at
 the bottom of the sidebar with Archive, Unarchive, Stop, Delete, Select
-all / Deselect all, and Done controls.
+all / Deselect all, and Clear controls.
 
 These tests drive the full round-trip: enter selection mode → select
 sessions → perform a bulk action → verify the server-side effect is
@@ -47,7 +47,7 @@ def test_selection_mode_toggle(
     - Rows show checkbox icons in selection mode.
     - Clicking a row in selection mode toggles its selection (no navigation).
     - The BulkActionBar shows the selection count.
-    - Exiting selection mode (Done button) hides the bar and checkboxes.
+    - Exiting selection mode (Clear button) hides the bar and checkboxes.
 
     :param page: Playwright page fixture (fresh context per test).
     :param seeded_session: ``(base_url, session_id)`` for a pre-created
@@ -82,8 +82,8 @@ def test_selection_mode_toggle(
     # BulkActionBar shows "1 selected".
     expect(page.get_by_text("1 selected")).to_be_visible()
 
-    # Click Done to exit selection mode.
-    page.get_by_role("button", name="Done").click()
+    # Click Clear to exit selection mode.
+    page.get_by_role("button", name="Clear").click()
     expect(toggle).to_have_attribute("aria-label", "Select sessions")
 
     # Checkbox icons should be gone.

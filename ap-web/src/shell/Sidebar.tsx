@@ -395,6 +395,18 @@ export function Sidebar({ open, onClose }: SidebarProps) {
           scrollbars, the list's scrollbar appearing/disappearing (e.g. while
           a Radix menu locks scrolling) resizes every row — titles gain/lose
           a character. Reserving the gutter keeps row width constant. */}
+      {selectionMode && (
+        <BulkActionBar
+          selectedIds={selectedIds}
+          allConversations={(conversationsQuery.data?.pages ?? []).flatMap((page) => page.data)}
+          onSelectAll={() =>
+            selectAll((conversationsQuery.data?.pages ?? []).flatMap((page) => page.data))
+          }
+          onDeselectAll={deselectAll}
+          onClear={exitSelectionMode}
+        />
+      )}
+
       <nav className="relative flex-1 overflow-y-auto px-3 pb-3 [scrollbar-gutter:stable]">
         <ConversationList
           conversationsQuery={conversationsQuery}
@@ -408,18 +420,6 @@ export function Sidebar({ open, onClose }: SidebarProps) {
           onToggleSelected={toggleSelected}
         />
       </nav>
-
-      {selectionMode && (
-        <BulkActionBar
-          selectedIds={selectedIds}
-          allConversations={(conversationsQuery.data?.pages ?? []).flatMap((page) => page.data)}
-          onSelectAll={() =>
-            selectAll((conversationsQuery.data?.pages ?? []).flatMap((page) => page.data))
-          }
-          onDeselectAll={deselectAll}
-          onDone={exitSelectionMode}
-        />
-      )}
 
       {/* Account footer. Sibling *after* the flex-1 nav so it pins to the
           bottom of the sidebar column. Renders nothing (no border, no
@@ -1472,13 +1472,13 @@ function BulkActionBar({
   allConversations,
   onSelectAll,
   onDeselectAll,
-  onDone,
+  onClear,
 }: {
   selectedIds: Set<string>;
   allConversations: Conversation[];
   onSelectAll: () => void;
   onDeselectAll: () => void;
-  onDone: () => void;
+  onClear: () => void;
 }) {
   const navigate = useNavigate();
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
@@ -1515,6 +1515,10 @@ function BulkActionBar({
     () => ownedSelected.filter((c) => c.archived !== true),
     [ownedSelected],
   );
+
+  const allSelectedSameArchiveGroup =
+    ownedSelected.length > 0 &&
+    (archivedSelected.length === 0 || nonArchivedSelected.length === 0);
 
   const count = selectedIds.size;
   const allSelected = count > 0 && count === allConversations.length;
@@ -1575,7 +1579,7 @@ function BulkActionBar({
 
   return (
     <>
-      <div className="flex flex-col gap-2 border-t border-border bg-card px-3 py-2">
+      <div className="flex flex-col gap-2 border-b border-border bg-card px-3 py-2">
         <div className="flex items-center justify-between">
           <span className="text-xs font-medium text-muted-foreground">
             {count === 0 ? "None selected" : `${count} selected`}
@@ -1595,16 +1599,16 @@ function BulkActionBar({
               variant="ghost"
               size="sm"
               className="h-6 px-2 text-xs"
-              onClick={onDone}
+              onClick={onClear}
             >
-              Done
+              Clear
             </Button>
           </div>
         </div>
 
         {count > 0 && (
           <div className="flex items-center gap-1.5">
-            {nonArchivedSelected.length > 0 && (
+            {allSelectedSameArchiveGroup && nonArchivedSelected.length > 0 && (
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Button
@@ -1627,7 +1631,7 @@ function BulkActionBar({
                 <TooltipContent>Archive {nonArchivedSelected.length} session(s)</TooltipContent>
               </Tooltip>
             )}
-            {archivedSelected.length > 0 && (
+            {allSelectedSameArchiveGroup && archivedSelected.length > 0 && (
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Button
