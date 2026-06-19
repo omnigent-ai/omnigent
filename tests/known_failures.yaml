@@ -28,11 +28,6 @@
 # want to debug a skipped test locally, comment out its block.
 skips:
 
-  - id: tests/e2e/test_repl_approval_e2e.py::test_repl_subagent_tool_call_ask_tunnels_to_root
-    reason: "Broken fixture independent of the ASK path: the spawned toolworker sub-agent has no `echo` callable registered (live: 'Tool echo not found in agent Omnigent', 3/3), so the TOOL_CALL ASK never runs — the tool errors before policy matters. Needs the sub-agent local-tool bridge fixed; interactive mid-flight ASK tracked by #765."
-    issue: 763
-    cluster: repl-policy-ask-surfacing
-    mode: skip
 
   - id: tests/e2e/omnigent/test_run_harness_without_agent_e2e.py::test_run_harness_without_agent_live_repl_round_trip[claude-sdk]
     reason: "No-AGENT `omnigent run --harness` live round-trip hangs >180s in CI -> pytest-timeout thread-kill -> xdist worker crash; claude-sdk fails 30/30 in flake-stress 27808074172. Auth is NOT the cause: CI sets DATABRICKS_BEARER and the harness auth-commands short-circuit on it, so the hang is post-auth in the round-trip. Environment-wide, not harness-specific (codex + openai-agents siblings hang identically). The test's _COMPLETION_TIMEOUT=240 also exceeds the e2e --timeout=180 cap. Not locally reproducible (oss OAuth + macOS PTY diverge from CI); needs CI-env debugging."

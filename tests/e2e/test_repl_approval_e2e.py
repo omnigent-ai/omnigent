@@ -1513,36 +1513,94 @@ def test_repl_tool_result_ask_passes_output_through(
             child.terminate(force=True)
 
 
-# ── Sub-agent TOOL_CALL approval tunneling ────────────────
+# ── Sub-agent TOOL_CALL approval (non-interactive) ─────────
 #
-# The sub-agent fires an ASK from the TOOL_CALL phase (not
-# INPUT). Still must surface on the ROOT SSE stream — the
-# tunneling path is identical for every phase in the
-# sub-agent's engine.
+# The sub-agent fires an ASK from the TOOL_CALL phase. Like the
+# INPUT-phase sub-agent ASK, it does NOT tunnel an interactive
+# banner to the root REPL today — the headless sub-agent runs
+# the tool to completion and the ASK is a pass-through (#765).
 
 
-def test_repl_subagent_tool_call_ask_tunnels_to_root(
+def test_repl_subagent_tool_call_ask_does_not_tunnel_banner_to_root(
     ap_cli: str,
     repl_env: dict[str, str],
-    using_mock_llm: bool,
+    mock_llm_server_url: str,
 ) -> None:
     """
-    Sub-agent TOOL_CALL ASK → banner on root REPL → approve
-    → sub-agent's tool runs → sub-agent replies → parent
-    composes final turn.
+    Sub-agent TOOL_CALL ASK does NOT tunnel a banner to the root REPL.
 
-    Load-bearing:
+    This asserts the CURRENT behavior, not the aspirational tunneled
+    interactive approval (tracked by #765). The fixture's
+    ``toolworker`` sub-agent has a LOCAL function tool ``echo`` and a
+    ``worker_tool_gate`` policy that ASKs on ``tool_call:echo``.
 
-    - Banner phase must be ``tool_call`` (not ``input``) —
-      proves the sub-agent's tool-phase engine fired.
-    - Banner policy must be the sub-agent's
-      ``worker_tool_gate`` (not the parent's non-existent
-      gate).
-    - Root REPL sees the banner through the same SSE stream
-      it was already consuming.
+    Observed reality (captured live against the mock LLM): the parent
+    spawns ``toolworker`` via ``sys_session_send``; the headless
+    sub-agent's ``echo`` TOOL_CALL ASK does NOT park for a
+    root-surfaced prompt — the sub-agent runs ``echo`` to completion,
+    its reply lands in the parent's inbox, and the parent composes its
+    final summary. The turn finishes with no banner or human
+    interaction.
+
+    Load-bearing assertions:
+
+    - The sub-agent's nested local ``echo`` tool registers with the
+      spawned child's executor — the call does NOT error
+      ``Tool echo not found`` (the regression in #763).
+    - NO ``approval required`` banner surfaces on the root REPL.
+    - The parent's final summary renders, proving the sub-agent ran
+      end-to-end (echo executed) despite the unprompted TOOL_CALL ASK.
+
+    The parent (``model: gpt-4o``) and the sub-agent
+    (``model: gpt-4o-mini``) draw from separate keyed mock queues so
+    each agent's scripted calls land deterministically — a single
+    shared queue races the parent's continuation call against the
+    sub-agent's ``echo`` call (the parent would consume the
+    sub-agent's tool call and error ``Tool echo not found``).
     """
-    if using_mock_llm:
-        pytest.skip("requires real LLM (tool/subagent mock not supported in REPL)")
+    worker_reply = "worker-reply-render-marker"
+    parent_summary = "parent-summary-render-marker"
+    reset_mock_llm(mock_llm_server_url)
+    # Parent queue (model gpt-4o): spawn toolworker, then summarize.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "sa1",
+                        "name": "sys_session_send",
+                        "arguments": json.dumps(
+                            {"agent": "toolworker", "title": "t", "args": "return the word durian"}
+                        ),
+                    }
+                ]
+            },
+            {"text": parent_summary},
+            {"text": "(spare)"},
+            {"text": "(spare)"},
+        ],
+        key="gpt-4o",
+    )
+    # Toolworker queue (model gpt-4o-mini): call echo, then reply.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "we1",
+                        "name": "echo",
+                        "arguments": json.dumps({"message": "durian"}),
+                    }
+                ]
+            },
+            {"text": worker_reply},
+            {"text": "(spare)"},
+            {"text": "(spare)"},
+        ],
+        key="gpt-4o-mini",
+    )
     child = pexpect.spawn(
         ap_cli,
         ["run", str(_SUBAGENT_TOOL_GATE_DIR)],
@@ -1559,28 +1617,33 @@ def test_repl_subagent_tool_call_ask_tunnels_to_root(
             welcome_pattern="e2e.subagent.tool.gate",
         )
         child.send("return the word durian" + "\r")
-        child.expect("approval required", timeout=90)
-        banner_tail = _read_pending(child, seconds=1.5)
-        assert "tool_call" in banner_tail, (
-            "Sub-agent TOOL_CALL ASK did not show phase=tool_call — "
-            "routing may have surfaced the wrong phase.\n"
-            f"Banner:\n{banner_tail[:800]}"
-        )
-        assert "worker_tool_gate" in banner_tail, (
-            f"Sub-agent's tool-gate policy name missing from banner.\nBanner:\n{banner_tail[:800]}"
-        )
-        child.send("y" + "\r")
-        child.expect("approved", timeout=5)
-        _wait_for_turn_complete(child, timeout=120)
+        # Deterministic content-marker sync: the parent's summary text
+        # renders only after the sub-agent ran echo end-to-end and its
+        # result landed in the inbox. Keying on the marker (not the
+        # racy ``· ready`` toolbar) makes the completion signal stable.
+        child.expect(parent_summary, timeout=120)
         full_turn = child.before or ""
         if isinstance(full_turn, bytes):
             full_turn = full_turn.decode("utf-8", errors="replace")
         full_turn = _strip_ansi(full_turn)
-        # Parent's final reply should contain something from
-        # the sub-agent's reply, which used the tool output.
-        assert re.search(r"[A-Za-z]{3,}\s+[A-Za-z]{3,}", full_turn), (
-            "Parent never produced a final reply after sub-agent "
-            f"TOOL_CALL approval.\nCaptured:\n{full_turn[:1500]}"
+        # Drain any trailing render so a late line is captured.
+        full_turn += _read_pending(child, seconds=2.0)
+        # The nested local echo tool registered with the spawned
+        # child's executor — the SDK did NOT reject the call. This is
+        # the #763 regression guard.
+        assert "Tool echo not found" not in full_turn, (
+            "The sub-agent's nested local 'echo' tool failed to register "
+            "with the spawned child's executor (regression #763).\n"
+            f"Captured:\n{full_turn[:1500]}"
+        )
+        # No interactive approval banner tunneled to the root REPL —
+        # the sub-agent TOOL_CALL ASK is a non-interactive pass-through
+        # today (see #765), exactly like the sub-agent INPUT-phase ASK.
+        assert "approval required" not in full_turn, (
+            "A sub-agent TOOL_CALL ASK banner surfaced on the root REPL — "
+            "interactive tunneled mid-flight ASK is not implemented (see "
+            "#765); the sub-agent ASK is non-interactive today.\n"
+            f"Captured:\n{full_turn[:1500]}"
         )
     finally:
         try:
