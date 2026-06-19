@@ -67,12 +67,6 @@ skips:
     mode: skip
 
 
-  - id: tests/e2e/test_claude_coder_sandbox.py::test_write_blocked_outside_workspace
-    reason: "Distinct from the bwrap CLI-path fix (this PR): the claude-sdk Write tool is NOT blocked from creating files outside the workspace, while edit/read/glob enforcement IS (those 4 sandbox tests pass 30/30 in flake-stress run 27796759300). write_blocked fails 30/30 — a real write-path sandbox-enforcement gap. Needs its own fix."
-    issue: 770
-    cluster: sandbox-deps-env
-    mode: skip
-
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_output_ask_approve_surfaces_llm_reply
     reason: "OUTPUT-phase ASK banner does not surface in the REPL (#763): expect('approval required') times out 60/60. Same surfacing gap as TOOL_CALL."
     issue: 763
