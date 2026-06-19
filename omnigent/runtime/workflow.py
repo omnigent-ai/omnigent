@@ -139,7 +139,9 @@ _logger = logging.getLogger(__name__)
 # (hyphen), e.g. ``"claude_sdk"`` → ``"claude-sdk"`` used by ``_HARNESS_MODULES``.
 
 
-AgentHarnessType = Literal["claude-sdk", "codex", "pi", "openai-agents-sdk"]
+AgentHarnessType = Literal[
+    "claude-sdk", "codex", "pi", "openai-agents-sdk", "antigravity", "opencode"
+]
 
 
 @dataclass(frozen=True)

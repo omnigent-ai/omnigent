@@ -65,6 +65,11 @@ _HARNESS_MODULES: dict[str, str] = {
     # has no third-party SDK dependency — it talks HTTP / SSE
     # directly to the Databricks gateway.
     "databricks_supervisor": "omnigent.inner.databricks_supervisor_harness",
+    # OpenCode harness wrap. See omnigent/inner/opencode_harness.py.
+    # Drives OpenCode (https://opencode.ai) via a persistent
+    # ``opencode serve`` process talked to over HTTP/SSE with the
+    # ``opencode-ai`` Python SDK.
+    "opencode": "omnigent.inner.opencode_harness",
 }
 
 __all__ = ["_HARNESS_MODULES"]

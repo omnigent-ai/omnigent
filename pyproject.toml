@@ -76,6 +76,11 @@ dependencies = [
     # to remember `--extra all`. Issue #406.
     "claude-agent-sdk>=0.1.62",
     "openai-agents>=0.0.17",
+    # OpenCode harness transport: the Stainless-generated httpx SDK
+    # for talking to a persistent ``opencode serve`` process. Pre-release
+    # package (install with `pip install --pre`); the `opencode` binary
+    # itself is installed separately via npm `opencode-ai` or opencode.ai/install.
+    "opencode-ai>=0.1.0a36",
     "PyJWT[crypto]>=2.8,<3",
     "argon2-cffi>=23.1,<24",
 ]
