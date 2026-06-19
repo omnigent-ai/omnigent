@@ -120,12 +120,6 @@ skips:
     cluster: repl-pexpect-cli
     mode: skip
 
-  - id: tests/e2e/test_decorated_tools_e2e.py::test_decorated_tools_varied_signatures_e2e
-    reason: "openai-agents harness test hits platform.openai.com directly and 401s under the Databricks gateway profile (dapi PAT rejected as OpenAI key); needs gateway-routing/base_url fix before it can run in CI. Passes only with a real OPENAI_API_KEY locally."
-    issue: 676
-    cluster: run-ap-examples-harness
-    mode: skip
-
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_tool_result_ask_refuse_replaces_output
     reason: "Shard 1 bulk: REPL approval pexpect-timeout family."
     issue: 523
@@ -186,22 +180,11 @@ skips:
     issue: 523
     cluster: repl-pexpect-cli
     mode: skip
-  - id: tests/e2e/omnigent/test_run_omnigent_example_agents.py::test_run_omnigent_example_yaml[agent_with_tools_calculate]
-    reason: "Flaky on gateway flake-stress (7/8 pass); intermittent tool/harness behavior, keep suppressed until stable."
-    issue: 677
-    cluster: run-ap-examples-harness
-    mode: skip
 
   - id: tests/e2e/omnigent/test_repl_inline_tool_streaming.py::test_repl_inline_tool_call_and_result_streaming
     reason: "Shard 3 bulk: REPL inline tool-call streaming."
     issue: 523
     cluster: repl-pexpect-cli
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_run_omnigent_quiet_startup.py::test_run_prompt_mode_is_headless_for_local_agent
-    reason: "fixture uses claude-sdk harness which 401s on the gateway (~/.databrickscfg auth); needs a gateway-compatible harness/model."
-    issue: 676
-    cluster: run-ap-examples-harness
     mode: skip
 
   - id: tests/e2e/omnigent/test_run_harness_without_agent_e2e.py::test_run_harness_without_agent_live_repl_round_trip[codex]
@@ -314,13 +297,13 @@ skips:
     mode: skip
 
   - id: tests/e2e/omnigent/test_yaml_hello_world.py::test_yaml_agent_with_tools[codex]
-    reason: "Same tool-call-rendering issue as the [claude-sdk] variant: codex says 'I'll compute it with the calculator tool now.7' but no '◦ calculate' lifecycle marker appears in stdout."
+    reason: "Snapshot mismatch on the tool-call lifecycle markers (◦ calculate / • calculate) not rendered to stdout in oneshot mode. Fails consistently 30/30 in flake-stress run 27798661226 (not flaky). See #677."
     issue: 677
     cluster: run-ap-examples-harness
     mode: skip
 
   - id: tests/e2e/omnigent/test_yaml_hello_world.py::test_yaml_agent_with_tools[openai-agents]
-    reason: "Flaky on gateway flake-stress (7/8 pass); intermittent tool-call lifecycle rendering, keep suppressed until stable."
+    reason: "Snapshot mismatch on the tool-call lifecycle markers (◦/• calculate) not rendered to stdout in oneshot mode. Fails consistently 30/30 in flake-stress run 27798661226 (was logged 7/8-flaky; now consistent). Same cause as the [codex] variant — see #677."
     issue: 677
     cluster: run-ap-examples-harness
     mode: skip
