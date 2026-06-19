@@ -28,17 +28,10 @@
 # want to debug a skipped test locally, comment out its block.
 skips:
 
-
   - id: tests/e2e/omnigent/test_run_harness_without_agent_e2e.py::test_run_harness_without_agent_live_repl_round_trip[claude-sdk]
-    reason: "No-AGENT `omnigent run --harness` live round-trip hangs >180s in CI -> pytest-timeout thread-kill -> xdist worker crash; claude-sdk fails 30/30 in flake-stress 27808074172. Auth is NOT the cause: CI sets DATABRICKS_BEARER and the harness auth-commands short-circuit on it, so the hang is post-auth in the round-trip. Environment-wide, not harness-specific (codex + openai-agents siblings hang identically). The test's _COMPLETION_TIMEOUT=240 also exceeds the e2e --timeout=180 cap. Not locally reproducible (oss OAuth + macOS PTY diverge from CI); needs CI-env debugging."
+    reason: "Hangs >180s in CI -> xdist worker crash even on the mock LLM (#796 migration): the claude-sdk native claude-code CLI calls auth/metadata endpoints the mock server does not serve, so its headless -p turn never completes. Distinct from the stale-glyph fix that greened the openai-agents/codex rows; claude-sdk is mock-incompatible and should be excluded from the mock matrix (or the mock taught to serve the claude-code endpoints). Not the old live-gateway hang (that was removed by the mock migration)."
     issue: 523
-    cluster: no-agent-harness-roundtrip-hang
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_run_harness_without_agent_e2e.py::test_run_harness_without_agent_live_repl_round_trip[openai-agents]
-    reason: "No-AGENT `omnigent run --harness` live round-trip hangs >180s in CI -> xdist worker crash; openai-agents fails 10/10 in flake-stress 27809210955. Same post-auth round-trip hang as the [claude-sdk]/[codex] siblings -- notably the in-process SDK harness hangs too, confirming the cause is environment-wide rather than CLI-subprocess-specific. See [claude-sdk] entry for the full diagnosis."
-    issue: 523
-    cluster: no-agent-harness-roundtrip-hang
+    cluster: mock-claude-sdk-cli-unsupported
     mode: skip
 
   - id: tests/e2e/omnigent/test_repl_inline_tool_streaming.py::test_repl_inline_tool_call_and_result_streaming
@@ -47,11 +40,6 @@ skips:
     cluster: repl-pexpect-cli
     mode: skip
 
-  - id: tests/e2e/omnigent/test_run_harness_without_agent_e2e.py::test_run_harness_without_agent_live_repl_round_trip[codex]
-    reason: "No-AGENT `omnigent run --harness` live round-trip hangs >180s in CI -> xdist worker crash; codex fails 6/6 in flake-stress 27808990899. Same post-auth round-trip hang as the [claude-sdk]/[openai-agents] siblings (locally codex fast-fails on the databricks auth-command instead, an oss-OAuth repro artifact, not the CI failure). See [claude-sdk] entry for the full diagnosis."
-    issue: 523
-    cluster: no-agent-harness-roundtrip-hang
-    mode: skip
 
   - id: tests/e2e/omnigent/test_run_harness_without_agent_e2e.py::test_run_harness_without_agent_live_repl_round_trip[pi]
     reason: "No-AGENT `omnigent run --harness` live round-trip crashes the xdist worker — same family as the [claude-sdk]/[codex]/[openai-agents] siblings. Surfaced once pi was enabled in CI (PR #809); previously the [pi] row skipped because the pi CLI was absent. See [claude-sdk] entry for the full diagnosis."
