@@ -205,12 +205,6 @@ skips:
   # 2 are the existing files-upload 409 'conversation not bound
   # to a runner' family. Triage under #532.
 
-  - id: tests/e2e/test_filesystem_changed_files_e2e.py::test_diff_endpoint_shows_git_diff_for_modified_file
-    reason: "Migrated to mock LLM but underlying infrastructure issue persists: the main e2e runner fixture does not set OMNIGENT_RUNNER_WORKSPACE, so the filesystem changes tracking does not detect agent writes. Needs OMNIGENT_RUNNER_WORKSPACE wiring in the e2e runner fixture."
-    issue: 673
-    cluster: files-uploads-attachments
-    mode: skip
-
   # ── Re-quarantined after #1141 path sweep (2026-05-21) ──
   # PR #1141 fixed examples/*.yaml → tests/resources/examples/*.yaml
   # and dropped 33 manifest entries on the affected files. Of those
@@ -335,11 +329,6 @@ skips:
   # red together).
 
   # Standalone failures — no obvious cluster yet.
-  - id: tests/e2e/test_filesystem_changed_files_e2e.py::test_filesystem_changes_appear_after_agent_write
-    reason: "Migrated to mock LLM but underlying infrastructure issue persists: the main e2e runner fixture does not set OMNIGENT_RUNNER_WORKSPACE, so the filesystem changes tracking does not detect agent writes. Needs OMNIGENT_RUNNER_WORKSPACE wiring in the e2e runner fixture."
-    issue: 673
-    cluster: files-uploads-attachments
-    mode: skip
 
   # ──────────────────────────────────────────────────────────────
   # Re-triaged 2026-06-18 (flake-stress run 27761358025 on main, 20×,
