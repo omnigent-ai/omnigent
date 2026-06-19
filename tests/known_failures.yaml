@@ -55,15 +55,15 @@ skips:
     mode: skip
 
   - id: tests/e2e/omnigent/test_run_harness_without_agent_e2e.py::test_run_harness_without_agent_live_repl_round_trip[claude-sdk]
-    reason: "No-AGENT harness round-trip claude-sdk."
+    reason: "No-AGENT `omnigent run --harness` live round-trip hangs >180s in CI -> pytest-timeout thread-kill -> xdist worker crash; claude-sdk fails 30/30 in flake-stress 27808074172. Auth is NOT the cause: CI sets DATABRICKS_BEARER and the harness auth-commands short-circuit on it, so the hang is post-auth in the round-trip. Environment-wide, not harness-specific (codex + openai-agents siblings hang identically). The test's _COMPLETION_TIMEOUT=240 also exceeds the e2e --timeout=180 cap. Not locally reproducible (oss OAuth + macOS PTY diverge from CI); needs CI-env debugging."
     issue: 523
-    cluster: repl-pexpect-cli
+    cluster: no-agent-harness-roundtrip-hang
     mode: skip
 
   - id: tests/e2e/omnigent/test_run_harness_without_agent_e2e.py::test_run_harness_without_agent_live_repl_round_trip[openai-agents]
-    reason: "No-AGENT harness round-trip openai-agents, same family."
+    reason: "No-AGENT `omnigent run --harness` live round-trip hangs >180s in CI -> xdist worker crash; openai-agents fails 10/10 in flake-stress 27809210955. Same post-auth round-trip hang as the [claude-sdk]/[codex] siblings -- notably the in-process SDK harness hangs too, confirming the cause is environment-wide rather than CLI-subprocess-specific. See [claude-sdk] entry for the full diagnosis."
     issue: 523
-    cluster: repl-pexpect-cli
+    cluster: no-agent-harness-roundtrip-hang
     mode: skip
 
 
@@ -92,9 +92,9 @@ skips:
     mode: skip
 
   - id: tests/e2e/omnigent/test_run_harness_without_agent_e2e.py::test_run_harness_without_agent_live_repl_round_trip[codex]
-    reason: "No-AGENT harness round-trip, codex variant; same family as [claude-sdk], [openai-agents]."
+    reason: "No-AGENT `omnigent run --harness` live round-trip hangs >180s in CI -> xdist worker crash; codex fails 6/6 in flake-stress 27808990899. Same post-auth round-trip hang as the [claude-sdk]/[openai-agents] siblings (locally codex fast-fails on the databricks auth-command instead, an oss-OAuth repro artifact, not the CI failure). See [claude-sdk] entry for the full diagnosis."
     issue: 523
-    cluster: repl-pexpect-cli
+    cluster: no-agent-harness-roundtrip-hang
     mode: skip
 
   - id: tests/e2e/omnigent/test_repl_session_lifecycle.py::test_repl_effort_command_persists_session_metadata
