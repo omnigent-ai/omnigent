@@ -46,35 +46,35 @@ skips:
 
 
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_tool_call_approval_allows_tool_to_run
-    reason: "Same REPL approval pexpect-timeout family."
-    issue: 523
-    cluster: repl-pexpect-cli
+    reason: "REPL policy-ASK banner does not surface for TOOL_CALL-phase ASK (#763): expect('approval required') times out 60/60 in run 27802341342. INPUT-phase ASKs surface fine; the tool_call elicitation->REPL path does not."
+    issue: 763
+    cluster: repl-policy-ask-surfacing
     mode: skip
 
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_subagent_tool_call_ask_tunnels_to_root
-    reason: "Same REPL approval pexpect-timeout family."
-    issue: 523
-    cluster: repl-pexpect-cli
+    reason: "Sub-agent ASK does not surface as a tunneled root banner (#763): agent-start/sub-agent ASK is collapsed to DENY (app.py:5328); expect('approval required') times out."
+    issue: 763
+    cluster: repl-policy-ask-surfacing
     mode: skip
 
 
 
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_tool_call_refusal_blocks_tool
-    reason: "Shard 0 bulk: REPL approval pexpect-timeout family (same as other test_repl_approval_e2e entries)."
-    issue: 523
-    cluster: repl-pexpect-cli
+    reason: "REPL policy-ASK banner does not surface for TOOL_CALL-phase ASK (#763): expect('approval required') times out 60/60 in run 27802341342. INPUT-phase ASKs surface fine; the tool_call elicitation->REPL path does not."
+    issue: 763
+    cluster: repl-policy-ask-surfacing
     mode: skip
 
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_subagent_ask_tunnels_approval_to_root
-    reason: "Shard 0 bulk: REPL approval pexpect-timeout family."
-    issue: 523
-    cluster: repl-pexpect-cli
+    reason: "Sub-agent ASK does not surface as a tunneled root banner (#763): agent-start/sub-agent ASK is collapsed to DENY (app.py:5328); expect('approval required') times out."
+    issue: 763
+    cluster: repl-policy-ask-surfacing
     mode: skip
 
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_tool_result_ask_approve_surfaces_tool_output
-    reason: "Shard 0 bulk: REPL approval pexpect-timeout family."
-    issue: 523
-    cluster: repl-pexpect-cli
+    reason: "TOOL_RESULT ASK is collapsed to DENY by design (runner cannot prompt mid-flight, policy.py:218) -> no interactive banner (#763). The test expects an interactive approve/refuse; needs an owner decision (build mid-flight ASK vs rewrite/delete)."
+    issue: 763
+    cluster: repl-policy-ask-surfacing
     mode: skip
 
   # ── Shard 1 bulk quarantine (2026-05-15) ──
@@ -101,9 +101,9 @@ skips:
     mode: skip
 
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_tool_result_ask_refuse_replaces_output
-    reason: "Shard 1 bulk: REPL approval pexpect-timeout family."
-    issue: 523
-    cluster: repl-pexpect-cli
+    reason: "TOOL_RESULT ASK is collapsed to DENY by design (runner cannot prompt mid-flight, policy.py:218) -> no interactive banner (#763). The test expects an interactive approve/refuse; needs an owner decision (build mid-flight ASK vs rewrite/delete)."
+    issue: 763
+    cluster: repl-policy-ask-surfacing
     mode: skip
 
 
@@ -134,16 +134,16 @@ skips:
   # product investigation before re-greening.
 
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_output_ask_approve_surfaces_llm_reply
-    reason: "Shard 3 bulk: REPL output ask-approve family."
-    issue: 523
-    cluster: repl-pexpect-cli
+    reason: "OUTPUT-phase ASK banner does not surface in the REPL (#763): expect('approval required') times out 60/60. Same surfacing gap as TOOL_CALL."
+    issue: 763
+    cluster: repl-policy-ask-surfacing
     mode: skip
 
 
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_output_ask_refuse_replaces_reply_with_sentinel
-    reason: "Shard 3 bulk: REPL output ask-refuse family."
-    issue: 523
-    cluster: repl-pexpect-cli
+    reason: "OUTPUT-phase ASK banner does not surface in the REPL (#763): expect('approval required') times out 60/60. Same surfacing gap as TOOL_CALL."
+    issue: 763
+    cluster: repl-policy-ask-surfacing
     mode: skip
 
   - id: tests/e2e/omnigent/test_repl_inline_tool_streaming.py::test_repl_inline_tool_call_and_result_streaming
