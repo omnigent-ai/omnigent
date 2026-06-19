@@ -190,8 +190,14 @@ def test_run_omnigent_propagates_os_env_inherit_to_spawned_worker(
     :param model: The harness-routed model identifier from
         :data:`HARNESS_HARNESS_MODELS`.
     """
-    worker_type = _WORKER_TYPE_BY_HARNESS[harness]
-    required_binary = _REQUIRED_BINARY_BY_HARNESS[harness]
+    worker_type = _WORKER_TYPE_BY_HARNESS.get(harness)
+    required_binary = _REQUIRED_BINARY_BY_HARNESS.get(harness)
+    if worker_type is None or required_binary is None:
+        pytest.skip(
+            f"{harness!r} has no inline ``<harness>_worker`` AgentTool "
+            "convention (only claude-sdk/codex/pi do), so the "
+            "os_env-inherit-to-spawned-worker invariant does not apply."
+        )
     for entry in _ROOT_ANCHOR_ENTRIES:
         assert (omnigent_repo_root / entry).exists(), (
             f"Expected anchor {entry!r} missing from "

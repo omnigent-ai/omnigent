@@ -36,9 +36,9 @@ skips:
   # (last STARTING on gw3 with no END). Pexpect REPL + sub-agent
   # spawn pattern.
   - id: tests/e2e/omnigent/test_run_omnigent_ctrl_g_subagent_dedup.py::test_run_omnigent_ctrl_g_deduplicates_subagent_across_spawn_and_send
-    reason: "Wedges hardened CI runner."
-    issue: 671
-    cluster: runner-wedge-subprocess-fanout
+    reason: "Sub-agent spawn/turn does not complete (pexpect.TIMEOUT) — parent never gets the spawned sub-agent result in time. Fails 30/30 even at workers=1 (run 27800002759); NOT a runner wedge. Same end-of-turn drain gap as #682."
+    issue: 682
+    cluster: subagent-result-delivery
     mode: skip
 
   # Shard 1 wedge candidates from run 25854221043's progress logger
@@ -49,15 +49,15 @@ skips:
   # reap the test's spawned children fast enough, accumulating until
   # the host wedges.
   - id: tests/e2e/omnigent/test_run_omnigent_os_env_inherit.py::test_run_omnigent_propagates_os_env_inherit_to_spawned_worker[claude-sdk]
-    reason: "Wedges hardened CI runner via os_env subprocess fanout."
-    issue: 671
-    cluster: runner-wedge-subprocess-fanout
+    reason: "Flaky sub-agent result-delivery: the spawned claude_worker file-listing result intermittently does not reach the parent before timeout (~half of attempts in run 27800002759, even serial). os_env propagation itself works when the result lands; the flake is the #682 drain gap."
+    issue: 682
+    cluster: subagent-result-delivery
     mode: skip
 
   - id: tests/e2e/omnigent/test_run_omnigent_twelve_shells.py::test_twelve_parallel_shells_complete_under_ap
-    reason: "Wedges hardened CI runner via 12 parallel pty shells."
-    issue: 671
-    cluster: runner-wedge-subprocess-fanout
+    reason: "Fan-out tool-result-delivery race: the LLM responds before all 12 parallel shell tool results land ('did NOT confirm all 12 shells finished'). Fails 30/30 even at workers=1 (run 27800002759); NOT a runner wedge. Canonical repro for the #522 async tool-result end-of-turn drain."
+    issue: 522
+    cluster: async-tool-result-delivery
     mode: skip
 
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_tool_call_approval_allows_tool_to_run
@@ -101,11 +101,6 @@ skips:
     reason: "Shard 1 bulk: secure_research_agent os-env one-shot. Triage pending."
     issue: 675
     cluster: sandbox-deps-env
-    mode: skip
-  - id: tests/e2e/omnigent/test_run_omnigent_os_env_inherit.py::test_run_omnigent_propagates_os_env_inherit_to_spawned_worker[openai-agents]
-    reason: "Shard 1 bulk: os_env propagation, same family as the [claude-sdk] variant."
-    issue: 671
-    cluster: runner-wedge-subprocess-fanout
     mode: skip
 
   - id: tests/e2e/omnigent/test_run_harness_without_agent_e2e.py::test_run_harness_without_agent_live_repl_round_trip[claude-sdk]
@@ -170,9 +165,9 @@ skips:
     mode: skip
 
   - id: tests/e2e/omnigent/test_run_omnigent_os_env_inherit.py::test_run_omnigent_propagates_os_env_inherit_to_spawned_worker[codex]
-    reason: "Shard 3 bulk: os_env propagation, codex variant. Same runner-wedge family."
-    issue: 671
-    cluster: runner-wedge-subprocess-fanout
+    reason: "Flaky sub-agent result-delivery: the spawned codex_worker result intermittently does not reach the parent before timeout (~quarter of attempts in run 27800002759, even serial). Same #682 drain gap; os_env propagation works when the result lands."
+    issue: 682
+    cluster: subagent-result-delivery
     mode: skip
 
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_output_ask_refuse_replaces_reply_with_sentinel
