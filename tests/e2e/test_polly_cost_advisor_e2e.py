@@ -249,7 +249,7 @@ def _verdict_label(base_url: str, conv_id: str) -> dict[str, Any] | None:
 
 
 def test_advise_mode_sizes_trivial_cheap_and_hard_expensive(
-    local_polly_server: str, tmp_path: Path
+    local_polly_server: str, tmp_path: Path, using_mock_llm: bool
 ) -> None:
     """Advise mode: a trivial turn and a hard turn each persist a v3
     verdict label sized to difficulty, brain model UNCHANGED.
@@ -266,7 +266,13 @@ def test_advise_mode_sizes_trivial_cheap_and_hard_expensive(
 
     :param local_polly_server: Base URL of the in-tree local server fixture.
     :param tmp_path: Per-test temp dir for the advise-mode spec variant.
+    :param using_mock_llm: Whether mock LLM mode is active.
     """
+    if using_mock_llm:
+        pytest.skip(
+            "polly cost-advisor e2e requires real LLM judge calls and real "
+            "subprocess omnigent run invocations; not feasible under mock LLM"
+        )
     polly_dir = _polly_spec_dir(tmp_path, mode="advise")
     # Trivial turn → cheap verdict.
     res_trivial = _run_polly_turn(local_polly_server, _TRIVIAL_PROMPT, polly_dir=polly_dir)
@@ -297,7 +303,9 @@ def test_advise_mode_sizes_trivial_cheap_and_hard_expensive(
     assert hard["applied"] is False
 
 
-def test_optimize_mode_runs_turn_on_verdict_model(local_polly_server: str, tmp_path: Path) -> None:
+def test_optimize_mode_runs_turn_on_verdict_model(
+    local_polly_server: str, tmp_path: Path, using_mock_llm: bool
+) -> None:
     """Optimize mode: the turn provably runs on the verdict model, and a
     conversational follow-up persists NO new label.
 
@@ -309,7 +317,13 @@ def test_optimize_mode_runs_turn_on_verdict_model(local_polly_server: str, tmp_p
 
     :param local_polly_server: Base URL of the in-tree local server fixture.
     :param tmp_path: Temp dir for the optimize-mode polly variant.
+    :param using_mock_llm: Whether mock LLM mode is active.
     """
+    if using_mock_llm:
+        pytest.skip(
+            "polly cost-advisor optimize e2e requires real LLM judge calls and real "
+            "subprocess omnigent run invocations; not feasible under mock LLM"
+        )
     polly_dir = _polly_spec_dir(tmp_path, mode="optimize")
     res = _run_polly_turn(local_polly_server, _HARD_PROMPT, polly_dir=polly_dir)
     assert res.returncode == 0, res.stderr[-800:]
@@ -353,7 +367,7 @@ def test_optimize_mode_runs_turn_on_verdict_model(local_polly_server: str, tmp_p
 
 
 def test_run_model_flag_is_spec_default_not_session_pin(
-    local_polly_server: str, tmp_path: Path
+    local_polly_server: str, tmp_path: Path, using_mock_llm: bool
 ) -> None:
     """``omnigent run --model X`` is the SPEC default, not a session pin —
     the optimize advisor still applies its verdict over it.
@@ -372,7 +386,13 @@ def test_run_model_flag_is_spec_default_not_session_pin(
 
     :param local_polly_server: Base URL of the in-tree local server fixture.
     :param tmp_path: Temp dir for the optimize-mode polly variant.
+    :param using_mock_llm: Whether mock LLM mode is active.
     """
+    if using_mock_llm:
+        pytest.skip(
+            "polly cost-advisor user-pin e2e requires real LLM judge calls and real "
+            "subprocess omnigent run invocations; not feasible under mock LLM"
+        )
     polly_dir = _polly_spec_dir(tmp_path, mode="optimize")
     res = _run_polly_turn(
         local_polly_server,

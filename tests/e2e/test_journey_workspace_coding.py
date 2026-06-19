@@ -73,6 +73,7 @@ def test_terminal_coding_session_journey(
     sys_terminal_test_agent: str,
     live_runner_id: str,
     http_client: httpx.Client,
+    using_mock_llm: bool,
 ) -> None:
     """
     Terminal coding journey: create a file via terminal, read it back,
@@ -105,7 +106,13 @@ def test_terminal_coding_session_journey(
     :param sys_terminal_test_agent: Registered agent with terminal tools.
     :param live_runner_id: Runner id for session binding.
     :param http_client: HTTP client pointed at the live server.
+    :param using_mock_llm: Whether mock LLM mode is active.
     """
+    if using_mock_llm:
+        pytest.skip(
+            "workspace coding tests require real tmux interaction and a real "
+            "LLM to drive terminal tools; not feasible under mock LLM"
+        )
     session_id = create_runner_bound_session(
         http_client,
         agent_name=sys_terminal_test_agent,
