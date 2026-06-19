@@ -33,9 +33,7 @@ SDK→native test needs only the Claude side. Set the matching gates::
 
     OMNIGENT_E2E_CLAUDE_NATIVE=1 OMNIGENT_E2E_CODEX_NATIVE=1 \\
     .venv/bin/python -m pytest tests/e2e/test_host_cross_family_fork_e2e.py \\
-        --profile oss \\
-        --llm-api-key "$(databricks auth token -p oss \\
-            | python -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')" \\
+        --llm-api-key "mock-key" \\
         -v
 """
 
@@ -56,7 +54,9 @@ from omnigent.stores.conversation_store import (
 )
 from tests.e2e.conftest import (
     _OPENAI_CODER_DIR,
+    configure_mock_llm,
     create_runner_bound_session,
+    reset_mock_llm,
     send_user_message_to_session,
     upload_agent,
 )
@@ -309,8 +309,7 @@ def test_fork_openai_sdk_source_into_claude_native_rebuilds_history(
     http_client: httpx.Client,
     tmp_path: Path,
     live_runner_id: str,
-    databricks_workspace_host: str | None,
-    databricks_profile_or_none: str | None,
+    mock_llm_server_url: str,
 ) -> None:
     """
     An openai-agents SDK source forked into claude-native recalls history.
@@ -324,28 +323,38 @@ def test_fork_openai_sdk_source_into_claude_native_rebuilds_history(
     server's runner), so this is the cross-family case that runs on hosts
     without a codex login.
 
+    Uses the mock LLM server for the openai-agents SDK source turn so no
+    real OpenAI credentials are needed.
+
     :param live_server: The test server URL.
     :param http_client: HTTP client pointed at the test server.
     :param tmp_path: Per-test temp dir.
     :param live_runner_id: The server fixture's runner id (runs the SDK
-        source turn).
-    :param databricks_workspace_host: Workspace host from ``--profile``
-        (``None`` for the api.openai.com path) — gates the bundle's model
-        rewrite.
-    :param databricks_profile_or_none: Databricks profile name from
-        ``--profile``, stamped onto executor blocks during the rewrite.
+        source turn against the mock LLM).
+    :param mock_llm_server_url: Mock LLM server base URL (no ``/v1`` suffix).
     :returns: None.
     """
     workspace = tmp_path / "xfam_sdk_to_claude_ws"
     workspace.mkdir()
     marker = f"FORKWORD_{uuid.uuid4().hex[:6].upper()}"
 
+    mock_model = "mock-openai-coder-xfam"
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"text": f"ACK — code word recorded: {marker}"},
+            {"text": marker},
+        ],
+        key=mock_model,
+    )
+
     # Register the openai-coder (openai-agents, openai family) SOURCE agent.
+    # No Databricks rewrite needed — we use the mock model key directly.
     sdk_agent_name = upload_agent(
         http_client,
         _OPENAI_CODER_DIR,
-        rewrite_model_for_databricks=databricks_workspace_host is not None,
-        databricks_profile=databricks_profile_or_none,
+        rewrite_model_for_databricks=False,
     )
 
     # Only the claude-native CLONE shows Claude's folder-trust dialog.

@@ -51,15 +51,13 @@ from omnigent._wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE as _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
 )
 from omnigent._wrapper_labels import (
-    CODEX_NATIVE_WRAPPER_VALUE as _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
-)
-from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY as _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
 )
 from omnigent.conversation_browser import open_conversation_link_if_enabled
 from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.inner.databricks_executor import _DatabricksBearerAuth, _read_databrickscfg
+from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.spec import load as load_spec
 from omnigent.spec._omnigent_compat import OMNIGENT_EXECUTOR_TYPE
 from omnigent.spec.parser import discover_host_skills
@@ -1029,7 +1027,10 @@ def _redirect_native_resume_if_needed(
     wrapper_label = _wrapper_label_for_conversation(
         base_url=base_url, conversation_id=conversation_id
     )
-    if wrapper_label == _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE:
+    native_agent = native_coding_agent_for_wrapper_label(wrapper_label)
+    if native_agent is None:
+        return False
+    if native_agent.key == "claude":
         _run_claude_native_resume_redirect(
             base_url=base_url,
             conversation_id=conversation_id,
@@ -1037,8 +1038,16 @@ def _redirect_native_resume_if_needed(
             progress=progress,
         )
         return True
-    if wrapper_label == _CODEX_NATIVE_WRAPPER_LABEL_VALUE:
+    if native_agent.key == "codex":
         _run_codex_native_resume_redirect(
+            base_url=base_url,
+            conversation_id=conversation_id,
+            auto_open_conversation=auto_open_conversation,
+            progress=progress,
+        )
+        return True
+    if native_agent.key == "pi":
+        _run_pi_native_resume_redirect(
             base_url=base_url,
             conversation_id=conversation_id,
             auto_open_conversation=auto_open_conversation,
@@ -1140,6 +1149,38 @@ def _run_codex_native_resume_redirect(
         server=base_url,
         session_id=conversation_id,
         codex_args=(),
+        auto_open_conversation=auto_open_conversation,
+    )
+
+
+def _run_pi_native_resume_redirect(
+    *,
+    base_url: str,
+    conversation_id: str,
+    auto_open_conversation: bool,
+    progress: RunnerStartupProgress | None,
+) -> None:
+    """
+    Hand a pi-native conversation back to ``omnigent pi``.
+
+    :param base_url: Omnigent server base URL.
+    :param conversation_id: Omnigent conversation id.
+    :param auto_open_conversation: Browser-open preference for the wrapper.
+    :param progress: Optional Omnigent startup spinner to finish before redirect.
+    :returns: None.
+    """
+    _finish_native_redirect_progress(
+        progress=progress,
+        conversation_id=conversation_id,
+        wrapper_name="pi-native",
+        native_command="pi",
+    )
+    from omnigent.pi_native import run_pi_native
+
+    run_pi_native(
+        server=base_url,
+        session_id=conversation_id,
+        pi_args=(),
         auto_open_conversation=auto_open_conversation,
     )
 
@@ -2222,9 +2263,78 @@ async def _query_sessions_once(
         if reconciled is not None:
             return reconciled
         raise
+    all_text_parts: list[str] = []
     if result.text:
-        return result.text
-    return await _persisted_turn_text(client, bound.id)
+        all_text_parts.append(result.text)
+    elif (reconciled := await _persisted_turn_text(client, bound.id)) is not None:
+        all_text_parts.append(reconciled)
+
+    # Multi-turn loop for async orchestrators (e.g. polly) that dispatch
+    # sub-agents and are auto-woken by inbox completions across multiple
+    # turns.
+    #
+    # Fast-exit: refresh() at the TOP of each iteration catches the common
+    # case (single-turn agent, session already idle) with one HTTP round-
+    # trip (~100 ms) instead of waiting up to _PER_TURN_TIMEOUT_S for a
+    # stream subscription to time out.
+    #
+    # Race window: a turn MAY complete in the gap between the top-of-loop
+    # refresh() showing "waiting" and await_turn() opening its subscription.
+    # The window is O(ms) in practice (subagents take seconds). If it fires,
+    # await_turn() times out, the bottom refresh() shows "idle", and we exit
+    # — the only cost is one _PER_TURN_TIMEOUT_S wait and possibly missing
+    # that turn's text.
+    #
+    # Timeouts: 120 s per turn bounds the race-window penalty. A global
+    # 1800 s wall-clock budget caps the loop regardless of turn count.
+    _MAX_EXTRA_TURNS = 30
+    _PER_TURN_TIMEOUT_S = 120.0
+    _LOOP_TIMEOUT_S = 1800.0
+
+    async def _drain_extra_turns() -> None:
+        for _ in range(_MAX_EXTRA_TURNS):
+            # Fast-exit for single-turn agents.
+            await chat.refresh()
+            if chat.status not in ("waiting", "running", "launching"):
+                return
+            # Session still active; subscribe before the next check to
+            # reduce (not eliminate) the race where a turn completes
+            # between refresh and subscribe.
+            extra = await chat.await_turn(timeout=_PER_TURN_TIMEOUT_S)
+            if extra.text:
+                all_text_parts.append(extra.text)
+            await chat.refresh()
+            if chat.status not in ("waiting", "running", "launching"):
+                return
+        logger.warning(
+            "headless -p hit the %d-turn guard for session %s; "
+            "the orchestrator may still be running",
+            _MAX_EXTRA_TURNS,
+            bound.id,
+        )
+
+    try:
+        async with asyncio.timeout(_LOOP_TIMEOUT_S):
+            await _drain_extra_turns()
+    except asyncio.TimeoutError:
+        logger.warning(
+            "headless -p timed out after %.0fs waiting for session %s to complete",
+            _LOOP_TIMEOUT_S,
+            bound.id,
+        )
+
+    if all_text_parts:
+        return "\n\n".join(p for p in all_text_parts if p)
+    # No assistant text at all. If the runner persisted a terminal
+    # ``error`` item (e.g. a harness start failure like the cursor SDK's
+    # invalid-model rejection), surface it instead of returning ``None`` —
+    # otherwise the headless caller renders a failed turn as a silent,
+    # exit-0 empty success. The callers wrap this in ``except
+    # ClientOmnigentError`` and print the message to stderr + exit non-zero.
+    turn_error = await _persisted_turn_error(client, bound.id)
+    if turn_error is not None:
+        raise ClientOmnigentError(turn_error)
+    return None
 
 
 def _sessions_tool_callables(
@@ -2343,6 +2453,44 @@ async def _persisted_turn_text(
     # Restore chronological order so multi-message output joins correctly.
     this_turn_assistant.reverse()
     return _response_output_text(this_turn_assistant)
+
+
+async def _persisted_turn_error(
+    client: OmnigentClient,
+    session_id: str,
+) -> str | None:
+    """Read the latest turn's persisted terminal error message, if any.
+
+    Companion to :func:`_persisted_turn_text`. When a turn produced no
+    ``completed`` assistant text, the runner may still have persisted a
+    terminal ``error`` item — e.g. a harness *start* failure such as the
+    cursor SDK rejecting an unknown model. Without this, the headless ``-p``
+    path renders that as a silent, exit-0 empty success; returning the message
+    lets the caller surface it and exit non-zero.
+
+    Mirrors :func:`_persisted_turn_text`'s walk: newest → oldest, stopping at
+    the current turn's user message, so a prior turn's error is never
+    attributed to this turn.
+
+    :param client: Connected SDK client bound to the session's server.
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :returns: The current turn's terminal error message, or ``None``.
+    """
+    try:
+        recent: _ResponseOutput = await client.sessions.list_items(
+            session_id, limit=_RECONCILE_ITEMS_LIMIT, order="desc"
+        )
+    except ClientOmnigentError as exc:
+        logger.debug("reconcile error read failed for %s: %r", session_id, exc)
+        return None
+    for item in recent:
+        if item.get("type") == "message" and item.get("role") == "user":
+            break  # reached the start of the current turn
+        if item.get("type") == "error":
+            message = item.get("message")
+            if isinstance(message, str) and message:
+                return message
+    return None
 
 
 def _resolve_resume_target(

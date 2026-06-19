@@ -47,6 +47,8 @@ _HARNESS_MODULES: dict[str, str] = {
     # Step 4d: pi harness wrap. See
     # omnigent/inner/pi_harness.py.
     "pi": "omnigent.inner.pi_harness",
+    # Native Pi TUI bridge used by ``omnigent pi``.
+    "pi-native": "omnigent.inner.pi_native_harness",
     # Step 4e: openai-agents harness wrap. See
     # omnigent/inner/openai_agents_sdk_harness.py. Registry
     # key is the Omnigent-side spelling (``openai-agents``,
@@ -57,14 +59,21 @@ _HARNESS_MODULES: dict[str, str] = {
     # the underlying SDK package is ``openai-agents`` and the
     # executor class is :class:`OpenAIAgentsSDKExecutor`.
     "openai-agents": "omnigent.inner.openai_agents_sdk_harness",
-    # Supervisor harness wrap. See
-    # omnigent/inner/databricks_supervisor_harness.py. Drives the Databricks
-    # Agent Bricks Supervisor API at
-    # ``{workspace}/ai-gateway/mlflow/v1/responses``. Differs from
-    # the SDK-wrapping harnesses above in that the inner executor
-    # has no third-party SDK dependency — it talks HTTP / SSE
-    # directly to the Databricks gateway.
-    "databricks_supervisor": "omnigent.inner.databricks_supervisor_harness",
+    # cursor harness wrap (Cursor's ``cursor-agent`` CLI, headless). See
+    # omnigent/inner/cursor_harness.py.
+    "cursor": "omnigent.inner.cursor_harness",
+    # cursor-native harness wrap. Drives the resident ``cursor-agent`` TUI by
+    # injecting each web-UI turn into its tmux pane and mirroring the transcript
+    # back — a native-CLI harness like claude/codex/pi-native, so it IS in
+    # ``NATIVE_HARNESSES``. See omnigent/inner/cursor_native_harness.py.
+    "cursor-native": "omnigent.inner.cursor_native_harness",
+    # Google Antigravity SDK harness wrap. See
+    # omnigent/inner/antigravity_harness.py. In-process SDK harness
+    # (``google-antigravity``), like openai-agents — Omnigent spawns no CLI
+    # binary or sandbox subprocess (the SDK itself launches a native
+    # localharness binary; needs glibc >=~2.36). Drives Gemini 3.5 Flash by
+    # default (also Claude / GPT-OSS), with Gemini API-key or Vertex AI auth.
+    "antigravity": "omnigent.inner.antigravity_harness",
 }
 
 __all__ = ["_HARNESS_MODULES"]

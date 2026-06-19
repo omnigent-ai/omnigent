@@ -17,6 +17,7 @@ from omnigent.claude_native_bridge import (
     read_active_session_id,
     read_bridge_id,
     read_claude_session_id,
+    read_claude_status_model,
     read_permission_hook_config,
     read_seen_claude_session_ids,
     record_hook_event,
@@ -28,6 +29,7 @@ from omnigent.claude_native_bridge import (
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.native_policy_hook import (
     evaluation_response_to_hook_output,
+    fail_closed_hook_output,
     hook_payload_to_evaluation_request,
 )
 
@@ -494,7 +496,12 @@ def _conversation_url_for_active_session(
     ap_server_url = config.get("ap_server_url")
     session_id = read_active_session_id(bridge_dir)
     if isinstance(ap_server_url, str) and ap_server_url and session_id:
-        return f"{ap_server_url.rstrip('/')}/c/{url_component(session_id)}"
+        # ``ap_server_url`` is the API base; route through the shared
+        # builder so workspace-hosted servers land on the ``/omnigent``
+        # SPA mount (with ``?o=<org>``) rather than the JSON API mount.
+        from omnigent.conversation_browser import conversation_url
+
+        return conversation_url(ap_server_url, session_id)
     return fallback_url
 
 
@@ -708,30 +715,49 @@ def _main_ask_user_question(argv: list[str]) -> int:
 
 def _main_evaluate_policy(argv: list[str]) -> int:
     """
-    Evaluate a Claude Code ``PreToolUse`` or ``PostToolUse`` hook against Omnigent policies.
+    Evaluate a Claude Code ``PreToolUse`` / ``PostToolUse`` /
+    ``UserPromptSubmit`` hook against Omnigent policies.
 
     Reads the hook JSON payload from stdin, converts it into the
     proto-compatible ``EvaluationRequest`` schema (``PHASE_TOOL_CALL``
-    for PreToolUse, ``PHASE_TOOL_RESULT`` for PostToolUse), POSTs to
+    for PreToolUse, ``PHASE_TOOL_RESULT`` for PostToolUse,
+    ``PHASE_REQUEST`` for UserPromptSubmit), POSTs to
     ``/v1/sessions/{id}/policies/evaluate``, and converts the
     ``EvaluationResponse`` back into Claude Code's hook output format.
 
-    For ``PreToolUse``, only constraining verdicts map to a
-    ``permissionDecision``: ``POLICY_ACTION_DENY`` → ``"deny"`` and
-    ``POLICY_ACTION_ASK`` → ``"defer"`` (falls through to the
-    ``PermissionRequest`` hook for interactive approval).
-    ``POLICY_ACTION_ALLOW`` (the engine's default when no policy matches)
-    emits no output — "no opinion" — so Claude's own permission prompt
-    still fires and the ``PermissionRequest`` hook can route it to the
-    web UI. See :func:`omnigent.native_policy_hook.evaluation_response_to_hook_output`.
+    For ``PreToolUse``, only the constraining ``POLICY_ACTION_DENY``
+    verdict maps to a ``permissionDecision`` (``"deny"``); ASK is
+    resolved server-side (the endpoint parks via ``_hold_native_ask_gate``
+    and returns a hard ALLOW/DENY). ``POLICY_ACTION_ALLOW`` (the engine's
+    default when no policy matches) emits no output — "no opinion" — so
+    Claude's own permission prompt still fires and the
+    ``PermissionRequest`` hook can route it to the web UI. See
+    :func:`omnigent.native_policy_hook.evaluation_response_to_hook_output`.
+
+    For ``UserPromptSubmit``, this is the request-phase gate for native
+    sessions (the server-level ``_evaluate_input_policy`` skips native
+    message events). A DENY emits top-level ``decision: "block"``, which
+    drops the prompt before the model sees it; ASK is resolved
+    server-side; ALLOW proceeds with no output.
 
     For ``PostToolUse``, policy denials are surfaced as
     ``additionalContext`` (Claude sees the warning but the tool result
     is already committed — PostToolUse hooks are observational).
 
-    On transport failures the hook returns exit 0 with no output,
-    which Claude Code treats as "no opinion". Fail-open design
-    ensures a network blip doesn't block every tool call.
+    Failure handling is phase-aware (mirroring the runner-side default
+    from PR #163). Once the session is known to be governed (an active
+    session id and a configured ``ap_server_url``) and the round-trip to
+    ``/policies/evaluate`` cannot yield a usable verdict — the server is
+    unreachable, returns non-2xx, or returns an empty / malformed body —
+    a ``PreToolUse`` (``PHASE_TOOL_CALL``) call fails CLOSED with a
+    ``deny`` (this hook is the sole enforcement point for native tools, so
+    a transient outage must not silently let a gated call through), while
+    ``UserPromptSubmit`` and ``PostToolUse`` fail OPEN. Pre-evaluation
+    conditions that mean the session simply is not governed — no active
+    session, no ``ap_server_url``, an unparseable hook payload, or an
+    ``mcp__omnigent__*`` tool already gated on the relay path — still
+    return exit 0 with no output ("no opinion") so non-Omnigent tool
+    calls are never blocked.
 
     :param argv: CLI argv after the ``evaluate-policy`` subcommand,
         e.g. ``["--bridge-dir", "/tmp/x"]``.
@@ -767,6 +793,34 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         # Unrecognized hook event — no policy to evaluate.
         return 0
 
+    # Stamp the live model from this session's statusLine capture (the
+    # statusLine wrapper writes the active model id into ``context.json`` on
+    # every render — including right after an in-pane ``/model`` switch). This
+    # is the cost gate's source of truth at hook time, race-free, unlike the
+    # forwarder's async ``model_override`` mirror which lags a poll behind.
+    # Without it the cost-budget gate can see an unresolved model (None) and
+    # fail closed — blocking a cheap-model (sonnet/haiku) session over budget,
+    # even though only expensive tiers should be gated (the server prefers a
+    # stamped model over its own resolution; see ``PolicyEngine._inject_model``).
+    # hook_payload_to_evaluation_request always returns an event with a
+    # "context" dict, so index it directly (fail loud if that contract changes).
+    context = eval_request["event"]["context"]
+    # Stamp the harness so the over-budget message names claude-native's
+    # model-switch surface (the in-pane ``/model`` picker).
+    context["harness"] = "claude-native"
+    status_model = read_claude_status_model(bridge_dir)
+    if status_model:
+        context["model"] = status_model
+
+    # The session is governed (active id + ap_server_url) and we have a
+    # policy-relevant event: from here a failure to obtain a usable verdict
+    # fails CLOSED for the tool-call gate (see ``fail_closed_hook_output``).
+    def _fail_closed() -> int:
+        out = fail_closed_hook_output(hook_event)
+        if out is not None:
+            sys.stdout.write(json.dumps(out))
+        return 0
+
     url = f"{ap_server_url.rstrip('/')}/v1/sessions/{url_component(session_id)}/policies/evaluate"
     try:
         with httpx.Client(
@@ -774,16 +828,24 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         ) as client:
             resp = client.post(url, json=eval_request)
             resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        print(
+            f"omnigent evaluate-policy hook: Omnigent returned {exc.response.status_code}",
+            file=sys.stderr,
+        )
+        return _fail_closed()
     except httpx.HTTPError as exc:
         print(f"omnigent evaluate-policy hook: Omnigent request failed: {exc}", file=sys.stderr)
-        return 0
+        return _fail_closed()
     if not resp.content:
-        return 0
+        print("omnigent evaluate-policy hook: empty Omnigent response", file=sys.stderr)
+        return _fail_closed()
 
     try:
         eval_response = resp.json()
     except json.JSONDecodeError:
-        return 0
+        print("omnigent evaluate-policy hook: malformed Omnigent response", file=sys.stderr)
+        return _fail_closed()
 
     hook_output = evaluation_response_to_hook_output(hook_event, eval_response)
     if hook_output is not None:

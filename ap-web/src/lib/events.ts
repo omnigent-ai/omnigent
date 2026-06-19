@@ -452,6 +452,33 @@ export interface SessionModelEvent {
 }
 
 /**
+ * `session.reasoning_effort` — active thinking-level switch from a native
+ * session.
+ *
+ * Emitted by the Omnigent server after a native wrapper reports an effort
+ * change observed outside the Web UI: Claude-native mirrors terminal/TUI
+ * changes, and Codex-native mirrors Codex app-server/config state. Carries
+ * `null` when the native runtime cleared back to its model default.
+ */
+export interface SessionReasoningEffortEvent {
+  type: "session_reasoning_effort";
+  conversationId: string;
+  reasoningEffort: string | null;
+}
+
+/**
+ * `session.collaboration_mode` — active Codex collaboration-mode switch.
+ *
+ * Emitted when a Codex-native thread enters or exits Plan mode, whether from
+ * the web UI toggle or from the native Codex TUI.
+ */
+export interface SessionCollaborationModeEvent {
+  type: "session_collaboration_mode";
+  conversationId: string;
+  mode: string;
+}
+
+/**
  * `session.agent_changed` — the session's bound agent was switched in
  * place (switch-agent route).
  *
@@ -683,6 +710,16 @@ export interface SessionSkillsEvent {
   conversationId: string;
 }
 
+/**
+ * `session.model_options` — the Codex app-server model catalog just
+ * resolved for a session. Consumers refetch the session snapshot and apply
+ * its now-populated `codexModelOptions`.
+ */
+export interface SessionModelOptionsEvent {
+  type: "session_model_options";
+  conversationId: string;
+}
+
 /** One user currently viewing the session (holding its stream open). */
 export interface SessionViewer {
   /** Authenticated identity, e.g. `"alice@example.com"`. */
@@ -738,6 +775,8 @@ export type StreamEvent =
   | SessionStatusEvent
   | SessionUsageEvent
   | SessionModelEvent
+  | SessionReasoningEffortEvent
+  | SessionCollaborationModeEvent
   | SessionAgentChangedEvent
   | SessionTodosEvent
   | SessionTerminalPendingEvent
@@ -751,4 +790,5 @@ export type StreamEvent =
   | SessionChangedFilesInvalidatedEvent
   | SessionTerminalActivityEvent
   | SessionSkillsEvent
+  | SessionModelOptionsEvent
   | SessionPresenceEvent;

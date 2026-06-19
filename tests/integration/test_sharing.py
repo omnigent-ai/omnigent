@@ -17,7 +17,11 @@ import uuid
 import httpx
 import pytest
 
-from tests.e2e.conftest import create_runner_bound_session, register_inline_agent
+from tests.e2e.conftest import (
+    configure_mock_llm,
+    create_runner_bound_session,
+    register_inline_agent,
+)
 from tests.integration.helpers import all_message_text, failure_detail, run_turn
 
 # EDIT level mirrored from omnigent/server/auth.py (see the sharing
@@ -31,9 +35,19 @@ def test_share_and_second_user_continues(
     harness_name: str,
     model_name: str,
     request: pytest.FixtureRequest,
+    mock_llm_server_url: str | None,
 ) -> None:
     suffix = uuid.uuid4().hex[:6]
     token = f"SHARED-{uuid.uuid4().hex[:8]}"
+
+    # In mock mode: owner turn returns "ok", Bob's turn returns the token.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"text": "ok"},
+            {"text": token},
+        ],
+    )
     with (
         httpx.Client(base_url=live_server, timeout=300) as owner,
         httpx.Client(
@@ -51,6 +65,7 @@ def test_share_and_second_user_continues(
             model=model_name,
             profile=request.config.getoption("--profile"),
             prompt="You are a terse test assistant. Follow instructions exactly.",
+            mock_llm_base_url=f"{mock_llm_server_url}/v1",
         )
         sid = create_runner_bound_session(owner, agent_name=agent_name, runner_id=live_runner_id)
         body_1 = run_turn(

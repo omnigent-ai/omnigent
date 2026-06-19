@@ -1,14 +1,10 @@
 name: Maintainer Approval Rerun
 
-# Bridges a maintainer's approving review to a re-run of the Maintainer
-# Approval check. `pull_request_target` does not fire on reviews, so
-# something has to re-trigger the check when an approval lands.
-#
-# A fork PR's `pull_request_review` token is read-only AND the run is
-# held behind the fork-approval gate, so it cannot re-run a workflow
-# itself. This job therefore only records the PR number as an artifact;
-# the privileged re-run happens in maintainer-approval-rerun-run.yml,
-# which runs from the base repo on `workflow_run`.
+# Bridges a maintainer's approving review to a re-run of the Maintainer Approval
+# check (`pull_request_target` doesn't fire on reviews). A fork PR's review token
+# is read-only and held behind the fork-approval gate, so it can't re-run a
+# workflow itself; this job only records the PR number as an artifact, and the
+# privileged re-run happens in maintainer-approval-rerun-run.yml (workflow_run).
 # See https://securitylab.github.com/research/github-actions-preventing-pwn-requests/
 
 on:
@@ -24,8 +20,10 @@ concurrency:
 
 jobs:
   record:
-    # Only approvals can flip the check green; skip everything else.
-    if: github.event.review.state == 'approved'
+    # Approvals flip the check green; dismissals and changes-requested flip
+    # it red and revoke the fork-e2e mirror. Skip COMMENTED reviews (they
+    # don't change review state).
+    if: github.event.review.state != 'commented'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

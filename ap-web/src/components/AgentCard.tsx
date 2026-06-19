@@ -1,11 +1,14 @@
 import { BotIcon } from "lucide-react";
 import { ClaudeIcon } from "@/components/icons/ClaudeIcon";
 import { CodexIcon } from "@/components/icons/CodexIcon";
+import { CursorIcon } from "@/components/icons/CursorIcon";
 import { NessieIcon } from "@/components/icons/NessieIcon";
 import { PiIcon } from "@/components/icons/PiIcon";
 import type { ComponentType, SVGProps } from "react";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
+import { nativeCodingAgentForAvailableAgent } from "@/lib/nativeCodingAgents";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { AgentHoverCard } from "@/components/AgentHoverCard";
 
 /**
  * Pick the glyph for a catalog agent.
@@ -20,9 +23,16 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
  */
 function iconForAgent(agent: AvailableAgent): ComponentType<SVGProps<SVGSVGElement>> {
   if (agent.name === "nessie") return NessieIcon;
+  const nativeAgent = nativeCodingAgentForAvailableAgent(agent);
+  if (nativeAgent?.iconKind === "claude") return ClaudeIcon;
+  if (nativeAgent?.iconKind === "codex") return CodexIcon;
+  if (nativeAgent?.iconKind === "pi") return PiIcon;
+  if (nativeAgent?.iconKind === "cursor") return CursorIcon;
   // A null harness (spec couldn't load) flows through to the bot fallback.
   if (agent.harness?.includes("codex")) return CodexIcon;
   if (agent.harness?.includes("claude")) return ClaudeIcon;
+  // Both the SDK "cursor" harness and "cursor-native" get the Cursor glyph.
+  if (agent.harness?.includes("cursor")) return CursorIcon;
   // Exact match — a substring check would false-match e.g. "openapi".
   if (agent.harness === "pi") return PiIcon;
   return BotIcon;
@@ -44,17 +54,24 @@ function iconForAgent(agent: AvailableAgent): ComponentType<SVGProps<SVGSVGEleme
  * @param compact - When true, render icon + name only (no inline
  *   description) so cards stay even in a horizontal row; the
  *   description is surfaced as a hover tooltip instead.
+ * @param hover - When true, wrap the card in a Cursor-style hover
+ *   flyout (``AgentHoverCard``) that opens to the right with the
+ *   agent's name + description. Additive to the inline description.
+ *   Ignored in compact mode, which already surfaces the description
+ *   via its own tooltip.
  */
 export function AgentCard({
   agent,
   selected,
   onSelect,
   compact = false,
+  hover = false,
 }: {
   agent: AvailableAgent;
   selected: boolean;
   onSelect: () => void;
   compact?: boolean;
+  hover?: boolean;
 }) {
   const Icon = iconForAgent(agent);
   const card = (
@@ -87,6 +104,11 @@ export function AgentCard({
         <TooltipContent>{agent.description}</TooltipContent>
       </Tooltip>
     );
+  }
+  // Non-compact opt-in: surface the richer Cursor-style flyout to the
+  // right on hover. AgentHoverCard no-ops when there's no description.
+  if (hover) {
+    return <AgentHoverCard agent={agent}>{card}</AgentHoverCard>;
   }
   return card;
 }

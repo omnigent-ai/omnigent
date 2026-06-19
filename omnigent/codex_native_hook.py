@@ -26,6 +26,7 @@ from omnigent.codex_native_bridge import (
 )
 from omnigent.native_policy_hook import (
     evaluation_response_to_hook_output,
+    fail_closed_hook_output,
     hook_payload_to_evaluation_request,
 )
 
@@ -61,7 +62,8 @@ def main(argv: list[str] | None = None) -> int:
 
 def _main_evaluate_policy(argv: list[str]) -> int:
     """
-    Evaluate a Codex ``PreToolUse`` or ``PostToolUse`` hook against Omnigent policies.
+    Evaluate a Codex ``PreToolUse`` / ``PostToolUse`` /
+    ``UserPromptSubmit`` hook against Omnigent policies.
 
     Reads the hook JSON payload from stdin, converts it into the
     proto-compatible ``EvaluationRequest`` schema via
@@ -69,15 +71,26 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     POSTs to ``/v1/sessions/{id}/policies/evaluate``, and converts the
     ``EvaluationResponse`` back into Codex's hook output format
     (``hookSpecificOutput.permissionDecision`` for PreToolUse;
-    ``additionalContext`` warning for PostToolUse).
+    ``additionalContext`` warning for PostToolUse; top-level
+    ``decision: "block"`` for UserPromptSubmit — the request-phase gate
+    for native sessions, which drops the prompt before the model runs).
 
-    On any transport or lookup failure the hook returns exit 0 with no
-    output, which Codex treats as "no opinion". This is the deliberate
-    fail-open behavior shared with the Claude-native hook: a network
-    blip must not block every tool call. The complementary fail-loud
-    guard — asserting the hook is actually registered and trusted — lives
-    at session startup in :mod:`omnigent.codex_native_app_server`, not
-    here, because a silently-skipped hook cannot report its own absence.
+    Failure handling is phase-aware (mirroring the runner-side default
+    from PR #163), shared with the Claude-native hook. Once the session is
+    known to be governed (an active session id and a configured
+    ``ap_server_url``) and the round-trip to ``/policies/evaluate`` cannot
+    yield a usable verdict — server unreachable, non-2xx, or an empty /
+    malformed body — a ``PreToolUse`` (``PHASE_TOOL_CALL``) call fails
+    CLOSED with a ``deny`` (this hook is the sole enforcement point for
+    native tools), while ``UserPromptSubmit`` and ``PostToolUse`` fail
+    OPEN. Conditions that mean the session simply is not governed — no
+    bridge state, no ``ap_server_url``, an unparseable payload, or an
+    ``mcp__omnigent__*`` tool already gated on the relay path — still
+    return exit 0 with no output ("no opinion") so non-Omnigent tool calls
+    are never blocked. The complementary fail-loud guard — asserting the
+    hook is actually registered and trusted — lives at session startup in
+    :mod:`omnigent.codex_native_app_server`, not here, because a
+    silently-skipped hook cannot report its own absence.
 
     :param argv: CLI argv after the ``evaluate-policy`` subcommand,
         e.g. ``["--bridge-dir", "/tmp/x"]``.
@@ -136,6 +149,15 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     if model:
         context["model"] = model
 
+    # The session is governed (bridge state + ap_server_url) and we have a
+    # policy-relevant event: from here a failure to obtain a usable verdict
+    # fails CLOSED for the tool-call gate (see ``fail_closed_hook_output``).
+    def _fail_closed() -> int:
+        out = fail_closed_hook_output(hook_event)
+        if out is not None:
+            sys.stdout.write(json.dumps(out))
+        return 0
+
     session_component = urllib.parse.quote(session_id, safe="")
     url = f"{ap_server_url.rstrip('/')}/v1/sessions/{session_component}/policies/evaluate"
     try:
@@ -144,19 +166,30 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         ) as client:
             resp = client.post(url, json=eval_request)
             resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        print(
+            f"omnigent codex evaluate-policy hook: Omnigent returned {exc.response.status_code}",
+            file=sys.stderr,
+        )
+        return _fail_closed()
     except httpx.HTTPError as exc:
         print(
             f"omnigent codex evaluate-policy hook: Omnigent request failed: {exc}",
             file=sys.stderr,
         )
-        return 0
+        return _fail_closed()
     if not resp.content:
-        return 0
+        print("omnigent codex evaluate-policy hook: empty Omnigent response", file=sys.stderr)
+        return _fail_closed()
 
     try:
         eval_response = resp.json()
     except json.JSONDecodeError:
-        return 0
+        print(
+            "omnigent codex evaluate-policy hook: malformed Omnigent response",
+            file=sys.stderr,
+        )
+        return _fail_closed()
 
     hook_output = evaluation_response_to_hook_output(hook_event, eval_response)
     if hook_output is not None:

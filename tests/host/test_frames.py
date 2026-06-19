@@ -8,6 +8,8 @@ import pytest
 
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HostCreateDirFrame,
+    HostCreateDirResultFrame,
     HostCreateWorktreeFrame,
     HostCreateWorktreeResultFrame,
     HostHelloFrame,
@@ -796,3 +798,85 @@ def test_remove_worktree_result_frame_round_trip() -> None:
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostRemoveWorktreeResultFrame)
     assert decoded == original
+
+
+# ── host.create_dir frames ──────────────────────────────
+
+
+def test_create_dir_frame_round_trip() -> None:
+    """
+    Verify HostCreateDirFrame request frame survives encode → decode.
+
+    Pins the wire shape used by the picker's "New folder" action:
+    ``request_id`` plus the directory ``path`` to create.
+    """
+    original = HostCreateDirFrame(
+        request_id="req_mkdir_1",
+        path="/Users/corey/projects/new-app",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostCreateDirFrame)
+    assert decoded == original
+
+
+def test_create_dir_frame_accepts_tilde_path() -> None:
+    """
+    Verify a tilde-prefixed path round-trips verbatim.
+
+    The host (not the server) expands ``~``, same rules as
+    ``host.list_dir`` — so the tilde must survive the wire.
+    """
+    original = HostCreateDirFrame(request_id="req_mkdir_tilde", path="~/scratch")
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostCreateDirFrame)
+    assert decoded.path == "~/scratch"
+
+
+def test_create_dir_request_missing_path_raises() -> None:
+    """
+    Verify decoding a create_dir without ``path`` raises ValueError.
+
+    Without ``path`` the host has nothing to create; failing loud
+    beats silently creating something under the process cwd.
+    """
+    with pytest.raises(ValueError, match="missing required string field"):
+        decode_host_frame('{"kind": "host.create_dir", "request_id": "r"}')
+
+
+def test_create_dir_result_success_round_trip() -> None:
+    """
+    Verify a successful create-dir result round-trips with the created
+    absolute path intact.
+
+    The picker navigates into ``path`` after creating it; a dropped
+    field would leave the user staring at the old directory.
+    """
+    original = HostCreateDirResultFrame(
+        request_id="req_mkdir_2",
+        status="ok",
+        path="/Users/corey/projects/new-app",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostCreateDirResultFrame)
+    assert decoded == original
+
+
+def test_create_dir_result_error_round_trip() -> None:
+    """
+    Verify an expected filesystem error round-trips with the message
+    intact and ``path`` left ``None``.
+
+    The route maps a non-empty ``error`` to a 409 so the picker can
+    show "directory already exists" — that hinges on the message
+    surviving the wire.
+    """
+    original = HostCreateDirResultFrame(
+        request_id="req_mkdir_3",
+        status="ok",
+        error="directory already exists",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostCreateDirResultFrame)
+    assert decoded.status == "ok"
+    assert decoded.path is None
+    assert decoded.error == "directory already exists"

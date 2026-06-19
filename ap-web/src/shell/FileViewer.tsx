@@ -39,6 +39,7 @@ import {
   PencilLineIcon,
   RowsIcon,
   SearchIcon,
+  SquareArrowOutUpRightIcon,
   Trash2Icon,
 } from "lucide-react";
 import { useSearchParams } from "@/lib/routing";
@@ -76,7 +77,12 @@ import { cn } from "@/lib/utils";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { type ChangedSort, compareChangedFiles } from "./FlatFileList";
 import { CodeViewer } from "./CodeViewer";
-import { detectLang, MONACO_SPLIT_BREAKPOINT, type SaveStatus } from "./codeViewerHelpers";
+import {
+  MONACO_SPLIT_BREAKPOINT,
+  type SaveStatus,
+  detectLang,
+  openHtmlArtifactInNewTab,
+} from "./codeViewerHelpers";
 import { CommentsPanel, type ActiveSelection } from "./CommentsPanel";
 
 // Monaco diff is heavy (~MBs + worker); load it only when the diff view is
@@ -463,6 +469,20 @@ function FileViewerBody({
     triggerBrowserDownload(fileContentToBlob(data), path.split("/").pop() ?? path);
   }, [fileQuery.data, path]);
 
+  // Pop the HTML artifact into its own browser tab. The artifact is rendered in
+  // a sandboxed, opaque-origin iframe (see `openHtmlArtifactInNewTab`), so it
+  // stays isolated from the host app — full-window rendering, no origin sharing.
+  const openHtmlInNewTab = useCallback(() => {
+    const data = fileQuery.data;
+    if (!data) return;
+    const opened = openHtmlArtifactInNewTab(data.content, path.split("/").pop() ?? path);
+    if (!opened) {
+      // window.open returned null — almost always a popup blocker. There's no
+      // toast surface here, so log it rather than failing silently.
+      console.warn("Open in new tab: the browser blocked the popup window.");
+    }
+  }, [fileQuery.data, path]);
+
   const copyFileLink = useCallback(() => {
     if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) return;
     const url = new URL(window.location.href);
@@ -697,6 +717,17 @@ function FileViewerBody({
           setPreviewableViewMode((mode) => (mode === "preview" ? "source" : "preview"));
         }
       },
+    });
+  }
+  // HTML artifacts can be popped out into their own browser tab for full-window
+  // viewing. The artifact still runs in the same sandboxed, opaque-origin iframe
+  // as the in-app preview (isolated from the host app) — just full-screen.
+  if (lang === "html" && fileQuery.data && viewMode !== "diff") {
+    toolbarActions.push({
+      key: "open-new-tab",
+      label: "Open in new tab",
+      icon: <SquareArrowOutUpRightIcon className="size-4" />,
+      onSelect: openHtmlInNewTab,
     });
   }
   toolbarActions.push({

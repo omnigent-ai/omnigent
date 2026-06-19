@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "omnigent"
-version = "0.1.0"
+version = "0.2.0.dev0"
 description = "Omnigent: declarative agent authoring and runtime framework"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -25,12 +25,13 @@ dependencies = [
     # one version, so a published `omnigent==X` must resolve the SDK wheels
     # built alongside it (release-omnigent.yml verifies these pins match the
     # release tag). Local/editable installs still resolve via tool.uv.sources.
-    "omnigent-client==0.1.0",
-    "omnigent-ui-sdk==0.1.0",
+    "omnigent-client==0.2.0.dev0",
+    "omnigent-ui-sdk==0.2.0.dev0",
     # Merged from omnigent + omnigent.
     "pyyaml>=6.0,<7",
     "openai>=1.0,<3",
-    "rich>=13.0,<14",
+    # >=14: the `e2b` extra's SDK (>=2.26) needs rich>=14 (was >=13,<14).
+    "rich>=14,<15",
     "prompt_toolkit>=3.0,<4",
     "mcp>=1.0,<2",
     "starlette>=0.27,<1",
@@ -42,7 +43,10 @@ dependencies = [
     "psutil>=5.9,<8",
     # CEL (Common Expression Language) for inline policy evaluation.
     # Non-Turing-complete, side-effect-free, guaranteed to terminate.
-    "cel-expr-python>=0.1",
+    # No wheels for Linux aarch64 or macOS x86_64 (Intel); excluded so
+    # installation succeeds. The CEL policy module degrades gracefully
+    # when the library is absent.
+    'cel-expr-python>=0.1; platform_machine != "aarch64" and (sys_platform != "darwin" or platform_machine != "x86_64")',
     # OS keychain for storing model-provider API keys (OSS model
     # selection). Used by omnigent/onboarding/secrets.py; falls back to
     # a 0600 file when no keyring backend is available (e.g. headless).
@@ -78,6 +82,11 @@ dependencies = [
     "openai-agents>=0.0.17",
     "PyJWT[crypto]>=2.8,<3",
     "argon2-cffi>=23.1,<24",
+    # PEP 440 version comparison for the update check / `omni upgrade`
+    # (omnigent/update_check.py, omnigent/cli.py): compares the installed
+    # version against the latest PyPI release. Previously only a
+    # transitive dep; pinned here now that we import it directly.
+    "packaging>=23,<26",
 ]
 
 [project.optional-dependencies]
@@ -92,6 +101,10 @@ openai-agents = []
 all = ["databricks-sdk>=0.56.0,<1"]
 # From omnigent.
 bedrock = ["boto3>=1.30,<2", "botocore>=1.30,<2"]
+# S3-compatible artifact store (AWS S3, Cloudflare R2, MinIO, …). Selected
+# with ``OMNIGENT_ARTIFACT_URI=s3://bucket/prefix``; the store imports boto3
+# lazily, so only users of this backend need the extra.
+s3 = ["boto3>=1.30,<2", "botocore>=1.30,<2"]
 vertex = ["google-auth>=2.0,<3"]
 # Modal sandbox launcher (`omnigent sandbox --provider modal`). The
 # launcher module ships in the base package and imports the SDK lazily,
@@ -104,7 +117,15 @@ daytona = ["daytona>=0.180,<1"]
 # CoreWeave Sandbox launcher (`omnigent sandbox --provider cwsandbox` and
 # server-managed `sandbox.provider: cwsandbox`).
 # Same lazy-import posture as above. Pre-1.0 SDK: pin minor.
-cwsandbox = ["cwsandbox>=0.26,<1"]
+cwsandbox = ["cwsandbox>=0.24,<1"]
+# E2B sandbox launcher (`omnigent sandbox --provider e2b` and
+# server-managed `sandbox.provider: e2b`).
+# Same lazy-import posture as above.
+e2b = ["e2b>=2.26,<3"]
+# NVIDIA OpenShell launcher (`omnigent sandbox --provider openshell`).
+# Self-hosted gRPC gateway; the SDK pulls grpcio + protobuf. Same
+# lazy-import posture as above. Pre-1.0 SDK: pin minor.
+openshell = ["openshell>=0.0.7,<1"]
 # MLflow tracing is opt-in: tracing is disabled by default and the
 # server degrades gracefully when mlflow is absent, so the (heavy) mlflow
 # dependency only installs for users who want it (`omnigent[tracing]`).
@@ -115,6 +136,15 @@ agents-sdk = [
     "openai-agents>=0.1,<1",
     "opentelemetry-instrumentation-openai-agents-v2>=0.1",
 ]
+# Google Antigravity SDK harness (`harness: antigravity`). Optional: the
+# harness module imports the SDK lazily on first turn, so only users of the
+# harness need this extra. Early SDK (v0.1.x) — pin minor.
+antigravity = ["google-antigravity>=0.1,<1"]
+# Cursor SDK harness (`harness: cursor`). Optional like antigravity: the
+# harness imports the cursor-sdk lazily on first turn, so only `--harness
+# cursor` users need this extra (`omnigent[cursor]`). Was a baseline dependency;
+# now opt-in to keep the default install lean.
+cursor = ["cursor-sdk>=0.1.7"]
 databricks = [
     # Floor matches what core code was tested against when the SDK was a
     # default dependency (it moved here from `dependencies` above).
@@ -176,6 +206,16 @@ dev = [
     # gitwildmatch glob matching for repo tooling manifests. Declared
     # explicitly rather than relied on transitively (via mypy).
     "pathspec>=0.12",
+    # Cloud-service mocks for the artifact-store / Cloudflare integration
+    # tests: moto is the standard S3-compatible mock (used for R2), respx is
+    # the standard HTTPX mock (used to back the Cloudflare D1 REST API with an
+    # in-memory SQLite), and boto3 backs the S3 artifact store under test.
+    "moto[s3]>=5,<6",
+    "respx>=0.21,<1",
+    "boto3>=1.30,<2",
+    # The Cloudflare D1 SQLAlchemy dialect, exercised by the D1 FTS integration
+    # test (tests/db/test_d1_fts_dialect.py) via respx + sqlite3.
+    "sqlalchemy-cloudflare-d1==0.3.10",
 ]
 
 [project.scripts]
@@ -206,6 +246,7 @@ include = ["omnigent*"]
 "omnigent.db" = ["alembic.ini"]
 "omnigent.db.migrations" = ["script.py.mako"]
 "omnigent.resources.examples" = ["*.yaml", "*.sh", "debby/**/*", "polly/**/*"]
+"omnigent.resources.pi_native" = ["*.js"]
 # include UI assets in build
 "omnigent.server" = ["static/web-ui/**/*"]
 
@@ -247,9 +288,11 @@ markers = [
     "live_app: end-to-end tests requiring a deployed Databricks App server",
     "model(name, ...): one arg pins this test to that model overriding the suite-wide --model CLI default; multiple args fan the test out across all listed models via indirect parametrize.",
     "model_pinned: opt out of tests/_model_pools.py spreading and retry rotation; literal model strings are used as written.",
+    "flaky(reruns=2, reruns_delay=0): rerun a nondeterministic test on failure (pytest-rerunfailures). Use for tests flaky due to timing/scheduling races (e.g. PTY drain timing), NOT real-LLM nondeterminism — those use llm_flaky, which rotates models per attempt.",
     "llm_flaky(reruns=2, reruns_delay=1): rerun a nondeterministic real-LLM test on failure, rotating to a different model each attempt (tests/_model_pools.py). Never apply to heavy e2e tests that can hit the CI --timeout=180 cap (rerun + loadscope can crash the shard).",
     "in_process_sessions: run a server integration test with the legacy in-process sessions path instead of sessions-native runner dispatch.",
     "nightly: runs only in the scheduled/dispatch pass of its suite; PR and push runs exclude it via -m 'not nightly'. Remove the marker to promote a burned-in test to the PR gate.",
+    "mock_only: tests/integration test that only works in mock-LLM mode (no --llm-api-key). Skipped by tests/integration/conftest.py when a real --llm-api-key is supplied (the real-LLM Integration jobs). Use for tests whose mock LLM is scripted with a fixed tool-call sequence — a real LLM cannot reproduce the scripted markers.",
 ]
 
 [tool.coverage.run]
@@ -458,6 +501,23 @@ ignore_missing_imports = true
 # posture as modal above.
 [[tool.mypy.overrides]]
 module = "cwsandbox.*"
+ignore_missing_imports = true
+
+# e2b is an optional dep (the `e2b` extra); same lazy-import posture as
+# modal above.
+[[tool.mypy.overrides]]
+module = "e2b.*"
+ignore_missing_imports = true
+
+# openshell is an optional dep (the `openshell` extra); same lazy-import
+# posture as modal above. grpc rides in via the openshell SDK and is not
+# a base dependency, so its imports are unresolved in the default env too.
+[[tool.mypy.overrides]]
+module = "openshell.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "grpc.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

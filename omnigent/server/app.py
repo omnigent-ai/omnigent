@@ -19,6 +19,12 @@ from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.native_coding_agents import (
+    CLAUDE_NATIVE_CODING_AGENT,
+    CODEX_NATIVE_CODING_AGENT,
+    CURSOR_NATIVE_CODING_AGENT,
+    PI_NATIVE_CODING_AGENT,
+)
 from omnigent.resources import examples as _examples_resources
 from omnigent.runtime import (
     get_terminal_registry,
@@ -70,8 +76,10 @@ _WEB_UI_HTML_CACHE_CONTROL = "no-cache"
 _WEB_UI_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _WEB_UI_STATIC_CACHE_CONTROL = "public, max-age=3600"
 _WEB_UI_GZIP_MINIMUM_SIZE = 1024
-_CLAUDE_NATIVE_AGENT_NAME = "claude-native-ui"
-_CODEX_NATIVE_AGENT_NAME = "codex-native-ui"
+_CLAUDE_NATIVE_AGENT_NAME = CLAUDE_NATIVE_CODING_AGENT.agent_name
+_CODEX_NATIVE_AGENT_NAME = CODEX_NATIVE_CODING_AGENT.agent_name
+_PI_NATIVE_AGENT_NAME = PI_NATIVE_CODING_AGENT.agent_name
+_CURSOR_NATIVE_AGENT_NAME = CURSOR_NATIVE_CODING_AGENT.agent_name
 _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
@@ -345,6 +353,8 @@ def _ensure_default_agents(
     """
     _ensure_default_claude_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_codex_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_pi_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_cursor_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_debby_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_polly_agent(agent_store, artifact_store, agent_cache)
     _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
@@ -503,6 +513,92 @@ def _ensure_default_codex_agent(
         agent_cache,
         name=_CODEX_NATIVE_AGENT_NAME,
         bundle_bytes=_build_codex_native_bundle(),
+    )
+
+
+def _build_pi_native_bundle() -> bytes:
+    """
+    Build a gzipped tarball of the pi-native-ui agent spec.
+
+    :returns: Gzipped tarball bytes suitable for the artifact store.
+    """
+    import tempfile
+
+    from omnigent.pi_native import _materialize_pi_agent_spec
+    from omnigent.spec import materialize_bundle
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        spec_path = _materialize_pi_agent_spec(Path(tmpdir))
+        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
+        return _tar_gz_dir(bundle_dir)
+
+
+def _ensure_default_pi_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """
+    Register or refresh the pi-native-ui agent.
+
+    Called during server lifespan startup so the Web UI can offer Pi as a
+    built-in native-terminal agent. Content-aware via
+    :func:`_ensure_builtin_agent`: a new wheel with a changed spec refreshes
+    the row in place rather than being ignored.
+
+    :param agent_store: Store for agent metadata.
+    :param artifact_store: Store for agent bundles.
+    :param agent_cache: Cache for loaded agent specs.
+    """
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=_PI_NATIVE_AGENT_NAME,
+        bundle_bytes=_build_pi_native_bundle(),
+    )
+
+
+def _build_cursor_native_bundle() -> bytes:
+    """
+    Build a gzipped tarball of the cursor-native-ui agent spec.
+
+    :returns: Gzipped tarball bytes suitable for the artifact store.
+    """
+    import tempfile
+
+    from omnigent.cursor_native import _materialize_cursor_agent_spec
+    from omnigent.spec import materialize_bundle
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        spec_path = _materialize_cursor_agent_spec(Path(tmpdir))
+        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
+        return _tar_gz_dir(bundle_dir)
+
+
+def _ensure_default_cursor_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """
+    Register or refresh the cursor-native-ui agent.
+
+    Called during server lifespan startup so the Web UI offers Cursor as a
+    built-in native-terminal agent on every deployment (not only after the
+    ``omnigent cursor`` CLI first registers it). Content-aware via
+    :func:`_ensure_builtin_agent`.
+
+    :param agent_store: Store for agent metadata.
+    :param artifact_store: Store for agent bundles.
+    :param agent_cache: Cache for loaded agent specs.
+    """
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=_CURSOR_NATIVE_AGENT_NAME,
+        bundle_bytes=_build_cursor_native_bundle(),
     )
 
 

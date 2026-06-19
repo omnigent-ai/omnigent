@@ -2029,6 +2029,61 @@ def test_augment_claude_args_registers_permission_command_hook(
     assert "omnigent.claude_native_status" in settings["statusLine"]["command"]
 
 
+def test_augment_claude_args_registers_user_prompt_submit_policy_hook(
+    tmp_path: Path,
+) -> None:
+    """
+    Passing ``ap_server_url`` wires the evaluate-policy hook onto
+    ``UserPromptSubmit`` alongside the transcript forwarder's status hook.
+
+    For native sessions the server-level ``_evaluate_input_policy`` skips
+    message events, so this hook is the sole REQUEST-phase gate (covering
+    both web-UI-injected and direct-terminal prompts). If it regressed,
+    native prompts would reach the model with no request-phase policy. The
+    forwarder's own UserPromptSubmit hook (status → running) must survive,
+    so the policy hook is appended, not substituted.
+    """
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        ap_server_url="http://127.0.0.1:8787/",
+        ap_auth_headers={"Authorization": "Bearer xyz"},
+    )
+    settings = json.loads(args[args.index("--settings") + 1])
+    entries = settings["hooks"]["UserPromptSubmit"]
+    commands = [h["command"] for entry in entries for h in entry["hooks"]]
+    # The forwarder status hook stays; the policy hook is appended.
+    assert any("evaluate-policy" in command for command in commands), (
+        f"UserPromptSubmit must carry the evaluate-policy hook; got {commands!r}."
+    )
+    assert any("evaluate-policy" not in command for command in commands), (
+        "The transcript forwarder's UserPromptSubmit hook must not be replaced."
+    )
+
+
+def test_augment_claude_args_omits_user_prompt_submit_policy_hook_without_server(
+    tmp_path: Path,
+) -> None:
+    """
+    Without ``ap_server_url`` the UserPromptSubmit policy hook is not wired.
+
+    Policy hooks only make sense when an Omnigent server is configured to
+    evaluate against; the forwarder's status hook still registers, but no
+    evaluate-policy command should appear (mirrors PreToolUse/PostToolUse,
+    which are also gated behind ``ap_server_url``).
+    """
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+    settings = json.loads(args[args.index("--settings") + 1])
+    entries = settings["hooks"]["UserPromptSubmit"]
+    commands = [h["command"] for entry in entries for h in entry["hooks"]]
+    assert all("evaluate-policy" not in command for command in commands)
+
+
 def test_augment_claude_args_keeps_permission_hook_without_launch_session_id(
     tmp_path: Path,
 ) -> None:
@@ -4833,3 +4888,77 @@ def test_compute_transcript_cumulative_cost_none_when_nothing_priceable(
         claude_native_bridge.compute_transcript_cumulative_cost(priced, include_sidechains=True)
         is None
     )
+
+
+def test_format_terminal_failure_tail_returns_empty_for_blank_pane() -> None:
+    """
+    A pane with no visible text yields no tail block.
+
+    :returns: None.
+    """
+    assert claude_native_bridge._format_terminal_failure_tail("   \n\n  ") == ""
+
+
+def test_format_terminal_failure_tail_includes_recent_error_lines() -> None:
+    """
+    The tail block carries the pane's trailing non-blank lines, so a
+    startup crash surfaces in the readiness-timeout error.
+
+    :returns: None.
+    """
+    pane = "ERROR  JSON Parse error: Unrecognized token '<'\n  at <parse> (:0)\n"
+    tail = claude_native_bridge._format_terminal_failure_tail(pane)
+    assert tail.startswith(" Last terminal output:\n")
+    assert "JSON Parse error: Unrecognized token '<'" in tail
+
+
+def test_format_terminal_failure_tail_caps_length(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A very long pane is truncated to the configured character cap.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TERMINAL_FAILURE_TAIL_CHARS", 50)
+    pane = "\n".join(f"line {i}" for i in range(100))
+    tail = claude_native_bridge._format_terminal_failure_tail(pane)
+    body = tail.split("\n", 1)[1]
+    assert body.startswith("…")
+    # Leading ellipsis marker plus at most the configured character cap.
+    assert len(body) <= 51
+
+
+def test_wait_for_claude_prompt_ready_surfaces_terminal_output_on_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    On a readiness timeout, the RuntimeError carries Claude Code's own
+    terminal output (e.g. a startup ``JSON Parse error``) so the cause
+    surfaces in the web UI error banner, not only in the terminal.
+
+    Without the tail, the user sees a generic "terminal did not become
+    ready" timeout in the UI while the actual crash sits unread in the
+    terminal pane.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    crash_pane = (
+        "ERROR  JSON Parse error: Unrecognized token '<'\n"
+        "  at <parse> (:0)\n"
+        "  at parse (unknown)\n"
+    )
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge._capture_pane",
+        lambda socket_path, tmux_target: crash_pane,
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=0.0,
+        )
+    message = str(excinfo.value)
+    assert "did not become ready" in message
+    assert "Last terminal output:" in message
+    assert "JSON Parse error: Unrecognized token '<'" in message

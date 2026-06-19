@@ -6,6 +6,7 @@ import pytest
 
 from omnigent.native_policy_hook import (
     evaluation_response_to_hook_output,
+    fail_closed_hook_output,
     hook_payload_to_evaluation_request,
 )
 
@@ -230,3 +231,126 @@ def test_post_tool_use_allow_returns_none() -> None:
     """
     output = evaluation_response_to_hook_output("PostToolUse", {"result": "POLICY_ACTION_ALLOW"})
     assert output is None
+
+
+def test_user_prompt_submit_maps_to_phase_request() -> None:
+    """
+    A UserPromptSubmit payload becomes a PHASE_REQUEST EvaluationRequest.
+
+    The prompt text must land in ``event.data.text`` because the server's
+    ``_build_evaluation_context`` reads REQUEST content from ``data.text``
+    (falling back to ``data.content``). If the prompt were dropped, the
+    request-phase gate would evaluate empty content and ALLOW everything.
+    """
+    result = hook_payload_to_evaluation_request(
+        "UserPromptSubmit",
+        {"prompt": "delete the prod database"},
+    )
+    assert result is not None
+    event = result["event"]
+    assert event["type"] == "PHASE_REQUEST"
+    assert event["data"] == {"text": "delete the prod database"}
+    # A context dict must exist so the per-harness hook can stamp model/harness.
+    assert event["context"] == {}
+
+
+def test_user_prompt_submit_missing_prompt_yields_empty_text() -> None:
+    """
+    A UserPromptSubmit payload with no ``prompt`` still produces a request.
+
+    The text falls back to an empty string rather than ``None`` so the
+    server always receives a well-formed REQUEST event.
+    """
+    result = hook_payload_to_evaluation_request("UserPromptSubmit", {})
+    assert result is not None
+    assert result["event"]["data"] == {"text": ""}
+
+
+@pytest.mark.parametrize("action", ["POLICY_ACTION_DENY", "POLICY_ACTION_ASK"])
+def test_user_prompt_submit_blocking_actions_emit_decision_block(action: str) -> None:
+    """
+    DENY (and a stray ASK) block the prompt via top-level ``decision``.
+
+    UserPromptSubmit uses the top-level ``decision`` / ``reason`` contract
+    (NOT ``permissionDecision``) — both harnesses parse ``decision: "block"``
+    to drop the prompt before the model sees it. ASK is meant to be resolved
+    server-side (``_hold_native_ask_gate``), so if the hook ever sees it, it
+    must fail closed by blocking rather than letting the prompt through.
+    """
+    output = evaluation_response_to_hook_output(
+        "UserPromptSubmit",
+        {"result": action, "reason": "no prod mutations"},
+    )
+    assert output is not None
+    # Top-level decision/reason, not hookSpecificOutput.permissionDecision.
+    assert output == {"decision": "block", "reason": "no prod mutations"}
+
+
+def test_user_prompt_submit_block_defaults_reason() -> None:
+    """
+    A block with no reason still carries a non-empty reason.
+
+    Both harnesses drop a block whose reason is empty (the block is treated
+    as invalid), so a missing reason must be defaulted or the gate would
+    silently fail open.
+    """
+    output = evaluation_response_to_hook_output(
+        "UserPromptSubmit", {"result": "POLICY_ACTION_DENY"}
+    )
+    assert output == {"decision": "block", "reason": "Denied by policy"}
+
+
+@pytest.mark.parametrize("action", ["POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED"])
+def test_user_prompt_submit_non_blocking_actions_return_none(action: str) -> None:
+    """
+    ALLOW and the no-match default proceed with no output.
+
+    Returning None lets the prompt reach the model. Unlike PreToolUse there
+    is no separate user-consent gate on a prompt to preserve, so ALLOW need
+    not emit anything.
+    """
+    output = evaluation_response_to_hook_output("UserPromptSubmit", {"result": action})
+    assert output is None
+
+
+def test_fail_closed_pre_tool_use_denies() -> None:
+    """
+    An unobtainable verdict on PreToolUse fails CLOSED with ``deny``.
+
+    PreToolUse is the authoritative pre-execution gate for native tools —
+    the sole enforcement point for connector-native ``mcp__*`` tools and
+    native Bash/Write/Edit — so a verdict that cannot be fetched must deny
+    rather than silently let the call through (issue #536).
+    """
+    output = fail_closed_hook_output("PreToolUse")
+    assert output is not None
+    hook_specific = output["hookSpecificOutput"]
+    assert hook_specific["hookEventName"] == "PreToolUse"
+    assert hook_specific["permissionDecision"] == "deny"
+    # A deny is inert without a reason on the consuming harnesses, so one
+    # must always be present.
+    assert hook_specific["permissionDecisionReason"]
+
+
+@pytest.mark.parametrize("hook_event", ["UserPromptSubmit", "PostToolUse"])
+def test_fail_closed_non_tool_call_phases_fail_open(hook_event: str) -> None:
+    """
+    Off the tool-call gate, an unobtainable verdict fails OPEN (``None``).
+
+    The request gate is advisory (the tool-call gate still catches
+    dangerous actions) and PostToolUse runs after the tool has executed, so
+    denying there only blocks an already-incurred side effect. This mirrors
+    the runner-side ``FAIL_CLOSED_PHASES`` (PR #163).
+    """
+    assert fail_closed_hook_output(hook_event) is None
+
+
+def test_fail_closed_unknown_event_fails_open() -> None:
+    """
+    An unrecognized hook event fails OPEN (``None``), not closed.
+
+    Only the exact ``PreToolUse`` event denies; any novel event name added
+    by a future harness must fall through to "no opinion" rather than
+    accidentally blocking — the conservative default for an unknown gate.
+    """
+    assert fail_closed_hook_output("SomeNewEvent") is None

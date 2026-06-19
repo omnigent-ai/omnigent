@@ -154,6 +154,13 @@ _PASTED_PLACEHOLDER_PREFIX = "[Pasted text"
 # whether the draft is rendered in the input box. Short enough to fit
 # on the prompt row of a default 80-column detached pane.
 _DRAFT_NEEDLE_MAX_CHARS = 24
+# When Claude Code's input prompt never renders (it failed to boot), the
+# readiness gate attaches the tail of the captured pane to its error so
+# the real cause — often Claude Code's own startup crash, e.g. a
+# ``JSON Parse error`` from an HTML page served to its API client —
+# surfaces in the web UI error banner instead of only in the terminal.
+_TERMINAL_FAILURE_TAIL_LINES = 12
+_TERMINAL_FAILURE_TAIL_CHARS = 800
 
 ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[Any]]
 
@@ -178,8 +185,8 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
     Return the trusted parent for an allowed bridge directory.
 
     Claude-native files live below the uid-scoped temp bridge root.
-    Codex-native reuses the relay/MCP implementation but keeps bridge
-    files below ``~/.omnigent/codex-native``. Both roots use the same
+    Codex- and Cursor-native reuse the relay/MCP implementation but keep bridge
+    files below their own bridge roots. All roots use the same
     owner-only ancestor validation; only the trusted anchor differs.
 
     :param target: Normalized bridge directory path being created or validated,
@@ -204,9 +211,15 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
             trusted_parent = codex_root.parent.parent
         return _absolute_syntactic_path(trusted_parent)
 
+    from omnigent.cursor_native_bridge import bridge_root as cursor_bridge_root
+
+    cursor_root = _absolute_syntactic_path(cursor_bridge_root())
+    if target.is_relative_to(cursor_root):
+        return _absolute_syntactic_path(cursor_root.parent.parent)
+
     raise RuntimeError(
         f"bridge dir {target!s} is not under an allowed bridge root "
-        f"({claude_root!s}, {codex_root!s})"
+        f"({claude_root!s}, {codex_root!s}, {cursor_root!s})"
     )
 
 
@@ -1143,6 +1156,10 @@ def build_hook_settings(
             # timeout is irrelevant there.
             "timeout": 10,
         }
+        # The ``AskUserQuestion`` matcher only fires if that tool is actually
+        # callable. A session launched with ``--disallowedTools AskUserQuestion``
+        # (e.g. the exit-plan-mode e2e fixture) can never trigger this hook, so
+        # the registration is dormant there — harmless, just never reached.
         hooks["PreToolUse"] = [
             {"matcher": "AskUserQuestion", "hooks": [ask_uq_hook]},
             {"hooks": [evaluate_policy_hook]},
@@ -1152,6 +1169,15 @@ def build_hook_settings(
         # a catch-all policy evaluation entry so TOOL_RESULT policies
         # fire for all tools, not just the forwarder-specific ones.
         hooks["PostToolUse"].append({"hooks": [evaluate_policy_hook]})
+        # UserPromptSubmit already carries the transcript forwarder's
+        # status hook (running). Append the policy hook so REQUEST-phase
+        # policies gate native prompts — for native sessions this is the
+        # sole request gate (the server-level ``_evaluate_input_policy``
+        # skips native message events). A DENY emits ``decision: "block"``,
+        # dropping the prompt before the model sees it; ASK is resolved
+        # server-side. Covers both web-UI-injected and direct-terminal
+        # prompts, since both fire UserPromptSubmit.
+        hooks["UserPromptSubmit"].append({"hooks": [evaluate_policy_hook]})
     settings: dict[str, Any] = {"hooks": hooks}
     if api_key_helper:
         settings["apiKeyHelper"] = api_key_helper
@@ -2766,6 +2792,32 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
     return bool(needle) and needle in tail
 
 
+def _format_terminal_failure_tail(pane: str) -> str:
+    r"""
+    Format the tail of a captured tmux pane for a failure message.
+
+    When Claude Code's input prompt never renders, its own on-screen
+    output — often a startup error or stack trace (e.g. a ``JSON Parse
+    error`` raised when its API client receives an HTML page instead of
+    JSON) — is the only signal of the real cause. The readiness gate
+    raises into the web UI's error banner, so attaching this tail
+    surfaces that cause without the user having to open the terminal.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: A ``" Last terminal output:\n<tail>"`` block — the last
+        :data:`_TERMINAL_FAILURE_TAIL_LINES` non-blank lines, capped at
+        :data:`_TERMINAL_FAILURE_TAIL_CHARS` characters — or ``""`` when
+        the pane has no visible text.
+    """
+    lines = [line.rstrip() for line in pane.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    tail = "\n".join(lines[-_TERMINAL_FAILURE_TAIL_LINES:])
+    if len(tail) > _TERMINAL_FAILURE_TAIL_CHARS:
+        tail = "…" + tail[-_TERMINAL_FAILURE_TAIL_CHARS:]
+    return f" Last terminal output:\n{tail}"
+
+
 def _wait_for_claude_prompt_ready(
     socket_path: str,
     tmux_target: str,
@@ -2794,16 +2846,25 @@ def _wait_for_claude_prompt_ready(
     :param timeout_s: Seconds to wait for the prompt, e.g. ``30.0``.
     :returns: None.
     :raises RuntimeError: If the prompt never renders within
-        *timeout_s* (Claude failed to boot).
+        *timeout_s* (Claude failed to boot). The message carries the
+        tail of the captured pane (see :func:`_format_terminal_failure_tail`)
+        so Claude Code's own startup output surfaces in the caller's error.
     """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if _claude_prompt_rendered(_capture_pane(socket_path, tmux_target)):
             return
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    # Timed out: Claude Code never rendered its input prompt. Capture the
+    # pane one last time and attach its tail so the real cause — often a
+    # startup crash like a ``JSON Parse error`` — surfaces in the web UI
+    # error banner this raises into, instead of only a generic timeout
+    # the user has to open the terminal to diagnose.
+    pane = _capture_pane(socket_path, tmux_target)
     raise RuntimeError(
         f"Claude Code terminal did not become ready within {timeout_s}s "
         "(input prompt never rendered). The message was not delivered."
+        + _format_terminal_failure_tail(pane)
     )
 
 
@@ -3259,8 +3320,29 @@ def _stdio_jsonrpc_loop(
         active tool relay.
     :returns: None when stdin reaches EOF.
     """
-    for raw_line in sys.stdin:
-        line = raw_line.strip()
+    use_content_length = False
+    while True:
+        raw_line = sys.stdin.buffer.readline()
+        if raw_line == b"":
+            return
+        if raw_line.lower().startswith(b"content-length:"):
+            use_content_length = True
+            try:
+                length = int(raw_line.decode("ascii", errors="ignore").split(":", 1)[1].strip())
+            except ValueError:
+                continue
+            while True:
+                header = sys.stdin.buffer.readline()
+                if header in {b"\r\n", b"\n", b""}:
+                    break
+            if length <= 0:
+                continue
+            raw_payload = sys.stdin.buffer.read(length)
+            if len(raw_payload) != length:
+                return
+            line = raw_payload.decode("utf-8", errors="replace").strip()
+        else:
+            line = raw_line.decode("utf-8", errors="replace").strip()
         if not line:
             continue
         try:
@@ -3295,7 +3377,7 @@ def _stdio_jsonrpc_loop(
                 # -32603 is the JSON-RPC 2.0 "Internal error" code.
                 "error": {"code": -32603, "message": f"internal error: {exc}"},
             }
-        _write_jsonrpc(response, stdout_lock)
+        _write_jsonrpc(response, stdout_lock, framed=use_content_length)
 
 
 def _handle_mcp_request(
@@ -3596,17 +3678,29 @@ def _build_tools(config: dict[str, Any]) -> tuple[dict[str, Tool], Callable[[], 
     return tools, _close_tools
 
 
-def _write_jsonrpc(payload: dict[str, Any], stdout_lock: threading.Lock) -> None:
+def _write_jsonrpc(
+    payload: dict[str, Any],
+    stdout_lock: threading.Lock,
+    *,
+    framed: bool = False,
+) -> None:
     """
     Write one JSON-RPC message to stdout.
 
     :param payload: JSON-RPC object to serialize.
     :param stdout_lock: Lock protecting stdout.
+    :param framed: When ``True``, write MCP ``Content-Length`` framed output.
     :returns: None.
     """
     raw = json.dumps(payload, separators=(",", ":"))
     with stdout_lock:
-        print(raw, flush=True)
+        if framed:
+            encoded = raw.encode("utf-8")
+            sys.stdout.buffer.write(f"Content-Length: {len(encoded)}\r\n\r\n".encode("ascii"))
+            sys.stdout.buffer.write(encoded)
+            sys.stdout.buffer.flush()
+        else:
+            print(raw, flush=True)
 
 
 def _model_from_transcript_entry(entry: dict[str, Any]) -> str | None:
@@ -3663,6 +3757,33 @@ def read_claude_context_state(bridge_dir: Path) -> dict[str, Any] | None:
     if not isinstance(size, int) or size <= 0:
         return None
     return parsed
+
+
+def read_claude_status_model(bridge_dir: Path) -> str | None:
+    """
+    Read the active model id from the statusLine snapshot ``context.json``.
+
+    Unlike :func:`read_claude_context_state` (which returns ``None`` unless a
+    usable ``context_window_size`` is present, since it backs the context
+    ring), this returns the model whenever the wrapper captured one — the
+    model and the window are written independently, and the cost-budget gate
+    needs the model even on a render where the window field was absent. This
+    is claude-native's race-free, gate-time source of the live ``/model``
+    selection (the analogue of the codex hook reading ``config.toml``).
+
+    :param bridge_dir: Bridge directory shared with the statusLine wrapper.
+    :returns: The model id, e.g. ``"claude-sonnet-4-6"``, or ``None`` when
+        the file is missing / unreadable / carries no model string.
+    """
+    path = bridge_dir / _CONTEXT_FILE
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    model = parsed.get("model")
+    return model if isinstance(model, str) and model else None
 
 
 def read_user_status_line_command() -> str | None:

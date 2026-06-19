@@ -305,8 +305,8 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
     _seed_registry(registry, "conv_abc", stale)
 
     resource_registry = SessionResourceRegistry(terminal_registry=registry)
-    # Role stamped at auto-create time in production (launch_terminal's
-    # resource_role); seeded directly here to avoid spawning real tmux.
+    # Role stamped at auto-create time in production (resource_role);
+    # seeded directly here to avoid spawning real tmux.
     resource_registry._terminal_roles[("conv_abc", "terminal_tui_main")] = (
         OMNIGENT_REPL_TERMINAL_ROLE
     )
@@ -331,6 +331,7 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
         publish_event: object,
         *,
         server_client: object,
+        agent_spec: object = None,
     ) -> SessionResourceView:
         """
         Stand-in for ``_auto_create_repl_terminal`` that registers a
@@ -340,6 +341,9 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
         :param rr: The runner's resource registry (unused by the stub).
         :param publish_event: Per-session SSE emitter (unused).
         :param server_client: Omnigent server client (unused).
+        :param agent_spec: Resolved session agent spec threaded by the
+            recreate path so the REPL terminal inherits the agent sandbox
+            (unused by the stub).
         :returns: Terminal resource view for the fresh pane.
         """
         auto_create_sessions.append(session_id)

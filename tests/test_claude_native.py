@@ -5713,7 +5713,12 @@ def test_provider_config_for_native_claude_key_injects_base_url_and_helper() -> 
 
     cfg = claude_native._provider_config_for_native_claude(entry)
     assert cfg is not None
-    assert cfg.env == {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}
+    # ANTHROPIC_BASE_URL plus the gateway-safety beta-disable flag (gateways
+    # 400 on beta flags they don't implement; see _provider_config_for_native_claude).
+    assert cfg.env == {
+        "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+    }
     # Static key delivered via the apiKeyHelper, never the env (allowlist).
     assert cfg.api_key_helper == "printf %s sk-ant-test"
     assert cfg.model == "claude-sonnet-4-6"
@@ -5740,7 +5745,10 @@ def test_provider_config_for_native_claude_uses_auth_command_verbatim() -> None:
     cfg = claude_native._provider_config_for_native_claude(entry)
     assert cfg is not None
     assert cfg.api_key_helper == "my-cli print-token"
-    assert cfg.env == {"ANTHROPIC_BASE_URL": "https://gw.example/v1"}
+    assert cfg.env == {
+        "ANTHROPIC_BASE_URL": "https://gw.example/v1",
+        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+    }
 
 
 def test_resolve_native_claude_config_spec_provider_default(
