@@ -1625,6 +1625,102 @@ def test_get_openai_client_host_override_requires_auth_command(monkeypatch):
         )
 
 
+def test_get_openai_client_api_key_falls_back_to_env_base_url(monkeypatch):
+    """A spec-level api_key with NO override honors ambient ``OPENAI_BASE_URL``.
+
+    Regression for the residual gateway 401 (continuation-turn daemon
+    spawns): the api_key is frequently a gateway credential (e.g. a
+    Databricks AI Gateway PAT detected from ``OPENAI_API_KEY``), and the
+    companion base_url can be dropped on the daemon → runner → harness
+    propagation chain (the spec-auth bake omits it when ``OPENAI_BASE_URL``
+    is absent at materialization time; a reused local daemon may predate the
+    env var). Without the ambient fallback, the gateway PAT is sent to
+    ``api.openai.com`` and 401s. The runner inherits ``OPENAI_BASE_URL``, so
+    honoring it here keeps the gateway target present on every turn.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://gateway.example.com/ai-gateway/openai/v1")
+
+    captured: dict[str, Any] = {}
+
+    class _StubAsyncOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    import openai as _openai_mod
+
+    with patch.object(_openai_mod, "AsyncOpenAI", _StubAsyncOpenAI, create=True):
+        _get_openai_async_client(api_key="dapi-gateway-token", base_url_override=None)
+
+    assert captured["api_key"] == "dapi-gateway-token"
+    assert captured["base_url"] == "https://gateway.example.com/ai-gateway/openai/v1", (
+        "A spec-level api_key with no base_url override must fall back to the "
+        "ambient OPENAI_BASE_URL the runner inherits; routing to api.openai.com "
+        "(base_url=None) sends a gateway PAT to OpenAI and 401s."
+    )
+
+
+def test_get_openai_client_api_key_override_wins_over_env_base_url(monkeypatch):
+    """An explicit base_url override wins over the ambient ``OPENAI_BASE_URL``.
+
+    The baked ``executor.auth.base_url`` (threaded via
+    ``HARNESS_OPENAI_AGENTS_GATEWAY_BASE_URL``) is the authoritative
+    per-spec target and must not be shadowed by a differing env var.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://wrong-env.example.com/v1")
+
+    captured: dict[str, Any] = {}
+
+    class _StubAsyncOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    import openai as _openai_mod
+
+    with patch.object(_openai_mod, "AsyncOpenAI", _StubAsyncOpenAI, create=True):
+        _get_openai_async_client(
+            api_key="dapi-gateway-token",
+            base_url_override="https://spec-gateway.example.com/openai/v1",
+        )
+
+    assert captured["base_url"] == "https://spec-gateway.example.com/openai/v1"
+
+
+def test_get_openai_client_api_key_no_env_defaults_to_openai(monkeypatch):
+    """A genuine OpenAI key with no gateway anywhere still defaults to OpenAI.
+
+    With no override and no ambient ``OPENAI_BASE_URL``, ``base_url`` stays
+    ``None`` so the AsyncOpenAI client targets ``api.openai.com`` — the
+    correct behavior for a real ``sk-...`` key.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+
+    captured: dict[str, Any] = {}
+
+    class _StubAsyncOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    import openai as _openai_mod
+
+    with patch.object(_openai_mod, "AsyncOpenAI", _StubAsyncOpenAI, create=True):
+        _get_openai_async_client(api_key="sk-real-openai-key", base_url_override=None)
+
+    assert captured["api_key"] == "sk-real-openai-key"
+    assert captured["base_url"] is None
+
+
 def test_get_openai_client_no_profile_honors_env_vars(monkeypatch):
     """Without an explicit profile, the env-var branch still works.
 

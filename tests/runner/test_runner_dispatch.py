@@ -3034,7 +3034,7 @@ async def test_sys_session_send_model_rejected_for_unplumbed_harness(
     """
     A ``model`` for a harness without override plumbing fails loud.
 
-    ``databricks_supervisor`` has no runner-side model-override path, so
+    Unknown harnesses have no runner-side model-override path, so
     the persisted value would be silently ignored. The error must name
     the harness so the orchestrator understands why the dispatch failed.
 
@@ -3078,14 +3078,14 @@ async def test_sys_session_send_model_rejected_for_unplumbed_harness(
                 ),
                 server_client=server_client,
                 conversation_id="conv_parent_unplumbed",
-                agent_spec=_spec_with_subagent_harness("databricks_supervisor"),
+                agent_spec=_spec_with_subagent_harness("unknown-harness"),
                 session_inbox=session_inbox,
             )
         finally:
             runner_app._session_inboxes_ref.pop("conv_parent_unplumbed", None)
 
     assert output.startswith("Error:"), output
-    assert "databricks_supervisor" in output
+    assert "unknown-harness" in output
     # The unsupported dispatch must not create a child that would then
     # silently run on the harness default.
     assert create_posts == 0

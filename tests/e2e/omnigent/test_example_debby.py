@@ -2,7 +2,7 @@
 
 Debby never answers from a single model: every question is fanned out to BOTH a
 Claude sub-agent and a GPT sub-agent — two plain (non-coding) responders on the
-claude-sdk and openai-agents harnesses — and the ``debate`` skill has them
+claude-sdk and codex harnesses — and the ``debate`` skill has them
 critique each other before converging. Pure spec-load — no LLM, no credentials —
 modeled on ``test_example_polly.py``.
 
@@ -37,7 +37,7 @@ def debby_spec() -> AgentSpec:
 def test_debby_is_two_headed_cross_vendor(debby_spec: AgentSpec) -> None:
     """
     Debby has exactly two heads — ``claude`` on claude-sdk and ``gpt`` on
-    openai-agents — so every answer contrasts two distinct vendors.
+    codex — so every answer contrasts two distinct vendors.
 
     A missing/renamed head, or both heads landing on the same harness, removes
     the cross-model contrast that is Debby's entire reason to exist.
@@ -46,7 +46,7 @@ def test_debby_is_two_headed_cross_vendor(debby_spec: AgentSpec) -> None:
     fam = {a.name: a.executor.config.get("harness") for a in debby_spec.sub_agents}
     assert sorted(debby_spec.tools.agents) == ["claude", "gpt"]
     assert fam["claude"] == "claude-sdk"
-    assert fam["gpt"] == "openai-agents"
+    assert fam["gpt"] == "codex"
     # Two distinct vendors → the heads always disagree across providers.
     assert len(set(fam.values())) == 2
 

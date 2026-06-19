@@ -135,7 +135,7 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
 # CLI, and ``pi`` / ``pi-native`` the ``pi`` CLI.
 # SDK-based harnesses run in-process and are deliberately absent, so they
 # resolve to "no CLI required": ``claude-sdk``, ``codex``, ``openai-agents-sdk``,
-# ``databricks_supervisor``, and ``cursor`` (which drives the ``cursor-sdk``
+# and ``cursor`` (which drives the ``cursor-sdk``
 # Python package over its own bundled bridge, NOT the ``cursor-agent`` CLI).
 _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "claude-native": ANTHROPIC_FAMILY,

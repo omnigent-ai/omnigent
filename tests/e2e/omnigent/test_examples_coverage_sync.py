@@ -162,14 +162,7 @@ _ALT_COVERED: frozenset[str] = frozenset(
         # risk_score_agent: the built-in session-risk-score policy is
         # exercised in tests/runtime/policies/test_example_omnigent_yamls.py.
         "risk_score_agent",
-        # databricks_supervisor: covered by
-        # tests/e2e/omnigent/test_run_omnigent_supervisor.py plus a wide
-        # spread of spec/runner/executor unit tests.
-        "databricks_supervisor",
         # ── tests/resources/agents/ fixtures covered by name elsewhere ──
-        # web-search-test: loaded by
-        # tests/e2e/test_web_search_async_dispatch_e2e.py.
-        "web-search-test",
         # workspace-file-writer: loaded by the changed-files e2e tests
         # (test_filesystem_changed_files_e2e.py /
         # test_non_git_changed_files_e2e.py).

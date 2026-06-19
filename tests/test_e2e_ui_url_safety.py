@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import socket
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import pytest
+from _pytest.config import Config
 
-from tests.e2e_ui.conftest import pytest_configure
 from tests.e2e_ui.url_safety import DEV_PORTS, unsafe_ui_base_url_reason
 
 
@@ -16,6 +17,13 @@ class _ConfigStub:
 
     def getoption(self, name: str, default: Any = None) -> Any:
         return self.options.get(name, default)
+
+
+def _pytest_configure() -> Callable[[Config], None]:
+    pytest.importorskip("playwright", exc_type=ImportError)
+    from tests.e2e_ui.conftest import pytest_configure
+
+    return pytest_configure
 
 
 @pytest.mark.parametrize("port", sorted(DEV_PORTS))
@@ -63,7 +71,7 @@ def test_pytest_configure_rejects_headed_in_ci(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setenv("CI", "1")
 
     with pytest.raises(pytest.UsageError, match="must run headless in CI"):
-        pytest_configure(_ConfigStub({"--ui-base-url": None, "--headed": True}))
+        _pytest_configure()(cast(Config, _ConfigStub({"--ui-base-url": None, "--headed": True})))
 
 
 def test_pytest_configure_rejects_dev_ui_base_url(
@@ -73,6 +81,9 @@ def test_pytest_configure_rejects_dev_ui_base_url(
     monkeypatch.delenv("CI", raising=False)
 
     with pytest.raises(pytest.UsageError, match="Refusing --ui-base-url"):
-        pytest_configure(
-            _ConfigStub({"--ui-base-url": "http://127.0.0.1:5173", "--headed": False})
+        _pytest_configure()(
+            cast(
+                Config,
+                _ConfigStub({"--ui-base-url": "http://127.0.0.1:5173", "--headed": False}),
+            )
         )

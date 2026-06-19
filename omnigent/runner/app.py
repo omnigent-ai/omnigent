@@ -56,6 +56,7 @@ from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
+    CURSOR_NATIVE_TERMINAL_ROLE,
     OMNIGENT_REPL_TERMINAL_ROLE,
     PI_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
@@ -107,6 +108,18 @@ _SUBAGENT_DELIVERY_UNTRACKED = "untracked"
 _SUBAGENT_DELIVERY_MISSING_WORK_ENTRY = "missing_work_entry"
 _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX = "missing_parent_inbox"
 _NATIVE_TERMINAL_START_FAILED_CODE = "native_terminal_start_failed"
+# Read budget for runner→server POSTs that can PARK behind a human-approval
+# ASK gate: policy evaluation (``_evaluate_policy_via_omnigent``) and sub-agent
+# wake-notice delivery (``_deliver_subagent_wake_post``). Both are gated at the
+# recipient's REQUEST/LLM/TOOL phase, which can hold for the deciding policy's
+# ``ask_timeout`` (default one day). Held at one day (86400s) — matching that
+# default — so the POST WAITS for the real verdict instead of severing the
+# parked gate at a short read timeout. A 30s cut previously fail-closed to DENY
+# (and the wake POST retried into duplicate approval cards). Fast connect (30s)
+# so an unreachable server still fails out promptly into the caller's
+# fail-open/retry path. Guarded by tests/test_ask_timeout_infinite.py.
+_ASK_GATE_DELIVERY_READ_TIMEOUT_S: float = 86400.0
+_ASK_GATE_DELIVERY_TIMEOUT = httpx.Timeout(_ASK_GATE_DELIVERY_READ_TIMEOUT_S, connect=30.0)
 # Terminal resource hosting the framework's own TUI (the Omnigent REPL,
 # ``omnigent attach``) for runner-hosted SDK sessions — the SDK mirror of
 # the claude-/codex-native embedded terminals. Resource id derives as
@@ -828,6 +841,153 @@ async def _auto_create_pi_terminal(
     return terminal_view
 
 
+async def _auto_create_cursor_terminal(
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+    publish_event: Callable[[str, dict[str, Any]], None],
+    *,
+    server_client: httpx.AsyncClient | None,
+    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
+) -> SessionResourceView:
+    """
+    Auto-create the Cursor TUI terminal for a cursor-native session.
+
+    Launches ``cursor-agent`` (no args → interactive TUI) in a runner-owned
+    tmux pane. Auth is the ambient ``cursor-agent login`` (``$HOME/.cursor``),
+    so HOME is inherited and no extension bridge is written (cursor owns its own
+    tool surface). On first launch in an untrusted workspace the TUI shows a
+    one-time "Trust this workspace" prompt the user accepts.
+
+    :param session_id: Session/conversation identifier.
+    :param resource_registry: Session resource registry for launching the
+        terminal.
+    :param publish_event: Runner session event publisher.
+    :param server_client: Runner Omnigent server client.
+    :returns: Created terminal resource view.
+    """
+    from omnigent.cursor_native import resolve_cursor_executable
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+
+    # Stamp the launch time before the TUI starts. cursor creates the chat's
+    # on-disk store lazily on the first message, so its ``meta.json``
+    # ``createdAtMs`` is always >= this — which lets the forwarder discover
+    # *this* session's chat by recency under ``~/.cursor/chats/<md5(cwd)>``.
+    launch_epoch_ms = int(time.time() * 1000)
+    # Tear down any forwarder left from a prior terminal for this session before
+    # re-creating, so the old and new tasks can't both mirror (double-posting),
+    # and drop the prior terminal's stale forward cursor so the new forwarder
+    # can't resume the wrong chat / a stale rowid (mirrors codex's clear_bridge_state).
+    await _cancel_auto_forwarder_task(session_id)
+    from omnigent.cursor_native_bridge import (
+        approve_mcp_server_for_workspace,
+        bridge_dir_for_session_id,
+        write_mcp_config,
+    )
+    from omnigent.cursor_native_forwarder import clear_cursor_bridge_state
+
+    bridge_dir = bridge_dir_for_session_id(session_id)
+    clear_cursor_bridge_state(bridge_dir)
+
+    # ``_pi_native_launch_config`` is a generic session-snapshot reader
+    # (workspace + terminal_launch_args); reused here, not Pi-specific.
+    launch_config = await _pi_native_launch_config(
+        session_id=session_id,
+        server_client=server_client,
+    )
+    # Canonicalize the workspace (resolve symlinks / trailing slashes) so the
+    # cursor TUI's cwd and the forwarder hash the SAME path — cursor keys its
+    # chat store dir on ``md5(cwd)``, and a mismatch would hide the store.
+    workspace = os.path.realpath(str(launch_config.workspace))
+    write_mcp_config(Path(workspace), bridge_dir)
+    cursor_command = resolve_cursor_executable()
+    cursor_args = list(launch_config.terminal_launch_args or [])
+    if "--approve-mcps" not in cursor_args:
+        cursor_args.append("--approve-mcps")
+    terminal_view = await resource_registry.launch_required_terminal(
+        session_id=session_id,
+        terminal_name="cursor",
+        session_key="main",
+        resource_role=CURSOR_NATIVE_TERMINAL_ROLE,
+        spec=TerminalEnvSpec(
+            os_env=OSEnvSpec(type="caller_process", cwd=workspace),
+            command=cursor_command,
+            args=cursor_args,
+            env={},
+            scrollback=100_000,
+            tmux_allow_passthrough=True,
+            tmux_start_on_attach=False,
+        ),
+    )
+    # Advertise the tmux socket+target so the cursor-native harness executor can
+    # inject web-UI messages into this same pane (tmux paste), wiring the web
+    # chat box to the running TUI.
+    terminal_registry = resource_registry.terminal_registry
+    if terminal_registry is not None:
+        instance = terminal_registry.get(session_id, "cursor", "main")
+        if instance is not None and instance.running:
+            from omnigent.cursor_native_bridge import write_tmux_target
+
+            write_tmux_target(
+                bridge_dir,
+                socket_path=instance.socket_path,
+                tmux_target=instance.tmux_target,
+            )
+    publish_event(
+        session_id,
+        {
+            "type": "session.resource.created",
+            "resource": session_resource_view_to_dict(terminal_view),
+        },
+    )
+
+    # Mirror the Cursor TUI's conversation back into the Omnigent session so the
+    # chat view (message bubbles, derived title, working spinner) tracks the
+    # embedded terminal. Host-spawned sessions have no CLI client to start this,
+    # so the runner owns it — the cursor analog of the claude/codex transcript
+    # forwarders. Reuses the runner's own server URL + refresh-capable auth.
+    from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
+
+    # Fail loud if the server URL isn't in the env (matches codex's
+    # ``_required_runner_env``): silently defaulting to ``localhost:6767`` would
+    # make every mirror POST miss on a remote deploy, leaving the web
+    # conversation permanently empty.
+    server_url = _required_runner_env("RUNNER_SERVER_URL")
+    # Authorization rides solely on the refresh-capable auth (no static header
+    # snapshot that would expire mid-session), matching the runner's server_client.
+    _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
+
+    from omnigent.cursor_native_forwarder import supervise_cursor_forwarder
+
+    if server_client is not None and ensure_comment_relay is not None:
+        await ensure_comment_relay(
+            session_id,
+            explicit_bridge_dir=bridge_dir,
+            await_notify=False,
+        )
+    approve_mcp_server_for_workspace(Path(workspace))
+
+    _forwarder_task = asyncio.create_task(
+        supervise_cursor_forwarder(
+            base_url=server_url,
+            headers={},
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            agent_name="cursor-native-ui",
+            workspace=workspace,
+            launch_epoch_ms=launch_epoch_ms,
+            auth=_runner_auth,
+        ),
+        name=f"cursor-forwarder-{session_id}",
+    )
+    _register_auto_forwarder_task(session_id, _forwarder_task)
+    _logger.info(
+        "Auto-created cursor terminal + forwarder for session %s; forwarder_task=%s",
+        session_id,
+        _forwarder_task.get_name(),
+    )
+    return terminal_view
+
+
 async def _auto_create_codex_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -1179,14 +1339,24 @@ async def _auto_create_codex_terminal(
     # claude-native, whose terminal IS the agent process. On failure, close
     # the listener and app-server here: the background forwarder task (which
     # otherwise owns their teardown) has not been created yet.
+    # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
+    # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
+    # and ``parent_os_env`` below, launch_terminal falls back to
+    # _default_sandbox_for_platform (linux_bwrap), overriding the YAML config.
+    agent_os_env = _agent_os_env_from_spec(agent_spec)
     try:
         terminal_view = await resource_registry.launch_auxiliary_terminal(
             session_id=session_id,
             terminal_name="codex",
             session_key="main",
             resource_role=CODEX_NATIVE_TERMINAL_ROLE,
+            parent_os_env=agent_os_env,
             spec=TerminalEnvSpec(
-                os_env=OSEnvSpec(type="caller_process", cwd=workspace),
+                os_env=OSEnvSpec(
+                    type="caller_process",
+                    cwd=workspace,
+                    sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
+                ),
                 command=app_server.codex_path,
                 # Fresh sessions pass no thread id so the TUI creates the
                 # thread and the background task adopts it. Resume sessions
@@ -1574,6 +1744,29 @@ def _codex_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -
     return model if isinstance(model, str) and model else None
 
 
+def _agent_os_env_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> Any | None:
+    """
+    Read the agent's ``os_env`` from a resolved agent spec.
+
+    The auto-created native terminals (codex/claude) must inherit the
+    agent's ``os_env`` so its ``sandbox`` (e.g. ``type: none``),
+    ``egress_rules`` and ``env_passthrough`` are honoured. Without this
+    the terminal is built with a fresh ``OSEnvSpec`` carrying no sandbox,
+    and ``launch_terminal`` falls back to ``_default_sandbox_for_platform``
+    (``linux_bwrap`` / ``darwin_seatbelt``) — overriding the YAML config.
+    Mirrors :func:`create_session_terminal`, which resolves the spec once
+    and threads its ``os_env`` through as the inheritance parent.
+
+    :param agent_spec: Agent spec object, or a resolved wrapper carrying a
+        ``spec`` attribute. ``None`` means no spec was available.
+    :returns: The agent's ``os_env`` spec, or ``None``.
+    """
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    if spec is None:
+        return None
+    return getattr(spec, "os_env", None)
+
+
 def _is_runner_owned_codex_terminal(
     resource_registry: SessionResourceRegistry,
     resource: SessionResourceView,
@@ -1848,6 +2041,7 @@ async def _auto_create_claude_terminal(
     server_client: httpx.AsyncClient,
     bundle_dir: Path | None = None,
     agent_name: str | None = None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
     skills_filter: str | list[str] = "all",
 ) -> SessionResourceView:
     """
@@ -1877,6 +2071,11 @@ async def _auto_create_claude_terminal(
     :param agent_name: Agent display name for the bundle's plugin
         manifest, e.g. ``"researcher"``. ``None`` falls back to the
         bundle directory's basename.
+    :param agent_spec: Optional resolved agent spec for the session. Its
+        ``os_env`` (sandbox / egress_rules / env_passthrough) is threaded
+        through as the terminal's inheritance parent so the YAML sandbox
+        config (e.g. ``type: none``) is honoured instead of being
+        overridden by ``_default_sandbox_for_platform``.
     :param skills_filter: The agent spec's ``skills_filter`` (``"all"``
         / ``"none"`` / list of skill names), threaded to
         :func:`augment_claude_args`. Defaults to ``"all"``.
@@ -2259,8 +2458,17 @@ async def _auto_create_claude_terminal(
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
     )
 
+    # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
+    # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
+    # and ``parent_os_env`` below, launch_terminal falls back to
+    # _default_sandbox_for_platform (linux_bwrap), overriding the YAML config.
+    agent_os_env = _agent_os_env_from_spec(agent_spec)
     env_spec = TerminalEnvSpec(
-        os_env=OSEnvSpec(type="caller_process", cwd=workspace),
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=workspace,
+            sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
+        ),
         command="claude",
         args=list(claude_args),
         # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL
@@ -2300,6 +2508,7 @@ async def _auto_create_claude_terminal(
             terminal_name="claude",
             session_key="main",
             spec=env_spec,
+            parent_os_env=agent_os_env,
             # Mark this as the claude-native agent terminal so its pane
             # activity drives the session's PTY-derived working status.
             resource_role=CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -2408,6 +2617,7 @@ async def _auto_create_repl_terminal(
     publish_event: Callable[[str, dict[str, Any]], None],
     *,
     server_client: httpx.AsyncClient,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
 ) -> SessionResourceView:
     """
     Auto-create an Omnigent REPL terminal for a runner-hosted SDK session.
@@ -2453,8 +2663,17 @@ async def _auto_create_repl_terminal(
     started_at = time.monotonic()
     workspace = os.environ.get("OMNIGENT_RUNNER_WORKSPACE", str(Path.cwd()))
     server_url = os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767")
+    # Inherit the agent's os_env so its sandbox (e.g. ``type: none``) is honoured;
+    # without sandbox= here and parent_os_env below, launch_terminal falls back to
+    # _default_sandbox_for_platform (linux_bwrap), which fails in a hardened
+    # container. Mirrors the #175 fix on the codex/claude auto-create paths.
+    agent_os_env = _agent_os_env_from_spec(agent_spec)
     env_spec = TerminalEnvSpec(
-        os_env=OSEnvSpec(type="caller_process", cwd=workspace),
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=workspace,
+            sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
+        ),
         # The runner's interpreter is the venv with omnigent installed;
         # ``python -m omnigent`` avoids depending on the console script
         # being on the tmux pane's PATH.
@@ -2471,6 +2690,7 @@ async def _auto_create_repl_terminal(
         terminal_name=_REPL_TERMINAL_NAME,
         session_key=_REPL_TERMINAL_SESSION_KEY,
         spec=env_spec,
+        parent_os_env=agent_os_env,
         # Runner-private marker the attach WebSocket uses to recreate
         # this terminal when its tmux session has died (the REPL exited
         # or crashed) instead of rejecting the attach.
@@ -2779,7 +2999,18 @@ async def _evaluate_policy_via_omnigent(
                     "data": data,
                 },
             },
-            timeout=30.0,
+            # A TOOL_CALL/LLM_REQUEST/REQUEST ASK parks server-side in
+            # ``_hold_native_ask_gate`` until a human resolves it (up to the
+            # deciding policy's ``ask_timeout``, default one day). A 30s read
+            # budget here severed that long-poll after 30s — the server saw an
+            # UPSTREAM DISCONNECT and failed the gate closed (DENY), so the
+            # main (claude-sdk) agent's approval card auto-resolved while
+            # native sub-agents (whose hooks already wait the full day) parked
+            # correctly. Hold the read budget at one day to match the native
+            # hooks' ``_EVALUATE_POLICY_TIMEOUT_S``; the server's ``ask_timeout``
+            # remains the single real cap. Fast connect so an unreachable
+            # server still fails out promptly into the fail-open path below.
+            timeout=_ASK_GATE_DELIVERY_TIMEOUT,
         )
         if ap_resp.status_code == 200:
             result = ap_resp.json()
@@ -2956,6 +3187,32 @@ class _SessionSnapshot:
     sub_agent_name: str | None = None
 
 
+# Language constant the omnigent YAML translator stamps on callable-backed
+# tools (omnigent/spec/omnigent.py:OMNIGENT_TOOL_LANGUAGE). Duplicated rather
+# than imported to avoid pulling the heavy translator module in for one
+# string — same rationale as omnigent/tools/local_callable.py.
+_OMNIGENT_CALLABLE_LANGUAGE = "omnigent-python-callable"
+
+
+def _looks_like_file_path(path: str) -> bool:
+    """
+    Return whether *path* is a filesystem path rather than a dotted import.
+
+    File-based local tools are discovered as ``tools/python/foo.py`` /
+    ``tools/typescript/foo.ts`` — always carrying a path separator and a
+    source extension (see :func:`omnigent.spec.parser._discover_local_tools`).
+    Callable-backed tools store a dotted import path (``pkg.mod.func``) in the
+    same field — no separator, no source extension. This structural test is
+    the primary guard so a rename of the callable-tool *language* string can
+    never reintroduce the workdir-mangling bug.
+
+    :param path: A :class:`LocalToolInfo` ``path`` value.
+    :returns: ``True`` when *path* is a file path safe to resolve onto the
+        workdir; ``False`` for dotted import paths.
+    """
+    return "/" in path or os.sep in path or path.endswith((".py", ".ts"))
+
+
 def _spec_with_workdir_paths(spec: Any, workdir: Path | None) -> Any:
     if workdir is None or spec is None:
         return spec
@@ -2966,7 +3223,18 @@ def _spec_with_workdir_paths(spec: Any, workdir: Path | None) -> Any:
     changed = False
     for info in local_tools:
         path = getattr(info, "path", None)
-        if path and not Path(path).is_absolute():
+        # Only resolve genuine file paths onto the workdir. Callable-backed
+        # tools store a dotted import path (``pkg.mod.func``) in the same
+        # field; joining that to the workdir corrupts it, the import fails,
+        # the tool never registers, and any tool_call policy narrowed to it
+        # can never fire. The structural file-vs-dotted check is the primary
+        # guard; the language check is belt-and-suspenders.
+        if (
+            path
+            and getattr(info, "language", None) != _OMNIGENT_CALLABLE_LANGUAGE
+            and _looks_like_file_path(path)
+            and not Path(path).is_absolute()
+        ):
             resolved_tools.append(dataclasses.replace(info, path=str((workdir / path).resolve())))
             changed = True
         else:
@@ -3788,7 +4056,17 @@ async def _deliver_subagent_wake_post(
                         "content": [{"type": "input_text", "text": notice}],
                     },
                 },
-                timeout=30.0,
+                # The server gates this injected wake at the parent's REQUEST
+                # phase, which can PARK on a human ASK (e.g. session_cost_budget)
+                # for up to the deciding policy's ``ask_timeout`` (default one
+                # day). A 30s read budget severed that park after 30s → the
+                # TimeoutError below retried → each retry re-posted the notice
+                # and parked ANOTHER gate → duplicate approval cards, and the
+                # gate never cleanly blocked. Hold the read budget at one day so
+                # this POST waits for the real verdict (one held connection, one
+                # card); fast connect so an unreachable parent runner still
+                # fails out into the bounded retry below.
+                timeout=_ASK_GATE_DELIVERY_TIMEOUT,
             )
             # Treat a non-2xx RESPONSE (e.g. a genuine 503 JSONResponse) as a
             # failure — httpx does not raise on status by itself.
@@ -4239,6 +4517,7 @@ def create_runner_app(
     _session_comment_relays: dict[str, Any] = {}
     _codex_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _pi_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    _cursor_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     # Per-session lock guarding the claude-native terminal auto-create in
     # ``create_session``. Two ``POST /v1/sessions`` calls can land
     # concurrently on a host-launched runner — ``_on_runner_connect``
@@ -4625,8 +4904,12 @@ def create_runner_app(
             )
         return "\n".join(parts)
 
-    def _release_failed_required_terminal_session(session_id: str) -> None:
-        """Release the harness subprocess for a session whose runtime died."""
+    def _release_required_terminal_session(session_id: str) -> None:
+        """Release the harness subprocess after its required terminal exited.
+
+        Pure subprocess cleanup — publishes no ``failed`` lifecycle events, so
+        it is safe on both the crash and the clean-shutdown paths.
+        """
         if process_manager is None:
             return
 
@@ -4661,6 +4944,13 @@ def create_runner_app(
         if event.lifecycle != TerminalLifecycle.REQUIRED:
             return
 
+        # Exit while idle = the turn already finished and the pane shut down
+        # cleanly, so don't flip the chat to ``failed`` (the spurious-"failed"
+        # bug). Still release the harness; liveness surfaces the offline runner.
+        if event.session_was_idle:
+            _release_required_terminal_session(event.session_id)
+            return
+
         output = _format_required_terminal_exit_output(event)
         _publish_event(
             event.session_id,
@@ -4678,7 +4968,7 @@ def create_runner_app(
             status="failed",
             output=output,
         )
-        _release_failed_required_terminal_session(event.session_id)
+        _release_required_terminal_session(event.session_id)
 
     resource_registry.set_terminal_exit_publisher(_publish_terminal_exit)
 
@@ -5080,6 +5370,10 @@ def create_runner_app(
                 from omnigent.pi_native_bridge import build_pi_native_spawn_env
 
                 spawn_env = build_pi_native_spawn_env(session_id)
+            if harness_name == "cursor-native" and spawn_env is None:
+                from omnigent.cursor_native_bridge import build_cursor_native_spawn_env
+
+                spawn_env = build_cursor_native_spawn_env(session_id)
             _session_spec_cache[session_id] = spec_entry
             from omnigent.llms.context_window import get_model_context_window
             from omnigent.runtime.workflow import _resolve_spec_model
@@ -5260,6 +5554,7 @@ def create_runner_app(
                             server_client=server_client,
                             bundle_dir=_native_bundle_dir,
                             agent_name=_native_agent_name,
+                            agent_spec=_native_spec,
                             skills_filter=_native_skills_filter,
                         )
                     except Exception as exc:
@@ -5388,6 +5683,39 @@ def create_runner_app(
                     finally:
                         _publish_terminal_pending(_publish_event, session_id, False)
 
+        if harness_name == "cursor-native":
+            _cursor_ensure_lock = _cursor_terminal_ensure_locks.setdefault(
+                session_id, asyncio.Lock()
+            )
+            async with _cursor_ensure_lock:
+                _tr = resource_registry.terminal_registry
+                _has_cursor_terminal = (
+                    _tr is not None and _tr.get(session_id, "cursor", "main") is not None
+                )
+                if not _has_cursor_terminal:
+                    _publish_terminal_pending(_publish_event, session_id, True)
+                    try:
+                        await _auto_create_cursor_terminal(
+                            session_id,
+                            resource_registry,
+                            _publish_event,
+                            server_client=server_client,
+                            ensure_comment_relay=_ensure_comment_relay_started,
+                        )
+                    except Exception as exc:
+                        _logger.exception(
+                            "Failed to auto-create cursor terminal for %s",
+                            session_id,
+                        )
+                        _publish_native_terminal_start_error(
+                            _publish_event,
+                            session_id,
+                            "Cursor",
+                            exc,
+                        )
+                    finally:
+                        _publish_terminal_pending(_publish_event, session_id, False)
+
         # Auto-bootstrap the Omnigent REPL terminal for non-native
         # (SDK-harness) top-level sessions: host the framework's own TUI
         # (``omnigent attach``) in a tmux pane so the web UI can embed it
@@ -5413,11 +5741,16 @@ def create_runner_app(
                 if not _has_repl_terminal:
                     _publish_terminal_pending(_publish_event, session_id, True)
                     try:
+                        repl_agent_spec = await _resolve_session_agent_spec(session_id)
+                    except OmnigentError:
+                        repl_agent_spec = None
+                    try:
                         await _auto_create_repl_terminal(
                             session_id,
                             resource_registry,
                             _publish_event,
                             server_client=server_client,
+                            agent_spec=repl_agent_spec,
                         )
                     except Exception:
                         # Unlike the native branches, the REPL terminal is a
@@ -5649,6 +5982,7 @@ def create_runner_app(
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
+        _cursor_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
 
@@ -6345,9 +6679,14 @@ def create_runner_app(
         terminal observer already owns that edge.
 
         Terminal-backed sessions do not all have the same safe edge source.
-        For claude-native, the PTY-activity watcher owns ``running`` and
-        ``idle`` because a runner turn only types into Claude Code's pane.
-        For codex-native, the runner may publish ``running`` when it accepts
+        For claude-native, pi-native, and cursor-native, the PTY-activity
+        watcher owns ``running`` and ``idle`` because a runner turn only types
+        into the agent's own pane and ``run_turn`` returns the instant the
+        message is injected — the model turn then runs entirely in the TUI.
+        Publishing the turn-lifecycle ``idle`` here would race ahead of (and
+        clobber) the watcher's ``running``, dropping the web "Working…" spinner
+        the moment the message is sent. For codex-native, the runner may
+        publish ``running`` when it accepts
         a web turn for dispatch, but the Codex app-server forwarder owns
         ``idle`` because the runner's injection task returns as soon as Codex
         accepts the message, while the user-visible model turn may still be
@@ -6371,7 +6710,7 @@ def create_runner_app(
         # source — fall through and publish. Suppress only once we positively
         # know the harness/edge is terminal-owned.
         harness = _session_harness_name(conv_id)
-        if status != "failed" and harness in {"claude-native", "pi-native"}:
+        if status != "failed" and harness in {"claude-native", "pi-native", "cursor-native"}:
             return
         if status == "idle" and harness == "codex-native":
             return
@@ -7004,6 +7343,79 @@ def create_runner_app(
         ):
             _logger.warning(
                 "Claude-native stop succeeded but sub-agent delivery was "
+                "not confirmed; session=%s reason=%s",
+                conv_id,
+                delivery_ack.reason,
+            )
+        return Response(status_code=204)
+
+    async def _handle_cursor_native_interrupt(conv_id: str) -> Response:
+        """Cancel the in-flight cursor turn by sending ``Escape`` to its TUI pane.
+
+        cursor-native turns run inside the cursor-agent TUI; the runner harness
+        task returns right after the tmux paste, so the in-process cancel floor
+        has nothing to cancel. ``Escape`` stops a running cursor turn (verified).
+
+        :param conv_id: Session/conversation identifier.
+        :returns: 204 when Escape was sent; 503 if the tmux target is unavailable.
+        """
+        from omnigent.cursor_native_bridge import bridge_dir_for_session_id, inject_interrupt
+
+        try:
+            await asyncio.to_thread(
+                inject_interrupt, bridge_dir_for_session_id(conv_id), timeout_s=1.0
+            )
+        except RuntimeError as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "cursor_native_interrupt_failed",
+                    "detail": _client_safe_error_detail(exc, context="cursor-native interrupt"),
+                },
+            )
+        _wake_parent_after_native_interrupt(conv_id)
+        return Response(status_code=204)
+
+    async def _handle_cursor_native_stop(conv_id: str) -> Response:
+        """Hard-stop a cursor-native session by killing its tmux session.
+
+        Mirrors :func:`_handle_claude_native_stop`: kill the pane (ends
+        cursor-agent), tear the terminal resource down so the web UI stops
+        showing a live terminal, publish ``idle`` so the spinner clears, and
+        reclaim any sub-agent work entry.
+
+        :param conv_id: Session/conversation identifier.
+        :returns: 204 on success; 503 if the tmux target is unavailable.
+        """
+        from omnigent.cursor_native_bridge import bridge_dir_for_session_id, kill_session
+
+        try:
+            await asyncio.to_thread(
+                kill_session, bridge_dir_for_session_id(conv_id), timeout_s=1.0
+            )
+        except RuntimeError as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "cursor_native_stop_failed",
+                    "detail": _client_safe_error_detail(exc, context="cursor-native stop"),
+                },
+            )
+        await _teardown_session_terminals(conv_id)
+        # Stop mirroring: the chat store is now frozen, so the forwarder has
+        # nothing left to post — cancel it so it isn't left polling a dead pane.
+        await _cancel_auto_forwarder_task(conv_id)
+        _publish_event(conv_id, {"type": "session.status", "status": "idle"})
+        delivery_ack = _mark_subagent_terminal_and_wake(
+            conv_id,
+            status="cancelled",
+            output="[System: sub-agent stopped]",
+        )
+        if not delivery_ack.delivered and (
+            delivery_ack.entry is not None or conv_id in _session_sub_agent_names
+        ):
+            _logger.warning(
+                "Cursor-native stop succeeded but sub-agent delivery was "
                 "not confirmed; session=%s reason=%s",
                 conv_id,
                 delivery_ack.reason,
@@ -9008,6 +9420,10 @@ def create_runner_app(
             from omnigent.pi_native_bridge import build_pi_native_spawn_env
 
             spawn_env = build_pi_native_spawn_env(conv_id)
+        if harness_name == "cursor-native" and spawn_env is None:
+            from omnigent.cursor_native_bridge import build_cursor_native_spawn_env
+
+            spawn_env = build_cursor_native_spawn_env(conv_id)
 
         agent_version = dispatch.agent_version if dispatch else body.get("agent_version")
         if agent_version is not None and conv_id in _version_cache:
@@ -9657,6 +10073,13 @@ def create_runner_app(
             message_body = dict(body)
             message_body["conversation_id"] = conversation_id
 
+            # A new message means a turn is (about to be) in flight. Mark the
+            # native session running now so a pane crash before the PTY
+            # watcher's first ``running`` edge isn't misread as a clean
+            # shutdown against the prior turn's stale ``idle`` memo.
+            if _is_native_harness(conversation_id):
+                resource_registry.note_session_turn_started(conversation_id)
+
             # Take an arrival slot, then wait at the FIFO gate so this
             # conversation's messages reach the turn-vs-buffer decision in
             # arrival order regardless of content-resolution latency
@@ -9904,6 +10327,9 @@ def create_runner_app(
                 # harness task already returned, so the cancel floor has nothing
                 # to cancel. Queue an abort to the resident extension instead.
                 return await _handle_pi_native_interrupt(conversation_id)
+            if _harness == "cursor-native":
+                # cursor turn lives in the cursor-agent TUI; send Escape to stop it.
+                return await _handle_cursor_native_interrupt(conversation_id)
             # In-process harness: mark interrupted, forward an interrupt to the
             # harness, and force-cancel the runner turn task so the turn ends
             # promptly even if the harness can't honor the interrupt in time.
@@ -9971,6 +10397,9 @@ def create_runner_app(
                 # Pi has no separate session-kill; abort the active turn via the
                 # extension (mirrors codex-native reusing its interrupt handler).
                 return await _handle_pi_native_interrupt(conversation_id)
+            if _harness == "cursor-native":
+                # Hard-kill the cursor-agent tmux pane (the TUI is the runtime).
+                return await _handle_cursor_native_stop(conversation_id)
             await _cancel_inprocess_turn(conversation_id)
             return Response(status_code=204)
 
@@ -10448,11 +10877,13 @@ def create_runner_app(
                     claude_terminal_id,
                 )
                 try:
+                    claude_agent_spec = await _resolve_session_agent_spec(session_id)
                     terminal_view = await _auto_create_claude_terminal(
                         session_id,
                         resource_registry,
                         _publish_event,
                         server_client=server_client,
+                        agent_spec=claude_agent_spec,
                     )
                 except Exception as exc:
                     _logger.exception(
@@ -10545,6 +10976,41 @@ def create_runner_app(
                         session_id,
                     )
                     return _native_terminal_start_error_response(exc, "Pi")
+            return JSONResponse(
+                status_code=200,
+                content=session_resource_view_to_dict(terminal_view),
+            )
+
+        if (
+            body.get("ensure_native_terminal")
+            and terminal_name == "cursor"
+            and session_key == "main"
+        ):
+            cursor_terminal_id = terminal_resource_id("cursor", "main")
+            ensure_lock = _cursor_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
+            async with ensure_lock:
+                existing = await resource_registry.get_terminal_resource(
+                    session_id, cursor_terminal_id
+                )
+                if existing is not None:
+                    return JSONResponse(
+                        status_code=200,
+                        content=session_resource_view_to_dict(existing),
+                    )
+                try:
+                    terminal_view = await _auto_create_cursor_terminal(
+                        session_id,
+                        resource_registry,
+                        _publish_event,
+                        server_client=server_client,
+                        ensure_comment_relay=_ensure_comment_relay_started,
+                    )
+                except Exception as exc:
+                    _logger.exception(
+                        "Cursor terminal ensure failed for session=%s",
+                        session_id,
+                    )
+                    return _native_terminal_start_error_response(exc, "Cursor")
             return JSONResponse(
                 status_code=200,
                 content=session_resource_view_to_dict(terminal_view),
@@ -10865,11 +11331,16 @@ def create_runner_app(
                 # the entry unconditionally and tears the instance down.
                 await registry.close(session_id, _REPL_TERMINAL_NAME, _REPL_TERMINAL_SESSION_KEY)
                 try:
+                    repl_agent_spec = await _resolve_session_agent_spec(session_id)
+                except OmnigentError:
+                    repl_agent_spec = None
+                try:
                     await _auto_create_repl_terminal(
                         session_id,
                         resource_registry,
                         _publish_event,
                         server_client=server_client,
+                        agent_spec=repl_agent_spec,
                     )
                 except Exception:
                     # Broad catch, same rationale as the session-create
@@ -12019,6 +12490,7 @@ def create_runner_app(
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
+        _cursor_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         await resource_registry.cleanup_session(session_id)
         return JSONResponse(
@@ -12071,6 +12543,7 @@ def create_runner_app(
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
+        _cursor_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         # Close terminals with ``session.resource.deleted`` events BEFORE
         # cleanup_session — cleanup_conversation would silently pop them
@@ -12835,6 +13308,9 @@ _HARNESS_MODEL_ENV_KEY: dict[str, str] = {
     "pi": "HARNESS_PI_MODEL",
     "openai-agents": "HARNESS_OPENAI_AGENTS_MODEL",
     "cursor": "HARNESS_CURSOR_MODEL",
+    # cursor-native intentionally omitted: cursor-agent acp uses its configured
+    # default model and the executor ignores a model pin, so it is also absent
+    # from model_override._SDK_MODEL_OVERRIDE_HARNESSES. Keep all three in sync.
     "antigravity": "HARNESS_ANTIGRAVITY_MODEL",
 }
 

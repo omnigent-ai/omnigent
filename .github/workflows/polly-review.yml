@@ -181,7 +181,7 @@ jobs:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
           mkdir -p "${GITHUB_WORKSPACE}/.codex-cli" && cd "${GITHUB_WORKSPACE}/.codex-cli"
-          npm install --ignore-scripts --no-audit --no-fund @openai/codex@0.128.0-alpha.1
+          npm install --ignore-scripts --no-audit --no-fund @openai/codex@0.139.0
           echo "${GITHUB_WORKSPACE}/.codex-cli/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Set LLM credentials
@@ -303,7 +303,9 @@ jobs:
           IMPORTANT: Your output will be posted directly as a PR comment. Output
           ONLY the final structured review — no coordination messages, no status
           updates about dispatching sub-agents, no "waiting for results" narration.
-          Start your response with the review content itself.
+          Begin your response with the exact marker <!-- POLLY_REVIEW_START -->
+          on its own line, then the review content. Nothing before the marker
+          will be shown.
           """
           pathlib.Path("/tmp/review_prompt.txt").write_text(prompt)
           PYEOF
@@ -328,6 +330,23 @@ jobs:
             | tee /tmp/polly_output.txt \
             || { echo "::warning::Polly review exited non-zero"; cat polly-stderr.log; }
 
+          # Strip any sub-agent coordination preamble that leaks before
+          # the actual review.  Primary: look for the sentinel we asked the
+          # model to emit.  Fallback: first markdown heading or standalone
+          # horizontal rule.
+          python3 -c "
+          import re, pathlib
+          raw = pathlib.Path('/tmp/polly_output.txt').read_text()
+          sentinel = '<!-- POLLY_REVIEW_START -->'
+          idx = raw.find(sentinel)
+          if idx >= 0:
+              cleaned = raw[idx + len(sentinel):].lstrip('\n')
+          else:
+              m = re.search(r'^(#{1,6} |---\s*$)', raw, re.MULTILINE)
+              cleaned = raw[m.start():] if m else raw
+          pathlib.Path('/tmp/polly_output.txt').write_text(cleaned)
+          "
+
           # Use a collision-resistant random delimiter so model output
           # containing "REVIEW_EOF" cannot truncate the output.
           delim="REVIEW_$(openssl rand -hex 8)"
@@ -336,10 +355,18 @@ jobs:
           head -c 61440 /tmp/polly_output.txt >> "$GITHUB_OUTPUT"
           echo "${delim}" >> "$GITHUB_OUTPUT"
 
+      - name: Mint App token
+        id: app-token
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true' && vars.OMNIGENT_BOT_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
+          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
+
       - name: Post review comment
         if: steps.polly.outputs.review_text != ''
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           REVIEW_TEXT: ${{ steps.polly.outputs.review_text }}

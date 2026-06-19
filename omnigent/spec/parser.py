@@ -60,28 +60,6 @@ _CONTEXT_FILE_PRIORITY: tuple[str, ...] = ("AGENTS.md", "CLAUDE.md", ".cursorrul
 _FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n(.*)", re.DOTALL)
 
 
-# Allowed tool ``type`` values when the supervisor harness is
-# selected (``config.harness == "databricks_supervisor"``). Each entry maps the
-# tool type to its required field names — the parser enforces both
-# membership and required fields. Lives at the top of the module so
-# they are easy to grep and so two functions cannot independently
-# duplicate the same set.
-#
-# Adding a new tool type is a one-line change here plus a parser
-# test — no runtime, harness, or workflow code touches needed. See
-# ``designs/DATABRICKS_SUPERVISOR_API_INTEGRATION.md`` for the recipe and the
-# rationale for why these tools are Databricks-resident only.
-_SUPERVISOR_TOOL_REQUIRED_FIELDS: dict[str, frozenset[str]] = {
-    "genie_space": frozenset({"id", "description"}),
-    "uc_function": frozenset({"name", "description"}),
-    "uc_connection": frozenset({"name", "description"}),
-    "app": frozenset({"name", "description"}),
-    "knowledge_assistant": frozenset({"knowledge_assistant_id", "description"}),
-    "uc_table": frozenset({"table_name", "description"}),
-    "volume": frozenset({"name", "description"}),
-}
-
-
 class _ConfigYamlLoader(yaml.SafeLoader):
     """
     SafeLoader variant that does NOT treat ``on``/``off``/
@@ -168,38 +146,13 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
             code=ErrorCode.INVALID_INPUT,
         )
 
-    # Determine the executor type and (for omnigent) the harness
-    # up front so the rest of the parse can route type-specific
-    # YAML shapes correctly. The supervisor harness expects
-    # ``tools:`` as a top-level list of typed dicts (rejected by
-    # the legacy ``_parse_tools_config`` which expects a mapping).
     raw_executor = raw.get("executor")
-    executor_type = "omnigent"
-    if isinstance(raw_executor, dict) and raw_executor.get("type") is not None:
-        executor_type = str(raw_executor["type"])
-    # Peek at executor.config.harness to detect the supervisor
-    # harness before _parse_executor runs. Needed because the
-    # tools-list parse path must branch on this value.
-    _raw_cfg = raw_executor.get("config", {}) if isinstance(raw_executor, dict) else {}
-    _is_supervisor_harness = (
-        executor_type == "omnigent"
-        and isinstance(_raw_cfg, dict)
-        and str(_raw_cfg.get("harness", "")) == "databricks_supervisor"
-    )
     raw_llm = raw.get("llm")
     raw_tools = raw.get("tools")
     llm = _parse_llm(raw_llm, expand_env=expand_env)
     interaction = _parse_interaction(raw.get("interaction"))
-    # When the supervisor harness is selected, the top-level
-    # ``tools:`` is a list of typed dicts that lands in
-    # ``ExecutorSpec.supervisor_tools`` (verbatim). Skip the
-    # legacy ToolsConfig path — it expects a mapping and would
-    # otherwise reject a list with a confusing error.
-    if _is_supervisor_harness:
-        tools_config = ToolsConfig()
-    else:
-        tools_config = _parse_tools_config(raw_tools)
-    executor = _parse_executor(raw_executor, raw_tools=raw_tools, expand_env=expand_env)
+    tools_config = _parse_tools_config(raw_tools)
+    executor = _parse_executor(raw_executor, expand_env=expand_env)
     # ── Consolidate llm: → executor ────────────────────────────────
     # ``executor.model`` and ``executor.connection`` are the primary
     # source of truth. When the deprecated ``llm:`` block provides
@@ -417,12 +370,14 @@ def _parse_sandbox_config(
     """
     Parse the ``tools.sandbox`` block from config.yaml.
 
-    Only agent-level settings (``docker_image``) are parsed here.
-    Whether sandboxing is enabled is a runtime decision, not an
-    agent config decision::
+    Accepted settings: ``container_image`` (preferred),
+    ``docker_image`` (deprecated alias), and
+    ``container_runtime``. Whether sandboxing is enabled is a
+    runtime decision, not an agent config decision::
 
         sandbox:
-          docker_image: python:3.12-slim
+          container_image: python:3.12-slim
+          container_runtime: podman  # optional, defaults to docker
 
     :param raw: The raw ``sandbox`` value from the ``tools``
         block. ``None`` means not specified (use defaults).
@@ -430,8 +385,15 @@ def _parse_sandbox_config(
     """
     if raw is None or not isinstance(raw, dict):
         return SandboxConfig()
+    runtime = raw.get("container_runtime", "docker")
+    if runtime not in ("docker", "podman"):
+        raise ValueError(
+            f"Unsupported container_runtime {runtime!r}; expected 'docker' or 'podman'."
+        )
+    image = raw.get("container_image") or raw.get("docker_image")
     return SandboxConfig(
-        docker_image=raw.get("docker_image"),
+        container_image=image,
+        container_runtime=runtime,
     )
 
 
@@ -516,7 +478,6 @@ def _parse_retry(
 def _parse_executor(
     raw: dict[str, Any] | None,
     *,
-    raw_tools: object = None,
     expand_env: bool = True,
 ) -> ExecutorSpec:
     """
@@ -529,24 +490,11 @@ def _parse_executor(
     ``type == "omnigent"`` ALSO mirrors that value into
     ``config["profile"]`` (back-compat — the omnigent executor
     reads ``config["profile"]`` today; will be migrated when the
-    omnigent-compat sunset lands). When
-    ``config["harness"] == "databricks_supervisor"``, parses the *raw_tools*
-    list of typed tool dicts into
-    :attr:`ExecutorSpec.supervisor_tools`.
+    omnigent-compat sunset lands).
 
     :param raw: The raw ``executor:`` mapping, or ``None`` if
         absent. Example: ``{"type": "omnigent"}``.
-    :param raw_tools: The raw top-level ``tools:`` value from
-        config.yaml. Routed into
-        :attr:`ExecutorSpec.supervisor_tools` only when
-        ``config["harness"] == "databricks_supervisor"``; ignored otherwise.
-        Passed in (rather than read from *raw*) because the
-        supervisor's ``tools`` live at the YAML top level
-        alongside ``executor:``, not nested inside it.
     :returns: A populated :class:`ExecutorSpec`.
-    :raises OmnigentError: If the supervisor harness is selected
-        and the ``tools:`` list is malformed (see
-        :func:`_parse_supervisor_tools`).
     """
     if raw is None:
         return ExecutorSpec()
@@ -576,10 +524,6 @@ def _parse_executor(
         profile = str(profile_raw)
     if etype == "omnigent" and profile is not None and "profile" not in config:
         config["profile"] = profile
-    is_supervisor = config.get("harness") == "databricks_supervisor"
-    supervisor_tools = _parse_supervisor_tools(
-        raw_tools, is_supervisor=is_supervisor, expand_env=expand_env
-    )
     raw_cw = raw.get("context_window")
     context_window: int | None = int(raw_cw) if raw_cw is not None else None
     raw_model = raw.get("model")
@@ -603,7 +547,6 @@ def _parse_executor(
         model=model,
         connection=connection,
         context_window=context_window,
-        supervisor_tools=supervisor_tools,
         auth=auth,
     )
 
@@ -686,258 +629,6 @@ def _parse_executor_auth(
         f"executor.auth.type must be 'api_key', 'databricks', or 'provider', got {auth_type!r}",
         code=ErrorCode.INVALID_INPUT,
     )
-
-
-def _parse_supervisor_tools(  # type: ignore[explicit-any]
-    raw_tools: object,
-    *,
-    is_supervisor: bool,
-    expand_env: bool = True,
-) -> list[dict[str, Any]] | None:
-    """
-    Parse the top-level ``tools:`` list for the supervisor harness.
-
-    Returns ``None`` when *is_supervisor* is ``False``. When
-    ``True``, validates that every entry uses the Databricks
-    Supervisor API's nested shape
-    (``{"type": X, X: {<config>}}``), expands ``${VAR}`` references
-    inside the nested sub-dict against the current environment
-    (when *expand_env* is True), and checks that all per-type
-    required fields are present. Each entry round-trips verbatim so
-    the supervisor executor can forward the list to the gateway
-    with no reshaping.
-
-    :param raw_tools: The raw top-level ``tools:`` value from
-        config.yaml. ``None`` is treated as an empty list when
-        *is_supervisor* is ``True``. Example:
-        ``[{"type": "genie_space",
-        "genie_space": {"id": "${GENIE_SPACE_ID}", "description": "..."}}]``.
-    :param is_supervisor: Whether the supervisor harness is
-        selected (``config["harness"] == "databricks_supervisor"``).
-    :param expand_env: When ``True`` (default), expand ``${VAR}``
-        / ``$VAR`` references in nested string values via
-        :func:`expand_env_vars` and fail loud on unresolved refs.
-        When ``False`` (scaffolding / validation paths), skip
-        expansion — the caller is not running the agent for real.
-    :returns: A list of verbatim nested tool dicts when
-        *is_supervisor* is ``True`` (possibly empty);
-        ``None`` otherwise.
-    :raises OmnigentError: If *raw_tools* is not a list, an
-        entry is not a dict, an entry's ``type`` is missing or
-        not in the supported set, the nested ``<type>:`` sub-dict
-        is missing, a required field is missing, or (when
-        *expand_env* is True) a ``${VAR}`` reference cannot be
-        resolved against the environment.
-    """
-    if not is_supervisor:
-        return None
-    if raw_tools is None:
-        return []
-    if not isinstance(raw_tools, list):
-        raise OmnigentError(
-            "tools must be a YAML list when the supervisor harness "
-            f"is selected, got {type(raw_tools).__name__}",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    return [
-        _validate_supervisor_tool_entry(index, entry, expand_env=expand_env)
-        for index, entry in enumerate(raw_tools)
-    ]
-
-
-def _validate_supervisor_tool_entry(  # type: ignore[explicit-any]
-    index: int,
-    entry: object,
-    *,
-    expand_env: bool = True,
-) -> dict[str, Any]:
-    """
-    Validate one entry in the supervisor ``tools:`` list and return
-    its verbatim dict form (with ``${VAR}`` references resolved).
-
-    The real Databricks Supervisor API rejects flat tool entries; it
-    expects each entry to NEST its config under a key matching the
-    declared ``type``::
-
-        {"type": "uc_connection",
-         "uc_connection": {"name": "...", "description": "..."}}
-
-    Validation order:
-
-    1. Outer entry is a mapping with a ``type`` key in the supported
-       set (:func:`_extract_supervisor_tool_type`).
-    2. Nested ``<type>:`` sub-dict is present
-       (:func:`_extract_supervisor_tool_nested`).
-    3. (When *expand_env* is True) ``${VAR}`` / ``$VAR`` references in
-       string values inside the sub-dict are expanded via
-       :func:`expand_env_vars` and unresolved refs fail loud.
-    4. Required fields per type are present
-       (:func:`_check_supervisor_tool_required_fields`) — checked
-       AFTER expansion so a YAML like ``id: ${SET_TO_EMPTY}``
-       triggers the missing-field error rather than silently
-       passing an empty string to the gateway.
-
-    :param index: Position of *entry* in the original ``tools:`` list.
-    :param entry: One element from the parsed YAML list.
-    :param expand_env: Whether to expand ``${VAR}`` references in
-        nested string values. Default ``True``; ``False`` for
-        scaffolding paths.
-    :returns: The validated nested entry, with strings expanded.
-    :raises OmnigentError: On any validation failure.
-    """
-    if not isinstance(entry, dict):
-        raise OmnigentError(
-            f"tools[{index}] must be a YAML mapping when the "
-            f"supervisor harness is selected, got "
-            f"{type(entry).__name__}",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    type_str = _extract_supervisor_tool_type(index, entry)
-    nested = _extract_supervisor_tool_nested(index, entry, type_str)
-    if expand_env:
-        nested = _expand_supervisor_tool_env_vars(index, type_str, nested)
-    _check_supervisor_tool_required_fields(index, type_str, nested)
-    # Round-trip the nested entry verbatim. Stringify only the
-    # outer ``type`` key (it's always a string and we want the
-    # round-trip to be predictable); the inner sub-dict is already
-    # a plain dict thanks to env-expansion above.
-    return {
-        "type": type_str,
-        type_str: dict(nested),
-    }
-
-
-def _expand_supervisor_tool_env_vars(  # type: ignore[explicit-any]
-    index: int,
-    type_str: str,
-    nested: dict[str, Any],
-) -> dict[str, Any]:
-    """
-    Run ``${VAR}`` expansion over the string-valued fields of a
-    supervisor tool's nested config.
-
-    Non-string values (booleans, numbers, nested dicts) pass
-    through unchanged — the expansion convention applies only to
-    strings, which is where the Supervisor API places connector
-    names, IDs, and descriptions.
-
-    :param index: Position in the original ``tools:`` list (for
-        error messages).
-    :param type_str: The validated tool type, e.g. ``"genie_space"``.
-    :param nested: The nested config sub-dict.
-    :returns: A new dict with string values expanded.
-    :raises OmnigentError: If a string value contains an
-        unresolved ``${VAR}`` reference.
-    """
-    string_values = {k: v for k, v in nested.items() if isinstance(v, str)}
-    other_values = {k: v for k, v in nested.items() if not isinstance(v, str)}
-    try:
-        expanded = expand_env_vars(string_values)
-    except OmnigentError as exc:
-        # Decorate the existing message with the offending tool
-        # entry's index/type so the user knows which YAML field
-        # to fix without having to grep for the unresolved var.
-        raise OmnigentError(
-            f"tools[{index}] (type={type_str!r}): {exc}",
-            code=ErrorCode.INVALID_INPUT,
-        ) from exc
-    return {**other_values, **expanded}
-
-
-def _extract_supervisor_tool_type(  # type: ignore[explicit-any]
-    index: int,
-    entry: dict[str, Any],
-) -> str:
-    """
-    Pull and validate the outer ``type`` key on a supervisor tool entry.
-
-    :param index: Position in the original ``tools:`` list (for
-        error messages).
-    :param entry: The entry dict, already known to be a mapping.
-    :returns: The validated type string, guaranteed to be a key
-        in :data:`_SUPERVISOR_TOOL_REQUIRED_FIELDS`.
-    :raises OmnigentError: When ``type`` is missing or unsupported.
-    """
-    supported = sorted(_SUPERVISOR_TOOL_REQUIRED_FIELDS)
-    type_value = entry.get("type")
-    if type_value is None:
-        raise OmnigentError(
-            f"tools[{index}] is missing required key 'type' (must be one of {supported})",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    type_str = str(type_value)
-    if type_str not in _SUPERVISOR_TOOL_REQUIRED_FIELDS:
-        raise OmnigentError(
-            f"tools[{index}].type {type_str!r} is not a "
-            f"supported supervisor tool type — must be one "
-            f"of {supported}",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    return type_str
-
-
-def _extract_supervisor_tool_nested(  # type: ignore[explicit-any]
-    index: int,
-    entry: dict[str, Any],
-    type_str: str,
-) -> dict[str, Any]:
-    """
-    Pull the nested ``<type>:`` sub-dict from a supervisor tool entry.
-
-    The Databricks Supervisor API requires the per-type config to
-    live under a key matching the declared ``type``. Flat shapes
-    (config keys at the entry's top level) are rejected.
-
-    :param index: Position in the original ``tools:`` list.
-    :param entry: The entry dict, already type-validated.
-    :param type_str: The validated type string from
-        :func:`_extract_supervisor_tool_type`.
-    :returns: The nested config dict.
-    :raises OmnigentError: When the nested mapping is missing or
-        not a dict.
-    """
-    nested = entry.get(type_str)
-    if not isinstance(nested, dict):
-        raise OmnigentError(
-            f"tools[{index}] (type={type_str!r}) must include a "
-            f"nested {type_str!r} mapping with the tool's config "
-            f"(the Databricks Supervisor API rejects flat shapes)",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    return nested
-
-
-def _check_supervisor_tool_required_fields(  # type: ignore[explicit-any]
-    index: int,
-    type_str: str,
-    nested: dict[str, Any],
-) -> None:
-    """
-    Validate the per-type required fields on a supervisor tool's
-    nested config.
-
-    Required fields live INSIDE the nested sub-dict in the
-    supervisor's API shape. Treat missing keys and empty/blank
-    values the same — a YAML key like ``id:`` with no value
-    collapses to None and should fail identically to a key omitted
-    entirely.
-
-    :param index: Position in the original ``tools:`` list.
-    :param type_str: The validated type string.
-    :param nested: The nested config dict.
-    :raises OmnigentError: When any required field is missing or
-        has a falsy value.
-    """
-    required = _SUPERVISOR_TOOL_REQUIRED_FIELDS[type_str]
-    missing = sorted(field_name for field_name in required if not nested.get(field_name))
-    if missing:
-        raise OmnigentError(
-            f"tools[{index}] (type={type_str!r}) is missing "
-            f"required field(s) {missing} inside the nested "
-            f"{type_str!r} block; required fields are "
-            f"{sorted(required)}",
-            code=ErrorCode.INVALID_INPUT,
-        )
 
 
 def _parse_os_env(

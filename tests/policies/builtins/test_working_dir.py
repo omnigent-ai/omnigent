@@ -251,6 +251,26 @@ def test_chained_command_gates_the_cd() -> None:
 @pytest.mark.parametrize(
     "command",
     [
+        "echo hi & cd /etc",
+        "cd /etc & echo hi",
+        "ls & cd /etc & pwd",
+    ],
+)
+def test_background_operator_does_not_hide_the_cd(command: str) -> None:
+    """A single ``&`` (background operator) is a command separator too.
+
+    Without splitting on a lone ``&``, ``echo hi & cd /etc`` is one un-split
+    segment whose head is ``echo``, so the ``cd /etc`` slips past the gate —
+    a trivial bypass. Each ``&``-separated sub-command must be evaluated.
+    """
+    policy = block_working_dir_changes()
+    result = policy(_sh(command))
+    assert result is not None and result["result"] == "DENY"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
         'bash -c "cd /etc"',
         '/bin/bash -c "cd /etc"',
         "sh -c 'cd /etc'",

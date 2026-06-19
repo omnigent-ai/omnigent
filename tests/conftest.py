@@ -205,13 +205,12 @@ def pytest_configure(config: pytest.Config) -> None:
 
 
 def _run_test_environment_guardrails(config: pytest.Config) -> None:
-    """Surface test-environment guardrail warnings at session start.
+    """Enforce test-environment guardrails at session start.
 
-    Warn-only: :func:`check_test_environment` logs ``TEST GUARDRAIL:``
-    warnings for anything that looks like a real (non-test) DB or a base
-    URL aimed at a dev/prod host or port, and never raises in this mode.
-    A future PR can flip ``warn_only=False`` to make these hard
-    preconditions — this call site needs no change for that.
+    Hard-fail: :func:`check_test_environment` raises on anything that
+    looks like a real (non-test) DB or a base URL aimed at a dev/prod host
+    or port. Set ``OMNIGENT_DISABLE_TEST_GUARDRAILS=1`` to temporarily
+    downgrade violations to warn-only for deliberate integration runs.
 
     The resolved DB URI mirrors how a run would pick one: an explicit
     ``OMNIGENT_DATABASE_URI`` wins (so pointing the suite at a real DB
@@ -222,7 +221,7 @@ def _run_test_environment_guardrails(config: pytest.Config) -> None:
 
     db_uri = os.environ.get("OMNIGENT_DATABASE_URI") or os.environ.get("MLFLOW_TRACKING_URI", "")
     base_url = config.getoption("--omnigent-server-url", default=None)
-    check_test_environment(db_uri=db_uri, base_url=base_url, warn_only=True)
+    check_test_environment(db_uri=db_uri, base_url=base_url, warn_only=False)
 
 
 def pytest_unconfigure(config: pytest.Config) -> None:

@@ -43,6 +43,7 @@ from omnigent.host.local_server import (
     stop_local_omnigent_server,
     stop_untracked_local_server,
 )
+from omnigent.inner import ui
 from omnigent.onboarding.sandboxes import available_providers as _sandbox_providers
 from omnigent.onboarding.ucode_setup import (
     build_ucode_configure_command,
@@ -56,6 +57,7 @@ if TYPE_CHECKING:
     from omnigent._runner_startup import RunnerStartupProgress
     from omnigent.onboarding.ambient import DetectedProvider
     from omnigent.onboarding.provider_config import ProviderEntry
+    from omnigent.update_check import _InstalledWheelInfo
 
 
 # Any: YAML configs have heterogeneous value types (str, int, list, etc.)
@@ -266,6 +268,8 @@ _LOCAL_DAEMON_ENV_PREFIXES: tuple[str, ...] = (
     "ANTHROPIC_DEFAULT_",
     "AZURE_OPENAI_",
     "DATABRICKS_",
+    "MLFLOW_",
+    "OTEL_",
     "OMNIGENT_",
     "OPENAI_",
 )
@@ -507,7 +511,7 @@ def _resolve_first_run_plan() -> _FirstRunPlan | None:
 
     plan = _pick_first_run_harness()
     if plan is None:
-        click.secho("Found no harnesses configured.", fg="yellow", err=True)
+        ui.warn("Found no harnesses configured.")
         _run_configure_harnesses_interactive()
         plan = _pick_first_run_harness()
     return plan
@@ -1107,7 +1111,34 @@ def _print_version_callback(ctx: click.Context, _param: click.Parameter, value: 
     ctx.exit()
 
 
-@click.group()
+class _OmnigentCLI(click.Group):
+    """Top-level group that prints the brand lockup above its help.
+
+    The Otto + wordmark lockup is drawn on stderr (decoration) and is
+    TTY-gated by :func:`omnigent.inner.ui.show_banner`, so ``omnigent
+    --help`` shows the banner interactively while piped/CI help stays
+    clean. Only the top-level group overrides help; subcommand help
+    (``omnigent run --help``) is untouched.
+    """
+
+    def format_help(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
+        from omnigent.inner import ui
+
+        if ui.show_banner():
+            import importlib.metadata
+
+            try:
+                version = importlib.metadata.version("omnigent")
+            except importlib.metadata.PackageNotFoundError:  # pragma: no cover
+                version = ""
+            epilogue = [("Get started", "omnigent setup")]
+            if version:
+                epilogue.insert(0, ("Version", version))
+            ui.print_landing(tagline="all your agents, one cli", epilogue=epilogue)
+        super().format_help(ctx, formatter)
+
+
+@click.group(cls=_OmnigentCLI)
 @click.option(
     "--version",
     is_flag=True,
@@ -1130,6 +1161,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "claude",
         "codex",
         "config",
+        "cursor",
         "debby",
         "debug",
         "host",
@@ -3376,6 +3408,130 @@ def _wait_for_local_sessions_to_drain() -> None:
             last = count
 
 
+def _drain_and_stop_local_server(*, force: bool) -> None:
+    """Drain (or force-stop) the local server + daemon before an upgrade.
+
+    Shared by both ``omni upgrade`` paths (registry and git): the running
+    process must stop serving BEFORE its code is swapped, so it never serves
+    half-upgraded modules. The next ``omni`` invocation respawns a fresh
+    server on the new version.
+
+    :param force: When ``False``, wait for in-flight sessions to drain first;
+        when ``True``, stop them immediately.
+    """
+    if not force:
+        _wait_for_local_sessions_to_drain()
+    if _stop_local_server_and_daemon(force=force):
+        click.echo("Stopped the background server before upgrading.")
+
+
+def _upgrade_vcs_install(
+    info: _InstalledWheelInfo, *, check_only: bool, force: bool, pre: bool
+) -> None:
+    """Update a git/VCS ``omni`` install by re-pulling its tracked ref.
+
+    A git install's version string is frozen at whatever its source branch
+    declares (e.g. ``0.1.0`` on an unbumped ``main``), so it cannot be
+    compared against PyPI — that comparison reports a build *ahead* of the
+    latest release as "behind" and never converges, because reinstalling the
+    ref can't change the version string. Instead, compare the installed commit
+    against the remote ref's HEAD, and after re-pulling verify the commit
+    actually moved rather than asserting a PyPI version the ref can't produce.
+
+    :param info: Installed-distribution metadata, with ``info.vcs_url`` set.
+    :param check_only: Report status only; exit non-zero only when we can
+        positively confirm the install is behind its tracked ref.
+    :param force: Stop in-flight sessions immediately instead of draining.
+    :param pre: Pass the installer's allow-pre-releases flag (no-op for git).
+    """
+    from omnigent.update_check import (
+        _build_upgrade_suggestion,
+        _probe_installed_distribution,
+        _remote_git_head,
+        _run_upgrade_command,
+    )
+
+    current_sha = info.commit_sha or ""
+    cur_short = current_sha[:9] if current_sha else "unknown"
+    remote_sha = _remote_git_head(info.vcs_url) if info.vcs_url else None
+    remote_short = remote_sha[:9] if remote_sha else ""
+    known_behind = bool(remote_sha and current_sha and remote_sha != current_sha)
+
+    if remote_sha and current_sha and remote_sha == current_sha:
+        click.echo(f"omnigent is up to date (git {cur_short}, tracking {info.vcs_url}).")
+        return
+    if known_behind:
+        click.echo(
+            f"A newer commit is available: {cur_short} → {remote_short} "
+            f"(git install tracking {info.vcs_url})."
+        )
+    else:
+        click.echo(
+            f"This is a git install ({info.vcs_url} @ {cur_short}). The latest "
+            "commit couldn't be determined; re-pulling the tracked ref."
+        )
+
+    if check_only:
+        # Exit non-zero only when we KNOW it's behind, so `--check` stays a
+        # reliable CI gate; an indeterminate remote is not a failure. SystemExit
+        # (not ctx.exit) for the same reason as the PyPI path — main() runs the
+        # group with standalone_mode=False, where ctx.exit's code is dropped.
+        if known_behind:
+            raise SystemExit(1)
+        return
+
+    if pre:
+        # ``--pre`` only steers a PyPI resolve; a git install gets exactly the
+        # commit its ref points at, so say so rather than implying it had effect.
+        click.echo(
+            "Note: --pre has no effect on a git install; the tracked ref decides the commit."
+        )
+
+    suggestion = _build_upgrade_suggestion(info, allow_prerelease=pre)
+    if not suggestion.runnable:
+        raise click.ClickException(
+            f"No automatic upgrade command is known for this install. {suggestion.command}."
+        )
+
+    _drain_and_stop_local_server(force=force)
+
+    console = Console()
+    code = _run_upgrade_command(suggestion.command, console)
+    if code != 0:
+        raise click.ClickException(
+            f"Upgrade command exited with status {code}; your previous install is intact."
+        )
+
+    # Verify by commit, not exit code: a re-pull of a ref that hasn't moved (or
+    # a pinned ref, or a cached reinstall) exits 0 without changing anything.
+    _, new_sha = _probe_installed_distribution()
+    if new_sha and current_sha and new_sha != current_sha:
+        click.echo(
+            f"✓ Updated to git {new_sha[:9]}. Re-run your command — the local "
+            "server will start on the new version."
+        )
+        return
+    if known_behind and new_sha and new_sha == current_sha:
+        # We positively confirmed the ref had advanced, yet the re-pull left the
+        # install on the same commit — a silent no-op that would otherwise
+        # recreate the "still behind" loop. Fail loudly, mirroring the PyPI guard.
+        raise click.ClickException(
+            f"The re-pull ran but the install is still at {cur_short} (the ref is at "
+            f"{remote_short}). The ref may be pinned or the reinstall reused a cached "
+            f"commit; try `uv tool install --reinstall {info.vcs_url}`."
+        )
+    if new_sha and current_sha and new_sha == current_sha:
+        # Remote was indeterminate, so we never claimed it was behind — a
+        # no-change re-pull is fine here.
+        click.echo(
+            f"Already on the latest commit of the tracked ref ({cur_short}); nothing changed."
+        )
+        return
+    # Couldn't read the new commit — the re-pull ran, but don't assert a
+    # result we can't confirm.
+    click.echo("Re-pulled the git ref. Run `omni upgrade --check` to confirm.")
+
+
 @cli.command("upgrade")
 @click.option(
     "--check",
@@ -3420,11 +3576,12 @@ def upgrade(check_only: bool, force: bool, pre: bool) -> None:
     """
     import importlib.metadata
 
-    from packaging.version import InvalidVersion, parse
-
     from omnigent.update_check import (
+        _UPGRADE_INDEX_TIMEOUT_SECONDS,
         _build_upgrade_suggestion,
         _find_repo_root,
+        _is_newer,
+        _probe_installed_distribution,
         _read_installed_wheel_info,
         _run_upgrade_command,
         fetch_latest_version,
@@ -3447,19 +3604,29 @@ def upgrade(check_only: bool, force: bool, pre: bool) -> None:
             "This is an editable install — update it with `git pull`, not `omni upgrade`."
         )
 
+    # A git/VCS install tracks a moving git ref, not a PyPI release. Its
+    # version string (a frozen ``0.1.0`` on an unbumped ``main``, say) is NOT
+    # comparable to the latest PyPI release: comparing them reports a build
+    # that is *ahead* of the release as "behind" and loops forever, because
+    # reinstalling the ref can never change that version string. For these
+    # installs "upgrade" means re-pulling the ref — compared and verified by
+    # commit, not by PyPI version.
+    if info.vcs_url:
+        _upgrade_vcs_install(info, check_only=check_only, force=force, pre=pre)
+        return
+
     current = importlib.metadata.version("omnigent")
-    latest = fetch_latest_version(include_prereleases=pre)
+    # User-initiated: a more forgiving timeout + one retry so a momentarily slow
+    # mirror doesn't spuriously report the index as unreachable.
+    latest = fetch_latest_version(
+        include_prereleases=pre, timeout=_UPGRADE_INDEX_TIMEOUT_SECONDS, attempts=2
+    )
     if latest is None:
         raise click.ClickException(
             "Couldn't reach the package index to check for a newer release. Check your "
             "connection (or OMNIGENT_INDEX_URL / your configured index) and try again."
         )
-    try:
-        is_behind = parse(latest) > parse(current)
-    except InvalidVersion:
-        is_behind = latest != current
-
-    if not is_behind:
+    if not _is_newer(latest, current):
         click.echo(f"omnigent is up to date (v{current}).")
         return
 
@@ -3477,13 +3644,7 @@ def upgrade(check_only: bool, force: bool, pre: bool) -> None:
             f"No automatic upgrade command is known for this install. {suggestion.command}."
         )
 
-    # Drain (or force-stop) the local server + daemon BEFORE swapping the
-    # code, so the running process never serves half-upgraded modules.
-    # The next command respawns a fresh server on the new version.
-    if not force:
-        _wait_for_local_sessions_to_drain()
-    if _stop_local_server_and_daemon(force=force):
-        click.echo("Stopped the background server before upgrading.")
+    _drain_and_stop_local_server(force=force)
 
     console = Console()
     code = _run_upgrade_command(suggestion.command, console)
@@ -3491,9 +3652,32 @@ def upgrade(check_only: bool, force: bool, pre: bool) -> None:
         raise click.ClickException(
             f"Upgrade command exited with status {code}; your previous install is intact."
         )
-    click.echo(
-        f"✓ Upgraded to v{latest}. Re-run your command — the local server will "
-        "start on the new version."
+
+    # Trust the installed version, not the installer's exit code. The running
+    # process still has the OLD version loaded, so re-read it in a fresh
+    # subprocess. A no-op upgrade (version-pinned spec, a cooldown /
+    # exclude-newer that excludes the new release, or a stale index cache)
+    # exits 0 without moving — claiming "✓ Upgraded" there is exactly the
+    # "I upgraded but it still says an update is available" bug.
+    new_version, _ = _probe_installed_distribution()
+    if new_version is None:
+        click.echo(
+            "Ran the upgrade command, but couldn't confirm the installed version. "
+            "Run `omni upgrade --check` to verify."
+        )
+        return
+    if _is_newer(new_version, current):
+        click.echo(
+            f"✓ Upgraded to v{new_version}. Re-run your command — the local "
+            "server will start on the new version."
+        )
+        return
+    raise click.ClickException(
+        f"The upgrade command ran but omnigent is still v{new_version} (expected "
+        f"v{latest}). The install is likely version-pinned, a cooldown / "
+        "exclude-newer is excluding the new release, or the index cache is stale. "
+        "Reinstall it explicitly — e.g. `uv tool upgrade --reinstall omnigent` or "
+        f"`pip install --force-reinstall 'omnigent=={latest}'`."
     )
 
 
@@ -3889,6 +4073,18 @@ _RESUME_PICKER_SENTINEL = "__resume_picker__"
         f"{_CLAUDE_STARTUP_PROFILE_ENV_VAR}=1."
     ),
 )
+@click.option(
+    "--command",
+    "claude_command",
+    default=None,
+    metavar="CMD",
+    help=(
+        "Claude Code CLI executable to run. "
+        "Defaults to ``claude``. Use this when a wrapper binary replaces the "
+        "``claude`` CLI while preserving its interface (e.g. a custom launcher "
+        "that injects auth or environment before delegating to ``claude``)."
+    ),
+)
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
 def claude(
     server: str | None,
@@ -3897,6 +4093,7 @@ def claude(
     register_host: bool,
     use_claude_config: bool,
     profile_startup: bool,
+    claude_command: str | None,
     claude_args: tuple[str, ...],
 ) -> None:
     # Param docs live in comments — Click uses the docstring for --help.
@@ -3969,6 +4166,7 @@ def claude(
         use_claude_config=use_claude_config,
         auto_open_conversation=auto_open_conversation,
         startup_profiler=startup_profiler,
+        **({"command": claude_command} if claude_command else {}),
     )
 
 
@@ -4171,6 +4369,86 @@ def pi(
     )
 
 
+@cli.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+@click.option(
+    "--server",
+    default=None,
+    help=(
+        "Remote omnigent URL. Ensures the host daemon, asks the "
+        "daemon-spawned runner to launch the Cursor TUI, and attaches this TTY. "
+        'Pass --server "" to auto-spawn a persistent local server in the '
+        "background and use that instead of a remote one."
+    ),
+)
+@click.option(
+    "-r",
+    "--resume",
+    "resume",
+    is_flag=False,
+    flag_value=_RESUME_PICKER_SENTINEL,
+    default=None,
+    help=(
+        "Resume a prior Omnigent conversation. With a conversation id "
+        "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
+        "opens an interactive picker scoped to cursor-native sessions."
+    ),
+)
+@click.option(
+    "--session",
+    "session_id",
+    metavar="SESSION_ID",
+    default=None,
+    hidden=True,
+    help="Deprecated alias for ``--resume <id>``; kept for one release.",
+)
+@click.argument("cursor_args", nargs=-1, type=click.UNPROCESSED)
+def cursor(
+    server: str | None,
+    resume: str | None,
+    session_id: str | None,
+    cursor_args: tuple[str, ...],
+) -> None:
+    """Launch the Cursor TUI in an Omnigent terminal.
+
+    \b
+    Examples:
+      omnigent cursor
+      omnigent cursor --resume conv_abc123
+      omnigent cursor --resume                 # interactive picker
+    """
+    choice = _split_resume_value(resume)
+    if session_id is not None and (choice.picker or choice.conversation_id is not None):
+        raise click.UsageError(
+            "--session and --resume are mutually exclusive; "
+            "prefer --resume (--session is deprecated).",
+        )
+
+    from omnigent.cursor_native import run_cursor_native
+
+    cfg = _load_effective_config()
+    if server is None:
+        server = cfg.get("server")
+    auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
+
+    server = _ensure_backend(server)
+    resolved_session_id = (
+        choice.conversation_id if choice.conversation_id is not None else session_id
+    )
+
+    run_cursor_native(
+        server=server,
+        session_id=resolved_session_id,
+        resume_picker=choice.picker,
+        cursor_args=cursor_args,
+        auto_open_conversation=auto_open_conversation,
+    )
+
+
 def _run_bundled_agent(name: str, run_args: tuple[str, ...]) -> None:
     """Forward a bundled-agent subcommand to ``run`` on its packaged path.
 
@@ -4309,7 +4587,7 @@ def resume(
 _HARNESS_CHOICES_HELP = (
     "'claude' (alias for 'claude-sdk'), 'claude-sdk', 'codex', "
     "'cursor', "
-    "'openai-agents', 'open-responses', or 'pi'"
+    "'openai-agents', 'open-responses', 'pi', or 'antigravity'"
 )
 _HARNESS_HELP = f"Harness to use for a local agent: {_HARNESS_CHOICES_HELP}."
 _RUN_HARNESS_HELP = (
@@ -6803,7 +7081,8 @@ def _warn_missing_harness_dependencies() -> None:
     ``codex`` do need both, hence the prominent notice.
 
     :returns: None. Side effect: writes a yellow warning block to stderr
-        via :func:`click.secho` when one or more dependencies are missing.
+        via :mod:`omnigent.inner.ui` when one or more dependencies are
+        missing.
     """
     problems: list[str] = []
     node_problem = _node_dependency_problem()
@@ -6817,20 +7096,16 @@ def _warn_missing_harness_dependencies() -> None:
         )
     if not problems:
         return
-    click.secho(
-        "\n⚠ External tooling needed for some harnesses is missing or outdated:",
-        fg="yellow",
-        bold=True,
-        err=True,
-    )
+    ui.err_console.print()
+    ui.warn("External tooling needed for some harnesses is missing or outdated:")
     for problem in problems:
-        click.secho(f"  • {problem}", fg="yellow", err=True)
-    click.secho(
+        ui.err_console.print(f"  • {problem}", style="omni.warning", markup=False)
+    ui.err_console.print(
         "You can still configure credentials — the pure-Python openai-agents harness "
         "runs without these — but install them before `omnigent claude` / "
         "`omnigent codex` or the Pi harness.\n",
-        fg="yellow",
-        err=True,
+        style="omni.warning",
+        markup=False,
     )
 
 
@@ -7933,6 +8208,63 @@ def _manage_harness_providers(family: str) -> None:
             status = _manage_credential(row.provider, family)
 
 
+def _prompt_install_cursor() -> str | None:
+    """Offer to install the missing ``cursor`` extra; return a status line.
+
+    Shown atop the Cursor drill-in when the optional-extra ``cursor-sdk`` is
+    absent. Three-choice ``select`` like :func:`_prompt_install_antigravity` /
+    :func:`_prompt_install_harness` (install now / set key anyway / show
+    command), but does NOT gate key management on the SDK: the ``cursor:`` key
+    is stored independently and is useful once the SDK lands, so declining falls
+    through to the key menu (whereas ``_prompt_install_harness`` returns to the
+    picker, since pi can't configure credentials without its CLI). Install is
+    portable and index-free — see
+    :func:`omnigent.onboarding.cursor_auth.cursor_install_command`.
+
+    :returns: Status string for the drill-in's transient status line, or
+        ``None`` (set-key-anyway / Esc / printed-command, no actionable result).
+    """
+    from rich.markup import escape as _rich_escape
+
+    from omnigent.onboarding.cursor_auth import (
+        CURSOR_EXTRA_INSTALL_COMMAND,
+        install_cursor_sdk,
+    )
+    from omnigent.onboarding.interactive import console, select
+
+    cmd = CURSOR_EXTRA_INSTALL_COMMAND
+    # ``select`` renders text through Rich markup; escape the literal
+    # ``[cursor]`` so it renders verbatim.
+    cmd_markup = _rich_escape(cmd)
+    choice = select(
+        "Cursor's SDK (cursor-sdk) isn't installed. Install it now?",
+        [
+            f"Install it now ({cmd_markup})",
+            "Set the Cursor key anyway",
+            "I'll run it myself (show the command)",
+        ],
+        descriptions=[
+            f"Runs `{cmd_markup}` (uses uv when available), then continues.",
+            "Skip the install — store the key now; the SDK can be added later.",
+            "Print the command so you can install it yourself, then continue.",
+        ],
+        default=0,
+        clear_on_exit=True,
+    )
+    if choice == 0:
+        console.print(f"  [dim]Installing the cursor extra — running `{cmd_markup}`…[/dim]")
+        if install_cursor_sdk():
+            console.print("  [green]✓ cursor-sdk installed[/green]")
+            return "✓ cursor-sdk installed"
+        console.print(f"  [red]Install failed.[/red] Run it manually: [bold]{cmd_markup}[/bold]")
+        return "✗ Install failed — set the key anyway, or install by hand"
+    if choice == 2:  # run it yourself
+        console.print(f"  Install the cursor extra with:\n    [bold]{cmd_markup}[/bold]")
+        return None
+    # choice == 1 (set key anyway) or Esc: fall through to the key menu silently.
+    return None
+
+
 def _manage_cursor_harness() -> None:
     """Run the level-2 loop for Cursor: manage its ``CURSOR_API_KEY``.
 
@@ -7944,14 +8276,29 @@ def _manage_cursor_harness() -> None:
     harnesses persist their api keys (the secret in the store, a
     ``keychain:``/``env:`` reference in ``~/.omnigent/config.yaml``).
 
-    :returns: None. Side effects: may write the ``cursor:`` block of
-        ``~/.omnigent/config.yaml`` and the secret store.
+    When the optional ``cursor-sdk`` is missing, the drill-in first offers to
+    install it (:func:`_prompt_install_cursor`). Unlike the CLI-backed harnesses
+    (which gate on the CLI), declining still drops into the key menu — the
+    ``cursor:`` key is independently storable. Mirrors Antigravity post-#322.
+
+    :returns: None. Side effects: may install the ``cursor`` extra, and may
+        write the ``cursor:`` block of ``~/.omnigent/config.yaml`` and the
+        secret store.
     """
     from omnigent.onboarding import secrets as secret_store
-    from omnigent.onboarding.cursor_auth import cursor_api_key_configured, cursor_api_key_ref
+    from omnigent.onboarding.cursor_auth import (
+        cursor_api_key_configured,
+        cursor_api_key_ref,
+        cursor_sdk_installed,
+    )
     from omnigent.onboarding.interactive import select
 
+    # Offer the install once on entry (not per loop iteration) when the SDK is
+    # absent; the result seeds the menu's status line. Declining falls through
+    # to key management, since the key is SDK-independent.
     status: str | None = None
+    if not cursor_sdk_installed():
+        status = _prompt_install_cursor()
     while True:
         config = _load_global_config()
         key_set = cursor_api_key_configured(config)
@@ -8006,7 +8353,12 @@ def _set_cursor_api_key() -> str | None:
     )
     from omnigent.onboarding.interactive import prompt_text
 
-    detected = os.environ.get("CURSOR_API_KEY")
+    # Strip surrounding whitespace before validating/forwarding so a key
+    # exported with a trailing newline (a common ``export $(…)`` mishap)
+    # validates and resolves cleanly — matching the pasted-key branch's
+    # ``.strip()`` below and the strip in ``resolve_secret``'s ``env:`` branch.
+    raw_detected = os.environ.get("CURSOR_API_KEY")
+    detected = raw_detected.strip() if raw_detected else None
     if detected and click.confirm(
         "Detected CURSOR_API_KEY in the environment — use it?", default=True
     ):
@@ -8158,13 +8510,14 @@ def _set_antigravity_api_key() -> str | None:
     Offers an existing ``GEMINI_API_KEY`` / ``ANTIGRAVITY_API_KEY`` first
     (recorded as an ``env:`` ref, so the secret stays in the environment), else
     reads it with a hidden prompt and stores it under ``keychain:antigravity``.
-    The ``AIza`` prefix is checked softly (a wrong paste is caught but can be
-    forced). The key is never echoed.
+    The key prefix (``AIza`` or ``AQ``) is checked softly (a wrong paste is
+    caught but can be forced). The key is never echoed.
 
     :returns: A status string for the menu, or ``None`` if the user aborted.
     """
     from omnigent.onboarding import secrets as secret_store
     from omnigent.onboarding.antigravity_auth import (
+        ANTIGRAVITY_API_KEY_PREFIX_HINT,
         ANTIGRAVITY_ENV_VARS,
         ANTIGRAVITY_SECRET_NAME,
         antigravity_api_key_settings,
@@ -8178,7 +8531,9 @@ def _set_antigravity_api_key() -> str | None:
     ):
         detected = os.environ[detected_var]
         if not looks_like_gemini_api_key(detected) and not click.confirm(
-            f"${detected_var} doesn't start with 'AIza'. Use it anyway?", default=False
+            f"${detected_var} doesn't start with {ANTIGRAVITY_API_KEY_PREFIX_HINT}. "
+            "Use it anyway?",
+            default=False,
         ):
             return None
         _save_global_config(antigravity_api_key_settings(f"env:{detected_var}"))
@@ -8188,7 +8543,8 @@ def _set_antigravity_api_key() -> str | None:
     if not pasted:
         return None
     if not looks_like_gemini_api_key(pasted) and not click.confirm(
-        "That doesn't start with 'AIza'. Store it anyway?", default=False
+        f"That doesn't start with {ANTIGRAVITY_API_KEY_PREFIX_HINT}. Store it anyway?",
+        default=False,
     ):
         return None
     secret_store.store_secret(ANTIGRAVITY_SECRET_NAME, pasted)
@@ -8481,7 +8837,11 @@ def _run_configure_harnesses_interactive() -> None:
         antigravity_sdk_installed,
     )
     from omnigent.onboarding.configure_models import family_label
-    from omnigent.onboarding.cursor_auth import cursor_api_key_configured
+    from omnigent.onboarding.cursor_auth import (
+        CURSOR_EXTRA_INSTALL_COMMAND,
+        cursor_api_key_configured,
+        cursor_sdk_installed,
+    )
     from omnigent.onboarding.harness_install import CURSOR_KEY, harness_cli_installed
     from omnigent.onboarding.interactive import select
     from omnigent.onboarding.provider_config import (
@@ -8574,14 +8934,28 @@ def _run_configure_harnesses_interactive() -> None:
         options.append(f"{'  ' if cursor_key_set else '[red]✗[/] '}Cursor")
         selectable.append(True)
         row_target.append(CURSOR_KEY)
-        cursor_sub = (
+        # ``cursor-sdk`` now ships in an OPTIONAL extra, so the key can be set
+        # with no SDK present. When the extra is missing, lead with that gap and
+        # the install command (parallel to Antigravity post-#322), then still
+        # report key status. ``[cursor]`` is escaped — sub-lines render through
+        # Rich markup, where bare brackets parse as a tag.
+        cursor_sub_lines: list[str] = []
+        if not cursor_sdk_installed():
+            from rich.markup import escape as _rich_escape
+
+            cursor_sub_lines.append(
+                f"[dim]not installed — open to install "
+                f"({_rich_escape(CURSOR_EXTRA_INSTALL_COMMAND)})[/]"
+            )
+        cursor_sub_lines.append(
             "[green]✓[/] API key configured"
             if cursor_key_set
             else "[dim]no API key yet — open to add one[/]"
         )
-        options.append(f"  {cursor_sub}")
-        selectable.append(False)
-        row_target.append(None)
+        for cursor_sub in cursor_sub_lines:
+            options.append(f"  {cursor_sub}")
+            selectable.append(False)
+            row_target.append(None)
         # Antigravity (Gemini-native, no provider family): like Cursor, readiness
         # is just whether a Gemini key is configured (``antigravity:`` block or
         # ambient env); its drill-in manages that key. Vertex specs need no key,
@@ -8654,6 +9028,11 @@ def setup(internal_beta: bool) -> None:
     ``omnigent config list``.) Pass ``--internal-beta`` to configure
     Databricks internal-beta defaults and authentication instead.
     """
+    from omnigent.inner import ui
+
+    # Brand lockup at the top of the first-run experience (TTY-gated).
+    ui.print_landing(tagline="all your agents, one cli")
+
     if internal_beta:
         # The internal-beta workspace defaults are excluded from the public OSS
         # build. Fail loud with a clear message instead of an ImportError deep

@@ -20,34 +20,42 @@ required to start the server):
   overwrite it and read back again. No inference; distinct from the
   agent ``sys_os_write`` path.
 
-**LLM-required test**:
+**Mock-LLM tests** (driven by the mock LLM server, no real LLM
+needed):
 
 - ``test_filesystem_changes_appear_after_agent_write``: creates a
   bound session from the workspace-writer bundle, asks it to write a
-  uniquely-named file, then asserts it surfaces in the directory
-  listing with a non-null ``status`` and that its content is readable
-  via the file endpoint.
+  uniquely-named file via a mock ``sys_os_write`` tool call, then
+  asserts it surfaces in the directory listing with a non-null
+  ``status`` and that its content is readable via the file endpoint.
+
+- ``test_diff_endpoint_shows_git_diff_for_modified_file``: asks the
+  agent to overwrite an existing tracked file via a mock
+  ``sys_os_write`` tool call, then asserts the diff endpoint returns
+  the correct ``before`` (git HEAD) and ``after`` (modified) content.
 
 Usage::
 
-    # No-LLM tests only:
     pytest tests/e2e/test_filesystem_changed_files_e2e.py -v
-
-    # Including the LLM test:
-    pytest tests/e2e/test_filesystem_changed_files_e2e.py \\
-        --llm-api-key $LLM_API_KEY -v
 """
 
 from __future__ import annotations
 
+import io
 import json
+import tarfile
 import time
 import uuid
 from pathlib import Path
 
 import httpx
+import yaml
 
-from tests.e2e.conftest import build_agent_bundle
+from tests.e2e.conftest import (
+    build_agent_bundle,
+    configure_mock_llm,
+    reset_mock_llm,
+)
 from tests.e2e.helpers import POLL_INTERVAL_S
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -120,6 +128,7 @@ def _create_bound_session(
     live_runner_id: str,
     databricks_workspace_host: str | None,
     initial_text: str | None = None,
+    mock_llm_server_url: str | None = None,
 ) -> str:
     """
     Create a session-scoped workspace-writer agent and bind the runner.
@@ -131,12 +140,18 @@ def _create_bound_session(
         test suite routes LLM calls through Databricks model serving.
     :param initial_text: Optional first user message to enqueue
         after binding.
+    :param mock_llm_server_url: Mock LLM server URL. When set, injects
+        mock auth into the agent bundle so the executor hits the mock
+        server instead of a real LLM.
     :returns: The created session id.
     """
-    bundle = build_agent_bundle(
-        _WORKSPACE_WRITER_DIR,
-        rewrite_model_for_databricks=databricks_workspace_host is not None,
-    )
+    if mock_llm_server_url is not None:
+        bundle = _build_mock_workspace_writer_bundle(mock_llm_server_url)
+    else:
+        bundle = build_agent_bundle(
+            _WORKSPACE_WRITER_DIR,
+            rewrite_model_for_databricks=databricks_workspace_host is not None,
+        )
     create_resp = client.post(
         "/v1/sessions",
         data={"metadata": json.dumps({})},
@@ -165,6 +180,28 @@ def _create_bound_session(
         event_resp.raise_for_status()
 
     return session_id
+
+
+def _build_mock_workspace_writer_bundle(mock_llm_server_url: str) -> bytes:
+    """Read the on-disk workspace-file-writer YAML, inject mock auth, tarball.
+
+    :param mock_llm_server_url: Mock LLM server base URL.
+    :returns: Gzipped tarball bytes ready for upload.
+    """
+    yaml_path = _WORKSPACE_WRITER_DIR / "workspace-file-writer.yaml"
+    spec = yaml.safe_load(yaml_path.read_text())
+    spec.setdefault("executor", {})["auth"] = {
+        "type": "api_key",
+        "api_key": "mock-key",
+        "base_url": f"{mock_llm_server_url}/v1",
+    }
+    patched = yaml.dump(spec, sort_keys=False).encode()
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        info = tarfile.TarInfo(name="./workspace-file-writer.yaml")
+        info.size = len(patched)
+        tar.addfile(info, io.BytesIO(patched))
+    return buf.getvalue()
 
 
 # ── No-LLM tests ──────────────────────────────────────────────────────────────
@@ -214,7 +251,7 @@ def test_filesystem_user_write_put_round_trip(
     live_runner_id: str,
     databricks_workspace_host: str | None,
 ) -> None:
-    """User PUT write round-trips: create → read-back → overwrite → read-back.
+    """User PUT write round-trips: create -> read-back -> overwrite -> read-back.
 
     Exercises the exact endpoint the web editor's auto-save calls
     (``PUT .../filesystem/{path}`` with ``{content, encoding}``), which is a
@@ -224,24 +261,13 @@ def test_filesystem_user_write_put_round_trip(
     directory), so no repo-tree cleanup is needed.
 
     Steps:
-    1. PUT a brand-new file → ``write_result`` reports ``created=True`` and
+    1. PUT a brand-new file -> ``write_result`` reports ``created=True`` and
        the UTF-8 byte length of the payload.
-    2. GET the file → content matches exactly (proves the bytes were
+    2. GET the file -> content matches exactly (proves the bytes were
        persisted and read back from disk, not echoed from the request).
-    3. PUT again with new content → ``created=False`` (overwrite detected,
+    3. PUT again with new content -> ``created=False`` (overwrite detected,
        the auto-save re-write case) and the new byte count.
-    4. GET → content reflects the overwrite.
-
-    Failure modes this catches:
-    - PUT handler not wiring ``CallerProcessFilesystem.write`` → non-200 or
-      wrong ``created`` flag.
-    - Content not persisted or the read path broken → GET mismatch.
-    - Overwrite mis-detected as a create (or vice versa) → wrong ``created``.
-
-    Change-tracking (the changed-files listing) is a separate subsystem with
-    its own coverage in ``test_filesystem_changes_appear_after_agent_write``;
-    this test deliberately scopes to the write/read contract that auto-save
-    depends on.
+    4. GET -> content reflects the overwrite.
 
     :param http_client: HTTP client pointed at the live server.
     :param live_runner_id: Runner id registered by the live server.
@@ -317,40 +343,62 @@ def test_filesystem_user_write_put_round_trip(
     )
 
 
-# ── LLM-required test ─────────────────────────────────────────────────────────
+# ── Mock-LLM tests ───────────────────────────────────────────────────────────
 
 
 def test_filesystem_changes_appear_after_agent_write(
     http_client: httpx.Client,
     live_runner_id: str,
     databricks_workspace_host: str | None,
+    mock_llm_server_url: str,
 ) -> None:
     """Agent write surfaces in the directory listing with a non-null status.
 
     Full round-trip verification via the resources API:
-    1. Ask the agent to write a uniquely-named file via POST /v1/sessions.
-    2. Extract the session_id from the response.
-    3. Poll GET .../filesystem until the written file appears.
-    4. Assert the file entry has ``status`` in (``"added"``, ``"modified"``).
-    5. Assert the file content is readable via the file endpoint.
-    6. Clean up the written file.
+    1. Configure the mock LLM to return a ``sys_os_write`` tool call
+       followed by a text confirmation.
+    2. Ask the agent to write a uniquely-named file via POST /v1/sessions.
+    3. Extract the session_id from the response.
+    4. Poll GET .../changes until the written file appears.
+    5. Assert the file entry has ``status`` in (``"created"``).
+    6. Assert the file content is readable via the file endpoint.
 
     Failure modes this catches:
-    - Watchdog observer not started (lifespan wiring bug) → listing
+    - Watchdog observer not started (lifespan wiring bug) -> listing
       never shows the file with a non-null status.
-    - File written outside the watched CWD → path never appears in events.
-    - ``_ensure_session_registered`` failing silently → incorrect start
+    - File written outside the watched CWD -> path never appears in events.
+    - ``_ensure_session_registered`` failing silently -> incorrect start
       boundary causes the file to be invisible.
 
     :param http_client: HTTP client pointed at the live server.
     :param live_runner_id: Runner id registered by the live server.
     :param databricks_workspace_host: Workspace host URL when the
         test suite routes LLM calls through Databricks model serving.
+    :param mock_llm_server_url: Mock LLM server URL.
     """
     # Use a UUID suffix so parallel test runs don't collide.
     filename = f"e2e_workspace_test_{uuid.uuid4().hex[:8]}.md"
     file_content = "Hello from the workspace e2e test"
     test_file = _REPO_ROOT / filename
+
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_write_fs",
+                        "name": "sys_os_write",
+                        "arguments": json.dumps({"path": filename, "content": file_content}),
+                    },
+                ],
+            },
+            {"text": "File created successfully."},
+        ],
+        key="default",
+    )
+
     try:
         session_id = _create_bound_session(
             http_client,
@@ -360,6 +408,7 @@ def test_filesystem_changes_appear_after_agent_write(
                 f"Write a file named '{filename}' containing exactly: "
                 f"'{file_content}'. Use sys_os_write."
             ),
+            mock_llm_server_url=mock_llm_server_url,
         )
 
         terminal = _poll_until_session_idle(http_client, session_id, timeout=120)
@@ -436,28 +485,31 @@ def test_diff_endpoint_shows_git_diff_for_modified_file(
     http_client: httpx.Client,
     live_runner_id: str,
     databricks_workspace_host: str | None,
+    mock_llm_server_url: str,
 ) -> None:
     """The diff endpoint returns the git HEAD content as ``before`` and the modified
     content as ``after`` for a file that exists in the git repo.
 
-    Verifies the full round-trip from agent write → diff endpoint → git baseline:
+    Verifies the full round-trip from agent write -> diff endpoint -> git baseline:
 
-    1. Ask the agent to overwrite an existing tracked file via ``sys_os_write``.
+    1. Configure the mock LLM to return a ``sys_os_write`` tool call that
+       overwrites an existing tracked file.
     2. Poll the changes endpoint until the file appears as ``"modified"``.
     3. Call ``GET .../diff/{path}`` and assert:
        - ``before`` equals the committed content from ``git show HEAD:<path>``.
        - ``after`` equals the modified content the agent wrote.
 
     Failure modes this catches:
-    - ``get_baseline`` not wired into the diff endpoint → ``before`` is ``None``
+    - ``get_baseline`` not wired into the diff endpoint -> ``before`` is ``None``
       when it should have content.
-    - ``git show HEAD:<path>`` path construction wrong → ``before`` is ``None``.
-    - ``after`` read path broken → ``after`` is ``None`` or wrong content.
+    - ``git show HEAD:<path>`` path construction wrong -> ``before`` is ``None``.
+    - ``after`` read path broken -> ``after`` is ``None`` or wrong content.
 
     :param http_client: HTTP client pointed at the live server.
     :param live_runner_id: Runner id registered by the live server.
     :param databricks_workspace_host: Workspace host URL when the
         test suite routes LLM calls through Databricks model serving.
+    :param mock_llm_server_url: Mock LLM server URL.
     """
     import subprocess
 
@@ -475,6 +527,24 @@ def test_diff_endpoint_shows_git_diff_for_modified_file(
 
     modified_content = f"modified by e2e diff test {uuid.uuid4().hex[:8]}"
 
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_write_diff",
+                        "name": "sys_os_write",
+                        "arguments": json.dumps({"path": target_rel, "content": modified_content}),
+                    },
+                ],
+            },
+            {"text": "File overwritten successfully."},
+        ],
+        key="default",
+    )
+
     try:
         session_id = _create_bound_session(
             http_client,
@@ -484,6 +554,7 @@ def test_diff_endpoint_shows_git_diff_for_modified_file(
                 f"Overwrite the file '{target_rel}' with exactly this content "
                 f"(no trailing newline): '{modified_content}'. Use sys_os_write."
             ),
+            mock_llm_server_url=mock_llm_server_url,
         )
 
         terminal = _poll_until_session_idle(http_client, session_id, timeout=120)

@@ -109,7 +109,7 @@ def test_harness_supports_model_override_for_plumbed_harnesses(harness: str) -> 
     [
         # No model-override plumbing on the runner path: the persisted
         # value would be silently ignored.
-        "databricks_supervisor",
+        "unknown-harness",
         "totally-unknown",
         None,
     ],

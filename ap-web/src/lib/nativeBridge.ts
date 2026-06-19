@@ -33,6 +33,14 @@ interface ElectronDesktopApi {
   setBadgeCount: (count: number) => void;
   /** Fire an OS notification; resolves true when it was shown. */
   notify: (params: NativeNotifyParams) => Promise<boolean>;
+  // Optional: a shell older than this SPA may lack notification-click routing,
+  // in which case clicking a desktop toast only focuses the window (the prior
+  // behavior) instead of also navigating.
+  /**
+   * Subscribe to OS-notification clicks. The main process sends the in-app
+   * path the notification carried (its `navigatePath`); returns an unsubscribe.
+   */
+  onNotificationActivated?: (callback: (path: string) => void) => () => void;
   // The server-picker trio is optional: the SPA is server-served and may be
   // newer than the installed shell, whose preload then lacks these methods.
   /** Current server origin + recent servers, or null on a foreign page. */
@@ -92,6 +100,13 @@ export interface NativeNotifyParams {
   title: string;
   /** Secondary line, e.g. "Agent finished and is ready for your input." */
   body?: string;
+  /**
+   * In-app path the shell should open when the user clicks this notification,
+   * e.g. `"/c/conv_abc123"`. A click closure can't cross the process boundary,
+   * so we forward the destination as a string and route to it on click via
+   * `onNativeNotificationActivated`. Omitted -> click only focuses the window.
+   */
+  navigatePath?: string;
 }
 
 /**
@@ -102,16 +117,41 @@ export interface NativeNotifyParams {
  * not running under Electron or anything went wrong (so the caller can fall
  * back to the Web Notifications API).
  */
-export async function nativeNotify({ title, body }: NativeNotifyParams): Promise<boolean> {
+export async function nativeNotify({
+  title,
+  body,
+  navigatePath,
+}: NativeNotifyParams): Promise<boolean> {
   const electron = electronApi();
   if (!electron) return false;
   try {
-    return await electron.notify({ title, body });
+    return await electron.notify({ title, body, navigatePath });
   } catch (err) {
     // Only reachable inside the desktop shell. Log rather than swallow so a
     // broken bridge is visible instead of silently dropping notifications.
     console.warn("[nativeBridge] electron notify failed:", err);
     return false;
+  }
+}
+
+/**
+ * Subscribe to native notification clicks from the desktop shell. The shell
+ * fires the in-app path the clicked notification carried (its `navigatePath`),
+ * so the renderer can route to it — restoring the in-browser behavior where
+ * clicking a toast opens its conversation.
+ *
+ * Returns an unsubscribe function. A no-op (returning a no-op unsubscribe)
+ * outside the Electron shell or under a shell too old to support click
+ * routing, so callers can register it unconditionally.
+ */
+export function onNativeNotificationActivated(callback: (path: string) => void): () => void {
+  const electron = electronApi();
+  if (!electron?.onNotificationActivated) return () => {};
+  try {
+    return electron.onNotificationActivated(callback);
+  } catch (err) {
+    console.warn("[nativeBridge] electron onNotificationActivated failed:", err);
+    return () => {};
   }
 }
 

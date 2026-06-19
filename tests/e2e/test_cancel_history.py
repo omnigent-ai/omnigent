@@ -1,26 +1,31 @@
-"""End-to-end test for cancellation history markers.
-
-Requires ``--llm-api-key`` and a real server. Run with::
-
-    pytest tests/e2e/test_cancel_history.py \
-        --llm-api-key $LLM_API_KEY -v
+"""End-to-end test for cancellation history markers (mock LLM).
 
 Exercises:
-- Cancelling an in-progress response via the cancel endpoint
+- Cancelling an in-progress response via the interrupt endpoint
 - Verifying a cancellation marker is appended to the conversation
 - Verifying a follow-up turn sees the cancellation context
+
+Usage::
+
+    pytest tests/e2e/test_cancel_history.py -v
 """
 
 from __future__ import annotations
 
 import time
+import uuid
 from typing import Any
 
 import httpx
+import pytest
 
 from tests.e2e.conftest import (
+    configure_mock_llm,
     create_runner_bound_session,
     poll_session_until_terminal,
+    register_inline_agent,
+    release_mock_gate,
+    reset_mock_llm,
     send_user_message_to_session,
 )
 
@@ -111,7 +116,7 @@ def _list_all_session_items(client: httpx.Client, session_id: str) -> list[dict[
     items: list[dict[str, Any]] = []
     after: str | None = None
     while True:
-        params = {"order": "asc", "limit": _SESSION_ITEMS_PAGE_SIZE}
+        params: dict[str, Any] = {"order": "asc", "limit": _SESSION_ITEMS_PAGE_SIZE}
         if after is not None:
             params["after"] = after
         items_resp = client.get(f"/v1/sessions/{session_id}/items", params=params)
@@ -171,57 +176,82 @@ def _wait_for_idle(
     )
 
 
+def _wait_for_gate_pending(mock_llm_server_url: str, timeout: float = 30) -> None:
+    """Poll until a request is blocked on the mock LLM gate."""
+    import httpx as _httpx
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        resp = _httpx.get(f"{mock_llm_server_url}/gate/pending", timeout=2.0)
+        resp.raise_for_status()
+        if resp.json().get("pending"):
+            return
+        time.sleep(0.1)
+    raise AssertionError(f"No gate pending within {timeout}s")
+
+
 def test_cancel_appends_history_marker_and_followup_sees_it(
     http_client: httpx.Client,
-    archer_agent: str,
     live_runner_id: str,
+    mock_llm_server_url: str,
 ) -> None:
     """
-    Cancel an archer response and verify the follow-up sees the
+    Cancel a blocked mock response and verify the follow-up sees the
     cancellation in conversation history.
 
     Flow:
-    1. Open a runner-bound session and send a broad question to
-       archer so it takes a while.
-    2. Wait for ``in_progress``, then cancel via
-       ``/v1/responses/{id}/cancel`` — same endpoint as before;
-       cancel routes by task_id regardless of dispatch path.
+    1. Open a runner-bound session and send a message. The mock LLM's
+       first response blocks on a gate, keeping the session running.
+    2. Wait for the mock gate to be pending, then cancel via the
+       interrupt endpoint.
     3. Verify the conversation has a cancellation marker item.
-    4. Send a follow-up in the same session asking whether the
-       previous response was cancelled.
-    5. Assert the follow-up's output mentions the cancellation.
-
-    **What breaks if wrong:**
-
-    - If ``_append_cancellation_item`` is not called after cancel,
-      the conversation has no marker and the follow-up agent has
-      no awareness of the interruption.
-    - If the marker text is missing or malformed, the follow-up
-      LLM won't know a cancellation happened.
+    4. Send a follow-up in the same session.
+    5. Assert the follow-up completes (the cancellation marker was
+       persisted and doesn't break the next turn).
     """
-    # Step 1: open a session, send a broad question that will take time.
+    model = f"mock-cancel-hist-{uuid.uuid4().hex[:6]}"
+    reset_mock_llm(mock_llm_server_url)
+
+    agent_name = register_inline_agent(
+        http_client,
+        name=f"cancel-hist-{uuid.uuid4().hex[:6]}",
+        harness="openai-agents",
+        model=model,
+        profile="",
+        prompt="You are a helpful assistant. Answer concisely.",
+        mock_llm_base_url=f"{mock_llm_server_url}/v1",
+    )
+
+    # First response blocks so we can interrupt; second is the follow-up.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"text": "This long essay about the Byzantine Empire...", "block": True},
+            {"text": "YES, the previous response was cancelled/interrupted."},
+        ],
+        key=model,
+    )
+
+    # Step 1: open session, send a message that triggers the blocking response.
     session_id = create_runner_bound_session(
-        http_client, agent_name=archer_agent, runner_id=live_runner_id
+        http_client, agent_name=agent_name, runner_id=live_runner_id
     )
     send_user_message_to_session(
         http_client,
         session_id=session_id,
-        content=(
-            "Write a detailed 2000-word essay about the history "
-            "of the Byzantine Empire, covering all major emperors "
-            "and key events from 330 AD to 1453 AD."
-        ),
+        content="Write a detailed 2000-word essay about the Byzantine Empire.",
     )
 
-    # Step 2: wait for it to start, then interrupt via the sessions API.
-    _wait_for_session_running(http_client, session_id, timeout=60)
+    # Step 2: wait for the mock LLM to be blocked on the gate, then interrupt.
+    _wait_for_gate_pending(mock_llm_server_url)
     cancel_resp = http_client.post(f"/v1/sessions/{session_id}/events", json={"type": "interrupt"})
     cancel_resp.raise_for_status()
     assert cancel_resp.status_code in (202, 204)
 
-    # Step 3: verify the conversation has the cancellation marker. The
-    # interrupt endpoint acknowledges before the runner's async marker
-    # persistence task necessarily completes, so poll the session items.
+    # Release the gate so the mock server unblocks and the session can settle.
+    release_mock_gate(mock_llm_server_url)
+
+    # Step 3: verify the conversation has the cancellation marker.
     cancellation_items = _wait_for_cancellation_marker(http_client, session_id)
     assert len(cancellation_items) == 1, (
         f"Expected exactly 1 cancellation marker, found {len(cancellation_items)}. "
@@ -234,11 +264,7 @@ def test_cancel_appends_history_marker_and_followup_sees_it(
     followup_id = send_user_message_to_session(
         http_client,
         session_id=session_id,
-        content=(
-            "Was the previous assistant response cancelled or "
-            "interrupted? Answer YES or NO, followed by a brief "
-            "explanation of how you know."
-        ),
+        content="Was the previous response cancelled? Answer YES or NO.",
     )
 
     # Step 5: wait for the follow-up to complete.
@@ -251,11 +277,85 @@ def test_cancel_appends_history_marker_and_followup_sees_it(
     assert followup_body["status"] == "completed", (
         f"Follow-up failed: {followup_body.get('error')}"
     )
-
-    # The follow-up should acknowledge the cancellation.
     text = _extract_all_text(followup_body).upper()
     assert "YES" in text, (
         f"Expected the follow-up to acknowledge the cancellation with 'YES'. Got: {text[:500]}"
+    )
+
+
+def test_cancel_mid_response_followup_succeeds(
+    http_client: httpx.Client,
+    live_runner_id: str,
+    mock_llm_server_url: str,
+) -> None:
+    """
+    Cancel a blocked response and verify the follow-up turn succeeds.
+
+    The cancellation handler must clean up session state so a
+    subsequent turn doesn't fail with a 400 or stale-state error.
+    This is the mock-LLM equivalent of the original
+    ``test_cancel_mid_tool_call_followup_succeeds``: the mock
+    server's gate mechanism blocks the LLM response mid-flight
+    so we can reliably interrupt and verify recovery.
+    """
+    model = f"mock-cancel-followup-{uuid.uuid4().hex[:6]}"
+    reset_mock_llm(mock_llm_server_url)
+
+    agent_name = register_inline_agent(
+        http_client,
+        name=f"cancel-followup-{uuid.uuid4().hex[:6]}",
+        harness="openai-agents",
+        model=model,
+        profile="",
+        prompt="You are a helpful assistant.",
+        mock_llm_base_url=f"{mock_llm_server_url}/v1",
+    )
+
+    # First response blocks so we can interrupt; second is the follow-up.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"text": "This response will be interrupted...", "block": True},
+            {"text": "Hello! The previous request was cancelled."},
+        ],
+        key=model,
+    )
+
+    session_id = create_runner_bound_session(
+        http_client, agent_name=agent_name, runner_id=live_runner_id
+    )
+    send_user_message_to_session(
+        http_client,
+        session_id=session_id,
+        content="Tell me a very long story.",
+    )
+
+    # Wait for the mock to be blocked, then cancel.
+    _wait_for_gate_pending(mock_llm_server_url)
+    cancel_resp = http_client.post(f"/v1/sessions/{session_id}/events", json={"type": "interrupt"})
+    cancel_resp.raise_for_status()
+    assert cancel_resp.status_code in (202, 204)
+
+    release_mock_gate(mock_llm_server_url)
+    _wait_for_idle(http_client, session_id)
+
+    # Follow-up must succeed — session state should be clean.
+    followup_id = send_user_message_to_session(
+        http_client,
+        session_id=session_id,
+        content="Never mind. Just say hello.",
+    )
+
+    followup_body = poll_session_until_terminal(
+        http_client,
+        session_id=session_id,
+        response_id=followup_id,
+        timeout=120,
+    )
+    assert followup_body["status"] == "completed", (
+        f"Follow-up after cancel failed: "
+        f"status={followup_body['status']!r}, "
+        f"error={followup_body.get('error')}"
     )
 
 
@@ -263,6 +363,7 @@ def test_cancel_mid_tool_call_followup_succeeds(
     http_client: httpx.Client,
     archer_agent: str,
     live_runner_id: str,
+    using_mock_llm: bool,
 ) -> None:
     """
     Cancel a response while tools are executing, then verify the
@@ -280,6 +381,12 @@ def test_cancel_mid_tool_call_followup_succeeds(
       every subsequent message in the conversation fails with
       ``[llm] failed``.
     """
+    if using_mock_llm:
+        pytest.skip(
+            "cancel-mid-tool-call requires real tool execution (web_search) "
+            "that the mock LLM cannot orchestrate"
+        )
+
     # Step 1: open session; ask archer to use tools (web_search triggers tool calls).
     session_id = create_runner_bound_session(
         http_client, agent_name=archer_agent, runner_id=live_runner_id

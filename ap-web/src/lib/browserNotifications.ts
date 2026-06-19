@@ -55,6 +55,13 @@ export interface ShowNotificationParams {
   tag?: string;
   /** Invoked when the user clicks the notification (after focusing). */
   onClick?: () => void;
+  /**
+   * In-app path to open when the notification is clicked, e.g. `"/c/abc"`.
+   * The browser path runs `onClick` directly; the Electron path can't carry a
+   * JS closure across the process boundary, so it forwards this string to the
+   * shell, which routes to it on click (see `onNativeNotificationActivated`).
+   */
+  navigatePath?: string;
 }
 
 /**
@@ -69,13 +76,16 @@ export function showNotification({
   body,
   tag,
   onClick,
+  navigatePath,
 }: ShowNotificationParams): Notification | null {
   // Desktop shell: hand off to the native OS notification and skip the web
   // toast entirely. `nativeNotify` is async/best-effort; we don't await it
   // (callers treat this function as fire-and-forget) and return null because
-  // no web `Notification` object is created in the native path.
+  // no web `Notification` object is created in the native path. We forward
+  // `navigatePath` (not the `onClick` closure, which can't cross the IPC
+  // boundary) so the shell can route to the conversation on click.
   if (isNativeShell()) {
-    void nativeNotify({ title, body });
+    void nativeNotify({ title, body, navigatePath });
     return null;
   }
   if (!isNotificationSupported() || Notification.permission !== "granted") return null;
