@@ -241,12 +241,69 @@ Implementation follows TDD (red → green → refactor) per the project's skills
 - The Databricks-Apps in-sandbox OAuth flow (auto-skipped via
   `supports_local_port_forward = False`).
 
-## Open verification items (resolve during implementation)
+## Discovery findings (sbx v0.32.0, recorded 2026-06-18)
 
-1. Exact contents of sbx's default `shell` image → which of
-   python3/pip/git/tmux/docker-CLI/Claude-Code must be installed by the setup
-   step.
-2. The git-subdirectory URL form `sbx --kit` / `sbx kit validate` accepts.
-3. Whether local sbx sandboxes have any idle auto-stop (shapes `keep_alive`).
-4. The precise `sbx ls` output / exit behavior used to detect "not logged in"
-   in `prepare`.
+Resolved against a real, logged-in `sbx` during the implementation discovery
+spike. Each item updates the corresponding design assumption.
+
+1. **Default `shell` image contents** — _pending live confirmation_ (the
+   discovery sandbox create is blocked by a host erofs/containerd issue, see
+   item 6). The setup step stays defensive/idempotent regardless: it installs
+   only the missing tools, so whatever the base image already ships simply
+   no-ops.
+2. **Kit reference forms.** `sbx create --kit` takes `strings` (repeatable);
+   accepted forms are a **local directory, ZIP, or OCI** reference. A GitHub
+   `…/tree/<branch>/<subdir>` URL is **rejected** (`sbx kit validate` →
+   "OCI references are not supported"). Documented path for a repo-subdir kit
+   (e.g. the user's `landreville/sbxkit/claude`): clone the repo locally and
+   pass the subdirectory path. Passthrough is verbatim either way.
+3. **Idle auto-stop EXISTS — design change.** The daemon auto-stops a runtime
+   ~30s after its last "sentinel session" disconnects
+   (`auto-stop grace period expired, stopping runtime` in the daemon log). The
+   earlier assumption that local sandboxes never idle-stop is WRONG. Impact:
+   `keep_alive` cannot be a pure no-op, and the host must hold a session open.
+   In practice the bootstrap's `connect` step runs `omnigent host` in the
+   foreground via `sbx exec`, which keeps a session attached for as long as the
+   host runs — so the host stays up while connected. A *disconnected* sandbox
+   will stop and must be restarted; `sbx exec` auto-starts a stopped sandbox
+   ("If the sandbox is stopped, it is started first"), so `run`/`exec_foreground`
+   transparently revive it. `keep_alive` should document the 30s idle-stop
+   (like Modal's lifetime note) rather than claim none exists.
+4. **Login detection.** `sbx ls` exits non-zero with
+   `ERROR: Not authenticated to Docker` / `Sign in with: sbx login` when logged
+   out — the clean signal for `prepare`. (Pre-verified.)
+5. **Default network policy is a prerequisite — new `prepare` check.** Before any
+   sandbox can start, a default network policy must be set, else
+   `sbx create`/start fails with `ERROR: default network policy has not been
+   configured` / `Set a policy with: sbx policy set-default <…>`. `prepare`
+   should detect this and point the user at
+   `sbx policy set-default balanced` (recommended: allows AI services + package
+   registries; use `allow-all` if a custom `--server` host gets blocked). This
+   is host-global one-time setup, not per-sandbox.
+6. **Host blocker — eCryptfs home (environment, not design).** On the dev
+   machine, `sbx create` fails to extract the image with
+   `failed to create prepare snapshot dir: … no space left on device` from the
+   containerd **erofs** snapshotter — and the daemon also fails to write tiny
+   `.lock` files with the same ENOSPC — despite ~116 GB and 27M inodes free.
+   Root cause: `/home/jason` is an **eCryptfs** encrypted home
+   (`/home/.ecryptfs/jason/.Private … type ecryptfs`), and sbx stores its
+   containerd/microVM data under `~/.local/{state,share}/sandboxes`.
+   containerd's overlay/erofs snapshotters do not work on eCryptfs; the failure
+   surfaces as spurious ENOSPC. **Remediation (host side):** relocate sbx's
+   data off the encrypted home onto the non-encrypted root fs — sbx honors the
+   XDG base dirs, so `export XDG_STATE_HOME=/var/tmp/sbx-$USER/state
+   XDG_DATA_HOME=/var/tmp/sbx-$USER/share` (a path on the ext4 `/`, not under
+   `/home/$USER`) before `sbx login` / first `sbx` call is the likely fix; `/tmp`
+   is unsuitable (tmpfs, 16 GB, volatile). This blocks the live image-contents
+   probe (item 1) and the Task 11 end-to-end verification until resolved on the
+   host. It does **not** affect the launcher code, which is fully unit-tested
+   against a mocked `sbx`.
+
+### Confirmed CLI surface (matches the plan's argv assumptions)
+
+- `sbx create [--name N] [--kit REF]… [-t IMG] shell PATH` — `shell` is a valid
+  agent; bind-mounts the host `PATH` as the workspace.
+- `sbx exec [-i] [-t] [-e NAME=VAL]… [-u USER] [-w DIR] SANDBOX CMD…` — flags
+  mirror `docker exec`; auto-starts a stopped sandbox.
+- `sbx cp SRC DST` with one side as `SANDBOX:PATH`.
+- `sbx ls [--json] [-q]`, `sbx rm [-f] SANDBOX…`, `sbx stop SANDBOX…`.

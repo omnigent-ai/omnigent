@@ -569,6 +569,24 @@ def test_provision_wraps_create_failure(
     with pytest.raises(click.ClickException, match="Docker is not running"):
         SbxSandboxLauncher().provision("box")
     assert [c.args[1] for c in fake_sbx.calls] == ["create"]
+
+
+def test_provision_missing_network_policy_gives_remediation(
+    fake_sbx: _FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Discovery finding: sbx refuses to start a sandbox until a default
+    network policy is set. provision rewrites that into a `sbx policy
+    set-default` remediation instead of echoing the raw error.
+    """
+    monkeypatch.chdir(tmp_path)
+    fake_sbx.responses["create"] = _FakeCompleted(
+        args=[],
+        returncode=1,
+        stderr="ERROR: default network policy has not been configured",
+    )
+    with pytest.raises(click.ClickException, match="sbx policy set-default"):
+        SbxSandboxLauncher().provision("box")
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -603,9 +621,19 @@ Add to `SbxSandboxLauncher`:
         click.echo(f"▸ Creating sbx sandbox '{name}' (workspace: {workspace})")
         result = self._run_sbx(args)
         if result.returncode != 0:
-            raise click.ClickException(
-                f"sbx sandbox creation failed: {result.stderr.strip() or result.stdout.strip()}"
-            )
+            detail = result.stderr.strip() or result.stdout.strip()
+            # Discovery finding: sbx refuses to start any sandbox until a
+            # host-global default network policy is set, with a distinctive
+            # message. Rewrite it into a single actionable remediation so the
+            # user isn't left guessing which `sbx policy` invocation to run.
+            if "default network policy" in detail.lower():
+                raise click.ClickException(
+                    "sbx has no default network policy configured. Run "
+                    "`sbx policy set-default balanced` (allows AI services + "
+                    "package registries; use `allow-all` if your --server host "
+                    "gets blocked), then retry."
+                )
+            raise click.ClickException(f"sbx sandbox creation failed: {detail}")
 
         click.echo("  → installing host runtime dependencies")
         setup = self._run_sbx(["exec", "-u", "root", name, "bash", "-lc", _SETUP_COMMAND])
@@ -623,7 +651,7 @@ Add `from pathlib import Path` to the module imports (top of file, with the othe
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/onboarding/sandboxes/test_sbx.py -k provision -v`
-Expected: PASS (3 tests).
+Expected: PASS (4 tests).
 
 - [ ] **Step 5: Commit**
 
@@ -967,8 +995,12 @@ def test_attach_unknown_fails_with_hint(fake_sbx: _FakeSbx) -> None:
         SbxSandboxLauncher().attach("box")
 
 
-def test_keep_alive_is_noop(fake_sbx: _FakeSbx) -> None:
-    """Local sandboxes have no idle-stop, so keep_alive issues no sbx calls."""
+def test_keep_alive_issues_no_sbx_call(fake_sbx: _FakeSbx) -> None:
+    """
+    sbx DOES idle-stop (~30s after the last session disconnects), but
+    there is no disable knob — the foreground `connect` session is what
+    holds the host up — so keep_alive is informational and calls no sbx.
+    """
     SbxSandboxLauncher().keep_alive("box")
     assert fake_sbx.calls == []
 
@@ -1029,13 +1061,23 @@ Add `import json` to the module imports, then add to `SbxSandboxLauncher`:
 
     def keep_alive(self, sandbox_id: str) -> None:
         """
-        No-op: local sbx sandboxes have no cloud idle auto-stop. (If the
-        discovery task found one, document it here like Modal's lifetime
-        note.)
+        Informational: issues no sbx call. Discovery confirmed sbx DOES
+        idle-stop a sandbox ~30s after its last session disconnects, but
+        there is no "disable idle-stop" knob to set here. The host stays
+        up the way it must anyway — the bootstrap's ``connect`` step runs
+        ``omnigent host`` in the FOREGROUND via ``sbx exec``, which holds
+        a session attached for the host's whole lifetime. A sandbox that
+        is merely created but not yet connected may idle-stop; that is
+        harmless because ``sbx exec`` auto-starts a stopped sandbox on the
+        next call (``run`` during ship, ``exec_foreground`` on connect).
 
         :param sandbox_id: Unused; present to satisfy the contract.
         """
-        click.echo("  → sbx sandboxes run locally and do not idle-stop")
+        click.echo(
+            "  → sbx idle-stops a sandbox ~30s after its last session "
+            "disconnects; `connect` holds one open. A stopped sandbox is "
+            "auto-started on the next exec."
+        )
 
     def terminate(self, sandbox_id: str) -> None:
         """
