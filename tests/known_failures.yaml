@@ -35,7 +35,7 @@ skips:
     mode: skip
 
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_subagent_tool_call_ask_tunnels_to_root
-    reason: "Sub-agent ASK does not surface as a tunneled root banner (#763): agent-start/sub-agent ASK is collapsed to DENY (app.py:5328); expect('approval required') times out."
+    reason: "Broken fixture independent of the ASK path: the spawned toolworker sub-agent has no `echo` callable registered (live: 'Tool echo not found in agent Omnigent', 3/3), so the TOOL_CALL ASK never runs — the tool errors before policy matters. Needs the sub-agent local-tool bridge fixed; interactive mid-flight ASK tracked by #765."
     issue: 763
     cluster: repl-policy-ask-surfacing
     mode: skip
@@ -46,17 +46,7 @@ skips:
     cluster: repl-policy-ask-surfacing
     mode: skip
 
-  - id: tests/e2e/test_repl_approval_e2e.py::test_repl_subagent_ask_tunnels_approval_to_root
-    reason: "Sub-agent ASK does not surface as a tunneled root banner (#763): agent-start/sub-agent ASK is collapsed to DENY (app.py:5328); expect('approval required') times out."
-    issue: 763
-    cluster: repl-policy-ask-surfacing
-    mode: skip
 
-  - id: tests/e2e/test_repl_approval_e2e.py::test_repl_tool_result_ask_approve_surfaces_tool_output
-    reason: "TOOL_RESULT ASK is collapsed to DENY by design (runner cannot prompt mid-flight, policy.py:218) -> no interactive banner (#763). The test expects an interactive approve/refuse; needs an owner decision (build mid-flight ASK vs rewrite/delete)."
-    issue: 763
-    cluster: repl-policy-ask-surfacing
-    mode: skip
 
   - id: tests/e2e/omnigent/test_example_secure_research_agent_os_env.py::test_secure_research_agent_os_env_one_shot
     reason: "Secure_research_agent os-env one-shot. Triage pending."
@@ -76,11 +66,6 @@ skips:
     cluster: repl-pexpect-cli
     mode: skip
 
-  - id: tests/e2e/test_repl_approval_e2e.py::test_repl_tool_result_ask_refuse_replaces_output
-    reason: "TOOL_RESULT ASK is collapsed to DENY by design (runner cannot prompt mid-flight, policy.py:218) -> no interactive banner (#763). The test expects an interactive approve/refuse; needs an owner decision (build mid-flight ASK vs rewrite/delete)."
-    issue: 763
-    cluster: repl-policy-ask-surfacing
-    mode: skip
 
   - id: tests/e2e/test_claude_coder_sandbox.py::test_write_blocked_outside_workspace
     reason: "Distinct from the bwrap CLI-path fix (this PR): the claude-sdk Write tool is NOT blocked from creating files outside the workspace, while edit/read/glob enforcement IS (those 4 sandbox tests pass 30/30 in flake-stress run 27796759300). write_blocked fails 30/30 — a real write-path sandbox-enforcement gap. Needs its own fix."
