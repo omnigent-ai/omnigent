@@ -7581,6 +7581,61 @@ def create_runner_app(
             )
         return Response(status_code=204)
 
+    async def _handle_claude_sdk_compact(conv_id: str) -> Response:
+        """
+        Compact a claude-sdk session in place via the harness.
+
+        The claude-sdk harness owns its own context, so — like claude-native
+        injecting ``/compact`` into the tmux pane — explicit compaction must
+        run inside the harness, not as the Omnigent server's transcript-side
+        summary (which can't shrink the SDK's real context and errors when the
+        agent pins no model). Forwards a ``compact`` event to the harness
+        subprocess, which drives the SDK's own ``/compact``
+        (:meth:`ClaudeSDKExecutor.compact_session`).
+
+        Returns 200 (handled — server skips its AP-side compaction) on a
+        successful compaction or when there is no live session to compact;
+        409 when a turn is in flight; 503 on a forward/compaction error.
+        Mirrors the proactive path's ``response.compaction.in_progress`` /
+        ``response.compaction.completed`` SSE so the UI shows the indicator.
+
+        :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        :returns: 200 / 409 / 503 per the outcome above.
+        """
+        if process_manager is None:
+            return Response(status_code=204)
+        _publish_event(
+            conv_id,
+            {"type": "response.compaction.in_progress", "session_id": conv_id},
+        )
+        try:
+            result = await process_manager.forward_compact(conv_id)
+        finally:
+            _publish_event(
+                conv_id,
+                {"type": "response.compaction.completed", "session_id": conv_id},
+            )
+        if result is None:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "claude_sdk_compact_failed", "detail": "harness forward failed"},
+            )
+        out_status = result.get("status")
+        _logger.info("claude-sdk /compact for %s: %s", conv_id, result)
+        if out_status == "busy":
+            return JSONResponse(
+                status_code=409,
+                content={"error": "compact_busy", "detail": "a turn is in flight"},
+            )
+        if out_status == "error":
+            return JSONResponse(
+                status_code=503,
+                content={"error": "claude_sdk_compact_failed", "detail": result.get("error")},
+            )
+        # success / no_session / unsupported: handled in-harness — 200 so the
+        # server does NOT fall back to its (erroring, desyncing) AP-side path.
+        return Response(status_code=200)
+
     async def _handle_claude_native_compact(conv_id: str) -> Response:
         """
         Type ``/compact`` into Claude's tmux pane.
@@ -10513,6 +10568,10 @@ def create_runner_app(
                 return await _handle_claude_native_compact(conversation_id)
             if _session_harness_name(conversation_id) == "codex-native":
                 return await _handle_codex_native_compact(conversation_id)
+            if _session_harness_name(conversation_id) == "claude-sdk":
+                # claude-sdk owns its context: compact in place via the harness
+                # (SDK /compact) rather than the server's transcript-side path.
+                return await _handle_claude_sdk_compact(conversation_id)
             return Response(status_code=204)
 
         if body_type == "cost_approval_popup":

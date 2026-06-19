@@ -44,6 +44,7 @@ from collections.abc import Callable
 from typing import Any
 
 from fastapi import Response
+from fastapi.responses import JSONResponse
 
 from omnigent.inner.executor import (
     Executor,
@@ -525,6 +526,25 @@ class ExecutorAdapter(HarnessApp):
         if self._executor is not None:
             await self._executor.interrupt_session(self._session_key)
         return response
+
+    async def _handle_compact_event(self) -> Response:
+        """Compact the live executor session in place.
+
+        Drives the inner :meth:`Executor.compact_session` (e.g. the Claude
+        Agent SDK's own ``/compact``). Must run between turns — the live
+        client must be idle — so a turn in flight returns ``"busy"`` and no
+        live executor yet returns ``"no_session"``. All outcomes are 200 +
+        JSON (compaction is best-effort, not a turn): the runner reads the
+        ``status`` to decide whether to fall back.
+
+        :returns: 200 with the executor's compact-result JSON.
+        """
+        if self._in_flight:
+            return JSONResponse(status_code=200, content={"status": "busy"})
+        if self._executor is None:
+            return JSONResponse(status_code=200, content={"status": "no_session"})
+        result = await self._executor.compact_session(self._session_key)
+        return JSONResponse(status_code=200, content=result)
 
     async def _watch_injections(self, ctx: TurnContext, executor: Executor) -> None:
         """

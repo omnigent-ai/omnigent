@@ -46,7 +46,7 @@ from dataclasses import dataclass
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, FastAPI, Request, Response, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from omnigent.errors import ErrorCode, OmnigentError
@@ -337,13 +337,36 @@ class PolicyVerdictEvent(BaseModel):
     data: dict[str, Any] | None = None
 
 
+class CompactEvent(BaseModel):
+    """
+    Downward ``compact`` event — compact the live session in place.
+
+    For a harness that owns its own context (e.g. the Claude Agent SDK),
+    the runner forwards this so the harness compacts its real context
+    rather than the runner summarizing only its transcript copy. Runs
+    between turns; the harness reports the outcome in the response body
+    (``status`` ``"success"`` / ``"no_session"`` / ``"unsupported"`` /
+    ``"busy"`` / ``"error"``) so the runner can decide whether to fall
+    back. Best-effort — a no-op outcome is not an error.
+
+    :param type: Event discriminator; always ``"compact"``.
+    """
+
+    type: Literal["compact"]
+
+
 # Discriminated union of every downward event the harness accepts on
 # ``POST /v1/sessions/{conversation_id}/events``. FastAPI / Pydantic
 # v2 dispatches by the ``type`` field at request-validation time;
 # unknown values raise 422 (fail-loud per
 # ``designs/DESIGN_PRINCIPLES.md``).
 InboundEventRequest = Annotated[
-    MessageEvent | InterruptEvent | ToolResultEvent | ApprovalEvent | PolicyVerdictEvent,
+    MessageEvent
+    | InterruptEvent
+    | ToolResultEvent
+    | ApprovalEvent
+    | PolicyVerdictEvent
+    | CompactEvent,
     Field(discriminator="type"),
 ]
 
@@ -1074,6 +1097,8 @@ class HarnessApp:
             )
         if isinstance(body, PolicyVerdictEvent):
             return await self._handle_policy_verdict_event(body)
+        if isinstance(body, CompactEvent):
+            return await self._handle_compact_event()
         # Pydantic's discriminated-union validator should reject
         # unknown variants before we reach this branch; if it ever
         # falls through, fail loud rather than silently no-op.
@@ -1081,6 +1106,21 @@ class HarnessApp:
             f"unsupported inbound event type {type(body).__name__!r}",
             code=ErrorCode.INVALID_INPUT,
         )
+
+    async def _handle_compact_event(self) -> Response:
+        """
+        Apply a :class:`CompactEvent` — compact the live session in place.
+
+        Base behaviour: report the harness has no in-place compaction
+        (``status: "unsupported"``) so the runner falls back to its own
+        transcript-side compaction. Harnesses backed by an executor that
+        owns its context (e.g. :class:`ExecutorAdapter` over the Claude
+        Agent SDK) override this to drive the executor's
+        :meth:`Executor.compact_session`.
+
+        :returns: 200 with a JSON ``{"status": ...}`` body.
+        """
+        return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "unsupported"})
 
     async def _handle_interrupt_event(self) -> Response:
         """

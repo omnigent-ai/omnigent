@@ -148,5 +148,12 @@ class TestSplitTransientTail(unittest.TestCase):
         self.assertEqual(split.transient, [])
 
 
+class TestCompactSessionDefault(unittest.TestCase):
+    def test_default_compact_session_is_unsupported(self):
+        """The base Executor reports no in-place compaction so callers fall back."""
+        result = _run(MockExecutor().compact_session("s1"))
+        self.assertEqual(result, {"status": "unsupported"})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -547,6 +547,23 @@ class Executor:
         """Ask the executor to interrupt a currently running turn, if supported."""
         return False
 
+    async def compact_session(self, session_key: str) -> dict[str, Any]:  # noqa: ARG002 — default no-op; subclasses override to support in-place compaction
+        """
+        Compact a live session's context in place, if supported.
+
+        Executors backed by a harness that owns its own context (e.g. the
+        Claude Agent SDK) should override this to trigger the harness's own
+        compaction — the runner's transcript-side compaction cannot shrink
+        that context. The default reports the capability is absent so callers
+        fall back to runner/server-side compaction.
+
+        :param session_key: The session to compact.
+        :returns: A result dict with ``status`` — ``"unsupported"`` by
+            default; overrides return ``"success"`` (with ``pre_tokens`` /
+            ``post_tokens`` / ``trigger``), ``"no_session"``, or ``"error"``.
+        """
+        return {"status": "unsupported"}
+
     async def enqueue_session_message(self, session_key: str, content: EnqueuedContent) -> bool:  # noqa: ARG002 — default no-op; subclasses override to support live queueing
         """Send a new user message to a live session without interrupting it, if supported."""
         return False

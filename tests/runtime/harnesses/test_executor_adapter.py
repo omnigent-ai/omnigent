@@ -1754,3 +1754,79 @@ async def test_interrupt_drops_inner_session_synchronously() -> None:
         "interrupt must drop the inner session so the next turn rebuilds fresh "
         f"instead of resuming the abandoned generation; got {executor.interrupted!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# CompactEvent → _handle_compact_event → executor.compact_session
+# ---------------------------------------------------------------------------
+
+
+class _CompactStubExecutor:
+    """Executor stub recording compact_session calls for the adapter tests."""
+
+    def __init__(self, result: dict) -> None:
+        self._result = result
+        self.compact_calls: list[str] = []
+
+    async def compact_session(self, session_key: str) -> dict:
+        self.compact_calls.append(session_key)
+        return self._result
+
+    async def close(self) -> None:
+        """Match Executor.close()."""
+
+    async def close_session(self, session_key: str) -> None:
+        """Match Executor.close_session()."""
+        del session_key
+
+
+async def test_handle_compact_event_drives_executor_compact_session() -> None:
+    import json
+
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    stub = _CompactStubExecutor({"status": "success", "pre_tokens": 100, "post_tokens": 10})
+    adapter = ExecutorAdapter(executor_factory=lambda: stub, session_key="s1")
+    adapter._executor = stub  # a turn would normally set this
+    adapter._in_flight = {}
+
+    resp = await adapter._handle_compact_event()
+
+    assert resp.status_code == 200
+    assert json.loads(resp.body) == {"status": "success", "pre_tokens": 100, "post_tokens": 10}
+    # It compacted the adapter's session_key (the key the inner client is under).
+    assert stub.compact_calls == ["s1"]
+
+
+async def test_handle_compact_event_busy_when_turn_in_flight() -> None:
+    import json
+
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    stub = _CompactStubExecutor({"status": "success"})
+    adapter = ExecutorAdapter(executor_factory=lambda: stub, session_key="s1")
+    adapter._executor = stub
+    adapter._in_flight = {"resp_1": object()}  # a turn is running
+
+    resp = await adapter._handle_compact_event()
+
+    assert resp.status_code == 200
+    assert json.loads(resp.body) == {"status": "busy"}
+    assert stub.compact_calls == []  # must NOT compact mid-turn
+
+
+async def test_handle_compact_event_no_session_before_first_turn() -> None:
+    import json
+
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    stub = _CompactStubExecutor({"status": "success"})
+    adapter = ExecutorAdapter(executor_factory=lambda: stub, session_key="s1")
+    adapter._in_flight = {}
+    # adapter._executor is None until a turn runs.
+
+    resp = await adapter._handle_compact_event()
+
+    assert resp.status_code == 200
+    assert json.loads(resp.body) == {"status": "no_session"}
+    assert stub.compact_calls == []

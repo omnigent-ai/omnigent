@@ -810,3 +810,64 @@ async def test_orphan_sweep_escalates_to_sigkill(
 
     assert calls == 2
     assert killed == [(12345, signal.SIGTERM), (12345, signal.SIGKILL)]
+
+
+# ---------------------------------------------------------------------------
+# forward_compact — runner → harness compact forward
+# ---------------------------------------------------------------------------
+
+
+async def test_forward_compact_no_entry_returns_no_session() -> None:
+    """No live harness entry → graceful no_session (runner can fall back)."""
+    mgr = HarnessProcessManager()
+    result = await mgr.forward_compact("conv_missing")
+    assert result == {"status": "no_session"}
+
+
+async def test_forward_compact_posts_event_and_returns_result() -> None:
+    """Posts {"type":"compact"} to the harness and returns its parsed body."""
+    import types
+
+    captured: dict = {}
+
+    class _Resp:
+        status_code = 200
+
+        def json(self) -> dict:
+            return {"status": "success", "pre_tokens": 200, "post_tokens": 20}
+
+    class _Client:
+        async def post(self, url: str, json: dict) -> "_Resp":
+            captured["url"] = url
+            captured["json"] = json
+            return _Resp()
+
+    mgr = HarnessProcessManager()
+    mgr._entries["conv_1"] = types.SimpleNamespace(client=_Client())
+
+    result = await mgr.forward_compact("conv_1")
+
+    assert result == {"status": "success", "pre_tokens": 200, "post_tokens": 20}
+    assert captured["url"] == "/v1/sessions/conv_1/events"
+    assert captured["json"] == {"type": "compact"}
+
+
+async def test_forward_compact_http_error_returns_none() -> None:
+    """A 4xx/5xx from the harness → None (logged; runner treats as failure)."""
+    import types
+
+    class _Resp:
+        status_code = 503
+
+        def json(self) -> dict:  # pragma: no cover - not reached on >=400
+            return {}
+
+    class _Client:
+        async def post(self, url: str, json: dict) -> "_Resp":
+            del url, json
+            return _Resp()
+
+    mgr = HarnessProcessManager()
+    mgr._entries["conv_1"] = types.SimpleNamespace(client=_Client())
+
+    assert await mgr.forward_compact("conv_1") is None

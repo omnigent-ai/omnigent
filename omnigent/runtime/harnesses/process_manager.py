@@ -29,6 +29,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -661,6 +662,64 @@ class HarnessProcessManager:
             )
             return False
         return True
+
+    async def forward_compact(
+        self,
+        conversation_id: str,
+        timeout_s: float = 60.0,
+    ) -> dict[str, Any] | None:
+        """
+        Forward a ``compact`` event to the harness subprocess.
+
+        Sends ``{"type": "compact"}`` to
+        ``POST /v1/sessions/{conversation_id}/events`` so a harness that owns
+        its own context (e.g. the Claude Agent SDK) compacts in place, and
+        returns the harness's result body (``status`` ``"success"`` with
+        ``pre_tokens`` / ``post_tokens``, or ``"no_session"`` /
+        ``"unsupported"`` / ``"busy"`` / ``"error"``).
+
+        Best-effort: no entry registered for this conversation returns
+        ``{"status": "no_session"}`` (the runner can fall back); network /
+        HTTP / parse failures are logged and return ``None``. The timeout is
+        generous because the harness runs a real summarization LLM call.
+
+        :param conversation_id: The Omnigent conversation id whose harness
+            subprocess should compact.
+        :param timeout_s: Max seconds to wait for the harness response.
+        :returns: The harness compact-result dict, or ``None`` on transport
+            error.
+        """
+        async with self._registry_lock:
+            entry = self._entries.get(conversation_id)
+        if entry is None:
+            # No live harness (e.g. default-LLM agent, or not yet spawned).
+            return {"status": "no_session"}
+        try:
+            compact_url = f"/v1/sessions/{conversation_id}/events"
+            resp = await asyncio.wait_for(
+                entry.client.post(compact_url, json={"type": "compact"}),
+                timeout=timeout_s,
+            )
+        except (httpx.HTTPError, asyncio.TimeoutError):
+            _logger.exception(
+                "harness compact forward failed: conversation_id=%s", conversation_id
+            )
+            return None
+        if resp.status_code >= 400:
+            _logger.warning(
+                "harness compact returned %d for conversation_id=%s",
+                resp.status_code,
+                conversation_id,
+            )
+            return None
+        try:
+            return resp.json()
+        except (ValueError, RuntimeError):
+            _logger.exception(
+                "harness compact response parse failed: conversation_id=%s",
+                conversation_id,
+            )
+            return None
 
     def has_session(self, conversation_id: str) -> bool:
         """
