@@ -16,6 +16,9 @@ import type { Conversation } from "@/hooks/useConversations";
 vi.mock("@/hooks/useConversations", () => ({
   useConversations: vi.fn(),
   useArchiveConversation: () => ({ mutate: vi.fn() }),
+  useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useConnectedConversations: () => [],
   useStopAndDeleteConversation: () => ({ mutate: vi.fn() }),
   usePinnedConversationBackfill: () => [],

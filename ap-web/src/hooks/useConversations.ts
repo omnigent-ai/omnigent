@@ -434,6 +434,126 @@ export function useStopSession() {
 }
 
 /**
+ * Archive multiple conversations in parallel via `PATCH /v1/sessions/{id}`.
+ *
+ * Each session is archived independently — individual failures don't
+ * block the rest. The conversations list is invalidated once on
+ * completion so the sidebar refreshes. Returns an array of session IDs
+ * that failed.
+ */
+export function useBulkArchiveConversations() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ ids, archived }: { ids: string[]; archived: boolean }) => {
+      const results = await Promise.allSettled(ids.map((id) => archiveConversation(id, archived)));
+      const failed: string[] = [];
+      for (let i = 0; i < results.length; i++) {
+        if (results[i].status === "rejected") failed.push(ids[i]);
+        else
+          markConversationSeen(
+            ids[i],
+            (results[i] as PromiseFulfilledResult<Conversation>).value.updated_at,
+          );
+      }
+      if (failed.length > 0) throw { failed, total: ids.length };
+      return results
+        .filter((r): r is PromiseFulfilledResult<Conversation> => r.status === "fulfilled")
+        .map((r) => r.value);
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+    },
+  });
+}
+
+/**
+ * Delete multiple conversations in parallel (stop + delete each).
+ *
+ * Each session is stopped (best-effort) then deleted independently.
+ * The conversations list cache is patched to remove successful
+ * deletions. Returns an array of session IDs that failed.
+ */
+export function useBulkDeleteConversations() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (ids: string[]) => {
+      const results = await Promise.allSettled(
+        ids.map(async (id) => {
+          try {
+            await stopSession(id);
+          } catch {
+            // Best-effort stop
+          }
+          await deleteConversation(id);
+        }),
+      );
+      const succeeded: string[] = [];
+      const failed: string[] = [];
+      for (let i = 0; i < results.length; i++) {
+        if (results[i].status === "fulfilled") succeeded.push(ids[i]);
+        else failed.push(ids[i]);
+      }
+      if (failed.length > 0) throw { failed, succeeded, total: ids.length };
+      return { succeeded, failed };
+    },
+    onSuccess: (_data, ids) => {
+      const idSet = new Set(ids);
+      for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+        queryKey: ["conversations"],
+      })) {
+        const { data: next, removed } = removeIdsFromPages(data, idSet);
+        if (removed) queryClient.setQueryData(key, next);
+      }
+      for (const id of ids) {
+        queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
+        queryClient.removeQueries({ queryKey: ["session", id] });
+      }
+    },
+    onError: (err: any) => {
+      if (err?.succeeded) {
+        const idSet = new Set(err.succeeded as string[]);
+        for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+          queryKey: ["conversations"],
+        })) {
+          const { data: next, removed } = removeIdsFromPages(data, idSet);
+          if (removed) queryClient.setQueryData(key, next);
+        }
+        for (const id of err.succeeded) {
+          queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
+          queryClient.removeQueries({ queryKey: ["session", id] });
+        }
+      }
+    },
+  });
+}
+
+/**
+ * Stop multiple live sessions in parallel.
+ *
+ * Each session is stopped independently — individual failures don't
+ * block the rest. Returns arrays of succeeded/failed IDs.
+ */
+export function useBulkStopSessions() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (ids: string[]) => {
+      const results = await Promise.allSettled(ids.map((id) => stopSession(id)));
+      const succeeded: string[] = [];
+      const failed: string[] = [];
+      for (let i = 0; i < results.length; i++) {
+        if (results[i].status === "fulfilled") succeeded.push(ids[i]);
+        else failed.push(ids[i]);
+      }
+      if (failed.length > 0) throw { failed, succeeded, total: ids.length };
+      return { succeeded, failed };
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+    },
+  });
+}
+
+/**
  * Fetch pinned sessions that aren't present in the loaded paginated
  * data. Returns the backfilled conversations so the caller can merge
  * them into the list before grouping.
