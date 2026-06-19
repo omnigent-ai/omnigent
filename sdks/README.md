@@ -9,14 +9,13 @@ sdks/
   python-client/           # Headless HTTP/SSE client
     pyproject.toml
     omnigent_client/    # import omnigent_client
-  frontend/                # Terminal UI layer (Rich + prompt_toolkit)
+  ui/                      # Terminal UI layer (Rich + prompt_toolkit)
     pyproject.toml
     omnigent_ui_sdk/    # import omnigent_ui_sdk
       terminal/
 ```
 
-Claude Code skills for SDK development live in the top-level `skills/`
-directory (e.g. `skills/repl-sdk/`).
+Claude Code skills for SDK development live under `.claude/skills/`.
 
 ## `omnigent_client` — the headless client
 
@@ -96,7 +95,7 @@ Provides:
 ### Install
 
 ```bash
-pip install -e sdks/frontend
+pip install -e sdks/ui
 ```
 
 (Pulls in `omnigent-client` as a dependency.)
@@ -166,10 +165,3 @@ stream = pipe(
 The built-in REPL at `omnigent/repl/` demonstrates all features:
 streaming, tool calls, reasoning, slash commands, conversation
 switching, elapsed timer. See `omnigent/repl/_repl.py`.
-
-## Design Documents
-
-- `designs/CLIENT_AND_REPL.md` — client library + REPL design
-- `designs/STREAM_RENDERER.md` — block stream design
-- `designs/FRONTEND_SDK_LAYERS.md` — three-layer architecture
-- `designs/FRONTEND_SDK_V2.md` — blocks with context, transforms
