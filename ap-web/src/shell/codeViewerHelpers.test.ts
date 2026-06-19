@@ -225,6 +225,16 @@ describe("prepareHtmlPreviewDoc", () => {
     expect(twice.match(/<base target="_blank">/g)).toHaveLength(1);
   });
 
+  it("still injects a real base when the literal base string only appears in content", () => {
+    // Regression: a loose `html.includes(baseTag)` idempotency check wrongly
+    // skipped injection for content that merely *mentions* the string (e.g. a
+    // comment or code sample), leaving links to navigate the preview in place
+    // instead of opening a new tab. The base must still land in <head>.
+    const html = '<html><head></head><body><!-- <base target="_blank"> --></body></html>';
+    const out = prepareHtmlPreviewDoc(html);
+    expect(out).toContain(`<head>${BASE}</head>`);
+  });
+
   it("documents the matcher limitation: a <head> literal in earlier markup is matched textually", () => {
     // A simple regex (not a full parser) matches the first <head> string, even
     // inside a comment. This only mis-places the harmless base tag inside the

@@ -240,20 +240,23 @@ export const HTML_PREVIEW_SANDBOX =
 export function prepareHtmlPreviewDoc(html: string): string {
   const baseTag = '<base target="_blank">';
 
-  // Idempotency guard: if our base tag is already present (e.g. content was
-  // accidentally prepared twice), don't inject a second one. The current call
-  // graph always passes raw content, but this keeps the function safe to
-  // double-call.
-  if (html.includes(baseTag)) return html;
-
   const headMatch = html.match(/<head[^>]*>/i);
   if (headMatch?.index !== undefined) {
     const insertAt = headMatch.index + headMatch[0].length;
+    // Idempotency guard, scoped to the actual injection point: only skip if our
+    // base tag is ALREADY right after <head> (i.e. content was prepared twice).
+    // We must NOT use a loose `html.includes(baseTag)` — the literal string can
+    // legitimately appear elsewhere in artifact content (a comment, a code
+    // sample), and skipping injection there would leave the document with no
+    // real <base>, so links navigate the preview in place instead of opening a
+    // new tab.
+    if (html.startsWith(baseTag, insertAt)) return html;
     return html.slice(0, insertAt) + baseTag + html.slice(insertAt);
   }
 
   // No <head>: create one right after <html> so the base still lands inside the
-  // document head (after the doctype, preserving standards mode).
+  // document head (after the doctype, preserving standards mode). A second pass
+  // matches the <head> we created above, so this path is idempotent too.
   const htmlMatch = html.match(/<html[^>]*>/i);
   if (htmlMatch?.index !== undefined) {
     const insertAt = htmlMatch.index + htmlMatch[0].length;
@@ -262,6 +265,7 @@ export function prepareHtmlPreviewDoc(html: string): string {
 
   // Bare fragment (no <html>/<head>, hence no doctype to displace) — the browser
   // wraps it in an implicit head, so a leading base tag is safe.
+  if (html.startsWith(baseTag)) return html;
   return baseTag + html;
 }
 
