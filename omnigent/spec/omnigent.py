@@ -1098,6 +1098,20 @@ def agent_def_to_agent_spec(
             )
             agent_tool_names.append(tool_name)
         elif isinstance(tool, AgentTool):
+            # Extract the raw executor dict for this tool so auth.base_url
+            # (and other raw-YAML-only fields like use_responses) propagate
+            # into the child spec. The omnigent AgentTool dataclass does not
+            # model auth, so parsing silently drops it; reading back from the
+            # raw YAML dict is the only way to recover it.
+            raw_tool_executor: dict[str, Any] | None = None
+            if raw_yaml is not None:
+                raw_tools = raw_yaml.get("tools")
+                if isinstance(raw_tools, dict):
+                    raw_tool = raw_tools.get(tool_name)
+                    if isinstance(raw_tool, dict):
+                        _candidate = raw_tool.get("executor")
+                        if isinstance(_candidate, dict):
+                            raw_tool_executor = _candidate
             sub_agents.append(
                 _agent_tool_to_sub_spec(
                     tool_name,
@@ -1112,6 +1126,7 @@ def agent_def_to_agent_spec(
                     # "supervisor delegates terminal work to
                     # workers" pattern.
                     parent_terminals=agent_def.terminals,
+                    raw_executor=raw_tool_executor,
                 ),
             )
             agent_tool_names.append(tool_name)
@@ -1316,6 +1331,7 @@ def _agent_tool_to_sub_spec(
     parent_harness: str | None = None,
     parent_os_env: OSEnvSpec | None = None,
     parent_terminals: dict[str, TerminalEnvSpec] | None = None,
+    raw_executor: dict[str, Any] | None = None,
 ) -> AgentSpec:
     """
     Translate an omnigent inline :class:`AgentTool` (sub-agent
@@ -1367,6 +1383,17 @@ def _agent_tool_to_sub_spec(
         resolved os_env is also ``None`` and the sub-agent boots
         without filesystem access (matching legacy behavior when
         the parent itself has no os_env).
+    :param raw_executor: The raw ``executor:`` dict for this inline
+        AgentTool taken directly from the parent's YAML (before
+        omnigent' dataclass parsing dropped unknown keys). When set,
+        fields the omnigent :class:`~omnigent.inner.datamodel.ExecutorSpec`
+        datamodel does not expose — ``auth`` and ``use_responses`` —
+        are read from this dict and forwarded into the child's
+        :class:`ExecutorSpec` via :func:`_translate_executor_from_def`.
+        Without this, an ``executor.auth`` block declared on an inline
+        AgentTool is silently ignored, causing child sub-agents to fall
+        back to the ambient ``OPENAI_BASE_URL`` rather than the explicitly
+        declared mock/gateway URL.
     :returns: A nested :class:`AgentSpec` representing the
         sub-agent.
     """
@@ -1425,6 +1452,7 @@ def _agent_tool_to_sub_spec(
             oa_executor,
             parent_profile=parent_profile,
             parent_harness=parent_harness,
+            raw_executor=raw_executor,
         ),
         os_env=sub_os_env,
         terminals=sub_terminals,
