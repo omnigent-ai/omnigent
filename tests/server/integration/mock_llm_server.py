@@ -157,6 +157,49 @@ def sse_text_response(text: str, model: str = "mock-model") -> str:
     return "".join(events)
 
 
+def json_text_response(text: str, model: str = "mock-model") -> dict:
+    """
+    Build a non-streaming Responses API JSON body for a text response.
+
+    Used when the request does NOT include ``stream: true`` — for example,
+    the cost-advisor judge calls ``responses.create`` without streaming and
+    the OpenAI adapter calls ``_send_request`` which expects a plain JSON dict.
+
+    :param text: The assistant response text.
+    :param model: Model name to include in the response.
+    :returns: Responses API response dict.
+    """
+    resp_id = _response_id()
+    msg_id = f"msg_{resp_id}"
+    output_tokens = max(5, len(text.split()))
+    now = _time_mod.time()
+    return {
+        "id": resp_id,
+        "object": "response",
+        "status": "completed",
+        "model": model,
+        "output": [
+            {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": text}],
+            }
+        ],
+        "parallel_tool_calls": True,
+        "tools": [],
+        "tool_choice": "auto",
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": output_tokens,
+            "total_tokens": 10 + output_tokens,
+        },
+        "created_at": now,
+        "completed_at": now,
+    }
+
+
 def sse_tool_call_response(
     tool_calls: list[dict[str, str]],
     model: str = "mock-model",
@@ -607,6 +650,19 @@ async def create_response(
         qr._pending.set()
         _state.pending_gates.append(qr)
         await qr._gate.wait()
+
+    # When the request does not include ``stream: true``, return a plain
+    # JSON body (non-streaming Responses API format).  This supports callers
+    # like the cost-advisor judge that call ``responses.create`` without
+    # streaming and use ``_send_request`` which calls ``resp.json()``.
+    # Tool-call responses and native-item responses are streaming-only; fall
+    # through to SSE for those.
+    is_streaming = isinstance(parsed, dict) and parsed.get("stream")
+    if not is_streaming and not qr.tool_calls and not qr.native_items:
+        model_name = (
+            parsed.get("model", "mock-model") if isinstance(parsed, dict) else "mock-model"
+        )
+        return JSONResponse(content=json_text_response(qr.text or "", model=model_name))
 
     # Build SSE body
     if qr.tool_calls:
