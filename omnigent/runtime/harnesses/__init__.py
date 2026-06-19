@@ -67,6 +67,12 @@ _HARNESS_MODULES: dict[str, str] = {
     # back — a native-CLI harness like claude/codex/pi-native, so it IS in
     # ``NATIVE_HARNESSES``. See omnigent/inner/cursor_native_harness.py.
     "cursor-native": "omnigent.inner.cursor_native_harness",
+    # goose-native harness wrap. Drives the resident ``goose session`` TUI by
+    # injecting each web-UI turn into its tmux pane and mirroring the transcript
+    # back from Goose's SQLite session store — a native-CLI harness like
+    # cursor-native, so it IS in ``NATIVE_HARNESSES``. See
+    # omnigent/inner/goose_native_harness.py.
+    "goose-native": "omnigent.inner.goose_native_harness",
     # Google Antigravity SDK harness wrap. See
     # omnigent/inner/antigravity_harness.py. In-process SDK harness
     # (``google-antigravity``), like openai-agents — Omnigent spawns no CLI

@@ -53,3 +53,7 @@ PI_NATIVE_WRAPPER_VALUE = "pi-native-ui"
 # Value the ``omnigent cursor`` wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 CURSOR_NATIVE_WRAPPER_VALUE = "cursor-native-ui"
+
+# Value the ``omnigent goose`` wrapper writes into
+# ``conversations.labels[WRAPPER_LABEL_KEY]``.
+GOOSE_NATIVE_WRAPPER_VALUE = "goose-native-ui"
