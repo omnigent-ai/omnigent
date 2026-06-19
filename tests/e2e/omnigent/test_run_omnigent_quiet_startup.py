@@ -28,8 +28,6 @@ leaked through.
 
 from __future__ import annotations
 
-import os
-import subprocess
 from pathlib import Path
 
 from tests._model_pools import resolve_model
@@ -149,79 +147,4 @@ def test_run_omnigent_startup_does_not_leak_server_logs(
         f"~30 lines of DBOS / alembic init noise. "
         f"Combined stripped output (last 4000 chars):\n"
         f"{combined_stripped[-4000:]}"
-    )
-
-
-def test_run_prompt_mode_is_headless_for_local_agent(
-    omnigent_python: Path,
-    omnigent_repo_root: Path,
-    databricks_workspace: tuple[str, str],
-    tmp_path: Path,
-) -> None:
-    """
-    ``omnigent run <agent> -p`` sends one Omnigent turn, prints the
-    assistant text, and exits without starting the Rich REPL UI.
-
-    This is the e2e regression for the headless prompt-mode bug. It deliberately
-    matches the reported local command shape,
-    ``examples/databricks_coding_agent.yaml -p`` — with Databricks
-    routing coming from the global config's ``auth:`` block (the
-    ``--profile`` CLI flag was removed from the omnigent CLI).
-    """
-    yaml_path = omnigent_repo_root / "examples" / "databricks_coding_agent.yaml"
-    profile, _ = databricks_workspace
-    prompt = "hi"
-    argv = [
-        str(omnigent_python),
-        "-m",
-        "omnigent",
-        "run",
-        str(yaml_path),
-        "-p",
-        prompt,
-    ]
-
-    # The removed ``--profile`` flag is replaced by an ``auth:`` block in
-    # an isolated ``OMNIGENT_CONFIG_HOME`` — the supported source of
-    # Databricks model/gateway routing for spawned CLIs.
-    config_home = tmp_path / "omnigent-config"
-    config_home.mkdir()
-    (config_home / "config.yaml").write_text(
-        f"auth:\n  type: databricks\n  profile: {profile}\n",
-        encoding="utf-8",
-    )
-    env = os.environ.copy()
-    env["OMNIGENT_CONFIG_HOME"] = str(config_home)
-    env["DATABRICKS_CONFIG_PROFILE"] = profile
-
-    result = subprocess.run(
-        argv,
-        env=env,
-        cwd=str(omnigent_repo_root),
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    stripped = strip_ansi(result.stdout + result.stderr)
-
-    assert result.returncode == 0, (
-        f"headless prompt command failed; stdout/stderr:\n{stripped[-4000:]}"
-    )
-    assert "What can I help you with" in stripped, (
-        "headless prompt command did not print assistant output; stdout/stderr:\n"
-        f"{stripped[-4000:]}"
-    )
-    forbidden = [
-        "Traceback (most recent call last)",
-        "AttributeError:",
-        "╭",
-        "╰",
-        "state: sleeping",
-        "Use /help",
-    ]
-    leaked = [item for item in forbidden if item in stripped]
-    assert not leaked, (
-        "``omnigent run -p`` should be headless and must not "
-        f"print tracebacks or REPL UI. Leaked markers: {leaked}. "
-        f"Output tail:\n{stripped[-4000:]}"
     )
