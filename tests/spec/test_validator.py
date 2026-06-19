@@ -583,8 +583,11 @@ def test_os_env_egress_rules_requires_hard_enforcing_backend() -> None:
     assert not result.valid
     matches = [e for e in result.errors if e.path == "os_env.sandbox.egress_rules"]
     assert matches, f"expected egress_rules error, got: {result.errors}"
-    assert "linux_bwrap" in matches[0].message
-    assert "darwin_seatbelt" in matches[0].message
+    message = matches[0].message
+    assert "linux_bwrap" in message
+    assert "darwin_seatbelt" in message
+    assert "Fix:" in message
+    assert "do not use sandbox.type=none with egress_rules" in message
 
 
 def test_os_env_egress_rules_accepted_for_bwrap() -> None:

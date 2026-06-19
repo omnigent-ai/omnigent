@@ -21,11 +21,12 @@
 #
 # To add: append a `- id: ... reason: ... issue: ...` block.
 # To remove: delete the block. (`pytest_collection_modifyitems`
-# emits a warning at session start for any entry whose `id`
-# doesn't match a collected test, so stale entries surface.)
+# emits a warning at session start for in-scope entries whose
+# `id` doesn't match a collected test, so stale entries surface
+# during full/default collection without noisy focused-run warnings.)
 #
-# Note: entries here apply to every pytest invocation. If you
-# want to debug a skipped test locally, comment out its block.
+# Note: entries here apply whenever the matching test is collected.
+# If you want to debug a skipped test locally, comment out its block.
 skips:
 
   - id: tests/e2e/omnigent/test_run_harness_without_agent_e2e.py::test_run_harness_without_agent_live_repl_round_trip[claude-sdk]

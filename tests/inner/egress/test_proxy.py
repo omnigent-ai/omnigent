@@ -234,6 +234,36 @@ async def test_s2_assert_destination_blocks_loopback_by_default(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ip",
+    [
+        "10.0.0.5",
+        "172.16.0.5",
+        "192.168.1.10",
+        "169.254.169.254",
+        "::1",
+        "fd00::1",
+    ],
+)
+async def test_s2_assert_destination_blocks_private_and_link_local_ranges(
+    ca_paths: tuple[Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    ip: str,
+) -> None:
+    """Private, loopback, link-local, and ULA destinations remain
+    blocked by default even when the hostname matches an egress rule.
+    """
+    cert_path, key_path, _ = ca_paths
+    proxy = EgressProxy(parse_rules(["GET *.example.com/**"]), cert_path, key_path)
+
+    loop = asyncio.get_event_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", _stub_getaddrinfo_to(ip))
+
+    with pytest.raises(PermissionError, match=ip.replace(".", r"\.")):
+        await proxy._assert_destination_allowed("trap.example.com", 443)
+
+
+@pytest.mark.asyncio
 async def test_s2_assert_destination_blocks_cgnat_alibaba_imds(
     ca_paths: tuple[Path, Path, Path],
     monkeypatch: pytest.MonkeyPatch,

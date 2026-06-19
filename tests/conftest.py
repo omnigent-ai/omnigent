@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import warnings
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 
@@ -78,6 +79,78 @@ def _load_known_failures() -> dict[str, dict[str, Any]]:
 _KNOWN_FAILURES: dict[str, dict[str, Any]] = _load_known_failures()
 
 
+def _nodeid_path(nodeid: str) -> str:
+    return nodeid.split("::", 1)[0]
+
+
+def _strip_nodeid_suffix(path: str) -> str:
+    return path.split("::", 1)[0]
+
+
+def _normalize_collection_path(raw_path: object, rootpath: Path) -> str:
+    path = Path(_strip_nodeid_suffix(str(raw_path)))
+    try:
+        if path.is_absolute():
+            path = path.relative_to(rootpath)
+    except ValueError:
+        pass
+    return path.as_posix().removeprefix("./").rstrip("/")
+
+
+def _nodeid_is_under_path(nodeid: str, collection_path: str) -> bool:
+    node_path = _nodeid_path(nodeid)
+    if not collection_path or collection_path == ".":
+        return True
+    return node_path == collection_path or node_path.startswith(f"{collection_path}/")
+
+
+def _known_failure_is_in_collection_scope(config: pytest.Config, nodeid: str) -> bool:
+    rootpath = Path(str(config.rootpath))
+    selected_paths = config.args or list(config.getini("testpaths")) or ["."]
+    return any(
+        _nodeid_is_under_path(nodeid, _normalize_collection_path(path, rootpath))
+        for path in selected_paths
+    )
+
+
+def _known_failure_is_ignored(config: pytest.Config, nodeid: str) -> bool:
+    rootpath = Path(str(config.rootpath))
+    ignored_paths = config.getoption("ignore", default=[]) or []
+    ignored_globs = config.getoption("ignore_glob", default=[]) or []
+    node_path = _nodeid_path(nodeid)
+
+    for raw_path in ignored_paths:
+        ignored_path = _normalize_collection_path(raw_path, rootpath)
+        if _nodeid_is_under_path(nodeid, ignored_path):
+            return True
+
+    for raw_glob in ignored_globs:
+        ignored_glob = _normalize_collection_path(raw_glob, rootpath)
+        if fnmatch(node_path, ignored_glob):
+            return True
+
+    return False
+
+
+def _known_failure_stale_check_enabled(config: pytest.Config) -> bool:
+    return not (
+        config.getoption("keyword", default="")
+        or config.getoption("markexpr", default="")
+        or config.getoption("deselect", default=[])
+    )
+
+
+def _stale_known_failure_ids(config: pytest.Config, seen: set[str]) -> list[str]:
+    if not _known_failure_stale_check_enabled(config):
+        return []
+    return sorted(
+        nodeid
+        for nodeid in set(_KNOWN_FAILURES) - seen
+        if _known_failure_is_in_collection_scope(config, nodeid)
+        and not _known_failure_is_ignored(config, nodeid)
+    )
+
+
 def pytest_collection_modifyitems(
     config: pytest.Config,
     items: list[pytest.Item],
@@ -94,9 +167,11 @@ def pytest_collection_modifyitems(
     set by the `force-all-tests` PR label in ci.yml). Useful for
     validating that manifest entries are still needed.
 
-    Emits a warning at collection end for any manifest entry whose
+    Emits a warning at collection end for in-scope manifest entries whose
     `id` doesn't match a collected test, so renames / removals
-    don't leave stale entries lingering silently.
+    don't leave stale entries lingering silently. Entries outside the
+    current collection scope, under ignored paths, or hidden by explicit
+    ``-k`` / ``-m`` / ``--deselect`` filters are not treated as stale.
 
     Also translates ``@pytest.mark.llm_flaky`` into a rerunfailures
     ``flaky`` marker; each rerun resolves to a different model via
@@ -141,7 +216,7 @@ def pytest_collection_modifyitems(
                 )
             item.add_marker(pytest.mark.skip(reason=marker_reason))
 
-    stale = sorted(set(_KNOWN_FAILURES) - seen)
+    stale = _stale_known_failure_ids(config, seen)
     if stale:
         warnings.warn(
             f"tests/known_failures.yaml has {len(stale)} entries that "
