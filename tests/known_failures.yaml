@@ -371,9 +371,9 @@ skips:
 
   # Standalone failures — no obvious cluster yet.
   - id: tests/e2e/omnigent/test_compaction_sessions_native_e2e.py::test_compaction_fires_and_agent_retains_context
-    reason: "Force-merge backlog (standalone). First observed failing at 801c389c (2026-05-23T00:35:30Z, E2E)."
-    issue: 679
-    cluster: steering-cancel-compaction-state
+    reason: "Not a compaction bug: the pexpect `omnigent run` child never finishes booting -- it stays on 'Starting the local server...' and never reaches the 'sleeping' ready state within the 120s _BOOT_TIMEOUT (fails at line 163, before any compaction assertion runs). Boot-starvation, same family as the repl-pexpect-cli tests, so repointed off the compaction tracker (#679, mis-filed) to #523. Fails 30/30 in flake-stress run 27799636357 (main, --no-skip-known, 2 workers, 2026-06-19)."
+    issue: 523
+    cluster: repl-pexpect-cli
     mode: skip
   - id: tests/e2e/test_filesystem_changed_files_e2e.py::test_filesystem_changes_appear_after_agent_write
     reason: "Force-merge backlog (standalone). First observed failing at 305e9bb9 (2026-05-23T06:06:59Z, E2E)."
