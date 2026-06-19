@@ -1545,15 +1545,15 @@ function BulkActionBar({
   return (
     <>
       <div className="relative mt-3 flex flex-col gap-1.5">
-        <div className="flex min-h-8 items-center gap-1.5 px-2">
-          <span className="text-xs font-medium text-muted-foreground">
+        <div className="relative flex min-h-8 items-center gap-1.5 px-2 pr-9">
+          <span className="shrink-0 whitespace-nowrap text-sm text-muted-foreground">
             {count === 0 ? "None selected" : `${count} selected`}
           </span>
           <Button
             type="button"
             variant="ghost"
             size="sm"
-            className="h-6 px-1.5 text-xs"
+            className="h-6 px-1.5 text-sm"
             onClick={allSelected ? onDeselectAll : onSelectAll}
           >
             {allSelected ? "Deselect all" : "Select all"}
@@ -1562,20 +1562,72 @@ function BulkActionBar({
             type="button"
             variant="ghost"
             size="sm"
-            className="h-6 px-1.5 text-xs"
+            className="h-6 px-1.5 text-sm"
             disabled={count === 0}
             onClick={onClear}
           >
             Clear
           </Button>
-          <div className="flex-1" />
+          {count > 0 && (
+            <div className="flex items-center gap-1.5 md:hidden">
+              {allSelectedSameArchiveGroup && nonArchivedSelected.length > 0 && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-7 gap-1.5 text-xs"
+                  disabled={isBusy}
+                  onClick={handleArchive}
+                >
+                  {bulkArchive.isPending ? (
+                    <Loader2Icon className="size-3 animate-spin" />
+                  ) : (
+                    <ArchiveIcon className="size-3" />
+                  )}
+                  Archive
+                </Button>
+              )}
+              {allSelectedSameArchiveGroup && archivedSelected.length > 0 && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-7 gap-1.5 text-xs"
+                  disabled={isBusy}
+                  onClick={handleUnarchive}
+                >
+                  {bulkArchive.isPending ? (
+                    <Loader2Icon className="size-3 animate-spin" />
+                  ) : (
+                    <ArchiveRestoreIcon className="size-3" />
+                  )}
+                  Unarchive
+                </Button>
+              )}
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-7 gap-1.5 text-xs text-destructive"
+                disabled={isBusy || ownedSelected.length === 0}
+                onClick={() => setConfirmDeleteOpen(true)}
+              >
+                {bulkDelete.isPending ? (
+                  <Loader2Icon className="size-3 animate-spin" />
+                ) : (
+                  <Trash2Icon className="size-3" />
+                )}
+                Delete {ownedSelected.length > 0 ? ownedSelected.length : ""}
+              </Button>
+            </div>
+          )}
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
                 type="button"
                 variant="secondary"
                 size="icon-sm"
-                className="shrink-0 rounded-full"
+                className="-translate-y-1/2 absolute top-1/2 right-0 shrink-0 rounded-full"
                 aria-label="Exit selection mode"
                 data-testid="toggle-selection-mode"
                 onClick={onExit}
@@ -1588,7 +1640,7 @@ function BulkActionBar({
         </div>
 
         {count > 0 && (
-          <div className="flex items-center gap-1.5 px-2">
+          <div className="hidden items-center gap-1.5 px-2 md:flex">
             {allSelectedSameArchiveGroup && nonArchivedSelected.length > 0 && (
               <Button
                 type="button"
