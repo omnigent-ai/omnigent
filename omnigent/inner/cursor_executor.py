@@ -483,6 +483,10 @@ class CursorExecutor(Executor):
         # pi / claude-sdk use). ``None`` on single-process / pre-turn paths
         # (then policy is a no-op).
         self._policy_evaluator: Callable[[str, dict[str, Any]], Awaitable[Any]] | None = None
+        # Installed by the runtime adapter; surfaces ASK verdicts to the
+        # user via the elicitation UI (approval prompt). ``None`` when no
+        # handler is wired (single-process / test paths → fail closed).
+        self._elicitation_handler: Callable[[str, dict[str, Any]], Awaitable[bool]] | None = None
 
     def supports_streaming(self) -> bool:
         return True
@@ -519,6 +523,10 @@ class CursorExecutor(Executor):
         """Evaluate PHASE_TOOL_CALL policy for a Cursor native tool.
 
         Returns ``{"block": bool, "reason": str}``.
+
+        ASK is treated as DENY (fail-closed) because Cursor native tools
+        execute inside the Cursor process — by the time we observe them the
+        tool has already started, so we cannot pause for human approval.
         """
         evaluator = self._policy_evaluator
         if evaluator is None:
@@ -527,6 +535,34 @@ class CursorExecutor(Executor):
         action = getattr(verdict, "action", None)
         if action == "POLICY_ACTION_DENY":
             return {"block": True, "reason": getattr(verdict, "reason", "") or "blocked by policy"}
+        if action == "POLICY_ACTION_ASK":
+            reason = getattr(verdict, "reason", "") or "approval required by policy"
+            # Cursor native tools have already started by the time we see
+            # them, but we still surface the elicitation UI so the human
+            # can decide whether the *rest of the turn* should continue.
+            handler = self._elicitation_handler
+            if handler is not None:
+                logger.info(
+                    "TOOL_CALL policy ASK on native cursor tool %s; "
+                    "prompting user (tool already started): %s",
+                    name,
+                    reason,
+                )
+                approved = await handler(name, args)
+                if approved:
+                    return {"block": False, "reason": ""}
+                return {"block": True, "reason": reason}
+            # No handler → fail closed.
+            logger.warning(
+                "TOOL_CALL policy ASK on native cursor tool %s — no elicitation "
+                "handler; treating as DENY: %s",
+                name,
+                reason,
+            )
+            return {
+                "block": True,
+                "reason": f"approval required (auto-denied — no elicitation handler): {reason}",
+            }
         return {"block": False, "reason": ""}
 
     # -- custom-tool bridge -------------------------------------------------
