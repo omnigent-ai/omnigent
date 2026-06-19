@@ -1,7 +1,8 @@
 name: E2E Tests
 
-# Runs the `tests/e2e/` suite against a live LLM (Databricks gateway):
-# sub-agent spawning, parking, tunneled client tools, PATCH/GET routes.
+# Runs the `tests/e2e/` suite against the in-process mock LLM server.
+# All tests use mock LLM by default; real-credential tests skip cleanly
+# when no DATABRICKS_TOKEN is present.
 #
 # Triggers:
 #   schedule            09:00 UTC daily (alongside nightly.yml).
@@ -133,23 +134,6 @@ jobs:
         with:
           path: .venv
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
-      - name: Set LLM credentials
-        run: echo "LLM_API_KEY=${{ secrets.LLM_API_KEY }}" >> "$GITHUB_ENV"
-      - name: Write gateway profile (~/.databrickscfg)
-        env:
-          GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-        run: |
-          # Strip the /serving-endpoints suffix the conftest re-appends.
-          host="${GATEWAY_BASE_URL%/serving-endpoints}"
-          cat > "$HOME/.databrickscfg" <<EOF
-          [default]
-          host  = $host
-          token = $LLM_API_KEY
-          EOF
-          # PAT passthrough for the codex / claude-sdk auth commands.
-          echo "DATABRICKS_BEARER=$LLM_API_KEY" >> "$GITHUB_ENV"
-
       - name: Install project and dev dependencies
         run: |
           uv sync --extra all --extra dev
@@ -195,12 +179,6 @@ jobs:
           # recover the last-started test when a runner wedges.
           PYTEST_PROGRESS_LOG_DIR: /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ matrix.shard_id }}/progress
           OMNIGENT_TOKEN_USAGE_JSON: /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ matrix.shard_id }}/tokens.json
-          # Spread interchangeable gateway models across tests (deterministic
-          # per nodeid; tests/_model_pools.py).
-          OMNIGENT_TEST_MODEL_SPREAD: '1'
-          # Drain gpt-5-4 from the pool: its FMAPI quota is far below the
-          # others, so tests hashed to it fail on sustained 429s.
-          OMNIGENT_TEST_MODEL_POOL_GPT: 'databricks-gpt-5-5,databricks-gpt-5-4-mini'
         run: |
           # Validate parallelism (untrusted input -- bind to env, never
           # interpolate a GitHub expression into the shell).
@@ -227,9 +205,6 @@ jobs:
           # fails the shard fast instead of letting loadscope requeue deadlock
           # the controller (the 2026-06-11 shard-2 wedge).
           uv run pytest tests/e2e/ \
-            --llm-api-key "$LLM_API_KEY" \
-            --profile default \
-            --harness databricks \
             -n "$WORKERS" \
             --dist=loadscope \
             --max-worker-restart=0 \

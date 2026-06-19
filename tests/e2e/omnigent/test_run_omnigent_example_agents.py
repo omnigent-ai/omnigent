@@ -79,10 +79,13 @@ _CASES = [
             "Call the calculate tool to compute 6 * 9, then reply "
             "with exactly 'answer=54' and nothing else."
         ),
-        ("claude",),
+        # No vendor binary required — override to openai-agents so the
+        # mock LLM handles the call (the YAML's claude-sdk executor needs
+        # gateway credentials we don't have in CI).
+        (),
         ("answer=54", "answer = 54", "answer:54"),
         (),
-        (),
+        ("--harness", "openai-agents", "--model", "mock-model"),
         id="agent_with_tools_calculate",
     ),
     pytest.param(
@@ -93,8 +96,9 @@ _CASES = [
             "``ls`` in its working directory. When it completes, "
             "include its listing verbatim in your final answer."
         ),
-        # The workers inherit the parent's openai-agents harness.
-        # No vendor binary required.
+        # No vendor binary required — override to openai-agents so the
+        # mock LLM handles all turns (the YAML's claude-sdk executor
+        # needs gateway credentials we don't have in CI).
         (),
         # The fork's cwd is the repo root, so ``ls`` sees the
         # real repo anchors. Any one match is enough — the mock
@@ -105,7 +109,7 @@ _CASES = [
         # regression even if the LLM's reply text happens to
         # include one of the success markers.
         ("lacked normal file/shell access", "403 Invalid access token"),
-        (),
+        ("--harness", "openai-agents", "--model", "mock-model"),
         id="coding_supervisor_with_forks",
     ),
 ]

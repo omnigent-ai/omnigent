@@ -120,14 +120,12 @@ def test_switch_agent_in_place_carries_history(
             [{"text": "ACK"}],
             key=source_model,
         )
-        # The claude-sdk harness replays the prior transcript as context
-        # when binding a switched session, which sends an initial
-        # /v1/messages request before the user's recall turn. Queue two
-        # responses: a throwaway for the replay and the marker for the
-        # actual recall.
+        # The switch passes the prior transcript as context to the first
+        # real LLM call (the recall turn itself) — no separate replay
+        # request is made. Queue only the marker for the recall turn.
         configure_mock_llm(
             mock_llm_server_url,
-            [{"text": "OK"}, {"text": marker}],
+            [{"text": marker}],
             key=target_model,
         )
     else:

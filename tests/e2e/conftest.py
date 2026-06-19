@@ -303,13 +303,43 @@ def configure_mock_llm(
 
 def reset_mock_llm(mock_llm_server_url: str | None) -> None:
     """
-    Clear all keyed queues, captured requests, and gates.
+    Clear all regular keyed queues, captured requests, and gates.
+
+    Fallbacks set via :func:`set_fallback_mock_llm` are preserved.
 
     :param mock_llm_server_url: Mock server URL or ``None``.
     """
     if mock_llm_server_url is None:
         return
     resp = httpx.post(f"{mock_llm_server_url}/mock/reset", timeout=5.0)
+    resp.raise_for_status()
+
+
+def set_fallback_mock_llm(
+    mock_llm_server_url: str | None,
+    key: str,
+    text: str,
+) -> None:
+    """
+    Set a non-resettable fallback response for a queue key.
+
+    The fallback is returned when the regular queue for *key* is
+    exhausted.  Unlike regular entries, the fallback survives
+    :func:`reset_mock_llm` — use it for session-level queues that
+    must return a valid response even when per-test resets clear the
+    regular queue (e.g. the server-level policy-classifier LLM queue).
+
+    :param mock_llm_server_url: Mock server URL or ``None``.
+    :param key: Queue key (typically the server's ``llm.model``).
+    :param text: Fallback response text.
+    """
+    if mock_llm_server_url is None:
+        return
+    resp = httpx.post(
+        f"{mock_llm_server_url}/mock/set_fallback",
+        json={"key": key, "text": text},
+        timeout=5.0,
+    )
     resp.raise_for_status()
 
 
@@ -543,7 +573,7 @@ def live_server(
             yaml.safe_dump(
                 {
                     "llm": {
-                        "model": "mock-model",
+                        "model": "_policy_llm_",
                         "connection": {
                             "base_url": f"{mock_llm_server_url}/v1",
                             "api_key": "mock-key",
@@ -631,6 +661,17 @@ def live_server(
             f"Server didn't start within {HEALTH_TIMEOUT_S}s.\n"
             f"Server log at {server_log}:\n{log_contents[-3000:]}\n"
             f"Runner log at {runner_log}:\n{runner_log_contents[-3000:]}"
+        )
+
+    # Set a non-resettable ALLOW fallback on the server's policy-classifier
+    # LLM queue ("_policy_llm_") so the classifier always returns ALLOW even
+    # when a parallel xdist worker's reset_mock_llm clears the regular queue
+    # between configure and the actual classifier call.
+    if using_mock_llm and mock_llm_server_url is not None:
+        set_fallback_mock_llm(
+            mock_llm_server_url,
+            "_policy_llm_",
+            '{"action": "allow", "reason": ""}',
         )
 
     try:
