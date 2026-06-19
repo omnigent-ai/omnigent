@@ -15,7 +15,6 @@ import {
   CheckIcon,
   ChevronRightIcon,
   CircleStopIcon,
-  CopyIcon,
   GitBranchIcon,
   InboxIcon,
   Loader2Icon,
@@ -63,7 +62,6 @@ import { isSessionStoppable } from "@/lib/sessionStop";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import { getSessionState } from "@/hooks/useSessionState";
 import { isConversationUnseen } from "@/hooks/useUnseenConversations";
-import { copyText } from "@/lib/clipboard";
 import { sumPendingApprovals } from "@/lib/inbox";
 import { cn } from "@/lib/utils";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
@@ -856,7 +854,7 @@ function ConversationRow({
           e.preventDefault();
           setIsEditing(true);
         }}
-        title={`${conversation.title ?? label}\nSession ID: ${conversation.id}`}
+        title={conversation.title ?? conversation.id}
       >
         {/* Row 1: the session name. Status markers (working, needs-approval,
             unseen) render in the trailing time-marker slot below, replacing
@@ -955,7 +953,7 @@ function ConversationRow({
             <MoreHorizontalIcon className="size-3.5" />
           </Button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="min-w-44">
+        <DropdownMenuContent align="end" className="min-w-36">
           {isOwner ? (
             <DropdownMenuItem data-testid="archive-conversation" onSelect={runArchive}>
               {isArchived ? (
@@ -1024,17 +1022,6 @@ function ConversationRow({
               </TooltipContent>
             </Tooltip>
           )}
-          <DropdownMenuItem
-            data-testid="copy-conversation-id"
-            onSelect={() => {
-              void copyText(conversation.id).catch((err) => {
-                console.warn("Failed to copy session ID", err);
-              });
-            }}
-          >
-            <CopyIcon className="size-3.5" />
-            Copy session ID
-          </DropdownMenuItem>
           {/* Stop session — only on stoppable sessions whose runner isn't
               already known-offline (canStop). Owner-gated like Delete:
               non-owners see it disabled with an explanatory tooltip. */}

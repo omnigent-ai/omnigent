@@ -16,7 +16,6 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 // vi.mock factory (hoisted above imports) can reference it.
 const mocks = vi.hoisted(() => ({
   rename: { mutate: vi.fn() },
-  copyText: vi.fn(() => Promise.resolve()),
 }));
 
 vi.mock("@/hooks/useConversations", () => ({
@@ -41,7 +40,6 @@ vi.mock("./AgentTypeFilter", () => ({ AgentTypeFilter: () => null }));
 vi.mock("./ReportIssueButton", () => ({ ReportIssueButton: () => null }));
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 vi.mock("@/components/theme/ThemeModeMenu", () => ({ ThemeModeMenu: () => null }));
-vi.mock("@/lib/clipboard", () => ({ copyText: mocks.copyText }));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { Sidebar } from "./Sidebar";
@@ -97,7 +95,6 @@ function renderSidebar() {
 
 beforeEach(() => {
   mocks.rename.mutate.mockReset();
-  mocks.copyText.mockClear();
   useConvMock.mockReset();
   localStorage.clear();
   mockConversations([CONV]);
@@ -106,25 +103,6 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("quick pin/unpin hover button", () => {
-  it("shows copy session id below rename in the wider row action menu", () => {
-    renderSidebar();
-
-    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
-
-    const menu = screen.getByRole("menu");
-    expect(menu.className).toContain("min-w-44");
-    const renameItem = screen.getByTestId("rename-conversation");
-    const copyItem = screen.getByTestId("copy-conversation-id");
-    expect(
-      Boolean(renameItem.compareDocumentPosition(copyItem) & Node.DOCUMENT_POSITION_FOLLOWING),
-    ).toBe(true);
-
-    fireEvent.click(screen.getByTestId("copy-conversation-id"));
-
-    expect(mocks.copyText).toHaveBeenCalledTimes(1);
-    expect(mocks.copyText).toHaveBeenCalledWith("conv_1");
-  });
-
   it("toggles the pin without opening the kebab menu, moving the row under Pinned", () => {
     renderSidebar();
 

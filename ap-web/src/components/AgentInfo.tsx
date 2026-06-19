@@ -1,8 +1,16 @@
 // Agent info surface: the MCP-server and policy badges plus the
 // header info-icon popover that displays them.
 
-import { useState } from "react";
-import { InfoIcon, PlusIcon, ServerIcon, ShieldCheckIcon, TrashIcon } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import {
+  CheckIcon,
+  CopyIcon,
+  InfoIcon,
+  PlusIcon,
+  ServerIcon,
+  ShieldCheckIcon,
+  TrashIcon,
+} from "lucide-react";
 import type { Agent, McpServerSummary } from "@/hooks/useAgents";
 import type { ModelUsage } from "@/lib/types";
 import {
@@ -26,6 +34,7 @@ import { capitalizeAgentName } from "@/lib/agentLabels";
 import { coercePolicyParams } from "@/lib/policyParams";
 import { agentRootName } from "@/lib/forkHarness";
 import { nativeCodingAgentForAgentName } from "@/lib/nativeCodingAgents";
+import { copyText } from "@/lib/clipboard";
 import { useChatStore } from "@/store/chatStore";
 
 /**
@@ -610,6 +619,8 @@ export function agentHasInfo(agent: Agent | undefined, sessionId?: string | null
 export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
   const servers = agent?.mcp_servers ?? [];
   const displayName = agent ? agentDisplayLabel(agent.name) : null;
+  const [sessionIdCopied, setSessionIdCopied] = useState(false);
+  const copyResetTimeoutRef = useRef<number | null>(null);
   // Cumulative session spend, live from the store (seeded on bind, updated
   // by SSE ``session_usage``). ``null`` when the session is unpriced (no
   // turn priced yet) — omit the row rather than show "$0.00" / "—".
@@ -620,6 +631,25 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
   // from this map rather than receiving flat token fields.
   const usageByModel = useChatStore((s) => s.sessionUsageByModel);
 
+  useEffect(() => {
+    return () => {
+      if (copyResetTimeoutRef.current !== null) window.clearTimeout(copyResetTimeoutRef.current);
+    };
+  }, []);
+
+  async function copySessionId() {
+    if (!sessionId) return;
+    try {
+      await copyText(sessionId);
+    } catch (err) {
+      console.warn("Failed to copy session ID", err);
+      return;
+    }
+    setSessionIdCopied(true);
+    if (copyResetTimeoutRef.current !== null) window.clearTimeout(copyResetTimeoutRef.current);
+    copyResetTimeoutRef.current = window.setTimeout(() => setSessionIdCopied(false), 2000);
+  }
+
   return (
     <div className="flex flex-col gap-3">
       {displayName && (
@@ -628,6 +658,35 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
           {agent?.description && (
             <span className="text-xs text-muted-foreground">{agent.description}</span>
           )}
+        </div>
+      )}
+      {sessionId && (
+        <div className="flex flex-col gap-1.5">
+          <SectionLabel>Session ID</SectionLabel>
+          <div className="flex items-center gap-2">
+            <code
+              className="min-w-0 flex-1 truncate rounded bg-muted px-1.5 py-1 font-mono text-xs text-muted-foreground"
+              data-testid="agent-info-session-id"
+              title={sessionId}
+            >
+              {sessionId}
+            </code>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              aria-label={sessionIdCopied ? "Copied session ID" : "Copy session ID"}
+              data-testid="agent-info-copy-session-id"
+              onClick={copySessionId}
+              className="shrink-0"
+            >
+              {sessionIdCopied ? (
+                <CheckIcon className="size-3.5" />
+              ) : (
+                <CopyIcon className="size-3.5" />
+              )}
+            </Button>
+          </div>
         </div>
       )}
       {sessionId && sessionCostUsd != null && (
