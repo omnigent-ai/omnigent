@@ -27,7 +27,7 @@ import {
   SearchIcon,
   ShareIcon,
   SquareIcon,
-  SquareCheckBigIcon,
+  SquareCheckIcon,
   Trash2Icon,
   XIcon,
 } from "lucide-react";
@@ -354,57 +354,49 @@ export function Sidebar({ open, onClose }: SidebarProps) {
             )}
           </Link>
         </Button>
-        <div className="relative mt-3 flex items-center gap-1.5">
-          <div className="relative flex-1">
-            <SearchIcon className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2.5 size-3.5 text-muted-foreground" />
-            <input
-              type="search"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              aria-label="Search sessions"
-              placeholder="Search sessions"
-              className="min-h-8 w-full rounded-full border border-input pr-3 pl-8 text-sm transition placeholder:text-muted-foreground focus-visible:outline-1"
-            />
+        {selectionMode ? (
+          <BulkActionBar
+            selectedIds={selectedIds}
+            allConversations={(conversationsQuery.data?.pages ?? []).flatMap((page) => page.data)}
+            onSelectAll={() =>
+              selectAll((conversationsQuery.data?.pages ?? []).flatMap((page) => page.data))
+            }
+            onDeselectAll={deselectAll}
+            onClear={deselectAll}
+            onExit={exitSelectionMode}
+          />
+        ) : (
+          <div className="relative mt-3 flex items-center gap-1.5">
+            <div className="relative flex-1">
+              <SearchIcon className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2.5 size-3.5 text-muted-foreground" />
+              <input
+                type="search"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                aria-label="Search sessions"
+                placeholder="Search sessions"
+                className="min-h-8 w-full rounded-full border border-input pr-3 pl-8 text-sm transition placeholder:text-muted-foreground focus-visible:outline-1"
+              />
+            </div>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="Select sessions"
+                  data-testid="toggle-selection-mode"
+                  className="shrink-0 rounded-full"
+                  onClick={() => setSelectionMode(true)}
+                >
+                  <ListChecksIcon className="size-3.5" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">Select sessions</TooltipContent>
+            </Tooltip>
           </div>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                type="button"
-                variant={selectionMode ? "secondary" : "ghost"}
-                size="icon-sm"
-                aria-label={selectionMode ? "Exit selection mode" : "Select sessions"}
-                data-testid="toggle-selection-mode"
-                className="shrink-0 rounded-full"
-                onClick={() => {
-                  if (selectionMode) exitSelectionMode();
-                  else setSelectionMode(true);
-                }}
-              >
-                <ListChecksIcon className="size-3.5" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent side="bottom">
-              {selectionMode ? "Exit selection" : "Select sessions"}
-            </TooltipContent>
-          </Tooltip>
-        </div>
+        )}
       </div>
-
-      {/* [scrollbar-gutter:stable]: with macOS classic (space-taking)
-          scrollbars, the list's scrollbar appearing/disappearing (e.g. while
-          a Radix menu locks scrolling) resizes every row — titles gain/lose
-          a character. Reserving the gutter keeps row width constant. */}
-      {selectionMode && (
-        <BulkActionBar
-          selectedIds={selectedIds}
-          allConversations={(conversationsQuery.data?.pages ?? []).flatMap((page) => page.data)}
-          onSelectAll={() =>
-            selectAll((conversationsQuery.data?.pages ?? []).flatMap((page) => page.data))
-          }
-          onDeselectAll={deselectAll}
-          onClear={deselectAll}
-        />
-      )}
 
       <nav className="relative flex-1 overflow-y-auto px-3 pb-3 [scrollbar-gutter:stable]">
         <ConversationList
@@ -917,11 +909,11 @@ function ConversationRow({
       <Link
         to={selectionMode ? "#" : `/c/${conversation.id}`}
         className={cn(
-          "relative flex w-full flex-col gap-0.5 rounded-md py-2 text-left text-sm hover:bg-muted",
-          selectionMode ? "pl-9 pr-4" : "px-4",
+          "relative flex w-full flex-col gap-0.5 rounded-md px-4 py-2 text-left text-sm hover:bg-muted",
           !selectionMode &&
             (sessionState?.kind === "awaiting" ? "pr-44 md:pr-28" : "pr-28 md:pr-16"),
-          isActive && !selectionMode && "bg-muted font-semibold",
+          selectionMode && "pr-10",
+          isActive && "bg-muted font-semibold",
           selectionMode && isSelected && "bg-primary/5",
         )}
         onClick={(e) => {
@@ -941,15 +933,6 @@ function ConversationRow({
         }}
         title={conversation.title ?? conversation.id}
       >
-        {selectionMode && (
-          <span className="-translate-y-1/2 absolute top-1/2 left-2.5 flex items-center">
-            {isSelected ? (
-              <SquareCheckBigIcon className="size-4 text-primary" />
-            ) : (
-              <SquareIcon className="size-4 text-muted-foreground" />
-            )}
-          </span>
-        )}
         {/* Row 1: the session name. Status markers (working, needs-approval,
             unseen) render in the trailing time-marker slot below, replacing
             the timestamp — not inline here. Leading icons (agent type, pin,
@@ -972,14 +955,19 @@ function ConversationRow({
           </span>
         )}
       </Link>
-      {!selectionMode && sessionState !== null ? (
-        // pointer-events-none keeps clicks falling through to the row, so
-        // the badge's hover tooltip is intentionally inert here; screen
-        // readers still get the badge's own role="img" aria-label.
+      {selectionMode ? (
+        <span className="-translate-y-1/2 pointer-events-none absolute top-1/2 right-2.5 flex items-center">
+          {isSelected ? (
+            <SquareCheckIcon className="size-4 text-primary" />
+          ) : (
+            <SquareIcon className="size-4 text-muted-foreground" />
+          )}
+        </span>
+      ) : sessionState !== null ? (
         <span className={TIME_MARKER_SLOT_CLASS}>
           <SessionStateBadge state={sessionState} />
         </span>
-      ) : !selectionMode ? (
+      ) : (
         <span
           className={cn(TIME_MARKER_SLOT_CLASS, "text-xs tabular-nums text-muted-foreground")}
           aria-label={absoluteTime(conversation.updated_at * 1000)}
@@ -987,7 +975,7 @@ function ConversationRow({
         >
           {relativeTime(conversation.updated_at * 1000)}
         </span>
-      ) : null}
+      )}
       {!selectionMode && (
         <Button
           type="button"
@@ -1472,12 +1460,14 @@ function BulkActionBar({
   onSelectAll,
   onDeselectAll,
   onClear,
+  onExit,
 }: {
   selectedIds: Set<string>;
   allConversations: Conversation[];
   onSelectAll: () => void;
   onDeselectAll: () => void;
   onClear: () => void;
+  onExit: () => void;
 }) {
   const navigate = useNavigate();
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
@@ -1554,107 +1544,103 @@ function BulkActionBar({
 
   return (
     <>
-      <div className="flex flex-col gap-2 border-b border-border bg-card px-3 py-2">
-        <div className="flex items-center justify-between">
+      <div className="relative mt-3 flex flex-col gap-1.5">
+        <div className="flex min-h-8 items-center gap-1.5 px-2">
           <span className="text-xs font-medium text-muted-foreground">
             {count === 0 ? "None selected" : `${count} selected`}
           </span>
-          <div className="flex items-center gap-1">
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="h-6 px-2 text-xs"
-              onClick={allSelected ? onDeselectAll : onSelectAll}
-            >
-              {allSelected ? "Deselect all" : "Select all"}
-            </Button>
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="h-6 px-2 text-xs"
-              disabled={count === 0}
-              onClick={onClear}
-            >
-              Clear
-            </Button>
-          </div>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-6 px-1.5 text-xs"
+            onClick={allSelected ? onDeselectAll : onSelectAll}
+          >
+            {allSelected ? "Deselect all" : "Select all"}
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-6 px-1.5 text-xs"
+            disabled={count === 0}
+            onClick={onClear}
+          >
+            Clear
+          </Button>
+          <div className="flex-1" />
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant="secondary"
+                size="icon-sm"
+                className="shrink-0 rounded-full"
+                aria-label="Exit selection mode"
+                data-testid="toggle-selection-mode"
+                onClick={onExit}
+              >
+                <XIcon className="size-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">Exit selection</TooltipContent>
+          </Tooltip>
         </div>
 
         {count > 0 && (
-          <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-1.5 px-2">
             {allSelectedSameArchiveGroup && nonArchivedSelected.length > 0 && (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="h-7 gap-1.5 text-xs"
-                    disabled={isBusy}
-                    onClick={handleArchive}
-                    data-testid="bulk-archive"
-                  >
-                    {bulkArchive.isPending ? (
-                      <Loader2Icon className="size-3 animate-spin" />
-                    ) : (
-                      <ArchiveIcon className="size-3" />
-                    )}
-                    Archive
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent>Archive {nonArchivedSelected.length} session(s)</TooltipContent>
-              </Tooltip>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-7 gap-1.5 text-xs"
+                disabled={isBusy}
+                onClick={handleArchive}
+                data-testid="bulk-archive"
+              >
+                {bulkArchive.isPending ? (
+                  <Loader2Icon className="size-3 animate-spin" />
+                ) : (
+                  <ArchiveIcon className="size-3" />
+                )}
+                Archive
+              </Button>
             )}
             {allSelectedSameArchiveGroup && archivedSelected.length > 0 && (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="h-7 gap-1.5 text-xs"
-                    disabled={isBusy}
-                    onClick={handleUnarchive}
-                    data-testid="bulk-unarchive"
-                  >
-                    {bulkArchive.isPending ? (
-                      <Loader2Icon className="size-3 animate-spin" />
-                    ) : (
-                      <ArchiveRestoreIcon className="size-3" />
-                    )}
-                    Unarchive
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent>Unarchive {archivedSelected.length} session(s)</TooltipContent>
-              </Tooltip>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-7 gap-1.5 text-xs"
+                disabled={isBusy}
+                onClick={handleUnarchive}
+                data-testid="bulk-unarchive"
+              >
+                {bulkArchive.isPending ? (
+                  <Loader2Icon className="size-3 animate-spin" />
+                ) : (
+                  <ArchiveRestoreIcon className="size-3" />
+                )}
+                Unarchive
+              </Button>
             )}
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  className="h-7 gap-1.5 text-xs text-destructive"
-                  disabled={isBusy || ownedSelected.length === 0}
-                  onClick={() => setConfirmDeleteOpen(true)}
-                  data-testid="bulk-delete"
-                >
-                  {bulkDelete.isPending ? (
-                    <Loader2Icon className="size-3 animate-spin" />
-                  ) : (
-                    <Trash2Icon className="size-3" />
-                  )}
-                  Delete
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>
-                {ownedSelected.length > 0
-                  ? `Delete ${ownedSelected.length} session(s)`
-                  : "No owned sessions selected"}
-              </TooltipContent>
-            </Tooltip>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-7 gap-1.5 text-xs text-destructive"
+              disabled={isBusy || ownedSelected.length === 0}
+              onClick={() => setConfirmDeleteOpen(true)}
+              data-testid="bulk-delete"
+            >
+              {bulkDelete.isPending ? (
+                <Loader2Icon className="size-3 animate-spin" />
+              ) : (
+                <Trash2Icon className="size-3" />
+              )}
+              Delete {ownedSelected.length > 0 ? ownedSelected.length : ""}
+            </Button>
           </div>
         )}
 
