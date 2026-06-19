@@ -678,6 +678,79 @@ async def create_message(
     )
 
 
+@app.post("/v1/chat/completions", response_model=None)
+async def create_chat_completion(
+    request: Request,
+) -> StreamingResponse | JSONResponse:
+    """OpenAI Chat Completions API endpoint (for pi and legacy harnesses).
+
+    Returns a non-streaming JSON response in Chat Completions format,
+    routing through the same keyed queue as /v1/responses.
+    """
+    body = await request.body()
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        parsed = {"raw": body.decode(errors="replace")}
+
+    async with _state._lock:
+        _state.request_count += 1
+        _state.captured_requests.append(parsed)
+        model = parsed.get("model") if isinstance(parsed, dict) else None
+        queue = _state.resolve_queue(model)
+        qr = queue.next()
+
+    if qr.error is not None:
+        return JSONResponse(
+            status_code=qr.status_code,
+            content={"error": {"message": qr.error, "type": "mock_error"}},
+        )
+
+    if qr.block:
+        qr._pending.set()
+        _state.pending_gates.append(qr)
+        await qr._gate.wait()
+
+    text = qr.text if not qr.tool_calls else ""
+    resp_id = _response_id()
+    body_json = {
+        "id": f"chatcmpl-{resp_id}",
+        "object": "chat.completion",
+        "model": model or "mock-model",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": max(5, len(text.split())),
+            "total_tokens": 15,
+        },
+    }
+    if parsed.get("stream"):
+        chunk = {
+            "id": f"chatcmpl-{resp_id}",
+            "object": "chat.completion.chunk",
+            "model": model or "mock-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": text},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+        async def _stream() -> AsyncIterator[str]:
+            yield f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n"
+
+        return StreamingResponse(_stream(), media_type="text/event-stream")
+    return JSONResponse(content=body_json)
+
+
 @app.get("/v1/models")
 async def list_models() -> dict:
     """Return an empty model list (satisfies SDK preflight checks)."""
