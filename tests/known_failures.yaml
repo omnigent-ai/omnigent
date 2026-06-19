@@ -97,12 +97,6 @@ skips:
     cluster: repl-pexpect-cli
     mode: skip
 
-  - id: tests/e2e/test_steering_during_async_drain_e2e.py::test_steering_breaks_blocked_async_drain
-    reason: "Steering does not interrupt a blocked async drain (#771); fails 30/30 in flake-stress run 27804139920."
-    issue: 771
-    cluster: steering-cancel-compaction-state
-    mode: skip
-
   - id: tests/e2e/omnigent/test_repl_session_lifecycle.py::test_repl_effort_command_persists_session_metadata
     reason: "REPL session-lifecycle / pexpect cluster."
     issue: 523
