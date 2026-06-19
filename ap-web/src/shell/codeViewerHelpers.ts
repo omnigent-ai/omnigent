@@ -240,6 +240,12 @@ export const HTML_PREVIEW_SANDBOX =
 export function prepareHtmlPreviewDoc(html: string): string {
   const baseTag = '<base target="_blank">';
 
+  // Idempotency guard: if our base tag is already present (e.g. content was
+  // accidentally prepared twice), don't inject a second one. The current call
+  // graph always passes raw content, but this keeps the function safe to
+  // double-call.
+  if (html.includes(baseTag)) return html;
+
   const headMatch = html.match(/<head[^>]*>/i);
   if (headMatch?.index !== undefined) {
     const insertAt = headMatch.index + headMatch[0].length;

@@ -218,6 +218,13 @@ describe("prepareHtmlPreviewDoc", () => {
     expect(out.match(/<base target="_blank">/g)).toHaveLength(1);
   });
 
+  it("is idempotent: re-preparing already-prepared content adds no second base tag", () => {
+    const once = prepareHtmlPreviewDoc("<head></head>");
+    const twice = prepareHtmlPreviewDoc(once);
+    expect(twice).toBe(once);
+    expect(twice.match(/<base target="_blank">/g)).toHaveLength(1);
+  });
+
   it("documents the matcher limitation: a <head> literal in earlier markup is matched textually", () => {
     // A simple regex (not a full parser) matches the first <head> string, even
     // inside a comment. This only mis-places the harmless base tag inside the

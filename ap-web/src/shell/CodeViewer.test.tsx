@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { useFileContent } from "@/hooks/useFileContent";
 import { CodeViewer } from "./CodeViewer";
+import { HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 
@@ -229,6 +230,8 @@ describe("CodeViewer HTML preview sandbox", () => {
     const iframe = container.querySelector('iframe[title="HTML preview"]');
     expect(iframe).not.toBeNull();
     const sandbox = iframe!.getAttribute("sandbox") ?? "";
+    // Full-string lock: any change to the sandbox flags must be deliberate.
+    expect(sandbox).toBe(HTML_PREVIEW_SANDBOX);
     // #778: scripts must run inside the preview.
     expect(sandbox).toContain("allow-scripts");
     // Security invariant: the artifact must never share the app's origin.
