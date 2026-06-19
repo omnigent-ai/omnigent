@@ -847,6 +847,7 @@ async def _auto_create_cursor_terminal(
     publish_event: Callable[[str, dict[str, Any]], None],
     *,
     server_client: httpx.AsyncClient | None,
+    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
 ) -> SessionResourceView:
     """
     Auto-create the Cursor TUI terminal for a cursor-native session.
@@ -877,10 +878,15 @@ async def _auto_create_cursor_terminal(
     # and drop the prior terminal's stale forward cursor so the new forwarder
     # can't resume the wrong chat / a stale rowid (mirrors codex's clear_bridge_state).
     await _cancel_auto_forwarder_task(session_id)
-    from omnigent.cursor_native_bridge import bridge_dir_for_session_id
+    from omnigent.cursor_native_bridge import (
+        approve_mcp_server_for_workspace,
+        bridge_dir_for_session_id,
+        write_mcp_config,
+    )
     from omnigent.cursor_native_forwarder import clear_cursor_bridge_state
 
-    clear_cursor_bridge_state(bridge_dir_for_session_id(session_id))
+    bridge_dir = bridge_dir_for_session_id(session_id)
+    clear_cursor_bridge_state(bridge_dir)
 
     # ``_pi_native_launch_config`` is a generic session-snapshot reader
     # (workspace + terminal_launch_args); reused here, not Pi-specific.
@@ -892,8 +898,11 @@ async def _auto_create_cursor_terminal(
     # cursor TUI's cwd and the forwarder hash the SAME path — cursor keys its
     # chat store dir on ``md5(cwd)``, and a mismatch would hide the store.
     workspace = os.path.realpath(str(launch_config.workspace))
+    write_mcp_config(Path(workspace), bridge_dir)
     cursor_command = resolve_cursor_executable()
     cursor_args = list(launch_config.terminal_launch_args or [])
+    if "--approve-mcps" not in cursor_args:
+        cursor_args.append("--approve-mcps")
     terminal_view = await resource_registry.launch_required_terminal(
         session_id=session_id,
         terminal_name="cursor",
@@ -916,10 +925,10 @@ async def _auto_create_cursor_terminal(
     if terminal_registry is not None:
         instance = terminal_registry.get(session_id, "cursor", "main")
         if instance is not None and instance.running:
-            from omnigent.cursor_native_bridge import bridge_dir_for_session_id, write_tmux_target
+            from omnigent.cursor_native_bridge import write_tmux_target
 
             write_tmux_target(
-                bridge_dir_for_session_id(session_id),
+                bridge_dir,
                 socket_path=instance.socket_path,
                 tmux_target=instance.tmux_target,
             )
@@ -949,12 +958,20 @@ async def _auto_create_cursor_terminal(
 
     from omnigent.cursor_native_forwarder import supervise_cursor_forwarder
 
+    if server_client is not None and ensure_comment_relay is not None:
+        await ensure_comment_relay(
+            session_id,
+            explicit_bridge_dir=bridge_dir,
+            await_notify=False,
+        )
+    approve_mcp_server_for_workspace(Path(workspace))
+
     _forwarder_task = asyncio.create_task(
         supervise_cursor_forwarder(
             base_url=server_url,
             headers={},
             session_id=session_id,
-            bridge_dir=bridge_dir_for_session_id(session_id),
+            bridge_dir=bridge_dir,
             agent_name="cursor-native-ui",
             workspace=workspace,
             launch_epoch_ms=launch_epoch_ms,
@@ -5683,6 +5700,7 @@ def create_runner_app(
                             resource_registry,
                             _publish_event,
                             server_client=server_client,
+                            ensure_comment_relay=_ensure_comment_relay_started,
                         )
                     except Exception as exc:
                         _logger.exception(
@@ -10985,6 +11003,7 @@ def create_runner_app(
                         resource_registry,
                         _publish_event,
                         server_client=server_client,
+                        ensure_comment_relay=_ensure_comment_relay_started,
                     )
                 except Exception as exc:
                     _logger.exception(

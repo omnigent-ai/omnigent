@@ -35,6 +35,7 @@ from omnigent.inner.executor import (
     ToolCallComplete,
     ToolCallRequest,
     ToolCallStatus,
+    TurnCancelled,
     TurnComplete,
 )
 
@@ -770,6 +771,88 @@ async def test_mid_turn_error_status_drops_session(monkeypatch: pytest.MonkeyPat
     assert any(isinstance(e, TurnComplete) for e in turn2)
 
 
+async def test_mid_turn_expired_status_is_retryable_and_drops_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ``expired`` terminal status (Cursor-side timeout / usage cap / quota)
+    must surface as a retryable ExecutorError and drop the session — never a
+    TurnComplete committing whatever partial text streamed."""
+    scripts = [
+        {"messages": [_assistant("partial")], "status": "expired", "result": "quota hit"},
+        {"messages": [_assistant("recovered")], "result": "recovered"},
+    ]
+    state = _install_fake_sdk(monkeypatch, scripts)
+    executor = CursorExecutor(api_key="crsr_x")
+    try:
+        turn1 = [e async for e in executor.run_turn([_user("first")], [], "SYS")]
+        turn2 = [e async for e in executor.run_turn([_user("second")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    errors = [e for e in turn1 if isinstance(e, ExecutorError)]
+    assert len(errors) == 1 and errors[0].retryable is True
+    assert "expired" in errors[0].message
+    # No TurnComplete — the partial text must not be committed as a success.
+    assert not any(isinstance(e, TurnComplete) for e in turn1)
+    # Session was dropped on expiry, so turn 2 creates a fresh agent.
+    assert len(state["create_models"]) == 2
+    assert any(isinstance(e, TurnComplete) for e in turn2)
+
+
+async def test_mid_turn_cancelled_status_emits_turn_cancelled_and_drops_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``cancelled`` terminal status must surface as a TurnCancelled (not a
+    TurnComplete) and drop the session, so partial text isn't persisted as a
+    legitimate assistant message."""
+    scripts = [
+        {"messages": [_assistant("partial")], "status": "cancelled", "result": "stopped"},
+        {"messages": [_assistant("recovered")], "result": "recovered"},
+    ]
+    state = _install_fake_sdk(monkeypatch, scripts)
+    executor = CursorExecutor(api_key="crsr_x")
+    try:
+        turn1 = [e async for e in executor.run_turn([_user("first")], [], "SYS")]
+        turn2 = [e async for e in executor.run_turn([_user("second")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    cancels = [e for e in turn1 if isinstance(e, TurnCancelled)]
+    assert len(cancels) == 1
+    # Cancellation is not an error, and must not be committed as a completed turn.
+    assert not any(isinstance(e, ExecutorError) for e in turn1)
+    assert not any(isinstance(e, TurnComplete) for e in turn1)
+    # Session was dropped on cancellation, so turn 2 creates a fresh agent.
+    assert len(state["create_models"]) == 2
+    assert any(isinstance(e, TurnComplete) for e in turn2)
+
+
+async def test_mid_turn_unknown_non_finished_status_is_retryable_and_drops_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only ``finished`` is allowed to produce TurnComplete. If the SDK adds a
+    new terminal status, fail loud and retry instead of silently committing
+    partial streamed text as a successful assistant turn."""
+    scripts = [
+        {"messages": [_assistant("partial")], "status": "paused", "result": "new state"},
+        {"messages": [_assistant("recovered")], "result": "recovered"},
+    ]
+    state = _install_fake_sdk(monkeypatch, scripts)
+    executor = CursorExecutor(api_key="crsr_x")
+    try:
+        turn1 = [e async for e in executor.run_turn([_user("first")], [], "SYS")]
+        turn2 = [e async for e in executor.run_turn([_user("second")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    errors = [e for e in turn1 if isinstance(e, ExecutorError)]
+    assert len(errors) == 1 and errors[0].retryable is True
+    assert "non-finished status 'paused'" in errors[0].message
+    assert not any(isinstance(e, TurnComplete) for e in turn1)
+    assert len(state["create_models"]) == 2
+    assert any(isinstance(e, TurnComplete) for e in turn2)
+
+
 async def test_empty_prompt_completes_without_sending(monkeypatch: pytest.MonkeyPatch) -> None:
     state = _install_fake_sdk(monkeypatch, [])
     executor = CursorExecutor(api_key="crsr_x")
@@ -1186,6 +1269,104 @@ async def test_run_turn_native_tool_allowed_by_policy(monkeypatch: pytest.Monkey
     # The tool call went through.
     reqs = [e for e in events if isinstance(e, ToolCallRequest)]
     assert len(reqs) == 1 and reqs[0].name == "bash"
+
+
+def _policy_ask(ask_phase: str) -> Any:
+    """Build a fake policy evaluator that returns ASK on *ask_phase*, else ALLOW."""
+
+    async def evaluator(phase: str, _data: dict[str, Any]) -> Any:
+        action = "POLICY_ACTION_ASK" if phase == ask_phase else "POLICY_ACTION_ALLOW"
+        return SimpleNamespace(action=action, reason="approval required by test")
+
+    return evaluator
+
+
+async def test_run_turn_native_tool_ask_no_handler_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ASK with no elicitation handler is fail-closed to DENY."""
+    script = {
+        "messages": [
+            _assistant("Let me check."),
+            _tool("bash", "t1", "running", args={"cmd": "ls"}),
+        ],
+        "status": "finished",
+        "result": "",
+    }
+    _install_fake_sdk(monkeypatch, [script])
+    executor = CursorExecutor(api_key="crsr_x")
+    executor._policy_evaluator = _policy_ask("PHASE_TOOL_CALL")
+    # No _elicitation_handler set → fail closed.
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert len(errors) == 1
+    assert "auto-denied" in errors[0].message
+    assert not any(isinstance(e, TurnComplete) for e in events)
+
+
+async def test_run_turn_native_tool_ask_user_approves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ASK with elicitation handler that approves → turn continues."""
+    script = {
+        "messages": [
+            _assistant("Running."),
+            _tool("bash", "t1", "running", args={"cmd": "ls"}),
+            _tool("bash", "t1", "completed", result="file.txt"),
+            _assistant("Done."),
+        ],
+        "status": "finished",
+        "result": "Done.",
+    }
+    _install_fake_sdk(monkeypatch, [script])
+    executor = CursorExecutor(api_key="crsr_x")
+    executor._policy_evaluator = _policy_ask("PHASE_TOOL_CALL")
+
+    async def _approve(_name: str, _args: dict[str, Any]) -> bool:
+        return True
+
+    executor._elicitation_handler = _approve
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    assert any(isinstance(e, TurnComplete) for e in events)
+    assert not any(isinstance(e, ExecutorError) for e in events)
+
+
+async def test_run_turn_native_tool_ask_user_denies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ASK with elicitation handler that denies → turn aborted."""
+    script = {
+        "messages": [
+            _assistant("Running."),
+            _tool("bash", "t1", "running", args={"cmd": "rm -rf /"}),
+        ],
+        "status": "finished",
+        "result": "",
+    }
+    _install_fake_sdk(monkeypatch, [script])
+    executor = CursorExecutor(api_key="crsr_x")
+    executor._policy_evaluator = _policy_ask("PHASE_TOOL_CALL")
+
+    async def _deny(_name: str, _args: dict[str, Any]) -> bool:
+        return False
+
+    executor._elicitation_handler = _deny
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert len(errors) == 1
+    assert not any(isinstance(e, TurnComplete) for e in events)
 
 
 # ---------------------------------------------------------------------------

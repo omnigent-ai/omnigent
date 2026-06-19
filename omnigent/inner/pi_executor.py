@@ -624,6 +624,47 @@ _PI_ENV_ALLOW_EXACT: frozenset[str] = frozenset(
 )
 _STREAM_READ_CHUNK_SIZE = 65536
 
+# CLI flags whose values are sensitive (e.g. the full system prompt) and must
+# not be written to logs verbatim. The value following these flags is replaced
+# with a length-only placeholder.
+_REDACTED_ARGV_FLAGS = frozenset({"--append-system-prompt", "--system-prompt"})
+
+
+def _redact_argv_for_log(args: Sequence[str]) -> list[str]:
+    """
+    Return a copy of ``args`` with sensitive flag values redacted for logging.
+
+    The system prompt value (e.g. passed via ``--append-system-prompt``) is
+    replaced with a ``[system prompt N chars]`` placeholder so it never leaks
+    into debug logs. Two argv forms are handled:
+
+    * the two-token form ``--append-system-prompt <value>`` (what the current
+      spawn code emits), and
+    * the equals-joined form ``--append-system-prompt=<value>`` (not emitted
+      today, but redacted defensively in case a future refactor switches to it).
+
+    All other tokens are preserved so the command remains useful for debugging.
+    """
+    redacted: list[str] = []
+    redact_next = False
+    for arg in args:
+        if redact_next:
+            redacted.append(f"[system prompt {len(arg)} chars]")
+            redact_next = False
+            continue
+        if arg in _REDACTED_ARGV_FLAGS:
+            # Two-token form: redact the following value token.
+            redacted.append(arg)
+            redact_next = True
+            continue
+        flag, sep, value = arg.partition("=")
+        if sep and flag in _REDACTED_ARGV_FLAGS:
+            # Equals-joined form: redact the inline value, keep the flag name.
+            redacted.append(f"{flag}=[system prompt {len(value)} chars]")
+            continue
+        redacted.append(arg)
+    return redacted
+
 
 def _build_models_json(
     host: str,
@@ -854,7 +895,7 @@ class _PiRpcSession:
         if extra_args:
             args.extend(extra_args)
 
-        logger.debug("PiExecutor: spawning %s", " ".join(args))
+        logger.debug("PiExecutor: spawning %s", " ".join(_redact_argv_for_log(args)))
         self.process = await _create_subprocess_exec(
             *args,
             stdin=asyncio.subprocess.PIPE,

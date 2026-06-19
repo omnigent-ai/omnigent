@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     from omnigent._runner_startup import RunnerStartupProgress
     from omnigent.onboarding.ambient import DetectedProvider
     from omnigent.onboarding.provider_config import ProviderEntry
+    from omnigent.update_check import _InstalledWheelInfo
 
 
 # Any: YAML configs have heterogeneous value types (str, int, list, etc.)
@@ -3407,6 +3408,130 @@ def _wait_for_local_sessions_to_drain() -> None:
             last = count
 
 
+def _drain_and_stop_local_server(*, force: bool) -> None:
+    """Drain (or force-stop) the local server + daemon before an upgrade.
+
+    Shared by both ``omni upgrade`` paths (registry and git): the running
+    process must stop serving BEFORE its code is swapped, so it never serves
+    half-upgraded modules. The next ``omni`` invocation respawns a fresh
+    server on the new version.
+
+    :param force: When ``False``, wait for in-flight sessions to drain first;
+        when ``True``, stop them immediately.
+    """
+    if not force:
+        _wait_for_local_sessions_to_drain()
+    if _stop_local_server_and_daemon(force=force):
+        click.echo("Stopped the background server before upgrading.")
+
+
+def _upgrade_vcs_install(
+    info: _InstalledWheelInfo, *, check_only: bool, force: bool, pre: bool
+) -> None:
+    """Update a git/VCS ``omni`` install by re-pulling its tracked ref.
+
+    A git install's version string is frozen at whatever its source branch
+    declares (e.g. ``0.1.0`` on an unbumped ``main``), so it cannot be
+    compared against PyPI — that comparison reports a build *ahead* of the
+    latest release as "behind" and never converges, because reinstalling the
+    ref can't change the version string. Instead, compare the installed commit
+    against the remote ref's HEAD, and after re-pulling verify the commit
+    actually moved rather than asserting a PyPI version the ref can't produce.
+
+    :param info: Installed-distribution metadata, with ``info.vcs_url`` set.
+    :param check_only: Report status only; exit non-zero only when we can
+        positively confirm the install is behind its tracked ref.
+    :param force: Stop in-flight sessions immediately instead of draining.
+    :param pre: Pass the installer's allow-pre-releases flag (no-op for git).
+    """
+    from omnigent.update_check import (
+        _build_upgrade_suggestion,
+        _probe_installed_distribution,
+        _remote_git_head,
+        _run_upgrade_command,
+    )
+
+    current_sha = info.commit_sha or ""
+    cur_short = current_sha[:9] if current_sha else "unknown"
+    remote_sha = _remote_git_head(info.vcs_url) if info.vcs_url else None
+    remote_short = remote_sha[:9] if remote_sha else ""
+    known_behind = bool(remote_sha and current_sha and remote_sha != current_sha)
+
+    if remote_sha and current_sha and remote_sha == current_sha:
+        click.echo(f"omnigent is up to date (git {cur_short}, tracking {info.vcs_url}).")
+        return
+    if known_behind:
+        click.echo(
+            f"A newer commit is available: {cur_short} → {remote_short} "
+            f"(git install tracking {info.vcs_url})."
+        )
+    else:
+        click.echo(
+            f"This is a git install ({info.vcs_url} @ {cur_short}). The latest "
+            "commit couldn't be determined; re-pulling the tracked ref."
+        )
+
+    if check_only:
+        # Exit non-zero only when we KNOW it's behind, so `--check` stays a
+        # reliable CI gate; an indeterminate remote is not a failure. SystemExit
+        # (not ctx.exit) for the same reason as the PyPI path — main() runs the
+        # group with standalone_mode=False, where ctx.exit's code is dropped.
+        if known_behind:
+            raise SystemExit(1)
+        return
+
+    if pre:
+        # ``--pre`` only steers a PyPI resolve; a git install gets exactly the
+        # commit its ref points at, so say so rather than implying it had effect.
+        click.echo(
+            "Note: --pre has no effect on a git install; the tracked ref decides the commit."
+        )
+
+    suggestion = _build_upgrade_suggestion(info, allow_prerelease=pre)
+    if not suggestion.runnable:
+        raise click.ClickException(
+            f"No automatic upgrade command is known for this install. {suggestion.command}."
+        )
+
+    _drain_and_stop_local_server(force=force)
+
+    console = Console()
+    code = _run_upgrade_command(suggestion.command, console)
+    if code != 0:
+        raise click.ClickException(
+            f"Upgrade command exited with status {code}; your previous install is intact."
+        )
+
+    # Verify by commit, not exit code: a re-pull of a ref that hasn't moved (or
+    # a pinned ref, or a cached reinstall) exits 0 without changing anything.
+    _, new_sha = _probe_installed_distribution()
+    if new_sha and current_sha and new_sha != current_sha:
+        click.echo(
+            f"✓ Updated to git {new_sha[:9]}. Re-run your command — the local "
+            "server will start on the new version."
+        )
+        return
+    if known_behind and new_sha and new_sha == current_sha:
+        # We positively confirmed the ref had advanced, yet the re-pull left the
+        # install on the same commit — a silent no-op that would otherwise
+        # recreate the "still behind" loop. Fail loudly, mirroring the PyPI guard.
+        raise click.ClickException(
+            f"The re-pull ran but the install is still at {cur_short} (the ref is at "
+            f"{remote_short}). The ref may be pinned or the reinstall reused a cached "
+            f"commit; try `uv tool install --reinstall {info.vcs_url}`."
+        )
+    if new_sha and current_sha and new_sha == current_sha:
+        # Remote was indeterminate, so we never claimed it was behind — a
+        # no-change re-pull is fine here.
+        click.echo(
+            f"Already on the latest commit of the tracked ref ({cur_short}); nothing changed."
+        )
+        return
+    # Couldn't read the new commit — the re-pull ran, but don't assert a
+    # result we can't confirm.
+    click.echo("Re-pulled the git ref. Run `omni upgrade --check` to confirm.")
+
+
 @cli.command("upgrade")
 @click.option(
     "--check",
@@ -3451,11 +3576,12 @@ def upgrade(check_only: bool, force: bool, pre: bool) -> None:
     """
     import importlib.metadata
 
-    from packaging.version import InvalidVersion, parse
-
     from omnigent.update_check import (
+        _UPGRADE_INDEX_TIMEOUT_SECONDS,
         _build_upgrade_suggestion,
         _find_repo_root,
+        _is_newer,
+        _probe_installed_distribution,
         _read_installed_wheel_info,
         _run_upgrade_command,
         fetch_latest_version,
@@ -3478,19 +3604,29 @@ def upgrade(check_only: bool, force: bool, pre: bool) -> None:
             "This is an editable install — update it with `git pull`, not `omni upgrade`."
         )
 
+    # A git/VCS install tracks a moving git ref, not a PyPI release. Its
+    # version string (a frozen ``0.1.0`` on an unbumped ``main``, say) is NOT
+    # comparable to the latest PyPI release: comparing them reports a build
+    # that is *ahead* of the release as "behind" and loops forever, because
+    # reinstalling the ref can never change that version string. For these
+    # installs "upgrade" means re-pulling the ref — compared and verified by
+    # commit, not by PyPI version.
+    if info.vcs_url:
+        _upgrade_vcs_install(info, check_only=check_only, force=force, pre=pre)
+        return
+
     current = importlib.metadata.version("omnigent")
-    latest = fetch_latest_version(include_prereleases=pre)
+    # User-initiated: a more forgiving timeout + one retry so a momentarily slow
+    # mirror doesn't spuriously report the index as unreachable.
+    latest = fetch_latest_version(
+        include_prereleases=pre, timeout=_UPGRADE_INDEX_TIMEOUT_SECONDS, attempts=2
+    )
     if latest is None:
         raise click.ClickException(
             "Couldn't reach the package index to check for a newer release. Check your "
             "connection (or OMNIGENT_INDEX_URL / your configured index) and try again."
         )
-    try:
-        is_behind = parse(latest) > parse(current)
-    except InvalidVersion:
-        is_behind = latest != current
-
-    if not is_behind:
+    if not _is_newer(latest, current):
         click.echo(f"omnigent is up to date (v{current}).")
         return
 
@@ -3508,13 +3644,7 @@ def upgrade(check_only: bool, force: bool, pre: bool) -> None:
             f"No automatic upgrade command is known for this install. {suggestion.command}."
         )
 
-    # Drain (or force-stop) the local server + daemon BEFORE swapping the
-    # code, so the running process never serves half-upgraded modules.
-    # The next command respawns a fresh server on the new version.
-    if not force:
-        _wait_for_local_sessions_to_drain()
-    if _stop_local_server_and_daemon(force=force):
-        click.echo("Stopped the background server before upgrading.")
+    _drain_and_stop_local_server(force=force)
 
     console = Console()
     code = _run_upgrade_command(suggestion.command, console)
@@ -3522,9 +3652,32 @@ def upgrade(check_only: bool, force: bool, pre: bool) -> None:
         raise click.ClickException(
             f"Upgrade command exited with status {code}; your previous install is intact."
         )
-    click.echo(
-        f"✓ Upgraded to v{latest}. Re-run your command — the local server will "
-        "start on the new version."
+
+    # Trust the installed version, not the installer's exit code. The running
+    # process still has the OLD version loaded, so re-read it in a fresh
+    # subprocess. A no-op upgrade (version-pinned spec, a cooldown /
+    # exclude-newer that excludes the new release, or a stale index cache)
+    # exits 0 without moving — claiming "✓ Upgraded" there is exactly the
+    # "I upgraded but it still says an update is available" bug.
+    new_version, _ = _probe_installed_distribution()
+    if new_version is None:
+        click.echo(
+            "Ran the upgrade command, but couldn't confirm the installed version. "
+            "Run `omni upgrade --check` to verify."
+        )
+        return
+    if _is_newer(new_version, current):
+        click.echo(
+            f"✓ Upgraded to v{new_version}. Re-run your command — the local "
+            "server will start on the new version."
+        )
+        return
+    raise click.ClickException(
+        f"The upgrade command ran but omnigent is still v{new_version} (expected "
+        f"v{latest}). The install is likely version-pinned, a cooldown / "
+        "exclude-newer is excluding the new release, or the index cache is stale. "
+        "Reinstall it explicitly — e.g. `uv tool upgrade --reinstall omnigent` or "
+        f"`pip install --force-reinstall 'omnigent=={latest}'`."
     )
 
 
@@ -4434,7 +4587,7 @@ def resume(
 _HARNESS_CHOICES_HELP = (
     "'claude' (alias for 'claude-sdk'), 'claude-sdk', 'codex', "
     "'cursor', "
-    "'openai-agents', 'open-responses', or 'pi'"
+    "'openai-agents', 'open-responses', 'pi', or 'antigravity'"
 )
 _HARNESS_HELP = f"Harness to use for a local agent: {_HARNESS_CHOICES_HELP}."
 _RUN_HARNESS_HELP = (
