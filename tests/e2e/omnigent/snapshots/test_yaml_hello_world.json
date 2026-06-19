@@ -1,5 +1,5 @@
 {
     "exit_code": {"kind": "exact", "value": 0},
     "stderr_is_clean": {"kind": "exact", "value": true},
-    "stdout": {"kind": "contains", "value": "calculate"}
+    "stdout": {"kind": "contains", "value": "TOOL_ROUNDTRIP_OK_7"}
 }

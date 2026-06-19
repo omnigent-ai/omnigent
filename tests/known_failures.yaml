@@ -107,20 +107,8 @@ skips:
     cluster: repl-pexpect-cli
     mode: skip
 
-  - id: tests/e2e/omnigent/test_yaml_hello_world.py::test_yaml_agent_with_tools[claude-sdk]
-    reason: "Tool-call lifecycle markers ('◦ calculate' / '• calculate') not rendering to stdout after path fix; harness answers '3 + 4 = 7' directly without invoking the calculate tool, so the snapshot's stdout-contains-'calculate' check fails. Investigate per-harness tool surfacing."
-    issue: 677
-    cluster: repl-pexpect-cli
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_yaml_hello_world.py::test_yaml_agent_with_tools[codex]
-    reason: "Snapshot mismatch on the tool-call lifecycle markers (◦ calculate / • calculate) not rendered to stdout in oneshot mode. Fails consistently 30/30 in flake-stress run 27798661226 (not flaky). See #677."
-    issue: 677
-    cluster: run-ap-examples-harness
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_yaml_hello_world.py::test_yaml_agent_with_tools[openai-agents]
-    reason: "Snapshot mismatch on the tool-call lifecycle markers (◦/• calculate) not rendered to stdout in oneshot mode. Fails consistently 30/30 in flake-stress run 27798661226 (was logged 7/8-flaky; now consistent). Same cause as the [codex] variant — see #677."
-    issue: 677
-    cluster: run-ap-examples-harness
+  - id: tests/e2e/omnigent/test_yaml_hello_world.py::test_yaml_agent_with_tools[pi]
+    reason: "pi harness does not complete the headless `-p` tool round-trip: it makes only ONE LLM request (receives the forced calculate tool_call) then exits 0 with empty stdout — the tool is never dispatched and no follow-up call is made. Distinct from #677 (stale stdout-marker expectation, now fixed for the claude-sdk/codex/openai-agents rows); reproduces only locally since pi's CLI is absent in CI (row skipped there). Needs a tracking issue + pi headless-dispatch investigation."
+    issue: 0
+    cluster: pi-headless-tool-roundtrip
     mode: skip

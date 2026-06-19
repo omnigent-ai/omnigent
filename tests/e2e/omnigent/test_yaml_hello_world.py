@@ -15,8 +15,12 @@ still picks up openai-agents without needing the ``claude`` / ``codex``
 - Per-YAML defaults fail to pick up the ``callable:`` dotted
   paths via ``importlib.import_module`` — the tool never gets
   registered and the agent can't invoke it.
-- ``omnigent.cli`` one-shot path stops streaming tool-call
-  lifecycle lines (``◦ <tool>`` / ``• <tool>``) to stdout.
+- The YAML→tools round-trip breaks: the forced ``calculate``
+  tool_call never executes / its result never returns, so the
+  mock's final response (carrying the sentinel) is never reached.
+  (Headless ``-p`` does not stream ``◦/• <tool>`` lifecycle lines
+  to stdout — see #783 — so the tool is verified via the sentinel,
+  not those markers.)
 
 Design reference: ``designs/OMNIGENT_INTEGRATION.md`` §Phase 0
 YAML→agent characterization.
@@ -40,13 +44,18 @@ from tests.e2e.omnigent._snapshot import compare_snapshot
 
 _PROMPT = "What is 3 + 4? Use the calculate tool."
 
-# ``agent_with_tools.yaml`` defines a ``calculate`` tool. The
-# REPL's tool-lifecycle lines look like
-# ``◦ calculate`` (start) and ``• calculate (NNms)`` (complete).
-# We snapshot the substring ``"calculate"`` so the comparator
-# succeeds as long as either line appears, regardless of the
-# exact timing format.
-_EXPECTED_TOOL_NAME = "calculate"
+# Headless ``-p`` mode no longer streams ``◦/• <tool>`` tool-lifecycle
+# markers to stdout — since #783 it accumulates assistant text across
+# auto-triggered turns until the session is idle, then prints that. So
+# we cannot assert the tool name appears in stdout anymore.
+#
+# Instead the mock's FINAL (second) response carries a unique sentinel.
+# The mock serves that second response only after the harness has
+# executed the forced ``calculate`` tool_call and sent its result back
+# (the second LLM request), so the sentinel reaching stdout proves the
+# whole YAML→tools round-trip happened — you cannot get the final answer
+# without going through the tool.
+_TOOL_ROUNDTRIP_SENTINEL = "TOOL_ROUNDTRIP_OK_7"
 
 # Minimum assistant-text length. The prompt asks a direct
 # arithmetic question so the reply is typically short but must
@@ -159,7 +168,7 @@ def test_yaml_agent_with_tools(
                     }
                 ],
             },
-            {"text": "The answer is 7."},
+            {"text": f"The answer is 7. {_TOOL_ROUNDTRIP_SENTINEL}"},
         ],
         key=mock_model,
     )
@@ -192,10 +201,11 @@ def test_yaml_agent_with_tools(
 
     observed: dict[str, Any] = {
         "exit_code": result.returncode,
-        # Combined stdout because the tool-lifecycle lines
-        # (``◦ calculate`` / ``• calculate``) and the assistant
-        # reply both land on stdout, not stderr. The snapshot's
-        # ``contains`` comparator checks for the tool name.
+        # Headless ``-p`` does NOT stream ``◦/• <tool>`` lifecycle markers
+        # (#783). The snapshot checks the final-answer sentinel instead;
+        # because the mock only serves that final text after the forced
+        # ``calculate`` tool_call round-trips, the sentinel in stdout is
+        # itself the proof that the tool ran.
         "stdout": result.stdout,
         "stderr_is_clean": result.stderr.strip() == "",
     }
@@ -216,14 +226,17 @@ def test_yaml_agent_with_tools(
         f"chars after stripping tool lifecycle lines; got "
         f"{stripped!r} (full stdout: {result.stdout!r})"
     )
-    # Belt-and-braces — the snapshot's ``contains`` comparator
-    # already covers this, but naming the assertion explicitly
-    # makes the failure message self-explanatory if the
-    # snapshot file is ever accidentally deleted.
-    assert _EXPECTED_TOOL_NAME in result.stdout, (
-        f"Expected tool name {_EXPECTED_TOOL_NAME!r} not found "
-        f"in stdout; the {harness} harness did not invoke "
-        f"the calculate tool.\n\nstdout:\n{result.stdout!r}"
+    # Belt-and-braces — the snapshot's ``contains`` comparator already
+    # covers this, but naming the assertion explicitly makes the failure
+    # message self-explanatory if the snapshot file is ever deleted. The
+    # sentinel lives only in the mock's SECOND response, which is served
+    # only after the forced ``calculate`` tool_call executes and its
+    # result is sent back — so its presence proves the tool round-trip.
+    assert _TOOL_ROUNDTRIP_SENTINEL in result.stdout, (
+        f"Final-answer sentinel {_TOOL_ROUNDTRIP_SENTINEL!r} not found in "
+        f"stdout; the {harness} harness did not complete the calculate "
+        f"tool round-trip (the final response is unreachable without it).\n\n"
+        f"stdout:\n{result.stdout!r}"
     )
 
 
