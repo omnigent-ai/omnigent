@@ -1,10 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
+  HTML_PREVIEW_SANDBOX,
   detectLang,
   getSelectionOffsets,
   indexToLine,
   isBinaryPath,
   lineOverlapsSelection,
+  openHtmlArtifactInNewTab,
   prepareHtmlPreviewDoc,
 } from "./codeViewerHelpers";
 
@@ -222,6 +224,38 @@ describe("prepareHtmlPreviewDoc", () => {
     // sandboxed preview — never a security issue — so we lock in the behavior.
     const out = prepareHtmlPreviewDoc("<!-- <head> --><html><head></head></html>");
     expect(out).toBe(`<!-- <head>${BASE} --><html><head></head></html>`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// openHtmlArtifactInNewTab — pop-out renders in an isolated sandboxed iframe
+// ---------------------------------------------------------------------------
+
+describe("openHtmlArtifactInNewTab", () => {
+  it("renders the artifact in a sandboxed, opaque-origin iframe (never the app origin)", () => {
+    // A real (detached) document stands in for the popped tab's document.
+    const shellDoc = document.implementation.createHTMLDocument("");
+    const open = vi.fn(() => ({ document: shellDoc }) as unknown as Window);
+
+    const ok = openHtmlArtifactInNewTab("<h1>hi</h1>", "art.html", { open });
+
+    expect(ok).toBe(true);
+    // Critically: the artifact is NOT navigated to as a top-level blob:/data:
+    // page (which would inherit the app origin) — it's hosted in about:blank.
+    expect(open).toHaveBeenCalledWith("about:blank", "_blank");
+    const frame = shellDoc.querySelector("iframe");
+    expect(frame).not.toBeNull();
+    const sandbox = frame!.getAttribute("sandbox") ?? "";
+    expect(sandbox).toBe(HTML_PREVIEW_SANDBOX);
+    // Security invariant: the artifact must never share the app's origin.
+    expect(sandbox).not.toContain("allow-same-origin");
+    // Links still open in a new tab inside the pop-out (#777).
+    expect(frame!.getAttribute("srcdoc")).toContain('<base target="_blank">');
+  });
+
+  it("returns false when the popup is blocked (window.open → null)", () => {
+    const open = vi.fn(() => null);
+    expect(openHtmlArtifactInNewTab("<h1>hi</h1>", "art.html", { open })).toBe(false);
   });
 });
 

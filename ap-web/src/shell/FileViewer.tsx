@@ -78,11 +78,10 @@ import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileVie
 import { type ChangedSort, compareChangedFiles } from "./FlatFileList";
 import { CodeViewer } from "./CodeViewer";
 import {
-  HTML_PREVIEW_SANDBOX,
   MONACO_SPLIT_BREAKPOINT,
   type SaveStatus,
   detectLang,
-  prepareHtmlPreviewDoc,
+  openHtmlArtifactInNewTab,
 } from "./codeViewerHelpers";
 import { CommentsPanel, type ActiveSelection } from "./CommentsPanel";
 
@@ -470,34 +469,18 @@ function FileViewerBody({
     triggerBrowserDownload(fileContentToBlob(data), path.split("/").pop() ?? path);
   }, [fileQuery.data, path]);
 
-  // Open the HTML artifact in its own browser tab WITHOUT handing its
-  // (untrusted, agent-generated) scripts the app's own origin.
-  //
-  // We open a blank, same-origin tab we fully control and render the artifact
-  // inside a *sandboxed* iframe — the same opaque-origin isolation the in-app
-  // preview uses. A `blob:` or `data:` document would instead run the artifact
-  // AT the app's origin, where its JS could read the app's storage and issue
-  // credentialed same-origin requests to our API (see the #777/#778 security
-  // review). The sandboxed-iframe shell gives full-window rendering with none
-  // of that exposure: the artifact gets an opaque origin and cannot reach this
-  // shell tab, its `window.opener`, or the host app.
+  // Pop the HTML artifact into its own browser tab. The artifact is rendered in
+  // a sandboxed, opaque-origin iframe (see `openHtmlArtifactInNewTab`), so it
+  // stays isolated from the host app — full-window rendering, no origin sharing.
   const openHtmlInNewTab = useCallback(() => {
     const data = fileQuery.data;
     if (!data) return;
-    const win = window.open("about:blank", "_blank");
-    if (!win) return; // popup blocked
-    const doc = win.document;
-    doc.title = path.split("/").pop() ?? path;
-    doc.body.style.margin = "0";
-    // Sandbox is set via setAttribute just below; the static rule can't see it.
-    // oxlint-disable-next-line iframe-missing-sandbox
-    const frame = doc.createElement("iframe");
-    // No `allow-same-origin`: the artifact runs in an opaque origin, isolated
-    // from this shell tab and the host app.
-    frame.setAttribute("sandbox", HTML_PREVIEW_SANDBOX);
-    frame.srcdoc = prepareHtmlPreviewDoc(data.content);
-    frame.style.cssText = "position:fixed;inset:0;height:100%;width:100%;border:0";
-    doc.body.appendChild(frame);
+    const opened = openHtmlArtifactInNewTab(data.content, path.split("/").pop() ?? path);
+    if (!opened) {
+      // window.open returned null — almost always a popup blocker. There's no
+      // toast surface here, so log it rather than failing silently.
+      console.warn("Open in new tab: the browser blocked the popup window.");
+    }
   }, [fileQuery.data, path]);
 
   const copyFileLink = useCallback(() => {
@@ -736,9 +719,9 @@ function FileViewerBody({
       },
     });
   }
-  // HTML artifacts can be popped out into a real browser tab, where they render
-  // unsandboxed (full JS, links, forms) — handy when the in-app preview's
-  // sandbox is too restrictive for a given page.
+  // HTML artifacts can be popped out into their own browser tab for full-window
+  // viewing. The artifact still runs in the same sandboxed, opaque-origin iframe
+  // as the in-app preview (isolated from the host app) — just full-screen.
   if (lang === "html" && fileQuery.data && viewMode !== "diff") {
     toolbarActions.push({
       key: "open-new-tab",

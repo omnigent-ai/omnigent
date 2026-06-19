@@ -10,7 +10,9 @@ Regression coverage for two bugs in the HTML artifact preview
     relaxes the sandbox so links open a real new tab.
 
 It also covers the new "Open in new tab" toolbar button, which pops the
-artifact out as a standalone, fully-unsandboxed ``blob:`` page.
+artifact into a blank, app-controlled tab and renders it inside the same
+sandboxed (opaque-origin) iframe — full-window viewing without giving the
+artifact the app's own origin.
 
 The file is seeded via the filesystem PUT endpoint (no agent run), so the test
 is deterministic, and the fixture's JavaScript is self-contained (no network),

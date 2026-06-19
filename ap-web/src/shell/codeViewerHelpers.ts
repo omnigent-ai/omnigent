@@ -206,6 +206,13 @@ export function detectLang(path: string): BundledLanguage | "text" {
  * that with `allow-scripts` would let untrusted artifact code reach into the
  * parent app (cookies, storage, DOM). Withholding it gives the document an
  * opaque origin, so scripts run fully sandboxed away from the host page.
+ *
+ * Accepted trade-offs from these flags: `allow-popups-to-escape-sandbox` lets
+ * artifact JS spawn fully-capable new windows (phishing / window-spam surface),
+ * and `allow-modals` lets it raise blocking `alert`/`confirm`/`prompt` dialogs.
+ * Neither can reach app data (the opaque origin still applies / the spawned
+ * window's `opener` is the opaque frame), so these are bounded nuisance risks
+ * we accept in exchange for links and interactive artifacts behaving normally.
  */
 export const HTML_PREVIEW_SANDBOX =
   "allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-modals";
@@ -234,7 +241,7 @@ export function prepareHtmlPreviewDoc(html: string): string {
   const baseTag = '<base target="_blank">';
 
   const headMatch = html.match(/<head[^>]*>/i);
-  if (headMatch?.index != null) {
+  if (headMatch?.index !== undefined) {
     const insertAt = headMatch.index + headMatch[0].length;
     return html.slice(0, insertAt) + baseTag + html.slice(insertAt);
   }
@@ -242,7 +249,7 @@ export function prepareHtmlPreviewDoc(html: string): string {
   // No <head>: create one right after <html> so the base still lands inside the
   // document head (after the doctype, preserving standards mode).
   const htmlMatch = html.match(/<html[^>]*>/i);
-  if (htmlMatch?.index != null) {
+  if (htmlMatch?.index !== undefined) {
     const insertAt = htmlMatch.index + htmlMatch[0].length;
     return `${html.slice(0, insertAt)}<head>${baseTag}</head>${html.slice(insertAt)}`;
   }
@@ -250,6 +257,42 @@ export function prepareHtmlPreviewDoc(html: string): string {
   // Bare fragment (no <html>/<head>, hence no doctype to displace) — the browser
   // wraps it in an implicit head, so a leading base tag is safe.
   return baseTag + html;
+}
+
+/**
+ * Open an HTML artifact in its own browser tab, isolated from the host app.
+ *
+ * Renders the (untrusted, agent-generated) artifact inside a sandboxed iframe
+ * within a blank, app-controlled tab, so it runs in an opaque origin — the same
+ * isolation as the in-app preview, just full-window. We deliberately do NOT use
+ * a `blob:` or `data:` document: a top-level page there inherits the app's own
+ * origin, which would let artifact JS read the app's storage and issue
+ * credentialed same-origin requests to our API. The sandboxed-iframe shell
+ * avoids that — the artifact cannot reach this shell tab, its `window.opener`,
+ * or the host app.
+ *
+ * `opener` is injectable so this is unit-testable without a real browser window.
+ * Returns `false` if the popup was blocked (the caller can surface feedback).
+ */
+export function openHtmlArtifactInNewTab(
+  content: string,
+  filename: string,
+  opener: Pick<Window, "open"> = window,
+): boolean {
+  const win = opener.open("about:blank", "_blank");
+  if (!win) return false; // popup blocked by the browser
+  const doc = win.document;
+  doc.title = filename;
+  doc.body.style.margin = "0";
+  // oxlint-disable-next-line iframe-missing-sandbox -- sandbox set via setAttribute below
+  const frame = doc.createElement("iframe");
+  // No `allow-same-origin`: the artifact runs in an opaque origin, isolated from
+  // this shell tab and the host app.
+  frame.setAttribute("sandbox", HTML_PREVIEW_SANDBOX);
+  frame.srcdoc = prepareHtmlPreviewDoc(content);
+  frame.style.cssText = "position:fixed;inset:0;height:100%;width:100%;border:0";
+  doc.body.appendChild(frame);
+  return true;
 }
 
 // ---------------------------------------------------------------------------
