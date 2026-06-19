@@ -124,6 +124,8 @@ def test_configured_harness_map_covers_all_spellings(
         "pi-native",
         "native-pi",
         "cursor",
+        "cursor-native",
+        "native-cursor",
         # Antigravity SDK harness + its user-facing aliases.
         "antigravity",
         "agy",
@@ -156,8 +158,8 @@ def test_configured_harness_map_gates_only_cli_harnesses(
     ):
         assert result[sdk] is True, f"{sdk} should never be gated"
     # CLI-wrapping spellings — gated, so False when the binary is absent.
-    # (Cursor is excluded: it runs via the ``cursor-sdk`` package and gates on
-    # a configured ``CURSOR_API_KEY``, not a binary — covered separately.)
+    # (Bare ``cursor`` is excluded: it runs via the ``cursor-sdk`` package and
+    # gates on a configured ``CURSOR_API_KEY``, not a binary — covered separately.)
     for cli in (
         "claude-native",
         "native-claude",
@@ -165,6 +167,8 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         "codex-native",
         "native-codex",
         "pi",
+        "cursor-native",
+        "native-cursor",
     ):
         assert result[cli] is False, f"{cli} should be gated on its CLI binary"
 
@@ -212,3 +216,17 @@ def test_cursor_readiness_keys_off_api_key(
         yaml.safe_dump({"cursor": {"api_key_ref": "env:MY_CURSOR_KEY"}})
     )
     assert harness_is_configured("cursor") is True
+
+
+def test_cursor_native_readiness_keys_off_cursor_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cursor-native is configured iff the ``cursor-agent`` CLI is installed."""
+    monkeypatch.setenv("CURSOR_API_KEY", "crsr_sdk_key_does_not_matter")
+    _all_clis_installed(monkeypatch)
+    assert harness_is_configured("cursor-native") is True
+    assert harness_is_configured("native-cursor") is True
+
+    _no_clis_installed(monkeypatch)
+    assert harness_is_configured("cursor-native") is False
+    assert harness_is_configured("native-cursor") is False

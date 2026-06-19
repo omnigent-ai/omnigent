@@ -15,7 +15,9 @@ import contextlib
 import hashlib
 import json
 import os
+import secrets
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -26,6 +28,37 @@ BRIDGE_DIR_ENV_VAR = "HARNESS_CURSOR_NATIVE_BRIDGE_DIR"
 
 _BRIDGE_ROOT = Path(os.environ.get("TMPDIR", "/tmp")) / f"omnigent-{os.getuid()}" / "cursor-native"
 _TMUX_FILE = "tmux.json"
+_BRIDGE_CONFIG_FILE = "bridge.json"
+_MCP_CONFIG_FILE = "mcp.json"
+_MCP_SERVER_NAME = "omnigent"
+_CURSOR_AUTO_APPROVE_TOOLS = [
+    "list_comments",
+    "sys_add_policy",
+    "sys_agent_download",
+    "sys_agent_get",
+    "sys_agent_list",
+    "sys_call_async",
+    "sys_cancel_async",
+    "sys_cancel_task",
+    "sys_list_models",
+    "sys_os_edit",
+    "sys_os_read",
+    "sys_os_shell",
+    "sys_os_write",
+    "sys_policy_registry",
+    "sys_session_close",
+    "sys_session_create",
+    "sys_session_get_history",
+    "sys_session_get_info",
+    "sys_session_list",
+    "sys_session_send",
+    "sys_terminal_close",
+    "sys_terminal_launch",
+    "sys_terminal_list",
+    "sys_terminal_read",
+    "sys_terminal_send",
+    "update_comment",
+]
 _TMUX_READY_TIMEOUT_S = 30.0
 _TMUX_SEND_TIMEOUT_S = 10.0
 _POLL_INTERVAL_S = 0.2
@@ -47,6 +80,11 @@ def bridge_dir_for_session_id(session_id: str) -> Path:
     return _BRIDGE_ROOT / digest
 
 
+def bridge_root() -> Path:
+    """Return the configured Cursor-native bridge root."""
+    return _BRIDGE_ROOT
+
+
 def _ensure_dir(path: Path) -> None:
     """Create *path* (and parents) with owner-only permissions."""
     path.mkdir(parents=True, exist_ok=True)
@@ -61,6 +99,149 @@ def build_cursor_native_spawn_env(session_id: str) -> dict[str, str]:
     return {
         BRIDGE_DIR_ENV_VAR: str(bridge_dir),
     }
+
+
+def build_mcp_config(
+    bridge_dir: Path,
+    *,
+    python_executable: str | None = None,
+) -> dict[str, Any]:
+    """Build Cursor's ``.cursor/mcp.json`` for the Omnigent relay server.
+
+    Cursor prompts for MCP tool approval before it sends ``tools/call`` to the
+    server. Omnigent tools already route through the Omnigent ``/mcp`` proxy,
+    where TOOL_CALL policies publish ``response.elicitation_request`` events
+    that the web UI can render. Auto-approving the Cursor-side MCP gate avoids a
+    hidden in-terminal approval prompt blocking the call before Omnigent ever
+    sees it, while preserving Omnigent's own policy/elicitation gate.
+    """
+    python = python_executable or sys.executable
+    return {
+        "mcpServers": {
+            _MCP_SERVER_NAME: {
+                "command": python,
+                "args": [
+                    "-I",
+                    "-m",
+                    "omnigent.claude_native_bridge",
+                    "serve-mcp",
+                    "--bridge-dir",
+                    str(bridge_dir),
+                ],
+                "autoApprove": list(_CURSOR_AUTO_APPROVE_TOOLS),
+                "env": {
+                    "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
+                },
+            }
+        }
+    }
+
+
+def write_mcp_bridge_config(bridge_dir: Path) -> None:
+    """Write the token config required by the shared Omnigent MCP bridge."""
+    _ensure_dir(bridge_dir)
+    config_path = bridge_dir / _BRIDGE_CONFIG_FILE
+    if config_path.exists():
+        return
+    payload = {"token": secrets.token_urlsafe(32)}
+    tmp = bridge_dir / (_BRIDGE_CONFIG_FILE + ".tmp")
+    tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, config_path)
+
+
+def write_mcp_config(
+    workspace: Path,
+    bridge_dir: Path,
+    *,
+    python_executable: str | None = None,
+) -> Path:
+    """Write the workspace-scoped Cursor MCP config for Omnigent tools."""
+    write_mcp_bridge_config(bridge_dir)
+    cursor_dir = workspace / ".cursor"
+    cursor_dir.mkdir(parents=True, exist_ok=True)
+    path = cursor_dir / _MCP_CONFIG_FILE
+    payload = build_mcp_config(bridge_dir, python_executable=python_executable)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    enable_mcp_for_workspace(workspace)
+    allow_mcp_tools_in_cli_config()
+    return path
+
+
+def approve_mcp_server_for_workspace(workspace: Path) -> None:
+    """Approve the workspace-scoped Omnigent MCP server in Cursor's state.
+
+    Cursor stores per-workspace MCP approvals using a private hash of the
+    concrete server config. Rather than duplicate that implementation here,
+    ask ``cursor-agent mcp enable omnigent`` to write the exact approval entry
+    for this workspace. This is best-effort: the TUI still launches if the
+    installed Cursor CLI cannot run the management subcommand, but when it can,
+    the hidden server-approval gate is cleared before startup.
+    """
+    try:
+        from omnigent.cursor_native import resolve_cursor_executable
+
+        cursor = resolve_cursor_executable()
+        subprocess.run(
+            [cursor, "mcp", "enable", _MCP_SERVER_NAME],
+            cwd=workspace,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
+
+
+def cursor_project_key(workspace: Path) -> str:
+    """Return Cursor's project-state directory key for *workspace*."""
+    return str(workspace).strip("/").replace("/", "-") or "root"
+
+
+def enable_mcp_for_workspace(workspace: Path) -> None:
+    """Ensure Cursor does not keep the Omnigent MCP disabled for this workspace."""
+    disabled_path = (
+        Path.home() / ".cursor" / "projects" / cursor_project_key(workspace) / "mcp-disabled.json"
+    )
+    try:
+        raw = json.loads(disabled_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(raw, list) or _MCP_SERVER_NAME not in raw:
+        return
+    updated = [item for item in raw if item != _MCP_SERVER_NAME]
+    tmp = disabled_path.with_suffix(disabled_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(updated, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, disabled_path)
+
+
+def allow_mcp_tools_in_cli_config() -> None:
+    """Allow Omnigent MCP tool calls in Cursor's CLI permission config."""
+    path = Path.home() / ".cursor" / "cli-config.json"
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(config, dict):
+        return
+    permissions = config.setdefault("permissions", {})
+    if not isinstance(permissions, dict):
+        return
+    allow = permissions.setdefault("allow", [])
+    if not isinstance(allow, list):
+        return
+    existing = {item for item in allow if isinstance(item, str)}
+    for tool_name in _CURSOR_AUTO_APPROVE_TOOLS:
+        entry = f"Mcp({_MCP_SERVER_NAME}:{tool_name})"
+        if entry not in existing:
+            allow.append(entry)
+            existing.add(entry)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def write_tmux_target(
