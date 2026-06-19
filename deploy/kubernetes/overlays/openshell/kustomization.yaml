@@ -7,6 +7,8 @@ resources:
   - ../../base
   - gateway-networkpolicy.yaml
   - sandbox-rbac.yaml
+  - sandbox-clusterrole.yaml
+  - sandbox-clusterrolebinding.yaml
 
 patches:
   - path: configmap-patch.yaml

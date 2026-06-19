@@ -1,0 +1,14 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: openshell-sandbox-manager
+  labels:
+    app: omnigent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: openshell-sandbox-manager
+subjects:
+  - kind: ServiceAccount
+    name: omnigent
+    namespace: omnigent
