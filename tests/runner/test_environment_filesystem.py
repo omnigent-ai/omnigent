@@ -740,6 +740,91 @@ async def test_filesystem_changes_no_events_returns_empty(
     assert body["data"] == [], "No registry means no changes"
 
 
+@pytest.mark.asyncio
+async def test_filesystem_changes_tracking_non_git(
+    client_with_registry: httpx.AsyncClient,
+) -> None:
+    """Non-git workspaces flag tracking as incomplete with the non-git reason.
+
+    The seeded registry watches a plain (non-git) tmp workspace, so only agent
+    tool-call edits are visible.  The endpoint must say so via ``tracking`` —
+    otherwise the partial list reads as a definitive "no changes" and native
+    harnesses (which write outside ``record_change``) look like they did
+    nothing.
+    """
+    resp = await client_with_registry.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+    )
+    assert resp.status_code == 200
+    assert resp.json()["tracking"] == {"complete": False, "reason": "non_git_workspace"}
+
+
+@pytest.mark.asyncio
+async def test_filesystem_changes_tracking_git_workspace(tmp_path: Path) -> None:
+    """Git workspaces flag tracking as complete with no limit reason.
+
+    ``git status`` reflects every working-tree change, so the changes panel
+    needs no "limited tracking" caveat.  Failure means git sessions would
+    wrongly surface the non-git notice.
+    """
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    # A ``.git`` entry makes _find_git_root classify this as a git workspace,
+    # so the runner builds a GitFilesystemRegistry (complete tracking).
+    (ws / ".git").mkdir()
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(ws),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+    assert os_env is not None
+    reg = SessionResourceRegistry()
+    reg._primary_envs["conv_test"] = os_env
+    app = create_runner_app(
+        resource_registry=reg,
+        runner_workspace=ws,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        resp = await client.get(
+            f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+        )
+    assert resp.status_code == 200
+    assert resp.json()["tracking"] == {"complete": True, "reason": None}
+
+
+@pytest.mark.asyncio
+async def test_filesystem_changes_tracking_no_workspace(
+    registry: SessionResourceRegistry,
+) -> None:
+    """A runner with no workspace flags tracking as unavailable.
+
+    When ``runner_workspace`` is ``None`` the runner has no filesystem
+    registry, so ``/changes`` is always empty.  The endpoint must report that
+    tracking is unavailable (``reason="no_workspace"``) rather than let the
+    empty list imply a definitive "no changes".  Guards the registry-less
+    branch's exact reason string against a constant typo.
+    """
+    app = create_runner_app(
+        resource_registry=registry,
+        runner_workspace=None,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    assert app.state.filesystem_registry is None
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        resp = await client.get(
+            f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["data"] == []
+    assert body["tracking"] == {"complete": False, "reason": "no_workspace"}
+
+
 # ── _require_os_env guard: all Phase-3 endpoints ────────────────────────────
 
 

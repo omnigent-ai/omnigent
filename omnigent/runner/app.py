@@ -11593,23 +11593,37 @@ def create_runner_app(
         Use this endpoint for the flat "changed files" view; use the
         directory listing endpoints for hierarchical browsing.
 
+        The response carries a ``tracking`` object —
+        ``{"complete": bool, "reason": str | None}`` — describing whether the
+        list captures every edit.  Git workspaces are complete
+        (``reason`` ``None``); non-git workspaces and registry-less sessions are
+        incomplete with a machine-readable reason (``"non_git_workspace"`` /
+        ``"no_workspace"``) so the UI can explain the limitation rather than
+        let a partial list read as "no changes".
+
         :param session_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
         :param environment_id: Environment resource id,
             e.g. ``"default"``.
-        :returns: JSON list of changed file entries with ``status`` field.
+        :returns: JSON list of changed file entries (each with a ``status``
+            field) plus a top-level ``tracking`` completeness descriptor.
         """
+        from omnigent.runtime.filesystem_registry import TRACKING_LIMIT_NO_WORKSPACE
+
         await _require_os_env(session_id)
         await _ensure_session_registered(session_id)
         session_registry = await _resolve_session_fs_registry(session_id)
-        raw_changes = (
-            session_registry.list_changed_files(
-                session_id,
-                limit=10_000,
-            )
-            if session_registry is not None
-            else []
-        )
+        if session_registry is not None:
+            raw_changes = session_registry.list_changed_files(session_id, limit=10_000)
+            tracking_complete = session_registry.tracks_all_changes
+            tracking_reason = session_registry.tracking_limit_reason
+        else:
+            # No registry at all (runner has no workspace path): the list is
+            # always empty, so flag tracking as unavailable rather than letting
+            # the empty list read as a definitive "no changes".
+            raw_changes = []
+            tracking_complete = False
+            tracking_reason = TRACKING_LIMIT_NO_WORKSPACE
         data = [
             {
                 "object": "session.environment.filesystem.entry",
@@ -11623,7 +11637,19 @@ def create_runner_app(
         ]
         return JSONResponse(
             status_code=200,
-            content={"object": "list", "data": data, "has_more": False},
+            content={
+                "object": "list",
+                "data": data,
+                "has_more": False,
+                # Whether the list captures every working-tree edit.  Git
+                # workspaces are complete; non-git workspaces track only agent
+                # tool-call edits (``tracking.reason`` says why), so the UI can
+                # surface the limitation instead of an ambiguous empty list.
+                "tracking": {
+                    "complete": tracking_complete,
+                    "reason": tracking_reason,
+                },
+            },
         )
 
     @app.get(

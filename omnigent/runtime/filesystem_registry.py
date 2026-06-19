@@ -18,7 +18,12 @@ Use :func:`create_filesystem_registry` to obtain the correct implementation
 for a given workspace path.
 
 Both classes share the :class:`FilesystemRegistry` abstract base class, which
-defines the full public interface.
+defines the full public interface.  The base class also exposes
+:attr:`~FilesystemRegistry.tracks_all_changes` /
+:attr:`~FilesystemRegistry.tracking_limit_reason` so callers (the
+``GET …/changes`` endpoint) can tell the UI when a non-git workspace tracks
+only agent tool-call edits — surfacing the limitation instead of letting a
+necessarily-partial list read as a definitive "no changes".
 """
 
 from __future__ import annotations
@@ -34,6 +39,14 @@ from pathlib import Path
 from typing import Any
 
 _logger = logging.getLogger(__name__)
+
+# Machine-readable reasons surfaced in the ``GET …/changes`` response's
+# ``tracking.reason`` field when change tracking cannot observe every
+# working-tree edit.  The web UI maps these to an explanatory notice in the
+# Files "changes" panel so a necessarily-partial list does not read as a
+# definitive "no changes".
+TRACKING_LIMIT_NON_GIT = "non_git_workspace"
+TRACKING_LIMIT_NO_WORKSPACE = "no_workspace"
 
 # Filename patterns for ephemeral process artifacts that should never appear in
 # the Files panel regardless of .gitignore rules.  These are write-temp files
@@ -322,6 +335,33 @@ class FilesystemRegistry(ABC):
         """The workspace root directory being watched."""
         return self._cwd
 
+    # ── Concrete: change-tracking completeness ─────────────────────
+
+    @property
+    def tracks_all_changes(self) -> bool:
+        """Whether the registry observes *every* working-tree change.
+
+        ``True`` means changes are reported regardless of which process made
+        them (e.g. :class:`GitFilesystemRegistry`, backed by ``git status``).
+        ``False`` (the default) means only edits routed through
+        :meth:`record_change` — the agent's write/edit tool calls and the REST
+        filesystem endpoints — are visible; files written by a native-harness
+        CLI, ``sys_os_shell``, or any external process are missed.  Callers use
+        this to tell the UI that the changes list may be incomplete.
+        """
+        return False
+
+    @property
+    def tracking_limit_reason(self) -> str | None:
+        """Machine-readable reason change tracking is incomplete.
+
+        ``None`` when :attr:`tracks_all_changes` is ``True``.  Otherwise one of
+        the ``TRACKING_LIMIT_*`` constants (e.g. :data:`TRACKING_LIMIT_NON_GIT`),
+        surfaced verbatim in the ``GET …/changes`` response so the web UI can
+        explain *why* tracking is limited rather than showing a bare empty list.
+        """
+        return None
+
     # ── Concrete: record_change (no-op default) ────────────────────
 
     def record_change(
@@ -451,6 +491,16 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         # registered by that session.  Used by ``unregister_conversation`` to
         # evict snapshot entries when a session ends, preventing unbounded growth.
         self._snapshot_sessions: dict[str, set[str]] = {}
+
+    @property
+    def tracking_limit_reason(self) -> str | None:
+        """Non-git workspaces track only agent tool-call edits.
+
+        :returns: :data:`TRACKING_LIMIT_NON_GIT` — external/shell/native-CLI
+            writes never reach :meth:`record_change`, so the changes list is
+            necessarily partial.  (:attr:`tracks_all_changes` stays ``False``.)
+        """
+        return TRACKING_LIMIT_NON_GIT
 
     def record_change(
         self,
@@ -669,6 +719,15 @@ class GitFilesystemRegistry(FilesystemRegistry):
         """
         super().__init__(watch_path)
         self._git_root = git_root
+
+    @property
+    def tracks_all_changes(self) -> bool:
+        """``git status`` reflects every working-tree change regardless of which
+        process wrote it, so git-backed tracking is complete.
+
+        :returns: ``True``.  (:attr:`tracking_limit_reason` stays ``None``.)
+        """
+        return True
 
     def list_changed_files(self, conversation_id: str, *, limit: int) -> list[dict[str, Any]]:
         """Return all uncommitted changes in the working tree, newest first.
