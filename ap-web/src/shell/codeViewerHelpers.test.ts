@@ -5,6 +5,7 @@ import {
   indexToLine,
   isBinaryPath,
   lineOverlapsSelection,
+  prepareHtmlPreviewDoc,
 } from "./codeViewerHelpers";
 
 // ---------------------------------------------------------------------------
@@ -161,6 +162,43 @@ describe("indexToLine", () => {
     // ["", "x"] → line 1 is empty (length 0), line 2 starts at offset 1.
     expect(indexToLine(0, ["", "x"])).toBe(1); // on the empty first line
     expect(indexToLine(1, ["", "x"])).toBe(2); // on "x"
+  });
+});
+
+// ---------------------------------------------------------------------------
+// prepareHtmlPreviewDoc — force links to open in a new tab (issue #777)
+// ---------------------------------------------------------------------------
+
+describe("prepareHtmlPreviewDoc", () => {
+  const BASE = '<base target="_blank">';
+
+  it("injects the base tag inside an existing <head>", () => {
+    const html = "<!DOCTYPE html><html><head><title>x</title></head><body>hi</body></html>";
+    const out = prepareHtmlPreviewDoc(html);
+    expect(out).toContain(`<head>${BASE}<title>x</title>`);
+    // Doctype stays first so the document keeps standards mode.
+    expect(out.indexOf("<!DOCTYPE html>")).toBe(0);
+  });
+
+  it("matches <head> with attributes", () => {
+    const out = prepareHtmlPreviewDoc('<head lang="en"><meta></head>');
+    expect(out).toContain(`<head lang="en">${BASE}<meta>`);
+  });
+
+  it("creates a <head> after <html> when none exists", () => {
+    const out = prepareHtmlPreviewDoc("<!DOCTYPE html><html><body>hi</body></html>");
+    expect(out).toContain(`<html><head>${BASE}</head><body>`);
+    expect(out.indexOf("<!DOCTYPE html>")).toBe(0);
+  });
+
+  it("prepends the base tag for a bare fragment (no doctype to displace)", () => {
+    const out = prepareHtmlPreviewDoc('<a href="https://example.com">link</a>');
+    expect(out).toBe(`${BASE}<a href="https://example.com">link</a>`);
+  });
+
+  it("is case-insensitive on the HEAD tag", () => {
+    const out = prepareHtmlPreviewDoc("<HEAD></HEAD>");
+    expect(out).toContain(`<HEAD>${BASE}`);
   });
 });
 

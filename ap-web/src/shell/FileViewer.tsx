@@ -39,6 +39,7 @@ import {
   PencilLineIcon,
   RowsIcon,
   SearchIcon,
+  SquareArrowOutUpRightIcon,
   Trash2Icon,
 } from "lucide-react";
 import { useSearchParams } from "@/lib/routing";
@@ -463,6 +464,18 @@ function FileViewerBody({
     triggerBrowserDownload(fileContentToBlob(data), path.split("/").pop() ?? path);
   }, [fileQuery.data, path]);
 
+  // Open the HTML artifact as a standalone page in a real browser tab, where it
+  // renders with no sandbox — scripts and links behave exactly as they would
+  // for a normal web page. A blob URL keeps it client-side (no upload). The URL
+  // is revoked after a delay so the new tab has time to load it first.
+  const openHtmlInNewTab = useCallback(() => {
+    const data = fileQuery.data;
+    if (!data || typeof URL.createObjectURL !== "function") return;
+    const url = URL.createObjectURL(new Blob([data.content], { type: "text/html" }));
+    window.open(url, "_blank", "noopener");
+    window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  }, [fileQuery.data]);
+
   const copyFileLink = useCallback(() => {
     if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) return;
     const url = new URL(window.location.href);
@@ -697,6 +710,17 @@ function FileViewerBody({
           setPreviewableViewMode((mode) => (mode === "preview" ? "source" : "preview"));
         }
       },
+    });
+  }
+  // HTML artifacts can be popped out into a real browser tab, where they render
+  // unsandboxed (full JS, links, forms) — handy when the in-app preview's
+  // sandbox is too restrictive for a given page.
+  if (lang === "html" && fileQuery.data && viewMode !== "diff") {
+    toolbarActions.push({
+      key: "open-new-tab",
+      label: "Open in new tab",
+      icon: <SquareArrowOutUpRightIcon className="size-4" />,
+      onSelect: openHtmlInNewTab,
     });
   }
   toolbarActions.push({

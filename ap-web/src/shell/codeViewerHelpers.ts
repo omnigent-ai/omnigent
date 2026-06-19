@@ -187,6 +187,64 @@ export function detectLang(path: string): BundledLanguage | "text" {
 }
 
 // ---------------------------------------------------------------------------
+// HTML preview helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Sandbox flags for the HTML artifact preview iframe.
+ *
+ * - `allow-scripts` — run the page's JavaScript (without this, JS in rendered
+ *   HTML is silently dropped — see issue #778).
+ * - `allow-popups` + `allow-popups-to-escape-sandbox` — let links/`window.open`
+ *   open a new browsing context that is NOT itself sandboxed, so clicking a
+ *   link actually navigates a real tab (see issue #777).
+ * - `allow-forms` / `allow-modals` — typical interactive artifacts submit forms
+ *   and call `alert`/`confirm`.
+ *
+ * NOTE: we deliberately omit `allow-same-origin`. The iframe is fed via
+ * `srcDoc`, which would otherwise inherit the embedder's origin — combining
+ * that with `allow-scripts` would let untrusted artifact code reach into the
+ * parent app (cookies, storage, DOM). Withholding it gives the document an
+ * opaque origin, so scripts run fully sandboxed away from the host page.
+ */
+export const HTML_PREVIEW_SANDBOX =
+  "allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-modals";
+
+/**
+ * Prepare HTML artifact content for the preview iframe by forcing every link to
+ * open in a new tab (issue #777: "We should always make it open in a new
+ * window").
+ *
+ * We inject `<base target="_blank">` rather than rewriting individual anchors so
+ * it covers links created at runtime by scripts too. Placement matters: a
+ * `<base>` (or anything) before the `<!DOCTYPE>` would push the document into
+ * quirks mode and change how the artifact renders, so we insert *inside* the
+ * existing `<head>`/`<html>` when present and only fall back to prepending for
+ * bare fragments that have no doctype to displace.
+ */
+export function prepareHtmlPreviewDoc(html: string): string {
+  const baseTag = '<base target="_blank">';
+
+  const headMatch = html.match(/<head[^>]*>/i);
+  if (headMatch?.index != null) {
+    const insertAt = headMatch.index + headMatch[0].length;
+    return html.slice(0, insertAt) + baseTag + html.slice(insertAt);
+  }
+
+  // No <head>: create one right after <html> so the base still lands inside the
+  // document head (after the doctype, preserving standards mode).
+  const htmlMatch = html.match(/<html[^>]*>/i);
+  if (htmlMatch?.index != null) {
+    const insertAt = htmlMatch.index + htmlMatch[0].length;
+    return `${html.slice(0, insertAt)}<head>${baseTag}</head>${html.slice(insertAt)}`;
+  }
+
+  // Bare fragment (no <html>/<head>, hence no doctype to displace) — the browser
+  // wraps it in an implicit head, so a leading base tag is safe.
+  return baseTag + html;
+}
+
+// ---------------------------------------------------------------------------
 // DOM → absolute character offset helpers
 // ---------------------------------------------------------------------------
 
