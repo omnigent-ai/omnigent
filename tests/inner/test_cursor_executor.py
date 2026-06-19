@@ -206,6 +206,25 @@ def test_resolve_model_drops_databricks_and_defaults_to_auto() -> None:
     assert _resolve_model(None) == "auto"
 
 
+def test_resolve_model_maps_cursor_display_labels_to_sdk_ids() -> None:
+    """The in-chat / `/model` switcher can carry a Cursor display LABEL
+    (``Composer``) rather than the SDK id (``composer-2.5``). The SDK rejects
+    the label with ``invalid_argument``, so _resolve_model must map known
+    display labels to their SDK ids before agent creation (issue #547)."""
+    # The reported case: the friendly label maps to its SDK id, case-insensitively.
+    assert _resolve_model("Composer") == "composer-2.5"
+    assert _resolve_model("composer") == "composer-2.5"
+    assert _resolve_model("  COMPOSER  ") == "composer-2.5"
+    # Capitalized "Auto"/"Default" normalize to the SDK's lowercase ids.
+    assert _resolve_model("Auto") == "auto"
+    assert _resolve_model("Default") == "default"
+    # A real SDK id passes through unchanged (no drift-prone allow-list that
+    # would silently downgrade a valid-but-unlisted model to auto).
+    assert _resolve_model("composer-2.5") == "composer-2.5"
+    assert _resolve_model("claude-opus-4-8") == "claude-opus-4-8"
+    assert _resolve_model("gpt-5.4") == "gpt-5.4"
+
+
 def test_resolve_model_warns_when_dropping_a_pinned_model(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

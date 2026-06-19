@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
+import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
+import { CURSOR_SDK_MODELS } from "@/lib/cursorSdkModels";
 import {
   effortLevelsForConv,
   isModelImplicitlySelected,
+  modelOptionsForPicker,
   shouldShowEffortPicker,
   shouldShowModelPicker,
 } from "./ChatPage";
@@ -61,6 +64,31 @@ describe("shouldShowModelPicker", () => {
     expect(shouldShowModelPicker({ labels: {} })).toBe(false);
     expect(shouldShowModelPicker(null)).toBe(false);
     expect(shouldShowModelPicker(undefined)).toBe(false);
+  });
+});
+
+describe("modelOptionsForPicker", () => {
+  it("sources cursor (Polly) options from the SDK-id catalog, never display labels (#547)", () => {
+    // WHY: the picker sends `setModel(m.id)`, so every cursor option id must be
+    // a Cursor SDK id (composer-2.5), never a friendly label (Composer) the SDK
+    // rejects with invalid_argument.
+    const opts = modelOptionsForPicker(null, "cursor", []);
+    expect(opts).toBe(CURSOR_SDK_MODELS);
+    expect(opts.length).toBeGreaterThan(0);
+    // The labelled model is exposed by its SDK id, with the friendly label.
+    const composer = opts.find((m) => m.label === "Composer");
+    expect(composer?.id).toBe("composer-2.5");
+    // No option id is a capitalized display label.
+    expect(opts.every((m) => m.id === m.id.toLowerCase())).toBe(true);
+  });
+
+  it("keeps the native vendor catalogs and empty fallback", () => {
+    expect(modelOptionsForPicker("claude", "cursor", [])).toBe(CLAUDE_NATIVE_MODELS);
+    const codex = [{ id: "gpt-5.4", displayName: "GPT-5.4" }];
+    expect(modelOptionsForPicker("codex", "cursor", codex)).toBe(codex);
+    // A non-cursor brain harness with no native wrapper gets no picker rows.
+    expect(modelOptionsForPicker(null, "pi", [])).toEqual([]);
+    expect(modelOptionsForPicker(null, null, [])).toEqual([]);
   });
 });
 

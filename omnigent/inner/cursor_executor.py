@@ -84,6 +84,23 @@ ToolExecutor: TypeAlias = Callable[[str, dict[str, Any]], Awaitable[Any]]  # typ
 # ``None``).
 _DEFAULT_CURSOR_MODEL = "auto"
 
+# The in-chat model switcher / ``/model`` command can carry a human-facing
+# Cursor display LABEL rather than the Cursor SDK id. The SDK rejects the label
+# with ``invalid_argument`` (e.g. "Cannot use this model: Composer", whose valid
+# id is ``composer-2.5``) and the turn fails before the agent starts (#547).
+# Map the known label mismatches to their SDK ids before agent creation, keyed
+# by the trimmed/lower-cased input so any casing (``Composer`` / ``COMPOSER``)
+# matches. Deliberately a small mapping, NOT a full allow-list: an unrecognized
+# id passes through to the SDK unchanged, so a valid-but-unlisted model the user
+# pins is never silently downgraded to auto when Cursor's catalog moves ahead of
+# ours (the SDK still returns its own "Available models: ..." guidance for a
+# genuinely invalid id).
+_CURSOR_DISPLAY_LABEL_TO_ID = {
+    "composer": "composer-2.5",
+    "auto": "auto",
+    "default": "default",
+}
+
 # Upper bound (seconds) on one bridged-tool call: generous (sub-agent dispatches
 # can run for minutes) but finite, so a wedged tool surfaces a timeout error
 # instead of blocking the SDK's daemon callback thread forever.
@@ -93,10 +110,16 @@ _TOOL_CALL_TIMEOUT_S = 1800.0
 def _resolve_model(model: str | None) -> str:
     """Resolve the cursor model id, dropping ids cursor can't honor.
 
-    cursor-sdk accepts only Cursor model ids (``auto``, ``gpt-5``,
-    ``composer-2.5``, ...), so a gateway-routed model id (carried by a spec
+    cursor-sdk accepts only Cursor model ids (``auto``, ``composer-2.5``,
+    ``claude-opus-4-8``, ...), so a gateway-routed model id (carried by a spec
     authored for another harness) falls back to cursor's auto-select. ``None``
     likewise resolves to ``auto`` (the SDK requires a model).
+
+    A known Cursor display LABEL (e.g. ``Composer``) is mapped to its SDK id
+    (``composer-2.5``) before it reaches ``AsyncAgent.create`` — without this
+    the SDK rejects the label with ``invalid_argument`` (#547). Any other id is
+    returned unchanged so the SDK can accept a valid id (or surface its own
+    "Available models: ..." error for a genuinely invalid one).
     """
     if not model or model.startswith(("databricks-", "databricks/")):
         if model:
@@ -110,7 +133,9 @@ def _resolve_model(model: str | None) -> str:
                 _DEFAULT_CURSOR_MODEL,
             )
         return _DEFAULT_CURSOR_MODEL
-    return model
+    # Normalize a known display label (any casing) to its Cursor SDK id; pass
+    # everything else through so valid ids (incl. ones newer than our map) work.
+    return _CURSOR_DISPLAY_LABEL_TO_ID.get(model.strip().lower(), model)
 
 
 def _first_of(d: dict[str, Any], *keys: str, default: int = 0) -> int:

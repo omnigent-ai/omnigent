@@ -86,6 +86,7 @@ import {
 import { getCurrentAuthorId } from "@/lib/identity";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { codexEffortLevelsForModel, findCodexModelOption } from "@/lib/codexNativeModels";
+import { CURSOR_SDK_MODELS } from "@/lib/cursorSdkModels";
 import {
   consumePendingInitialPrompt,
   type PendingInitialPrompt,
@@ -4061,6 +4062,28 @@ export function isModelImplicitlySelected(modelId: string, llmModel: string | nu
   return llmModel === modelId || llmModel.endsWith(`/${modelId}`) || llmModel.includes(modelId);
 }
 
+/**
+ * Model rows the in-chat picker should offer for a session.
+ *
+ * Native wrappers use their vendor catalog (`claude` → CLAUDE_NATIVE_MODELS,
+ * `codex` → the Codex app-server `model/list`). The `cursor` brain harness
+ * (Polly) is not a native wrapper, so it is keyed off `sessionHarness`; its
+ * options are Cursor SDK ids (never display labels), so `setModel(id)` can't
+ * hand the SDK a label like `Composer` that it rejects with `invalid_argument`
+ * (#547). Everything else has no in-chat model picker — an empty list hides
+ * the Models section.
+ */
+export function modelOptionsForPicker(
+  modelPickerKind: NativeModelPickerKind | null,
+  sessionHarness: string | null,
+  codexModelOptions: readonly CodexModelOption[],
+): ReadonlyArray<{ id: string; label?: string; displayName?: string }> {
+  if (modelPickerKind === "claude") return CLAUDE_NATIVE_MODELS;
+  if (modelPickerKind === "codex") return codexModelOptions;
+  if (sessionHarness === "cursor") return CURSOR_SDK_MODELS;
+  return [];
+}
+
 interface AgentPickerProps {
   agents: Agent[] | undefined;
   isLoading: boolean;
@@ -4119,12 +4142,10 @@ function AgentPicker({
   const selectedModel = useChatStore((s) => s.selectedModel);
   const llmModel = useChatStore((s) => s.llmModel);
 
-  const modelOptions: ReadonlyArray<{ id: string; label?: string; displayName?: string }> =
-    modelPickerKind === "claude"
-      ? CLAUDE_NATIVE_MODELS
-      : modelPickerKind === "codex"
-        ? codexModelOptions
-        : [];
+  // Effective brain harness from the session snapshot (override-aware). Read
+  // before modelOptions so the cursor brain harness can source its picker rows.
+  const sessionHarness = useChatStore((s) => s.sessionHarness);
+  const modelOptions = modelOptionsForPicker(modelPickerKind, sessionHarness, codexModelOptions);
   const isNativeModelPicker = modelPickerKind !== null;
   // Only offer the agent list when there's an actual choice. Inside a
   // session the picker is scoped to the single bound agent (the runner is
@@ -4134,10 +4155,9 @@ function AgentPicker({
   const showAgents = !isNativeModelPicker && (agents?.length ?? 0) > 1;
   const rawAgentName = agents?.find((a) => a.id === selectedId)?.name ?? agents?.[0]?.name;
   const agentDisplayName = rawAgentName ? agentDisplayLabel(rawAgentName) : rawAgentName;
-  // Effective brain harness from the session snapshot (override-aware).
-  // Only the SDK brain harnesses get a pill suffix — native wrappers
-  // already use their own "Claude" branch below.
-  const sessionHarness = useChatStore((s) => s.sessionHarness);
+  // Only the SDK brain harnesses get a pill suffix — native wrappers already
+  // use their own "Claude" branch below. `sessionHarness` is read above (it
+  // also sources the cursor model rows).
   const harnessLabel = sessionHarness ? (BRAIN_HARNESS_LABELS[sessionHarness] ?? null) : null;
 
   // Build the pill piece-by-piece so empty selections don't leave
