@@ -258,7 +258,7 @@ skips:
   # to a runner' family. Triage under #532.
 
   - id: tests/e2e/test_filesystem_changed_files_e2e.py::test_diff_endpoint_shows_git_diff_for_modified_file
-    reason: "Failing deterministically on `main` and across multiple feature branches: 3 of 5 most recent E2E runs reported `Agent turn failed with status 'failed'. The workspace-file-writer agent did not complete successfully.` Likely a regression in the workspace-file-writer agent spec or its dispatch; needs owner investigation before un-quarantining."
+    reason: "Migrated to mock LLM but underlying infrastructure issue persists: the main e2e runner fixture does not set OMNIGENT_RUNNER_WORKSPACE, so the filesystem changes tracking does not detect agent writes. Needs OMNIGENT_RUNNER_WORKSPACE wiring in the e2e runner fixture."
     issue: 673
     cluster: files-uploads-attachments
     mode: skip
@@ -393,7 +393,7 @@ skips:
     cluster: steering-cancel-compaction-state
     mode: skip
   - id: tests/e2e/test_filesystem_changed_files_e2e.py::test_filesystem_changes_appear_after_agent_write
-    reason: "Force-merge backlog (standalone). First observed failing at 305e9bb9 (2026-05-23T06:06:59Z, E2E)."
+    reason: "Migrated to mock LLM but underlying infrastructure issue persists: the main e2e runner fixture does not set OMNIGENT_RUNNER_WORKSPACE, so the filesystem changes tracking does not detect agent writes. Needs OMNIGENT_RUNNER_WORKSPACE wiring in the e2e runner fixture."
     issue: 673
     cluster: files-uploads-attachments
     mode: skip
