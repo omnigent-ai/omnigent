@@ -52,7 +52,6 @@ import {
   useArchiveConversation,
   useBulkArchiveConversations,
   useBulkDeleteConversations,
-  useBulkStopSessions,
   useConversations,
   usePinnedConversationBackfill,
   useRenameConversation,
@@ -1484,7 +1483,6 @@ function BulkActionBar({
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
   const bulkArchive = useBulkArchiveConversations();
   const bulkDelete = useBulkDeleteConversations();
-  const bulkStop = useBulkStopSessions();
 
   const selectedConversations = useMemo(
     () => allConversations.filter((c) => selectedIds.has(c.id)),
@@ -1494,16 +1492,6 @@ function BulkActionBar({
   const ownedSelected = useMemo(
     () => selectedConversations.filter((c) => isOwnedByViewer(c)),
     [selectedConversations],
-  );
-
-  const stoppableSelected = useMemo(
-    () =>
-      ownedSelected.filter(
-        (c) =>
-          isSessionStoppable({ labels: c.labels, hostId: c.host_id, runnerId: c.runner_id }) &&
-          c.status === "running",
-      ),
-    [ownedSelected],
   );
 
   const archivedSelected = useMemo(
@@ -1521,7 +1509,7 @@ function BulkActionBar({
 
   const count = selectedIds.size;
   const allSelected = count > 0 && count === allConversations.length;
-  const isBusy = bulkArchive.isPending || bulkDelete.isPending || bulkStop.isPending;
+  const isBusy = bulkArchive.isPending || bulkDelete.isPending;
 
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
 
@@ -1562,18 +1550,6 @@ function BulkActionBar({
         if (activeId && err?.succeeded?.includes(activeId)) navigate("/", { replace: true });
       },
     });
-  }
-
-  function handleStop() {
-    if (stoppableSelected.length === 0) return;
-    bulkStop.mutate(
-      stoppableSelected.map((c) => c.id),
-      {
-        onSuccess: () => {
-          onDeselectAll();
-        },
-      },
-    );
   }
 
   return (
@@ -1654,29 +1630,6 @@ function BulkActionBar({
                 <TooltipContent>Unarchive {archivedSelected.length} session(s)</TooltipContent>
               </Tooltip>
             )}
-            {stoppableSelected.length > 0 && (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="h-7 gap-1.5 text-xs text-destructive"
-                    disabled={isBusy}
-                    onClick={handleStop}
-                    data-testid="bulk-stop"
-                  >
-                    {bulkStop.isPending ? (
-                      <Loader2Icon className="size-3 animate-spin" />
-                    ) : (
-                      <CircleStopIcon className="size-3" />
-                    )}
-                    Stop
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent>Stop {stoppableSelected.length} session(s)</TooltipContent>
-              </Tooltip>
-            )}
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button
@@ -1705,7 +1658,7 @@ function BulkActionBar({
           </div>
         )}
 
-        {(bulkArchive.isError || bulkDelete.isError || bulkStop.isError) && (
+        {(bulkArchive.isError || bulkDelete.isError) && (
           <p className="text-xs text-destructive" role="alert">
             Some actions failed. Retry or dismiss.
           </p>
