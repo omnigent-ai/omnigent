@@ -27,7 +27,6 @@ Usage::
 
 from __future__ import annotations
 
-import os
 import uuid
 from pathlib import Path
 
@@ -520,62 +519,147 @@ def test_no_guardrails_agent_unaffected(
     assert "[Denied by policy" not in text
 
 
-# ── Prompt policy (Phase 9): real LLM classifier end-to-end ─
+# ── Prompt policy (Phase 9): LLM classifier end-to-end ──────
 #
-# These tests exercise the production path of the
-# ``prompt_policy`` builtin — the real LLM gets called with
-# the framework-generated envelope + author prompt, and the
-# parsed JSON verdict drives the ALLOW / DENY branch.
+# The ``prompt_policy`` builtin calls ``event["llm_client"]``,
+# a ``PolicyLLMClient`` pre-bound to the server-level ``llm:``
+# config.  In mock mode the live_server fixture writes a server
+# config with ``llm: {model: "mock-model", connection: {base_url:
+# <mock_url>/v1, api_key: mock-key}}``, so the classifier call
+# goes to the mock server's ``/v1/responses`` queue keyed by
+# ``"mock-model"``.  Pre-seeding that queue with a JSON verdict
+# fully exercises the wiring without real credentials.
+
+_DENY_CANADA_POLICY_CONFIG = {
+    "policies": {
+        "deny_canada": {
+            "type": "function",
+            "function": {
+                "path": "omnigent.policies.builtins.prompt.prompt_policy",
+                "arguments": {
+                    "prompt": (
+                        "You are a strict content filter. Look at the user's "
+                        "message and decide:\n"
+                        "- If it mentions Canada, Canadian, Ontario, Quebec, "
+                        "Toronto, Montreal, or anything unambiguously Canadian, "
+                        "deny the request.\n"
+                        "- Otherwise allow."
+                    ),
+                },
+            },
+        },
+    },
+}
+
+# Server-level LLM model key — the PolicyLLMClient uses the
+# model from the server's ``llm:`` config, which in mock mode
+# is always ``"mock-model"``.
+_SERVER_LLM_MODEL = "mock-model"
 
 
-# The verdict comes from a real LLM-backed classifier (the deny_canada
-# PromptPolicy), so an occasional misclassification or a transient
-# classifier-call failure (fail-closed DENY) can flip the expected
-# allow/deny outcome. Bounded reruns absorb that non-determinism without
-# masking a genuine wiring regression: a real break fails all 3 attempts.
-@pytest.mark.skipif(
-    not os.getenv("DATABRICKS_TOKEN"),
-    reason="requires real LLM credentials for prompt policy classifier",
-)
-@pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_prompt_policy_allow_path_reaches_llm(
     http_client: httpx.Client,
+    live_runner_id: str,
+    mock_llm_server_url: str,
 ) -> None:
     """
     Non-Canadian input → classifier ALLOWs → agent LLM runs →
-    assistant text comes back. Proves the real classifier
-    works end-to-end through the real LLM, the policy engine
-    composes ALLOW, and the full turn completes normally.
+    assistant text comes back.
+
+    The mock server's ``"mock-model"`` queue is pre-seeded with an
+    ALLOW verdict so the prompt_policy classifier returns ALLOW
+    without any real LLM call.  The agent model is a separate mock
+    key so the two queues don't interfere.
+
+    :param http_client: HTTP client pointed at the live server.
+    :param live_runner_id: Runner id for the session.
+    :param mock_llm_server_url: Mock LLM server URL.
     """
-    # NOTE: body is unreachable — @pytest.mark.skip bypasses fixture
-    # collection entirely; variables below document the intended live flow.
-    raise NotImplementedError("unreachable — skipped at collection time")
+    agent_model = f"mock-pp-allow-{uuid.uuid4().hex[:6]}"
+
+    reset_mock_llm(mock_llm_server_url)
+    # Classifier verdict: ALLOW (non-Canadian input).
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": '{"action": "allow", "reason": ""}'}],
+        key=_SERVER_LLM_MODEL,
+    )
+    # Agent's own LLM response (reached only after ALLOW).
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "The Eiffel Tower is in Paris, France."}],
+        key=agent_model,
+    )
+    agent_name = register_inline_agent(
+        http_client,
+        name=f"pp-allow-{uuid.uuid4().hex[:6]}",
+        harness="openai-agents",
+        model=agent_model,
+        profile="",
+        prompt="You are a minimal test agent. Reply briefly.",
+        mock_llm_base_url=f"{mock_llm_server_url}/v1",
+        extra_config=_DENY_CANADA_POLICY_CONFIG,
+    )
+    session_id = create_runner_bound_session(
+        http_client, agent_name=agent_name, runner_id=live_runner_id
+    )
+    rid = send_user_message_to_session(
+        http_client,
+        session_id=session_id,
+        content="Where is the Eiffel Tower?",
+    )
+    body = poll_session_until_terminal(
+        http_client, session_id=session_id, response_id=rid, timeout=120
+    )
+    assert body["status"] == "completed", f"Unexpected status: {body.get('error')}"
+    text = _extract_all_assistant_text(body)
+    assert len(text.strip()) > 0, "Expected LLM output after ALLOW; got empty response."
+    assert "[Denied by policy" not in text
 
 
-# Same real-classifier non-determinism as the allow-path test: the DENY can
-# occasionally not fire. Bounded reruns; a real regression fails all 3.
-@pytest.mark.skipif(
-    not os.getenv("DATABRICKS_TOKEN"),
-    reason="requires real LLM credentials for prompt policy classifier",
-)
-@pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_prompt_policy_deny_path_short_circuits(
     http_client: httpx.Client,
+    live_runner_id: str,
+    mock_llm_server_url: str,
 ) -> None:
     """
-    Canadian-topic input → classifier DENYs → the events endpoint
-    short-circuits the turn synchronously with an inline deny
-    verdict; the agent LLM never produces its normal output.
+    Canadian-topic input → classifier DENYs → events endpoint
+    short-circuits with an inline deny verdict; agent LLM never runs.
 
-    This is the canonical reason prompt policies exist: a
-    topic-level content filter an author describes in prose
-    rather than a Python predicate. If the real classifier
-    isn't wired (or can't reach the gateway), the policy fails
-    and the verdict carries an error reason rather than the
-    author's ``"mentions Canada"`` — so this test is both a
-    classifier-wiring proof and a gateway-routing regression
-    guard.
+    The mock server's ``"mock-model"`` queue is pre-seeded with a
+    DENY verdict so the prompt_policy classifier fires DENY and the
+    turn is resolved synchronously before reaching the runner.
+
+    :param http_client: HTTP client pointed at the live server.
+    :param live_runner_id: Runner id for the session.
+    :param mock_llm_server_url: Mock LLM server URL.
     """
-    # NOTE: body is unreachable — @pytest.mark.skip bypasses fixture
-    # collection entirely; variables below document the intended live flow.
-    raise NotImplementedError("unreachable — skipped at collection time")
+    agent_model = f"mock-pp-deny-{uuid.uuid4().hex[:6]}"
+
+    reset_mock_llm(mock_llm_server_url)
+    # Classifier verdict: DENY (Canadian input).
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": '{"action": "deny", "reason": "Input mentions Canada."}'}],
+        key=_SERVER_LLM_MODEL,
+    )
+    agent_name = register_inline_agent(
+        http_client,
+        name=f"pp-deny-{uuid.uuid4().hex[:6]}",
+        harness="openai-agents",
+        model=agent_model,
+        profile="",
+        prompt="You are a minimal test agent. Reply briefly.",
+        mock_llm_base_url=f"{mock_llm_server_url}/v1",
+        extra_config=_DENY_CANADA_POLICY_CONFIG,
+    )
+    session_id = create_runner_bound_session(
+        http_client, agent_name=agent_name, runner_id=live_runner_id
+    )
+    resp = _post_user_message(http_client, session_id, "Tell me about Toronto, Canada.")
+    assert resp.status_code == 202, f"unexpected status: {resp.status_code} {resp.text[:300]}"
+    verdict = resp.json()
+    assert verdict.get("denied") is True, (
+        f"Expected synchronous DENY from prompt policy; got {verdict}"
+    )
+    assert verdict.get("reason"), f"Expected a deny reason; got {verdict}"
