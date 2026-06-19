@@ -1177,6 +1177,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "server",
         "setup",
         "stop",
+        "update",
         "upgrade",
         "version",
     }
@@ -1188,8 +1189,9 @@ def _should_skip_update_check(argv: list[str]) -> bool:
 
     Skipped for help / version requests, internal TUI subcommands
     (``pane-split`` / ``pane-picker``, invoked by the terminal UI rather
-    than the user), and ``upgrade`` itself (pointing the user at
-    ``omni upgrade`` while they are running it is noise).
+    than the user), and ``upgrade`` (and its ``update`` alias) itself
+    (pointing the user at ``omni upgrade`` while they are running it is
+    noise).
 
     :param argv: CLI arguments without the program name, e.g.
         ``["run", "agent.yaml"]``.
@@ -1202,6 +1204,7 @@ def _should_skip_update_check(argv: list[str]) -> bool:
         "-h",
         "--version",
         "version",
+        "update",
         "upgrade",
         "pane-split",
         "pane-picker",
@@ -1297,11 +1300,11 @@ def main() -> None:
     setup_cli_logging(argv)
 
     # ``omnigent setup`` IS the setup wizard — if it fails, telling the
-    # user to "run omnigent setup" would be circular. ``upgrade`` is
-    # excluded too: its failures (unreachable index, dev checkout, install
-    # error) are never about a missing model credential, so the setup hint
-    # would only mislead.
-    suggest_setup = argv[0] not in {"setup", "upgrade"}
+    # user to "run omnigent setup" would be circular. ``upgrade`` (and its
+    # ``update`` alias) is excluded too: its failures (unreachable index,
+    # dev checkout, install error) are never about a missing model
+    # credential, so the setup hint would only mislead.
+    suggest_setup = argv[0] not in {"setup", "update", "upgrade"}
 
     # Lightweight update notice: only on an interactive terminal and only
     # for user-facing commands. Reads a cached "latest PyPI version" and
@@ -3685,6 +3688,13 @@ def upgrade(check_only: bool, force: bool, pre: bool) -> None:
         "Reinstall it explicitly — e.g. `uv tool upgrade --reinstall omnigent` or "
         f"`pip install --force-reinstall 'omnigent=={latest}'`."
     )
+
+
+# ``omni update`` is an alias for ``omni upgrade`` — mistyping the latter as
+# the former is common, and silently doing nothing is annoying. Registering
+# the same Command object under a second name shares the exact callback,
+# options, and semantics; there is no duplicated implementation to drift.
+cli.add_command(upgrade, name="update")
 
 
 def _bundle(source: Path) -> bytes:
