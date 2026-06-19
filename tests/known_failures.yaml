@@ -375,11 +375,6 @@ skips:
     issue: 673
     cluster: files-uploads-attachments
     mode: skip
-  - id: tests/e2e/omnigent/test_run_omnigent_coding_supervisor.py::test_run_omnigent_coding_supervisor_codex_shell_not_disabled
-    reason: "Consistent real failure (40/40 in flake-stress run 27765495452): codex worker doesn't read the fixture file — codex shell_tool / supervisor-delegation regression, NOT a flake."
-    issue: 678
-    cluster: subagent-supervisor-routing
-    mode: skip
 
   # ──────────────────────────────────────────────────────────────
   # Re-triaged 2026-06-18 (flake-stress run 27761358025 on main, 20×,
