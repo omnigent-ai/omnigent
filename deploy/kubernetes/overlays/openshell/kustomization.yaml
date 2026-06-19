@@ -1,0 +1,14 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: omnigent
+
+resources:
+  - ../../base
+  - gateway-networkpolicy.yaml
+  - sandbox-rbac.yaml
+
+patches:
+  - path: configmap-patch.yaml
+  - path: secret-patch.yaml
+  - path: deployment-patch.yaml

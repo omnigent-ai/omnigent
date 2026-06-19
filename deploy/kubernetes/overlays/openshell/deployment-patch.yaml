@@ -1,0 +1,24 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: omnigent
+spec:
+  template:
+    spec:
+      serviceAccountName: omnigent
+      containers:
+        - name: omnigent
+          volumeMounts:
+            - name: artifacts
+              mountPath: /data/artifacts
+            - name: openshell-gateway
+              mountPath: /home/omnigent/.config/openshell
+              readOnly: true
+      volumes:
+        - name: artifacts
+          persistentVolumeClaim:
+            claimName: omnigent-artifacts
+        - name: openshell-gateway
+          secret:
+            secretName: openshell-gateway-config
+            optional: true

@@ -1,0 +1,21 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: omnigent-to-openshell-gateway
+  labels:
+    app: omnigent
+spec:
+  podSelector:
+    matchLabels:
+      app: omnigent
+  policyTypes:
+    - Egress
+  egress:
+    # Allow the server pod to reach the OpenShell gateway over gRPC.
+    # Replace the port/CIDR with your gateway's actual endpoint.
+    - ports:
+        - protocol: TCP
+          port: 443
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
