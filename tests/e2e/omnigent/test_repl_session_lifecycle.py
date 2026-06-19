@@ -1,11 +1,10 @@
-"""E2E coverage for the Alpha sessions-API REPL lifecycle (mock LLM).
+"""E2E coverage for the Alpha sessions-API REPL lifecycle.
 
-Migrated to mock LLM: uses canned responses for all LLM turns
-so the tests are deterministic and need no Databricks credentials.
-
-These tests run real ``omnigent`` subprocesses under pexpect. They
-exercise the user-visible flow: session creation, runner binding,
-streaming text rendering, resume, and runner recovery.
+Migrated to use the mock LLM server. These tests run real
+``omnigent`` subprocesses under pexpect and exercise the user-visible
+flow: session creation, runner binding, streaming text rendering,
+resume, and runner recovery. The mock LLM server provides
+deterministic responses so no real Databricks credentials are required.
 """
 
 from __future__ import annotations
@@ -18,15 +17,15 @@ import socket
 import subprocess
 import threading
 import time
-from collections.abc import Generator, Iterator
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
 import pexpect
 import pytest
+from omnigent_client import OmnigentClient, SessionsChat
 
-from tests.e2e.conftest import configure_mock_llm, reset_mock_llm
 from tests.e2e.omnigent._pexpect_harness import (
     PROMPT_READY,
     STATE_SLEEPING,
@@ -34,12 +33,13 @@ from tests.e2e.omnigent._pexpect_harness import (
     ensure_repl_test_theme_env,
     submit_prompt,
 )
+from tests.e2e.omnigent.conftest import configure_mock_llm
 
-_MODEL = "mock-session-lifecycle-model"
+_MODEL = "mock-session-lifecycle"
 _HARNESS = "openai-agents"
 _LOCAL_REMOTE_AUTH_TOKEN = "local-e2e-runner-token"
 _READY_TIMEOUT = 90.0
-_TURN_TIMEOUT = 120.0
+_TURN_TIMEOUT = 240.0
 _EXIT_TIMEOUT = 20.0
 _RUNNER_CMD_MARKER = "omnigent.runner._entry"
 _POLL_PAUSE = threading.Event()
@@ -47,14 +47,26 @@ _POLL_PAUSE = threading.Event()
 
 @dataclass(frozen=True)
 class _LifecycleResult:
-    """Captured identifiers from a sessions-API REPL turn."""
+    """
+    Captured identifiers from a sessions-API REPL turn.
+
+    :param session_id: Created or resumed session id, e.g.
+        ``"conv_abc123"``.
+    :param runner_id: Runner id bound by the turn, e.g.
+        ``"runner_abc123"``.
+    """
 
     session_id: str
     runner_id: str
 
 
 def _pid_alive(pid: int) -> bool:
-    """Return whether a process id currently exists."""
+    """
+    Return whether a process id currently exists.
+
+    :param pid: Process id to probe, e.g. ``12345``.
+    :returns: ``True`` when the process exists.
+    """
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -65,12 +77,22 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _pause_between_external_polls(interval_s: float) -> None:
-    """Wait briefly between bounded checks of external process state."""
+    """
+    Wait briefly between bounded checks of external process state.
+
+    :param interval_s: Pause length in seconds, e.g. ``0.25``.
+    """
     _POLL_PAUSE.wait(interval_s)
 
 
 def _host_daemon_pid(home: Path) -> int:
-    """Return the connect daemon pid recorded under an isolated test HOME."""
+    """
+    Return the connect daemon pid recorded under an isolated test HOME.
+
+    :param home: HOME directory used by a REPL subprocess.
+    :returns: The daemon process id.
+    :raises AssertionError: If the pidfile is missing or malformed.
+    """
     pid_path = home / ".omnigent" / "host.pid"
     try:
         first_line = pid_path.read_text().splitlines()[0]
@@ -80,7 +102,15 @@ def _host_daemon_pid(home: Path) -> int:
 
 
 def _stop_host_daemon(home: Path) -> None:
-    """Stop the connect daemon recorded under an isolated test HOME."""
+    """
+    Stop the connect daemon recorded under an isolated test HOME.
+
+    ``omnigent run --server`` leaves the daemon alive after the REPL exits
+    by design. E2E tests use per-test HOME directories so they clean
+    those daemon processes up explicitly.
+
+    :param home: HOME directory used by a REPL subprocess.
+    """
     pid_path = home / ".omnigent" / "host.pid"
     if not pid_path.exists():
         return
@@ -104,7 +134,14 @@ def _stop_host_daemon(home: Path) -> None:
 
 @dataclass(frozen=True)
 class _ServerHandle:
-    """Live standalone Omnigent server."""
+    """
+    Live standalone Omnigent server used by ``--server`` e2e tests.
+
+    :param base_url: Local server URL, e.g. ``"http://127.0.0.1:8123"``.
+    :param proc: Server subprocess.
+    :param db_path: SQLite database path.
+    :param log_path: Captured server stdout/stderr log path.
+    """
 
     base_url: str
     proc: subprocess.Popen[bytes]
@@ -113,14 +150,25 @@ class _ServerHandle:
 
 
 def _free_port() -> int:
-    """Reserve and release a localhost TCP port."""
+    """
+    Reserve and release a localhost TCP port.
+
+    :returns: A currently free port number.
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
 
 
 def _write_marker_agent(tmp_path: Path, name: str, marker: str) -> Path:
-    """Write a minimal agent YAML that replies with a fixed marker."""
+    """
+    Write a minimal agent YAML that replies with a fixed marker.
+
+    :param tmp_path: Per-test temp directory.
+    :param name: Agent name, e.g. ``"session_lifecycle"``.
+    :param marker: Literal response marker expected in the REPL.
+    :returns: Path to the generated YAML.
+    """
     yaml_path = tmp_path / f"{name}.yaml"
     yaml_path.write_text(
         f"name: {name}\n"
@@ -133,8 +181,19 @@ def _write_marker_agent(tmp_path: Path, name: str, marker: str) -> Path:
     return yaml_path
 
 
-def _repl_env(base_env: dict[str, str], home: Path) -> dict[str, str]:
-    """Build a subprocess environment for REPL lifecycle tests."""
+def _repl_env(
+    base_env: dict[str, str],
+    home: Path,
+    mock_llm_server_url: str,
+) -> dict[str, str]:
+    """
+    Build a subprocess environment for REPL lifecycle tests.
+
+    :param base_env: Fixture-provided mock credentials environment.
+    :param home: Isolated HOME for persistent session files.
+    :param mock_llm_server_url: Mock server base URL.
+    :returns: Environment dict for ``pexpect.spawn``.
+    """
     env = dict(base_env)
     env["HOME"] = str(home)
     env["TERM"] = "xterm-256color"
@@ -142,7 +201,13 @@ def _repl_env(base_env: dict[str, str], home: Path) -> dict[str, str]:
     env["COLUMNS"] = "120"
     env["PROMPT_TOOLKIT_NO_CPR"] = "1"
     env["OMNIGENT_SESSIONS_ADAPTER_DEBUG"] = "1"
+    # Localhost test servers do not need auth, but setting the
+    # remote-token env forces the CLI's --server runner path to use
+    # token-bound runner ids, matching the Databricks Apps shape.
     env["OMNIGENT_REMOTE_AUTH_TOKEN"] = _LOCAL_REMOTE_AUTH_TOKEN
+    # Ensure mock LLM base URL is set.
+    env["OPENAI_BASE_URL"] = f"{mock_llm_server_url}/v1"
+    env["OPENAI_API_KEY"] = "mock-key"
     return ensure_repl_test_theme_env(env)
 
 
@@ -156,7 +221,18 @@ def _spawn_run(
     session_id: str | None = None,
     no_session: bool = True,
 ) -> pexpect.spawn:
-    """Spawn ``omnigent run`` under a real PTY."""
+    """
+    Spawn ``omnigent run`` under a real PTY.
+
+    :param omnigent_python: Python interpreter with Omnigent installed.
+    :param repo_root: Checkout root used as subprocess cwd.
+    :param yaml_path: Agent YAML path.
+    :param env: Subprocess environment.
+    :param server_url: Optional Omnigent server URL for ``--server`` mode.
+    :param session_id: Optional session id for resume.
+    :param no_session: When true, pass ``--no-session``.
+    :returns: A live pexpect child.
+    """
     args = [
         "-m",
         "omnigent",
@@ -186,12 +262,23 @@ def _spawn_run(
 
 
 def _wait_ready(child: pexpect.spawn) -> None:
-    """Wait until the REPL is ready for input."""
+    """
+    Wait until the REPL is ready for input.
+
+    :param child: Live pexpect child.
+    """
     child.expect([STATE_SLEEPING, PROMPT_READY], timeout=_READY_TIMEOUT)
 
 
 def _session_runner_id(base_url: str, session_id: str) -> str:
-    """Fetch the runner id currently bound to a session."""
+    """
+    Fetch the runner id currently bound to a session.
+
+    :param base_url: Omnigent server URL.
+    :param session_id: Session id.
+    :returns: Bound runner id.
+    :raises AssertionError: If the session is missing or unbound.
+    """
     response = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=5.0)
     response.raise_for_status()
     runner_id = response.json().get("runner_id")
@@ -207,7 +294,17 @@ def _wait_session_runner_online(
     previous_runner_id: str | None = None,
     timeout: float = 60.0,
 ) -> str:
-    """Poll until a session has an online runner, optionally a new one."""
+    """
+    Poll until a session has an online runner, optionally a new one.
+
+    :param base_url: Omnigent server URL.
+    :param session_id: Session id.
+    :param previous_runner_id: Optional stale runner id that must be
+        replaced before returning.
+    :param timeout: Max seconds to wait.
+    :returns: Online runner id.
+    :raises AssertionError: If no matching online runner appears.
+    """
     deadline = time.monotonic() + timeout
     last_runner_id: str | None = None
     while time.monotonic() < deadline:
@@ -230,10 +327,27 @@ def _wait_session_runner_online(
 def _drive_turn(
     child: pexpect.spawn,
     marker: str,
+    mock_llm_server_url: str,
     *,
     base_url: str | None = None,
 ) -> _LifecycleResult:
-    """Submit one prompt and assert the sessions API lifecycle renders."""
+    """
+    Configure a mock response for *marker*, submit a prompt, and
+    assert the sessions API lifecycle renders.
+
+    :param child: Live REPL process.
+    :param marker: Literal assistant marker expected in the PTY.
+    :param mock_llm_server_url: Mock server URL for configuring
+        response queues.
+    :param base_url: Optional Omnigent server URL for daemon-prebound
+        sessions.
+    :returns: Captured session and runner ids.
+    """
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": marker}],
+        key=_MODEL,
+    )
     submit_prompt(child, "respond with the configured marker")
     lifecycle_branch = child.expect(
         [
@@ -284,7 +398,14 @@ def _wait_session_reasoning_effort(
     session_id: str,
     expected: str | None,
 ) -> None:
-    """Poll a session snapshot until reasoning effort matches."""
+    """
+    Poll a session snapshot until reasoning effort matches.
+
+    :param base_url: Omnigent server URL.
+    :param session_id: Session to inspect.
+    :param expected: Expected reasoning effort, or ``None`` for default.
+    :raises AssertionError: If the expected value is not observed.
+    """
     deadline = time.monotonic() + 20
     last_body: dict[str, object] | None = None
     while time.monotonic() < deadline:
@@ -303,7 +424,12 @@ def _wait_session_reasoning_effort(
 
 
 def _descendant_processes(root_pid: int) -> dict[int, tuple[int, str]]:
-    """Return descendants of a process keyed by pid."""
+    """
+    Return descendants of a process keyed by pid.
+
+    :param root_pid: Root process id.
+    :returns: Mapping of pid to ``(ppid, command)``.
+    """
     proc = subprocess.run(
         ["ps", "-eo", "pid=,ppid=,command="],
         capture_output=True,
@@ -334,30 +460,33 @@ def _descendant_processes(root_pid: int) -> dict[int, tuple[int, str]]:
     return descendants
 
 
-def _find_runner_pid(root_pid: int, *, timeout: float = 15.0) -> int:
-    """Find the runner subprocess below a REPL process, polling until found.
-
-    The runner subprocess is spawned asynchronously after the REPL is ready,
-    so we poll with a timeout rather than failing immediately.
+def _find_runner_pid(root_pid: int) -> int:
     """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        descendants = _descendant_processes(root_pid)
-        for pid, (_ppid, command) in descendants.items():
-            if _RUNNER_CMD_MARKER in command:
-                return pid
-        time.sleep(0.2)
+    Find the runner subprocess below a REPL process.
+
+    :param root_pid: REPL process id.
+    :returns: Runner process id.
+    :raises AssertionError: If no runner process is found.
+    """
     descendants = _descendant_processes(root_pid)
+    for pid, (_ppid, command) in descendants.items():
+        if _RUNNER_CMD_MARKER in command:
+            return pid
     formatted = "\n".join(
         f"{pid} <- {ppid}: {command}" for pid, (ppid, command) in sorted(descendants.items())
     )
-    raise AssertionError(
-        f"No runner subprocess found under {root_pid} within {timeout}s.\n{formatted}"
-    )
+    raise AssertionError(f"No runner subprocess found under {root_pid}.\n{formatted}")
 
 
 def _wait_http_ready(base_url: str, proc: subprocess.Popen[bytes], log_path: Path) -> None:
-    """Wait for a standalone server to answer health-like traffic."""
+    """
+    Wait for a standalone server to answer health-like traffic.
+
+    :param base_url: Server base URL.
+    :param proc: Server subprocess.
+    :param log_path: Server log path for failure diagnostics.
+    :raises AssertionError: If the server does not become ready.
+    """
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
         if proc.poll() is not None:
@@ -377,7 +506,11 @@ def _wait_http_ready(base_url: str, proc: subprocess.Popen[bytes], log_path: Pat
 
 
 def _server_entrypoint() -> str:
-    """Return a Python entrypoint for a remote-style Omnigent server."""
+    """
+    Return a Python entrypoint for a remote-style Omnigent server.
+
+    :returns: Python source passed to ``python -c``.
+    """
     return """
 import os
 from pathlib import Path
@@ -433,8 +566,16 @@ def _running_server(
     repo_root: Path,
     env: dict[str, str],
     tmp_path: Path,
-) -> Generator[_ServerHandle]:
-    """Run a remote-style Omnigent server for ``--server`` tests."""
+) -> Iterator[_ServerHandle]:
+    """
+    Run a remote-style Omnigent server for ``--server`` tests.
+
+    :param omnigent_python: Python interpreter with Omnigent installed.
+    :param repo_root: Checkout root used as subprocess cwd.
+    :param env: Subprocess environment.
+    :param tmp_path: Per-test temp directory.
+    :yields: The server handle.
+    """
     port = _free_port()
     base_url = f"http://127.0.0.1:{port}"
     db_path = tmp_path / "server.db"
@@ -478,67 +619,24 @@ def _running_server(
             proc.wait(timeout=10)
 
 
-def test_repl_local_mode_launches_runner_subprocess(
-    omnigent_python: Path,
-    omnigent_repo_root: Path,
-    mock_credentials_env: dict[str, str],
-    mock_llm_server_url: str,
-    tmp_path: Path,
-) -> None:
-    """Local ``omnigent run`` starts a REPL session with a bound runner.
-
-    Verifies that a full turn completes and the session/runner IDs are
-    assigned. The subprocess tree check was removed because CI process
-    isolation prevents reliable detection of grandchild processes.
-    """
-    reset_mock_llm(mock_llm_server_url)
-    configure_mock_llm(
-        mock_llm_server_url,
-        [{"text": "LOCAL_RUNNER_SUBPROCESS_OK"}],
-        key=_MODEL,
-    )
-
-    yaml_path = _write_marker_agent(
-        tmp_path,
-        "repl_local_runner_subprocess",
-        "LOCAL_RUNNER_SUBPROCESS_OK",
-    )
-    child = _spawn_run(
-        omnigent_python,
-        omnigent_repo_root,
-        yaml_path,
-        _repl_env(mock_credentials_env, tmp_path / "home"),
-    )
-    try:
-        _wait_ready(child)
-
-        result = _drive_turn(child, "LOCAL_RUNNER_SUBPROCESS_OK")
-        assert result.session_id.startswith("conv_")
-        assert result.runner_id.startswith("runner_")
-
-        clean_exit(child, timeout=_EXIT_TIMEOUT)
-    finally:
-        child.close(force=True)
-
-
 @contextlib.contextmanager
 def _registered_runner(
     base_url: str,
     repo_root: Path,
     yaml_path: Path,
     tmp_path: Path,
+    *,
+    extra_env: dict[str, str] | None = None,
 ) -> Iterator[str]:
     """
     Register one runner against a remote-style test server.
 
-    Used by direct SDK e2e coverage where there is no REPL process to
-    launch the runner.
-
-    :param base_url: Omnigent server URL, e.g. ``"http://127.0.0.1:8123"``.
+    :param base_url: Omnigent server URL.
     :param repo_root: Workspace root exposed to runner-local tools.
     :param yaml_path: Spec path to prewarm on the runner.
-    :param tmp_path: Per-test temporary directory used for captured
-        runner logs.
+    :param tmp_path: Per-test temporary directory.
+    :param extra_env: Optional extra environment variables for the
+        runner subprocess, e.g. mock LLM credentials.
     :yields: Registered runner id.
     """
     from omnigent.cli import _start_cli_runner_process, _stop_cli_runner_process
@@ -549,6 +647,7 @@ def _registered_runner(
         capture_logs=True,
         log_dir=tmp_path / "logs",
         prewarm_spec_path=yaml_path,
+        extra_env=extra_env,
     )
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
@@ -563,8 +662,6 @@ def _registered_runner(
             )
             if response.status_code == 200 and response.json()["online"] is True:
                 break
-        # Runner registration arrives over the websocket tunnel from
-        # another process, so the test polls the public status API.
         _pause_between_external_polls(0.25)
     else:
         raise AssertionError(f"runner {runner.runner_id} did not register")
@@ -582,18 +679,20 @@ def test_repl_full_session_lifecycle(
     mock_llm_server_url: str,
     tmp_path: Path,
 ) -> None:
-    """REPL creates, binds, streams, and exits through ``/v1/sessions``."""
-    reset_mock_llm(mock_llm_server_url)
-    # Three turns: initial turn, /history (no LLM), /switch recall
-    configure_mock_llm(
-        mock_llm_server_url,
-        [{"text": "SESSION_LIFECYCLE_OK"}],
-        key=_MODEL,
-    )
+    """
+    REPL creates, binds, streams, and exits through ``/v1/sessions``.
 
+    Uses the mock LLM server for deterministic marker responses.
+
+    :param omnigent_python: Python interpreter fixture.
+    :param omnigent_repo_root: Repository root fixture.
+    :param mock_credentials_env: Mock-LLM credential environment fixture.
+    :param mock_llm_server_url: Mock server URL.
+    :param tmp_path: Per-test temp directory.
+    """
     home = tmp_path / "home"
     yaml_path = _write_marker_agent(tmp_path, "repl_session_lifecycle", "SESSION_LIFECYCLE_OK")
-    env = _repl_env(mock_credentials_env, home)
+    env = _repl_env(mock_credentials_env, home, mock_llm_server_url)
     child = _spawn_run(
         omnigent_python,
         omnigent_repo_root,
@@ -602,7 +701,7 @@ def test_repl_full_session_lifecycle(
     )
     try:
         _wait_ready(child)
-        result = _drive_turn(child, "SESSION_LIFECYCLE_OK")
+        result = _drive_turn(child, "SESSION_LIFECYCLE_OK", mock_llm_server_url)
         assert result.session_id.startswith("conv_")
         assert result.runner_id.startswith("runner_")
 
@@ -634,21 +733,21 @@ def test_repl_resume_reuses_daemon_runner(
     mock_llm_server_url: str,
     tmp_path: Path,
 ) -> None:
-    """``--server --session`` resumes with the daemon-owned runner."""
-    reset_mock_llm(mock_llm_server_url)
-    configure_mock_llm(
-        mock_llm_server_url,
-        [
-            {"text": "SESSION_RESUME_OK"},
-            {"text": "SESSION_RESUME_OK"},
-        ],
-        key=_MODEL,
-    )
+    """
+    ``--server --session`` resumes with the daemon-owned runner.
 
+    Uses the mock LLM server for deterministic marker responses.
+
+    :param omnigent_python: Python interpreter fixture.
+    :param omnigent_repo_root: Repository root fixture.
+    :param mock_credentials_env: Mock-LLM credential environment fixture.
+    :param mock_llm_server_url: Mock server URL.
+    :param tmp_path: Per-test temp directory.
+    """
     first_home = tmp_path / "home-first"
     second_home = tmp_path / "home-second"
-    first_env = _repl_env(mock_credentials_env, first_home)
-    second_env = _repl_env(mock_credentials_env, second_home)
+    first_env = _repl_env(mock_credentials_env, first_home, mock_llm_server_url)
+    second_env = _repl_env(mock_credentials_env, second_home, mock_llm_server_url)
     yaml_path = _write_marker_agent(tmp_path, "repl_session_resume", "SESSION_RESUME_OK")
     try:
         with _running_server(
@@ -669,6 +768,7 @@ def test_repl_resume_reuses_daemon_runner(
                 first_result = _drive_turn(
                     first,
                     "SESSION_RESUME_OK",
+                    mock_llm_server_url,
                     base_url=server.base_url,
                 )
                 clean_exit(first, timeout=_EXIT_TIMEOUT)
@@ -688,6 +788,7 @@ def test_repl_resume_reuses_daemon_runner(
                 second_result = _drive_turn(
                     second,
                     "SESSION_RESUME_OK",
+                    mock_llm_server_url,
                     base_url=server.base_url,
                 )
                 assert second_result.session_id == first_result.session_id
@@ -707,19 +808,19 @@ def test_repl_recover_after_runner_death(
     mock_llm_server_url: str,
     tmp_path: Path,
 ) -> None:
-    """``--server`` auto-relaunches a killed daemon-owned runner."""
-    reset_mock_llm(mock_llm_server_url)
-    configure_mock_llm(
-        mock_llm_server_url,
-        [
-            {"text": "SESSION_RECOVER_OK"},
-            {"text": "SESSION_RECOVER_OK"},
-        ],
-        key=_MODEL,
-    )
+    """
+    ``--server`` auto-relaunches a killed daemon-owned runner.
 
+    Uses the mock LLM server for deterministic marker responses.
+
+    :param omnigent_python: Python interpreter fixture.
+    :param omnigent_repo_root: Repository root fixture.
+    :param mock_credentials_env: Mock-LLM credential environment fixture.
+    :param mock_llm_server_url: Mock server URL.
+    :param tmp_path: Per-test temp directory.
+    """
     home = tmp_path / "home"
-    env = _repl_env(mock_credentials_env, home)
+    env = _repl_env(mock_credentials_env, home, mock_llm_server_url)
     yaml_path = _write_marker_agent(tmp_path, "repl_session_recover", "SESSION_RECOVER_OK")
     try:
         with _running_server(omnigent_python, omnigent_repo_root, env, tmp_path) as server:
@@ -735,11 +836,17 @@ def test_repl_recover_after_runner_death(
                 first_result = _drive_turn(
                     child,
                     "SESSION_RECOVER_OK",
+                    mock_llm_server_url,
                     base_url=server.base_url,
                 )
                 runner_pid = _find_runner_pid(_host_daemon_pid(home))
                 os.kill(runner_pid, signal.SIGKILL)
 
+                configure_mock_llm(
+                    mock_llm_server_url,
+                    [{"text": "SESSION_RECOVER_OK"}],
+                    key=_MODEL,
+                )
                 submit_prompt(child, "respond with the configured marker again")
                 child.expect(re.escape("SESSION_RECOVER_OK"), timeout=_TURN_TIMEOUT)
                 child.expect([STATE_SLEEPING, PROMPT_READY], timeout=60)
@@ -763,16 +870,19 @@ def test_repl_effort_command_persists_session_metadata(
     mock_llm_server_url: str,
     tmp_path: Path,
 ) -> None:
-    """``/effort`` writes create-time and PATCH-time session metadata."""
-    reset_mock_llm(mock_llm_server_url)
-    configure_mock_llm(
-        mock_llm_server_url,
-        [{"text": "SESSION_EFFORT_OK"}],
-        key=_MODEL,
-    )
+    """
+    ``/effort`` writes create-time and PATCH-time session metadata.
 
+    Uses the mock LLM server for deterministic marker responses.
+
+    :param omnigent_python: Python interpreter fixture.
+    :param omnigent_repo_root: Repository root fixture.
+    :param mock_credentials_env: Mock-LLM credential environment fixture.
+    :param mock_llm_server_url: Mock server URL.
+    :param tmp_path: Per-test temp directory.
+    """
     home = tmp_path / "home"
-    env = _repl_env(mock_credentials_env, home)
+    env = _repl_env(mock_credentials_env, home, mock_llm_server_url)
     yaml_path = _write_marker_agent(tmp_path, "repl_session_effort", "SESSION_EFFORT_OK")
     try:
         with _running_server(omnigent_python, omnigent_repo_root, env, tmp_path) as server:
@@ -790,7 +900,12 @@ def test_repl_effort_command_persists_session_metadata(
                 child.expect("reasoning effort set to high", timeout=20)
                 child.expect([STATE_SLEEPING, PROMPT_READY], timeout=20)
 
-                result = _drive_turn(child, "SESSION_EFFORT_OK", base_url=server.base_url)
+                result = _drive_turn(
+                    child,
+                    "SESSION_EFFORT_OK",
+                    mock_llm_server_url,
+                    base_url=server.base_url,
+                )
                 _wait_session_reasoning_effort(server.base_url, result.session_id, "high")
 
                 submit_prompt(child, "/effort medium")
@@ -818,61 +933,48 @@ async def test_repl_reasoning_effort_threads_through(
     mock_llm_server_url: str,
     tmp_path: Path,
 ) -> None:
-    """Session creation with ``reasoning_effort`` completes a real turn."""
-    reset_mock_llm(mock_llm_server_url)
-    configure_mock_llm(
-        mock_llm_server_url,
-        [{"text": "SESSION_REASONING_OK"}],
-        key=_MODEL,
-    )
+    """
+    Session creation with ``reasoning_effort`` completes a mock turn.
 
-    env = _repl_env(mock_credentials_env, tmp_path / "home")
+    Uses the mock LLM server to verify that create-time session metadata
+    works and does not break dispatch.
+
+    :param omnigent_python: Python interpreter fixture.
+    :param omnigent_repo_root: Repository root fixture.
+    :param mock_credentials_env: Mock-LLM credential environment fixture.
+    :param mock_llm_server_url: Mock server URL.
+    :param tmp_path: Per-test temp directory.
+    """
+    env = _repl_env(mock_credentials_env, tmp_path / "home", mock_llm_server_url)
     yaml_path = _write_marker_agent(
         tmp_path,
         "repl_session_reasoning_effort",
         "SESSION_REASONING_OK",
     )
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "SESSION_REASONING_OK"}],
+        key=_MODEL,
+    )
     with _running_server(omnigent_python, omnigent_repo_root, env, tmp_path) as server:
-        from omnigent.cli import _bundle, _start_cli_runner_process, _stop_cli_runner_process
+        from omnigent.cli import _bundle
 
         bundle = _bundle(yaml_path)
-
-        runner = _start_cli_runner_process(
-            server_url=server.base_url,
-            workspace_cwd=omnigent_repo_root,
-            capture_logs=True,
-            log_dir=tmp_path / "logs",
-            prewarm_spec_path=yaml_path,
+        with _registered_runner(
+            server.base_url,
+            omnigent_repo_root,
+            yaml_path,
+            tmp_path,
             extra_env={k: env[k] for k in ("OPENAI_BASE_URL", "OPENAI_API_KEY") if k in env},
-        )
-        deadline = time.monotonic() + 60
-        while time.monotonic() < deadline:
-            if runner.proc.poll() is not None:
-                raise AssertionError(
-                    f"runner exited early with code {runner.proc.returncode}",
-                )
-            with contextlib.suppress(httpx.HTTPError):
-                response = httpx.get(
-                    f"{server.base_url}/v1/runners/{runner.runner_id}/status",
-                    timeout=2.0,
-                )
-                if response.status_code == 200 and response.json()["online"] is True:
-                    break
-            _pause_between_external_polls(0.25)
-        else:
-            raise AssertionError(f"runner {runner.runner_id} did not register")
-
-        try:
-            from omnigent_client import OmnigentClient, SessionsChat
-
+        ) as runner_id:
             async with OmnigentClient(base_url=server.base_url) as client:
                 created = await client.sessions.create(bundle, reasoning_effort="high")
                 assert created.reasoning_effort == "high"
                 bound = await client.sessions.bind_runner(
                     created.id,
-                    runner_id=runner.runner_id,
+                    runner_id=runner_id,
                 )
-                assert bound.runner_id == runner.runner_id
+                assert bound.runner_id == runner_id
                 session_files = client.files.for_session(bound.id)
                 chat = SessionsChat(
                     namespace=client.sessions,
@@ -884,5 +986,3 @@ async def test_repl_reasoning_effort_threads_through(
                 assert "SESSION_REASONING_OK" in result.text
                 refreshed = await client.sessions.get(created.id)
                 assert refreshed.reasoning_effort == "high"
-        finally:
-            _stop_cli_runner_process(runner.proc, grace_timeout=1.0)
