@@ -42,7 +42,7 @@ jobs:
       # Checkout main only for load-maintainers.sh; the PR branch is checked
       # out later (regen job), after authorization passes.
       - name: Checkout (for the maintainer script)
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Load maintainers from .github/MAINTAINER
         id: maint
@@ -114,7 +114,7 @@ jobs:
       # build backends, which must not find a push token on disk. The App token
       # is minted only after `uv lock` and enters only at the push step.
       - name: Checkout the PR branch
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           ref: ${{ needs.authorize.outputs.head }}
           persist-credentials: false
@@ -155,11 +155,11 @@ jobs:
       # to GITHUB_TOKEN and a maintainer must re-push to run CI).
       - name: Mint App token
         id: app-token
-        if: vars.OSS_REGEN_APP_ID != ''
+        if: vars.OMNIGENT_BOT_APP_ID != ''
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.OSS_REGEN_APP_ID }}
-          private-key: ${{ secrets.OSS_REGEN_APP_KEY }}
+          app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
+          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
 
       # ${{ }} values pass via env: as "$VAR" to avoid injection (HEAD_REF is a
       # user-influenced branch name). The push token authenticates inline (scoped
@@ -171,8 +171,8 @@ jobs:
           PUSH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "omnigent-ci[bot]"
+          git config user.email "294685417+omnigent-ci[bot]@users.noreply.github.com"
           # --porcelain (not git diff) so first-time UNTRACKED lockfiles count too.
           if [ -z "$(git status --porcelain -- uv.lock ap-web/package-lock.json)" ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"

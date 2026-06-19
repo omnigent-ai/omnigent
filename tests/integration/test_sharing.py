@@ -34,6 +34,7 @@ def test_share_and_second_user_continues(
     live_runner_id: str,
     harness_name: str,
     model_name: str,
+    using_mock_llm: bool,
     request: pytest.FixtureRequest,
     mock_llm_server_url: str | None,
 ) -> None:
@@ -66,9 +67,7 @@ def test_share_and_second_user_continues(
             profile=request.config.getoption("--profile"),
             prompt="You are a terse test assistant. Follow instructions exactly.",
             mock_llm_base_url=(
-                f"{mock_llm_server_url}/v1"
-                if request.config.getoption("--llm-api-key") is None and mock_llm_server_url
-                else None
+                f"{mock_llm_server_url}/v1" if using_mock_llm and mock_llm_server_url else None
             ),
         )
         sid = create_runner_bound_session(owner, agent_name=agent_name, runner_id=live_runner_id)

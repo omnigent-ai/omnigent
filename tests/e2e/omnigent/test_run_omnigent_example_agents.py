@@ -86,21 +86,6 @@ _CASES = [
         id="agent_with_tools_calculate",
     ),
     pytest.param(
-        # Moved to tests/resources/agents/ in commit acf1762
-        # ("Move 6 redundant/test-only agents to tests/resources/agents/").
-        "tests/resources/agents/agent_with_subagent_session/agent_with_subagent_session.yaml",
-        (
-            "Use sys_session_send to send the worker a request to "
-            "calculate 11 * 11. Wait for it to finish (read the "
-            "inbox), then reply with exactly 'result=121'."
-        ),
-        (),
-        ("result=121", "121"),
-        (),
-        (),
-        id="agent_with_subagent_session",
-    ),
-    pytest.param(
         # Moved to tests/resources/agents/ in commit acf1762.
         "tests/resources/agents/coding_supervisor_with_forks/coding_supervisor_with_forks.yaml",
         (

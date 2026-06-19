@@ -623,10 +623,23 @@ def _parse_executor_spec(data: YamlData | str | bool | None) -> ExecutorSpec | N
         # missing keys map to ``None`` directly. ``data.get`` happens to
         # already return ``None`` for missing keys, so the assignment
         # flows through unchanged.
+        #
+        # Parse ``executor.auth`` into a typed auth dataclass so that
+        # inline AgentTool sub-agents can declare auth (e.g. api_key +
+        # base_url for mock LLM routing) and have it flow through to the
+        # child spec's executor. Without this, auth blocks on inline
+        # sub-agent executors are silently dropped.
+        auth = None
+        raw_auth = data.get("auth")
+        if isinstance(raw_auth, dict):
+            from omnigent.spec.parser import _parse_executor_auth
+
+            auth = _parse_executor_auth(data, expand_env=True)
         return ExecutorSpec(
             model=data.get("model"),
             harness=data.get("harness"),
             profile=data.get("profile"),
+            auth=auth,
         )
     return None
 

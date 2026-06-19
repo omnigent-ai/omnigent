@@ -26,7 +26,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from omnigent import claude_native_bridge, codex_native_bridge
+from omnigent import claude_native_bridge, codex_native_bridge, cursor_native_bridge
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
     bridge_dir_for_bridge_id,
@@ -1099,6 +1099,59 @@ async def test_create_session_threads_resolved_bundle_dir_to_codex_spawn_env(
     assert env is not None
     assert env["HARNESS_CODEX_BUNDLE_DIR"] == str(bundle_dir)
     assert env["HARNESS_CODEX_SKILLS_FILTER"] == '["codex_e2e_xyz_greet_a3f9c2"]'
+
+
+@pytest.mark.asyncio
+async def test_create_session_threads_cursor_bridge_dir_without_dead_guard_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cursor-native session pre-spawn emits only the bridge dir env.
+
+    This locks the runner boundary, not just the bridge helper: the
+    session-creation route must pass a cursor-native bridge dir into the
+    harness process manager, while omitting the unread request-session-id
+    guard env. Inject/stop/interrupt paths use the bridge dir and tmux target;
+    none consume an active-session guard.
+    """
+    monkeypatch.setattr(cursor_native_bridge, "_BRIDGE_ROOT", tmp_path / "cursor-bridge")
+    spec = AgentSpec(
+        spec_version=1,
+        name="cursor-native-agent",
+        executor=ExecutorSpec(
+            config={"harness": "cursor-native", "model": "cursor-default"},
+        ),
+    )
+    harness_client = _ScriptedHarnessClient([])
+    pm = _FakeProcessManager(harness_client)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_cursor", "agent_id": "ag_cursor"},
+        )
+
+    assert resp.status_code == 201
+    assert pm.get_client_calls
+    conversation_id, harness, env = pm.get_client_calls[-1]
+    assert conversation_id == "conv_cursor"
+    assert harness == "cursor-native"
+    assert env == {
+        cursor_native_bridge.BRIDGE_DIR_ENV_VAR: str(
+            cursor_native_bridge.bridge_dir_for_session_id("conv_cursor")
+        )
+    }
+    assert "HARNESS_CURSOR_NATIVE_REQUEST_SESSION_ID" not in env
 
 
 @pytest.mark.parametrize(
@@ -8979,6 +9032,117 @@ async def test_required_terminal_exit_publishes_deleted_and_failed(tmp_path: Pat
     assert f"cwd: {tmp_path}" in inbox_item["output"]
     assert "startup failed\ncomplete setup first" in inbox_item["output"]
     assert "Suggested next checks" not in inbox_item["output"]
+
+
+@pytest.mark.asyncio
+async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path: Path) -> None:
+    """
+    A required terminal that exits while the session is idle is a clean shutdown.
+
+    The native agent terminal is long-lived and goes ``idle`` once its turn
+    completes. When the pane then disappears, the work for that turn was already
+    delivered, so the runner must NOT publish ``session.status: failed`` — doing
+    so was the source of spurious "failed" chats in the UI. The terminal
+    resource is still removed and the harness subprocess released; the runner
+    going offline is surfaced separately via liveness, not a failure.
+
+    :param tmp_path: Temporary directory for fake terminal paths.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.app import _session_event_queues_ref
+    from tests.runner.helpers import make_test_terminal_instance
+
+    parent_id = f"conv_parent_idle_exit_{uuid.uuid4().hex[:12]}"
+    conv_id = f"conv_idle_exit_{uuid.uuid4().hex[:12]}"
+    parent_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("worker", "main", tmp_path)
+    instance.command = "worker-cli"
+    instance.launch_cwd = str(tmp_path)
+    terminal_registry._by_conversation.setdefault(conv_id, {})[("worker", "main")] = instance
+    callbacks: dict[str, Any] = {}
+
+    def _capture_watcher(
+        on_idle: object | None = None,
+        *,
+        on_activity: object | None = None,
+        on_exit: object | None = None,
+        idle_threshold_s: float | None = None,
+        poll_interval_s: float | None = None,
+        replace: bool = False,
+    ) -> None:
+        del on_idle, on_activity, idle_threshold_s, poll_interval_s, replace
+        callbacks["on_exit"] = on_exit
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    pm._sessions.add(conv_id)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+    )
+    resource_registry = app.state.session_resource_registry
+    runner_app._session_inboxes_ref[parent_id] = parent_inbox
+    runner_app.register_child_session(
+        conv_id,
+        parent_session_id=parent_id,
+        title="worker:main",
+        tool="worker",
+        session_name="main",
+    )
+    runner_app.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=conv_id,
+        agent="worker",
+        title="main",
+    )
+
+    try:
+        await resource_registry.observe_required_terminal(
+            conv_id,
+            "worker",
+            "main",
+            instance,
+        )
+        # The session reached idle (turn completed) before the pane vanished.
+        resource_registry._last_session_status[conv_id] = "idle"
+        on_exit = callbacks.get("on_exit")
+        assert callable(on_exit)
+        on_exit()
+        # The harness subprocess release is the terminal's last lifecycle step;
+        # wait on it as the settle signal, then inspect the published events.
+        for _ in range(1000):
+            if pm.released:
+                break
+            await asyncio.sleep(0)
+        queued_events = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+        parent_events = _drain_session_event_queue(_session_event_queues_ref.get(parent_id))
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+        _session_event_queues_ref.pop(parent_id, None)
+        runner_app.unregister_subagent_work(conv_id)
+        runner_app.unregister_child_session(conv_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    # The terminal resource is still removed...
+    assert terminal_registry.get(conv_id, "worker", "main") is None
+    assert {
+        "type": "session.resource.deleted",
+        "resource_id": "terminal_worker_main",
+        "resource_type": "terminal",
+        "session_id": conv_id,
+    } in queued_events
+    # ...but no failure is published, and the parent is not woken as failed.
+    assert [
+        event
+        for event in queued_events
+        if event.get("type") == "session.status" and event.get("status") == "failed"
+    ] == []
+    assert parent_events == []
+    assert parent_inbox.empty()
+    # The harness subprocess is still released — the terminal is gone.
+    assert pm.released == [conv_id]
 
 
 @pytest.mark.asyncio

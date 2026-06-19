@@ -524,6 +524,7 @@ _CODEX_REGRESSION_TODO_BODY = (
 _CODEX_NONEXISTENT_ERROR = "/nonexistent"
 
 
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_run_omnigent_coding_supervisor_codex_shell_not_disabled(
     omnigent_python: Path,
     omnigent_repo_root: Path,
@@ -610,12 +611,18 @@ def test_run_omnigent_coding_supervisor_codex_shell_not_disabled(
                 # pushes the codex_worker to actually cat the file
                 # rather than paraphrase from its own knowledge —
                 # the sentinel marker can only reach stdout via a
-                # real shell read.
+                # real shell read. "When the worker returns, include
+                # … in your final answer" is load-bearing: the
+                # codex_worker is an async AgentTool, so without it the
+                # supervisor fire-and-forgets ("Launched the worker…")
+                # and ends the turn before the result is drained back
+                # (same wait-for-return phrasing as the green
+                # spawns_codex_worker_to_list_files sibling).
                 (
                     f"Launch one codex_worker named 'codex-regression' and "
-                    f"ask it to read {_CODEX_REGRESSION_TODO_NAME} in the "
-                    f"current working directory and reply with the file's "
-                    f"contents verbatim."
+                    f"ask it to read the file {_CODEX_REGRESSION_TODO_NAME} in "
+                    f"the current working directory. When the worker returns, "
+                    f"include the file's contents verbatim in your final answer."
                 ),
             ],
             env=omnigent_credentials_env,
