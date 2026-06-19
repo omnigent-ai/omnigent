@@ -80,10 +80,14 @@ jobs:
       #    load-bearing: the wheel packages on-disk files, so the bundle must
       #    exist before `uv build`. `rm -rf` backstops Vite's emptyOutDir
       #    against stale bundles; `npm ci` installs the exact locked deps.
+      #    `--legacy-peer-deps` matches how ap-web's lockfile is generated and
+      #    validated everywhere else (lint, e2e-ui, ap-web-tests, the regen
+      #    jobs) — required for the React 19 peer conflict; without it `npm ci`
+      #    rejects the lockfile ("Missing: yaml@1.10.3 from lock file").
       - name: Build web UI (clean, fresh)
         run: |
           rm -rf omnigent/server/static/web-ui
-          npm --prefix ap-web ci
+          npm --prefix ap-web ci --legacy-peer-deps
           npm --prefix ap-web run build # Vite outDir -> omnigent/server/static/web-ui
 
       # 2. Tag-driven: the tag must match the version in all three pyprojects
