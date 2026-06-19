@@ -29,6 +29,7 @@ import {
   ShareIcon,
   SquareIcon,
   SquareCheckIcon,
+  TagIcon,
   Trash2Icon,
   XIcon,
 } from "lucide-react";
@@ -56,6 +57,7 @@ import {
   useConversations,
   usePinnedConversationBackfill,
   useRenameConversation,
+  useSetSessionLabel,
   useStopAndDeleteConversation,
   useStopSession,
 } from "@/hooks/useConversations";
@@ -79,8 +81,11 @@ import { SettingsSidebarBody, useSettingsRoute } from "./settingsNav";
 import {
   type ActiveChatOverride,
   COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY,
+  collectUserLabels,
   computeNextActiveOverride,
   conversationDisplayLabel,
+  getUserLabel,
+  labelColor,
   normalizePinnedConversationIds,
   orderByPinnedSequence,
   PINNED_CONVERSATION_IDS_STORAGE_KEY,
@@ -167,6 +172,7 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
   const [pinnedConversationIds, setPinnedConversationIds] = useState(readPinnedConversationIds);
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [labelFilter, setLabelFilter] = useState<string | undefined>(undefined);
 
   const toggleSelected = useCallback((id: string) => {
     setSelectedIds((prev) => {
@@ -201,9 +207,12 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
   // connection state, so the sidebar fetches a single undifferentiated
   // list. Archived sessions are included (`includeArchived: true`) and
   // peeled into their own "Archived" section at the bottom of the list.
-  const conversationsQuery = useConversations(debouncedSearchQuery, true, {
-    reconcileWhileConnected: true,
-  });
+  const conversationsQuery = useConversations(
+    debouncedSearchQuery,
+    true,
+    { reconcileWhileConnected: true },
+    labelFilter,
+  );
 
   // Inbox badge — total approval prompts across loaded rows. Same
   // `pending_elicitations_count` the per-row "awaiting" hand badge
@@ -212,6 +221,12 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
     () => (conversationsQuery.data?.pages ?? []).flatMap((page) => page.data),
     [conversationsQuery.data],
   );
+  const labelsFromRows = useMemo(() => collectUserLabels(loadedRows), [loadedRows]);
+  const knownLabelsRef = useRef<string[]>([]);
+  if (!labelFilter) {
+    knownLabelsRef.current = labelsFromRows;
+  }
+  const knownLabels = labelFilter ? knownLabelsRef.current : labelsFromRows;
   const pendingApprovals = useMemo(() => sumPendingApprovals(loadedRows), [loadedRows]);
   // Plus unseen file comments — the badge counts everything the Inbox
   // page lists. Comment queries are shared with the page/FileViewer
@@ -458,6 +473,40 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
               </div>
             )}
           </div>
+          {(knownLabels.length > 0 || labelFilter) && (
+            <div className="mt-2 flex flex-wrap gap-1 px-3">
+              {labelFilter && (
+                <button
+                  type="button"
+                  onClick={() => setLabelFilter(undefined)}
+                  className="inline-flex h-6 items-center gap-1 rounded-full bg-muted px-2 text-xs text-muted-foreground hover:bg-muted/80"
+                >
+                  <XIcon className="size-3" />
+                  Clear filter
+                </button>
+              )}
+              {knownLabels.map((l) => {
+                const colors = labelColor(l);
+                const isActive = labelFilter === l;
+                return (
+                  <button
+                    key={l}
+                    type="button"
+                    onClick={() => setLabelFilter(isActive ? undefined : l)}
+                    className={cn(
+                      "inline-flex h-6 items-center gap-1 rounded-full px-2 text-xs font-medium transition-all",
+                      colors.bg,
+                      colors.text,
+                      isActive && "ring-2 ring-current ring-offset-1 ring-offset-background",
+                    )}
+                  >
+                    <TagIcon className="size-3" />
+                    {l}
+                  </button>
+                );
+              })}
+            </div>
+          )}
 
           {/* Mobile: extra bottom padding so the last session scrolls clear of
           the floating Settings icon (which is absolutely positioned, out of
@@ -882,8 +931,10 @@ function ConversationRow({
   // The kebab's user-facing "Stop session" action — separate mutation
   // instance so its pending/error state can't bleed into archiving's.
   const stopSession = useStopSession();
+  const setLabel = useSetSessionLabel();
   const isArchived = conversation.archived === true;
   const [isEditing, setIsEditing] = useState(false);
+  const [labelPopoverOpen, setLabelPopoverOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [stopOpen, setStopOpen] = useState(false);
   // Opt-in "delete local branch" checkbox (worktree sessions only).
@@ -1069,14 +1120,33 @@ function ConversationRow({
             {hasUnseenMessages && <span className="sr-only"> (unread)</span>}
           </span>
         </div>
-        {/* Row 2: git branch subtitle, spanning the full row below. */}
-        {gitBranch !== null && (
-          <span
-            className="flex items-center gap-1 font-normal text-xs text-muted-foreground"
-            title={gitBranch}
-          >
-            <GitBranchIcon className="size-3 shrink-0" />
-            <span className="truncate">{gitBranch}</span>
+        {/* Row 2: label + git branch subtitles. */}
+        {(getUserLabel(conversation) || gitBranch !== null) && (
+          <span className="flex items-center gap-1.5 font-normal text-xs">
+            {getUserLabel(conversation) && (() => {
+              const userLabel = getUserLabel(conversation)!;
+              const colors = labelColor(userLabel);
+              return (
+                <span
+                  className={cn(
+                    "inline-flex items-center gap-0.5 rounded-full px-1.5 py-0 text-[10px] font-medium leading-4",
+                    colors.bg,
+                    colors.text,
+                  )}
+                >
+                  {userLabel}
+                </span>
+              );
+            })()}
+            {gitBranch !== null && (
+              <span
+                className="flex items-center gap-1 text-muted-foreground"
+                title={gitBranch}
+              >
+                <GitBranchIcon className="size-3 shrink-0" />
+                <span className="truncate">{gitBranch}</span>
+              </span>
+            )}
           </span>
         )}
       </Link>
@@ -1234,6 +1304,29 @@ function ConversationRow({
                 </TooltipTrigger>
                 <TooltipContent side="left">
                   You need edit permissions to rename this session
+                </TooltipContent>
+              </Tooltip>
+            )}
+            {canEdit ? (
+              <DropdownMenuItem
+                data-testid="label-conversation"
+                onSelect={() => setLabelPopoverOpen(true)}
+              >
+                <TagIcon className="size-3.5" />
+                Label
+              </DropdownMenuItem>
+            ) : (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <div>
+                    <DropdownMenuItem data-testid="label-conversation" disabled>
+                      <TagIcon className="size-3.5" />
+                      Label
+                    </DropdownMenuItem>
+                  </div>
+                </TooltipTrigger>
+                <TooltipContent side="left">
+                  You need edit permissions to label this session
                 </TooltipContent>
               </Tooltip>
             )}
@@ -1410,7 +1503,89 @@ function ConversationRow({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+      <LabelPopover
+        open={labelPopoverOpen}
+        onOpenChange={setLabelPopoverOpen}
+        currentLabel={getUserLabel(conversation)}
+        onSetLabel={(newLabel) => {
+          setLabel.mutate({ id: conversation.id, label: newLabel });
+          setLabelPopoverOpen(false);
+        }}
+      />
     </li>
+  );
+}
+
+function LabelPopover({
+  open,
+  onOpenChange,
+  currentLabel,
+  onSetLabel,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  currentLabel: string | null;
+  onSetLabel: (label: string | null) => void;
+}) {
+  const [value, setValue] = useState(currentLabel ?? "");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (open) {
+      setValue(currentLabel ?? "");
+      setTimeout(() => {
+        inputRef.current?.focus();
+        inputRef.current?.select();
+      }, 0);
+    }
+  }, [open, currentLabel]);
+
+  function handleSubmit() {
+    const trimmed = value.trim();
+    onSetLabel(trimmed || null);
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent onClick={(e) => e.stopPropagation()} className="sm:max-w-xs">
+        <DialogHeader>
+          <DialogTitle>Set label</DialogTitle>
+          <DialogDescription>Add a label to organize this session.</DialogDescription>
+        </DialogHeader>
+        <input
+          ref={inputRef}
+          type="text"
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              handleSubmit();
+            }
+          }}
+          placeholder="e.g. project-x, bug-fix, research"
+          className="w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-1"
+        />
+        <DialogFooter className="border-t-0 bg-transparent">
+          {currentLabel && (
+            <Button
+              type="button"
+              variant="ghost"
+              className="mr-auto text-destructive"
+              onClick={() => onSetLabel(null)}
+            >
+              Remove
+            </Button>
+          )}
+          <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>
+            Cancel
+          </Button>
+          <Button type="button" onClick={handleSubmit}>
+            Save
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 

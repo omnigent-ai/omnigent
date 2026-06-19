@@ -426,6 +426,7 @@ class ConversationStore(ABC):
         search_query: str | None = None,
         accessible_by: str | None = None,
         include_archived: bool = False,
+        label: str | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -509,6 +510,9 @@ class ConversationStore(ABC):
             conversations are excluded. When ``True``, archived and
             non-archived conversations are both returned (the caller
             groups them). Powers the sidebar's "Show archived" toggle.
+        :param label: When set, only return conversations that have
+            a ``user.label`` entry in ``conversation_labels`` whose
+            value matches exactly. ``None`` disables the filter.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """

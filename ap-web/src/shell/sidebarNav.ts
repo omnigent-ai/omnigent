@@ -3,6 +3,8 @@ import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodi
 
 export const PINNED_CONVERSATION_IDS_STORAGE_KEY = "omnigent:pinned-conversation-ids";
 
+export const USER_LABEL_KEY = "user.label";
+
 // Titles of sidebar sections the user has collapsed, e.g. ["Archived"].
 // Keyed by display title — stable identifiers for these fixed groups.
 export const COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY = "omnigent:collapsed-sidebar-sections";
@@ -162,4 +164,36 @@ export function normalizePinnedConversationIds(
   }
 
   return normalized;
+}
+
+export function getUserLabel(conversation: Conversation): string | null {
+  return conversation.labels?.[USER_LABEL_KEY] ?? null;
+}
+
+const LABEL_COLORS = [
+  { bg: "bg-blue-500/15", text: "text-blue-700 dark:text-blue-400" },
+  { bg: "bg-emerald-500/15", text: "text-emerald-700 dark:text-emerald-400" },
+  { bg: "bg-amber-500/15", text: "text-amber-700 dark:text-amber-400" },
+  { bg: "bg-purple-500/15", text: "text-purple-700 dark:text-purple-400" },
+  { bg: "bg-rose-500/15", text: "text-rose-700 dark:text-rose-400" },
+  { bg: "bg-cyan-500/15", text: "text-cyan-700 dark:text-cyan-400" },
+  { bg: "bg-orange-500/15", text: "text-orange-700 dark:text-orange-400" },
+  { bg: "bg-indigo-500/15", text: "text-indigo-700 dark:text-indigo-400" },
+];
+
+export function labelColor(label: string): { bg: string; text: string } {
+  let hash = 0;
+  for (let i = 0; i < label.length; i++) {
+    hash = (hash * 31 + label.charCodeAt(i)) | 0;
+  }
+  return LABEL_COLORS[Math.abs(hash) % LABEL_COLORS.length];
+}
+
+export function collectUserLabels(conversations: readonly Conversation[]): string[] {
+  const seen = new Set<string>();
+  for (const c of conversations) {
+    const l = getUserLabel(c);
+    if (l) seen.add(l);
+  }
+  return [...seen].sort((a, b) => a.localeCompare(b));
 }

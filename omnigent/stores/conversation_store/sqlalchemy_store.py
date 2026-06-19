@@ -1465,6 +1465,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         search_query: str | None = None,
         accessible_by: str | None = None,
         include_archived: bool = False,
+        label: str | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -1509,6 +1510,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param include_archived: When ``False`` (default), exclude
             rows where ``archived`` is true. When ``True``, include
             archived rows alongside non-archived ones.
+        :param label: When set, only return conversations that have
+            a ``user.label`` entry in ``conversation_labels`` whose
+            value matches exactly. ``None`` disables the filter.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """
@@ -1549,6 +1553,15 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlSessionPermission.user_id == accessible_by
                 )
                 stmt = stmt.where(SqlConversation.id.in_(accessible_ids))
+            if label is not None:
+                stmt = stmt.where(
+                    SqlConversation.id.in_(
+                        select(SqlConversationLabel.conversation_id).where(
+                            SqlConversationLabel.key == "user.label",
+                            SqlConversationLabel.value == label,
+                        )
+                    )
+                )
             if search_query:
                 pattern = f"%{search_query.lower()}%"
                 title_match = func.lower(SqlConversation.title).like(pattern)
