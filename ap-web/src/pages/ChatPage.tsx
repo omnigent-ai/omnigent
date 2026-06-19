@@ -3448,7 +3448,11 @@ export function Composer({
     // within the wrapped line.  Gating on position 0 / length ensures the
     // browser gets to move the caret through wrapped lines first; only the
     // final ArrowUp-at-start / ArrowDown-at-end triggers recall.
-    if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+    // Recall is for UNmodified arrows only. Cmd/Ctrl+↑/↓ (switch session) and
+    // Cmd/Alt+↑/↓ (jump between messages) are global window hotkeys meant to
+    // fire even mid-compose; without this guard the recall below intercepts
+    // them (replacing the draft) and the hotkeys appear broken in the composer.
+    if ((e.key === "ArrowUp" || e.key === "ArrowDown") && !e.metaKey && !e.ctrlKey && !e.altKey) {
       const ta = e.currentTarget;
       if (e.key === "ArrowUp" && ta.selectionStart === 0) {
         const recalled = recallPrevious(value);
