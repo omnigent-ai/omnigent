@@ -770,6 +770,25 @@ async def test_fork_switch_404_unknown_target() -> None:
             False,
             {"omnigent.ui": "terminal", "omnigent.wrapper": "codex-native-ui"},
         ),
+        # cursor/pi targets are native terminal-first harnesses, but they
+        # cannot replay fork history (no resumable native session and no TUI
+        # transcript import), so do not stamp carry_history_into_native.
+        (
+            "claude_sdk",
+            "cursor-native",
+            False,
+            False,
+            False,
+            {"omnigent.ui": "terminal", "omnigent.wrapper": "cursor-native-ui"},
+        ),
+        (
+            "claude_sdk",
+            "pi-native",
+            False,
+            False,
+            False,
+            {"omnigent.ui": "terminal", "omnigent.wrapper": "pi-native-ui"},
+        ),
         # native → SDK, same family: model carries, but an SDK target
         # replays the transcript itself so no native-rebuild marker is set.
         # The clone drops terminal-first mode (chat) — the bug this fixes.
@@ -801,13 +820,13 @@ async def test_fork_switch_model_and_carry_gating(
     """The switch gates model copy + native carry + UI mode on the target.
 
     A model id is provider-bound, so ``copy_model_settings`` must be True
-    only within a family. ``carry_history_into_native`` must be True for
-    ANY native target — same-family rebuilds via clone-or-items, cross-
-    family via items only — while SDK targets replay history themselves so
-    they never set it. ``resume_source_native_session`` must be False on a
-    cross-family switch so the store skips the fork-source directive (the
-    source's native transcript is the wrong format; a clone attempt would
-    fail and launch fresh). ``presentation_labels`` must reflect the TARGET
+    only within a family. ``carry_history_into_native`` must be True only for
+    native targets that can replay fork history (claude/codex); cursor/pi
+    targets are terminal-first but launch fresh, and SDK targets replay
+    history themselves so they never set it. ``resume_source_native_session``
+    must be False on a cross-family switch so the store skips the fork-source
+    directive (the source's native transcript is the wrong format; a clone
+    attempt would fail and launch fresh). ``presentation_labels`` must reflect the TARGET
     harness so the clone's UI mode is right — an SDK target drops
     terminal-first mode (``{}``), a native target sets it; copying the
     source's would leave an SDK clone of a native session with a stale
@@ -840,7 +859,7 @@ async def test_fork_switch_model_and_carry_gating(
     )
     assert fork_call["carry_history_into_native"] is expect_carry, (
         f"{source_harness}->{target_harness}: carry_history_into_native should "
-        f"be {expect_carry} (native rebuild for any native target; never for SDK)."
+        f"be {expect_carry} (only native harnesses with replayable fork history)."
     )
     assert fork_call["resume_source_native_session"] is expect_resume_source, (
         f"{source_harness}->{target_harness}: resume_source_native_session should "
@@ -889,4 +908,85 @@ async def test_fork_no_switch_native_source_carries_history(
     assert fork_call["presentation_labels"] is None, (
         "A same-agent fork must not recompute presentation labels (None); "
         "the copied source labels are already correct."
+    )
+
+
+@pytest.mark.parametrize("harness", ["cursor-native", "pi-native"])
+@pytest.mark.asyncio
+async def test_fork_cursor_native_does_not_carry_history(
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+) -> None:
+    """A fork of a cursor/pi native source must NOT mark native carry.
+
+    Unlike claude/codex native, the cursor and pi harnesses record no
+    resumable native session and their TUIs can't import a transcript, so
+    ``carry_history_into_native`` must be False — stamping it would be a
+    false promise the runner can't keep (the fork launches fresh anyway).
+    """
+    conv = _make_conversation()
+    conv_store = _ConversationStore(
+        conversations={"conv_src": conv},
+        items_by_conv={"conv_src": [_make_item("msg_1", "Hi")]},
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_agent_cache",
+        lambda: _StubAgentCache({"ag_test": harness}),
+    )
+    client = TestClient(_build_app(conv_store))
+
+    resp = client.post("/v1/sessions/conv_src/fork", json={})
+
+    assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
+    fork_call = conv_store.fork_calls[0]
+    assert fork_call["carry_history_into_native"] is False, (
+        f"A {harness} fork must not mark native carry — that harness can't "
+        "replay fork history, so the directive would be a false promise."
+    )
+
+
+@pytest.mark.parametrize(
+    "harness,expect_carry",
+    [
+        # Reversed native spellings ("native-claude" / "native-codex") are
+        # valid harness ids that canonicalize_harness passes through unchanged,
+        # so the carry gate must recognize them just like their canonical
+        # spellings — otherwise an identically-behaving agent silently loses
+        # fork history. cursor/pi (either spelling) still must NOT carry.
+        ("native-claude", True),
+        ("native-codex", True),
+        ("native-cursor", False),
+        ("native-pi", False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_fork_reversed_native_spelling_carry_gating(
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    expect_carry: bool,
+) -> None:
+    """The carry gate honors reversed native spellings like the canonical ones.
+
+    ``canonicalize_harness`` only aliases ``native-pi``; the other reversed
+    spellings pass through unchanged, so the predicate must list both forms
+    explicitly. claude/codex carry fork history; cursor/pi never do.
+    """
+    conv = _make_conversation()
+    conv_store = _ConversationStore(
+        conversations={"conv_src": conv},
+        items_by_conv={"conv_src": [_make_item("msg_1", "Hi")]},
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_agent_cache",
+        lambda: _StubAgentCache({"ag_test": harness}),
+    )
+    client = TestClient(_build_app(conv_store))
+
+    resp = client.post("/v1/sessions/conv_src/fork", json={})
+
+    assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
+    fork_call = conv_store.fork_calls[0]
+    assert fork_call["carry_history_into_native"] is expect_carry, (
+        f"A {harness} fork should set carry_history_into_native={expect_carry}: "
+        "reversed native spellings must be treated like their canonical form."
     )

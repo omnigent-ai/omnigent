@@ -26,7 +26,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from omnigent import claude_native_bridge, codex_native_bridge
+from omnigent import claude_native_bridge, codex_native_bridge, cursor_native_bridge
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
     bridge_dir_for_bridge_id,
@@ -1099,6 +1099,59 @@ async def test_create_session_threads_resolved_bundle_dir_to_codex_spawn_env(
     assert env is not None
     assert env["HARNESS_CODEX_BUNDLE_DIR"] == str(bundle_dir)
     assert env["HARNESS_CODEX_SKILLS_FILTER"] == '["codex_e2e_xyz_greet_a3f9c2"]'
+
+
+@pytest.mark.asyncio
+async def test_create_session_threads_cursor_bridge_dir_without_dead_guard_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cursor-native session pre-spawn emits only the bridge dir env.
+
+    This locks the runner boundary, not just the bridge helper: the
+    session-creation route must pass a cursor-native bridge dir into the
+    harness process manager, while omitting the unread request-session-id
+    guard env. Inject/stop/interrupt paths use the bridge dir and tmux target;
+    none consume an active-session guard.
+    """
+    monkeypatch.setattr(cursor_native_bridge, "_BRIDGE_ROOT", tmp_path / "cursor-bridge")
+    spec = AgentSpec(
+        spec_version=1,
+        name="cursor-native-agent",
+        executor=ExecutorSpec(
+            config={"harness": "cursor-native", "model": "cursor-default"},
+        ),
+    )
+    harness_client = _ScriptedHarnessClient([])
+    pm = _FakeProcessManager(harness_client)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_cursor", "agent_id": "ag_cursor"},
+        )
+
+    assert resp.status_code == 201
+    assert pm.get_client_calls
+    conversation_id, harness, env = pm.get_client_calls[-1]
+    assert conversation_id == "conv_cursor"
+    assert harness == "cursor-native"
+    assert env == {
+        cursor_native_bridge.BRIDGE_DIR_ENV_VAR: str(
+            cursor_native_bridge.bridge_dir_for_session_id("conv_cursor")
+        )
+    }
+    assert "HARNESS_CURSOR_NATIVE_REQUEST_SESSION_ID" not in env
 
 
 @pytest.mark.parametrize(
@@ -9057,14 +9110,31 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
         on_exit = callbacks.get("on_exit")
         assert callable(on_exit)
         on_exit()
-        # The harness subprocess release is the terminal's last lifecycle step;
-        # wait on it as the settle signal, then inspect the published events.
+        # Terminal-exit cleanup fans out across two independent background
+        # tasks: one publishes the resource events, a second releases the
+        # harness subprocess. Their completion order is not guaranteed, so
+        # settle on BOTH the published ``deleted`` event and the subprocess
+        # release — accumulating drained events each tick — rather than using
+        # the release as a proxy for the publish (which raced: the release
+        # task could finish first, leaving the drain empty).
+        deleted_event = {
+            "type": "session.resource.deleted",
+            "resource_id": "terminal_worker_main",
+            "resource_type": "terminal",
+            "session_id": conv_id,
+        }
+        queued_events: list[dict[str, Any]] = []
+        parent_events: list[dict[str, Any]] = []
         for _ in range(1000):
-            if pm.released:
+            queued_events.extend(
+                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+            )
+            parent_events.extend(
+                _drain_session_event_queue(_session_event_queues_ref.get(parent_id))
+            )
+            if pm.released and deleted_event in queued_events:
                 break
             await asyncio.sleep(0)
-        queued_events = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
-        parent_events = _drain_session_event_queue(_session_event_queues_ref.get(parent_id))
     finally:
         _session_event_queues_ref.pop(conv_id, None)
         _session_event_queues_ref.pop(parent_id, None)
@@ -9074,12 +9144,7 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
 
     # The terminal resource is still removed...
     assert terminal_registry.get(conv_id, "worker", "main") is None
-    assert {
-        "type": "session.resource.deleted",
-        "resource_id": "terminal_worker_main",
-        "resource_type": "terminal",
-        "session_id": conv_id,
-    } in queued_events
+    assert deleted_event in queued_events
     # ...but no failure is published, and the parent is not woken as failed.
     assert [
         event
@@ -10486,6 +10551,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
             session_key: str,
             spec: Any,
             resource_role: str | None = None,
+            parent_os_env: Any = None,
         ) -> SessionResourceView:
             """Record the launch and return a terminal resource view."""
             captured["terminal_name"] = terminal_name
@@ -10516,6 +10582,114 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     assert captured["spec"].command == "pi"
     # The fresh terminal is surfaced on the live stream for the Terminal toggle.
     assert any(evt.get("type") == "session.resource.created" for evt in published)
+
+
+@pytest.mark.asyncio
+async def test_auto_create_pi_terminal_inherits_agent_sandbox(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Pi-native auto-create must honour the agent's ``os_env.sandbox``.
+
+    Regression for the sandbox-override bug: the pi-native auto-create path
+    built a fresh ``TerminalEnvSpec`` whose ``os_env`` carried no ``sandbox``
+    and passed no ``parent_os_env``, so ``launch_required_terminal`` fell back
+    to ``_default_sandbox_for_platform`` (``linux_bwrap`` on Linux) and ignored
+    the agent YAML.  A pi-native agent that declares
+    ``os_env.sandbox.type: none`` was wrongly forced into bwrap, which failed
+    on a hardened host.
+
+    Asserts the launched terminal spec's ``os_env.sandbox`` is the agent's
+    ``none`` sandbox (not the platform default) and that the agent's ``os_env``
+    is threaded through as the launch ``parent_os_env`` so the rest of the
+    policy (egress_rules / env_passthrough) is also inherited.
+
+    :param tmp_path: Pytest-provided temporary directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    import omnigent.pi_native as pi_native
+    import omnigent.pi_native_bridge as pi_native_bridge
+    import omnigent.pi_native_credentials as pi_native_credentials
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+    monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
+    monkeypatch.setattr(pi_native_credentials, "resolve_pi_native_provider", lambda: None)
+
+    async def _fake_launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
+        return _PiNativeLaunchConfig(
+            workspace=tmp_path,
+            server_url="http://127.0.0.1:8000",
+            terminal_launch_args=None,
+            external_session_id=None,
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        """Captures the launched terminal spec and parent os_env."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """Record the spec + parent_os_env and return a resource view."""
+            del terminal_name, session_key
+            captured["spec"] = spec
+            captured["parent_os_env"] = parent_os_env
+            return SessionResourceView(
+                id="terminal_pi_main",
+                type="terminal",
+                session_id=session_id,
+                name="pi:main",
+                metadata={"terminal_name": "pi", "session_key": "main", "running": True},
+            )
+
+    # An agent that declares sandbox: none (runs unconfined; outer
+    # container/VM is the security boundary).
+    agent_os_env = OSEnvSpec(
+        type="caller_process",
+        cwd=".",
+        sandbox=OSEnvSandboxSpec(type="none"),
+    )
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="pi_code",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "pi-native", "model": "pi-default"},
+        ),
+        os_env=agent_os_env,
+    )
+
+    await _auto_create_pi_terminal(
+        "conv_pi_sandbox_none",
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, _evt: None,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        agent_spec=agent_spec,
+    )
+
+    launched_sandbox = captured["spec"].os_env.sandbox
+    assert launched_sandbox is not None, (
+        "auto-create dropped the agent's sandbox; launch_required_terminal will "
+        "fall back to _default_sandbox_for_platform (bwrap), overriding sandbox: none"
+    )
+    assert launched_sandbox.type == "none"
+    # The whole os_env is threaded through as the inheritance parent.
+    assert captured["parent_os_env"] is agent_os_env
 
 
 @pytest.mark.asyncio

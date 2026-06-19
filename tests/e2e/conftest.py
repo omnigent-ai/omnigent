@@ -41,6 +41,7 @@ import httpx
 import pytest
 import yaml
 
+from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from tests._model_pools import current_attempt, resolve_model
 from tests.e2e._harness_probes import skip_if_harness_cli_missing
 from tests.e2e.helpers import HEALTH_TIMEOUT_S, POLL_INTERVAL_S, lookup_databricks_host
@@ -302,13 +303,43 @@ def configure_mock_llm(
 
 def reset_mock_llm(mock_llm_server_url: str | None) -> None:
     """
-    Clear all keyed queues, captured requests, and gates.
+    Clear all regular keyed queues, captured requests, and gates.
+
+    Fallbacks set via :func:`set_fallback_mock_llm` are preserved.
 
     :param mock_llm_server_url: Mock server URL or ``None``.
     """
     if mock_llm_server_url is None:
         return
     resp = httpx.post(f"{mock_llm_server_url}/mock/reset", timeout=5.0)
+    resp.raise_for_status()
+
+
+def set_fallback_mock_llm(
+    mock_llm_server_url: str | None,
+    key: str,
+    text: str,
+) -> None:
+    """
+    Set a non-resettable fallback response for a queue key.
+
+    The fallback is returned when the regular queue for *key* is
+    exhausted.  Unlike regular entries, the fallback survives
+    :func:`reset_mock_llm` — use it for session-level queues that
+    must return a valid response even when per-test resets clear the
+    regular queue (e.g. the server-level policy-classifier LLM queue).
+
+    :param mock_llm_server_url: Mock server URL or ``None``.
+    :param key: Queue key (typically the server's ``llm.model``).
+    :param text: Fallback response text.
+    """
+    if mock_llm_server_url is None:
+        return
+    resp = httpx.post(
+        f"{mock_llm_server_url}/mock/set_fallback",
+        json={"key": key, "text": text},
+        timeout=5.0,
+    )
     resp.raise_for_status()
 
 
@@ -542,7 +573,7 @@ def live_server(
             yaml.safe_dump(
                 {
                     "llm": {
-                        "model": "mock-model",
+                        "model": "_policy_llm_",
                         "connection": {
                             "base_url": f"{mock_llm_server_url}/v1",
                             "api_key": "mock-key",
@@ -632,6 +663,17 @@ def live_server(
             f"Runner log at {runner_log}:\n{runner_log_contents[-3000:]}"
         )
 
+    # Set a non-resettable ALLOW fallback on the server's policy-classifier
+    # LLM queue ("_policy_llm_") so the classifier always returns ALLOW even
+    # when a parallel xdist worker's reset_mock_llm clears the regular queue
+    # between configure and the actual classifier call.
+    if using_mock_llm and mock_llm_server_url is not None:
+        set_fallback_mock_llm(
+            mock_llm_server_url,
+            "_policy_llm_",
+            '{"action": "allow", "reason": ""}',
+        )
+
     try:
         yield base_url
     finally:
@@ -660,7 +702,16 @@ def http_client(live_server: str) -> Iterator[httpx.Client]:
     :param live_server: The server base URL.
     :returns: An ``httpx.Client`` with long timeout.
     """
-    with httpx.Client(base_url=live_server, timeout=300) as client:
+    # Announce this as a first-party non-browser client via the sentinel
+    # Origin, exactly like the real SDK / runner. The multipart session
+    # routes are behind require_trusted_origin; sending the sentinel keeps
+    # these tests passing on their own merit rather than leaning on the
+    # guard's (temporary) fail-open-on-absent-Origin behavior.
+    with httpx.Client(
+        base_url=live_server,
+        timeout=300,
+        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+    ) as client:
         yield client
 
 
@@ -711,6 +762,9 @@ def upload_agent(
                 "application/gzip",
             ),
         },
+        # First-party sentinel Origin so the multipart create passes the
+        # require_trusted_origin guard regardless of which client is passed.
+        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
     )
     if resp.status_code == 409:
         return agent_dir.name
@@ -804,6 +858,9 @@ def register_inline_agent(
         "/v1/sessions",
         data={"metadata": _json.dumps({})},
         files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+        # First-party sentinel Origin so the multipart create passes the
+        # require_trusted_origin guard regardless of which client is passed.
+        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
     )
     # 409 = already registered by a prior parametrize row against the
     # same session-scoped server; treat as success. Explicit raise (not
@@ -1240,7 +1297,13 @@ def create_runner_bound_session(
     :returns: The session/conversation id, e.g. ``"conv_abc"``.
     """
     agent_id = lookup_agent_id(client, agent_name)
-    resp = client.post("/v1/sessions", json={"agent_id": agent_id})
+    # First-party sentinel Origin so the create passes the
+    # require_trusted_origin guard regardless of which client is passed.
+    resp = client.post(
+        "/v1/sessions",
+        json={"agent_id": agent_id},
+        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+    )
     resp.raise_for_status()
     session_id = str(resp.json()["id"])
     resp = client.patch(

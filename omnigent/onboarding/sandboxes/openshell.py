@@ -37,6 +37,7 @@ Notes that shape this launcher:
 
 from __future__ import annotations
 
+import logging
 import os
 import shlex
 from collections.abc import Callable, Sequence
@@ -57,6 +58,8 @@ if TYPE_CHECKING:
 
     from openshell import ExecResult
 
+_logger = logging.getLogger(__name__)
+
 HOST_IMAGE_ENV_VAR: str = "OMNIGENT_OPENSHELL_HOST_IMAGE"
 """Environment variable overriding :data:`DEFAULT_HOST_IMAGE` for
 OpenShell sandboxes."""
@@ -76,7 +79,7 @@ _EXEC_TIMEOUT_S = 300
 # ceiling. The pidfile records the in-sandbox pid so Ctrl-C can kill the
 # remote process (cancelling the local stream doesn't stop it).
 _FOREGROUND_TIMEOUT_S = 7 * 24 * 3600
-_FOREGROUND_PIDFILE = "/tmp/oa-openshell-foreground.pid"
+_FOREGROUND_PIDFILE_TEMPLATE = "/tmp/oa-openshell-foreground-{sandbox_id}.pid"
 
 # OpenShell runs the agent as the non-root ``sandbox`` user (its image
 # contract; see deploy/docker/Dockerfile), whose home is ``/home/sandbox``.
@@ -232,12 +235,13 @@ class _OpenShellClient:
                 ):
                     pass
             except Exception:
-                # Fire-and-forget daemon pump: exec_stream raises (gRPC
-                # cancellation / SandboxError) when the in-sandbox host exits
-                # or the sandbox is deleted — the expected end of this thread,
-                # with no caller left to surface it to.
-                pass
+                _logger.debug(
+                    "exec_background stream ended for sandbox %s",
+                    name,
+                    exc_info=True,
+                )
 
+        self._bg_threads = [t for t in self._bg_threads if t.is_alive()]
         thread = threading.Thread(target=_pump, name=f"openshell-host-{name}", daemon=True)
         thread.start()
         self._bg_threads.append(thread)
@@ -265,6 +269,9 @@ class _OpenShellClient:
                 f"Failed to delete OpenShell sandbox '{name}': {exc}"
             ) from exc
         except SandboxError as exc:
+            if "not found" in str(exc).lower():
+                self._ids.pop(name, None)
+                return
             raise click.ClickException(
                 f"Failed to delete OpenShell sandbox '{name}': {exc}"
             ) from exc
@@ -356,25 +363,6 @@ class OpenShellSandboxLauncher(SandboxLauncher):
 
     def run(self, sandbox_id: str, command: str, *, check: bool = True) -> RemoteCommandResult:
         """Run ``bash -lc <command>`` in the sandbox and capture its output."""
-        # The server's managed-host launch detaches the in-sandbox host with a
-        # ``setsid nohup omnigent host … & echo launched`` idiom and expects it
-        # to keep running after this call returns. On OpenShell a backgrounded
-        # exec process is killed the moment the exec returns, so run it instead
-        # as a foreground command on a held-open stream (exec_background); the
-        # host then survives to dial back and register.
-        stripped = command.rstrip()
-        if stripped.endswith("& echo launched") and "omnigent host" in stripped:
-            # Drop the detach scaffolding (``setsid nohup … & echo launched``):
-            # the command must run in the FOREGROUND of the held-open stream,
-            # or OpenShell reaps it the instant the exec returns. The output
-            # redirect (``> … 2>&1 < /dev/null``) is kept so the stream stays
-            # quiet while the host runs for the session's lifetime.
-            foreground = stripped[: -len("& echo launched")].rstrip()
-            foreground = foreground.replace("setsid nohup ", "")
-            self._openshell().exec_background(
-                sandbox_id, ["bash", "-lc", foreground], timeout=_FOREGROUND_TIMEOUT_S
-            )
-            return RemoteCommandResult(returncode=0, stdout="launched\n", stderr="")
         result = self._openshell().execute(sandbox_id, ["bash", "-lc", command])
         if result.stdout:
             click.echo(result.stdout, nl=False)
@@ -388,6 +376,22 @@ class OpenShellSandboxLauncher(SandboxLauncher):
         return RemoteCommandResult(
             returncode=result.exit_code, stdout=result.stdout, stderr=result.stderr
         )
+
+    def run_background(
+        self, sandbox_id: str, command: str, *, log_path: str = "/tmp/omnigent-host.log"
+    ) -> RemoteCommandResult:
+        """Hold *command* on a long-lived exec stream instead of detaching.
+
+        OpenShell kills an exec's processes when the RPC returns, so the
+        base class's ``setsid nohup`` detach pattern doesn't work. Instead
+        the command runs in the foreground of an ``exec_stream`` drained on
+        a daemon thread — the stream stays open for the process's lifetime.
+        """
+        bg_command = f"{command} > {log_path} 2>&1 < /dev/null"
+        self._openshell().exec_background(
+            sandbox_id, ["bash", "-lc", bg_command], timeout=_FOREGROUND_TIMEOUT_S
+        )
+        return RemoteCommandResult(returncode=0, stdout="launched\n", stderr="")
 
     def put(self, sandbox_id: str, local_path: Path, remote_path: str) -> None:
         """Copy a local file into the sandbox by piping its bytes to ``cat``."""
@@ -413,10 +417,11 @@ class OpenShellSandboxLauncher(SandboxLauncher):
         Ctrl-C kills the remote process and re-raises ``KeyboardInterrupt``.
         """
         client = self._openshell()
+        pidfile = _FOREGROUND_PIDFILE_TEMPLATE.format(sandbox_id=sandbox_id)
         # `exec` keeps the recorded pid across the shell swap, so a Ctrl-C
         # can kill the remote process — cancelling the local gRPC stream
         # stops our reads but doesn't stop the remote command.
-        remote = f"echo $$ > {shlex.quote(_FOREGROUND_PIDFILE)} && exec {command}"
+        remote = f"echo $$ > {shlex.quote(pidfile)} && exec {command}"
         try:
             return client.run_foreground(
                 sandbox_id, ["bash", "-lc", remote], timeout=_FOREGROUND_TIMEOUT_S
@@ -428,7 +433,7 @@ class OpenShellSandboxLauncher(SandboxLauncher):
                 [
                     "bash",
                     "-lc",
-                    f"kill $(cat {shlex.quote(_FOREGROUND_PIDFILE)}) 2>/dev/null || true",
+                    f"kill $(cat {shlex.quote(pidfile)}) 2>/dev/null || true",
                 ],
             )
             raise
@@ -445,6 +450,15 @@ class OpenShellSandboxLauncher(SandboxLauncher):
             if self._client is not None:
                 self._client.close()
                 self._client = None
+
+    def close(self) -> None:
+        """Release the underlying gRPC channel, if one was opened."""
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+
+    def __del__(self) -> None:
+        self.close()
 
     def _openshell(self) -> _OpenShellClient:
         if self._client is None:
@@ -465,7 +479,7 @@ class OpenShellSandboxLauncher(SandboxLauncher):
             value = os.environ.get(name)
             if value is None:
                 raise click.ClickException(
-                    f"sandbox env passthrough names '{name}' but it is not set "
+                    f"sandbox env passthrough lists '{name}' but it is not set "
                     "in the server's environment — set it (or remove it from "
                     f"sandbox.openshell.env / {SANDBOX_ENV_PASSTHROUGH_ENV_VAR})."
                 )

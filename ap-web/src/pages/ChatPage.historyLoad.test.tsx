@@ -155,6 +155,7 @@ describe("JumpToTopButton", () => {
   afterEach(() => {
     cleanup();
     useChatStore.setState({ loadMoreHistory: originalLoadMoreHistory, hasMoreHistory: false });
+    vi.useRealTimers();
   });
 
   // Query by the aria-label attribute rather than role/accessible-name: when
@@ -222,6 +223,51 @@ describe("JumpToTopButton", () => {
     // Leaving the conversation hides it again.
     act(() => {
       fireEvent.mouseLeave(container);
+    });
+    expect(pill().className).toContain("pointer-events-none");
+  });
+
+  it("reveals when the user scrolls up, then auto-hides after the linger timeout", () => {
+    vi.useFakeTimers();
+    const { container, scroll, scroller } = makeScroller({
+      scrollTop: 500,
+      scrollHeight: 1000,
+      clientHeight: 400,
+    });
+    const metrics = scroll as unknown as { scrollTop: number };
+
+    render(<JumpToTopButton containerEl={container} scroller={scroller} hasMoreHistory={true} />);
+    // Mount reads the initial position; no scroll yet, so the pill stays hidden.
+    expect(pill().className).toContain("pointer-events-none");
+
+    // Scroll up (scrollTop decreases): the pill reveals without any hover.
+    act(() => {
+      metrics.scrollTop = 300;
+      fireEvent.scroll(scroll);
+    });
+    expect(pill().className).toContain("pointer-events-auto");
+
+    // After the linger window with no further upward scroll, it fades back out.
+    act(() => {
+      vi.advanceTimersByTime(2000);
+    });
+    expect(pill().className).toContain("pointer-events-none");
+  });
+
+  it("does not reveal on a downward scroll", () => {
+    const { container, scroll, scroller } = makeScroller({
+      scrollTop: 300,
+      scrollHeight: 1000,
+      clientHeight: 400,
+    });
+    const metrics = scroll as unknown as { scrollTop: number };
+
+    render(<JumpToTopButton containerEl={container} scroller={scroller} hasMoreHistory={true} />);
+
+    // Scrolling down (scrollTop increases) must not surface the pill.
+    act(() => {
+      metrics.scrollTop = 600;
+      fireEvent.scroll(scroll);
     });
     expect(pill().className).toContain("pointer-events-none");
   });
