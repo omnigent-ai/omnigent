@@ -65,11 +65,6 @@ skips:
     cluster: repl-server-mode-startup-crash
     mode: skip
 
-  - id: tests/e2e/omnigent/test_repl_multiline.py::test_repl_multiline_ctrl_j_insert
-    reason: "Kept suppressed as a known shard-load/worker-killer heavy pexpect test pending a dedicated round."
-    issue: 523
-    cluster: repl-pexpect-cli
-    mode: skip
 
 
 
