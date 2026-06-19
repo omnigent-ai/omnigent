@@ -54,19 +54,6 @@ skips:
     cluster: no-agent-harness-roundtrip-hang
     mode: skip
 
-
-  - id: tests/e2e/test_repl_approval_e2e.py::test_repl_output_ask_approve_surfaces_llm_reply
-    reason: "OUTPUT-phase ASK banner does not surface in the REPL (#763): expect('approval required') times out 60/60. Same surfacing gap as TOOL_CALL."
-    issue: 763
-    cluster: repl-policy-ask-surfacing
-    mode: skip
-
-  - id: tests/e2e/test_repl_approval_e2e.py::test_repl_output_ask_refuse_replaces_reply_with_sentinel
-    reason: "OUTPUT-phase ASK banner does not surface in the REPL (#763): expect('approval required') times out 60/60. Same surfacing gap as TOOL_CALL."
-    issue: 763
-    cluster: repl-policy-ask-surfacing
-    mode: skip
-
   - id: tests/e2e/omnigent/test_repl_inline_tool_streaming.py::test_repl_inline_tool_call_and_result_streaming
     reason: "REPL inline tool-call streaming."
     issue: 523
