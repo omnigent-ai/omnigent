@@ -1,20 +1,19 @@
 """E2E test: cancel → file attachment → cancel → file attachment → success.
 
-Exercises the full REPL-style cancel + file attachment flow via the
-SDK session (same code path as the terminal REPL). Verifies that:
+Exercises the full cancel + file-attachment flow on the runner-native
+sessions API (``POST /v1/sessions/{id}/events``). Verifies that:
 
-1. Cancelling mid-response doesn't break subsequent turns.
-2. File attachments work after cancellation.
-3. Multiple cancel → send cycles don't corrupt session state.
+1. Interrupting a running turn doesn't break subsequent turns.
+2. File attachments work after an interrupt.
+3. Multiple interrupt → send cycles don't corrupt session state.
 4. The LLM actually reads the attached markdown content.
 
-The test simulates the REPL's Escape-cancel behavior by consuming
-a few streaming events then calling ``session.cancel()`` — the exact
-same sequence the REPL's ``on_input`` + ``asyncio.shield`` performs.
-
-Uses keyword assertions on the final response to confirm the file
-was read (the file contains distinctive fictional terms that can
-only appear if the LLM processed the content).
+Migrated off the removed ``POST /v1/responses`` route: turns are now
+driven through one runner-bound session, cancellation uses the
+sessions interrupt event (the same path :mod:`test_cancel_history`
+exercises), and continuity is implicit in the shared session rather
+than threaded through ``previous_response_id``. File upload is
+unchanged — ``POST /v1/sessions/{id}/resources/files``.
 
 Usage::
 
@@ -24,10 +23,18 @@ Usage::
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import httpx
 import pytest
+
+from tests.e2e.conftest import (
+    create_runner_bound_session,
+    poll_session_until_terminal,
+    send_user_message_to_session,
+)
+from tests.e2e.helpers import POLL_INTERVAL_S, final_assistant_text
 
 _MD_CONTENT = (
     b"# Zebra Deployment Protocol\n\n"
@@ -42,210 +49,159 @@ _MD_CONTENT = (
     b"4. Confirm delivery via carrier pigeon relay.\n"
 )
 """Distinctive fictional markdown — keyword assertions check for
-'zebra', 'Mars', 'catapult' to confirm the file was actually read."""
+'zebra', 'Mars' to confirm the file was actually read."""
 
 
-def _extract_text(body: dict[str, Any]) -> str:
-    """
-    Concatenate all output_text blocks from a response body.
-
-    :param body: The terminal response body.
-    :returns: All assistant text.
-    """
-    parts: list[str] = []
-    for item in body.get("output", []):
-        if item.get("type") == "message":
-            for block in item.get("content", []):
-                text = block.get("text")
-                if text:
-                    parts.append(text)
-    return "\n".join(parts)
-
-
-def _upload_md(client: httpx.Client, base_url: str, session_id: str) -> str:
+def _upload_md(client: httpx.Client, session_id: str) -> str:
     """
     Upload the test markdown file and return its file_id.
 
-    :param client: Sync HTTP client.
-    :param base_url: Server base URL.
+    :param client: Sync HTTP client pointed at the live server.
     :param session_id: Owning session/conversation id.
     :returns: The uploaded file's ID.
     """
     resp = client.post(
-        f"{base_url}/v1/sessions/{session_id}/resources/files",
+        f"/v1/sessions/{session_id}/resources/files",
         files={"file": ("protocol.md", _MD_CONTENT, "text/markdown")},
     )
     resp.raise_for_status()
     return resp.json()["id"]
 
 
-def _session_id_for_response(client: httpx.Client, base_url: str, response_id: str) -> str:
-    """Return the conversation/session id for a response."""
-    resp = client.get(f"{base_url}/v1/responses/{response_id}")
-    resp.raise_for_status()
-    body = resp.json()
-    return body["conversation"]["id"]
+def _file_message(text: str, file_id: str) -> list[dict[str, Any]]:
+    """User-message content blocks pairing a prompt with an attachment."""
+    return [
+        {"type": "input_text", "text": text},
+        {"type": "input_file", "file_id": file_id, "filename": "protocol.md"},
+    ]
 
 
-def _send_with_file(
-    client: httpx.Client,
-    base_url: str,
-    model: str,
-    text: str,
-    file_id: str,
-    previous_response_id: str | None,
-) -> dict[str, Any]:
-    """
-    Send a message with a file attachment (blocking).
-
-    :param client: Sync HTTP client.
-    :param base_url: Server base URL.
-    :param model: Agent name.
-    :param text: User message text.
-    :param file_id: Uploaded file ID.
-    :param previous_response_id: Previous response for conversation
-        continuity, or None.
-    :returns: The response JSON body.
-    """
-    body: dict[str, Any] = {
-        "model": model,
-        "input": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": text},
-                    {"type": "input_file", "file_id": file_id, "filename": "protocol.md"},
-                ],
-            },
-        ],
-        "stream": False,
-    }
-    if previous_response_id:
-        body["previous_response_id"] = previous_response_id
-    resp = client.post(
-        f"{base_url}/v1/responses",
-        json=body,
-        timeout=120.0,
-    )
-    resp.raise_for_status()
-    return resp.json()
+def _wait_for_session_running(client: httpx.Client, session_id: str, timeout: float = 60) -> None:
+    """Poll until the runner-native session transitions to ``running``."""
+    deadline = time.monotonic() + timeout
+    last: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        resp = client.get(f"/v1/sessions/{session_id}")
+        resp.raise_for_status()
+        last = resp.json()
+        status = last.get("status")
+        if status == "running":
+            return
+        if status not in ("idle", "running"):
+            raise AssertionError(f"Session reached {status!r} before running: {last}")
+        time.sleep(POLL_INTERVAL_S)
+    raise AssertionError(f"Session {session_id} didn't reach running within {timeout}s: {last}")
 
 
-@pytest.mark.asyncio()
-async def test_cancel_send_file_cancel_send_file_succeeds(
-    live_server: str,
+def _interrupt_and_wait_idle(client: httpx.Client, session_id: str, timeout: float = 30) -> None:
+    """Interrupt the running turn and wait for the session to settle idle."""
+    cancel = client.post(f"/v1/sessions/{session_id}/events", json={"type": "interrupt"})
+    cancel.raise_for_status()
+    assert cancel.status_code in (202, 204), f"Unexpected interrupt status: {cancel.status_code}"
+    deadline = time.monotonic() + timeout
+    last: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        resp = client.get(f"/v1/sessions/{session_id}")
+        resp.raise_for_status()
+        last = resp.json()
+        status = last.get("status")
+        if status == "failed":
+            raise AssertionError(f"Session failed during interrupt teardown: {last}")
+        if status == "idle":
+            return
+        time.sleep(POLL_INTERVAL_S)
+    raise AssertionError(f"Session {session_id} did not return to idle within {timeout}s: {last}")
+
+
+def test_cancel_send_file_cancel_send_file_succeeds(
+    http_client: httpx.Client,
     archer_agent: str,
+    live_runner_id: str,
+    using_mock_llm: bool,
 ) -> None:
     """
-    REPL-style flow: send → cancel → send with .md → cancel →
+    Sessions-API flow: send → interrupt → send with .md → interrupt →
     send with .md → verify content was read.
 
-    Uses the SDK Session for the cancel-aware turns (same code path
-    as the REPL's on_input + Escape handling), then sends the final
-    file attachment via HTTP to verify the conversation state is
-    clean.
+    All turns run in one runner-bound session, so conversation
+    continuity is implicit. Cancellation uses the sessions interrupt
+    event; the final turn must complete and quote distinctive terms
+    from the uploaded markdown.
 
     **What breaks if wrong:**
 
-    - session._is_terminal not reset after cancel → next send()
-      tries to steer a dead response.
-    - Dangling function_call items without outputs → OpenAI 400.
-    - File content_type stored as application/octet-stream → OpenAI
-      rejects the data URI.
-    - _normalize_input double-wraps message items → OpenAI 400.
+    - Interrupt teardown leaves the session non-idle → the next
+      ``events`` POST can't start a fresh turn.
+    - Dangling ``function_call`` items without outputs after an
+      interrupt → the next turn fails ``[llm] failed``.
+    - The attached file never reaches the model → the final answer
+      omits 'zebra'/'Mars'.
 
-    :param live_server: Base URL of the running test server.
+    :param http_client: Sync HTTP client for the live server.
     :param archer_agent: Name of the registered archer agent.
+    :param live_runner_id: Registered runner id to bind the session to.
+    :param using_mock_llm: True when the mock LLM backs the server.
     """
-    from omnigent_client import OmnigentClient
-
-    async with OmnigentClient(base_url=live_server) as client:
-        session = client.session(model=archer_agent)
-
-        # ── Turn 1: send a message, cancel mid-stream ──────────
-        event_count = 0
-        async for _event in session.send("Write a 2000-word essay about volcanoes."):
-            event_count += 1
-            if event_count >= 3:
-                break
-        await session.cancel()
-        prev_id_1 = session.current_response_id
-        assert prev_id_1 is not None, "Session should have a response ID after cancel"
-
-        # ── Turn 2: send with markdown file, cancel mid-stream ─
-        # Upload via sync client (simpler for file upload).
-        sync_client = httpx.Client(base_url=live_server, timeout=120)
-        session_id = _session_id_for_response(sync_client, live_server, prev_id_1)
-        file_id_1 = _upload_md(sync_client, live_server, session_id)
-
-        # Start a turn with the file — use HTTP directly since
-        # session.send(files=) takes disk paths, not file_ids.
-        resp2 = sync_client.post(
-            f"{live_server}/v1/responses",
-            json={
-                "model": archer_agent,
-                "input": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "input_text", "text": "Read this file."},
-                            {
-                                "type": "input_file",
-                                "file_id": file_id_1,
-                                "filename": "protocol.md",
-                            },
-                        ],
-                    },
-                ],
-                "previous_response_id": prev_id_1,
-                "background": True,
-            },
-        )
-        resp2.raise_for_status()
-        rid2 = resp2.json()["id"]
-
-        # Let it start, then cancel.
-        import time
-
-        for _ in range(30):
-            check = sync_client.get(f"{live_server}/v1/responses/{rid2}")
-            if check.json()["status"] == "in_progress":
-                break
-            time.sleep(0.3)
-        cancel2 = sync_client.post(f"{live_server}/v1/responses/{rid2}/cancel")
-        cancel2.raise_for_status()
-
-        # ── Turn 3: send with markdown file again — must succeed ─
-        file_id_2 = _upload_md(sync_client, live_server, session_id)
-        body3 = _send_with_file(
-            sync_client,
-            live_server,
-            archer_agent,
-            text=(
-                "Read this file and tell me: what is the name of "
-                "the protocol, what planet does it target, and what "
-                "animal is in the name? Answer in one sentence."
-            ),
-            file_id=file_id_2,
-            previous_response_id=rid2,
+    if using_mock_llm:
+        pytest.skip(
+            "requires real streaming generation + file comprehension; "
+            "the mock gate/interrupt interaction and the 'agent read the "
+            "file' assertions do not reproduce under the mock LLM"
         )
 
-        assert body3["status"] == "completed", (
-            f"Turn 3 status: {body3['status']!r}. Error: {body3.get('error')}"
-        )
+    session_id = create_runner_bound_session(
+        http_client, agent_name=archer_agent, runner_id=live_runner_id
+    )
 
-        text = _extract_text(body3)
-        assert text.strip(), f"Agent produced no output. Body: {body3}"
+    # ── Turn 1: start a long turn, interrupt mid-flight ───────────
+    send_user_message_to_session(
+        http_client,
+        session_id=session_id,
+        content="Write a detailed 2000-word essay about volcanoes.",
+    )
+    _wait_for_session_running(http_client, session_id)
+    _interrupt_and_wait_idle(http_client, session_id)
 
-        # ── LLM judge: verify the agent actually read the file ──
-        # The content has distinctive terms that can only appear
-        # if the LLM processed the uploaded markdown.
-        text_lower = text.lower()
-        assert "zebra" in text_lower, (
-            f"Response should mention 'zebra' from the file. Got: {text[:300]}"
-        )
-        assert "mars" in text_lower, (
-            f"Response should mention 'Mars' from the file. Got: {text[:300]}"
-        )
+    # ── Turn 2: send with markdown file, interrupt mid-flight ─────
+    file_id_1 = _upload_md(http_client, session_id)
+    send_user_message_to_session(
+        http_client,
+        session_id=session_id,
+        content=_file_message("Read this file and summarize it in detail.", file_id_1),
+    )
+    _wait_for_session_running(http_client, session_id)
+    _interrupt_and_wait_idle(http_client, session_id)
 
-        sync_client.close()
+    # ── Turn 3: send with markdown file again — must succeed ──────
+    file_id_2 = _upload_md(http_client, session_id)
+    response_id = send_user_message_to_session(
+        http_client,
+        session_id=session_id,
+        content=_file_message(
+            "Read this file and tell me: what is the name of the protocol, "
+            "what planet does it target, and what animal is in the name? "
+            "Answer in one sentence.",
+            file_id_2,
+        ),
+    )
+    body = poll_session_until_terminal(
+        http_client,
+        session_id=session_id,
+        response_id=response_id,
+        timeout=120,
+    )
+
+    assert body["status"] == "completed", (
+        f"Turn 3 status: {body['status']!r}. Error: {body.get('error')}"
+    )
+
+    text = final_assistant_text(body)
+    assert text.strip(), f"Agent produced no output. Body: {body}"
+
+    # The content has distinctive terms that can only appear if the
+    # LLM actually processed the uploaded markdown.
+    text_lower = text.lower()
+    assert "zebra" in text_lower, (
+        f"Response should mention 'zebra' from the file. Got: {text[:300]}"
+    )
+    assert "mars" in text_lower, f"Response should mention 'Mars' from the file. Got: {text[:300]}"

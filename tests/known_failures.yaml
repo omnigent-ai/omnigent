@@ -60,12 +60,6 @@ skips:
     cluster: runner-wedge-subprocess-fanout
     mode: skip
 
-  - id: tests/e2e/test_cancel_then_file_attachment.py::test_cancel_send_file_cancel_send_file_succeeds
-    reason: "Agent calls sys_os_shell to list filesystem instead of reading the uploaded markdown attachment; file attachment may not be reaching the LLM correctly."
-    issue: 532
-    cluster: files-uploads-attachments
-    mode: skip
-
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_tool_call_approval_allows_tool_to_run
     reason: "Same REPL approval pexpect-timeout family."
     issue: 532
