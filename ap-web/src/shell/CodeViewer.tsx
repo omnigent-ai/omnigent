@@ -40,11 +40,13 @@ import { MarkdownRichTextViewer } from "./MarkdownRichTextViewer";
 import {
   type ActiveSelection,
   type SaveStatus,
+  HTML_PREVIEW_SANDBOX,
   detectLang,
   getSelectionOffsets,
   indexToLine,
   isBinaryPath,
   lineOverlapsSelection,
+  prepareHtmlPreviewDoc,
 } from "./codeViewerHelpers";
 import { renderLineTokens } from "./codeViewerRendering";
 import { TruncatedBanner } from "./TruncatedBanner";
@@ -392,8 +394,9 @@ export function CodeViewer({
         <MarkdownPreview content={content} />
       ) : (
         <iframe
-          srcDoc={content}
-          sandbox=""
+          srcDoc={prepareHtmlPreviewDoc(content)}
+          // oxlint-disable-next-line eslint-plugin-react(iframe-missing-sandbox)
+          sandbox={HTML_PREVIEW_SANDBOX}
           title="HTML preview"
           className="w-full h-full border-0"
         />
