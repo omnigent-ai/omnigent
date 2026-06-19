@@ -33,7 +33,7 @@ function iconForAgent(agent: AvailableAgent): ComponentType<SVGProps<SVGSVGEleme
   if (agent.harness?.includes("claude")) return ClaudeIcon;
   // Both the SDK "cursor" harness and "cursor-native" get the Cursor glyph.
   if (agent.harness?.includes("cursor")) return CursorIcon;
-  if (agent.harness?.includes("qwen")) return BotIcon; // Qwen falls back to generic bot
+  // qwen falls back to generic BotIcon for now; see docs/QWEN_FOLLOWUPS.md
   // Exact match — a substring check would false-match e.g. "openapi".
   if (agent.harness === "pi") return PiIcon;
   return BotIcon;
@@ -44,9 +44,9 @@ function iconForAgent(agent: AvailableAgent): ComponentType<SVGProps<SVGSVGEleme
  *
  * Shared by the new-session picker (NewChatDialog) and the "Add agent"
  * picker (AddAgentDialog) so both render the agent catalog identically.
- * Claude, Codex, pi, and qwen agents reuse their own glyphs, matched by
- * harness/kind so a custom-registered qwen reviewer still gets the bot icon;
- * nessie matches by name. Everything else falls back to a generic bot icon.
+ * Claude, Codex, and pi agents reuse their own glyphs; qwen falls back
+ * to a generic bot icon for now. Nessie matches by name. Everything else
+ * falls back to a generic bot icon.
  *
  * @param agent - The catalog entry to render.
  * @param selected - Whether this card is the current selection.

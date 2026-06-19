@@ -520,6 +520,25 @@ def test_codex_command_session_and_resume_mutually_exclusive(
     assert "mutually exclusive" in result.output
 
 
+def test_qwen_command_forwards_to_run_main(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``omnigent qwen`` forwards to ``run.main`` with --harness qwen."""
+    captured_args: list[str] = []
+    
+    def fake_run_main(args: list[str], **kwargs: object) -> None:
+        captured_args.extend(args)
+    
+    monkeypatch.setattr("omnigent.cli.run.main", fake_run_main)
+
+    result = CliRunner().invoke(cli, ["qwen", "--model", "qwen/qwen-plus", "-p", "hi"])
+
+    assert result.exit_code == 0, result.output
+    # Should forward to run.main with --harness qwen and all args
+    assert captured_args[0] == "--harness"
+    assert captured_args[1] == "qwen"
+    assert "--model" in captured_args
+    assert "-p" in captured_args or "--prompt" in captured_args
+
+
 # ── bundled-agent shorthands (omnigent polly / omnigent debby) ──────────
 
 

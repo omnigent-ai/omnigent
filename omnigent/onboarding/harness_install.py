@@ -121,7 +121,7 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
     QWEN_KEY: HarnessInstallSpec(
         "Qwen Code",
         "qwen",
-        "@qwen/qwen-code",
+        "@qwen-code/qwen-code",
         login_args=("login",),
         logout_args=("logout",),
         status_args=("auth", "status"),
