@@ -60,6 +60,16 @@ from omnigent.llms.routing import RoutedModel, infer_harness_from_model, parse_m
             "moonshot/kimi-k2-instruct",
             RoutedModel(provider="moonshot", model="kimi-k2-instruct"),
         ),
+        (
+            "litellm/gpt-4o",
+            RoutedModel(provider="litellm", model="gpt-4o"),
+        ),
+        (
+            # Split on the FIRST "/" only, so a nested litellm model string
+            # (provider/model) is preserved for litellm to resolve.
+            "litellm/anthropic/claude-3-5-sonnet",
+            RoutedModel(provider="litellm", model="anthropic/claude-3-5-sonnet"),
+        ),
     ],
 )
 def test_parse_with_provider_prefix(

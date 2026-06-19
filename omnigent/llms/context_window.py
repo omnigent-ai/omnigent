@@ -244,6 +244,13 @@ def get_model_context_window(model: str) -> int:
     override = os.environ.get("AP_CONTEXT_WINDOW_OVERRIDE")
     if override is not None:
         return int(override)
+    # ``litellm/`` is Omnigent's routing prefix, not a litellm registry key.
+    # Strip it so the underlying model resolves (e.g.
+    # ``litellm/anthropic/claude-3-5-sonnet`` → ``anthropic/claude-3-5-sonnet``,
+    # which ``litellm.get_model_info`` understands). Without this every
+    # ``litellm/`` model silently falls back to the 128K default (#854).
+    if model.startswith("litellm/"):
+        model = model[len("litellm/") :]
     try:
         import litellm
     except ImportError:

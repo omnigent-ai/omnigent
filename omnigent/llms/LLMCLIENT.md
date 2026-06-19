@@ -35,6 +35,15 @@ for event in client.responses.create(..., stream=True):
 
 Model strings use `"provider/model-name"` format. If no provider prefix is given, defaults to `"openai"`.
 
+For providers without a dedicated adapter, the **`litellm/`** prefix reaches any
+of [LiteLLM](https://github.com/BerriAI/litellm)'s 100+ providers through a
+single passthrough adapter (optional dep: `omnigent[litellm]`). It runs in
+**SDK mode** — `litellm/<litellm-model>`, e.g. `litellm/gpt-4o` or
+`litellm/anthropic/claude-3-5-sonnet` (the router splits on the first `/`, so
+the nested provider/model is preserved for litellm to resolve) — or **proxy
+mode** by setting `connection.base_url` to a running LiteLLM proxy. Streaming,
+non-streaming, and tool calls pass through unchanged.
+
 ---
 
 ## Architecture
@@ -55,6 +64,7 @@ llms/
     bedrock.py             # AWS Bedrock Converse API
     vertex.py              # Vertex AI (Gemini format + GCP auth)
     databricks.py          # Databricks (OpenAI-compat + OAuth)
+    litellm.py             # LiteLLM passthrough (100+ providers; SDK or proxy) — optional dep
 ```
 
 ### Request Flow

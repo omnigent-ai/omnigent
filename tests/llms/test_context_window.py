@@ -274,3 +274,34 @@ def test_provider_catalog_caches_fetch_failure(
     assert first == 128_000  # _DEFAULT_CONTEXT_WINDOW fallback
     assert second == 128_000
     assert calls == ["anthropic"]
+
+
+def test_get_model_context_window_strips_litellm_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ``litellm/`` routing prefix is stripped before the registry lookup.
+
+    Without stripping, ``litellm.get_model_info`` cannot resolve the made-up
+    ``litellm`` provider and every ``litellm/`` model silently falls back to the
+    128K default (#854). The underlying model must be looked up instead.
+    """
+    import sys
+    import types
+
+    seen: dict[str, str] = {}
+
+    def fake_get_model_info(model: str) -> dict[str, int] | None:
+        seen["model"] = model
+        if model == "anthropic/claude-3-5-sonnet":
+            return {"max_input_tokens": 200_000}
+        return None
+
+    fake = types.ModuleType("litellm")
+    fake.get_model_info = fake_get_model_info  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "litellm", fake)
+    monkeypatch.delenv("AP_CONTEXT_WINDOW_OVERRIDE", raising=False)
+
+    result = context_window.get_model_context_window("litellm/anthropic/claude-3-5-sonnet")
+
+    assert seen["model"] == "anthropic/claude-3-5-sonnet"  # prefix stripped
+    assert result == 200_000

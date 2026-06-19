@@ -29,6 +29,10 @@ PROVIDER_CONFIGS: dict[str, str | None] = {
     "openrouter": "https://openrouter.ai/api/v1",
     "ollama": "http://localhost:11434/v1",
     "moonshot": "https://api.moonshot.cn/v1",
+    # litellm routes via the litellm SDK, which resolves the endpoint from the
+    # model string (SDK mode) or from connection_params["base_url"] (proxy mode),
+    # so it has no fixed default base URL.
+    "litellm": None,
 }
 
 _DEFAULT_PROVIDER = "openai"
