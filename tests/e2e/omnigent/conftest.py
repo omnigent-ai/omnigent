@@ -15,9 +15,14 @@ from __future__ import annotations
 import configparser
 import os
 import shutil
+import signal
+import subprocess
+import sys
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
+import httpx
 import pytest
 from filelock import FileLock
 
@@ -345,3 +350,151 @@ def patched_databrickscfg(
                 shutil.move(str(backup_path), str(_DATABRICKSCFG_PATH))
             else:
                 _DATABRICKSCFG_PATH.unlink(missing_ok=True)
+
+
+# ── Mock LLM server fixtures ────────────────────────────────
+
+
+def _find_free_port() -> int:
+    """Find a free TCP port by binding to port 0."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+@pytest.fixture(scope="session")
+def mock_llm_server_url(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[str]:
+    """
+    Start a mock LLM server for the test session.
+
+    Spawns ``tests/server/integration/mock_llm_server.py`` as a
+    subprocess and waits for its ``/stats`` endpoint to respond.
+    The fixture yields the base URL (e.g.
+    ``http://127.0.0.1:<port>``) and kills the process on teardown.
+
+    :param tmp_path_factory: Pytest temp path factory for logs.
+    :yields: The mock server base URL.
+    """
+    mock_port = _find_free_port()
+    mock_log = tmp_path_factory.mktemp("mock_llm_logs") / "mock_llm.log"
+    log_handle = open(mock_log, "w")  # noqa: SIM115
+
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(_OMNIGENT_REPO / "tests" / "server" / "integration" / "mock_llm_server.py"),
+            str(mock_port),
+        ],
+        env={**os.environ, "PYTHONPATH": str(_OMNIGENT_REPO)},
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+    )
+    base_url = f"http://127.0.0.1:{mock_port}"
+
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        try:
+            resp = httpx.get(f"{base_url}/stats", timeout=1.0)
+            if resp.status_code == 200:
+                break
+        except httpx.ConnectError:
+            continue
+        time.sleep(0.1)
+    else:
+        proc.kill()
+        log_handle.close()
+        log_contents = mock_log.read_text() if mock_log.exists() else ""
+        raise RuntimeError(
+            f"Mock LLM server didn't start within 10s.\nLog at {mock_log}:\n{log_contents[-2000:]}"
+        )
+
+    try:
+        yield base_url
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        log_handle.close()
+
+
+def configure_mock_llm(
+    mock_llm_server_url: str,
+    responses: list[dict],
+    *,
+    key: str = "default",
+) -> None:
+    """
+    Configure a keyed response queue on the mock LLM server.
+
+    :param mock_llm_server_url: Mock server URL.
+    :param responses: List of response config dicts.
+    :param key: Queue key (typically model name).
+    """
+    resp = httpx.post(
+        f"{mock_llm_server_url}/mock/configure",
+        json={"key": key, "responses": responses},
+        timeout=5.0,
+    )
+    resp.raise_for_status()
+
+
+def reset_mock_llm(mock_llm_server_url: str) -> None:
+    """Clear all keyed queues, captured requests, and gates."""
+    resp = httpx.post(f"{mock_llm_server_url}/mock/reset", timeout=5.0)
+    resp.raise_for_status()
+
+
+@pytest.fixture(scope="session")
+def mock_credentials_env(
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> dict[str, str]:
+    """
+    Environment dict for subprocess invocations of ``omnigent``
+    that point at the mock LLM server instead of a real LLM.
+
+    Drop-in replacement for ``omnigent_credentials_env`` in tests
+    that can run against canned responses.
+
+    :param mock_llm_server_url: Base URL of the mock server.
+    :param tmp_path_factory: Pytest factory for a session-scoped
+        config home.
+    :returns: A dict suitable for ``subprocess.Popen(env=...)``.
+    """
+    env = dict(os.environ)
+    env["OPENAI_BASE_URL"] = f"{mock_llm_server_url}/v1"
+    env["OPENAI_API_KEY"] = "mock-key"
+    # Strip stale / conflicting auth vars — same as the real
+    # omnigent_credentials_env fixture does.
+    for stale in (
+        "ANTHROPIC_API_KEY",
+        "DATABRICKS_TOKEN",
+        "CLAUDE_CODE",
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_EXECPATH",
+        "CODEX",
+    ):
+        env.pop(stale, None)
+    env["OMNIGENT_SKIP_ONBOARD"] = "1"
+    env["OMNIGENT_NO_UPDATE_CHECK"] = "1"
+    config_home = tmp_path_factory.mktemp("omnigent-mock-config")
+    (config_home / "config.yaml").write_text(
+        "auth:\n  type: api_key\n",
+        encoding="utf-8",
+    )
+    env["OMNIGENT_CONFIG_HOME"] = str(config_home)
+    env["OMNIGENT_REMOTE_AUTH_TOKEN"] = "mock-key"
+    # PYTHONPATH — same worktree-first logic as the real fixture.
+    repo = str(_OMNIGENT_REPO)
+    omnigent_path = str(_OMNIGENT_REPO / "omnigent")
+    existing_pp = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (repo, omnigent_path, existing_pp) if p)
+    return env
