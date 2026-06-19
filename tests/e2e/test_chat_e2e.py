@@ -1,86 +1,135 @@
-"""E2E test for ``omnigent chat`` — local mode with archer.
+"""E2E test for ``omnigent chat`` — local mode with mock LLM.
 
 Verifies that ``omnigent chat ./agent-dir/`` starts a server, opens the
 REPL, and the agent responds. Since the REPL is interactive, we
 test by directly calling the local mode components rather than
 launching the full CLI.
 
-Usage::
+Runs entirely against the mock LLM server — no real API key needed::
 
-    pytest tests/e2e/test_chat_e2e.py \
-        --llm-api-key $LLM_API_KEY -v
+    pytest tests/e2e/test_chat_e2e.py -v
 """
 
 from __future__ import annotations
 
-import configparser
 import os
+import uuid
 from pathlib import Path
-from typing import Any
 
 import httpx
-import pytest
+import yaml as _yaml
 
-from tests.e2e.conftest import find_free_port, wait_for_server
+from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from tests.e2e.conftest import (
+    configure_mock_llm,
+    find_free_port,
+    poll_session_until_terminal,
+    reset_mock_llm,
+    send_user_message_to_session,
+)
+from tests.e2e.helpers import final_assistant_text
 
 
-def _resolve_workspace(request: pytest.FixtureRequest) -> tuple[str, str]:
+def _lookup_builtin_agent_id(client: httpx.Client, agent_name: str) -> str:
     """
-    Resolve ``(profile, host)`` from the active ``--profile``.
+    Return the durable agent id for a built-in agent registered by name.
 
-    Falls back to ``default`` (the profile CI passes explicitly)
-    when ``--profile`` isn't given; raises if the profile isn't in
-    ``~/.databrickscfg``. Local helper rather than a shared
-    fixture so this file stays self-contained.
+    Uses ``GET /v1/agents`` (the built-in agent discovery list) which
+    includes agents registered via ``--agent`` at server startup, unlike
+    ``GET /v1/sessions?agent_name=...`` which only finds agents that
+    already have an associated session.
 
-    :param request: pytest request — used to read ``--profile``.
-    :returns: ``(profile_name, host_url)``. Host has trailing
-        ``/`` stripped.
-    :raises pytest.UsageError: When the resolved profile isn't
-        configured.
+    :param client: HTTP client pointed at the live server.
+    :param agent_name: Display name of the registered agent.
+    :returns: The matching agent id, e.g. ``"ag_..."``.
+    :raises AssertionError: If no agent with that name is found.
     """
-    profile = request.config.getoption("--profile") or "default"
-    cfg_path = Path.home() / ".databrickscfg"
-    cfg = configparser.ConfigParser()
-    if cfg_path.exists():
-        cfg.read(cfg_path)
-    if profile not in cfg or not cfg[profile].get("host"):
-        raise pytest.UsageError(
-            f"Databricks profile {profile!r} is missing from {cfg_path} or has no ``host`` entry."
+    resp = client.get("/v1/agents", params={"limit": 100})
+    resp.raise_for_status()
+    for item in resp.json().get("data", []):
+        if item.get("name") == agent_name:
+            return str(item["id"])
+    raise AssertionError(
+        f"agent {agent_name!r} not found in GET /v1/agents. "
+        f"Available: {[d.get('name') for d in resp.json().get('data', [])]}"
+    )
+
+
+def _create_runner_bound_session_for_builtin(
+    client: httpx.Client,
+    *,
+    agent_name: str,
+    runner_id: str,
+) -> str:
+    """
+    Create a session bound to a built-in agent and to *runner_id*.
+
+    Looks up the agent id via ``GET /v1/agents`` (not via existing
+    sessions) so this works immediately after ``_start_local_server``
+    before any session has been created.
+
+    :param client: HTTP client pointed at the live server.
+    :param agent_name: Display name of the registered built-in agent.
+    :param runner_id: Registered runner id from ``server.runner_id``.
+    :returns: The session/conversation id, e.g. ``"conv_abc"``.
+    """
+    agent_id = _lookup_builtin_agent_id(client, agent_name)
+    resp = client.post(
+        "/v1/sessions",
+        json={"agent_id": agent_id},
+        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+    )
+    resp.raise_for_status()
+    session_id = str(resp.json()["id"])
+    resp = client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"runner_id": runner_id},
+    )
+    resp.raise_for_status()
+    return session_id
+
+
+def _make_inline_agent_yaml(
+    tmp_path: Path,
+    *,
+    agent_name: str,
+    model: str,
+    mock_llm_server_url: str | None,
+) -> Path:
+    """
+    Write a minimal openai-agents YAML wired to the mock LLM server.
+
+    :param tmp_path: Directory to write the YAML into.
+    :param agent_name: Agent ``name`` field.
+    :param model: Mock model name (used as the mock queue key).
+    :param mock_llm_server_url: Mock server base URL.
+    :returns: Path to the written YAML file.
+    """
+    yaml_path = tmp_path / f"{agent_name}.yaml"
+    yaml_path.write_text(
+        _yaml.safe_dump(
+            {
+                "name": agent_name,
+                "prompt": "You are a terse test assistant.",
+                "executor": {
+                    "harness": "openai-agents",
+                    "model": model,
+                    "profile": "",
+                    "auth": {
+                        "type": "api_key",
+                        "api_key": "mock-key",
+                        "base_url": f"{mock_llm_server_url}/v1",
+                    },
+                },
+            }
         )
-    return profile, cfg[profile]["host"].rstrip("/")
-
-
-# Path was ``examples/agents/archer/`` before the layout
-# flattening (commit 3abd7c2 "examples: flatten examples/agents/
-# → examples/"); now ``examples/archer/``.
-_ARCHER_DIR = Path(__file__).resolve().parents[2] / "examples" / "archer"
-
-
-# ``body`` is a parsed Responses API JSON object with heterogeneous
-# nested shape (output items, content parts, etc.); using ``Any``
-# here avoids drawing up a TypedDict for a test helper that just
-# walks the tree looking for output_text values.
-def _extract_all_text(body: dict[str, Any]) -> str:
-    """
-    Concatenate all output_text blocks from a response body.
-
-    :param body: The terminal response body.
-    :returns: All assistant text joined by newlines.
-    """
-    parts: list[str] = []
-    for item in body.get("output", []):
-        if item.get("type") == "message":
-            for block in item.get("content", []):
-                text = block.get("text")
-                if text:
-                    parts.append(text)
-    return "\n".join(parts)
+    )
+    return yaml_path
 
 
 def test_chat_local_starts_server_and_agent_responds(
-    llm_api_key: str,
-    openai_judge_api_key: str,
+    mock_llm_server_url: str | None,
+    tmp_path: Path,
 ) -> None:
     """
     ``omnigent chat ./agent-dir/`` starts a local server with the agent
@@ -89,12 +138,12 @@ def test_chat_local_starts_server_and_agent_responds(
     Tests the server startup and agent registration path used by
     ``omnigent chat`` in local mode. Since the REPL itself is interactive,
     we verify the underlying server works by sending a direct HTTP
-    request.
+    request through the sessions API.
 
     **What breaks if this fails:**
     - _start_local_server broken → server doesn't boot.
-    - Agent bundle not registered → 404 on responses.
-    - Agent config invalid → 500 on responses.
+    - Agent bundle not registered → agent lookup in GET /v1/agents fails.
+    - Agent config invalid → session turn fails.
     """
     from omnigent.chat import (
         _start_local_server,
@@ -102,63 +151,64 @@ def test_chat_local_starts_server_and_agent_responds(
         _wait_for_server,
     )
 
-    # The archer spec's connection block uses ${OPENAI_API_KEY}, which
-    # the spec parser expands at load time from the subprocess's env.
-    os.environ["OPENAI_API_KEY"] = openai_judge_api_key
+    marker = f"CHAT_LOCAL_OK_{uuid.uuid4().hex[:6]}"
+    model = f"mock-chat-local-{uuid.uuid4().hex[:6]}"
+    agent_name = f"chat-local-probe-{uuid.uuid4().hex[:6]}"
+
+    # Inline YAML agent — openai-agents harness wired to mock model so no
+    # real LLM is needed. OPENAI_BASE_URL / OPENAI_API_KEY are injected
+    # into os.environ before _start_local_server so the child subprocess
+    # inherits them ({**os.environ, ...} in _start_local_server's child_env).
+    yaml_path = _make_inline_agent_yaml(
+        tmp_path, agent_name=agent_name, model=model, mock_llm_server_url=mock_llm_server_url
+    )
+
+    # Set env vars before _start_local_server so the spawned server
+    # subprocess inherits them through child_env = {**os.environ, ...}.
+    os.environ["OPENAI_API_KEY"] = "mock-key"
+    os.environ["OPENAI_BASE_URL"] = f"{mock_llm_server_url}/v1"
+
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(mock_llm_server_url, [{"text": marker}], key=model)
 
     port = find_free_port()
-    server = _start_local_server(_ARCHER_DIR, port)
-
+    server = _start_local_server(yaml_path, port, ephemeral=True)
     base_url = f"http://127.0.0.1:{port}"
+
     try:
         _wait_for_server(port, server)
 
-        # Verify agent is registered by checking for sessions with
-        # the expected agent_name.
-        sessions_resp = httpx.get(
-            f"{base_url}/v1/sessions",
-            params={"agent_name": "archer", "limit": 1},
-            timeout=10.0,
+        client = httpx.Client(base_url=base_url, timeout=30.0)
+        session_id = _create_runner_bound_session_for_builtin(
+            client,
+            agent_name=agent_name,
+            runner_id=server.runner_id or "",
         )
-        sessions_resp.raise_for_status()
-        sessions = sessions_resp.json()["data"]
-        assert len(sessions) > 0, "No sessions with agent_name='archer' after server start."
-
-        agent_name = sessions[0]["agent_name"]
-        assert agent_name == "archer", f"Expected archer agent, got {agent_name!r}."
-
-        # Send a message and verify the agent responds.
-        resp = httpx.post(
-            f"{base_url}/v1/responses",
-            json={
-                "model": agent_name,
-                "input": "Say hello briefly.",
-                "stream": False,
-            },
-            timeout=60.0,
+        response_id = send_user_message_to_session(
+            client,
+            session_id=session_id,
+            content="Say hello briefly.",
         )
-        resp.raise_for_status()
-        body = resp.json()
+        body = poll_session_until_terminal(
+            client,
+            session_id=session_id,
+            response_id=response_id,
+            timeout=120,
+        )
 
         assert body["status"] == "completed", (
             f"Status: {body['status']!r}. Output: {body.get('output', [])}"
         )
-
-        text = _extract_all_text(body)
-        # Verify the agent actually produced non-whitespace text, not
-        # just an empty or whitespace-only response that len() > 0
-        # would let through.
-        assert text.strip(), f"Agent produced no meaningful text output. Raw: {text!r}"
+        text = final_assistant_text(body)
+        assert marker in text, f"Expected marker {marker!r} in agent output. Got: {text!r}"
 
     finally:
         _stop_local_server(server)
 
 
 def test_chat_local_accepts_omnigent_yaml_file(
-    llm_api_key: str,
-    openai_judge_api_key: str,
+    mock_llm_server_url: str | None,
     tmp_path: Path,
-    request: pytest.FixtureRequest,
 ) -> None:
     """
     ``omnigent chat examples/coding_supervisor.yaml`` (or any
@@ -179,128 +229,146 @@ def test_chat_local_accepts_omnigent_yaml_file(
     - Agent-plane's spec dispatch stops routing omnigent YAMLs
       through ``load_omnigent_yaml``.
 
-    :param llm_api_key: Databricks PAT passed as
-        ``OPENAI_API_KEY`` to the openai-agents harness.
+    :param mock_llm_server_url: Mock LLM server base URL.
     :param tmp_path: Per-test temp dir for the YAML fixture.
     """
-    import yaml as _yaml
-
     from omnigent.chat import (
         _start_local_server,
         _stop_local_server,
         _wait_for_server,
     )
 
-    # Inline fixture: minimal omnigent YAML with harness set so
-    # the synthesized spec passes the validator. Self-contained
-    # so an edit to the real ``examples/hello_world.yaml`` can't
-    # flake this test.
-    profile, host = _resolve_workspace(request)
+    marker = f"CHAT_YAML_OK_{uuid.uuid4().hex[:6]}"
+    model = f"mock-chat-yaml-{uuid.uuid4().hex[:6]}"
+    agent_name = "yaml-e2e-probe"
+
+    # Inline fixture: minimal omnigent YAML with the openai-agents harness
+    # wired to the mock server. Self-contained so an edit to the real
+    # ``examples/hello_world.yaml`` can't flake this test.
     yaml_path = tmp_path / "yaml-e2e-probe.yaml"
     yaml_path.write_text(
         _yaml.safe_dump(
             {
-                "name": "yaml-e2e-probe",
+                "name": agent_name,
                 "prompt": "You are a friendly assistant. Say hello briefly.",
                 "executor": {
-                    "model": "databricks-gpt-5-mini",
+                    "model": model,
                     "harness": "openai-agents",
-                    "profile": profile,
+                    "profile": "",
+                    "auth": {
+                        "type": "api_key",
+                        "api_key": "mock-key",
+                        "base_url": f"{mock_llm_server_url}/v1",
+                    },
                 },
-            },
-        ),
+            }
+        )
     )
 
-    # openai-agents reads credentials from ``OPENAI_API_KEY`` and
-    # its endpoint from ``OPENAI_BASE_URL`` when no explicit profile
-    # wins. Point both at Databricks' native OpenAI Responses AI
-    # Gateway so the PAT authenticates — without the base-URL
-    # override the SDK hits api.openai.com and the PAT is rejected
-    # as a malformed OpenAI key.
-    os.environ["OPENAI_API_KEY"] = openai_judge_api_key
-    os.environ["OPENAI_BASE_URL"] = f"{host}/ai-gateway/openai/v1"
+    # Set env vars before _start_local_server so the spawned server
+    # subprocess inherits them through child_env = {**os.environ, ...}.
+    os.environ["OPENAI_API_KEY"] = "mock-key"
+    os.environ["OPENAI_BASE_URL"] = f"{mock_llm_server_url}/v1"
+
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(mock_llm_server_url, [{"text": marker}], key=model)
 
     port = find_free_port()
-    server = _start_local_server(yaml_path, port)
+    server = _start_local_server(yaml_path, port, ephemeral=True)
     base_url = f"http://127.0.0.1:{port}"
 
     try:
         _wait_for_server(port, server)
 
+        client = httpx.Client(base_url=base_url, timeout=30.0)
+
         # Agent is registered under the YAML's ``name`` field —
         # proves the materialize_bundle → tarball → load chain
         # preserves the spec name end-to-end.
-        sessions_resp = httpx.get(
-            f"{base_url}/v1/sessions",
-            params={"agent_name": "yaml-e2e-probe", "limit": 1},
-            timeout=10.0,
+        session_id = _create_runner_bound_session_for_builtin(
+            client,
+            agent_name=agent_name,
+            runner_id=server.runner_id or "",
         )
-        sessions_resp.raise_for_status()
-        sessions = sessions_resp.json()["data"]
-        assert len(sessions) == 1, (
-            f"Expected exactly one session with agent_name='yaml-e2e-probe', got {len(sessions)}."
-        )
-        assert sessions[0]["agent_name"] == "yaml-e2e-probe", (
-            f"Expected 'yaml-e2e-probe' (from YAML name field), got {sessions[0]['agent_name']!r}."
+        response_id = send_user_message_to_session(
+            client,
+            session_id=session_id,
+            content="Say hello briefly.",
         )
 
         # A full turn proves the spec the server rehydrates from
         # the stored tarball also produces a runnable agent — not
         # just a registered-but-broken one. This is the single
         # strongest regression guard for the bundling refactor.
-        resp = httpx.post(
-            f"{base_url}/v1/responses",
-            json={
-                "model": "yaml-e2e-probe",
-                "input": "Say hello briefly.",
-                "stream": False,
-            },
-            timeout=60.0,
+        body = poll_session_until_terminal(
+            client,
+            session_id=session_id,
+            response_id=response_id,
+            timeout=120,
         )
-        resp.raise_for_status()
-        body = resp.json()
 
         assert body["status"] == "completed", (
             f"Status: {body['status']!r}. Output: {body.get('output', [])}"
         )
-        assert _extract_all_text(body).strip(), (
-            f"Agent produced no meaningful output. Body: {body!r}"
-        )
+        text = final_assistant_text(body)
+        assert marker in text, f"Expected marker {marker!r} in agent output. Got: {text!r}"
     finally:
         _stop_local_server(server)
 
 
 def test_chat_remote_pick_agent(
-    llm_api_key: str,
-    openai_judge_api_key: str,
+    mock_llm_server_url: str | None,
+    tmp_path: Path,
 ) -> None:
     """
     Remote chat can list and identify agents on a server.
 
     Tests the remote mode's agent discovery by starting a server with
-    archer and verifying ``_pick_agent`` finds it.
+    an inline agent and verifying ``_pick_agent`` finds it.
 
     **What breaks if this fails:**
     - _pick_agent can't parse server agent listing response.
     - Agent name extraction broken.
     """
-    from omnigent.chat import _pick_agent, _start_local_server, _stop_local_server
+    from omnigent.chat import (
+        _pick_agent,
+        _start_local_server,
+        _stop_local_server,
+        _wait_for_server,
+    )
 
-    # The archer spec's connection block uses ${OPENAI_API_KEY}, which
-    # the spec parser expands at load time from the subprocess's env.
-    os.environ["OPENAI_API_KEY"] = openai_judge_api_key
+    agent_name = f"pick-agent-probe-{uuid.uuid4().hex[:6]}"
+    model = f"mock-pick-{uuid.uuid4().hex[:6]}"
+
+    yaml_path = _make_inline_agent_yaml(
+        tmp_path, agent_name=agent_name, model=model, mock_llm_server_url=mock_llm_server_url
+    )
+
+    # Set env vars before _start_local_server so the spawned server
+    # subprocess inherits them through child_env = {**os.environ, ...}.
+    os.environ["OPENAI_API_KEY"] = "mock-key"
+    os.environ["OPENAI_BASE_URL"] = f"{mock_llm_server_url}/v1"
 
     port = find_free_port()
-    server = _start_local_server(_ARCHER_DIR, port)
+    server = _start_local_server(yaml_path, port, ephemeral=True)
     base_url = f"http://127.0.0.1:{port}"
 
     try:
-        wait_for_server(base_url)
+        _wait_for_server(port, server)
+
+        # Create a session so _pick_agent can discover the agent name
+        # from GET /v1/sessions (which it uses to list agent names).
+        client = httpx.Client(base_url=base_url, timeout=30.0)
+        _create_runner_bound_session_for_builtin(
+            client,
+            agent_name=agent_name,
+            runner_id=server.runner_id or "",
+        )
 
         # _pick_agent auto-selects when there's only one agent.
-        agent_name = _pick_agent(base_url)
-        assert agent_name == "archer", (
-            f"Expected _pick_agent to return 'archer', got {agent_name!r}."
+        picked = _pick_agent(base_url)
+        assert picked == agent_name, (
+            f"Expected _pick_agent to return {agent_name!r}, got {picked!r}."
         )
     finally:
         _stop_local_server(server)

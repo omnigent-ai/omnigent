@@ -23,6 +23,7 @@ from omnigent.spec.types import DatabricksAuth
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEBBY_DIR = _REPO_ROOT / "examples" / "debby"
+_PACKAGED_DEBBY_DIR = _REPO_ROOT / "omnigent" / "resources" / "examples" / "debby"
 
 
 def test_debby_gpt_head_uses_codex_not_openai_agents() -> None:
@@ -56,6 +57,31 @@ def test_debby_gpt_head_uses_codex_not_openai_agents() -> None:
     )
 
 
+def test_packaged_debby_resource_stays_in_sync_with_source_example() -> None:
+    """The bundled Debby resource resolves to the updated source example.
+
+    ``omnigent debby`` launches the packaged resource path, not
+    ``examples/debby`` directly. Keep this guard so the resource copy cannot
+    drift back to ``openai-agents`` while the source example remains fixed.
+    """
+    assert _PACKAGED_DEBBY_DIR.exists(), "Debby's packaged resource should exist."
+    assert _PACKAGED_DEBBY_DIR.resolve() == _DEBBY_DIR.resolve(), (
+        "Debby's packaged resource must resolve to examples/debby so bundled "
+        "launches use the same GPT-head config as the source example."
+    )
+
+    spec = parse(_PACKAGED_DEBBY_DIR)
+    by_name = {sub.name: sub for sub in spec.sub_agents}
+
+    assert "gpt" in by_name, (
+        f"Packaged Debby should declare a 'gpt' sub-agent; got {sorted(by_name)}."
+    )
+    assert by_name["gpt"].executor.harness_kind == "codex", (
+        "Packaged Debby's GPT head must run on the 'codex' harness; bundled "
+        "launches must not fall back to openai-agents."
+    )
+
+
 def test_debby_claude_head_unchanged() -> None:
     """The Claude head still runs on ``claude-sdk`` (the fix is GPT-only)."""
     spec = parse(_DEBBY_DIR)
@@ -64,4 +90,6 @@ def test_debby_claude_head_unchanged() -> None:
     assert "claude" in by_name, (
         f"Debby should declare a 'claude' sub-agent; got {sorted(by_name)}."
     )
-    assert by_name["claude"].executor.harness_kind == "claude-sdk"
+    assert by_name["claude"].executor.harness_kind == "claude-sdk", (
+        "Debby's Claude head should remain on the 'claude-sdk' harness."
+    )

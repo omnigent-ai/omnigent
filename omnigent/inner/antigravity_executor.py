@@ -296,6 +296,8 @@ class _AntigravitySessionState:
     :param agent_signature: ``(model, system_prompt, tool_signature)`` key; a
         change forces an agent rebuild. A model change thus resets the SDK
         conversation — fine since mid-session model switches are rare.
+        :meth:`interrupt_session` clears this to ``None`` so the next turn
+        rebuilds rather than reusing the cancelled conversation.
     :param pending_tools: Open tool calls keyed by call id, populated on
         :class:`ToolCallRequest` and drained by the ``PostToolCallHook``.
     :param active_queue: The current turn's event queue (the
@@ -427,6 +429,25 @@ class AntigravityExecutor(Executor):
         then raises ``AntigravityCancelledError`` or yields a ``CANCELED``
         step, which the consumer surfaces as :class:`TurnCancelled`.
 
+        A cancelled SDK conversation carries aborted state, so reusing it for
+        the next turn would resume from that broken state. Invalidating the
+        cached agent signature forces the next :meth:`run_turn` through
+        :meth:`_ensure_agent`'s rebuild path — the same teardown the
+        error / signature-change path uses — which closes the stale agent and
+        opens a fresh agent + conversation (re-seeding prior history) before it
+        sends. The close is deferred to that path rather than awaited here so
+        it cannot race the still-running producer task and turn a clean cancel
+        into an :class:`ExecutorError`.
+
+        This deliberately departs from the peer executors, which call
+        ``close_session()`` eagerly on interrupt (see
+        :meth:`CursorExecutor.interrupt_session` and
+        :meth:`ClaudeSDKExecutor.interrupt_session`). Antigravity cannot do the
+        same: an eager close would race the still-live turn's producer task and
+        convert a clean :class:`TurnCancelled` into an :class:`ExecutorError`,
+        so we only invalidate the signature here and defer the rebuild (and
+        close) to the next turn.
+
         :param session_key: The Omnigent session id to interrupt.
         :returns: ``True`` if a live conversation was asked to cancel,
             ``False`` when the session has no open conversation.
@@ -437,6 +458,9 @@ class AntigravityExecutor(Executor):
         state.interrupt_requested = True
         with contextlib.suppress(Exception):
             await state.conversation.cancel()
+        # Drop the cached signature (not the agent itself — _ensure_agent needs
+        # the live agent reference to close it) so the next turn rebuilds.
+        state.agent_signature = None
         return True
 
     async def run_turn(
@@ -544,6 +568,11 @@ class AntigravityExecutor(Executor):
             yield TurnCancelled(reason="user_cancelled", phase="model")
             return
         usage = self._extract_usage(state.last_usage)
+        # Stamp the resolved model onto the usage dict so the scaffold can
+        # price the turn via the MLflow catalog (same pattern as the
+        # claude-sdk and openai-agents-sdk executors).
+        if usage is not None:
+            usage["model"] = model
         # Notify in-process usage subscribers (and the auto-recorder) before the
         # terminal event, matching the peer SDK executors so antigravity turns
         # are not invisible to usage observers. No-op for an empty usage dict.
@@ -772,8 +801,12 @@ class AntigravityExecutor(Executor):
         signature = (model, system_prompt, self._tool_signature(tools))
         state = self._session_states.get(session_key)
         if state is None:
+            # A brand-new session's state is NOT registered until the agent is
+            # fully built below, so a construction failure (bad creds, a host
+            # without the SDK's required glibc, SDK drift) leaves no dead,
+            # agent-less entry accumulating in ``_session_states`` turn after
+            # turn. A reused session is already registered.
             state = _AntigravitySessionState()
-            self._session_states[session_key] = state
 
         if state.agent is not None and state.agent_signature == signature:
             return state, False
@@ -786,9 +819,23 @@ class AntigravityExecutor(Executor):
         agent = await self._open_agent(
             state, model=model, system_prompt=system_prompt, tools=tools
         )
+        # Record the opened agent on the state BEFORE the (failure-prone)
+        # conversation access: ``_open_agent`` has already entered the agent's
+        # async context, which spawns the native ``localharness`` subprocess, so
+        # if anything after this point raises, the agent must still be reachable
+        # by ``close()`` / ``close_session()`` for teardown — otherwise that
+        # subprocess orphans. If wiring the conversation fails, reap it here.
         state.agent = agent
-        state.conversation = agent.conversation
+        try:
+            state.conversation = agent.conversation
+        except Exception:
+            await self._close_agent(agent)
+            state.agent = None
+            state.conversation = None
+            raise
         state.agent_signature = signature
+        # Register only once the agent is fully built (see the no-state branch).
+        self._session_states[session_key] = state
         return state, True
 
     async def _open_agent(

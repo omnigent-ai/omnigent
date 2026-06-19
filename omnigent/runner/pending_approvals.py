@@ -31,10 +31,16 @@ import asyncio
 from collections.abc import Callable
 from typing import Any
 
-# Default wait budget for a UI verdict, in seconds. Bounded so a
-# user who walked away doesn't pin a runner task forever; on
-# timeout the caller treats the elicitation as refused.
-_DEFAULT_WAIT_SECONDS: float = 120.0
+# Default wait budget for a UI verdict, in seconds. Held at one day
+# (86400s) — matching the deciding policy's default ``ask_timeout``: an ASK
+# is a human-in-the-loop gate and should outlive a user stepping away rather
+# than auto-refuse on its own. The old 120s default silently refused (treated
+# as DENY) any prompt a user didn't answer within two minutes — the
+# runner-side mirror of the cost-policy auto-resolve bug. Callers that resolve
+# a per-policy ``ask_timeout`` should still pass ``timeout_seconds`` explicitly;
+# this is only the fallback when none is provided. Headless/unattended agents
+# that want a fast fail-closed should pass a finite ``timeout_seconds``.
+_DEFAULT_WAIT_SECONDS: float = 86400.0
 
 # Module-global registry: elicitation_id → asyncio.Future[bool].
 # True = approved, False = declined/timed-out. Future is owned by the

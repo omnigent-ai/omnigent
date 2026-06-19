@@ -1,27 +1,18 @@
 """Live REPL e2e for ``omnigent run --harness`` without AGENT.
 
-This test drives the user-facing launcher shape::
+Migrated to use the mock LLM server. This test drives the user-facing
+launcher shape::
 
     omnigent run --harness <harness> -p <prompt>
 
-under a real pseudo-TTY. It waits for the REPL banner, lets the
-``-p`` startup hook submit a real user turn, and asserts the model
-returns an exact marker. That covers the integration unit tests
-cannot: Click optional-AGENT parsing, synthetic Omnigent YAML
-materialization, Omnigent server boot, harness executor selection,
-Databricks profile routing, REPL initial-message handling, and
-model response rendering.
-
-Run explicitly with Databricks credentials, for example::
-
-    .venv/bin/python -m pytest \
-      tests/e2e/omnigent/test_run_harness_without_agent_e2e.py \
-      --profile test-profile -v
+under a real pseudo-TTY against the mock LLM server. It waits for the
+REPL banner, lets the ``-p`` startup hook submit a real user turn, and
+asserts the mock model returns the expected marker. No real Databricks
+credentials are required.
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
@@ -39,6 +30,7 @@ from tests.e2e.omnigent._pexpect_harness import (
     spawn_omnigent_run,
     strip_ansi,
 )
+from tests.e2e.omnigent.conftest import configure_mock_llm
 
 _PROMPT_TEMPLATE = (
     "Reply with exactly the identifier between <answer> tags, but omit the tags: "
@@ -49,85 +41,49 @@ _COMPLETION_TIMEOUT = 240.0
 _EXIT_TIMEOUT = 20.0
 
 
-def _profile_env(repo_root: Path, profile: str, config_home: Path) -> dict[str, str]:
-    """Return a subprocess env that resolves credentials via the profile.
-
-    Unlike most e2e tests, this intentionally does not depend on
-    ``--llm-api-key`` or a patched ``~/.databrickscfg``. The feature under
-    test is the real CLI shape users run locally:
-    ``omnigent run --harness <harness>`` with Databricks routing taken
-    from the global config's ``auth:`` block (the ``--profile`` CLI flag
-    was removed). Harnesses should resolve host/token through the
-    Databricks SDK/profile path themselves.
-    """
-    env = dict(os.environ)
-    env["DATABRICKS_CONFIG_PROFILE"] = profile
-    # The omnigent CLI no longer accepts ``--profile``; write the
-    # supported replacement — an ``auth:`` block in an isolated
-    # ``OMNIGENT_CONFIG_HOME`` — so the spawned CLI routes harness
-    # model/gateway traffic through the test profile.
-    config_home.mkdir(parents=True, exist_ok=True)
-    (config_home / "config.yaml").write_text(
-        f"auth:\n  type: databricks\n  profile: {profile}\n",
-        encoding="utf-8",
-    )
-    env["OMNIGENT_CONFIG_HOME"] = str(config_home)
-    for stale in (
-        # Force profile-backed routing instead of accidental direct OpenAI.
-        "OPENAI_API_KEY",
-        "OPENAI_BASE_URL",
-        "DATABRICKS_TOKEN",
-        # Nested Claude/Codex sessions can set these and block child harnesses.
-        "ANTHROPIC_API_KEY",
-        "CLAUDE_CODE",
-        "CLAUDECODE",
-        "CLAUDE_CODE_ENTRYPOINT",
-        "CLAUDE_CODE_EXECPATH",
-        "CODEX",
-    ):
-        env.pop(stale, None)
-    existing_pp = env.get("PYTHONPATH", "")
-    omnigent_path = str(repo_root / "omnigent")
-    env["PYTHONPATH"] = os.pathsep.join(
-        p for p in (str(repo_root), omnigent_path, existing_pp) if p
-    )
-    return env
-
-
 @pytest.mark.parametrize("probe", HARNESS_PROBES, ids=HARNESS_IDS)
 def test_run_harness_without_agent_live_repl_round_trip(
     probe: HarnessProbe,
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    databricks_workspace: tuple[str, str],
+    mock_credentials_env: dict[str, str],
+    mock_llm_server_url: str,
     tmp_path: Path,
 ) -> None:
     """``omnigent run --harness`` boots and answers via each wrapped harness.
 
-    The no-AGENT launcher should behave like a first-class agent:
-    it should render the selected harness banner, auto-submit the
-    provided ``-p`` prompt, reach the real Databricks-backed model,
-    stream a reply, and exit cleanly. A missing marker means either
-    the launch path did not reach the model or the response was
-    garbled before the REPL rendered it.
+    Uses the mock LLM server for deterministic responses. The no-AGENT
+    launcher should behave like a first-class agent: it should render the
+    selected harness banner, auto-submit the provided ``-p`` prompt,
+    stream a mock reply, and exit cleanly. A missing marker means either
+    the launch path did not reach the model or the response was garbled
+    before the REPL rendered it.
 
-    ``HARNESS_PROBES`` covers every coding harness registered in
-    ``omnigent.runtime.harnesses`` and accepted by the Omnigent
-    compat allowlist. A separate assertion below keeps that matrix in
-    lock-step with the runtime registry.
+    :param probe: Harness probe with model and marker.
+    :param omnigent_python: Interpreter with omnigent installed.
+    :param omnigent_repo_root: Working directory for the subprocess.
+    :param mock_credentials_env: Mock-LLM env vars.
+    :param mock_llm_server_url: Mock server URL.
+    :param tmp_path: Per-test temp directory.
     """
     skip_if_harness_cli_missing(probe.harness)
 
-    profile, _host = databricks_workspace
-    env = _profile_env(omnigent_repo_root, profile, tmp_path / "omnigent-config")
+    model = f"mock-harness-no-agent-{probe.harness}"
     marker = f"{probe.marker}_RUN_HARNESS_WITHOUT_AGENT"
     prompt = _PROMPT_TEMPLATE.format(marker=marker)
+
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": marker}],
+        key=model,
+    )
+
     child = spawn_omnigent_run(
         omnigent_python=omnigent_python,
         yaml_path=None,
-        model=probe.model,
+        model=model,
         harness=probe.harness,
-        env=env,
+        env=mock_credentials_env,
         cwd=omnigent_repo_root,
         timeout=_SPAWN_TIMEOUT,
         initial_prompt=prompt,
@@ -176,29 +132,23 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     because their inner executors require bridge directories plus
     runner-managed terminal panes to inject keys into — both set up by
     their native launchers, not by ``omnigent run --harness <native>``.
-    Running them through this matrix would hang or crash. Their e2e
-    coverage is via native launcher smoke tests (tracked separately as
-    native-launcher PTY/REPL smoke tests).
 
     ``cursor`` is excluded because this matrix authenticates through
     the Databricks gateway/profile, while cursor-agent talks only to
-    Cursor's own backend (``CURSOR_API_KEY``) and rejects gateway
-    model ids. Its live coverage is the gated row in
-    ``tests/e2e/omnigent/test_per_harness_cursor.py``.
+    Cursor's own backend and rejects gateway model ids.
 
     ``antigravity`` is excluded for the same reason as ``cursor``: it is
-    Gemini-native — it authenticates with a Gemini API key (or Vertex AI),
-    not the Databricks gateway/profile this matrix uses — and its SDK
-    launches a native binary needing a modern glibc, so it cannot round-trip
-    through this gateway-backed matrix.
+    Gemini-native and its SDK launches a native binary needing a modern
+    glibc.
+
+    ``cursor-native`` is excluded for the union of both reasons above.
     """
     expected_live_harnesses = set(OMNIGENT_HARNESSES).intersection(_HARNESS_MODULES) - {
         "claude-native",
         "codex-native",
         "pi-native",
         "cursor",
+        "cursor-native",
         "antigravity",
     }
-    # The intersection above keeps this expectation tied to the actual
-    # runtime registry instead of duplicating the harness list here.
     assert {probe.harness for probe in HARNESS_PROBES} == expected_live_harnesses

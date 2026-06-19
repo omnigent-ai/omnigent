@@ -4,7 +4,7 @@ export const WRAPPER_LABEL_KEY = "omnigent.wrapper";
 export const UI_MODE_LABEL_KEY = "omnigent.ui";
 export const UI_MODE_TERMINAL_VALUE = "terminal";
 
-export type NativeCodingAgentIconKind = "claude" | "codex" | "pi";
+export type NativeCodingAgentIconKind = "claude" | "codex" | "pi" | "cursor";
 export type NativeCodingAgentCapability = "permissionMode" | "approvalMode";
 
 export interface NativeCodingAgentSpec {
@@ -40,13 +40,22 @@ export const NATIVE_CODING_AGENTS = [
     capabilities: ["approvalMode"],
   },
   {
+    key: "cursor",
+    agentName: "cursor-native-ui",
+    harness: "cursor-native",
+    wrapperLabel: "cursor-native-ui",
+    displayName: "Cursor",
+    iconKind: "cursor",
+    sortRank: 30,
+  },
+  {
     key: "pi",
     agentName: "pi-native-ui",
     harness: "pi-native",
     wrapperLabel: "pi-native-ui",
     displayName: "Pi",
     iconKind: "pi",
-    sortRank: 30,
+    sortRank: 40,
   },
 ] as const satisfies readonly NativeCodingAgentSpec[];
 
@@ -65,6 +74,7 @@ const BY_WRAPPER: Map<string, NativeCodingAgentSpec> = new Map(
 // supported reversed alias (claude/codex use the canonical form).
 const HARNESS_ALIASES: Record<string, string> = {
   "native-pi": "pi-native",
+  "native-cursor": "cursor-native",
 };
 
 export function nativeCodingAgentForAgentName(

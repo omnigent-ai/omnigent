@@ -4318,6 +4318,40 @@ def _codex_tool_call_from_item(item: dict[str, Any]) -> _CodexToolCall | None:
     return builder(call_id, item)
 
 
+# Codex runs each model-issued shell command inside its OWN bwrap command
+# sandbox. In a hardened container that disallows unprivileged user namespaces,
+# that sandbox cannot start and every command hard-fails with this raw bwrap
+# error, with no hint at how to recover. Detect the marker and append actionable
+# guidance so a top-level session degrades with direction instead of an opaque
+# failure (issue #657; mirrors the degrade-not-crash ask in #517). The codex
+# ``--approval-mode`` presets do NOT disable this sandbox — only the "Full
+# access" preset's ``danger-full-access`` (or a config ``sandbox_mode``) does.
+_CODEX_SANDBOX_NAMESPACE_ERROR_MARKER = "No permissions to create new namespace"
+_CODEX_SANDBOX_BYPASS_GUIDANCE = (
+    "Omnigent: Codex's command sandbox could not start because this container "
+    "disallows unprivileged user namespaces, so the command did not run. To run "
+    'shell commands here, start a new Codex session with the "Full access" '
+    "approval preset (New chat → Advanced settings), or set "
+    'sandbox_mode = "danger-full-access" in ~/.codex/config.toml on the runner.'
+)
+
+
+def _augment_sandbox_namespace_error(output_text: str) -> str:
+    """Append recovery guidance when a Codex shell command failed because its
+    own command sandbox could not start (no unprivileged user namespaces).
+
+    Returns *output_text* unchanged when the bwrap-namespace marker is absent,
+    so ordinary command output is never altered. See issue #657.
+
+    :param output_text: Aggregated command output, any exit-code suffix already
+        appended, e.g. ``"bwrap: No permissions ...\\n[exit code: 1]"``.
+    :returns: The output with a trailing guidance paragraph, or unchanged.
+    """
+    if _CODEX_SANDBOX_NAMESPACE_ERROR_MARKER not in output_text:
+        return output_text
+    return f"{output_text}\n\n{_CODEX_SANDBOX_BYPASS_GUIDANCE}"
+
+
 def _command_execution_tool_call(call_id: str, item: dict[str, Any]) -> _CodexToolCall | None:
     """
     Build a tool call from a Codex ``commandExecution`` item.
@@ -4349,6 +4383,9 @@ def _command_execution_tool_call(call_id: str, item: dict[str, Any]) -> _CodexTo
     if isinstance(exit_code, int) and exit_code != 0:
         suffix = f"[exit code: {exit_code}]"
         output_text = f"{output_text}\n{suffix}" if output_text else suffix
+    # Turn codex's opaque "sandbox can't start" bwrap failure into actionable
+    # recovery guidance (issue #657); a no-op for any other output.
+    output_text = _augment_sandbox_namespace_error(output_text)
     return _CodexToolCall(call_id=call_id, name="shell", arguments=arguments, output=output_text)
 
 

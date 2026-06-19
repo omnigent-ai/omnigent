@@ -98,6 +98,15 @@ _SUBAGENT_POLICY_STATUSES = frozenset({"completed", "failed"})
 _SUBAGENT_INBOX_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 _SUBAGENT_POLICY_FAILURE_OUTPUT = "[Result suppressed by policy: policy evaluation failed]"
 _SESSION_WRAPPER_LABEL_KEY = "omnigent.wrapper"
+# Read budget for runner→server message-send POSTs that are gated at the
+# recipient's REQUEST phase, which can PARK behind a human-approval ASK gate
+# (e.g. session_cost_budget) for the deciding policy's ``ask_timeout``. Held at
+# one day (86400s) — matching that default — so the send WAITS for the verdict
+# instead of severing the parked gate at a short read timeout (a 30s cut
+# previously fail-closed to DENY). Fast connect (30s) so an unreachable server
+# still fails out promptly. Guarded by tests/test_ask_timeout_infinite.py.
+_ASK_GATE_DELIVERY_READ_TIMEOUT_S: float = 86400.0
+_ASK_GATE_DELIVERY_TIMEOUT = httpx.Timeout(_ASK_GATE_DELIVERY_READ_TIMEOUT_S, connect=30.0)
 
 # Read timeouts for the two MCP-proxy hops that carry a tool call back to the
 # runner (runner → Omnigent server → runner). ``sys_os_shell`` accepts caller-provided
@@ -1186,7 +1195,12 @@ async def _execute_subagent_tool(
                     "content": [{"type": "input_text", "text": str(message)}],
                 },
             },
-            timeout=30.0,
+            # This message is gated at the recipient's REQUEST phase, which can
+            # PARK on a human ASK (e.g. session_cost_budget) up to the policy's
+            # ``ask_timeout``. A 30s read budget severed that park → fail-closed
+            # /retry → duplicate cards. Wait for the real verdict (one-day read
+            # budget, fast connect); a non-parking eval still returns immediately.
+            timeout=_ASK_GATE_DELIVERY_TIMEOUT,
         )
     except httpx.HTTPError as exc:
         _runner_app.unregister_child_session(child_session_id)
@@ -1328,7 +1342,11 @@ async def _send_to_existing_session(
                     "content": [{"type": "input_text", "text": message}],
                 },
             },
-            timeout=30.0,
+            # Same as the other message-send: gated at the recipient's REQUEST
+            # phase, which can PARK on a human ASK up to the policy's
+            # ``ask_timeout``. Wait for the real verdict (one-day read budget,
+            # fast connect) instead of severing at 30s and retrying into duplicates.
+            timeout=_ASK_GATE_DELIVERY_TIMEOUT,
         )
     except httpx.HTTPError as exc:
         _runner_app.unregister_child_session(target_session_id)
