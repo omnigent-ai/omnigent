@@ -1,0 +1,62 @@
+# Create a GitHub Release entry (the `…/releases` page) when a version tag is
+# pushed. This is METADATA ONLY — it does NOT build or publish any installable
+# artifact. PyPI publishing lives in the central secure-release repo
+# (databricks/secure-public-registry-releases-eng → `omnigent` workflow), on
+# hardened runners with OIDC Trusted Publishing and a mandatory dependency
+# scan. Keeping those concerns separate is deliberate (see RELEASING.md):
+#
+#   * This job runs NO project or third-party code — no build, no `pip
+#     install`/`npm ci`, no tests. Its only action is SHA-pinned
+#     `actions/checkout` plus `gh release create`. A malicious tagged commit
+#     therefore cannot execute anything here.
+#   * It uses the ephemeral `GITHUB_TOKEN` (no stored secret / PAT). The single
+#     elevated scope, `contents: write`, is the minimum GitHub requires to
+#     create a release and nothing else in the job uses it.
+#   * It attaches NO wheels. The release carries only generated notes and the
+#     source tarball GitHub auto-attaches, so PyPI (the scanned, securely
+#     published channel) stays the single source of installable artifacts.
+#   * The release is created as a DRAFT: a human verifies/edits the generated
+#     notes and publishes it (ideally after the prod PyPI publish lands), so a
+#     bot never makes a public release on its own.
+name: GitHub Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Least privilege: creating a release requires `contents: write`; nothing here
+# needs anything more.
+permissions:
+  contents: write
+
+jobs:
+  draft-release:
+    # Inert in forks / mirrors — only the canonical repo should cut releases.
+    if: github.repository == 'omnigent-ai/omnigent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Full history so `--generate-notes` can diff against the previous tag.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Draft release with generated notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # rc / dev tags are flagged as pre-releases.
+          pre=""
+          case "$TAG" in
+            *rc*|*dev*|*a[0-9]*|*b[0-9]*) pre="--prerelease" ;;
+          esac
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --verify-tag \
+            --generate-notes \
+            --title "$TAG" \
+            $pre
+          echo "Drafted release $TAG. Review/edit the notes and publish from the Releases page."
