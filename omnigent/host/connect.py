@@ -48,6 +48,7 @@ from omnigent.host.git_worktree import (
     remove_worktree,
 )
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
+from omnigent.onboarding.harness_install import harness_setup_hint
 from omnigent.onboarding.harness_readiness import (
     configured_harness_map,
     harness_is_configured,
@@ -710,8 +711,7 @@ class HostProcess:
                 status="failed",
                 error=(
                     f"harness {frame.harness!r} is not configured on host "
-                    f"{self._identity.name!r} — run `omnigent setup` on that "
-                    "machine to install the CLI and set a default credential"
+                    f"{self._identity.name!r} — {harness_setup_hint(frame.harness)}"
                 ),
                 error_code=HARNESS_NOT_CONFIGURED_ERROR_CODE,
             )

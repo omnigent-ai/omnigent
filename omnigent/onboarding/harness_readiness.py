@@ -49,6 +49,13 @@ _SDK_HARNESSES: frozenset[str] = frozenset(
 # ``_HARNESS_FAMILY`` entry — pi uses the ``PI_SURFACE`` sentinel — so they must
 # be gated explicitly or they fail open like an unknown harness.
 _PI_HARNESSES: frozenset[str] = frozenset({PI_SURFACE, "pi-native"})
+
+# Native Cursor harnesses. These boot the ``cursor-agent`` TUI (``omni cursor``)
+# and so, like the other native CLI harnesses, can't launch without that binary
+# on ``PATH`` — gate them on it. Distinct from the SDK ``cursor`` harness
+# (``CURSOR_KEY`` below), which runs in-process via ``cursor-sdk`` and gates on
+# a ``CURSOR_API_KEY`` instead. Without these entries they'd fail open like an
+# unknown harness, letting a binary-less launch die inside the executor.
 _CURSOR_NATIVE_HARNESSES: frozenset[str] = frozenset({"cursor-native", "native-cursor"})
 
 
@@ -102,6 +109,10 @@ def harness_is_configured(harness: str) -> bool:
     if canonical in _SDK_HARNESSES:
         return True
     if canonical in _CURSOR_NATIVE_HARNESSES:
+        # Native Cursor (``omni cursor``) wraps the ``cursor-agent`` CLI — gate
+        # on that binary, like ``claude-native`` / ``codex-native``. (Login
+        # state surfaces at run time; the daemon gates only on binary presence,
+        # mirroring the other native harnesses.)
         return harness_cli_installed(CURSOR_KEY)
     if canonical == CURSOR_KEY:
         # Cursor runs in-process via ``cursor-sdk`` and authenticates with a
