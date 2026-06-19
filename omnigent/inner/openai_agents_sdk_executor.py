@@ -438,10 +438,22 @@ def _get_openai_async_client(
     # Checked before profile and env-var lookups so the spec is self-contained.
     # base_url_override is populated from HARNESS_OPENAI_AGENTS_GATEWAY_BASE_URL
     # when the spec also declares executor.auth.base_url.
+    #
+    # Fall back to the ambient OPENAI_BASE_URL when no override reached us.
+    # The api_key is frequently a gateway credential (e.g. a Databricks AI
+    # Gateway PAT detected from OPENAI_API_KEY), and the companion base_url
+    # can be dropped anywhere on the daemon → runner → harness propagation
+    # chain (the spec auth bake omits it when OPENAI_BASE_URL is absent at
+    # materialization time; a reused local daemon may predate the env var).
+    # Without this fallback, a missing base_url silently routes the gateway
+    # token to api.openai.com and every request 401s; honoring the ambient
+    # OPENAI_BASE_URL the runner inherits keeps the gateway target present on
+    # every turn even when the override is lost. base_url=None still defaults
+    # to api.openai.com for a genuine OpenAI key with no gateway configured.
     if api_key and api_key.strip():
         return AsyncOpenAI(
             api_key=api_key,
-            base_url=base_url_override or None,
+            base_url=base_url_override or os.environ.get("OPENAI_BASE_URL") or None,
             **retry_kwargs,
         )
 

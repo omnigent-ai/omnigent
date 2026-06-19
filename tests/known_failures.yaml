@@ -27,795 +27,144 @@
 # Note: entries here apply to every pytest invocation. If you
 # want to debug a skipped test locally, comment out its block.
 skips:
-  # Pre-existing product regressions on `main`. `mode: xfail`
-  # so the test runs and we get an XPASS signal when fixed,
-  # at which point the entry can be removed. Need their
-  # respective code owners to investigate.
-
-  # Shard 0 wedge candidate per the prior wedged run's partial log
-  # (last STARTING on gw3 with no END). Pexpect REPL + sub-agent
-  # spawn pattern.
-  - id: tests/e2e/omnigent/test_run_omnigent_ctrl_g_subagent_dedup.py::test_run_omnigent_ctrl_g_deduplicates_subagent_across_spawn_and_send
-    reason: "Wedges hardened CI runner (#426)."
-    issue: 426
-    cluster: runner-wedge-subprocess-fanout
-    mode: skip
-
-  # Shard 1 wedge candidates from run 25854221043's progress logger
-  # (last STARTING on each xdist worker with no matching END). All
-  # are test_run_omnigent_* tests doing heavy subprocess/pty fanout --
-  # same family as the shard 0 candidate above. Suspect the
-  # CrowdStrike-hardened runner's subprocess cleanup is unable to
-  # reap the test's spawned children fast enough, accumulating until
-  # the host wedges.
-  - id: tests/e2e/omnigent/test_run_omnigent_os_env_inherit.py::test_run_omnigent_propagates_os_env_inherit_to_spawned_worker[claude-sdk]
-    reason: "Wedges hardened CI runner via os_env subprocess fanout (#426)."
-    issue: 426
-    cluster: runner-wedge-subprocess-fanout
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_run_omnigent_twelve_shells.py::test_twelve_parallel_shells_complete_under_ap
-    reason: "Wedges hardened CI runner via 12 parallel pty shells (#426)."
-    issue: 426
-    cluster: runner-wedge-subprocess-fanout
-    mode: skip
-
-  # Shard 2 iteration: openai-agents harness on databricks-gpt-5-mini
-  # via ai-oss frequently exceeds the test's internal 60s
-  # turn-completion timeout (state stays "running" past the
-  # pexpect deadline). Not test-tunable; needs a faster-model or
-  # higher per-test timeout.
-  - id: tests/e2e/omnigent/test_run_omnigent_policy_enforcement.py::test_policy_denies_tool_call_by_name[codex]
-    reason: "Real policy-enforcement gap: tool_call:calculate deny policy doesn't fire under codex harness; tool runs and returns the real answer instead of the deny sentinel. Needs production fix, not a test patch."
-    issue: 476
-    cluster: policy-guardrails
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_run_omnigent_policy_enforcement.py::test_policy_denies_tool_call_by_name[claude-sdk]
-    reason: "Shard 0 bulk: same policy-enforcement cluster as #476."
-    issue: 476
-    cluster: policy-guardrails
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_run_omnigent_policy_enforcement.py::test_policy_denies_tool_call_by_name[openai-agents]
-    reason: "Shard 0 bulk: same policy-enforcement cluster as #476."
-    issue: 476
-    cluster: policy-guardrails
-    mode: skip
-
-
-  - id: tests/e2e/test_cancel_then_file_attachment.py::test_cancel_send_file_cancel_send_file_succeeds
-    reason: "Agent calls sys_os_shell to list filesystem instead of reading the uploaded markdown attachment; file attachment may not be reaching the LLM correctly."
-    issue: 532
-    cluster: files-uploads-attachments
-    mode: skip
-  - id: tests/e2e/test_d6_direct_cancel_e2e.py::test_sdk_cancels_local_body_on_llm_cancel_task
-    reason: "Server raises in _build_terminal_event during cancel flow; final response surfaces as 'failed' with 'Failed to retrieve final response'. Real server-side bug in cancel→terminal handling."
-    issue: 532
-    cluster: terminal-d6
-    mode: xfail
-
-  - id: tests/e2e/test_d6_sdk_async_dispatch_e2e.py::test_sdk_async_client_tool_completes_round_trip
-    reason: "Same 'Failed to retrieve final response' server bug as test_sdk_cancels_local_body_on_llm_cancel_task; _build_terminal_event raises during D6 async-dispatch round-trip."
-    issue: 532
-    cluster: terminal-d6
-    mode: xfail
-
-  - id: tests/e2e/test_repl_approval_e2e.py::test_repl_refusal_shows_deny_sentinel
-    reason: "Pexpect timeout waiting for 'approval required' regex. Same REPL-pexpect timeout family as the earlier test_repl_* entries."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
 
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_tool_call_approval_allows_tool_to_run
-    reason: "Same REPL approval pexpect-timeout family."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
-
-  - id: tests/e2e/test_repl_approval_e2e.py::test_repl_label_driven_ask_refuse_shows_sentinel
-    reason: "Same REPL approval pexpect-timeout family."
-    issue: 532
-    cluster: repl-pexpect-cli
+    reason: "REPL policy-ASK banner does not surface for TOOL_CALL-phase ASK (#763): expect('approval required') times out 60/60 in run 27802341342. INPUT-phase ASKs surface fine; the tool_call elicitation->REPL path does not."
+    issue: 763
+    cluster: repl-policy-ask-surfacing
     mode: skip
 
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_subagent_tool_call_ask_tunnels_to_root
-    reason: "Same REPL approval pexpect-timeout family."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
-
-  - id: tests/e2e/test_sys_terminal_e2e.py::test_sys_terminal_persists_across_turns_e2e
-    reason: "Server returns 500 on this test. Likely runner availability or model deployment issue, not narrowed."
-    issue: 532
-    cluster: terminal-d6
-    mode: skip
-
-  - id: tests/e2e/test_sys_terminal_e2e.py::test_sys_terminal_send_keys_drives_interactive_e2e
-    reason: "Same 500 pattern as test_sys_terminal_persists_across_turns_e2e."
-    issue: 532
-    cluster: terminal-d6
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_run_omnigent_policy_enforcement.py::test_policy_denies_input_containing_sentinel[openai-agents]
-    reason: "Shard 0 bulk: policy-enforcement family, same cluster as test_policy_denies_tool_call_by_name[codex] (#476)."
-    issue: 476
-    cluster: policy-guardrails
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_run_omnigent_policy_enforcement.py::test_policy_denies_sub_agent_by_name[codex]
-    reason: "Shard 0 bulk: same policy-enforcement cluster as #476."
-    issue: 476
-    cluster: policy-guardrails
-    mode: skip
-
-  - id: tests/e2e/test_async_tools_e2e.py::test_async_tool_real_llm_e2e
-    reason: "Shard 0 bulk: async tool real-LLM assertion failure. Triage under #532."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
-    mode: skip
-
-  - id: tests/e2e/test_client_tool_cancellation_message_e2e.py::test_cancelled_client_tool_persists_system_message_in_conversation
-    reason: "Shard 0 bulk: client-tool cancellation persistence assertion fails. Triage under #532."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
+    reason: "Broken fixture independent of the ASK path: the spawned toolworker sub-agent has no `echo` callable registered (live: 'Tool echo not found in agent Omnigent', 3/3), so the TOOL_CALL ASK never runs — the tool errors before policy matters. Needs the sub-agent local-tool bridge fixed; interactive mid-flight ASK tracked by #765."
+    issue: 763
+    cluster: repl-policy-ask-surfacing
     mode: skip
 
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_tool_call_refusal_blocks_tool
-    reason: "Shard 0 bulk: REPL approval pexpect-timeout family (same as other test_repl_approval_e2e entries)."
-    issue: 532
-    cluster: repl-pexpect-cli
+    reason: "REPL policy-ASK banner does not surface for TOOL_CALL-phase ASK (#763): expect('approval required') times out 60/60 in run 27802341342. INPUT-phase ASKs surface fine; the tool_call elicitation->REPL path does not."
+    issue: 763
+    cluster: repl-policy-ask-surfacing
     mode: skip
 
-  - id: tests/e2e/test_repl_approval_e2e.py::test_repl_subagent_ask_tunnels_approval_to_root
-    reason: "Shard 0 bulk: REPL approval pexpect-timeout family."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
 
-  - id: tests/e2e/test_repl_approval_e2e.py::test_repl_tool_result_ask_approve_surfaces_tool_output
-    reason: "Shard 0 bulk: REPL approval pexpect-timeout family."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
-  - id: tests/e2e/test_sys_async_inbox_e2e.py::test_sys_cancel_async_aborts_in_flight_dispatch_e2e
-    reason: "Shard 0 bulk: sys async-inbox cancel mid-dispatch. Triage under #532."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
-    mode: skip
-
-  # ── Shard 1 bulk quarantine (2026-05-15) ──
-  # 46 failed + 7 errors on a local run against profile ai-oss /
-  # harness databricks. Same caveats as shard 0: bulk-quarantine
-  # first to unblock e2e PR gating, triage individually under #532.
 
   - id: tests/e2e/omnigent/test_example_secure_research_agent_os_env.py::test_secure_research_agent_os_env_one_shot
-    reason: "Shard 1 bulk: secure_research_agent os-env one-shot. Triage under #532."
-    issue: 532
+    reason: "Secure_research_agent os-env one-shot. Triage pending."
+    issue: 675
     cluster: sandbox-deps-env
-    mode: skip
-  - id: tests/e2e/omnigent/test_run_omnigent_os_env_inherit.py::test_run_omnigent_propagates_os_env_inherit_to_spawned_worker[openai-agents]
-    reason: "Shard 1 bulk: os_env propagation, same family as the [claude-sdk] variant in #426."
-    issue: 426
-    cluster: runner-wedge-subprocess-fanout
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_run_omnigent_policy_enforcement.py::test_policy_denies_input_containing_sentinel[claude-sdk]
-    reason: "Shard 1 bulk: policy-enforcement cluster (#476)."
-    issue: 476
-    cluster: policy-guardrails
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_run_omnigent_policy_enforcement.py::test_policy_denies_input_containing_sentinel[codex]
-    reason: "Shard 1 bulk: policy-enforcement cluster (#476)."
-    issue: 476
-    cluster: policy-guardrails
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_run_omnigent_policy_enforcement.py::test_policy_denies_sub_agent_by_name[claude-sdk]
-    reason: "Shard 1 bulk: sub_agent deny under claude-sdk."
-    issue: 476
-    cluster: policy-guardrails
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_run_omnigent_policy_enforcement.py::test_policy_denies_sub_agent_by_name[openai-agents]
-    reason: "Shard 1 bulk: sub_agent deny under openai-agents."
-    issue: 476
-    cluster: policy-guardrails
     mode: skip
 
   - id: tests/e2e/omnigent/test_run_harness_without_agent_e2e.py::test_run_harness_without_agent_live_repl_round_trip[claude-sdk]
-    reason: "Shard 1 bulk: no-AGENT harness round-trip claude-sdk."
-    issue: 532
-    cluster: repl-pexpect-cli
+    reason: "No-AGENT `omnigent run --harness` live round-trip hangs >180s in CI -> pytest-timeout thread-kill -> xdist worker crash; claude-sdk fails 30/30 in flake-stress 27808074172. Auth is NOT the cause: CI sets DATABRICKS_BEARER and the harness auth-commands short-circuit on it, so the hang is post-auth in the round-trip. Environment-wide, not harness-specific (codex + openai-agents siblings hang identically). The test's _COMPLETION_TIMEOUT=240 also exceeds the e2e --timeout=180 cap. Not locally reproducible (oss OAuth + macOS PTY diverge from CI); needs CI-env debugging."
+    issue: 523
+    cluster: no-agent-harness-roundtrip-hang
     mode: skip
 
   - id: tests/e2e/omnigent/test_run_harness_without_agent_e2e.py::test_run_harness_without_agent_live_repl_round_trip[openai-agents]
-    reason: "Shard 1 bulk: no-AGENT harness round-trip openai-agents, same family."
-    issue: 532
-    cluster: repl-pexpect-cli
+    reason: "No-AGENT `omnigent run --harness` live round-trip hangs >180s in CI -> xdist worker crash; openai-agents fails 10/10 in flake-stress 27809210955. Same post-auth round-trip hang as the [claude-sdk]/[codex] siblings -- notably the in-process SDK harness hangs too, confirming the cause is environment-wide rather than CLI-subprocess-specific. See [claude-sdk] entry for the full diagnosis."
+    issue: 523
+    cluster: no-agent-harness-roundtrip-hang
     mode: skip
 
 
-
-  - id: tests/e2e/test_client_tool_sse_status_e2e.py::test_client_side_tool_inline_sse_carries_action_required
-    reason: "Shard 1 bulk: SSE action_required signaling. Triage under #532."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
-    mode: skip
-
-  - id: tests/e2e/test_decorated_tools_e2e.py::test_decorated_tools_varied_signatures_e2e
-    reason: "openai-agents harness test hits platform.openai.com directly and 401s under the Databricks gateway profile (dapi PAT rejected as OpenAI key); needs gateway-routing/base_url fix before it can run in CI. Passes only with a real OPENAI_API_KEY locally."
-    issue: 532
-    cluster: run-ap-examples-harness
-    mode: skip
-
-  - id: tests/e2e/test_repl_approval_e2e.py::test_repl_approve_always_caches_for_later_turns
-    reason: "Shard 1 bulk: REPL approval pexpect-timeout family."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
-
-  - id: tests/e2e/test_repl_approval_e2e.py::test_repl_label_driven_ask_approves
-    reason: "Shard 1 bulk: REPL approval pexpect-timeout family."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
-
-  - id: tests/e2e/test_repl_approval_e2e.py::test_repl_tool_result_ask_refuse_replaces_output
-    reason: "Shard 1 bulk: REPL approval pexpect-timeout family."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
-  - id: tests/e2e/test_sys_async_inbox_e2e.py::test_sys_call_async_dispatch_marker_reaches_llm_e2e
-    reason: "Shard 1 bulk: sys async-inbox marker delivery."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
-    mode: skip
-
-  - id: tests/e2e/test_sys_async_inbox_harness_e2e.py::test_sys_read_inbox_harness_path_returns_drained_marker_e2e
-    reason: "Shard 1 bulk: sys async-inbox harness drain."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
-    mode: skip
-
-  - id: tests/e2e/test_sys_terminal_e2e.py::test_sys_terminal_cwd_default_is_workspace_e2e
-    reason: "Shard 1 bulk: sys-terminal cwd default; same family as sys_terminal_persists/send_keys in shard 2."
-    issue: 532
-    cluster: terminal-d6
-    mode: skip
-
-  - id: tests/e2e/test_tool_dispatch_workflow_client_side_e2e.py::test_harness_routes_client_side_tool_through_dispatch_workflow
-    reason: "Shard 1 bulk: tool-dispatch workflow client-side."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
-    mode: skip
-
-  # ── Shard 1 errors (collection / fixture-level, not test body) ──
-  - id: tests/e2e/omnigent/test_example_agent_with_os_env_fork.py::test_agent_with_os_env_fork_one_shot
-    reason: "Shards 0/1 bulk: agent_with_os_env_fork one-shot exits 0 with no stdout."
-    issue: 532
+  - id: tests/e2e/test_claude_coder_sandbox.py::test_write_blocked_outside_workspace
+    reason: "Distinct from the bwrap CLI-path fix (this PR): the claude-sdk Write tool is NOT blocked from creating files outside the workspace, while edit/read/glob enforcement IS (those 4 sandbox tests pass 30/30 in flake-stress run 27796759300). write_blocked fails 30/30 — a real write-path sandbox-enforcement gap. Needs its own fix."
+    issue: 770
     cluster: sandbox-deps-env
     mode: skip
 
-  # ── Shard 3 bulk quarantine (2026-05-15) ──
-  # 55 FAILED + 9 ERROR on a local run against profile ai-oss /
-  # harness databricks with -n 2 --dist=loadscope (single-process
-  # mode hung on test_run_omnigent_rate_limit_approval; xdist + per-test
-  # timeout lets the rest of the shard complete). Same bulk-first,
-  # triage-later approach as PRs #475/#482/#554/#606.
-
-  - id: tests/e2e/omnigent/test_run_omnigent_rate_limit_approval.py::test_run_omnigent_rate_limit_approval_round_trip
-    reason: "Shard 3 bulk: pexpect timeout waiting for 'approval required'; hung the whole pytest process under single-worker thread-timeout."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
-
-  - id: tests/e2e/test_repl_approval_e2e.py::test_repl_single_approval_allows_llm_response
-    reason: "Shard 3 bulk: REPL approval pexpect family."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
-
-  - id: tests/e2e/test_repl_approval_e2e.py::test_repl_two_turns_fires_one_approval_per_turn
-    reason: "Shard 3 bulk: REPL approval pexpect family."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_run_omnigent_coding_supervisor.py::test_run_omnigent_coding_supervisor_oneshot
-    reason: "Shard 3 bulk: coding supervisor one-shot. Triage under #532."
-    issue: 532
-    cluster: subagent-supervisor-routing
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_run_omnigent_coding_supervisor.py::test_run_omnigent_coding_supervisor_exposes_subagent_tools
-    reason: "Shard 3 bulk: coding supervisor subagent tools."
-    issue: 532
-    cluster: subagent-supervisor-routing
-    mode: skip
-
-  # Verified live on oss 2026-06-11: spawn / ambient_hint / parallel
-  # pass under the module's 600s signal-method timeout marker, but
-  # continuation failed 1 of 2 runs with a clean AssertionError (the
-  # sub-agent result never reached the parent via auto-wake within
-  # 240s; passed standalone in 47s). Flaky auto-wake delivery, needs
-  # product investigation before re-greening.
-  - id: tests/e2e/test_named_sub_agent_persistence.py::test_send_to_named_sub_agent_continuation_e2e
-    reason: "Flaky live: turn-2 sys_session_send result intermittently never auto-wakes the parent within 240s (#532)."
-    issue: 532
-    cluster: subagent-supervisor-routing
-    mode: skip
-
-  - id: tests/e2e/test_named_sub_agent_persistence.py::test_cross_parent_named_isolation_e2e
-    reason: "Wedges the e2e shard in CI: this test dispatches a sub-agent in TWO separate runner-bound sessions on the same runner, and the second session's async sub-agent dispatch / auto-wake contends with the first, hanging well past the shard's per-test timeout (the other 4 test_named_sub_agent_persistence tests pass after the #2534 session-flow migration; this two-concurrent-sessions-on-one-runner interaction needs separate investigation). Passes locally on oss in ~30s."
-    issue: 532
-    cluster: subagent-supervisor-routing
-    mode: skip
-
-  - id: tests/e2e/test_policies_e2e.py::test_streaming_api_explicit_approval_allows_llm
-    reason: "Shard 3 bulk: streaming-API explicit approval. Policy / approval cluster."
-    issue: 476
-    cluster: policy-guardrails
-    mode: skip
-
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_output_ask_approve_surfaces_llm_reply
-    reason: "Shard 3 bulk: REPL output ask-approve family."
-    issue: 532
-    cluster: repl-pexpect-cli
+    reason: "OUTPUT-phase ASK banner does not surface in the REPL (#763): expect('approval required') times out 60/60. Same surfacing gap as TOOL_CALL."
+    issue: 763
+    cluster: repl-policy-ask-surfacing
     mode: skip
 
-  - id: tests/e2e/omnigent/test_run_omnigent_os_env_inherit.py::test_run_omnigent_propagates_os_env_inherit_to_spawned_worker[codex]
-    reason: "Shard 3 bulk: os_env propagation, codex variant. Same #426 family."
-    issue: 426
-    cluster: runner-wedge-subprocess-fanout
-    mode: skip
-
-  - id: tests/e2e/test_async_tools_e2e.py::test_async_tool_failure_surfaces_e2e
-    reason: "Shard 3 bulk: async-tool failure surfacing."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
-    mode: skip
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_output_ask_refuse_replaces_reply_with_sentinel
-    reason: "Shard 3 bulk: REPL output ask-refuse family."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
-  - id: tests/e2e/omnigent/test_run_omnigent_example_agents.py::test_run_omnigent_example_yaml[agent_with_tools_calculate]
-    reason: "Flaky on gateway flake-stress (7/8 pass); intermittent tool/harness behavior, keep suppressed until stable."
-    issue: 532
-    cluster: run-ap-examples-harness
-    mode: skip
-
-  - id: tests/e2e/test_sys_terminal_e2e.py::test_sys_terminal_basic_round_trip_e2e
-    reason: "Shard 3 bulk: sys-terminal basic round-trip. Same sys-terminal family."
-    issue: 532
-    cluster: terminal-d6
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_run_omnigent_example_agents.py::test_run_omnigent_example_yaml[agent_with_subagent_session]
-    reason: "Shard 3 bulk: run_omnigent example-yaml agent_with_subagent_session."
-    issue: 532
-    cluster: subagent-supervisor-routing
-    mode: skip
-
-  - id: tests/e2e/test_sys_terminal_e2e.py::test_sys_terminal_ten_parallel_dispatches_complete_e2e
-    reason: "Shard 3 bulk: sys-terminal 10-parallel-dispatch. Same family."
-    issue: 532
-    cluster: terminal-d6
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_run_omnigent_example_agents.py::test_run_omnigent_example_yaml[coding_supervisor_with_forks]
-    reason: "Shard 3 bulk: run_omnigent example-yaml coding_supervisor_with_forks."
-    issue: 532
-    cluster: subagent-supervisor-routing
+    reason: "OUTPUT-phase ASK banner does not surface in the REPL (#763): expect('approval required') times out 60/60. Same surfacing gap as TOOL_CALL."
+    issue: 763
+    cluster: repl-policy-ask-surfacing
     mode: skip
 
   - id: tests/e2e/omnigent/test_repl_inline_tool_streaming.py::test_repl_inline_tool_call_and_result_streaming
-    reason: "Shard 3 bulk: REPL inline tool-call streaming."
-    issue: 532
+    reason: "REPL inline tool-call streaming."
+    issue: 523
     cluster: repl-pexpect-cli
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_run_omnigent_quiet_startup.py::test_run_prompt_mode_is_headless_for_local_agent
-    reason: "fixture uses claude-sdk harness which 401s on the gateway (~/.databrickscfg auth); needs a gateway-compatible harness/model."
-    issue: 532
-    cluster: run-ap-examples-harness
     mode: skip
 
   - id: tests/e2e/omnigent/test_run_harness_without_agent_e2e.py::test_run_harness_without_agent_live_repl_round_trip[codex]
-    reason: "Shard 3 bulk: no-AGENT harness round-trip, codex variant; same family as [claude-sdk], [openai-agents]."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
-  - id: tests/e2e/test_d6_parallel_fan_out_e2e.py::test_async_client_tools_fan_out_in_parallel
-    reason: "Shard 3 bulk: D6 parallel client-tool fan-out. Same D6 server-side terminal-event family."
-    issue: 532
-    cluster: terminal-d6
+    reason: "No-AGENT `omnigent run --harness` live round-trip hangs >180s in CI -> xdist worker crash; codex fails 6/6 in flake-stress 27808990899. Same post-auth round-trip hang as the [claude-sdk]/[openai-agents] siblings (locally codex fast-fails on the databricks auth-command instead, an oss-OAuth repro artifact, not the CI failure). See [claude-sdk] entry for the full diagnosis."
+    issue: 523
+    cluster: no-agent-harness-roundtrip-hang
     mode: skip
 
-  - id: tests/e2e/test_sys_async_inbox_e2e.py::test_sys_read_inbox_str_branch_routes_without_crash_e2e
-    reason: "Shard 3 bulk: sys async-inbox str-branch routing."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
-    mode: skip
-
-  - id: tests/e2e/test_sys_async_inbox_harness_e2e.py::test_sys_call_async_harness_path_returns_handle_e2e
-    reason: "Shard 3 bulk: sys async-inbox harness path returns handle."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
-    mode: skip
-
-  - id: tests/e2e/test_steering_during_async_drain_e2e.py::test_steering_breaks_blocked_async_drain
-    reason: "Shard 3 bulk: steering breaks blocked async drain."
-    issue: 532
-    cluster: steering-cancel-compaction-state
-    mode: skip
-
-  - id: tests/e2e/test_sub_agent_async_client_tool_routing_e2e.py::test_sub_agent_async_client_tool_signal_routes_to_worker_drain
-    reason: "Shard 3 bulk: sub-agent async client-tool signal routing."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
-    mode: skip
-
-  # ── Shard 3 errors (collection / fixture-level) ──
-
-  - id: tests/e2e/test_async_tools_e2e.py::test_mixed_sync_and_async_tools_e2e
-    reason: "Follow-up: delayed_echo marker missing; inbox empty when test expected the async result."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
-    mode: skip
-
-  - id: tests/e2e/test_sys_terminal_e2e.py::test_sys_terminal_omnigent_yaml_threaded_through_e2e
-    reason: "Follow-up: sys-terminal omnigent-yaml threaded through. sys-terminal cluster."
-    issue: 532
-    cluster: terminal-d6
-    mode: skip
-
-  - id: tests/e2e/test_sys_terminal_e2e.py::test_sys_terminal_full_workflow_e2e
-    reason: "Follow-up: sys-terminal full workflow. sys-terminal cluster."
-    issue: 532
-    cluster: terminal-d6
-    mode: skip
-
-  - id: tests/e2e/test_sys_terminal_e2e.py::test_sys_terminal_repl_tool_call_render_no_mcp_prefix_no_duplicates_e2e
-    reason: "Follow-up: sys-terminal REPL tool-call render. sys-terminal cluster."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
   - id: tests/e2e/omnigent/test_repl_session_lifecycle.py::test_repl_effort_command_persists_session_metadata
-    reason: "Nightly bulk: REPL session-lifecycle / pexpect cluster."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_repl_session_lifecycle.py::test_repl_full_session_lifecycle
-    reason: "Nightly bulk: REPL session-lifecycle / pexpect cluster."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_repl_session_lifecycle.py::test_repl_local_mode_launches_runner_subprocess
-    reason: "Nightly bulk: REPL session-lifecycle / pexpect cluster."
-    issue: 532
+    reason: "REPL session-lifecycle / pexpect cluster."
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
 
   - id: tests/e2e/omnigent/test_repl_session_lifecycle.py::test_repl_recover_after_runner_death
-    reason: "Nightly bulk: REPL session-lifecycle / pexpect cluster."
-    issue: 532
+    reason: "REPL session-lifecycle / pexpect cluster."
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
 
   - id: tests/e2e/omnigent/test_repl_session_lifecycle.py::test_repl_resume_reuses_daemon_runner
-    reason: "Nightly bulk: REPL session-lifecycle / pexpect cluster."
-    issue: 532
+    reason: "REPL session-lifecycle / pexpect cluster."
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
-
-  - id: tests/e2e/omnigent/test_run_omnigent_coding_supervisor.py::test_run_omnigent_coding_supervisor_interactive_enters_repl
-    reason: "Nightly bulk: run_omnigent CLI cluster."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_server_remote_omnigent_autonomous_flows.py::test_manual_server_remote_omnigent_notify_when_idle_does_not_hang_and_delivers
-    reason: "Nightly bulk: server-remote-ap autonomous flows; pexpect timeout family."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_server_remote_omnigent_autonomous_flows.py::test_manual_server_remote_omnigent_sys_timer_set_does_not_hang_and_fires
-    reason: "Nightly bulk: server-remote-ap autonomous flows; pexpect timeout family."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
-  - id: tests/e2e/test_claude_coder_client_tools.py::test_claude_sdk_parks_client_tool_call
-    reason: "Nightly bulk: claude-coder client-tool park."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
-    mode: skip
-
-  - id: tests/e2e/test_policies_e2e.py::test_streaming_api_explicit_decline_denies
-    reason: "Nightly bulk: policy cluster (409 conflict / SSE content-type mismatch)."
-    issue: 532
-    cluster: policy-guardrails
-    mode: skip
-
-  - id: tests/e2e/test_policies_e2e.py::test_streaming_api_malformed_verdict_rejected_by_route
-    reason: "Nightly bulk: policy cluster (409 conflict / SSE content-type mismatch)."
-    issue: 532
-    cluster: policy-guardrails
-    mode: skip
-
-  - id: tests/e2e/test_web_search_async_dispatch_e2e.py::test_web_search_async_dispatch_completes_on_non_openai_model
-    reason: "Nightly bulk: web-search async dispatch (409 conflict)."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
-    mode: skip
-
-  # ── Bulk-quarantine round 3 (2026-05-18, run 26017551154) ──
-  # 20 tests across all 4 shards. Agent setup migrated from
-  # POST /api/agents to multipart POST /v1/sessions in #1559.
-  # 2 are the existing files-upload 409 'conversation not bound
-  # to a runner' family. Triage under #532.
-
-  - id: tests/e2e/test_filesystem_changed_files_e2e.py::test_diff_endpoint_shows_git_diff_for_modified_file
-    reason: "Failing deterministically on `main` and across multiple feature branches: 3 of 5 most recent E2E runs reported `Agent turn failed with status 'failed'. The workspace-file-writer agent did not complete successfully.` Likely a regression in the workspace-file-writer agent spec or its dispatch; needs owner investigation before un-quarantining."
-    issue: 532
-    cluster: files-uploads-attachments
-    mode: skip
-
-  # ── Re-quarantined after #1141 path sweep (2026-05-21) ──
-  # PR #1141 fixed examples/*.yaml → tests/resources/examples/*.yaml
-  # and dropped 33 manifest entries on the affected files. Of those
-  # 33, the path fix unblocked some (now passing) and revealed new
-  # failure modes for others. The block below re-adds the still-
-  # failing ones with accurate reasons so CI doesn't re-discover
-  # them every run.
 
   - id: tests/e2e/omnigent/test_repl_multiline.py::test_repl_multiline_ctrl_j_insert
     reason: "Kept suppressed as a known shard-load/worker-killer heavy pexpect test pending a dedicated round."
-    issue: 532
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
 
   - id: tests/e2e/omnigent/test_repl_ctrl_g_overview.py::test_repl_ctrl_g_overview_toggle
     reason: "REPL pexpect TIMEOUT post-path-fix: openai-agents+gpt-5-mini turn exceeds 60s pexpect deadline on ai-oss. Original skip reason still applies after #1141."
-    issue: 532
+    issue: 523
     cluster: model-gateway-compat
     mode: skip
 
   - id: tests/e2e/omnigent/test_repl_model_e2e.py::test_repl_model_command_show_set_reset
     reason: "REPL pexpect TIMEOUT post-path-fix: /model success line not appearing in pexpect after Rich markup output. Needs REPL output-capture investigation."
-    issue: 532
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
 
   - id: tests/e2e/omnigent/test_repl_overview_terminal_visibility.py::test_repl_overview_terminal_visibility
     reason: "REPL pexpect TIMEOUT post-path-fix. Same family as test_repl_ctrl_g_overview."
-    issue: 532
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
 
   - id: tests/e2e/omnigent/test_repl_overview_subagent_visibility.py::test_repl_overview_subagent_visibility[claude-sdk]
     reason: "Suspected worker-death contributor on shard 0 alongside test_repl_multiline_ctrl_j_insert. Investigate together."
-    issue: 532
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
 
   - id: tests/e2e/omnigent/test_repl_overview_subagent_visibility.py::test_repl_overview_subagent_visibility[codex]
     reason: "Same family as the [claude-sdk] variant; suspected worker-death contributor on shard 0."
-    issue: 532
+    issue: 523
     cluster: repl-pexpect-cli
     mode: skip
 
   - id: tests/e2e/omnigent/test_yaml_hello_world.py::test_yaml_agent_with_tools[claude-sdk]
     reason: "Tool-call lifecycle markers ('◦ calculate' / '• calculate') not rendering to stdout after path fix; harness answers '3 + 4 = 7' directly without invoking the calculate tool, so the snapshot's stdout-contains-'calculate' check fails. Investigate per-harness tool surfacing."
-    issue: 532
+    issue: 677
     cluster: repl-pexpect-cli
     mode: skip
 
   - id: tests/e2e/omnigent/test_yaml_hello_world.py::test_yaml_agent_with_tools[codex]
-    reason: "Same tool-call-rendering issue as the [claude-sdk] variant: codex says 'I'll compute it with the calculator tool now.7' but no '◦ calculate' lifecycle marker appears in stdout."
-    issue: 532
+    reason: "Snapshot mismatch on the tool-call lifecycle markers (◦ calculate / • calculate) not rendered to stdout in oneshot mode. Fails consistently 30/30 in flake-stress run 27798661226 (not flaky). See #677."
+    issue: 677
     cluster: run-ap-examples-harness
     mode: skip
 
   - id: tests/e2e/omnigent/test_yaml_hello_world.py::test_yaml_agent_with_tools[openai-agents]
-    reason: "Flaky on gateway flake-stress (7/8 pass); intermittent tool-call lifecycle rendering, keep suppressed until stable."
-    issue: 532
+    reason: "Snapshot mismatch on the tool-call lifecycle markers (◦/• calculate) not rendered to stdout in oneshot mode. Fails consistently 30/30 in flake-stress run 27798661226 (was logged 7/8-flaky; now consistent). Same cause as the [codex] variant — see #677."
+    issue: 677
     cluster: run-ap-examples-harness
-    mode: skip
-
-  # ──────────────────────────────────────────────────────────────
-  # Force-merge regression backlog (2026-05-22 → 2026-05-25).
-  # Tests consistently failing 3-of-3 on main runs sampled in
-  # the window. Clustered by likely shared root cause; each
-  # cluster is one investigation, not N.
-  #
-  # Per-test ``reason`` lines record the first main run where
-  # each test was observed failing. These are the FIRST RUN that
-  # reached the test on broken main -- not necessarily the
-  # introducing commit. Several mechanisms create gaps in CI
-  # signal during this window:
-  #
-  # 1. Earlier runs got cancelled by GH Actions' concurrency
-  #    cancel-in-progress when a newer commit landed. The CI
-  #    workflow had ~14 consecutive cancelled runs between
-  #    2026-05-23 00:35 and 06:06 (5.5 hours) because force-merges
-  #    fired in rapid succession.
-  # 2. E2E shards timed out before reaching some tests.
-  #
-  # First-failing-commit distribution (raw -- read with the
-  # caveat above):
-  #   305e9bb9 (#1329, "README: quick-start nits")    35 tests
-  #   1a515983 (#1340, "setup: scrub auth env vars")   6 tests
-  #   2fe283bf (#1188, "refactor - remove DBOS")       3 tests
-  #   801c389c (#1302, "persist runtime-native ...")   3 tests
-  #   ab620102 (#1305, "publish session.status ...")   3 tests
-  #   0449cd1a (#1246, "perf(sessions): kill N+1 ...") 1 test
-  #   4d60bca0 (#1312, "remove OMNIGENT_NO_DBOS")    1 test
-  #   (no SHA -- flaky-on-main, not pinned)  8 tests
-  #
-  # The 35-test cluster at #1329 is the most distorted one. A
-  # README change can't break 35 tests; #1329 is just the first
-  # CI run after the cancelled-run gap that actually reached
-  # those tests. The actual introducing-commit window is
-  # ab620102..305e9bb9 (2026-05-23 00:35 - 06:06):
-  #
-  # * The sessions-cluster tests (16) passed at ab620102 (Pytest
-  #   server-rest reported success). They broke
-  #   somewhere in the next 14 commits, almost all of which had
-  #   their CI runs cancelled, so we have no per-commit signal.
-  #   Strongest candidates given the affected modules:
-  #     #1302 (801c389c) -- persist runtime-native session id
-  #                         as conversations.external_session_id
-  #     #1312 (4d60bca0) -- remove OMNIGENT_NO_DBOS override
-  #
-  # * The earliest first-failing sha for ANY test in this set is
-  #   2fe283bf (#1188 "refactor - remove DBOS") at 00:08,
-  #   immediately after the last green E2E run (a6de1763 at
-  #   2026-05-22T07:13). #1188 is the strongest candidate for
-  #   the bulk regression source for the E2E-side breakage; a
-  #   bisect on a6de1763..2fe283bf would confirm.
-  #
-  # Issue: 0 = needs umbrella issue filed; replace with a real
-  # tracking issue per cluster as triage proceeds.
-  # ──────────────────────────────────────────────────────────────
-
-  # Cluster: server-integration sessions endpoints (likely one
-  # regression broke the whole module — fork, interrupt, reasoning
-  # effort, runner-state, repl-adapter, title-seeding all flipped
-  # red together).
-  # Cluster: policy / canada classifier. Related to existing #483
-  # (prompt-policy sub-executor routing), but the regression now
-  # spans more harness parametrizations than #483 originally listed.
-  - id: tests/e2e/omnigent/test_yaml_policies.py::test_yaml_policies_blocks_canada_input[claude-sdk]
-    reason: "Force-merge backlog (canada-policy cluster, related to #483). First observed failing at ab620102 (2026-05-23T00:33:55Z, E2E)."
-    issue: 483
-    cluster: policy-guardrails
-    mode: skip
-  - id: tests/e2e/omnigent/test_yaml_policies.py::test_yaml_policies_blocks_canada_input[codex]
-    reason: "Force-merge backlog (canada-policy cluster, related to #483). First observed failing at 2fe283bf (2026-05-23T00:08:54Z, E2E)."
-    issue: 483
-    cluster: policy-guardrails
-    mode: skip
-  - id: tests/e2e/omnigent/test_yaml_policies.py::test_yaml_policies_blocks_canada_input[openai-agents]
-    reason: "Force-merge backlog (canada-policy cluster, related to #483). First observed failing at 801c389c (2026-05-23T00:35:30Z, E2E)."
-    issue: 483
-    cluster: policy-guardrails
-    mode: skip
-  # Cluster: claude_coder sandbox enforcement. All 5 tests in
-  # test_claude_coder_sandbox.py flipped together — suggests the
-  # sandbox enforcement path or its fixture regressed.
-  - id: tests/e2e/test_claude_coder_sandbox.py::test_edit_blocked_outside_workspace
-    reason: "Sandbox enforcement e2e: claude-sdk harness needs the claude CLI, which is not on PATH after the linux_bwrap sandbox re-exec under flake-stress (FileNotFoundError .../node_modules/.bin/claude). Migration to sessions API is done but live validation must happen in the e2e.yml shard, not flake-stress. Kept suppressed pending that."
-    issue: 0
-    cluster: sandbox-deps-env
-    mode: skip
-  - id: tests/e2e/test_claude_coder_sandbox.py::test_glob_blocked_outside_workspace
-    reason: "Sandbox enforcement e2e: claude-sdk harness needs the claude CLI, which is not on PATH after the linux_bwrap sandbox re-exec under flake-stress (FileNotFoundError .../node_modules/.bin/claude). Migration to sessions API is done but live validation must happen in the e2e.yml shard, not flake-stress. Kept suppressed pending that."
-    issue: 0
-    cluster: sandbox-deps-env
-    mode: skip
-  - id: tests/e2e/test_claude_coder_sandbox.py::test_read_blocked_outside_workspace
-    reason: "Sandbox enforcement e2e: claude-sdk harness needs the claude CLI, which is not on PATH after the linux_bwrap sandbox re-exec under flake-stress (FileNotFoundError .../node_modules/.bin/claude). Migration to sessions API is done but live validation must happen in the e2e.yml shard, not flake-stress. Kept suppressed pending that."
-    issue: 0
-    cluster: sandbox-deps-env
-    mode: skip
-  - id: tests/e2e/test_claude_coder_sandbox.py::test_write_blocked_outside_workspace
-    reason: "Sandbox enforcement e2e: claude-sdk harness needs the claude CLI, which is not on PATH after the linux_bwrap sandbox re-exec under flake-stress (FileNotFoundError .../node_modules/.bin/claude). Migration to sessions API is done but live validation must happen in the e2e.yml shard, not flake-stress. Kept suppressed pending that."
-    issue: 0
-    cluster: sandbox-deps-env
-    mode: skip
-  - id: tests/e2e/test_claude_coder_sandbox.py::test_write_succeeds_inside_workspace
-    reason: "Sandbox enforcement e2e: claude-sdk harness needs the claude CLI, which is not on PATH after the linux_bwrap sandbox re-exec under flake-stress (FileNotFoundError .../node_modules/.bin/claude). Migration to sessions API is done but live validation must happen in the e2e.yml shard, not flake-stress. Kept suppressed pending that."
-    issue: 0
-    cluster: sandbox-deps-env
-    mode: skip
-
-  # Standalone failures — no obvious cluster yet.
-  - id: tests/e2e/omnigent/test_compaction_sessions_native_e2e.py::test_compaction_fires_and_agent_retains_context
-    reason: "Force-merge backlog (standalone). First observed failing at 801c389c (2026-05-23T00:35:30Z, E2E)."
-    issue: 0
-    cluster: steering-cancel-compaction-state
-    mode: skip
-  - id: tests/e2e/omnigent/test_repl_session_lifecycle.py::test_repl_reasoning_effort_threads_through
-    reason: "Force-merge backlog (standalone). First observed failing at 305e9bb9 (2026-05-23T06:06:59Z, E2E)."
-    issue: 0
-    cluster: repl-pexpect-cli
-    mode: skip
-  - id: tests/e2e/test_filesystem_changed_files_e2e.py::test_filesystem_changes_appear_after_agent_write
-    reason: "Force-merge backlog (standalone). First observed failing at 305e9bb9 (2026-05-23T06:06:59Z, E2E)."
-    issue: 0
-    cluster: files-uploads-attachments
-    mode: skip
-  - id: tests/e2e/omnigent/test_run_omnigent_coding_supervisor.py::test_run_omnigent_coding_supervisor_codex_shell_not_disabled
-    reason: "Flaky e2e: codex worker doesn't read fixture file — shell_tool regression or supervisor delegation failure."
-    issue: 0
-    cluster: subagent-supervisor-routing
-    mode: skip
-
-  # ──────────────────────────────────────────────────────────────
-  # ──────────────────────────────────────────────────────────────
-  # openai-agents empty-output cluster RESURFACED on `main` (2026-06-09,
-  # #2707). The 8 tests #2725 unquarantined (after the harness empty-turn
-  # retry/fail-loud fix) are crashing again on the gpt-5-4 gateway —
-  # e.g. test_single_sub_agent_e2e — so they are red/annoying for everyone
-  # on main. Re-quarantining as `skip` to stop the bleeding while the
-  # gateway condition is investigated; these are heavy e2e turns that can
-  # also wedge the loadscope shard, so skip (not xfail). The separate
-  # attempt to route this cluster onto databricks-gpt-5-5 (#2736) is being
-  # tackled independently — this quarantine is not blocked on it.
-  # ──────────────────────────────────────────────────────────────
-  - id: tests/e2e/test_sub_agent_phase3_e2e.py::test_single_sub_agent_e2e
-    reason: "openai-agents empty-output/crash resurfaced on the gateway (#2707)."
-    issue: 2707
-    cluster: openai-agents-empty-output
-    mode: skip
-  - id: tests/e2e/test_sub_agent_phase3_e2e.py::test_parallel_sub_agents_e2e
-    reason: "openai-agents empty-output/crash resurfaced on the gateway (#2707)."
-    issue: 2707
-    cluster: openai-agents-empty-output
-    mode: skip
-  - id: tests/e2e/test_sub_agent_phase3_e2e.py::test_mixed_sub_agent_and_async_tool_e2e
-    reason: "researcher sub-agent result never delivered before the parent replied; same gateway-side sub-agent flake family as its quarantined siblings (#2707). Seen on PR #2914."
-    issue: 2707
-    cluster: openai-agents-empty-output
-    mode: skip
-  - id: tests/e2e/test_coder_subagent.py::test_coder_spawns_reviewer_and_collects
-    reason: "openai-agents empty-output/crash resurfaced on the gateway (#2707)."
-    issue: 2707
-    cluster: openai-agents-empty-output
-    mode: skip
-  - id: tests/e2e/test_subagent_autowake_e2e.py::test_subagent_completion_auto_wakes_idle_parent
-    reason: "openai-agents empty-output/crash resurfaced on the gateway (#2707)."
-    issue: 2707
-    cluster: openai-agents-empty-output
-    mode: skip
-  - id: tests/e2e/test_subagent_autowake_e2e.py::test_subagent_completion_auto_wakes_parent_on_a_second_round
-    reason: "Pre-existing unsuppressed flake: gw0 worker crash under full e2e shard (xdist/loadscope); surfaced alongside #421 but independent of it. Heavy subagent autowake e2e."
-    issue: 0
-    cluster: async-dispatch-inbox-sse
-    mode: skip
-  - id: tests/e2e/test_steering.py::test_steering_acknowledged
-    reason: "openai-agents empty-output/crash resurfaced on the gateway (#2707)."
-    issue: 2707
-    cluster: openai-agents-empty-output
-    mode: skip
-  - id: tests/e2e/test_steering.py::test_steering_during_multi_tool_iterations
-    reason: "openai-agents empty-output/crash resurfaced on the gateway (#2707)."
-    issue: 2707
-    cluster: openai-agents-empty-output
-    mode: skip
-  - id: tests/e2e/test_openai_coder_client_tools.py::test_openai_coder_lists_files_with_client_tools
-    reason: "openai-agents empty-output/crash resurfaced on the gateway (#2707)."
-    issue: 2707
-    cluster: openai-agents-empty-output
-    mode: skip
-  - id: tests/e2e/test_agent_update.py::test_update_agent_zero_downtime
-    reason: "openai-agents empty-output/crash resurfaced on the gateway (#2707)."
-    issue: 2707
-    cluster: openai-agents-empty-output
     mode: skip

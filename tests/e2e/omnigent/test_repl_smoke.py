@@ -39,7 +39,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from tests._model_pools import resolve_model
 from tests.e2e.omnigent._pexpect_harness import (
     await_turn_complete,
     clean_exit,
@@ -48,10 +47,9 @@ from tests.e2e.omnigent._pexpect_harness import (
     submit_prompt,
 )
 from tests.e2e.omnigent._snapshot import compare_snapshot
+from tests.e2e.omnigent.conftest import configure_mock_llm
 
-# openai-agents is used here for the same reason as the serve
-# test — no ``~/.databrickscfg`` patching required.
-_MODEL = resolve_model("databricks-gpt-5-mini", key=__name__)
+_MODEL = "mock-model"
 _HARNESS = "openai-agents"
 _PROMPT = "say hi in 5 words"
 
@@ -86,24 +84,27 @@ _EXIT_TIMEOUT = 15.0
 def test_repl_smoke_single_prompt(
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    omnigent_credentials_env: dict[str, str],
+    mock_credentials_env: dict[str, str],
+    mock_llm_server_url: str,
 ) -> None:
     """
     Spawn the REPL, type one prompt, assert assistant text
     renders, and exit cleanly on Ctrl+D.
 
-    Uses the ``_pexpect_harness`` helpers so the synchronization
-    details (state-bar expects, send-then-CR submission) live
-    in one place and this test reads as a narrative.
+    Uses the mock LLM server for deterministic responses.
 
     :param omnigent_python: Interpreter with omnigent +
         openai-agents installed.
     :param omnigent_repo_root: Working directory for the
         subprocess.
-    :param omnigent_credentials_env: Env vars with
-        ``OPENAI_API_KEY`` / ``OPENAI_BASE_URL`` /
-        ``DATABRICKS_CONFIG_PROFILE`` populated.
+    :param mock_credentials_env: Mock-LLM env vars.
+    :param mock_llm_server_url: Mock server URL for configuring
+        response queues.
     """
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "Hello there, how are you today?"}],
+    )
     yaml_path = omnigent_repo_root / "tests" / "resources" / "examples" / "hello_world.yaml"
 
     child = spawn_omnigent_run(
@@ -111,7 +112,7 @@ def test_repl_smoke_single_prompt(
         yaml_path=yaml_path,
         model=_MODEL,
         harness=_HARNESS,
-        env=omnigent_credentials_env,
+        env=mock_credentials_env,
         cwd=omnigent_repo_root,
         timeout=_SPAWN_TIMEOUT,
     )

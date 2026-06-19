@@ -224,6 +224,45 @@ async def test_handle_launch_refuses_unconfigured_harness(
     assert host._runners == {}
 
 
+async def test_handle_launch_native_cursor_message_points_at_cursor_installer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A native-Cursor refusal must name the ``cursor-agent`` installer and
+    login, not ``omnigent setup`` — which only configures the SDK ``cursor``
+    harness and never installs the ``cursor-agent`` CLI ``omni cursor`` boots.
+
+    Here ``harness_setup_hint`` is the real function (only the readiness check
+    is forced False), so this exercises the connect.py → hint wiring end to end.
+    """
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    monkeypatch.setattr(
+        "omnigent.host.connect.harness_is_configured",
+        lambda harness: False,
+    )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_cursor_native",
+        binding_token="token_abc",
+        workspace=str(workspace),
+        harness="cursor-native",
+    )
+    result = await host._handle_launch(frame)
+
+    assert result.status == "failed"
+    assert result.error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE
+    message = result.error or ""
+    assert "'cursor-native'" in message
+    assert "test-laptop" in message
+    assert "cursor.com/install" in message
+    assert "cursor-agent login" in message
+    assert "omnigent setup" not in message
+    assert host._runners == {}
+
+
 async def test_handle_launch_configured_harness_proceeds_to_spawn(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1016,6 +1055,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         "DATABRICKS_TOKEN": "dapi-secret",
         "AWS_SECRET_ACCESS_KEY": "aws-secret",
         "SOME_RANDOM_VAR": "x",
+        "OMNIGENT_CLAUDE_SDK_NO_SANDBOX": "1",
     }
 
     env = _build_runner_env(
@@ -1044,6 +1084,11 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     # needs it to allow --dangerously-skip-permissions under root in
     # sandbox containers. Only the baked host image ever sets it.
     assert env["IS_SANDBOX"] == "1"
+    # The claude-sdk sandbox bypass flag forwards — it is read inside the
+    # harness, so a bare ``OMNIGENT_CLAUDE_SDK_NO_SANDBOX=1 omnigent run …``
+    # must reach the runner without also forcing
+    # ``OMNIGENT_RUNNER_ENV_PASSTHROUGH=OMNIGENT_CLAUDE_SDK_NO_SANDBOX``.
+    assert env["OMNIGENT_CLAUDE_SDK_NO_SANDBOX"] == "1"
     # Non-harness secrets are stripped — the point of the allowlist.
     assert "DATABRICKS_TOKEN" not in env
     assert "AWS_SECRET_ACCESS_KEY" not in env

@@ -4888,3 +4888,77 @@ def test_compute_transcript_cumulative_cost_none_when_nothing_priceable(
         claude_native_bridge.compute_transcript_cumulative_cost(priced, include_sidechains=True)
         is None
     )
+
+
+def test_format_terminal_failure_tail_returns_empty_for_blank_pane() -> None:
+    """
+    A pane with no visible text yields no tail block.
+
+    :returns: None.
+    """
+    assert claude_native_bridge._format_terminal_failure_tail("   \n\n  ") == ""
+
+
+def test_format_terminal_failure_tail_includes_recent_error_lines() -> None:
+    """
+    The tail block carries the pane's trailing non-blank lines, so a
+    startup crash surfaces in the readiness-timeout error.
+
+    :returns: None.
+    """
+    pane = "ERROR  JSON Parse error: Unrecognized token '<'\n  at <parse> (:0)\n"
+    tail = claude_native_bridge._format_terminal_failure_tail(pane)
+    assert tail.startswith(" Last terminal output:\n")
+    assert "JSON Parse error: Unrecognized token '<'" in tail
+
+
+def test_format_terminal_failure_tail_caps_length(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A very long pane is truncated to the configured character cap.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TERMINAL_FAILURE_TAIL_CHARS", 50)
+    pane = "\n".join(f"line {i}" for i in range(100))
+    tail = claude_native_bridge._format_terminal_failure_tail(pane)
+    body = tail.split("\n", 1)[1]
+    assert body.startswith("…")
+    # Leading ellipsis marker plus at most the configured character cap.
+    assert len(body) <= 51
+
+
+def test_wait_for_claude_prompt_ready_surfaces_terminal_output_on_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    On a readiness timeout, the RuntimeError carries Claude Code's own
+    terminal output (e.g. a startup ``JSON Parse error``) so the cause
+    surfaces in the web UI error banner, not only in the terminal.
+
+    Without the tail, the user sees a generic "terminal did not become
+    ready" timeout in the UI while the actual crash sits unread in the
+    terminal pane.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    crash_pane = (
+        "ERROR  JSON Parse error: Unrecognized token '<'\n"
+        "  at <parse> (:0)\n"
+        "  at parse (unknown)\n"
+    )
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge._capture_pane",
+        lambda socket_path, tmux_target: crash_pane,
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=0.0,
+        )
+    message = str(excinfo.value)
+    assert "did not become ready" in message
+    assert "Last terminal output:" in message
+    assert "JSON Parse error: Unrecognized token '<'" in message

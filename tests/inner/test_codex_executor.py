@@ -308,6 +308,7 @@ class TestCodexExecutor(unittest.TestCase):
             patch("omnigent.inner.codex_executor._find_codex_cli", return_value="/usr/bin/codex"),
             patch.dict("os.environ", {}, clear=True),
             patch("omnigent.inner.codex_executor._read_databrickscfg", return_value=None),
+            patch("omnigent.inner.codex_executor._read_databrickscfg_host", return_value=None),
         ):
             with self.assertRaises(EnvironmentError):
                 CodexExecutor(gateway=True)

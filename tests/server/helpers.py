@@ -191,6 +191,7 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.vcpus: int | None = None
         self.memory_mb: int | None = None
         self.disk_gb: int | None = None
+        self.cluster: str | None = None
         self.prepared = False
         self.provisioned_names: list[str] = []
         self.commands: list[str] = []
@@ -412,6 +413,37 @@ def install_fake_e2b_launcher(
         return fake
 
     monkeypatch.setattr(e2b_mod, "E2BSandboxLauncher", _ctor)
+
+
+def install_fake_openshell_launcher(
+    monkeypatch: Any,  # pytest.MonkeyPatch — Any avoids importing pytest in a helpers module
+    fake: FakeSandboxLauncher,
+) -> None:
+    """
+    Substitute the fake for ``OpenShellSandboxLauncher`` at its public seam.
+
+    The managed flow constructs ``OpenShellSandboxLauncher(image=…,
+    env=…, cluster=…)``; the shim records those constructor args on the
+    fake and hands it back, so production code runs unmodified against it.
+
+    :param monkeypatch: The test's ``pytest.MonkeyPatch``.
+    :param fake: The fake launcher to substitute.
+    """
+    import omnigent.onboarding.sandboxes.openshell as openshell_mod
+
+    def _ctor(
+        *,
+        image: str | None = None,
+        env: list[str] | None = None,
+        cluster: str | None = None,
+    ) -> FakeSandboxLauncher:
+        """Stand-in constructor recording the construction wiring."""
+        fake.image = image
+        fake.env = env
+        fake.cluster = cluster
+        return fake
+
+    monkeypatch.setattr(openshell_mod, "OpenShellSandboxLauncher", _ctor)
 
 
 async def wait_for_completion(

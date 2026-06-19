@@ -251,7 +251,7 @@ def _polly_parent_id(base_url: str) -> str:
 
 
 def test_polly_dispatches_distinct_models_per_worker(
-    local_polly_server: str, reap_spawned_terminals: None
+    local_polly_server: str, reap_spawned_terminals: None, using_mock_llm: bool
 ) -> None:
     """
     One turn, three workers, three different explicit models — each child row
@@ -265,7 +265,13 @@ def test_polly_dispatches_distinct_models_per_worker(
 
     :param local_polly_server: Base URL of the in-tree local server fixture.
     :param reap_spawned_terminals: Teardown fixture for native terminals.
+    :param using_mock_llm: Whether mock LLM mode is active.
     """
+    if using_mock_llm:
+        pytest.skip(
+            "polly sub-agent model e2e requires real model inference and real "
+            "subprocess omnigent run invocations; not feasible under mock LLM"
+        )
     result = _run_polly_turn(local_polly_server, _DISPATCH_PROMPT)
     assert result.returncode == 0, (
         f"polly run exited {result.returncode}\n--- stdout ---\n{result.stdout}\n"
@@ -295,7 +301,7 @@ def test_polly_dispatches_distinct_models_per_worker(
 
 
 def test_polly_rejects_cross_family_model_dispatch(
-    local_polly_server: str, reap_spawned_terminals: None
+    local_polly_server: str, reap_spawned_terminals: None, using_mock_llm: bool
 ) -> None:
     """
     A GPT model on ``claude_code`` fails loud at dispatch and creates NO child.
@@ -306,7 +312,13 @@ def test_polly_rejects_cross_family_model_dispatch(
 
     :param local_polly_server: Base URL of the in-tree local server fixture.
     :param reap_spawned_terminals: Teardown fixture for native terminals.
+    :param using_mock_llm: Whether mock LLM mode is active.
     """
+    if using_mock_llm:
+        pytest.skip(
+            "polly sub-agent model e2e requires real model inference and real "
+            "subprocess omnigent run invocations; not feasible under mock LLM"
+        )
     result = _run_polly_turn(local_polly_server, _VIOLATION_PROMPT)
     assert result.returncode == 0, (
         f"polly run exited {result.returncode}\n--- stdout ---\n{result.stdout}\n"
@@ -333,7 +345,7 @@ def test_polly_rejects_cross_family_model_dispatch(
 
 
 def test_polly_lists_models_then_dispatches_pi_from_list(
-    local_polly_server: str, reap_spawned_terminals: None
+    local_polly_server: str, reap_spawned_terminals: None, using_mock_llm: bool
 ) -> None:
     """
     The brain enumerates models via ``sys_list_models`` and dispatches pi
@@ -348,7 +360,13 @@ def test_polly_lists_models_then_dispatches_pi_from_list(
 
     :param local_polly_server: Base URL of the in-tree local server fixture.
     :param reap_spawned_terminals: Teardown fixture for native terminals.
+    :param using_mock_llm: Whether mock LLM mode is active.
     """
+    if using_mock_llm:
+        pytest.skip(
+            "polly sub-agent model e2e requires real model inference and real "
+            "subprocess omnigent run invocations; not feasible under mock LLM"
+        )
     result = _run_polly_turn(local_polly_server, _LIST_THEN_DISPATCH_PROMPT)
     assert result.returncode == 0, (
         f"polly run exited {result.returncode}\n--- stdout ---\n{result.stdout}\n"
@@ -405,7 +423,7 @@ _CANONICAL_DISPATCH_PROMPT = (
 
 
 def test_polly_canonical_id_localized_for_gateway_child(
-    local_polly_server: str, reap_spawned_terminals: None
+    local_polly_server: str, reap_spawned_terminals: None, using_mock_llm: bool
 ) -> None:
     """
     A canonical vendor id (``claude-opus-4-8``) sent to a gateway-routed
@@ -419,7 +437,13 @@ def test_polly_canonical_id_localized_for_gateway_child(
 
     :param local_polly_server: Base URL of the in-tree local server fixture.
     :param reap_spawned_terminals: Teardown fixture for native terminals.
+    :param using_mock_llm: Whether mock LLM mode is active.
     """
+    if using_mock_llm:
+        pytest.skip(
+            "polly sub-agent model e2e requires real model inference and real "
+            "subprocess omnigent run invocations; not feasible under mock LLM"
+        )
     result = _run_polly_turn(local_polly_server, _CANONICAL_DISPATCH_PROMPT)
     assert result.returncode == 0, (
         f"polly run exited {result.returncode}\n--- stdout ---\n{result.stdout}\n"

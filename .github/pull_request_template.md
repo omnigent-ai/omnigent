@@ -1,11 +1,23 @@
 <!--
 For AI-written descriptions:
-- Follow this template (Summary, Type of change, Test coverage, Coverage rationale).
+- Follow this template (Related issue, Summary, Type of change, Test coverage, Coverage rationale).
 - Keep it concise; reviewers skim long descriptions.
 - For non-trivial changes, include an ELI5 and a diagram (ASCII or mermaid).
 - Leave every checkbox in place. The PR Template check fails if required sections
   or checkbox rows are removed.
 -->
+
+## Related issue
+
+<!--
+Link the issue this PR addresses with a closing keyword so GitHub auto-links it
+(and closes it on merge): e.g. `Closes #123`. One issue per PR. If an older,
+still-open community PR already closes the same issue, the newer one may be
+auto-closed as a duplicate (maintainer PRs are exempt). Use `N/A` for
+chores/docs with no associated issue.
+-->
+
+Closes #
 
 ## Summary
 

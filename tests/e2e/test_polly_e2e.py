@@ -181,7 +181,9 @@ def local_polly_server(tmp_path: Path) -> Iterator[str]:
             proc.kill()
 
 
-def test_polly_orchestrator_boots_and_responds(local_polly_server: str) -> None:
+def test_polly_orchestrator_boots_and_responds(
+    local_polly_server: str, using_mock_llm: bool
+) -> None:
     """
     ``omnigent run examples/polly --server <local> -p <prompt>``
     (with the ``oss`` profile supplied via the global-config auth block)
@@ -195,7 +197,13 @@ def test_polly_orchestrator_boots_and_responds(local_polly_server: str) -> None:
     auth fix — so this is the regression guard for the substrate.
 
     :param local_polly_server: Base URL of the in-tree local server fixture.
+    :param using_mock_llm: Whether mock LLM mode is active.
     """
+    if using_mock_llm:
+        pytest.skip(
+            "polly orchestrator e2e requires real model inference via claude-sdk "
+            "and real subprocess omnigent run invocations; not feasible under mock LLM"
+        )
     result = subprocess.run(
         [
             sys.executable,

@@ -82,6 +82,7 @@ def test_terminal_multi_command_workflow(
     sys_terminal_test_agent: str,
     http_client: httpx.Client,
     live_runner_id: str,
+    using_mock_llm: bool,
 ) -> None:
     """Multi-command developer workflow: run a command, see output,
     follow up with another command that references the first.
@@ -93,6 +94,11 @@ def test_terminal_multi_command_workflow(
     the second marker appears and ideally the same terminal was
     reused (no second launch).
     """
+    if using_mock_llm:
+        pytest.skip(
+            "terminal-driven dev tests require real tmux interaction and a real "
+            "LLM to drive the terminal tools; not feasible under mock LLM"
+        )
     session_id = create_runner_bound_session(
         http_client,
         agent_name=sys_terminal_test_agent,
@@ -180,6 +186,7 @@ def test_terminal_persists_across_turns(
     sys_terminal_test_agent: str,
     http_client: httpx.Client,
     live_runner_id: str,
+    using_mock_llm: bool,
 ) -> None:
     """Terminal state (tmux session) persists between agent turns.
 
@@ -196,6 +203,11 @@ def test_terminal_persists_across_turns(
     test also validates that the agent can reuse the terminal
     without relaunching.
     """
+    if using_mock_llm:
+        pytest.skip(
+            "terminal persistence test requires real tmux interaction and a real "
+            "LLM to drive the terminal tools; not feasible under mock LLM"
+        )
     session_id = create_runner_bound_session(
         http_client,
         agent_name=sys_terminal_test_agent,

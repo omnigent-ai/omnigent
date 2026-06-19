@@ -48,6 +48,7 @@ from omnigent.host.git_worktree import (
     remove_worktree,
 )
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
+from omnigent.onboarding.harness_install import harness_setup_hint
 from omnigent.onboarding.harness_readiness import (
     configured_harness_map,
     harness_is_configured,
@@ -269,13 +270,22 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # …" for a key the CLI just saved to the file. Not a secret (a boolean
         # flag); safe to propagate.
         "OMNIGENT_DISABLE_KEYRING",
+        # claude-sdk sandbox bypass flag. A diagnostic knob (not a
+        # secret — a plain boolean) read inside the harness to decide
+        # whether to wrap the brain CLI in sandbox-exec. Without it in
+        # the allowlist the daemon→runner env strip drops it, so a bare
+        # ``OMNIGENT_CLAUDE_SDK_NO_SANDBOX=1 omnigent run …`` had no
+        # effect (the operator also had to set
+        # ``OMNIGENT_RUNNER_ENV_PASSTHROUGH=OMNIGENT_CLAUDE_SDK_NO_SANDBOX``).
+        # Safe to propagate: not a secret.
+        "OMNIGENT_CLAUDE_SDK_NO_SANDBOX",
         # Testing knob: override the context window size for compaction
         # trigger threshold. Not a secret — a plain integer.
         "AP_CONTEXT_WINDOW_OVERRIDE",
     }
 )
 # Locale family (``LC_ALL``, ``LC_CTYPE``, …) — allowed by prefix.
-_RUNNER_ENV_ALLOWLIST_PREFIXES: tuple[str, ...] = ("LC_",)
+_RUNNER_ENV_ALLOWLIST_PREFIXES: tuple[str, ...] = ("LC_", "MLFLOW_", "OTEL_")
 
 # Harness credential / endpoint env vars forwarded host→runner when
 # present. These are the names the harnesses themselves resolve —
@@ -701,8 +711,7 @@ class HostProcess:
                 status="failed",
                 error=(
                     f"harness {frame.harness!r} is not configured on host "
-                    f"{self._identity.name!r} — run `omnigent setup` on that "
-                    "machine to install the CLI and set a default credential"
+                    f"{self._identity.name!r} — {harness_setup_hint(frame.harness)}"
                 ),
                 error_code=HARNESS_NOT_CONFIGURED_ERROR_CODE,
             )
