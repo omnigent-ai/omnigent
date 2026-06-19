@@ -36,6 +36,7 @@ import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { userColor, userColorTint, userInitials } from "@/lib/userBadge";
 import { useNavigate, useParams } from "@/lib/routing";
+import { isImeCompositionKeyEvent } from "@/lib/ime";
 import {
   Conversation,
   ConversationContent,
@@ -735,11 +736,18 @@ export function ChatPage() {
   // badges from the sidebar/Agents rail. An open-but-untitled session
   // (no synthesized title yet) reads as "New session" to match its
   // sidebar row; the landing page (no active session) stays "Omnigent".
+  // Sub-agent (child) sessions are absent from the sidebar list, so
+  // ``activeConv`` is null and the title would otherwise read "New session";
+  // name the tab after the sub-agent instead, mirroring the header.
+  const subAgentTabTitle =
+    activeSession?.parentSessionId != null
+      ? (boundAgentBySession?.name ?? boundAgentName ?? subAgentLabel ?? null)
+      : null;
   useEffect(() => {
     const fallback = urlConvId ? UNTITLED_CONVERSATION_LABEL : "Omnigent";
-    const base = truncateTitle(activeConv?.title ?? fallback);
+    const base = truncateTitle(activeConv?.title ?? subAgentTabTitle ?? fallback);
     document.title = showsWorking ? `● ${base}` : base;
-  }, [activeConv?.title, showsWorking, urlConvId]);
+  }, [activeConv?.title, subAgentTabTitle, showsWorking, urlConvId]);
 
   const codexModelOptions = useChatStore((s) => s.codexModelOptions);
   const selectedModel = useChatStore((s) => s.selectedModel);
@@ -1763,6 +1771,12 @@ export function JumpToTopButton({
   const [atTop, setAtTop] = useState(true);
   const [hovering, setHovering] = useState(false);
   const [jumping, setJumping] = useState(false);
+  // Reveal the pill while the user is scrolling up, then fade it back out once
+  // they pause — so it's reachable without having to find the top hover band.
+  const [scrolledUp, setScrolledUp] = useState(false);
+
+  // How long the pill lingers after the last upward scroll before fading out.
+  const SCROLL_REVEAL_MS = 2000;
 
   // Pixels below the conversation's top edge that count as "hovering the top".
   // Comfortably clears the pill (anchored at the fade border, ~50px) so moving
@@ -1787,23 +1801,38 @@ export function JumpToTopButton({
     };
   }, [containerEl]);
 
-  // Track whether the loaded window is scrolled to its very top.
+  // Track whether the loaded window is scrolled to its very top, and reveal the
+  // pill whenever the user scrolls up (auto-hiding after they pause).
   const scrollEl = scroller?.el ?? null;
   useEffect(() => {
     if (!scrollEl) return;
+    let lastTop = scrollEl.scrollTop;
+    let hideTimer: ReturnType<typeof setTimeout> | undefined;
     const onScroll = () => {
-      const next = scrollEl.scrollTop <= 1;
+      const top = scrollEl.scrollTop;
+      const next = top <= 1;
       setAtTop((prev) => (prev === next ? prev : next));
+      // Upward scroll (and not already pinned to the top): show the pill and
+      // (re)arm the idle timer that fades it out once scrolling settles.
+      if (top < lastTop - 1 && top > 1) {
+        setScrolledUp(true);
+        clearTimeout(hideTimer);
+        hideTimer = setTimeout(() => setScrolledUp(false), SCROLL_REVEAL_MS);
+      }
+      lastTop = top;
     };
     onScroll();
     scrollEl.addEventListener("scroll", onScroll, { passive: true });
-    return () => scrollEl.removeEventListener("scroll", onScroll);
+    return () => {
+      clearTimeout(hideTimer);
+      scrollEl.removeEventListener("scroll", onScroll);
+    };
   }, [scrollEl]);
 
   // Somewhere to go: older pages exist, or we're scrolled down within the
   // loaded window. At the very first message there's nothing to jump to.
   const canJump = hasMoreHistory || !atTop;
-  const visible = jumping || (hovering && canJump);
+  const visible = jumping || ((hovering || scrolledUp) && canJump);
 
   const jumpToTop = useCallback(async () => {
     if (!scroller) return;
@@ -2919,6 +2948,7 @@ export function Composer({
   const [pickerOpenNonce, setPickerOpenNonce] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const isComposingRef = useRef(false);
   // Highlight overlay mirroring the textarea; scroll-synced so the tinted
   // `/skill` token stays aligned once the draft grows past the visible rows.
   const backdropRef = useRef<HTMLDivElement>(null);
@@ -3363,6 +3393,10 @@ export function Composer({
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (isImeCompositionKeyEvent(e, isComposingRef.current)) {
+      return;
+    }
+
     // When the suggestions menu is open, ArrowUp/Down navigate it and
     // Enter/Tab complete the highlighted item. These take priority over
     // history recall and normal submission.
@@ -3414,7 +3448,11 @@ export function Composer({
     // within the wrapped line.  Gating on position 0 / length ensures the
     // browser gets to move the caret through wrapped lines first; only the
     // final ArrowUp-at-start / ArrowDown-at-end triggers recall.
-    if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+    // Recall is for UNmodified arrows only. Cmd/Ctrl+↑/↓ (switch session) and
+    // Cmd/Alt+↑/↓ (jump between messages) are global window hotkeys meant to
+    // fire even mid-compose; without this guard the recall below intercepts
+    // them (replacing the draft) and the hotkeys appear broken in the composer.
+    if ((e.key === "ArrowUp" || e.key === "ArrowDown") && !e.metaKey && !e.ctrlKey && !e.altKey) {
       const ta = e.currentTarget;
       if (e.key === "ArrowUp" && ta.selectionStart === 0) {
         const recalled = recallPrevious(value);
@@ -3568,6 +3606,12 @@ export function Composer({
               // reset for that one tick.
               if (recallingRef.current) recallingRef.current = false;
               else resetCursor();
+            }}
+            onCompositionStart={() => {
+              isComposingRef.current = true;
+            }}
+            onCompositionEnd={() => {
+              isComposingRef.current = false;
             }}
             onKeyDown={handleKeyDown}
             onPaste={handlePaste}

@@ -57,7 +57,7 @@ jobs:
 
       - name: Check out repo
         if: steps.creds.outputs.available == 'true'
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
@@ -285,7 +285,32 @@ jobs:
             --no-session \
             2>triage-stderr.log \
             | tee /tmp/triage_output.txt \
-            || { echo "::warning::Triage agent exited non-zero"; cat triage-stderr.log; }
+            || { echo "::warning::Triage agent exited non-zero"; }
+
+      - name: Redact secrets from logs
+        if: steps.creds.outputs.available == 'true' && always()
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          # Scrub any accidental secret leaks from logs before they are
+          # printed to the console or uploaded as artifacts.
+          for f in triage-stderr.log /tmp/triage_output.txt; do
+            [ -f "$f" ] || continue
+            python3 -c "
+          import os, pathlib, sys
+          key = os.environ.get('LLM_API_KEY', '')
+          if not key:
+              sys.exit(0)
+          p = pathlib.Path(sys.argv[1])
+          text = p.read_text(errors='replace')
+          p.write_text(text.replace(key, '***REDACTED***'))
+          " "$f"
+          done
+          # Print redacted stderr so maintainers can still debug failures.
+          if [ -f triage-stderr.log ] && [ -s triage-stderr.log ]; then
+            echo "--- triage-stderr.log (redacted) ---"
+            cat triage-stderr.log
+          fi
 
       # ── Trusted label application (LLM cannot influence these) ───────
 

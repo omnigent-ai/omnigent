@@ -26,6 +26,7 @@ from collections.abc import Awaitable, Callable
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from omnigent.host.frames import (
+    HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
     HostHelloFrame,
     HostLaunchRunnerResultFrame,
@@ -459,6 +460,18 @@ async def _receive_loop(
                 remove_wt_future.set_result(
                     {
                         "status": frame.status,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostCreateDirResultFrame):
+            create_dir_future = conn.pending_create_dirs.pop(frame.request_id, None)
+            if create_dir_future is not None and not create_dir_future.done():
+                create_dir_future.set_result(
+                    {
+                        "status": frame.status,
+                        "path": frame.path,
                         "error": frame.error,
                     }
                 )

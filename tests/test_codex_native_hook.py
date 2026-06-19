@@ -18,6 +18,7 @@ from omnigent.codex_native_bridge import (
     write_bridge_state,
     write_policy_hook_config,
 )
+from tests.native_hook_helpers import make_failing_client
 
 
 class _DenyHttpxClient:
@@ -387,6 +388,75 @@ def test_missing_policy_config_is_fail_open(
         {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {}},
         monkeypatch,
     )
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.out == ""
+
+
+@pytest.mark.parametrize("mode", ["connect_error", "non_2xx", "empty_body", "malformed_json"])
+def test_pre_tool_use_fails_closed_when_verdict_unavailable(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    mode: str,
+) -> None:
+    """
+    A governed PreToolUse call denies when no usable verdict is returned.
+
+    For native harnesses this hook is the sole TOOL_CALL enforcement point,
+    so a server outage / non-2xx / empty / malformed response must fail
+    CLOSED (deny) instead of "no opinion" — the bypass reported in #536.
+    """
+    write_policy_hook_config(bridge_dir, ap_server_url="http://127.0.0.1:8787", ap_auth_headers={})
+    monkeypatch.setattr(codex_native_hook.httpx, "Client", make_failing_client(mode))
+
+    exit_code = _run_hook(
+        bridge_dir,
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "rm -rf /"},
+        },
+        monkeypatch,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    result = json.loads(captured.out)
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny", result
+    assert result["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+            "tool_output": "ok",
+        },
+        {"hook_event_name": "UserPromptSubmit", "prompt": "hello"},
+    ],
+)
+def test_non_tool_call_phases_fail_open_on_error(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    payload: dict[str, object],
+) -> None:
+    """
+    Off the tool-call gate, an unobtainable verdict stays fail-open.
+
+    PostToolUse runs after the tool executed and the request gate is
+    advisory, so neither denies on a transport error — mirroring the
+    runner-side ``FAIL_CLOSED_PHASES`` (PR #163).
+    """
+    write_policy_hook_config(bridge_dir, ap_server_url="http://127.0.0.1:8787", ap_auth_headers={})
+    monkeypatch.setattr(codex_native_hook.httpx, "Client", make_failing_client("connect_error"))
+
+    exit_code = _run_hook(bridge_dir, payload, monkeypatch)
+
     captured = capsys.readouterr()
     assert exit_code == 0
     assert captured.out == ""

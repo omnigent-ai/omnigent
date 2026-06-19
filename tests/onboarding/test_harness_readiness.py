@@ -74,7 +74,9 @@ def test_sdk_and_unknown_harnesses_are_never_gated(
     assert harness_is_configured(harness) is True
 
 
-# CLI-wrapping harnesses are gated on their binary being on PATH.
+# CLI-wrapping harnesses are gated on their binary being on PATH. Native Cursor
+# (``omni cursor``) joins the list: it wraps the ``cursor-agent`` CLI, unlike the
+# SDK ``cursor`` harness which gates on a key (covered separately below).
 @pytest.mark.parametrize(
     "harness",
     [
@@ -85,6 +87,8 @@ def test_sdk_and_unknown_harnesses_are_never_gated(
         "native-codex",
         "pi",
         "opencode",
+        "cursor-native",
+        "native-cursor",
     ],
 )
 def test_cli_harness_configured_only_when_binary_installed(
@@ -132,6 +136,9 @@ def test_configured_harness_map_covers_all_spellings(
         "pi-native",
         "native-pi",
         "cursor",
+        # Native Cursor (``omni cursor``) — gates on the cursor-agent CLI.
+        "cursor-native",
+        "native-cursor",
         # Antigravity SDK harness + its user-facing aliases.
         "antigravity",
         "agy",
@@ -165,8 +172,10 @@ def test_configured_harness_map_gates_only_cli_harnesses(
     ):
         assert result[sdk] is True, f"{sdk} should never be gated"
     # CLI-wrapping spellings — gated, so False when the binary is absent.
-    # (Cursor is excluded: it runs via the ``cursor-sdk`` package and gates on
-    # a configured ``CURSOR_API_KEY``, not a binary — covered separately.)
+    # (The SDK ``cursor`` harness is excluded: it runs via the ``cursor-sdk``
+    # package and gates on a configured ``CURSOR_API_KEY``, not a binary —
+    # covered separately. Native Cursor (``cursor-native`` / ``native-cursor``)
+    # wraps the ``cursor-agent`` CLI, so it IS gated on the binary.)
     for cli in (
         "claude-native",
         "native-claude",
@@ -175,6 +184,8 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         "native-codex",
         "pi",
         "opencode",
+        "cursor-native",
+        "native-cursor",
     ):
         assert result[cli] is False, f"{cli} should be gated on its CLI binary"
 
@@ -222,3 +233,28 @@ def test_cursor_readiness_keys_off_api_key(
         yaml.safe_dump({"cursor": {"api_key_ref": "env:MY_CURSOR_KEY"}})
     )
     assert harness_is_configured("cursor") is True
+
+
+def test_native_cursor_keys_off_binary_not_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native Cursor (``omni cursor``) gates on the cursor-agent CLI, not a key.
+
+    The mirror image of :func:`test_cursor_readiness_keys_off_api_key`: native
+    Cursor boots the ``cursor-agent`` TUI, so its readiness is the binary on
+    ``PATH`` — a ``CURSOR_API_KEY`` (which configures the SDK ``cursor`` harness)
+    does not make it launchable. Conflating the two would tell a native-Cursor
+    user with a key set "you're ready" and then die booting a CLI that isn't
+    installed.
+    """
+    # A key set but no binary → not configured (the SDK key doesn't help here).
+    _no_clis_installed(monkeypatch)
+    monkeypatch.setenv("CURSOR_API_KEY", "crsr_from_env")
+    assert harness_is_configured("cursor-native") is False
+    assert harness_is_configured("native-cursor") is False
+
+    # Binary present → configured, even with no key.
+    _all_clis_installed(monkeypatch)
+    monkeypatch.delenv("CURSOR_API_KEY", raising=False)
+    assert harness_is_configured("cursor-native") is True
+    assert harness_is_configured("native-cursor") is True

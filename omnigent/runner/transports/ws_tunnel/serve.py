@@ -573,7 +573,6 @@ async def _send_hello(
                     "claude-native",
                     "claude-sdk",
                     "codex",
-                    "databricks_supervisor",
                     "openai-agents",
                     "open-responses",
                     "pi",

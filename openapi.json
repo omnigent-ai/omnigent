@@ -413,6 +413,20 @@
         "title": "CreateDefaultPolicyRequest",
         "type": "object"
       },
+      "CreateDirectoryRequest": {
+        "description": "Request body for ``POST /v1/hosts/{host_id}/directories``.\n\n:param path: Absolute path of the directory to create on the host\n    machine, e.g. ``\"/Users/corey/projects/new-app\"``, or a\n    tilde-prefixed path (``\"~/scratch\"``) the host expands against\n    its own process owner. Missing parents are created.",
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "CreateDirectoryRequest",
+        "type": "object"
+      },
       "CreateSessionPolicyRequest": {
         "description": "Request body for ``POST /v1/sessions/{session_id}/policies``.\n\n:param name: Human-readable policy name. Must be unique\n    within the session, e.g.\n    ``\"block_non_feature_branch_push\"``.\n:param type: Handler discriminator: ``\"python\"`` or\n    ``\"url\"``.\n:param handler: Dotted import path (python) or HTTPS URL\n    (url), e.g.\n    ``\"github_mcp_policy.block_non_misc_push\"``\n    or ``\"https://example.com/policies/eval\"``.\n:param factory_params: Optional dict of kwargs passed to the\n    handler when it is a factory function. Only valid for\n    ``type=\"python\"``, e.g. ``{\"limit\": 10}``.",
         "properties": {
@@ -3980,6 +3994,61 @@
           }
         },
         "summary": "Get Host",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/directories": {
+      "post": {
+        "description": "Create a new directory on a host.\n\nBacks the Web UI workspace picker's \"New folder\" action so a\nuser can make a fresh directory to start a session in without\ndropping to a terminal. Owner-scoped exactly like the\nfilesystem browse endpoints (``GET /v1/hosts/{id}/filesystem``):\nonly the host owner can create directories, and \u2014 like browse \u2014\nthis is NOT scoped to a session. The workspace-boundary check\nstill runs at session-create time, so creating a directory here\ndoes not by itself grant an agent access to it.\n\n:param request: FastAPI request (for auth).\n:param host_id: Host identifier, e.g. ``\"host_a1b2c3d4...\"``.\n:param body: Request body carrying the absolute (or\n    tilde-prefixed) ``path`` to create.\n:returns: ``{\"object\": \"directory\", \"path\": \"<created abs path>\"}``.\n:raises HTTPException: 404 if host not found, 403 if not owned\n    by caller, 409 if host is offline or the directory could not\n    be created (already exists / permission denied), 400 on path\n    validation, 504 on host timeout, 502 on host I/O failure.",
+        "operationId": "create_host_directory_v1_hosts__host_id__directories_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateDirectoryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Host Directory V1 Hosts  Host Id  Directories Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Host Directory",
         "tags": [
           "hosts"
         ]

@@ -189,9 +189,11 @@ from omnigent.server.routes._content_type import (
     require_json_or_multipart_content_type,
 )
 from omnigent.server.routes._host_worktree import CreatedWorktree
+from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.schemas import (
     AgentObject,
     ChildSessionSummary,
+    CompletedEvent,
     ConversationDeleted,
     CreatedSessionResponse,
     ElicitationRequestEvent,
@@ -207,6 +209,7 @@ from omnigent.server.schemas import (
     PaginatedList,
     PermissionObject,
     PolicySummary,
+    ResponseObject,
     SandboxStatus,
     ServerStreamEvent,
     SessionAgentChangedEvent,
@@ -2350,7 +2353,11 @@ def _resolve_llm_model(conv: Conversation | None) -> str | None:
             agent.id, agent.bundle_location, expand_env=agent.session_id is None
         )
         return loaded.spec.llm.model if loaded.spec.llm else None
-    except (KeyError, AttributeError, ValueError, ImportError, OSError):
+    except (KeyError, AttributeError, ValueError, ImportError, OSError, RuntimeError):
+        # ``RuntimeError`` covers ``get_agent_cache()`` before the runtime is
+        # initialized: this is a best-effort display resolver (now also called
+        # on native cost-only broadcasts), so an uninitialized runtime must
+        # degrade to "model unknown" — the cost still records, just unattributed.
         return None
 
 
@@ -2830,14 +2837,32 @@ def _persist_native_cumulative_usage(
             + int(current.get("output_tokens", 0))
         )
 
-    # Resolve the model only when tokens are present — both the token-pricing
-    # branch and the per-model attribution below need it, and both are gated on
-    # tokens. Resolving lazily avoids calling ``_resolve_llm_model`` (which
-    # touches the runtime agent cache) on a cost-only broadcast. Computed once
-    # out of the pricing-only branch so attribution works even on an unpriced
-    # turn. The raw harness model id wins; falls back to the agent spec's model.
+    # Resolve the model for per-model attribution on any broadcast that carries
+    # tokens OR a priced cost — both the token-pricing branch and the per-model
+    # attribution below need it. A cost-only broadcast must resolve it too:
+    # claude-native forwards Claude Code's statusLine total (S) with NO token
+    # counts, so gating model resolution on tokens alone dropped that cost from
+    # ``by_model`` entirely — the per-model TOKEN USAGE view undercounted the
+    # session total by every native (sub-)agent's spend, while the flat
+    # ``total_cost_usd`` (and the Session-cost badge) still included it.
+    # Priority mirrors the relay path's ``_accumulate_session_usage``: the
+    # event's ``model`` (the statusLine's active model, forwarded alongside the
+    # cost) wins, then the session's ``model_override`` (the forwarder mirrors
+    # in-pane /model switches there), then the agent spec's static model.
+    # Computed once out of the pricing-only branch so attribution works even on
+    # an unpriced turn. (The agent-cache lookup in ``_resolve_llm_model`` is
+    # memoized, so resolving on cost-only polls is cheap.)
     has_tokens = cin is not None or cout is not None
-    model_name = (data.get("model") or _resolve_llm_model(conv)) if has_tokens else None
+    needs_model = has_tokens or cost is not None
+    model_name = (
+        (
+            data.get("model")
+            or (conv.model_override if conv and conv.model_override else None)
+            or _resolve_llm_model(conv)
+        )
+        if needs_model
+        else None
+    )
     if cost is not None:
         current["total_cost_usd"] = float(cost)
     elif has_tokens:
@@ -2861,8 +2886,9 @@ def _persist_native_cumulative_usage(
     # switch the current model absorbs the cumulative (splitting deferred —
     # keyed on the raw harness model id). Cost mirrors the flat
     # ``total_cost_usd`` so the per-model cost key is present iff priced.
-    # ``model_name`` is only set when tokens are present, so this is skipped
-    # for cost-only broadcasts (nothing to attribute per-model).
+    # ``model_name`` is set on token-bearing AND cost-bearing broadcasts, so a
+    # claude-native cost-only broadcast attributes its cumulative cost here too
+    # (token buckets stay absent — claude-native reports no token counts).
     if isinstance(model_name, str) and model_name:
         bucket = _model_usage_bucket(current, model_name)
         for key in _MODEL_TOKEN_KEYS:
@@ -8859,11 +8885,12 @@ def _same_provider_family(a: Agent, b: Agent) -> bool:
 def _agent_is_native(agent: Agent) -> bool:
     """Return whether an agent runs a native CLI harness.
 
-    Loads the agent's spec to read its ``harness_kind``. A native target
-    (claude-native / codex-native) is the only case where a fork needs the
-    transcript-rebuild carry path — SDK targets replay the Omnigent
-    transcript as context on their own. Returns ``False`` when the bundle
-    can't be loaded (treated as non-native).
+    Loads the agent's spec to read its ``harness_kind``. Native targets run
+    a vendor TUI in a terminal (claude-native / codex-native / pi-native /
+    cursor-native). This is broader than "can replay fork history" — only
+    claude/codex native carry the transcript-rebuild path; use
+    ``_agent_carries_native_fork_history`` for that narrower gate. Returns
+    ``False`` when the bundle can't be loaded (treated as non-native).
 
     :param agent: The agent whose harness to classify.
     :returns: ``True`` for a native CLI harness, else ``False``.
@@ -8879,6 +8906,43 @@ def _agent_is_native(agent: Agent) -> bool:
     except Exception:  # noqa: BLE001 — unloadable bundle → treat as non-native
         return False
     return is_native_harness(spec.executor.harness_kind)
+
+
+# Native harnesses that record a resumable session and can rebuild a fork's
+# transcript from copied Omnigent items. Both spellings are listed because
+# canonicalize_harness passes the reversed native ids through unchanged (only
+# "native-pi" is aliased) — same reasoning as model_override._CLAUDE_FAMILY_HARNESSES.
+# cursor/pi native are intentionally absent: they can't replay fork history.
+_FORK_HISTORY_NATIVE_HARNESSES: frozenset[str] = frozenset(
+    {"claude-native", "native-claude", "codex-native", "native-codex"}
+)
+
+
+def _agent_carries_native_fork_history(agent: Agent) -> bool:
+    """Return whether *agent*'s native harness can replay fork history.
+
+    Only claude-native / codex-native record a resumable native session and
+    can rebuild a fork's transcript from the copied Omnigent items. cursor-
+    native and pi-native are native CLIs but cannot carry chat history into a
+    fork (no resumable external_session_id and their TUIs can't import a
+    transcript), so stamping ``carry_history_into_native`` for them would be a
+    false promise — the fork launches fresh regardless. Returns ``False`` when
+    the bundle can't be loaded (treated as non-carrying).
+
+    :param agent: The agent whose harness to classify.
+    :returns: ``True`` only for fork-history-capable native harnesses.
+    """
+    from omnigent.harness_aliases import canonicalize_harness
+
+    try:
+        spec = (
+            get_agent_cache()
+            .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
+            .spec
+        )
+    except Exception:  # noqa: BLE001 — unloadable bundle → treat as non-carrying
+        return False
+    return canonicalize_harness(spec.executor.harness_kind) in _FORK_HISTORY_NATIVE_HARNESSES
 
 
 def _native_coding_agent_for_agent(agent: Agent) -> NativeCodingAgent | None:
@@ -9320,15 +9384,12 @@ def _publish_policy_deny(session_id: str, reason: str) -> None:
     tests assert it, and native harnesses relay it to the model), so it is
     always carried in a ``response.output_text.delta``.
 
-    The deny is never persisted as a conversation item — the input gate
-    publishes it and returns without forwarding — so a ``message_id``-less
-    delta lands in the web reducer's response-scoped text path as an
-    un-reconciled "stray bubble" with no item to dedupe against. On the next
-    user submit the response switch re-finalizes that still-open text,
-    rendering the deny twice (observed on both native and non-native web
-    sessions). Stamping a unique ``message_id`` (matching how live streaming
-    text is tagged) routes it through the web's live-preview path instead,
-    where it folds into a single ``live:<id>`` block.
+    Input DENY callers also persist the same sentinel as an assistant
+    conversation item. This stream publish remains separate so live clients
+    still get immediate feedback before the handler returns. Stamping a unique
+    ``message_id`` (matching how live streaming text is tagged) routes the
+    delta through the web's live-preview path, where it folds into a single
+    ``live:<id>`` block rather than a response-scoped stray bubble.
 
     Safe for the other consumers: the REPL converts any ``output_text.delta``
     to a ``TextDelta`` regardless of ``message_id``; the ``/v1/responses`` API
@@ -9350,6 +9411,86 @@ def _publish_policy_deny(session_id: str, reason: str) -> None:
             "index": 0,
         },
     )
+
+
+def _publish_input_deny_terminal(session_id: str, conv: Conversation, reason: str) -> None:
+    """
+    Publish a terminal ``response.completed`` for an INPUT-phase DENY.
+
+    The short-circuit never forwards to a runner, so no runner-relayed
+    terminal ``response.*`` event is emitted. SSE consumers that drive a
+    turn off the live-tail (the headless ``-p`` client,
+    :class:`omnigent_client.SessionsChat.send`) iterate until a
+    turn-terminal event arrives and would otherwise block forever. The
+    output carries the same sentinel text so the terminal-snapshot fallback
+    also surfaces the deny.
+
+    :param session_id: Session/conversation identifier.
+    :param conv: Conversation whose agent/model name tags the response.
+    :param reason: Human-readable deny reason from the policy verdict.
+    """
+    sentinel = f"{_DENY_SENTINEL_PREFIX}{reason}]"
+    response = ResponseObject(
+        id=f"deny_{secrets.token_hex(8)}",
+        status="completed",
+        model=conv.agent_id or "policy",
+        created_at=int(time.time()),
+        completed_at=int(time.time()),
+        output=[
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": sentinel}],
+            }
+        ],
+    )
+    session_stream.publish(
+        session_id,
+        CompletedEvent(type="response.completed", response=response).model_dump(exclude_none=True),
+    )
+
+
+async def _persist_policy_deny_sentinel(
+    session_id: str,
+    conv: Conversation,
+    reason: str,
+    conversation_store: ConversationStore,
+    agent_store: AgentStore,
+) -> None:
+    """
+    Persist the ``[Denied by policy: ...]`` sentinel as assistant history.
+
+    INPUT policy DENY returns synchronously and never forwards the user turn
+    to a runner, so no downstream stream relay can append the assistant-side
+    deny marker. Persisting the same assistant message shape used by OUTPUT
+    policy DENY keeps follow-up turns and the items API consistent with the
+    streamed deny users already see.
+
+    :param session_id: Session/conversation identifier.
+    :param conv: Conversation whose agent/model name tags the message.
+    :param reason: Human-readable deny reason from the policy verdict.
+    :param conversation_store: Store for item persistence.
+    :param agent_store: Store used to resolve the agent's display name.
+    """
+    import uuid
+
+    sentinel = f"{_DENY_SENTINEL_PREFIX}{reason}]"
+    agent = agent_store.get(conv.agent_id) if conv.agent_id else None
+    agent_name = agent.name if agent is not None else conv.agent_id or "policy"
+    item = NewConversationItem(
+        type="message",
+        response_id=f"deny_{uuid.uuid4().hex}",
+        data=parse_item_data(
+            "message",
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": sentinel}],
+                "agent": agent_name,
+            },
+        ),
+    )
+    await asyncio.to_thread(conversation_store.append, session_id, [item])
 
 
 async def _evaluate_input_policy(
@@ -10231,27 +10372,33 @@ def _spec_harness(spec: AgentSpec) -> str:
     return canonicalize_harness(harness) or harness
 
 
-def _spec_config_flag_enabled(spec: AgentSpec, key: str) -> bool:
+def _spec_config_flag_explicitly_disabled(spec: AgentSpec, key: str) -> bool:
     """
-    Read a boolean-ish ``executor.config`` flag, tolerating string coercion.
+    Return whether an ``executor.config`` flag is explicitly set false.
 
     The spec parser stringifies every ``executor.config`` value (see
     ``omnigent/spec/parser.py`` — ``{str(k): str(v) ...}``), so a YAML
-    ``yolo: true`` arrives here as the string ``"True"``. A naive
-    ``bool(value)`` is wrong: ``bool("False")`` is ``True``. This compares
-    against the truthy spellings explicitly so only an intentional
-    ``true`` / ``True`` enables the flag.
+    ``yolo: false`` arrives here as the string ``"False"``. A naive
+    ``not bool(value)`` is wrong: ``bool("False")`` is ``True`` (so a
+    naive truthiness test would read ``"False"`` as enabled). This
+    compares against the falsey spellings explicitly so only an
+    intentional ``false`` / ``False`` counts as disabled — an absent key
+    or any other value is NOT disabled.
+
+    Used for opt-OUT semantics: the relevant flag defaults to enabled and
+    an explicit ``false`` is the escape hatch (see the codex-native branch
+    of :func:`_derive_terminal_launch_args_from_spec`).
 
     :param spec: A parsed sub-agent spec.
     :param key: The ``executor.config`` key to read, e.g. ``"yolo"``.
-    :returns: ``True`` only when the value is the boolean ``True`` or the
-        string ``"true"`` (case-insensitive); ``False`` otherwise
+    :returns: ``True`` only when the value is the boolean ``False`` or the
+        string ``"false"`` (case-insensitive); ``False`` otherwise
         (including when the key is absent).
     """
     value = spec.executor.config.get(key)
     if isinstance(value, bool):
-        return value
-    return isinstance(value, str) and value.strip().lower() == "true"
+        return value is False
+    return isinstance(value, str) and value.strip().lower() == "false"
 
 
 def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | None:
@@ -10269,8 +10416,17 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
       ``["--permission-mode", "<value>"]``. The value is passed through
       verbatim so non-YOLO modes (``acceptEdits``, ``plan``, ...) work too;
       YOLO uses ``bypassPermissions``.
-    - codex-native + ``executor.config.yolo`` truthy ->
-      ``["--dangerously-bypass-approvals-and-sandbox"]``.
+    - codex-native -> ``["--dangerously-bypass-approvals-and-sandbox"]``
+      by DEFAULT. A headless codex worker has no human to answer codex's
+      approval prompts, and codex's own command sandbox often cannot even
+      start (e.g. inside a hardened container), so codex's default
+      ``approval_policy=on-request`` + own-sandbox stance stalls the
+      worker on its first Edit/Write/Bash. Full bypass is the only
+      non-stalling stance for the headless seam (the container / worktree
+      is the real boundary, matching claude-native's ``bypassPermissions``
+      and the codex-sdk executor's ``approvalPolicy="never"``). An explicit
+      ``executor.config.yolo: false`` opts back out for a read-only / must
+      -keep-prompting sub-agent. See issue #171.
 
     Only the two native harnesses are translated; for any other harness
     (e.g. ``claude-sdk``, whose bypass is set via the SDK ``permissionMode``
@@ -10292,9 +10448,17 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
             return _validate_terminal_launch_args(["--permission-mode", str(permission_mode)])
         return None
     if harness == _CODEX_NATIVE_HARNESS:
-        if _spec_config_flag_enabled(sub_spec, "yolo"):
-            return _validate_terminal_launch_args(["--dangerously-bypass-approvals-and-sandbox"])
-        return None
+        # Headless default: full bypass. The terminal_launch_args set the
+        # codex --remote TUI's launch flags, which is what creates the
+        # app-server thread and fixes its approval/sandbox stance for the
+        # session; the omnigent executor's later turn/start inherits that
+        # stance (codex_native_executor.run_turn carries no per-turn
+        # approval/sandbox). Without the flag the thread is created at
+        # codex's on-request + own-sandbox default and a headless worker
+        # stalls. An explicit ``yolo: false`` is the opt-out. See #171.
+        if _spec_config_flag_explicitly_disabled(sub_spec, "yolo"):
+            return None
+        return _validate_terminal_launch_args(["--dangerously-bypass-approvals-and-sandbox"])
     return None
 
 
@@ -10582,11 +10746,14 @@ async def _create_session_from_existing_agent(
     #
     # Named sub-agent creates (``body.sub_agent_name`` set) DERIVE these
     # from the trusted, server-loaded sub-spec only — any caller-supplied
-    # ``body.terminal_launch_args`` is ignored. This is the YOLO seam: a
-    # native worker bundle declaring ``permission_mode`` / ``yolo: true``
-    # gets the corresponding full-bypass flag so it can edit in a
-    # headless pane, and a caller cannot inject launch wiring by
-    # smuggling args through the spawn body.
+    # ``body.terminal_launch_args`` is ignored. This is the YOLO seam:
+    # claude-native maps ``permission_mode`` to ``--permission-mode``,
+    # while codex-native defaults to full bypass
+    # (``--dangerously-bypass-approvals-and-sandbox``) so a headless
+    # codex worker can edit/run unattended without stalling on codex's
+    # on-request approval default (opt out with ``yolo: false``). A
+    # caller cannot inject launch wiring by smuggling args through the
+    # spawn body.
     #
     # Sessions that resolve their own agent (top-level sessions and the
     # manual Add Agent child flow where ``sub_agent_name`` is null) keep
@@ -11957,7 +12124,14 @@ def create_sessions_router(
         # CSRF hardening: this route dispatches on Content-Type (JSON vs
         # multipart bundled-create), so reject text/plain and other simple
         # types up front while still allowing both legitimate body shapes.
-        dependencies=[Depends(require_json_or_multipart_content_type)],
+        # The multipart shape is CORS-safelisted, so the content-type guard
+        # alone can't stop a cross-site bundle upload — require_trusted_origin
+        # closes that gap (allows absent Origin for non-browser SDK/runner
+        # clients; in local mode a present Origin must be loopback).
+        dependencies=[
+            Depends(require_json_or_multipart_content_type),
+            Depends(require_trusted_origin),
+        ],
     )
     async def create_session(
         request: Request,
@@ -13454,7 +13628,12 @@ def create_sessions_router(
         # items (the converters consume Omnigent's normalized item shape, so
         # the source harness doesn't matter). SDK targets replay the
         # transcript as context regardless, so the marker is inert for them.
-        carry_history_into_native = await asyncio.to_thread(_agent_is_native, base_agent)
+        # Only claude/codex native can replay fork history; cursor/pi native
+        # can't (no resumable session, TUI can't import a transcript), so don't
+        # stamp a carry-history promise they'd silently break with a fresh launch.
+        carry_history_into_native = await asyncio.to_thread(
+            _agent_carries_native_fork_history, base_agent
+        )
         # The source's native session id is only resumable by a target in the
         # SAME provider family — a Claude target can't clone a Codex rollout.
         # Cross-family, the store must skip the fork-source directive so the
@@ -13642,7 +13821,12 @@ def create_sessions_router(
         copy_model_settings = await asyncio.to_thread(
             _same_provider_family, current_agent, target_agent
         )
-        carry_history_into_native = await asyncio.to_thread(_agent_is_native, target_agent)
+        # Only claude/codex native can replay fork history; cursor/pi native
+        # can't (no resumable session, TUI can't import a transcript), so don't
+        # stamp a carry-history promise they'd silently break with a fresh launch.
+        carry_history_into_native = await asyncio.to_thread(
+            _agent_carries_native_fork_history, target_agent
+        )
         presentation_labels = await asyncio.to_thread(_presentation_labels_for_agent, target_agent)
 
         # Resolve the built-in the session is leaving so the UI can offer a
@@ -15096,6 +15280,12 @@ def create_sessions_router(
         "/sessions/{session_id}/resources/files",
         status_code=201,
         response_model=None,
+        # CSRF hardening: this route only accepts multipart/form-data, which
+        # is CORS-safelisted, so a content-type guard can't stop a cross-site
+        # upload. require_trusted_origin closes the gap (allows absent Origin
+        # for the non-browser SDK/runner clients; in local mode a present
+        # Origin must be loopback).
+        dependencies=[Depends(require_trusted_origin)],
     )
     async def upload_session_file(
         request: Request,
@@ -16011,6 +16201,16 @@ def create_sessions_router(
                 reason = _input_verdict.get("reason", "Denied by policy")
                 _publish_status(session_id, "running")
                 _publish_policy_deny(session_id, reason)
+                await _persist_policy_deny_sentinel(
+                    session_id,
+                    conv,
+                    reason,
+                    conversation_store,
+                    agent_store,
+                )
+                # Terminal response.completed before idle so live-tail
+                # consumers (the headless ``-p`` client) unblock.
+                _publish_input_deny_terminal(session_id, conv, reason)
                 _publish_status(session_id, "idle")
                 # Return the same shape the client expects from POST
                 # /events so postEvent doesn't throw on an unexpected
@@ -16031,6 +16231,15 @@ def create_sessions_router(
                 reason = _input_verdict.get("reason", "Denied by policy")
                 _publish_status(session_id, "running")
                 _publish_policy_deny(session_id, reason)
+                await _persist_policy_deny_sentinel(
+                    session_id,
+                    conv,
+                    reason,
+                    conversation_store,
+                    agent_store,
+                )
+                # Terminal response.completed before idle (see message branch).
+                _publish_input_deny_terminal(session_id, conv, reason)
                 _publish_status(session_id, "idle")
                 return {"queued": False, "denied": True, "reason": reason}
         elif (

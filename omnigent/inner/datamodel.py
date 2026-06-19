@@ -345,11 +345,16 @@ class ExecutorSpec:
     :param profile: Credentials profile name (typically a
         ``~/.databrickscfg`` profile), e.g. ``"<your-profile>"``.
         ``None`` when no profile override is needed.
+    :param auth: Parsed auth block from the YAML (e.g. api_key +
+        base_url). Carried through so the omnigent spec translator
+        can forward it into the child :class:`ExecutorSpec` without
+        re-reading raw YAML.
     """
 
     model: str | None = None
     harness: str | None = None
     profile: str | None = None
+    auth: object | None = None  # ApiKeyAuth | DatabricksAuth | None
 
 
 # ---------------------------------------------------------------------------

@@ -3,7 +3,7 @@ name: Merge Ready
 # Posts the "Merge Ready" commit status on the PR head SHA -- the single
 # required branch-protection check, backed by the REQUIRED list inside
 # this workflow. Triggers: `/merge` comment (write-access commenter only),
-# `pull_request` labeled (acts only with `automerge`),
+# `pull_request_target` labeled (acts only with `automerge`),
 # `workflow_run` on same-repo CI completion, `check_suite` completion on a
 # `fork-e2e/**` branch (the mirrored fork PR e2e -- a delivery that actually
 # fires, unlike the brittle fork-PR `workflow_run` hop it replaces), and
@@ -24,7 +24,9 @@ name: Merge Ready
 on:
   # `labeled` only; `workflow_run` re-evaluates on CI completion (same-repo PRs
   # and the fork-e2e/** mirror push -- see the job `if`).
-  pull_request:
+  # pull_request_target (not pull_request) so this workflow always runs from
+  # main -- a PR cannot modify the gate logic by editing this file.
+  pull_request_target:
     types: [labeled]
   workflow_run:
     workflows: [PR Template, CI, Lint, E2E UI Tests, E2E Tests, Integration Tests]
@@ -71,7 +73,7 @@ jobs:
     # open PR (push to main, etc.) are dropped by the ctx step.
     if: >-
       (
-        github.event_name == 'pull_request' &&
+        github.event_name == 'pull_request_target' &&
         github.event.label.name == 'automerge'
       ) ||
       (
@@ -104,8 +106,9 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Check out scripts
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
+          ref: main             # trusted gate scripts; never the PR head
           sparse-checkout: .github/scripts/merge-ready
           persist-credentials: false
 
@@ -128,7 +131,7 @@ jobs:
             gh api "repos/$REPO/commits/$1/pulls" \
               --jq 'map(select(.state == "open")) | .[0].number // empty' 2>/dev/null || true
           }
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          if [[ "${{ github.event_name }}" == "pull_request_target" ]]; then
             PR="${{ github.event.pull_request.number }}"
             SHA="${{ github.event.pull_request.head.sha }}"
           elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
@@ -178,19 +181,60 @@ jobs:
           echo "pr=$PR"   >> "$GITHUB_OUTPUT"
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
-      - name: Read PR labels
+      - name: Load maintainers
+        id: maintainers
+        if: steps.ctx.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: bash .github/scripts/merge-ready/load-maintainers.sh
+
+      - name: Read PR labels and fork approval state
         id: labels
         if: steps.ctx.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR: ${{ steps.ctx.outputs.pr }}
+          MAINTAINERS: ${{ steps.maintainers.outputs.list }}
         run: |
-          NAMES=$(gh pr view "$PR" --repo "$REPO" --json labels --jq '.labels[].name')
+          INFO=$(gh pr view "$PR" --repo "$REPO" --json labels,isCrossRepository)
+          NAMES=$(echo "$INFO" | jq -r '.labels[].name')
           if echo "$NAMES" | grep -qx "automerge"; then
             echo "automerge=true" >> "$GITHUB_OUTPUT"
           else
             echo "automerge=false" >> "$GITHUB_OUTPUT"
+          fi
+          # A fork PR without a maintainer's approving review or the
+          # `e2e-approved` label never runs e2e (the fork pull_request run is
+          # an empty matrix), so the gate blocks until one of these is present.
+          # Same-repo PRs run e2e with secrets directly and need no gate.
+          if [[ "$(echo "$INFO" | jq -r '.isCrossRepository')" == "true" ]]; then
+            # Check path 1: maintainer approval via PR review.
+            MAINTAINERS_LC=$(echo "${MAINTAINERS:-}" | tr '[:upper:]' '[:lower:]')
+            APPROVERS=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
+              --jq '[.[] | select(.state != "COMMENTED")] | group_by(.user.login) | map(max_by(.submitted_at)) | .[] | select(.state == "APPROVED") | .user.login')
+            HAS_GATE=false
+            for u in $APPROVERS; do
+              u_lc=$(echo "$u" | tr '[:upper:]' '[:lower:]')
+              for m in $MAINTAINERS_LC; do
+                if [[ "$m" == "$u_lc" ]]; then
+                  HAS_GATE=true
+                  break 2
+                fi
+              done
+            done
+            # Check path 2: e2e-approved label.
+            if [[ "$HAS_GATE" == "false" ]] && echo "$NAMES" | grep -qx "e2e-approved"; then
+              HAS_GATE=true
+            fi
+            if [[ "$HAS_GATE" == "false" ]]; then
+              echo "fork_needs_e2e_approval=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "fork_needs_e2e_approval=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "fork_needs_e2e_approval=false" >> "$GITHUB_OUTPUT"
           fi
 
       # post_red gates posting a red status: /merge needs it, automerge opts
@@ -230,6 +274,7 @@ jobs:
         env:
           EVAL: ${{ steps.eval.outcome }}
           FAILED: ${{ steps.eval.outputs.failed }}
+          FORK_NEEDS_E2E_APPROVAL: ${{ steps.labels.outputs.fork_needs_e2e_approval }}
         run: bash .github/scripts/merge-ready/compute-gate.sh
 
       # Skipped when post_red is false AND gate is red: leaves prior
@@ -286,7 +331,7 @@ jobs:
       - name: Enable auto-merge on automerge label
         if: >-
           steps.ctx.outputs.skip != 'true' &&
-          github.event_name == 'pull_request' &&
+          github.event_name == 'pull_request_target' &&
           github.event.action == 'labeled' &&
           github.event.label.name == 'automerge'
         env:
@@ -295,7 +340,7 @@ jobs:
           PR: ${{ steps.ctx.outputs.pr }}
         run: bash .github/scripts/merge-ready/enable-automerge-label.sh
 
-      # Not on pull_request-labeled: auto-merge was enabled in an earlier
+      # Not on pull_request_target-labeled: auto-merge was enabled in an earlier
       # step there, so failing here would make the label look broken even
       # though it worked. Safe on workflow_run/check_suite/workflow_dispatch.
       - name: Fail job when gate is red

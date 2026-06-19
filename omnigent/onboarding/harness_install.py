@@ -154,11 +154,13 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
 # :data:`_HARNESS_INSTALL` family key. Only the CLI-backed harnesses appear
 # here — the ones that cannot launch without a binary on ``PATH``:
 # ``claude-native`` wraps the ``claude`` CLI, ``codex-native`` the ``codex``
-# CLI, and ``pi`` / ``pi-native`` the ``pi`` CLI.
+# CLI, ``pi`` / ``pi-native`` the ``pi`` CLI, and ``cursor-native`` /
+# ``native-cursor`` the ``cursor-agent`` CLI (the native Cursor TUI, installed
+# via Cursor's curl installer rather than npm — see its ``install_hint``).
 # SDK-based harnesses run in-process and are deliberately absent, so they
 # resolve to "no CLI required": ``claude-sdk``, ``codex``, ``openai-agents-sdk``,
-# ``databricks_supervisor``, and ``cursor`` (which drives the ``cursor-sdk``
-# Python package over its own bundled bridge, NOT the ``cursor-agent`` CLI).
+# and the SDK ``cursor`` harness (which drives the ``cursor-sdk`` Python package
+# over its own bundled bridge, NOT the ``cursor-agent`` CLI).
 _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "claude-native": ANTHROPIC_FAMILY,
     "codex-native": OPENAI_FAMILY,
@@ -169,6 +171,8 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     # ``required_cli_for_harness`` returns its install spec and
     # ``missing_harness_cli`` fails loud before a subagent spawn.
     OPENCODE_KEY: OPENCODE_KEY,
+    "cursor-native": CURSOR_KEY,
+    "native-cursor": CURSOR_KEY,
 }
 
 
@@ -208,6 +212,35 @@ def missing_harness_cli(harness: str) -> HarnessInstallSpec | None:
     if shutil.which(spec.binary) is not None:
         return None
     return spec
+
+
+def harness_setup_hint(harness: str | None) -> str:
+    """Return actionable remediation when *harness* can't launch on a machine.
+
+    Most CLI harnesses (``claude``/``codex``/``pi``) install via npm and a
+    model credential, both of which ``omnigent setup`` handles — so they route
+    there. But a harness whose CLI ships out-of-band (``cursor-agent``, via
+    Cursor's own curl installer rather than npm — it carries an ``install_hint``
+    and no ``package``) is **not** installed by ``omnigent setup``: pointing a
+    native-Cursor user there is a dead end, since setup only configures the
+    SDK-based ``cursor`` harness (``cursor-sdk`` + ``CURSOR_API_KEY``). For
+    those, name the vendor installer and the CLI's own login instead.
+
+    :param harness: An executor harness identifier, e.g. ``"cursor-native"``,
+        ``"claude-native"``, or ``"codex"``; ``None`` falls back to the
+        ``omnigent setup`` hint.
+    :returns: A remediation clause for the "harness not configured" message,
+        e.g. ``"install the cursor-agent CLI on that machine with `curl
+        https://cursor.com/install -fsS | bash`, then run `cursor-agent
+        login`"`` for native Cursor, or the ``omnigent setup`` hint otherwise.
+    """
+    spec = required_cli_for_harness(harness or "")
+    if spec is not None and spec.package is None and spec.install_hint:
+        login = ""
+        if spec.login_args:
+            login = f", then run `{spec.binary} {' '.join(spec.login_args)}`"
+        return f"install the {spec.binary} CLI on that machine with `{spec.install_hint}`{login}"
+    return "run `omnigent setup` on that machine to install the CLI and set a default credential"
 
 
 def harness_install_spec(key: str) -> HarnessInstallSpec | None:

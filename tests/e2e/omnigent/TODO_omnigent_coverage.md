@@ -156,9 +156,8 @@ the `_tool_executor` bridge called `context.call_tool`, which
 fell through to `await_tool_output` (the client-side tunneling
 path) and parked forever waiting for a client that doesn't exist.
 
-**Fix** (see `omnigent/runtime/executors/omnigent.py`):
-`_make_tool_executor_bridge` now takes the `AgentDef` and
-dispatches user tools directly:
+**Fix** (in the tool-executor bridge): the bridge takes the
+`AgentDef` and dispatches user tools directly:
 
 - `FunctionTool` → call `tool.callable(**args)` directly
   (sync: on the thread pool; async: awaited on the current loop).
@@ -172,10 +171,9 @@ TOOL_CALL policy enforcement is preserved: the bridge now calls
 `context.enforce_tool_call_policy(tool_name, args)` **before**
 dispatching, so the same guardrails Omnigent' native tool
 loop applies also apply here. On DENY, the sentinel returns as
-the tool output instead of invoking the real callable.
-`ExecutorContext` got a new `enforce_tool_call_policy` field;
-the workflow wires it to `_enforce_tool_call_policy` with the
-already-built `PolicyEngine`.
+the tool output instead of invoking the real callable. The
+workflow wires the enforcement hook to `_enforce_tool_call_policy`
+with the already-built `PolicyEngine`.
 
 Verified by:
 - `examples/agent_with_tools.yaml` (xfail removed, passes
