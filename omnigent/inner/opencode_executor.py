@@ -30,6 +30,7 @@ The SDK client is built from the announced ``http://127.0.0.1:<port>`` URL.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -145,3 +146,56 @@ def _latest_user_text(messages: list[Message]) -> str:
             if parts:
                 return "\n".join(parts)
     return ""
+
+
+def _resolve_mcp_servers_env() -> dict[str, Any]:
+    """Decode ``HARNESS_OPENCODE_MCP_SERVERS`` into the OpenCode MCP map.
+
+    :returns: Decoded ``{server_name: info}`` map, or ``{}`` when unset.
+    :raises ValueError: When set but not a JSON object.
+    """
+    raw = os.environ.get(_ENV_MCP_SERVERS, "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{_ENV_MCP_SERVERS} is not valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{_ENV_MCP_SERVERS} must be a JSON object")
+    return parsed
+
+
+def _build_opencode_config_content(
+    mcp_extra: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Synthesise the ``OPENCODE_CONFIG_CONTENT`` payload, if any.
+
+    Combines the gateway provider override (``provider.<id>.options.baseURL`` /
+    ``apiKey``) with the merged MCP map (env-supplied servers + the in-process
+    bridge entry *mcp_extra*).
+
+    :param mcp_extra: In-process bridge entries to merge into the ``mcp`` map.
+    :returns: A config dict, or ``None`` when nothing is configured.
+    """
+    base_url = os.environ.get(_ENV_GATEWAY_BASE_URL, "").strip()
+    api_key = os.environ.get(_ENV_GATEWAY_API_KEY, "").strip()
+    mcp_servers = dict(_resolve_mcp_servers_env())
+    if mcp_extra:
+        mcp_servers.update(mcp_extra)
+
+    if not base_url and not api_key and not mcp_servers:
+        return None
+
+    payload: dict[str, Any] = {}
+    if base_url or api_key:
+        provider_id = os.environ.get(_ENV_GATEWAY_PROVIDER, "").strip() or "anthropic"
+        options: dict[str, Any] = {}
+        if base_url:
+            options["baseURL"] = base_url
+        if api_key:
+            options["apiKey"] = api_key
+        payload["provider"] = {provider_id: {"options": options}}
+    if mcp_servers:
+        payload["mcp"] = mcp_servers
+    return payload
