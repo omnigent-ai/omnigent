@@ -37,6 +37,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -74,6 +75,46 @@ def _strip_ansi(text: str) -> str:
     :returns: Plain text suitable for substring assertions.
     """
     return _ANSI_RE.sub("", text)
+
+
+def _wait_for_function_call_outputs(
+    mock_llm_server_url: str,
+    *,
+    timeout: float = 120.0,
+    poll_interval: float = 0.5,
+) -> str:
+    """
+    Poll the mock server until the tool round-trip's
+    ``function_call_output`` is recorded, then return the joined outputs.
+
+    Waits on the *exact* post-condition the callers assert on (a
+    recorded ``function_call_output``) rather than sampling
+    :func:`get_mock_requests` once after a proxy signal (the follow-up
+    text rendering). The REPL can render the follow-up reply a beat
+    before the mock server finishes persisting the request that carried
+    the output, so a single sample races and returns ``''`` (~3% flake
+    observed on CI shard 2). Polling the real signal removes the race;
+    ``timeout`` is only a safety cap, not the thing we time against.
+
+    :param mock_llm_server_url: Mock server URL.
+    :param timeout: Max seconds to wait for the output to be recorded.
+    :param poll_interval: Seconds between polls.
+    :returns: Space-joined ``function_call_output`` values (``''`` if
+        none were recorded within ``timeout``).
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        reqs = get_mock_requests(mock_llm_server_url)
+        outputs = [
+            item.get("output", "")
+            for req in reqs
+            for item in (req.get("input") or [])
+            if isinstance(item, dict) and item.get("type") == "function_call_output"
+        ]
+        joined = " ".join(str(o) for o in outputs)
+        if outputs or time.monotonic() >= deadline:
+            return joined
+        time.sleep(poll_interval)
 
 
 @pytest.fixture(scope="module")
@@ -793,14 +834,7 @@ def test_repl_tool_call_approval_allows_tool_to_run(
         child.expect(follow_up, timeout=120)
         # The echo tool runs; its output prefix 'echo:' should reach the
         # LLM's function_call_output on the follow-up call.
-        reqs = get_mock_requests(mock_llm_server_url)
-        outputs = [
-            item.get("output", "")
-            for req in reqs
-            for item in (req.get("input") or [])
-            if isinstance(item, dict) and item.get("type") == "function_call_output"
-        ]
-        joined = " ".join(str(o) for o in outputs)
+        joined = _wait_for_function_call_outputs(mock_llm_server_url)
         assert "echo: testing123" in joined, (
             "Tool output did not reach the LLM's function_call_output after "
             f"approval.\nfunction_call_outputs: {joined[:800]}"
@@ -868,14 +902,7 @@ def test_repl_tool_call_refusal_blocks_tool(
         # separate TOOL_RESULT substitution path.) The regression
         # guard: a denial is recorded AND the raw echo output must
         # NEVER reach the conversation.
-        reqs = get_mock_requests(mock_llm_server_url)
-        outputs = [
-            item.get("output", "")
-            for req in reqs
-            for item in (req.get("input") or [])
-            if isinstance(item, dict) and item.get("type") == "function_call_output"
-        ]
-        joined = " ".join(str(o) for o in outputs)
+        joined = _wait_for_function_call_outputs(mock_llm_server_url)
         assert "denied" in joined.lower(), (
             "Tool-call denial marker did not appear in the LLM's "
             "function_call_output — refusal enforcement may have "
@@ -1396,14 +1423,7 @@ def test_repl_tool_result_ask_does_not_prompt_in_repl(
         )
         # The raw tool output reached the LLM untouched (no deny
         # sentinel) — the ASK passed through rather than blocking.
-        reqs = get_mock_requests(mock_llm_server_url)
-        outputs = [
-            item.get("output", "")
-            for req in reqs
-            for item in (req.get("input") or [])
-            if isinstance(item, dict) and item.get("type") == "function_call_output"
-        ]
-        joined = " ".join(str(o) for o in outputs)
+        joined = _wait_for_function_call_outputs(mock_llm_server_url)
         assert "echo: pineapple" in joined, (
             "Expected the raw echo output to reach the LLM's "
             "function_call_output (TOOL_RESULT ASK is a no-op today), but "
@@ -1474,12 +1494,11 @@ def test_repl_tool_result_ask_passes_output_through(
         child.send("mangosteen" + "\r")
         # Sync on the post-tool follow-up reply: it only renders after the
         # LLM's second call, which requires the function_call_output round-trip
-        # to have completed (and thus been recorded by the mock server).
-        # Polling get_mock_requests right after `· ready` can race the mock
-        # server's request recording (~3% flake observed) — expecting the
-        # follow-up text first makes the round-trip recording deterministic.
-        # 120s headroom for REPL turn latency under CI worker contention
-        # (#523 family); within the --timeout=180 pytest cap.
+        # to have completed. 120s headroom for REPL turn latency under CI
+        # worker contention (#523 family); within the --timeout=180 pytest cap.
+        # (The follow-up render is a proxy; the function_call_output assertion
+        # below waits on the real signal via _wait_for_function_call_outputs,
+        # which polls until the mock has recorded the output.)
         child.expect(follow_up, timeout=120)
         full_turn = _strip_ansi((child.before or "") + follow_up)
         assert "approval required" not in full_turn, (
@@ -1487,14 +1506,7 @@ def test_repl_tool_result_ask_passes_output_through(
             f"mid-flight ASK is not implemented (see #765).\nCaptured:\n{full_turn[:1500]}"
         )
         # No deny sentinel: today's path does not suppress the output.
-        reqs = get_mock_requests(mock_llm_server_url)
-        outputs = [
-            item.get("output", "")
-            for req in reqs
-            for item in (req.get("input") or [])
-            if isinstance(item, dict) and item.get("type") == "function_call_output"
-        ]
-        joined = " ".join(str(o) for o in outputs)
+        joined = _wait_for_function_call_outputs(mock_llm_server_url)
         assert "echo: mangosteen" in joined, (
             "The raw echo output did not reach the LLM — TOOL_RESULT ASK "
             f"is a no-op today and must not suppress it.\noutputs: {joined[:800]}"
