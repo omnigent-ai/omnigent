@@ -725,9 +725,9 @@ def _materialize_internal_beta_agents() -> Path:
         path = _materialize_bundled_example(name)
         if name == _INTERNAL_BETA_DEFAULT_AGENT_NAME:
             default_path = path
-    assert default_path is not None, (
-        f"_INTERNAL_BETA_BUNDLED_AGENTS must include {_INTERNAL_BETA_DEFAULT_AGENT_NAME}"
-    )
+    assert (
+        default_path is not None
+    ), f"_INTERNAL_BETA_BUNDLED_AGENTS must include {_INTERNAL_BETA_DEFAULT_AGENT_NAME}"
     return default_path
 
 
@@ -7692,12 +7692,11 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         # Codex harness sees gpt-*/o3-*/etc.).
         _ANTHROPIC_PREFIXES = ("anthropic/", "claude")
         _anthropic_models = [
-            m for m in discovered_models
+            m
+            for m in discovered_models
             if any(m.lower().startswith(p) for p in _ANTHROPIC_PREFIXES)
         ]
-        _openai_models = [
-            m for m in discovered_models if m not in _anthropic_models
-        ]
+        _openai_models = [m for m in discovered_models if m not in _anthropic_models]
 
         models: dict[str, str] = {}
         if discovered_models:
