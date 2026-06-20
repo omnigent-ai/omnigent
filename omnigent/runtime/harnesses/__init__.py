@@ -74,6 +74,12 @@ _HARNESS_MODULES: dict[str, str] = {
     # localharness binary; needs glibc >=~2.36). Drives Gemini 3.5 Flash by
     # default (also Claude / GPT-OSS), with Gemini API-key or Vertex AI auth.
     "antigravity": "omnigent.inner.antigravity_harness",
+    # Hermes Agent harness wrap. Runs the ``hermes`` CLI as a subprocess
+    # for each turn, managing its own session state via Hermes' SQLite
+    # session store. See omnigent/inner/hermes_harness.py and
+    # omnigent/inner/hermes_executor.py. The ``hermes`` binary must be
+    # on PATH (or set by HARNESS_HERMES_PATH).
+    "hermes": "omnigent.inner.hermes_harness",
 }
 
 __all__ = ["_HARNESS_MODULES"]
