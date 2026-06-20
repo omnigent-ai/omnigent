@@ -38,7 +38,6 @@ import os
 import re
 import shutil
 import socket
-import uuid  # noqa: F401 — available for session-id generation if needed
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, cast
 
@@ -73,7 +72,9 @@ _OPENCODE_CONFIG_CONTENT_ENV = "OPENCODE_CONFIG_CONTENT"
 _OPENCODE_DISABLE_PROJECT_CONFIG_ENV = "OPENCODE_DISABLE_PROJECT_CONFIG"
 
 _SERVER_BOOT_TIMEOUT_S = 30.0
-_STDERR_CHUNK_LIMIT = 65536
+# Read size for draining the server's stderr pipe. The output is discarded
+# (it's only drained so the pipe never fills and blocks the subprocess).
+_STDERR_READ_SIZE = 65536
 
 
 def _parse_truthy(raw: str | None) -> bool:
@@ -296,7 +297,6 @@ def _translate_part_event(
         state = part.get("state") or {}
         status_str = state.get("status")
         events: list[ExecutorEvent] = []
-        metadata = {"call_id": call_id}
         raw_input = state.get("input")
         tool_args: dict[str, Any] = raw_input if isinstance(raw_input, dict) else {}
         # Defer emitting ToolCallRequest until the state is past "pending".
@@ -307,7 +307,7 @@ def _translate_part_event(
                 ToolCallRequest(
                     name=tool_name,
                     args=tool_args,
-                    metadata=dict(metadata),
+                    metadata={"call_id": call_id},
                 )
             )
         if status_str in {"completed", "error"} and tracker.mark_tool_completed(pid):
@@ -318,7 +318,7 @@ def _translate_part_event(
                     status=status,
                     result=state.get("output"),
                     error=state.get("error") if status == ToolCallStatus.ERROR else None,
-                    metadata=dict(metadata),
+                    metadata={"call_id": call_id},
                 )
             )
         return events
@@ -392,7 +392,7 @@ class _OpenCodeServer:
     async def _drain_stderr(self) -> None:
         assert self._proc is not None and self._proc.stderr is not None
         while True:
-            chunk = await self._proc.stderr.read(4096)
+            chunk = await self._proc.stderr.read(_STDERR_READ_SIZE)
             if not chunk:
                 return
 
@@ -493,9 +493,10 @@ class _OmnigentToolBridge:
         if not isinstance(name, str) or not name:
             return
         description = spec.get("description") or ""
-        schema = spec.get("parameters") if isinstance(spec.get("parameters"), dict) else {}
-        properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
-        required = set(schema.get("required", []) or []) if isinstance(schema, dict) else set()
+        params_schema = spec.get("parameters")
+        schema = params_schema if isinstance(params_schema, dict) else {}
+        properties = schema.get("properties", {})
+        required = set(schema.get("required", []) or [])
         executor = self._tool_executor
 
         async def _handler(**kwargs: Any) -> Any:
@@ -768,7 +769,8 @@ class OpenCodeExecutor(Executor):
                 if etype == "message.part.updated":
                     part = self._as_dict(props.get("part"))
                     # Filter parts from other sessions when a session_id is present.
-                    if part.get("session_id") and part.get("session_id") != session_id:
+                    part_session = part.get("session_id")
+                    if part_session and part_session != session_id:
                         continue
                     # Correction (B): no reasoning part type in this SDK;
                     # emit_reasoning=self._thinking kept for future compat.
