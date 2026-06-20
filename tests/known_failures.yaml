@@ -40,24 +40,6 @@ skips:
     cluster: no-agent-harness-roundtrip-hang
     mode: skip
 
-  - id: tests/e2e/omnigent/test_repl_session_lifecycle.py::test_repl_effort_command_persists_session_metadata
-    reason: "mock-LLM migrated but still CRASHES at REPL startup in --server mode: the spawned `omnigent run --model mock-session-lifecycle --harness openai-agents --server <url>` exits before reaching `state: sleeping`/`❯` (the generic 'auth or configuration problem' CLI hint masks the real error, which logs to a file). Fails 0/10 in CI flake-stress run 27816505132 AND 0/3 locally in a clean env — NOT stale-green and NOT a local artifact. #751 (resume idle sessions) + the mock migration did not green it. Daemon/server-mode startup family (cf. WT-B F1/F2/F3 triage); needs the real --server-mode startup error captured and fixed."
-    issue: 523
-    cluster: repl-server-mode-startup-crash
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_repl_session_lifecycle.py::test_repl_recover_after_runner_death
-    reason: "mock-LLM migrated but still CRASHES at REPL startup in --server mode: the spawned `omnigent run --model mock-session-lifecycle --harness openai-agents --server <url>` exits before reaching `state: sleeping`/`❯` (the generic 'auth or configuration problem' CLI hint masks the real error, which logs to a file). Fails 0/10 in CI flake-stress run 27816505132 AND 0/3 locally in a clean env — NOT stale-green and NOT a local artifact. #751 (resume idle sessions) + the mock migration did not green it. Daemon/server-mode startup family (cf. WT-B F1/F2/F3 triage); needs the real --server-mode startup error captured and fixed."
-    issue: 523
-    cluster: repl-server-mode-startup-crash
-    mode: skip
-
-  - id: tests/e2e/omnigent/test_repl_session_lifecycle.py::test_repl_resume_reuses_daemon_runner
-    reason: "mock-LLM migrated but still CRASHES at REPL startup in --server mode: the spawned `omnigent run --model mock-session-lifecycle --harness openai-agents --server <url>` exits before reaching `state: sleeping`/`❯` (the generic 'auth or configuration problem' CLI hint masks the real error, which logs to a file). Fails 0/10 in CI flake-stress run 27816505132 AND 0/3 locally in a clean env — NOT stale-green and NOT a local artifact. #751 (resume idle sessions) + the mock migration did not green it. Daemon/server-mode startup family (cf. WT-B F1/F2/F3 triage); needs the real --server-mode startup error captured and fixed."
-    issue: 523
-    cluster: repl-server-mode-startup-crash
-    mode: skip
-
 
 
 
