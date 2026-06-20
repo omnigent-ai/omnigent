@@ -456,14 +456,26 @@ class _OmnigentToolBridge:
         app = mcp.streamable_http_app()
         import uvicorn
 
-        config = uvicorn.Config(app, host="127.0.0.1", port=self._port, log_level="warning")
+        # ws="none": the MCP streamable-HTTP transport is POST/SSE only, so
+        # skip loading uvicorn's websockets protocol (avoids its third-party
+        # DeprecationWarnings and a needless import).
+        config = uvicorn.Config(
+            app, host="127.0.0.1", port=self._port, log_level="warning", ws="none"
+        )
         self._server = uvicorn.Server(config)
         self._task = asyncio.create_task(self._server.serve())
-        # Wait until uvicorn flips started.
+        # Wait until uvicorn flips started (bounded ~5s). If it never does,
+        # the returned URL would be dead — surface that instead of handing
+        # OpenCode a port nothing is listening on.
         for _ in range(100):
             if getattr(self._server, "started", False):
                 break
             await asyncio.sleep(0.05)
+        else:
+            await self.close()
+            raise RuntimeError(
+                "opencode tool-bridge MCP server failed to start within 5s"
+            )
         return f"http://127.0.0.1:{self._port}/mcp"
 
     def _register_tool(self, mcp: Any, spec: ToolSpec) -> None:
@@ -502,8 +514,9 @@ class _OmnigentToolBridge:
         # Advertise the ORIGINAL spec JSON schema (with real types) to clients —
         # the synthesized Any-typed signature loses per-field types, but call-time
         # validation only uses fn_metadata, so overriding the advertised schema is
-        # safe and gives OpenCode the correct parameter types.
-        if schema:
+        # safe and gives OpenCode the correct parameter types. Overriding with
+        # an empty schema ({}) is benign, so no truthiness guard.
+        if isinstance(schema, dict):
             tool.parameters = schema
         mcp._tool_manager._tools[name] = tool
 
