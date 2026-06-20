@@ -7676,24 +7676,38 @@ def _configure_harness_add(family: str | None = None) -> str | None:
             except (OSError, KeyError, ValueError):
                 pass
 
+        # Split discovered models by family so each harness only sees
+        # relevant models (e.g. Claude harness sees anthropic/claude-*,
+        # Codex harness sees gpt-*/o3-*/etc.).
+        _ANTHROPIC_PREFIXES = ("anthropic/", "claude")
+        _anthropic_models = [
+            m for m in discovered_models
+            if any(m.lower().startswith(p) for p in _ANTHROPIC_PREFIXES)
+        ]
+        _openai_models = [
+            m for m in discovered_models if m not in _anthropic_models
+        ]
+
         models: dict[str, str] = {}
         if discovered_models:
             if OPENAI_FAMILY in families:
+                _family_models = _openai_models or discovered_models
                 _model_choice = select(
                     "Default model for the Codex / OpenAI surface",
-                    discovered_models,
+                    _family_models,
                     clear_on_exit=True,
                 )
                 if _model_choice >= 0:
-                    models[OPENAI_FAMILY] = discovered_models[_model_choice]
+                    models[OPENAI_FAMILY] = _family_models[_model_choice]
             if ANTHROPIC_FAMILY in families:
+                _family_models = _anthropic_models or discovered_models
                 _model_choice = select(
                     "Default model for the Claude surface",
-                    discovered_models,
+                    _family_models,
                     clear_on_exit=True,
                 )
                 if _model_choice >= 0:
-                    models[ANTHROPIC_FAMILY] = discovered_models[_model_choice]
+                    models[ANTHROPIC_FAMILY] = _family_models[_model_choice]
         else:
             if OPENAI_FAMILY in families:
                 models[OPENAI_FAMILY] = prompt_text(
