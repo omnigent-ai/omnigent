@@ -33,9 +33,3 @@ skips:
     issue: 523
     cluster: mock-claude-sdk-cli-unsupported
     mode: skip
-
-  - id: tests/e2e/omnigent/test_yaml_hello_world.py::test_yaml_agent_with_tools[pi]
-    reason: "pi harness does not complete the headless `-p` tool round-trip: it makes only ONE LLM request (receives the forced calculate tool_call) then exits 0 with empty stdout — the tool is never dispatched and no follow-up call is made. Distinct from #677 (stale stdout-marker expectation, fixed for the claude-sdk/codex/openai-agents rows). See #807 for the full diagnosis."
-    issue: 807
-    cluster: pi-headless-tool-roundtrip
-    mode: skip
