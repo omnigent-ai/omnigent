@@ -790,6 +790,29 @@ async def create_chat_completion(
         await qr._gate.wait()
 
     text = qr.text if not qr.tool_calls else ""
+    # Render queued tool_calls in Chat Completions format (harnesses on the
+    # openai-completions wire — e.g. pi's gateway models.json — POST here, not
+    # /v1/responses). Without this, a tool_call response collapsed to empty
+    # content and the tool round-trip silently produced nothing.
+    cc_tool_calls = (
+        [
+            {
+                "id": tc.get("call_id", "call-mock"),
+                "type": "function",
+                "function": {
+                    "name": tc.get("name", ""),
+                    "arguments": tc.get("arguments", "{}"),
+                },
+            }
+            for tc in qr.tool_calls
+        ]
+        if qr.tool_calls
+        else None
+    )
+    finish_reason = "tool_calls" if cc_tool_calls else "stop"
+    cc_message: dict[str, object] = {"role": "assistant", "content": text or None}
+    if cc_tool_calls:
+        cc_message["tool_calls"] = cc_tool_calls
     resp_id = _response_id()
     body_json = {
         "id": f"chatcmpl-{resp_id}",
@@ -798,8 +821,8 @@ async def create_chat_completion(
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
+                "message": cc_message,
+                "finish_reason": finish_reason,
             }
         ],
         "usage": {
@@ -809,6 +832,9 @@ async def create_chat_completion(
         },
     }
     if parsed.get("stream"):
+        delta: dict[str, object] = {"role": "assistant", "content": text or None}
+        if cc_tool_calls:
+            delta["tool_calls"] = [{"index": i, **tc} for i, tc in enumerate(cc_tool_calls)]
         chunk = {
             "id": f"chatcmpl-{resp_id}",
             "object": "chat.completion.chunk",
@@ -816,8 +842,8 @@ async def create_chat_completion(
             "choices": [
                 {
                     "index": 0,
-                    "delta": {"role": "assistant", "content": text},
-                    "finish_reason": "stop",
+                    "delta": delta,
+                    "finish_reason": finish_reason,
                 }
             ],
         }
