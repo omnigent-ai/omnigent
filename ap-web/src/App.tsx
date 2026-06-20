@@ -1,6 +1,7 @@
 import { lazy, Suspense } from "react";
 import { Route, Routes } from "react-router-dom";
 import { ChatPage } from "@/pages/ChatPage";
+import { ComparePage } from "@/pages/ComparePage";
 import { NotFoundPage } from "@/pages/NotFoundPage";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
@@ -119,6 +120,7 @@ function App({ basename }: AppProps = {}) {
         <Route element={<AppShell />}>
           <Route path={prefix || "/"} element={<ChatPage />} />
           <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
+          <Route path={`${prefix}/compare`} element={<ComparePage />} />
           <Route path={`${prefix}/inbox`} element={<InboxPage />} />
           {info.accounts_enabled && (
             <>
