@@ -442,71 +442,73 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
                 onExit={exitSelectionMode}
               />
             ) : (
-              <div className="relative mt-3 flex items-center gap-1.5">
-                <div className="relative flex-1">
-                  <SearchIcon className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2.5 size-3.5 text-muted-foreground" />
-                  <input
-                    type="search"
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                    aria-label="Search sessions"
-                    placeholder="Search sessions"
-                    className="min-h-8 w-full rounded-full border border-input pr-3 pl-8 text-sm transition placeholder:text-muted-foreground focus-visible:outline-1"
-                  />
+              <>
+                <div className="relative mt-3 flex items-center gap-1.5">
+                  <div className="relative flex-1">
+                    <SearchIcon className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2.5 size-3.5 text-muted-foreground" />
+                    <input
+                      type="search"
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      aria-label="Search sessions"
+                      placeholder="Search sessions"
+                      className="min-h-8 w-full rounded-full border border-input pr-3 pl-8 text-sm transition placeholder:text-muted-foreground focus-visible:outline-1"
+                    />
+                  </div>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-sm"
+                        aria-label="Select sessions"
+                        data-testid="toggle-selection-mode"
+                        className="shrink-0 rounded-full"
+                        onClick={() => setSelectionMode(true)}
+                      >
+                        <ListChecksIcon className="size-3.5" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent side="bottom">Select sessions</TooltipContent>
+                  </Tooltip>
                 </div>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label="Select sessions"
-                      data-testid="toggle-selection-mode"
-                      className="shrink-0 rounded-full"
-                      onClick={() => setSelectionMode(true)}
-                    >
-                      <ListChecksIcon className="size-3.5" />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent side="bottom">Select sessions</TooltipContent>
-                </Tooltip>
-              </div>
+                {(knownLabels.length > 0 || labelFilter) && (
+                  <div className="mt-2 flex flex-wrap gap-1">
+                    {labelFilter && (
+                      <button
+                        type="button"
+                        onClick={() => setLabelFilter(undefined)}
+                        className="inline-flex h-6 items-center gap-1 rounded-full bg-muted px-2 text-xs text-muted-foreground hover:bg-muted/80"
+                      >
+                        <XIcon className="size-3" />
+                        Clear filter
+                      </button>
+                    )}
+                    {knownLabels.map((l) => {
+                      const colors = labelColor(l);
+                      const isActive = labelFilter === l;
+                      return (
+                        <button
+                          key={l}
+                          type="button"
+                          onClick={() => setLabelFilter(isActive ? undefined : l)}
+                          className={cn(
+                            "inline-flex h-6 items-center gap-1 rounded-full px-2 text-xs font-medium transition-all",
+                            colors.bg,
+                            colors.text,
+                            isActive && "ring-2 ring-current ring-offset-1 ring-offset-background",
+                          )}
+                        >
+                          <TagIcon className="size-3" />
+                          {l}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </>
             )}
           </div>
-          {(knownLabels.length > 0 || labelFilter) && (
-            <div className="mt-2 flex flex-wrap gap-1 px-3">
-              {labelFilter && (
-                <button
-                  type="button"
-                  onClick={() => setLabelFilter(undefined)}
-                  className="inline-flex h-6 items-center gap-1 rounded-full bg-muted px-2 text-xs text-muted-foreground hover:bg-muted/80"
-                >
-                  <XIcon className="size-3" />
-                  Clear filter
-                </button>
-              )}
-              {knownLabels.map((l) => {
-                const colors = labelColor(l);
-                const isActive = labelFilter === l;
-                return (
-                  <button
-                    key={l}
-                    type="button"
-                    onClick={() => setLabelFilter(isActive ? undefined : l)}
-                    className={cn(
-                      "inline-flex h-6 items-center gap-1 rounded-full px-2 text-xs font-medium transition-all",
-                      colors.bg,
-                      colors.text,
-                      isActive && "ring-2 ring-current ring-offset-1 ring-offset-background",
-                    )}
-                  >
-                    <TagIcon className="size-3" />
-                    {l}
-                  </button>
-                );
-              })}
-            </div>
-          )}
 
           {/* Mobile: extra bottom padding so the last session scrolls clear of
           the floating Settings icon (which is absolutely positioned, out of
@@ -1123,26 +1125,24 @@ function ConversationRow({
         {/* Row 2: label + git branch subtitles. */}
         {(getUserLabel(conversation) || gitBranch !== null) && (
           <span className="flex items-center gap-1.5 font-normal text-xs">
-            {getUserLabel(conversation) && (() => {
-              const userLabel = getUserLabel(conversation)!;
-              const colors = labelColor(userLabel);
-              return (
-                <span
-                  className={cn(
-                    "inline-flex items-center gap-0.5 rounded-full px-1.5 py-0 text-[10px] font-medium leading-4",
-                    colors.bg,
-                    colors.text,
-                  )}
-                >
-                  {userLabel}
-                </span>
-              );
-            })()}
+            {getUserLabel(conversation) &&
+              (() => {
+                const userLabel = getUserLabel(conversation)!;
+                const colors = labelColor(userLabel);
+                return (
+                  <span
+                    className={cn(
+                      "inline-flex items-center gap-0.5 rounded-full px-1.5 py-0 text-[10px] font-medium leading-4",
+                      colors.bg,
+                      colors.text,
+                    )}
+                  >
+                    {userLabel}
+                  </span>
+                );
+              })()}
             {gitBranch !== null && (
-              <span
-                className="flex items-center gap-1 text-muted-foreground"
-                title={gitBranch}
-              >
+              <span className="flex items-center gap-1 text-muted-foreground" title={gitBranch}>
                 <GitBranchIcon className="size-3 shrink-0" />
                 <span className="truncate">{gitBranch}</span>
               </span>

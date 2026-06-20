@@ -24,6 +24,7 @@ vi.mock("@/hooks/useConversations", () => ({
   useStopAndDeleteConversation: () => ({ mutate: vi.fn() }),
   usePinnedConversationBackfill: () => [],
   useRenameConversation: () => ({ mutate: vi.fn() }),
+  useSetSessionLabel: () => ({ mutate: vi.fn() }),
   useStopSession: () => ({ mutate: vi.fn() }),
 }));
 // Header / dialog children that pull their own context — stub to keep the
@@ -116,7 +117,12 @@ describe("Sidebar session list", () => {
     // bottom "Archived" section. A regression to false would make that
     // section perpetually empty.
     expect(useConvMock.mock.calls).toHaveLength(1);
-    expect(useConvMock.mock.calls[0]).toEqual(["", true, { reconcileWhileConnected: true }]);
+    expect(useConvMock.mock.calls[0]).toEqual([
+      "",
+      true,
+      { reconcileWhileConnected: true },
+      undefined,
+    ]);
   });
 
   it("swaps the card content to the settings section nav on /settings", () => {

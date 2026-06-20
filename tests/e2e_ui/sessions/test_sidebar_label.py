@@ -121,6 +121,4 @@ def test_remove_label(
     snap = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
     snap.raise_for_status()
     labels = snap.json().get("labels", {})
-    assert labels.get("user.label", "") == "", (
-        f"server should clear the label, got {labels!r}"
-    )
+    assert labels.get("user.label", "") == "", f"server should clear the label, got {labels!r}"
