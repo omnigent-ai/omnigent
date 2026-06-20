@@ -614,6 +614,7 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
               selectedIds={selectedIds}
               onToggleSelected={toggleSelected}
               visibleIdsRef={visibleIdsRef}
+              knownLabels={knownLabels}
             />
           </nav>
 
@@ -857,6 +858,7 @@ interface ConversationListProps {
   selectedIds: Set<string>;
   onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
   visibleIdsRef: RefObject<string[]>;
+  knownLabels?: string[];
 }
 
 // permission_level null (no ACL row / legacy) or >= 4 both mean owner.
@@ -876,6 +878,7 @@ function ConversationList({
   selectedIds,
   onToggleSelected,
   visibleIdsRef,
+  knownLabels,
 }: ConversationListProps) {
   // All loaded conversations from the single paginated list (for pinned
   // backfill, normalization, and the flat session list).
@@ -1311,6 +1314,7 @@ function ConversationList({
                   selectedIds={selectedIds}
                   onToggleSelected={onToggleSelected}
                   onProjectAssigned={expandProject}
+                  knownLabels={knownLabels}
                 />
               </PinDropZone>
             )}
@@ -1421,6 +1425,7 @@ function ConversationList({
                   selectedIds={selectedIds}
                   onToggleSelected={onToggleSelected}
                   onProjectAssigned={expandProject}
+                  knownLabels={knownLabels}
                 />
               </ChatsDropZone>
             )}
@@ -1437,6 +1442,7 @@ function ConversationList({
                 selectedIds={selectedIds}
                 onToggleSelected={onToggleSelected}
                 onProjectAssigned={expandProject}
+                knownLabels={knownLabels}
               />
             )}
             {/* Archived sessions are no longer listed here — they live on the
@@ -1736,6 +1742,7 @@ function ConversationSection({
   headerAction,
   footer,
   onProjectAssigned,
+  knownLabels,
 }: {
   title?: string;
   /** Optional icon rendered before the title (e.g. project folder icon). */
@@ -1765,6 +1772,7 @@ function ConversationSection({
   /** Called with the project name when a row is filed into one, so the sidebar
       can expand that (possibly brand-new) project folder. */
   onProjectAssigned?: (projectName: string) => void;
+  knownLabels?: string[];
 }) {
   // An untitled section is always open — there's no header to collapse it.
   const isCollapsed = title != null && collapsed;
@@ -1812,6 +1820,7 @@ function ConversationSection({
                   isSelected={selectedIds.has(conv.id)}
                   onToggleSelected={onToggleSelected}
                   onProjectAssigned={onProjectAssigned}
+                  knownLabels={knownLabels}
                 />
               ))}
             </ul>
@@ -2153,6 +2162,7 @@ function ConversationRow({
   isSelected,
   onToggleSelected,
   onProjectAssigned,
+  knownLabels,
 }: {
   conversation: Conversation;
   isPinned: boolean;
@@ -2162,6 +2172,7 @@ function ConversationRow({
   isSelected: boolean;
   onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
   onProjectAssigned?: (projectName: string) => void;
+  knownLabels?: string[];
 }) {
   // `useParams` reads from the active matched route. On `/`, the param is
   // undefined; on `/c/:conversationId`, it carries the active id.
@@ -2784,6 +2795,7 @@ function ConversationRow({
         open={labelPopoverOpen}
         onOpenChange={setLabelPopoverOpen}
         currentLabel={getUserLabel(conversation)}
+        suggestions={knownLabels}
         onSetLabel={(newLabel) => {
           setLabel.mutate({ id: conversation.id, label: newLabel });
           setLabelPopoverOpen(false);
@@ -2797,11 +2809,13 @@ function LabelPopover({
   open,
   onOpenChange,
   currentLabel,
+  suggestions,
   onSetLabel,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   currentLabel: string | null;
+  suggestions: string[];
   onSetLabel: (label: string | null) => void;
 }) {
   const [value, setValue] = useState(currentLabel ?? "");
@@ -2821,6 +2835,10 @@ function LabelPopover({
     const trimmed = value.trim();
     onSetLabel(trimmed || null);
   }
+
+  const filtered = suggestions.filter(
+    (s) => s !== currentLabel && s.toLowerCase().includes(value.toLowerCase()),
+  );
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -2843,6 +2861,31 @@ function LabelPopover({
           placeholder="e.g. project-x, bug-fix, research"
           className="w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-1"
         />
+        {filtered.length > 0 && (
+          <div className="flex flex-wrap gap-1">
+            {filtered.map((s) => {
+              const colors = labelColor(s);
+              return (
+                <button
+                  key={s}
+                  type="button"
+                  onClick={() => {
+                    setValue(s);
+                    onSetLabel(s);
+                  }}
+                  className={cn(
+                    "inline-flex h-6 items-center gap-1 rounded-full px-2 text-xs font-medium transition-colors hover:opacity-80",
+                    colors.bg,
+                    colors.text,
+                  )}
+                >
+                  <TagIcon className="size-3" />
+                  {s}
+                </button>
+              );
+            })}
+          </div>
+        )}
         <DialogFooter className="border-t-0 bg-transparent">
           {currentLabel && (
             <Button
