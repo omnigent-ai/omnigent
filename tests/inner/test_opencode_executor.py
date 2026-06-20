@@ -1,7 +1,9 @@
 # tests/inner/test_opencode_executor.py
 import asyncio
+
 import pytest
-from omnigent.inner.executor import TextChunk, TurnComplete, ExecutorConfig
+
+from omnigent.inner.executor import ExecutorConfig, TextChunk, TurnComplete
 from omnigent.inner.opencode_executor import OpenCodeExecutor
 
 

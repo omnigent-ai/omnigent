@@ -40,7 +40,7 @@ import shutil
 import socket
 import uuid  # noqa: F401 — available for session-id generation if needed
 from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import Any
+from typing import Any, cast
 
 from omnigent.inner.executor import (
     EnqueuedContent,
@@ -297,11 +297,13 @@ def _translate_part_event(
         status_str = state.get("status")
         events: list[ExecutorEvent] = []
         metadata = {"call_id": call_id}
+        raw_input = state.get("input")
+        tool_args: dict[str, Any] = raw_input if isinstance(raw_input, dict) else {}
         if tracker.mark_tool_requested(pid):
             events.append(
                 ToolCallRequest(
                     name=tool_name,
-                    args=state.get("input") if isinstance(state.get("input"), dict) else {},
+                    args=tool_args,
                     metadata=dict(metadata),
                 )
             )
@@ -424,7 +426,7 @@ def _pick_free_port() -> int:
     """Bind an ephemeral port, release it, and return the number."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+        return int(sock.getsockname()[1])
 
 
 class _OmnigentToolBridge:
@@ -481,6 +483,7 @@ class _OmnigentToolBridge:
 
     def _register_tool(self, mcp: Any, spec: ToolSpec) -> None:
         import inspect as _inspect
+
         from mcp.server.fastmcp.tools.base import Tool
 
         name = spec.get("name")
@@ -504,14 +507,21 @@ class _OmnigentToolBridge:
         # passes and args forward correctly). Annotate each param ``Any``.
         params = []
         for pname in properties:
-            if pname in required:
-                params.append(_inspect.Parameter(pname, _inspect.Parameter.KEYWORD_ONLY, annotation=Any))
-            else:
-                params.append(_inspect.Parameter(pname, _inspect.Parameter.KEYWORD_ONLY, annotation=Any, default=None))
-        _handler.__signature__ = _inspect.Signature(params)
-        _handler.__annotations__ = {pname: Any for pname in properties}
+            default = _inspect.Parameter.empty if pname in required else None
+            params.append(
+                _inspect.Parameter(
+                    pname,
+                    _inspect.Parameter.KEYWORD_ONLY,
+                    annotation=Any,
+                    default=default,
+                )
+            )
+        _handler.__signature__ = _inspect.Signature(params)  # type: ignore[attr-defined]
+        _handler.__annotations__ = dict.fromkeys(properties, Any)
 
-        tool = Tool.from_function(_handler, name=name, description=description, structured_output=False)
+        tool = Tool.from_function(
+            _handler, name=name, description=description, structured_output=False
+        )
         # Advertise the ORIGINAL spec JSON schema (with real types) to clients —
         # the synthesized Any-typed signature loses per-field types, but call-time
         # validation only uses fn_metadata, so overriding the advertised schema is
@@ -614,7 +624,7 @@ class OpenCodeExecutor(Executor):
             return provider_id, model_id
         # Need the server default for at least one half.
         if self._default_provider_model is None:
-            resp = await self._client.app.providers()
+            resp = await self._require_client().app.providers()
             default_map: dict[str, str] = dict(getattr(resp, "default", {}) or {})
             if not default_map:
                 raise RuntimeError(
@@ -649,10 +659,23 @@ class OpenCodeExecutor(Executor):
         key = session_key or "default"
         if key in self._session_ids:
             return self._session_ids[key]
-        created = await self._client.session.create()
+        created = await self._require_client().session.create()
         sid = created.id
         self._session_ids[key] = sid
-        return sid
+        return str(sid)
+
+    def _require_client(self) -> Any:
+        """Return the SDK client, asserting the server has been started.
+
+        Narrows ``self._client`` from ``Any | None`` to non-None for callers
+        that run after :meth:`_ensure_server`.
+
+        :returns: The live ``AsyncOpencode`` client.
+        :raises RuntimeError: When the server has not been started yet.
+        """
+        if self._client is None:
+            raise RuntimeError("opencode: server not started")
+        return self._client
 
     @staticmethod
     def _as_dict(obj: Any) -> dict[str, Any]:
@@ -667,7 +690,7 @@ class OpenCodeExecutor(Executor):
         if isinstance(obj, dict):
             return obj
         if hasattr(obj, "model_dump"):
-            return obj.model_dump(by_alias=False)
+            return cast("dict[str, Any]", obj.model_dump(by_alias=False))
         return getattr(obj, "__dict__", {})
 
     async def run_turn(
@@ -707,7 +730,7 @@ class OpenCodeExecutor(Executor):
         )
 
         tracker = _PartTracker()
-        stream = await self._client.event.list()
+        stream = await self._require_client().event.list()
         chat_kwargs: dict[str, Any] = {
             "id": session_id,
             "parts": [{"type": "text", "text": prompt}],
@@ -716,7 +739,7 @@ class OpenCodeExecutor(Executor):
         }
         if system_prompt:
             chat_kwargs["system"] = system_prompt
-        chat_task = asyncio.create_task(self._client.session.chat(**chat_kwargs))
+        chat_task = asyncio.create_task(self._require_client().session.chat(**chat_kwargs))
 
         final_text: list[str] = []
         usage: dict[str, Any] | None = None

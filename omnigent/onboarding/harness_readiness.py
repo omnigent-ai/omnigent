@@ -92,7 +92,11 @@ def harness_is_configured(harness: str) -> bool:
     canonical = _canonical_harness(harness)
     if canonical in _SDK_HARNESSES:
         return True
-    if canonical not in _HARNESS_FAMILY and canonical != PI_SURFACE and canonical != OPENCODE_SURFACE:
+    if (
+        canonical not in _HARNESS_FAMILY
+        and canonical != PI_SURFACE
+        and canonical != OPENCODE_SURFACE
+    ):
         # Unknown harness — the daemon has no install metadata for it, so
         # it can't assess readiness. Fail open (custom/newer harnesses,
         # version skew).

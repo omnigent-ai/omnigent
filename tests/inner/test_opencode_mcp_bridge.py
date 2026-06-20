@@ -1,5 +1,6 @@
 # tests/inner/test_opencode_mcp_bridge.py
 import pytest
+
 from omnigent.inner.opencode_executor import _OmnigentToolBridge
 
 
@@ -42,7 +43,7 @@ async def test_registered_tool_advertises_schema_and_forwards_call():
         # through the executor callback.
         tool = bridge._mcp._tool_manager._tools["echo"]
         assert tool.parameters == schema
-        result = await tool.run({"msg": "hello"})
+        await tool.run({"msg": "hello"})
         assert seen == {"name": "echo", "args": {"msg": "hello"}}
     finally:
         await bridge.close()

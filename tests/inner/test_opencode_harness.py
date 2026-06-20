@@ -1,6 +1,7 @@
 from fastapi import FastAPI
-from omnigent.inner.opencode_harness import create_app, _build_opencode_executor
+
 from omnigent.inner.opencode_executor import OpenCodeExecutor
+from omnigent.inner.opencode_harness import _build_opencode_executor, create_app
 
 
 def test_build_executor():

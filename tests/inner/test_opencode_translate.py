@@ -1,9 +1,15 @@
 # tests/inner/test_opencode_translate.py
 from omnigent.inner.executor import (
-    TextChunk, ReasoningChunk, ToolCallRequest, ToolCallComplete, ToolCallStatus,
+    ReasoningChunk,
+    TextChunk,
+    ToolCallComplete,
+    ToolCallRequest,
+    ToolCallStatus,
 )
 from omnigent.inner.opencode_executor import (
-    _PartTracker, _translate_part_event, _tokens_to_usage,
+    _PartTracker,
+    _tokens_to_usage,
+    _translate_part_event,
 )
 
 

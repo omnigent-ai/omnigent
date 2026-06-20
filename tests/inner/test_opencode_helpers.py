@@ -1,9 +1,10 @@
 # tests/inner/test_opencode_helpers.py
 import pytest
+
 from omnigent.inner.opencode_executor import (
+    _latest_user_text,
     _parse_truthy,
     _split_provider_model,
-    _latest_user_text,
 )
 
 
@@ -16,7 +17,10 @@ def test_parse_truthy(raw, expected):
 
 
 def test_split_provider_model_with_slash():
-    assert _split_provider_model("anthropic/claude-sonnet-4-5") == ("anthropic", "claude-sonnet-4-5")
+    assert _split_provider_model("anthropic/claude-sonnet-4-5") == (
+        "anthropic",
+        "claude-sonnet-4-5",
+    )
 
 
 def test_split_provider_model_no_slash():
