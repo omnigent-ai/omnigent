@@ -533,6 +533,7 @@ def test_add_menu_options_ordering() -> None:
         "ChatGPT — subscription",
         "Claude — subscription (Pro/Max)",
         "Gateway — custom base URL + key (e.g. OpenRouter)",
+        "LiteLLM — proxy URL + key",
         "OpenRouter — API key",
         "Databricks — workspace",
         "Other provider — API key",
@@ -545,6 +546,7 @@ def test_add_menu_options_ordering() -> None:
         "OpenAI — API key",
         "ChatGPT — subscription",
         "Gateway — custom base URL + key (e.g. OpenRouter)",
+        "LiteLLM — proxy URL + key",
         "OpenRouter — API key",
         "Databricks — workspace",
         "Other provider — API key",
@@ -558,6 +560,7 @@ def test_add_menu_options_ordering() -> None:
         "Anthropic — API key",
         "Claude — subscription (Pro/Max)",
         "Gateway — custom base URL + key (e.g. OpenRouter)",
+        "LiteLLM — proxy URL + key",
         "Databricks — workspace",
     ]
 
