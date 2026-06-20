@@ -115,7 +115,7 @@ def _split_provider_model(model: str | None) -> tuple[str | None, str | None]:
     if not model:
         return (None, None)
     if "/" in model:
-        provider, _, rest = model.partition("/")
+        provider, rest = model.split("/", 1)
         return (provider or None, rest or None)
     return (None, model)
 
