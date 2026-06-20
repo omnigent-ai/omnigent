@@ -7657,16 +7657,53 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         # user can type any gateway model id.
         from omnigent.onboarding.providers import default_chat_model
 
+        # For LiteLLM gateways, discover models via /v1/models so the
+        # user picks from a list instead of guessing model names.
+        is_litellm = "litellm" in chosen.label.lower()
+        discovered_models: list[str] = []
+        if is_litellm:
+            try:
+                import httpx as _httpx
+
+                resp = _httpx.get(
+                    f"{base_url.rstrip('/')}/v1/models",
+                    headers={"Authorization": f"Bearer {pasted}"},
+                    timeout=5.0,
+                )
+                if resp.status_code == 200:
+                    for m in resp.json().get("data", []):
+                        discovered_models.append(m["id"])
+            except (OSError, KeyError, ValueError):
+                pass
+
         models: dict[str, str] = {}
-        if OPENAI_FAMILY in families:
-            models[OPENAI_FAMILY] = prompt_text(
-                "Default model for the Codex / OpenAI surface",
-                default=default_chat_model("openrouter"),
-            ).strip()
-        if ANTHROPIC_FAMILY in families:
-            models[ANTHROPIC_FAMILY] = prompt_text(
-                "Default model for the Claude surface (the gateway's Claude model id)"
-            ).strip()
+        if discovered_models:
+            if OPENAI_FAMILY in families:
+                _model_choice = select(
+                    "Default model for the Codex / OpenAI surface",
+                    discovered_models,
+                    clear_on_exit=True,
+                )
+                if _model_choice >= 0:
+                    models[OPENAI_FAMILY] = discovered_models[_model_choice]
+            if ANTHROPIC_FAMILY in families:
+                _model_choice = select(
+                    "Default model for the Claude surface",
+                    discovered_models,
+                    clear_on_exit=True,
+                )
+                if _model_choice >= 0:
+                    models[ANTHROPIC_FAMILY] = discovered_models[_model_choice]
+        else:
+            if OPENAI_FAMILY in families:
+                models[OPENAI_FAMILY] = prompt_text(
+                    "Default model for the Codex / OpenAI surface",
+                    default=default_chat_model("openrouter"),
+                ).strip()
+            if ANTHROPIC_FAMILY in families:
+                models[ANTHROPIC_FAMILY] = prompt_text(
+                    "Default model for the Claude surface (the gateway's Claude model id)"
+                ).strip()
         entry = build_gateway_provider_entry(
             base_url=base_url,
             api_key_ref=f"keychain:{name}",
