@@ -18,6 +18,7 @@ function stub(name: string) {
 vi.mock("@/components/icons/ClaudeIcon", () => ({ ClaudeIcon: stub("claude") }));
 vi.mock("@/components/icons/CodexIcon", () => ({ CodexIcon: stub("codex") }));
 vi.mock("@/components/icons/CursorIcon", () => ({ CursorIcon: stub("cursor") }));
+vi.mock("@/components/icons/GooseIcon", () => ({ GooseIcon: stub("goose") }));
 vi.mock("@/components/icons/NessieIcon", () => ({ NessieIcon: stub("nessie") }));
 vi.mock("@/components/icons/PiIcon", () => ({ PiIcon: stub("pi") }));
 vi.mock("lucide-react", () => ({ BotIcon: stub("bot") }));
@@ -50,6 +51,9 @@ describe("AgentCard icon selection", () => {
     { name: "claude-native-ui", harness: "claude-native", expected: "claude" },
     { name: "pi-native-ui", harness: "pi-native", expected: "pi" },
     { name: "cursor-native-ui", harness: "cursor-native", expected: "cursor" },
+    { name: "goose-native-ui", harness: "goose-native", expected: "goose" },
+    // A goose-harnessed agent also reads as Goose via the harness fallback.
+    { name: "x", harness: "goose-native", expected: "goose" },
     // The SDK "cursor" harness also reads as Cursor via the harness fallback.
     { name: "x", harness: "cursor", expected: "cursor" },
     { name: "x", harness: "claude-sdk", expected: "claude" },

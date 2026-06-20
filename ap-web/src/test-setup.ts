@@ -13,6 +13,9 @@ vi.mock("@/components/icons/CodexIcon", () => ({
 vi.mock("@/components/icons/CursorIcon", () => ({
   CursorIcon: () => null,
 }));
+vi.mock("@/components/icons/GooseIcon", () => ({
+  GooseIcon: () => null,
+}));
 
 // Radix UI primitives (DropdownMenu, etc.) call these pointer-capture and
 // scroll APIs that jsdom doesn't implement. Stub them so component tests
