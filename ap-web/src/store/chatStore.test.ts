@@ -45,10 +45,13 @@ import type { TerminalInfo } from "@/hooks/useTerminals";
 import { terminalsQueryKey } from "@/hooks/useTerminals";
 import { type ChildSessionInfo, childSessionsQueryKey } from "@/hooks/useChildSessions";
 import {
+  acquireSession,
   consumePendingInitialPrompt,
+  getChatSessionStore,
   handleSessionEvent,
   initChatStore,
   pumpStreamEvents,
+  releaseSession,
   setPendingInitialPrompt,
   startStreamPump,
   useChatStore,
@@ -346,14 +349,14 @@ beforeEach(() => {
   sessionCostControlOverrides = new Map();
   sessionLabels = new Map();
   initChatStore(client);
+  // initChatStore (above) tears down the per-session registry, clears the
+  // module-level pending stash, and resets the facade to a fresh draft store —
+  // so a stash entry or bound session left by one test can't leak into the
+  // next. This reset just re-asserts the draft store's defaults explicitly.
   useChatStore.setState({
     conversationId: null,
     blocks: [],
     pendingUserMessages: [],
-    // Reset the per-conversation stash too, or a stash entry left by one
-    // navigation test leaks into the next (the entry survives switchTo by
-    // design — that's the whole point — so beforeEach must clear it).
-    pendingByConversation: {},
     activeResponse: null,
     status: "idle",
     sessionStatus: "idle",
@@ -1369,7 +1372,12 @@ describe("chatStore — switchTo", () => {
       },
       content: [{ type: "input_text", text: "preserved" }],
     };
-    useChatStore.setState({ conversationId: "conv_abc", blocks: [block] });
+    // Bind conv_abc as the active session, then re-switch to it: the same-id
+    // guard must short-circuit before any re-fetch.
+    seedSession("conv_abc");
+    await useChatStore.getState().switchTo("conv_abc");
+    useChatStore.setState({ blocks: [block] });
+    fetchMock.mockClear();
 
     await useChatStore.getState().switchTo("conv_abc");
 
@@ -1381,19 +1389,30 @@ describe("chatStore — switchTo", () => {
   });
 
   it("aborts the in-flight stream's controller when switching conversations", async () => {
-    const controller = new AbortController();
-    useChatStore.setState({
-      conversationId: "conv_abc",
-      abortController: controller,
+    // Keep conv_abc's stream open (a pushable sink that never closes) so its
+    // pump — and the controller it owns — stays live until we switch away.
+    const sink = pushableStream();
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/conv_abc\/stream$/.test(url)) {
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      return defaultFetchHandler(input, init);
     });
+    seedSession("conv_abc");
     seedSession("conv_def");
+    await useChatStore.getState().switchTo("conv_abc");
+    // The live bind owns a controller; switching away must abort exactly it.
+    const controller = useChatStore.getState().abortController;
+    expect(controller).not.toBeNull();
 
     await useChatStore.getState().switchTo("conv_def");
 
-    expect(controller.signal.aborted).toBe(true);
+    expect(controller!.signal.aborted).toBe(true);
     // The NEW bind creates a fresh controller; that one stays for the
     // lifetime of the new session's stream.
     expect(useChatStore.getState().conversationId).toBe("conv_def");
+    sink.error();
   });
 
   it("switching to null clears state without opening a stream", async () => {
@@ -1409,13 +1428,16 @@ describe("chatStore — switchTo", () => {
       },
       content: [{ type: "input_text", text: "x" }],
     };
+    // Be on a real conversation with in-flight state, then return to `/`.
+    seedSession("conv_abc");
+    await useChatStore.getState().switchTo("conv_abc");
     useChatStore.setState({
-      conversationId: "conv_abc",
       blocks: [block],
       pendingUserMessages: [
         { tempId: "pend_unacked", content: [{ type: "input_text", text: "still waiting" }] },
       ],
     });
+    fetchMock.mockClear();
 
     await useChatStore.getState().switchTo(null);
 
@@ -1427,6 +1449,7 @@ describe("chatStore — switchTo", () => {
     // ghost bubble from the conv they just left.
     expect(state.pendingUserMessages).toEqual([]);
     expect(state.loadingConversation).toBe(false);
+    // switchTo(null) itself opens no stream (the landing page has no session).
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -6068,7 +6091,6 @@ describe("chatStore — startStreamPump reconnect loop", () => {
 
   it("drops a stale reconcile/re-hydrate after a switch-away-and-back mid-backfill", async () => {
     const preGap = Array.from({ length: 30 }, (_, i) => gapUser("spre", i));
-    const windowItems = preGap.slice(-SESSION_HISTORY_PAGE_SIZE);
     seedSession("conv_stale", preGap);
     seedSession("conv_other", []);
     // Route /stream opens to sinks AND hold reconcile's first backfill page.
@@ -6088,17 +6110,13 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       }
       return defaultFetchHandler(input, init);
     });
-    const controller = new AbortController();
-    useChatStore.setState({
-      conversationId: "conv_stale",
-      abortController: controller,
-      blocks: itemsToBlocks(windowItems),
-      hasMoreHistory: true,
-      oldestItemId: windowItems[0]!.id,
-    });
 
-    const loop = startStreamPump("conv_stale", controller, setState, getState);
+    // Bind conv_stale through the real switchTo path so its stream + controller
+    // are owned by `bindStream` (and aborted on switch-away), rather than a
+    // hand-injected controller the registry never sees.
+    const bind = useChatStore.getState().switchTo("conv_stale");
     await drainAsync();
+    await bind;
     expect(sinks).toHaveLength(1);
 
     // 100 gap items: if the stale backfill resumed, it would outrun the
@@ -6110,8 +6128,9 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     // Sync gate: reconcile is parked on its first deferred backfill page.
     expect(releaseBackfill).not.toBeNull();
 
-    // The user leaves and comes back: the revisit hydrates a FRESH window
-    // (the newest 20 gap items) and then scrolls one page up.
+    // The user leaves and comes back: switch-away aborts the live stream; the
+    // revisit re-binds a FRESH window (the newest 20 gap items), bumps the
+    // history generation, and then scrolls one page up.
     const away = useChatStore.getState().switchTo("conv_other");
     await drainAsync(5);
     await away;
@@ -6124,8 +6143,9 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       gap.slice(-2 * SESSION_HISTORY_PAGE_SIZE).map((it) => it.id),
     );
 
-    // The stale page resolves: the conversation id matches again, so only
-    // the generation guard separates it from the new window.
+    // The stale page resolves: the conversation id matches again (the cached
+    // store was re-bound), so only the generation guard separates it from the
+    // new window.
     releaseBackfill!();
     await drainAsync();
 
@@ -6147,10 +6167,9 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       gap.slice(-3 * SESSION_HISTORY_PAGE_SIZE).map((it) => it.id),
     );
 
-    // Unpark the orphaned pump so the awaited loop can exit.
-    sinks[1]!.error();
+    // Unpark every orphaned pump so dangling reconnect loops can exit.
+    for (const sink of sinks) sink.error();
     await drainAsync(2);
-    await loop;
   });
 
   it("re-hydrate keeps pending elicitation and synthetic error blocks in the tail", async () => {
@@ -7188,5 +7207,131 @@ describe("chatStore — policy deny renders once", () => {
     expect(
       await run({ delta: "[Denied by policy: over budget]", message_id: "deny_abc", index: 0 }),
     ).toBe(1);
+  });
+});
+
+describe("chatStore — per-session isolation (side-by-side)", () => {
+  type PumpSetter = Parameters<typeof pumpStreamEvents>[3];
+  type PumpGetter = Parameters<typeof pumpStreamEvents>[4];
+  const textDelta = (marker: string): string =>
+    sse("response.output_text.delta", { delta: `${marker.repeat(34)} ` });
+
+  it("(a) streams two concurrent sessions into independent slices", async () => {
+    // Two sessions, each pumped from its own SSE body. A chunk delivered to
+    // one must land ONLY in that session's store — never bleed across.
+    const storeA = getChatSessionStore("conv_iso_a");
+    const storeB = getChatSessionStore("conv_iso_b");
+    storeA.setState({ conversationId: "conv_iso_a", blocks: [] });
+    storeB.setState({ conversationId: "conv_iso_b", blocks: [] });
+    const sinkA = pushableStream();
+    const sinkB = pushableStream();
+    const ctrlA = new AbortController();
+    const ctrlB = new AbortController();
+    void pumpStreamEvents(
+      "conv_iso_a",
+      sinkA.stream,
+      ctrlA,
+      storeA.setState as unknown as PumpSetter,
+      storeA.getState as unknown as PumpGetter,
+    );
+    void pumpStreamEvents(
+      "conv_iso_b",
+      sinkB.stream,
+      ctrlB,
+      storeB.setState as unknown as PumpSetter,
+      storeB.getState as unknown as PumpGetter,
+    );
+
+    // Stream a response into A only (first content flushes synchronously).
+    sinkA.push(sse("response.created", { id: "resp_a", status: "in_progress", output: [] }));
+    sinkA.push(textDelta("A"));
+    await tick();
+
+    expect(storeA.getState().blocks.some((b) => b.type === "text_chunk")).toBe(true);
+    // B's slice is untouched by A's stream.
+    expect(storeB.getState().blocks).toEqual([]);
+
+    // Now stream into B; A's slice does not change.
+    const aLen = storeA.getState().blocks.length;
+    sinkB.push(sse("response.created", { id: "resp_b", status: "in_progress", output: [] }));
+    sinkB.push(textDelta("B"));
+    await tick();
+
+    expect(storeB.getState().blocks.some((b) => b.type === "text_chunk")).toBe(true);
+    expect(storeA.getState().blocks.length).toBe(aLen);
+
+    ctrlA.abort();
+    ctrlB.abort();
+    sinkA.error();
+    sinkB.error();
+  });
+
+  it("(b) per-session send queues do not cross-talk", async () => {
+    // Hold session A's POST open; session B's resolves normally. If the send
+    // chains were shared, B would block behind A's stalled POST.
+    let releaseA: (() => void) | null = null;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/conv_q_a\/events$/.test(url) && init?.method === "POST") {
+        return new Promise<Response>((resolve) => {
+          releaseA = () => resolve(mockResponse({ queued: true, item_id: "ci_a" }));
+        }) as unknown as Response;
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const storeA = getChatSessionStore("conv_q_a");
+    const storeB = getChatSessionStore("conv_q_b");
+    storeA.setState({ conversationId: "conv_q_a", abortController: new AbortController() });
+    storeB.setState({ conversationId: "conv_q_b", abortController: new AbortController() });
+
+    // A's send hangs on its held-open POST; B's send completes independently.
+    const aSend = storeA.getState().send("from A", "agent_xyz");
+    await storeB.getState().send("from B", "agent_xyz");
+
+    // B settled (its optimistic bubble is marked posted) without waiting for A.
+    expect(storeB.getState().pendingUserMessages).toHaveLength(1);
+    expect(storeB.getState().pendingUserMessages.every((p) => p.posted === true)).toBe(true);
+    // A is still in flight — its bubble has not settled.
+    expect(storeA.getState().pendingUserMessages.some((p) => p.posted !== true)).toBe(true);
+
+    releaseA!();
+    await aSend;
+    expect(storeA.getState().pendingUserMessages.every((p) => p.posted === true)).toBe(true);
+  });
+
+  it("(c) releasing a pane aborts ONLY that session's stream", async () => {
+    const sinks: Record<string, StreamSink> = {};
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const m = url.match(/\/v1\/sessions\/([^/]+)\/stream$/);
+      if (m) {
+        const sink = pushableStream();
+        sinks[m[1]!] = sink;
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    seedSession("conv_pane_a");
+    seedSession("conv_pane_b");
+
+    // Two panes, each holding a ref → each binds its own live stream.
+    await acquireSession("conv_pane_a");
+    await acquireSession("conv_pane_b");
+    await tick();
+    const ctrlA = getChatSessionStore("conv_pane_a").getState().abortController;
+    const ctrlB = getChatSessionStore("conv_pane_b").getState().abortController;
+    expect(ctrlA).not.toBeNull();
+    expect(ctrlB).not.toBeNull();
+
+    // Close pane A: ONLY A's stream aborts; B keeps streaming.
+    releaseSession("conv_pane_a");
+    expect(ctrlA!.signal.aborted).toBe(true);
+    expect(ctrlB!.signal.aborted).toBe(false);
+    expect(getChatSessionStore("conv_pane_b").getState().abortController).toBe(ctrlB);
+
+    releaseSession("conv_pane_b");
+    expect(ctrlB!.signal.aborted).toBe(true);
+    sinks["conv_pane_a"]?.error();
+    sinks["conv_pane_b"]?.error();
   });
 });
