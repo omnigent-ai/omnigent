@@ -11633,6 +11633,11 @@ _HARNESS_MODEL_ENV_KEY: dict[str, str] = {
     "codex": "HARNESS_CODEX_MODEL",
     "pi": "HARNESS_PI_MODEL",
     "openai-agents": "HARNESS_OPENAI_AGENTS_MODEL",
+    # OpenCode reads ``HARNESS_OPENCODE_MODEL`` in
+    # :mod:`omnigent.inner.opencode_executor`; without this mapping a
+    # per-session ``/model`` override would silently drop on the
+    # opencode harness path.
+    "opencode": "HARNESS_OPENCODE_MODEL",
 }
 
 
@@ -11663,6 +11668,7 @@ def _build_spawn_env_from_spec(
             _build_claude_sdk_spawn_env,
             _build_codex_spawn_env,
             _build_openai_agents_sdk_spawn_env,
+            _build_opencode_spawn_env,
             _build_pi_spawn_env,
         )
 
@@ -11674,6 +11680,8 @@ def _build_spawn_env_from_spec(
             env = _build_pi_spawn_env(spec, workdir=workdir)
         elif harness == "openai-agents":
             env = _build_openai_agents_sdk_spawn_env(spec)
+        elif harness == "opencode":
+            env = _build_opencode_spawn_env(spec, workdir=workdir)
         else:
             # claude-native / codex-native / unknown — no spawn-env.
             return None
