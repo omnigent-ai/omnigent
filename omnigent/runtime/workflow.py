@@ -388,7 +388,9 @@ _HARNESS_GATEWAY_FLAG: dict[AgentHarnessType, str] = {
     "claude-sdk": "HARNESS_CLAUDE_SDK_GATEWAY",
     "codex": "HARNESS_CODEX_GATEWAY",
     "pi": "HARNESS_PI_GATEWAY",
-    "opencode": "HARNESS_OPENCODE_GATEWAY",
+    # NB: no ``opencode`` — like ``openai-agents-sdk`` it takes the gateway
+    # base URL + API key directly (via _apply_provider_to_opencode), with no
+    # separate GATEWAY-enable flag the executor reads.
 }
 
 # Maps a generic-provider family to the key pi uses in its
