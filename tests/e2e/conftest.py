@@ -41,6 +41,13 @@ import httpx
 import pytest
 import yaml
 
+from tests._helpers.compat import (
+    apply_server_env,
+    compat_server_cwd,
+    meets_min_server_version,
+    resolve_server_version,
+    server_executable,
+)
 from tests._model_pools import current_attempt, resolve_model
 from tests.e2e._harness_probes import skip_if_harness_cli_missing
 from tests.e2e.helpers import HEALTH_TIMEOUT_S, POLL_INTERVAL_S, lookup_databricks_host
@@ -62,6 +69,56 @@ def _skip_when_harness_cli_missing(request: pytest.FixtureRequest) -> None:
     harness = callspec.params.get("harness")
     if harness:
         skip_if_harness_cli_missing(harness)
+
+
+@pytest.fixture(scope="session")
+def server_version(live_server: str) -> str:
+    """Version of the live server under test (source of truth: GET /api/version).
+
+    In the backwards-compat workflow the server is a pinned older build, so
+    this can differ from the installed (test-process) version. See
+    :func:`tests._helpers.compat.resolve_server_version` and
+    ``docs/SERVER_VERSION_COMPAT_CI.md``.
+
+    :param live_server: Base URL of the live server, e.g.
+        ``"http://localhost:54321"``.
+    :returns: The server version string, e.g. ``"0.1.1"``.
+    """
+    return resolve_server_version(live_server)
+
+
+@pytest.fixture(autouse=True)
+def _enforce_min_server_version(request: pytest.FixtureRequest) -> None:
+    """Skip tests marked ``@pytest.mark.min_server_version(X)`` on older servers.
+
+    Resolves :func:`server_version` (and thus requires a live server) when a
+    test carries the marker OR when a compat run is active
+    (``OMNIGENT_COMPAT_SERVER_VERSION`` set). The latter makes the
+    ``/api/version`` ↔ env cross-check (the PYTHONPATH/CWD-shadow tripwire in
+    :func:`resolve_server_version`) fire once per session even before any
+    feature has a marker. In normal runs with no marker, nothing is resolved,
+    so non-server tests are unaffected.
+
+    Comparison is on the PEP 440 release tuple, so a ``.devN`` of ``X``
+    satisfies ``min_server_version("X")``.
+
+    :param request: The pytest request, used to read the marker and lazily
+        resolve the ``server_version`` fixture.
+    """
+    marker = request.node.get_closest_marker("min_server_version")
+    compat_pinned = os.environ.get("OMNIGENT_COMPAT_SERVER_VERSION")
+    if marker is None and not compat_pinned:
+        return
+    # Resolving server_version cross-checks /api/version against the pinned
+    # version and fails loud on a shadow (server running the wrong code).
+    server_ver = request.getfixturevalue("server_version")
+    if marker is None:
+        return
+    if not marker.args:
+        raise pytest.UsageError("min_server_version marker requires a version argument")
+    required = marker.args[0]
+    if not meets_min_server_version(server_ver, required):
+        pytest.skip(f"requires server >= {required}; running {server_ver}")
 
 
 # Agent bundle directories relative to repo root.
@@ -318,9 +375,12 @@ def live_server(
     env = {
         **os.environ,
         "OPENAI_API_KEY": llm_api_key,
-        "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
         "OMNIGENT_BUILTIN_AGENT_DIRS": str(builtin_sdk_chat_spec),
     }
+    # Prepend the worktree so the server imports the branch's source (see
+    # comment above). Dropped in compat mode so the pinned older server in
+    # the compat venv resolves instead of being shadowed by main.
+    apply_server_env(env, _REPO_ROOT)
     if databricks_workspace_host is not None:
         env["OPENAI_BASE_URL"] = f"{databricks_workspace_host}/serving-endpoints"
         # Thread --profile so claude-sdk and other harnesses that read
@@ -354,7 +414,10 @@ def live_server(
     # 401s under ``--profile``. Point it at the same gateway the
     # agent executors use so prompt-policy e2e tests can classify.
     server_args = [
-        sys.executable,
+        # Compat-aware: the test process's python normally, the pinned old
+        # server's venv python in compat mode. The runner below stays on
+        # sys.executable (it tracks the test process / client version).
+        server_executable(),
         "-m",
         "omnigent.cli",
         "server",
@@ -392,6 +455,9 @@ def live_server(
             **env,
             "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token,
         },
+        # Compat mode: neutral CWD so the worktree omnigent/ doesn't shadow
+        # the pinned old install via sys.path[0]. None (inherit) otherwise.
+        cwd=compat_server_cwd(),
         stdout=log_handle,
         stderr=subprocess.STDOUT,
     )
@@ -1264,8 +1330,10 @@ def resume_test_server(
     env = {
         **os.environ,
         "OPENAI_API_KEY": llm_api_key,
-        "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
     }
+    # Worktree shadow in normal mode; dropped in compat mode (see the
+    # primary live_server fixture above).
+    apply_server_env(env, _REPO_ROOT)
     if databricks_workspace_host is not None:
         env["OPENAI_BASE_URL"] = f"{databricks_workspace_host}/serving-endpoints"
     # See docstring: an allow-list would reject the CLI's own runner.
@@ -1274,7 +1342,7 @@ def resume_test_server(
     log_handle = open(server_log, "w")  # noqa: SIM115 — lives for the Popen lifetime; closed in finally
     proc = subprocess.Popen(
         [
-            sys.executable,
+            server_executable(),
             "-m",
             "omnigent.cli",
             "server",
@@ -1286,6 +1354,8 @@ def resume_test_server(
             str(artifact_dir),
         ],
         env=env,
+        # Compat mode: neutral CWD (see the primary live_server fixture).
+        cwd=compat_server_cwd(),
         stdout=log_handle,
         stderr=subprocess.STDOUT,
     )

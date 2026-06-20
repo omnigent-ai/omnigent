@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "omnigent-ui-sdk"
-version = "0.1.0"
+version = "0.1.2.dev0"
 description = "Terminal UI components (Rich + prompt_toolkit) for building omnigent frontends"
 requires-python = ">=3.12"
 dependencies = [
@@ -12,7 +12,7 @@ dependencies = [
     # at one version (release-omnigent.yml verifies the pin). A `>=`
     # floor would also reject pre-releases (e.g. 0.1.0rc1 < 0.1.0 in
     # PEP 440).
-    "omnigent-client==0.1.0",
+    "omnigent-client==0.1.2.dev0",
     "rich>=13",
     "prompt_toolkit>=3",
     "pyyaml>=6.0,<7",
