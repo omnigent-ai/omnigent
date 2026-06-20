@@ -1,4 +1,6 @@
 # tests/inner/test_opencode_mcp_bridge.py
+import asyncio
+
 import pytest
 
 from omnigent.inner.opencode_executor import _OmnigentToolBridge
@@ -22,6 +24,24 @@ async def test_bridge_starts_and_reports_url():
         assert url.endswith("/mcp")
     finally:
         await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_close_cancels_hung_serve_task():
+    async def _noop_executor(name: str, args: dict) -> dict:
+        return {}
+
+    bridge = _OmnigentToolBridge([], _noop_executor)
+
+    class _StubServer:
+        should_exit = False
+
+    bridge._server = _StubServer()
+    bridge._task = asyncio.create_task(asyncio.sleep(3600))
+    task = bridge._task
+    await asyncio.wait_for(bridge.close(), timeout=10)
+    assert task.done()
+    assert bridge._task is None and bridge._server is None
 
 
 @pytest.mark.asyncio

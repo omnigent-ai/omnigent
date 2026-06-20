@@ -299,7 +299,10 @@ def _translate_part_event(
         metadata = {"call_id": call_id}
         raw_input = state.get("input")
         tool_args: dict[str, Any] = raw_input if isinstance(raw_input, dict) else {}
-        if tracker.mark_tool_requested(pid):
+        # Defer emitting ToolCallRequest until the state is past "pending".
+        # The pending state carries no input, so emitting there always yields
+        # args={}.  running/completed/error all have input available.
+        if status_str != "pending" and tracker.mark_tool_requested(pid):
             events.append(
                 ToolCallRequest(
                     name=tool_name,
@@ -536,8 +539,14 @@ class _OmnigentToolBridge:
         if self._server is not None:
             self._server.should_exit = True
         if self._task is not None:
-            with contextlib.suppress(asyncio.CancelledError, Exception):
+            try:
                 await asyncio.wait_for(self._task, timeout=5.0)
+            except (TimeoutError, asyncio.TimeoutError):
+                self._task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._task
+            except Exception:  # noqa: BLE001
+                pass
         self._server = None
         self._task = None
         self._mcp = None

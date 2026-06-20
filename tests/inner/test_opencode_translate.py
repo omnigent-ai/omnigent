@@ -73,3 +73,25 @@ def test_tokens_to_usage():
         "input_tokens": 100, "output_tokens": 50, "total_tokens": 150,
         "cache_read_input_tokens": 20, "cache_creation_input_tokens": 5,
     }
+
+
+def test_tool_pending_then_completed_emits_request_with_real_args():
+    tracker = _PartTracker()
+    pid = "t-pending"
+    pending = {"id": pid, "type": "tool", "tool": "bash", "callID": "c9",
+               "state": {"status": "pending"}}
+    running = {"id": pid, "type": "tool", "tool": "bash", "callID": "c9",
+               "state": {"status": "running", "input": {"command": "ls -la"}}}
+    completed = {"id": pid, "type": "tool", "tool": "bash", "callID": "c9",
+                 "state": {"status": "completed", "input": {"command": "ls -la"},
+                           "output": "ok"}}
+    out_pending = _translate_part_event(pending, tracker, emit_reasoning=False)
+    out_running = _translate_part_event(running, tracker, emit_reasoning=False)
+    out_completed = _translate_part_event(completed, tracker, emit_reasoning=False)
+    # The pending update emits nothing.
+    assert out_pending == []
+    reqs = [e for e in out_running + out_completed if isinstance(e, ToolCallRequest)]
+    comps = [e for e in out_running + out_completed if isinstance(e, ToolCallComplete)]
+    assert len(reqs) == 1
+    assert reqs[0].args == {"command": "ls -la"}  # real args, not {}
+    assert len(comps) == 1 and comps[0].result == "ok"
