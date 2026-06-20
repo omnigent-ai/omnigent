@@ -1484,6 +1484,7 @@ async def _codex_discover_thread_and_forward(
     """
     from omnigent.codex_native_bridge import (
         CodexNativeBridgeState,
+        write_bridge_startup_error,
         write_bridge_state,
     )
     from omnigent.codex_native_forwarder import (
@@ -1498,7 +1499,7 @@ async def _codex_discover_thread_and_forward(
     try:
         try:
             thread_id = await wait_for_thread_started(event_client)
-        except (TimeoutError, RuntimeError):
+        except (TimeoutError, RuntimeError) as exc:
             # Expected failure modes of wait_for_thread_started: the TUI exited
             # at startup, or the event stream ended before a thread was
             # created. Stop forwarding (cleanup runs in ``finally``); any other
@@ -1506,6 +1507,13 @@ async def _codex_discover_thread_and_forward(
             _logger.exception(
                 "Codex TUI never started a thread for %s; chat will not forward",
                 session_id,
+            )
+            # Bridge state is never written here; leave the real cause for the executor (#59).
+            write_bridge_startup_error(
+                bridge_dir,
+                f"Codex app-server never started a thread (startup timed out: "
+                f"{type(exc).__name__}). See the runner log near 'native-codex "
+                "routing' for the resolved provider/model.",
             )
             return
 
