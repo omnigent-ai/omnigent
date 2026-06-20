@@ -15,6 +15,7 @@ import {
   CheckIcon,
   ChevronRightIcon,
   CircleStopIcon,
+  Columns2Icon,
   GitBranchIcon,
   InboxIcon,
   ListChecksIcon,
@@ -1641,6 +1642,20 @@ function BulkActionBar({
 
         {count > 0 && (
           <div className="hidden items-center gap-1.5 px-2 md:flex">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-7 gap-1.5 text-xs"
+              disabled={selectedConversations.length < 2}
+              onClick={() =>
+                navigate(`/compare?sessions=${selectedConversations.map((c) => c.id).join(",")}`)
+              }
+              data-testid="open-side-by-side"
+            >
+              <Columns2Icon className="size-3" />
+              Open side-by-side
+            </Button>
             {allSelectedSameArchiveGroup && nonArchivedSelected.length > 0 && (
               <Button
                 type="button"
