@@ -720,6 +720,13 @@ class OpenCodeExecutor(Executor):
 
         final_text: list[str] = []
         usage: dict[str, Any] | None = None
+        # Tracks whether we reached the normal end-of-turn (session.idle). Any
+        # other exit — session.error return, an exception, or the caller
+        # abandoning/cancelling the generator mid-stream — must cancel the
+        # in-flight chat task rather than leave it orphaned ("Task was
+        # destroyed but it is pending"). Only the idle path awaits it below
+        # for its token usage.
+        idle_seen = False
         try:
             async for raw in stream:
                 evt = self._as_dict(raw)
@@ -748,10 +755,17 @@ class OpenCodeExecutor(Executor):
                     )
                     return
                 elif etype == "session.idle" and ev_session == session_id:
+                    idle_seen = True
                     break
         finally:
             with contextlib.suppress(Exception):
                 await stream.close()
+            # Reap the chat task on every non-idle exit so it can't outlive the
+            # turn. The idle path leaves it intact to be awaited for usage.
+            if not idle_seen and not chat_task.done():
+                chat_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await chat_task
 
         try:
             result = await chat_task
@@ -824,8 +838,20 @@ class OpenCodeExecutor(Executor):
             "provider_id": provider_id,
             "model_id": model_id,
         }
-        asyncio.create_task(self._client.session.chat(**kwargs))
+        task = asyncio.create_task(self._client.session.chat(**kwargs))
+        # Observe the result so a failed enqueue logs a warning instead of an
+        # unretrievable "Task exception was never retrieved" at GC time.
+        task.add_done_callback(self._log_enqueue_result)
         return True
+
+    @staticmethod
+    def _log_enqueue_result(task: asyncio.Task[Any]) -> None:
+        """Done-callback that surfaces a failed fire-and-forget enqueue."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.warning("opencode harness: enqueued message failed: %s", exc)
 
     async def close_session(self, session_key: str) -> None:
         """Drop the cached OpenCode session id for *session_key*.
