@@ -1524,10 +1524,11 @@ def _native_claude_config_from_entry(
         DATABRICKS_KIND,
         GATEWAY_KIND,
         KEY_KIND,
+        LITELLM_KIND,
         LOCAL_KIND,
     )
 
-    if entry.kind in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND):
+    if entry.kind in (KEY_KIND, GATEWAY_KIND, LITELLM_KIND, LOCAL_KIND):
         return _provider_config_for_native_claude(entry)
     if entry.kind == DATABRICKS_KIND:
         _logger.info("native-claude routing: Databricks ucode profile %r", entry.profile)

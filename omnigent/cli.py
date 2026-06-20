@@ -7604,10 +7604,21 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         name = f"{cli_name}-subscription"
         entry = build_subscription_provider_entry(cli_name)
 
-    elif kind == "gateway":
-        name = prompt_text("Name for this gateway", default="gateway")
-        base_url = prompt_text("Gateway base_url (OpenAI/Anthropic-compatible)")
-        pasted = prompt_text("Gateway API key", hide_input=True)
+    elif kind in ("gateway", "litellm"):
+        is_litellm_kind = kind == "litellm"
+        if is_litellm_kind:
+            _default_name = "litellm"
+            _url_prompt = "LiteLLM proxy URL"
+            _key_prompt = "LiteLLM proxy API key"
+            _name_prompt = "Name for this LiteLLM gateway"
+        else:
+            _default_name = "gateway"
+            _url_prompt = "Gateway base_url (OpenAI/Anthropic-compatible)"
+            _key_prompt = "Gateway API key"
+            _name_prompt = "Name for this gateway"
+        name = prompt_text(_name_prompt, default=_default_name)
+        base_url = prompt_text(_url_prompt)
+        pasted = prompt_text(_key_prompt, hide_input=True)
         secret_store.store_secret(name, pasted)
         # Which harness surfaces — one clear pick instead of two y/n prompts.
         # (These are *harness* surfaces: Codex/OpenAI → codex + openai-agents;
@@ -7718,13 +7729,24 @@ def _configure_harness_add(family: str | None = None) -> str | None:
                 models[ANTHROPIC_FAMILY] = prompt_text(
                     "Default model for the Claude surface (the gateway's Claude model id)"
                 ).strip()
-        entry = build_gateway_provider_entry(
-            base_url=base_url,
-            api_key_ref=f"keychain:{name}",
-            families=families,
-            wire_api=wire_api,
-            models=models,
-        )
+        if is_litellm_kind:
+            from omnigent.onboarding.configure_models import build_litellm_provider_entry
+
+            entry = build_litellm_provider_entry(
+                base_url=base_url,
+                api_key_ref=f"keychain:{name}",
+                families=families,
+                wire_api=wire_api,
+                models=models,
+            )
+        else:
+            entry = build_gateway_provider_entry(
+                base_url=base_url,
+                api_key_ref=f"keychain:{name}",
+                families=families,
+                wire_api=wire_api,
+                models=models,
+            )
 
     else:  # databricks
         # Gate on the `databricks` extra: a `kind: databricks` provider mints

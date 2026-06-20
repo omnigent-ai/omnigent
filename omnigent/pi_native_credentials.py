@@ -30,6 +30,7 @@ from omnigent.onboarding.provider_config import (
     DATABRICKS_KIND,
     GATEWAY_KIND,
     KEY_KIND,
+    LITELLM_KIND,
     LOCAL_KIND,
     OPENAI_FAMILY,
     PI_SURFACE,
@@ -200,7 +201,7 @@ def resolve_pi_native_provider(
             return None
         if entry.kind == DATABRICKS_KIND:
             return _databricks_pi_provider(entry, model=model)
-        if entry.kind in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND):
+        if entry.kind in (KEY_KIND, GATEWAY_KIND, LITELLM_KIND, LOCAL_KIND):
             return _inline_family_pi_provider(entry, model=model)
         # subscription / cli-config: a CLI's own login can't be reused outside
         # that CLI — let Pi use its own login.

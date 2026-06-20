@@ -38,6 +38,7 @@ from omnigent.onboarding.provider_config import (
     DATABRICKS_KIND,
     GATEWAY_KIND,
     KEY_KIND,
+    LITELLM_KIND,
     LOCAL_KIND,
     OPENAI_FAMILY,
     PI_SURFACE,
@@ -59,6 +60,7 @@ _KIND_GLYPH: dict[str, str] = {
     KEY_KIND: "\N{KEY}",
     SUBSCRIPTION_KIND: "\N{ADMISSION TICKETS}\N{VARIATION SELECTOR-16}",
     GATEWAY_KIND: "\N{GLOBE WITH MERIDIANS}",
+    LITELLM_KIND: "\N{HIGH-SPEED TRAIN}",
     LOCAL_KIND: "\N{DESKTOP COMPUTER}\N{VARIATION SELECTOR-16}",
     DATABRICKS_KIND: "\N{BRICK}",
     # GEAR carries a VS16 for the same 2-cell-emoji rendering reason as the
@@ -74,6 +76,7 @@ _KIND_STYLE: dict[str, str] = {
     KEY_KIND: "yellow",
     SUBSCRIPTION_KIND: "magenta",
     GATEWAY_KIND: "cyan",
+    LITELLM_KIND: "cyan",
     LOCAL_KIND: "green",
     DATABRICKS_KIND: "red",
     CLI_CONFIG_KIND: "blue",
@@ -433,10 +436,10 @@ def add_menu_options() -> list[AddOption]:
             "An OpenAI/Anthropic-compatible proxy: LiteLLM, Ollama, OpenRouter, vLLM, …",
             GATEWAY_KIND,
         ),
-        AddOption(
-            label="\N{HIGH-SPEED TRAIN} LiteLLM — proxy URL + key",
-            description="100+ providers via LiteLLM AI gateway proxy (litellm.ai).",
-            kind=GATEWAY_KIND,
+        _opt(
+            "LiteLLM — proxy URL + key",
+            "100+ providers via LiteLLM AI gateway proxy (litellm.ai).",
+            LITELLM_KIND,
         ),
         _opt(
             "OpenRouter — API key",
@@ -481,7 +484,7 @@ def _add_option_families(opt: AddOption) -> frozenset[str]:
     :returns: The surfaces this option can configure — a subset of
         ``{"anthropic", "openai", "pi"}``.
     """
-    if opt.kind == GATEWAY_KIND or opt.kind == DATABRICKS_KIND:
+    if opt.kind in (GATEWAY_KIND, LITELLM_KIND, DATABRICKS_KIND):
         return frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE})
     if opt.kind == SUBSCRIPTION_KIND:
         if opt.cli == "claude":
@@ -828,6 +831,32 @@ def build_gateway_provider_entry(
         raise ValueError("a gateway must serve at least one family")
     models = models or {}
     body: dict[str, object] = {"kind": GATEWAY_KIND}
+    for family in families:
+        block: dict[str, object] = {"base_url": base_url, "api_key_ref": api_key_ref}
+        if family == OPENAI_FAMILY and wire_api is not None:
+            block["wire_api"] = wire_api
+        if models.get(family):
+            block["models"] = {"default": models[family]}
+        body[family] = block
+    return body
+
+
+def build_litellm_provider_entry(
+    base_url: str,
+    api_key_ref: str,
+    families: list[str],
+    wire_api: str | None = None,
+    models: dict[str, str] | None = None,
+) -> dict[str, object]:
+    """Build a ``kind: litellm`` provider entry body.
+
+    Identical to :func:`build_gateway_provider_entry` but stamped
+    with ``LITELLM_KIND`` so the UI renders the 🚅 glyph.
+    """
+    if not families:
+        raise ValueError("a litellm provider must serve at least one family")
+    models = models or {}
+    body: dict[str, object] = {"kind": LITELLM_KIND}
     for family in families:
         block: dict[str, object] = {"base_url": base_url, "api_key_ref": api_key_ref}
         if family == OPENAI_FAMILY and wire_api is not None:

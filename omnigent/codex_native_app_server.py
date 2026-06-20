@@ -1194,6 +1194,7 @@ def _codex_provider_launch(entry: ProviderEntry, model: str | None) -> NativeCod
         DATABRICKS_KIND,
         GATEWAY_KIND,
         KEY_KIND,
+        LITELLM_KIND,
         LOCAL_KIND,
         OPENAI_FAMILY,
     )
@@ -1209,7 +1210,7 @@ def _codex_provider_launch(entry: ProviderEntry, model: str | None) -> NativeCod
             model=model,
             profile=None,
         )
-    if entry.kind not in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND):
+    if entry.kind not in (KEY_KIND, GATEWAY_KIND, LITELLM_KIND, LOCAL_KIND):
         return None
     try:
         family = entry.family(OPENAI_FAMILY)

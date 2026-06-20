@@ -87,6 +87,7 @@ _VALID_WIRE_API = (RESPONSES_WIRE_API, CHAT_WIRE_API)
 KEY_KIND = "key"
 SUBSCRIPTION_KIND = "subscription"
 GATEWAY_KIND = "gateway"
+LITELLM_KIND = "litellm"
 LOCAL_KIND = "local"
 DATABRICKS_KIND = "databricks"
 CLI_CONFIG_KIND = "cli-config"
@@ -94,6 +95,7 @@ _VALID_KINDS = (
     KEY_KIND,
     SUBSCRIPTION_KIND,
     GATEWAY_KIND,
+    LITELLM_KIND,
     LOCAL_KIND,
     DATABRICKS_KIND,
     CLI_CONFIG_KIND,
@@ -881,7 +883,7 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
         ``frozenset({"anthropic", "openai", "pi"})`` for a Databricks
         profile.
     """
-    if entry.kind in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND):
+    if entry.kind in (KEY_KIND, GATEWAY_KIND, LITELLM_KIND, LOCAL_KIND):
         return frozenset(entry.families) | {PI_SURFACE}
     if entry.kind in (SUBSCRIPTION_KIND, CLI_CONFIG_KIND):
         if entry.cli == "claude":
