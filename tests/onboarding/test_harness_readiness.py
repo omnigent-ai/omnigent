@@ -105,6 +105,7 @@ def test_configured_harness_map_covers_all_spellings(
         "agents_sdk",
         "claude",
         "pi",
+        "opencode",
     }
     assert set(result) == expected_keys
 

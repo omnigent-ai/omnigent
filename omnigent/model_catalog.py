@@ -91,6 +91,7 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, str] = {
     "codex-native": "codex",
     "native-codex": "codex",
     "pi": "pi",
+    "opencode": "opencode",
     "openai-agents": "openai-agents-sdk",
     "openai-agents-sdk": "openai-agents-sdk",
     "agents_sdk": "openai-agents-sdk",

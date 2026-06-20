@@ -44,6 +44,7 @@ from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
 # Pi is not a configure-menu family (the menu is Claude + Codex), but the
 # first-run ``run`` flow falls back to it, so it has install metadata too.
 PI_KEY = "pi"
+OPENCODE_KEY = "opencode"
 
 
 @dataclass(frozen=True)
@@ -98,6 +99,13 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         status_args=("login", "status"),
     ),
     PI_KEY: HarnessInstallSpec("Pi", "pi", "@earendil-works/pi-coding-agent"),
+    OPENCODE_KEY: HarnessInstallSpec(
+        "OpenCode",
+        "opencode",
+        "opencode-ai",
+        login_args=("auth", "login"),
+        logout_args=("auth", "logout"),
+    ),
 }
 
 
@@ -113,6 +121,7 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "claude-native": ANTHROPIC_FAMILY,
     "codex-native": OPENAI_FAMILY,
     PI_KEY: PI_KEY,
+    OPENCODE_KEY: OPENCODE_KEY,
 }
 
 
