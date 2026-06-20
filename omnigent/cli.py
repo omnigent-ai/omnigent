@@ -725,9 +725,9 @@ def _materialize_internal_beta_agents() -> Path:
         path = _materialize_bundled_example(name)
         if name == _INTERNAL_BETA_DEFAULT_AGENT_NAME:
             default_path = path
-    assert (
-        default_path is not None
-    ), f"_INTERNAL_BETA_BUNDLED_AGENTS must include {_INTERNAL_BETA_DEFAULT_AGENT_NAME}"
+    assert default_path is not None, (
+        f"_INTERNAL_BETA_BUNDLED_AGENTS must include {_INTERNAL_BETA_DEFAULT_AGENT_NAME}"
+    )
     return default_path
 
 
