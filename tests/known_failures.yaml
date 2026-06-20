@@ -34,13 +34,6 @@ skips:
     cluster: mock-claude-sdk-cli-unsupported
     mode: skip
 
-  - id: tests/e2e/omnigent/test_repl_inline_tool_streaming.py::test_repl_inline_tool_call_and_result_streaming
-    reason: "REPL inline tool-call streaming."
-    issue: 523
-    cluster: repl-pexpect-cli
-    mode: skip
-
-
   - id: tests/e2e/omnigent/test_run_harness_without_agent_e2e.py::test_run_harness_without_agent_live_repl_round_trip[pi]
     reason: "No-AGENT `omnigent run --harness` live round-trip crashes the xdist worker — same family as the [claude-sdk]/[codex]/[openai-agents] siblings. Surfaced once pi was enabled in CI (PR #809); previously the [pi] row skipped because the pi CLI was absent. See [claude-sdk] entry for the full diagnosis."
     issue: 523
