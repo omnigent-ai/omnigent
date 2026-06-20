@@ -185,8 +185,11 @@ CLI / UX: `cli.py` (`omnigent opencode` subcommand + harness choices + default
 prompt + first-run plan), `ap-web/.../AgentCard.tsx` (fallback glyph note),
 `README.md`, `docs/AGENT_YAML_SPEC.md`, `examples/opencode_hello.yaml`.
 
-Packaging: `pyproject.toml` — add `opencode-ai` (pre-release;
-`pip install --pre`) to deps.
+Packaging: `pyproject.toml` — `opencode-ai` (pre-release) is an **optional**
+dependency, exposed as the `opencode` extra (`pip install "omnigent[opencode]"`)
+and folded into `all`. It is imported lazily inside `_OpenCodeServer.start`, so
+a default install never pulls it; the executor raises an actionable `ImportError`
+when the harness is used without it.
 
 Tests: harness unit tests, spawn-env/provider-routing tests, onboarding
 install/readiness tests, CLI test, and an opt-in e2e gated on
