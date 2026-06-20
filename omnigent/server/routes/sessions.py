@@ -1330,13 +1330,17 @@ def _signal_terminal_resolved_harness_elicitation(
     resolves a parked prompt for the SAME ``tool_name`` in the same
     session. That is what stops an unrelated auto-allowed tool's output
     from clearing a different tool's pending prompt. Among
-    same-named parked prompts it prefers an exact ``tool_input`` match;
-    if none match exactly but exactly one same-named prompt is parked it
-    resolves that one (the hook payload and the transcript can serialize
-    identical input differently, so a single unambiguous candidate is
-    treated as the match). If several same-named prompts are parked and
-    none match by input it stays conservative and resolves none — the
-    web verdict or timeout still applies.
+    same-named parked prompts it prefers an exact ``tool_input`` match.
+    When the result carried no input (``tool_input is None``, e.g. a
+    Codex result) and exactly one same-named prompt is parked, it
+    resolves that lone prompt — with nothing to match on, the single
+    candidate is the only reasonable target. But when the input IS known
+    and matches none of the parked prompts it stays conservative and
+    resolves none: the matching prompt was already resolved (e.g. a web
+    verdict on an earlier prompt of a parallel same-tool batch), so
+    resolving the lone survivor would misattribute this result and flip an
+    unanswered prompt to "Resolved elsewhere", forcing the user to the
+    native terminal. The web verdict or timeout still applies.
 
     Best-effort and idempotent: a no-op when no parked prompt matches
     (e.g. the web UI already resolved it, the tool needed no permission,
@@ -1363,7 +1367,13 @@ def _signal_terminal_resolved_harness_elicitation(
         if parked.tool_input == tool_input:
             parked.resolved_elsewhere.set()
             return
-    if len(candidates) == 1:
+    # No exact match. Fall back to the lone candidate ONLY when the result
+    # carried no input to match on (``tool_input is None``). A known input
+    # that matches nothing means its own prompt was already resolved, so the
+    # lone survivor is a DIFFERENT prompt the user has not answered yet —
+    # resolving it would wrongly badge it "Resolved elsewhere" (the parallel
+    # same-tool batch bug). Resolve none; the web verdict or timeout settles it.
+    if tool_input is None and len(candidates) == 1:
         candidates[0].resolved_elsewhere.set()
 
 
