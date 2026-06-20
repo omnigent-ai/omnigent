@@ -426,9 +426,7 @@ describe("itemsToBlocks — native tools and compaction", () => {
     // space artifact in the reconstructed text.
     const echo = blocks.find((b): b is UserMessageBlock => b.type === "user_message");
     expect(echo).toBeDefined();
-    expect(echo!.content).toEqual([
-      { type: "input_text", text: "/dev-productivity:simplify" },
-    ]);
+    expect(echo!.content).toEqual([{ type: "input_text", text: "/dev-productivity:simplify" }]);
   });
 
   it("compaction item produces a CompactionBlock inline (no synthetic turn)", () => {

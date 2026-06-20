@@ -138,10 +138,7 @@ export function WorkspacePathField({
   const { dir, partial } = splitTypedPath(value);
 
   // List the parent directory only while the dropdown is open.
-  const { data, isLoading } = useHostFilesystem(
-    hostId,
-    dropdownOpen ? dir : null,
-  );
+  const { data, isLoading } = useHostFilesystem(hostId, dropdownOpen ? dir : null);
 
   // Recent: unfiltered at the home shortcut, else filtered by the
   // typed text so a concrete path doesn't surface stale history.

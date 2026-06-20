@@ -64,6 +64,12 @@ deploy/
 │   ├── modal_app.py
 │   └── README.md
 │
+├── cloudflare/        ← Cloudflare Containers + D1 + R2 (serverless, scale-to-zero)
+│   ├── Dockerfile        server image + D1 dialect
+│   ├── src/index.js      the Worker that fronts the container
+│   ├── wrangler.jsonc
+│   └── README.md
+│
 ├── trycloudflare/     ← Cloudflare quick tunnel (public URL for a LOCAL server)
 │   └── README.md
 │
@@ -71,6 +77,15 @@ deploy/
 │   ├── wrangler.toml     Worker egress relay for its free tier; NOT a
 │   ├── src/index.js      server deploy target. See its README.md.
 │   └── README.md
+│
+├── islo/              ← Islo sandbox-provider guide (gateway credential
+│   └── README.md         injection); NOT a server deploy target.
+│
+├── e2b/               ← E2B sandbox-provider guide (boots from a pre-built
+│   └── README.md         E2B template); NOT a server deploy target.
+│
+├── openshell/         ← NVIDIA OpenShell sandbox-provider guide (self-hosted
+│   └── README.md         gRPC gateway, on-prem/air-gapped); NOT a server target.
 │
 └── docker/            ← common Docker image + compose stack
     ├── Dockerfile         multi-stage slim image (node web build → python builder → runtime)
@@ -90,6 +105,7 @@ deploy/
 | Run on any host you already have (VPS, home server, on-prem) | Docker compose | [`docker/README.md`](docker/README.md): copy the compose stack, `./bootstrap.sh`, then `docker compose up -d` |
 | Deploy to Fly.io | Fly | [`fly/README.md`](fly/README.md): `fly deploy`, SQLite on a volume |
 | Deploy to Modal (durable artifact Volume) | Modal | [`modal/README.md`](modal/README.md): `modal deploy`, BYO Neon Postgres |
+| Deploy serverless (scale-to-zero, no VM/Postgres to manage) | Cloudflare Containers + D1 + R2 | [`cloudflare/README.md`](cloudflare/README.md): `wrangler deploy` |
 | Stand up a quick demo (no DB to provision) | HF Spaces | [`hf-spaces/README.md`](hf-spaces/README.md): Docker Space, SQLite |
 | Share a server running on your **laptop**: demo it to teammates, or let remote runners & cloud sandboxes connect back to it (nothing to deploy) | Cloudflare quick tunnel | `cloudflared tunnel --url http://localhost:6767` |
 | Cloud Run / Kubernetes / other | Docker image | [`docker/README.md`](docker/README.md), then point your platform at the image |
@@ -192,22 +208,26 @@ omnigent run path/to/agent.yaml --server https://your-host
 
 Don't want a laptop to be the host? Run the host in a cloud sandbox instead.
 
-**From the CLI (Modal or Daytona).** Install the extra
-(`pip install 'omnigent[modal]'` or `'omnigent[daytona]'`), authenticate
-(`modal token new`, or set `DAYTONA_API_KEY`), then:
+**From the CLI (Modal, Daytona, Islo, or E2B).** Install the provider extra when
+needed (`pip install 'omnigent[modal]'`, `'omnigent[daytona]'`, or
+`'omnigent[e2b]'`; Islo uses the built-in HTTP client), authenticate
+(`modal token new`, `DAYTONA_API_KEY`, `ISLO_API_KEY`, or `E2B_API_KEY`), then:
 
 ```bash
-omnigent sandbox create --provider modal     # or --provider daytona
+omnigent sandbox create --provider modal     # or --provider daytona / islo / e2b
 omnigent sandbox connect --provider modal --sandbox-id <id> --server https://your-host
 ```
 
 > [!NOTE]
 > Modal caps sandbox lifetime at 24 hours. Re-run `create` + `connect` to
-> roll the host onto a fresh sandbox. Daytona has no lifetime cap, but
-> free-tier orgs restrict egress to an allowlist; see
-> [`daytona/README.md`](daytona/README.md) for the relay workaround.
+> roll the host onto a fresh sandbox. Daytona and Islo have no Omnigent-imposed
+> lifetime cap; Daytona free-tier orgs restrict egress to an allowlist; see
+> [`daytona/README.md`](daytona/README.md) for the relay workaround. E2B
+> shares Modal's 24-hour cap **and** boots from a pre-built E2B *template*
+> rather than a registry image — build it once first; see
+> [`e2b/README.md`](e2b/README.md).
 
-**Server-managed (Modal or Daytona).** With *managed hosts*, creating a
+**Server-managed (Modal, Daytona, Islo, or E2B).** With *managed hosts*, creating a
 session with `"host_type": "managed"` (e.g.
 `POST /v1/sessions {"agent_id": ..., "host_type": "managed"}`) makes the
 server provision a sandbox, start a host in it, and run the session there.
@@ -223,6 +243,8 @@ sandbox:
 
 Modal credentials come from the server's environment (`MODAL_TOKEN_ID` /
 `MODAL_TOKEN_SECRET`, or a mounted `~/.modal.toml`), not the config file.
+Daytona reads `DAYTONA_API_KEY`; Islo reads `ISLO_API_KEY` (and optional
+`ISLO_BASE_URL`); E2B reads `E2B_API_KEY` from the server environment.
 Each sandbox authenticates back with a server-minted, per-launch token, so
 no user credentials ever enter the sandbox.
 
@@ -252,7 +274,8 @@ sandbox:
 For private registries, set `OMNIGENT_MODAL_REGISTRY_SECRET` on the server
 to the name of a Modal secret holding `REGISTRY_USERNAME` /
 `REGISTRY_PASSWORD`; for CLI-launched sandboxes, `OMNIGENT_MODAL_HOST_IMAGE`
-(or `OMNIGENT_DAYTONA_HOST_IMAGE`) overrides the image ref.
+(or `OMNIGENT_DAYTONA_HOST_IMAGE` / `OMNIGENT_ISLO_HOST_IMAGE`) overrides the
+image ref.
 
 **LLM credentials for managed sessions.** A fresh sandbox has no API keys.
 Park your provider credentials in a [Modal secret](https://modal.com/secrets)
@@ -275,6 +298,18 @@ sandbox:
     secrets: [omnigent-llm]
 ```
 
+For Daytona and Islo, list server environment variable names under
+`sandbox.daytona.env` or `sandbox.islo.env`; the launcher copies the current
+server env values into each sandbox:
+
+```yaml
+sandbox:
+  provider: islo
+  server_url: https://your-host
+  islo:
+    env: [OPENAI_API_KEY, GIT_TOKEN]
+```
+
 Using a **Claude subscription** instead of an API key? Run
 `claude setup-token` on your own machine and store the resulting long-lived
 token as `CLAUDE_CODE_OAUTH_TOKEN` in the secret. A **ChatGPT
@@ -292,7 +327,9 @@ fetch/push.
 
 The full Modal guide (CLI sandboxes, custom images, LLM and git credentials,
 troubleshooting) lives at [`modal/README.md`](modal/README.md); the Daytona
-guide lives at [`daytona/README.md`](daytona/README.md).
+guide lives at [`daytona/README.md`](daytona/README.md); the Islo guide
+(including its gateway credential-injection model) lives at
+[`islo/README.md`](islo/README.md).
 
 ## Auth
 

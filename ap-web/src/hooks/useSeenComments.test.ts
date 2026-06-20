@@ -1,10 +1,6 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  getSeenCommentIds,
-  markCommentsSeen,
-  useSeenCommentIds,
-} from "./useSeenComments";
+import { getSeenCommentIds, markCommentsSeen, useSeenCommentIds } from "./useSeenComments";
 
 const STORAGE_KEY = "omnigent:seen-comment-ids";
 
@@ -45,9 +41,7 @@ describe("markCommentsSeen", () => {
 
   it("prunes the oldest entries past the 1000-entry cap", () => {
     // Seed a full registry with seenAt 1..1000 (c0 oldest).
-    const full = Object.fromEntries(
-      Array.from({ length: 1000 }, (_, i) => [`c${i}`, i + 1]),
-    );
+    const full = Object.fromEntries(Array.from({ length: 1000 }, (_, i) => [`c${i}`, i + 1]));
     localStorage.setItem(STORAGE_KEY, JSON.stringify(full));
     vi.useFakeTimers({ now: 9_000_000 });
     markCommentsSeen(["new"]);

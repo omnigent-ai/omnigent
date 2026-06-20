@@ -345,16 +345,117 @@ class ExecutorSpec:
     :param profile: Credentials profile name (typically a
         ``~/.databrickscfg`` profile), e.g. ``"<your-profile>"``.
         ``None`` when no profile override is needed.
+    :param auth: Parsed auth block from the YAML (e.g. api_key +
+        base_url). Carried through so the omnigent spec translator
+        can forward it into the child :class:`ExecutorSpec` without
+        re-reading raw YAML.
     """
 
     model: str | None = None
     harness: str | None = None
     profile: str | None = None
+    auth: object | None = None  # ApiKeyAuth | DatabricksAuth | None
 
 
 # ---------------------------------------------------------------------------
 # OS environment
 # ---------------------------------------------------------------------------
+
+# Basic-auth username GitHub (and ``gh``) accept for token auth: the
+# token lives in the password field, so this placeholder username works
+# for any GitHub PAT / gh token. Shared by the spec parser (default for
+# ``https_basic`` / ``git_https`` / ``gh_basic``), the runtime, and the
+# egress proxy's Basic emit path so the literal lives in exactly one
+# place.
+DEFAULT_BASIC_USERNAME = "x-access-token"
+
+
+@dataclass
+class CredentialSourceSpec:
+    """Where the parent process resolves a real secret from.
+
+    The secret is resolved in the *parent* (trusted) process and never
+    handed to the sandbox verbatim — only a synthetic placeholder is.
+
+    :param kind: Resolution mode, one of ``"env"``, ``"file"``, or
+        ``"command"``.
+    :param env: Environment-variable name carrying the secret when
+        ``kind="env"``, e.g. ``"OA_TEST_GITHUB_PAT"``.
+    :param path: File path to read when ``kind="file"`` (``~`` is
+        expanded), e.g. ``"~/.config/tokens/github_pat.txt"``.
+    :param command: Shell command whose stdout is the secret when
+        ``kind="command"``, e.g. ``"gh auth token"``.
+    """
+
+    kind: Literal["env", "file", "command"]
+    env: str | None = None
+    path: str | None = None
+    command: str | None = None
+
+
+@dataclass
+class CredentialProxyEntry:
+    """One normalized host binding for the secretless credential proxy.
+
+    Every YAML ``credential_proxy`` type (``https_bearer``,
+    ``https_basic``, ``git_https``, ``gh_basic``) is normalized by the
+    spec parser into one or more of these entries. The runtime resolves
+    :attr:`source` in the parent (it never enters the sandbox) and the
+    egress MITM proxy attaches the real credential to outbound requests
+    bound for :attr:`host`.
+
+    **Default: swap-on-access.** The sandbox holds *nothing*
+    credential-shaped. A tool simply makes its request to :attr:`host`
+    with no ``Authorization`` header, and the proxy injects
+    ``Authorization: <scheme> <real>`` on the way out. Git over HTTPS,
+    ``curl``, and any HTTP client work this way with zero in-sandbox
+    wiring.
+
+    **Opt-in: env injection.** Some clients refuse to issue a request
+    when they don't see a credential locally — most notably ``gh``,
+    which short-circuits with "authentication required" before touching
+    the network. For those, :attr:`inject_env` names env vars that
+    receive a synthetic ``oa_cred_*`` placeholder so the client believes
+    it is authenticated and actually sends the request; the proxy then
+    swaps the placeholder for the real secret (and rejects a placeholder
+    replayed to any other host with HTTP 403, the cross-host leak guard).
+    The placeholder is non-secret — the real secret still never enters
+    the sandbox.
+
+    :param host: Exact hostname this binding applies to (lower-cased),
+        e.g. ``"github.com"`` or ``"api.github.com"``. Path scoping is
+        delegated to ``egress_rules``; the credential binds to the host.
+    :param scheme: HTTP ``Authorization`` scheme the proxy emits upstream,
+        one of ``"basic"``, ``"bearer"``, or ``"token"``.
+    :param source: Where the parent resolves the real secret from.
+    :param username: Basic-auth username emitted upstream when
+        ``scheme="basic"``, e.g. ``"x-access-token"``. ``None`` for the
+        ``bearer`` / ``token`` schemes.
+    :param inject_env: Opt-in environment-variable names set to a
+        synthetic placeholder inside the sandbox so a credential-gating
+        client (e.g. ``gh`` via ``GH_TOKEN`` / ``GITHUB_TOKEN``) will
+        emit a request the proxy can rewrite. Empty (the default) means
+        pure swap-on-access — nothing is injected and the proxy attaches
+        the credential unconditionally for :attr:`host`.
+    """
+
+    host: str
+    scheme: Literal["basic", "bearer", "token"]
+    source: CredentialSourceSpec
+    username: str | None = None
+    inject_env: list[str] = field(default_factory=list)
+
+
+@dataclass
+class CredentialProxySpec:
+    """Secretless credential-proxy policy for a sandbox.
+
+    :param entries: Normalized per-host credential bindings. The real
+        secrets stay in the parent; the sandbox only ever sees synthetic
+        placeholders that the egress proxy rewrites.
+    """
+
+    entries: list[CredentialProxyEntry]
 
 
 @dataclass
@@ -543,6 +644,18 @@ class OSEnvSandboxSpec:
     # this check including the cloud-trap list, so flip it on only
     # for workloads that genuinely need cloud-host metadata.
     egress_allow_private_destinations: bool = False
+    # Optional secretless credential-proxy policy. Real tokens stay in
+    # the parent process and are attached to outbound requests by the
+    # egress MITM proxy. By default the sandbox holds nothing
+    # credential-shaped at all (swap-on-access): a tool makes its
+    # request with no ``Authorization`` header and the proxy injects the
+    # real credential for the bound host. Entries may opt into injecting
+    # a synthetic ``oa_cred_*`` placeholder env var for clients that
+    # won't issue a request without a local credential (e.g. ``gh``).
+    # Requires ``egress_rules`` (the proxy is what attaches the
+    # credential and rejects placeholder leaks) and a backend that
+    # hard-isolates the network (``linux_bwrap`` / ``darwin_seatbelt``).
+    credential_proxy: CredentialProxySpec | None = None
 
 
 @dataclass

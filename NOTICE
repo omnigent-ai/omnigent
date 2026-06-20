@@ -1,0 +1,149 @@
+Copyright (2026) Databricks, Inc.
+
+This Software includes software developed at Databricks (https://www.databricks.com/) and its use is subject to the included LICENSE file.
+
+________________
+
+This Software contains code from the following open source projects, licensed under the Apache 2.0 license (https://www.apache.org/licenses/LICENSE-2.0):
+
+openai - https://pypi.org/project/openai/
+Copyright 2026 OpenAI.
+
+databricks-mcp - https://pypi.org/project/databricks-mcp/
+Copyright Databricks, Inc.
+
+databricks-sdk - https://pypi.org/project/databricks-sdk/
+Copyright 2023 Databricks, Inc. All rights reserved.
+
+mlflow-tracing - https://pypi.org/project/mlflow-tracing/
+Copyright 2018 Databricks, Inc. All rights reserved.
+
+ftfy - https://pypi.org/project/ftfy/
+Copyright Robyn Speer.
+
+opentelemetry-exporter-otlp-proto-grpc - https://pypi.org/project/opentelemetry-exporter-otlp-proto-grpc/
+Copyright The OpenTelemetry Authors.
+
+opentelemetry-exporter-otlp-proto-http - https://pypi.org/project/opentelemetry-exporter-otlp-proto-http/
+Copyright The OpenTelemetry Authors.
+
+opentelemetry-instrumentation-fastapi - https://pypi.org/project/opentelemetry-instrumentation-fastapi/
+Copyright The OpenTelemetry Authors.
+
+opentelemetry-instrumentation-httpx - https://pypi.org/project/opentelemetry-instrumentation-httpx/
+Copyright The OpenTelemetry Authors.
+
+boto3 - https://pypi.org/project/boto3/
+Copyright 2014 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+botocore - https://pypi.org/project/botocore/
+Copyright 2014 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+google-auth - https://pypi.org/project/google-auth/
+Copyright 2016 Google LLC.
+
+opentelemetry-instrumentation-openai-agents-v2 - https://pypi.org/project/opentelemetry-instrumentation-openai-agents-v2/
+Copyright The OpenTelemetry Authors.
+
+cel-expr-python - https://github.com/cel-expr/cel-python/
+Copyright The Cel Expr Python Authors.
+
+modal - https://pypi.org/project/modal/
+Copyright Modal Labs 2022.
+
+daytona - https://pypi.org/project/daytona/
+Copyright 2024 Daytona.
+
+opentelemetry-distro - https://pypi.org/project/opentelemetry-distro/
+Copyright The OpenTelemetry Authors.
+
+________________
+
+This Software contains code from the following open source projects, licensed under the MIT license (https://opensource.org/license/mit):
+
+pyyaml - https://pypi.org/project/pyyaml/
+Copyright (c) 2017-2021 Ingy döt Net. Copyright (c) 2006-2016 Kirill Simonov.
+
+rich - https://pypi.org/project/rich/
+Copyright (c) 2020 Will McGugan.
+
+mcp - https://pypi.org/project/mcp/
+Copyright (c) 2024 Anthropic, PBC.
+
+keyring - https://pypi.org/project/keyring/
+Copyright Keyring authors.
+
+alembic - https://pypi.org/project/alembic/
+Copyright 2009-2025 Michael Bayer.
+
+anyio - https://pypi.org/project/anyio/
+Copyright (c) 2018 Alex Grönholm.
+
+cachetools - https://pypi.org/project/cachetools/
+Copyright (c) 2014-2026 Thomas Kemmer.
+
+fastapi - https://pypi.org/project/fastapi/
+Copyright (c) 2018 Sebastián Ramírez.
+
+pydantic - https://pypi.org/project/pydantic/
+Copyright (c) 2017 to present Pydantic Services Inc. and individual contributors.
+
+sqlalchemy - https://pypi.org/project/sqlalchemy/
+Copyright 2005-2026 SQLAlchemy authors and contributors <see AUTHORS file>.
+
+tiktoken - https://pypi.org/project/tiktoken/
+Copyright (c) 2022 OpenAI, Shantanu Jain.
+
+claude-agent-sdk - https://pypi.org/project/claude-agent-sdk/
+Copyright (c) 2025 Anthropic, PBC.
+
+openai-agents - https://pypi.org/project/openai-agents/
+Copyright (c) 2025 OpenAI.
+
+PyJWT - https://pypi.org/project/pyjwt/
+Copyright (c) 2015-2022 José Padilla.
+
+argon2-cffi - https://pypi.org/project/argon2-cffi/
+Copyright (c) 2015 Hynek Schlawack and the argon2-cffi contributors.
+
+tomlkit - https://pypi.org/project/tomlkit/
+Copyright (c) 2018 Sébastien Eustace.
+
+________________
+
+This Software contains code from the following open source projects, licensed under the BSD-3 license (https://opensource.org/license/bsd-3-clause):
+
+prompt_toolkit - https://pypi.org/project/prompt-toolkit/
+Copyright (c) 2014, Jonathan Slenders. All rights reserved.
+
+starlette - https://pypi.org/project/starlette/
+Copyright © 2018, Encode OSS Ltd. All rights reserved.
+
+uvicorn - https://pypi.org/project/uvicorn/
+Copyright © 2017-present, Encode OSS Ltd. All rights reserved.
+
+httpx - https://pypi.org/project/httpx/
+Copyright © 2019, Encode OSS Ltd. All rights reserved.
+
+click - https://pypi.org/project/click/
+Copyright 2014 Pallets.
+
+psutil - https://pypi.org/project/psutil/
+Copyright (c) 2009, Jay Loden, Dave Daeschler, Giampaolo Rodola. All rights reserved.
+
+________________
+
+This Software contains code from the following open source projects, licensed under the ISC license (https://opensource.org/license/isc):
+
+pexpect - https://pypi.org/project/pexpect/
+Copyright (c) 2013-2016, Pexpect development team. Copyright (c) 2012, Noah Spurrier.
+
+________________
+
+This Software contains code from the following open source projects, licensed under the LGPL-3.0 license (https://opensource.org/license/lgpl-3-0):
+
+pyte - https://pypi.org/project/pyte/
+Copyright (c) 2011-2012 by Selectel. Copyright (c) 2012-2017 by pyte authors and contributors.
+
+psycopg - https://pypi.org/project/psycopg/
+Copyright (C) 2003-2019 Federico Di Gregorio. Copyright (C) 2020-2021 The Psycopg Team.

@@ -3,18 +3,13 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Outlet, useParams, useSearchParams } from "@/lib/routing";
 import { useConversations } from "@/hooks/useConversations";
 import { useSessionAgent } from "@/hooks/useAgents";
+import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
-import {
-  readFilesPanelPreferences,
-  writeFilesPanelPreferences,
-} from "@/lib/filesPanelPreferences";
+import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import { isMacElectronShell } from "@/lib/nativeBridge";
-import {
-  readSessionWorkspaceState,
-  writeSessionWorkspaceState,
-} from "@/lib/sessionWorkspaceState";
+import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import {
   Dialog,
   DialogContent,
@@ -38,8 +33,12 @@ import {
   terminalTabKey,
   useTerminals,
 } from "@/hooks/useTerminals";
-import { useWorkspaceChangedFiles, useWorkspaceEnvironment } from "@/hooks/useWorkspaceChangedFiles";
+import {
+  useWorkspaceChangedFiles,
+  useWorkspaceEnvironment,
+} from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
+import { isNativeWrapper as isNativeWrapperLabel } from "@/lib/nativeCodingAgents";
 import { useChatStore } from "@/store/chatStore";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
@@ -104,12 +103,16 @@ import type { RightRailTab } from "./railTabs";
  * more than one agent (the root has at least one child).
  */
 export function AppShell() {
+  // Cmd/Ctrl+Enter accepts the pending harness approval prompt. Bound once
+  // here so it works on every chat route, regardless of where focus sits.
+  useApproveHotkey();
+
   // Read early: the conversationId scopes the per-session workspace state
   // (rail open/width/tab/open files) used throughout this component.
   const { conversationId } = useParams<{ conversationId: string }>();
   const [fileViewerCommentsOpen, setFileViewerCommentsOpen] = useState(false);
-  const [rightRailTab, setRightRailTab] = useState<RightRailTab>(
-    () => (conversationId ? readSessionWorkspaceState(conversationId).rightRailTab ?? "files" : "files"),
+  const [rightRailTab, setRightRailTab] = useState<RightRailTab>(() =>
+    conversationId ? (readSessionWorkspaceState(conversationId).rightRailTab ?? "files") : "files",
   );
   // The comments panel only contributes to the min width when the rail is
   // actually showing the file viewer — on the Terminals tab the FileViewer
@@ -118,22 +121,20 @@ export function AppShell() {
   // width. The panel can be dragged wider, but this floor keeps it usable at
   // its default; widening past it is the user's choice via the inline handle.
   const inlinePanelMinWidth = rightRailTab === "files" && fileViewerCommentsOpen ? 720 : undefined;
-  const { panelWidth: inlinePanelWidth, handleProps: inlinePanelHandleProps } = useResizableInlinePanel(
-    conversationId ?? null,
-    inlinePanelMinWidth,
-  );
+  const { panelWidth: inlinePanelWidth, handleProps: inlinePanelHandleProps } =
+    useResizableInlinePanel(conversationId ?? null, inlinePanelMinWidth);
   const [searchParams, setSearchParams] = useSearchParams();
   const [sidebarOpen, setSidebarOpen] = useState(initialSidebarOpen);
-  const [selectedFilePath, setSelectedFilePath] = useState<string | null>(
-    () => (conversationId ? readSessionWorkspaceState(conversationId).selectedFilePath ?? null : null),
+  const [selectedFilePath, setSelectedFilePath] = useState<string | null>(() =>
+    conversationId ? (readSessionWorkspaceState(conversationId).selectedFilePath ?? null) : null,
   );
   // Ordered list of open file tabs. ``selectedFilePath`` is the active tab
   // (null = a scope view, Changed/All, is active). Tabs persist when the user
   // switches to a scope view or another rail tab; only ``closeFile`` removes
   // an entry. Seeded from the per-session store; a ?file= URL param is merged
   // in by the conversation-restore effect below.
-  const [openFiles, setOpenFiles] = useState<string[]>(
-    () => (conversationId ? readSessionWorkspaceState(conversationId).openFiles ?? [] : []),
+  const [openFiles, setOpenFiles] = useState<string[]>(() =>
+    conversationId ? (readSessionWorkspaceState(conversationId).openFiles ?? []) : [],
   );
   // false = full folder tree ("All"), true = changed-files-only flat list.
   // Surfaced as the Changed | All toggle inside the Files panel. Seeded from
@@ -180,8 +181,8 @@ export function AppShell() {
   // conversation the rail can't render, so the state stays false — leaving it
   // true would let rail-gated side effects (the ?view= URL sync) fire on
   // non-session routes like the home page.
-  const [rightPanelOpen, setRightPanelOpen] = useState(
-    () => (conversationId ? readSessionWorkspaceState(conversationId).open ?? true : false),
+  const [rightPanelOpen, setRightPanelOpen] = useState(() =>
+    conversationId ? (readSessionWorkspaceState(conversationId).open ?? true) : false,
   );
   const [shareOpen, setShareOpen] = useState(false);
   const [forkOpen, setForkOpen] = useState(false);
@@ -220,7 +221,9 @@ export function AppShell() {
   useIdleNotifications(conversationId);
   const activeConv = useMemo(() => {
     if (!conversationId) return null;
-    return conversationsData?.pages.flatMap((p) => p.data).find((c) => c.id === conversationId) ?? null;
+    return (
+      conversationsData?.pages.flatMap((p) => p.data).find((c) => c.id === conversationId) ?? null
+    );
   }, [conversationId, conversationsData]);
   // Single-conversation snapshot (shared cache with chatStore.bindStream).
   // For sub-agent (child) sessions the sidebar list omits the row, so this
@@ -266,8 +269,7 @@ export function AppShell() {
   // (composer slash commands, `/model`); terminal-first SDK sessions
   // (embedded Omnigent REPL terminal) have NO wrapper label and must
   // keep regular chat behavior. See TerminalFirstContext.tsx.
-  const isNativeWrapper =
-    isClaudeNative || sessionLabels["omnigent.wrapper"] === "codex-native-ui";
+  const isNativeWrapper = isNativeWrapperLabel(sessionLabels["omnigent.wrapper"]);
   const todos = useChatStore((s) => s.todos);
   const todosCompleted = todos.filter((t) => t.status === "completed").length;
   // Used for the header "Back to parent" link, which is hidden on
@@ -495,9 +497,7 @@ export function AppShell() {
     }
     const persisted = readSessionWorkspaceState(conversationId);
 
-    const stored = sessionStorage.getItem(
-      `omnigent.ap-web.panel-key:${conversationId}`,
-    );
+    const stored = sessionStorage.getItem(`omnigent.ap-web.panel-key:${conversationId}`);
     setPanelInitialKeyState(stored);
 
     // Restore the Files view scope. A deep-link ?view= param wins and forces
@@ -580,15 +580,18 @@ export function AppShell() {
   // since the scope is meaningless (and shouldn't deep-link the rail back open)
   // once the workspace is collapsed. Collapsing thus drops ?view= here.
   useEffect(() => {
-    setSearchParams((prev) => {
-      const next = new URLSearchParams(prev);
-      if (rightPanelOpen && filesPanelFlatView) {
-        next.set("view", "changed");
-      } else {
-        next.delete("view");
-      }
-      return next;
-    }, { replace: true });
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (rightPanelOpen && filesPanelFlatView) {
+          next.set("view", "changed");
+        } else {
+          next.delete("view");
+        }
+        return next;
+      },
+      { replace: true },
+    );
   }, [filesPanelFlatView, rightPanelOpen]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Manual scope changes (the Changed | All toggle) persist the choice so it
@@ -601,62 +604,71 @@ export function AppShell() {
     writeFilesPanelPreferences({ changedOnly: v });
   }, []);
 
-  const openFileViewer = useCallback((path: string) => {
-    setSelectedFilePath(path);
-    // Add the path to the open tabs if it isn't already open; activating an
-    // already-open tab just re-selects it (no duplicate).
-    setOpenFiles((prev) => (prev.includes(path) ? prev : [...prev, path]));
-    // Close the terminal drawer so the file viewer is unobscured —
-    // but only in non-terminal-first sessions, where opening a file
-    // and viewing the terminal compete for the same rail slot. In
-    // terminal-first sessions the terminal renders inline in main
-    // (no drawer) and the rail stays visible alongside it, so we
-    // must NOT reset `panelInitialKey` here — that would silently
-    // flip the connection-pill view back to Chat (#bug from PR
-    // review: clicking a file collapsed Terminal view).
-    if (!terminalFirst) {
-      setPanelInitialKey(null);
-    }
-    setExecutionLogsKey(null); // close execution-logs panel
-    setFilesPanelOpen(false); // close files drawer so the viewer is unobscured
-    setSubagentsPanelOpen(false); // close mobile agents drawer
-    setTodosPanelOpen(false); // close mobile tasks drawer
-    // Pull the rail to the Files tab when parked on a tab where the viewer
-    // won't render (Terminals, Subagents, Todos). The Files tab surfaces the
-    // FileViewer inline, so leave it undisturbed.
-    setRightRailTab((prev) =>
-      prev === "terminals" || prev === "subagents" || prev === "todos" ? "files" : prev,
-    );
-    // Reveal the rail so the viewer is actually visible — the rail defaults
-    // open but a session the user collapsed restores collapsed, so opening a
-    // file (e.g. via a chat file-path link) there would otherwise route the
-    // file into an invisible panel. Persist open=true so the rail stays in
-    // sync with the open file on the next visit (mirroring the header
-    // toggle's persistence).
-    setRightPanelOpen(true);
-    if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
-    // Set URL in the callback (not a useEffect) to avoid racing with
-    // FileViewer's diff-sync effect which can clobber it on mount.
-    setSearchParams((prev) => {
-      const next = new URLSearchParams(prev);
-      next.set("file", path);
-      next.delete("comment"); // stale comment belongs to the previous file
-      return next;
-    }, { replace: true });
-  }, [setPanelInitialKey, terminalFirst, setSearchParams, conversationId]); // eslint-disable-line react-hooks/exhaustive-deps
+  const openFileViewer = useCallback(
+    (path: string) => {
+      setSelectedFilePath(path);
+      // Add the path to the open tabs if it isn't already open; activating an
+      // already-open tab just re-selects it (no duplicate).
+      setOpenFiles((prev) => (prev.includes(path) ? prev : [...prev, path]));
+      // Close the terminal drawer so the file viewer is unobscured —
+      // but only in non-terminal-first sessions, where opening a file
+      // and viewing the terminal compete for the same rail slot. In
+      // terminal-first sessions the terminal renders inline in main
+      // (no drawer) and the rail stays visible alongside it, so we
+      // must NOT reset `panelInitialKey` here — that would silently
+      // flip the connection-pill view back to Chat (#bug from PR
+      // review: clicking a file collapsed Terminal view).
+      if (!terminalFirst) {
+        setPanelInitialKey(null);
+      }
+      setExecutionLogsKey(null); // close execution-logs panel
+      setFilesPanelOpen(false); // close files drawer so the viewer is unobscured
+      setSubagentsPanelOpen(false); // close mobile agents drawer
+      setTodosPanelOpen(false); // close mobile tasks drawer
+      // Pull the rail to the Files tab when parked on a tab where the viewer
+      // won't render (Terminals, Subagents, Todos). The Files tab surfaces the
+      // FileViewer inline, so leave it undisturbed.
+      setRightRailTab((prev) =>
+        prev === "terminals" || prev === "subagents" || prev === "todos" ? "files" : prev,
+      );
+      // Reveal the rail so the viewer is actually visible — the rail defaults
+      // open but a session the user collapsed restores collapsed, so opening a
+      // file (e.g. via a chat file-path link) there would otherwise route the
+      // file into an invisible panel. Persist open=true so the rail stays in
+      // sync with the open file on the next visit (mirroring the header
+      // toggle's persistence).
+      setRightPanelOpen(true);
+      if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
+      // Set URL in the callback (not a useEffect) to avoid racing with
+      // FileViewer's diff-sync effect which can clobber it on mount.
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          next.set("file", path);
+          next.delete("comment"); // stale comment belongs to the previous file
+          return next;
+        },
+        { replace: true },
+      );
+    },
+    [setPanelInitialKey, terminalFirst, setSearchParams, conversationId],
+  ); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Strip the file-viewer URL params (file/diff/comment). Memoized on
   // ``setSearchParams`` so it always closes over react-router's *current*
   // ``navigate`` — which is bound to the live ``locationPathname`` — rather
   // than a stale one captured at first mount (see ``showScopeView`` below).
   const clearFileViewerUrl = useCallback(() => {
-    setSearchParams((prev) => {
-      const next = new URLSearchParams(prev);
-      next.delete("file");
-      next.delete("diff");
-      next.delete("comment");
-      return next;
-    }, { replace: true });
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.delete("file");
+        next.delete("diff");
+        next.delete("comment");
+        return next;
+      },
+      { replace: true },
+    );
   }, [setSearchParams]);
 
   // Mobile back button: close the open file and return to the files/changes
@@ -698,30 +710,36 @@ export function AppShell() {
   // its neighbor (prefer the previous tab, else the next); when no tabs
   // remain, fall back to a scope view (clearing ?file=). Closing a
   // non-active tab leaves the active selection untouched.
-  const closeFile = useCallback((path: string) => {
-    setOpenFiles((prev) => {
-      const idx = prev.indexOf(path);
-      if (idx === -1) return prev;
-      const next = prev.filter((p) => p !== path);
-      setSelectedFilePath((active) => {
-        if (active !== path) return active;
-        if (next.length === 0) {
-          setFileViewerCommentsOpen(false);
-          clearFileViewerUrl();
-          return null;
-        }
-        const neighbor = next[idx - 1] ?? next[idx] ?? next[0];
-        setSearchParams((sp) => {
-          const params = new URLSearchParams(sp);
-          params.set("file", neighbor);
-          params.delete("comment");
-          return params;
-        }, { replace: true });
-        return neighbor;
+  const closeFile = useCallback(
+    (path: string) => {
+      setOpenFiles((prev) => {
+        const idx = prev.indexOf(path);
+        if (idx === -1) return prev;
+        const next = prev.filter((p) => p !== path);
+        setSelectedFilePath((active) => {
+          if (active !== path) return active;
+          if (next.length === 0) {
+            setFileViewerCommentsOpen(false);
+            clearFileViewerUrl();
+            return null;
+          }
+          const neighbor = next[idx - 1] ?? next[idx] ?? next[0];
+          setSearchParams(
+            (sp) => {
+              const params = new URLSearchParams(sp);
+              params.set("file", neighbor);
+              params.delete("comment");
+              return params;
+            },
+            { replace: true },
+          );
+          return neighbor;
+        });
+        return next;
       });
-      return next;
-    });
-  }, [setSearchParams]); // eslint-disable-line react-hooks/exhaustive-deps
+    },
+    [setSearchParams],
+  ); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Switch the workspace rail's tab. The side effect (closing any open
   // file + its comments + URL) lives here, not in WorkspacePanel, so the
@@ -794,7 +812,6 @@ export function AppShell() {
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setTodosPanelOpen(true);
   }
-
 
   function openFirstTerminal() {
     // Mobile FAB → "Terminals" routes to the first terminal so the
@@ -873,8 +890,7 @@ export function AppShell() {
   // true, and MainTerminalView renders the shell with its own close
   // affordance. The PANEL_NO_TERMINAL_KEY sentinel ("") is falsy, so
   // "open with no target" stays a pill view.
-  const isShellView =
-    terminalFirst && !!panelInitialKey && !isAgentTerminalKey(panelInitialKey);
+  const isShellView = terminalFirst && !!panelInitialKey && !isAgentTerminalKey(panelInitialKey);
   const terminalFirstContextValue = useMemo<TerminalFirstContextValue>(
     () => ({
       isClaudeNative,
@@ -916,9 +932,9 @@ export function AppShell() {
 
   return (
     <FileViewerContext.Provider value={fileViewerContextValue}>
-    <TerminalFirstContextProvider value={terminalFirstContextValue}>
-    <ForkDialogContextProvider value={forkDialogContextValue}>
-    {/* `app-shell` paints the near-white brand gradient canvas (see
+      <TerminalFirstContextProvider value={terminalFirstContextValue}>
+        <ForkDialogContextProvider value={forkDialogContextValue}>
+          {/* `app-shell` paints the near-white brand gradient canvas (see
         index.css); bg-sidebar is the fallback the gradient sits over. The
         white sidebar / workspace cards float on this canvas.
 
@@ -926,28 +942,28 @@ export function AppShell() {
         macOS Electron shell hides the native title bar (titleBarStyle
         "hiddenInset"), so the web layer drops the sidebar below the
         traffic lights and supplies a drag strip in the freed space. */}
-    <div
-      className="app-shell relative flex h-dvh bg-sidebar text-foreground"
-      data-electron-mac={isMacElectronShell() ? "true" : undefined}
-    >
-      {/* Frameless-window titlebar stand-in (macOS Electron only): the
+          <div
+            className="app-shell relative flex h-dvh bg-sidebar text-foreground"
+            data-electron-mac={isMacElectronShell() ? "true" : undefined}
+          >
+            {/* Frameless-window titlebar stand-in (macOS Electron only): the
           sidebar's electron top margin (see index.css) frees this strip of
           canvas for the traffic lights, and the strip is the window's one
           drag surface — content below and right stays fully clickable. */}
-      {isMacElectronShell() && <div className="electron-drag-strip" aria-hidden="true" />}
-      {/* Centered title + server picker in the freed title-bar strip. The
+            {isMacElectronShell() && <div className="electron-drag-strip" aria-hidden="true" />}
+            {/* Centered title + server picker in the freed title-bar strip. The
           open thread's title (snapshot first — it's the only source for
           child sessions — then the sidebar row) replaces the brand label. */}
-      {isMacElectronShell() && (
-        <TitleBarServerPicker threadTitle={activeSession?.title ?? activeConv?.title} />
-      )}
-      <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
+            {isMacElectronShell() && (
+              <TitleBarServerPicker threadTitle={activeSession?.title ?? activeConv?.title} />
+            )}
+            <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
 
-      {/* Content region (everything right of the sidebar): a relative
+            {/* Content region (everything right of the sidebar): a relative
           flex row holding the chat+workspace group and the push panels
           as siblings. */}
-      <div className="relative flex min-h-0 min-w-0 flex-1">
-        {/* Chat + workspace group. The full-width header overlay is
+            <div className="relative flex min-h-0 min-w-0 flex-1">
+              {/* Chat + workspace group. The full-width header overlay is
             scoped to this group, so it spans the chat *and* the right
             workspace card but never reaches over the push panels (which
             render their own top chrome as siblings outside the group).
@@ -955,86 +971,86 @@ export function AppShell() {
             over — *except* in terminal-first sessions, where the terminal
             renders inline in main (via MainTerminalView) and the
             workspace card stays visible alongside. */}
-        <div
-          className={cn(
-            "relative flex min-h-0 min-w-0 flex-1",
-            panelOpen && !terminalFirst && "md:hidden",
-          )}
-        >
-          <ChatHeader
-            sidebarOpen={sidebarOpen}
-            onOpenSidebar={() => setSidebarOpen(true)}
-            isChildSession={isChildSession}
-            parentSessionId={activeSession?.parentSessionId}
-            conversationId={conversationId}
-            boundAgent={boundAgent}
-            canShare={canShare}
-            onShare={() => setShareOpen(true)}
-            hasAgentInfo={hasAgentInfo}
-            onAgentInfo={() => setAgentInfoOpen(true)}
-            hasHeaderMenu={hasHeaderMenu}
-            showFilesPanel={showFilesPanel}
-            hasRailContent={hasRailContent}
-            rightPanelOpen={rightPanelOpen}
-            onToggleRightPanel={() => {
-              const next = !rightPanelOpen;
-              if (conversationId) writeSessionWorkspaceState(conversationId, { open: next });
-              if (next) {
-                // Reopening lands back on the file remembered in per-session
-                // state, so re-add ?file= to keep the URL shareable — mirroring
-                // how the scope-sync effect re-adds ?view= on reopen. diff and
-                // comment are URL-only ephemerals (not remembered), so they
-                // intentionally don't rehydrate. Imperative (not an effect) to
-                // avoid the FileViewer diff-sync race documented in that effect.
-                if (selectedFilePath) {
-                  setSearchParams(
-                    (prev) => {
-                      const params = new URLSearchParams(prev);
-                      params.set("file", selectedFilePath);
-                      return params;
-                    },
-                    { replace: true },
-                  );
-                }
-              } else {
-                // Collapsing the rail hides the workspace, so strip the deep-
-                // link params that point into it (file/diff/comment) — otherwise
-                // the URL advertises a file that isn't shown and a reload would
-                // re-open the rail. (?view= is dropped by the scope-sync effect,
-                // which is gated on rightPanelOpen.)
-                clearFileViewerUrl();
-              }
-              setRightPanelOpen(next);
-            }}
-            mobileMenu={{
-              fileViewerOpen,
-              panelOpen,
-              terminalFirst,
-              executionLogsOpen,
-              filesPanelOpen,
-              subagentsPanelOpen,
-              todosPanelOpen,
-              hideTerminalsTab,
-              terminalsLength: railTerminals.length,
-              isClaudeNative,
-              todosCompleted,
-              todosTotal: todos.length,
-              debugMode,
-              changedCount,
-              subagentsWorking,
-              agentCount,
-              onOpenFiles: openFilesPanel,
-              onOpenFirstTerminal: openFirstTerminal,
-              onOpenSubagents: openSubagentsPanel,
-              onOpenTodos: openTodosPanel,
-              onOpenMainExecutionLog: openMainExecutionLog,
-            }}
-          />
-          <main className="relative flex min-h-0 min-w-0 flex-1 flex-col">
-            <Outlet />
-          </main>
+              <div
+                className={cn(
+                  "relative flex min-h-0 min-w-0 flex-1",
+                  panelOpen && !terminalFirst && "md:hidden",
+                )}
+              >
+                <ChatHeader
+                  sidebarOpen={sidebarOpen}
+                  onOpenSidebar={() => setSidebarOpen(true)}
+                  isChildSession={isChildSession}
+                  parentSessionId={activeSession?.parentSessionId}
+                  conversationId={conversationId}
+                  boundAgent={boundAgent}
+                  canShare={canShare}
+                  onShare={() => setShareOpen(true)}
+                  hasAgentInfo={hasAgentInfo}
+                  onAgentInfo={() => setAgentInfoOpen(true)}
+                  hasHeaderMenu={hasHeaderMenu}
+                  showFilesPanel={showFilesPanel}
+                  hasRailContent={hasRailContent}
+                  rightPanelOpen={rightPanelOpen}
+                  onToggleRightPanel={() => {
+                    const next = !rightPanelOpen;
+                    if (conversationId) writeSessionWorkspaceState(conversationId, { open: next });
+                    if (next) {
+                      // Reopening lands back on the file remembered in per-session
+                      // state, so re-add ?file= to keep the URL shareable — mirroring
+                      // how the scope-sync effect re-adds ?view= on reopen. diff and
+                      // comment are URL-only ephemerals (not remembered), so they
+                      // intentionally don't rehydrate. Imperative (not an effect) to
+                      // avoid the FileViewer diff-sync race documented in that effect.
+                      if (selectedFilePath) {
+                        setSearchParams(
+                          (prev) => {
+                            const params = new URLSearchParams(prev);
+                            params.set("file", selectedFilePath);
+                            return params;
+                          },
+                          { replace: true },
+                        );
+                      }
+                    } else {
+                      // Collapsing the rail hides the workspace, so strip the deep-
+                      // link params that point into it (file/diff/comment) — otherwise
+                      // the URL advertises a file that isn't shown and a reload would
+                      // re-open the rail. (?view= is dropped by the scope-sync effect,
+                      // which is gated on rightPanelOpen.)
+                      clearFileViewerUrl();
+                    }
+                    setRightPanelOpen(next);
+                  }}
+                  mobileMenu={{
+                    fileViewerOpen,
+                    panelOpen,
+                    terminalFirst,
+                    executionLogsOpen,
+                    filesPanelOpen,
+                    subagentsPanelOpen,
+                    todosPanelOpen,
+                    hideTerminalsTab,
+                    terminalsLength: railTerminals.length,
+                    isClaudeNative,
+                    todosCompleted,
+                    todosTotal: todos.length,
+                    debugMode,
+                    changedCount,
+                    subagentsWorking,
+                    agentCount,
+                    onOpenFiles: openFilesPanel,
+                    onOpenFirstTerminal: openFirstTerminal,
+                    onOpenSubagents: openSubagentsPanel,
+                    onOpenTodos: openTodosPanel,
+                    onOpenMainExecutionLog: openMainExecutionLog,
+                  }}
+                />
+                <main className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+                  <Outlet />
+                </main>
 
-          {/* Right workspace card — gated on conversationId (panels have
+                {/* Right workspace card — gated on conversationId (panels have
               no workspace to read without a session), default-open,
               hidden when any push panel takes the right side, *except* in
               terminal-first sessions where the terminal renders inline
@@ -1044,166 +1060,169 @@ export function AppShell() {
               rectangle (e.g. a no-filesystem agent with no terminals).
               Sits inside the group so the header overlay spans it; the
               push panels below sit outside the group. */}
-          {conversationId &&
-            hasRailContent &&
-            rightPanelOpen &&
-            (terminalFirst || !panelOpen) &&
-            !executionLogsOpen &&
-            !filesPanelOpen && (
-              <WorkspacePanel
-                conversationId={conversationId}
-                width={inlinePanelWidth}
-                inert={inlinePanelWidth === 0}
-                handleProps={inlinePanelHandleProps}
-                rightRailTab={rightRailTab}
-                onRightRailTabChange={handleRightRailTabChange}
-                showFilesPanel={showFilesPanel}
-                changedCount={changedCount}
-                showShellsTab={railTabsAvailable.terminals}
-                terminalsLength={railTerminals.length}
-                subagentsWorking={subagentsWorking}
-                agentCount={agentCount}
-                isClaudeNative={isClaudeNative}
-                todosCompleted={todosCompleted}
-                todosTotal={todos.length}
-                rootSessionId={rootSessionId}
-                selectedFilePath={selectedFilePath}
-                openFiles={openFiles}
-                openFileViewer={openFileViewer}
-                onCloseFile={closeFile}
-                onShowScopeView={showScopeView}
-                onCommentsOpenChange={setFileViewerCommentsOpen}
-                openTerminalsPanel={openTerminalsPanel}
-                permissionLevel={permissionLevel}
-                filesPanelSort={filesPanelSort}
-                onSortChange={setFilesPanelSort}
-                filesPanelFlatView={filesPanelFlatView}
-                onFlatViewChange={handleFilesFlatViewChange}
-                filesPanelShowHidden={filesPanelShowHidden}
-                onShowHiddenChange={setFilesPanelShowHidden}
-              />
-            )}
-        </div>
+                {conversationId &&
+                  hasRailContent &&
+                  rightPanelOpen &&
+                  (terminalFirst || !panelOpen) &&
+                  !executionLogsOpen &&
+                  !filesPanelOpen && (
+                    <WorkspacePanel
+                      conversationId={conversationId}
+                      width={inlinePanelWidth}
+                      inert={inlinePanelWidth === 0}
+                      handleProps={inlinePanelHandleProps}
+                      rightRailTab={rightRailTab}
+                      onRightRailTabChange={handleRightRailTabChange}
+                      showFilesPanel={showFilesPanel}
+                      changedCount={changedCount}
+                      showShellsTab={railTabsAvailable.terminals}
+                      terminalsLength={railTerminals.length}
+                      subagentsWorking={subagentsWorking}
+                      agentCount={agentCount}
+                      isClaudeNative={isClaudeNative}
+                      todosCompleted={todosCompleted}
+                      todosTotal={todos.length}
+                      rootSessionId={rootSessionId}
+                      selectedFilePath={selectedFilePath}
+                      openFiles={openFiles}
+                      openFileViewer={openFileViewer}
+                      onCloseFile={closeFile}
+                      onShowScopeView={showScopeView}
+                      onCommentsOpenChange={setFileViewerCommentsOpen}
+                      openTerminalsPanel={openTerminalsPanel}
+                      permissionLevel={permissionLevel}
+                      filesPanelSort={filesPanelSort}
+                      onSortChange={setFilesPanelSort}
+                      filesPanelFlatView={filesPanelFlatView}
+                      onFlatViewChange={handleFilesFlatViewChange}
+                      filesPanelShowHidden={filesPanelShowHidden}
+                      onShowHiddenChange={setFilesPanelShowHidden}
+                    />
+                  )}
+              </div>
 
-      {/* Push panels — flex siblings to main, animate width. Only one is open at a time.
+              {/* Push panels — flex siblings to main, animate width. Only one is open at a time.
           Terminal-first sessions render the terminal inline inside main
           (via MainTerminalView in ChatPage) and never mount the drawer. */}
-      {conversationId && !terminalFirst && (
-        <TerminalsPanel
-          open={panelOpen}
-          conversationId={conversationId}
-          initialTerminalKey={panelInitialKey}
-          // No neighbor to resize against (chat is hidden, FilesPanel
-          // owns its own width) — grow via flex-1.
-          fluid={panelOpen}
-          // Non-owners attach read-only: a shared PTY can't attribute
-          // input per-user, so only the owner may type (server-enforced).
-          readOnly={!isOwnerLevel(permissionLevel)}
-          onClose={() => setPanelInitialKey(null)}
-        />
-      )}
-      {conversationId && (
-        <ExecutionLogsPanel
-          open={executionLogsOpen}
-          conversationId={conversationId}
-          initialKey={executionLogsKey}
-          onClose={() => setExecutionLogsKey(null)}
-        />
-      )}
-      {conversationId && showFilesPanel && (
-        <FilesPanelDrawer
-          open={filesPanelOpen}
-          onClose={() => setFilesPanelOpen(false)}
-          onFileSelect={openFileViewer}
-          flatView={filesPanelFlatView}
-          onFlatViewChange={handleFilesFlatViewChange}
-          showHidden={filesPanelShowHidden}
-          onShowHiddenChange={setFilesPanelShowHidden}
-          sort={filesPanelSort}
-          onSortChange={setFilesPanelSort}
-        />
-      )}
-      {/* Mobile-only full-screen drawers for the rail tabs that have no
+              {conversationId && !terminalFirst && (
+                <TerminalsPanel
+                  open={panelOpen}
+                  conversationId={conversationId}
+                  initialTerminalKey={panelInitialKey}
+                  // No neighbor to resize against (chat is hidden, FilesPanel
+                  // owns its own width) — grow via flex-1.
+                  fluid={panelOpen}
+                  // Non-owners attach read-only: a shared PTY can't attribute
+                  // input per-user, so only the owner may type (server-enforced).
+                  readOnly={!isOwnerLevel(permissionLevel)}
+                  onClose={() => setPanelInitialKey(null)}
+                />
+              )}
+              {conversationId && (
+                <ExecutionLogsPanel
+                  open={executionLogsOpen}
+                  conversationId={conversationId}
+                  initialKey={executionLogsKey}
+                  onClose={() => setExecutionLogsKey(null)}
+                />
+              )}
+              {conversationId && showFilesPanel && (
+                <FilesPanelDrawer
+                  open={filesPanelOpen}
+                  onClose={() => setFilesPanelOpen(false)}
+                  onFileSelect={openFileViewer}
+                  flatView={filesPanelFlatView}
+                  onFlatViewChange={handleFilesFlatViewChange}
+                  showHidden={filesPanelShowHidden}
+                  onShowHiddenChange={setFilesPanelShowHidden}
+                  sort={filesPanelSort}
+                  onSortChange={setFilesPanelSort}
+                />
+              )}
+              {/* Mobile-only full-screen drawers for the rail tabs that have no
           desktop push panel of their own. `MobilePanelDrawer` is `md:hidden`,
           so these never collide with the desktop rail; they're opened from
           the session-menu FAB above. */}
-      {conversationId && rootSessionId && (
-        <MobilePanelDrawer
-          open={subagentsPanelOpen}
-          title="Agents"
-          onClose={() => setSubagentsPanelOpen(false)}
-          testId="subagents-panel-drawer"
-        >
-          <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
-        </MobilePanelDrawer>
-      )}
-      {conversationId && (
-        <MobilePanelDrawer
-          open={todosPanelOpen}
-          title="Tasks"
-          onClose={() => setTodosPanelOpen(false)}
-          testId="todos-panel-drawer"
-        >
-          <TodoPanel frameless />
-        </MobilePanelDrawer>
-      )}
-      {/* Mobile-only push panel — on desktop the viewer lives inside the inline aside. */}
-      {conversationId && selectedFilePath !== null && (
-        <div className="md:hidden">
-          <FileViewer
-            open
-            conversationId={conversationId}
-            path={selectedFilePath}
-            onClose={closeFileViewer}
-            onNavigateTo={openFileViewer}
-            permissionLevel={permissionLevel}
-            sort={filesPanelSort}
-          />
-        </div>
-      )}
-
-      </div>
-    </div>
-    {conversationId && (
-      <PermissionsModal sessionId={conversationId} open={shareOpen} onOpenChange={setShareOpen} />
-    )}
-    {conversationId && (
-      <ForkSessionDialog
-        // Remount per session so the title prefill (captured at mount)
-        // re-derives when the user navigates between sessions.
-        key={`fork-session-dialog-${conversationId}`}
-        sourceSessionId={conversationId}
-        sourceTitle={activeSession?.title}
-        sourceWorkspace={activeSession?.workspace}
-        sourceHostId={activeSession?.hostId}
-        sourceGitBranch={activeSession?.gitBranch}
-        upToResponseId={forkUpToResponseId}
-        open={forkOpen}
-        onOpenChange={(open) => {
-          setForkOpen(open);
-          // Closing clears the truncation point so a later Clone (or
-          // reopened dialog) doesn't silently fork a partial history.
-          if (!open) setForkUpToResponseId(null);
-        }}
-      />
-    )}
-    {/* Agent tools & policies — the mobile counterpart of the desktop
+              {conversationId && rootSessionId && (
+                <MobilePanelDrawer
+                  open={subagentsPanelOpen}
+                  title="Agents"
+                  onClose={() => setSubagentsPanelOpen(false)}
+                  testId="subagents-panel-drawer"
+                >
+                  <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+                </MobilePanelDrawer>
+              )}
+              {conversationId && (
+                <MobilePanelDrawer
+                  open={todosPanelOpen}
+                  title="Tasks"
+                  onClose={() => setTodosPanelOpen(false)}
+                  testId="todos-panel-drawer"
+                >
+                  <TodoPanel frameless />
+                </MobilePanelDrawer>
+              )}
+              {/* Mobile-only push panel — on desktop the viewer lives inside the inline aside. */}
+              {conversationId && selectedFilePath !== null && (
+                <div className="md:hidden">
+                  <FileViewer
+                    open
+                    conversationId={conversationId}
+                    path={selectedFilePath}
+                    onClose={closeFileViewer}
+                    onNavigateTo={openFileViewer}
+                    permissionLevel={permissionLevel}
+                    sort={filesPanelSort}
+                  />
+                </div>
+              )}
+            </div>
+          </div>
+          {conversationId && (
+            <PermissionsModal
+              sessionId={conversationId}
+              open={shareOpen}
+              onOpenChange={setShareOpen}
+            />
+          )}
+          {conversationId && (
+            <ForkSessionDialog
+              // Remount per session so the title prefill (captured at mount)
+              // re-derives when the user navigates between sessions.
+              key={`fork-session-dialog-${conversationId}`}
+              sourceSessionId={conversationId}
+              sourceTitle={activeSession?.title}
+              sourceWorkspace={activeSession?.workspace}
+              sourceHostId={activeSession?.hostId}
+              sourceGitBranch={activeSession?.gitBranch}
+              upToResponseId={forkUpToResponseId}
+              open={forkOpen}
+              onOpenChange={(open) => {
+                setForkOpen(open);
+                // Closing clears the truncation point so a later Clone (or
+                // reopened dialog) doesn't silently fork a partial history.
+                if (!open) setForkUpToResponseId(null);
+              }}
+            />
+          )}
+          {/* Agent tools & policies — the mobile counterpart of the desktop
         AgentInfoButton popover, opened from the header's three-dot menu. */}
-    {hasAgentInfo && (
-      <Dialog open={agentInfoOpen} onOpenChange={setAgentInfoOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Agent</DialogTitle>
-            <DialogDescription className="sr-only">
-              Tools and policies configured for the active agent.
-            </DialogDescription>
-          </DialogHeader>
-          <AgentInfoContent agent={boundAgent} sessionId={conversationId} />
-        </DialogContent>
-      </Dialog>
-    )}
-    </ForkDialogContextProvider>
-    </TerminalFirstContextProvider>
+          {hasAgentInfo && (
+            <Dialog open={agentInfoOpen} onOpenChange={setAgentInfoOpen}>
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>Agent</DialogTitle>
+                  <DialogDescription className="sr-only">
+                    Tools and policies configured for the active agent.
+                  </DialogDescription>
+                </DialogHeader>
+                <AgentInfoContent agent={boundAgent} sessionId={conversationId} />
+              </DialogContent>
+            </Dialog>
+          )}
+        </ForkDialogContextProvider>
+      </TerminalFirstContextProvider>
     </FileViewerContext.Provider>
   );
 }

@@ -96,9 +96,7 @@ export function AddAgentDialog({
       handleOpenChange(false);
       navigate(`/c/${session.id}`);
     } catch (e) {
-      setError(
-        e instanceof Error ? e.message : "Couldn't add the agent. Try again.",
-      );
+      setError(e instanceof Error ? e.message : "Couldn't add the agent. Try again.");
     } finally {
       setSubmitting(false);
     }
@@ -118,14 +116,9 @@ export function AddAgentDialog({
 
         <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto">
           <div className="flex flex-col gap-2">
-            <span className="text-xs font-medium text-muted-foreground">
-              Pick an agent
-            </span>
+            <span className="text-xs font-medium text-muted-foreground">Pick an agent</span>
             {agentList.length === 0 ? (
-              <p
-                data-testid="add-agent-empty"
-                className="text-xs text-muted-foreground"
-              >
+              <p data-testid="add-agent-empty" className="text-xs text-muted-foreground">
                 No agents available on this server. Register one with{" "}
                 <code className="font-mono">omnigent server --agent</code>.
               </p>
@@ -136,6 +129,7 @@ export function AddAgentDialog({
                   agent={agent}
                   selected={agent.id === selectedAgentId}
                   onSelect={() => selectAgent(agent.id)}
+                  hover
                 />
               ))
             )}
@@ -143,10 +137,7 @@ export function AddAgentDialog({
 
           {selectedAgent !== null && (
             <div className="flex flex-col gap-1.5">
-              <label
-                htmlFor="add-agent-name"
-                className="text-xs font-medium text-muted-foreground"
-              >
+              <label htmlFor="add-agent-name" className="text-xs font-medium text-muted-foreground">
                 Name
               </label>
               {/* Raw input matching NewChatDialog's "Name" field for a
@@ -172,11 +163,7 @@ export function AddAgentDialog({
         </div>
 
         <DialogFooter>
-          <Button
-            variant="ghost"
-            onClick={() => handleOpenChange(false)}
-            disabled={submitting}
-          >
+          <Button variant="ghost" onClick={() => handleOpenChange(false)} disabled={submitting}>
             Cancel
           </Button>
           <Button

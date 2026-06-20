@@ -1,6 +1,9 @@
 {
   "fill" : {
-    "automatic-gradient" : "display-p3:0.17673,0.38168,0.68246,1.00000",
+    "linear-gradient" : [
+      "display-p3:0.12164,0.15594,0.26582,1.00000",
+      "display-p3:0.11859,0.15173,0.25830,1.00000"
+    ],
     "orientation" : {
       "start" : {
         "x" : 0.5,
@@ -28,7 +31,7 @@
         }
       ],
       "position" : {
-        "scale" : 0.85,
+        "scale" : 1,
         "translation-in-points" : [
           0,
           0
@@ -39,33 +42,6 @@
         "opacity" : 0.5
       },
       "specular" : true,
-      "translucency" : {
-        "enabled" : false,
-        "value" : 0.5
-      }
-    },
-    {
-      "blend-mode-specializations" : [
-        {
-          "appearance" : "dark",
-          "value" : "soft-light"
-        },
-        {
-          "appearance" : "tinted",
-          "value" : "overlay"
-        }
-      ],
-      "layers" : [
-        {
-          "image-name" : "SVG Image 6.svg",
-          "name" : "SVG Image 6"
-        }
-      ],
-      "shadow" : {
-        "kind" : "neutral",
-        "opacity" : 0.5
-      },
-      "specular" : false,
       "translucency" : {
         "enabled" : false,
         "value" : 0.5

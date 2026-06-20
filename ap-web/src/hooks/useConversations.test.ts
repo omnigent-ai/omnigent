@@ -11,6 +11,9 @@ import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import {
   deleteConversation,
   renameConversation,
+  useBulkArchiveConversations,
+  useBulkDeleteConversations,
+  useBulkStopSessions,
   useConversations,
   useRenameConversation,
   useStopAndDeleteConversation,
@@ -386,10 +389,7 @@ describe("useRenameConversation cache patching", () => {
       ["conversations", "", true],
       infinitePage([conversation({ id: "conv_x" })]),
     );
-    queryClient.setQueryData(
-      ["conversation-backfill", "conv_x"],
-      conversation({ id: "conv_x" }),
-    );
+    queryClient.setQueryData(["conversation-backfill", "conv_x"], conversation({ id: "conv_x" }));
     queryClient.setQueryData(["session", "conv_x"], {
       id: "conv_x",
       agentId: "ag_1",
@@ -487,5 +487,175 @@ describe("useStopSession invalidation", () => {
     // state. Dropping this invalidation reintroduces the bug where the
     // header lagged (Stop lingering).
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["session", "conv_x"] });
+  });
+});
+
+describe("useBulkArchiveConversations", () => {
+  function renderBulkArchiveHook() {
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const rendered = renderHook(() => useBulkArchiveConversations(), { wrapper });
+    return { queryClient, invalidateSpy, rendered };
+  }
+
+  it("PATCHes each session and invalidates the list on success", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({
+          id: "conv_a",
+          object: "conversation",
+          title: "A",
+          created_at: 0,
+          updated_at: 10,
+          labels: {},
+        }),
+      )
+      .mockResolvedValueOnce(
+        mockResponse({
+          id: "conv_b",
+          object: "conversation",
+          title: "B",
+          created_at: 0,
+          updated_at: 11,
+          labels: {},
+        }),
+      );
+
+    const { invalidateSpy, rendered } = renderBulkArchiveHook();
+    rendered.result.current.mutate({ ids: ["conv_a", "conv_b"], archived: true });
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    for (const [, init] of fetchMock.mock.calls as [string, RequestInit][]) {
+      expect(init.method).toBe("PATCH");
+      expect(JSON.parse(init.body as string)).toEqual({ archived: true });
+    }
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
+  });
+
+  it("throws with failed ids when some archives fail", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({
+          id: "conv_a",
+          object: "conversation",
+          title: "A",
+          created_at: 0,
+          updated_at: 10,
+          labels: {},
+        }),
+      )
+      .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 500 }));
+
+    const { rendered } = renderBulkArchiveHook();
+    rendered.result.current.mutate({ ids: ["conv_a", "conv_b"], archived: true });
+    await waitFor(() => expect(rendered.result.current.isError).toBe(true));
+
+    expect((rendered.result.current.error as any).failed).toEqual(["conv_b"]);
+  });
+});
+
+describe("useBulkDeleteConversations", () => {
+  function renderBulkDeleteHook() {
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([
+        conversation({ id: "conv_a" }),
+        conversation({ id: "conv_b" }),
+        conversation({ id: "conv_keep" }),
+      ]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const rendered = renderHook(() => useBulkDeleteConversations(), { wrapper });
+    return { queryClient, rendered };
+  }
+
+  it("stops and deletes each session, then removes them from cache", async () => {
+    // For each id: stop (POST) then delete (DELETE) = 4 calls for 2 ids.
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ queued: false })) // stop conv_a
+      .mockResolvedValueOnce(mockResponse({ deleted: true })) // delete conv_a
+      .mockResolvedValueOnce(mockResponse({ queued: false })) // stop conv_b
+      .mockResolvedValueOnce(mockResponse({ deleted: true })); // delete conv_b
+
+    const { queryClient, rendered } = renderBulkDeleteHook();
+    rendered.result.current.mutate(["conv_a", "conv_b"]);
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+    const data = queryClient.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
+    expect(data!.pages[0].data.map((c) => c.id)).toEqual(["conv_keep"]);
+  });
+
+  it("evicts succeeded ids from cache even when some deletes fail", async () => {
+    // conv_a succeeds (stop+delete), conv_b fails on delete.
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ queued: false })) // stop conv_a
+      .mockResolvedValueOnce(mockResponse({ deleted: true })) // delete conv_a
+      .mockResolvedValueOnce(mockResponse({ queued: false })) // stop conv_b
+      .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 500 })); // delete conv_b fails
+
+    const { queryClient, rendered } = renderBulkDeleteHook();
+    rendered.result.current.mutate(["conv_a", "conv_b"]);
+    await waitFor(() => expect(rendered.result.current.isError).toBe(true));
+
+    // conv_a was successfully deleted and should be evicted; conv_b stays.
+    const data = queryClient.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
+    const ids = data!.pages[0].data.map((c) => c.id);
+    expect(ids).not.toContain("conv_a");
+    expect(ids).toContain("conv_b");
+    expect(ids).toContain("conv_keep");
+  });
+});
+
+describe("useBulkStopSessions", () => {
+  function renderBulkStopHook() {
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const rendered = renderHook(() => useBulkStopSessions(), { wrapper });
+    return { invalidateSpy, rendered };
+  }
+
+  it("POSTs stop_session for each id and invalidates the list", async () => {
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ queued: false }))
+      .mockResolvedValueOnce(mockResponse({ queued: false }));
+
+    const { invalidateSpy, rendered } = renderBulkStopHook();
+    rendered.result.current.mutate(["conv_a", "conv_b"]);
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    for (const [url, init] of fetchMock.mock.calls as [string, RequestInit][]) {
+      expect(url).toMatch(/\/v1\/sessions\/conv_[ab]\/events$/);
+      expect(init.method).toBe("POST");
+      expect(JSON.parse(init.body as string)).toEqual({ type: "stop_session", data: {} });
+    }
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
+  });
+
+  it("throws with failed ids when some stops fail", async () => {
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ queued: false }))
+      .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 503 }));
+
+    const { rendered } = renderBulkStopHook();
+    rendered.result.current.mutate(["conv_a", "conv_b"]);
+    await waitFor(() => expect(rendered.result.current.isError).toBe(true));
+
+    const err = rendered.result.current.error as any;
+    expect(err.succeeded).toEqual(["conv_a"]);
+    expect(err.failed).toEqual(["conv_b"]);
   });
 });

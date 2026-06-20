@@ -397,14 +397,15 @@ export interface ClientTaskCancel {
 /**
  * `session.status` — session lifecycle transition.
  *
- * `waiting` arrives when the parent agent loop parks on
- * background tools / sub-agents. The session snapshot's `status`
- * never reports `waiting`; it is live-only.
+ * `launching` means a task/session exists but has not emitted a concrete
+ * harness-start signal. `waiting` arrives when the parent agent loop parks
+ * on background tools / sub-agents. The session snapshot's `status` never
+ * reports `waiting`; it is live-only.
  */
 export interface SessionStatusEvent {
   type: "session_status";
   conversationId: string;
-  status: "idle" | "running" | "waiting" | "failed";
+  status: "idle" | "launching" | "running" | "waiting" | "failed";
   responseId?: string;
 }
 
@@ -448,6 +449,33 @@ export interface SessionModelEvent {
   type: "session_model";
   conversationId: string;
   model: string;
+}
+
+/**
+ * `session.reasoning_effort` — active thinking-level switch from a native
+ * session.
+ *
+ * Emitted by the Omnigent server after a native wrapper reports an effort
+ * change observed outside the Web UI: Claude-native mirrors terminal/TUI
+ * changes, and Codex-native mirrors Codex app-server/config state. Carries
+ * `null` when the native runtime cleared back to its model default.
+ */
+export interface SessionReasoningEffortEvent {
+  type: "session_reasoning_effort";
+  conversationId: string;
+  reasoningEffort: string | null;
+}
+
+/**
+ * `session.collaboration_mode` — active Codex collaboration-mode switch.
+ *
+ * Emitted when a Codex-native thread enters or exits Plan mode, whether from
+ * the web UI toggle or from the native Codex TUI.
+ */
+export interface SessionCollaborationModeEvent {
+  type: "session_collaboration_mode";
+  conversationId: string;
+  mode: string;
 }
 
 /**
@@ -682,6 +710,16 @@ export interface SessionSkillsEvent {
   conversationId: string;
 }
 
+/**
+ * `session.model_options` — the Codex app-server model catalog just
+ * resolved for a session. Consumers refetch the session snapshot and apply
+ * its now-populated `codexModelOptions`.
+ */
+export interface SessionModelOptionsEvent {
+  type: "session_model_options";
+  conversationId: string;
+}
+
 /** One user currently viewing the session (holding its stream open). */
 export interface SessionViewer {
   /** Authenticated identity, e.g. `"alice@example.com"`. */
@@ -737,6 +775,8 @@ export type StreamEvent =
   | SessionStatusEvent
   | SessionUsageEvent
   | SessionModelEvent
+  | SessionReasoningEffortEvent
+  | SessionCollaborationModeEvent
   | SessionAgentChangedEvent
   | SessionTodosEvent
   | SessionTerminalPendingEvent
@@ -750,4 +790,5 @@ export type StreamEvent =
   | SessionChangedFilesInvalidatedEvent
   | SessionTerminalActivityEvent
   | SessionSkillsEvent
+  | SessionModelOptionsEvent
   | SessionPresenceEvent;

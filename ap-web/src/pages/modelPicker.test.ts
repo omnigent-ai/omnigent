@@ -1,7 +1,41 @@
 import { describe, expect, it } from "vitest";
 
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
+import {
+  codexEffortLevelsForModel,
+  findCodexModelOption,
+  isCodexNativeModel,
+} from "@/lib/codexNativeModels";
+import type { CodexModelOption } from "@/lib/types";
 import { isModelImplicitlySelected } from "./ChatPage";
+
+const CODEX_MODEL_OPTIONS: CodexModelOption[] = [
+  {
+    id: "gpt-5.5",
+    model: "databricks-gpt-5-5",
+    displayName: "GPT-5.5",
+    defaultReasoningEffort: "high",
+    supportedReasoningEfforts: [
+      { reasoningEffort: "low", description: "Low" },
+      { reasoningEffort: "medium", description: "Medium" },
+      { reasoningEffort: "high", description: "High" },
+      { reasoningEffort: "xhigh", description: "Extra high" },
+    ],
+    isDefault: true,
+  },
+  {
+    id: "gpt-5.4-mini",
+    model: "databricks-gpt-5-4-mini",
+    displayName: "GPT-5.4 mini",
+    defaultReasoningEffort: "medium",
+    supportedReasoningEfforts: [
+      { reasoningEffort: "minimal", description: "Minimal" },
+      { reasoningEffort: "low", description: "Low" },
+      { reasoningEffort: "medium", description: "Medium" },
+    ],
+    isDefault: false,
+  },
+];
 
 describe("CLAUDE_NATIVE_MODELS", () => {
   it("offers Claude Code tier aliases, not pinned version IDs", () => {
@@ -11,19 +45,38 @@ describe("CLAUDE_NATIVE_MODELS", () => {
     // the installed version supports, so the list never drifts. Guard
     // against a regression back to version-numbered IDs.
     const ids = CLAUDE_NATIVE_MODELS.map((m) => m.id);
-    // Capability order, most powerful first: Fable is the tier above Opus.
-    expect(ids).toEqual(["fable", "opus", "sonnet", "haiku"]);
+    // Capability order, most powerful first. Fable is temporarily withheld.
+    expect(ids).toEqual(["opus", "sonnet", "haiku"]);
     for (const id of ids) {
       expect(id).not.toMatch(/\d/); // an alias carries no version digits
     }
   });
 
   it("labels each alias by tier", () => {
-    expect(CLAUDE_NATIVE_MODELS.map((m) => m.label)).toEqual([
-      "Fable",
-      "Opus",
-      "Sonnet",
-      "Haiku",
+    expect(CLAUDE_NATIVE_MODELS.map((m) => m.label)).toEqual(["Opus", "Sonnet", "Haiku"]);
+  });
+});
+
+describe("Codex model-list helpers", () => {
+  it("matches only raw Codex picker ids from the Codex catalog", () => {
+    expect(findCodexModelOption(CODEX_MODEL_OPTIONS, "gpt-5.5")?.id).toBe("gpt-5.5");
+    expect(findCodexModelOption(CODEX_MODEL_OPTIONS, "databricks-gpt-5-5")).toBeNull();
+    expect(isCodexNativeModel(CODEX_MODEL_OPTIONS, "gpt-5.4-mini")).toBe(true);
+    expect(isCodexNativeModel(CODEX_MODEL_OPTIONS, "databricks-gpt-5-4-mini")).toBe(false);
+    expect(isCodexNativeModel(CODEX_MODEL_OPTIONS, "opus")).toBe(false);
+  });
+
+  it("derives effort levels from the matched Codex model", () => {
+    expect(codexEffortLevelsForModel(CODEX_MODEL_OPTIONS, "gpt-5.4-mini")).toEqual([
+      "minimal",
+      "low",
+      "medium",
+    ]);
+    expect(codexEffortLevelsForModel(CODEX_MODEL_OPTIONS, null)).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
     ]);
   });
 });

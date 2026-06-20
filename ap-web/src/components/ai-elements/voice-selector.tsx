@@ -13,12 +13,7 @@ import {
   CommandSeparator,
   CommandShortcut,
 } from "@/components/ui/command";
-import {
-  Dialog,
-  DialogContent,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
 import {
@@ -42,16 +37,12 @@ interface VoiceSelectorContextValue {
   setOpen: (open: boolean) => void;
 }
 
-const VoiceSelectorContext = createContext<VoiceSelectorContextValue | null>(
-  null
-);
+const VoiceSelectorContext = createContext<VoiceSelectorContextValue | null>(null);
 
 export const useVoiceSelector = () => {
   const context = useContext(VoiceSelectorContext);
   if (!context) {
-    throw new Error(
-      "VoiceSelector components must be used within VoiceSelector"
-    );
+    throw new Error("VoiceSelector components must be used within VoiceSelector");
   }
   return context;
 };
@@ -86,7 +77,7 @@ export const VoiceSelector = ({
 
   const voiceSelectorContext = useMemo(
     () => ({ open, setOpen, setValue, value }),
-    [value, setValue, open, setOpen]
+    [value, setValue, open, setOpen],
   );
 
   return (
@@ -114,15 +105,9 @@ export const VoiceSelectorContent = ({
   title = "Voice Selector",
   ...props
 }: VoiceSelectorContentProps) => (
-  <DialogContent
-    aria-describedby={undefined}
-    className={cn("p-0", className)}
-    {...props}
-  >
+  <DialogContent aria-describedby={undefined} className={cn("p-0", className)} {...props}>
     <DialogTitle className="sr-only">{title}</DialogTitle>
-    <Command className="**:data-[slot=command-input-wrapper]:h-auto">
-      {children}
-    </Command>
+    <Command className="**:data-[slot=command-input-wrapper]:h-auto">{children}</Command>
   </DialogContent>
 );
 
@@ -134,37 +119,25 @@ export const VoiceSelectorDialog = (props: VoiceSelectorDialogProps) => (
 
 export type VoiceSelectorInputProps = ComponentProps<typeof CommandInput>;
 
-export const VoiceSelectorInput = ({
-  className,
-  ...props
-}: VoiceSelectorInputProps) => (
+export const VoiceSelectorInput = ({ className, ...props }: VoiceSelectorInputProps) => (
   <CommandInput className={cn("h-auto py-3.5", className)} {...props} />
 );
 
 export type VoiceSelectorListProps = ComponentProps<typeof CommandList>;
 
-export const VoiceSelectorList = (props: VoiceSelectorListProps) => (
-  <CommandList {...props} />
-);
+export const VoiceSelectorList = (props: VoiceSelectorListProps) => <CommandList {...props} />;
 
 export type VoiceSelectorEmptyProps = ComponentProps<typeof CommandEmpty>;
 
-export const VoiceSelectorEmpty = (props: VoiceSelectorEmptyProps) => (
-  <CommandEmpty {...props} />
-);
+export const VoiceSelectorEmpty = (props: VoiceSelectorEmptyProps) => <CommandEmpty {...props} />;
 
 export type VoiceSelectorGroupProps = ComponentProps<typeof CommandGroup>;
 
-export const VoiceSelectorGroup = (props: VoiceSelectorGroupProps) => (
-  <CommandGroup {...props} />
-);
+export const VoiceSelectorGroup = (props: VoiceSelectorGroupProps) => <CommandGroup {...props} />;
 
 export type VoiceSelectorItemProps = ComponentProps<typeof CommandItem>;
 
-export const VoiceSelectorItem = ({
-  className,
-  ...props
-}: VoiceSelectorItemProps) => (
+export const VoiceSelectorItem = ({ className, ...props }: VoiceSelectorItemProps) => (
   <CommandItem className={cn("px-4 py-2", className)} {...props} />
 );
 
@@ -174,22 +147,14 @@ export const VoiceSelectorShortcut = (props: VoiceSelectorShortcutProps) => (
   <CommandShortcut {...props} />
 );
 
-export type VoiceSelectorSeparatorProps = ComponentProps<
-  typeof CommandSeparator
->;
+export type VoiceSelectorSeparatorProps = ComponentProps<typeof CommandSeparator>;
 
 export const VoiceSelectorSeparator = (props: VoiceSelectorSeparatorProps) => (
   <CommandSeparator {...props} />
 );
 
 export type VoiceSelectorGenderProps = ComponentProps<"span"> & {
-  value?:
-    | "male"
-    | "female"
-    | "transgender"
-    | "androgyne"
-    | "non-binary"
-    | "intersex";
+  value?: "male" | "female" | "transgender" | "androgyne" | "non-binary" | "intersex";
 };
 
 export const VoiceSelectorGender = ({
@@ -415,26 +380,14 @@ export const VoiceSelectorAccent = ({
 
 export type VoiceSelectorAgeProps = ComponentProps<"span">;
 
-export const VoiceSelectorAge = ({
-  className,
-  ...props
-}: VoiceSelectorAgeProps) => (
-  <span
-    className={cn("text-muted-foreground text-xs tabular-nums", className)}
-    {...props}
-  />
+export const VoiceSelectorAge = ({ className, ...props }: VoiceSelectorAgeProps) => (
+  <span className={cn("text-muted-foreground text-xs tabular-nums", className)} {...props} />
 );
 
 export type VoiceSelectorNameProps = ComponentProps<"span">;
 
-export const VoiceSelectorName = ({
-  className,
-  ...props
-}: VoiceSelectorNameProps) => (
-  <span
-    className={cn("flex-1 truncate text-left font-medium", className)}
-    {...props}
-  />
+export const VoiceSelectorName = ({ className, ...props }: VoiceSelectorNameProps) => (
+  <span className={cn("flex-1 truncate text-left font-medium", className)} {...props} />
 );
 
 export type VoiceSelectorDescriptionProps = ComponentProps<"span">;
@@ -460,23 +413,13 @@ export const VoiceSelectorAttributes = ({
 
 export type VoiceSelectorBulletProps = ComponentProps<"span">;
 
-export const VoiceSelectorBullet = ({
-  className,
-  ...props
-}: VoiceSelectorBulletProps) => (
-  <span
-    aria-hidden="true"
-    className={cn("select-none text-border", className)}
-    {...props}
-  >
+export const VoiceSelectorBullet = ({ className, ...props }: VoiceSelectorBulletProps) => (
+  <span aria-hidden="true" className={cn("select-none text-border", className)} {...props}>
     &bull;
   </span>
 );
 
-export type VoiceSelectorPreviewProps = Omit<
-  ComponentProps<"button">,
-  "children"
-> & {
+export type VoiceSelectorPreviewProps = Omit<ComponentProps<"button">, "children"> & {
   playing?: boolean;
   loading?: boolean;
   onPlay?: () => void;
@@ -496,7 +439,7 @@ export const VoiceSelectorPreview = ({
       onClick?.(event);
       onPlay?.();
     },
-    [onClick, onPlay]
+    [onClick, onPlay],
   );
 
   let icon = <PlayIcon className="size-3" />;

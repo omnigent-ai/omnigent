@@ -53,9 +53,7 @@ describe("ReasoningView — expandable gating", () => {
     // the trigger to expand first. Asserting on the actual text after
     // expanding proves the content path still renders end-to-end, not
     // just that a button exists.
-    render(
-      <ReasoningView text="Considered the options." isStreaming={false} duration={2.5} />,
-    );
+    render(<ReasoningView text="Considered the options." isStreaming={false} duration={2.5} />);
     const trigger = screen.getByRole("button");
     expect(trigger).toBeTruthy();
     expect(screen.queryByText("Considered the options.")).toBeNull(); // collapsed

@@ -13,10 +13,7 @@ import { useAvailableAgents } from "./useAvailableAgents";
 // stubbing `fetch` exercises the real fetch + mapping path rather than
 // a hand-rolled stand-in. The two top-level fetches run in parallel
 // (Promise.all), so the stub is keyed by URL, not by call order.
-function mockResponse(
-  body: unknown,
-  init?: { ok?: boolean; status?: number },
-): Response {
+function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): Response {
   return {
     ok: init?.ok ?? true,
     status: init?.status ?? 200,
@@ -51,9 +48,7 @@ function wrapper({ children }: { children: ReactNode }) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
-  return (
-    <QueryClientProvider client={client}>{children}</QueryClientProvider>
-  );
+  return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
 }
 
 beforeEach(() => {
@@ -95,7 +90,7 @@ describe("useAvailableAgents", () => {
     expect(urls).toContain(SCAN_URL);
   });
 
-  it("maps rows into AvailableAgent and applies the claude-native, nessie, and debby display names", async () => {
+  it("maps rows into AvailableAgent and applies native, nessie, and debby display names", async () => {
     routeFetch({
       [BUILTINS_URL]: mockResponse({
         object: "list",
@@ -105,6 +100,12 @@ describe("useAvailableAgents", () => {
             name: "claude-native-ui",
             description: null,
             harness: "claude-native",
+          },
+          {
+            id: "ag_pi_native",
+            name: "pi-native-ui",
+            description: null,
+            harness: "pi-native",
           },
           {
             id: "ag_nessie",
@@ -134,8 +135,8 @@ describe("useAvailableAgents", () => {
     const { result } = renderHook(() => useAvailableAgents(), { wrapper });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
-    // claude-native-ui is the terminal-first wrapper; the picker shows
-    // it as "Claude Code". nessie's and debby's lowercase slugs are
+    // Native terminal wrappers show product names ("Claude Code" / "Pi").
+    // nessie's and debby's lowercase slugs are
     // title-cased to "Nessie" / "Debby". A regression in DISPLAY_NAMES
     // would surface the raw slug to users. Other agents pass their name through as the
     // display name. `harness` is passed through verbatim so the picker
@@ -151,6 +152,14 @@ describe("useAvailableAgents", () => {
         display_name: "Claude Code",
         description: null,
         harness: "claude-native",
+        skills: [],
+      },
+      {
+        id: "ag_pi_native",
+        name: "pi-native-ui",
+        display_name: "Pi",
+        description: null,
+        harness: "pi-native",
         skills: [],
       },
       {
@@ -250,6 +259,18 @@ describe("useAvailableAgents", () => {
             agent_id: "ag_clone",
             agent_name: "claude-native-ui (fork conv_9)",
           },
+          // A fork OF A fork of the built-in — nested clone suffixes. A
+          // single-layer strip leaves "claude-native-ui (fork conv_9)"
+          // (not a built-in name), so the clone leaks into the picker;
+          // once enriched its claude-native harness resolves to the
+          // "Claude Code" display name, surfacing as a DUPLICATE of the
+          // built-in. agentRootName peels every layer so it drops by
+          // name before it is ever enriched.
+          {
+            id: "conv_6",
+            agent_id: "ag_clone2",
+            agent_name: "claude-native-ui (fork conv_9) (fork conv_10)",
+          },
           // Genuinely custom agent; survives and is enriched below.
           { id: "conv_3", agent_id: "ag_doc", agent_name: "doc-writer" },
           // Same custom agent on an older session — deduped by id, and
@@ -268,13 +289,26 @@ describe("useAvailableAgents", () => {
         harness: "claude-sdk",
         skills: [{ name: "humanizer", description: "Remove AI writing patterns" }],
       }),
+      // Reached only if the fork-of-fork leaks (i.e. the fix regressed):
+      // its claude-native harness would resolve to "Claude Code", proving
+      // the leak renders as a duplicate built-in. With the fix conv_6 is
+      // dropped before enrichment, so this mock is never hit.
+      "/v1/sessions/conv_6/agent": mockResponse({
+        id: "ag_clone2",
+        object: "agent",
+        name: "claude-native-ui (fork conv_9) (fork conv_10)",
+        harness: "claude-native",
+        skills: [],
+      }),
     });
 
     const { result } = renderHook(() => useAvailableAgents(), { wrapper });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
-    // One built-in + one custom. ag_clone or ag_native appearing twice
-    // means shadow-dropping regressed; ag_doc missing means kind=any
+    // One built-in + one custom. A second "Claude Code" row (from
+    // ag_clone/ag_clone2 leaking) means shadow-dropping regressed —
+    // ag_clone2 specifically guards the nested fork-of-fork case that
+    // surfaces as a duplicate built-in; ag_doc missing means kind=any
     // discovery broke; two ag_doc rows mean the by-id dedup broke.
     expect(result.current.data).toEqual([
       {

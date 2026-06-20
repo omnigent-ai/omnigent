@@ -218,6 +218,35 @@ describe("SubagentsPanel", () => {
     expect(main).not.toHaveTextContent("claude-native-ui");
   });
 
+  it("labels Pi native-wrapper main rows with the product name", () => {
+    useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
+    useSessionMock.mockReturnValue({
+      session: {
+        id: "conv_root",
+        agentId: "ag_root",
+        agentName: "pi-native-ui",
+        runnerId: null,
+        status: "idle",
+        createdAt: 0,
+        title: null,
+        labels: { "omnigent.wrapper": "pi-native-ui" },
+        items: [],
+        pendingElicitations: [],
+        permissionLevel: 4,
+        parentSessionId: null,
+        subAgentName: null,
+      },
+      isLoading: false,
+      error: null,
+    } as unknown as ReturnType<typeof useSession>);
+
+    renderPanel({ rootSessionId: "conv_root" });
+
+    const main = screen.getByTestId("subagent-main-row");
+    expect(main).toHaveTextContent("Pi");
+    expect(main).not.toHaveTextContent("pi-native-ui");
+  });
+
   it("shows the root's latest message as the main-row preview", () => {
     useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
     useSessionMock.mockReturnValue({
@@ -301,6 +330,11 @@ describe("SubagentsPanel", () => {
       name: "codex-native wrapper → codex-native marker",
       labels: { "omnigent.wrapper": "codex-native-ui" },
       expectedKind: "codex-native",
+    },
+    {
+      name: "pi-native wrapper → pi-native marker",
+      labels: { "omnigent.wrapper": "pi-native-ui" },
+      expectedKind: "pi-native",
     },
     {
       name: "nessie agent → nessie marker",
@@ -670,8 +704,8 @@ describe("SubagentsPanel", () => {
   });
 
   it("renders 'Failed' for a child whose latest task ended in failure", () => {
-    // Matches MainStatusBadge's red-dot + "Failed" treatment, so the
-    // two surfaces read consistently when something goes wrong.
+    // Failed keeps the label in destructive text, with a trailing dot
+    // matching the rest of the rail's compact status markers.
     mockChildTree({
       conv_parent: [
         {
@@ -693,6 +727,34 @@ describe("SubagentsPanel", () => {
     expect(row).toHaveTextContent(/Failed/);
     // Should not lowercase-bleed the raw status into the label.
     expect(row.textContent).not.toMatch(/failed[^F]/);
+  });
+
+  it("renders a child with last_task_error as failed and exposes the error detail", () => {
+    mockChildTree({
+      conv_parent: [
+        childInfo({
+          id: "conv_child",
+          title: "researcher:auth",
+          tool: "researcher",
+          session_name: "auth",
+          last_task_error: {
+            code: "required_terminal_exited",
+            message:
+              "\nRequired terminal exited unexpectedly; the session runtime is no longer available.\ncommand: worker-cli",
+          },
+        }),
+      ],
+    });
+
+    const { container } = renderPanel();
+
+    const row = childRow(container, "conv_child");
+    const indicator = within(row).getByTestId("subagent-status-dot");
+    expect(row).toHaveTextContent(/Failed/);
+    expect(indicator).toHaveAttribute(
+      "aria-label",
+      "Failed: Required terminal exited unexpectedly; the session runtime is no longer available.",
+    );
   });
 
   it("shows the pulsing working dot (no redundant 'Working' word) on the main row when the parent session is running", () => {
@@ -777,9 +839,14 @@ describe("SubagentsPanel", () => {
     ).not.toBeNull();
     // Terminal states use design tokens, not raw 500-weight Tailwind. "done"
     // is a quiet, expected outcome, so it reads as a muted dot (not green);
-    // only failures keep a saturated tone.
+    // failures keep destructive text + a destructive dot.
     expect(childRow(container, "c_done").querySelector(".bg-muted-foreground\\/55")).not.toBeNull();
-    expect(childRow(container, "c_fail").querySelector(".bg-destructive")).not.toBeNull();
+    const failedIndicator = within(childRow(container, "c_fail")).getByTestId(
+      "subagent-status-dot",
+    );
+    expect(failedIndicator).toHaveClass("text-destructive");
+    expect(failedIndicator.querySelector(".bg-destructive")).not.toBeNull();
+    expect(failedIndicator.querySelector("svg")).toBeNull();
     // Regression guard: "done" must not regress to the loud green success tone.
     expect(childRow(container, "c_done").querySelector(".bg-success")).toBeNull();
     // Regression guard: the pre-polish stoplight classes must be gone.
@@ -821,6 +888,7 @@ describe("SubagentsPanel", () => {
   it("shows the status word only for notable states, not quiet ones", () => {
     mockChildTree({
       conv_parent: [
+        childInfo({ id: "c_launch", tool: "researcher", current_task_status: "launching" }),
         childInfo({ id: "c_work", tool: "researcher", busy: true }),
         childInfo({ id: "c_done", tool: "researcher", current_task_status: "completed" }),
         childInfo({ id: "c_idle", tool: "researcher" }),
@@ -832,6 +900,10 @@ describe("SubagentsPanel", () => {
 
     // The unexpected "cancelled" terminal state keeps its word so it stands out.
     expect(childRow(container, "c_cancel")).toHaveTextContent(/cancelled/);
+    // Launching is not yet real work, so it shows its word and does not reuse
+    // the active running dot.
+    expect(childRow(container, "c_launch")).toHaveTextContent(/Launching/);
+    expect(childRow(container, "c_launch").querySelector('[data-testid="running-dot"]')).toBeNull();
     // Quiet states render no word — the label lives in the tooltip. Working is
     // quiet too: the pulsing pink dot already reads as "active".
     expect(childRow(container, "c_work")).not.toHaveTextContent(/Working/);
@@ -849,11 +921,11 @@ describe("SubagentsPanel", () => {
     ).toHaveAttribute("aria-label", "Idle");
   });
 
-  it("renders the dot last so dots align across rows regardless of label width", () => {
-    // Alignment fix: the dot trails the label, so a wide label ("Failed")
-    // can't push its dot left of a bare "Idle" dot. If the dot ever renders
-    // before the label again, lastElementChild stops being the dot and the
-    // dots fall out of column.
+  it("renders the status marker last so markers align across rows regardless of label width", () => {
+    // Alignment fix: the marker trails the label, so a wide label ("Failed")
+    // can't push its marker left of a bare "Idle" dot. If the marker ever
+    // renders before the label again, lastElementChild stops being the marker
+    // and the markers fall out of column.
     mockChildTree({
       conv_parent: [
         childInfo({ id: "c_fail", tool: "researcher", current_task_status: "failed" }),
@@ -863,7 +935,7 @@ describe("SubagentsPanel", () => {
 
     const { container } = renderPanel();
 
-    // Failed row shows its label, with the colored dot trailing it.
+    // Failed row shows its label, with the destructive dot trailing it.
     const failIndicator = within(childRow(container, "c_fail")).getByTestId("subagent-status-dot");
     const failDot = failIndicator.querySelector("span.rounded-full");
     expect(failDot).not.toBeNull();

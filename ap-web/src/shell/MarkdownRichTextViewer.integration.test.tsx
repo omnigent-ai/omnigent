@@ -32,13 +32,25 @@ function makeFakeEditor(initial: string): FakeEditor {
   return {
     isDestroyed: false,
     getMarkdown: () => markdown,
-    on: (evt, h) => { (handlers[evt] ??= new Set()).add(h); },
-    off: (evt, h) => { handlers[evt]?.delete(h); },
-    commands: { setContent: (c: string) => { markdown = c; } },
+    on: (evt, h) => {
+      (handlers[evt] ??= new Set()).add(h);
+    },
+    off: (evt, h) => {
+      handlers[evt]?.delete(h);
+    },
+    commands: {
+      setContent: (c: string) => {
+        markdown = c;
+      },
+    },
     setEditable: () => {},
     state: { selection: { empty: true, from: 0, to: 0 } },
-    emit: (evt) => { handlers[evt]?.forEach((h) => h()); },
-    setMarkdown: (m) => { markdown = m; },
+    emit: (evt) => {
+      handlers[evt]?.forEach((h) => h());
+    },
+    setMarkdown: (m) => {
+      markdown = m;
+    },
     // Default focused: these tests simulate USER edits, which only happen while
     // the editor has focus. The load-normalisation test flips this to false.
     isFocused: true,
@@ -71,7 +83,9 @@ vi.mock("@tiptap/markdown", () => ({ Markdown: { configure: vi.fn().mockReturnVa
 vi.mock("@tiptap/starter-kit", () => ({ default: { configure: vi.fn().mockReturnValue({}) } }));
 vi.mock("@tiptap/extension-table", () => ({
   Table: { configure: vi.fn().mockReturnValue({}) },
-  TableRow: {}, TableCell: {}, TableHeader: {},
+  TableRow: {},
+  TableCell: {},
+  TableHeader: {},
 }));
 vi.mock("./TipTapGitHubAlert", () => ({ GitHubAlertBlockquote: {} }));
 vi.mock("./TipTapHtmlPassthrough", () => ({ HtmlPassthrough: {} }));
@@ -88,7 +102,10 @@ vi.mock("./MarkdownCommentPlugin", () => ({ MarkdownCommentPlugin: () => null })
 // Capture the onSave the viewer wires so a test can fire a "manual save" (⌘S / pill).
 const toolbar = vi.hoisted(() => ({ onSave: null as ((md: string) => void) | null }));
 vi.mock("./MarkdownEditorToolbar", () => ({
-  ToolbarPlugin: (props: { onSave: (md: string) => void }) => { toolbar.onSave = props.onSave; return null; },
+  ToolbarPlugin: (props: { onSave: (md: string) => void }) => {
+    toolbar.onSave = props.onSave;
+    return null;
+  },
 }));
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn().mockReturnValue(true) }));
 vi.mock("@/hooks/useWriteFileContent", () => ({ useWriteFileContent: vi.fn() }));
@@ -107,7 +124,10 @@ let mutateAsync: ReturnType<typeof vi.fn>;
 function mockWrite(): void {
   mutateAsync = vi.fn().mockResolvedValue(undefined);
   vi.mocked(writeHook.useWriteFileContent).mockReturnValue({
-    isPending: false, isError: false, reset: vi.fn(), mutateAsync,
+    isPending: false,
+    isError: false,
+    reset: vi.fn(),
+    mutateAsync,
   } as unknown as ReturnType<typeof writeHook.useWriteFileContent>);
 }
 
@@ -150,10 +170,14 @@ describe("MarkdownRichTextViewer auto-save wiring (integration)", () => {
     render(makeViewer());
     // Edit: content diverges from the onCreate baseline, then emit 'update'.
     fakeEditor!.setMarkdown(EDITED);
-    await act(async () => { fakeEditor!.emit("update"); });
+    await act(async () => {
+      fakeEditor!.emit("update");
+    });
     // Still within the debounce window — nothing written yet.
     expect(mutateAsync).not.toHaveBeenCalled();
-    await act(async () => { vi.advanceTimersByTime(1000); });
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+    });
     // If this fails the update→schedule→runSave→handleSave chain is broken.
     expect(mutateAsync).toHaveBeenCalledWith({ path: PATH, content: EDITED });
   });
@@ -161,9 +185,13 @@ describe("MarkdownRichTextViewer auto-save wiring (integration)", () => {
   it("blur flushes the pending save before the debounce elapses", async () => {
     render(makeViewer());
     fakeEditor!.setMarkdown(EDITED);
-    await act(async () => { fakeEditor!.emit("update"); });
+    await act(async () => {
+      fakeEditor!.emit("update");
+    });
     expect(mutateAsync).not.toHaveBeenCalled();
-    await act(async () => { fakeEditor!.emit("blur"); });
+    await act(async () => {
+      fakeEditor!.emit("blur");
+    });
     // Blur must flush immediately — a missing editor.on("blur", flush) wiring
     // would leave this uncalled until the timer fired.
     expect(mutateAsync).toHaveBeenCalledWith({ path: PATH, content: EDITED });
@@ -172,8 +200,12 @@ describe("MarkdownRichTextViewer auto-save wiring (integration)", () => {
   it("unmount flushes pending edits", async () => {
     const { unmount } = render(makeViewer());
     fakeEditor!.setMarkdown(EDITED);
-    await act(async () => { fakeEditor!.emit("update"); });
-    await act(async () => { unmount(); });
+    await act(async () => {
+      fakeEditor!.emit("update");
+    });
+    await act(async () => {
+      unmount();
+    });
     // The unmount cleanup must flush so a file-switch mid-debounce isn't lost.
     expect(mutateAsync).toHaveBeenCalledWith({ path: PATH, content: EDITED });
   });
@@ -186,12 +218,14 @@ describe("MarkdownRichTextViewer auto-save wiring (integration)", () => {
     // unmount/blur flush must require a real (focused) edit, or merely opening
     // then closing a file silently rewrites it with the normalised serialisation.
     const { unmount } = render(makeViewer());
-    fakeEditor!.isFocused = false;            // user never clicked in
-    fakeEditor!.setMarkdown(INITIAL + "\n");  // drift, but no "update" emitted
+    fakeEditor!.isFocused = false; // user never clicked in
+    fakeEditor!.setMarkdown(INITIAL + "\n"); // drift, but no "update" emitted
     // Unmount (panel close / file switch) flushes — it must find nothing to
     // save. Before the fix the live dirty check (getMarkdown ≠ baseline) fired a
     // PUT of the normalised content here.
-    await act(async () => { unmount(); });
+    await act(async () => {
+      unmount();
+    });
     expect(mutateAsync).not.toHaveBeenCalled();
   });
 
@@ -204,18 +238,24 @@ describe("MarkdownRichTextViewer auto-save wiring (integration)", () => {
     // user edit. A successful save must still end clean.
     const saved: string[] = [];
     vi.mocked(writeHook.useWriteFileContent).mockReturnValue({
-      isPending: false, isError: false, reset: vi.fn(),
+      isPending: false,
+      isError: false,
+      reset: vi.fn(),
       mutateAsync: vi.fn(async ({ content }: { content: string }) => {
         saved.push(content);
-        fakeEditor!.setMarkdown(content + "\n");   // round-trip drift, not a user edit
+        fakeEditor!.setMarkdown(content + "\n"); // round-trip drift, not a user edit
       }),
     } as unknown as ReturnType<typeof writeHook.useWriteFileContent>);
 
     render(makeViewer());
     fakeEditor!.setMarkdown(EDITED);
-    await act(async () => { fakeEditor!.emit("update"); });
-    expect(screen.getByText(/Unsaved changes/)).toBeInTheDocument();  // dirty before the save
-    await act(async () => { vi.advanceTimersByTime(1100); });
+    await act(async () => {
+      fakeEditor!.emit("update");
+    });
+    expect(screen.getByText(/Unsaved changes/)).toBeInTheDocument(); // dirty before the save
+    await act(async () => {
+      vi.advanceTimersByTime(1100);
+    });
 
     // Saved once, and clean afterward despite getMarkdown() != the saved text.
     // With setDirty(isEditorDirty()) this would be stuck "Unsaved".
@@ -230,10 +270,14 @@ describe("MarkdownRichTextViewer auto-save wiring (integration)", () => {
     // treated as an edit and autosaved — merely viewing a file must never
     // rewrite it. Regression for the silent normalize-on-open writes.
     render(makeViewer());
-    fakeEditor!.isFocused = false;           // user hasn't clicked in yet
-    fakeEditor!.setMarkdown(INITIAL + "\n");  // round-trip drift, not a user edit
-    await act(async () => { fakeEditor!.emit("update"); });
-    await act(async () => { vi.advanceTimersByTime(1100); });
+    fakeEditor!.isFocused = false; // user hasn't clicked in yet
+    fakeEditor!.setMarkdown(INITIAL + "\n"); // round-trip drift, not a user edit
+    await act(async () => {
+      fakeEditor!.emit("update");
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(1100);
+    });
     // If onUpdate flagged this dirty (or the wiring scheduled it), a spurious
     // write fires here — the exact open-rewrites-file bug.
     expect(mutateAsync).not.toHaveBeenCalled();
@@ -247,27 +291,43 @@ describe("MarkdownRichTextViewer auto-save wiring (integration)", () => {
     // concurrent PUT. The old wiring (onSave={handleSave}) called the writer
     // directly and fired two overlapping PUTs.
     let resolveWrite!: () => void;
-    const writePromise = new Promise<void>((r) => { resolveWrite = r; });
+    const writePromise = new Promise<void>((r) => {
+      resolveWrite = r;
+    });
     let calls = 0;
     vi.mocked(writeHook.useWriteFileContent).mockReturnValue({
-      isPending: false, isError: false, reset: vi.fn(),
-      mutateAsync: vi.fn(() => { calls++; return writePromise; }),
+      isPending: false,
+      isError: false,
+      reset: vi.fn(),
+      mutateAsync: vi.fn(() => {
+        calls++;
+        return writePromise;
+      }),
     } as unknown as ReturnType<typeof writeHook.useWriteFileContent>);
 
     render(makeViewer());
     fakeEditor!.isFocused = true;
     fakeEditor!.setMarkdown(EDITED);
-    await act(async () => { fakeEditor!.emit("update"); });
-    await act(async () => { vi.advanceTimersByTime(1100); });  // auto-save now in flight
+    await act(async () => {
+      fakeEditor!.emit("update");
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(1100);
+    }); // auto-save now in flight
     expect(calls).toBe(1);
 
     // Manual save while the auto-save PUT is still unresolved.
-    await act(async () => { toolbar.onSave!(EDITED); });
+    await act(async () => {
+      toolbar.onSave!(EDITED);
+    });
     // Single-flight coalesced it — still one write. Old wiring → 2.
     expect(calls).toBe(1);
 
     // Settle: baseline now equals the saved content, so no trailing resave fires.
-    await act(async () => { resolveWrite(); await writePromise; });
+    await act(async () => {
+      resolveWrite();
+      await writePromise;
+    });
     expect(calls).toBe(1);
   });
 
@@ -276,13 +336,17 @@ describe("MarkdownRichTextViewer auto-save wiring (integration)", () => {
     vi.mocked(runnerHook.useSessionRunnerOnline).mockReturnValue(false);
     const { rerender } = render(makeViewer());
     fakeEditor!.setMarkdown(EDITED);
-    await act(async () => { fakeEditor!.emit("update"); });
+    await act(async () => {
+      fakeEditor!.emit("update");
+    });
     // Dirty, but offline → no write attempted.
     expect(mutateAsync).not.toHaveBeenCalled();
 
     // Runner reconnects → the re-enable effect flushes the queued edits.
     vi.mocked(runnerHook.useSessionRunnerOnline).mockReturnValue(true);
-    await act(async () => { rerender(makeViewer()); });
+    await act(async () => {
+      rerender(makeViewer());
+    });
     expect(mutateAsync).toHaveBeenCalledWith({ path: PATH, content: EDITED });
   });
 });

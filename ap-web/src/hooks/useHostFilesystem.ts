@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { authenticatedFetch } from "@/lib/identity";
 
@@ -50,18 +50,13 @@ interface HostFilesystemResponse {
  *   ``"/Users/corey/projects"``), or empty string for home.
  * @returns The relative URL to fetch.
  */
-export function buildHostFilesystemUrl(
-  hostId: string,
-  absolutePath: string,
-): string {
+export function buildHostFilesystemUrl(hostId: string, absolutePath: string): string {
   const base = `/v1/hosts/${encodeURIComponent(hostId)}/filesystem`;
   if (absolutePath === "") {
     return base;
   }
   // Strip the single leading slash; the route handler re-adds it.
-  const stripped = absolutePath.startsWith("/")
-    ? absolutePath.slice(1)
-    : absolutePath;
+  const stripped = absolutePath.startsWith("/") ? absolutePath.slice(1) : absolutePath;
   if (stripped === "") {
     // The user navigated to "/" exactly. Keep a trailing slash so
     // the route still matches /filesystem/{path:path}.
@@ -115,10 +110,7 @@ const MAX_PAGES = 50;
  *   when the page cap was hit with more entries still pending.
  * @throws FetchError carrying the HTTP status on a non-OK response.
  */
-async function fetchHostFilesystem(
-  hostId: string,
-  path: string,
-): Promise<HostDirectoryListing> {
+async function fetchHostFilesystem(hostId: string, path: string): Promise<HostDirectoryListing> {
   const baseUrl = buildHostFilesystemUrl(hostId, path);
   const entries: HostFilesystemEntry[] = [];
   let after: string | null = null;
@@ -132,13 +124,9 @@ async function fetchHostFilesystem(
       params.set("after", after);
     }
     const sep = baseUrl.includes("?") ? "&" : "?";
-    const res = await authenticatedFetch(
-      `${baseUrl}${sep}${params.toString()}`,
-    );
+    const res = await authenticatedFetch(`${baseUrl}${sep}${params.toString()}`);
     if (!res.ok) {
-      const err: FetchError = new Error(
-        `host filesystem fetch failed: HTTP ${res.status}`,
-      );
+      const err: FetchError = new Error(`host filesystem fetch failed: HTTP ${res.status}`);
       err.status = res.status;
       throw err;
     }
@@ -176,10 +164,7 @@ async function fetchHostFilesystem(
  *   ``null`` keeps the query disabled.
  * @returns React Query result with ``data: HostDirectoryListing``.
  */
-export function useHostFilesystem(
-  hostId: string | null,
-  path: string | null,
-) {
+export function useHostFilesystem(hostId: string | null, path: string | null) {
   return useQuery({
     queryKey: ["host-filesystem", hostId, path],
     queryFn: () => fetchHostFilesystem(hostId as string, path as string),
@@ -189,5 +174,73 @@ export function useHostFilesystem(
     // loads, so navigating up/into a folder doesn't flicker through
     // an empty "Loading…" collapse.
     placeholderData: (prev) => prev,
+  });
+}
+
+/** Shape returned by ``POST /v1/hosts/{id}/directories``. */
+interface CreateHostDirectoryResponse {
+  object: string;
+  /** Absolute path of the created directory, e.g. ``"/Users/me/new"``. */
+  path: string;
+}
+
+/**
+ * Create a directory on a host via ``POST /v1/hosts/{id}/directories``.
+ *
+ * The server forwards a ``host.create_dir`` frame to the host, which
+ * runs ``os.makedirs`` (parents included) and returns the created
+ * absolute path. A non-OK response carries the host's error message
+ * (e.g. "directory already exists" as a 409) so the picker can show it
+ * inline.
+ *
+ * @param hostId Host identifier, e.g. ``"host_a1b2..."``.
+ * @param path Absolute (or ``~``-prefixed) directory path to create.
+ * @returns The created directory's absolute path.
+ * @throws FetchError carrying the HTTP status and the server's detail
+ *   message on a non-OK response.
+ */
+export async function createHostDirectory(hostId: string, path: string): Promise<string> {
+  const res = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}/directories`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+  if (!res.ok) {
+    // Surface the server's detail (e.g. "directory already exists") so
+    // the user sees why creation failed rather than a bare status code.
+    let detail: string | null = null;
+    try {
+      const body = (await res.json()) as { detail?: string };
+      detail = typeof body.detail === "string" ? body.detail : null;
+    } catch {
+      detail = null;
+    }
+    const err: FetchError = new Error(detail ?? `create directory failed: HTTP ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+  const body = (await res.json()) as CreateHostDirectoryResponse;
+  return body.path;
+}
+
+/**
+ * React Query mutation: create a directory on a host, then refresh any
+ * cached listings for that host so the new folder appears.
+ *
+ * Invalidates every ``["host-filesystem", hostId, *]`` query rather
+ * than just the parent's, because the picker keys listings by its raw
+ * path state ("" for home, absolute otherwise) and the caller may not
+ * know which key the new directory's parent maps to.
+ *
+ * @returns A React Query mutation; call ``mutateAsync({ hostId, path })``.
+ */
+export function useCreateHostDirectory() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ hostId, path }: { hostId: string; path: string }) =>
+      createHostDirectory(hostId, path),
+    onSuccess: (_createdPath, { hostId }) => {
+      void queryClient.invalidateQueries({ queryKey: ["host-filesystem", hostId] });
+    },
   });
 }

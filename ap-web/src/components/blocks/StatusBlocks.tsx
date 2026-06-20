@@ -24,13 +24,20 @@ interface ErrorBannerProps {
 export function ErrorBanner({ message, source, code }: ErrorBannerProps) {
   const display = message || code || "Unknown error";
   return (
-    <Alert variant="destructive">
+    <Alert
+      variant="destructive"
+      className="min-w-0 max-w-full overflow-hidden has-[>svg]:grid-cols-[auto_minmax(0,1fr)]"
+    >
       <AlertCircleIcon />
-      <AlertTitle>
+      <AlertTitle className="min-w-0 break-words [overflow-wrap:anywhere]">
         Error{source ? ` · ${source}` : ""}
         {code && message ? ` · ${code}` : ""}
       </AlertTitle>
-      <AlertDescription>{display}</AlertDescription>
+      <AlertDescription className="min-w-0 max-w-full overflow-hidden">
+        <span className="block max-w-full whitespace-pre-wrap break-words [overflow-wrap:anywhere] [text-wrap:wrap]">
+          {display}
+        </span>
+      </AlertDescription>
     </Alert>
   );
 }
@@ -48,9 +55,7 @@ export function PolicyDeniedBanner({ reason, phase }: PolicyDeniedBannerProps) {
   return (
     <Alert>
       <ShieldXIcon />
-      <AlertTitle>
-        Blocked by policy{phase ? ` · ${phase}` : ""}
-      </AlertTitle>
+      <AlertTitle>Blocked by policy{phase ? ` · ${phase}` : ""}</AlertTitle>
       <AlertDescription>{reason}</AlertDescription>
     </Alert>
   );

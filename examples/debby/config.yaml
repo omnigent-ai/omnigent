@@ -2,7 +2,7 @@
 #
 # Debby never answers from a single model. Every question she receives is
 # fanned out to BOTH a Claude sub-agent and a GPT sub-agent — two plain
-# (non-coding) responders running on the claude-sdk and openai-agents
+# (non-coding) responders running on the claude-sdk and codex
 # harnesses — and she shows you what each one thinks, side by side.
 #
 # Load the `debate` skill (highlighted as a chip on her empty surface) to
@@ -12,7 +12,7 @@
 # Usage:
 #   omnigent run examples/debby
 #
-# Debby's two heads run on the claude-sdk and openai-agents harnesses, so
+# Debby's two heads run on the claude-sdk and codex harnesses, so
 # configure both a Claude and an OpenAI provider first (e.g. `omnigent setup`,
 # or export ANTHROPIC_API_KEY and OPENAI_API_KEY).
 
@@ -42,7 +42,7 @@ prompt: |
   question from a single model's point of view. You have exactly two plain
   sub-agents — neither is a coding agent; each is a pure responder:
   - `claude` — a Claude responder (claude-sdk harness).
-  - `gpt`    — a GPT responder (openai-agents harness).
+  - `gpt`    — a GPT responder (codex harness).
 
   ## Your default behavior — always fan out to both
 
@@ -113,13 +113,36 @@ prompt: |
 async: true
 cancellable: true
 
-# Debby only orchestrates the two responders and formats their output; she
-# needs no filesystem, shell, or terminals of her own.
+# Debby orchestrates the two responders and formats their output. She also has
+# filesystem access so she can read reference material and save the side-by-side
+# results she produces. Declaring ``os_env`` registers the ``sys_os_read`` /
+# ``sys_os_write`` / ``sys_os_edit`` / ``sys_os_shell`` tools (filesystem access
+# comes bundled with a shell). ``sandbox: type: none`` runs unsandboxed in the
+# caller's working directory.
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
+
+# Same blast-radius guardrail Polly uses, so Debby's shell behaves identically:
+# the catastrophic set (force-push, ``rm -rf /``, hard-reset to a remote ref) is
+# denied outright, while everything else runs without an ASK
+# (``gate_pushes: false``).
+guardrails:
+  policies:
+    blast_radius:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.blast_radius
+        arguments:
+          gate_pushes: false
 
 tools:
-  # The two plain brainstorming partners — see agents/<name>/. Both are pure
-  # responders (no coding tools); claude runs on claude-sdk, gpt on
-  # openai-agents.
+  # The two brainstorming partners — see agents/<name>/. Both reason and write,
+  # and each has its own filesystem access (`os_env`); claude runs on claude-sdk,
+  # gpt on codex.
   agents:
     - claude
     - gpt

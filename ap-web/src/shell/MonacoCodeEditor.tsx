@@ -28,7 +28,12 @@ import { TruncatedBanner } from "./TruncatedBanner";
 // setContentRef). Named for markdown only because that was its first caller.
 import { useMarkdownEditorSync } from "./useMarkdownEditorSync";
 import { useEditorAutoSave } from "./useEditorAutoSave";
-import { ensureLanguage, ensureMonacoReady, monacoLanguageId, resolvedThemeToMonaco } from "./monacoSetup";
+import {
+  ensureLanguage,
+  ensureMonacoReady,
+  monacoLanguageId,
+  resolvedThemeToMonaco,
+} from "./monacoSetup";
 import { useMonacoCommentLayer, type CodeEditorInstance } from "./useMonacoCommentLayer";
 import "./monacoCodeEditor.css";
 
@@ -206,10 +211,16 @@ function MonacoCodeEditorInner({
     // Handle rejection explicitly: otherwise a failed Shiki/Monaco init is an
     // unhandled promise rejection and the view is stuck on "Loading…" forever.
     void Promise.all([ensureMonacoReady(), ensureLanguage(lang)]).then(
-      () => { if (!cancelled) setReady(true); },
-      () => { if (!cancelled) setLoadError(true); },
+      () => {
+        if (!cancelled) setReady(true);
+      },
+      () => {
+        if (!cancelled) setLoadError(true);
+      },
     );
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [lang]);
 
   const editorInstanceRef = useRef<CodeEditorInstance | null>(null);
@@ -251,45 +262,57 @@ function MonacoCodeEditorInner({
   const flushRef = useRef(autoSave.flush);
   flushRef.current = autoSave.flush;
 
-  const handleMount: OnMount = useCallback((editor, monaco) => {
-    editorInstanceRef.current = editor;
-    baselineRef.current = editor.getValue();
-    latestContentRef.current = editor.getValue();
-    // Keep Monaco's offsets aligned with the raw file's char offsets (which the
-    // comment anchors use): enforce the file's existing EOL so a CRLF file isn't
-    // silently counted as LF. Never converts — only re-asserts what's there.
-    editor.getModel()?.setEOL(
-      content.includes("\r\n") ? monaco.editor.EndOfLineSequence.CRLF : monaco.editor.EndOfLineSequence.LF,
-    );
-    // Route ⌘S through the same single-flight + trailing-save engine as
-    // auto-save, so a manual save during an in-flight/debounced auto-save can't
-    // start an overlapping PUT.
-    // oxlint-disable-next-line eslint(no-bitwise) -- Monaco keybindings are bit-OR'd flags.
-    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
-      flushRef.current();
-    });
-    // Flush a pending debounce when focus leaves the editor (snappier than
-    // waiting out the timer). Disposed with the editor on unmount.
-    editor.onDidBlurEditorWidget(() => { flushRef.current(); });
-    // Push same-file external updates in place (preserves scroll/cursor).
-    setContentRef.current = (newContent: string) => {
-      const ed = editorInstanceRef.current;
-      if (!ed) return;
-      const viewState = ed.saveViewState();
-      // Set the baseline before setValue so the onChange it triggers sees a
-      // clean buffer and doesn't briefly flag the editor dirty.
-      baselineRef.current = newContent;
-      latestContentRef.current = newContent;
-      ed.setValue(newContent);
-      setDirty(false);
-      if (viewState) ed.restoreViewState(viewState);
-    };
-    setMounted(true);
-  }, [setContentRef, setDirty, content]);
+  const handleMount: OnMount = useCallback(
+    (editor, monaco) => {
+      editorInstanceRef.current = editor;
+      baselineRef.current = editor.getValue();
+      latestContentRef.current = editor.getValue();
+      // Keep Monaco's offsets aligned with the raw file's char offsets (which the
+      // comment anchors use): enforce the file's existing EOL so a CRLF file isn't
+      // silently counted as LF. Never converts — only re-asserts what's there.
+      editor
+        .getModel()
+        ?.setEOL(
+          content.includes("\r\n")
+            ? monaco.editor.EndOfLineSequence.CRLF
+            : monaco.editor.EndOfLineSequence.LF,
+        );
+      // Route ⌘S through the same single-flight + trailing-save engine as
+      // auto-save, so a manual save during an in-flight/debounced auto-save can't
+      // start an overlapping PUT.
+      // oxlint-disable-next-line eslint(no-bitwise) -- Monaco keybindings are bit-OR'd flags.
+      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
+        flushRef.current();
+      });
+      // Flush a pending debounce when focus leaves the editor (snappier than
+      // waiting out the timer). Disposed with the editor on unmount.
+      editor.onDidBlurEditorWidget(() => {
+        flushRef.current();
+      });
+      // Push same-file external updates in place (preserves scroll/cursor).
+      setContentRef.current = (newContent: string) => {
+        const ed = editorInstanceRef.current;
+        if (!ed) return;
+        const viewState = ed.saveViewState();
+        // Set the baseline before setValue so the onChange it triggers sees a
+        // clean buffer and doesn't briefly flag the editor dirty.
+        baselineRef.current = newContent;
+        latestContentRef.current = newContent;
+        ed.setValue(newContent);
+        setDirty(false);
+        if (viewState) ed.restoreViewState(viewState);
+      };
+      setMounted(true);
+    },
+    [setContentRef, setDirty, content],
+  );
 
-  useEffect(() => () => {
-    setContentRef.current = null;
-  }, [setContentRef]);
+  useEffect(
+    () => () => {
+      setContentRef.current = null;
+    },
+    [setContentRef],
+  );
 
   // Open Monaco's native find when the toolbar requests it. Gated on `mounted`
   // so a Find pressed while the lazy chunk was still loading isn't dropped —
@@ -302,15 +325,18 @@ function MonacoCodeEditorInner({
     onSearchHandled?.();
   }, [mounted, searchOpen, onSearchHandled]);
 
-  const handleChange: OnChange = useCallback((value) => {
-    const next = value ?? "";
-    latestContentRef.current = next;
-    const dirty = next !== baselineRef.current;
-    setDirty(dirty);
-    // Debounce an auto-save only on a real edit. A programmatic setValue (external
-    // sync) re-baselines first, so this sees a clean buffer and won't schedule.
-    if (dirty) autoSave.schedule();
-  }, [setDirty, autoSave]);
+  const handleChange: OnChange = useCallback(
+    (value) => {
+      const next = value ?? "";
+      latestContentRef.current = next;
+      const dirty = next !== baselineRef.current;
+      setDirty(dirty);
+      // Debounce an auto-save only on a real edit. A programmatic setValue (external
+      // sync) re-baselines first, so this sees a clean buffer and won't schedule.
+      if (dirty) autoSave.schedule();
+    },
+    [setDirty, autoSave],
+  );
 
   // Surface the auto-save lifecycle to the FileViewer toolbar chip (this editor
   // no longer renders its own Save button). Ref'd so the effect doesn't re-run
@@ -341,7 +367,12 @@ function MonacoCodeEditorInner({
 
   // Clear the toolbar chip when this editor goes away (file switch / mode change
   // / panel close) so a stale "Saving…"/"Saved" doesn't outlive the editor.
-  useEffect(() => () => { onSaveStatusChangeRef.current?.("idle"); }, []);
+  useEffect(
+    () => () => {
+      onSaveStatusChangeRef.current?.("idle");
+    },
+    [],
+  );
 
   // Comments may be added only when editable and clean (offsets must match the
   // saved server content). Existing comments stay highlighted/navigable always.
@@ -355,25 +386,31 @@ function MonacoCodeEditorInner({
     pendingBodyRef,
   });
 
-  const options = useMemo<EditorOptions>(() => ({
-    readOnly: !canEdit,
-    minimap: { enabled: false },
-    scrollBeyondLastLine: false,
-    fontSize: 12,
-    automaticLayout: true,
-    renderLineHighlight: canEdit ? "line" : "none",
-    // Read-only buffers still allow selection + copy; just hide the caret.
-    cursorStyle: canEdit ? "line" : "underline-thin",
-  }), [canEdit]);
+  const options = useMemo<EditorOptions>(
+    () => ({
+      readOnly: !canEdit,
+      minimap: { enabled: false },
+      scrollBeyondLastLine: false,
+      fontSize: 12,
+      automaticLayout: true,
+      renderLineHighlight: canEdit ? "line" : "none",
+      // Read-only buffers still allow selection + copy; just hide the caret.
+      cursorStyle: canEdit ? "line" : "underline-thin",
+    }),
+    [canEdit],
+  );
 
   return (
     <div className="flex h-full flex-col">
       {truncated && <TruncatedBanner />}
-      {canEdit && isDirty && (
-        hasExternalUpdate ? (
+      {canEdit &&
+        isDirty &&
+        (hasExternalUpdate ? (
           <div className="flex items-center gap-2 border-b border-border bg-warning/10 px-4 py-1.5 text-xs text-foreground shrink-0">
             <AlertTriangleIcon className="size-3.5 shrink-0 text-warning" />
-            <span className="flex-1">This file was modified externally while you were editing.</span>
+            <span className="flex-1">
+              This file was modified externally while you were editing.
+            </span>
             <button
               type="button"
               className="rounded px-2 py-0.5 font-medium hover:bg-muted transition-colors"
@@ -394,14 +431,17 @@ function MonacoCodeEditorInner({
             <MessageSquareOffIcon className="size-3.5 shrink-0" />
             Save your changes to enable commenting on selections.
           </div>
-        )
-      )}
+        ))}
       <div className="relative min-h-0 flex-1">
         {loadError && (
-          <div className="flex items-center justify-center p-8 text-destructive text-sm">Failed to load the editor.</div>
+          <div className="flex items-center justify-center p-8 text-destructive text-sm">
+            Failed to load the editor.
+          </div>
         )}
         {!loadError && !ready && (
-          <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">Loading…</div>
+          <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+            Loading…
+          </div>
         )}
         {!loadError && ready && (
           <Editor

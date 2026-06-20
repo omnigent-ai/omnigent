@@ -124,6 +124,37 @@ JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dic
 # ---------------------------------------------------------------------------
 
 
+def _safe_dumps(response: dict[str, Any], req_id: str | None) -> str:  # type: ignore[explicit-any]
+    """Serialize a tool-server response, never raising on bad payloads.
+
+    Tool callbacks may return values ``json.dumps`` can't encode (a
+    ``datetime``, ``set``, ``bytes``, custom object, ...). Encoding happens
+    on the response path *outside* :meth:`_ToolServer._execute`'s try, so an
+    unguarded ``json.dumps`` would propagate and the connection would close
+    with zero bytes written — leaving the JS ``callTool`` promise pending and
+    hanging the entire Pi turn. Mirrors codex's ``_result_text`` guard: on a
+    serialization failure, fall back to an ``{"error": ...}`` envelope so the
+    client always receives a valid frame.
+
+    :param response: The response dict to serialize.
+    :param req_id: The originating request id, echoed back on the error
+        envelope so the client correlates the failure with its call.
+    :returns: A compact JSON string (no trailing newline).
+    """
+    try:
+        return json.dumps(response, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        # Stringify ``req_id`` so the fallback envelope itself can never raise
+        # on a non-serializable id (the caller passes a ``str`` today, but the
+        # guard must hold for any future caller). ``None`` stays ``None`` so the
+        # client still sees a null id rather than the literal "None".
+        safe_id: str | None = req_id if req_id is None or isinstance(req_id, str) else str(req_id)
+        return json.dumps(
+            {"id": safe_id, "error": f"unserializable tool result: {exc}"},
+            separators=(",", ":"),
+        )
+
+
 class _ToolServer:
     """Async TCP server that handles tool-call requests from the Pi extension.
 
@@ -213,7 +244,14 @@ class _ToolServer:
                 else:
                     response = await self._execute(raw_tool_name, tool_args)
                     response["id"] = raw_req_id
-                out = json.dumps(response, separators=(",", ":")) + "\n"
+                # Serialize defensively: a tool result may carry a value
+                # ``json.dumps`` can't encode (e.g. ``datetime``/``set``).
+                # If it raises here — outside ``_execute``'s try — the frame
+                # is never written and the JS ``callTool`` promise hangs the
+                # whole turn (no ``data``/``error`` event). Always emit a JSON
+                # frame: a serializable error envelope when the response can't
+                # be encoded, mirroring codex's ``_result_text`` guard.
+                out = _safe_dumps(response, raw_req_id) + "\n"
                 writer.write(out.encode("utf-8"))
                 await writer.drain()
         except (asyncio.CancelledError, ConnectionError):
@@ -371,7 +409,17 @@ const TOKEN = {token_json};
 
 /** Send a tool call request over TCP and return the result. */
 function callTool(toolName, args) {{
-  return new Promise((resolve, reject) => {{
+  return new Promise((resolve) => {{
+    // Idempotent settle: a tool call must resolve exactly once. Route every
+    // resolve through finish() so a late "close" after a real "data" response
+    // can't clobber the result, and a bare close with no data still resolves
+    // (rather than hanging Pi's agent loop forever).
+    let settled = false;
+    const finish = (v) => {{ if (!settled) {{ settled = true; resolve(v); }} }};
+    const errorResult = (text) => ({{
+      content: [{{ type: "text", text: JSON.stringify({{ error: text }}) }}],
+      isError: true
+    }});
     const client = net.createConnection({{ port: PORT, host: "127.0.0.1" }}, () => {{
       const id = Math.random().toString(36).slice(2);
       const req = JSON.stringify({{ id, token: TOKEN, tool: toolName, args }}) + "\\n";
@@ -384,39 +432,33 @@ function callTool(toolName, args) {{
             const resp = JSON.parse(buf.slice(0, nl));
             client.end();
             if (resp.error) {{
-              resolve({{
-                content: [{{ type: "text", text: JSON.stringify({{ error: resp.error }}) }}],
-                isError: true
-              }});
+              finish(errorResult(resp.error));
             }} else {{
               const text = typeof resp.result === "string"
                 ? resp.result
                 : JSON.stringify(resp.result);
               const isError = resp.result && (resp.result.error || resp.result.blocked);
-              resolve({{ content: [{{ type: "text", text }}], isError: !!isError }});
+              finish({{ content: [{{ type: "text", text }}], isError: !!isError }});
             }}
           }} catch (e) {{
             client.end();
-            resolve({{
-              content: [{{ type: "text", text: JSON.stringify({{ error: e.message }}) }}],
-              isError: true
-            }});
+            finish(errorResult(e.message));
           }}
         }}
       }});
       client.on("error", (err) => {{
-        resolve({{
-          content: [{{ type: "text", text: JSON.stringify({{ error: err.message }}) }}],
-          isError: true
-        }});
+        finish(errorResult(err.message));
+      }});
+      // A clean FIN with no bytes (e.g. the server failed to serialize the
+      // result and closed) emits neither "data" nor "error"; without this
+      // the promise would hang forever. finish() is a no-op if already settled.
+      client.on("close", () => {{
+        finish(errorResult("tool server closed connection without a response"));
       }});
       client.write(req);
     }});
     client.on("error", (err) => {{
-      resolve({{
-        content: [{{ type: "text", text: JSON.stringify({{ error: err.message }}) }}],
-        isError: true
-      }});
+      finish(errorResult(err.message));
     }});
   }});
 }}
@@ -580,6 +622,48 @@ _PI_ENV_ALLOW_EXACT: frozenset[str] = frozenset(
         "TZ",
     }
 )
+_STREAM_READ_CHUNK_SIZE = 65536
+
+# CLI flags whose values are sensitive (e.g. the full system prompt) and must
+# not be written to logs verbatim. The value following these flags is replaced
+# with a length-only placeholder.
+_REDACTED_ARGV_FLAGS = frozenset({"--append-system-prompt", "--system-prompt"})
+
+
+def _redact_argv_for_log(args: Sequence[str]) -> list[str]:
+    """
+    Return a copy of ``args`` with sensitive flag values redacted for logging.
+
+    The system prompt value (e.g. passed via ``--append-system-prompt``) is
+    replaced with a ``[system prompt N chars]`` placeholder so it never leaks
+    into debug logs. Two argv forms are handled:
+
+    * the two-token form ``--append-system-prompt <value>`` (what the current
+      spawn code emits), and
+    * the equals-joined form ``--append-system-prompt=<value>`` (not emitted
+      today, but redacted defensively in case a future refactor switches to it).
+
+    All other tokens are preserved so the command remains useful for debugging.
+    """
+    redacted: list[str] = []
+    redact_next = False
+    for arg in args:
+        if redact_next:
+            redacted.append(f"[system prompt {len(arg)} chars]")
+            redact_next = False
+            continue
+        if arg in _REDACTED_ARGV_FLAGS:
+            # Two-token form: redact the following value token.
+            redacted.append(arg)
+            redact_next = True
+            continue
+        flag, sep, value = arg.partition("=")
+        if sep and flag in _REDACTED_ARGV_FLAGS:
+            # Equals-joined form: redact the inline value, keep the flag name.
+            redacted.append(f"{flag}=[system prompt {len(value)} chars]")
+            continue
+        redacted.append(arg)
+    return redacted
 
 
 def _build_models_json(
@@ -616,7 +700,17 @@ def _build_models_json(
     :returns: Pi ``models.json`` contents.
     """
     h = host.rstrip("/")
-    openai_base_url = (base_urls or {}).get("openai") or f"{h}/serving-endpoints"
+    serving_endpoints_url = f"{h}/serving-endpoints"
+    raw_openai_base_url = (base_urls or {}).get("openai")
+    # ucode's ``openai`` gateway is the Codex Responses gateway
+    # (``.../ai-gateway/codex/v1``), which 404s pi's openai-completions
+    # ``/chat/completions`` POST. Re-route only that case to serving-endpoints;
+    # generic providers (no ``/ai-gateway/codex``) pass through. Gemini rides
+    # this path via databricks-completions since pi can't speak generateContent.
+    if raw_openai_base_url and "/ai-gateway/codex" in raw_openai_base_url:
+        openai_base_url = serving_endpoints_url
+    else:
+        openai_base_url = raw_openai_base_url or serving_endpoints_url
     claude_base_url = (base_urls or {}).get("claude") or f"{h}/serving-endpoints/anthropic"
     config: dict[str, Any] = {  # type: ignore[explicit-any]  # Pi-owned schema, see note above
         "providers": {
@@ -801,7 +895,7 @@ class _PiRpcSession:
         if extra_args:
             args.extend(extra_args)
 
-        logger.debug("PiExecutor: spawning %s", " ".join(args))
+        logger.debug("PiExecutor: spawning %s", " ".join(_redact_argv_for_log(args)))
         self.process = await _create_subprocess_exec(
             *args,
             stdin=asyncio.subprocess.PIPE,
@@ -817,7 +911,7 @@ class _PiRpcSession:
         """Background task: read lines from Pi stdout and enqueue them."""
         assert self.process is not None and self.process.stdout is not None
         try:
-            async for raw_line in self.process.stdout:
+            async for raw_line in self._iter_stream_lines(self.process.stdout):
                 line = raw_line.decode("utf-8", errors="replace").rstrip("\n\r")
                 if line:
                     self._line_queue.put_nowait(line)
@@ -833,7 +927,7 @@ class _PiRpcSession:
         if self.process is None or self.process.stderr is None:
             return
         try:
-            async for raw_line in self.process.stderr:
+            async for raw_line in self._iter_stream_lines(self.process.stderr):
                 text = raw_line.decode("utf-8", errors="replace").rstrip("\n\r")
                 if text:
                     logger.debug("pi stderr: %s", text)
@@ -841,6 +935,29 @@ class _PiRpcSession:
                         self._stderr_lines.append(text)
         except (asyncio.CancelledError, Exception):  # noqa: BLE001 — stderr drainer is best-effort; never crashes
             pass
+
+    @staticmethod
+    async def _iter_stream_chunks(stream: asyncio.StreamReader) -> AsyncIterator[bytes]:
+        while True:
+            chunk = await stream.read(_STREAM_READ_CHUNK_SIZE)
+            if not chunk:
+                break
+            yield chunk
+
+    @staticmethod
+    async def _iter_stream_lines(stream: asyncio.StreamReader) -> AsyncIterator[bytes]:
+        buffer = bytearray()
+        async for chunk in _PiRpcSession._iter_stream_chunks(stream):
+            buffer.extend(chunk)
+            while True:
+                newline_index = buffer.find(b"\n")
+                if newline_index < 0:
+                    break
+                line = bytes(buffer[: newline_index + 1])
+                del buffer[: newline_index + 1]
+                yield line
+        if buffer:
+            yield bytes(buffer)
 
     async def send_command(self, command: CodexEvent) -> None:
         """Send a JSONL command to Pi's stdin."""
@@ -1162,7 +1279,7 @@ def _extract_pi_turn_usage(
     that :class:`TurnComplete` consumes, so pi sub-agent cost is priced
     the same way as ``claude-sdk`` and ``codex`` turns.
 
-    Pi (``@mariozechner/pi-coding-agent``) forwards assistant messages
+    Pi (``@earendil-works/pi-coding-agent``) forwards assistant messages
     whose ``usage`` dict carries ``input`` / ``output`` / ``cacheRead`` /
     ``cacheWrite`` / ``totalTokens`` token counts, and the message itself
     carries the resolved ``model``. This translates those into omnigent's

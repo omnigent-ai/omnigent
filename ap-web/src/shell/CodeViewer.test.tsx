@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { useFileContent } from "@/hooks/useFileContent";
 import { CodeViewer } from "./CodeViewer";
+import { HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 
@@ -211,5 +212,31 @@ describe("CodeViewer truncated preview", () => {
   it("shows no banner in markdown preview when not truncated", () => {
     renderViewer("# full file", true, "notes.md", { viewMode: "preview", truncated: false });
     expect(screen.queryByText(/too large to load fully/)).toBeNull();
+  });
+});
+
+describe("CodeViewer HTML preview sandbox", () => {
+  // The HTML preview is the security-load-bearing surface: artifact content is
+  // untrusted (agent/user-generated), so these assertions lock in the iframe's
+  // isolation. A regression here (e.g. adding `allow-same-origin`) would let
+  // artifact JS reach the host app's cookies, storage, and credentialed API.
+  it("enables scripts but withholds same-origin, and forces links to a new tab", () => {
+    const { container } = renderViewer(
+      "<html><head></head><body><a href='https://example.com'>link</a></body></html>",
+      true,
+      "page.html",
+      { viewMode: "preview" },
+    );
+    const iframe = container.querySelector('iframe[title="HTML preview"]');
+    expect(iframe).not.toBeNull();
+    const sandbox = iframe!.getAttribute("sandbox") ?? "";
+    // Full-string lock: any change to the sandbox flags must be deliberate.
+    expect(sandbox).toBe(HTML_PREVIEW_SANDBOX);
+    // #778: scripts must run inside the preview.
+    expect(sandbox).toContain("allow-scripts");
+    // Security invariant: the artifact must never share the app's origin.
+    expect(sandbox).not.toContain("allow-same-origin");
+    // #777: every link opens in a new tab via the injected base tag.
+    expect(iframe!.getAttribute("srcdoc")).toContain('<base target="_blank">');
   });
 });

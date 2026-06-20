@@ -21,7 +21,13 @@
 // the host injects `basenamedRouting(basename)` via `RoutingProvider` so they
 // land under the mount path instead of the host root (see `basenamedRouting`).
 
-import { type ComponentPropsWithoutRef, type ReactNode, createContext, forwardRef, useContext } from "react";
+import {
+  type ComponentPropsWithoutRef,
+  type ReactNode,
+  createContext,
+  forwardRef,
+  useContext,
+} from "react";
 import {
   Link as RRLink,
   type NavigateOptions,
@@ -99,7 +105,10 @@ function rebaseTo(to: To, basename: string): To {
  * absolute `navigate()`/`<Link to>` targets must be rebased so they land under
  * the mount instead of the host root.
  */
-export function basenamedRouting(basename: string, base: RoutingApi = reactRouterRouting): RoutingApi {
+export function basenamedRouting(
+  basename: string,
+  base: RoutingApi = reactRouterRouting,
+): RoutingApi {
   return {
     ...base,
     useNavigate: () => {

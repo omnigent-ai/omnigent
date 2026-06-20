@@ -36,17 +36,24 @@ import json
 import mimetypes
 import pathlib
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, overload
 
 from omnigent.server.schemas import (
     CancelledEvent,
     CompletedEvent,
+    CreatedEvent,
+    ElicitationRequestEvent,
     FailedEvent,
     IncompleteEvent,
+    InProgressEvent,
     OutputFileDoneEvent,
     OutputItemDoneEvent,
     OutputTextDeltaEvent,
+    QueuedEvent,
+    ReasoningStartedEvent,
+    ReasoningSummaryTextDeltaEvent,
+    ReasoningTextDeltaEvent,
     ServerStreamEvent,
     SessionStatusEvent,
 )
@@ -55,7 +62,20 @@ from ._errors import OmnigentError
 from ._files import FilesNamespace
 from ._query import QueryResult, QueryStream
 from ._sessions import Session, SessionsNamespace
-from ._types import File
+from ._tool_handler import (
+    ElicitationRequestCtx,
+    FileOutputCtx,
+    MessageEndCtx,
+    MessageStartCtx,
+    ReasoningEndCtx,
+    ReasoningStartCtx,
+    ResponseEndCtx,
+    ResponseStartCtx,
+    StreamHooks,
+    ToolCallEndCtx,
+    ToolCallStartCtx,
+)
+from ._types import File, Response
 
 # Text block types accepted when falling back from streamed deltas
 # to final assistant message content.
@@ -198,11 +218,36 @@ _TURN_TERMINAL_EVENT_TYPES: tuple[type[ServerStreamEvent], ...] = (
     CancelledEvent,
 )
 
+_RESPONSE_START_EVENT_TYPES: tuple[type[ServerStreamEvent], ...] = (
+    CreatedEvent,
+    QueuedEvent,
+    InProgressEvent,
+)
+
 # Newer servers emit an immediate ``session.heartbeat`` after the
 # live-tail subscriber is registered. Older servers do not, so keep a
 # short fallback instead of hanging forever before posting the user's
 # message.
 _STREAM_READY_TIMEOUT_S: float = 1.0
+
+
+@dataclass
+class _StreamHookState:
+    """
+    Per-subscription hook bookkeeping.
+
+    Sessions streams are long-lived and event-oriented, so lifecycle
+    hooks need a tiny amount of local state to avoid duplicate starts
+    and to pair reasoning/message end hooks with their starts.
+    """
+
+    started_response_ids: set[str] = field(default_factory=set)
+    current_response_id: str = ""
+    message_started: bool = False
+    in_reasoning: bool = False
+    reasoning_text: str = ""
+    reasoning_summary_text: str = ""
+    completed_tool_call_ids: set[str] = field(default_factory=set)
 
 
 class SessionsChat:
@@ -261,6 +306,8 @@ class SessionsChat:
         ``tool_callables`` is non-empty but ``agent_tools_getter``
         is ``None`` :meth:`send` raises rather than silently
         skipping validation.
+    :param hooks: Optional lifecycle hooks fired from sessions stream
+        events.
     """
 
     def __init__(
@@ -271,6 +318,7 @@ class SessionsChat:
         session: Session,
         tool_callables: dict[str, ToolCallable] | None = None,
         agent_tools_getter: _AgentToolsGetter | None = None,
+        hooks: StreamHooks | None = None,
     ) -> None:
         """
         Wire the chat helper around an already-created session.
@@ -290,6 +338,8 @@ class SessionsChat:
             client-side tool execution; see class docstring.
         :param agent_tools_getter: Optional async fetcher for the
             agent's tool list; see class docstring.
+        :param hooks: Optional lifecycle hooks fired from sessions
+            stream events; see class docstring.
         """
         self._namespace = namespace
         self._files_uploader = files_uploader
@@ -299,6 +349,7 @@ class SessionsChat:
             dict(tool_callables) if tool_callables else {}
         )
         self._agent_tools_getter = agent_tools_getter
+        self._hooks = hooks or StreamHooks()
         # ``True`` once :meth:`_validate_tool_callables` has run for
         # this session. The check is idempotent and the result
         # invariant for a session bound to a single immutable
@@ -318,6 +369,7 @@ class SessionsChat:
         files_namespace: FilesNamespace | None = None,
         tool_callables: dict[str, ToolCallable] | None = None,
         agent_tools_getter: _AgentToolsGetter | None = None,
+        hooks: StreamHooks | None = None,
     ) -> SessionsChat:
         """
         Create a new server-side session and return a chat helper bound to it.
@@ -348,6 +400,8 @@ class SessionsChat:
             the agent's tool list (with the spec ``runtime`` field
             on each entry). Used to validate ``tool_callables``
             against the spec at stream-start time.
+        :param hooks: Optional lifecycle hooks fired from sessions
+            stream events.
         :returns: A :class:`SessionsChat` bound to the newly created
             session.
         :raises OmnigentError: If session creation fails.
@@ -364,6 +418,7 @@ class SessionsChat:
             session=session,
             tool_callables=tool_callables,
             agent_tools_getter=agent_tools_getter,
+            hooks=hooks,
         )
 
     @property
@@ -480,6 +535,7 @@ class SessionsChat:
         # ready/heartbeat event, wait for it before posting so fast
         # turns cannot publish all output before this subscriber exists.
         stream_aiter = self._namespace.stream(self._session.id)
+        hook_state = _StreamHookState()
         first_event_task = asyncio.create_task(stream_aiter.__anext__())
         try:
             first_event: ServerStreamEvent | None
@@ -501,6 +557,7 @@ class SessionsChat:
             else:
                 event = first_event
             while True:
+                await self._fire_stream_hooks(event, hook_state)
                 yield event
                 # Dispatch client-side tool calls inline, BEFORE
                 # checking the terminal flag. The server emits
@@ -516,7 +573,7 @@ class SessionsChat:
                 # ``status == "completed"`` and need no client
                 # action.
                 if isinstance(event, OutputItemDoneEvent):
-                    await self._maybe_dispatch_tool_call(event)
+                    await self._maybe_dispatch_tool_call(event, hook_state)
                 if isinstance(event, _TURN_TERMINAL_EVENT_TYPES):
                     return
                 # A SETUP-phase failure (spec resolution, spawn-env
@@ -612,6 +669,7 @@ class SessionsChat:
     async def _maybe_dispatch_tool_call(
         self,
         event: OutputItemDoneEvent,
+        hook_state: _StreamHookState,
     ) -> None:
         """
         If the event carries a client-side tool call, run it and post the result.
@@ -626,6 +684,10 @@ class SessionsChat:
         the parked turn can resume.
 
         :param event: The :class:`OutputItemDoneEvent` to inspect.
+        :param hook_state: Per-subscription hook state used to pair
+            client-executed tool starts with their local result and
+            suppress duplicate end hooks if the server later echoes the
+            same ``function_call_output`` item.
         :raises KeyError: If the action-required item is missing
             its ``call_id`` or ``name`` field — the wire shape is
             non-negotiable, so failing loud is correct.
@@ -655,6 +717,16 @@ class SessionsChat:
             )
 
         output_str = await _invoke_callable(callable_for_tool, info)
+        hook_state.completed_tool_call_ids.add(info.call_id)
+        await _call_hook(
+            self._hooks.on_tool_call_end,
+            ToolCallEndCtx(
+                name=info.name,
+                call_id=info.call_id,
+                agent_name="",
+                output=output_str,
+            ),
+        )
         await self._namespace.post_event(
             self._session.id,
             {
@@ -729,16 +801,205 @@ class SessionsChat:
         await self._validate_tool_callables()
 
         stream_aiter = self._namespace.stream(self._session.id)
+        hook_state = _StreamHookState()
         try:
             async for event in stream_aiter:
+                await self._fire_stream_hooks(event, hook_state)
                 yield event
                 # Same dispatch path as :meth:`send` — see the
                 # comment there for the action_required vs completed
                 # filter rationale.
                 if isinstance(event, OutputItemDoneEvent):
-                    await self._maybe_dispatch_tool_call(event)
+                    await self._maybe_dispatch_tool_call(event, hook_state)
         finally:
             await _aclose(stream_aiter)
+
+    async def _fire_stream_hooks(
+        self,
+        event: ServerStreamEvent,
+        state: _StreamHookState,
+    ) -> None:
+        """
+        Translate sessions SSE events into public ``StreamHooks`` callbacks.
+
+        The legacy responses client already exposed these lifecycle hooks.
+        This adapter keeps the sessions-first helper observability-compatible
+        without changing the typed event stream consumers already iterate.
+        """
+        if isinstance(event, _RESPONSE_START_EVENT_TYPES):
+            response = _response_from_server_object(event.response)
+            await self._ensure_response_started(response, state)
+            return
+
+        if isinstance(event, ReasoningStartedEvent):
+            state.in_reasoning = True
+            state.reasoning_text = ""
+            state.reasoning_summary_text = ""
+            await _call_hook(self._hooks.on_reasoning_start, ReasoningStartCtx())
+            return
+
+        if isinstance(event, ReasoningTextDeltaEvent):
+            state.reasoning_text += event.delta
+            return
+
+        if isinstance(event, ReasoningSummaryTextDeltaEvent):
+            state.reasoning_summary_text += event.delta
+            return
+
+        if isinstance(event, OutputTextDeltaEvent):
+            await self._end_reasoning_if_open(state)
+            if not state.message_started:
+                state.message_started = True
+                await _call_hook(
+                    self._hooks.on_message_start,
+                    MessageStartCtx(response_id=state.current_response_id),
+                )
+            return
+
+        if isinstance(event, OutputItemDoneEvent):
+            await self._fire_output_item_hooks(event.item, state)
+            return
+
+        if isinstance(event, OutputFileDoneEvent):
+            await _call_hook(
+                self._hooks.on_file_output,
+                FileOutputCtx(
+                    file_id=event.file_id,
+                    filename=event.filename,
+                    content_type=event.content_type,
+                ),
+            )
+            return
+
+        if isinstance(event, ElicitationRequestEvent):
+            await self._handle_elicitation_request(event, state)
+            return
+
+        if isinstance(event, _TURN_TERMINAL_EVENT_TYPES):
+            await self._end_reasoning_if_open(state)
+            response = _response_from_server_object(event.response)
+            await self._ensure_response_started(response, state)
+            await _call_hook(
+                self._hooks.on_response_end,
+                ResponseEndCtx(response=response, status=response.status),
+            )
+
+    async def _ensure_response_started(
+        self,
+        response: Response,
+        state: _StreamHookState,
+    ) -> None:
+        """
+        Fire ``on_response_start`` once for a response id.
+
+        Some older sessions streams may omit ``response.created`` and
+        surface only the terminal response snapshot. In that case the
+        terminal path calls this before ``on_response_end`` so consumers
+        still get a balanced lifecycle.
+        """
+        if response.id in state.started_response_ids:
+            state.current_response_id = response.id
+            return
+        state.started_response_ids.add(response.id)
+        state.current_response_id = response.id
+        await _call_hook(self._hooks.on_response_start, ResponseStartCtx(response=response))
+
+    async def _end_reasoning_if_open(self, state: _StreamHookState) -> None:
+        """Fire ``on_reasoning_end`` if a reasoning block is currently open."""
+        if not state.in_reasoning:
+            return
+        state.in_reasoning = False
+        await _call_hook(
+            self._hooks.on_reasoning_end,
+            ReasoningEndCtx(
+                reasoning_text=state.reasoning_text,
+                summary_text=state.reasoning_summary_text,
+            ),
+        )
+
+    async def _fire_output_item_hooks(
+        self,
+        item: dict[str, Any],
+        state: _StreamHookState,
+    ) -> None:
+        """Fire hooks derived from a completed output item."""
+        item_type = item.get("type")
+        if item_type == "message":
+            await self._end_reasoning_if_open(state)
+            if not state.message_started:
+                state.message_started = True
+                await _call_hook(
+                    self._hooks.on_message_start,
+                    MessageStartCtx(response_id=state.current_response_id),
+                )
+            raw_content = item.get("content")
+            content = raw_content if isinstance(raw_content, list) else []
+            await _call_hook(self._hooks.on_message_end, MessageEndCtx(content=content))
+            state.message_started = False
+            return
+
+        if item_type == _FUNCTION_CALL_ITEM_TYPE:
+            await _call_hook(
+                self._hooks.on_tool_call_start,
+                ToolCallStartCtx(
+                    name=str(item.get("name", "")),
+                    arguments=_parse_hook_arguments(item.get("arguments", "{}")),
+                    call_id=str(item.get("call_id", "")),
+                    agent_name=str(item.get("agent_name", "")),
+                    executed_by=(
+                        "client" if item.get("status") == _ACTION_REQUIRED_STATUS else "server"
+                    ),
+                ),
+            )
+            return
+
+        if item_type == _FUNCTION_CALL_OUTPUT_TYPE:
+            call_id = str(item.get("call_id", ""))
+            if call_id in state.completed_tool_call_ids:
+                return
+            await _call_hook(
+                self._hooks.on_tool_call_end,
+                ToolCallEndCtx(
+                    name=str(item.get("name", "")),
+                    call_id=call_id,
+                    agent_name=str(item.get("agent_name", "")),
+                    output=str(item.get("output", "")),
+                ),
+            )
+
+    async def _handle_elicitation_request(
+        self,
+        event: ElicitationRequestEvent,
+        state: _StreamHookState,
+    ) -> None:
+        """
+        Route a sessions elicitation through ``on_elicitation_request``.
+
+        No registered hook means fail-closed decline, matching the
+        deprecated responses client and avoiding a parked workflow that
+        waits forever for a decision the SDK will never send.
+        """
+        params = event.params
+        accepted = await _invoke_elicitation_hook(
+            self._hooks,
+            ElicitationRequestCtx(
+                elicitation_id=event.elicitation_id,
+                message=params.message,
+                requested_schema=params.requestedSchema or {},
+                mode=params.mode,
+                phase=params.phase or "",
+                policy_name=params.policy_name or "",
+                content_preview=params.content_preview or "",
+                response_id=state.current_response_id,
+                url=params.url,
+            ),
+        )
+        target_session_id = params.target_session_id or self._session.id
+        await self._namespace.resolve_elicitation(
+            target_session_id,
+            event.elicitation_id,
+            {"action": "accept" if accepted else "decline"},
+        )
 
     @overload
     async def query(
@@ -804,6 +1065,58 @@ class SessionsChat:
         if stream:
             return self._stream_query(input, files=files)
         return await self._collect_query(input, files=files)
+
+    async def await_turn(self, *, timeout: float | None = 1200.0) -> QueryResult:
+        """
+        Collect the next auto-triggered turn without posting a message.
+
+        Used by headless runners to follow async orchestrator sessions
+        across multiple turns. Unlike :meth:`query`, no user message is
+        posted — this helper subscribes to the live stream and waits for
+        the server to start a new turn (e.g. an inbox auto-wake when a
+        sub-agent completes), then collects its text output.
+
+        A ``timeout`` guards against the race window where the turn
+        already completed before the subscription opened. If no terminal
+        event arrives within ``timeout`` seconds, the coroutine returns
+        an empty :class:`QueryResult` so the caller can refresh session
+        status and decide how to proceed.
+
+        :param timeout: Seconds to wait for the turn to complete. ``None``
+            waits indefinitely. Defaults to 1200 (20 minutes).
+        :returns: :class:`QueryResult` with the turn's text (may be empty
+            if the turn completed before we subscribed).
+        :raises OmnigentError: Propagated from :meth:`stream` if the
+            session does not exist.
+        """
+        text_parts: list[str] = []
+        produced: list[File] = []
+
+        async def _collect() -> None:
+            async for event in self.stream():
+                if isinstance(event, OutputTextDeltaEvent):
+                    if event.delta:
+                        text_parts.append(event.delta)
+                elif isinstance(event, OutputItemDoneEvent) and not text_parts:
+                    text_parts.extend(_assistant_text_from_output_item(event.item))
+                elif isinstance(event, OutputFileDoneEvent):
+                    produced.append(await self._fetch_file(event))
+                elif isinstance(event, CompletedEvent):
+                    if not text_parts:
+                        text_parts.extend(_assistant_text_from_response(event.response.output))
+                    break
+                elif isinstance(event, _TURN_TERMINAL_EVENT_TYPES):
+                    break
+
+        try:
+            async with asyncio.timeout(timeout):
+                await _collect()
+        except asyncio.TimeoutError:
+            # Timeout is expected when the session completes before the deadline
+            # or the race window is missed; return whatever text was collected so
+            # far per the method contract (empty QueryResult is valid).
+            pass
+        return QueryResult(text="".join(text_parts), files=produced)
 
     async def _collect_query(
         self,
@@ -1021,6 +1334,65 @@ class _FilesGetter(Protocol):
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
+
+
+def _response_from_server_object(server_response: Any) -> Response:
+    """
+    Convert a server schema ``ResponseObject`` into the SDK dataclass.
+
+    Sessions streams use Pydantic schema objects while public hooks
+    expose SDK dataclasses. Converting at this boundary preserves the
+    hook API shared with the legacy responses client.
+    """
+    if hasattr(server_response, "model_dump"):
+        data = server_response.model_dump(mode="json")
+    elif isinstance(server_response, dict):
+        data = server_response
+    else:
+        data = {}
+    return Response.from_dict(data)
+
+
+async def _call_hook(hook: Any, ctx: Any) -> Any:
+    """Call a hook (sync or async) and return its result."""
+    if hook is None:
+        return None
+    result = hook(ctx)
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+async def _invoke_elicitation_hook(
+    hooks: StreamHooks,
+    ctx: ElicitationRequestCtx,
+) -> bool:
+    """Invoke an elicitation hook, declining fail-closed on absence/error."""
+    if hooks.on_elicitation_request is None:
+        return False
+    try:
+        return bool(await _call_hook(hooks.on_elicitation_request, ctx))
+    except Exception:
+        return False
+
+
+def _parse_hook_arguments(raw_args: object) -> dict[str, object]:
+    """
+    Best-effort argument parsing for hook context.
+
+    Hook callbacks are observers. Malformed function-call arguments
+    should not make the event stream itself fail before the stricter
+    dispatch path has a chance to validate action-required calls.
+    """
+    if isinstance(raw_args, dict):
+        return raw_args
+    if not isinstance(raw_args, str) or not raw_args:
+        return {}
+    try:
+        parsed = json.loads(raw_args)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _build_tool_call_info(item: dict[str, Any]) -> SessionToolCallInfo:

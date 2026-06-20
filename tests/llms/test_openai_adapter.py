@@ -1,8 +1,18 @@
 """Tests for llms.adapters.openai — payload building and SSE parsing."""
 
+import asyncio
 import json
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from omnigent.llms.adapters.openai import OpenAICompatibleAdapter, _parse_sse_line
+import httpx
+import pytest
+
+from omnigent.llms.adapters.openai import (
+    OpenAIAdapter,
+    OpenAICompatibleAdapter,
+    _parse_sse_line,
+)
+from omnigent.llms.types import ResponseTextDeltaEvent
 
 # ── Payload building ─────────────────────────────────────
 
@@ -155,11 +165,6 @@ def test_stream_request_aread_called_before_raise_for_status() -> None:
     has been reverted and bad-model 404s will again show
     ``"<unreadable response body>"``.
     """
-    import asyncio
-    from unittest.mock import AsyncMock, MagicMock, patch
-
-    import httpx
-
     adapter = OpenAICompatibleAdapter(base_url="https://fake-host/v1", api_key_env=None)
 
     aread_called = False
@@ -215,3 +220,369 @@ def test_stream_request_aread_called_before_raise_for_status() -> None:
         "the message, producing '<unreadable response body>' instead of the "
         "actual provider error text."
     )
+
+
+def test_stream_responses_decodes_utf8_split_across_chunks() -> None:
+    """
+    ``_stream_responses`` must decode the byte stream incrementally so a
+    multi-byte UTF-8 character split across two ``aiter_bytes`` chunks is
+    reassembled, not turned into U+FFFD replacement characters.
+
+    ``httpx`` yields arbitrary network-sized byte chunks, so the two bytes of
+    ``é`` (0xC3 0xA9) can land in different chunks. Decoding each chunk in
+    isolation corrupts the character; an incremental decoder preserves it.
+
+    Failure meaning: if the assertion fires, per-chunk decoding has been
+    reintroduced and non-ASCII streamed output (accents, CJK, emoji) is being
+    silently corrupted.
+    """
+    adapter = OpenAIAdapter(base_url="https://fake-host/v1")
+
+    # SSE for one text delta containing 'é', split mid-character.
+    sse = 'event: response.output_text.delta\ndata: {"delta": "café"}\n\n'.encode()
+    split = sse.index(b"\xc3\xa9") + 1  # between the two bytes of 'é'
+    chunks = [sse[:split], sse[split:]]
+
+    async def _aiter_bytes():
+        for c in chunks:
+            yield c
+
+    mock_response = MagicMock(spec=httpx.Response)
+    mock_response.status_code = 200
+    mock_response.raise_for_status = MagicMock()
+    mock_response.aiter_bytes = _aiter_bytes
+
+    mock_stream_ctx = AsyncMock()
+    mock_stream_ctx.__aenter__ = AsyncMock(return_value=mock_response)
+    mock_stream_ctx.__aexit__ = AsyncMock(return_value=False)
+
+    mock_client = MagicMock()
+    mock_client.stream = MagicMock(return_value=mock_stream_ctx)
+
+    mock_client_ctx = AsyncMock()
+    mock_client_ctx.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client_ctx.__aexit__ = AsyncMock(return_value=False)
+
+    async def _run() -> str:
+        with patch("httpx.AsyncClient", return_value=mock_client_ctx):
+            deltas = [
+                event.delta
+                async for event in adapter._stream_responses(
+                    "https://fake-host/v1/responses",
+                    {},
+                    {"stream": True},
+                )
+                if isinstance(event, ResponseTextDeltaEvent)
+            ]
+        return "".join(deltas)
+
+    assert asyncio.run(_run()) == "café"
+
+
+# ── URL resolution ──────────────────────────────────────
+
+
+def test_resolve_base_url_override_wins() -> None:
+    from omnigent.llms.adapters.openai import _resolve_base_url
+
+    assert (
+        _resolve_base_url("https://custom.api/v1/", "https://default.api/v1")
+        == "https://custom.api/v1"
+    )
+
+
+def test_resolve_base_url_falls_back_to_default() -> None:
+    from omnigent.llms.adapters.openai import _resolve_base_url
+
+    assert _resolve_base_url(None, "https://default.api/v1") == "https://default.api/v1"
+
+
+def test_resolve_base_url_raises_when_both_none() -> None:
+    from omnigent.errors import OmnigentError
+    from omnigent.llms.adapters.openai import _resolve_base_url
+
+    with pytest.raises(OmnigentError, match="base_url"):
+        _resolve_base_url(None, None)
+
+
+# ── Responses API tool conversion ───────────────────────
+
+
+def test_to_responses_tools_flattens_chat_format() -> None:
+    from omnigent.llms.adapters.openai import _to_responses_tools
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get the weather",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    result = _to_responses_tools(tools)
+    assert len(result) == 1
+    assert result[0] == {
+        "type": "function",
+        "name": "get_weather",
+        "description": "Get the weather",
+        "parameters": {"type": "object", "properties": {}},
+    }
+
+
+def test_to_responses_tools_passes_through_responses_format() -> None:
+    from omnigent.llms.adapters.openai import _to_responses_tools
+
+    tools = [
+        {
+            "type": "function",
+            "name": "already_flat",
+            "parameters": {},
+        }
+    ]
+    result = _to_responses_tools(tools)
+    assert result[0] is tools[0]
+
+
+def test_to_responses_tools_no_description() -> None:
+    from omnigent.llms.adapters.openai import _to_responses_tools
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "fn",
+                "parameters": {},
+            },
+        }
+    ]
+    result = _to_responses_tools(tools)
+    assert "description" not in result[0]
+
+
+# ── Responses API output parsing ────────────────────────
+
+
+def test_parse_responses_output_message() -> None:
+    from omnigent.llms.adapters.openai import _parse_responses_output
+    from omnigent.llms.types import MessageOutput
+
+    items = [
+        {
+            "type": "message",
+            "content": [{"type": "output_text", "text": "Hello!"}],
+        }
+    ]
+    output = _parse_responses_output(items)
+    assert len(output) == 1
+    assert isinstance(output[0], MessageOutput)
+    assert output[0].content[0].text == "Hello!"
+
+
+def test_parse_responses_output_function_call() -> None:
+    from omnigent.llms.adapters.openai import _parse_responses_output
+    from omnigent.llms.types import FunctionCallOutput
+
+    items = [
+        {
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "get_weather",
+            "arguments": '{"city": "London"}',
+        }
+    ]
+    output = _parse_responses_output(items)
+    assert len(output) == 1
+    assert isinstance(output[0], FunctionCallOutput)
+    assert output[0].call_id == "call_1"
+    assert output[0].name == "get_weather"
+
+
+def test_parse_responses_output_native_tool() -> None:
+    from omnigent.llms.adapters.openai import _parse_responses_output
+    from omnigent.llms.types import NativeToolOutput
+
+    items = [
+        {
+            "type": "web_search_call",
+            "id": "ws_1",
+            "status": "completed",
+        }
+    ]
+    output = _parse_responses_output(items)
+    assert len(output) == 1
+    assert isinstance(output[0], NativeToolOutput)
+    assert output[0].data["type"] == "web_search_call"
+
+
+def test_parse_responses_output_reasoning_item() -> None:
+    from omnigent.llms.adapters.openai import _parse_responses_output
+    from omnigent.llms.types import NativeToolOutput
+
+    items = [
+        {
+            "type": "reasoning",
+            "content": [{"type": "text", "text": "thinking..."}],
+        }
+    ]
+    output = _parse_responses_output(items)
+    assert len(output) == 1
+    assert isinstance(output[0], NativeToolOutput)
+
+
+def test_parse_responses_output_ignores_unknown_type() -> None:
+    from omnigent.llms.adapters.openai import _parse_responses_output
+
+    items = [{"type": "unknown_future_type", "data": "something"}]
+    output = _parse_responses_output(items)
+    assert len(output) == 0
+
+
+# ── Responses API response parsing ──────────────────────
+
+
+def test_parse_responses_response_full() -> None:
+    from omnigent.llms.adapters.openai import _parse_responses_response
+    from omnigent.llms.types import MessageOutput, Usage
+
+    data = {
+        "model": "gpt-5.4",
+        "output": [
+            {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "Hi"}],
+            }
+        ],
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "total_tokens": 15,
+        },
+    }
+    resp = _parse_responses_response(data)
+    assert resp.model == "gpt-5.4"
+    assert isinstance(resp.output[0], MessageOutput)
+    assert resp.usage == Usage(input_tokens=10, output_tokens=5, total_tokens=15)
+
+
+def test_parse_responses_response_missing_model_raises() -> None:
+    from omnigent.errors import OmnigentError
+    from omnigent.llms.adapters.openai import _parse_responses_response
+
+    with pytest.raises(OmnigentError, match="model"):
+        _parse_responses_response({"output": []})
+
+
+def test_parse_responses_response_no_usage() -> None:
+    from omnigent.llms.adapters.openai import _parse_responses_response
+
+    data = {"model": "gpt-5.4", "output": []}
+    resp = _parse_responses_response(data)
+    assert resp.usage is None
+
+
+# ── Responses API SSE event parsing ─────────────────────
+
+
+def test_parse_responses_event_text_delta() -> None:
+    from omnigent.llms.adapters.openai import _parse_responses_event
+    from omnigent.llms.types import ResponseTextDeltaEvent
+
+    event = _parse_responses_event("response.output_text.delta", {"delta": "Hello"})
+    assert isinstance(event, ResponseTextDeltaEvent)
+    assert event.delta == "Hello"
+
+
+def test_parse_responses_event_reasoning_delta() -> None:
+    from omnigent.llms.adapters.openai import _parse_responses_event
+    from omnigent.llms.types import ResponseReasoningTextDeltaEvent
+
+    event = _parse_responses_event("response.reasoning_text.delta", {"delta": "thinking"})
+    assert isinstance(event, ResponseReasoningTextDeltaEvent)
+    assert event.delta == "thinking"
+
+
+def test_parse_responses_event_reasoning_summary_delta() -> None:
+    from omnigent.llms.adapters.openai import _parse_responses_event
+    from omnigent.llms.types import ResponseReasoningSummaryTextDeltaEvent
+
+    event = _parse_responses_event("response.reasoning_summary_text.delta", {"delta": "summary"})
+    assert isinstance(event, ResponseReasoningSummaryTextDeltaEvent)
+    assert event.delta == "summary"
+
+
+def test_parse_responses_event_reasoning_started() -> None:
+    from omnigent.llms.adapters.openai import _parse_responses_event
+    from omnigent.llms.types import ResponseReasoningStartedEvent
+
+    event = _parse_responses_event("response.output_item.added", {"item": {"type": "reasoning"}})
+    assert isinstance(event, ResponseReasoningStartedEvent)
+
+
+def test_parse_responses_event_native_tool_done() -> None:
+    from omnigent.llms.adapters.openai import _parse_responses_event
+    from omnigent.llms.types import NativeToolOutputAddedEvent
+
+    event = _parse_responses_event(
+        "response.output_item.done",
+        {"item": {"type": "web_search_call", "id": "ws_1", "status": "completed"}},
+    )
+    assert isinstance(event, NativeToolOutputAddedEvent)
+    assert event.item["type"] == "web_search_call"
+
+
+def test_parse_responses_event_reasoning_done() -> None:
+    from omnigent.llms.adapters.openai import _parse_responses_event
+    from omnigent.llms.types import NativeToolOutputAddedEvent
+
+    event = _parse_responses_event(
+        "response.output_item.done",
+        {"item": {"type": "reasoning", "content": []}},
+    )
+    assert isinstance(event, NativeToolOutputAddedEvent)
+
+
+def test_parse_responses_event_completed() -> None:
+    from omnigent.llms.adapters.openai import _parse_responses_event
+    from omnigent.llms.types import ResponseCompletedEvent
+
+    event = _parse_responses_event(
+        "response.completed",
+        {
+            "response": {
+                "model": "gpt-5.4",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "Done"}],
+                    }
+                ],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            }
+        },
+    )
+    assert isinstance(event, ResponseCompletedEvent)
+    assert event.response.model == "gpt-5.4"
+
+
+def test_parse_responses_event_unknown_returns_none() -> None:
+    from omnigent.llms.adapters.openai import _parse_responses_event
+
+    assert _parse_responses_event("response.some_future_event", {}) is None
+
+
+def test_parse_responses_event_non_reasoning_item_added_returns_none() -> None:
+    """output_item.added for non-reasoning types returns None."""
+    from omnigent.llms.adapters.openai import _parse_responses_event
+
+    event = _parse_responses_event("response.output_item.added", {"item": {"type": "message"}})
+    assert event is None
+
+
+def test_parse_responses_event_non_native_item_done_returns_none() -> None:
+    """output_item.done for non-native types returns None."""
+    from omnigent.llms.adapters.openai import _parse_responses_event
+
+    event = _parse_responses_event("response.output_item.done", {"item": {"type": "message"}})
+    assert event is None

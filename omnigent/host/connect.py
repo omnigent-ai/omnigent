@@ -22,6 +22,8 @@ from websockets.exceptions import InvalidStatus, InvalidURI
 
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HostCreateDirFrame,
+    HostCreateDirResultFrame,
     HostCreateWorktreeFrame,
     HostCreateWorktreeResultFrame,
     HostHelloFrame,
@@ -46,6 +48,7 @@ from omnigent.host.git_worktree import (
     remove_worktree,
 )
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
+from omnigent.onboarding.harness_install import harness_setup_hint
 from omnigent.onboarding.harness_readiness import (
     configured_harness_map,
     harness_is_configured,
@@ -267,13 +270,22 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # …" for a key the CLI just saved to the file. Not a secret (a boolean
         # flag); safe to propagate.
         "OMNIGENT_DISABLE_KEYRING",
+        # claude-sdk sandbox bypass flag. A diagnostic knob (not a
+        # secret — a plain boolean) read inside the harness to decide
+        # whether to wrap the brain CLI in sandbox-exec. Without it in
+        # the allowlist the daemon→runner env strip drops it, so a bare
+        # ``OMNIGENT_CLAUDE_SDK_NO_SANDBOX=1 omnigent run …`` had no
+        # effect (the operator also had to set
+        # ``OMNIGENT_RUNNER_ENV_PASSTHROUGH=OMNIGENT_CLAUDE_SDK_NO_SANDBOX``).
+        # Safe to propagate: not a secret.
+        "OMNIGENT_CLAUDE_SDK_NO_SANDBOX",
         # Testing knob: override the context window size for compaction
         # trigger threshold. Not a secret — a plain integer.
         "AP_CONTEXT_WINDOW_OVERRIDE",
     }
 )
 # Locale family (``LC_ALL``, ``LC_CTYPE``, …) — allowed by prefix.
-_RUNNER_ENV_ALLOWLIST_PREFIXES: tuple[str, ...] = ("LC_",)
+_RUNNER_ENV_ALLOWLIST_PREFIXES: tuple[str, ...] = ("LC_", "MLFLOW_", "OTEL_")
 
 # Harness credential / endpoint env vars forwarded host→runner when
 # present. These are the names the harnesses themselves resolve —
@@ -699,8 +711,7 @@ class HostProcess:
                 status="failed",
                 error=(
                     f"harness {frame.harness!r} is not configured on host "
-                    f"{self._identity.name!r} — run `omnigent setup` on that "
-                    "machine to install the CLI and set a default credential"
+                    f"{self._identity.name!r} — {harness_setup_hint(frame.harness)}"
                 ),
                 error_code=HARNESS_NOT_CONFIGURED_ERROR_CODE,
             )
@@ -1050,6 +1061,78 @@ class HostProcess:
             before=frame.before,
         )
 
+    def _handle_create_dir(self, frame: HostCreateDirFrame) -> HostCreateDirResultFrame:
+        """Handle a ``host.create_dir`` request from the server.
+
+        Creates the directory (and any missing parents) with
+        ``os.makedirs``. ``~`` expands against the host process
+        owner's home, same rules as ``host.list_dir``. Expected
+        filesystem errors (the directory already exists, permission
+        denied, a parent component is a file) return ``status: "ok"``
+        with a descriptive ``error`` so the route layer can map them
+        to a 409 rather than a 500 — mirroring how ``_handle_list_dir``
+        reports a missing path. Only unexpected I/O errors surface as
+        ``status: "failed"``.
+
+        :param frame: The create-dir request frame. ``frame.path`` may
+            be absolute or tilde-prefixed.
+        :returns: Result frame carrying the created absolute path on
+            success, or an ``error`` describing why it was not created.
+        """
+        try:
+            expanded = os.path.expanduser(frame.path)
+        except (TypeError, ValueError) as exc:
+            return HostCreateDirResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"path expansion failed: {exc}",
+            )
+        try:
+            # exist_ok=False so creating an existing folder is a clear
+            # "already exists" rather than a silent no-op — the picker
+            # should tell the user the name is taken.
+            os.makedirs(expanded, exist_ok=False)
+        except FileExistsError:
+            # makedirs raises FileExistsError whether the leaf is an
+            # existing directory or a regular file. Distinguish the two
+            # so "name is taken by a file" isn't mislabelled as an
+            # existing directory.
+            error = (
+                "directory already exists"
+                if os.path.isdir(expanded)
+                else "a file already exists at that path"
+            )
+            return HostCreateDirResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                error=error,
+            )
+        except NotADirectoryError:
+            return HostCreateDirResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                error="a parent path component is not a directory",
+            )
+        except PermissionError:
+            return HostCreateDirResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                error="permission denied",
+            )
+        except OSError as exc:
+            return HostCreateDirResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"mkdir failed: {exc.strerror or str(exc)}",
+            )
+        created = os.path.abspath(expanded)
+        _logger.info("Created directory %s", created)
+        return HostCreateDirResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            path=created,
+        )
+
     async def _handle_create_worktree(
         self,
         frame: HostCreateWorktreeFrame,
@@ -1283,8 +1366,14 @@ class HostProcess:
             managed-host token header or — only when a token could be
             minted — ``{"Authorization": "Bearer <token>"}``.
         """
-        headers: dict[str, str] = {}
         from omnigent.host.identity import HOST_TOKEN_ENV_VAR, MANAGED_HOST_TOKEN_HEADER
+        from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+
+        # Identify as a first-party client so the server's WebSocket origin
+        # guard (CSWSH protection) allows the handshake — the host process
+        # is not a browser. Seeded before either auth branch so it is sent
+        # on both the managed-token and Bearer paths.
+        headers: dict[str, str] = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
 
         managed_token = os.environ.get(HOST_TOKEN_ENV_VAR)
         if managed_token:
@@ -1406,6 +1495,8 @@ class HostProcess:
             await ws.send(encode_host_frame(self._handle_stat(frame)))
         elif isinstance(frame, HostListDirFrame):
             await ws.send(encode_host_frame(self._handle_list_dir(frame)))
+        elif isinstance(frame, HostCreateDirFrame):
+            await ws.send(encode_host_frame(self._handle_create_dir(frame)))
         elif isinstance(frame, HostCreateWorktreeFrame):
             await ws.send(encode_host_frame(await self._handle_create_worktree(frame)))
         elif isinstance(frame, HostRemoveWorktreeFrame):

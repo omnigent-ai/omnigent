@@ -11,8 +11,23 @@
 //   highlighted range navigates to that comment in CommentsPanel.
 
 import { createPortal } from "react-dom";
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
-import { ChevronDownIcon, ChevronUpIcon, MessageSquarePlusIcon, SearchIcon, XIcon } from "lucide-react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type RefObject,
+} from "react";
+import {
+  ChevronDownIcon,
+  ChevronUpIcon,
+  MessageSquarePlusIcon,
+  SearchIcon,
+  XIcon,
+} from "lucide-react";
 import type { BundledLanguage, ThemedToken } from "shiki";
 import { highlightCode } from "@/components/ai-elements/code-block";
 import ReactMarkdown from "react-markdown";
@@ -25,11 +40,13 @@ import { MarkdownRichTextViewer } from "./MarkdownRichTextViewer";
 import {
   type ActiveSelection,
   type SaveStatus,
+  HTML_PREVIEW_SANDBOX,
   detectLang,
   getSelectionOffsets,
   indexToLine,
   isBinaryPath,
   lineOverlapsSelection,
+  prepareHtmlPreviewDoc,
 } from "./codeViewerHelpers";
 import { renderLineTokens } from "./codeViewerRendering";
 import { TruncatedBanner } from "./TruncatedBanner";
@@ -73,7 +90,9 @@ export interface CodeViewerProps {
    * indicator. Passes the absolute offsets and anchor text so the parent
    * can open the CommentsPanel.
    */
-  onSetActiveSelection: (sel: { start_index: number; end_index: number; anchor_content: string } | null) => void;
+  onSetActiveSelection: (
+    sel: { start_index: number; end_index: number; anchor_content: string } | null,
+  ) => void;
   panelOpen: boolean;
   searchOpen: boolean;
   setSearchOpen: (open: boolean) => void;
@@ -131,11 +150,17 @@ export function CodeViewer({
   // Stable refs so the mouseup handler can access current values without
   // being recreated on every change (avoids stale closure bugs).
   const commentsRef = useRef(comments);
-  useEffect(() => { commentsRef.current = comments; }, [comments]);
+  useEffect(() => {
+    commentsRef.current = comments;
+  }, [comments]);
   const onSetActiveSelectionRef = useRef(onSetActiveSelection);
-  useEffect(() => { onSetActiveSelectionRef.current = onSetActiveSelection; }, [onSetActiveSelection]);
+  useEffect(() => {
+    onSetActiveSelectionRef.current = onSetActiveSelection;
+  }, [onSetActiveSelection]);
   const canEditRef = useRef(canEdit);
-  useEffect(() => { canEditRef.current = canEdit; }, [canEdit]);
+  useEffect(() => {
+    canEditRef.current = canEdit;
+  }, [canEdit]);
 
   const content = fileQuery.data?.content ?? "";
   // Server returns only a prefix for very large files. Editing + saving a
@@ -160,7 +185,9 @@ export function CodeViewer({
       if (!cancelled) setTokenLines(result.tokens);
     });
     if (cached) setTokenLines(cached.tokens);
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [content, lang, viewMode, showMonaco]);
 
   // Scroll to the line containing the active selection when it changes
@@ -171,8 +198,12 @@ export function CodeViewer({
     matchLineRefs.current.get(lineNum - 1)?.scrollIntoView({ block: "center", behavior: "smooth" });
   }, [activeSelection]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  useEffect(() => { setCurrentMatchIdx(0); }, [searchQuery]);
-  useEffect(() => { if (!searchOpen) setSearchQuery(""); }, [searchOpen]);
+  useEffect(() => {
+    setCurrentMatchIdx(0);
+  }, [searchQuery]);
+  useEffect(() => {
+    if (!searchOpen) setSearchQuery("");
+  }, [searchOpen]);
 
   // Scroll the current search match into view.
   useEffect(() => {
@@ -244,7 +275,7 @@ export function CodeViewer({
           const offsets = getSelectionOffsets(range, container, rawLines);
           if (offsets) {
             const clicked = commentsRef.current.find(
-              c => c.start_index <= offsets.start_index && offsets.start_index < c.end_index,
+              (c) => c.start_index <= offsets.start_index && offsets.start_index < c.end_index,
             );
             if (clicked) {
               onSetActiveSelectionRef.current({
@@ -306,7 +337,9 @@ export function CodeViewer({
     };
     // Clear the flag on any mousedown so a manual selection won't accidentally
     // trigger the raw-content override.
-    const clearFlag = () => { selectAllPendingRef.current = false; };
+    const clearFlag = () => {
+      selectAllPendingRef.current = false;
+    };
     document.addEventListener("copy", handleCopy);
     document.addEventListener("mousedown", clearFlag);
     return () => {
@@ -316,7 +349,11 @@ export function CodeViewer({
   }, [content]);
 
   if (fileQuery.isLoading) {
-    return <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">Loading…</div>;
+    return (
+      <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+        Loading…
+      </div>
+    );
   }
   if (fileQuery.isError) {
     return (
@@ -327,7 +364,11 @@ export function CodeViewer({
     );
   }
   if (fileQuery.data?.encoding === "base64" || isBinaryPath(path)) {
-    return <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">Preview not available for binary files.</div>;
+    return (
+      <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+        Preview not available for binary files.
+      </div>
+    );
   }
 
   if (viewMode === "editor" && lang === "markdown") {
@@ -348,9 +389,18 @@ export function CodeViewer({
   }
 
   if (viewMode === "preview" && (lang === "markdown" || lang === "html")) {
-    const preview = lang === "markdown"
-      ? <MarkdownPreview content={content} />
-      : <iframe srcDoc={content} sandbox="" title="HTML preview" className="w-full h-full border-0" />;
+    const preview =
+      lang === "markdown" ? (
+        <MarkdownPreview content={content} />
+      ) : (
+        <iframe
+          srcDoc={prepareHtmlPreviewDoc(content)}
+          // oxlint-disable-next-line eslint-plugin-react(iframe-missing-sandbox)
+          sandbox={HTML_PREVIEW_SANDBOX}
+          title="HTML preview"
+          className="w-full h-full border-0"
+        />
+      );
     // A truncated preview renders incomplete content; warn the user (the editor
     // and source surfaces already do). No layout change when not truncated.
     if (!truncated) return preview;
@@ -364,7 +414,13 @@ export function CodeViewer({
 
   if (showMonaco) {
     return (
-      <Suspense fallback={<div className="flex items-center justify-center p-8 text-muted-foreground text-sm">Loading…</div>}>
+      <Suspense
+        fallback={
+          <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+            Loading…
+          </div>
+        }
+      >
         <MonacoCodeEditor
           content={content}
           conversationId={conversationId}
@@ -401,7 +457,13 @@ export function CodeViewer({
 
   // Precompute absolute start offset of each line for character-level highlighting.
   const lineStarts: number[] = [];
-  { let off = 0; for (const l of rawLines) { lineStarts.push(off); off += l.length + 1; } }
+  {
+    let off = 0;
+    for (const l of rawLines) {
+      lineStarts.push(off);
+      off += l.length + 1;
+    }
+  }
 
   return (
     <>
@@ -458,7 +520,10 @@ export function CodeViewer({
             type="button"
             aria-label="Close search"
             className="rounded p-0.5 text-muted-foreground hover:bg-muted"
-            onClick={() => { setSearchOpen(false); setSearchQuery(""); }}
+            onClick={() => {
+              setSearchOpen(false);
+              setSearchQuery("");
+            }}
           >
             <XIcon className="size-3.5" />
           </button>
@@ -469,29 +534,42 @@ export function CodeViewer({
       <div ref={codeContainerRef} className="font-mono text-xs bg-white dark:bg-[#0d1117]">
         {rawLines.map((rawLine, idx) => {
           const lineNum = idx + 1;
-          const isMatchLine = searchQuery.trim() !== "" && rawLines[idx].toLowerCase().includes(searchQuery.toLowerCase());
+          const isMatchLine =
+            searchQuery.trim() !== "" &&
+            rawLines[idx].toLowerCase().includes(searchQuery.toLowerCase());
           const isCurrentMatch = isMatchLine && matches[safeMatchIdx] === idx;
           const commentOnLine = commentByLine.get(lineNum);
-          const isActiveRange = activeSelection != null &&
-            lineOverlapsSelection(idx, rawLines, activeSelection.start_index, activeSelection.end_index);
+          const isActiveRange =
+            activeSelection != null &&
+            lineOverlapsSelection(
+              idx,
+              rawLines,
+              activeSelection.start_index,
+              activeSelection.end_index,
+            );
           const tokens = tokenLines?.[idx] ?? null;
 
           // Column offsets within this line for character-level highlight overlay.
           const lineAbsStart = lineStarts[idx] ?? 0;
-          const selStartCol = isActiveRange ? Math.max(0, activeSelection!.start_index - lineAbsStart) : 0;
-          const selEndCol = isActiveRange ? Math.min(rawLine.length, activeSelection!.end_index - lineAbsStart) : 0;
+          const selStartCol = isActiveRange
+            ? Math.max(0, activeSelection!.start_index - lineAbsStart)
+            : 0;
+          const selEndCol = isActiveRange
+            ? Math.min(rawLine.length, activeSelection!.end_index - lineAbsStart)
+            : 0;
 
           // Per-comment overlays for this line (shown whenever comments exist).
           const commentOverlays = comments
-            .filter(c => lineOverlapsSelection(idx, rawLines, c.start_index, c.end_index))
-            .map(c => ({
+            .filter((c) => lineOverlapsSelection(idx, rawLines, c.start_index, c.end_index))
+            .map((c) => ({
               id: c.id,
               startCol: Math.max(0, c.start_index - lineAbsStart),
               endCol: Math.min(rawLine.length, c.end_index - lineAbsStart),
-              isSelected: activeSelection?.start_index === c.start_index &&
-                          activeSelection?.end_index === c.end_index,
+              isSelected:
+                activeSelection?.start_index === c.start_index &&
+                activeSelection?.end_index === c.end_index,
             }))
-            .filter(o => o.endCol > o.startCol);
+            .filter((o) => o.endCol > o.startCol);
           const hasAnyHighlight = commentOverlays.length > 0 || isActiveRange;
 
           return (
@@ -539,7 +617,7 @@ export function CodeViewer({
                       Known limitation: `ch` equals the advance width of "0" in the
                       font, so tabs, wide Unicode, and proportional glyphs can cause
                       slight misalignment with the actual text. Acceptable for v1. */}
-                  {commentOverlays.map(o => (
+                  {commentOverlays.map((o) => (
                     <span
                       key={o.id}
                       aria-hidden
@@ -556,17 +634,22 @@ export function CodeViewer({
                     />
                   ))}
                   {/* New selection (not yet saved as a comment) gets the active color. */}
-                  {isActiveRange && selEndCol > selStartCol &&
-                    !comments.some(c => c.start_index === activeSelection!.start_index && c.end_index === activeSelection!.end_index) && (
-                    <span
-                      aria-hidden
-                      className="absolute inset-y-0 bg-yellow-400/25 dark:bg-yellow-400/25 pointer-events-none"
-                      style={{
-                        left: `calc(0.75rem + ${selStartCol}ch)`,
-                        width: `${selEndCol - selStartCol}ch`,
-                      }}
-                    />
-                  )}
+                  {isActiveRange &&
+                    selEndCol > selStartCol &&
+                    !comments.some(
+                      (c) =>
+                        c.start_index === activeSelection!.start_index &&
+                        c.end_index === activeSelection!.end_index,
+                    ) && (
+                      <span
+                        aria-hidden
+                        className="absolute inset-y-0 bg-yellow-400/25 dark:bg-yellow-400/25 pointer-events-none"
+                        style={{
+                          left: `calc(0.75rem + ${selStartCol}ch)`,
+                          width: `${selEndCol - selStartCol}ch`,
+                        }}
+                      />
+                    )}
                   {tokens !== null
                     ? renderLineTokens(tokens, isMatchLine ? searchQuery : "", isCurrentMatch)
                     : rawLine}
@@ -579,27 +662,32 @@ export function CodeViewer({
 
       {/* Floating "Add Comment" button — rendered into document.body so that
           CSS transforms on ancestor elements don't break fixed positioning. */}
-      {selectionAnchor && createPortal(
-        <button
-          data-add-comment-btn
-          type="button"
-          className="fixed z-50 flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-xs font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
-          style={{ left: selectionAnchor.x, top: selectionAnchor.y, transform: "translateY(-100%)" }}
-          onClick={() => {
-            onSetActiveSelection({
-              start_index: selectionAnchor.start_index,
-              end_index: selectionAnchor.end_index,
-              anchor_content: selectionAnchor.anchor_content,
-            });
-            setSelectionAnchor(null);
-            window.getSelection()?.removeAllRanges();
-          }}
-        >
-          <MessageSquarePlusIcon className="size-3.5" />
-          Add comment
-        </button>,
-        getEmbedRoot() ?? document.body,
-      )}
+      {selectionAnchor &&
+        createPortal(
+          <button
+            data-add-comment-btn
+            type="button"
+            className="fixed z-50 flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-xs font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
+            style={{
+              left: selectionAnchor.x,
+              top: selectionAnchor.y,
+              transform: "translateY(-100%)",
+            }}
+            onClick={() => {
+              onSetActiveSelection({
+                start_index: selectionAnchor.start_index,
+                end_index: selectionAnchor.end_index,
+                anchor_content: selectionAnchor.anchor_content,
+              });
+              setSelectionAnchor(null);
+              window.getSelection()?.removeAllRanges();
+            }}
+          >
+            <MessageSquarePlusIcon className="size-3.5" />
+            Add comment
+          </button>,
+          getEmbedRoot() ?? document.body,
+        )}
     </>
   );
 }

@@ -26,6 +26,7 @@ from pydantic import TypeAdapter, ValidationError
 from omnigent.server.schemas import (
     ServerStreamEvent,
     SessionCreatedEvent,
+    SessionModelOptionsEvent,
     SessionSkillsEvent,
     SessionStatusEvent,
     is_known_event,
@@ -307,6 +308,25 @@ def test_session_skills_event_round_trips_through_union() -> None:
     # ``session.*`` variant; a misroute would mean a duplicate or
     # shadowed wire type.
     assert isinstance(parsed, SessionSkillsEvent)
+    assert parsed.conversation_id == "conv_abc"
+
+
+def test_session_model_options_event_round_trips_through_union() -> None:
+    """``session.model_options`` routes via the discriminator."""
+    event = SessionModelOptionsEvent(
+        type="session.model_options",
+        conversation_id="conv_abc",
+    )
+    dumped = event.model_dump()
+    assert dumped == {
+        "type": "session.model_options",
+        "conversation_id": "conv_abc",
+        "sequence_number": None,
+    }
+    parsed = _ADAPTER.validate_python(dumped)
+    # Discriminator must route to the model-options nudge, otherwise
+    # clients would never be told to refetch the cache-warmed snapshot.
+    assert isinstance(parsed, SessionModelOptionsEvent)
     assert parsed.conversation_id == "conv_abc"
 
 

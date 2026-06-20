@@ -275,6 +275,7 @@ class BwrapSandboxBackend(SandboxBackend):
                 if sandbox_spec.env_passthrough is not None
                 else None
             ),
+            credential_proxy=sandbox_spec.credential_proxy,
         )
 
     def wrap_launcher_argv(
@@ -283,6 +284,7 @@ class BwrapSandboxBackend(SandboxBackend):
         policy: SandboxPolicy,
         cwd: Path,
         chdir: Path | None = None,
+        target: str | None = None,
     ) -> list[str]:
         """
         Build the ``bwrap`` argv that wraps *argv* with the hermetic
@@ -307,6 +309,15 @@ class BwrapSandboxBackend(SandboxBackend):
             set — typically to the per-helper scratch tmpdir for
             ``OSEnvSpec.start_in_scratch`` — the helper starts there
             instead while *cwd* stays bound for reads.
+        :param target: Absolute path to the binary that the launcher
+            will exec as its final target after the re-exec (e.g. the
+            ``claude`` CLI installed under ``node_modules/.bin/``).
+            When set and the path lives outside the default mounts,
+            :func:`_ensure_executable_visible` is called for it so
+            its directory chain is bind-mounted into the namespace —
+            the same treatment ``argv[0]`` (the Python interpreter)
+            already receives.  ``None`` when the target is already
+            reachable via the standard mounts.
         :returns: A complete ``bwrap`` argv ready for
             ``subprocess.Popen`` — never an empty list.
 
@@ -346,6 +357,15 @@ class BwrapSandboxBackend(SandboxBackend):
         # the sandbox even when it lives outside the default mounts —
         # e.g. a pyenv install under ``$HOME/.pyenv``.
         bwrap_args += _ensure_executable_visible(argv, cwd_resolved)
+
+        # Make sure the final target binary (e.g. the claude CLI at
+        # node_modules/.bin/claude) is also reachable.  The launcher
+        # re-execs itself into the bwrap namespace and then runs the
+        # target via subprocess.run — without this bind the target's
+        # directory is invisible inside the namespace and the exec
+        # fails with FileNotFoundError.
+        if target is not None:
+            bwrap_args += _ensure_executable_visible([target], cwd_resolved)
 
         # cwd bind: writable iff a write_root resolves to cwd.
         cwd_writable = any(_is_same_path(root, cwd_resolved) for root in policy.write_roots)
@@ -1001,12 +1021,37 @@ def _dotfile_and_symlink_mask_args(
             entries.append(entry)
     args: list[str] = []
     for entry in entries:
+        # Re-stat just before emitting: a mask overlays onto an EXISTING
+        # path, so a transient dotfile (e.g. coverage.py's `.coverage.*`)
+        # that vanished since the scan would force bwrap to create the
+        # mountpoint inside the ro-bound cwd and abort. Skipping a gone
+        # target is safe — persistent host dotfiles still exist and are
+        # still masked.
+        if not _path_exists_lstat(entry.path):
+            continue
         if entry.kind == "dir":
             args.extend(["--tmpfs", str(entry.path)])
         else:
-            # --bind-try: silently skips if the file vanished since scan (TOCTOU).
             args.extend(["--bind-try", "/dev/null", str(entry.path)])
     return args
+
+
+def _path_exists_lstat(path: Path) -> bool:
+    """
+    Return whether *path* exists without following a final symlink.
+
+    ``lstat`` (not ``stat``) so a dangling / escaping symlink still
+    counts as present and gets masked.
+
+    :param path: Candidate mask target.
+    :returns: ``True`` when the path still exists (including broken
+        symlinks), ``False`` when it has been removed.
+    """
+    try:
+        os.lstat(path)
+    except OSError:
+        return False
+    return True
 
 
 def _scratch_tmpdir(write_roots: list[Path]) -> Path | None:

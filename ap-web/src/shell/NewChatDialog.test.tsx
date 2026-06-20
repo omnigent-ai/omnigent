@@ -36,7 +36,12 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
 }));
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
-vi.mock("@/hooks/useHostFilesystem", () => ({ useHostFilesystem: vi.fn() }));
+vi.mock("@/hooks/useHostFilesystem", () => ({
+  useHostFilesystem: vi.fn(),
+  // WorkspacePicker (rendered by the file browser) reads this on mount;
+  // an idle mutation keeps it inert for these tests.
+  useCreateHostDirectory: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
+}));
 vi.mock("@/hooks/useDirectorySessions", () => ({
   useDirectorySessions: vi.fn(),
 }));
@@ -606,6 +611,48 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByText("No agents")).toBeTruthy();
   });
 
+  it("orders Cursor above Pi in the built-in agent picker", () => {
+    mockAgents([
+      {
+        id: "a_pi",
+        name: "pi-native-ui",
+        display_name: "Pi",
+        description: null,
+        harness: "pi-native",
+        skills: [],
+      },
+      {
+        id: "a_cursor",
+        name: "cursor-native-ui",
+        display_name: "Cursor",
+        description: null,
+        harness: "cursor-native",
+        skills: [],
+      },
+      {
+        id: "a_codex",
+        name: "codex-native-ui",
+        display_name: "Codex",
+        description: null,
+        harness: "codex-native",
+        skills: [],
+      },
+      {
+        id: "a_claude",
+        name: "claude-native-ui",
+        display_name: "Claude Code",
+        description: null,
+        harness: "claude-native",
+        skills: [],
+      },
+    ]);
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    const cursor = screen.getByTestId("new-chat-landing-agent-a_cursor");
+    const pi = screen.getByTestId("new-chat-landing-agent-a_pi");
+    expect(cursor.compareDocumentPosition(pi) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   it("seeds the working directory from the host's most-recent path", async () => {
     renderLanding();
     // host_1's recent ("/Users/corey/repo") seeds the field; the chip shows
@@ -670,12 +717,29 @@ describe("NewChatLandingScreen", () => {
     expect(detail.textContent).toContain("Prompts before edits and commands");
     fireEvent.pointerEnter(planOption);
     expect(detail.textContent).toContain("Plans only; makes no edits");
-    // Switch to Codex (a2: not native, no overridable harness) — the whole
-    // Advanced chip is gone since --permission-mode only applies to the
-    // claude CLI and codex-native offers no harness override.
+    // Switch to Codex (a2: codex-native) — the Advanced chip stays visible
+    // but now shows approval-mode radios instead of permission-mode radios.
+    // Close the Advanced menu first (Escape), then switch agents.
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
-    expect(screen.queryByTestId("new-chat-landing-advanced-chip")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-advanced-chip")).not.toBeNull();
+  });
+
+  it("shows approval-mode options in the Advanced menu for the codex-native agent", () => {
+    renderLanding();
+    // Switch to Codex first.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
+    const fullAccessOption = screen.getByTestId("new-chat-landing-approval-full-access");
+    expect(fullAccessOption.textContent).toContain("Full access");
+    // The footer line explains the SELECTED mode until a row is hovered.
+    const detail = screen.getByTestId("new-chat-landing-approval-detail");
+    // Default is selected initially.
+    expect(detail.textContent).toContain("Read/edit/run in workspace");
+    fireEvent.pointerEnter(fullAccessOption);
+    expect(detail.textContent).toContain("Edit any file and access the internet");
   });
 
   it("shows a conflict banner in the file browser for an occupied directory", async () => {
@@ -790,7 +854,9 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-sandbox-option")).toBeNull();
     fireEvent.focus(screen.getByLabelText("Why New Sandbox is unavailable"));
     await waitFor(() =>
-      expect(screen.getAllByText("Managed sandboxes are disabled in this workspace.").length).toBeGreaterThan(0),
+      expect(
+        screen.getAllByText("Managed sandboxes are disabled in this workspace.").length,
+      ).toBeGreaterThan(0),
     );
   });
 
@@ -1000,7 +1066,9 @@ describe("NewChatLandingScreen", () => {
     expect(helpButton).toBeTruthy();
     fireEvent.focus(helpButton);
     await waitFor(() =>
-      expect(screen.getAllByText("Use Databricks Git credentials before cloning.").length).toBeGreaterThan(0),
+      expect(
+        screen.getAllByText("Use Databricks Git credentials before cloning.").length,
+      ).toBeGreaterThan(0),
     );
   });
 
@@ -1276,5 +1344,30 @@ describe("NewChatLandingScreen attachments", () => {
     expect(screen.getByText("notes.txt")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Remove notes.txt" }));
     expect(screen.queryByText("notes.txt")).toBeNull();
+  });
+
+  it("attaches files dropped onto the composer and surfaces a drop overlay", () => {
+    renderLanding();
+    const composer = screen.getByTestId("new-chat-landing-composer");
+    // Dragging over the composer lifts the drop-target overlay.
+    fireEvent.dragOver(composer, { dataTransfer: { files: [] } });
+    expect(screen.getByText("Drop files here")).toBeTruthy();
+    // Dropping a file attaches it (chip proves it reached state) and clears
+    // the overlay.
+    const file = new File(["hello"], "dropped.txt", { type: "text/plain" });
+    fireEvent.drop(composer, { dataTransfer: { files: [file] } });
+    expect(screen.getByText("dropped.txt")).toBeTruthy();
+    expect(screen.queryByText("Drop files here")).toBeNull();
+  });
+
+  it("clears the drop overlay when the drag leaves the composer", () => {
+    renderLanding();
+    const composer = screen.getByTestId("new-chat-landing-composer");
+    fireEvent.dragEnter(composer, { dataTransfer: { files: [] } });
+    expect(screen.getByText("Drop files here")).toBeTruthy();
+    // relatedTarget defaults to null (outside the composer), so the active
+    // state clears rather than sticking when moving between child elements.
+    fireEvent.dragLeave(composer, { dataTransfer: { files: [] } });
+    expect(screen.queryByText("Drop files here")).toBeNull();
   });
 });

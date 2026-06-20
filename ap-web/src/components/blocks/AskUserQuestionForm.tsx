@@ -69,9 +69,7 @@ function answerForQuestion(
   if (question.multiSelect) {
     const selected = Array.isArray(selection) ? selection : [];
     const all =
-      customSelected && customValue
-        ? Array.from(new Set([...selected, customValue]))
-        : selected;
+      customSelected && customValue ? Array.from(new Set([...selected, customValue])) : selected;
     return all.length > 0 ? all : null;
   }
   if (customSelected) {
@@ -84,11 +82,7 @@ function questionKey(question: ClaudeQuestion): string {
   return question.id && question.id.length > 0 ? question.id : question.question;
 }
 
-export function AskUserQuestionForm({
-  questions,
-  onSubmit,
-  onReject,
-}: AskUserQuestionFormProps) {
+export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQuestionFormProps) {
   // Currently-visible question (carousel index).
   const [currentIndex, setCurrentIndex] = useState(0);
 
@@ -169,19 +163,17 @@ export function AskUserQuestionForm({
   // Every question needs at least one answer. Without this guard
   // the form submits half-filled answers and the LLM sees ``null``
   // for the missing slots.
-  const allAnswered = questions.every(
-    (q) => {
-      const key = questionKey(q);
-      return (
-        answerForQuestion(
-          q,
-          selections[key] ?? "",
-          customSelected[key] ?? false,
-          customInputs[key] ?? "",
-        ) !== null
-      );
-    },
-  );
+  const allAnswered = questions.every((q) => {
+    const key = questionKey(q);
+    return (
+      answerForQuestion(
+        q,
+        selections[key] ?? "",
+        customSelected[key] ?? false,
+        customInputs[key] ?? "",
+      ) !== null
+    );
+  });
 
   const handleSubmit = () => {
     const finalAnswers: AskUserQuestionAnswers = {};
@@ -233,10 +225,10 @@ export function AskUserQuestionForm({
           Question {currentIndex + 1} of {questions.length}:
         </span>
         {current.header && (
-            <span className="text-muted-foreground text-xs rounded bg-muted px-1.5 py-0.5">
-              {current.header}
-            </span>
-          )}
+          <span className="text-muted-foreground text-xs rounded bg-muted px-1.5 py-0.5">
+            {current.header}
+          </span>
+        )}
       </div>
 
       <fieldset

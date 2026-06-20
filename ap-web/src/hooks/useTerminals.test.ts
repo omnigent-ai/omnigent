@@ -14,6 +14,7 @@ import {
   createTerminal,
   fetchTerminals,
   inventoryTerminals,
+  isAgentTerminalKey,
   PENDING_RECONCILE_INTERVAL_MS,
   terminalInfoFromResource,
   terminalsReconcileInterval,
@@ -199,7 +200,6 @@ describe("createTerminal", () => {
     await expect(createTerminal("conv_abc", "zsh")).rejects.toThrow(/not declared/);
   });
 });
-
 
 describe("terminalsReconcileInterval", () => {
   // The spinner is `terminalPending && !terminalsAvailable`. This decides
@@ -471,12 +471,38 @@ describe("inventoryTerminals", () => {
     session: "main",
     running: true,
   };
+  const piPane: TerminalInfo = {
+    id: "terminal_pi_main",
+    name: "pi",
+    session: "main",
+    running: true,
+  };
+  const cursorPane: TerminalInfo = {
+    id: "terminal_cursor_main",
+    name: "cursor",
+    session: "main",
+    running: true,
+  };
   const bash: TerminalInfo = {
     id: "terminal_bash_s1",
     name: "bash",
     session: "s1",
     running: true,
   };
+
+  it("drops the pi vendor pane for native Pi sessions", () => {
+    // Regression: terminal_pi_main was missing from AGENT_TERMINAL_IDS, so
+    // the pi pane leaked into the Shells inventory and (via isShellView) hid
+    // the Chat/Terminal pill in Terminal view — stranding the user.
+    expect(inventoryTerminals([piPane, bash], true)).toEqual([bash]);
+  });
+
+  it("drops the cursor vendor pane for native Cursor sessions", () => {
+    // Regression: terminal_cursor_main was missing from AGENT_TERMINAL_IDS,
+    // same failure mode as the pi pane above — leaked into Shells and hid
+    // the Chat/Terminal pill in Terminal view.
+    expect(inventoryTerminals([cursorPane, bash], true)).toEqual([bash]);
+  });
 
   it("drops the embedded REPL terminal for terminal-first SDK sessions", () => {
     // The REPL terminal backs the pill's Terminal view; listing it in
@@ -504,5 +530,22 @@ describe("inventoryTerminals", () => {
     // A regular session never hosts an agent terminal; an id collision
     // (agent-declared "tui"/"main") must not be hidden.
     expect(inventoryTerminals([repl, bash], false)).toEqual([repl, bash]);
+  });
+});
+
+describe("isAgentTerminalKey", () => {
+  it("recognizes the agent's own terminal for every session shape", () => {
+    expect(isAgentTerminalKey("terminal:terminal_tui_main")).toBe(true);
+    expect(isAgentTerminalKey("terminal:terminal_claude_main")).toBe(true);
+    expect(isAgentTerminalKey("terminal:terminal_codex_main")).toBe(true);
+    // pi-native: missing here is what hid the Chat/Terminal pill in
+    // Terminal view (isShellView wrongly true) for Pi sessions.
+    expect(isAgentTerminalKey("terminal:terminal_pi_main")).toBe(true);
+    // cursor-native: same regression class as pi above.
+    expect(isAgentTerminalKey("terminal:terminal_cursor_main")).toBe(true);
+  });
+
+  it("treats a user shell as not-the-agent-terminal", () => {
+    expect(isAgentTerminalKey("terminal:terminal_bash_s1")).toBe(false);
   });
 });

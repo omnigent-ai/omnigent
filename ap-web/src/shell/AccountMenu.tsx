@@ -148,9 +148,7 @@ export function AccountMenu() {
           <DropdownMenuLabel>
             {me.id}
             {me.is_admin && (
-              <span className="ml-1 text-xs font-normal text-muted-foreground">
-                (admin)
-              </span>
+              <span className="ml-1 text-xs font-normal text-muted-foreground">(admin)</span>
             )}
           </DropdownMenuLabel>
           <DropdownMenuSeparator />
@@ -177,10 +175,7 @@ export function AccountMenu() {
           >
             <KeyRoundIcon /> Change password
           </DropdownMenuItem>
-          <DropdownMenuItem
-            onClick={() => void onSignOut()}
-            className="flex items-center gap-2"
-          >
+          <DropdownMenuItem onClick={() => void onSignOut()} className="flex items-center gap-2">
             <LogOutIcon /> Sign out
           </DropdownMenuItem>
         </DropdownMenuContent>
@@ -250,10 +245,7 @@ export function AccountMenu() {
                 <Button
                   type="submit"
                   disabled={
-                    pwBusy ||
-                    oldPw.length === 0 ||
-                    newPw.length === 0 ||
-                    confirmPw.length === 0
+                    pwBusy || oldPw.length === 0 || newPw.length === 0 || confirmPw.length === 0
                   }
                 >
                   {pwBusy ? "Changing…" : "Change password"}

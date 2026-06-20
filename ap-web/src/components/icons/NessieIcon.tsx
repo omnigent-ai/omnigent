@@ -5,12 +5,7 @@ export function NessieIcon(props: SVGProps<SVGSVGElement>) {
   // Unique mask id per instance so multiple icons on a page don't collide.
   const maskId = useId();
   return (
-    <svg
-      viewBox="0 0 92.4 52.9"
-      fill="currentColor"
-      aria-hidden="true"
-      {...props}
-    >
+    <svg viewBox="0 0 92.4 52.9" fill="currentColor" aria-hidden="true" {...props}>
       <mask id={maskId}>
         <rect width="92.4" height="52.9" fill="#fff" />
         <circle cx="80.1" cy="4.8" r="1.9" fill="#000" />

@@ -1,11 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import type { Session } from "@/lib/types";
 
 /** Per-session cost-control switch value; `null` = unset (presents as off). */
@@ -267,7 +262,11 @@ export function IntelligentModelControl({
             </span>
           </Button>
         </TooltipTrigger>
-        <TooltipContent side="top" sideOffset={6} className="flex-col items-start gap-0.5 px-3 py-2">
+        <TooltipContent
+          side="top"
+          sideOffset={6}
+          className="flex-col items-start gap-0.5 px-3 py-2"
+        >
           <span className="font-medium" data-testid="imc-tooltip-title">
             Intelligent model router
           </span>

@@ -4,7 +4,11 @@ import type { FileContentResponse } from "./useFileContent";
 
 const DEFAULT_ENVIRONMENT_ID = "default";
 
-async function writeFileContent(conversationId: string, path: string, content: string): Promise<void> {
+async function writeFileContent(
+  conversationId: string,
+  path: string,
+  content: string,
+): Promise<void> {
   const encodedPath = path.split("/").map(encodeURIComponent).join("/");
   const url =
     `/v1/sessions/${encodeURIComponent(conversationId)}` +
@@ -27,8 +31,9 @@ export function useWriteFileContent(conversationId: string) {
     mutationFn: ({ path, content }: { path: string; content: string }) =>
       writeFileContent(conversationId, path, content),
     onSuccess: (_, { path, content }) => {
-      queryClient.setQueryData<FileContentResponse>(["file-content", conversationId, path], (old) =>
-        old ? { ...old, content } : undefined
+      queryClient.setQueryData<FileContentResponse>(
+        ["file-content", conversationId, path],
+        (old) => (old ? { ...old, content } : undefined),
       );
       queryClient.invalidateQueries({ queryKey: ["file-content", conversationId, path] });
       queryClient.invalidateQueries({ queryKey: ["workspace-changed-files", conversationId] });

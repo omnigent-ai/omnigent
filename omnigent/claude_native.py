@@ -1491,7 +1491,16 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
         family.default_model,
     )
     return ClaudeNativeUcodeConfig(
-        env={_UCODE_CLAUDE_BASE_URL_ENV: family.base_url},
+        env={
+            _UCODE_CLAUDE_BASE_URL_ENV: family.base_url,
+            # Disable Claude Code's experimental anthropic-beta flags. Gateways
+            # (Databricks serving-endpoints and the like) reject beta flags they
+            # don't implement with a 400 "invalid beta flag", which kills every
+            # turn. The ucode/databricks path already sets this; mirror it here
+            # so the generic key/gateway/local provider path is equally
+            # gateway-safe.
+            _CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV: "1",
+        },
         api_key_helper=api_key_helper,
         model=family.default_model,
     )
@@ -2854,7 +2863,8 @@ def _run_with_remote_server(
         if prepared is not None and outcome is _AttachOutcome.DETACHED:
             active_session_id = read_active_session_id(prepared.bridge_dir) or prepared.session_id
             click.echo(
-                f"\nDetached. Agent still running at {base_url}/c/{active_session_id}",
+                f"\nDetached. Agent still running at "
+                f"{conversation_url(base_url, active_session_id)}",
                 err=True,
             )
             echo_native_resume_hint(
@@ -4032,16 +4042,23 @@ def _websocket_connect(attach_url: str, *, headers: dict[str, str]) -> Any:
     """
     import websockets
 
+    from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+
+    # Identify as a first-party client so the server's WebSocket origin
+    # guard (CSWSH protection) allows the handshake — this attach client
+    # is not a browser. Set on a copy so the caller's dict (which also
+    # carries auth headers and may be reused) is not mutated here.
+    handshake_headers = {**headers, "Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
     try:
         return websockets.connect(
             attach_url,
-            additional_headers=headers,
+            additional_headers=handshake_headers,
             close_timeout=_CLAUDE_ATTACH_WS_CLOSE_TIMEOUT_S,
         )
     except TypeError:
         return websockets.connect(
             attach_url,
-            extra_headers=headers,
+            extra_headers=handshake_headers,
             close_timeout=_CLAUDE_ATTACH_WS_CLOSE_TIMEOUT_S,
         )
 

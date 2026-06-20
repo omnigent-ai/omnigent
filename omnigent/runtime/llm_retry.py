@@ -83,11 +83,13 @@ def _detect_context_overflow(body: str) -> _OverflowTokens | None:
         pass
 
     # Anthropic: "{input} + {max_tokens} > {limit}"
-    anthropic_sum = re.search(r"(\d+)\s*\+\s*\d+\s*>\s*(\d+)", body)
+    # The total request size is input + max_tokens; capture both so
+    # actual_tokens reflects the full request (not just the prompt).
+    anthropic_sum = re.search(r"(\d+)\s*\+\s*(\d+)\s*>\s*(\d+)", body)
     if anthropic_sum:
         return _OverflowTokens(
-            max_context_tokens=int(anthropic_sum.group(2)),
-            actual_tokens=int(anthropic_sum.group(1)),
+            max_context_tokens=int(anthropic_sum.group(3)),
+            actual_tokens=int(anthropic_sum.group(1)) + int(anthropic_sum.group(2)),
         )
 
     # Anthropic: "prompt is too long: {actual} tokens > {limit} maximum"

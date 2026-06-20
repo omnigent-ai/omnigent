@@ -18,7 +18,7 @@ from typing import TypeAlias, cast
 
 from omnigent.runner.identity import RUNNER_AUTH_SECRET_ENV_VARS
 
-from .datamodel import OSEnvSandboxSpec, OSEnvSpec
+from .datamodel import CredentialProxySpec, OSEnvSandboxSpec, OSEnvSpec
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +148,13 @@ class SandboxPolicy:
     egress_relay_port: int | None = None
     egress_socket_path: str | None = None
     deny_unix_socket_paths: list[Path] | None = None
+    # Parent-side only: the resolved credential-proxy policy. Read in
+    # ``_HelperProcessClient._start_locked`` (parent) to mint synthetic
+    # placeholders and proxy rewrite rules. Intentionally NOT carried in
+    # ``to_jsonable`` / ``from_jsonable`` — the helper receives only the
+    # non-secret synthetic payload over the config FD, and resolved
+    # secrets never touch the policy that serialises into logs / dumps.
+    credential_proxy: CredentialProxySpec | None = None
 
     def to_jsonable(self) -> dict[str, JsonValue]:
         result: dict[str, JsonValue] = {
@@ -277,6 +284,7 @@ class SandboxBackend(ABC):
         policy: SandboxPolicy,
         cwd: Path,
         chdir: Path | None = None,
+        target: str | None = None,
     ) -> list[str]:
         """
         Wrap *argv* with whatever launcher the backend needs at spawn
@@ -304,10 +312,18 @@ class SandboxBackend(ABC):
             ``None``, the helper starts in *cwd*. When set (e.g. for
             ``OSEnvSpec.start_in_scratch``), the launcher chdirs
             there on entry. In-process backends may ignore this.
+        :param target: Absolute path to the binary that the launcher
+            will exec as its final target (e.g. the ``claude`` CLI).
+            When set, the backend must ensure this path is reachable
+            inside the sandbox namespace — for bwrap this means
+            bind-mounting the target's directory chain just as it does
+            for ``argv[0]`` (the Python interpreter). ``None`` when
+            the target is already covered by the default mounts (e.g.
+            ``/usr/bin/something``).
         :returns: The (possibly wrapped) argv. The default
             implementation returns *argv* unchanged.
         """
-        del policy, cwd, chdir
+        del policy, cwd, chdir, target
         return argv
 
 
@@ -384,6 +400,11 @@ def _clone_policy_with(
             if policy.deny_unix_socket_paths is not None
             else None
         ),
+        # Preserve the credential-proxy policy across clones: the
+        # ``with_additional_*`` helpers run before the parent reads it in
+        # ``_start_locked``, so dropping it here would silently disable
+        # the feature.
+        credential_proxy=policy.credential_proxy,
         # Egress fields are intentionally NOT preserved here — the
         # ``with_additional_*`` helpers run BEFORE the egress proxy
         # starts, so the source policy never carries egress fields.
@@ -625,6 +646,7 @@ def run_launcher(encoded_sandbox: str, target_path: str, argv: list[str]) -> int
                 launcher_argv,
                 sandbox,
                 Path(os.getcwd()),
+                target=target_path,
             )
         )
         os.environ[_LAUNCHER_WRAPPED_ENV] = "1"

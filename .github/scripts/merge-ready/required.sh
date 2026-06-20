@@ -1,7 +1,10 @@
-# Sourced by evaluate-checks.sh. Only always-on checks are required (unit
-# tests, lint, type-check). The e2e and integration suites run on
-# schedule/dispatch only and are intentionally absent from REQUIRED and
-# ALLOW_SKIP so missing checks do not block contributor PRs.
+# Sourced by evaluate-checks.sh. The unit/lint/type-check checks gate every PR.
+# The e2e + e2e-ui suites also gate PRs, but only run with secrets on same-repo
+# PRs (maintainer branches); fork PRs cannot read the LLM_API_KEY /
+# GATEWAY_BASE_URL secrets, so their e2e jobs skip via a workflow fork guard.
+# The e2e and integration check names are therefore in BOTH REQUIRED (a
+# same-repo PR must pass them) and ALLOW_SKIP (a fork PR's skipped check still
+# satisfies the gate).
 # Generated file -- do not hand-edit; it is replaced wholesale on every sync.
 
 REQUIRED=(
@@ -19,6 +22,16 @@ REQUIRED=(
   "Pytest (server-rest)"
   "Pytest (spec-llms)"
   "Pytest (misc)"
+  "E2E Tests (shard 0/4)"
+  "E2E Tests (shard 1/4)"
+  "E2E Tests (shard 2/4)"
+  "E2E Tests (shard 3/4)"
+  "E2E UI Tests (shard 0/3)"
+  "E2E UI Tests (shard 1/3)"
+  "E2E UI Tests (shard 2/3)"
+  "Integration (claude-sdk)"
+  "Integration (openai-agents)"
+  "Integration (codex)"
 )
 
 ALLOW_SKIP=(
@@ -35,18 +48,30 @@ ALLOW_SKIP=(
   "Pytest (server-rest)"
   "Pytest (spec-llms)"
   "Pytest (misc)"
+  "E2E Tests (shard 0/4)"
+  "E2E Tests (shard 1/4)"
+  "E2E Tests (shard 2/4)"
+  "E2E Tests (shard 3/4)"
+  "E2E UI Tests (shard 0/3)"
+  "E2E UI Tests (shard 1/3)"
+  "E2E UI Tests (shard 2/3)"
+  "Integration (claude-sdk)"
+  "Integration (openai-agents)"
+  "Integration (codex)"
 )
 
 is_allow_skip() { printf '%s\n' "${ALLOW_SKIP[@]}" | grep -qxF "$1"; }
 
 # Maps an ALLOW_SKIP check to the workflow that produces it, so
-# evaluate-checks.sh can tell a genuine path-skip from a check that is
-# merely absent because its workflow is still queued or re-running. In
-# the public variant the only skippable checks are the CI Pytest jobs;
-# everything else echoes "" (unmapped).
+# evaluate-checks.sh can tell a genuine skip (a CI Pytest shard path-skip, or
+# the fork guard skipping an e2e job) from a check that is merely absent
+# because its workflow is still queued or re-running.
 workflow_for() {
   case "$1" in
-    "Pytest ("*) echo "CI" ;;
-    *)           echo "" ;;
+    "Pytest ("*)             echo "CI" ;;
+    "E2E Tests (shard "*)    echo "E2E Tests" ;;
+    "E2E UI Tests (shard "*) echo "E2E UI Tests" ;;
+    "Integration ("*)        echo "Integration Tests" ;;
+    *)                       echo "" ;;
   esac
 }

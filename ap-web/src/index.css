@@ -13,82 +13,84 @@
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {
-    --font-heading: var(--font-sans);
-    /* Native system UI font stack — defers to whatever the OS ships
+  --font-heading: var(--font-sans);
+  /* Native system UI font stack — defers to whatever the OS ships
      * (San Francisco on Apple, Segoe UI on Windows, Roboto on Android),
      * matching Tailwind's default sans so the app reads as native chrome. */
-    --font-sans: ui-sans-serif, system-ui, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
-    --font-mono: 'Geist Mono Variable', 'JetBrains Mono', ui-monospace, monospace;
-    /* 13px/20px text step between text-xs (12px) and text-sm (14px) —
+  --font-sans:
+    ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol",
+    "Noto Color Emoji";
+  --font-mono: "Geist Mono Variable", "JetBrains Mono", ui-monospace, monospace;
+  /* 13px/20px text step between text-xs (12px) and text-sm (14px) —
      * generates the `text-13` utility. Used for compact UI chrome like
      * the composer footer selectors and slash-command menu rows. */
-    --text-13: 13px;
-    --text-13--line-height: 20px;
-    /* Hero/title step — overrides Tailwind's default text-3xl (30/36)
+  --text-13: 13px;
+  --text-13--line-height: 20px;
+  /* Hero/title step — overrides Tailwind's default text-3xl (30/36)
      * with a slightly larger 32px face on the same 36px line. */
-    --text-3xl: 32px;
-    --text-3xl--line-height: 36px;
-    --color-sidebar-ring: var(--sidebar-ring);
-    --color-sidebar-border: var(--sidebar-border);
-    --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
-    --color-sidebar-accent: var(--sidebar-accent);
-    --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
-    --color-sidebar-primary: var(--sidebar-primary);
-    --color-sidebar-foreground: var(--sidebar-foreground);
-    --color-sidebar: var(--sidebar);
-    --color-chart-5: var(--chart-5);
-    --color-chart-4: var(--chart-4);
-    --color-chart-3: var(--chart-3);
-    --color-chart-2: var(--chart-2);
-    --color-chart-1: var(--chart-1);
-    --color-ring: var(--ring);
-    --color-input: var(--input);
-    --color-border: var(--border);
-    /* Stronger border for higher-contrast dividers/outlines. */
-    --color-border-strong: var(--border-strong);
-    /* Neutral border specifically for buttons (lighter than --border-strong). */
-    --color-button-border: var(--button-border);
-    --color-destructive: var(--destructive);
-    --color-destructive-foreground: var(--destructive-foreground);
-    --color-success: var(--success);
-    --color-warning: var(--warning);
-    --color-info: var(--info);
-    /* Brand pink — reserved for brand moments, not status. */
-    --color-brand-accent: var(--brand-accent);
-    /* Named status hues — success/warning/info are repointed to the
+  --text-3xl: 32px;
+  --text-3xl--line-height: 36px;
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  /* Stronger border for higher-contrast dividers/outlines. */
+  --color-border-strong: var(--border-strong);
+  /* Neutral border specifically for buttons (lighter than --border-strong). */
+  --color-button-border: var(--button-border);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-info: var(--info);
+  /* Brand pink — reserved for brand moments, not status. */
+  --color-brand-accent: var(--brand-accent);
+  /* Named status hues — success/warning/info are repointed to the
      * green/yellow/blue of this set below, so the two stay in lockstep. */
-    --color-status-blue: var(--status-blue);
-    --color-status-green: var(--status-green);
-    --color-status-yellow: var(--status-yellow);
-    --color-status-red: var(--status-red);
-    --color-status-gray: var(--status-gray);
-    --color-accent-foreground: var(--accent-foreground);
-    --color-accent: var(--accent);
-    --color-muted-foreground: var(--muted-foreground);
-    --color-muted: var(--muted);
-    --color-secondary-foreground: var(--secondary-foreground);
-    --color-secondary: var(--secondary);
-    --color-primary-foreground: var(--primary-foreground);
-    --color-primary: var(--primary);
-    --color-popover-foreground: var(--popover-foreground);
-    --color-popover: var(--popover);
-    --color-card-foreground: var(--card-foreground);
-    --color-card: var(--card);
-    /* Opaque form of --card, for card surfaces that must fully hide
+  --color-status-blue: var(--status-blue);
+  --color-status-green: var(--status-green);
+  --color-status-yellow: var(--status-yellow);
+  --color-status-red: var(--status-red);
+  --color-status-gray: var(--status-gray);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  /* Opaque form of --card, for card surfaces that must fully hide
      * content tucked behind them (e.g. the composer's tray corners). */
-    --color-card-solid: var(--card-solid);
-    /* Translucent card surface for trays/overlays layered on the page
+  --color-card-solid: var(--card-solid);
+  /* Translucent card surface for trays/overlays layered on the page
      * gradient — consumed with an opacity modifier (e.g. bg-tray/50). */
-    --color-tray: var(--tray);
-    --color-foreground: var(--foreground);
-    --color-background: var(--background);
-    --radius-sm: calc(var(--radius) * 0.6);
-    --radius-md: calc(var(--radius) * 0.8);
-    --radius-lg: var(--radius);
-    --radius-xl: calc(var(--radius) * 1.4);
-    --radius-2xl: calc(var(--radius) * 1.8);
-    --radius-3xl: calc(var(--radius) * 2.2);
-    --radius-4xl: calc(var(--radius) * 2.6);
+  --color-tray: var(--tray);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
 }
 
 /* Apple system-blue accent (hue 256, matches iOS / macOS systemBlue —
@@ -97,7 +99,7 @@
  * buttons stay neutral grey (hue 240). See designs/UI/WEB_UI.md (still
  * describes the older cobalt direction). */
 :root {
-    /* Brand palette (light). Hex values are the brand spec, kept verbatim
+  /* Brand palette (light). Hex values are the brand spec, kept verbatim
      * for fidelity. --background is white: the lavender brand canvas is
      * expressed by the .app-shell gradient (see index.css .app-shell), so
      * the base background stays white. This keeps bg-background tiles/
@@ -105,149 +107,149 @@
      * from rendering as lavender patches on the white cards they sit on.
      * The auth pages (outside the gradient shell) use this as their
      * full-page canvas. */
-    --background: #fff;
-    --foreground: #11171c;
-    --card: #fff;
-    /* Light --card is already opaque; the solid form only diverges in dark. */
-    --card-solid: #fff;
-    --card-foreground: #11171c;
-    /* Tray surface (composer footer tray): white, applied translucently
+  --background: #fff;
+  --foreground: #11171c;
+  --card: #fff;
+  /* Light --card is already opaque; the solid form only diverges in dark. */
+  --card-solid: #fff;
+  --card-foreground: #11171c;
+  /* Tray surface (composer footer tray): white, applied translucently
      * via opacity modifiers so the page gradient shows through. */
-    --tray: #fff;
-    /* Popover/dropdown/tooltip/dialog surfaces — light, matching --card.
+  --tray: #fff;
+  /* Popover/dropdown/tooltip/dialog surfaces — light, matching --card.
      * (These all consume bg-popover / text-popover-foreground.) */
-    --popover: #fff;
-    --popover-foreground: #11171c;
-    --primary: #11171c;
-    --primary-foreground: #fff;
-    /* Light grey fill so secondary badges/headers read as surfaces (a
+  --popover: #fff;
+  --popover-foreground: #11171c;
+  --primary: #11171c;
+  --primary-foreground: #fff;
+  /* Light grey fill so secondary badges/headers read as surfaces (a
      * fully-transparent value left them as bare floating text). */
-    --secondary: #eceef1;
-    --secondary-foreground: #11171c;
-    --muted: #0000000f;
-    --muted-foreground: #6f6f6f;
-    /* Dedicated chip background for inline code — a hair darker than the
+  --secondary: #eceef1;
+  --secondary-foreground: #11171c;
+  --muted: #0000000f;
+  --muted-foreground: #6f6f6f;
+  /* Dedicated chip background for inline code — a hair darker than the
      * white card so the chip reads as a tile. Kept separate from --muted
      * (now a translucent black wash reused for hover/quote surfaces). */
-    --code-bg: #0000000f;
-    --accent: #d7edfe;
-    --accent-foreground: #04355d;
-    --destructive: #c8324c;
-    --destructive-foreground: #fff;
-    /* success/warning/info repointed onto the named status hues below so
+  --code-bg: #0000000f;
+  --accent: #d7edfe;
+  --accent-foreground: #04355d;
+  --destructive: #c8324c;
+  --destructive-foreground: #fff;
+  /* success/warning/info repointed onto the named status hues below so
      * the ~45 existing badges/indicators adopt the brand status palette. */
-    --success: #2ea65c;
-    --warning: #d4972a;
-    --info: #3b8ff5;
-    --border: #e8ecf0;
-    /* Stronger divider/outline + a dedicated neutral button border. */
-    --border-strong: #a3b1bf;
-    --button-border: #d6d6d6;
-    --button-icon-hover-color: #11171c;
-    --input: #e8ecf0;
-    /* Focus ring matches --primary. */
-    --ring: #11171c;
-    /* Brand pink — reserved for brand moments, not status. */
-    --brand-accent: #df3c85;
-    /* Named status hues. success/warning/info above mirror green/yellow/blue. */
-    --status-blue: #3b8ff5;
-    --status-green: #2ea65c;
-    --status-yellow: #d4972a;
-    --status-red: #f04858;
-    --status-gray: #8e99a4;
-    --chart-1: #3b8ff5;
-    --chart-2: #2272b4;
-    --chart-3: #2ea65c;
-    --chart-4: #d4972a;
-    --chart-5: #8e99a4;
-    --radius: 0.5rem;
-    /* Sidebar + workspace cards are white (--card); they float on the
+  --success: #2ea65c;
+  --warning: #d4972a;
+  --info: #3b8ff5;
+  --border: #e8ecf0;
+  /* Stronger divider/outline + a dedicated neutral button border. */
+  --border-strong: #a3b1bf;
+  --button-border: #d6d6d6;
+  --button-icon-hover-color: #11171c;
+  --input: #e8ecf0;
+  /* Focus ring matches --primary. */
+  --ring: #11171c;
+  /* Brand pink — reserved for brand moments, not status. */
+  --brand-accent: #df3c85;
+  /* Named status hues. success/warning/info above mirror green/yellow/blue. */
+  --status-blue: #3b8ff5;
+  --status-green: #2ea65c;
+  --status-yellow: #d4972a;
+  --status-red: #f04858;
+  --status-gray: #8e99a4;
+  --chart-1: #3b8ff5;
+  --chart-2: #2272b4;
+  --chart-3: #2ea65c;
+  --chart-4: #d4972a;
+  --chart-5: #8e99a4;
+  --radius: 0.5rem;
+  /* Sidebar + workspace cards are white (--card); they float on the
      * near-white .app-shell gradient canvas. --sidebar matches that
      * gradient's lightest tone so bg-sidebar surfaces (the app-shell's
      * fallback fill under the gradient, translucent chrome like the
      * message copy button) blend into the canvas rather than painting
      * a lavender band. */
-    --sidebar: #fdfafa;
-    --sidebar-foreground: #11171c;
-    --sidebar-primary: #2272b4;
-    --sidebar-primary-foreground: #fff;
-    --sidebar-accent: #d7edfe;
-    --sidebar-accent-foreground: #04355d;
-    --sidebar-border: #e8ecf0;
-    --sidebar-ring: #2272b4;
+  --sidebar: #fdfafa;
+  --sidebar-foreground: #11171c;
+  --sidebar-primary: #2272b4;
+  --sidebar-primary-foreground: #fff;
+  --sidebar-accent: #d7edfe;
+  --sidebar-accent-foreground: #04355d;
+  --sidebar-border: #e8ecf0;
+  --sidebar-ring: #2272b4;
 }
 
 .dark {
-    /* Dark mode tokens — semi-transparent for glassmorphism backdrop-filter */
-    --background: #0d1218;
-    --foreground: oklch(0.965 0.003 240);
-    --card: rgba(40, 34, 58, 0.6);
-    /* Opaque stand-in for the glass --card. The composer card uses this
+  /* Dark mode tokens — semi-transparent for glassmorphism backdrop-filter */
+  --background: #0d1218;
+  --foreground: oklch(0.965 0.003 240);
+  --card: rgba(40, 34, 58, 0.6);
+  /* Opaque stand-in for the glass --card. The composer card uses this
      * instead of --card: its trays tuck their square corners behind the
      * card (negative-margin overlap), and a translucent card lets the
      * tucked strip ghost through its edges. Not --card's raw RGB
      * (#28223a) — full-alpha that read lighter than the neighboring
      * glass surfaces; this approximates the glass card's perceived
      * color: 60% of #28223a composited over the dark canvas gradient. */
-    --card-solid: #201c30;
-    --card-foreground: oklch(0.965 0.003 240);
-    /* Dark counterpart of the tray surface — semi-transparent for glass effect */
-    --tray: rgba(40, 34, 58, 0.6);
-    --popover: rgba(26, 33, 41, 0.8);
-    --popover-foreground: oklch(0.965 0.003 240);
-    --primary: #e8ecf0;
-    --primary-foreground: #11171c;
-    --secondary: #1f272d;
-    --secondary-foreground: #e8ecf0;
-    /* Active/selected states, hover backgrounds, subtle containers. */
-    /* Opaque base (#28223a is var(--card)'s solid form — the dark-mode --card
+  --card-solid: #201c30;
+  --card-foreground: oklch(0.965 0.003 240);
+  /* Dark counterpart of the tray surface — semi-transparent for glass effect */
+  --tray: rgba(40, 34, 58, 0.6);
+  --popover: rgba(26, 33, 41, 0.8);
+  --popover-foreground: oklch(0.965 0.003 240);
+  --primary: #e8ecf0;
+  --primary-foreground: #11171c;
+  --secondary: #1f272d;
+  --secondary-foreground: #e8ecf0;
+  /* Active/selected states, hover backgrounds, subtle containers. */
+  /* Opaque base (#28223a is var(--card)'s solid form — the dark-mode --card
        itself is translucent). bg-muted backs ~160 solid utility surfaces (code
        blocks, badges, hover rows) that must not let the canvas gradient bleed
        through; the frosted look is reserved for the .dark .bg-card rule. */
-    --muted: color-mix(in srgb, var(--muted-foreground) 15%, #28223a);
-    --muted-foreground: #92a4b3;
-    --code-bg: oklch(0.38 0.005 240);
-    --accent: #04355d;
-    --accent-foreground: #4299e0;
-    --destructive: #e65b77;
-    --destructive-foreground: #fff;
-    /* success/warning/info repointed onto the status hues below, mirroring
+  --muted: color-mix(in srgb, var(--muted-foreground) 15%, #28223a);
+  --muted-foreground: #92a4b3;
+  --code-bg: oklch(0.38 0.005 240);
+  --accent: #04355d;
+  --accent-foreground: #4299e0;
+  --destructive: #e65b77;
+  --destructive-foreground: #fff;
+  /* success/warning/info repointed onto the status hues below, mirroring
      * light mode so dark mode doesn't carry a second green/yellow/blue. */
-    --success: #2ea65c;
-    --warning: #d4972a;
-    --info: #3b8ff5;
-    /* Brand pink + named status hues (same values as light — the brand
+  --success: #2ea65c;
+  --warning: #d4972a;
+  --info: #3b8ff5;
+  /* Brand pink + named status hues (same values as light — the brand
      * status palette is hue-stable across themes). Defined explicitly here
      * rather than inheriting from :root so dark mode is self-contained. */
-    --brand-accent: #df3c85;
-    --status-blue: #3b8ff5;
-    --status-green: #2ea65c;
-    --status-yellow: #d4972a;
-    --status-red: #f04858;
-    --status-gray: #8e99a4;
-    --border: oklch(0.28 0.005 240);
-    --input: oklch(0.28 0.005 240);
-    /* Focus ring matches --primary. */
-    --ring: #e8ecf0;
-    --chart-1: oklch(0.64 0.22 254);
-    --chart-2: oklch(0.65 0.14 200);
-    --chart-3: oklch(0.68 0.15 145);
-    --chart-4: oklch(0.75 0.16 70);
-    --chart-5: oklch(0.65 0.008 240);
-    /* bg-sidebar surfaces blend into the dark .app-shell gradient — a 45°
+  --brand-accent: #df3c85;
+  --status-blue: #3b8ff5;
+  --status-green: #2ea65c;
+  --status-yellow: #d4972a;
+  --status-red: #f04858;
+  --status-gray: #8e99a4;
+  --border: oklch(0.28 0.005 240);
+  --input: oklch(0.28 0.005 240);
+  /* Focus ring matches --primary. */
+  --ring: #e8ecf0;
+  --chart-1: oklch(0.64 0.22 254);
+  --chart-2: oklch(0.65 0.14 200);
+  --chart-3: oklch(0.68 0.15 145);
+  --chart-4: oklch(0.75 0.16 70);
+  --chart-5: oklch(0.65 0.008 240);
+  /* bg-sidebar surfaces blend into the dark .app-shell gradient — a 45°
      * diagonal sweeping green (rgb 17,24,28) → purple (rgb 19,13,33);
      * --sidebar sits in the green-dominant region and stays translucent
      * so it tracks the canvas underneath (a flat color can't match a
      * diagonal everywhere). Mirrors the light-mode treatment. */
-    --sidebar: rgba(17, 23, 28, 0.75);
-    --sidebar-foreground: oklch(0.965 0.003 240);
-    --sidebar-primary: oklch(0.64 0.22 254);
-    --sidebar-primary-foreground: oklch(0.12 0.004 240);
-    --sidebar-accent: oklch(0.245 0.005 240);
-    --sidebar-accent-foreground: oklch(0.965 0.003 240);
-    --sidebar-border: oklch(0.28 0.005 240);
-    --sidebar-ring: oklch(0.92 0.003 240 / 0.40);
-    --tooltip-bg: #2a2440;
+  --sidebar: rgba(17, 23, 28, 0.75);
+  --sidebar-foreground: oklch(0.965 0.003 240);
+  --sidebar-primary: oklch(0.64 0.22 254);
+  --sidebar-primary-foreground: oklch(0.12 0.004 240);
+  --sidebar-accent: oklch(0.245 0.005 240);
+  --sidebar-accent-foreground: oklch(0.965 0.003 240);
+  --sidebar-border: oklch(0.28 0.005 240);
+  --sidebar-ring: oklch(0.92 0.003 240 / 0.4);
+  --tooltip-bg: #2a2440;
 }
 
 /* App-shell canvas gradient. Copied verbatim from the brand mock
@@ -280,9 +282,9 @@
 .dark .app-shell {
   background:
     radial-gradient(ellipse at 20% 50%, rgba(100, 40, 180, 0.15) 0%, transparent 50%),
-    radial-gradient(ellipse at 80% 20%, rgba(80, 30, 140, 0.10) 0%, transparent 45%),
+    radial-gradient(ellipse at 80% 20%, rgba(80, 30, 140, 0.1) 0%, transparent 45%),
     radial-gradient(ellipse at 60% 80%, rgba(140, 30, 100, 0.08) 0%, transparent 40%),
-    linear-gradient(145deg, #1e1035 0%, #11171C 50%, #161020 100%);
+    linear-gradient(145deg, #1e1035 0%, #11171c 50%, #161020 100%);
 }
 
 /* Chat scroll fade: the ChatHeader overlay paints no background (a flat
@@ -318,15 +320,24 @@
  * panels while a menu/dialog is up, and dropping this rule's 1px border
  * then reflowed every sidebar row 2px wider. Not [inert] either: this
  * React version drops the boolean inert attribute from the DOM.) */
-.dark :is(.bg-card, [class*="md:bg-card"]):not(:is(.bg-card, [class*="md:bg-card"]) :is(.bg-card, [class*="md:bg-card"])):not([data-collapsed]) {
+.dark
+  :is(.bg-card, [class*="md:bg-card"]):not(
+    :is(.bg-card, [class*="md:bg-card"]) :is(.bg-card, [class*="md:bg-card"])
+  ):not([data-collapsed]) {
   /* -webkit- must come BEFORE the unprefixed property: LightningCSS (vite
    * build) collapses the pair and keeps only the last declaration. */
   -webkit-backdrop-filter: blur(32px) saturate(180%) !important;
   backdrop-filter: blur(32px) saturate(180%) !important;
   border: 1px solid rgba(255, 255, 255, 0.09);
   border-top-color: rgba(255, 255, 255, 0.14);
-  background-image: linear-gradient(135deg, rgba(255, 255, 255, 0.04) 0%, rgba(255, 255, 255, 0) 60%);
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.22), 0 1px 3px rgba(0, 0, 0, 0.16);
+  background-image: linear-gradient(
+    135deg,
+    rgba(255, 255, 255, 0.04) 0%,
+    rgba(255, 255, 255, 0) 60%
+  );
+  box-shadow:
+    0 4px 16px rgba(0, 0, 0, 0.22),
+    0 1px 3px rgba(0, 0, 0, 0.16);
 }
 
 /* Side panels (FileViewer, TerminalsPanel, FilesPanelDrawer) manage their own
@@ -397,7 +408,7 @@
  * the full emboss + dark depth shadow reads too heavy on the light
  * canvas. Dark mode: stronger emboss plus the grounding shadow. */
 .share-button-glassy {
-  background: linear-gradient(to bottom, #fa3d99 0%, #F22286 40%, #d51d74 100%);
+  background: linear-gradient(to bottom, #fa3d99 0%, #f22286 40%, #d51d74 100%);
   border: none;
   box-shadow: none;
   color: #ffffff;
@@ -409,9 +420,11 @@
 }
 
 .dark .share-button-glassy {
-  background: linear-gradient(150deg, #ff4da6 0%, #F22286 40%, #b8185f 100%);
+  background: linear-gradient(150deg, #ff4da6 0%, #f22286 40%, #b8185f 100%);
   border: none;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5), 0 1px 3px rgba(0, 0, 0, 0.4);
+  box-shadow:
+    0 4px 16px rgba(0, 0, 0, 0.5),
+    0 1px 3px rgba(0, 0, 0, 0.4);
   color: #ffffff;
 }
 
@@ -422,13 +435,13 @@
 @layer base {
   * {
     @apply border-border outline-ring/50;
-    }
+  }
   *:focus-visible {
     @apply outline-2 outline-offset-2 outline-ring;
   }
   body {
     @apply bg-background text-foreground;
-    }
+  }
   /* The app shell is a fixed-viewport layout (h-dvh) with internal
    * scrollers — the document itself must never scroll. Without this, any
    * sub-pixel overflow (browser zoom rounding, floating overlays) gives the
@@ -442,15 +455,15 @@
   }
   html {
     @apply font-sans;
-    }
+  }
   /* Text selection — brand pink highlight. Light: gentle wash + dark pink
    * text. Dark: solid brand pink background + white text. */
   ::selection {
-    background: color-mix(in srgb, #F22286 20%, transparent);
-    color: #F22286;
+    background: color-mix(in srgb, #f22286 20%, transparent);
+    color: #f22286;
   }
   .dark ::selection {
-    background: #F22286;
+    background: #f22286;
     color: #ffffff;
   }
 }
@@ -512,9 +525,15 @@
 
 /* Flash highlight on nav jump. Duration must match FLASH_DURATION_MS in chatStore.ts. */
 @keyframes user-msg-flash {
-  0%   { box-shadow: 0 0 0 0 var(--ring); }
-  20%  { box-shadow: 0 0 0 4px var(--ring); }
-  100% { box-shadow: 0 0 0 0 transparent; }
+  0% {
+    box-shadow: 0 0 0 0 var(--ring);
+  }
+  20% {
+    box-shadow: 0 0 0 4px var(--ring);
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
 }
 
 .animate-user-msg-flash {
@@ -534,8 +553,13 @@
  * between faint and full opacity. Subtle yet noticeable, and cheaper than a
  * spinner. Shared by the sidebar SessionStateBadge and the SubagentsPanel. */
 @keyframes running-pulse {
-  0%, 100% { opacity: 0.35; }
-  50%      { opacity: 1; }
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
 }
 
 .running-pulse-dot {
@@ -568,24 +592,45 @@
     opacity 160ms ease,
     transform 200ms cubic-bezier(0.34, 1.56, 0.64, 1);
 }
-.imc-layer-off { opacity: 1; transform: none; }
-.imc-layer-on  { opacity: 0; transform: scale(0.55) rotate(-40deg); }
-.imc-toggle[data-mode="on"] .imc-layer-off { opacity: 0; transform: scale(0.55) rotate(40deg); }
+.imc-layer-off {
+  opacity: 1;
+  transform: none;
+}
+.imc-layer-on {
+  opacity: 0;
+  transform: scale(0.55) rotate(-40deg);
+}
+.imc-toggle[data-mode="on"] .imc-layer-off {
+  opacity: 0;
+  transform: scale(0.55) rotate(40deg);
+}
 /* Monochrome lit state: full foreground, no glow — color stays semantic. */
-.imc-toggle[data-mode="on"] { color: var(--foreground); }
+.imc-toggle[data-mode="on"] {
+  color: var(--foreground);
+}
 .imc-toggle[data-mode="on"] .imc-layer-on {
   opacity: 1;
   transform: none;
 }
 
 /* Whisper of intent on hover; squish on press (the spring eases it back). */
-.imc-toggle[data-mode="off"]:hover:not(:disabled) .imc-layer-off { transform: scale(1.08); }
+.imc-toggle[data-mode="off"]:hover:not(:disabled) .imc-layer-off {
+  transform: scale(1.08);
+}
 .imc-toggle:active:not(:disabled) .imc-layer-off,
-.imc-toggle:active:not(:disabled) .imc-layer-on { transform: scale(0.88); }
+.imc-toggle:active:not(:disabled) .imc-layer-on {
+  transform: scale(0.88);
+}
 
 /* Companion sparks stage in just after the star lands. */
-.imc-spark { opacity: 0; transition: opacity 140ms ease; }
-.imc-toggle[data-mode="on"] .imc-spark { opacity: 1; transition-delay: 110ms; }
+.imc-spark {
+  opacity: 0;
+  transition: opacity 140ms ease;
+}
+.imc-toggle[data-mode="on"] .imc-spark {
+  opacity: 1;
+  transition-delay: 110ms;
+}
 
 .imc-halo {
   position: absolute;
@@ -607,7 +652,10 @@
     transform 200ms ease;
   pointer-events: none;
 }
-.imc-toggle[data-mode="on"] .imc-halo { opacity: 1; transform: scale(1); }
+.imc-toggle[data-mode="on"] .imc-halo {
+  opacity: 1;
+  transform: scale(1);
+}
 .dark .imc-toggle[data-mode="on"] .imc-halo {
   background: radial-gradient(
     circle,
@@ -620,9 +668,18 @@
  * (the keyframes end where the element's static state is, so a collapsed
  * reduced-motion run shows nothing). */
 @keyframes imc-verdict-ping {
-  0%   { opacity: 0;   transform: scale(0.5); }
-  30%  { opacity: 0.8; transform: scale(1); }
-  100% { opacity: 0;   transform: scale(1.9); }
+  0% {
+    opacity: 0;
+    transform: scale(0.5);
+  }
+  30% {
+    opacity: 0.8;
+    transform: scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.9);
+  }
 }
 .imc-ping {
   position: absolute;
@@ -642,8 +699,12 @@
  * doesn't pull framer-motion (~165KB) into the bundle — see Shimmer in
  * components/ai-elements/shimmer.tsx. Duration is set via --shimmer-duration. */
 @keyframes shimmer-sweep {
-  from { background-position: 100% center; }
-  to   { background-position: 0% center; }
+  from {
+    background-position: 100% center;
+  }
+  to {
+    background-position: 0% center;
+  }
 }
 
 .text-shimmer {
@@ -654,13 +715,25 @@
  * Opt-in via .otto-working so the mascot can also render static. The global
  * reduced-motion gate below freezes both animations. */
 @keyframes otto-bob {
-  0%, 100% { transform: translateY(5%); }
-  50% { transform: translateY(-5%); }
+  0%,
+  100% {
+    transform: translateY(5%);
+  }
+  50% {
+    transform: translateY(-5%);
+  }
 }
 
 @keyframes otto-blink {
-  0%, 88%, 96%, 100% { transform: scaleY(1); }
-  92% { transform: scaleY(0.1); }
+  0%,
+  88%,
+  96%,
+  100% {
+    transform: scaleY(1);
+  }
+  92% {
+    transform: scaleY(0.1);
+  }
 }
 
 .otto-working {
@@ -680,7 +753,9 @@
  * animate-* timer so users who request reduced motion don't see any
  * sweeping change we forgot to scope. */
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after {
+  *,
+  *::before,
+  *::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
@@ -719,13 +794,90 @@
 .tiptap-md-content .ProseMirror {
   outline: none;
 }
-.tiptap-md-content .ProseMirror h1 { font-size: 1.75em; font-weight: 700; margin: 0.75em 0 0.5em; }
-.tiptap-md-content .ProseMirror h2 { font-size: 1.4em;  font-weight: 600; margin: 0.75em 0 0.5em; }
-.tiptap-md-content .ProseMirror h3 { font-size: 1.15em; font-weight: 600; margin: 0.75em 0 0.5em; }
-.tiptap-md-content .ProseMirror p  { margin: 0.5em 0; line-height: 1.7; }
-.tiptap-md-content .ProseMirror ul { list-style-type: disc; padding-left: 1.5em; margin: 0.5em 0; }
-.tiptap-md-content .ProseMirror ol { list-style-type: decimal; padding-left: 1.5em; margin: 0.5em 0; }
-.tiptap-md-content .ProseMirror li { margin: 0.25em 0; }
+.tiptap-md-content .ProseMirror h1 {
+  font-size: 1.75em;
+  font-weight: 700;
+  margin: 0.75em 0 0.5em;
+}
+.tiptap-md-content .ProseMirror h2 {
+  font-size: 1.4em;
+  font-weight: 600;
+  margin: 0.75em 0 0.5em;
+}
+.tiptap-md-content .ProseMirror h3 {
+  font-size: 1.15em;
+  font-weight: 600;
+  margin: 0.75em 0 0.5em;
+}
+.tiptap-md-content .ProseMirror p {
+  margin: 0.5em 0;
+  line-height: 1.7;
+}
+.tiptap-md-content .ProseMirror ul {
+  list-style-type: disc;
+  padding-left: 1.5em;
+  margin: 0.5em 0;
+}
+.tiptap-md-content .ProseMirror ol {
+  list-style-type: decimal;
+  padding-left: 1.5em;
+  margin: 0.5em 0;
+}
+.tiptap-md-content .ProseMirror li {
+  margin: 0.25em 0;
+}
+/* GitHub-style task lists (`- [ ]` / `- [x]`), rendered by
+   @tiptap/extension-list's TaskList/TaskItem (registered in
+   MarkdownRichTextViewer.tsx). TaskList renders <ul data-type="taskList">;
+   each item is drawn by TaskItem's node-view as
+   <li data-checked><label><input type=checkbox><span></span></label><div>…</div></li>
+   — note the live editor DOM carries data-checked on the <li> but NOT
+   data-type (that only appears on the static renderHTML/clipboard path), so we
+   target items as `ul[data-type="taskList"] > li`. The data-attribute selector
+   out-specifies the plain ul/li rules above: drop the inherited disc marker and
+   lay the checkbox out beside the content instead of stacking on top of it. */
+.tiptap-md-content .ProseMirror ul[data-type="taskList"] {
+  list-style: none;
+  padding-left: 0;
+  margin: 0.5em 0;
+}
+.tiptap-md-content .ProseMirror ul[data-type="taskList"] > li {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5em;
+  margin: 0.25em 0;
+}
+/* The checkbox lives in a contenteditable=false <label>. Give the label the
+   height of one content line (paragraph line-height: 1.7) and center the
+   checkbox within it, so it sits on the first text line at any font size
+   instead of relying on a fixed margin nudge. */
+.tiptap-md-content .ProseMirror ul[data-type="taskList"] > li > label {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  height: 1.7em;
+  user-select: none;
+}
+.tiptap-md-content .ProseMirror ul[data-type="taskList"] > li > label input[type="checkbox"] {
+  width: 0.95em;
+  height: 0.95em;
+  margin: 0;
+  cursor: pointer;
+  accent-color: var(--primary);
+}
+/* Content column: the <div> wraps the item's paragraph(s). Collapse the
+   paragraph's default vertical margin so a single-line item hugs the checkbox. */
+.tiptap-md-content .ProseMirror ul[data-type="taskList"] > li > div {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.tiptap-md-content .ProseMirror ul[data-type="taskList"] > li > div > p {
+  margin: 0;
+}
+/* Nested checklists tuck under their parent item, not the page margin. */
+.tiptap-md-content .ProseMirror ul[data-type="taskList"] > li ul[data-type="taskList"] {
+  margin: 0.25em 0 0;
+}
 .tiptap-md-content .ProseMirror blockquote {
   border-left: 3px solid var(--border);
   padding-left: 1em;
@@ -782,11 +934,21 @@
   --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.47.22A.749.749 0 0 1 5 0h6c.199 0 .389.079.53.22l4.25 4.25c.141.14.22.331.22.53v6a.749.749 0 0 1-.22.53l-4.25 4.25a.749.749 0 0 1-.53.22H5a.749.749 0 0 1-.53-.22L.22 11.53A.749.749 0 0 1 0 11V5c0-.199.079-.389.22-.53Zm.84 1.28L1.5 5.31v5.38l3.81 3.81h5.38l3.81-3.81V5.31L10.69 1.5ZM8 4a.75.75 0 0 1 .75.75v3.5a.75.75 0 0 1-1.5 0v-3.5A.75.75 0 0 1 8 4Zm0 8a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z'/%3E%3C/svg%3E");
 }
 /* GitHub's dark-palette hues for the same five types. */
-.dark .tiptap-md-content .ProseMirror blockquote[data-alert-type="note"] { --md-alert-color: #4493f8; }
-.dark .tiptap-md-content .ProseMirror blockquote[data-alert-type="tip"] { --md-alert-color: #3fb950; }
-.dark .tiptap-md-content .ProseMirror blockquote[data-alert-type="important"] { --md-alert-color: #ab7df8; }
-.dark .tiptap-md-content .ProseMirror blockquote[data-alert-type="warning"] { --md-alert-color: #d29922; }
-.dark .tiptap-md-content .ProseMirror blockquote[data-alert-type="caution"] { --md-alert-color: #f85149; }
+.dark .tiptap-md-content .ProseMirror blockquote[data-alert-type="note"] {
+  --md-alert-color: #4493f8;
+}
+.dark .tiptap-md-content .ProseMirror blockquote[data-alert-type="tip"] {
+  --md-alert-color: #3fb950;
+}
+.dark .tiptap-md-content .ProseMirror blockquote[data-alert-type="important"] {
+  --md-alert-color: #ab7df8;
+}
+.dark .tiptap-md-content .ProseMirror blockquote[data-alert-type="warning"] {
+  --md-alert-color: #d29922;
+}
+.dark .tiptap-md-content .ProseMirror blockquote[data-alert-type="caution"] {
+  --md-alert-color: #f85149;
+}
 .tiptap-md-content .ProseMirror code {
   font-family: var(--font-mono);
   font-size: 0.85em;
@@ -801,13 +963,27 @@
   overflow-x: auto;
   margin: 0.75em 0;
 }
-.tiptap-md-content .ProseMirror pre code { background: none; padding: 0; }
-.tiptap-md-content .ProseMirror a { color: var(--primary); text-decoration: underline; }
-.tiptap-md-content .ProseMirror hr { border: none; border-top: 1px solid var(--border); margin: 1.5em 0; }
+.tiptap-md-content .ProseMirror pre code {
+  background: none;
+  padding: 0;
+}
+.tiptap-md-content .ProseMirror a {
+  color: var(--primary);
+  text-decoration: underline;
+}
+.tiptap-md-content .ProseMirror hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 1.5em 0;
+}
 /* Raw-HTML passthrough blocks (TipTapHtmlPassthrough.ts). Hidden blocks
    (comments, bare wrapper tags) keep the bytes without visual presence;
    summary blocks render as a dim disclosure line. */
-.tiptap-md-content .ProseMirror .md-html-passthrough-hidden { height: 0; overflow: hidden; margin: 0; }
+.tiptap-md-content .ProseMirror .md-html-passthrough-hidden {
+  height: 0;
+  overflow: hidden;
+  margin: 0;
+}
 .tiptap-md-content .ProseMirror .md-html-passthrough-summary {
   color: var(--muted-foreground);
   font-weight: 500;
@@ -817,19 +993,41 @@
    it would override explicit height="" attributes from HTML <img> tags.
    inline-block overrides Tailwind preflight's `img { display: block }` so
    images flow within headings/paragraphs (logos, badges) like on GitHub. */
-.tiptap-md-content .ProseMirror img { max-width: 100%; display: inline-block; vertical-align: middle; }
-.tiptap-md-content .ProseMirror img.ProseMirror-selectednode { outline: 2px solid var(--primary); border-radius: 2px; }
-.tiptap-md-content .ProseMirror .tableWrapper { overflow-x: auto; }
+.tiptap-md-content .ProseMirror img {
+  max-width: 100%;
+  display: inline-block;
+  vertical-align: middle;
+}
+.tiptap-md-content .ProseMirror img.ProseMirror-selectednode {
+  outline: 2px solid var(--primary);
+  border-radius: 2px;
+}
+.tiptap-md-content .ProseMirror .tableWrapper {
+  overflow-x: auto;
+}
 /* GitHub-style tables: auto layout + max-content so columns size to their
    content and the table hugs it (capped by the wrapper, which scrolls).
    Column-resize still works — prosemirror-tables' <col> widths apply under
    auto layout too, just less pixel-exact than with table-layout: fixed. */
-.tiptap-md-content .ProseMirror table { border-collapse: collapse; width: max-content; max-width: 100%; margin: 0.75em 0; }
+.tiptap-md-content .ProseMirror table {
+  border-collapse: collapse;
+  width: max-content;
+  max-width: 100%;
+  margin: 0.75em 0;
+}
 .tiptap-md-content .ProseMirror th,
-.tiptap-md-content .ProseMirror td { border: 1px solid var(--border); padding: 6px 13px; position: relative; }
-.tiptap-md-content .ProseMirror th { font-weight: 600; }
+.tiptap-md-content .ProseMirror td {
+  border: 1px solid var(--border);
+  padding: 6px 13px;
+  position: relative;
+}
+.tiptap-md-content .ProseMirror th {
+  font-weight: 600;
+}
 /* Zebra striping on even body rows (row 1 is the header), as on GitHub. */
-.tiptap-md-content .ProseMirror table tr:nth-child(odd):not(:first-child) { background: var(--muted); }
+.tiptap-md-content .ProseMirror table tr:nth-child(odd):not(:first-child) {
+  background: var(--muted);
+}
 /* Column resize handle injected by TipTap as a single element inside the
    hovered cell.  JS in TableBubbleMenu stretches top/height to the full
    table so it spans the entire column visually. */
@@ -838,11 +1036,13 @@
   pointer-events: none;
   position: absolute;
   right: -2px;
-  top: 0;         /* overridden by JS */
-  height: 100%;   /* fallback before JS runs */
+  top: 0; /* overridden by JS */
+  height: 100%; /* fallback before JS runs */
   width: 3px;
   z-index: 20;
   border-radius: 2px;
 }
 /* Cursor when hovering over a resizable column border */
-.tiptap-md-content .resize-cursor { cursor: col-resize; }
+.tiptap-md-content .resize-cursor {
+  cursor: col-resize;
+}

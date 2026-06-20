@@ -34,7 +34,7 @@ from omnigent.inner.codex_executor import (
     _populate_codex_home_config,
     _provider_codex_config_overrides,
 )
-from omnigent.inner.databricks_executor import _read_databrickscfg
+from omnigent.inner.databricks_executor import _read_databrickscfg, _read_databrickscfg_host
 
 _logger = logging.getLogger(__name__)
 
@@ -198,7 +198,7 @@ def _pin_codex_config_model(codex_home: Path, model: str) -> None:
 
             shutil.copy2(target, config_path)
     existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
-    pin_line = f'model = "{model}"'
+    pin_line = f"model = {json.dumps(model)}"
     lines = existing.splitlines()
     replaced = False
     for i, line in enumerate(lines):
@@ -802,11 +802,14 @@ def _codex_policy_hooks_settings(
     """
     Build the ``hooks.json`` payload registering the policy hook.
 
-    Registers one catch-all (no ``matcher``) command hook on both
-    ``PreToolUse`` (blocks before execution) and ``PostToolUse`` (warns
-    after). ``mcp__*`` tools are filtered out inside the hook itself, not
-    by a matcher, so the relay path remains the single MCP enforcement
-    point.
+    Registers one catch-all (no ``matcher``) command hook on
+    ``PreToolUse`` (blocks before execution), ``PostToolUse`` (warns
+    after), and ``UserPromptSubmit`` (blocks a user prompt before the
+    model sees it — the request-phase gate for native sessions, since
+    the server-level ``_evaluate_input_policy`` skips native message
+    events). ``mcp__*`` tools are filtered out inside the hook itself,
+    not by a matcher, so the relay path remains the single MCP
+    enforcement point.
 
     :param bridge_dir: Native Codex bridge directory.
     :param python_executable: Python executable for the hook command.
@@ -817,7 +820,13 @@ def _codex_policy_hooks_settings(
         "command": _codex_policy_hook_command(bridge_dir, python_executable),
         "timeout": _POLICY_HOOK_TIMEOUT_SECONDS,
     }
-    return {"hooks": {"PreToolUse": [{"hooks": [hook]}], "PostToolUse": [{"hooks": [hook]}]}}
+    return {
+        "hooks": {
+            "PreToolUse": [{"hooks": [hook]}],
+            "PostToolUse": [{"hooks": [hook]}],
+            "UserPromptSubmit": [{"hooks": [hook]}],
+        }
+    }
 
 
 def _write_codex_policy_hooks_file(
@@ -1060,13 +1069,14 @@ def build_codex_native_server(
     config_overrides: list[str] = []
     if profile is not None:
         creds = _read_databrickscfg(profile)
-        if creds is None:
+        host = creds.host if creds is not None else _read_databrickscfg_host(profile)
+        if not host:
             raise OSError(
                 f"Native Codex with Databricks profile {profile!r} (from your "
                 "provider config) requires a matching ~/.databrickscfg section "
-                "visible to the runner process."
+                "with a host visible to the runner process."
             )
-        host = creds.host.rstrip("/")
+        host = host.rstrip("/")
         config_overrides.extend(
             _databricks_codex_config_overrides(
                 model=model or _DATABRICKS_CODEX_DEFAULT_MODEL,

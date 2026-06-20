@@ -160,6 +160,7 @@ def test_build_codex_native_server_profile_error_names_profile(
         "omnigent.codex_native_app_server._read_databrickscfg",
         lambda _profile: None,
     )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / "missing-databrickscfg"))
 
     with pytest.raises(OSError, match="profile 'oss'"):
         build_codex_native_server(
@@ -172,6 +173,57 @@ def test_build_codex_native_server_profile_error_names_profile(
             ap_server_url=None,
             ap_auth_headers={},
         )
+
+
+def test_build_codex_native_server_uses_profile_host_without_static_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Native Codex accepts Databricks CLI OAuth profiles without static tokens.
+
+    A default Omnigent install may not include ``databricks-sdk`` in the
+    runner process. In that case ``_read_databrickscfg`` cannot mint a bearer
+    at startup, but the profile's host is still enough: Codex gets an
+    ``auth.command`` that runs ``databricks auth token --profile`` at request
+    time.
+    """
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server._find_codex_cli",
+        lambda: sys.executable,
+    )
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server._read_databrickscfg",
+        lambda _profile: None,
+    )
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "[oss]",
+                "host = https://example.cloud.databricks.com",
+                "auth_type = databricks-cli",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+
+    app_server = build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path,
+        model=None,
+        profile="oss",
+        bridge_dir=tmp_path / "bridge",
+        ap_server_url=None,
+        ap_auth_headers={},
+    )
+
+    overrides = "\n".join(app_server.config_overrides)
+    assert "https://example.cloud.databricks.com/ai-gateway/codex/v1" in overrides
+    assert 'databricks auth token --profile \\"oss\\"' in overrides
 
 
 def _test_app_server(
@@ -634,17 +686,37 @@ def test_policy_hooks_timeout_outlasts_the_hooks_request_budget() -> None:
     """
     settings = _codex_policy_hooks_settings(Path("/b"), "/venv/bin/python")
     hooks = settings["hooks"]
-    # Both phases register the same command hook; assert the timeout on each so
-    # neither can silently regress independently.
+    # All registered phases share the same command hook; assert the timeout on
+    # each so none can silently regress independently. UserPromptSubmit gates
+    # the request phase and also blocks on a server-side ASK park, so it needs
+    # the same generous timeout as the tool phases.
     pre = hooks["PreToolUse"][0]["hooks"][0]
     post = hooks["PostToolUse"][0]["hooks"][0]
+    prompt = hooks["UserPromptSubmit"][0]["hooks"][0]
     assert pre["timeout"] == _POLICY_HOOK_TIMEOUT_SECONDS
     assert post["timeout"] == _POLICY_HOOK_TIMEOUT_SECONDS
+    assert prompt["timeout"] == _POLICY_HOOK_TIMEOUT_SECONDS
     # The invariant that actually prevents the bug: codex must wait at least as
     # long as the hook itself will block on the server. If this fails (e.g. the
     # constant is dropped back to 30), the gate becomes advisory for every
     # native tool call, sub-agent or not.
     assert _POLICY_HOOK_TIMEOUT_SECONDS >= _EVALUATE_POLICY_TIMEOUT_S
+
+
+def test_policy_hooks_register_user_prompt_submit() -> None:
+    """The request-phase gate must be wired onto UserPromptSubmit.
+
+    For native sessions the server-level ``_evaluate_input_policy`` skips
+    message events, so this hook is the sole REQUEST gate. If it were dropped
+    from ``hooks.json``, native prompts (web-UI-injected and direct-terminal
+    alike) would reach the model with no request-phase policy at all.
+    """
+    settings = _codex_policy_hooks_settings(Path("/b"), "/venv/bin/python")
+    hooks = settings["hooks"]
+    assert "UserPromptSubmit" in hooks
+    prompt_hook = hooks["UserPromptSubmit"][0]["hooks"][0]
+    # Same evaluate-policy command as the tool phases.
+    assert prompt_hook["command"] == hooks["PreToolUse"][0]["hooks"][0]["command"]
 
 
 class TestPinCodexConfigModel:

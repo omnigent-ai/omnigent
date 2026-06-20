@@ -12,21 +12,28 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   basename,
+  joinPath,
   listingFilter,
   normalizeTypedPath,
   parentOf,
   WorkspacePicker,
 } from "./WorkspacePicker";
 import {
+  useCreateHostDirectory,
   useHostFilesystem,
   type HostFilesystemEntry,
 } from "@/hooks/useHostFilesystem";
 
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: vi.fn(),
+  // Default to an idle mutation; tests that exercise creation override
+  // mutateAsync. The component only reads this when the new-folder form
+  // is open, so the default is harmless for the other suites.
+  useCreateHostDirectory: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
 }));
 
 const useHostFilesystemMock = vi.mocked(useHostFilesystem);
+const useCreateHostDirectoryMock = vi.mocked(useCreateHostDirectory);
 
 function dir(name: string, path: string): HostFilesystemEntry {
   return { name, path, type: "directory", bytes: null, modified_at: 0 };
@@ -78,9 +85,7 @@ describe("parentOf", () => {
 
 describe("normalizeTypedPath", () => {
   it("returns the path unchanged for a clean absolute path", () => {
-    expect(normalizeTypedPath("/Users/corey/projects")).toBe(
-      "/Users/corey/projects",
-    );
+    expect(normalizeTypedPath("/Users/corey/projects")).toBe("/Users/corey/projects");
   });
 
   it("trims whitespace", () => {
@@ -92,9 +97,7 @@ describe("normalizeTypedPath", () => {
   it("collapses runs of slashes", () => {
     // A typo like "/Users//corey" should still navigate to the
     // intended directory rather than failing the listing.
-    expect(normalizeTypedPath("/Users//corey///foo")).toBe(
-      "/Users/corey/foo",
-    );
+    expect(normalizeTypedPath("/Users//corey///foo")).toBe("/Users/corey/foo");
   });
 
   it("strips a trailing slash", () => {
@@ -138,28 +141,20 @@ describe("normalizeTypedPath", () => {
     // The user from the bug report typed "~/omnigent"
     // and nothing happened. Now the picker expands it
     // client-side using the resolved home dir.
-    expect(
-      normalizeTypedPath("~/omnigent", "/Users/corey"),
-    ).toBe("/Users/corey/omnigent");
+    expect(normalizeTypedPath("~/omnigent", "/Users/corey")).toBe("/Users/corey/omnigent");
   });
 
   it("expands a bare tilde to the resolved home", () => {
-    expect(normalizeTypedPath("~", "/Users/corey")).toBe(
-      "/Users/corey",
-    );
+    expect(normalizeTypedPath("~", "/Users/corey")).toBe("/Users/corey");
   });
 
   it("collapses extra slashes after tilde expansion", () => {
     // ~//foo → home + "/" + "/foo" → run-of-slashes collapse.
-    expect(
-      normalizeTypedPath("~//projects", "/Users/corey"),
-    ).toBe("/Users/corey/projects");
+    expect(normalizeTypedPath("~//projects", "/Users/corey")).toBe("/Users/corey/projects");
   });
 
   it("strips a trailing slash after tilde expansion", () => {
-    expect(
-      normalizeTypedPath("~/projects/", "/Users/corey"),
-    ).toBe("/Users/corey/projects");
+    expect(normalizeTypedPath("~/projects/", "/Users/corey")).toBe("/Users/corey/projects");
   });
 
   it("does not support ~user form", () => {
@@ -248,9 +243,7 @@ describe("WorkspacePicker path bar", () => {
     useHostFilesystemMock.mockImplementation(() => result(listing));
 
     const { rerender } = render(<WorkspacePicker hostId="host_1" />);
-    const input = screen.getByTestId(
-      "workspace-picker-path-input",
-    ) as HTMLInputElement;
+    const input = screen.getByTestId("workspace-picker-path-input") as HTMLInputElement;
     fireEvent.change(input, { target: { value: "/Users/serena.ruan/Doc" } });
 
     // Home listing arrives — resolvedHome derives, currentAbsolute flips.
@@ -282,9 +275,7 @@ describe("WorkspacePicker path bar", () => {
     );
 
     render(<WorkspacePicker hostId="host_1" />);
-    const input = screen.getByTestId(
-      "workspace-picker-path-input",
-    ) as HTMLInputElement;
+    const input = screen.getByTestId("workspace-picker-path-input") as HTMLInputElement;
     fireEvent.click(screen.getByTestId("workspace-picker-entry-projects"));
     expect(input.value).toBe("/Users/serena.ruan/projects");
   });
@@ -304,13 +295,7 @@ describe("WorkspacePicker path bar", () => {
       }),
     );
     const onSelect = vi.fn();
-    render(
-      <WorkspacePicker
-        hostId="host_1"
-        initialPath="~/projects"
-        onSelect={onSelect}
-      />,
-    );
+    render(<WorkspacePicker hostId="host_1" initialPath="~/projects" onSelect={onSelect} />);
     fireEvent.click(screen.getByTestId("workspace-picker-select"));
     expect(onSelect).toHaveBeenCalledWith("/Users/corey/projects");
   });
@@ -458,5 +443,133 @@ describe("WorkspacePicker listing filter", () => {
     // not an actually-empty folder.
     expect(screen.getByText("No matching entries")).toBeTruthy();
     expect(screen.queryByTestId("workspace-picker-entry-src")).toBeNull();
+  });
+});
+
+describe("joinPath", () => {
+  it("joins a nested directory and a child name", () => {
+    expect(joinPath("/Users/me", "new-app")).toBe("/Users/me/new-app");
+  });
+
+  it("does not double the slash at the filesystem root", () => {
+    // "/" + "foo" must be "/foo", not "//foo" — the latter would
+    // confuse the host's path resolution.
+    expect(joinPath("/", "foo")).toBe("/foo");
+  });
+
+  it("ignores a trailing slash on the parent", () => {
+    expect(joinPath("/Users/me/", "foo")).toBe("/Users/me/foo");
+  });
+
+  it("trims surrounding whitespace from the child name", () => {
+    expect(joinPath("/Users/me", "  foo  ")).toBe("/Users/me/foo");
+  });
+});
+
+// The "New folder" action lets a user create a directory inline rather
+// than dropping to a terminal. It only makes sense once the picker has
+// resolved a real absolute directory to create in.
+describe("WorkspacePicker new folder", () => {
+  beforeEach(() => {
+    useHostFilesystemMock.mockReset();
+    useCreateHostDirectoryMock.mockReset();
+    useCreateHostDirectoryMock.mockReturnValue({
+      mutateAsync: vi.fn(),
+      isPending: false,
+    } as unknown as ReturnType<typeof useCreateHostDirectory>);
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  function listingWith(entries: HostFilesystemEntry[]) {
+    useHostFilesystemMock.mockReturnValue(
+      result({ data: { entries, truncated: false }, isLoading: false, isPlaceholderData: false }),
+    );
+  }
+
+  it("creates a folder under the current directory and navigates into it", async () => {
+    listingWith([dir("app", "/Users/corey/projects/app")]);
+    const mutateAsync = vi.fn().mockResolvedValue("/Users/corey/projects/fresh");
+    useCreateHostDirectoryMock.mockReturnValue({
+      mutateAsync,
+      isPending: false,
+    } as unknown as ReturnType<typeof useCreateHostDirectory>);
+
+    render(<WorkspacePicker hostId="host_1" initialPath="/Users/corey/projects" />);
+
+    fireEvent.click(screen.getByTestId("workspace-picker-new-folder"));
+    fireEvent.change(screen.getByTestId("workspace-picker-new-folder-input"), {
+      target: { value: "fresh" },
+    });
+    fireEvent.click(screen.getByTestId("workspace-picker-new-folder-create"));
+
+    await Promise.resolve();
+    expect(mutateAsync).toHaveBeenCalledWith({
+      hostId: "host_1",
+      path: "/Users/corey/projects/fresh",
+    });
+  });
+
+  it("shows the server error inline when creation fails", async () => {
+    listingWith([dir("app", "/Users/corey/projects/app")]);
+    const mutateAsync = vi.fn().mockRejectedValue(new Error("directory already exists"));
+    useCreateHostDirectoryMock.mockReturnValue({
+      mutateAsync,
+      isPending: false,
+    } as unknown as ReturnType<typeof useCreateHostDirectory>);
+
+    render(<WorkspacePicker hostId="host_1" initialPath="/Users/corey/projects" />);
+
+    fireEvent.click(screen.getByTestId("workspace-picker-new-folder"));
+    fireEvent.change(screen.getByTestId("workspace-picker-new-folder-input"), {
+      target: { value: "app" },
+    });
+    fireEvent.click(screen.getByTestId("workspace-picker-new-folder-create"));
+
+    // Let the rejected mutation settle and the error state render.
+    await screen.findByTestId("workspace-picker-new-folder-error");
+    expect(screen.getByTestId("workspace-picker-new-folder-error").textContent).toContain(
+      "already exists",
+    );
+  });
+
+  it("disables the New folder button until an absolute directory resolves", () => {
+    // Home view ("") with no listing yet — currentAbsolute is "", so the
+    // button is disabled (there is no real directory to create in).
+    useHostFilesystemMock.mockReturnValue(
+      result({ data: undefined, isLoading: true, isPlaceholderData: false }),
+    );
+    render(<WorkspacePicker hostId="host_1" />);
+    const btn = screen.getByTestId("workspace-picker-new-folder") as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+  });
+
+  it("creates under ~ when home is empty (no entry to resolve the absolute path)", async () => {
+    // An empty home has no entries, so the absolute home path can't be
+    // derived — but the listing HAS loaded. The button must still enable
+    // and create under "~" (the host expands it), otherwise the first
+    // folder in an empty home could never be made.
+    listingWith([]);
+    const mutateAsync = vi.fn().mockResolvedValue("/home/e2e/fresh");
+    useCreateHostDirectoryMock.mockReturnValue({
+      mutateAsync,
+      isPending: false,
+    } as unknown as ReturnType<typeof useCreateHostDirectory>);
+
+    render(<WorkspacePicker hostId="host_1" />);
+
+    const btn = screen.getByTestId("workspace-picker-new-folder") as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
+
+    fireEvent.click(btn);
+    fireEvent.change(screen.getByTestId("workspace-picker-new-folder-input"), {
+      target: { value: "fresh" },
+    });
+    fireEvent.click(screen.getByTestId("workspace-picker-new-folder-create"));
+
+    await Promise.resolve();
+    expect(mutateAsync).toHaveBeenCalledWith({ hostId: "host_1", path: "~/fresh" });
   });
 });

@@ -15,6 +15,7 @@ import { isMessageItem } from "./conversationItems";
 import type { MessageContentBlock } from "./blocks";
 import { authenticatedFetch } from "./identity";
 import type {
+  CodexModelOption,
   ModelUsage,
   NestedSessionItem,
   SandboxStatus,
@@ -184,6 +185,7 @@ interface SessionResponseWire {
    * description. Surfaced in the web composer's slash-command menu.
    */
   skills?: SkillSummary[];
+  model_options?: CodexModelOption[];
   /**
    * True while the runner is auto-creating a terminal-first session's
    * terminal. Drives the Terminal-pill spinner; absent on older
@@ -277,13 +279,14 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     subAgentName: wire.sub_agent_name ?? null,
     todos: wire.todos ?? [],
     skills: wire.skills ?? [],
+    codexModelOptions: wire.model_options ?? [],
     terminalPending: wire.terminal_pending ?? false,
     sandboxStatus: wire.sandbox_status ?? null,
   };
 }
 
 async function readJsonOrThrow<T>(res: Response): Promise<T> {
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (!res.ok) throw await apiErrorFromResponse(res);
   return (await res.json()) as T;
 }
 
@@ -556,6 +559,7 @@ export async function updateSession(
   updates: {
     reasoningEffort?: string | null;
     modelOverride?: string | null;
+    codexPlanMode?: boolean;
     costControlModeOverride?: "on" | "off" | null;
     runnerId?: string;
     silent?: boolean;
@@ -567,6 +571,9 @@ export async function updateSession(
   }
   if ("modelOverride" in updates) {
     body.model_override = updates.modelOverride ?? "default";
+  }
+  if (updates.codexPlanMode !== undefined) {
+    body.collaboration_mode = updates.codexPlanMode ? "plan" : "default";
   }
   if ("costControlModeOverride" in updates) {
     body.cost_control_mode_override = updates.costControlModeOverride ?? null;
@@ -655,9 +662,26 @@ export async function getSession(sessionId: string): Promise<Session> {
  * on the SAME variant — mixing full and slim under one key would let a
  * cached slim snapshot serve a caller that expected items.
  */
-export async function getSessionSlim(sessionId: string): Promise<Session> {
+export interface GetSessionSlimOptions {
+  /**
+   * Ask the AP server to refresh runner-backed session state before
+   * returning the snapshot. Used by page-load/bind paths so a browser
+   * refresh pierces stale server-side capability caches.
+   */
+  refreshState?: boolean;
+}
+
+export async function getSessionSlim(
+  sessionId: string,
+  options: GetSessionSlimOptions = {},
+): Promise<Session> {
+  const params = new URLSearchParams({
+    include_items: "false",
+    include_liveness: "false",
+  });
+  if (options.refreshState === true) params.set("refresh_state", "true");
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}?include_items=false&include_liveness=false`,
+    `/v1/sessions/${encodeURIComponent(sessionId)}?${params.toString()}`,
   );
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
 }

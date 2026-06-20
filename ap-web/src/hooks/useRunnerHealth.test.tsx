@@ -48,9 +48,7 @@ describe("useRunnerHealth", () => {
         conv_b: { runner_online: false, host_online: true },
       }),
     );
-    const { result } = renderHook(() =>
-      useRunnerHealth([input("conv_a"), input("conv_b")]),
-    );
+    const { result } = renderHook(() => useRunnerHealth([input("conv_a"), input("conv_b")]));
 
     await waitFor(() => expect(result.current.size).toBe(2));
     // Assert both fields, not just structure: this proves the host-aware
@@ -73,9 +71,7 @@ describe("useRunnerHealth", () => {
     );
     const { result } = renderHook(() => useRunnerHealth([input("conv_a", "runner_x")]));
 
-    await waitFor(() =>
-      expect(result.current.get("conv_a")?.runner_online).toBe(true),
-    );
+    await waitFor(() => expect(result.current.get("conv_a")?.runner_online).toBe(true));
   });
 
   it("reports a dead-runner-on-live-host as runner_online false, host_online true", async () => {
@@ -96,9 +92,7 @@ describe("useRunnerHealth", () => {
   it("defaults host_online to null when the server omits it (not host-bound)", async () => {
     // A non-host-bound session has no host to be online; the server reports
     // host_online null (or omits it), and the poll normalizes to null.
-    fetchMock.mockResolvedValueOnce(
-      mockHealth({ conv_a: { runner_online: true } }),
-    );
+    fetchMock.mockResolvedValueOnce(mockHealth({ conv_a: { runner_online: true } }));
     const { result } = renderHook(() => useRunnerHealth([input("conv_a")]));
 
     await waitFor(() => expect(result.current.has("conv_a")).toBe(true));

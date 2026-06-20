@@ -33,6 +33,7 @@ import type {
   RetryEvent,
   SessionChangedFilesInvalidatedEvent,
   SessionChildSessionUpdatedEvent,
+  SessionModelOptionsEvent,
   SessionCreatedEvent,
   SessionInputConsumedEvent,
   SessionInterruptedEvent,
@@ -45,6 +46,8 @@ import type {
   SessionTerminalActivityEvent,
   SessionStatusEvent,
   SessionModelEvent,
+  SessionCollaborationModeEvent,
+  SessionReasoningEffortEvent,
   SessionAgentChangedEvent,
   SessionTodosEvent,
   SessionSandboxStatusEvent,
@@ -408,7 +411,11 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     if (
       typeof conversationId === "string" &&
       conversationId &&
-      (status === "idle" || status === "running" || status === "waiting" || status === "failed")
+      (status === "idle" ||
+        status === "launching" ||
+        status === "running" ||
+        status === "waiting" ||
+        status === "failed")
     ) {
       const responseId = typeof data.response_id === "string" ? data.response_id : undefined;
       return {
@@ -483,6 +490,28 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     const model = data.model;
     if (typeof model !== "string" || !model) return null;
     return { type: "session_model", conversationId, model } satisfies SessionModelEvent;
+  }
+  if (eventType === "session.reasoning_effort") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const reasoningEffort = data.reasoning_effort;
+    if (reasoningEffort !== null && typeof reasoningEffort !== "string") return null;
+    return {
+      type: "session_reasoning_effort",
+      conversationId,
+      reasoningEffort,
+    } satisfies SessionReasoningEffortEvent;
+  }
+  if (eventType === "session.collaboration_mode") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const mode = data.mode;
+    if (typeof mode !== "string") return null;
+    return {
+      type: "session_collaboration_mode",
+      conversationId,
+      mode,
+    } satisfies SessionCollaborationModeEvent;
   }
   if (eventType === "session.agent_changed") {
     const conversationId = data.conversation_id;
@@ -674,6 +703,14 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       type: "session_skills",
       conversationId,
     } satisfies SessionSkillsEvent;
+  }
+  if (eventType === "session.model_options") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    return {
+      type: "session_model_options",
+      conversationId,
+    } satisfies SessionModelOptionsEvent;
   }
   if (eventType === "session.presence") {
     const conversationId = data.conversation_id;
