@@ -176,6 +176,7 @@ COMMON_PROVIDERS: list[str] = [
     "gemini",
     "vertex_ai",
     "azure",
+    "litellm",
     "xai",
     "mistral",
     "groq",
@@ -570,6 +571,27 @@ _PROVIDER_AUTH_MODES: dict[str, dict[str, dict[str, Any]]] = {
             ],
         },
     },
+    "litellm": {
+        "api_key": {
+            "display_name": "API Key",
+            "description": "Use LiteLLM API Key (proxy master key or provider API key)",
+            "default": True,
+            "fields": [
+                {
+                    "name": "api_key",
+                    "description": "LiteLLM API Key",
+                    "secret": True,
+                    "required": False,
+                },
+                {
+                    "name": "base_url",
+                    "description": "LiteLLM Proxy URL (e.g. http://localhost:4000)",
+                    "secret": False,
+                    "required": False,
+                },
+            ],
+        },
+    },
     "sagemaker": {
         "access_keys": {
             "display_name": "Access Keys",
@@ -609,6 +631,7 @@ _PROVIDER_DISPLAY_NAMES: dict[str, str] = {
     "gemini": "Google Gemini",
     "vertex_ai": "Google Vertex AI",
     "azure": "Azure OpenAI",
+    "litellm": "LiteLLM",
     "groq": "Groq",
     "databricks": "Databricks",
     "xai": "xAI",
@@ -667,6 +690,7 @@ PROVIDER_ENV_VARS: dict[str, str] = {
     "cerebras": "CEREBRAS_API_KEY",
     "sambanova": "SAMBANOVA_API_KEY",
     "novita": "NOVITA_API_KEY",
+    "litellm": "LITELLM_API_KEY",
 }
 
 

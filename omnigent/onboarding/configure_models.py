@@ -147,6 +147,7 @@ _CATALOG_PROVIDER_FAMILY: dict[str, str] = {
     "mistral": OPENAI_FAMILY,
     "together_ai": OPENAI_FAMILY,
     "fireworks_ai": OPENAI_FAMILY,
+    "litellm": OPENAI_FAMILY,
 }
 
 
@@ -237,6 +238,7 @@ _PROVIDER_DISPLAY_NAME: dict[str, str] = {
     "mistral": "Mistral",
     "together_ai": "Together AI",
     "fireworks_ai": "Fireworks AI",
+    "litellm": "LiteLLM",
     "gemini": "Google Gemini",
     "google": "Google Gemini",
     "databricks": "Databricks",
@@ -430,6 +432,11 @@ def add_menu_options() -> list[AddOption]:
             "Gateway — custom base URL + key (e.g. OpenRouter)",
             "An OpenAI/Anthropic-compatible proxy: LiteLLM, Ollama, OpenRouter, vLLM, …",
             GATEWAY_KIND,
+        ),
+        AddOption(
+            label="\N{HIGH-SPEED TRAIN} LiteLLM — proxy URL + key",
+            description="100+ providers via LiteLLM AI gateway proxy (litellm.ai).",
+            kind=GATEWAY_KIND,
         ),
         _opt(
             "OpenRouter — API key",

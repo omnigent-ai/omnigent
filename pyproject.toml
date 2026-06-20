@@ -145,6 +145,7 @@ antigravity = ["google-antigravity>=0.1,<1"]
 # cursor` users need this extra (`omnigent[cursor]`). Was a baseline dependency;
 # now opt-in to keep the default install lean.
 cursor = ["cursor-sdk>=0.1.7"]
+litellm = ["litellm>=1.80.0,<1.87.0"]
 databricks = [
     # Floor matches what core code was tested against when the SDK was a
     # default dependency (it moved here from `dependencies` above).
@@ -514,6 +515,10 @@ ignore_missing_imports = true
 # a base dependency, so its imports are unresolved in the default env too.
 [[tool.mypy.overrides]]
 module = "openshell.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "litellm.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
