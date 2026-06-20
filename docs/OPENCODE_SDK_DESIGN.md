@@ -207,3 +207,56 @@ usage; plus MCP-bridge variant).
 - **Auth token materialisation** for gateway providers without a static key:
   keep the PR's one-shot `_materialise_one_shot_token` (non-refreshing,
   documented).
+
+## Status: implemented
+
+Landed across 13 TDD tasks. Module layout:
+
+- `omnigent/inner/opencode_executor.py` — helpers, config synthesis, event
+  translation, `_OpenCodeServer` lifecycle, `_OmnigentToolBridge` (in-process
+  FastMCP), and `OpenCodeExecutor` (turn loop + interrupt + live queue).
+- `omnigent/inner/opencode_harness.py` — `create_app()` wrap.
+- Registry / spec allowlist / `AgentHarnessType` / spawn-env + provider &
+  Databricks routing (`workflow.py`) / runner dispatch (`runner/app.py`) /
+  model catalog + override / onboarding install + readiness / `omnigent
+  opencode` CLI / docs / `examples/opencode_hello.yaml` / frontend glyph note.
+
+Tests: 40 opencode unit tests + 1 opt-in e2e (`OMNIGENT_E2E_OPENCODE=1`).
+`ruff` clean across all touched files; `mypy` clears every error except the
+`explicit-any` class, which the sibling inner executors (e.g.
+`codex_executor.py`) also carry at the untyped-SDK boundary.
+
+### Notes / details settled during implementation
+
+- **`session.chat` requires both `provider_id` and `model_id`** (no SDK
+  defaults). When the model is unpinned or carries no provider prefix, both
+  are resolved from `client.app.providers().default` (a `{provider_id:
+  model_id}` map) and cached. Applies to `enqueue_session_message` too.
+- **No reasoning Part type** in `opencode-ai` 0.1.0a36 — the Part union is
+  text/file/tool/step*/snapshot/patch — so reasoning does not stream even with
+  `HARNESS_OPENCODE_THINKING=1`. The translator's reasoning branch is retained
+  for forward-compat but never fires.
+- **MCP tool schema registration**: `FastMCP.add_tool` infers the schema from
+  the handler signature and has no JSON-schema parameter, so each spec tool is
+  registered by synthesising a keyword-only `__signature__` from its
+  `parameters`, building the `Tool` via `Tool.from_function`, then overriding
+  `tool.parameters` with the original spec schema so OpenCode sees real types.
+- **Chat task lifecycle**: the `session.chat` task is reaped (cancelled +
+  awaited) on every non-idle exit (`session.error`, exception, cancellation)
+  so it can never outlive the turn.
+- The tool-bridge uvicorn server runs with `ws="none"` (the MCP transport is
+  POST/SSE only) and raises if it does not reach `started` within ~5s.
+
+### Deferred (documented; match the PR's follow-up list)
+
+- **Multimodal input** — image/file/audio blocks are dropped with a warning in
+  `_latest_user_text`; only text reaches OpenCode.
+- **Native TUI** (`opencode-native`, tmux-pane parity with `omnigent claude` /
+  `omnigent codex`).
+- **Dedicated frontend glyph** — `AgentCard.tsx` falls through to `BotIcon`.
+- **`--continue` / last-session resume** affordance.
+- **Three extra provider-default integration tests** from the PR reference
+  (anthropic global default, openai-family fallback, workdir→cwd) — the unit
+  builder tests cover the core paths; these can be ported into
+  `tests/runtime/test_provider_spawn_env.py` later.
+- **uv.lock regeneration** for the new `opencode-ai` dependency before release.
