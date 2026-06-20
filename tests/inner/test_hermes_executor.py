@@ -31,7 +31,6 @@ from omnigent.inner.hermes_executor import (
     _strip_hermes_metadata,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helper function tests
 # ---------------------------------------------------------------------------
@@ -45,7 +44,10 @@ class TestUtils:
         assert _strip_hermes_metadata(output) == "Hello, world!"
 
     def test_strip_hermes_metadata_removes_resume_notice(self) -> None:
-        output = "↻ Resumed session 20260620_123456_abc123 (1 message)\n\nsession_id: 20260620_123456_abc123\nHello again!"
+        output = (
+            "↻ Resumed session 20260620_123456_abc123 (1 message)\n"
+            "\nsession_id: 20260620_123456_abc123\nHello again!"
+        )
         assert _strip_hermes_metadata(output) == "Hello again!"
 
     def test_strip_hermes_metadata_removes_warnings(self) -> None:
@@ -110,9 +112,7 @@ class TestUtils:
         assert "deepseek/deepseek-chat" in args
 
     def test_build_hermes_args_with_session(self) -> None:
-        args = _build_hermes_args(
-            "hermes", "Hi", session_id="20260620_abc123"
-        )
+        args = _build_hermes_args("hermes", "Hi", session_id="20260620_abc123")
         assert "--resume" in args
         idx = args.index("--resume")
         assert args[idx + 1] == "20260620_abc123"
@@ -219,9 +219,7 @@ async def test_run_turn_subprocess_error(
     """A non-zero exit code yields ExecutorError."""
     mock_process = MagicMock()
     mock_process.returncode = 1
-    mock_process.communicate = AsyncMock(
-        return_value=(b"", b"Error: something went wrong")
-    )
+    mock_process.communicate = AsyncMock(return_value=(b"", b"Error: something went wrong"))
 
     with patch.object(
         asyncio,
@@ -286,9 +284,7 @@ async def test_run_turn_stores_session_id(
     ):
         events = []
         async for event in executor.run_turn(
-            messages=[
-                {"role": "user", "content": "Hi", "session_id": "test-session-key"}
-            ],
+            messages=[{"role": "user", "content": "Hi", "session_id": "test-session-key"}],
             tools=[],
             system_prompt="",
         ):
@@ -319,9 +315,7 @@ async def test_run_turn_resumes_existing_session(
     ) as mock_create:
         events = []
         async for event in executor.run_turn(
-            messages=[
-                {"role": "user", "content": "Follow up", "session_id": "test-session-key"}
-            ],
+            messages=[{"role": "user", "content": "Follow up", "session_id": "test-session-key"}],
             tools=[],
             system_prompt="",
         ):
@@ -341,9 +335,7 @@ async def test_run_turn_passes_model_from_config(
     """Model from ExecutorConfig.extra or config.model is threaded through."""
     mock_process = MagicMock()
     mock_process.returncode = 0
-    mock_process.communicate = AsyncMock(
-        return_value=(b"session_id: test\nResponse", b"")
-    )
+    mock_process.communicate = AsyncMock(return_value=(b"session_id: test\nResponse", b""))
     config = ExecutorConfig(model="deepseek/deepseek-chat")
 
     with patch.object(

@@ -13,9 +13,6 @@ in the e2e suite, gated on the ``hermes`` binary being available.
 
 from __future__ import annotations
 
-from typing import Any
-from unittest.mock import patch
-
 import pytest
 
 from omnigent.inner import hermes_harness

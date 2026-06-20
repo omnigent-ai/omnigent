@@ -38,13 +38,11 @@ Env vars read at construction:
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import re
 import shutil
 from collections.abc import AsyncIterator
-from typing import Any
 
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
@@ -160,7 +158,6 @@ def _build_hermes_args(
     *,
     model: str | None = None,
     session_id: str | None = None,
-    cwd: str | None = None,
 ) -> list[str]:
     """
     Build the argument list for a Hermes subprocess call.
@@ -169,7 +166,6 @@ def _build_hermes_args(
     :param message: The user message text.
     :param model: Optional model override (``-m`` flag).
     :param session_id: Optional session ID to resume (``--resume``).
-    :param cwd: Not used in arg building (passed to subprocess as cwd).
     :returns: A list of CLI arguments.
     """
     args = [
@@ -329,7 +325,8 @@ class HermesExecutor(Executor):
             yield ExecutorError(
                 message=(
                     f"Hermes CLI not found at '{self._hermes_path}'. "
-                    "Install Hermes Agent (curl -fsSL https://hermes-agent.nousresearch.com/install.sh | sh)"
+                    "Install: curl -fsSL https://hermes-agent.nousresearch.com"
+                    "/install.sh | sh"
                 ),
                 retryable=False,
             )
@@ -383,10 +380,9 @@ class HermesExecutor(Executor):
             if isinstance(sid, str) and sid:
                 return sid
         # Fallback: hash the serialised messages for a stable key
-        return str(hash(tuple(
-            (m.get("role", ""), str(m.get("content", ""))[:200])
-            for m in messages
-        )))
+        return str(
+            hash(tuple((m.get("role", ""), str(m.get("content", ""))[:200]) for m in messages))
+        )
 
     async def close_session(self, session_key: str) -> None:
         """
