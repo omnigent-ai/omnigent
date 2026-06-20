@@ -49,7 +49,7 @@ resolved from the YAML file's directory.
 
 ```yaml
 executor:
-  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, pi, antigravity, ...
+  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, pi, antigravity, hermes, ...
   model: databricks-claude-opus-4-7
   auth:
     type: databricks
@@ -93,6 +93,35 @@ CLI flags such as `--harness` and `--model` can override or supply missing
 executor values for a run. Databricks credentials come from the spec's
 `executor.auth` block or your `omnigent setup` provider config — there is
 no profile flag.
+
+### Hermes (Hermes Agent)
+
+`harness: hermes` runs the agent through the
+[Hermes Agent CLI](https://hermes-agent.nousresearch.com/),
+a self-improving open-source AI agent by Nous Research.
+Hermes manages its own session state, tool execution, provider-agnostic
+model routing, skills, and persistent memory.  Omnigent provides the
+web UI, collaboration, sandboxing, and policy layer.
+
+The ``hermes`` binary must be on PATH (or set via
+``HARNESS_HERMES_PATH``).  Install with:
+
+```bash
+curl -fsSL https://hermes-agent.nousresearch.com/install.sh | sh
+```
+
+```yaml
+executor:
+  harness: hermes
+  # Model is optional — Hermes uses its own configured default model
+  # from ~/.hermes/config.yaml if omitted:
+  # model: anthropic/claude-sonnet-4
+```
+
+Each turn runs ``hermes chat -q`` as a subprocess.  On the first turn the
+harness captures the Hermes session ID; subsequent turns use
+``--resume <session_id>`` so conversational context is maintained
+through Hermes' own SQLite session store.
 
 ## Local OS access
 

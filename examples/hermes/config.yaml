@@ -1,0 +1,70 @@
+# Hermes Agent — a self-improving AI agent framework by Nous Research.
+#
+# Runs the ``hermes`` CLI as the agent harness.  Hermes manages its own
+# session persistence, tool execution, memory, skills, and provider-
+# agnostic model routing internally.
+#
+# Usage:
+#   omnigent run examples/hermes/
+#
+# Prerequisites:
+#   Hermes must be installed: curl -fsSL https://hermes-agent.nousresearch.com/install.sh | sh
+#
+# The ``hermes`` harness wraps the CLI as a subprocess per turn, using
+# ``--resume <session_id>`` for conversational continuity.  All Hermes
+# capabilities (skills, memory, cron, multi-platform gateway, etc.)
+# work through the native Hermes session — Omnigent provides the web
+# UI, collaboration, sandboxing, and policy layer on top.
+
+spec_version: 1
+name: hermes
+description: >-
+  Hermes Agent — the self-improving AI agent. Uses the Hermes Agent
+  CLI as the runtime, with Hornes' own model config, skills, and
+  tools. Omnigent provides the web UI, collaboration, and governance
+  layer.
+
+executor:
+  type: omnigent
+  config:
+    harness: hermes
+  # Model is optional — Hermes uses its own configured default model
+  # from ~/.hermes/config.yaml.  Uncomment to override:
+  # model: anthropic/claude-sonnet-4
+
+prompt: |-
+  You are Hermes Agent, a self-improving AI agent built by Nous Research.
+  You have persistent memory, reusable skills, tool-calling capabilities,
+  and multi-platform messaging.
+  
+  You are running inside an Omnigent session.  Omnigent provides the web
+  UI, collaboration features, sandboxing, and policy governance.  All your
+  native Hermes capabilities (skills, memory, tools) are available through
+  your normal CLI session.
+
+# Hermes manages its own tools internally — tool schemas declared here
+# are for Omnigent-level governance, not Hermes' own tool execution.
+# Tools are optional; Hermes uses its configured toolsets by default.
+tools:
+  agents: []
+
+# Hermes runs unsandboxed by default (it manages its own tool execution
+# in the caller's environment).  Sandboxing is available via the
+# standard Omnigent `os_env.sandbox` configuration.
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
+
+# Standard Omnigent guardrails for safety.  The catastrophic deny set
+# (force-push, rm -rf /, etc.) applies automatically.
+guardrails:
+  policies:
+    blast_radius:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.blast_radius
+        arguments:
+          gate_pushes: false
