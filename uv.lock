@@ -2477,6 +2477,7 @@ agents-sdk = [
 ]
 all = [
     { name = "databricks-sdk" },
+    { name = "opencode-ai" },
 ]
 bedrock = [
     { name = "boto3" },
@@ -2511,6 +2512,9 @@ dev = [
 ]
 modal = [
     { name = "modal" },
+]
+opencode = [
+    { name = "opencode-ai" },
 ]
 tracing = [
     { name = "mlflow" },
@@ -2551,6 +2555,8 @@ requires-dist = [
     { name = "openai", specifier = ">=1.0,<3" },
     { name = "openai-agents", specifier = ">=0.0.17" },
     { name = "openai-agents", marker = "extra == 'agents-sdk'", specifier = ">=0.1,<1" },
+    { name = "opencode-ai", marker = "extra == 'all'", specifier = ">=0.1.0a36" },
+    { name = "opencode-ai", marker = "extra == 'opencode'", specifier = ">=0.1.0a36" },
     { name = "opentelemetry-distro", marker = "extra == 'databricks'", specifier = ">=0,<1" },
     { name = "opentelemetry-exporter-otlp-proto-grpc", specifier = ">=1.20,<2" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.20,<2" },
@@ -2584,7 +2590,7 @@ requires-dist = [
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30,<1" },
 ]
-provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "vertex", "modal", "daytona", "tracing", "agents-sdk", "databricks", "dev"]
+provides-extras = ["claude-sdk", "openai-agents", "opencode", "all", "bedrock", "vertex", "modal", "daytona", "tracing", "agents-sdk", "databricks", "dev"]
 
 [[package]]
 name = "omnigent-client"
@@ -2657,6 +2663,23 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/b2/db/97577be8089482d16cfe1ba3829a06910dc4e4dd8f43e99b66e5e05b99a3/openai_agents-0.13.4.tar.gz", hash = "sha256:977e27f2a51e8d95cd1c90f2378445d9b5ca77b22671d47a3e01507a03a6536a", size = 2693163, upload-time = "2026-04-01T02:38:16.07Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/7a/9c/02a5753a272888a8699ca766033e1c7d29d790b645582215f6e0e066686d/openai_agents-0.13.4-py3-none-any.whl", hash = "sha256:fc7d1d661d7261a3f4153fa3fe3b2c509dc4b1ede331f41c366901c93c9adb7f", size = 469589, upload-time = "2026-04-01T02:38:14.448Z" },
+]
+
+[[package]]
+name = "opencode-ai"
+version = "0.1.0a36"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "distro" },
+    { name = "httpx" },
+    { name = "pydantic" },
+    { name = "sniffio" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/b1/d5/51f96d49dd41c5d9996c7f03e22a760085c3589a43dacb8fa77a77c4d1cb/opencode_ai-0.1.0a36.tar.gz", hash = "sha256:3cd89e86e4a333f52999fc0df337afc9be39298c755e1a241d77dd33d7d79050", size = 108133, upload-time = "2025-08-27T02:38:58.878Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/17/af/0379ba45fd2f4c14be3b62a78714b1b34705d0472cdd8d62df47a8fb1ffd/opencode_ai-0.1.0a36-py3-none-any.whl", hash = "sha256:73bce046ec3d841dadb31bed658a5049f25cf0c2e3ebda2e2d1ff37d792ea1b5", size = 110221, upload-time = "2025-08-27T02:38:57.501Z" },
 ]
 
 [[package]]

@@ -61,7 +61,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 // returns agents newest-registered first (agent_store.list sorts by
 // created_at desc), so pin the order users expect; any agent not listed
 // here falls after, in server order.
-const AGENT_DISPLAY_ORDER = ["Claude Code", "Codex", "Polly"];
+const AGENT_DISPLAY_ORDER = ["Claude Code", "Codex", "Polly", "OpenCode"];
 
 // Hidden on the new-session picker only (superseded by polly; older
 // deployments still carry a seeded nessie row this filter keeps out).

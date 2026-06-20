@@ -39,6 +39,20 @@ export function harnessFamily(harness: string | null | undefined): "anthropic" |
   }
 }
 
+/** SDK harnesses that replay the Omnigent transcript as context and
+ * therefore carry history across forks/switches regardless of provider
+ * family. Multi-provider harnesses like OpenCode don't map to a single
+ * family but are still history-preserving SDK targets. */
+const _SDK_HISTORY_HARNESSES: ReadonlySet<string> = new Set([
+  "claude-sdk",
+  "claude_sdk",
+  "codex",
+  "openai-agents",
+  "openai-agents-sdk",
+  "agents_sdk",
+  "opencode",
+]);
+
 /** Whether a harness is a native CLI harness (Claude Code / Codex). */
 export function isNativeHarness(harness: string | null | undefined): boolean {
   return (
@@ -74,6 +88,8 @@ export function isNativeHarness(harness: string | null | undefined): boolean {
  * @param targetHarness - The harness the fork would switch to.
  */
 export function forkTargetCarriesHistory(targetHarness: string | null | undefined): boolean {
+  if (!targetHarness) return false;
+  if (_SDK_HISTORY_HARNESSES.has(targetHarness)) return true;
   return harnessFamily(targetHarness) !== null;
 }
 

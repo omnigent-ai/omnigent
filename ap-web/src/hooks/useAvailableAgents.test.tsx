@@ -95,7 +95,7 @@ describe("useAvailableAgents", () => {
     expect(urls).toContain(SCAN_URL);
   });
 
-  it("maps rows into AvailableAgent and applies the claude-native, nessie, and debby display names", async () => {
+  it("maps rows into AvailableAgent and applies the claude-native, nessie, debby, and opencode display names", async () => {
     routeFetch({
       [BUILTINS_URL]: mockResponse({
         object: "list",
@@ -118,6 +118,12 @@ describe("useAvailableAgents", () => {
             name: "debby",
             description: "A two-headed brainstorming partner.",
             harness: "claude-sdk",
+          },
+          {
+            id: "ag_opencode",
+            name: "opencode",
+            description: "Multi-provider coding agent.",
+            harness: "opencode",
           },
           {
             id: "ag_yaml",
@@ -167,6 +173,14 @@ describe("useAvailableAgents", () => {
         display_name: "Debby",
         description: "A two-headed brainstorming partner.",
         harness: "claude-sdk",
+        skills: [],
+      },
+      {
+        id: "ag_opencode",
+        name: "opencode",
+        display_name: "OpenCode",
+        description: "Multi-provider coding agent.",
+        harness: "opencode",
         skills: [],
       },
       {

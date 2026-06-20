@@ -27,6 +27,7 @@ const DISPLAY_NAMES: Record<string, string> = {
   nessie: "Nessie",
   polly: "Polly",
   debby: "Debby",
+  opencode: "OpenCode",
 };
 
 /** Wire row of the built-in list, GET /v1/agents. */

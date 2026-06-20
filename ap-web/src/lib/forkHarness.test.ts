@@ -45,12 +45,16 @@ describe("forkTargetCarriesHistory", () => {
   // SDK targets always carry history as context, regardless of source or
   // family — including native → SDK and cross-family. A false here would
   // wrongly hide a fully-supported switch from the picker.
-  it.each([["claude-sdk"], ["claude_sdk"], ["codex"], ["openai-agents"], ["agents_sdk"]])(
-    "SDK target %s carries history",
-    (target) => {
-      expect(forkTargetCarriesHistory(target)).toBe(true);
-    },
-  );
+  it.each([
+    ["claude-sdk"],
+    ["claude_sdk"],
+    ["codex"],
+    ["openai-agents"],
+    ["agents_sdk"],
+    ["opencode"],
+  ])("SDK target %s carries history", (target) => {
+    expect(forkTargetCarriesHistory(target)).toBe(true);
+  });
 
   // Native targets carry from ANY source: the runner clones the source's
   // native transcript when the source is same-family native, else rebuilds
