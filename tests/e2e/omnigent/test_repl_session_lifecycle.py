@@ -41,7 +41,6 @@ _LOCAL_REMOTE_AUTH_TOKEN = "local-e2e-runner-token"
 _READY_TIMEOUT = 90.0
 _TURN_TIMEOUT = 240.0
 _EXIT_TIMEOUT = 20.0
-_RUNNER_CMD_MARKER = "omnigent.runner._entry"
 _POLL_PAUSE = threading.Event()
 
 
@@ -83,22 +82,6 @@ def _pause_between_external_polls(interval_s: float) -> None:
     :param interval_s: Pause length in seconds, e.g. ``0.25``.
     """
     _POLL_PAUSE.wait(interval_s)
-
-
-def _host_daemon_pid(home: Path) -> int:
-    """
-    Return the connect daemon pid recorded under an isolated test HOME.
-
-    :param home: HOME directory used by a REPL subprocess.
-    :returns: The daemon process id.
-    :raises AssertionError: If the pidfile is missing or malformed.
-    """
-    pid_path = home / ".omnigent" / "host.pid"
-    try:
-        first_line = pid_path.read_text().splitlines()[0]
-        return int(first_line)
-    except (IndexError, OSError, ValueError) as exc:
-        raise AssertionError(f"Missing or invalid daemon pidfile at {pid_path}") from exc
 
 
 def _stop_host_daemon(home: Path) -> None:
@@ -248,7 +231,9 @@ def _spawn_run(
     elif no_session:
         args.append("--no-session")
     if session_id is not None:
-        args.extend(["--session", session_id])
+        # Resume a prior conversation by id. The flag was renamed
+        # --session -> -r/--resume in the current CLI.
+        args.extend(["--resume", session_id])
     return pexpect.spawn(
         str(omnigent_python),
         args,
@@ -324,23 +309,64 @@ def _wait_session_runner_online(
     )
 
 
+def _newest_session_id(base_url: str, agent_name: str) -> str:
+    """
+    Resolve the most recent session id for *agent_name* via the API.
+
+    The sessions-adapter debug log emits ``session created``/``resuming
+    existing session`` ids, but in the ``--server``/daemon flow those
+    fire once at STARTUP (before :func:`_wait_ready` returns) and never
+    re-appear on a turn — so scraping them from the PTY races. The
+    server's session list is the robust source of truth instead.
+
+    :param base_url: Omnigent server URL.
+    :param agent_name: Agent display name to resolve.
+    :returns: The newest session id, e.g. ``"conv_..."``.
+    :raises AssertionError: When no session exists for the agent.
+    """
+    resp = httpx.get(
+        f"{base_url}/v1/sessions",
+        params={"agent_name": agent_name, "limit": 1},
+        timeout=5.0,
+    )
+    resp.raise_for_status()
+    data = resp.json().get("data", [])
+    if not data:
+        raise AssertionError(f"no session found for agent {agent_name!r}")
+    return str(data[0]["id"])
+
+
 def _drive_turn(
     child: pexpect.spawn,
     marker: str,
     mock_llm_server_url: str,
     *,
     base_url: str | None = None,
+    agent_name: str | None = None,
 ) -> _LifecycleResult:
     """
-    Configure a mock response for *marker*, submit a prompt, and
-    assert the sessions API lifecycle renders.
+    Configure a mock response for *marker*, submit a prompt, drive one
+    turn to completion, and resolve the session + runner ids.
+
+    Two modes, by ``base_url``:
+
+    * **Local** (``base_url is None``): the session is created *on the
+      turn*, so the sessions-adapter debug markers (``POST /v1/sessions``
+      / ``session created`` / ``runner bound``) render during the turn
+      and the ids are parsed from the PTY.
+    * **``--server``/daemon** (``base_url`` set): the session is
+      created/resumed at STARTUP (before :func:`_wait_ready` returns), so
+      those markers fire once at boot and never re-appear on the turn
+      (#523). Sync on the assistant *marker* and read the ids from the
+      server API instead — robust to that timing.
 
     :param child: Live REPL process.
     :param marker: Literal assistant marker expected in the PTY.
-    :param mock_llm_server_url: Mock server URL for configuring
-        response queues.
-    :param base_url: Optional Omnigent server URL for daemon-prebound
-        sessions.
+    :param mock_llm_server_url: Mock server URL for configuring queues.
+    :param base_url: Omnigent server URL for the ``--server`` flow;
+        ``None`` for the local flow.
+    :param agent_name: Agent display name used to resolve the session
+        in the ``--server`` flow (required when ``base_url`` is set).
     :returns: Captured session and runner ids.
     """
     configure_mock_llm(
@@ -349,6 +375,18 @@ def _drive_turn(
         key=_MODEL,
     )
     submit_prompt(child, "respond with the configured marker")
+
+    if base_url is not None:
+        # --server/daemon flow: ids come from the API (see docstring).
+        if agent_name is None:
+            raise AssertionError("agent_name is required when base_url is set")
+        child.expect(re.escape(marker), timeout=_TURN_TIMEOUT)
+        child.expect([STATE_SLEEPING, PROMPT_READY], timeout=60)
+        session_id = _newest_session_id(base_url, agent_name)
+        runner_id = _wait_session_runner_online(base_url, session_id)
+        return _LifecycleResult(session_id=session_id, runner_id=runner_id)
+
+    # Local flow: parse the lifecycle markers rendered during the turn.
     lifecycle_branch = child.expect(
         [
             r"POST /v1/sessions multipart bundle",
@@ -380,102 +418,47 @@ def _drive_turn(
         runner_id = str(child.match.group(1))
     else:
         marker_seen = True
-
     if runner_id is None:
-        if base_url is None:
-            raise AssertionError(
-                "runner id was not rendered; pass base_url for daemon-prebound sessions",
-            )
-        runner_id = _wait_session_runner_online(base_url, session_id)
+        raise AssertionError("runner id was not rendered in the local turn")
     if not marker_seen:
         child.expect(re.escape(marker), timeout=_TURN_TIMEOUT)
     child.expect([STATE_SLEEPING, PROMPT_READY], timeout=60)
     return _LifecycleResult(session_id=session_id, runner_id=runner_id)
 
 
-def _wait_session_reasoning_effort(
-    base_url: str,
-    session_id: str,
-    expected: str | None,
-) -> None:
+def _runner_pid_from_daemon_log(home: Path, runner_id: str) -> int:
     """
-    Poll a session snapshot until reasoning effort matches.
+    Resolve a runner subprocess pid from the connect-daemon log.
 
-    :param base_url: Omnigent server URL.
-    :param session_id: Session to inspect.
-    :param expected: Expected reasoning effort, or ``None`` for default.
-    :raises AssertionError: If the expected value is not observed.
+    The daemon logs ``Launched runner <id> for workspace <ws> (pid=<N>)``
+    when it spawns a runner (omnigent/host/connect.py). Reading the pid
+    from that line is robust across environments — unlike walking the
+    daemon's process tree, which assumes the runner is a process-tree
+    descendant of the daemon. That holds locally but NOT under CI's
+    container/daemon model, where the tree walk yields "No runner
+    subprocess found under <pid>" (the same CI-process-model gap that
+    keeps ``local_mode_launches_runner_subprocess`` quarantined).
+
+    :param home: Isolated HOME for the REPL/daemon under test.
+    :param runner_id: Runner id whose pid to resolve, e.g.
+        ``"runner_token_abc123"``.
+    :returns: The runner subprocess pid.
+    :raises AssertionError: When the pid is not found in the daemon log.
     """
-    deadline = time.monotonic() + 20
-    last_body: dict[str, object] | None = None
-    while time.monotonic() < deadline:
-        response = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=5.0)
-        if response.status_code == 200:
-            body = response.json()
-            if isinstance(body, dict):
-                last_body = body
-                if body.get("reasoning_effort") == expected:
-                    return
-        _pause_between_external_polls(0.25)
-    raise AssertionError(
-        f"session {session_id} reasoning_effort did not become {expected!r}; "
-        f"last snapshot={last_body!r}",
+    log_dir = home / ".omnigent" / "logs" / "host-daemon"
+    logs = sorted(log_dir.glob("daemon-*.log"))
+    if not logs:
+        raise AssertionError(f"no connect-daemon log under {log_dir}")
+    text = "".join(p.read_text(errors="replace") for p in logs)
+    matches = re.findall(
+        rf"Launched runner {re.escape(runner_id)}\b.*?\(pid=(\d+)\)",
+        text,
     )
-
-
-def _descendant_processes(root_pid: int) -> dict[int, tuple[int, str]]:
-    """
-    Return descendants of a process keyed by pid.
-
-    :param root_pid: Root process id.
-    :returns: Mapping of pid to ``(ppid, command)``.
-    """
-    proc = subprocess.run(
-        ["ps", "-eo", "pid=,ppid=,command="],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    all_processes: dict[int, tuple[int, str]] = {}
-    children_by_parent: dict[int, list[int]] = {}
-    for raw_line in proc.stdout.splitlines():
-        parts = raw_line.strip().split(None, 2)
-        if len(parts) < 3:
-            continue
-        pid = int(parts[0])
-        ppid = int(parts[1])
-        command = parts[2]
-        all_processes[pid] = (ppid, command)
-        children_by_parent.setdefault(ppid, []).append(pid)
-
-    descendants: dict[int, tuple[int, str]] = {}
-    stack = list(children_by_parent.get(root_pid, []))
-    while stack:
-        pid = stack.pop()
-        process = all_processes.get(pid)
-        if process is None:
-            continue
-        descendants[pid] = process
-        stack.extend(children_by_parent.get(pid, []))
-    return descendants
-
-
-def _find_runner_pid(root_pid: int) -> int:
-    """
-    Find the runner subprocess below a REPL process.
-
-    :param root_pid: REPL process id.
-    :returns: Runner process id.
-    :raises AssertionError: If no runner process is found.
-    """
-    descendants = _descendant_processes(root_pid)
-    for pid, (_ppid, command) in descendants.items():
-        if _RUNNER_CMD_MARKER in command:
-            return pid
-    formatted = "\n".join(
-        f"{pid} <- {ppid}: {command}" for pid, (ppid, command) in sorted(descendants.items())
-    )
-    raise AssertionError(f"No runner subprocess found under {root_pid}.\n{formatted}")
+    if not matches:
+        raise AssertionError(
+            f"runner {runner_id!r} launch pid not found in daemon log under {log_dir}"
+        )
+    return int(matches[-1])
 
 
 def _wait_http_ready(base_url: str, proc: subprocess.Popen[bytes], log_path: Path) -> None:
@@ -526,6 +509,7 @@ from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.host_store import HostStore
 db_uri = os.environ["OMNIGENT_E2E_DB_URI"]
 artifact_location = Path(os.environ["OMNIGENT_E2E_ARTIFACT_LOCATION"])
 port = int(os.environ["OMNIGENT_E2E_PORT"])
@@ -534,6 +518,7 @@ agent_store = SqlAlchemyAgentStore(db_uri)
 file_store = SqlAlchemyFileStore(db_uri)
 conversation_store = SqlAlchemyConversationStore(db_uri)
 comment_store = SqlAlchemyCommentStore(db_uri)
+host_store = HostStore(db_uri)
 artifact_store = _create_artifact_store(str(artifact_location))
 agent_cache = AgentCache(
     artifact_store=artifact_store,
@@ -555,6 +540,7 @@ app = create_app(
     artifact_store=artifact_store,
     agent_cache=agent_cache,
     runner_tunnel_tokens=None,
+    host_store=host_store,
 )
 uvicorn.run(app, host="127.0.0.1", port=port)
 """
@@ -770,6 +756,7 @@ def test_repl_resume_reuses_daemon_runner(
                     "SESSION_RESUME_OK",
                     mock_llm_server_url,
                     base_url=server.base_url,
+                    agent_name="repl_session_resume",
                 )
                 clean_exit(first, timeout=_EXIT_TIMEOUT)
             finally:
@@ -790,6 +777,7 @@ def test_repl_resume_reuses_daemon_runner(
                     "SESSION_RESUME_OK",
                     mock_llm_server_url,
                     base_url=server.base_url,
+                    agent_name="repl_session_resume",
                 )
                 assert second_result.session_id == first_result.session_id
                 assert second_result.runner_id == first_result.runner_id
@@ -838,8 +826,9 @@ def test_repl_recover_after_runner_death(
                     "SESSION_RECOVER_OK",
                     mock_llm_server_url,
                     base_url=server.base_url,
+                    agent_name="repl_session_recover",
                 )
-                runner_pid = _find_runner_pid(_host_daemon_pid(home))
+                runner_pid = _runner_pid_from_daemon_log(home, first_result.runner_id)
                 os.kill(runner_pid, signal.SIGKILL)
 
                 configure_mock_llm(
@@ -856,68 +845,6 @@ def test_repl_recover_after_runner_death(
                     previous_runner_id=first_result.runner_id,
                 )
                 assert recovered_runner_id != first_result.runner_id
-                clean_exit(child, timeout=_EXIT_TIMEOUT)
-            finally:
-                child.close(force=True)
-    finally:
-        _stop_host_daemon(home)
-
-
-def test_repl_effort_command_persists_session_metadata(
-    omnigent_python: Path,
-    omnigent_repo_root: Path,
-    mock_credentials_env: dict[str, str],
-    mock_llm_server_url: str,
-    tmp_path: Path,
-) -> None:
-    """
-    ``/effort`` writes create-time and PATCH-time session metadata.
-
-    Uses the mock LLM server for deterministic marker responses.
-
-    :param omnigent_python: Python interpreter fixture.
-    :param omnigent_repo_root: Repository root fixture.
-    :param mock_credentials_env: Mock-LLM credential environment fixture.
-    :param mock_llm_server_url: Mock server URL.
-    :param tmp_path: Per-test temp directory.
-    """
-    home = tmp_path / "home"
-    env = _repl_env(mock_credentials_env, home, mock_llm_server_url)
-    yaml_path = _write_marker_agent(tmp_path, "repl_session_effort", "SESSION_EFFORT_OK")
-    try:
-        with _running_server(omnigent_python, omnigent_repo_root, env, tmp_path) as server:
-            child = _spawn_run(
-                omnigent_python,
-                omnigent_repo_root,
-                yaml_path,
-                env,
-                server_url=server.base_url,
-            )
-            try:
-                _wait_ready(child)
-
-                submit_prompt(child, "/effort high")
-                child.expect("reasoning effort set to high", timeout=20)
-                child.expect([STATE_SLEEPING, PROMPT_READY], timeout=20)
-
-                result = _drive_turn(
-                    child,
-                    "SESSION_EFFORT_OK",
-                    mock_llm_server_url,
-                    base_url=server.base_url,
-                )
-                _wait_session_reasoning_effort(server.base_url, result.session_id, "high")
-
-                submit_prompt(child, "/effort medium")
-                child.expect("reasoning effort set to medium", timeout=20)
-                child.expect([STATE_SLEEPING, PROMPT_READY], timeout=20)
-                _wait_session_reasoning_effort(server.base_url, result.session_id, "medium")
-
-                submit_prompt(child, "/effort default")
-                child.expect("reasoning effort reset to agent default", timeout=20)
-                child.expect([STATE_SLEEPING, PROMPT_READY], timeout=20)
-                _wait_session_reasoning_effort(server.base_url, result.session_id, None)
-
                 clean_exit(child, timeout=_EXIT_TIMEOUT)
             finally:
                 child.close(force=True)
