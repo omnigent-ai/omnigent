@@ -524,6 +524,7 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
               selectionMode={selectionMode}
               selectedIds={selectedIds}
               onToggleSelected={toggleSelected}
+              knownLabels={knownLabels}
             />
           </nav>
 
@@ -581,6 +582,7 @@ interface ConversationListProps {
   selectionMode: boolean;
   selectedIds: Set<string>;
   onToggleSelected: (conversationId: string) => void;
+  knownLabels: string[];
 }
 
 // permission_level null (no ACL row / legacy) or >= 4 both mean owner.
@@ -598,6 +600,7 @@ function ConversationList({
   selectionMode,
   selectedIds,
   onToggleSelected,
+  knownLabels,
 }: ConversationListProps) {
   // All loaded conversations from the single paginated list (for pinned
   // backfill, normalization, and the flat session list).
@@ -768,6 +771,7 @@ function ConversationList({
               selectionMode={selectionMode}
               selectedIds={selectedIds}
               onToggleSelected={onToggleSelected}
+              knownLabels={knownLabels}
             />
           )}
           {sections.sessions.length > 0 && (
@@ -782,6 +786,7 @@ function ConversationList({
               selectionMode={selectionMode}
               selectedIds={selectedIds}
               onToggleSelected={onToggleSelected}
+              knownLabels={knownLabels}
             />
           )}
           {sections.shared.length > 0 && (
@@ -796,6 +801,7 @@ function ConversationList({
               selectionMode={selectionMode}
               selectedIds={selectedIds}
               onToggleSelected={onToggleSelected}
+              knownLabels={knownLabels}
             />
           )}
           {/* Archived sessions are no longer listed here — they live on the
@@ -838,6 +844,7 @@ function ConversationSection({
   selectionMode,
   selectedIds,
   onToggleSelected,
+  knownLabels,
 }: {
   title?: string;
   conversations: Conversation[];
@@ -849,6 +856,7 @@ function ConversationSection({
   selectionMode: boolean;
   selectedIds: Set<string>;
   onToggleSelected: (conversationId: string) => void;
+  knownLabels: string[];
 }) {
   const collapsed = title != null && collapsedSections.includes(title);
   return (
@@ -883,6 +891,7 @@ function ConversationSection({
               selectionMode={selectionMode}
               isSelected={selectedIds.has(conv.id)}
               onToggleSelected={onToggleSelected}
+              knownLabels={knownLabels}
             />
           ))}
         </ul>
@@ -899,6 +908,7 @@ function ConversationRow({
   selectionMode,
   isSelected,
   onToggleSelected,
+  knownLabels,
 }: {
   conversation: Conversation;
   isPinned: boolean;
@@ -907,6 +917,7 @@ function ConversationRow({
   selectionMode: boolean;
   isSelected: boolean;
   onToggleSelected: (conversationId: string) => void;
+  knownLabels: string[];
 }) {
   // `useParams` reads from the active matched route. On `/`, the param is
   // undefined; on `/c/:conversationId`, it carries the active id.
@@ -1507,6 +1518,7 @@ function ConversationRow({
         open={labelPopoverOpen}
         onOpenChange={setLabelPopoverOpen}
         currentLabel={getUserLabel(conversation)}
+        suggestions={knownLabels}
         onSetLabel={(newLabel) => {
           setLabel.mutate({ id: conversation.id, label: newLabel });
           setLabelPopoverOpen(false);
@@ -1520,11 +1532,13 @@ function LabelPopover({
   open,
   onOpenChange,
   currentLabel,
+  suggestions,
   onSetLabel,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   currentLabel: string | null;
+  suggestions: string[];
   onSetLabel: (label: string | null) => void;
 }) {
   const [value, setValue] = useState(currentLabel ?? "");
@@ -1544,6 +1558,10 @@ function LabelPopover({
     const trimmed = value.trim();
     onSetLabel(trimmed || null);
   }
+
+  const filtered = suggestions.filter(
+    (s) => s !== currentLabel && s.toLowerCase().includes(value.toLowerCase()),
+  );
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -1566,6 +1584,31 @@ function LabelPopover({
           placeholder="e.g. project-x, bug-fix, research"
           className="w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-1"
         />
+        {filtered.length > 0 && (
+          <div className="flex flex-wrap gap-1">
+            {filtered.map((s) => {
+              const colors = labelColor(s);
+              return (
+                <button
+                  key={s}
+                  type="button"
+                  onClick={() => {
+                    setValue(s);
+                    onSetLabel(s);
+                  }}
+                  className={cn(
+                    "inline-flex h-6 items-center gap-1 rounded-full px-2 text-xs font-medium transition-colors hover:opacity-80",
+                    colors.bg,
+                    colors.text,
+                  )}
+                >
+                  <TagIcon className="size-3" />
+                  {s}
+                </button>
+              );
+            })}
+          </div>
+        )}
         <DialogFooter className="border-t-0 bg-transparent">
           {currentLabel && (
             <Button
