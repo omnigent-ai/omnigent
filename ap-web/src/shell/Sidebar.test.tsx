@@ -368,10 +368,7 @@ describe("Sidebar collection sections", () => {
       conv("conv_pinned", "Claude Code", { labels: { collection: "Customer X" } }),
     ]);
     // Pin one of the collectioned sessions via localStorage (client-side pins).
-    localStorage.setItem(
-      "omnigent:pinned-conversation-ids",
-      JSON.stringify(["conv_pinned"]),
-    );
+    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_pinned"]));
     renderSidebar();
 
     // No global "Pinned" section — the pinned session stays in its collection.
@@ -453,21 +450,12 @@ describe("Sidebar default section collapse", () => {
     mockConversations([conv("conv_pin", "Claude Code"), conv("conv_recent", "Claude Code")]);
     renderSidebar();
 
-    expect(screen.getByRole("button", { name: /Pinned/ })).toHaveAttribute(
-      "aria-expanded",
-      "true",
-    );
-    expect(screen.getByRole("button", { name: /Recent/ })).toHaveAttribute(
-      "aria-expanded",
-      "true",
-    );
+    expect(screen.getByRole("button", { name: /Pinned/ })).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("button", { name: /Recent/ })).toHaveAttribute("aria-expanded", "true");
   });
 
   it("honors a persisted collapse of Recent across remount", () => {
-    localStorage.setItem(
-      "omnigent:collapsed-sidebar-sections",
-      JSON.stringify(["Recent"]),
-    );
+    localStorage.setItem("omnigent:collapsed-sidebar-sections", JSON.stringify(["Recent"]));
     mockConversations([conv("conv_recent", "Claude Code")]);
     renderSidebar();
 
@@ -485,10 +473,7 @@ describe("Sidebar default section collapse", () => {
 describe("Sidebar pin marker visibility", () => {
   it("keeps the pin button visible at rest once a conversation is pinned", () => {
     mockConversations([conv("conv_pin", "Claude Code")]);
-    localStorage.setItem(
-      "omnigent:pinned-conversation-ids",
-      JSON.stringify(["conv_pin"]),
-    );
+    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_pin"]));
     renderSidebar();
 
     const pinned = screen.getByText("Pinned").closest("section")!;
@@ -502,13 +487,8 @@ describe("Sidebar pin marker visibility", () => {
     // Pinned in storage AND archived: archive wins, so the row sits in the
     // Archived group with NO pin button at all (not even on hover) — pinning
     // is meaningless there.
-    mockConversations([
-      conv("conv_pa", "Claude Code", { archived: true }),
-    ]);
-    localStorage.setItem(
-      "omnigent:pinned-conversation-ids",
-      JSON.stringify(["conv_pa"]),
-    );
+    mockConversations([conv("conv_pa", "Claude Code", { archived: true })]);
+    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_pa"]));
     renderSidebar();
 
     fireEvent.click(screen.getByRole("button", { name: "Archived" }));
@@ -537,10 +517,10 @@ describe("Sidebar move-to-collection action", () => {
     // Open the row's kebab menu (Radix opens on pointerdown, not click), then
     // open the "Move to collection" submenu flyout.
     const row = screen.getByRole("link", { name: /conv_move/ }).closest("li")!;
-    fireEvent.pointerDown(
-      within(row).getByRole("button", { name: "Conversation actions" }),
-      { button: 0, ctrlKey: false },
-    );
+    fireEvent.pointerDown(within(row).getByRole("button", { name: "Conversation actions" }), {
+      button: 0,
+      ctrlKey: false,
+    });
     fireEvent.click(await screen.findByTestId("move-to-collection"));
 
     // Collections render as menu items inside the submenu; picking one fires the
