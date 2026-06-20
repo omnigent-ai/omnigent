@@ -38,6 +38,7 @@ import os
 import re
 import shutil
 import socket
+import uuid  # noqa: F401 — available for session-id generation if needed
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
@@ -530,3 +531,314 @@ class _OmnigentToolBridge:
         self._server = None
         self._task = None
         self._mcp = None
+
+
+# ---------------------------------------------------------------------------
+# Main executor
+# ---------------------------------------------------------------------------
+
+
+class OpenCodeExecutor(Executor):
+    """Drive OpenCode via a persistent ``opencode serve`` + the Python SDK.
+
+    Keeps one long-lived ``opencode serve`` subprocess per Omnigent
+    conversation subprocess.  The SDK/serve transport unlocks mid-turn
+    interrupt, live message queue, and in-process MCP tool-bridge.
+    """
+
+    def __init__(self) -> None:
+        self._model: str | None = os.environ.get(_ENV_MODEL, "").strip() or None
+        self._cwd: str | None = os.environ.get(_ENV_CWD, "").strip() or None
+        self._thinking: bool = _parse_truthy(os.environ.get(_ENV_THINKING))
+        skip_raw = os.environ.get(_ENV_SKIP_PERMISSIONS)
+        self._skip_permissions: bool = True if skip_raw is None else _parse_truthy(skip_raw)
+        self._server = _OpenCodeServer()
+        self._server_started: bool = False
+        self._client: Any | None = None
+        self._bridge: _OmnigentToolBridge | None = None
+        self._session_ids: dict[str, str] = {}
+        # Cached (provider_id, model_id) from the server's default provider list.
+        # Populated lazily by _resolve_provider_model when no explicit pin is set.
+        self._default_provider_model: tuple[str, str] | None = None
+        # Set by ExecutorAdapter before the first run_turn.
+        self._tool_executor: ToolExecutor | None = None
+        self._lock = asyncio.Lock()
+
+    async def _ensure_server(self, tools: list[ToolSpec]) -> None:
+        """Lazily boot the opencode serve process + optional MCP tool-bridge.
+
+        Protected by ``self._lock`` so concurrent first-turn calls from
+        multiple sessions don't race on server startup.
+
+        :param tools: Tool specs advertised for this turn; empty when the
+            agent has no tools or the harness handles them externally.
+        """
+        async with self._lock:
+            if self._server_started:
+                return
+            mcp_extra: dict[str, Any] | None = None
+            if tools and self._tool_executor is not None:
+                self._bridge = _OmnigentToolBridge(tools, self._tool_executor)
+                url = await self._bridge.start()
+                mcp_extra = {"omnigent": {"type": "remote", "url": url}}
+            extra_env: dict[str, str] = {}
+            payload = _build_opencode_config_content(mcp_extra=mcp_extra)
+            if payload is not None:
+                extra_env[_OPENCODE_CONFIG_CONTENT_ENV] = json.dumps(
+                    payload, separators=(",", ":")
+                )
+                extra_env[_OPENCODE_DISABLE_PROJECT_CONFIG_ENV] = "1"
+            await self._server.start(cwd=self._cwd, extra_env=extra_env)
+            self._client = self._server.client
+            self._server_started = True
+
+    async def _resolve_provider_model(
+        self, config_model: str | None
+    ) -> tuple[str, str]:
+        """Resolve ``(provider_id, model_id)`` for ``session.chat``.
+
+        Both fields are required by the SDK; this method always returns a
+        fully-populated pair.
+
+        Precedence: per-turn *config_model* > ``self._model`` (from
+        ``HARNESS_OPENCODE_MODEL``) > the server's configured default
+        provider/model (cached after first lookup).
+
+        :param config_model: Per-turn model override from :class:`ExecutorConfig`.
+        :returns: ``(provider_id, model_id)`` — both non-empty strings.
+        :raises RuntimeError: When no providers are configured in OpenCode.
+        """
+        pinned = config_model or self._model
+        provider_id, model_id = _split_provider_model(pinned)
+        if provider_id and model_id:
+            return provider_id, model_id
+        # Need the server default for at least one half.
+        if self._default_provider_model is None:
+            resp = await self._client.app.providers()
+            default_map: dict[str, str] = dict(getattr(resp, "default", {}) or {})
+            if not default_map:
+                raise RuntimeError(
+                    "opencode: no providers configured; run `opencode auth login`"
+                )
+            # default_map is {provider_id: default_model_id}; take the first entry.
+            dprov, dmodel = next(iter(default_map.items()))
+            self._default_provider_model = (dprov, dmodel)
+        dprov, dmodel = self._default_provider_model
+        return (provider_id or dprov, model_id or dmodel)
+
+    def _session_key_for(self, messages: list[Message]) -> str | None:
+        """Extract the Omnigent session key from the message list.
+
+        :param messages: Inner ``Message`` list for the turn.
+        :returns: The ``session_id`` value from the first message that has
+            one, or ``None`` when none is present.
+        """
+        for message in messages:
+            sid = message.get("session_id")
+            if isinstance(sid, str) and sid:
+                return sid
+        return None
+
+    async def _opencode_session_id(self, session_key: str | None) -> str:
+        """Return the OpenCode session id for *session_key*, creating one if needed.
+
+        :param session_key: The Omnigent session key (from messages), or ``None``
+            to use the ``"default"`` bucket.
+        :returns: The OpenCode session id string.
+        """
+        key = session_key or "default"
+        if key in self._session_ids:
+            return self._session_ids[key]
+        created = await self._client.session.create()
+        sid = created.id
+        self._session_ids[key] = sid
+        return sid
+
+    @staticmethod
+    def _as_dict(obj: Any) -> dict[str, Any]:
+        """Coerce an SDK object or dict to a plain dict.
+
+        Uses ``model_dump(by_alias=False)`` to get snake_case keys from SDK
+        Pydantic models; falls back to ``__dict__`` for simple objects.
+
+        :param obj: Any SDK response object, dict, or simple ``__dict__`` holder.
+        :returns: A plain ``dict``; never ``None``.
+        """
+        if isinstance(obj, dict):
+            return obj
+        if hasattr(obj, "model_dump"):
+            return obj.model_dump(by_alias=False)
+        return getattr(obj, "__dict__", {})
+
+    async def run_turn(
+        self,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        system_prompt: str,
+        config: ExecutorConfig | None = None,
+    ) -> AsyncIterator[ExecutorEvent]:
+        """Run one turn via the persistent opencode serve process.
+
+        Subscribe to the global SSE event stream, then fire ``session.chat``
+        as a background task.  Events are consumed until ``session.idle`` fires
+        for our session id, at which point the chat task is awaited for token
+        usage.
+
+        :param messages: Full conversation history; the latest user message is
+            extracted and sent as the chat prompt.
+        :param tools: Tool specs to expose (via MCP bridge if non-empty).
+        :param system_prompt: System-level instruction forwarded to OpenCode.
+        :param config: Per-turn config overrides (model, temperature, etc.).
+        :yields: :class:`TextChunk`, :class:`ToolCallRequest`,
+            :class:`ToolCallComplete`, :class:`TurnComplete`, or
+            :class:`ExecutorError`.
+        """
+        await self._ensure_server(tools)
+        session_key = self._session_key_for(messages)
+        prompt = _latest_user_text(messages)
+        if not prompt:
+            yield ExecutorError(message="opencode harness: no user message in request")
+            return
+        session_id = await self._opencode_session_id(session_key)
+
+        # Correction (A): session.chat requires BOTH provider_id and model_id.
+        provider_id, model_id = await self._resolve_provider_model(
+            config.model if config else None
+        )
+
+        tracker = _PartTracker()
+        stream = await self._client.event.list()
+        chat_kwargs: dict[str, Any] = {
+            "id": session_id,
+            "parts": [{"type": "text", "text": prompt}],
+            "provider_id": provider_id,
+            "model_id": model_id,
+        }
+        if system_prompt:
+            chat_kwargs["system"] = system_prompt
+        chat_task = asyncio.create_task(self._client.session.chat(**chat_kwargs))
+
+        final_text: list[str] = []
+        usage: dict[str, Any] | None = None
+        try:
+            async for raw in stream:
+                evt = self._as_dict(raw)
+                etype = evt.get("type")
+                props = self._as_dict(evt.get("properties"))
+                ev_session = props.get("session_id") or props.get("sessionID")
+                if etype == "message.part.updated":
+                    part = self._as_dict(props.get("part"))
+                    # Filter parts from other sessions when a session_id is present.
+                    if part.get("session_id") and part.get("session_id") != session_id:
+                        continue
+                    # Correction (B): no reasoning part type in this SDK;
+                    # emit_reasoning=self._thinking kept for future compat.
+                    for out in _translate_part_event(
+                        part, tracker, emit_reasoning=self._thinking
+                    ):
+                        if isinstance(out, TextChunk):
+                            final_text.append(out.text)
+                        yield out
+                elif etype == "session.error" and (
+                    ev_session in (None, session_id)
+                ):
+                    err = self._as_dict(props.get("error"))
+                    yield ExecutorError(
+                        message=f"opencode: {err.get('name') or err or 'error'}"
+                    )
+                    return
+                elif etype == "session.idle" and ev_session == session_id:
+                    break
+        finally:
+            with contextlib.suppress(Exception):
+                await stream.close()
+
+        try:
+            result = await chat_task
+            tokens = self._as_dict(result).get("tokens")
+            if isinstance(tokens, dict):
+                usage = _tokens_to_usage(tokens)
+        except Exception as exc:  # noqa: BLE001
+            yield ExecutorError(message=f"opencode: chat failed: {exc}")
+            return
+
+        yield TurnComplete(response="".join(final_text) or None, usage=usage)
+
+    def supports_streaming(self) -> bool:
+        """Streaming is delivered via the SSE event bus."""
+        return True
+
+    def supports_tool_calling(self) -> bool:
+        """OpenCode calls tools via its own internal agent loop."""
+        return True
+
+    def handles_tools_internally(self) -> bool:
+        """OpenCode manages the tool-call / result cycle internally."""
+        return True
+
+    def supports_live_message_queue(self) -> bool:
+        """A second ``session.chat`` can enqueue into a running session."""
+        return True
+
+    def max_context_tokens(self) -> int | None:
+        """Context limit is model-dependent and not fixed here."""
+        return None
+
+    async def interrupt_session(self, session_key: str) -> bool:
+        """Abort the running OpenCode session for *session_key*.
+
+        :param session_key: The Omnigent session key identifying the session.
+        :returns: ``True`` when the abort call succeeded, ``False`` when the
+            session is unknown or the client is not ready.
+        """
+        sid = self._session_ids.get(session_key)
+        if not sid or self._client is None:
+            return False
+        with contextlib.suppress(Exception):
+            await self._client.session.abort(id=sid)
+            return True
+        return False
+
+    async def enqueue_session_message(
+        self, session_key: str, content: EnqueuedContent
+    ) -> bool:
+        """Fire-and-forget a new message into an already-running session.
+
+        Sends a second ``session.chat`` without waiting for it — OpenCode
+        queues it behind the current in-flight turn.
+
+        :param session_key: The Omnigent session key.
+        :param content: Text or structured content to enqueue.
+        :returns: ``True`` when the task was dispatched; ``False`` when the
+            session is unknown or the client is not ready.
+        """
+        sid = self._session_ids.get(session_key)
+        if not sid or self._client is None:
+            return False
+        text = content if isinstance(content, str) else str(content)
+        # Correction (A): always provide both provider_id and model_id.
+        provider_id, model_id = await self._resolve_provider_model(None)
+        kwargs: dict[str, Any] = {
+            "id": sid,
+            "parts": [{"type": "text", "text": text}],
+            "provider_id": provider_id,
+            "model_id": model_id,
+        }
+        asyncio.create_task(self._client.session.chat(**kwargs))
+        return True
+
+    async def close_session(self, session_key: str) -> None:
+        """Drop the cached OpenCode session id for *session_key*.
+
+        :param session_key: The Omnigent session key whose cache entry to remove.
+        """
+        self._session_ids.pop(session_key, None)
+
+    async def close(self) -> None:
+        """Release all resources: MCP bridge + opencode serve subprocess."""
+        if self._bridge is not None:
+            await self._bridge.close()
+            self._bridge = None
+        await self._server.close()
+        self._server_started = False
+        self._client = None
