@@ -37,7 +37,8 @@ import logging
 import os
 import re
 import shutil
-from collections.abc import AsyncIterator
+import socket
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 from omnigent.inner.executor import (
@@ -409,3 +410,110 @@ class _OpenCodeServer:
             self._stderr_task = None
         self._proc = None
         self.base_url = None
+
+
+# ---------------------------------------------------------------------------
+# In-process MCP tool-bridge
+# ---------------------------------------------------------------------------
+
+ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
+
+
+def _pick_free_port() -> int:
+    """Bind an ephemeral port, release it, and return the number."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+class _OmnigentToolBridge:
+    """In-process FastMCP server exposing Omnigent spec tools to OpenCode.
+
+    Each spec tool becomes one MCP tool whose handler round-trips through the
+    adapter-supplied *tool_executor* (which dispatches through Omnigent policy
+    + execution and emits the function_call events).
+    """
+
+    def __init__(self, tools: list[ToolSpec], tool_executor: ToolExecutor) -> None:
+        self._tools = tools
+        self._tool_executor = tool_executor
+        self._server: Any | None = None
+        self._task: asyncio.Task[None] | None = None
+        self._port: int | None = None
+        self._mcp: Any | None = None
+
+    async def start(self) -> str:
+        """Boot the MCP server on an ephemeral port; return its ``/mcp`` URL."""
+        from mcp.server.fastmcp import FastMCP
+
+        self._port = _pick_free_port()
+        mcp = FastMCP("omnigent", host="127.0.0.1", port=self._port)
+        self._mcp = mcp
+
+        for spec in self._tools:
+            self._register_tool(mcp, spec)
+
+        app = mcp.streamable_http_app()
+        import uvicorn
+
+        config = uvicorn.Config(app, host="127.0.0.1", port=self._port, log_level="warning")
+        self._server = uvicorn.Server(config)
+        self._task = asyncio.create_task(self._server.serve())
+        # Wait until uvicorn flips started.
+        for _ in range(100):
+            if getattr(self._server, "started", False):
+                break
+            await asyncio.sleep(0.05)
+        return f"http://127.0.0.1:{self._port}/mcp"
+
+    def _register_tool(self, mcp: Any, spec: ToolSpec) -> None:
+        import inspect as _inspect
+        from mcp.server.fastmcp.tools.base import Tool
+
+        name = spec.get("name")
+        if not isinstance(name, str) or not name:
+            return
+        description = spec.get("description") or ""
+        schema = spec.get("parameters") if isinstance(spec.get("parameters"), dict) else {}
+        properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
+        required = set(schema.get("required", []) or []) if isinstance(schema, dict) else set()
+        executor = self._tool_executor
+
+        async def _handler(**kwargs: Any) -> Any:
+            # Forward only the args the model actually supplied (drop defaulted
+            # None values for omitted optionals) so the dispatch path sees a
+            # clean arg dict.
+            forwarded = {k: v for k, v in kwargs.items() if v is not None}
+            return await executor(name, forwarded)
+
+        # Synthesize a real keyword-only signature from the spec schema so
+        # FastMCP's func_metadata builds a valid arg model (call-time validation
+        # passes and args forward correctly). Annotate each param ``Any``.
+        params = []
+        for pname in properties:
+            if pname in required:
+                params.append(_inspect.Parameter(pname, _inspect.Parameter.KEYWORD_ONLY, annotation=Any))
+            else:
+                params.append(_inspect.Parameter(pname, _inspect.Parameter.KEYWORD_ONLY, annotation=Any, default=None))
+        _handler.__signature__ = _inspect.Signature(params)
+        _handler.__annotations__ = {pname: Any for pname in properties}
+
+        tool = Tool.from_function(_handler, name=name, description=description, structured_output=False)
+        # Advertise the ORIGINAL spec JSON schema (with real types) to clients —
+        # the synthesized Any-typed signature loses per-field types, but call-time
+        # validation only uses fn_metadata, so overriding the advertised schema is
+        # safe and gives OpenCode the correct parameter types.
+        if schema:
+            tool.parameters = schema
+        mcp._tool_manager._tools[name] = tool
+
+    async def close(self) -> None:
+        """Shut the MCP server down."""
+        if self._server is not None:
+            self._server.should_exit = True
+        if self._task is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(self._task, timeout=5.0)
+        self._server = None
+        self._task = None
+        self._mcp = None
