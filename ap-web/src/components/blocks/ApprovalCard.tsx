@@ -49,7 +49,7 @@ import {
   parseAskUserQuestionPreview,
 } from "@/lib/askUserQuestion";
 import { formatPreview } from "@/lib/previewFormat";
-import { useChatStore } from "@/store/chatStore";
+import { useScopedChatStore } from "@/store/chatStore";
 import { AskUserQuestionForm, type AskUserQuestionAnswers } from "./AskUserQuestionForm";
 import { ExitPlanModeReview } from "./ExitPlanModeReview";
 
@@ -161,10 +161,14 @@ export function ApprovalCard({
   allowAllEdits,
   onSubmit,
 }: ApprovalCardProps) {
+  // Scope the default submitter to THIS pane's session so approving a card in
+  // one side-by-side pane never resolves another pane's elicitation. The Inbox
+  // still overrides via `onSubmit` for cards outside the chat store entirely.
+  const scopedChat = useScopedChatStore();
   const submit: SubmitApprovalFn =
     onSubmit ??
     ((id, action, content) => {
-      void useChatStore.getState().submitApproval(id, action, content);
+      void scopedChat.getState().submitApproval(id, action, content);
     });
   const submitBinary = (action: "accept" | "decline") => {
     submit(elicitationId, action);

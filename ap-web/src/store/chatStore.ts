@@ -42,6 +42,7 @@
 //     stream, fetches the items snapshot, and merges into blocks
 //     deduping by item id.
 
+import { createContext, useContext } from "react";
 import type { InfiniteData, QueryClient } from "@tanstack/react-query";
 import { createStore, useStore, type StoreApi } from "zustand";
 import type {
@@ -1521,14 +1522,40 @@ export function getChatSessionStore(sessionId: string | null): StoreApi<ChatStat
 }
 
 /**
- * Backward-compatible facade over the ACTIVE session's store. Existing
- * single-session call sites — `useChatStore((s) => s.x)`,
- * `useChatStore.getState().send(...)`, `useChatStore.setState(...)` — keep
- * working unchanged; they all resolve against whichever session `switchTo`
- * last made active (the draft store when none).
+ * When set by a side-by-side pane, redirects the `useChatStore` HOOK reads (and
+ * scoped imperative access) to a specific session id instead of the global
+ * active session — so each pane shows and drives its OWN session. `undefined`
+ * (no provider — e.g. the single-session route) falls back to the active
+ * session, leaving that path observably unchanged. A `null` value scopes to
+ * the landing/draft store.
+ */
+export const ChatSessionScopeContext = createContext<string | null | undefined>(undefined);
+
+/** The session id the current subtree is scoped to (pane scope, or active). */
+export function useScopedSessionId(): string | null {
+  const scopeId = useContext(ChatSessionScopeContext);
+  const activeId = useStore(activeSessionStore, (s) => s.id);
+  return scopeId === undefined ? activeId : scopeId;
+}
+
+/**
+ * Store api for the current scope — for imperative action calls
+ * (`useScopedChatStore().getState().send(...)`) inside a pane or the route.
+ */
+export function useScopedChatStore(): StoreApi<ChatState> {
+  return ensureSessionStore(useScopedSessionId());
+}
+
+/**
+ * Backward-compatible, scope-aware facade over the chat store. Reactive reads
+ * `useChatStore((s) => s.x)` resolve to the nearest pane scope when one is
+ * provided, else the active session — so existing single-session call sites are
+ * unchanged while a pane's subtree automatically reads its OWN session. The
+ * static `getState()`/`setState()` always target the active session; pane
+ * imperative calls use `useScopedChatStore()` instead.
  */
 function useChatStoreHook<T>(selector: (s: ChatState) => T): T {
-  const id = useStore(activeSessionStore, (s) => s.id);
+  const id = useScopedSessionId();
   return useStore(ensureSessionStore(id), selector);
 }
 

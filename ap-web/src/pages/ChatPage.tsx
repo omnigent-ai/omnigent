@@ -91,6 +91,7 @@ import {
   type PendingInitialPrompt,
   type PendingUserMessage,
   useChatStore,
+  useScopedChatStore,
 } from "@/store/chatStore";
 import { useSession } from "@/hooks/useSession";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
@@ -384,8 +385,30 @@ const sessionDrafts = loadDraftsFromStorage();
  * and triggers `switchTo` when the URL changes. The store owns the
  * items fetch (no useConversationItems here).
  */
-export function ChatPage() {
+export interface ChatPageProps {
+  /**
+   * When set, this ChatPage instance renders as a side-by-side PANE bound to
+   * this session id instead of the URL's conversation. The pane's whole
+   * subtree is wrapped in a `ChatSessionScopeContext` by `MultiSessionGrid`,
+   * so store reads/imperatives resolve to this session automatically.
+   */
+  paneSessionId?: string;
+  /** Pane mode: render lean pane chrome (own header + close) and skip the
+   *  route-only behaviors (URL sync, initial-prompt auto-send, dialogs). */
+  embedded?: boolean;
+  /** Close control for the pane header (pane mode only). */
+  onClose?: () => void;
+}
+
+export function ChatPage({ paneSessionId, embedded = false, onClose }: ChatPageProps = {}) {
   const { conversationId: urlConvId } = useParams<{ conversationId: string }>();
+  // The session this instance shows: the pane's id when embedded, else the URL.
+  // On the route the two are identical, so route behavior is unchanged.
+  const sessionId = paneSessionId ?? urlConvId ?? null;
+  // Imperative store access scoped to THIS pane (or the active session on the
+  // route) — pane sends/stops must target their own session, not the global
+  // active one. Reactive `useChatStore((s) => …)` reads scope via context.
+  const scopedChat = useScopedChatStore();
   const navigate = useNavigate();
   // Optional first message handed off by the landing composer through the
   // shared chatStore (keyed by conversation id), not router state — router state
@@ -436,7 +459,10 @@ export function ChatPage() {
   // Clear the "unseen messages" sidebar dot for the conversation the
   // user is currently viewing. Re-fires when conversations refresh
   // (every 4 s) so messages arriving while viewing are marked seen.
-  useMarkConversationSeen(urlConvId, conversations?.find((c) => c.id === urlConvId)?.updated_at);
+  useMarkConversationSeen(
+    sessionId ?? undefined,
+    conversations?.find((c) => c.id === sessionId)?.updated_at,
+  );
 
   // Sync the store's active conversation to the URL. Single source of
   // truth: URL is what's "current"; store mirrors it. The effect is
@@ -449,8 +475,11 @@ export function ChatPage() {
   // intentionally don't await it here. The store's `loadingConversation` flag
   // drives the loading UI below; `conversationLoadError` drives the error UI.
   useEffect(() => {
+    // Panes own their bind lifecycle via MultiSessionGrid (acquire/release);
+    // only the single-session route mirrors the URL into the active session.
+    if (embedded) return;
     void useChatStore.getState().switchTo(urlConvId ?? null);
-  }, [urlConvId]);
+  }, [urlConvId, embedded]);
 
   // Pull the first message the landing composer stashed for this conversation,
   // if any. Read-once (consume deletes), so a refresh/back can't replay
@@ -491,8 +520,8 @@ export function ChatPage() {
   // Read runner liveness from the app-level batch poller (see
   // RunnerHealthProvider). `undefined` = not yet polled — the indicator
   // stays hidden until the first poll for this session resolves.
-  const runnerOnline = useSessionRunnerOnline(urlConvId);
-  useRefreshSessionStateOnRunnerOnline(urlConvId, runnerOnline);
+  const runnerOnline = useSessionRunnerOnline(sessionId ?? undefined);
+  useRefreshSessionStateOnRunnerOnline(sessionId ?? undefined, runnerOnline);
   // OR'd into "Working…" so cross-client turns surface a shimmer.
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const loadingConversation = useChatStore((s) => s.loadingConversation);
@@ -504,7 +533,7 @@ export function ChatPage() {
   // agent object for the active session. Drives the picker's
   // name/description; the same react-query cache also feeds the header
   // info icon (AgentInfoButton) its tools & policies.
-  const { data: boundAgentBySession } = useSessionAgent(urlConvId ?? null);
+  const { data: boundAgentBySession } = useSessionAgent(sessionId);
   const hasMoreHistory = useChatStore((s) => s.hasMoreHistory);
   const loadingMoreHistory = useChatStore((s) => s.loadingMoreHistory);
 
@@ -654,7 +683,7 @@ export function ChatPage() {
   // Must be declared BEFORE the early-return guards below — otherwise
   // the hook is skipped on renders that hit the loading/error branches,
   // tripping React's "rendered fewer hooks than expected".
-  const { session: activeSession, isLoading: sessionLoading } = useSession(urlConvId ?? null);
+  const { session: activeSession, isLoading: sessionLoading } = useSession(sessionId);
 
   // Hoisted above the guards; the turn-start/turn-end ["session", id] invalidations refresh it (no new polling).
   const activeSessionLabels = activeSession?.labels;
@@ -672,7 +701,7 @@ export function ChatPage() {
   const subAgentLabel = subAgentComposerLabel(activeSession);
 
   // Hoisted above the early-return guards so the title-update effect can read them.
-  const activeConv = urlConvId ? conversations?.find((c) => c.id === urlConvId) : null;
+  const activeConv = sessionId ? conversations?.find((c) => c.id === sessionId) : null;
 
   // `isWorking` gates the parent's OWN turn (Stop/Interrupt) and must NOT
   // include child-session activity. `showsWorking` is display-only (tab title
@@ -707,7 +736,7 @@ export function ChatPage() {
   const viewerId = getCurrentAuthorId();
   const sessionOwner = activeConv?.owner ?? null;
   const viewerOwnsSession = sessionOwner !== null && sessionOwner === viewerId;
-  const { data: ownerGrants } = usePermissions(viewerOwnsSession ? (urlConvId ?? null) : null);
+  const { data: ownerGrants } = usePermissions(viewerOwnsSession ? sessionId : null);
   const isSessionShared = isSessionSharedWithOthers(sessionOwner, viewerId, ownerGrants);
 
   // The open session's derived liveness — the single signal the chat
@@ -727,7 +756,7 @@ export function ChatPage() {
   // session misclassifies as `local_stranded` and shows the wrong reconnect
   // path. See `livenessRowFromSession`.
   const livenessRow = activeConv ?? livenessRowFromSession(activeSession);
-  const liveness = useSessionLiveness(urlConvId ?? undefined, livenessRow, {
+  const liveness = useSessionLiveness(sessionId ?? undefined, livenessRow, {
     turnActive: status === "streaming",
   });
 
@@ -753,11 +782,13 @@ export function ChatPage() {
   const selectedModel = useChatStore((s) => s.selectedModel);
   const llmModel = useChatStore((s) => s.llmModel);
 
-  // Loading + error gates for `/c/:id` hydration.
-  if (urlConvId) {
+  // Loading + error gates for `/c/:id` hydration. Panes skip the full-page
+  // placeholder/error and render their own frame (the transcript shows the
+  // loading state), so a hydrating pane still has its header + close control.
+  if (sessionId && !embedded) {
     if (loadingConversation) return <HydratingPlaceholder />;
     if (conversationLoadError) {
-      return <ConversationLoadError conversationId={urlConvId} error={conversationLoadError} />;
+      return <ConversationLoadError conversationId={sessionId} error={conversationLoadError} />;
     }
   }
 
@@ -792,7 +823,7 @@ export function ChatPage() {
       setReconnectDialogOpen(true);
       return;
     }
-    void useChatStore.getState().send(text, agentId, files, {
+    void scopedChat.getState().send(text, agentId, files, {
       onConversationCreated: (newId) => {
         // Eager URL update: the moment the server tells us this
         // conversation's id, promote `/` → `/c/:newId`. Replace (not
@@ -815,7 +846,7 @@ export function ChatPage() {
       setReconnectDialogOpen(true);
       return;
     }
-    void useChatStore.getState().sendSlashCommand(name, args, agentId, {
+    void scopedChat.getState().sendSlashCommand(name, args, agentId, {
       onConversationCreated: (newId) => {
         navigate(`/c/${newId}`, { replace: true });
       },
@@ -823,7 +854,7 @@ export function ChatPage() {
   }
 
   function onStop() {
-    useChatStore.getState().stop();
+    scopedChat.getState().stop();
   }
 
   // Sub-agent (child) sessions aren't returned by the sidebar list, so
@@ -867,7 +898,7 @@ export function ChatPage() {
 
   const mainAgent = (
     <MainAgentSurface
-      conversationId={urlConvId ?? null}
+      conversationId={sessionId}
       bubbles={bubbles}
       status={status}
       isWorking={isWorking}
@@ -905,6 +936,43 @@ export function ChatPage() {
       subAgentLabel={subAgentLabel}
     />
   );
+
+  // Side-by-side pane: a self-contained interactive chat view bound to its own
+  // session — own header (title + close), transcript, composer — without the
+  // route-only chrome (workspace rail, dialogs, landing screen). The pane's
+  // subtree already reads/drives THIS session via the scope context provided
+  // by MultiSessionGrid, so the reused transcript + composer stay isolated.
+  if (embedded) {
+    const paneTitle =
+      activeConv?.title ?? activeSession?.title ?? boundAgentName ?? subAgentLabel ?? "Session";
+    return (
+      <section
+        data-testid="session-pane"
+        data-session-id={sessionId ?? ""}
+        aria-label={`Session: ${paneTitle}`}
+        className="flex h-full min-h-0 min-w-0 flex-col"
+      >
+        <header className="flex h-10 shrink-0 items-center gap-2 border-b border-border px-3">
+          <span className="min-w-0 flex-1 truncate text-sm font-medium" title={paneTitle}>
+            {paneTitle}
+          </span>
+          {onClose && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              aria-label="Close pane"
+              data-testid="session-pane-close"
+              onClick={onClose}
+            >
+              <XIcon className="size-4" />
+            </Button>
+          )}
+        </header>
+        <div className="relative flex min-h-0 flex-1 flex-col">{mainAgent}</div>
+      </section>
+    );
+  }
 
   // On `/` (no conversation), the composer would let the user POST a
   // first message and silently create a session — but sessions are
@@ -1630,6 +1698,9 @@ export function HistoryAutoLoader({
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
     scrollRef: React.RefObject<HTMLElement>;
   };
+  // Scope older-history paging to THIS pane's session (or the active session
+  // on the route), never the global active store.
+  const scopedChat = useScopedChatStore();
 
   // Preserve scroll position when items are prepended after a scroll-up
   // fetch. Snapshot scrollHeight before the call; restore the offset in a
@@ -1639,8 +1710,8 @@ export function HistoryAutoLoader({
     if (!hasMoreHistory || loadingMoreHistory) return;
     const el = ctx.scrollRef?.current;
     if (el) prevScrollHeightRef.current = el.scrollHeight;
-    void useChatStore.getState().loadMoreHistory();
-  }, [ctx.scrollRef, hasMoreHistory, loadingMoreHistory]);
+    void scopedChat.getState().loadMoreHistory();
+  }, [ctx.scrollRef, hasMoreHistory, loadingMoreHistory, scopedChat]);
 
   useLayoutEffect(() => {
     const el = ctx.scrollRef?.current;
@@ -1673,9 +1744,9 @@ export function HistoryAutoLoader({
     const el = ctx.scrollRef?.current;
     if (!el || !hasMoreHistory || loadingMoreHistory) return;
     if (el.scrollHeight <= el.clientHeight) {
-      void useChatStore.getState().loadMoreHistory();
+      void scopedChat.getState().loadMoreHistory();
     }
-  }, [ctx.scrollRef, hasMoreHistory, loadingMoreHistory]);
+  }, [ctx.scrollRef, hasMoreHistory, loadingMoreHistory, scopedChat]);
 
   // Re-check on mount and whenever a fetch settles (loadingMoreHistory flips
   // back to false): if content still doesn't overflow, the callback pages again.
@@ -1768,6 +1839,8 @@ export function JumpToTopButton({
   scroller: ConversationScroller | null;
   hasMoreHistory: boolean;
 }) {
+  // Exhaustive "jump to top" paging targets THIS pane's session.
+  const scopedChat = useScopedChatStore();
   const [atTop, setAtTop] = useState(true);
   const [hovering, setHovering] = useState(false);
   const [jumping, setJumping] = useState(false);
@@ -1856,8 +1929,8 @@ export function JumpToTopButton({
       // history or on error. The rAF wait yields a frame for the prepend to
       // commit and for the in-flight flag to settle between pages. The
       // iteration cap is a backstop against a server that never reports done.
-      for (let i = 0; i < 1000 && useChatStore.getState().hasMoreHistory; i++) {
-        await useChatStore.getState().loadMoreHistory();
+      for (let i = 0; i < 1000 && scopedChat.getState().hasMoreHistory; i++) {
+        await scopedChat.getState().loadMoreHistory();
         // Keep the lock released — a prepend that briefly lands us near the
         // bottom can otherwise re-arm it via the library's scroll handler.
         state.isAtBottom = false;
@@ -1880,7 +1953,7 @@ export function JumpToTopButton({
     } finally {
       setJumping(false);
     }
-  }, [scroller]);
+  }, [scroller, scopedChat]);
 
   return (
     <div
@@ -2934,6 +3007,9 @@ export function Composer({
   costRoutingEligible = false,
   subAgentLabel = null,
 }: ComposerProps) {
+  // Slash commands and model/effort/plan toggles act on THIS pane's session
+  // (or the active session on the route), never the global active store.
+  const scopedChat = useScopedChatStore();
   const [value, setValue] = useState("");
   const [files, setFiles] = useState<File[]>([]);
   const [commandError, setCommandError] = useState<string | null>(null);
@@ -3067,7 +3143,7 @@ export function Composer({
     setCommandError(null);
     setPlanModeBusy(true);
     try {
-      await useChatStore.getState().setCodexPlanMode(!codexPlanMode);
+      await scopedChat.getState().setCodexPlanMode(!codexPlanMode);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setCommandError(`Could not ${codexPlanMode ? "exit" : "enter"} Plan mode: ${message}`);
@@ -3107,7 +3183,7 @@ export function Composer({
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
-        void useChatStore
+        void scopedChat
           .getState()
           .compact()
           .catch((err: unknown) => {
@@ -3125,7 +3201,7 @@ export function Composer({
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
-        void useChatStore
+        void scopedChat
           .getState()
           .setEffort(level)
           .catch((err: unknown) => {
@@ -3140,7 +3216,7 @@ export function Composer({
         if (!showModel) return false;
         const target = arg.trim();
         if (!target) {
-          const { sessionModelOverride, llmModel } = useChatStore.getState();
+          const { sessionModelOverride, llmModel } = scopedChat.getState();
           const current = sessionModelOverride
             ? `${sessionModelOverride} (override)`
             : (llmModel ?? "agent default");
@@ -3156,7 +3232,7 @@ export function Composer({
         // Confirmation is a durable `[System: model changed to X]` note the
         // server appends to the transcript (see _persist_model_change_note) —
         // not a transient composer hint. Surface only failures inline here.
-        void useChatStore
+        void scopedChat
           .getState()
           .setModel(clear ? null : target)
           .catch((err: unknown) => {
@@ -3165,7 +3241,7 @@ export function Composer({
         return true;
       }
       case "/context": {
-        const state = useChatStore.getState();
+        const state = scopedChat.getState();
         const { contextWindow, llmModel, sessionModelOverride, tokensUsed, blocks } = state;
         const lines: string[] = [];
         if (sessionModelOverride) lines.push(`Model: ${sessionModelOverride} (override)`);
@@ -3714,7 +3790,7 @@ export function Composer({
               <IntelligentModelControl
                 value={costControlModeOverride}
                 onChange={(mode) =>
-                  void useChatStore
+                  void scopedChat
                     .getState()
                     .setCostControlMode(mode)
                     .catch(() => {})
@@ -4119,6 +4195,8 @@ function AgentPicker({
   }, [openNonce]);
 
   const hasAgents = !!agents && agents.length > 0;
+  // Model/effort selections from the dropdown apply to THIS pane's session.
+  const scopedChat = useScopedChatStore();
   const selectedEffort = useChatStore((s) => s.selectedEffort);
   const selectedModel = useChatStore((s) => s.selectedModel);
   const llmModel = useChatStore((s) => s.llmModel);
@@ -4233,7 +4311,7 @@ function AgentPicker({
                   data-model-id={m.id}
                   data-active={isActive ? "true" : undefined}
                   onSelect={() =>
-                    void useChatStore
+                    void scopedChat
                       .getState()
                       .setModel(m.id)
                       .catch(() => {})
@@ -4264,7 +4342,7 @@ function AgentPicker({
                 data-effort-level={level}
                 data-active={selectedEffort === level ? "true" : undefined}
                 onSelect={() =>
-                  void useChatStore
+                  void scopedChat
                     .getState()
                     .setEffort(level)
                     .catch(() => {})
