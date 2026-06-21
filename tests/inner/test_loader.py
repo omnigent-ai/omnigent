@@ -823,6 +823,149 @@ os_env:
             finally:
                 os.unlink(f.name)
 
+    def test_load_agent_def_parses_credential_proxy(self):
+        """Single-file omnigent YAML must parse ``credential_proxy``.
+
+        Regression: this loader (the path ``omnigent run agent.yaml``
+        takes, distinct from the bundle ``parse(config.yaml)`` path)
+        had no ``credential_proxy`` parsing, so the field was silently
+        dropped and the secretless proxy never armed even though the
+        YAML declared it. We assert the entry actually reaches the spec
+        with the right host/scheme/injection — not merely that the
+        sandbox is non-None — because a dropped field would leave
+        ``credential_proxy`` as ``None`` while everything else parsed.
+        """
+        yaml_content = """
+name: t
+prompt: hi
+os_env:
+  type: caller_process
+  sandbox:
+    type: darwin_seatbelt
+    egress_rules:
+      - "* corp.example.com/**"
+    credential_proxy:
+      - type: https_bearer
+        target: corp.example.com/rest
+        source: {env: CORP}
+        env: CORP_TOKEN
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write(yaml_content)
+            f.flush()
+            try:
+                agent = load_agent_def(f.name)
+            finally:
+                os.unlink(f.name)
+        proxy = agent.os_env.sandbox.credential_proxy
+        self.assertIsNotNone(proxy)
+        # The YAML declares exactly one credential_proxy binding; a
+        # different count would mean the loader dropped it (the original
+        # bug) or duplicated it.
+        self.assertEqual(len(proxy.entries), 1)
+        entry = proxy.entries[0]
+        self.assertEqual(entry.host, "corp.example.com")
+        self.assertEqual(entry.scheme, "bearer")
+        self.assertEqual(entry.inject_env, ["CORP_TOKEN"])
+        self.assertEqual(entry.source.kind, "env")
+        self.assertEqual(entry.source.env, "CORP")
+
+    def test_load_agent_def_rejects_credential_proxy_without_egress_rules(self):
+        """``credential_proxy`` without ``egress_rules`` is rejected here too.
+
+        The MITM egress proxy (driven by egress_rules) is what performs
+        the synthetic->real swap and blocks placeholder leaks; without it
+        the proxy injects a placeholder the agent can't use. The loader
+        must fail loud rather than hand back an inert, half-wired policy
+        — mirroring the bundle parser guard so the two paths can't drift.
+        """
+        yaml_content = """
+name: t
+prompt: hi
+os_env:
+  type: caller_process
+  sandbox:
+    type: darwin_seatbelt
+    credential_proxy:
+      - type: git_https
+        target: github.com
+        source: {env: GH_PAT}
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write(yaml_content)
+            f.flush()
+            try:
+                with self.assertRaisesRegex(ValueError, r"requires os_env\.sandbox\.egress_rules"):
+                    load_agent_def(f.name)
+            finally:
+                os.unlink(f.name)
+
+    def test_load_agent_def_rejects_credential_proxy_on_soft_backend(self):
+        """``credential_proxy`` requires a network-isolating backend.
+
+        On a soft backend (here ``none``) the egress proxy is not the
+        only way out, so binding credentials to it is unsafe. We omit
+        ``egress_rules`` so the backend guard (checked first) is the one
+        that fires, isolating the credential_proxy-specific backend
+        requirement rather than the generic egress-rules backend guard.
+        """
+        yaml_content = """
+name: t
+prompt: hi
+os_env:
+  type: caller_process
+  sandbox:
+    type: none
+    credential_proxy:
+      - type: git_https
+        target: github.com
+        source: {env: GH_PAT}
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write(yaml_content)
+            f.flush()
+            try:
+                with self.assertRaisesRegex(
+                    ValueError, r"credential_proxy requires sandbox\.type"
+                ):
+                    load_agent_def(f.name)
+            finally:
+                os.unlink(f.name)
+
+    def test_load_agent_def_rejects_gh_basic_on_macos(self):
+        """Single-file YAML rejects ``gh_basic`` on macOS too.
+
+        ``gh_basic`` wires the GitHub CLI (a Go binary); Go on macOS ignores
+        SSL_CERT_FILE and verifies TLS via the keychain, so it rejects the
+        egress MITM CA and every ``gh`` call fails at runtime with
+        ``certificate is not trusted``. The single-file loader (the
+        ``omnigent run agent.yaml`` path) must fail loud at load time with the
+        same explanation as the bundle parser — sharing one detection helper so
+        the two paths can't drift.
+        """
+        yaml_content = """
+name: t
+prompt: hi
+os_env:
+  type: caller_process
+  sandbox:
+    type: darwin_seatbelt
+    egress_rules:
+      - "* github.com/**"
+      - "* api.github.com/**"
+    credential_proxy:
+      - type: gh_basic
+        source: {env: GH_PAT}
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write(yaml_content)
+            f.flush()
+            try:
+                with self.assertRaisesRegex(ValueError, r"gh_basic' does not work on macOS"):
+                    load_agent_def(f.name)
+            finally:
+                os.unlink(f.name)
+
 
 def test_factory_params_with_unresolvable_handler_does_not_crash() -> None:
     """factory_params + a handler that cannot be imported must not raise.

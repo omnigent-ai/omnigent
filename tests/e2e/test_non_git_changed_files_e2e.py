@@ -37,12 +37,14 @@ Usage::
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import secrets
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import uuid
@@ -52,11 +54,13 @@ from typing import Any
 
 import httpx
 import pytest
+import yaml
 
 from tests.e2e.conftest import (
-    build_agent_bundle,
+    configure_mock_llm,
     find_free_port,
     poll_session_until_terminal,
+    reset_mock_llm,
     send_user_message_to_session,
 )
 from tests.e2e.helpers import HEALTH_TIMEOUT_S, POLL_INTERVAL_S
@@ -128,9 +132,8 @@ def non_git_runner_id() -> str:
 
 @pytest.fixture(scope="module")
 def non_git_server(
-    request: pytest.FixtureRequest,
     llm_api_key: str,
-    databricks_workspace_host: str | None,
+    mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
     non_git_workspace: Path,
     non_git_runner_id: str,
@@ -144,8 +147,7 @@ def non_git_server(
     directory and returns an :class:`AgentEditFilesystemRegistry`.
 
     :param llm_api_key: The ``--llm-api-key`` option value.
-    :param databricks_workspace_host: Workspace host, or ``None``
-        when ``--profile`` is not set.
+    :param mock_llm_server_url: Mock LLM server URL.
     :param tmp_path_factory: pytest temp path factory.
     :param non_git_workspace: Non-git workspace directory (used as CWD).
     :param non_git_runner_id: Runner id to register.
@@ -164,9 +166,8 @@ def non_git_server(
         "OMNIGENT_SKIP_ONBOARD": "1",
         "OMNIGENT_NO_UPDATE_CHECK": "1",
     }
-    if databricks_workspace_host is not None:
-        env["OPENAI_BASE_URL"] = f"{databricks_workspace_host}/serving-endpoints"
-        env["DATABRICKS_CONFIG_PROFILE"] = request.config.getoption("--profile")
+    if mock_llm_server_url is not None:
+        env["OPENAI_BASE_URL"] = f"{mock_llm_server_url}/v1"
 
     log_handle = open(server_log, "w")  # noqa: SIM115
     proc = subprocess.Popen(
@@ -280,11 +281,29 @@ def non_git_client(non_git_server: str) -> Iterator[httpx.Client]:
 # ── Shared helpers ────────────────────────────────────────────────────────────
 
 
+def _build_mock_workspace_writer_bundle(mock_llm_base_url: str) -> bytes:
+    """Read the on-disk workspace-file-writer YAML, inject mock auth, tarball."""
+    yaml_path = _WORKSPACE_WRITER_DIR / "workspace-file-writer.yaml"
+    spec = yaml.safe_load(yaml_path.read_text())
+    spec.setdefault("executor", {})["auth"] = {
+        "type": "api_key",
+        "api_key": "mock-key",
+        "base_url": f"{mock_llm_base_url}/v1",
+    }
+    patched = yaml.dump(spec, sort_keys=False).encode()
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        info = tarfile.TarInfo(name="./workspace-file-writer.yaml")
+        info.size = len(patched)
+        tar.addfile(info, io.BytesIO(patched))
+    return buf.getvalue()
+
+
 def _create_session(
     client: httpx.Client,
     *,
     runner_id: str,
-    databricks_workspace_host: str | None,
+    mock_llm_server_url: str,
 ) -> str:
     """Upload the workspace-writer agent and create a bound session.
 
@@ -294,14 +313,11 @@ def _create_session(
 
     :param client: HTTP client pointed at the non-git server.
     :param runner_id: Runner id to bind the session to.
-    :param databricks_workspace_host: Workspace host URL used for model
-        rewriting; ``None`` when not running against Databricks.
+    :param mock_llm_server_url: Mock LLM server URL used to inject
+        mock auth into the agent bundle.
     :returns: The new session id, e.g. ``"conv_abc123"``.
     """
-    bundle = build_agent_bundle(
-        _WORKSPACE_WRITER_DIR,
-        rewrite_model_for_databricks=databricks_workspace_host is not None,
-    )
+    bundle = _build_mock_workspace_writer_bundle(mock_llm_server_url)
     create_resp = client.post(
         "/v1/sessions",
         data={"metadata": json.dumps({})},
@@ -358,7 +374,7 @@ def test_non_git_create_file(
     non_git_client: httpx.Client,
     non_git_runner_id: str,
     non_git_workspace: Path,
-    databricks_workspace_host: str | None,
+    mock_llm_server_url: str,
 ) -> None:
     """Agent-created file appears in the changes listing with status ``"created"``.
 
@@ -379,15 +395,33 @@ def test_non_git_create_file(
     :param non_git_client: HTTP client pointed at the non-git server.
     :param non_git_runner_id: Runner id registered by the fixture.
     :param non_git_workspace: Non-git temp workspace directory (= server CWD).
-    :param databricks_workspace_host: Workspace host URL for model rewriting.
+    :param mock_llm_server_url: Mock LLM server URL.
     """
     filename = f"create_{uuid.uuid4().hex[:8]}.txt"
     content = "created by e2e test"
 
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_write_1",
+                        "name": "sys_os_write",
+                        "arguments": json.dumps({"path": filename, "content": content}),
+                    },
+                ],
+            },
+            {"text": "File created successfully."},
+        ],
+        key="default",
+    )
+
     session_id = _create_session(
         non_git_client,
         runner_id=non_git_runner_id,
-        databricks_workspace_host=databricks_workspace_host,
+        mock_llm_server_url=mock_llm_server_url,
     )
     response_id = send_user_message_to_session(
         non_git_client,
@@ -436,7 +470,7 @@ def test_non_git_edit_file(
     non_git_client: httpx.Client,
     non_git_runner_id: str,
     non_git_workspace: Path,
-    databricks_workspace_host: str | None,
+    mock_llm_server_url: str,
 ) -> None:
     """Agent overwrite of a pre-existing file appears with status ``"modified"``.
 
@@ -454,17 +488,35 @@ def test_non_git_edit_file(
     :param non_git_client: HTTP client pointed at the non-git server.
     :param non_git_runner_id: Runner id registered by the fixture.
     :param non_git_workspace: Non-git temp workspace directory.
-    :param databricks_workspace_host: Workspace host URL for model rewriting.
+    :param mock_llm_server_url: Mock LLM server URL.
     """
     filename = f"edit_{uuid.uuid4().hex[:8]}.txt"
     original_content = "original content written before session"
     updated_content = "overwritten by e2e edit test"
 
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_write_2",
+                        "name": "sys_os_write",
+                        "arguments": json.dumps({"path": filename, "content": updated_content}),
+                    },
+                ],
+            },
+            {"text": "File overwritten successfully."},
+        ],
+        key="default",
+    )
+
     # Create the session to learn its id before seeding the file.
     session_id = _create_session(
         non_git_client,
         runner_id=non_git_runner_id,
-        databricks_workspace_host=databricks_workspace_host,
+        mock_llm_server_url=mock_llm_server_url,
     )
 
     # Seed the file into the workspace root so the agent's write is an

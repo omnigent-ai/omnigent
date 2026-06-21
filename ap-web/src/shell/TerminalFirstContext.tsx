@@ -9,13 +9,14 @@
 // from different conversation labels:
 //
 //   - `omnigent.wrapper === "claude-code-native-ui"` → `isClaudeNative`
-//   - `omnigent.wrapper` ∈ {"claude-code-native-ui", "codex-native-ui"} → `isNativeWrapper`
+//   - registered `omnigent.wrapper` native value    → `isNativeWrapper`
 //   - `omnigent.ui === "terminal"`                  → `isTerminalFirst`
 //
 // `isTerminalFirst` is purely presentational (the Chat/Terminal pill and
 // the inline terminal surface); `isNativeWrapper` keys the behavior
-// differences of native-CLI harnesses (no server-side slash_command
-// path, model pinned at launch). The flags used to coincide when the
+// differences of native-CLI harnesses (no server-side slash_command path;
+// `/model` is only exposed when a picker-backed propagation path exists).
+// The flags used to coincide when the
 // native wrappers were the only sessions stamping the terminal UI
 // label; runner-hosted SDK sessions now stamp `omnigent.ui` WITHOUT a
 // wrapper label (their embedded terminal hosts the Omnigent REPL), so
@@ -29,8 +30,7 @@ export interface TerminalFirstContextValue {
   /** True when `omnigent.wrapper === "claude-code-native-ui"`. */
   isClaudeNative: boolean;
   /**
-   * True when the session runs a native-CLI wrapper (claude-native or
-   * codex-native). Keys harness *behavior* gates — composer slash
+   * True when the session runs a native-CLI wrapper. Keys harness *behavior* gates — composer slash
    * commands and the `/model` command — unlike `isTerminalFirst`,
    * which only gates presentation (SDK sessions with an embedded
    * Omnigent REPL terminal are terminal-first but not native).

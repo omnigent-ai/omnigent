@@ -9,7 +9,8 @@ shape, not just the command's exit code, so a regression in the
 add/set-default/remove write paths surfaces here rather than silently.
 
 ``configure harnesses`` is a **three-level** picker. Level 1 picks a harness —
-the cursor moves between ``1=Claude``, ``2=Codex``, ``3=Pi``, and ``4=Quit`` (each
+the cursor moves between ``1=Claude``, ``2=Codex``, ``3=Pi``, ``4=Cursor``,
+``5=Antigravity``, and ``6=Quit`` (each
 harness's prominent default + ``+N more`` summary renders as non-selectable
 sub-lines that are skipped; a harness with no usable default — uninstalled or
 unconfigured — shows a red ✗, while a configured one carries no name-level
@@ -78,8 +79,10 @@ def isolated_config(tmp_path, monkeypatch):
         "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",
         "GEMINI_API_KEY",
+        "ANTIGRAVITY_API_KEY",
         "OPENROUTER_API_KEY",
         "DATABRICKS_TOKEN",
+        "CURSOR_API_KEY",
     ):
         monkeypatch.delenv(var, raising=False)
     # Redirect CLI-detected credential homes so a developer's real
@@ -671,15 +674,15 @@ def test_kind_glyph_uniform_display_width(kind: str) -> None:
 
     Proves the "ticket looks cramped" fix comes from the subscription
     glyph's VARIATION SELECTOR-16 (which makes ADMISSION TICKETS a 2-cell
-    emoji like 🔑 / 🌐 / 🧱), not ad-hoc padding. Width is measured the way
-    the banner box measures it — ``cell_len`` plus one cell per VS16 —
-    because ``rich.cells.cell_len`` itself under-counts a VS16 emoji as 1
-    cell. A regression that dropped the VS16 (or a glyph) yields width != 2.
+    emoji like 🔑 / 🌐 / 🧱), not ad-hoc padding. Width is measured via the
+    banner box's own ``_display_width`` (rich >= 14 ``cell_len``, which counts
+    a VS16-forced wide emoji as the two cells terminals render). A regression
+    that dropped the VS16 (or a glyph) yields width != 2.
     """
-    from rich.cells import cell_len
+    from omnigent.inner.banner import _display_width
 
     g = kind_glyph(kind)
-    width = cell_len(g) + g.count("\ufe0f")
+    width = _display_width(g)
     assert width == 2, f"glyph for {kind!r} should be 2 display cells; got {width} ({g!r})."
 
 
@@ -1960,3 +1963,509 @@ def test_add_menu_readds_dismissed_cli_config_credential(isolated_config) -> Non
     # The dismissal is cleared, so the credential behaves like an ordinary
     # detection again instead of staying half-dismissed.
     assert cfg["dismissed_detections"] == []
+
+
+# ── Cursor API-key flow ─────────────────────────────────────────────────────
+# Cursor runs via the ``cursor-sdk`` package and authenticates with a
+# ``CURSOR_API_KEY``; it has no provider/gateway family. Its drill-in (L1 row 4)
+# stores the key in the secret store + a dedicated ``cursor:`` config block,
+# mirroring the other harnesses' api-key persistence. The menu is API-key-only
+# (Set/Replace/Remove), so it touches neither the ``cursor-agent`` binary nor a
+# login probe. ``isolated_config`` clears any ambient ``CURSOR_API_KEY``.
+
+
+@pytest.fixture()
+def _cursor_sdk_present(monkeypatch):
+    """Force ``cursor-sdk`` detection to report installed.
+
+    The key-management tests below script the Cursor drill-in assuming no
+    install-offer. ``cursor-sdk`` is an opt-in extra (absent in CI), so without
+    this the drill-in's install-offer fires — consuming a scripted menu token
+    (desyncing the input) and even running a real ``uv pip install``. Patching the
+    source-module attribute is seen at every call site (it's resolved at call
+    time). Mirror of :func:`_cursor_sdk_absent`.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setattr(
+        "omnigent.onboarding.cursor_auth.cursor_sdk_installed",
+        lambda: True,
+    )
+
+
+def test_cursor_set_api_key_paste_writes_block_and_secret(
+    isolated_config, _cursor_sdk_present
+) -> None:
+    """Pasting a ``crsr_`` key stores the secret + writes the ``cursor:`` block.
+
+    Proves the api-key path: the secret lands in the store (never plaintext in
+    config) and the config references it via ``keychain:cursor``.
+    """
+    # L1 4=Cursor → cursor menu 1=Set API key → paste key (crsr_ → no warn) →
+    # cursor menu q=back → L1 q=quit.
+    stdin = "\n".join(["4", "1", "crsr_test_key_123", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    assert cfg["cursor"] == {"api_key_ref": "keychain:cursor"}
+    # The pasted secret reached the store under the ``cursor`` name; config
+    # holds only the reference.
+    assert secrets.load_secret("cursor") == "crsr_test_key_123"
+
+
+def test_cursor_adopt_env_api_key_writes_env_ref(
+    isolated_config, monkeypatch, _cursor_sdk_present
+) -> None:
+    """Adopting an existing ``$CURSOR_API_KEY`` records an ``env:`` ref only.
+
+    The env path must NOT copy the secret into the store — it points the config
+    at the live environment variable so the key never leaves the user's shell.
+    """
+    monkeypatch.setenv("CURSOR_API_KEY", "crsr_env_key_456")
+    # L1 4=Cursor → 1=Set API key → "y" adopt detected $CURSOR_API_KEY →
+    # q back → q quit.
+    stdin = "\n".join(["4", "1", "y", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    assert cfg["cursor"] == {"api_key_ref": "env:CURSOR_API_KEY"}
+    assert secrets.load_secret("cursor") is None
+
+
+def test_cursor_remove_api_key_drops_block_and_secret(
+    isolated_config, _cursor_sdk_present
+) -> None:
+    """Removing a Cursor key deletes the stored secret AND drops the config block."""
+    # Seed a stored key: the keychain secret + the ``cursor:`` block referencing it.
+    secrets.store_secret("cursor", "crsr_seeded")
+    config_path = os.path.join(isolated_config, "config.yaml")
+    with open(config_path, "w") as f:
+        yaml.safe_dump({"cursor": {"api_key_ref": "keychain:cursor"}}, f)
+
+    # L1 4=Cursor → cursor menu (key set: 1=Replace 2=Remove 3=Back) → 2=Remove
+    # → q back → q quit.
+    stdin = "\n".join(["4", "2", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    assert "cursor" not in cfg
+    assert secrets.load_secret("cursor") is None
+
+
+def test_cursor_set_api_key_non_crsr_declined_is_not_stored(
+    isolated_config, _cursor_sdk_present
+) -> None:
+    """A non-``crsr_`` paste that the user declines to force is NOT persisted.
+
+    The soft prefix check warns and asks to store anyway; declining must leave
+    both the secret store and the config untouched.
+    """
+    # L1 4=Cursor → 1=Set API key → paste non-crsr_ key → "n" decline warning →
+    # q back → q quit.
+    stdin = "\n".join(["4", "1", "sk-not-a-cursor-key", "n", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    assert "cursor" not in cfg
+    assert secrets.load_secret("cursor") is None
+
+
+# ── Cursor SDK-extra install offer (the optional ``cursor`` extra) ───────────
+# ``cursor-sdk`` is now an OPTIONAL extra, so a key can be set with no SDK and
+# setup must offer to install it (like antigravity post-#322). These tests force
+# detection absent (the SDK is actually present in the test venv).
+
+
+@pytest.fixture()
+def _cursor_sdk_absent(monkeypatch):
+    """Force ``cursor-sdk`` detection to report missing.
+
+    Both the overview row and the drill-in resolve ``cursor_sdk_installed`` from
+    the source module at call time, so patching the module attribute covers both.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setattr(
+        "omnigent.onboarding.cursor_auth.cursor_sdk_installed",
+        lambda: False,
+    )
+
+
+def test_cursor_overview_surfaces_install_command_when_sdk_missing(
+    isolated_config, _cursor_sdk_absent
+) -> None:
+    """L1 overview: the Cursor row names the extra install command when absent.
+
+    The exact ``pip install "omnigent[cursor]"`` is shown (escaped so the
+    literal brackets render).
+    """
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert "not installed — open to install" in out
+    # The literal command (brackets included) reaches the rendered output.
+    assert 'pip install "omnigent[cursor]"' in out
+
+
+def test_cursor_drillin_offers_install_when_sdk_missing(
+    isolated_config, _cursor_sdk_absent
+) -> None:
+    """Drilling into Cursor with the SDK absent presents the install offer.
+
+    Here the user picks "show the command" (choice 3), which prints it and falls
+    through to the key menu, then backs out.
+    """
+    # L1 4=Cursor → install offer 3=show command → key menu q=back → L1 q.
+    stdin = "\n".join(["4", "3", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert "isn't installed" in out
+    assert 'pip install "omnigent[cursor]"' in out
+
+
+def test_cursor_key_settable_when_sdk_missing(isolated_config, _cursor_sdk_absent) -> None:
+    """The Cursor key is still storable when the SDK is absent (no hard block).
+
+    The deliberate divergence from pi: the drill-in offers the install but does
+    NOT gate key management on it. Here the user declines ("set the key anyway" =
+    choice 2), then sets the key — which must persist as it does with the SDK.
+    """
+    # L1 4=Cursor → install offer 2=set key anyway → key menu 1=Set →
+    # paste crsr_ key → key menu q=back → L1 q=quit.
+    stdin = "\n".join(["4", "2", "1", "crsr_key_no_sdk", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    assert cfg["cursor"] == {"api_key_ref": "keychain:cursor"}
+    assert secrets.load_secret("cursor") == "crsr_key_no_sdk"
+
+
+def test_cursor_install_now_invokes_runner_without_index(
+    isolated_config, _cursor_sdk_absent, monkeypatch
+) -> None:
+    """Choosing "install it now" shells the install with ``omnigent[cursor]``.
+
+    Mocks the subprocess and asserts the argv targets the extra and carries NO
+    hardcoded index URL / proxy. Forces the ``uv``-absent path for determinism.
+    """
+    import subprocess
+
+    calls: list[list[str]] = []
+
+    def _run(argv: list[str], *, check: bool = False, timeout: float | None = None):
+        calls.append(argv)
+        return subprocess.CompletedProcess(args=argv, returncode=0)
+
+    monkeypatch.setattr("omnigent.onboarding.cursor_auth.shutil.which", lambda name: None)
+    monkeypatch.setattr("omnigent.onboarding.cursor_auth.subprocess.run", _run)
+
+    # L1 4=Cursor → install offer 1=install now → key menu q=back → L1 q.
+    stdin = "\n".join(["4", "1", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    assert len(calls) == 1, f"expected exactly one install invocation, got {calls}"
+    argv = calls[0]
+    assert "omnigent[cursor]" in argv
+    assert "install" in argv
+    # No index URL / proxy is baked into committed code.
+    assert not any("index" in part or "://" in part for part in argv)
+
+
+# ── Antigravity Gemini API-key flow ─────────────────────────────────────────
+# Antigravity (Gemini-native, no provider family) drills in at L1 row 5
+# (Claude/Codex/Pi/Antigravity/Quit) and stores its key in the secret store +
+# the ``antigravity:`` config block. API-key-only menu (Set/Replace/Remove);
+# ``isolated_config`` clears ambient GEMINI_API_KEY / ANTIGRAVITY_API_KEY.
+
+
+@pytest.fixture()
+def _antigravity_sdk_present(monkeypatch):
+    """Force ``google-antigravity`` detection to report installed.
+
+    The key-management tests below script the Antigravity drill-in assuming no
+    install-offer. The optional ``antigravity`` extra is absent in CI, so without
+    this the drill-in's install-offer fires — consuming a scripted menu token
+    (desyncing the input) and even running a real ``uv pip install``. Patching the
+    source-module attribute is seen at every call site (it's resolved at call
+    time). Mirror of :func:`_antigravity_sdk_absent`.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setattr(
+        "omnigent.onboarding.antigravity_auth.antigravity_sdk_installed",
+        lambda: True,
+    )
+
+
+def test_antigravity_set_api_key_paste_writes_block_and_secret(
+    isolated_config, _antigravity_sdk_present
+) -> None:
+    """Pasting an ``AIza`` key stores the secret + writes the ``antigravity:`` block.
+
+    Proves the api-key path: the secret lands in the store (never plaintext in
+    config) and the config references it via ``keychain:antigravity``.
+    """
+    # L1 5=Antigravity → antigravity menu 1=Set API key → paste key (AIza → no
+    # warn) → antigravity menu q=back → L1 q=quit.
+    stdin = "\n".join(["5", "1", "AIza_test_key_123", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    assert cfg["antigravity"] == {"api_key_ref": "keychain:antigravity"}
+    # The pasted secret reached the store under the ``antigravity`` name; config
+    # holds only the reference.
+    assert secrets.load_secret("antigravity") == "AIza_test_key_123"
+
+
+def test_antigravity_adopt_env_api_key_writes_env_ref(
+    isolated_config, monkeypatch, _antigravity_sdk_present
+) -> None:
+    """Adopting an existing ``$GEMINI_API_KEY`` records an ``env:`` ref only.
+
+    The env path must NOT copy the secret into the store — it points the config
+    at the live environment variable so the key never leaves the user's shell.
+    """
+    monkeypatch.setenv("GEMINI_API_KEY", "AIza_env_key_456")
+    # L1 5=Antigravity → 1=Set API key → "y" adopt detected $GEMINI_API_KEY →
+    # q back → q quit.
+    stdin = "\n".join(["5", "1", "y", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    assert cfg["antigravity"] == {"api_key_ref": "env:GEMINI_API_KEY"}
+    assert secrets.load_secret("antigravity") is None
+
+
+def test_antigravity_remove_api_key_drops_block_and_secret(
+    isolated_config, _antigravity_sdk_present
+) -> None:
+    """Removing a Gemini key deletes the stored secret AND drops the config block."""
+    # Seed a stored key: the keychain secret + the ``antigravity:`` block.
+    secrets.store_secret("antigravity", "AIza_seeded")
+    config_path = os.path.join(isolated_config, "config.yaml")
+    with open(config_path, "w") as f:
+        yaml.safe_dump({"antigravity": {"api_key_ref": "keychain:antigravity"}}, f)
+
+    # L1 5=Antigravity → antigravity menu (key set: 1=Replace 2=Remove 3=Back) →
+    # 2=Remove → q back → q quit.
+    stdin = "\n".join(["5", "2", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    assert "antigravity" not in cfg
+    assert secrets.load_secret("antigravity") is None
+
+
+def test_antigravity_remove_does_not_delete_foreign_keychain_secret(
+    isolated_config, _antigravity_sdk_present
+) -> None:
+    """Removing antigravity drops the block but spares a shared ``keychain:<other>``.
+
+    A hand-edited ``antigravity:`` block may point at a secret we don't own
+    (here ``keychain:shared-gemini``). Remove must NOT clobber that secret —
+    only the config block is dropped. Against the old over-broad delete (any
+    ``keychain:`` ref) the shared secret would have been destroyed.
+    """
+    # Seed a foreign shared secret referenced by a hand-edited block.
+    secrets.store_secret("shared-gemini", "AIza_shared_seeded")
+    config_path = os.path.join(isolated_config, "config.yaml")
+    with open(config_path, "w") as f:
+        yaml.safe_dump({"antigravity": {"api_key_ref": "keychain:shared-gemini"}}, f)
+
+    # L1 5=Antigravity → antigravity menu 2=Remove → q back → q quit.
+    stdin = "\n".join(["5", "2", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    # Block dropped, but the secret we don't own is left intact.
+    assert "antigravity" not in cfg
+    assert secrets.load_secret("shared-gemini") == "AIza_shared_seeded"
+
+
+def test_antigravity_set_api_key_non_aiza_declined_is_not_stored(
+    isolated_config, _antigravity_sdk_present
+) -> None:
+    """A non-``AIza`` paste that the user declines to force is NOT persisted.
+
+    The soft prefix check warns and asks to store anyway; declining must leave
+    both the secret store and the config untouched.
+    """
+    # L1 5=Antigravity → 1=Set API key → paste non-AIza key → "n" decline
+    # warning → q back → q quit.
+    stdin = "\n".join(["5", "1", "sk-not-a-gemini-key", "n", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    assert "antigravity" not in cfg
+    assert secrets.load_secret("antigravity") is None
+
+
+# ── Antigravity SDK-extra install offer (the optional ``antigravity`` extra) ──
+# The antigravity SDK ships in an OPTIONAL extra, so a user can paste a key and still
+# have no SDK; setup must detect that and offer to install. These tests force detection
+# absent (the SDK is actually present in the test venv).
+
+
+@pytest.fixture()
+def _antigravity_sdk_absent(monkeypatch):
+    """Force ``google-antigravity`` detection to report missing.
+
+    Both call sites (overview row + drill-in) resolve ``antigravity_sdk_installed``
+    from the source module at call time, so patching the module attribute is seen by
+    both.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setattr(
+        "omnigent.onboarding.antigravity_auth.antigravity_sdk_installed",
+        lambda: False,
+    )
+
+
+def test_antigravity_overview_surfaces_install_command_when_sdk_missing(
+    isolated_config, _antigravity_sdk_absent
+) -> None:
+    """L1 overview: the Antigravity row names the extra install command when absent.
+
+    The exact ``pip install "omnigent[antigravity]"`` is shown (escaped so the literal
+    brackets render). Without the SDK-detection branch this line never appears.
+    """
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert "not installed — open to install" in out
+    # The literal command (brackets included) reaches the rendered output.
+    assert 'pip install "omnigent[antigravity]"' in out
+
+
+def test_antigravity_drillin_offers_install_when_sdk_missing(
+    isolated_config, _antigravity_sdk_absent
+) -> None:
+    """Drilling into Antigravity with the SDK absent presents the install offer.
+
+    The user picks "show the command" (choice 3), which prints the command and falls
+    through to the key menu, then backs out.
+    """
+    # L1 5=Antigravity → install offer 3=show command → key menu q=back → L1 q.
+    stdin = "\n".join(["5", "3", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert "isn't installed" in out
+    assert 'pip install "omnigent[antigravity]"' in out
+
+
+def test_antigravity_key_settable_when_sdk_missing(
+    isolated_config, _antigravity_sdk_absent
+) -> None:
+    """The Gemini key is still storable when the SDK is absent (no hard block).
+
+    The deliberate divergence from pi: the drill-in offers the install but does NOT
+    gate key management on it. The user declines ("set the key anyway" = choice 2),
+    then sets the key, which must persist as it does with the SDK present.
+    """
+    # L1 5=Antigravity → install offer 2=set key anyway → key menu 1=Set →
+    # paste AIza key → key menu q=back → L1 q=quit.
+    stdin = "\n".join(["5", "2", "1", "AIza_key_no_sdk", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    assert cfg["antigravity"] == {"api_key_ref": "keychain:antigravity"}
+    assert secrets.load_secret("antigravity") == "AIza_key_no_sdk"
+
+
+def test_antigravity_install_now_invokes_runner_without_index(
+    isolated_config, _antigravity_sdk_absent, monkeypatch
+) -> None:
+    """Choosing "install it now" shells the install with ``omnigent[antigravity]``.
+
+    Mocks the subprocess and asserts the argv targets the extra and carries NO
+    hardcoded index URL / proxy. Forces the ``uv``-absent path for a deterministic argv.
+    """
+    import subprocess
+
+    calls: list[list[str]] = []
+
+    def _run(argv: list[str], *, check: bool = False, timeout: float | None = None):
+        calls.append(argv)
+        return subprocess.CompletedProcess(args=argv, returncode=0)
+
+    monkeypatch.setattr("omnigent.onboarding.antigravity_auth.shutil.which", lambda name: None)
+    monkeypatch.setattr("omnigent.onboarding.antigravity_auth.subprocess.run", _run)
+
+    # L1 5=Antigravity → install offer 1=install now → key menu q=back → L1 q.
+    stdin = "\n".join(["5", "1", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    assert len(calls) == 1, f"expected exactly one install invocation, got {calls}"
+    argv = calls[0]
+    assert "omnigent[antigravity]" in argv
+    assert "install" in argv
+    # No index URL / proxy is baked into committed code.
+    assert not any("index" in part or "://" in part for part in argv)
+
+
+def _other_key_add_menu_index(family: str) -> int:
+    """Return the 1-based numbered-fallback position of "Other provider — API key".
+
+    Computed from the live per-family add menu rather than hardcoded, so a
+    reordering of :func:`add_menu_options` doesn't aim this test's piped stdin
+    at the wrong row.
+
+    :param family: The harness surface whose add menu is inspected.
+    :returns: The 1-based index of the catch-all ``other``-key option.
+    """
+    from omnigent.onboarding.configure_models import add_menu_options_for_family
+    from omnigent.onboarding.provider_config import KEY_KIND
+
+    opts = add_menu_options_for_family(family)
+    return next(i for i, o in enumerate(opts) if o.kind == KEY_KIND and o.other) + 1
+
+
+def test_configure_harnesses_add_other_key_no_remaining_providers_aborts_cleanly(
+    isolated_config, monkeypatch
+) -> None:
+    """Picking "Other provider — API key" with no catalog providers left aborts
+    cleanly instead of crashing.
+
+    Regression for #820: when every catch-all key provider is already configured,
+    ``other_key_providers()`` returns ``[]`` and the secondary ``select`` was
+    handed an empty option list, raising ``ValueError: select() requires at least
+    one option`` out of ``omnigent setup``. The add branch must detect the empty
+    list, tell the user, and return — exit code 0, no traceback. Driven under Pi
+    (the surface from the report), with the harness CLI forced installed so the
+    drill-in reaches the add menu.
+    """
+    from omnigent.onboarding.provider_config import PI_SURFACE
+
+    # Force the harness CLI "installed" so the Pi drill-in shows the add menu
+    # rather than the install prompt, and pretend the catch-all catalog is
+    # exhausted (the real-world trigger: all of Groq/DeepSeek/… already added).
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: True
+    )
+    monkeypatch.setattr("omnigent.onboarding.configure_models.other_key_providers", list)
+
+    other = _other_key_add_menu_index(PI_SURFACE)
+    # L1 3=Pi → L2 1=+Add → add menu <other>=Other provider — API key → L2 q=back → L1 q=exit.
+    stdin = "\n".join(["3", "1", str(other), "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+
+    # Pre-fix this exited non-zero with a ValueError; the guard makes it graceful.
+    assert result.exit_code == 0, result.output
+    assert result.exception is None, result.exception
+    assert "No other API-key providers" in result.output

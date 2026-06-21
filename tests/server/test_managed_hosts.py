@@ -11,12 +11,14 @@ from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
 
 from omnigent.db.utils import now_epoch
+from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s as e2b_managed_token_ttl_s
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.managed_hosts import (
     DAYTONA_MANAGED_TOKEN_TTL_S,
     ISLO_MANAGED_TOKEN_TTL_S,
     MODAL_MANAGED_TOKEN_TTL_S,
+    OPENSHELL_MANAGED_TOKEN_TTL_S,
     ManagedSandboxConfig,
     RepoWorkspace,
     launch_managed_host,
@@ -34,8 +36,10 @@ from tests.server.helpers import (
     FakeSandboxLauncher,
     HostStartInvocation,
     install_fake_daytona_launcher,
+    install_fake_e2b_launcher,
     install_fake_islo_launcher,
     install_fake_modal_launcher,
+    install_fake_openshell_launcher,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -264,6 +268,116 @@ def test_parse_islo_without_section_defaults(
     assert fake.disk_gb is None
 
 
+def test_parse_valid_e2b_config_builds_parameterized_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The documented e2b YAML shape parses into a config whose factory
+    constructs E2B launchers carrying the configured template name and
+    env-passthrough names, with the e2b token TTL (24h cap → mirror
+    Modal's 25h token lifetime).
+    """
+    cfg = parse_sandbox_config(
+        {
+            "provider": "e2b",
+            "server_url": "https://srv.example.com/",
+            "e2b": {
+                "template": "omnigent-host",
+                "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
+            },
+        }
+    )
+    assert cfg is not None
+    assert cfg.server_url == "https://srv.example.com"
+    assert cfg.token_ttl_s == e2b_managed_token_ttl_s()
+    assert cfg.managed_launch_supported is True
+    assert cfg.provider == "e2b"
+    fake = FakeSandboxLauncher()
+    install_fake_e2b_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.template == "omnigent-host"
+    assert fake.env == ["OPENAI_API_KEY", "GIT_TOKEN"]
+
+
+def test_parse_e2b_without_section_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    `provider: e2b` + `server_url` is a complete config: template and
+    env are optional and reach the launcher as None (its own env-var
+    fallbacks / default-template apply).
+    """
+    cfg = parse_sandbox_config({"provider": "e2b", "server_url": "https://s.example.com"})
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_e2b_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.template is None
+    assert fake.env is None
+
+
+def test_parse_e2b_template_rejects_non_string(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A present-but-malformed e2b template fails loud at parse time."""
+    with pytest.raises(ValueError, match=r"sandbox\.e2b\.template"):
+        parse_sandbox_config(
+            {
+                "provider": "e2b",
+                "server_url": "https://s.example.com",
+                "e2b": {"template": ""},
+            }
+        )
+
+
+def test_parse_valid_openshell_config_builds_parameterized_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The documented openshell YAML shape parses into a config whose
+    factory constructs OpenShell launchers carrying image, env names,
+    and the optional gateway cluster.
+    """
+    cfg = parse_sandbox_config(
+        {
+            "provider": "openshell",
+            "server_url": "https://srv.example.com/",
+            "openshell": {
+                "image": "docker.io/me/omnigent-host:latest",
+                "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
+                "cluster": "my-gateway",
+            },
+        }
+    )
+    assert cfg is not None
+    assert cfg.server_url == "https://srv.example.com"
+    assert cfg.token_ttl_s == OPENSHELL_MANAGED_TOKEN_TTL_S
+    assert cfg.managed_launch_supported is True
+    assert cfg.provider == "openshell"
+    fake = FakeSandboxLauncher()
+    install_fake_openshell_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.image == "docker.io/me/omnigent-host:latest"
+    assert fake.env == ["OPENAI_API_KEY", "GIT_TOKEN"]
+    assert fake.cluster == "my-gateway"
+
+
+def test_parse_openshell_without_section_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    `provider: openshell` + `server_url` is a complete config: optional
+    constructor fields reach the launcher as None so its env-var
+    fallbacks / official-image default / active-gateway apply.
+    """
+    cfg = parse_sandbox_config({"provider": "openshell", "server_url": "https://s.example.com"})
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_openshell_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.image is None
+    assert fake.env is None
+    assert fake.cluster is None
+
+
 @pytest.mark.parametrize(
     ("raw", "expected_fragment"),
     [
@@ -320,6 +434,23 @@ def test_parse_islo_without_section_defaults(
         (
             {"provider": "islo", "server_url": "https://s", "islo": {"memory_mb": "large"}},
             "sandbox.islo.memory_mb",
+        ),
+        # openshell section present but malformed.
+        (
+            {"provider": "openshell", "server_url": "https://s", "openshell": "x"},
+            "sandbox.openshell",
+        ),
+        (
+            {"provider": "openshell", "server_url": "https://s", "openshell": {"image": "  "}},
+            "sandbox.openshell.image",
+        ),
+        (
+            {"provider": "openshell", "server_url": "https://s", "openshell": {"env": ["", "X"]}},
+            "sandbox.openshell.env",
+        ),
+        (
+            {"provider": "openshell", "server_url": "https://s", "openshell": {"cluster": "  "}},
+            "sandbox.openshell.cluster",
         ),
     ],
 )

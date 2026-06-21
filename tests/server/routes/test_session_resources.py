@@ -127,6 +127,17 @@ class _ConversationStore:
         conv.title = title
         return conv
 
+    def set_labels(
+        self,
+        conversation_id: str,
+        updates: dict[str, str],
+        updated_at: int | None = None,
+    ) -> None:
+        """Merge label updates into an in-memory conversation."""
+        del updated_at
+        conv = self._conversations[conversation_id]
+        conv.labels.update(updates)
+
     def append(
         self,
         conversation_id: str,
@@ -2365,6 +2376,40 @@ async def test_relay_persists_terminal_resource_deleted_from_runner() -> None:
     assert events[0].data.resource_type == "terminal"
     # Delete carries no resource body.
     assert events[0].data.resource is None
+
+
+@pytest.mark.asyncio
+async def test_relay_persists_failed_status_error_labels_from_runner() -> None:
+    """Runner ``session.status: failed`` error details survive reload."""
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    store = _ConversationStore()
+    client = _FakeStreamingRunnerClient(
+        [
+            _sse_frame(
+                {
+                    "type": "session.status",
+                    "status": "failed",
+                    "error": {
+                        "code": "required_terminal_exited",
+                        "message": "Required terminal exited unexpectedly",
+                    },
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+
+    await _relay_runner_stream("conv_proxy", client, store)  # type: ignore[arg-type]
+
+    assert (
+        store._conversations["conv_proxy"].labels["omnigent.last_task_error_code"]
+        == "required_terminal_exited"
+    )
+    assert (
+        store._conversations["conv_proxy"].labels["omnigent.last_task_error_message"]
+        == "Required terminal exited unexpectedly"
+    )
 
 
 @pytest.mark.asyncio

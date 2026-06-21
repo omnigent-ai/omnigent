@@ -129,8 +129,8 @@ SdkOptions: TypeAlias = Any  # type: ignore[explicit-any]
 # this executor touches.
 #
 # The private reaches (``_query``, ``_transport``, ``_process``,
-# ``_stderr_task_group``, etc.) are necessary to tear down the CLI
-# subprocess tree when the SDK's own ``disconnect()`` path is unsafe
+# ``_stderr_task`` / ``_stderr_task_group``, etc.) are necessary to tear
+# down the CLI subprocess tree when the SDK's own ``disconnect()`` path is unsafe
 # (different event loop / task) or hangs. The SDK does not expose a
 # supported equivalent, so we treat the private attributes as part of
 # our integration contract and document them here.
@@ -159,6 +159,19 @@ class _CancelScope(Protocol):
 
 class _TaskGroup(Protocol):
     cancel_scope: _CancelScope
+
+
+class _TaskHandle(Protocol):
+    """Private view of the SDK's detached stderr-reader task.
+
+    Current ``claude-agent-sdk`` (>=0.2.x) runs the stderr reader as a
+    single task exposed as ``_stderr_task`` with a ``cancel()`` method;
+    older revs used an anyio task group (``_stderr_task_group``). The
+    executor probes both shapes during force-close, so both are typed
+    optional on ``_ClaudeTransport`` below.
+    """
+
+    def cancel(self) -> None: ...
 
 
 class _ClaudeQuery(Protocol):
@@ -193,6 +206,7 @@ class _ClaudeTransport(Protocol):
     _stdout_stream: _Stream | None
     _stdin_stream: _Stream | None
     _stderr_stream: _Stream | None
+    _stderr_task: _TaskHandle | None
     _stderr_task_group: _TaskGroup | None
     _ready: bool
 
@@ -666,6 +680,47 @@ def _build_mcp_tools(
     return mcp_tools
 
 
+def _augment_system_prompt_for_omnigent_mcp_tools(
+    system_prompt: str,
+    tool_schemas: list[ToolSpec],
+) -> str:
+    """
+    Add Claude SDK-specific MCP tool-name guidance to the system prompt.
+
+    Omnigent schemas use bare names such as ``sys_session_send``. The
+    Claude SDK exposes tools from our in-process MCP server to the model
+    as ``mcp__omnigent__<bare_name>``. Bundled agent prompts and skills use
+    bare names because other executors call those directly, so the SDK needs
+    a bridge note to stop the model from trying a non-existent bare tool first.
+    """
+    tool_names = [
+        name for schema in tool_schemas if isinstance((name := schema.get("name")), str) and name
+    ]
+    if not tool_names:
+        return system_prompt
+
+    examples = [name for name in ("sys_session_send", "sys_session_create") if name in tool_names]
+    if examples:
+        example_text = "; ".join(
+            f"use `mcp__omnigent__{name}` when instructions say `{name}`" for name in examples
+        )
+        note = (
+            "Claude SDK tool naming: Omnigent tools are exposed as MCP tools. "
+            f"{example_text}. For any other Omnigent tool, use "
+            "`mcp__omnigent__<tool_name>` rather than the bare name."
+        )
+    else:
+        note = (
+            "Claude SDK tool naming: Omnigent tools are exposed as MCP tools. "
+            "When instructions mention a bare Omnigent tool name, invoke "
+            "`mcp__omnigent__<tool_name>` rather than the bare name."
+        )
+
+    if not system_prompt:
+        return note
+    return f"{system_prompt.rstrip()}\n\n{note}"
+
+
 def _find_system_claude() -> str | None:
     """Find a system-installed ``claude`` CLI binary on PATH.
 
@@ -721,6 +776,18 @@ def _resolve_gateway_env(
         corresponding base URL or auth command.
     """
     host = host_override.rstrip("/") if host_override else None
+    if host is None and base_url_override is not None and auth_command_override is not None:
+        # Generic-provider gateway: explicit base_url + auth command,
+        # no Databricks host or profile required (e.g. ApiKeyAuth with
+        # a mock LLM server URL).
+        return {
+            "ANTHROPIC_BASE_URL": base_url_override,
+            "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": str(
+                auth_refresh_interval_ms or _GATEWAY_AUTH_REFRESH_MS
+            ),
+            "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+            _CLAUDE_API_KEY_HELPER_ENV_KEY: auth_command_override,
+        }
     if host is None:
         try:
             from .databricks_executor import _read_databrickscfg
@@ -1489,10 +1556,21 @@ class ClaudeSDKExecutor(Executor):
 
         transport = getattr(client, "_transport", None)
         if transport is not None:
-            stderr_tg = transport._stderr_task_group
-            if stderr_tg is not None:
+            # The SDK's stderr reader changed shape across revs: current
+            # claude-agent-sdk (>=0.2.x) exposes a single ``_stderr_task``
+            # TaskHandle with ``cancel()``; older revs an anyio
+            # ``_stderr_task_group``. Probe both via getattr so a force-close
+            # never raises AttributeError out of lifespan shutdown (which
+            # crashed the runner on session stop).
+            stderr_task = getattr(transport, "_stderr_task", None)
+            if stderr_task is not None:
                 with suppress(Exception):
-                    stderr_tg.cancel_scope.cancel()
+                    stderr_task.cancel()
+            else:
+                stderr_tg = getattr(transport, "_stderr_task_group", None)
+                if stderr_tg is not None:
+                    with suppress(Exception):
+                        stderr_tg.cancel_scope.cancel()
 
             for stream in (
                 transport._stdout_stream,
@@ -1528,7 +1606,10 @@ class ClaudeSDKExecutor(Executor):
             transport._stdout_stream = None
             transport._stdin_stream = None
             transport._stderr_stream = None
-            transport._stderr_task_group = None
+            if getattr(transport, "_stderr_task", None) is not None:
+                transport._stderr_task = None
+            if getattr(transport, "_stderr_task_group", None) is not None:
+                transport._stderr_task_group = None
             transport._ready = False
 
         client._query = None
@@ -1797,6 +1878,10 @@ class ClaudeSDKExecutor(Executor):
                 name="omnigent",
                 version="1.0.0",
                 tools=mcp_tools,
+            )
+            system_prompt = _augment_system_prompt_for_omnigent_mcp_tools(
+                system_prompt,
+                tools,
             )
 
         # Build allowed_tools list.  OS-environment operations route

@@ -257,6 +257,30 @@ class SandboxLauncher(ABC):
             command exits non-zero.
         """
 
+    def run_background(
+        self, sandbox_id: str, command: str, *, log_path: str = "/tmp/omnigent-host.log"
+    ) -> RemoteCommandResult:
+        """
+        Start *command* as a detached background process in the sandbox.
+
+        The default wraps the command in ``setsid nohup … & echo launched``
+        so it survives the exec session ending. Providers where backgrounded
+        processes are reaped on exec return (e.g. OpenShell) override this
+        to hold the exec stream open instead.
+
+        :param sandbox_id: Target sandbox.
+        :param command: Shell command to background, e.g.
+            ``"ENV=val omnigent host --server https://…"``.
+        :param log_path: Where stdout/stderr of the backgrounded process
+            are redirected inside the sandbox.
+        :returns: A synthetic result with ``stdout="launched\\n"`` on success.
+        :raises click.ClickException: If the launch command fails.
+        """
+        return self.run(
+            sandbox_id,
+            f"setsid nohup {command} > {log_path} 2>&1 < /dev/null & echo launched",
+        )
+
     def put(self, sandbox_id: str, local_path: Path, remote_path: str) -> None:
         """
         Copy a local file into the sandbox.

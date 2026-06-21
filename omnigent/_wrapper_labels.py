@@ -45,3 +45,11 @@ CLAUDE_NATIVE_WRAPPER_VALUE = "claude-code-native-ui"
 # Value the ``omnigent codex`` wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 CODEX_NATIVE_WRAPPER_VALUE = "codex-native-ui"
+
+# Value the ``omnigent pi`` wrapper writes into
+# ``conversations.labels[WRAPPER_LABEL_KEY]``.
+PI_NATIVE_WRAPPER_VALUE = "pi-native-ui"
+
+# Value the ``omnigent cursor`` wrapper writes into
+# ``conversations.labels[WRAPPER_LABEL_KEY]``.
+CURSOR_NATIVE_WRAPPER_VALUE = "cursor-native-ui"

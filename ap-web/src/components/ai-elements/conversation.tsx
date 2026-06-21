@@ -75,7 +75,13 @@ export const ConversationScrollButton = ({
     !isAtBottom && (
       <Button
         className={cn(
-          "absolute bottom-4 left-[50%] translate-x-[-50%] rounded-full dark:bg-background dark:hover:bg-muted",
+          "absolute bottom-4 left-[50%] translate-x-[-50%] rounded-full",
+          // Keep the fill OPAQUE on hover. The outline variant's hover (bg-muted)
+          // is a translucent black wash (--muted is #0000000f), so over the chat
+          // content behind it the button reads as transparent on hover. Hover
+          // feedback comes from a brightness filter instead, which stays opaque.
+          "bg-background hover:bg-background hover:brightness-95",
+          "dark:bg-background dark:hover:bg-background dark:hover:brightness-125",
           className,
         )}
         onClick={handleScrollToBottom}

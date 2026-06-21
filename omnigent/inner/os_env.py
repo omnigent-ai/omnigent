@@ -21,7 +21,12 @@ from urllib.parse import urlparse, urlunparse
 from omnigent.runner.identity import strip_runner_auth_secrets
 
 from .async_utils import run_sync_on_thread
-from .datamodel import OSEnvSpec
+from .credential_proxy import (
+    CredentialProxyRuntime,
+    CredentialRewriteRule,
+    prepare_credential_proxy_runtime,
+)
+from .datamodel import CredentialProxySpec, OSEnvSpec
 from .sandbox import (
     SandboxPolicy,
     activate_sandbox,
@@ -207,6 +212,38 @@ def build_helper_env(
     return strip_runner_auth_secrets(env)
 
 
+def _build_credential_proxy_parent_env(
+    *,
+    helper_env: Mapping[str, str],
+    parent_env: Mapping[str, str],
+    spec: CredentialProxySpec,
+) -> dict[str, str]:
+    """
+    Build the parent-side env used to resolve credential-proxy sources.
+
+    ``file:`` / ``command:`` sources run against the same filtered
+    baseline the sandbox helper gets (so a ``command`` source can't
+    enumerate the parent's full secret-bearing environment), with the
+    one narrow addition that ``env:`` sources need: their referenced
+    variable, lifted from the real parent environment.
+
+    :param helper_env: The filtered helper environment from
+        :func:`build_helper_env`.
+    :param parent_env: The real parent process environment (typically
+        ``os.environ``).
+    :param spec: The credential-proxy policy whose ``env:`` source names
+        are lifted from *parent_env*.
+    :returns: An env map suitable for source resolution.
+    """
+    resolved = dict(helper_env)
+    for entry in spec.entries:
+        if entry.source.kind == "env" and entry.source.env:
+            value = parent_env.get(entry.source.env)
+            if value is not None:
+                resolved[entry.source.env] = value
+    return resolved
+
+
 @dataclass
 class OSEnvironment(ABC):
     """Base OS environment interface."""
@@ -360,6 +397,7 @@ class _HelperProcessClient:
         )
 
         helper_cwd = self.cwd
+        credential_runtime: CredentialProxyRuntime | None = None
         if sandbox.active:
             self._tmpdir = create_private_tmpdir()
             sandbox = with_additional_write_roots(sandbox, [self._tmpdir])
@@ -367,13 +405,36 @@ class _HelperProcessClient:
             if self.start_in_scratch:
                 helper_cwd = self._tmpdir
                 env["PWD"] = str(self._tmpdir)
+            if sandbox.credential_proxy is not None:
+                # Resolve real secrets in the parent. Real secrets stay
+                # here and are attached to outbound requests by the egress
+                # proxy (swap-on-access). Only entries that opted into
+                # ``inject_env`` contribute a synthetic placeholder, merged
+                # into the helper env below; nothing else crosses into the
+                # sandbox.
+                credential_parent_env = _build_credential_proxy_parent_env(
+                    helper_env=env,
+                    parent_env=os.environ,
+                    spec=sandbox.credential_proxy,
+                )
+                credential_runtime = prepare_credential_proxy_runtime(
+                    sandbox.credential_proxy,
+                    parent_env=credential_parent_env,
+                )
+                env.update(credential_runtime.helper_env_updates)
 
         # Start L7 egress proxy if rules are configured. The proxy
         # listens on a Unix socket in the scratch tmpdir; the helper
         # starts a relay inside the network namespace that bridges
         # loopback TCP to this socket.
         if self._egress_rules and self._tmpdir is not None:
-            sandbox = self._start_egress_proxy_locked(sandbox, env)
+            sandbox = self._start_egress_proxy_locked(
+                sandbox,
+                env,
+                credential_rewrites=(
+                    credential_runtime.rewrites if credential_runtime is not None else None
+                ),
+            )
 
         config: dict[str, JsonValue] = {
             "cwd": str(helper_cwd),
@@ -519,7 +580,11 @@ class _HelperProcessClient:
     # ------------------------------------------------------------------
 
     def _start_egress_proxy_locked(
-        self, sandbox: SandboxPolicy, env: dict[str, str]
+        self,
+        sandbox: SandboxPolicy,
+        env: dict[str, str],
+        *,
+        credential_rewrites: list[CredentialRewriteRule] | None = None,
     ) -> SandboxPolicy:
         """Start the egress MITM proxy and inject env vars.
 
@@ -570,6 +635,8 @@ class _HelperProcessClient:
             replacement for egress fields).
         :param env: The helper environment dict — proxy/CA env vars
             are added in-place.
+        :param credential_rewrites: Optional synthetic-to-real credential
+            rewrites the proxy applies (secretless ``credential_proxy``).
         :returns: Updated :class:`SandboxPolicy` with egress relay
             port and socket path set. The egress auth token is NOT
             stored on the policy (which serialises to JSON and
@@ -592,6 +659,7 @@ class _HelperProcessClient:
             tmpdir=self._tmpdir,
             allow_private_destinations=self._egress_allow_private_destinations,
             require_auth=True,
+            credential_rewrites=credential_rewrites,
         )
 
         # S4 (security): hold the controller refs on the client so
@@ -1248,6 +1316,7 @@ def _run_helper(config_fd: int) -> int:
 
     cwd = Path(cwd_value)
     os.chdir(cwd)
+
     sandbox = SandboxPolicy.from_jsonable(sandbox_value)
     activate_sandbox(sandbox)
 

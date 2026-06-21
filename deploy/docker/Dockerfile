@@ -155,11 +155,24 @@ FROM node:${NODE_VERSION}-slim AS node-runtime
 
 # ── Host runtime (`--target host`) ──────────────────────
 # Prebaked Omnigent host for remote sandboxes: full omnigent install,
-# git + tmux for harness runtime needs, curl + CA certificates for
-# outbound HTTPS and in-sandbox downloads, plus the coding-harness
-# CLIs (claude / codex / pi) so claude-sdk, claude-native, codex, and
-# pi agents can run in managed sandboxes without an in-sandbox
+# git + tmux for harness runtime needs, bubblewrap to OS-sandbox the
+# native harness terminals (mandatory and fail-loud on Linux), curl + CA
+# certificates for outbound HTTPS and in-sandbox downloads, plus the
+# coding-harness CLIs (claude / codex / pi) so claude-sdk, claude-native,
+# codex, and pi agents can run in managed sandboxes without an in-sandbox
 # install. No SPA, no psycopg, no server entrypoint.
+#
+# Also carries two additions required only by the NVIDIA OpenShell provider
+# (deploy/openshell/README.md) and inert for the root-based providers
+# (Modal / Daytona / CoreWeave):
+#   - iproute2 / nftables: OpenShell puts each sandbox in its own network
+#     namespace and routes egress through a policy proxy; the supervisor
+#     shells out to `ip` to build that netns and refuses to start a sandbox
+#     without it. The other providers create no namespaces, so it sits unused.
+#   - a non-root `sandbox` user/group: OpenShell drops privileges to a user
+#     literally named `sandbox` before running the agent (defense in depth)
+#     and fails closed if it is absent. The other providers run as root and
+#     never reference it.
 FROM python:${PYTHON_VERSION}-slim AS host
 ARG NPM_CONFIG_REGISTRY=
 ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
@@ -176,8 +189,16 @@ ENV PYTHONUNBUFFERED=1 \
     IS_SANDBOX=1
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git tmux curl ca-certificates \
+ && apt-get install -y --no-install-recommends git tmux bubblewrap curl ca-certificates \
+      iproute2 nftables \
  && rm -rf /var/lib/apt/lists/*
+
+# OpenShell-required non-root user (see the header note). UID/GID in the high
+# range per OpenShell's bring-your-own-container guidance, so that without
+# user-namespace remapping the sandbox user maps to an unprivileged, unused
+# host id. Unused by the root-based providers.
+RUN groupadd -g 1000660000 sandbox \
+ && useradd -m -u 1000660000 -g sandbox sandbox
 
 # Git credential helper for private repositories over HTTPS: answers
 # `git credential get` from GIT_TOKEN / GIT_USERNAME in the

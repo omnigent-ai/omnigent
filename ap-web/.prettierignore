@@ -3,3 +3,6 @@ dist
 ../omnigent/server/static/web-ui
 src/components/ui
 package-lock.json
+
+# Generated Apple Icon Composer bundles (machine-formatted; prettier fights the tooling)
+electron/icons/**/*.icon

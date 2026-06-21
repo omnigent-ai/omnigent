@@ -1450,6 +1450,34 @@ describe("BlockStream — elicitation", () => {
     expect(elic!.ctx.responseId).toBe("resp_1");
   });
 
+  it("stamps a REQUEST-phase elicitation with its own response id, not the prior turn's", () => {
+    // A follow-up REQUEST-phase ASK arrives BEFORE the next turn starts,
+    // so `state.responseId` still holds the previous turn's id. If the
+    // card inherited it, bubble grouping would fold the card into the last
+    // answer's bubble. Stamping a unique id keeps it standalone so the
+    // ChatPage reorder can lift the prompt above it.
+    const blocks = reduce([
+      { type: "response_created", response: makeResponse({ responseId: "resp_prev" }) },
+      { type: "text_delta", delta: "Previous answer." },
+      {
+        type: "elicitation_request",
+        elicitationId: "elic_req",
+        message: "Session cost passed the threshold. Continue?",
+        requestedSchema: {},
+        mode: "form",
+        phase: "request",
+        policyName: "session_cost_budget",
+        contentPreview: '{"role":"user","content":[{"type":"input_text","text":"Hi again"}]}',
+      },
+    ]);
+
+    const elic = blocks.find((b): b is ElicitationBlock => b.type === "elicitation");
+    expect(elic).toBeDefined();
+    expect(elic!.phase).toBe("request");
+    expect(elic!.ctx.responseId).toBe("elicit_elic_req");
+    expect(elic!.ctx.responseId).not.toBe("resp_prev");
+  });
+
   it("carries structured Codex command approval details", () => {
     const blocks = reduce([
       { type: "response_created", response: makeResponse({ responseId: "resp_cmd" }) },

@@ -7302,6 +7302,84 @@ def test_session_usage_data_without_output_tokens_omits_cumulative_output() -> N
     assert "cumulative_output_tokens" not in data
 
 
+def test_session_usage_data_context_tokens_uses_last_turn_input() -> None:
+    """
+    ``context_tokens`` (the context-ring value) should reflect the LAST
+    turn's input — how much of the window the latest request occupied —
+    not the cumulative total across the whole thread.
+
+    When ``tokenUsage.last`` is present, ``context_tokens`` comes from
+    ``last.inputTokens``; ``cumulative_input_tokens`` still uses
+    ``total.inputTokens`` for cost pricing.
+    """
+    params = {
+        "tokenUsage": {
+            "total": {
+                "inputTokens": 4_800_000,
+                "outputTokens": 200_000,
+                "contextWindow": 1_178_000,
+            },
+            "last": {
+                "inputTokens": 950_000,
+                "outputTokens": 12_000,
+            },
+        },
+    }
+    data = codex_native_forwarder._session_usage_data_from_params(params)
+    assert data is not None
+    # Ring shows current context occupancy from the last turn.
+    assert data["context_tokens"] == 950_000
+    # Cost pricing uses cumulative totals.
+    assert data["cumulative_input_tokens"] == 4_800_000
+    assert data["cumulative_output_tokens"] == 200_000
+    assert data["context_window"] == 1_178_000
+
+
+def test_session_usage_data_context_tokens_falls_back_without_last() -> None:
+    """
+    When ``tokenUsage.last`` is absent (e.g. first frame before a turn
+    completes), ``context_tokens`` falls back to ``total.inputTokens``.
+    """
+    params = {
+        "tokenUsage": {
+            "total": {
+                "inputTokens": 1000,
+                "outputTokens": 250,
+                "contextWindow": 200_000,
+            },
+        },
+    }
+    data = codex_native_forwarder._session_usage_data_from_params(params)
+    assert data is not None
+    assert data["context_tokens"] == 1000
+    assert data["cumulative_input_tokens"] == 1000
+
+
+def test_session_usage_data_context_tokens_falls_back_when_last_missing_input() -> None:
+    """
+    When ``tokenUsage.last`` is present but lacks a usable ``inputTokens``,
+    ``context_tokens`` falls back to ``total.inputTokens`` rather than being
+    omitted (which would leave the UI ring stuck on a stale value from a
+    previous coalescer frame).
+    """
+    params = {
+        "tokenUsage": {
+            "total": {
+                "inputTokens": 3000,
+                "outputTokens": 500,
+                "contextWindow": 200_000,
+            },
+            "last": {
+                "outputTokens": 100,
+                # inputTokens intentionally absent
+            },
+        },
+    }
+    data = codex_native_forwarder._session_usage_data_from_params(params)
+    assert data is not None
+    assert data["context_tokens"] == 3000
+
+
 def test_usage_coalescer_flush_attaches_model_to_every_post() -> None:
     """
     ``flush`` attaches the recorded model to each token-bearing post.
@@ -8735,3 +8813,38 @@ def test_mint_codex_thread_id_is_uuidv7() -> None:
     parsed = _uuid.UUID(minted)
     assert parsed.version == 7
     assert codex_native._CODEX_THREAD_ID_RE.fullmatch(minted)
+
+
+def test_command_execution_appends_sandbox_bypass_guidance_on_namespace_error() -> None:
+    """A codex shell command that fails because codex's own command sandbox
+    cannot start (no unprivileged user namespaces in a hardened container) gets
+    actionable recovery guidance appended, instead of surfacing only the opaque
+    ``bwrap: No permissions to create new namespace`` output (issue #657)."""
+    item = {
+        "command": "/bin/zsh -lc 'echo hi'",
+        "aggregatedOutput": (
+            "bwrap: No permissions to create new namespace, likely because the "
+            "kernel does not allow non-privileged user namespaces.\n"
+        ),
+        "exitCode": 1,
+    }
+    tool_call = codex_native_forwarder._command_execution_tool_call("call_1", item)
+    assert tool_call is not None
+    # The raw bwrap output and the exit code are preserved verbatim...
+    assert "No permissions to create new namespace" in tool_call.output
+    assert "[exit code: 1]" in tool_call.output
+    # ...with actionable recovery guidance appended (the "Full access" preset
+    # and the config sandbox_mode workaround).
+    assert "Full access" in tool_call.output
+    assert "danger-full-access" in tool_call.output
+
+
+def test_command_execution_leaves_normal_output_untouched() -> None:
+    """A successful command keeps its output verbatim — the guidance only fires
+    on the sandbox-namespace failure, never on ordinary output (issue #657)."""
+    item = {"command": "pwd", "aggregatedOutput": "/repo\n", "exitCode": 0}
+    tool_call = codex_native_forwarder._command_execution_tool_call("call_1", item)
+    assert tool_call is not None
+    assert tool_call.output == "/repo\n"
+    assert "Full access" not in tool_call.output
+    assert "danger-full-access" not in tool_call.output

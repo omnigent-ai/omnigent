@@ -29,7 +29,9 @@
 # uncertainty. A wrong/injected "pass" cannot merge anything on its own: the
 # separate required `Maintainer Approval` check still gates merge.
 #
-# Case 3 mirrors merge-ready/force-merge-eligibility.sh exactly.
+# Case 3 applies the maintainer-effective waiver: the `skip-e2e-ui-test` label
+# is honoured only when the author is a maintainer, or a maintainer's latest
+# decisive review is APPROVED (see below) -- a fork author cannot self-waive.
 #
 # Reads change/label/review state from the API only -- never checks out or runs
 # PR-head code. Called from a base-branch (pull_request_target) job, so a PR
@@ -64,9 +66,10 @@ fi
 # --- 2. LLM judge: behavior change without adequate e2e_ui coverage? ------
 # Build a bounded diff blob: only ap-web/** and tests/e2e_ui/** patches. Each
 # file's patch is truncated to MAX_PATCH_LINES so one huge file can't crowd out
-# the others, keeping the prompt representative across many-file PRs. A final
-# head -c is an overall backstop for PRs with very many files.
+# the others, keeping the prompt representative across many-file PRs. An
+# overall byte cap (applied below) is a backstop for PRs with very many files.
 MAX_PATCH_LINES=400
+MAX_BLOB_BYTES=60000
 # `gh api --paginate` (no --jq) merges all pages into one JSON array; pipe that
 # to jq so --argjson reaches jq (gh api itself has no --argjson flag).
 DIFF_BLOB=$(gh api "repos/$REPO/pulls/$PR/files" --paginate \
@@ -77,8 +80,13 @@ DIFF_BLOB=$(gh api "repos/$REPO/pulls/$PR/files" --paginate \
     | (if ($lines | length) > $max
          then (($lines[:$max] | join("\n")) + "\n... (patch truncated at \($max) lines)")
          else $p end) as $trunc
-    | "=== \(.status) \(.filename) ===\n\($trunc)"' \
-  | head -c 60000)
+    | "=== \(.status) \(.filename) ===\n\($trunc)"')
+# Apply the overall byte cap in-shell, NOT via `... | head -c`. Under
+# `set -o pipefail`, head closing the pipe early sends jq SIGPIPE, and that
+# broken-pipe exit aborts the whole gate on any large UI PR (diff > cap) --
+# fail-closed before the judge or the skip-label logic ever runs. Bash slicing
+# truncates the captured string with no pipe to break.
+DIFF_BLOB=${DIFF_BLOB:0:$MAX_BLOB_BYTES}
 
 PR_TITLE=$(gh pr view "$PR" --repo "$REPO" --json title --jq '.title')
 
@@ -164,7 +172,8 @@ for m in $MAINTAINERS_LC; do
 done
 
 # Latest decisive (non-COMMENTED) review per user; effective if a maintainer's
-# latest such review is APPROVED. Same semantics as force-merge-eligibility.sh.
+# latest such review is APPROVED. Matches GitHub's UI: a later COMMENTED review
+# doesn't supersede an approval, but CHANGES_REQUESTED or DISMISSED does.
 APPROVERS=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
   --jq '[.[] | select(.state != "COMMENTED")] | group_by(.user.login) | map(max_by(.submitted_at)) | .[] | select(.state == "APPROVED") | .user.login')
 for u in $APPROVERS; do

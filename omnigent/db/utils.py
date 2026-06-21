@@ -505,18 +505,37 @@ _CREATE_FTS = text(
     "item_id UNINDEXED, conversation_id UNINDEXED, search_text)"
 )
 
+# Dialects that support SQLite's FTS5 extension. Cloudflare D1 is SQLite
+# served over HTTP, so it gets full-text search too — gate FTS on the dialect
+# *family*, not the literal name "sqlite". (The engine-level WAL/PRAGMA path in
+# ``_create_engine`` stays sqlite-only: those are local-file concerns that D1
+# neither needs nor supports over the wire.)
+_FTS5_DIALECTS = frozenset({"sqlite", "cloudflare_d1"})
+
+
+def _supports_fts5(dialect_name: str) -> bool:
+    """
+    Whether *dialect_name* is a SQLite-family dialect that supports FTS5.
+
+    :param dialect_name: A SQLAlchemy ``dialect.name``, e.g. ``"sqlite"``,
+        ``"cloudflare_d1"``, or ``"postgresql"``.
+    :returns: ``True`` for SQLite and SQLite-over-the-wire dialects (D1),
+        ``False`` otherwise.
+    """
+    return dialect_name in _FTS5_DIALECTS
+
 
 def ensure_fts_table(engine: Engine) -> None:
     """
-    Create the FTS5 virtual table if on SQLite. Idempotent.
+    Create the FTS5 virtual table on SQLite-family dialects. Idempotent.
 
-    On non-SQLite dialects this is a no-op.
+    On dialects without FTS5 (e.g. PostgreSQL) this is a no-op.
 
     :param engine: The SQLAlchemy engine whose dialect is inspected.
-        If SQLite, the ``conversation_items_fts`` virtual table is
-        created (if it does not already exist).
+        On a SQLite-family dialect (SQLite or Cloudflare D1) the
+        ``conversation_items_fts`` virtual table is created if absent.
     """
-    if engine.dialect.name == "sqlite":
+    if _supports_fts5(engine.dialect.name):
         with engine.connect() as conn:
             conn.execute(_CREATE_FTS)
             conn.commit()
@@ -529,9 +548,9 @@ def insert_fts(
     search_text: str,
 ) -> None:
     """
-    Dual-write a row into the FTS5 table (SQLite only).
+    Dual-write a row into the FTS5 table (SQLite-family dialects only).
 
-    On non-SQLite dialects this is a no-op.
+    On dialects without FTS5 this is a no-op.
 
     :param session: An active SQLAlchemy session. Its bound engine's
         dialect is checked to decide whether to write.
@@ -542,7 +561,7 @@ def insert_fts(
     :param search_text: Plain-text content to store in the FTS
         index for this item.
     """
-    if session.bind and session.bind.dialect.name == "sqlite":
+    if session.bind and _supports_fts5(session.bind.dialect.name):
         session.execute(
             text(
                 f"INSERT INTO {_FTS_TABLE}"
@@ -555,16 +574,16 @@ def insert_fts(
 
 def delete_fts_by_conversation(session: Session, conversation_id: str) -> None:
     """
-    Remove all FTS rows for a conversation (SQLite only).
+    Remove all FTS rows for a conversation (SQLite-family dialects only).
 
-    On non-SQLite dialects this is a no-op.
+    On dialects without FTS5 this is a no-op.
 
     :param session: An active SQLAlchemy session. Its bound engine's
         dialect is checked to decide whether to delete.
     :param conversation_id: The conversation whose FTS rows should be
         removed, e.g. ``"conv_e4f5a6b7..."``.
     """
-    if session.bind and session.bind.dialect.name == "sqlite":
+    if session.bind and _supports_fts5(session.bind.dialect.name):
         session.execute(
             text(f"DELETE FROM {_FTS_TABLE} WHERE conversation_id = :cid"),
             {"cid": conversation_id},

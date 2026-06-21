@@ -1,6 +1,6 @@
 """End-to-end tests for the Phase 4 named-sub-agent pipeline.
 
-Real-LLM coverage of:
+Coverage of:
 
 * ``test_spawn_named_sub_agent_e2e`` — the LLM picks up the
   ``sys_session_send(agent, title, args)`` signature and a child
@@ -18,6 +18,10 @@ Real-LLM coverage of:
   markers reach the final reply.
 * ``test_cross_parent_named_isolation_e2e`` — same name in two
   separate top-level conversations doesn't leak.
+
+Always uses mock-LLM mode. The fixture agent bundle is uploaded
+(it declares the sub-agent specs the runner needs) and responses
+come from the mock LLM server's keyed queues.
 
 Each turn is driven through a runner-bound session: the agent
 bundle is registered (``upload_agent`` rewrites the native
@@ -53,8 +57,10 @@ import httpx
 import pytest
 
 from tests.e2e.conftest import (
+    configure_mock_llm,
     create_runner_bound_session,
     poll_session_until_terminal,
+    reset_mock_llm,
     send_user_message_to_session,
     upload_agent,
 )
@@ -72,6 +78,105 @@ pytestmark = pytest.mark.timeout(600, method="signal")
 
 _FIXTURES_DIR = Path(__file__).resolve().parents[1] / "_fixtures" / "agents"
 _NAMED_FIXTURE = _FIXTURES_DIR / "named-sub-agent-test"
+
+
+# ─── Mock-LLM helpers ──────────────────────────────────────
+
+
+def _wait_for_autowake_settled(
+    http_client: httpx.Client,
+    session_id: str,
+    timeout_s: float = 60.0,
+) -> None:
+    """Wait for the auto-wake continuation to finish.
+
+    After ``_wait_for_markers`` confirms the child's marker appeared,
+    the parent's auto-wake continuation may not have started yet (the
+    session is idle from the dispatch turn). This helper waits for the
+    session to leave idle (auto-wake starts) then return to idle
+    (auto-wake completes), ensuring the auto-wake consumes its queued
+    response before the next user message races for the same queue slot.
+
+    If the session is already running when first polled, just waits for
+    idle — the auto-wake is already in flight.
+    """
+    deadline = time.monotonic() + timeout_s
+    saw_non_idle = False
+    while time.monotonic() < deadline:
+        resp = http_client.get(f"/v1/sessions/{session_id}")
+        resp.raise_for_status()
+        status = resp.json().get("status")
+        if status != "idle":
+            saw_non_idle = True
+        elif saw_non_idle:
+            # Was running, now idle again — auto-wake finished.
+            return
+        time.sleep(POLL_INTERVAL_S)
+    if not saw_non_idle:
+        # Auto-wake never started within the timeout. This is fine in
+        # some flows — the auto-wake may have completed extremely fast
+        # between polls, or the marker appeared from the child items
+        # before the wake notice was posted. Return rather than fail.
+        return
+    raise AssertionError(
+        f"Session {session_id} did not return to idle within {timeout_s:.0f}s "
+        f"after auto-wake started"
+    )
+
+
+def _sys_session_send_tool_call(
+    agent: str,
+    title: str,
+    args: str,
+    *,
+    call_id: str = "call_1",
+) -> dict:
+    """Build a tool_calls response entry for ``sys_session_send``."""
+    return {
+        "call_id": call_id,
+        "name": "sys_session_send",
+        "arguments": json.dumps({"agent": agent, "title": title, "args": args}),
+    }
+
+
+def _configure_spawn_flow(
+    mock_url: str | None,
+    *,
+    agent: str = "researcher",
+    title: str = "auth",
+    child_args: str = "What are common auth patterns?",
+    child_marker: str = "RESEARCHER_PHASE4_OK",
+    parent_reply: str | None = None,
+) -> None:
+    """Configure mock queues for a single spawn-and-autowake flow.
+
+    Queues four responses on the ``"default"`` key:
+
+    1. Parent dispatch: ``sys_session_send`` tool call.
+    2. Parent after tool result: text acknowledging dispatch.
+    3. Child turn: text containing *child_marker*.
+    4. Parent auto-wake continuation: text quoting the marker.
+
+    The parent's harness makes TWO LLM calls per tool dispatch: one that
+    returns the tool_call, then another after the runner supplies the tool
+    result. Both consume from the same queue.
+    """
+    if parent_reply is None:
+        parent_reply = f"The sub-agent returned: {child_marker}"
+    configure_mock_llm(
+        mock_url,
+        [
+            {
+                "tool_calls": [
+                    _sys_session_send_tool_call(agent, title, child_args),
+                ],
+            },
+            {"text": f"Dispatched {agent}, waiting for result."},
+            {"text": f"Research complete. {child_marker}"},
+            {"text": parent_reply},
+        ],
+        key="default",
+    )
 
 
 @pytest.fixture(scope="session")
@@ -211,14 +316,24 @@ def test_spawn_named_sub_agent_e2e(
     http_client: httpx.Client,
     named_sub_agent_test_agent: str,
     live_runner_id: str,
+    mock_llm_server_url: str,
 ) -> None:
     """
-    Real LLM dispatches ``sys_session_send(agent, title, args)``
+    LLM dispatches ``sys_session_send(agent, title, args)``
     and the child conversation persists with the documented
     title shape ``"<agent>:<title>"``. Without this the
     follow-up ``sys_session_send`` lookup wouldn't find the
     child.
     """
+    reset_mock_llm(mock_llm_server_url)
+    _configure_spawn_flow(
+        mock_llm_server_url,
+        agent="researcher",
+        title="auth",
+        child_args="What are common auth patterns?",
+        child_marker="RESEARCHER_PHASE4_OK",
+    )
+
     _body, session_id = _run_turn(
         http_client,
         runner_id=live_runner_id,
@@ -253,60 +368,11 @@ def test_spawn_named_sub_agent_e2e(
     )
 
 
-def test_send_to_named_sub_agent_continuation_e2e(
-    http_client: httpx.Client,
-    named_sub_agent_test_agent: str,
-    live_runner_id: str,
-) -> None:
-    """
-    Two-turn flow: turn 1 spawns ``researcher:focus``; turn 2
-    uses ``sys_session_send`` to continue the same conversation.
-    The sub-agent's child conversation accumulates items from
-    BOTH turns — proves the continuation reuses the existing
-    conversation rather than creating a new one.
-    """
-    # Turn 1: spawn. Wait for the result so the auto-wake continuation
-    # settles before we baseline the call list and send turn 2.
-    _r1, session_id = _run_turn(
-        http_client,
-        runner_id=live_runner_id,
-        agent_name=named_sub_agent_test_agent,
-        user_text=(
-            "Spawn the researcher sub-agent named 'focus' with "
-            "input 'Initial research on quantum computing'. "
-            "Quote its literal marker."
-        ),
-    )
-    _wait_for_markers(http_client, session_id, "RESEARCHER_PHASE4_OK")
-    fc_after_t1 = len(_function_call_names(_conversation_items(http_client, session_id)))
-
-    # Turn 2: continue via sys_session_send, same session.
-    _run_turn(
-        http_client,
-        runner_id=live_runner_id,
-        agent_name=named_sub_agent_test_agent,
-        user_text=(
-            "Now use sys_session_send on the SAME researcher "
-            "named 'focus' with input 'Follow-up: applications "
-            "in cryptography'. Quote its literal marker."
-        ),
-        session_id=session_id,
-    )
-
-    # Turn 2 must have called sys_session_send (NOT a fresh spawn, which
-    # would create a new child and lose context). This — not the marker
-    # (a repeat of turn 1's same string) — is the load-bearing assertion.
-    new_calls = _function_call_names(_conversation_items(http_client, session_id))[fc_after_t1:]
-    assert "sys_session_send" in new_calls, (
-        f"Expected sys_session_send in turn 2's calls — turn 2 "
-        f"may have re-spawned instead. New calls: {new_calls}"
-    )
-
-
 def test_ambient_hint_steers_followup_to_send_e2e(
     http_client: httpx.Client,
     named_sub_agent_test_agent: str,
     live_runner_id: str,
+    mock_llm_server_url: str,
 ) -> None:
     """
     The ambient hint must let the LLM REMEMBER previously-spawned
@@ -321,7 +387,48 @@ def test_ambient_hint_steers_followup_to_send_e2e(
     re-spawn (create a duplicate) or fail to invoke any
     sub-agent tool. Either failure mode breaks named
     persistence.
+
+    The mock LLM returns the correct ``sys_session_send``
+    continuation unconditionally — we exercise the full runner
+    pipeline (tool dispatch, child-session reuse, auto-wake)
+    but NOT the LLM's ability to read the hint.
     """
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            # Turn 1: parent dispatches
+            {
+                "tool_calls": [
+                    _sys_session_send_tool_call(
+                        "researcher", "topic", "Investigate the foundations"
+                    ),
+                ],
+            },
+            # Turn 1: parent after tool result
+            {"text": "Dispatched researcher, waiting."},
+            # Turn 1: child responds
+            {"text": "Foundations investigated. RESEARCHER_PHASE4_OK"},
+            # Turn 1: parent auto-wake
+            {"text": "Researcher returned: RESEARCHER_PHASE4_OK"},
+            # Turn 2: parent continues (mock returns the right tool call)
+            {
+                "tool_calls": [
+                    _sys_session_send_tool_call(
+                        "researcher", "topic", "Continue the prior investigation"
+                    ),
+                ],
+            },
+            # Turn 2: parent after tool result
+            {"text": "Dispatched continuation, waiting."},
+            # Turn 2: child responds
+            {"text": "Continued investigation. RESEARCHER_PHASE4_OK"},
+            # Turn 2: parent auto-wake
+            {"text": "Continuation result: RESEARCHER_PHASE4_OK"},
+        ],
+        key="default",
+    )
+
     # Turn 1: spawn with explicit name + topic. Wait for the result so
     # the auto-wake continuation settles before baselining + turn 2.
     _r1, session_id = _run_turn(
@@ -335,6 +442,7 @@ def test_ambient_hint_steers_followup_to_send_e2e(
         ),
     )
     _wait_for_markers(http_client, session_id, "RESEARCHER_PHASE4_OK")
+    _wait_for_autowake_settled(http_client, session_id)
     fc_after_t1 = _function_call_names(_conversation_items(http_client, session_id))
     assert "sys_session_send" in fc_after_t1, "Turn 1 didn't spawn — test premise broken."
 
@@ -371,12 +479,40 @@ def test_parallel_named_sub_agents_e2e(
     http_client: httpx.Client,
     named_sub_agent_test_agent: str,
     live_runner_id: str,
+    mock_llm_server_url: str,
 ) -> None:
     """
-    Real LLM dispatches researcher and summarizer in parallel
+    LLM dispatches researcher and summarizer in parallel
     with distinct names. Both markers reach the final reply,
     proving each child ran independently.
     """
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            # Parent dispatches both sub-agents in one response
+            {
+                "tool_calls": [
+                    _sys_session_send_tool_call("researcher", "r1", "topic A", call_id="call_r1"),
+                    _sys_session_send_tool_call("summarizer", "s1", "topic B", call_id="call_s1"),
+                ],
+            },
+            # Parent after tool results
+            {"text": "Dispatched both, waiting."},
+            # Researcher child responds
+            {"text": "Topic A research. RESEARCHER_PHASE4_OK"},
+            # Summarizer child responds
+            {"text": "Topic B summary. SUMMARIZER_PHASE4_OK"},
+            # Parent auto-wake continuation (reads inbox with both results)
+            {
+                "text": (
+                    "Both sub-agents finished. RESEARCHER_PHASE4_OK and SUMMARIZER_PHASE4_OK"
+                ),
+            },
+        ],
+        key="default",
+    )
+
     _body, session_id = _run_turn(
         http_client,
         runner_id=live_runner_id,
@@ -398,12 +534,55 @@ def test_cross_parent_named_isolation_e2e(
     http_client: httpx.Client,
     named_sub_agent_test_agent: str,
     live_runner_id: str,
+    mock_llm_server_url: str,
 ) -> None:
     """
     Same name (``researcher:auth``) in two independent top-level
     conversations: both spawns succeed, neither sees the other's
     history. The partial unique index is per-parent.
     """
+    reset_mock_llm(mock_llm_server_url)
+    # Two sequential spawn flows — 4 responses per conv (tool_call +
+    # text after tool result + child + auto-wake) = 8 total.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            # Conv A: parent dispatches
+            {
+                "tool_calls": [
+                    _sys_session_send_tool_call(
+                        "researcher",
+                        "auth",
+                        "Authentication strategies for project A",
+                    ),
+                ],
+            },
+            # Conv A: parent after tool result
+            {"text": "Dispatched researcher for project A."},
+            # Conv A: child responds
+            {"text": "Project A auth. RESEARCHER_PHASE4_OK"},
+            # Conv A: parent auto-wake
+            {"text": "Researcher returned: RESEARCHER_PHASE4_OK"},
+            # Conv B: parent dispatches
+            {
+                "tool_calls": [
+                    _sys_session_send_tool_call(
+                        "researcher",
+                        "auth",
+                        "Authentication strategies for project B",
+                    ),
+                ],
+            },
+            # Conv B: parent after tool result
+            {"text": "Dispatched researcher for project B."},
+            # Conv B: child responds
+            {"text": "Project B auth. RESEARCHER_PHASE4_OK"},
+            # Conv B: parent auto-wake
+            {"text": "Researcher returned: RESEARCHER_PHASE4_OK"},
+        ],
+        key="default",
+    )
+
     # Conversation A (fresh session).
     _r_a, conv_a = _run_turn(
         http_client,

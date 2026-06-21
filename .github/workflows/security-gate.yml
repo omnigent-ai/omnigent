@@ -1,0 +1,95 @@
+name: Security Gate
+
+# Reusable (workflow_call) gate, called as the FIRST job of each CI workflow;
+# their real jobs declare `needs: gate`. Does NOT scan — the single scan runs in
+# security-scan.yml. This poller only decides whether to let its caller proceed:
+#   - non-PR event or trusted author -> proceed immediately
+#   - untrusted PR -> wait for the `Security Scan` check on the head SHA and
+#     MIRROR its conclusion (success -> proceed; failure -> fail, skipping the
+#     dependent CI jobs).
+#
+# The scan (security-scan.yml) is blocking: a finding fails the `Security Scan`
+# check, which this poller mirrors to block dependent CI. Splitting scan from
+# gate runs the scan once, not once per workflow. The trust decision is read
+# from `main` (should-scan.sh).
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: Security Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Check out trust check from main
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: main             # trusted; never the PR head
+          sparse-checkout: .github/scripts/security-scan
+          persist-credentials: false
+
+      - name: Trust gate
+        id: gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          AUTHOR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
+        run: |
+          # Before the scanner lands on main the scripts are absent there --
+          # proceed (fail-open) so the introducing PR is not bricked.
+          if [ ! -f .github/scripts/security-scan/should-scan.sh ]; then
+            echo "::warning::security scanner not present on main yet; proceeding (bootstrap)."
+            echo "scan=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          bash .github/scripts/security-scan/should-scan.sh
+
+      - name: Wait for Security Scan result
+        # Only untrusted PRs wait; trusted authors / non-PR events proceeded above.
+        if: ${{ steps.gate.outputs.scan == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          echo "Untrusted PR -- waiting for the single 'Security Scan' check on $HEAD_SHA"
+          # First-timer short-circuit. When a first-time contributor's runs are
+          # held behind GitHub's approval gate, Security Scan shows up as a
+          # workflow RUN with conclusion=action_required and NO check-run, so the
+          # poll below never sees it and spins the full ~6 min before failing
+          # open. Detect the held state and proceed now (same fail-open outcome);
+          # the gate re-runs on the next push or maintainer approval event.
+          held=$(gh api "repos/$REPO/actions/runs?head_sha=$HEAD_SHA&event=pull_request" \
+            --jq '[.workflow_runs[] | select(.name=="Security Scan")] | sort_by(.created_at) | last | .conclusion' 2>/dev/null || echo "")
+          if [ "$held" = "action_required" ]; then
+            echo "::warning::Security Scan is awaiting maintainer approval (action_required); proceeding (fail-open). It will re-gate on the next push or maintainer approval event."
+            exit 0
+          fi
+          q='[.check_runs[] | select(.name=="Security Scan")] | sort_by(.started_at) | last'
+          conclusion=""
+          details_url=""
+          for _ in $(seq 1 72); do   # up to ~6 min (72 * 5s)
+            status=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs" --jq "$q | .status" 2>/dev/null || echo "")
+            if [ "$status" = "completed" ]; then
+              conclusion=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs" --jq "$q | .conclusion")
+              # The scan's own run page -- where the findings/annotations live.
+              details_url=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs" --jq "$q | .html_url")
+              break
+            fi
+            sleep 5
+          done
+          if [ -z "$conclusion" ]; then
+            echo "::warning::Security Scan check did not complete in time; proceeding (fail-open)."
+            exit 0
+          fi
+          echo "Security Scan concluded: $conclusion"
+          case "$conclusion" in
+            success | skipped | neutral) exit 0 ;;
+            *)
+              echo "::error::Security Scan did not pass ($conclusion); dependent CI is blocked until it passes. See the findings: ${details_url:-the 'Security Scan' check on this PR}"
+              exit 1
+              ;;
+          esac

@@ -129,6 +129,9 @@ _HARNESS_FAMILY: dict[str, str] = {
     # normally maps it down via _provider_harness_name; accept both spellings
     # here so callers that pass the spec/CLI spelling directly resolve too.
     "openai-agents-sdk": OPENAI_FAMILY,
+    # Antigravity is Gemini-native but routes generic-provider traffic over
+    # the OpenAI-compatible wire, so it consumes the ``openai`` family.
+    "antigravity": OPENAI_FAMILY,
 }
 
 # Executor-type spellings that ``AgentSpec.harness_kind`` returns for SDK
@@ -411,7 +414,10 @@ def resolve_secret(ref: str) -> str:
                 f"'env:{var}'. Set the variable in the environment.",
                 code=ErrorCode.INVALID_INPUT,
             )
-        return value
+        # Strip surrounding whitespace: a key exported with a stray trailing
+        # newline (e.g. ``export KEY=$(cat file)``) must not be forwarded
+        # verbatim to a harness/SDK, where the padding fails auth.
+        return value.strip()
     # Bare inline reference, e.g. "$ANTHROPIC_API_KEY" or a literal value.
     expanded = os.path.expandvars(ref)
     check_unresolved_env_vars(ref, expanded)

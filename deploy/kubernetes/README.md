@@ -146,6 +146,21 @@ with its own 10 Gi PVC. Good for dev/testing clusters.
    kubectl kustomize deploy/kubernetes/overlays/postgres/ | kubectl apply -f -
    ```
 
+## Building a UBI image (Red Hat / OpenShift)
+
+For RHEL and OpenShift environments that require UBI-compliant containers, use
+the UBI variant of the Dockerfile. It uses Red Hat Universal Base Image 9
+(`ubi9/python-312`, `ubi9/nodejs-20`) and runs the server as non-root (UID 1001)
+by default — compatible with OpenShift's `restricted-v2` SCC out of the box.
+
+```bash
+# from the repo root
+docker build -t omnigent-server:ubi -f deploy/docker/Dockerfile.ubi .
+```
+
+Then reference the image in the OpenShift overlay by patching the Deployment
+or pointing your image stream at it.
+
 ## Deploy on Red Hat OpenShift
 
 The `overlays/openshift/` overlay replaces the Ingress with an OpenShift Route

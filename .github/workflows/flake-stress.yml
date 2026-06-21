@@ -1,50 +1,20 @@
 name: Flake stress
 
-# Manually-dispatched flake-reproducer. Runs an arbitrary pytest
-# target N times in parallel on the same hardened-runner pool as
-# ci.yml, then renders a pass/fail summary on the run page. Use to:
-#
-#   1. Quantify how often a suspect test or file fails (point at
-#      ``main`` to get a baseline rate).
-#   2. Verify a fix actually closes a flake (point at the fix
-#      branch and expect 0/N failures).
-#
-# Each attempt is one independent matrix leg, so ``failures / N``
-# is the observed flake probability for the chosen target +
-# configuration. Defaults (``-n 4 --dist=worksteal``) mirror the
-# ``server-responses`` group in ci.yml, which is where the
-# original ``test_delete_response`` flake was observed (PR #580),
-# but every knob is overridable so the tool works for any future
-# flake — by file, by node-id, by parametrized case.
-#
-# Not wired to pull_request / push — workflow_dispatch only — so
-# the matrix doesn't burn runner minutes on every PR.
+# Manually-dispatched flake-reproducer (workflow_dispatch only, so it
+# doesn't burn runner minutes per PR). Runs a pytest target N times in
+# parallel on ci.yml's hardened-runner pool, then renders a pass/fail
+# summary on the run page. Each attempt is one matrix leg, so failures/N
+# is the observed flake probability for the target + config. Use it to
+# quantify a flake rate (point at main) or verify a fix (point at the fix
+# branch, expect 0/N). Defaults (-n 4 --dist=worksteal) mirror ci.yml's
+# server-responses group; every knob is overridable.
 #
 # Examples:
-#
-#   # Quantify a suspect file's flake rate on main with defaults
-#   # (20 attempts, -n 4 --dist=worksteal):
 #   gh workflow run flake-stress.yml --ref main \
 #     -f test_target=tests/server/integration/test_routes_responses.py
-#
-#   # Verify a fix branch closes the same flake (expect 0/20):
-#   gh workflow run flake-stress.yml --ref main \
-#     -f test_target=tests/server/integration/test_routes_responses.py \
-#     -f target_branch=fix-delete-response-cancels-active
-#
-#   # Inner-test flake at the inner-* group's CI config:
-#   gh workflow run flake-stress.yml --ref main \
-#     -f test_target=tests/inner/test_terminal.py \
-#     -f workers=8 -f dist=loadfile
-#
-#   # Stress one parametrized node-id solo, skipping known_failures:
 #   gh workflow run flake-stress.yml --ref main \
 #     -f test_target='tests/foo.py::test_x[case1]' \
-#     -f workers=1 -f extra_pytest_args=--no-skip-known
-#
-# Triggers:
-#   workflow_dispatch   manual run from the Actions tab or
-#                       ``gh workflow run flake-stress.yml ...``.
+#     -f workers=1 -f extra_pytest_args=-x
 
 on:
   workflow_dispatch:
@@ -69,7 +39,7 @@ on:
         required: false
         default: "worksteal"
       extra_pytest_args:
-        description: "Extra pytest args appended to the command, e.g. '--no-skip-known' (default: empty)"
+        description: "Extra pytest args appended to the command, e.g. '-x' (default: empty)"
         required: false
         default: ""
 
@@ -77,22 +47,18 @@ permissions:
   contents: read
 
 env:
-  # No ap-web SPA build during `uv sync` (setup.py `_build_web_ui`):
-  # this job never serves the bundle, and the hardened runner's npm has
-  # no registry mirror so the build otherwise times out ~10min on public npm.
+  # No ap-web SPA build during `uv sync`: this job never serves the bundle
+  # and the hardened runner has no npm mirror (build would time out).
   OMNIGENT_SKIP_WEB_UI: "true"
-  # Hardened runners have no outbound network to public PyPI; route
-  # uv/pip through the Databricks proxy. Same as ci.yml.
+  # Pin the PyPI index for uv/pip resolution (same as ci.yml).
   UV_INDEX_URL: https://pypi.org/simple
   PIP_INDEX_URL: https://pypi.org/simple
 
 jobs:
   prep:
-    # Validate inputs and turn the ``attempts`` count into a JSON
-    # array the matrix can fan out across. Matrix arrays must be
-    # known at job-graph construction time, so we synthesize the
-    # array here and the downstream job picks it up via
-    # ``fromJSON``.
+    # Validate inputs and turn ``attempts`` into a JSON array the matrix
+    # fans out across (arrays must exist at job-graph construction time;
+    # the downstream job picks it up via ``fromJSON``).
     name: Validate inputs
     runs-on: ubuntu-latest
     outputs:
@@ -108,20 +74,17 @@ jobs:
           EXTRA_ARGS: ${{ github.event.inputs.extra_pytest_args }}
         run: |
           set -euo pipefail
-          # attempts ∈ [1, 50]. 50 is a soft cap to avoid
-          # accidentally consuming the whole runner pool.
+          # attempts ∈ [1, 50]; 50 soft-caps runner-pool consumption.
           if ! [[ "$ATTEMPTS" =~ ^[1-9][0-9]?$ ]] || (( ATTEMPTS > 50 )); then
             echo "::error::attempts must be an integer in [1, 50], got '$ATTEMPTS'"
             exit 1
           fi
-          # workers ∈ [1, 32]. Above that, xdist setup tends to
-          # cost more than the parallelism returns.
+          # workers ∈ [1, 32]; above that xdist setup outweighs parallelism.
           if ! [[ "$WORKERS" =~ ^([1-9]|[12][0-9]|3[0-2])$ ]]; then
             echo "::error::workers must be 1-32, got '$WORKERS'"
             exit 1
           fi
-          # dist is an enum — reject everything else so we don't
-          # silently pass garbage to pytest.
+          # dist is an enum; reject anything else.
           case "$DIST" in
             loadfile|worksteal|loadscope|load|each|no) ;;
             *)
@@ -129,18 +92,12 @@ jobs:
               exit 1
               ;;
           esac
-          # test_target and extra_pytest_args both reach a shell.
-          # Restrict to characters that show up in legitimate pytest
-          # node-ids (paths, ``::`` separators, ``[]`` parametrize
-          # brackets, ``-`` flags) so a hostile input can't smuggle
-          # command substitution. Authorized-only workflow_dispatch
-          # already limits the threat model; belt-and-suspenders.
-          #
-          # Regex stored in a quoted variable so bash doesn't strip
-          # backslashes / glob-expand brackets before the regex engine
-          # sees the pattern. ``]`` is the first char in the class to
-          # be treated as a literal (POSIX rule); ``-`` is last so it
-          # isn't read as a range separator.
+          # test_target / extra_pytest_args reach a shell; restrict to
+          # legitimate pytest node-id chars so hostile input can't smuggle
+          # command substitution (belt-and-suspenders atop authz dispatch).
+          # Quoted so bash doesn't strip backslashes / glob-expand brackets.
+          # POSIX char-class rules: ``]`` first (literal), ``-`` last (not a
+          # range).
           allowed_chars='^[]a-zA-Z0-9./_:[ =-]+$'
           if ! [[ "$TEST_TARGET" =~ $allowed_chars ]]; then
             echo "::error::test_target contains disallowed characters; allowed: a-zA-Z0-9 . / _ : [ ] - = space"
@@ -150,7 +107,7 @@ jobs:
             echo "::error::extra_pytest_args contains disallowed characters; allowed: a-zA-Z0-9 . / _ : [ ] - = space"
             exit 1
           fi
-          # Build JSON array [1,2,...,N] for the matrix to consume.
+          # Build JSON array [1,2,...,N] for the matrix.
           ARR=$(python3 -c "import json,os; print(json.dumps(list(range(1, int(os.environ['ATTEMPTS'])+1))))")
           echo "attempts_json=$ARR" >> "$GITHUB_OUTPUT"
           echo "Will run $ATTEMPTS attempts of: $TEST_TARGET"
@@ -162,15 +119,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:
-      # Keep going after a failure so we observe the full pass/fail
-      # distribution across attempts, not just the first failure.
+      # Keep going after a failure to observe the full distribution.
       fail-fast: false
       matrix:
         attempt: ${{ fromJSON(needs.prep.outputs.attempts_json) }}
 
     steps:
       - name: Check out repo
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           ref: ${{ github.event.inputs.target_branch }}
 
@@ -185,10 +141,8 @@ jobs:
           enable-cache: true
 
       - name: Install ripgrep + bubblewrap
-        # Some inner tests need these (Grep tool fallback,
-        # linux_bwrap sandbox). Cheap enough to always install so
-        # the tool works for inner-test flakes without a surprise
-        # import error. Apparmor sysctl mirrors ci.yml.
+        # Inner tests need these (Grep fallback, linux_bwrap sandbox);
+        # always install so inner-test flakes work. Apparmor sysctl mirrors ci.yml.
         run: |
           sudo apt-get update
           sudo apt-get install -y ripgrep bubblewrap
@@ -201,17 +155,14 @@ jobs:
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
 
       - name: Install dependencies
-        # Matches ci.yml's install set. ``--extra all`` pulls
-        # claude-sdk + openai-agents so executor adapters can
-        # import their SDKs at collection time.
+        # Matches ci.yml; ``--extra all`` pulls the harness SDKs so
+        # executor adapters import at collection time.
         run: uv sync --extra all --extra dev
 
       - name: Run pytest target
-        # test_target and extra_pytest_args were validated by the
-        # prep job. Word-splitting on $TEST_TARGET and $EXTRA_ARGS
-        # is intentional — both may carry multiple tokens (paths,
-        # flags). We bind via env (not ``${{ }}`` interpolation)
-        # to avoid GitHub-expression injection at the shell layer.
+        # Inputs validated by prep. Word-splitting on $TEST_TARGET /
+        # $EXTRA_ARGS is intentional (multi-token); bound via env (not
+        # ``${{ }}``) to avoid expression injection at the shell.
         shell: bash
         env:
           TEST_TARGET: ${{ github.event.inputs.test_target }}
@@ -238,10 +189,8 @@ jobs:
           if-no-files-found: ignore
 
   summarize:
-    # Render a pass/fail summary table on the run page so a glance
-    # at the workflow run gives you the flake rate without drilling
-    # into each matrix leg. ``if: always()`` so we still summarize
-    # when some attempts failed (the common case for this tool).
+    # Render a pass/fail summary table on the run page for an at-a-glance
+    # flake rate. ``if: always()`` so failed attempts still summarize.
     name: Summarize results
     needs: repro
     if: always()
@@ -255,11 +204,8 @@ jobs:
           merge-multiple: true
 
       - name: Render summary
-        # Parse each junit XML to count pass/fail/error/skipped at
-        # the attempt level. The repro job's matrix-level conclusion
-        # already drives the visible status; this surfaces *which*
-        # tests failed and how often, which is the useful debugging
-        # artifact.
+        # Parse each junit XML per attempt to surface which tests failed
+        # and how often (the matrix conclusion already drives visible status).
         run: |
           python3 - <<'PY'
           import glob
