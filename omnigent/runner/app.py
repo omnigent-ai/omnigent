@@ -8635,6 +8635,7 @@ def _build_spawn_env_from_spec(
             _build_codex_spawn_env,
             _build_copilot_spawn_env,
             _build_cursor_spawn_env,
+            _build_databricks_genie_spawn_env,
             _build_goose_spawn_env,
             _build_kimi_spawn_env,
             _build_openai_agents_sdk_spawn_env,
@@ -8664,6 +8665,8 @@ def _build_spawn_env_from_spec(
             env = _build_acp_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "copilot":
             env = _build_copilot_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
+        elif harness == "databricks-genie":
+            env = _build_databricks_genie_spawn_env(effective_spec)
         else:
             builder_path = spawn_env_builders().get(harness)
             if builder_path is not None:

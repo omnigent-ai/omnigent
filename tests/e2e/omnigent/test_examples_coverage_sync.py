@@ -198,6 +198,11 @@ _ALT_COVERED: frozenset[str] = frozenset(
         # test_switch_agent_native_e2e.py, test_sessions_fork_e2e.py).
         "sdk-chat-builtin",
         "sandbox-deps-os-env",
+        # examples/genie is covered by test_per_harness_databricks_genie.py —
+        # the harness-named live characterization test that runs the example
+        # against a real Genie space (skipped when the workspace creds are
+        # absent), so there is no separate test_example_genie.py.
+        "genie",
     }
 )
 

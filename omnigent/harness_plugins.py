@@ -624,6 +624,22 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         interrupt=True,
         streaming=True,
     ),
+    # Genie answers each turn with one complete message over the databricks-sdk
+    # Genie API — DatabricksGenieExecutor.supports_streaming() returns False and
+    # it does not override interrupt_session(), so both are declared False. The
+    # conversation id it threads across turns lives on the executor instance and
+    # is not rehydrated on resume, hence COLD_ONLY.
+    "databricks-genie": _C(
+        _IM.SDK_IN_PROCESS,
+        _EL.NONE,
+        _RS.COLD_ONLY,
+        _EF.NONE,
+        _MF.MULTI,
+        _AU.OWN_AUTH,
+        subagents=False,
+        interrupt=False,
+        streaming=False,
+    ),
     # open-responses is resolved via an alternate path, but its executor
     # (omnigent/inner/open_responses_sdk.py) is concrete: interrupt_session()
     # closes the active stream and returns True, supports_streaming() is True,
@@ -657,6 +673,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "copilot",
             "cursor",
             "cursor-native",
+            "databricks-genie",
             "goose",
             "goose-native",
             "hermes",
@@ -684,6 +701,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "copilot": "omnigent.inner.copilot_harness",
         "cursor": "omnigent.inner.cursor_harness",
         "cursor-native": "omnigent.inner.cursor_native_harness",
+        "databricks-genie": "omnigent.inner.databricks_genie_harness",
         "goose": "omnigent.inner.goose_harness",
         "goose-native": "omnigent.inner.goose_native_harness",
         "hermes": "omnigent.inner.hermes_harness",
@@ -701,6 +719,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
     aliases={
         "agy": "antigravity",
         "claude": "claude-sdk",
+        "genie": "databricks-genie",
         "github-copilot": "copilot",
         "google-antigravity": "antigravity",
         "kimi-code": "kimi",
@@ -763,6 +782,8 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "codex": "HARNESS_CODEX_MODEL",
         "copilot": "HARNESS_COPILOT_MODEL",
         "cursor": "HARNESS_CURSOR_MODEL",
+        # Genie carries the space id (not a model name) in ``executor.model``.
+        "databricks-genie": "HARNESS_DATABRICKS_GENIE_MODEL",
         "goose": "HARNESS_GOOSE_MODEL",
         "kimi": "HARNESS_KIMI_MODEL",
         "openai-agents": "HARNESS_OPENAI_AGENTS_MODEL",

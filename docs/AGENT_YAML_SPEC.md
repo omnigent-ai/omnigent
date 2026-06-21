@@ -55,7 +55,7 @@ of the agent YAML.
 
 ```yaml
 executor:
-  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, kiro-native, pi, antigravity, qwen, kimi, copilot, hermes, ...
+  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, kiro-native, pi, antigravity, qwen, kimi, copilot, hermes, databricks-genie, ...
   model: databricks-claude-opus-4-7
   auth:
     type: databricks
@@ -148,6 +148,34 @@ declares no `executor.auth` block. To route through a gateway, either set
 shell, declare a key/gateway provider in `~/.omnigent/config.yaml`, or use
 `executor.auth: {type: databricks, profile: …}` and let Omnigent resolve
 the workspace.
+
+### Databricks Genie Spaces
+
+`harness: databricks-genie` (alias `genie`) registers a remote Databricks
+**AI/BI Genie space** as the agent's harness (`pip install
+"omnigent[databricks]"`). Each turn is forwarded to the Genie space, which
+answers natural-language questions over your curated data; the response carries
+Genie's summary, the SQL it generated, and the result rows. Follow-up turns
+continue the same Genie conversation.
+
+A Genie space is the conversational unit, so its **space id** is carried in
+`executor.model`. Authentication reuses the Databricks CLI: run
+`databricks auth login --host <workspace>` once (writes `~/.databrickscfg`), then
+name the profile under `executor.auth`.
+
+```yaml
+executor:
+  harness: databricks-genie      # alias: genie
+  model: "01ef…"                 # the Genie space id (from the room URL)
+  auth:
+    type: databricks
+    profile: DEFAULT             # ~/.databrickscfg profile; omit to use defaults
+```
+
+Unlike the gateway-backed harnesses, Genie talks to the workspace through the
+databricks-sdk `WorkspaceClient`, not the Databricks AI gateway, and it dispatches
+no Omnigent tools — the space queries its own data directly. See
+[`examples/genie`](../examples/genie).
 
 CLI flags such as `--harness` and `--model` can override or supply missing
 executor values for a run. Databricks credentials come from the spec's
