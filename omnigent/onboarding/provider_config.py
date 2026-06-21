@@ -107,7 +107,9 @@ _VALID_KINDS = (
 # families. _parse_provider dispatches subscription/databricks first, then
 # treats every remaining kind as a family kind.
 
-ProviderKind = Literal["key", "subscription", "gateway", "local", "databricks", "cli-config", "bedrock"]
+ProviderKind = Literal[
+    "key", "subscription", "gateway", "local", "databricks", "cli-config", "bedrock"
+]
 
 # Maps a canonical harness name to the provider family it consumes. The
 # ``pi`` harness consumes both families and so is absent here — callers
