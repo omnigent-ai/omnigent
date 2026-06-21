@@ -20,8 +20,9 @@ harnesses`` be the single place a user signs in or out of Claude / Codex rather
 than running ``codex login`` / ``claude auth login`` by hand.
 
 The "is the CLI logged in?" verdict (:func:`harness_cli_logged_in`) asks the
-CLI itself (``claude auth status`` / ``codex login status``) rather than
-reading a credential file, because the file location is **platform-specific**
+CLI itself (``claude auth status`` / ``codex login status`` / ``agy models``)
+rather than reading a credential file, because the file location is
+**platform-specific**
 — Claude Code stores its OAuth tokens in the macOS Keychain (not
 ``~/.claude/.credentials.json``) on macOS, so a file check would falsely report
 "not logged in" right after a successful ``claude auth login``. The CLI's own
@@ -41,7 +42,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 
-from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
+from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 
 # Pi is not a configure-menu family (the menu is Claude + Codex), but the
 # first-run ``run`` flow falls back to it, so it has install metadata too.
@@ -77,8 +78,15 @@ class HarnessInstallSpec:
         when it has no npm *package* (e.g. cursor-agent's curl installer);
         ``None`` for npm-installable harnesses.
     :param login_status_key: The boolean field in the status command's JSON
-        output that reports login state, e.g. ``"isAuthenticated"`` for
-        cursor-agent. ``None`` falls back to ``"loggedIn"``, then the exit code.
+        output that reports login state, e.g. ``"loggedIn"`` for Claude or
+        ``"isAuthenticated"`` for cursor-agent. ``None`` means the harness has
+        no JSON verdict (Codex / agy print a human line or model list), so the
+        exit code is authoritative and stdout is never parsed.
+    :param auth_hint: Remediation phrase for a CLI whose sign-in is not a
+        ``login_args`` subcommand — agy authenticates by launching its bare TUI
+        once — appended after the install hint, e.g. ``"run `agy` once and
+        complete the browser sign-in"``; ``None`` when ``login_args`` (or
+        nothing) already covers sign-in.
     """
 
     display: str
@@ -89,6 +97,7 @@ class HarnessInstallSpec:
     status_args: tuple[str, ...] | None = None
     install_hint: str | None = None
     login_status_key: str | None = None
+    auth_hint: str | None = None
 
 
 # Keyed by harness family (Claude=anthropic, Codex=openai) plus the pi
@@ -104,6 +113,7 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         login_args=("auth", "login", "--claudeai"),
         logout_args=("auth", "logout"),
         status_args=("auth", "status"),
+        login_status_key="loggedIn",
     ),
     OPENAI_FAMILY: HarnessInstallSpec(
         "Codex",
@@ -124,6 +134,27 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         install_hint="curl https://cursor.com/install -fsS | bash",
         login_status_key="isAuthenticated",
     ),
+    # The native Antigravity (agy) TUI bridge wraps the ``agy`` CLI. ``agy`` has
+    # no ``login`` / ``logout`` subcommand — the user authenticates via browser
+    # OAuth by launching ``agy`` with no arguments on first run — so login_args /
+    # logout_args stay ``None`` (``harness_login`` / ``harness_logout`` no-op for
+    # it). It DOES expose a usable status check: ``agy models`` lists models and
+    # exits 0 only when signed in (else exits non-zero with "Please sign in …"),
+    # so status_args wires it the way Codex's exit-code ``login status`` is — so
+    # ``harness_cli_logged_in`` reads a real, revocation-aware verdict from the
+    # CLI instead of guessing from a credential file. (The readiness layer still
+    # uses the subprocess-free file check ``gemini_login_detected`` for its fast
+    # path.) ``agy`` ships via a shell installer rather than npm, so ``package``
+    # is ``None`` and the manual command lives in ``install_hint`` (shown as
+    # guidance; ``install_harness_cli`` refuses to auto-run it).
+    GEMINI_FAMILY: HarnessInstallSpec(
+        "Antigravity",
+        "agy",
+        package=None,
+        status_args=("models",),
+        install_hint="curl -fsSL https://antigravity.google/cli/install.sh | bash",
+        auth_hint="run `agy` once and complete the browser sign-in",
+    ),
 }
 
 
@@ -137,8 +168,9 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
 # via Cursor's curl installer rather than npm — see its ``install_hint``).
 # SDK-based harnesses run in-process and are deliberately absent, so they
 # resolve to "no CLI required": ``claude-sdk``, ``codex``, ``openai-agents-sdk``,
-# and the SDK ``cursor`` harness (which drives the ``cursor-sdk`` Python package
-# over its own bundled bridge, NOT the ``cursor-agent`` CLI).
+# the in-process ``antigravity`` Gemini SDK harness, and the SDK ``cursor``
+# harness (which drives the ``cursor-sdk`` Python package over its own bundled
+# bridge, NOT the ``cursor-agent`` CLI).
 _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "claude-native": ANTHROPIC_FAMILY,
     "codex-native": OPENAI_FAMILY,
@@ -146,6 +178,12 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "pi-native": PI_KEY,
     "cursor-native": CURSOR_KEY,
     "native-cursor": CURSOR_KEY,
+    # The native agy TUI bridge wraps the ``agy`` CLI; both spellings map to
+    # the Gemini family's install spec. (The in-process ``antigravity`` SDK
+    # harness is deliberately absent — like the other SDK harnesses it needs no
+    # CLI binary.)
+    "antigravity-native": GEMINI_FAMILY,
+    "native-antigravity": GEMINI_FAMILY,
 }
 
 
@@ -212,6 +250,8 @@ def harness_setup_hint(harness: str | None) -> str:
         login = ""
         if spec.login_args:
             login = f", then run `{spec.binary} {' '.join(spec.login_args)}`"
+        elif spec.auth_hint:
+            login = f", then {spec.auth_hint}"
         return f"install the {spec.binary} CLI on that machine with `{spec.install_hint}`{login}"
     return "run `omnigent setup` on that machine to install the CLI and set a default credential"
 
@@ -293,20 +333,22 @@ def harness_cli_logged_in(key: str) -> bool:
     """Return whether the harness CLI itself reports a usable login.
 
     Asks the CLI's own status command (``claude auth status`` /
-    ``codex login status``) instead of reading a credential file, because the
-    file location is platform-specific — Claude Code stores its tokens in the
-    macOS Keychain rather than ``~/.claude/.credentials.json`` on macOS, so a
-    file check would falsely report "not logged in" right after a successful
-    ``claude auth login``. The status command reads wherever the CLI actually
-    stored the credential, so this is correct on every platform.
+    ``codex login status`` / ``agy models``) instead of reading a credential
+    file, because the file location is platform-specific — Claude Code stores
+    its tokens in the macOS Keychain rather than ``~/.claude/.credentials.json``
+    on macOS, so a file check would falsely report "not logged in" right after a
+    successful ``claude auth login``. The status command reads wherever the CLI
+    actually stored the credential, so this is correct on every platform.
 
-    Two output shapes are handled: a CLI that prints a JSON object with a
-    ``loggedIn`` boolean (Claude) is read structurally; otherwise the process
-    exit code is used (Codex prints a human-readable line and exits ``0`` only
-    when logged in).
+    Two output shapes are handled, selected explicitly by the spec's
+    ``login_status_key``: a CLI that publishes a JSON status object names its
+    boolean field there (Claude ``loggedIn`` / Cursor ``isAuthenticated``) and
+    is read structurally; a CLI with no ``login_status_key`` has no JSON verdict
+    (Codex's human line, ``agy models``' model list), so the exit code decides
+    (``0`` only when logged in) and stdout is never parsed.
 
-    :param key: A harness family, ``"anthropic"`` (Claude) or ``"openai"``
-        (Codex).
+    :param key: A harness family, e.g. ``"anthropic"`` (Claude),
+        ``"openai"`` (Codex), or ``"gemini"`` (Antigravity, via ``agy models``).
     :returns: ``True`` when the CLI reports a usable login; ``False`` when the
         key has no status command, the CLI binary is missing, the status
         process failed to spawn, or the CLI reports no login.
@@ -326,16 +368,20 @@ def harness_cli_logged_in(key: str) -> bool:
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
-    # Prefer the CLI's structured verdict when it emits one (Claude prints a
-    # JSON ``{"loggedIn": ...}``); otherwise fall back to the exit code (Codex
-    # prints a human line and exits 0 only when logged in).
-    try:
-        payload = json.loads(result.stdout)
-    except (json.JSONDecodeError, ValueError):
-        return result.returncode == 0
-    status_key = spec.login_status_key or "loggedIn"
-    if isinstance(payload, dict) and status_key in payload:
-        return bool(payload[status_key])
+    # Dispatch is explicit per spec: a harness that publishes a JSON status
+    # object names its boolean field in ``login_status_key`` (Claude
+    # ``loggedIn`` / Cursor ``isAuthenticated``). When that key is unset the
+    # harness has no JSON verdict (Codex's human line, agy's model list), so the
+    # exit code is authoritative and stdout is never parsed — output that merely
+    # happens to be JSON can't flip the verdict.
+    status_key = spec.login_status_key
+    if status_key is not None:
+        try:
+            payload = json.loads(result.stdout)
+        except (json.JSONDecodeError, ValueError):
+            return result.returncode == 0
+        if isinstance(payload, dict) and status_key in payload:
+            return bool(payload[status_key])
     return result.returncode == 0
 
 
@@ -371,18 +417,20 @@ def harness_login(key: str) -> bool:
         # browser when it returns false, which strands the login until it times
         # out. Fall back to inherited stdio when /dev/tty can't be opened (a
         # headless run with no controlling terminal).
-        tty_fd = None
-        kwargs: dict = {"check": False, "timeout": 600}
+        tty_fd: int | None = None
         if not sys.stdin.isatty():
             try:
                 tty_fd = os.open("/dev/tty", os.O_RDWR)
-                kwargs["stdin"] = tty_fd
-                kwargs["stdout"] = tty_fd
-                kwargs["stderr"] = tty_fd
             except OSError:
-                pass
+                tty_fd = None
+        argv = [spec.binary, *spec.login_args]
         try:
-            subprocess.run([spec.binary, *spec.login_args], **kwargs)
+            if tty_fd is not None:
+                subprocess.run(
+                    argv, check=False, timeout=600, stdin=tty_fd, stdout=tty_fd, stderr=tty_fd
+                )
+            else:
+                subprocess.run(argv, check=False, timeout=600)
         finally:
             if tty_fd is not None:
                 os.close(tty_fd)

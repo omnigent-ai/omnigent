@@ -142,6 +142,9 @@ def test_configured_harness_map_covers_all_spellings(
         "antigravity",
         "agy",
         "google-antigravity",
+        # Native Antigravity (agy) CLI-wrapping harness, both spellings.
+        "antigravity-native",
+        "native-antigravity",
     }
     assert set(result) == expected_keys
 
@@ -174,6 +177,8 @@ def test_configured_harness_map_gates_only_cli_harnesses(
     # package and gates on a configured ``CURSOR_API_KEY``, not a binary —
     # covered separately. Native Cursor (``cursor-native`` / ``native-cursor``)
     # wraps the ``cursor-agent`` CLI, so it IS gated on the binary.)
+    # antigravity-native is also gated (it wraps the ``agy`` CLI); with no
+    # binary it reads False before its credential check is even reached.
     for cli in (
         "claude-native",
         "native-claude",
@@ -183,6 +188,8 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         "pi",
         "cursor-native",
         "native-cursor",
+        "antigravity-native",
+        "native-antigravity",
     ):
         assert result[cli] is False, f"{cli} should be gated on its CLI binary"
 
@@ -190,14 +197,19 @@ def test_configured_harness_map_gates_only_cli_harnesses(
 def test_configured_harness_map_all_true_with_clis(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Every spelling reads True once the CLIs are installed and cursor has a key.
+    """Every spelling reads True once the CLIs are installed and creds present.
 
     The CLI harnesses pass their binary check, the SDK harnesses are ungated,
-    and cursor (key-gated) is satisfied by a ``CURSOR_API_KEY`` — so nothing is
-    reported unconfigured.
+    cursor (key-gated) is satisfied by a ``CURSOR_API_KEY``, and
+    antigravity-native (binary + credential gated) is satisfied by a detected
+    Gemini OAuth credential — so nothing is reported unconfigured.
     """
+    import omnigent.onboarding.gemini_auth as _ga
+
     _all_clis_installed(monkeypatch)
     monkeypatch.setenv("CURSOR_API_KEY", "crsr_ready")
+    # antigravity-native also needs a credential (not just the ``agy`` binary).
+    monkeypatch.setattr(_ga, "gemini_login_detected", lambda: True)
     result = configured_harness_map()
     assert all(result.values())
 

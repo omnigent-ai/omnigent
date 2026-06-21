@@ -7,6 +7,7 @@ import pytest
 from omnigent.errors import OmnigentError
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
+    GEMINI_FAMILY,
     OPENAI_FAMILY,
     PI_SURFACE,
     default_provider_for_harness,
@@ -234,6 +235,187 @@ def test_default_true_never_claims_pi_scope() -> None:
     assert default_provider_for_harness(config, "pi").name == "anthropic"
 
 
+def test_gemini_key_never_becomes_pi_default() -> None:
+    """A gemini key serves ONLY the Gemini surface — never pi.
+
+    pi consumes the anthropic / openai families only (a gemini key's
+    add-surface scoping is ``frozenset({GEMINI_FAMILY})`` — no pi scope). So
+    a machine whose only configured provider is a gemini key must leave pi
+    UNRESOLVED: the cross-family pi fallback must skip gemini. A regression
+    that walks gemini in the pi fallback silently routes pi through a
+    credential it cannot use (incorrect default, broken pi launches).
+    """
+    config = {"providers": {"gemini": _key_entry(GEMINI_FAMILY, default=True)}}
+    # The gemini (antigravity-native) surface still resolves to its key…
+    assert default_provider_for_harness(config, "antigravity-native").name == "gemini"
+    # …but pi does NOT — gemini is not a pi-capable family.
+    assert default_provider_for_harness(config, "pi") is None
+    assert surface_default_provider(config, PI_SURFACE) is None
+
+
+def test_gemini_key_not_pi_capable_surface() -> None:
+    """A gemini key's served-surface set excludes pi (no auto/explicit pi default).
+
+    ``provider_families`` drives the add flow's "default every served surface"
+    step AND set_default_provider's scope validation. If a gemini key reported
+    pi, adding it would auto-write a pi default (and the Pi credential menu
+    would list it), wedging pi on a credential it cannot consume. So a gemini
+    key must serve only the Gemini surface, and scoping it to pi must fail loud
+    (parity with subscriptions, which also cannot drive pi).
+    """
+    config = {"providers": {"gemini": _key_entry(GEMINI_FAMILY, default=True)}}
+    entry = load_providers(config)["gemini"]
+    assert provider_families(entry) == frozenset({GEMINI_FAMILY})
+    # set_default_provider refuses to scope a gemini key to pi.
+    block = {"gemini": _key_entry(GEMINI_FAMILY)}
+    with pytest.raises(OmnigentError):
+        set_default_provider(block, "gemini", PI_SURFACE)
+
+
+def test_gemini_key_cannot_claim_pi_scope_at_parse() -> None:
+    """A hand-edited ``default: ["gemini","pi"]`` / ``"pi"`` on a gemini key
+    fails LOUD at parse, not silently at pi launch.
+
+    ``default_provider_for_harness(config, "pi")`` matches on
+    ``entry.default_families`` directly, bypassing ``provider_families``. So a
+    gemini key's pi scope must be rejected at PARSE time (parity with how a
+    subscription claiming pi is rejected) — otherwise a hand-edited config is
+    accepted, resolves pi to the gemini key, and only fails when pi launches.
+    """
+    for bad in (["gemini", "pi"], "pi"):
+        raw = {
+            "kind": "key",
+            "gemini": {"base_url": "https://x/v1", "api_key_ref": "env:K"},
+            "default": bad,
+        }
+        with pytest.raises(OmnigentError):
+            load_providers({"providers": {"gemini": raw}})
+
+
+def test_databricks_does_not_serve_gemini_surface() -> None:
+    """Databricks routes anthropic/openai + pi, NOT the Gemini surface.
+
+    The antigravity-native harness drives Gemini via the Google SDK + a
+    GEMINI_API_KEY / OAuth, not an OpenAI-compatible gateway, so a databricks
+    profile cannot supply the Gemini surface. Were it gemini-capable, a
+    ``default: true`` databricks profile would auto-become the gemini-surface
+    default and wedge its launch on a credential it cannot use.
+    """
+    config = {"providers": {"dbx": {"kind": "databricks", "profile": "ws", "default": True}}}
+    entry = load_providers(config)["dbx"]
+    assert provider_families(entry) == frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE})
+    assert GEMINI_FAMILY not in provider_families(entry)
+    # A default databricks profile does NOT become the gemini-surface default.
+    assert default_provider_for_harness(config, "antigravity-native") is None
+    # And a databricks profile cannot name the gemini scope at parse.
+    bad = {"providers": {"dbx": {"kind": "databricks", "profile": "ws", "default": ["gemini"]}}}
+    with pytest.raises(OmnigentError):
+        load_providers(bad)
+
+
+@pytest.mark.parametrize("kind", ["gateway", "local"])
+def test_gateway_local_does_not_serve_gemini_surface(kind: str) -> None:
+    """A gateway/local declaring a ``gemini:`` block does NOT claim the Gemini surface.
+
+    Invariant A: the Gemini surface is consumed by the antigravity flavors
+    (the antigravity SDK harness via a raw GEMINI_API_KEY, antigravity-native
+    via OAuth), neither of which can be driven by an OpenAI/Anthropic-compatible
+    proxy. So a ``gateway`` / ``local`` may carry a gemini block alongside a real
+    family but must NOT report ``gemini`` in ``provider_families`` — otherwise it
+    could silently become the gemini-surface default and wedge a launch the proxy
+    can't honor. Its legitimate anthropic surface is unaffected.
+    """
+    raw = {
+        "kind": kind,
+        "anthropic": {"base_url": "https://gw", "api_key_ref": "env:K"},
+        "gemini": {"base_url": "https://gw/v1beta", "api_key_ref": "env:G"},
+    }
+    entry = load_providers({"providers": {"gw": raw}})["gw"]
+    served = provider_families(entry)
+    assert GEMINI_FAMILY not in served
+    # The real (anthropic) surface — and its pi capability — are untouched.
+    assert served == frozenset({ANTHROPIC_FAMILY, PI_SURFACE})
+    # And it can never become the gemini-surface default…
+    cfg = {"providers": {"gw": {**raw, "default": True}}}
+    assert default_provider_for_harness(cfg, "antigravity-native") is None
+    # …nor name the gemini scope explicitly at parse.
+    with pytest.raises(OmnigentError):
+        load_providers({"providers": {"gw": {**raw, "default": ["gemini"]}}})
+
+
+@pytest.mark.parametrize("kind", ["gateway", "local"])
+def test_gemini_only_gateway_local_rejected_at_parse(kind: str) -> None:
+    """A gateway/local whose ONLY family is gemini fails loud at parse.
+
+    Such an entry configures nothing it can serve (the Gemini surface is
+    key-only, and it declares no anthropic/openai family), so parsing it into a
+    silently-surfaceless provider would be a footgun. Reject it, steering the
+    author to ``kind: 'key'`` for a real GEMINI_API_KEY.
+    """
+    raw = {"kind": kind, "gemini": {"base_url": "https://x/v1beta", "api_key_ref": "env:G"}}
+    with pytest.raises(OmnigentError, match="Gemini surface"):
+        load_providers({"providers": {"gw": raw}})
+
+
+def test_gemini_auth_command_rejected_at_parse() -> None:
+    """A ``gemini:`` family with ``auth_command`` (no static key) fails loud at parse.
+
+    The Gemini surface is consumed only by the antigravity harness, which
+    drives the google SDK with a STATIC GEMINI_API_KEY. ``auth_command`` mints a
+    bearer token the SDK cannot use as a key, so the block is nonsensical.
+    Rejecting it at PARSE (rather than only at the runtime spawn / ``/models``
+    guard) keeps every layer — provider_families, default-resolution, the
+    display+readiness check, spawn, ``/models`` — consistent by construction: an
+    auth_command gemini key can no longer leak a false "Gemini ready" into the
+    configure-harness readiness path while spawn rejects it.
+    """
+    raw = {"kind": "key", "gemini": {"base_url": "https://x/v1beta", "auth_command": "echo tok"}}
+    with pytest.raises(OmnigentError, match="auth_command is not allowed on a 'gemini' family"):
+        load_providers({"providers": {"google": raw}})
+
+
+def test_auth_command_still_valid_for_non_gemini_families() -> None:
+    """``auth_command`` remains valid for anthropic/openai families — no over-restriction.
+
+    The gemini parse-rejection is gemini-SPECIFIC: gateways and dynamic-token
+    setups still mint bearers via ``auth_command`` for the anthropic/openai
+    surfaces. A regression that rejected ``auth_command`` family-wide would break
+    every gateway, so assert these parse cleanly and keep the auth_command source.
+    """
+    gateway = {
+        "kind": "gateway",
+        "anthropic": {"base_url": "https://gw", "auth_command": "mint-anthropic-tok"},
+        "openai": {"base_url": "https://gw/v1", "auth_command": "mint-openai-tok"},
+    }
+    entry = load_providers({"providers": {"gw": gateway}})["gw"]
+    assert entry.families[ANTHROPIC_FAMILY].auth_command == "mint-anthropic-tok"
+    assert entry.families[OPENAI_FAMILY].auth_command == "mint-openai-tok"
+    # And a ``key`` provider's openai family may also use auth_command.
+    key = {"kind": "key", "openai": {"base_url": "https://x/v1", "auth_command": "mint-tok"}}
+    key_entry = load_providers({"providers": {"k": key}})["k"]
+    assert key_entry.families[OPENAI_FAMILY].auth_command == "mint-tok"
+
+
+def test_key_with_gemini_block_still_serves_gemini() -> None:
+    """A ``key`` provider with a ``gemini:`` block DOES report the Gemini surface.
+
+    The contrast case to the gateway/local rejection: a real GEMINI_API_KEY is
+    exactly what the antigravity harness consumes, so a ``key`` keeps the
+    Gemini surface (and only that — gemini is not pi-capable).
+    """
+    raw = {"kind": "key", "gemini": {"base_url": "https://x/v1beta", "api_key_ref": "env:G"}}
+    entry = load_providers({"providers": {"google": raw}})["google"]
+    assert provider_families(entry) == frozenset({GEMINI_FAMILY})
+    # A multi-family key keeps every served surface, gemini included.
+    multi = {
+        "kind": "key",
+        "openai": {"base_url": "https://x/v1", "api_key_ref": "env:K"},
+        "gemini": {"base_url": "https://y/v1beta", "api_key_ref": "env:G"},
+    }
+    multi_entry = load_providers({"providers": {"multi": multi}})["multi"]
+    assert provider_families(multi_entry) == frozenset({OPENAI_FAMILY, GEMINI_FAMILY, PI_SURFACE})
+
+
 def test_subscription_cannot_claim_pi_scope() -> None:
     """Naming ``"pi"`` in a subscription's default scope fails loud.
 
@@ -276,23 +458,46 @@ def test_set_default_provider_pi_scope_round_trips_and_moves() -> None:
 @pytest.mark.parametrize(
     "raw,expect_pi",
     [
-        # Every kind that can hand pi a usable credential serves the scope.
+        # An inline key/gateway/local serves pi when it declares a pi-capable
+        # family (anthropic / openai); databricks routes pi too.
         ({"kind": "key", "openai": {"base_url": "https://x/v1", "api_key_ref": "env:K"}}, True),
         (
             {"kind": "gateway", "anthropic": {"base_url": "https://x", "api_key_ref": "env:K"}},
             True,
         ),
         ({"kind": "databricks", "profile": "my-ws"}, True),
+        # A gemini-only inline key serves ONLY the Gemini surface, never pi.
+        ({"kind": "key", "gemini": {"base_url": "https://x/v1", "api_key_ref": "env:K"}}, False),
+        # A multi-family inline entry keeps pi via its anthropic / openai family.
+        (
+            {
+                "kind": "gateway",
+                "anthropic": {"base_url": "https://x", "api_key_ref": "env:K"},
+                "gemini": {"base_url": "https://y/v1", "api_key_ref": "env:G"},
+            },
+            True,
+        ),
+        (
+            {
+                "kind": "key",
+                "openai": {"base_url": "https://x/v1", "api_key_ref": "env:K"},
+                "gemini": {"base_url": "https://y/v1", "api_key_ref": "env:G"},
+            },
+            True,
+        ),
         # A CLI login is unusable outside its own CLI — never pi-capable.
         ({"kind": "subscription", "cli": "claude"}, False),
     ],
 )
 def test_provider_families_pi_capability(raw: dict[str, object], expect_pi: bool) -> None:
-    """``provider_families`` reports the pi scope for every kind but subscription.
+    """``provider_families`` reports the pi scope only for pi-capable providers.
 
-    This drives both the Pi page's credential list (which rows appear) and
-    set-default validation — a regression in either direction lets the menu
-    offer a credential pi can't use, or hides one it can.
+    pi-capable = an inline key/gateway/local declaring an anthropic or openai
+    family, or a databricks profile. A gemini-only key (Gemini surface only)
+    and a subscription (CLI-bound) are NOT pi-capable. This drives both the Pi
+    page's credential list (which rows appear) and set-default validation — a
+    regression in either direction lets the menu offer a credential pi can't
+    use, or hides one it can.
     """
     entry = load_providers({"providers": {"p": raw}})["p"]
     assert (PI_SURFACE in provider_families(entry)) is expect_pi
