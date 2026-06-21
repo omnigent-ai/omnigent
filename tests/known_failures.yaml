@@ -26,10 +26,4 @@
 #
 # Note: entries here apply to every pytest invocation. If you
 # want to debug a skipped test locally, comment out its block.
-skips:
-
-  - id: tests/e2e/omnigent/test_run_harness_without_agent_e2e.py::test_run_harness_without_agent_live_repl_round_trip[claude-sdk]
-    reason: "Hangs >180s in CI -> xdist worker crash even on the mock LLM (#796 migration): the claude-sdk native claude-code CLI calls auth/metadata endpoints the mock server does not serve, so its headless -p turn never completes. Distinct from the stale-glyph fix that greened the openai-agents/codex rows; claude-sdk is mock-incompatible and should be excluded from the mock matrix (or the mock taught to serve the claude-code endpoints). Not the old live-gateway hang (that was removed by the mock migration)."
-    issue: 523
-    cluster: mock-claude-sdk-cli-unsupported
-    mode: skip
+skips: []

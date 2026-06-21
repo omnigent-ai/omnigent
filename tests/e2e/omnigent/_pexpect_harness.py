@@ -25,6 +25,7 @@ shared infrastructure.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import re
 import shutil
 from collections.abc import Mapping
@@ -385,21 +386,28 @@ def clean_exit(child: pexpect.spawn, *, timeout: float) -> None:
         ``app.exit()`` — all of which can take a few seconds on
         shutdown.
     """
-    child.sendcontrol("d")
     try:
-        child.expect(pexpect.EOF, timeout=timeout)
-    except pexpect.TIMEOUT:
-        # Clear any half-rendered prompt contents before submitting
-        # the explicit exit command. If the Ctrl+D timeout happened
-        # after the process actually exited, the expect below will see
-        # EOF immediately.
-        child.send("\x15")
-        submit_prompt(child, "/quit")
+        child.sendcontrol("d")
         try:
             child.expect(pexpect.EOF, timeout=timeout)
         except pexpect.TIMEOUT:
-            # Both graceful gestures stalled. The functional assertions
-            # are already done; don't let a slow teardown fail the run.
+            # Clear any half-rendered prompt contents before submitting
+            # the explicit exit command. If the Ctrl+D timeout happened
+            # after the process actually exited, the expect below will see
+            # EOF immediately.
+            child.send("\x15")
+            submit_prompt(child, "/quit")
+            try:
+                child.expect(pexpect.EOF, timeout=timeout)
+            except pexpect.TIMEOUT:
+                # Both graceful gestures stalled. The functional assertions
+                # are already done; don't let a slow teardown fail the run.
+                child.close(force=True)
+                return
+        child.close()
+    except OSError:
+        # Child already exited (closed PTY → [Errno 5] on the exit gesture);
+        # a headless one-shot like ``claude -p`` self-terminates after
+        # replying. Assertions ran before teardown, so treat as a clean exit.
+        with contextlib.suppress(Exception):
             child.close(force=True)
-            return
-    child.close()
