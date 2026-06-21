@@ -40,7 +40,7 @@ from omnigent.onboarding.provider_config import (
 # workflow's ``AgentHarnessType`` uses; executor-type spellings (``claude_sdk``
 # / ``agents_sdk``) and the ``claude`` alias normalize onto these first.
 _SDK_HARNESSES: frozenset[str] = frozenset(
-    {"claude-sdk", "openai-agents", "openai-agents-sdk", "antigravity"}
+    {"claude-sdk", "openai-agents", "openai-agents-sdk", "antigravity", "databricks-genie"}
 )
 
 # CLI-wrapping pi harnesses. Both the bare ``pi`` surface and the native
@@ -158,4 +158,10 @@ def configured_harness_map() -> dict[str, bool]:
     spellings.update(_PI_HARNESSES)
     spellings.update(_CURSOR_NATIVE_HARNESSES)
     spellings.add(CURSOR_KEY)
+    # Include the in-process SDK harnesses by their canonical ids. Most also
+    # appear via ``_HARNESS_FAMILY``, but ``databricks-genie`` does not (it has
+    # no provider family / CLI binary), so without this a consumer holding the
+    # canonical ``databricks-genie`` spelling would miss the map and read it as
+    # "unknown".
+    spellings.update(_SDK_HARNESSES)
     return {spelling: harness_is_configured(spelling) for spelling in spellings}

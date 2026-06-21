@@ -142,6 +142,9 @@ def test_configured_harness_map_covers_all_spellings(
         "antigravity",
         "agy",
         "google-antigravity",
+        # Databricks Genie Spaces SDK harness + its short alias.
+        "databricks-genie",
+        "genie",
     }
     assert set(result) == expected_keys
 

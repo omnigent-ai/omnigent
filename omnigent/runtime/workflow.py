@@ -1495,6 +1495,42 @@ def _build_cursor_spawn_env(
     return env
 
 
+def _build_databricks_genie_spawn_env(spec: AgentSpec) -> dict[str, str]:
+    """
+    Map ``spec.executor`` fields → the ``HARNESS_DATABRICKS_GENIE_*`` env vars
+    the databricks-genie harness wrap reads.
+
+    - ``executor.model`` (the Genie space id) → ``HARNESS_DATABRICKS_GENIE_MODEL``
+    - the Databricks profile (``executor.auth: {type: databricks, profile}`` or
+      the legacy ``executor.profile`` / ``executor.config["profile"]``) →
+      ``HARNESS_DATABRICKS_GENIE_PROFILE``
+
+    Genie reaches the workspace via the databricks-sdk ``WorkspaceClient``
+    (Databricks-CLI / OAuth / PAT auth), NOT the Databricks AI gateway — so, like
+    cursor, it is intentionally absent from :data:`AgentHarnessType` and the
+    gateway / ucode dicts above, and there is no base-URL / gateway resolution
+    here.
+
+    :param spec: The agent spec.
+    :returns: Env-var overrides for the harness subprocess; may be empty (the
+        wrap then surfaces a "no space id configured" turn error).
+    """
+    env: dict[str, str] = {}
+    model = _resolve_spec_model(spec)
+    if model is not None:
+        env["HARNESS_DATABRICKS_GENIE_MODEL"] = model
+
+    auth = spec.executor.auth
+    if isinstance(auth, DatabricksAuth):
+        profile = auth.profile or None
+    else:
+        # Legacy path: executor.config["profile"] or executor.profile.
+        profile = spec.executor.config.get("profile") or spec.executor.profile or None
+    if profile:
+        env["HARNESS_DATABRICKS_GENIE_PROFILE"] = profile
+    return env
+
+
 def _build_antigravity_spawn_env(spec: AgentSpec) -> dict[str, str]:
     """
     Map ``spec.executor`` fields → the ``HARNESS_ANTIGRAVITY_*`` env vars the

@@ -15,6 +15,9 @@ HARNESS_ALIASES: dict[str, str] = {
     # canonical id is "antigravity" (matches the registry / workflow type).
     "agy": "antigravity",
     "google-antigravity": "antigravity",
+    # Short spelling for the Databricks Genie Spaces harness; the canonical id
+    # is "databricks-genie" (matches the registry).
+    "genie": "databricks-genie",
 }
 
 # Canonical native-CLI harness spellings. These harnesses type messages into
