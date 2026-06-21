@@ -374,7 +374,11 @@ class AddOption:
 
 # Catalog providers surfaced as their own top-level add option; the rest
 # are reachable via the "Other provider" catch-all so the menu stays short.
-_PRESET_KEY_PROVIDERS: tuple[str, ...] = ("openai", "anthropic", "openrouter")
+# ``gemini`` has its own "Gemini — API key" entry (it is the antigravity
+# surface, a distinct family), so it must be excluded here too — otherwise it
+# leaks into the openai-family "Other provider" catch-all, whose tail is
+# documented as "all openai-family" (see :func:`_add_option_families`).
+_PRESET_KEY_PROVIDERS: tuple[str, ...] = ("openai", "anthropic", "openrouter", "gemini")
 
 
 def add_menu_options() -> list[AddOption]:
