@@ -53,3 +53,7 @@ PI_NATIVE_WRAPPER_VALUE = "pi-native-ui"
 # Value the ``omnigent cursor`` wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 CURSOR_NATIVE_WRAPPER_VALUE = "cursor-native-ui"
+
+# Value the ``omnigent antigravity`` native (agy TUI) wrapper writes into
+# ``conversations.labels[WRAPPER_LABEL_KEY]``.
+ANTIGRAVITY_NATIVE_WRAPPER_VALUE = "antigravity-native-ui"
