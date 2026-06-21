@@ -842,7 +842,10 @@ class TerminalInstance:
         # commands outside the sandbox. The host-side control plane
         # addresses the socket via ``self.socket_path`` directly and never
         # needs the env var; any inherited value is stripped below too.
-        env = dict(os.environ) if self.inherit_env else {}
+        if self.inherit_env:
+            env = os.environ.copy()
+        else:
+            env = {}
         env.pop("OMNIGENT_TMUX_SOCK", None)
         # Apply per-terminal env overrides (takes precedence over inherited env).
         env.update(self.env)

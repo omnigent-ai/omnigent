@@ -45,6 +45,20 @@ _KIRO_PATH_ENV = "OMNIGENT_KIRO_PATH"
 _AGENT_NAME = "kiro-native-ui"
 _TERMINAL_NAME = "kiro"
 _TERMINAL_SESSION_KEY = "main"
+_TMUX_ATTACH_ENV_ALLOWLIST = (
+    "COLORTERM",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "TERM",
+    "TERM_PROGRAM",
+    "TMPDIR",
+    "USER",
+)
 _SESSION_LABELS = {
     "omnigent.ui": "terminal",
     _WRAPPER_LABEL_KEY: _WRAPPER_LABEL_VALUE,
@@ -505,8 +519,6 @@ async def _attach_terminal_resource(prepared: PreparedKiroTerminal) -> None:
 
 async def _attach_direct_tmux(socket_path: Path, tmux_target: str) -> None:
     """Attach the current terminal directly to the runner-owned tmux pane."""
-    env = dict(os.environ)
-    env.pop("TMUX", None)
     process = await asyncio.create_subprocess_exec(
         "tmux",
         "-S",
@@ -516,9 +528,14 @@ async def _attach_direct_tmux(socket_path: Path, tmux_target: str) -> None:
         "attach",
         "-t",
         tmux_target,
-        env=env,
+        env=_tmux_attach_env(),
     )
     await process.wait()
+
+
+def _tmux_attach_env() -> dict[str, str]:
+    """Return the small local environment needed by ``tmux attach``."""
+    return {key: os.environ[key] for key in _TMUX_ATTACH_ENV_ALLOWLIST if os.environ.get(key)}
 
 
 def _direct_tmux_unavailable_reason(prepared: PreparedKiroTerminal) -> str | None:
