@@ -1035,7 +1035,7 @@ async def _attach_direct_tmux(socket_path: Path, tmux_target: str) -> _AttachOut
     """
     from omnigent.terminals.ws_bridge import _tmux_session_alive
 
-    env = dict(os.environ)
+    env = os.environ.copy()
     env.pop("TMUX", None)
     process = await asyncio.create_subprocess_exec(
         "tmux",
