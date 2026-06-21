@@ -1435,8 +1435,15 @@ async def test_restart_with_persisted_cursor_emits_only_new_steps(
         )
 
     task2 = asyncio.create_task(_run_second())
+    # Wait for the persisted cursor (the assertion target), NOT merely the
+    # emitted event: the forwarder posts the item THEN advances the cursor, so
+    # breaking on the event and cancelling can interrupt before the cursor
+    # write lands — a CI-load race that surfaced as `forwarded_step_index == 2`.
+    # Waiting for cursor == 4 is strictly stronger (it implies step 4 was
+    # already mirrored) and mirrors the first-run loop above.
     for _ in range(400):
-        if any(t == "external_conversation_item" for t, _ in sink2.events):
+        state2 = read_bridge_state(bridge_dir)
+        if state2 is not None and state2.forwarded_step_index == 4:
             break
         await asyncio.sleep(0.005)
     task2.cancel()
