@@ -422,6 +422,13 @@ known-first-party = ["omnigent"]
 "omnigent/tools/**/*.py" = [
     "ARG001", "ARG002", "BLE001", "B008", "RUF012",
 ]
+# The native Antigravity (agy) transcript forwarder / supervisor is a
+# long-lived boundary loop that must restart on ANY non-cancellation
+# Exception (a crash there silently stops the web transcript mirror), so its
+# top-level catch is a deliberate, documented boundary catch — BLE001 is
+# waived for these top-level antigravity_native modules (see the inline
+# comments at each catch site).
+"omnigent/antigravity_native*.py" = ["BLE001"]
 "sdks/**/*.py" = [
     "ARG001", "ARG002", "BLE001", "B008", "RUF012",
 ]
