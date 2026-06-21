@@ -541,12 +541,21 @@ def other_key_providers() -> list[str]:
 
     Backs the ``"Other provider — API key"`` secondary pick — the long tail
     of API-key providers (Groq, DeepSeek, xAI, …) not already a top-level
-    :func:`add_menu_options` entry.
+    :func:`add_menu_options` entry. The ``"Other provider"`` option is scoped
+    to the openai family (see :func:`_add_option_families`), so the tail is
+    filtered to ``OPENAI_FAMILY`` rather than only excluding the preset list:
+    that way a future non-openai catalog family (the gemini case) cannot leak
+    into the openai-only catch-all even if it is omitted from
+    :data:`_PRESET_KEY_PROVIDERS`.
 
-    :returns: Catalog provider ids excluding :data:`_PRESET_KEY_PROVIDERS`,
-        in catalog (popular-first) order.
+    :returns: openai-family catalog provider ids excluding
+        :data:`_PRESET_KEY_PROVIDERS`, in catalog (popular-first) order.
     """
-    return [p for p in key_providers() if p not in _PRESET_KEY_PROVIDERS]
+    return [
+        p
+        for p in key_providers()
+        if p not in _PRESET_KEY_PROVIDERS and family_for_key_provider(p) == OPENAI_FAMILY
+    ]
 
 
 def render_provider_listing_by_harness(

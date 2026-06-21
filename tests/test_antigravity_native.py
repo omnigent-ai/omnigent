@@ -50,6 +50,11 @@ def _stub_agy_binary(monkeypatch: pytest.MonkeyPatch) -> None:
     case in CI. Patch the name at the site where ``build_agy_launch`` looks it up
     (its own module), plus the re-export in :mod:`omnigent.antigravity_native` used
     by the direct-CLI launch path, so no test depends on agy being installed.
+
+    This is autouse for the whole module; the real resolution / missing-agy
+    ``RuntimeError`` path is covered separately in
+    ``tests/test_antigravity_native_launch.py`` (which patches ``shutil.which``
+    directly), so nothing here needs the unstubbed binary lookup.
     """
     monkeypatch.setattr("omnigent.antigravity_native_launch.agy_binary_path", lambda: "agy")
     monkeypatch.setattr(_mod, "agy_binary_path", lambda: "agy")
