@@ -66,7 +66,7 @@ def test_per_harness_databricks_genie_one_shot(
 
     yaml_path = omnigent_repo_root / "tests" / "resources" / "examples" / "hello_world.yaml"
 
-    env = dict(os.environ)
+    env = os.environ.copy()
     profile = os.environ.get("OMNIGENT_GENIE_PROFILE", "").strip()
     if profile:
         env["DATABRICKS_CONFIG_PROFILE"] = profile
