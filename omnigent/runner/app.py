@@ -10564,6 +10564,42 @@ def create_runner_app(
             content={"skills": [{"name": s.name, "description": s.description} for s in skills]},
         )
 
+    @app.get("/v1/sessions/{session_id}/models")
+    async def get_session_models(session_id: str) -> JSONResponse:
+        """Proxy a model/providers query to the harness subprocess.
+
+        For opencode sessions, the harness subprocess boots ``opencode serve``
+        (if not already running) and returns the full provider/model list.
+        Non-opencode harnesses return 404 from the subprocess; this endpoint
+        forwards that status so the server can treat it as "no models list".
+
+        :param session_id: Session/conversation identifier.
+        :returns: JSON ``{"providers": [{"id", "name", "models": [{"id", "name"}]}, ...]}``
+            from the harness subprocess, or 404/503 on error.
+        """
+        try:
+            harness_client = await process_manager.get_client(session_id, "any")
+        except Exception:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "no harness subprocess for this session"},
+            )
+        try:
+            resp = await harness_client.get(
+                f"/v1/sessions/{session_id}/providers",
+                timeout=10.0,
+            )
+        except Exception:
+            _logger.debug("Harness providers query failed for %s", session_id)
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "harness providers unavailable"},
+            )
+        return JSONResponse(
+            status_code=resp.status_code,
+            content=resp.json() if resp.status_code == 200 else {"detail": "providers unavailable"},
+        )
+
     @app.post("/v1/sessions/{session_id}/skills/resolve")
     async def resolve_session_skill(session_id: str, request: Request) -> JSONResponse:
         """

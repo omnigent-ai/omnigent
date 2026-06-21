@@ -682,6 +682,16 @@ export interface SessionSkillsEvent {
   conversationId: string;
 }
 
+/**
+ * `session.models` — the session's harness-owned model/providers list
+ * just resolved (opencode). Same nudge-and-refetch shape as
+ * `session.skills`.
+ */
+export interface SessionModelsEvent {
+  type: "session_models";
+  conversationId: string;
+}
+
 /** One user currently viewing the session (holding its stream open). */
 export interface SessionViewer {
   /** Authenticated identity, e.g. `"alice@example.com"`. */
@@ -750,4 +760,5 @@ export type StreamEvent =
   | SessionChangedFilesInvalidatedEvent
   | SessionTerminalActivityEvent
   | SessionSkillsEvent
+  | SessionModelsEvent
   | SessionPresenceEvent;

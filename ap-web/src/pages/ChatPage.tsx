@@ -803,6 +803,7 @@ export function ChatPage() {
       effortLevels={effortLevelsForConv(capabilitySource)}
       showEffort={shouldShowEffortPicker(capabilitySource)}
       showModels={shouldShowModelPicker(capabilitySource)}
+      isOpencode={shouldShowOpencodeModelInput(capabilitySource)}
       costRoutingVerdict={costRoutingVerdict}
       costRoutingEligible={costRoutingEligible}
       subAgentLabel={subAgentLabel}
@@ -1023,6 +1024,8 @@ interface MainAgentSurfaceProps {
   showEffort: boolean;
   /** Whether the picker dropdown should include a Models section. */
   showModels: boolean;
+  /** Whether the model section should render a free-text input (opencode). */
+  isOpencode: boolean;
   /** Latest advisor verdict for the cost-routing pill; null when none. */
   costRoutingVerdict: CostRoutingVerdict | null;
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child). */
@@ -1093,6 +1096,7 @@ function MainAgentSurface({
   effortLevels,
   showEffort,
   showModels,
+  isOpencode,
   costRoutingVerdict,
   costRoutingEligible,
   subAgentLabel,
@@ -1326,6 +1330,7 @@ function MainAgentSurface({
         effortLevels={effortLevels}
         showEffort={showEffort}
         showModels={showModels}
+        isOpencode={isOpencode}
         isTerminalFirst={isTerminalFirst}
         isNativeWrapper={isNativeWrapper}
         reconnectHint={liveness.kind === "runner_asleep"}
@@ -2179,6 +2184,8 @@ interface ComposerProps {
   showEffort: boolean;
   /** Whether the picker dropdown should include a Models section. */
   showModels: boolean;
+  /** Whether the model section should render a free-text input (opencode). */
+  isOpencode?: boolean;
   /**
    * Terminal-first session (Chat/Terminal pill present). Presentation
    * only: tightens the composer's bottom padding to `pb-1.5` so it sits
@@ -2488,6 +2495,7 @@ export function Composer({
   effortLevels,
   showEffort,
   showModels,
+  isOpencode = false,
   isTerminalFirst = false,
   isNativeWrapper = false,
   reconnectHint = false,
@@ -3254,6 +3262,7 @@ export function Composer({
               effortLevels={effortLevels}
               showEffort={showEffort}
               showModels={showModels}
+              isOpencode={isOpencode}
               disabled={isReadOnly}
               openNonce={pickerOpenNonce}
             />
@@ -3503,7 +3512,18 @@ export function effortLevelsForConv(
 export function shouldShowModelPicker(
   conv: { labels?: Record<string, string | null> | null } | null | undefined,
 ): boolean {
-  return conv?.labels?.["omnigent.wrapper"] === "claude-code-native-ui";
+  const wrapper = conv?.labels?.["omnigent.wrapper"];
+  return wrapper === "claude-code-native-ui" || wrapper === "opencode-sdk";
+}
+
+/**
+ * True when the model picker should render a free-text model input
+ * (opencode sessions) instead of the fixed claude-native model list.
+ */
+export function shouldShowOpencodeModelInput(
+  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+): boolean {
+  return conv?.labels?.["omnigent.wrapper"] === "opencode-sdk";
 }
 
 /**
@@ -3540,6 +3560,11 @@ interface AgentPickerProps {
   /** When true, render the Models section between agents and effort. */
   showModels: boolean;
   /**
+   * Render a free-text model input (opencode sessions) instead of the
+   * fixed claude-native model list. Only meaningful with ``showModels``.
+   */
+  isOpencode?: boolean;
+  /**
    * Disables the picker trigger. The picker is purely a write
    * surface (selecting an agent / model / effort changes how the
    * next turn runs), so read-only sessions disable it alongside the
@@ -3567,6 +3592,7 @@ function AgentPicker({
   effortLevels,
   showEffort,
   showModels,
+  isOpencode = false,
   disabled = false,
   openNonce = 0,
 }: AgentPickerProps) {
@@ -3583,8 +3609,9 @@ function AgentPicker({
   const selectedEffort = useChatStore((s) => s.selectedEffort);
   const selectedModel = useChatStore((s) => s.selectedModel);
   const llmModel = useChatStore((s) => s.llmModel);
+  const harnessModels = useChatStore((s) => s.harnessModels);
 
-  const isClaudeNative = showModels;
+  const isClaudeNative = showModels && !isOpencode;
   // Only offer the agent list when there's an actual choice. Inside a
   // session the picker is scoped to the single bound agent (the runner is
   // tied 1:1 to it and can't be reassigned), so a one-row "Agents" section
@@ -3619,7 +3646,19 @@ function AgentPicker({
     // effort stays a separate " · "-joined segment.
     const nameWithHarness =
       agentDisplayName && harnessLabel ? `${agentDisplayName} (${harnessLabel})` : agentDisplayName;
-    const parts = [nameWithHarness, effortLabel].filter(
+    // opencode sessions show the active model name in the pill so the
+    // user can see which model is bound without opening the dropdown.
+    // Look up the human-readable name from the harness models list.
+    let modelLabel: string | null = null;
+    if (isOpencode && selectedModel) {
+      const [provId, mdlId] = selectedModel.includes("/")
+        ? selectedModel.split("/", 2)
+        : [null, selectedModel];
+      const prov = harnessModels.find((p) => p.id === provId);
+      const mdl = prov?.models.find((m) => m.id === mdlId);
+      modelLabel = mdl?.name ?? selectedModel;
+    }
+    const parts = [nameWithHarness, modelLabel, effortLabel].filter(
       (p): p is string => p != null && p.length > 0,
     );
     triggerLabel = parts.join(" · ");
@@ -3673,32 +3712,72 @@ function AgentPicker({
           <>
             {!isClaudeNative && <DropdownMenuSeparator className="my-1" />}
             <PickerSectionHeader>Models</PickerSectionHeader>
-            {CLAUDE_NATIVE_MODELS.map((m) => {
-              const isExplicit = selectedModel === m.id;
-              const isImplicit =
-                selectedModel === null && isModelImplicitlySelected(m.id, llmModel);
-              const isActive = isExplicit || isImplicit;
-              return (
-                <DropdownMenuItem
-                  key={m.id}
-                  data-testid="model-picker-item"
-                  data-model-id={m.id}
-                  data-active={isActive ? "true" : undefined}
-                  onSelect={() =>
-                    void useChatStore
-                      .getState()
-                      .setModel(m.id)
-                      .catch(() => {})
-                  }
-                  className={cn(
-                    "items-center gap-2 rounded-sm px-2 py-1.5 text-xs",
-                    "data-[active=true]:bg-accent/60 data-[active=true]:text-foreground",
-                  )}
-                >
-                  <span className="flex-1 truncate">{m.label}</span>
-                </DropdownMenuItem>
-              );
-            })}
+            {isOpencode ? (
+              harnessModels.length === 0 ? (
+                <div className="px-2 py-1.5 text-xs text-muted-foreground/70">
+                  Loading models…
+                </div>
+              ) : (
+                harnessModels.map((provider) => (
+                  <div key={provider.id}>
+                    <div className="px-2 pt-2 pb-0.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground/60">
+                      {provider.name}
+                    </div>
+                    {provider.models.map((model) => {
+                      const modelId = `${provider.id}/${model.id}`;
+                      const isActive = selectedModel === modelId;
+                      return (
+                        <DropdownMenuItem
+                          key={modelId}
+                          data-testid="model-picker-item"
+                          data-model-id={modelId}
+                          data-active={isActive ? "true" : undefined}
+                          onSelect={() =>
+                            void useChatStore
+                              .getState()
+                              .setModel(modelId)
+                              .catch(() => {})
+                          }
+                          className={cn(
+                            "items-center gap-2 rounded-sm px-2 py-1.5 text-xs",
+                            "data-[active=true]:bg-accent/60 data-[active=true]:text-foreground",
+                          )}
+                        >
+                          <span className="flex-1 truncate">{model.name}</span>
+                        </DropdownMenuItem>
+                      );
+                    })}
+                  </div>
+                ))
+              )
+            ) : (
+              CLAUDE_NATIVE_MODELS.map((m) => {
+                const isExplicit = selectedModel === m.id;
+                const isImplicit =
+                  selectedModel === null && isModelImplicitlySelected(m.id, llmModel);
+                const isActive = isExplicit || isImplicit;
+                return (
+                  <DropdownMenuItem
+                    key={m.id}
+                    data-testid="model-picker-item"
+                    data-model-id={m.id}
+                    data-active={isActive ? "true" : undefined}
+                    onSelect={() =>
+                      void useChatStore
+                        .getState()
+                        .setModel(m.id)
+                        .catch(() => {})
+                    }
+                    className={cn(
+                      "items-center gap-2 rounded-sm px-2 py-1.5 text-xs",
+                      "data-[active=true]:bg-accent/60 data-[active=true]:text-foreground",
+                    )}
+                  >
+                    <span className="flex-1 truncate">{m.label}</span>
+                  </DropdownMenuItem>
+                );
+              })
+            )}
           </>
         )}
         {/* Skip the leading rule when Effort is the only section, so the

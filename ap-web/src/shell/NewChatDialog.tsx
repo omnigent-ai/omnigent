@@ -964,7 +964,9 @@ export function NewChatLandingScreen() {
             ? { "omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui" }
             : agent?.name === "codex-native-ui"
               ? { "omnigent.ui": "terminal", "omnigent.wrapper": "codex-native-ui" }
-              : undefined,
+              : agent?.name === "opencode"
+                ? { "omnigent.wrapper": "opencode-sdk" }
+                : undefined,
           // Permission mode → `claude --permission-mode <mode>`, persisted as
           // terminal_launch_args. Omitted for the default and non-native agents.
           terminal_launch_args:

@@ -1606,12 +1606,16 @@ def _build_opencode_spawn_env(
     if workdir is not None:
         env["HARNESS_OPENCODE_CWD"] = str(workdir)
 
-    provider = _resolve_provider_for_build(spec, harness_type="opencode")
-    if provider is not None:
-        configure_agent_harness_with_provider(env, provider, harness_type="opencode")
-        return env
-
+    # Only apply a provider override when explicitly configured via
+    # executor.auth. OpenCode manages its own providers internally,
+    # so auto-routing a default omnigent provider would silently
+    # override the user's ~/.config/opencode/opencode.json config.
     spec_auth = spec.executor.auth
+    if isinstance(spec_auth, ProviderAuth):
+        provider = _resolve_provider_for_build(spec, harness_type="opencode")
+        if provider is not None:
+            configure_agent_harness_with_provider(env, provider, harness_type="opencode")
+            return env
     auth: ApiKeyAuth | DatabricksAuth | None = (
         spec_auth if isinstance(spec_auth, (ApiKeyAuth, DatabricksAuth)) else None
     )

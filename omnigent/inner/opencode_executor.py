@@ -599,14 +599,28 @@ class OpenCodeExecutor(Executor):
         Protected by ``self._lock`` so concurrent first-turn calls from
         multiple sessions don't race on server startup.
 
+        If the server was already started without the MCP bridge (e.g. by
+        an eager :meth:`get_providers` call) and *tools* now require it,
+        the server is restarted with the bridge config. This is a one-time
+        cost: the restart only fires on the first real turn after a
+        pre-turn provider query.
+
         :param tools: Tool specs advertised for this turn; empty when the
             agent has no tools or the harness handles them externally.
         """
         async with self._lock:
+            needs_bridge = bool(tools and self._tool_executor is not None)
             if self._server_started:
-                return
+                if not needs_bridge or self._bridge is not None:
+                    return
+                # Server was warmed up without bridge (e.g. get_providers);
+                # restart with the MCP bridge so tools are available.
+                await self._server.close()
+                self._server_started = False
+                self._client = None
+                self._bridge = None
             mcp_extra: dict[str, Any] | None = None
-            if tools and self._tool_executor is not None:
+            if needs_bridge:
                 self._bridge = _OmnigentToolBridge(tools, self._tool_executor)
                 url = await self._bridge.start()
                 mcp_extra = {"omnigent": {"type": "remote", "url": url}}
@@ -620,6 +634,34 @@ class OpenCodeExecutor(Executor):
             await self._server.start(cwd=self._cwd, extra_env=extra_env)
             self._client = self._server.client
             self._server_started = True
+
+    async def get_providers(self) -> list[dict[str, Any]]:
+        """Return the list of providers and their models from the opencode server.
+
+        Boots the opencode serve process if it hasn't been started yet
+        (without the MCP tool-bridge — the first real turn will restart
+        with the bridge if tools are needed).
+
+        :returns: A list of ``{"id": str, "name": str, "models": list[{"id": str, "name": str}]}``
+            dicts, one per configured provider.
+        :raises RuntimeError: When the server can't be started or no
+            providers are configured.
+        """
+        await self._ensure_server([])
+        resp = await self._require_client().app.providers()
+        result: list[dict[str, Any]] = []
+        for provider in getattr(resp, "providers", []) or []:
+            models: list[dict[str, str]] = []
+            for model_id, model in (getattr(provider, "models", {}) or {}).items():
+                models.append({"id": model_id, "name": getattr(model, "name", model_id)})
+            result.append(
+                {
+                    "id": getattr(provider, "id", ""),
+                    "name": getattr(provider, "name", getattr(provider, "id", "")),
+                    "models": models,
+                }
+            )
+        return result
 
     async def _resolve_provider_model(
         self, config_model: str | None

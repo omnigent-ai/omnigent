@@ -186,6 +186,8 @@ from omnigent.server.schemas import (
     ErrorDetail,
     ErrorEvent,
     GrantPermissionRequest,
+    HarnessProvider,
+    HarnessProviderModel,
     MCPServerSummary,
     ModelUsage,
     OutputItemDoneEvent,
@@ -209,6 +211,7 @@ from omnigent.server.schemas import (
     SessionLabelsResponse,
     SessionListItem,
     SessionModelEvent,
+    SessionModelsEvent,
     SessionResourceListPage,
     SessionResourceObject,
     SessionResourcePaginatedList,
@@ -424,6 +427,7 @@ _CLAUDE_NATIVE_UI_LABEL_VALUE = "terminal"
 _CLAUDE_NATIVE_HARNESS = "claude-native"
 _CLAUDE_NATIVE_MODEL = "claude-native-ui"
 _CODEX_NATIVE_WRAPPER_LABEL_VALUE = "codex-native-ui"
+_OPENCODE_WRAPPER_LABEL_VALUE = "opencode-sdk"
 _CODEX_NATIVE_HARNESS = "codex-native"
 _CODEX_NATIVE_MODEL = "codex-native-ui"
 _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S = 30.0
@@ -708,6 +712,12 @@ _session_sandbox_status_cache: dict[str, SandboxStatus] = {}
 # poll can't pin the runner's event loop and wedge a turn.
 _runner_skills_cache: dict[str, list[SkillSummary]] = {}
 _runner_skills_inflight: dict[str, asyncio.Task[None]] = {}
+
+# Per-session harness-models cache + in-flight fetch. Same single-flight
+# background pattern as skills — the opencode harness subprocess boots
+# ``opencode serve`` on first query and returns the provider/model list.
+_runner_models_cache: dict[str, list[dict[str, object]]] = {}
+_runner_models_inflight: dict[str, asyncio.Task[None]] = {}
 
 
 @dataclass
@@ -1946,6 +1956,7 @@ def _build_session_response(
     last_task_error: dict[str, str] | None = None,
     agent_name: str | None = None,
     skills: list[SkillSummary] | None = None,
+    harness_models: list[HarnessProvider] | None = None,
     runner_online: bool | None = None,
     host_online: bool | None = None,
     pending_elicitation_events: list[dict[str, Any]] | None = None,
@@ -2082,6 +2093,7 @@ def _build_session_response(
         # non-claude-native sessions or before the first poll tick.
         todos=_session_todos_cache.get(conv.id, []),
         skills=skills or [],
+        harness_models=harness_models or [],
         # Replay terminal spin-up state so a client connecting while the
         # runner is still creating a terminal-first session's terminal
         # sees the Terminal-pill spinner. Populated by the runner SSE
@@ -8233,6 +8245,11 @@ async def _relay_runner_stream(
         inflight = _runner_skills_inflight.pop(session_id, None)
         if inflight is not None:
             inflight.cancel()
+        # Same invalidation for harness models cache.
+        _runner_models_cache.pop(session_id, None)
+        models_inflight = _runner_models_inflight.pop(session_id, None)
+        if models_inflight is not None:
+            models_inflight.cancel()
 
 
 def _ensure_runner_relay(
@@ -10249,6 +10266,11 @@ async def _create_session_from_existing_agent(
         _cx_labels = dict(body.labels) if body.labels else {}
         _cx_labels[_CLAUDE_NATIVE_WRAPPER_LABEL_KEY] = _CODEX_NATIVE_WRAPPER_LABEL_VALUE
         await asyncio.to_thread(conversation_store.set_labels, conv.id, _cx_labels)
+        conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+    elif agent.name == "opencode":
+        _oc_labels = dict(body.labels) if body.labels else {}
+        _oc_labels[_CLAUDE_NATIVE_WRAPPER_LABEL_KEY] = _OPENCODE_WRAPPER_LABEL_VALUE
+        await asyncio.to_thread(conversation_store.set_labels, conv.id, _oc_labels)
         conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
     elif (
         body.sub_agent_name
@@ -17164,6 +17186,73 @@ async def _load_runner_skills(
     _publish_runner_skills(session_id)
 
 
+def _publish_runner_models(session_id: str) -> None:
+    """Publish a ``session.models`` SSE nudge (mirrors skills)."""
+    event = SessionModelsEvent(
+        type="session.models",
+        conversation_id=session_id,
+    )
+    session_stream.publish(session_id, event.model_dump())
+
+
+async def _fetch_runner_models(
+    runner_client: httpx.AsyncClient | None,
+    session_id: str,
+) -> list[HarnessProvider]:
+    """Fetch a session's harness-owned model/providers list.
+
+    Same single-flight background pattern as :func:`_fetch_runner_skills`:
+    returns cached result or kicks a background fetch and returns ``[]``.
+    """
+    if runner_client is None:
+        return []
+    cached = _runner_models_cache.get(session_id)
+    if cached is not None:
+        return cached  # type: ignore[return-value]
+    if session_id not in _runner_models_inflight:
+        task = asyncio.create_task(_load_runner_models(runner_client, session_id))
+        _runner_models_inflight[session_id] = task
+        task.add_done_callback(lambda _t, sid=session_id: _runner_models_inflight.pop(sid, None))
+    return []
+
+
+async def _load_runner_models(
+    runner_client: httpx.AsyncClient,
+    session_id: str,
+) -> None:
+    """Background single-flight fetch of a session's harness models."""
+    try:
+        resp = await runner_client.get(
+            f"/v1/sessions/{session_id}/models",
+            timeout=10.0,
+        )
+    except httpx.HTTPError:
+        _logger.debug("Runner models query failed for %s", session_id)
+        return
+    if resp.status_code != 200:
+        return
+    try:
+        raw_providers = resp.json().get("providers", [])
+        providers: list[dict[str, object]] = []
+        for p in raw_providers:
+            models = [
+                {"id": m["id"], "name": m.get("name", m["id"])}
+                for m in (p.get("models") or [])
+            ]
+            providers.append(
+                {
+                    "id": p["id"],
+                    "name": p.get("name", p["id"]),
+                    "models": models,
+                }
+            )
+    except (ValueError, AttributeError, KeyError, TypeError):
+        _logger.debug("Runner models payload malformed for %s", session_id)
+        return
+    _runner_models_cache[session_id] = providers
+    _publish_runner_models(session_id)
+
+
 async def _get_session_snapshot(
     conv_store: ConversationStore,
     session_id: str,
@@ -17359,6 +17448,9 @@ async def _get_session_snapshot(
     # server only overlays the result; best-effort, empty when no runner
     # is bound or it can't be reached.
     skills = await _fetch_runner_skills(runner_client, session_id)
+    # Harness-owned provider/model list (opencode). Same single-flight
+    # background fetch as skills — returns [] until the cache warms.
+    models = await _fetch_runner_models(runner_client, session_id)
     # Dynamic override from the forwarder (real Claude Code window).
     # Only present after the first statusLine tick; before that the
     # spec default applies.
@@ -17396,6 +17488,7 @@ async def _get_session_snapshot(
         last_task_error=last_task_error,
         agent_name=agent_name,
         skills=skills,
+        harness_models=models,
         runner_online=runner_online,
         host_online=host_online,
         pending_elicitation_events=await asyncio.to_thread(

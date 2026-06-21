@@ -87,6 +87,7 @@ import type {
   Session,
   SessionStatus,
   SkillSummary,
+  HarnessProvider,
 } from "@/lib/types";
 import { uploadFile } from "@/lib/filesApi";
 import type { ActiveResponse } from "./types";
@@ -366,6 +367,12 @@ export interface ChatState {
    * suggest ``/skill-name``.
    */
   skills: SkillSummary[];
+  /**
+   * Harness-owned provider/model list (opencode). Populated from the
+   * session snapshot's `harness_models` field. Empty for non-opencode
+   * sessions or before the background fetch warms the server cache.
+   */
+  harnessModels: HarnessProvider[];
   /**
    * True while the runner is auto-creating the terminal for a
    * terminal-first session (claude-native / codex-native). Seeded from
@@ -657,6 +664,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   gitBranch: null,
   todos: [],
   skills: [],
+  harnessModels: [],
   terminalPending: false,
   viewers: [],
   sandboxStatus: null,
@@ -1128,6 +1136,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         gitBranch: null,
         todos: [],
         skills: [],
+        harnessModels: [],
         terminalPending: false,
         viewers: [],
         sandboxStatus: null,
@@ -1489,6 +1498,7 @@ function sessionBindingPatch(
   | "contextWindow"
   | "gitBranch"
   | "skills"
+  | "harnessModels"
   | "terminalPending"
   | "sandboxStatus"
 > {
@@ -1503,6 +1513,7 @@ function sessionBindingPatch(
     contextWindow: session.contextWindow ?? null,
     gitBranch: session.gitBranch ?? null,
     skills: session.skills ?? [],
+    harnessModels: session.harnessModels ?? [],
     terminalPending: session.terminalPending ?? false,
     sandboxStatus: session.sandboxStatus ?? null,
   };
@@ -3046,7 +3057,7 @@ async function refetchSkills(conversationId: string): Promise<void> {
   // while the request was in flight; applying now would leak another
   // session's skills into the open composer.
   if (useChatStore.getState().conversationId !== conversationId) return;
-  useChatStore.setState({ skills: session.skills ?? [] });
+  useChatStore.setState({ skills: session.skills ?? [], harnessModels: session.harnessModels ?? [] });
 }
 
 /**
@@ -3571,6 +3582,11 @@ export function handleSessionEvent(event: StreamEvent): void {
       // the first moment the slash-command menu can be filled. Refetch
       // the now-warm snapshot and apply its `skills`. Fire and forget —
       // refetchSkills self-guards against a stale apply.
+      void refetchSkills(event.conversationId);
+      return;
+    case "session_models":
+      // Same nudge for harness-owned models (opencode providers).
+      // refetchSkills also applies harnessModels from the snapshot.
       void refetchSkills(event.conversationId);
       return;
     case "tool_result":

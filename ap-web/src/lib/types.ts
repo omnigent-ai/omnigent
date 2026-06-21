@@ -382,6 +382,8 @@ export interface Session {
    * users can fire ``/skill-name``.
    */
   skills?: SkillSummary[];
+  /** Harness-owned provider/model list (opencode). */
+  harnessModels?: HarnessProvider[];
   /**
    * True while the runner is auto-creating the terminal for a
    * terminal-first session (claude-native / codex-native). Sourced
@@ -440,4 +442,26 @@ export interface SkillSummary {
   name: string;
   /** One-line summary from the SKILL.md frontmatter. */
   description: string;
+}
+
+/**
+ * A model entry within a harness provider (opencode).
+ */
+export interface HarnessProviderModel {
+  /** Model identifier, e.g. ``"claude-sonnet-4-5"``. */
+  id: string;
+  /** Human-readable model name, e.g. ``"Claude Sonnet 4.5"``. */
+  name: string;
+}
+
+/**
+ * A provider and its available models (opencode).
+ */
+export interface HarnessProvider {
+  /** Provider identifier, e.g. ``"anthropic"``. */
+  id: string;
+  /** Human-readable provider name, e.g. ``"Anthropic"``. */
+  name: string;
+  /** Models available under this provider. */
+  models: HarnessProviderModel[];
 }
