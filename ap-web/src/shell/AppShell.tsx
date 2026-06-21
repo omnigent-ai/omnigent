@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Outlet, useParams, useSearchParams } from "@/lib/routing";
+import { Outlet, useLocation, useParams, useSearchParams } from "@/lib/routing";
 import { useConversations } from "@/hooks/useConversations";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
@@ -110,6 +110,12 @@ export function AppShell() {
   // Read early: the conversationId scopes the per-session workspace state
   // (rail open/width/tab/open files) used throughout this component.
   const { conversationId } = useParams<{ conversationId: string }>();
+  // The side-by-side view (/compare) has no single active conversation and each
+  // pane brings its own header, so the shell's absolute ChatHeader overlay is
+  // both redundant and would cover the panes' top controls (their close
+  // buttons). Suppress it there; the rest of the chrome already self-gates on
+  // `conversationId` (undefined on /compare).
+  const isComparePage = useLocation().pathname.endsWith("/compare");
   const [fileViewerCommentsOpen, setFileViewerCommentsOpen] = useState(false);
   const [rightRailTab, setRightRailTab] = useState<RightRailTab>(() =>
     conversationId ? (readSessionWorkspaceState(conversationId).rightRailTab ?? "files") : "files",
@@ -977,75 +983,78 @@ export function AppShell() {
                   panelOpen && !terminalFirst && "md:hidden",
                 )}
               >
-                <ChatHeader
-                  sidebarOpen={sidebarOpen}
-                  onOpenSidebar={() => setSidebarOpen(true)}
-                  isChildSession={isChildSession}
-                  parentSessionId={activeSession?.parentSessionId}
-                  conversationId={conversationId}
-                  boundAgent={boundAgent}
-                  canShare={canShare}
-                  onShare={() => setShareOpen(true)}
-                  hasAgentInfo={hasAgentInfo}
-                  onAgentInfo={() => setAgentInfoOpen(true)}
-                  hasHeaderMenu={hasHeaderMenu}
-                  showFilesPanel={showFilesPanel}
-                  hasRailContent={hasRailContent}
-                  rightPanelOpen={rightPanelOpen}
-                  onToggleRightPanel={() => {
-                    const next = !rightPanelOpen;
-                    if (conversationId) writeSessionWorkspaceState(conversationId, { open: next });
-                    if (next) {
-                      // Reopening lands back on the file remembered in per-session
-                      // state, so re-add ?file= to keep the URL shareable — mirroring
-                      // how the scope-sync effect re-adds ?view= on reopen. diff and
-                      // comment are URL-only ephemerals (not remembered), so they
-                      // intentionally don't rehydrate. Imperative (not an effect) to
-                      // avoid the FileViewer diff-sync race documented in that effect.
-                      if (selectedFilePath) {
-                        setSearchParams(
-                          (prev) => {
-                            const params = new URLSearchParams(prev);
-                            params.set("file", selectedFilePath);
-                            return params;
-                          },
-                          { replace: true },
-                        );
+                {!isComparePage && (
+                  <ChatHeader
+                    sidebarOpen={sidebarOpen}
+                    onOpenSidebar={() => setSidebarOpen(true)}
+                    isChildSession={isChildSession}
+                    parentSessionId={activeSession?.parentSessionId}
+                    conversationId={conversationId}
+                    boundAgent={boundAgent}
+                    canShare={canShare}
+                    onShare={() => setShareOpen(true)}
+                    hasAgentInfo={hasAgentInfo}
+                    onAgentInfo={() => setAgentInfoOpen(true)}
+                    hasHeaderMenu={hasHeaderMenu}
+                    showFilesPanel={showFilesPanel}
+                    hasRailContent={hasRailContent}
+                    rightPanelOpen={rightPanelOpen}
+                    onToggleRightPanel={() => {
+                      const next = !rightPanelOpen;
+                      if (conversationId)
+                        writeSessionWorkspaceState(conversationId, { open: next });
+                      if (next) {
+                        // Reopening lands back on the file remembered in per-session
+                        // state, so re-add ?file= to keep the URL shareable — mirroring
+                        // how the scope-sync effect re-adds ?view= on reopen. diff and
+                        // comment are URL-only ephemerals (not remembered), so they
+                        // intentionally don't rehydrate. Imperative (not an effect) to
+                        // avoid the FileViewer diff-sync race documented in that effect.
+                        if (selectedFilePath) {
+                          setSearchParams(
+                            (prev) => {
+                              const params = new URLSearchParams(prev);
+                              params.set("file", selectedFilePath);
+                              return params;
+                            },
+                            { replace: true },
+                          );
+                        }
+                      } else {
+                        // Collapsing the rail hides the workspace, so strip the deep-
+                        // link params that point into it (file/diff/comment) — otherwise
+                        // the URL advertises a file that isn't shown and a reload would
+                        // re-open the rail. (?view= is dropped by the scope-sync effect,
+                        // which is gated on rightPanelOpen.)
+                        clearFileViewerUrl();
                       }
-                    } else {
-                      // Collapsing the rail hides the workspace, so strip the deep-
-                      // link params that point into it (file/diff/comment) — otherwise
-                      // the URL advertises a file that isn't shown and a reload would
-                      // re-open the rail. (?view= is dropped by the scope-sync effect,
-                      // which is gated on rightPanelOpen.)
-                      clearFileViewerUrl();
-                    }
-                    setRightPanelOpen(next);
-                  }}
-                  mobileMenu={{
-                    fileViewerOpen,
-                    panelOpen,
-                    terminalFirst,
-                    executionLogsOpen,
-                    filesPanelOpen,
-                    subagentsPanelOpen,
-                    todosPanelOpen,
-                    hideTerminalsTab,
-                    terminalsLength: railTerminals.length,
-                    isClaudeNative,
-                    todosCompleted,
-                    todosTotal: todos.length,
-                    debugMode,
-                    changedCount,
-                    subagentsWorking,
-                    agentCount,
-                    onOpenFiles: openFilesPanel,
-                    onOpenFirstTerminal: openFirstTerminal,
-                    onOpenSubagents: openSubagentsPanel,
-                    onOpenTodos: openTodosPanel,
-                    onOpenMainExecutionLog: openMainExecutionLog,
-                  }}
-                />
+                      setRightPanelOpen(next);
+                    }}
+                    mobileMenu={{
+                      fileViewerOpen,
+                      panelOpen,
+                      terminalFirst,
+                      executionLogsOpen,
+                      filesPanelOpen,
+                      subagentsPanelOpen,
+                      todosPanelOpen,
+                      hideTerminalsTab,
+                      terminalsLength: railTerminals.length,
+                      isClaudeNative,
+                      todosCompleted,
+                      todosTotal: todos.length,
+                      debugMode,
+                      changedCount,
+                      subagentsWorking,
+                      agentCount,
+                      onOpenFiles: openFilesPanel,
+                      onOpenFirstTerminal: openFirstTerminal,
+                      onOpenSubagents: openSubagentsPanel,
+                      onOpenTodos: openTodosPanel,
+                      onOpenMainExecutionLog: openMainExecutionLog,
+                    }}
+                  />
+                )}
                 <main className="relative flex min-h-0 min-w-0 flex-1 flex-col">
                   <Outlet />
                 </main>
