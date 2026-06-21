@@ -366,8 +366,7 @@ def _wait_for_turn_complete(child: Any, timeout: float = 45.0) -> None:
     ``\\d+\\.\\d+s`` decimal "elapsed" footer, but the current REPL
     never renders one — the only elapsed readout is the integer
     ``streaming… Ns`` segment that disappears on completion. Waiting
-    for that stale pattern times out even though the turn finished,
-    which is the second half of the REPL-pexpect quarantine family.
+    for that stale pattern times out even though the turn finished.
 
     A single ``· ready`` expect is enough: every send/approve site
     leaves the toolbar in ``state: running`` (the turn is dispatched,
