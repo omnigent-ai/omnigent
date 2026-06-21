@@ -33,6 +33,7 @@ from omnigent.onboarding.databricks_config import databricks_sdk_installed
 from omnigent.onboarding.interactive import ACCENT, console
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
+    BEDROCK_KIND,
     CHAT_WIRE_API,
     CLI_CONFIG_KIND,
     DATABRICKS_KIND,
@@ -64,6 +65,8 @@ _KIND_GLYPH: dict[str, str] = {
     # GEAR carries a VS16 for the same 2-cell-emoji rendering reason as the
     # ADMISSION TICKETS glyph above.
     CLI_CONFIG_KIND: "\N{GEAR}\N{VARIATION SELECTOR-16}",
+    # CLOUD for Bedrock-style gateways (AWS Bedrock, corporate AI gateways)
+    BEDROCK_KIND: "\N{CLOUD}",
 }
 
 
@@ -330,6 +333,8 @@ def credential_label(
         return display_name or provider_name
     if kind == KEY_KIND:
         return f"{provider_display_name(provider_name)} API Key"
+    if kind == BEDROCK_KIND:
+        return f"{provider_display_name(provider_name)} Bedrock"
     return provider_display_name(provider_name)
 
 

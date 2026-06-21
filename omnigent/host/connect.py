@@ -282,6 +282,14 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # Testing knob: override the context window size for compaction
         # trigger threshold. Not a secret — a plain integer.
         "AP_CONTEXT_WINDOW_OVERRIDE",
+        # Bedrock-style gateway configuration for Claude Code. These env vars
+        # configure Claude Code to use AWS Bedrock or Bedrock-compatible gateways
+        # (like corporate AI gateways). AWS_BEARER_TOKEN_BEDROCK is the auth token,
+        # ANTHROPIC_BEDROCK_BASE_URL is the gateway endpoint, and CLAUDE_CODE_USE_BEDROCK
+        # enables Bedrock mode.
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "ANTHROPIC_BEDROCK_BASE_URL",
+        "CLAUDE_CODE_USE_BEDROCK",
     }
 )
 # Locale family (``LC_ALL``, ``LC_CTYPE``, …) — allowed by prefix.

@@ -112,6 +112,9 @@ _TERMINAL_SESSION_KEY = "main"
 _UCODE_CLAUDE_AGENT_NAME = "claude"
 _UCODE_CLAUDE_BASE_URL_ENV = "ANTHROPIC_BASE_URL"
 _ANTHROPIC_API_KEY_ENV = "ANTHROPIC_API_KEY"
+_ANTHROPIC_BEDROCK_BASE_URL_ENV = "ANTHROPIC_BEDROCK_BASE_URL"
+_AWS_BEARER_TOKEN_BEDROCK_ENV = "AWS_BEARER_TOKEN_BEDROCK"
+_CLAUDE_CODE_USE_BEDROCK_ENV = "CLAUDE_CODE_USE_BEDROCK"
 _CLAUDE_CODE_NESTED_SESSION_ENV = "CLAUDECODE"
 _CLAUDE_CODE_API_KEY_HELPER_TTL_ENV = "CLAUDE_CODE_API_KEY_HELPER_TTL_MS"
 _CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV = "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"
@@ -1506,6 +1509,53 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
     )
 
 
+def _bedrock_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcodeConfig | None:
+    """Build native Claude Code launch config for Bedrock-style gateways.
+
+    AWS Bedrock and Bedrock-compatible gateways (like corporate AI gateways)
+    use a different set of environment variables than the standard Anthropic API:
+    - ``ANTHROPIC_BEDROCK_BASE_URL`` instead of ``ANTHROPIC_BASE_URL``
+    - ``AWS_BEARER_TOKEN_BEDROCK`` for the API key
+    - ``CLAUDE_CODE_USE_BEDROCK=1`` to enable Bedrock mode
+
+    :param entry: A resolved provider entry with ``kind="bedrock"``.
+    :returns: The launch config, or ``None`` when credentials are missing.
+    """
+    from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY
+
+    family = entry.family(ANTHROPIC_FAMILY)
+    if family is None:
+        _logger.warning(
+            "native-claude: bedrock provider %r does not serve the anthropic surface "
+            "— falling back to Claude Code's own login.",
+            entry.name,
+        )
+        return None
+    if not family.api_key:
+        _logger.warning(
+            "native-claude: bedrock provider %r has no usable credential "
+            "— falling back to Claude Code's own login.",
+            entry.name,
+        )
+        return None
+    _logger.info(
+        "native-claude routing: bedrock provider %r (base_url=%s, model=%s)",
+        entry.name,
+        family.base_url,
+        family.default_model,
+    )
+    return ClaudeNativeUcodeConfig(
+        env={
+            _ANTHROPIC_BEDROCK_BASE_URL_ENV: family.base_url,
+            _AWS_BEARER_TOKEN_BEDROCK_ENV: family.api_key,
+            _CLAUDE_CODE_USE_BEDROCK_ENV: "1",
+            _CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV: "1",
+        },
+        api_key_helper="echo bedrock-auth-via-env",
+        model=family.default_model,
+    )
+
+
 def _native_claude_config_from_entry(
     entry: ProviderEntry,
 ) -> ClaudeNativeUcodeConfig | None:
@@ -1513,6 +1563,8 @@ def _native_claude_config_from_entry(
 
     - ``key`` / ``gateway`` / ``local`` → provider gateway config
       (:func:`_provider_config_for_native_claude`).
+    - ``bedrock`` → Bedrock-style gateway config
+      (:func:`_bedrock_config_for_native_claude`).
     - ``databricks`` → the existing ucode path keyed on the provider profile.
     - ``subscription`` → ``None`` (use the ``claude`` CLI's own login, e.g. a
       Claude Enterprise seat) — intentional, not a fallback to ucode.
@@ -1521,6 +1573,7 @@ def _native_claude_config_from_entry(
     :returns: The launch config, or ``None`` to use Claude's own login.
     """
     from omnigent.onboarding.provider_config import (
+        BEDROCK_KIND,
         DATABRICKS_KIND,
         GATEWAY_KIND,
         KEY_KIND,
@@ -1529,6 +1582,8 @@ def _native_claude_config_from_entry(
 
     if entry.kind in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND):
         return _provider_config_for_native_claude(entry)
+    if entry.kind == BEDROCK_KIND:
+        return _bedrock_config_for_native_claude(entry)
     if entry.kind == DATABRICKS_KIND:
         _logger.info("native-claude routing: Databricks ucode profile %r", entry.profile)
         return _ucode_config_for_profile(entry.profile)

@@ -90,6 +90,7 @@ GATEWAY_KIND = "gateway"
 LOCAL_KIND = "local"
 DATABRICKS_KIND = "databricks"
 CLI_CONFIG_KIND = "cli-config"
+BEDROCK_KIND = "bedrock"
 _VALID_KINDS = (
     KEY_KIND,
     SUBSCRIPTION_KIND,
@@ -97,6 +98,7 @@ _VALID_KINDS = (
     LOCAL_KIND,
     DATABRICKS_KIND,
     CLI_CONFIG_KIND,
+    BEDROCK_KIND,
 )
 
 # Provider kinds that resolve their model/credentials from inline families
@@ -105,7 +107,7 @@ _VALID_KINDS = (
 # families. _parse_provider dispatches subscription/databricks first, then
 # treats every remaining kind as a family kind.
 
-ProviderKind = Literal["key", "subscription", "gateway", "local", "databricks", "cli-config"]
+ProviderKind = Literal["key", "subscription", "gateway", "local", "databricks", "cli-config", "bedrock"]
 
 # Maps a canonical harness name to the provider family it consumes. The
 # ``pi`` harness consumes both families and so is absent here — callers
@@ -881,7 +883,7 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
         ``frozenset({"anthropic", "openai", "pi"})`` for a Databricks
         profile.
     """
-    if entry.kind in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND):
+    if entry.kind in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND, BEDROCK_KIND):
         return frozenset(entry.families) | {PI_SURFACE}
     if entry.kind in (SUBSCRIPTION_KIND, CLI_CONFIG_KIND):
         if entry.cli == "claude":
