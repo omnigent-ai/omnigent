@@ -122,13 +122,14 @@ _TMUX_SEND_TIMEOUT_S = 5.0
 # The glyph persists while Claude is busy responding, so its presence
 # means "input box mounted" (not "idle"), which is what injection needs.
 _CLAUDE_PROMPT_GLYPH = "❯"
-# How many trailing non-empty lines to scan for the prompt glyph. The
-# input box sits near the bottom of the pane; scanning only the tail
-# avoids false positives from the glyph appearing in scrollback output.
-# The window has to clear the footer rendered below the box — some
-# people's statuslines run ~3 lines — so the ``❯`` row isn't the last
-# non-empty line.
-_PROMPT_SCAN_TAIL_LINES = 5
+# Characters Claude Code draws its input-box border / footer rules with.
+# The live ``❯`` row sits directly above one of these horizontal rules
+# (the box's bottom edge); a ``❯`` echoed into the transcript is instead
+# followed by ordinary response text. Keying readiness on this structural
+# adjacency — rather than a fixed tail window — lets the prompt sit
+# arbitrarily far above the bottom (e.g. behind a tall cost/usage status
+# bar) without being missed, while still rejecting scrollback echoes.
+_CLAUDE_BOX_RULE_CHARS = frozenset("─━═╌╍┄┅┈┉╭╮╯╰┌┐└┘")
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
 # How long to wait for the pasted draft to visibly land in Claude's
@@ -2718,20 +2719,47 @@ def _capture_pane(socket_path: str, tmux_target: str) -> str:
     return proc.stdout if proc.returncode == 0 else ""
 
 
+def _is_box_rule_line(line: str) -> bool:
+    """
+    Return whether *line* is one of Claude Code's input-box rule lines.
+
+    A rule line is the box's horizontal border — the edge drawn directly
+    under the ``❯`` row — made up entirely of
+    :data:`_CLAUDE_BOX_RULE_CHARS`. Used to tell the live input box from
+    a ``❯`` echoed into the transcript, which is followed by ordinary
+    text instead.
+
+    :param line: A single captured pane line.
+    :returns: ``True`` when the line is a non-empty run of box-rule
+        characters (ignoring surrounding whitespace).
+    """
+    stripped = line.strip()
+    return bool(stripped) and all(char in _CLAUDE_BOX_RULE_CHARS for char in stripped)
+
+
 def _claude_prompt_rendered(pane: str) -> bool:
     """
     Return whether Claude Code's input prompt is rendered in a pane.
 
-    Scans the last :data:`_PROMPT_SCAN_TAIL_LINES` non-empty lines for
-    :data:`_CLAUDE_PROMPT_GLYPH`. Restricting to the tail avoids false
-    positives from the glyph appearing in scrollback (e.g. echoed in a
-    prior response), since the live input box always sits at the bottom.
+    Locates the live input box structurally rather than by distance from
+    the bottom: the lowest non-empty line carrying
+    :data:`_CLAUDE_PROMPT_GLYPH` is the live ``❯`` row when it is either
+    the last non-empty line or is immediately followed by the box's
+    border rule (:func:`_is_box_rule_line`). A ``❯`` echoed into the
+    transcript is instead followed by ordinary response text, so it is
+    rejected. This is independent of footer height — a tall cost/usage
+    status bar pushes the ``❯`` row far above the bottom without hiding
+    it — unlike the old fixed tail-window scan (see issue #701).
 
     :param pane: Captured pane text from :func:`_capture_pane`.
-    :returns: ``True`` when the input box appears mounted.
+    :returns: ``True`` when the live input box appears mounted.
     """
     non_empty = [line for line in pane.splitlines() if line.strip()]
-    return any(_CLAUDE_PROMPT_GLYPH in line for line in non_empty[-_PROMPT_SCAN_TAIL_LINES:])
+    glyph_indices = [i for i, line in enumerate(non_empty) if _CLAUDE_PROMPT_GLYPH in line]
+    if not glyph_indices:
+        return False
+    last = glyph_indices[-1]
+    return last == len(non_empty) - 1 or _is_box_rule_line(non_empty[last + 1])
 
 
 def _submit_needle(content: str) -> str:

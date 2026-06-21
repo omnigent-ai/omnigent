@@ -4549,29 +4549,113 @@ def test_display_cost_approval_popup_raises_when_pane_not_advertised(
 
 def test_claude_prompt_rendered_sees_prompt_above_default_footer() -> None:
     """
-    The readiness scan reaches the prompt glyph above Claude's footer.
+    Readiness detects the prompt above Claude's default footer.
 
     Claude Code 2.1.x renders a footer below the input box (the box's
     closing rule line, the cwd/status line, the model+effort line, and
-    the permission-mode hint), so the live ``❯`` row is the 5th
-    non-empty line from the bottom — NOT the last. The prior 4-line scan
-    window never reached it and the web-UI readiness gate timed out with
-    "did not become ready" even though the box was mounted. A failure
-    here means the scan window regressed below 5 and the first web
-    message would be dropped.
+    the permission-mode hint), so the live ``❯`` row is NOT the last
+    non-empty line. Detection keys on the box's border rule sitting
+    directly under ``❯`` — not on distance from the bottom — so the
+    mounted box is recognized and the web-UI readiness gate proceeds.
     """
     pane = "\n".join(
         [
             "────────────────────────────────────────",  # input box top rule
-            "❯ ",  # the live prompt row (5th non-empty line from bottom)
+            "❯ ",  # the live prompt row
             "────────────────────────────────────────",  # box closing rule
             "  alice: /home/alice/proj   Remote Control failed",  # status line
             "  Opus 4.8 (1M context) | effort:high",  # model + effort line
             "  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents",  # hint line
         ]
     )
-    # ``❯`` is 5 non-empty lines above the bottom (rule + status + model
-    # + hint sit below it), so only a scan window of >= 5 reaches it.
+    # The closing rule sits directly below ``❯``, marking it the live
+    # input box rather than a scrollback echo.
+    assert _claude_prompt_rendered(pane) is True
+
+
+def test_claude_prompt_rendered_sees_prompt_above_tall_cost_footer() -> None:
+    """
+    Readiness holds when a tall cost/usage status bar sits below the box.
+
+    Regression for issue #701. Enterprise / power-user Claude Code seats
+    render a cost + usage footer (and many run a multi-line custom
+    ``statusLine`` such as claude-hud), so several non-empty rows sit
+    below the input box and the live ``❯`` row lands far more than five
+    lines from the bottom. The old fixed five-line tail scan never
+    reached it, so the web-UI readiness gate timed out with "did not
+    become ready" on every message even though the box was mounted.
+    Detection now keys on the box's border rule directly under ``❯``, so
+    footer height is irrelevant.
+    """
+    pane = "\n".join(
+        [
+            "────────────────────────────────────────",  # input box top rule
+            "❯ ",  # the live prompt row
+            "────────────────────────────────────────",  # box closing rule
+            "  ~/proj (main)  ▸  Opus 4.8 (1M)  10%",  # status line
+            "  d $260.61 · 7d $462.92",  # cost line
+            "  5h  use 10%  reset in 4h7m",  # usage line
+            "  7d  use 12%  reset in 18h27m",  # usage line
+            "  ⏵⏵ accept edits on (shift+tab to cycle)",  # hint line
+        ]
+    )
+    # ``❯`` is 6 non-empty lines above the bottom — outside any 5-line
+    # tail window. Fails before the structural fix, passes after.
+    assert _claude_prompt_rendered(pane) is True
+
+
+def test_claude_prompt_rendered_rejects_glyph_echoed_in_scrollback() -> None:
+    """
+    A ``❯`` echoed into the transcript is not mistaken for the live box.
+
+    Claude echoes prior input (which can contain ``❯``) into the visible
+    transcript. While the input box is still booting, that echo can be
+    the only ``❯`` on screen — and it is followed by ordinary response
+    text, never the box's border rule. Detection must reject it, or the
+    gate would pass before the box mounts and the first keystrokes would
+    drop. This is the guard a naive "match the last ``❯`` anywhere" fix
+    would break: here the echo sits within the last five lines, so the
+    old tail scan wrongly accepted it.
+    """
+    pane = "\n".join(
+        [
+            "❯ old prompt echo",
+            "Here is the answer to your question:",
+            "  - point one",
+            "  - point two",
+            "done.",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is False
+
+
+def test_claude_prompt_rendered_picks_live_box_below_scrollback_echo() -> None:
+    """
+    The live box is found past a stale ``❯`` echo higher in the pane.
+
+    The everyday post-first-turn state: Claude's transcript carries an
+    echoed ``❯`` above the live input box, and a tall cost/usage footer
+    sits below it. Detection must anchor on the bottom-most ``❯`` (the
+    mounted box, recognized by its border rule) and ignore the echo. The
+    old tail scan failed twice over here — the live ``❯`` is past the
+    five-line window and the only ``❯`` it could reach is none — so this
+    is both a multi-glyph guard and a tall-footer regression.
+    """
+    pane = "\n".join(
+        [
+            "❯ earlier question that scrolled up",  # stale transcript echo
+            "Sure — here is the answer, across a couple",
+            "of wrapped lines of response text.",
+            "────────────────────────────────────────",  # input box top rule
+            "❯ ",  # the live prompt row
+            "────────────────────────────────────────",  # box closing rule
+            "  ~/proj (main)  ▸  Opus 4.8 (1M)  10%",  # status line
+            "  d $260.61 · 7d $462.92",  # cost line
+            "  5h  use 10%  reset in 4h7m",  # usage line
+            "  7d  use 12%  reset in 18h27m",  # usage line
+            "  ⏵⏵ accept edits on (shift+tab to cycle)",  # hint line
+        ]
+    )
     assert _claude_prompt_rendered(pane) is True
 
 

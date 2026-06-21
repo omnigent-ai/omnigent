@@ -41,6 +41,8 @@ Environment requirements (why this is opt-in, not pure-CI):
   alone would let this run unauthenticated and hang the TUI until the
   shard times out. The env-var gate keeps it out of CI entirely; a
   developer with a logged-in Claude opts in explicitly.
+  The tmux-level readiness test at the bottom needs no Claude login and
+  DOES run in CI, gated only on ``tmux`` (installed on the e2e runners).
 * It runs the daemon under the real HOME with the real Claude login —
   like ``claude_coder`` relies on the CLI's own session.
 * The workspace folder must be trusted in ``~/.claude.json`` or Claude
@@ -66,6 +68,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import signal
 import stat
@@ -80,19 +83,20 @@ from pathlib import Path
 import httpx
 import pytest
 
+from omnigent import claude_native_bridge
 from tests.e2e.helpers import POLL_INTERVAL_S
 
-# Opt-in only. claude-native needs a real *interactive* Claude login
-# (OAuth/Enterprise), which can't be relocated into CI: the `claude`
-# binary IS present in CI (the claude-sdk e2e tests install it), but it
-# is not logged in, so this test would launch a Claude TUI that can
-# never reach its input box and hang until the shard times out. Binary
-# presence is therefore NOT a sufficient gate — require an explicit
-# opt-in env var that only a developer with a logged-in Claude sets.
-pytestmark = pytest.mark.skipif(
+# The full-stack claude-native tests need a real *interactive* Claude
+# login (OAuth/Enterprise): the `claude` binary IS present in CI but is
+# not logged in, so the TUI never reaches its input box and would hang
+# until the shard times out. Gate each of those tests with this marker so
+# they skip in CI. NOTE: this is a per-test decorator, deliberately NOT a
+# module-level ``pytestmark`` — the tmux readiness test at the bottom
+# needs no Claude login and MUST run in CI, so it is left undecorated.
+_needs_logged_in_claude = pytest.mark.skipif(
     os.environ.get("OMNIGENT_E2E_CLAUDE_NATIVE") != "1" or shutil.which("claude") is None,
     reason=(
-        "claude-native e2e needs an interactive Claude login; set "
+        "claude-native full-stack e2e needs an interactive Claude login; set "
         "OMNIGENT_E2E_CLAUDE_NATIVE=1 (and have `claude` installed + logged in) to run"
     ),
 )
@@ -331,6 +335,7 @@ def _poll_for_assistant_marker(
     )
 
 
+@_needs_logged_in_claude
 def test_claude_native_first_message_survives_terminal_boot(
     live_server: str,
     http_client: httpx.Client,
@@ -438,6 +443,7 @@ def _plant_poisoned_omnigent_package(workspace: Path) -> None:
     )
 
 
+@_needs_logged_in_claude
 def test_claude_native_hooks_ignore_workspace_omnigent_package(
     live_server: str,
     http_client: httpx.Client,
@@ -519,6 +525,7 @@ def test_claude_native_hooks_ignore_workspace_omnigent_package(
                 daemon.wait()
 
 
+@_needs_logged_in_claude
 def test_claude_native_message_not_duplicated_on_cold_start(
     live_server: str,
     http_client: httpx.Client,
@@ -635,3 +642,276 @@ def test_claude_native_message_not_duplicated_on_cold_start(
             except subprocess.TimeoutExpired:
                 daemon.kill()
                 daemon.wait()
+
+
+# Number of rows the test's custom statusLine emits below the input box.
+# Comfortably exceeds the old five-line prompt-scan window so the live
+# ``❯`` row lands well outside it — the issue #701 condition.
+_TALL_FOOTER_LINES = 8
+# A multi-line statusLine command (no quoting needed — hyphenated tokens).
+# omnigent chains the user's global statusLine into its own capture
+# wrapper, so these rows render in the launched Claude's footer exactly
+# as a real user's multi-line cost/usage bar (e.g. claude-hud) would.
+_TALL_STATUSLINE_COMMAND = "; ".join(
+    f"echo omnigent-hud-row-{i}" for i in range(1, _TALL_FOOTER_LINES + 1)
+)
+
+
+@contextmanager
+def _user_statusline_configured(command: str) -> Iterator[None]:
+    """
+    Set ``~/.claude/settings.json`` ``statusLine.command`` for the test.
+
+    omnigent overrides the launched Claude's statusLine with its own
+    capture wrapper but chains to whatever the user configured globally
+    (``claude_native_bridge.read_user_status_line_command``, wired into
+    the per-session ``--settings``). A multi-line command therefore
+    renders extra footer rows directly below the input box — faithfully
+    modeling the enterprise cost/usage status bar from issue #701 with no
+    paid seat. The original file bytes (or absence) are restored on exit.
+
+    :param command: Shell command string to install as
+        ``statusLine.command``.
+    :returns: Iterator yielding once the statusLine entry is written.
+    """
+    settings_path = Path.home() / ".claude" / "settings.json"
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    original = settings_path.read_bytes() if settings_path.exists() else None
+    settings = json.loads(original) if original is not None else {}
+    settings["statusLine"] = {"type": "command", "command": command}
+    settings_path.write_text(json.dumps(settings))
+    try:
+        yield
+    finally:
+        if original is not None:
+            settings_path.write_bytes(original)
+        else:
+            settings_path.unlink(missing_ok=True)
+
+
+def _lines_below_live_prompt(session_id: str, *, timeout_s: float = 10.0) -> int:
+    """
+    Capture the session's Claude pane; count non-empty rows below ``❯``.
+
+    Host-spawned sessions key the bridge dir by conversation id, so the
+    runner's ``tmux.json`` is locatable from *session_id*. Captures the
+    live pane with the same helpers the production gate uses and returns
+    how many non-empty rows sit below the bottom-most prompt glyph — i.e.
+    how far the footer has pushed the live ``❯`` off the bottom. Polls
+    until the footer is tall (or *timeout_s* elapses) to ride out a
+    status-bar redraw landing mid-capture.
+
+    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :param timeout_s: Seconds to keep re-capturing for a tall footer.
+    :returns: Non-empty pane rows below the live prompt (best observed).
+    :raises AssertionError: When no capture ever carried a prompt glyph
+        (capture failed, or the input box never mounted).
+    """
+    bridge_dir = claude_native_bridge.bridge_dir_for_conversation_id(session_id)
+    info = claude_native_bridge._wait_for_tmux_info(bridge_dir, timeout_s=30.0)
+    glyph = claude_native_bridge._CLAUDE_PROMPT_GLYPH
+    deadline = time.monotonic() + timeout_s
+    best = -1
+    last_pane = ""
+    while time.monotonic() < deadline:
+        pane = claude_native_bridge._capture_pane(info["socket_path"], info["tmux_target"])
+        non_empty = [line for line in pane.splitlines() if line.strip()]
+        glyph_rows = [i for i, line in enumerate(non_empty) if glyph in line]
+        if glyph_rows:
+            best = len(non_empty) - 1 - glyph_rows[-1]
+            last_pane = pane
+            if best >= 5:
+                return best
+        time.sleep(POLL_INTERVAL_S)
+    assert best >= 0, f"no Claude prompt glyph in captured pane:\n{last_pane}"
+    return best
+
+
+def _post_user_message(client: httpx.Client, *, session_id: str, text: str) -> None:
+    """
+    POST a user text message onto a session's event stream.
+
+    :param client: HTTP client pointed at the test server.
+    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :param text: User message text to deliver into the Claude terminal.
+    :returns: None.
+    """
+    resp = client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+        },
+        timeout=30.0,
+    )
+    resp.raise_for_status()
+
+
+@_needs_logged_in_claude
+def test_claude_native_second_message_survives_tall_status_footer(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+) -> None:
+    """
+    A 2nd message lands when a status bar grew taller than the scan window.
+
+    Regression for issue #701. The readiness gate scanned only the last
+    five non-empty pane lines for Claude's ``❯`` prompt glyph. An
+    enterprise cost/usage status bar — or any multi-line custom
+    ``statusLine`` — renders enough footer rows below the input box to
+    push ``❯`` out of that window, so ``_wait_for_claude_prompt_ready``
+    timed out and the message raised "did not become ready" before a
+    keystroke was sent (a restart recovered only the next single message,
+    then it broke again).
+
+    Faithful to the reported trigger: the **first** message lands during
+    boot, before the multi-line ``statusLine`` has rendered, so the
+    prompt is still near the bottom and even the old gate passes. That
+    turn drives Claude to paint its full (tall) footer. The **second**
+    message is the regression — ``❯`` now sits well above the bottom, so
+    the old fixed-window scan can't see it and injection times out, while
+    the structural detector (``_claude_prompt_rendered`` keying on the
+    box border rule directly under ``❯``) still finds it and the message
+    is delivered. Verified red→green by toggling the structural detector
+    (red: second marker never arrives; green: it does).
+
+    The tall ``statusLine`` is chained into the omnigent status wrapper
+    exactly as a real user's bar is (see
+    :func:`_user_statusline_configured`). No boot-delay shim: the footer
+    height — not boot timing — is what defeats the old gate.
+    """
+    workspace = tmp_path / "cn_tall_footer_ws"
+    workspace.mkdir()
+    marker_one = f"TALLBAR1_{uuid.uuid4().hex[:6].upper()}"
+    marker_two = f"TALLBAR2_{uuid.uuid4().hex[:6].upper()}"
+
+    with (
+        _workspace_trusted_in_claude_config(workspace),
+        _user_statusline_configured(_TALL_STATUSLINE_COMMAND),
+    ):
+        daemon = _spawn_host_daemon(tmp_path=tmp_path, live_server=live_server)
+        try:
+            host_id = _online_host_id(http_client, timeout=30.0)
+            agent_id = _claude_native_agent_id(http_client)
+
+            create = http_client.post(
+                "/v1/sessions",
+                json={"agent_id": agent_id, "host_id": host_id, "workspace": str(workspace)},
+                timeout=60.0,
+            )
+            create.raise_for_status()
+            session_id = create.json()["id"]
+
+            # Message 1: lands before the multi-line statusLine renders, so
+            # even the old gate passes. Its turn makes Claude paint the
+            # full, tall footer below the input box.
+            _post_user_message(
+                http_client,
+                session_id=session_id,
+                text=f"Reply with exactly one word: {marker_one}",
+            )
+            _poll_for_assistant_marker(
+                http_client, session_id=session_id, marker=marker_one, timeout=180.0
+            )
+
+            # Self-validation against vacuity: prove the footer actually
+            # pushed the live ``❯`` past the old five-line scan window. If a
+            # future Claude rendered a short footer the regression wouldn't
+            # reproduce, and without this guard the test would pass green
+            # while testing nothing. Fail loudly instead.
+            lines_below = _lines_below_live_prompt(session_id)
+            assert lines_below >= 5, (
+                f"tall-footer precondition not met: only {lines_below} non-empty "
+                "row(s) below the live prompt, so the old tail-5 scan would still "
+                "have found ❯ — this run would not exercise issue #701."
+            )
+
+            # Message 2: the tall footer is now rendered, so ``❯`` sits far
+            # above the bottom. The old tail-window scan never finds it and
+            # this injection times out; the structural detector delivers it.
+            _post_user_message(
+                http_client,
+                session_id=session_id,
+                text=f"Reply with exactly one word: {marker_two}",
+            )
+            text = _poll_for_assistant_marker(
+                http_client, session_id=session_id, marker=marker_two, timeout=180.0
+            )
+            assert marker_two in text, (
+                f"second message dropped: marker {marker_two!r} missing from {text!r} — "
+                "the tall-footer readiness regression (issue #701) re-appeared."
+            )
+        finally:
+            daemon.send_signal(signal.SIGTERM)
+            try:
+                daemon.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                daemon.kill()
+                daemon.wait()
+
+
+def test_prompt_ready_detects_glyph_above_tall_footer_in_real_tmux(tmp_path: Path) -> None:
+    """
+    The readiness gate finds ``❯`` above a tall footer in a *real* tmux pane.
+
+    The CI-runnable slice of issue #701: this needs no Claude login — only
+    ``tmux`` (installed on the e2e runners) — so, unlike the full-stack
+    tests above, it is deliberately NOT gated on a logged-in Claude and
+    runs in CI. It paints a Claude-like idle frame whose footer is far
+    taller than the old five-line prompt-scan window into a real tmux
+    pane, then drives the production readiness gate against it through the
+    same helpers injection uses (``_capture_pane`` →
+    ``_claude_prompt_rendered`` → ``_wait_for_claude_prompt_ready``).
+
+    Before the structural-detection fix the live ``❯`` sat outside the
+    scanned tail and the gate raised "did not become ready"; after it the
+    box is recognized by the border rule directly beneath ``❯``,
+    independent of footer height. Verified red→green by toggling the fix.
+    """
+    if shutil.which("tmux") is None:
+        pytest.skip("needs tmux")
+
+    # A Claude-like idle frame: input-box top rule, the live prompt, the
+    # box's closing rule, then a footer with far more than four rows below
+    # ``❯`` — so the old tail-5 scan cannot reach the prompt row.
+    pane_lines = [
+        "────────────────────────────────────────",
+        "❯ ",
+        "────────────────────────────────────────",
+        *[f"  status row {n}" for n in range(1, 9)],
+    ]
+    pane_file = tmp_path / "pane.txt"
+    pane_file.write_text("\n".join(pane_lines) + "\n", encoding="utf-8")
+
+    # Unix-domain socket paths are length-limited (~104 chars on macOS) and
+    # pytest's tmp_path is far longer, so put the tmux socket under /tmp with
+    # a short unique name. tmux removes it on kill-server (no manual cleanup).
+    socket = f"/tmp/cnrp-{uuid.uuid4().hex[:12]}.sock"
+    session = "cn_ready_probe"
+    # Paint the frame (cat) and hold the pane open (sleep) so the gate can
+    # poll a stable capture. tmux runs the command through the shell.
+    subprocess.run(
+        [
+            "tmux",
+            "-S",
+            socket,
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "-x",
+            "120",
+            "-y",
+            "40",
+            f"cat {shlex.quote(str(pane_file))}; sleep 30",
+        ],
+        check=True,
+    )
+    try:
+        # Returns once the frame renders (post-fix); raises RuntimeError
+        # "did not become ready" while the prompt stays outside the scan
+        # window (pre-fix). Reaching past this call means it was detected.
+        claude_native_bridge._wait_for_claude_prompt_ready(socket, session, timeout_s=10.0)
+    finally:
+        subprocess.run(["tmux", "-S", socket, "kill-server"], check=False)
