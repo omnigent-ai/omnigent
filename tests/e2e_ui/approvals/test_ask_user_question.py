@@ -98,7 +98,21 @@ def test_ask_user_question_form_renders_and_submits(
     # the PermissionRequest hook to the server and surfaces as a form here.
     _send(page, _ASK_PROMPT)
 
-    card = page.locator(f'{_APPROVAL_CARD}[data-state="pending"]').first
+    # Scope the wait to the pending approval card that *contains* the
+    # AskUserQuestion form, rather than grabbing ``.first`` pending card and
+    # then asserting the form inside it. The prompt forbids other tool calls,
+    # but if Claude ever calls an approval-requiring tool first (the same
+    # degree of freedom that flaked test_exit_plan_mode.py the other way),
+    # ``.first`` would latch onto that unrelated card and fail even though the
+    # question card appears moments later. Filtering by ``has=`` waits for the
+    # right card specifically. This does not weaken the assertion: if Claude
+    # never calls AskUserQuestion, no such card ever appears and the test still
+    # times out and fails.
+    card = (
+        page.locator(f'{_APPROVAL_CARD}[data-state="pending"]')
+        .filter(has=page.locator(_FORM))
+        .first
+    )
     expect(card).to_be_visible(timeout=_NATIVE_TURN_TIMEOUT_MS)
     form = card.locator(_FORM)
     expect(form).to_be_visible(timeout=30_000)

@@ -32,7 +32,7 @@ stores into ``create_app``):
    ``<data_dir>/config.yaml``)::
 
        sandbox:
-         provider: modal          # lakebox | modal | daytona | islo
+         provider: modal          # lakebox|modal|daytona|cwsandbox|islo|openshell
          server_url: https://omnigent.example.com
          modal:                   # optional block
            image: docker.io/me/omnigent-host:latest  # default: official image
@@ -54,6 +54,11 @@ stores into ``create_app``):
            vcpus: 2
            memory_mb: 4096
            disk_gb: 20
+         openshell:               # optional block (provider: openshell)
+           image: docker.io/me/omnigent-host:latest  # default: official image
+           env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES injected
+                                             # as sandbox env
+           cluster: my-gateway              # optional OpenShell gateway name
 
    The image defaults to the official prebaked host image
    (``ghcr.io/omnigent-ai/omnigent-host:latest``; see
@@ -65,9 +70,13 @@ stores into ``create_app``):
    launcher reads ``DAYTONA_API_KEY`` (plus optional
    ``DAYTONA_API_URL`` / ``DAYTONA_TARGET``), and the Islo launcher
    reads ``ISLO_API_KEY`` (plus optional ``ISLO_BASE_URL``) from the
-   server process environment. ``modal``, ``daytona``, and ``islo``
-   have managed-launch support; ``lakebox`` parses but rejects at
-   launch.
+   server process environment. The OpenShell launcher needs no API key:
+   it connects to the gateway made active with ``openshell gateway
+   select`` (``$OPENSHELL_GATEWAY`` / ``~/.config/openshell/active_gateway``,
+   or ``sandbox.openshell.cluster``), so the server process needs
+   OpenShell gateway access. ``modal``, ``daytona``, ``cwsandbox``,
+   ``islo``, and ``openshell`` have managed-launch support; ``lakebox``
+   parses but rejects at launch.
 
 2. **Direct construction** (embedding deployments): build
    :class:`ManagedSandboxConfig` with a custom
@@ -121,10 +130,10 @@ _logger = logging.getLogger(__name__)
 # ManagedSandboxConfig directly are not constrained by either set —
 # their launcher factory IS the support.)
 SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
-    {"lakebox", "modal", "daytona", "cwsandbox", "islo"}
+    {"lakebox", "modal", "daytona", "cwsandbox", "islo", "e2b", "openshell"}
 )
 PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
-    {"modal", "daytona", "cwsandbox", "islo"}
+    {"modal", "daytona", "cwsandbox", "islo", "e2b", "openshell"}
 )
 
 # How long a managed launch waits for the sandboxed host to register
@@ -156,6 +165,13 @@ DAYTONA_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 # deleted by managed-session teardown; use the same 7-day policy bound
 # as Daytona for long-lived hosts and stale-token cleanup.
 ISLO_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
+
+# Launch-token lifetime for the YAML openshell path. OpenShell sandboxes
+# run until deleted (no platform lifetime cap), so the bound is policy,
+# not platform: the same 7-day window as Daytona/Islo keeps a long-lived
+# sandbox re-authenticating across tunnel reconnects while still expiring
+# tokens of sandboxes nobody deleted. A relaunch mints a fresh token.
+OPENSHELL_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 
 # The cwsandbox launch-token TTL is NOT a constant: CW Sandbox's lifetime is
 # operator-overridable (OMNIGENT_CWSANDBOX_MAX_LIFETIME_S), so the TTL is
@@ -618,6 +634,23 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             disk_gb=_parse_provider_positive_int(raw, "islo", "disk_gb"),
         )
         token_ttl_s = ISLO_MANAGED_TOKEN_TTL_S
+    elif provider == "e2b":
+        from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s
+
+        launcher_factory = _e2b_launcher_factory(
+            _parse_e2b_template(raw), _parse_provider_env(raw, "e2b")
+        )
+        # Derived from OMNIGENT_E2B_MAX_LIFETIME_S so the token always
+        # outlives the (operator-overridable) sandbox lifetime — mirrors
+        # the cwsandbox path.
+        token_ttl_s = managed_token_ttl_s()
+    elif provider == "openshell":
+        launcher_factory = _openshell_launcher_factory(
+            image=_parse_provider_image(raw, "openshell"),
+            env=_parse_provider_env(raw, "openshell"),
+            cluster=_parse_provider_string(raw, "openshell", "cluster"),
+        )
+        token_ttl_s = OPENSHELL_MANAGED_TOKEN_TTL_S
     else:
         launcher_factory = _unsupported_launcher_factory(provider)
         # Never consulted (the factory rejects before any token is
@@ -860,6 +893,71 @@ def _parse_cwsandbox_env(raw: dict[str, object]) -> list[str] | None:
     return [name.strip() for name in env]
 
 
+def _e2b_launcher_factory(
+    template: str | None,
+    env: list[str] | None,
+) -> Callable[[], SandboxLauncher]:
+    """
+    Build the launcher factory for the YAML ``provider: e2b`` path.
+
+    :param template: E2B template NAME the Omnigent host image was built
+        into (``e2b template build``), or ``None`` to use the launcher's
+        env-var fallback / the default template. Unlike the other
+        providers' ``image`` field this is NOT a registry reference —
+        E2B boots from templates (see
+        :class:`omnigent.onboarding.sandboxes.e2b.E2BSandboxLauncher`).
+    :param env: Names of server-process environment variables (harness
+        LLM credentials, gateway URLs, ``GIT_TOKEN``) injected into
+        every sandbox, e.g. ``["OPENAI_API_KEY", "GIT_TOKEN"]``, or
+        ``None`` to resolve from the launcher's env-var fallback /
+        inject nothing.
+    :returns: A factory producing parameterized E2B launchers.
+    """
+
+    def _build() -> SandboxLauncher:
+        """Construct the E2B launcher (lazy SDK import inside)."""
+        from omnigent.onboarding.sandboxes.e2b import E2BSandboxLauncher
+
+        return E2BSandboxLauncher(template=template, env=env)
+
+    return _build
+
+
+def _parse_e2b_template(raw: dict[str, object]) -> str | None:
+    """
+    Extract and validate the e2b template from the ``sandbox`` dict.
+
+    ``sandbox.e2b.template`` names the pre-built E2B template the
+    Omnigent host image was built into — NOT a registry image reference
+    (the wording every other provider's ``image`` field uses), because
+    E2B cannot boot an arbitrary registry image. OPTIONAL — when absent,
+    the launcher resolves :data:`~omnigent.onboarding.sandboxes.e2b.TEMPLATE_ENV_VAR`
+    then the default template. A present-but-malformed value fails loud.
+
+    :param raw: The raw ``sandbox`` mapping (provider already known to
+        be ``"e2b"``).
+    :returns: The validated template name, or ``None`` to use the
+        launcher's fallback / default.
+    :raises ValueError: When ``sandbox.e2b`` is present but not a
+        mapping, or ``sandbox.e2b.template`` is present but not a
+        non-empty string.
+    """
+    section = _parse_provider_section(raw, "e2b")
+    if section is None:
+        return None
+    template = section.get("template")
+    if template is None:
+        return None
+    if not isinstance(template, str) or not template.strip():
+        raise ValueError(
+            "server config 'sandbox.e2b.template' must be the NAME of a pre-built "
+            "E2B template the omnigent host image was built into (e.g. "
+            "'omnigent-host'; see deploy/e2b/README.md) — NOT a registry image "
+            "reference (omit it to use the default template)"
+        )
+    return template.strip()
+
+
 def _islo_launcher_factory(
     *,
     image: str | None,
@@ -908,6 +1006,36 @@ def _islo_launcher_factory(
             memory_mb=memory_mb,
             disk_gb=disk_gb,
         )
+
+    return _build
+
+
+def _openshell_launcher_factory(
+    *,
+    image: str | None,
+    env: list[str] | None,
+    cluster: str | None,
+) -> Callable[[], SandboxLauncher]:
+    """
+    Build the launcher factory for the YAML ``provider: openshell`` path.
+
+    :param image: Registry image reference with omnigent pre-installed,
+        e.g. ``"docker.io/me/omnigent-host:latest"``, or ``None`` to use
+        the official prebaked host image (env-overridable).
+    :param env: Names of server-process environment variables injected
+        into every sandbox, e.g. ``["OPENAI_API_KEY", "GIT_TOKEN"]``, or
+        ``None`` to resolve from the launcher's env-var fallback.
+    :param cluster: OpenShell gateway name to connect to, or ``None`` to
+        use the active gateway (``$OPENSHELL_GATEWAY`` /
+        ``~/.config/openshell/active_gateway``).
+    :returns: A factory producing parameterized OpenShell launchers.
+    """
+
+    def _build() -> SandboxLauncher:
+        """Construct the OpenShell launcher (lazy SDK import inside)."""
+        from omnigent.onboarding.sandboxes.openshell import OpenShellSandboxLauncher
+
+        return OpenShellSandboxLauncher(image=image, env=env, cluster=cluster)
 
     return _build
 
@@ -1345,15 +1473,10 @@ def _start_host_in_sandbox(
             (HOST_NAME_ENV_VAR, host_name),
         )
     )
-    launcher.run(
+    launcher.run_background(
         sandbox_id,
-        # setsid + nohup + redirects detach the host from the exec
-        # session: the exec's bash exits immediately (the trailing echo
-        # gives it a clean foreground completion) while the host keeps
-        # running for the sandbox's lifetime.
-        f"{env_prefix} setsid nohup omnigent host "
-        f"--server {shlex.quote(server_url)} "
-        f"> {_HOST_LOG_PATH} 2>&1 < /dev/null & echo launched",
+        f"{env_prefix} omnigent host --server {shlex.quote(server_url)}",
+        log_path=_HOST_LOG_PATH,
     )
     return workspace
 

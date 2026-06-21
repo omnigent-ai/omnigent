@@ -1,53 +1,35 @@
 """
-REPL approval-flow e2e test — sessions API variant.
+REPL approval-flow e2e test -- sessions API variant (mock LLM).
 
 Sessions-API parallel of ``test_repl_approval_e2e.py``. Spawns
-``omnigent run <yaml>`` (sessions API is default; the Databricks
-profile rides on the config-home auth block)
-under pexpect and drives the same approval CUJs through the
-``/v1/sessions`` path instead of ``/v1/responses``.
+``omnigent run <yaml>`` under pexpect and drives approval CUJs
+through the ``/v1/sessions`` path.
 
-The agent fixtures are the same as the legacy tests (ask-demo,
-e2e-tool-gate, etc.) — only the spawn command differs. Each
-test asserts the identical behavior: approval prompts surface,
-verdicts route through the sessions event path, and the LLM
-reply (or deny sentinel) renders correctly.
-
-Prerequisites:
-    - ``pexpect`` installed (4.9+).
-    - A Databricks profile authenticated (default ``dev``);
-      override via ``OMNIGENT_SESSIONS_E2E_PROFILE=<name>``.
-    - Gated under CI unless ``OMNIGENT_RUN_LIVE_REPL_E2E=1``.
+All tests use the mock LLM server. ``OPENAI_BASE_URL`` in the
+subprocess env is pointed at the mock server, and responses are
+pre-configured before each pexpect interaction.
 
 Usage::
 
-    python -m pytest tests/e2e/test_repl_sessions_approval_e2e.py -v
+    python -m pytest tests/e2e/test_repl_sessions_approval_e2e.py -v --timeout=120
 """
 
 from __future__ import annotations
 
-import configparser
 import contextlib
-import json
 import os
 import re
-import shutil
-import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from tests._model_pools import resolve_model
+from tests.e2e.conftest import configure_mock_llm, reset_mock_llm
 
 pexpect = pytest.importorskip("pexpect")
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_PROFILE_ENV_VAR = "OMNIGENT_SESSIONS_E2E_PROFILE"
-_DEFAULT_PROFILE = "dev"
-_MODEL = resolve_model("databricks-claude-sonnet-4-6", key=__name__)
 _ASK_DEMO_YAML = _REPO_ROOT / "tests" / "resources" / "agents" / "ask-demo" / "ask-demo.yaml"
 _FIXTURES_DIR = _REPO_ROOT / "tests" / "_fixtures" / "agents"
 _TOOL_GATE_DIR = _FIXTURES_DIR / "e2e-tool-gate"
@@ -59,80 +41,11 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
 
 
-def _resolve_profile_token(profile: str) -> str | None:
-    """Resolve a Databricks bearer for ``profile`` via the CLI."""
-    cli = shutil.which("databricks")
-    if cli is None:
-        return None
-    try:
-        proc = subprocess.run(
-            [cli, "auth", "token", "--profile", profile],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except subprocess.TimeoutExpired:
-        return None
-    if proc.returncode != 0:
-        return None
-    try:
-        payload = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        return None
-    token = payload.get("access_token")
-    return token if isinstance(token, str) and token else None
-
-
-def _resolve_workspace_host(profile: str) -> str | None:
-    """Read ``~/.databrickscfg``'s ``host`` for ``profile``."""
-    cfg_path = Path.home() / ".databrickscfg"
-    if not cfg_path.exists():
-        return None
-    parser = configparser.ConfigParser()
-    try:
-        parser.read(cfg_path)
-    except configparser.Error:
-        return None
-    if profile not in parser:
-        return None
-    host = parser[profile].get("host")
-    return host.rstrip("/") if host else None
-
-
-@pytest.fixture(scope="module")
-def sessions_credentials() -> dict[str, str]:
-    """Resolve Databricks credentials for the sessions e2e profile."""
-    if os.environ.get("CI", "").lower() == "true" and not os.environ.get(
-        "OMNIGENT_RUN_LIVE_REPL_E2E"
-    ):
-        pytest.skip(
-            "live REPL e2e gated under CI; set OMNIGENT_RUN_LIVE_REPL_E2E=1 to opt in.",
-        )
-    profile = os.environ.get(_PROFILE_ENV_VAR, _DEFAULT_PROFILE)
-    token = _resolve_profile_token(profile)
-    if token is None:
-        pytest.skip(
-            f"Databricks profile {profile!r} not authenticated; "
-            f"run `databricks auth login --profile {profile}` first.",
-        )
-    host = _resolve_workspace_host(profile)
-    if host is None:
-        pytest.skip(
-            f"Databricks profile {profile!r} is missing a 'host' entry.",
-        )
-    return {"profile": profile, "token": token, "host": host}
-
-
-def _build_repl_env(creds: dict[str, str]) -> dict[str, str]:
+def _build_repl_env(mock_llm_server_url: str, tmp_home: Path) -> dict[str, str]:
     """Build the pexpect environment dict for REPL spawning.
 
-    Centralises SDK PYTHONPATH injection, credential plumbing,
-    and the suppression of variables that leak from the outer
-    agent process.
-
-    Databricks routing for the spawned CLI comes from the global
-    config's ``auth:`` block in an isolated ``OMNIGENT_CONFIG_HOME``
-    (the supported replacement for the removed ``--profile`` flag).
+    Points ``OPENAI_BASE_URL`` at the mock LLM server so the spawned
+    ``omnigent run`` subprocess uses mock responses.
     """
     from tests.e2e.omnigent._pexpect_harness import ensure_repl_test_theme_env
 
@@ -145,44 +58,40 @@ def _build_repl_env(creds: dict[str, str]) -> dict[str, str]:
         os.pathsep.join([*sdk_paths, existing_pp]) if existing_pp else os.pathsep.join(sdk_paths)
     )
 
-    config_home = Path(tempfile.mkdtemp(prefix="omnigent-approval-config-"))
+    config_home = tmp_home / ".omnigent"
+    config_home.mkdir(parents=True, exist_ok=True)
     (config_home / "config.yaml").write_text(
-        f"auth:\n  type: databricks\n  profile: {creds['profile']}\n",
-        encoding="utf-8",
+        "auto_open_conversation: false\ntui:\n  theme: dark\n",
     )
+
+    real_databrickscfg = Path.home() / ".databrickscfg"
     env = {
         **os.environ,
-        "DATABRICKS_TOKEN": creds["token"],
-        "OPENAI_API_KEY": creds["token"],
-        "OPENAI_BASE_URL": f"{creds['host']}/serving-endpoints",
-        "DATABRICKS_CONFIG_PROFILE": creds["profile"],
+        "OPENAI_API_KEY": "mock-key",
+        "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
+        "HOME": str(tmp_home),
         "OMNIGENT_CONFIG_HOME": str(config_home),
+        "DATABRICKS_CONFIG_FILE": str(real_databrickscfg),
+        "OMNIGENT_SKIP_ONBOARD": "1",
+        "OMNIGENT_NO_UPDATE_CHECK": "1",
         "PYTHONPATH": merged_pp,
         "TERM": "xterm-256color",
         "LINES": "40",
         "COLUMNS": "120",
         "PROMPT_TOOLKIT_NO_CPR": "1",
     }
-    for k in ("ANTHROPIC_API_KEY", "CLAUDE_CODE", "CODEX"):
+    for k in ("ANTHROPIC_API_KEY", "CLAUDE_CODE", "CLAUDECODE", "CODEX", "DATABRICKS_TOKEN"):
         env.pop(k, None)
     return ensure_repl_test_theme_env(env)
 
 
 def _spawn_sessions_repl(
     yaml_path: Path,
-    creds: dict[str, str],
+    env: dict[str, str],
     *,
     timeout: int = 120,
 ) -> Any:
-    """
-    Spawn ``omnigent run`` under a PTY (sessions API is default).
-
-    :param yaml_path: Path to the agent YAML (can be a directory
-        containing ``config.yaml`` or a standalone ``.yaml``).
-    :param creds: Dict with ``profile``, ``token``, ``host``.
-    :param timeout: pexpect timeout in seconds.
-    :returns: The pexpect child process.
-    """
+    """Spawn ``omnigent run`` under a PTY (sessions API is default)."""
     return pexpect.spawn(
         sys.executable,
         [
@@ -191,10 +100,8 @@ def _spawn_sessions_repl(
             "run",
             str(yaml_path),
             "--no-session",
-            "--model",
-            _MODEL,
         ],
-        env=_build_repl_env(creds),
+        env=env,
         cwd=str(_REPO_ROOT),
         encoding="utf-8",
         codec_errors="replace",
@@ -205,38 +112,25 @@ def _spawn_sessions_repl(
 
 def _spawn_repl_with_args(
     yaml_path: Path,
-    creds: dict[str, str],
+    env: dict[str, str],
     *,
     extra_args: list[str] | None = None,
     timeout: int = 120,
 ) -> Any:
-    """Spawn ``omnigent run`` with caller-supplied CLI args.
-
-    Unlike :func:`_spawn_sessions_repl` this does NOT inject
-    Sessions API is the default; the caller controls which
-    flags are passed via *extra_args*.
-
-    :param yaml_path: Path to the agent YAML.
-    :param creds: Dict with ``profile``, ``token``, ``host``.
-    :param extra_args: Additional CLI flags, e.g. ``["--log"]``.
-    :param timeout: pexpect timeout in seconds.
-    :returns: The pexpect child process.
-    """
+    """Spawn ``omnigent run`` with caller-supplied CLI args."""
     args = [
         "-m",
         "omnigent",
         "run",
         str(yaml_path),
         "--no-session",
-        "--model",
-        _MODEL,
     ]
     if extra_args:
         args.extend(extra_args)
     return pexpect.spawn(
         sys.executable,
         args,
-        env=_build_repl_env(creds),
+        env=env,
         cwd=str(_REPO_ROOT),
         encoding="utf-8",
         codec_errors="replace",
@@ -271,17 +165,51 @@ def _clean_exit(child: Any) -> None:
         child.terminate(force=True)
 
 
+@pytest.fixture(scope="module")
+def repl_env(
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> dict[str, str]:
+    """Build the env dict for REPL spawning with mock LLM."""
+    tmp_home = tmp_path_factory.mktemp("repl_sessions_home")
+    return _build_repl_env(mock_llm_server_url, tmp_home)
+
+
+def _configure_simple_response(mock_llm_server_url: str) -> None:
+    """Configure mock to return a simple text response."""
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "Hello! I am a friendly assistant. How can I help you today?"}],
+        key="default",
+    )
+
+
+def _configure_multi_turn_responses(mock_llm_server_url: str, count: int = 2) -> None:
+    """Configure mock to return multiple simple text responses."""
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"text": f"Response {i + 1}: I am happy to help with your request."}
+            for i in range(count)
+        ],
+        key="default",
+    )
+
+
 # ── CUJ 1: Single approval allows LLM response ─────────
 
 
 def test_sessions_single_approval_allows_llm_response(
-    sessions_credentials: dict[str, str],
+    repl_env: dict[str, str],
+    mock_llm_server_url: str,
 ) -> None:
-    """
-    Sessions API variant: approval prompt surfaces, user types
+    """Sessions API variant: approval prompt surfaces, user types
     ``y``, LLM reply renders.
     """
-    child = _spawn_sessions_repl(_ASK_DEMO_YAML, sessions_credentials)
+    reset_mock_llm(mock_llm_server_url)
+    _configure_simple_response(mock_llm_server_url)
+
+    child = _spawn_sessions_repl(_ASK_DEMO_YAML, repl_env)
     try:
         _wait_for_prompt_ready(child)
         child.send("Hello\r")
@@ -295,7 +223,6 @@ def test_sessions_single_approval_allows_llm_response(
             f"No LLM response after approval.\nBuffer:\n{buffered[:800]}"
         )
     except pexpect.EOF:
-        # Dump full buffer for diagnosis.
         buf = _strip_ansi(child.before or "")
         pytest.fail(f"REPL exited early. Full buffer:\n{buf[-2000:]}")
     finally:
@@ -306,12 +233,16 @@ def test_sessions_single_approval_allows_llm_response(
 
 
 def test_sessions_refusal_shows_deny_sentinel(
-    sessions_credentials: dict[str, str],
+    repl_env: dict[str, str],
+    mock_llm_server_url: str,
 ) -> None:
-    """
-    Sessions API variant: user refuses → deny sentinel appears.
-    """
-    child = _spawn_sessions_repl(_ASK_DEMO_YAML, sessions_credentials)
+    """Sessions API variant: user refuses -> deny sentinel appears."""
+    reset_mock_llm(mock_llm_server_url)
+    # Even though the user refuses, the mock must have something queued
+    # in case the agent still gets a turn after denial.
+    _configure_simple_response(mock_llm_server_url)
+
+    child = _spawn_sessions_repl(_ASK_DEMO_YAML, repl_env)
     try:
         _wait_for_prompt_ready(child)
         child.send("Hello\r")
@@ -331,13 +262,16 @@ def test_sessions_refusal_shows_deny_sentinel(
 
 
 def test_sessions_two_turns_fires_one_approval_per_turn(
-    sessions_credentials: dict[str, str],
+    repl_env: dict[str, str],
+    mock_llm_server_url: str,
 ) -> None:
-    """
-    Sessions API variant: each turn produces exactly one
+    """Sessions API variant: each turn produces exactly one
     approval prompt.
     """
-    child = _spawn_sessions_repl(_ASK_DEMO_YAML, sessions_credentials)
+    reset_mock_llm(mock_llm_server_url)
+    _configure_multi_turn_responses(mock_llm_server_url, count=2)
+
+    child = _spawn_sessions_repl(_ASK_DEMO_YAML, repl_env)
     try:
         _wait_for_prompt_ready(child)
 
@@ -365,13 +299,16 @@ def test_sessions_two_turns_fires_one_approval_per_turn(
 
 
 def test_sessions_approve_always_caches_for_later_turns(
-    sessions_credentials: dict[str, str],
+    repl_env: dict[str, str],
+    mock_llm_server_url: str,
 ) -> None:
-    """
-    Sessions API variant: ``a`` (approve always) on first turn
+    """Sessions API variant: ``a`` (approve always) on first turn
     suppresses the prompt on the second turn.
     """
-    child = _spawn_sessions_repl(_ASK_DEMO_YAML, sessions_credentials)
+    reset_mock_llm(mock_llm_server_url)
+    _configure_multi_turn_responses(mock_llm_server_url, count=2)
+
+    child = _spawn_sessions_repl(_ASK_DEMO_YAML, repl_env)
     try:
         _wait_for_prompt_ready(child)
 
@@ -401,16 +338,38 @@ def test_sessions_approve_always_caches_for_later_turns(
 
 
 def test_sessions_tool_call_approval_allows_tool(
-    sessions_credentials: dict[str, str],
+    repl_env: dict[str, str],
+    mock_llm_server_url: str,
 ) -> None:
-    """
-    Sessions API variant: tool-phase approval surfaces,
+    """Sessions API variant: tool-phase approval surfaces,
     user approves, tool runs.
     """
+    import json
+
     tool_gate_yaml = _TOOL_GATE_DIR / "e2e-tool-gate.yaml"
     if not tool_gate_yaml.exists():
         pytest.skip(f"Fixture {tool_gate_yaml} not found")
-    child = _spawn_sessions_repl(tool_gate_yaml, sessions_credentials)
+
+    reset_mock_llm(mock_llm_server_url)
+    # Mock: first call the echo tool, second produce final text.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_1",
+                        "name": "echo",
+                        "arguments": json.dumps({"message": "Use the tool"}),
+                    },
+                ],
+            },
+            {"text": "The echo tool returned: [ECHO] Use the tool"},
+        ],
+        key="default",
+    )
+
+    child = _spawn_sessions_repl(tool_gate_yaml, repl_env)
     try:
         _wait_for_prompt_ready(child, timeout=60)
         child.send("Use the tool\r")
@@ -429,10 +388,7 @@ def test_sessions_tool_call_approval_allows_tool(
 
 
 def _write_simple_agent_yaml(directory: Path) -> Path:
-    """Write a minimal agent YAML with no policies (no approval).
-
-    Returns the path to the created YAML file.
-    """
+    """Write a minimal agent YAML with no policies (no approval)."""
     yaml_path = directory / "simple_hello.yaml"
     yaml_path.write_text(
         "name: simple_hello\n"
@@ -443,31 +399,30 @@ def _write_simple_agent_yaml(directory: Path) -> Path:
 
 
 def test_sessions_default_flag_works(
-    sessions_credentials: dict[str, str],
+    repl_env: dict[str, str],
+    mock_llm_server_url: str,
     tmp_path: Path,
 ) -> None:
-    """
-    Spawns the REPL through the default sessions path and verifies
+    """Spawns the REPL through the default sessions path and verifies
     the agent responds through the sessions API.
-
-    A simple agent with no policies is used so the test is not blocked
-    by an approval prompt -- we only need to confirm the sessions
-    default works end-to-end.
     """
     yaml_path = _write_simple_agent_yaml(tmp_path)
-    child = _spawn_repl_with_args(yaml_path, sessions_credentials)
+
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "Hello there, nice to meet you today!"}],
+        key="default",
+    )
+
+    child = _spawn_repl_with_args(yaml_path, repl_env)
     try:
         _wait_for_prompt_ready(child, timeout=60)
         child.send("Say hello in exactly five words\r")
 
-        # Wait for the LLM to respond.  The agent has no policies so
-        # there should be no approval gate -- text should arrive.
         buffered = _read_pending(child, seconds=10.0)
         buffered += _read_pending(child, seconds=5.0)
 
-        # The LLM must produce at least one word of real text.
-        # If the sessions path were broken, the REPL would either
-        # error at startup or render no assistant output.
         assert re.search(r"[A-Za-z]{3,}", buffered), (
             f"No LLM response rendered -- sessions-API default may "
             f"not be active.\nBuffer:\n{buffered[:800]}"

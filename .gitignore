@@ -49,6 +49,7 @@ run-omnigents.sh
 *.db-shm
 # Persisted artifacts from ad-hoc runs.
 artifacts/
+.tmp-codex-parity-target/
 
 # Playwright test run output (screenshots, traces, videos).
 test-results/
@@ -69,3 +70,4 @@ omnigent/server/static/web-ui/
 # and the install would error with "No such file or directory".
 # DAB local state directory (created by `databricks bundle deploy`).
 deploy/databricks/.databricks/
+deploy/databricks/**/*.whl

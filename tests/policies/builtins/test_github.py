@@ -363,6 +363,18 @@ def test_shell_chained_commit_then_push_alias_asks() -> None:
     assert result is not None and result["result"] == "ASK"
 
 
+def test_shell_background_operator_does_not_hide_the_push() -> None:
+    """A single ``&`` must not hide a gated push behind a benign command.
+
+    Without splitting on a lone ``&``, ``echo hi & git push ...secret...`` is
+    one un-split segment whose head is ``echo``, so the denied push slips past
+    the gate entirely — a trivial bypass of the write allowlist.
+    """
+    policy = github_policy(write_repos=[_REPO])
+    result = policy(_sh("echo hi & git push https://github.com/octo/secret main"))
+    assert result is not None and result["result"] == "DENY"
+
+
 def test_shell_clone_read_allowed_and_denied() -> None:
     """git clone is a read: allowed for an allowlisted repo, denied otherwise."""
     policy = github_policy(read_all=False, read_repos=[_REPO])

@@ -33,7 +33,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Set up uv (clean public resolution, no proxy cache)
         uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
@@ -62,11 +62,18 @@ jobs:
       # Delete the lockfile so npm RESOLVES from scratch: min-release-age only
       # filters during resolution, and --package-lock-only keeps an existing
       # in-range pin without re-applying the cooldown.
+      #
+      # --legacy-peer-deps is REQUIRED: the tree pins React 18 at runtime while
+      # much of the UI stack (and @types/react) peer-requires React 19, so npm's
+      # strict resolver would ERESOLVE-fail without it. It MUST match the flag the
+      # freshness gate in lint.yml verifies with; generating without it resolves
+      # the peer graph differently and rewrites the dev/devOptional/extraneous
+      # flags, failing that byte-exact gate.
       - name: Regenerate package-lock.json
         working-directory: ap-web
         run: |
           rm -f package-lock.json
-          npm install --package-lock-only --no-audit --no-fund
+          npm install --package-lock-only --legacy-peer-deps --no-audit --no-fund
 
       # Validate BEFORE committing: the Docker build proves the regenerated
       # locks + public registries produce a working image.
@@ -80,11 +87,11 @@ jobs:
       # own CI. Skipped when the App isn't configured (falls back to GITHUB_TOKEN).
       - name: Mint App token
         id: app-token
-        if: vars.OSS_REGEN_APP_ID != ''
+        if: vars.OMNIGENT_BOT_APP_ID != ''
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
         with:
-          app-id: ${{ vars.OSS_REGEN_APP_ID }}
-          private-key: ${{ secrets.OSS_REGEN_APP_KEY }}
+          app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
+          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
 
       # Persist the validated lockfiles via a PR (not a direct push to main, so
       # it works under branch protection). App token so `gh pr create` isn't
@@ -96,8 +103,8 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "omnigent-ci[bot]"
+          git config user.email "294685417+omnigent-ci[bot]@users.noreply.github.com"
           # --porcelain (not git diff) so first-regen UNTRACKED lockfiles count too.
           if [ -z "$(git status --porcelain -- uv.lock ap-web/package-lock.json)" ]; then
             echo "Lockfiles already current — nothing to PR."

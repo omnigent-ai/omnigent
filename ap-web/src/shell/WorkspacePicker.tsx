@@ -1,5 +1,6 @@
 import {
   FolderIcon,
+  FolderPlusIcon,
   FileIcon,
   ArrowUpIcon,
   HomeIcon,
@@ -12,7 +13,29 @@ import {
 import { useEffect, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
-import { useHostFilesystem } from "@/hooks/useHostFilesystem";
+import { useCreateHostDirectory, useHostFilesystem } from "@/hooks/useHostFilesystem";
+
+/**
+ * Join a directory path and a new child name into an absolute path.
+ *
+ * Handles the filesystem root (``"/"`` + ``"foo"`` → ``"/foo"`` rather
+ * than ``"//foo"``) and trims a trailing slash off the parent so a
+ * typed ``"/Users/me/"`` still produces ``"/Users/me/foo"``. The child
+ * name is trimmed; surrounding/duplicate slashes in it are left to the
+ * host to resolve.
+ *
+ * @param dir Absolute parent directory, e.g. ``"/Users/me"`` or ``"/"``.
+ * @param name New child name, e.g. ``"new-app"``.
+ * @returns The joined absolute path, e.g. ``"/Users/me/new-app"``.
+ */
+export function joinPath(dir: string, name: string): string {
+  const trimmedName = name.trim();
+  if (dir === "/") {
+    return `/${trimmedName}`;
+  }
+  const base = dir.endsWith("/") ? dir.slice(0, -1) : dir;
+  return `${base}/${trimmedName}`;
+}
 
 /**
  * Compute the parent directory of an absolute path.
@@ -243,6 +266,12 @@ export function WorkspacePicker({
   // True while the user is editing the path bar, so a late listing
   // (e.g. home resolving) can't overwrite what they're typing.
   const userEditedRef = useRef(false);
+  // "New folder" inline form: null when closed, otherwise the in-progress
+  // folder name. A separate error string holds the last create failure
+  // (e.g. "directory already exists") so it shows inline by the input.
+  const [newFolderName, setNewFolderName] = useState<string | null>(null);
+  const [createError, setCreateError] = useState<string | null>(null);
+  const createDir = useCreateHostDirectory();
 
   // Reset to home when the host *changes* — a path from the old host
   // is meaningless on the new one. Compare the previous hostId rather
@@ -256,6 +285,8 @@ export function WorkspacePicker({
     setPathInput("");
     setResolvedHome(null);
     userEditedRef.current = false;
+    setNewFolderName(null);
+    setCreateError(null);
   }, [hostId]);
 
   const { data, isLoading, error, isPlaceholderData } = useHostFilesystem(hostId, path);
@@ -378,6 +409,49 @@ export function WorkspacePicker({
     onSelect?.(currentAbsolute);
   }
 
+  // Directory the "New folder" action creates in. A resolved absolute
+  // path is used as-is. At the home view the absolute path is derived
+  // from the first listing entry, so an *empty* home yields no entry and
+  // never resolves — fall back to "~" (the host expands it) once the
+  // listing has loaded, otherwise creating the first folder in an empty
+  // home would be impossible. Stays null while loading so the button is
+  // disabled until we know what home resolves to.
+  const createBaseDir = currentAbsolute.startsWith("/")
+    ? currentAbsolute
+    : path === "" && !isLoading && !isPlaceholderData
+      ? "~"
+      : null;
+  const canCreateFolder = hostId !== null && createBaseDir !== null;
+
+  function openNewFolder() {
+    setCreateError(null);
+    setNewFolderName("");
+  }
+
+  function cancelNewFolder() {
+    setNewFolderName(null);
+    setCreateError(null);
+  }
+
+  async function commitNewFolder() {
+    const name = (newFolderName ?? "").trim();
+    if (name === "" || hostId === null || createBaseDir === null) {
+      return;
+    }
+    const target = joinPath(createBaseDir, name);
+    try {
+      const created = await createDir.mutateAsync({ hostId, path: target });
+      // Drop into the freshly created folder so the user can pick it
+      // straight away (the reason they made it). The listing refresh is
+      // handled by the mutation's onSuccess invalidation.
+      setNewFolderName(null);
+      setCreateError(null);
+      navigateTo(created);
+    } catch (err) {
+      setCreateError(err instanceof Error ? err.message : "Failed to create folder");
+    }
+  }
+
   return (
     <div
       className="flex max-h-80 min-h-0 flex-col rounded-md border"
@@ -437,6 +511,17 @@ export function WorkspacePicker({
         >
           {showHidden ? <EyeIcon className="size-4" /> : <EyeOffIcon className="size-4" />}
         </button>
+        <button
+          type="button"
+          onClick={openNewFolder}
+          disabled={!canCreateFolder}
+          aria-label="New folder"
+          title="New folder"
+          className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-30"
+          data-testid="workspace-picker-new-folder"
+        >
+          <FolderPlusIcon className="size-4" />
+        </button>
         {onSelect && (
           <Button
             type="button"
@@ -464,6 +549,71 @@ export function WorkspacePicker({
           </button>
         )}
       </div>
+      {newFolderName !== null && (
+        <div
+          className="flex shrink-0 flex-col gap-1 border-b px-3 py-1.5"
+          data-testid="workspace-picker-new-folder-form"
+        >
+          <div className="flex items-center gap-2">
+            <FolderPlusIcon className="size-4 shrink-0 text-muted-foreground" />
+            <input
+              type="text"
+              // eslint-disable-next-line jsx-a11y/no-autofocus -- focus belongs on
+              // the field the user just opened; the picker is already a focus trap.
+              autoFocus
+              value={newFolderName}
+              onChange={(e) => {
+                setNewFolderName(e.target.value);
+                if (createError !== null) setCreateError(null);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  void commitNewFolder();
+                } else if (e.key === "Escape") {
+                  e.preventDefault();
+                  cancelNewFolder();
+                }
+              }}
+              placeholder="New folder name"
+              spellCheck={false}
+              autoCapitalize="off"
+              autoCorrect="off"
+              className="min-w-0 flex-1 bg-transparent text-xs text-foreground focus:outline-none"
+              data-testid="workspace-picker-new-folder-input"
+            />
+            <button
+              type="button"
+              disabled={newFolderName.trim() === "" || createDir.isPending}
+              onClick={() => void commitNewFolder()}
+              aria-label="Create folder"
+              title="Create folder"
+              className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-30"
+              data-testid="workspace-picker-new-folder-create"
+            >
+              <CheckIcon className="size-4" />
+            </button>
+            <button
+              type="button"
+              onClick={cancelNewFolder}
+              aria-label="Cancel new folder"
+              title="Cancel"
+              className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+              data-testid="workspace-picker-new-folder-cancel"
+            >
+              <XIcon className="size-4" />
+            </button>
+          </div>
+          {createError !== null && (
+            <span
+              className="text-xs text-destructive"
+              data-testid="workspace-picker-new-folder-error"
+            >
+              {createError}
+            </span>
+          )}
+        </div>
+      )}
       {occupiedCount > 0 && (
         <div
           className="flex shrink-0 items-start gap-1.5 border-b bg-warning/10 px-3 py-2 text-xs text-warning"

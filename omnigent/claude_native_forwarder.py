@@ -10,7 +10,8 @@ import logging
 import os
 import tempfile
 import time
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +57,151 @@ _HOOKS_FILE = "hooks.jsonl"
 # file is reset and the reader restarts from 0. Generous because one
 # prose answer can be hundreds of chunks.
 _MAX_SEEN_DELTA_KEYS = 5000
+
+# Max time an assistant ``message`` item is held waiting for its
+# streamed deltas to forward first. The transcript and deltas file have
+# independent writers, so a short reply's record can hit disk a poll
+# BEFORE its deltas — inverting the deltas-before-done order and
+# rendering the message twice. ~8 polls at 0.25s: well past the one-poll
+# race, short enough that an unmatched item (dropped deltas, or a
+# multi-block message that never byte-equals the whole-message stream)
+# posts with barely noticeable delay — and has no preview to duplicate.
+_ASSISTANT_ITEM_DELTA_HOLD_S = 2.0
+
+# Cap on the delta-ordering bookkeeping. Entries are consumed on match /
+# never revisited after post, so this is a backstop against pathological
+# sessions, not a working-set size.
+_MAX_DELTA_ORDERING_ENTRIES = 256
+
+
+@dataclass
+class _ForwardedDeltaText:
+    """
+    Forwarded streamed-text accumulation for one assistant message.
+
+    :param parts: Forwarded delta strings in arrival order, e.g.
+        ``["Hello ", "world"]``.
+    :param final: Whether the ``final: true`` chunk has forwarded — only
+        then is ``"".join(parts)`` the complete text, safe to byte-compare
+        against a transcript item.
+    """
+
+    parts: list[str] = field(default_factory=list)
+    final: bool = False
+
+
+@dataclass
+class _DeltaOrderingState:
+    """
+    Cross-poll state enforcing deltas-before-done item ordering.
+
+    Filled by :func:`_forward_available_deltas` (forwarded chunk text per
+    ``message_id``) and consumed by :func:`_hold_assistant_item_for_deltas`,
+    which matches an assistant ``message`` item to its forwarded stream by
+    byte-equal text (the transcript carries no ``message_id``).
+
+    :param texts: ``message_id`` → forwarded delta text state. Popped
+        when an item matches it.
+    :param held_since: ``source_id`` → monotonic time first held. Kept
+        after the timeout releases the item so a failed post's retry
+        isn't re-held; bounded.
+    """
+
+    texts: dict[str, _ForwardedDeltaText] = field(default_factory=dict)
+    held_since: dict[str, float] = field(default_factory=dict)
+
+
+def _hold_monotonic() -> float:
+    """
+    Monotonic clock for the assistant-item hold timeout.
+
+    Indirection so tests patch THIS, not the process-global
+    ``time.monotonic`` (see the no-global-singleton-patch test rule).
+
+    :returns: Seconds from an unspecified monotonic epoch.
+    """
+    return time.monotonic()
+
+
+def _item_output_text(data: dict[str, Any]) -> str | None:
+    """
+    Join the ``output_text`` blocks of a message item's content.
+
+    :param data: Item payload, e.g. ``{"role": "assistant", "content":
+        [{"type": "output_text", "text": "Hi"}]}``.
+    :returns: The joined text, or ``None`` when the item carries none.
+    """
+    content = data.get("content")
+    if not isinstance(content, list):
+        return None
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "output_text":
+            text = block.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    if not parts:
+        return None
+    return "".join(parts)
+
+
+def _hold_assistant_item_for_deltas(
+    item: ClaudeTranscriptItem,
+    ordering: _DeltaOrderingState | None,
+    bridge_dir: Path,
+) -> bool:
+    """
+    Decide whether to defer an assistant message item to a later poll.
+
+    Enforces deltas-before-done: an assistant ``message`` item posts only
+    once a complete (``final``-seen) forwarded stream byte-equals its
+    text, or after :data:`_ASSISTANT_ITEM_DELTA_HOLD_S`. Holding returns
+    ``True`` and the caller stops the batch here (cursor unadvanced) so
+    later items can't overtake it. Items that can't have a preview — tool
+    calls, user/text-less messages, no-deltas-file sessions — never hold.
+    The timeout is safe: a message whose deltas never arrive has no live
+    preview, so a late post renders once, like any non-streamed message.
+
+    :param item: The transcript item about to be posted.
+    :param ordering: Shared ordering state, or ``None`` to disable
+        holding (parsing-only test paths).
+    :param bridge_dir: Native Claude bridge directory (for the
+        deltas-file existence check).
+    :returns: ``True`` to hold the item (and the rest of the batch)
+        until the next poll; ``False`` to post it now.
+    """
+    if ordering is None:
+        return False
+    if item.item_type != "message" or item.data.get("role") != "assistant":
+        return False
+    text = _item_output_text(item.data)
+    if not text:
+        return False
+    if not (bridge_dir / MESSAGE_DELTAS_FILE).exists():
+        return False
+    for message_id, entry in ordering.texts.items():
+        if entry.final and "".join(entry.parts) == text:
+            # Deltas fully forwarded — consume the stream (a later
+            # identical-text message matches its own) and post.
+            ordering.texts.pop(message_id)
+            ordering.held_since.pop(item.source_id, None)
+            return False
+    now = _hold_monotonic()
+    first_held = ordering.held_since.setdefault(item.source_id, now)
+    while len(ordering.held_since) > _MAX_DELTA_ORDERING_ENTRIES:
+        del ordering.held_since[next(iter(ordering.held_since))]
+    if now - first_held >= _ASSISTANT_ITEM_DELTA_HOLD_S:
+        # Timestamp kept: a failed post's retry next poll is released
+        # immediately by the elapsed check, not re-held for a full timeout.
+        _logger.debug(
+            "Posting assistant transcript item without matching forwarded "
+            "deltas after %.1fs hold; source_id=%s",
+            _ASSISTANT_ITEM_DELTA_HOLD_S,
+            item.source_id,
+        )
+        return False
+    return True
+
 
 # Seconds of transcript inactivity after which we publish ``idle`` for
 # a sub-agent. The transcript is the only signal we have for sub-agent
@@ -491,6 +637,13 @@ async def forward_claude_transcript_to_session(
     # prevents re-reads on the normal path.
     delta_state = _read_delta_forward_state(bridge_dir)
     seen_delta_keys: dict[tuple[str, int], None] = {}
+    # Deltas-before-done ordering across the two independent tails: the
+    # deltas forwarder records each message's forwarded text, the items
+    # forwarder holds an assistant item until its text matches a complete
+    # forwarded stream (or a short timeout). Per-process like
+    # ``seen_delta_keys``; survives /clear and /fork (message_ids belong
+    # to the long-lived Claude process).
+    delta_ordering = _DeltaOrderingState()
     item_retries = _PostRetryTracker()
     status_retries = _PostRetryTracker()
     subagent_start_retries = _PostRetryTracker()
@@ -623,12 +776,17 @@ async def forward_claude_transcript_to_session(
                     # — would land just AFTER its done event and re-create the
                     # already-finalized preview on the client (duplicate bubble
                     # + a stale trailing preview). See the web reconciler.
+                    # Within-poll order can't cover the cross-poll race
+                    # (transcript flushed, hook delta write not yet);
+                    # ``delta_ordering`` closes it by holding the assistant
+                    # item until its deltas byte-match or a timeout expires.
                     delta_state = await _forward_available_deltas(
                         client=client,
                         session_id=current_session_id,
                         bridge_dir=bridge_dir,
                         state=delta_state,
                         seen_keys=seen_delta_keys,
+                        ordering=delta_ordering,
                     )
                     state = await _forward_available_items(
                         client=client,
@@ -639,6 +797,7 @@ async def forward_claude_transcript_to_session(
                         retry_tracker=item_retries,
                         skip_user_messages=skip_user_messages,
                         dedupe=dedupe,
+                        ordering=delta_ordering,
                     )
                     hook_state = await _forward_available_status_events(
                         client=client,
@@ -815,6 +974,40 @@ async def _write_subagent_forward_state_async(
     await asyncio.to_thread(_write_subagent_forward_state, bridge_dir, state)
 
 
+def _parse_json_response(resp: httpx.Response, *, context: str) -> Any:
+    """
+    Parse an Omnigent JSON response, failing loudly on a non-JSON body.
+
+    The forwarder calls ``resp.json()`` on Sessions API responses after
+    ``resp.raise_for_status()``. That guards non-2xx statuses but not a
+    2xx body that simply is not JSON: an auth or proxy layer in front of
+    the server — most commonly an expired Databricks Apps OAuth session —
+    can serve an HTML login or error page with a 200 status. A bare
+    ``resp.json()`` then raises an opaque ``json.JSONDecodeError``
+    ("Expecting value: line 1 column 1 (char 0)") with no hint that the
+    body was HTML, and the forwarder supervisor turns that into a silent
+    restart loop. This wrapper re-raises with the response content type
+    and a body snippet so the cause is obvious in logs.
+
+    :param resp: HTTP response whose body is expected to be JSON.
+    :param context: Short request description for the error message,
+        e.g. ``"session conv_abc123 snapshot"``.
+    :returns: The parsed JSON value (object, array, or scalar).
+    :raises RuntimeError: If the response body is not valid JSON.
+    """
+    try:
+        return resp.json()
+    except ValueError as exc:
+        content_type = resp.headers.get("content-type") or "<unknown>"
+        snippet = " ".join(resp.text[:200].split())
+        raise RuntimeError(
+            f"{context} returned a non-JSON body (content-type "
+            f"{content_type!r}); an auth or proxy page was likely served "
+            f"instead of the API response (e.g. an expired login session). "
+            f"Body starts with: {snippet!r}"
+        ) from exc
+
+
 async def _post_external_subagent_start(
     client: httpx.AsyncClient,
     *,
@@ -845,6 +1038,7 @@ async def _post_external_subagent_start(
     :raises KeyError: If the server response is missing
         ``child_session_id`` — indicates a server/forwarder version
         mismatch and is unrecoverable for this sub-agent.
+    :raises RuntimeError: If the server response body is not JSON.
     """
     resp = await client.post(
         f"/v1/sessions/{parent_session_id}/events",
@@ -859,7 +1053,7 @@ async def _post_external_subagent_start(
         },
     )
     resp.raise_for_status()
-    body = resp.json()
+    body = _parse_json_response(resp, context=f"sub-agent start for {parent_session_id!r}")
     return body["child_session_id"]
 
 
@@ -1438,7 +1632,7 @@ async def _forward_session_cost(
     # lower transcript read (e.g. just after a rotation) and suppresses
     # steady-state churn. The two fields advance independently (policy_cost
     # moves mid-turn while display_cost/S is frozen).
-    payload: dict[str, float] = {}
+    payload: dict[str, float | str] = {}
     if display_cost is not None and (
         dedupe.posted_cost is None or display_cost > dedupe.posted_cost
     ):
@@ -1449,6 +1643,17 @@ async def _forward_session_cost(
         payload["policy_cost_usd"] = policy_cost
     if not payload:
         return
+    # Tag a display-cost (S) advance with the active model captured by the
+    # statusLine wrapper (``{"model": "claude-opus-4-8", ...}`` in context.json).
+    # claude-native sends no token counts with its cost, so the server has
+    # nothing to attribute the cost to per-model without this — leaving it out
+    # of the TOKEN USAGE breakdown while the session total still counts it. Sent
+    # only when the display cost moves: that is the value being attributed
+    # (``policy_cost_usd``-only mid-turn posts carry no new display cost).
+    if "cumulative_cost_usd" in payload and isinstance(status_state, dict):
+        model = status_state.get("model")
+        if isinstance(model, str) and model:
+            payload["model"] = model
     try:
         await _post_external_session_usage(
             client,
@@ -1720,7 +1925,7 @@ async def _create_clear_replacement_session(
         },
     )
     create_resp.raise_for_status()
-    created = create_resp.json()
+    created = _parse_json_response(create_resp, context="clear-replacement session create")
     new_session_id = created.get("id")
     if not isinstance(new_session_id, str) or not new_session_id:
         raise RuntimeError("clear replacement session response did not include id")
@@ -1840,7 +2045,7 @@ async def _create_fork_replacement_session(
         json={},
     )
     fork_resp.raise_for_status()
-    forked = fork_resp.json()
+    forked = _parse_json_response(fork_resp, context=f"fork of session {old_session_id!r}")
     new_session_id = forked.get("id")
     if not isinstance(new_session_id, str) or not new_session_id:
         raise RuntimeError("fork replacement session response did not include id")
@@ -1954,7 +2159,7 @@ async def _fetch_session_snapshot(
     """
     resp = await client.get(f"/v1/sessions/{url_component(session_id)}")
     resp.raise_for_status()
-    payload = resp.json()
+    payload = _parse_json_response(resp, context=f"session {session_id!r} snapshot")
     if not isinstance(payload, dict):
         raise RuntimeError(f"session {session_id!r} snapshot was not an object")
     return payload
@@ -2409,6 +2614,7 @@ async def _forward_available_items(
     retry_tracker: _PostRetryTracker,
     skip_user_messages: bool = False,
     dedupe: _ForwardDedupeState,
+    ordering: _DeltaOrderingState | None = None,
 ) -> TranscriptForwardState:
     """
     Forward currently available transcript items after ``state``.
@@ -2422,6 +2628,11 @@ async def _forward_available_items(
         transcript item posts.
     :param dedupe: Last usage / context-window / model values POSTed;
         mutated in place to suppress duplicate ``external_*`` events.
+    :param ordering: Delta-ordering state shared with
+        :func:`_forward_available_deltas`. An assistant ``message`` item
+        whose deltas haven't fully forwarded is held (batch stops, cursor
+        unadvanced) until they have or a timeout expires — see
+        :func:`_hold_assistant_item_for_deltas`. ``None`` disables holding.
     :returns: The updated transcript cursor state. On post failure it
         is the last durable cursor so retries don't re-post successful
         items.
@@ -2450,6 +2661,11 @@ async def _forward_available_items(
             seen_source_ids.append(item.source_id)
             seen.add(item.source_id)
             continue
+        # Deltas-before-done: defer an assistant message whose deltas
+        # haven't forwarded yet. Stop the batch here (cursor before this
+        # item) so later items can't overtake it.
+        if _hold_assistant_item_for_deltas(item, ordering, bridge_dir):
+            return updated
         retry_key = f"item:{item.source_id}"
         if retry_tracker.retry_delay_s(retry_key) is not None:
             return updated
@@ -2876,6 +3092,7 @@ async def _forward_available_deltas(
     bridge_dir: Path,
     state: DeltaForwardState,
     seen_keys: dict[tuple[str, int], None],
+    ordering: _DeltaOrderingState | None = None,
 ) -> DeltaForwardState:
     """
     Forward newly appended assistant-text deltas to the active session.
@@ -2896,6 +3113,11 @@ async def _forward_available_deltas(
     :param seen_keys: In-memory ``(message_id, index)`` dedupe ring,
         mutated in place. Guards the rare file-truncation rewind where
         the reader restarts from offset ``0``.
+    :param ordering: Delta-ordering state, mutated in place: each
+        forwarded chunk's text accumulates under its ``message_id`` for
+        :func:`_hold_assistant_item_for_deltas` to byte-match. Accumulated
+        on read, not POST success — a dropped chunk should let the item
+        post, not wait on text that never completes. ``None`` disables it.
     :returns: The updated delta cursor state (offset advanced past the
         records just read).
     """
@@ -2921,6 +3143,13 @@ async def _forward_available_deltas(
         # limit.
         while len(seen_keys) > _MAX_SEEN_DELTA_KEYS:
             del seen_keys[next(iter(seen_keys))]
+        if ordering is not None:
+            entry = ordering.texts.setdefault(delta.message_id, _ForwardedDeltaText())
+            entry.parts.append(delta.delta)
+            if delta.final:
+                entry.final = True
+            while len(ordering.texts) > _MAX_DELTA_ORDERING_ENTRIES:
+                del ordering.texts[next(iter(ordering.texts))]
         try:
             await _post_external_output_text_delta(client, session_id=session_id, delta=delta)
         except httpx.HTTPError as exc:
@@ -2942,7 +3171,7 @@ async def _post_external_session_usage(
     client: httpx.AsyncClient,
     *,
     session_id: str,
-    usage: dict[str, float] | None,
+    usage: Mapping[str, float | str] | None,
     context_window: int | None = None,
 ) -> None:
     """
@@ -2953,7 +3182,9 @@ async def _post_external_session_usage(
 
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
-    :param usage: ``message.usage`` snapshot, or ``None`` to skip.
+    :param usage: ``message.usage`` snapshot, or ``None`` to skip. Values are
+        numeric counters/costs, plus an optional ``model`` string tagging the
+        cost with the active model for per-model attribution.
     :param context_window: Resolved window in tokens, or ``None`` to
         leave the server's persisted value untouched.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.

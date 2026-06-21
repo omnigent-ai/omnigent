@@ -116,7 +116,7 @@ def model_family_mismatch(harness: str, model: str) -> str | None:
         return (
             f"harness {canon!r} only runs Claude models (id containing "
             f"'claude'); got {model!r}. Use the codex worker for GPT models "
-            "or the pi worker for any other gateway model."
+            "or the pi / openai-agents worker for any other gateway model."
         )
     if canon in _CODEX_FAMILY_HARNESSES and not is_gpt:
         return (
@@ -215,7 +215,7 @@ def harness_supports_model_override(harness: str | None) -> bool:
     Native CLIs (claude-native / codex-native) receive the override as
     ``--model`` at terminal launch; the SDK harnesses receive it via
     ``HARNESS_<H>_MODEL`` in the spawn env. Anything else (e.g.
-    ``databricks_supervisor``, unknown harnesses) silently ignores the
+    unknown harnesses) silently ignores the
     persisted value, so callers must reject the override up front.
 
     :param harness: Harness id from a spec, e.g. ``"codex-native"`` or

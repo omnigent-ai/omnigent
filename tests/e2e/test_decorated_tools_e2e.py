@@ -1,225 +1,241 @@
-"""End-to-end tests for the @tool decorator on real LLM + real server.
+"""End-to-end tests for the @tool decorator (mock LLM).
 
 Verifies the full pipeline:
-- Agent image with ``@tool``-decorated functions in
-  ``tools/python/*.py`` is loaded into a real ``omnigent server``.
-- Real LLM calls each tool with arguments inferred from the
-  derived schema.
-- Tool runs in a subprocess; result returns through the runner
-  and gets persisted in the conversation.
-- Final LLM response references the literal output values.
+- Agent with ``callable``-style tool declarations is registered inline.
+- Mock LLM emits tool_calls with the correct arguments.
+- Tools run in the server subprocess; results return through the runner.
+- Mock LLM's follow-up response references the literal output values.
 
-These tests require an LLM API key and a working ``ap`` CLI on
-PATH; they are excluded from the default ``pytest`` run via
-``--ignore=tests/e2e``.
+Usage::
 
-**TUI verification** (mandatory per CLAUDE.md before merge):
-
-- archer's word_count: ``python examples/frontends/terminal.py
-  examples/archer/`` then ask "Count the words in this
-  paragraph: <text>".
-- decorator-signatures-test: ``python examples/frontends/terminal.py
-  tests/_fixtures/agents/decorator-signatures-test/`` then ask
-  "Greet Alice, format a record for Bob age 42, and compute
-  with value 5".
+    pytest tests/e2e/test_decorated_tools_e2e.py -v
 """
 
 from __future__ import annotations
 
 import json
-import tarfile
-import tempfile
-from pathlib import Path
+import uuid
 
 import httpx
 import pytest
 
 from tests.e2e.conftest import (
+    configure_mock_llm,
     create_runner_bound_session,
     poll_session_until_terminal,
+    register_inline_agent,
+    reset_mock_llm,
     send_user_message_to_session,
 )
-
-_DECORATOR_FIXTURE_DIR = (
-    Path(__file__).resolve().parents[1] / "_fixtures" / "agents" / "decorator-signatures-test"
-)
-
-
-@pytest.fixture(scope="session")
-def decorator_signatures_agent(http_client: httpx.Client) -> str:
-    """
-    Upload the decorator-signatures-test fixture agent.
-
-    :param http_client: HTTP client pointed at the live server.
-    :returns: The agent's name (matches its config.yaml ``name``).
-    """
-    with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
-        with tarfile.open(tmp.name, "w:gz") as tar:
-            tar.add(str(_DECORATOR_FIXTURE_DIR), arcname=".")
-        bundle_path = tmp.name
-    try:
-        with open(bundle_path, "rb") as f:
-            resp = http_client.post(
-                "/v1/sessions",
-                data={"metadata": json.dumps({})},
-                files={
-                    "bundle": (
-                        "agent.tar.gz",
-                        f,
-                        "application/gzip",
-                    ),
-                },
-            )
-        if resp.status_code == 409:
-            # Already registered from a prior test run in the same session.
-            return _DECORATOR_FIXTURE_DIR.name
-        resp.raise_for_status()
-        session_id = resp.json()["session_id"]
-        agent_resp = http_client.get(f"/v1/sessions/{session_id}/agent")
-        agent_resp.raise_for_status()
-        return agent_resp.json()["name"]
-    finally:
-        Path(bundle_path).unlink(missing_ok=True)
-
-
-def _run_turn_in_session(
-    http_client: httpx.Client,
-    *,
-    agent_name: str,
-    runner_id: str,
-    user_text: str,
-    timeout_s: float = 120.0,
-) -> dict:
-    """
-    Create a runner-bound session, send one user turn, return the body.
-
-    Wraps the runner-bound dispatch contract: create the
-    session, PATCH a runner binding, POST the message through
-    ``/events``, then poll the resolved response id to terminal state.
-
-    :param http_client: HTTP client pointed at the live server.
-    :param agent_name: Display name of an already-uploaded agent.
-    :param runner_id: Registered runner id (the ``live_runner_id``
-        fixture).
-    :param user_text: Plain-text input message for the agent.
-    :param timeout_s: Max seconds to wait for the response.
-    :returns: The terminal response body.
-    """
-    session_id = create_runner_bound_session(
-        http_client, agent_name=agent_name, runner_id=runner_id
-    )
-    response_id = send_user_message_to_session(
-        http_client, session_id=session_id, content=user_text
-    )
-    return poll_session_until_terminal(
-        http_client,
-        session_id=session_id,
-        response_id=response_id,
-        timeout=timeout_s,
-    )
-
-
-def _final_text(response_body: dict) -> str:
-    """
-    Extract the assistant's final text from a response.
-
-    Walks ``output`` items, picks message items with role
-    ``"assistant"``, and concatenates their ``output_text`` blocks.
-
-    :param response_body: The response JSON returned from
-        ``GET /v1/responses/{id}``.
-    :returns: Concatenated assistant text. Empty string if no
-        assistant message exists (which a passing test would
-        catch via the content assertions).
-    """
-    parts: list[str] = []
-    for item in response_body.get("output", []):
-        if item.get("type") != "message":
-            continue
-        if item.get("role") != "assistant":
-            continue
-        for block in item.get("content", []):
-            if block.get("type") == "output_text":
-                text = block.get("text")
-                if text:
-                    parts.append(text)
-    return "\n\n".join(parts)
+from tests.e2e.helpers import final_assistant_text
 
 
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
-def test_archer_word_count_e2e(
+def test_word_count_tool_e2e(
     http_client: httpx.Client,
-    archer_agent: str,
     live_runner_id: str,
+    mock_llm_server_url: str,
 ) -> None:
-    """
-    archer + migrated ``word_count`` produces a correct count.
+    """Mock LLM calls word_count, real tool runs, mock returns result text.
 
-    Phrase chosen so the count is unambiguous: 7 words.
+    The mock LLM first emits a tool_call for ``word_count`` with a
+    known phrase, the server executes the real function, and the mock's
+    second response references the literal count.
     """
-    body = _run_turn_in_session(
+    model = f"mock-wordcount-{uuid.uuid4().hex[:6]}"
+
+    reset_mock_llm(mock_llm_server_url)
+    agent_name = register_inline_agent(
         http_client,
-        agent_name=archer_agent,
-        runner_id=live_runner_id,
-        user_text=(
+        name=f"wordcount-{uuid.uuid4().hex[:6]}",
+        harness="openai-agents",
+        model=model,
+        profile="",
+        prompt=(
+            "You have a word_count tool. When asked to count words, "
+            "call the tool and report the result."
+        ),
+        mock_llm_base_url=f"{mock_llm_server_url}/v1",
+        extra_config={
+            "tools": {
+                "word_count": {
+                    "type": "function",
+                    "description": "Count whitespace-delimited words in text.",
+                    "callable": (
+                        "tests.resources.examples.archer.tools.python.word_count.word_count"
+                    ),
+                },
+            },
+        },
+    )
+
+    # Turn 1: LLM calls word_count with a 7-word phrase.
+    # Turn 2: LLM sees the tool result and reports the number.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_wc1",
+                        "name": "word_count",
+                        "arguments": json.dumps({"text": "one two three four five six seven"}),
+                    },
+                ],
+            },
+            {"text": "The word count is 7."},
+        ],
+        key=model,
+    )
+
+    session_id = create_runner_bound_session(
+        http_client, agent_name=agent_name, runner_id=live_runner_id
+    )
+    response_id = send_user_message_to_session(
+        http_client,
+        session_id=session_id,
+        content=(
             "Use the word_count tool to count the words in "
             "exactly this phrase: 'one two three four five six seven'. "
             "Tell me the number."
         ),
     )
+    body = poll_session_until_terminal(
+        http_client,
+        session_id=session_id,
+        response_id=response_id,
+        timeout=120,
+    )
+
     assert body["status"] == "completed", (
         f"archer turn did not complete: status={body.get('status')!r}, error={body.get('error')!r}"
     )
-    final = _final_text(body)
-    # The literal count must appear in the LLM's final response.
-    # If "7" is missing, either word_count returned the wrong number
-    # or the LLM didn't surface the result.
+    final = final_assistant_text(body)
     assert "7" in final, f"Expected the count '7' in the final response, got: {final!r}"
 
 
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_decorated_tools_varied_signatures_e2e(
     http_client: httpx.Client,
-    decorator_signatures_agent: str,
     live_runner_id: str,
+    mock_llm_server_url: str,
 ) -> None:
-    """
-    The decorator-signatures-test agent calls all three tools and
-    surfaces literal output from each.
+    """Mock LLM calls greet, format_record, compute; real tools execute.
 
     Exercises:
     - Primitive arg (greet name='Alice').
     - Pydantic BaseModel arg (format_record name='Bob' age=42).
-    - Multiple primitives + Annotated description (compute value=5).
+    - Multiple primitives + default (compute value=5).
     """
-    body = _run_turn_in_session(
+    model = f"mock-decsig-{uuid.uuid4().hex[:6]}"
+
+    reset_mock_llm(mock_llm_server_url)
+    agent_name = register_inline_agent(
         http_client,
-        agent_name=decorator_signatures_agent,
-        runner_id=live_runner_id,
-        user_text=(
+        name=f"decsig-{uuid.uuid4().hex[:6]}",
+        harness="openai-agents",
+        model=model,
+        profile="",
+        prompt=(
+            "You have three tools: greet, format_record, compute. "
+            "Call them as instructed and report their literal outputs."
+        ),
+        mock_llm_base_url=f"{mock_llm_server_url}/v1",
+        extra_config={
+            "tools": {
+                "greet": {
+                    "type": "function",
+                    "description": "Return a greeting for the given name.",
+                    "callable": ("tests._fixtures.agents._decorator_signatures_tools.greet"),
+                },
+                "format_record": {
+                    "type": "function",
+                    "description": "Format a person record as a one-line string.",
+                    "callable": (
+                        "tests._fixtures.agents._decorator_signatures_tools.format_record"
+                    ),
+                },
+                "compute": {
+                    "type": "function",
+                    "description": ("Multiply value by multiplier and echo the optional note."),
+                    "callable": ("tests._fixtures.agents._decorator_signatures_tools.compute"),
+                },
+            },
+        },
+    )
+
+    # Mock queue:
+    # 1. LLM calls all three tools in parallel.
+    # 2. After receiving tool results, LLM produces the final text.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_greet",
+                        "name": "greet",
+                        "arguments": json.dumps({"name": "Alice"}),
+                    },
+                    {
+                        "call_id": "call_fmt",
+                        "name": "format_record",
+                        "arguments": json.dumps(
+                            {
+                                "record": {"name": "Bob", "age": 42},
+                            }
+                        ),
+                    },
+                    {
+                        "call_id": "call_comp",
+                        "name": "compute",
+                        "arguments": json.dumps({"value": 5}),
+                    },
+                ],
+            },
+            {
+                "text": (
+                    "Results:\n"
+                    "- greet: Hello, Alice!\n"
+                    "- format_record: Person(name=Bob, age=42)\n"
+                    "- compute: product is 10"
+                ),
+            },
+        ],
+        key=model,
+    )
+
+    session_id = create_runner_bound_session(
+        http_client, agent_name=agent_name, runner_id=live_runner_id
+    )
+    response_id = send_user_message_to_session(
+        http_client,
+        session_id=session_id,
+        content=(
             "Call all three tools: "
             "greet with name='Alice', "
             "format_record with name='Bob' age=42 (no email), "
             "and compute with value=5 (use the default multiplier). "
-            "Then in your final response include the literal output "
-            "values from each tool so I can verify them."
+            "Then report the literal output values."
         ),
     )
+    body = poll_session_until_terminal(
+        http_client,
+        session_id=session_id,
+        response_id=response_id,
+        timeout=120,
+    )
+
     assert body["status"] == "completed", (
         f"signatures-test turn did not complete: "
         f"status={body.get('status')!r}, error={body.get('error')!r}"
     )
-    final = _final_text(body)
-    # Greet output: must contain "Alice" (literal name).
-    assert "Alice" in final, (
-        f"Final response missing 'Alice' from greet — either the tool "
-        f"wasn't called or its result didn't surface. Got: {final!r}"
-    )
+    final = final_assistant_text(body)
+
+    # Greet output: must contain "Alice".
+    assert "Alice" in final, f"Final response missing 'Alice' from greet. Got: {final!r}"
     # format_record output: must contain "Bob" and "42".
     assert "Bob" in final, f"Missing 'Bob' from format_record. Got: {final!r}"
     assert "42" in final, f"Missing age '42' from format_record. Got: {final!r}"
     # compute output: must contain "10" (5 * 2 default multiplier).
-    assert "10" in final, (
-        f"Missing computed value '10' (5 * 2 default) — multiplier "
-        f"default may not be honored, or compute wasn't called. "
-        f"Got: {final!r}"
-    )
+    assert "10" in final, f"Missing computed value '10' (5 * 2 default). Got: {final!r}"

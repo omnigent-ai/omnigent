@@ -1,5 +1,14 @@
-import { describe, expect, it } from "vitest";
-import { detectLang, indexToLine, isBinaryPath, lineOverlapsSelection } from "./codeViewerHelpers";
+import { describe, expect, it, vi } from "vitest";
+import {
+  HTML_PREVIEW_SANDBOX,
+  detectLang,
+  getSelectionOffsets,
+  indexToLine,
+  isBinaryPath,
+  lineOverlapsSelection,
+  openHtmlArtifactInNewTab,
+  prepareHtmlPreviewDoc,
+} from "./codeViewerHelpers";
 
 // ---------------------------------------------------------------------------
 // detectLang — language matrix backing syntax highlighting
@@ -159,6 +168,115 @@ describe("indexToLine", () => {
 });
 
 // ---------------------------------------------------------------------------
+// prepareHtmlPreviewDoc — force links to open in a new tab (issue #777)
+// ---------------------------------------------------------------------------
+
+describe("prepareHtmlPreviewDoc", () => {
+  const BASE = '<base target="_blank">';
+
+  it("injects the base tag inside an existing <head>", () => {
+    const html = "<!DOCTYPE html><html><head><title>x</title></head><body>hi</body></html>";
+    const out = prepareHtmlPreviewDoc(html);
+    expect(out).toContain(`<head>${BASE}<title>x</title>`);
+    // Doctype stays first so the document keeps standards mode.
+    expect(out.indexOf("<!DOCTYPE html>")).toBe(0);
+  });
+
+  it("matches <head> with attributes", () => {
+    const out = prepareHtmlPreviewDoc('<head lang="en"><meta></head>');
+    expect(out).toContain(`<head lang="en">${BASE}<meta>`);
+  });
+
+  it("creates a <head> after <html> when none exists", () => {
+    const out = prepareHtmlPreviewDoc("<!DOCTYPE html><html><body>hi</body></html>");
+    expect(out).toContain(`<html><head>${BASE}</head><body>`);
+    expect(out.indexOf("<!DOCTYPE html>")).toBe(0);
+  });
+
+  it("prepends the base tag for a bare fragment (no doctype to displace)", () => {
+    const out = prepareHtmlPreviewDoc('<a href="https://example.com">link</a>');
+    expect(out).toBe(`${BASE}<a href="https://example.com">link</a>`);
+  });
+
+  it("is case-insensitive on the HEAD tag", () => {
+    const out = prepareHtmlPreviewDoc("<HEAD></HEAD>");
+    expect(out).toContain(`<HEAD>${BASE}`);
+  });
+
+  it("preserves an existing <base href>; the injected target tag wins by order", () => {
+    // Browsers use the first <base> for each attribute, so injecting our
+    // `target` tag ahead of the artifact's keeps its `href` intact while still
+    // forcing links to a new tab.
+    const html = '<head><base href="https://cdn.example.com/"></head>';
+    const out = prepareHtmlPreviewDoc(html);
+    expect(out).toBe(`<head>${BASE}<base href="https://cdn.example.com/"></head>`);
+    expect(out.indexOf(BASE)).toBeLessThan(out.indexOf("<base href"));
+  });
+
+  it("injects exactly one base tag per call (no duplicates)", () => {
+    const out = prepareHtmlPreviewDoc("<head></head>");
+    expect(out.match(/<base target="_blank">/g)).toHaveLength(1);
+  });
+
+  it("is idempotent: re-preparing already-prepared content adds no second base tag", () => {
+    const once = prepareHtmlPreviewDoc("<head></head>");
+    const twice = prepareHtmlPreviewDoc(once);
+    expect(twice).toBe(once);
+    expect(twice.match(/<base target="_blank">/g)).toHaveLength(1);
+  });
+
+  it("still injects a real base when the literal base string only appears in content", () => {
+    // Regression: a loose `html.includes(baseTag)` idempotency check wrongly
+    // skipped injection for content that merely *mentions* the string (e.g. a
+    // comment or code sample), leaving links to navigate the preview in place
+    // instead of opening a new tab. The base must still land in <head>.
+    const html = '<html><head></head><body><!-- <base target="_blank"> --></body></html>';
+    const out = prepareHtmlPreviewDoc(html);
+    expect(out).toContain(`<head>${BASE}</head>`);
+  });
+
+  it("documents the matcher limitation: a <head> literal in earlier markup is matched textually", () => {
+    // A simple regex (not a full parser) matches the first <head> string, even
+    // inside a comment. This only mis-places the harmless base tag inside the
+    // sandboxed preview — never a security issue — so we lock in the behavior.
+    const out = prepareHtmlPreviewDoc("<!-- <head> --><html><head></head></html>");
+    expect(out).toBe(`<!-- <head>${BASE} --><html><head></head></html>`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// openHtmlArtifactInNewTab — pop-out renders in an isolated sandboxed iframe
+// ---------------------------------------------------------------------------
+
+describe("openHtmlArtifactInNewTab", () => {
+  it("renders the artifact in a sandboxed, opaque-origin iframe (never the app origin)", () => {
+    // A real (detached) document stands in for the popped tab's document.
+    const shellDoc = document.implementation.createHTMLDocument("");
+    const open = vi.fn(() => ({ document: shellDoc }) as unknown as Window);
+
+    const ok = openHtmlArtifactInNewTab("<h1>hi</h1>", "art.html", { open });
+
+    expect(ok).toBe(true);
+    // Critically: the artifact is NOT navigated to as a top-level blob:/data:
+    // page (which would inherit the app origin) — it's hosted in about:blank.
+    expect(open).toHaveBeenCalledWith("about:blank", "_blank");
+    const frame = shellDoc.querySelector("iframe");
+    expect(frame).not.toBeNull();
+    const sandbox = frame!.getAttribute("sandbox") ?? "";
+    expect(sandbox).toBe(HTML_PREVIEW_SANDBOX);
+    // Security invariant: the artifact must never share the app's origin.
+    expect(sandbox).not.toContain("allow-same-origin");
+    // Links still open in a new tab inside the pop-out (#777).
+    expect(frame!.getAttribute("srcdoc")).toContain('<base target="_blank">');
+  });
+
+  it("returns false when the popup is blocked (window.open → null)", () => {
+    const open = vi.fn(() => null);
+    expect(openHtmlArtifactInNewTab("<h1>hi</h1>", "art.html", { open })).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // lineOverlapsSelection
 // ---------------------------------------------------------------------------
 
@@ -204,5 +322,102 @@ describe("lineOverlapsSelection", () => {
     expect(lineOverlapsSelection(0, lines, 0, 8)).toBe(true);
     expect(lineOverlapsSelection(1, lines, 0, 8)).toBe(true);
     expect(lineOverlapsSelection(2, lines, 0, 8)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getSelectionOffsets — DOM Range → absolute byte offsets
+// ---------------------------------------------------------------------------
+
+describe("getSelectionOffsets", () => {
+  // Build a code container whose children carry `data-line` (1-based) and
+  // hold a single text node — mirroring the highlighted line elements
+  // CodeViewer renders. jsdom supports Range over these nodes.
+  function buildContainer(rawLines: string[]): HTMLElement {
+    const container = document.createElement("div");
+    rawLines.forEach((line, i) => {
+      const el = document.createElement("div");
+      el.dataset.line = String(i + 1);
+      el.textContent = line;
+      container.appendChild(el);
+    });
+    document.body.appendChild(container);
+    return container;
+  }
+
+  function lineTextNode(container: HTMLElement, lineIdx: number): Text {
+    return container.children[lineIdx].firstChild as Text;
+  }
+
+  it("computes absolute offsets for a single-line selection", () => {
+    // WHY: the common case — selecting chars within one line must map column
+    // offsets onto the absolute index, exercising the preRange column math.
+    const rawLines = ["hello", "world", "foo"];
+    const container = buildContainer(rawLines);
+    const range = document.createRange();
+    // Select "ell" on line 1 (cols 1..4).
+    range.setStart(lineTextNode(container, 0), 1);
+    range.setEnd(lineTextNode(container, 0), 4);
+
+    expect(getSelectionOffsets(range, container, rawLines)).toEqual({
+      start_index: 1,
+      end_index: 4,
+    });
+    container.remove();
+  });
+
+  it("sums preceding line lengths (+1 per newline) for a multi-line selection", () => {
+    // WHY: spanning lines must add each prior line's length plus its \n, so a
+    // boundary on line 2 lands past the line-1 text and its newline.
+    const rawLines = ["hello", "world", "foo"];
+    const container = buildContainer(rawLines);
+    const range = document.createRange();
+    // Start at col 2 of line 1, end at col 3 of line 2.
+    range.setStart(lineTextNode(container, 0), 2);
+    range.setEnd(lineTextNode(container, 1), 3);
+
+    // start = 2; end = ("hello".length 5 + \n 1) + 3 = 9.
+    expect(getSelectionOffsets(range, container, rawLines)).toEqual({
+      start_index: 2,
+      end_index: 9,
+    });
+    container.remove();
+  });
+
+  it("returns null when a boundary is outside any data-line element", () => {
+    // WHY: a selection that escaped the code container (e.g. into the gutter)
+    // can't be resolved to a line, so the helper must bail rather than emit a
+    // bogus offset.
+    const rawLines = ["hello"];
+    const container = buildContainer(rawLines);
+    const stray = document.createElement("span");
+    stray.textContent = "outside";
+    document.body.appendChild(stray);
+
+    const range = document.createRange();
+    range.setStart(stray.firstChild as Text, 0);
+    range.setEnd(stray.firstChild as Text, 3);
+
+    expect(getSelectionOffsets(range, container, rawLines)).toBeNull();
+    container.remove();
+    stray.remove();
+  });
+
+  it("returns null when a line element has a zero/missing line number", () => {
+    // WHY: data-line="0" parses to a falsy line number; the guard rejects it
+    // rather than computing against a non-existent line 0.
+    const container = document.createElement("div");
+    const el = document.createElement("div");
+    el.dataset.line = "0";
+    el.textContent = "abc";
+    container.appendChild(el);
+    document.body.appendChild(container);
+
+    const range = document.createRange();
+    range.setStart(el.firstChild as Text, 0);
+    range.setEnd(el.firstChild as Text, 2);
+
+    expect(getSelectionOffsets(range, container, ["abc"])).toBeNull();
+    container.remove();
   });
 });

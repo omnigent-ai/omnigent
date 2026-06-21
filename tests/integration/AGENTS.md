@@ -47,12 +47,26 @@ its own session-scoped live server, same as `tests/e2e/`).
 
 ## Authoring rules
 
-- Keep every test under the CI per-test `--timeout=180` cap PER
-  ATTEMPT (turn polls are capped at 50s for this reason). Do not add
-  blanket `llm_flaky`/`flaky` markers; the one sanctioned exception is
-  the conftest's codex-only rerun (bursty empty-turn flake, #544/#599
-  class), which is safe because attempts stay under the cap.
+- Keep every test under the CI per-test `--timeout=180` cap (turn
+  polls are capped at 50s for this reason). Do not add `llm_flaky`
+  or `flaky` markers.
 - Prompts must be imperative and assertions must check literal
   markers (`uuid` hex), never just "some text came back".
 - New harness? Add a nightly.yml matrix leg and extend
   `_SUPPORTED_HARNESSES` in `conftest.py`.
+
+## Mock-LLM mode
+
+All tests run against the always-on mock LLM server (no real gateway
+credentials required). The `--integration` gate is lifted when no
+`--llm-api-key` is passed (`conftest.py::pytest_collection_modifyitems`).
+
+One rule to keep queues clean:
+
+- **Central queue reset** — `conftest.py` has an autouse,
+  function-scoped `_reset_mock_llm_between_tests` fixture that clears the
+  shared (session-scoped) mock server queues before and after every
+  test. The mock server falls back to a default response when a queue is
+  exhausted or keyed for another agent, so without this reset a scripted
+  test leaks responses into its siblings. Do NOT add a per-file reset
+  fixture — the central one covers the whole directory.

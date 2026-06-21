@@ -1,6 +1,40 @@
 import { describe, expect, it } from "vitest";
+import type { CodexModelOption } from "@/lib/types";
 
-import { effortLevelsForConv, shouldShowEffortPicker, shouldShowModelPicker } from "./ChatPage";
+import {
+  effortLevelsForConv,
+  shouldShowCodexPlanModeControl,
+  shouldShowEffortPicker,
+  shouldShowModelPicker,
+} from "./ChatPage";
+
+const CODEX_MODEL_OPTIONS: CodexModelOption[] = [
+  {
+    id: "gpt-5.5",
+    model: "databricks-gpt-5-5",
+    displayName: "GPT-5.5",
+    defaultReasoningEffort: "high",
+    supportedReasoningEfforts: [
+      { reasoningEffort: "low", description: "Low" },
+      { reasoningEffort: "medium", description: "Medium" },
+      { reasoningEffort: "high", description: "High" },
+      { reasoningEffort: "xhigh", description: "Extra high" },
+    ],
+    isDefault: true,
+  },
+  {
+    id: "gpt-5.4-mini",
+    model: "databricks-gpt-5-4-mini",
+    displayName: "GPT-5.4 mini",
+    defaultReasoningEffort: "medium",
+    supportedReasoningEfforts: [
+      { reasoningEffort: "minimal", description: "Minimal" },
+      { reasoningEffort: "low", description: "Low" },
+      { reasoningEffort: "medium", description: "Medium" },
+    ],
+    isDefault: false,
+  },
+];
 
 describe("effortLevelsForConv", () => {
   it("returns the Claude-native effort set for claude-native conversations", () => {
@@ -9,11 +43,25 @@ describe("effortLevelsForConv", () => {
   });
 
   it("returns the default 3-level set for non-claude-native conversations", () => {
-    // Non-CN harnesses (claude-sdk, codex, openai-agents, ...) keep the
+    // Non-native harnesses (claude-sdk, codex, openai-agents, ...) keep the
     // existing low/medium/high options — we only changed CN, not the
     // shared default.
     const conv = { labels: {} };
     expect(effortLevelsForConv(conv)).toEqual(["low", "medium", "high"]);
+  });
+
+  it("returns Codex-native efforts from the selected Codex model option", () => {
+    const conv = { labels: { "omnigent.wrapper": "codex-native-ui" } };
+    expect(effortLevelsForConv(conv, CODEX_MODEL_OPTIONS, "gpt-5.4-mini")).toEqual([
+      "minimal",
+      "low",
+      "medium",
+    ]);
+  });
+
+  it("returns an empty Codex-native effort set until Codex options load", () => {
+    const conv = { labels: { "omnigent.wrapper": "codex-native-ui" } };
+    expect(effortLevelsForConv(conv, [], null)).toEqual([]);
   });
 
   it("returns the default set when conv is null or labels are missing", () => {
@@ -31,6 +79,11 @@ describe("effortLevelsForConv", () => {
 describe("shouldShowModelPicker", () => {
   it("returns true for claude-code-native-ui wrapper", () => {
     const conv = { labels: { "omnigent.wrapper": "claude-code-native-ui" } };
+    expect(shouldShowModelPicker(conv)).toBe(true);
+  });
+
+  it("returns true for codex-native-ui wrapper", () => {
+    const conv = { labels: { "omnigent.wrapper": "codex-native-ui" } };
     expect(shouldShowModelPicker(conv)).toBe(true);
   });
 
@@ -67,10 +120,11 @@ describe("shouldShowEffortPicker", () => {
     ).toBe(true);
   });
 
-  it("returns false for codex-native wrapper sessions", () => {
-    // Codex-native has no standalone `/effort` command.
+  it("returns true for codex-native wrapper sessions", () => {
+    // Codex-native uses Codex app-server `thread/settings/update`, not a
+    // terminal slash command, but the UI control is now meaningful.
     expect(shouldShowEffortPicker({ labels: { "omnigent.wrapper": "codex-native-ui" } })).toBe(
-      false,
+      true,
     );
     expect(
       shouldShowEffortPicker({
@@ -79,7 +133,7 @@ describe("shouldShowEffortPicker", () => {
           "omnigent.wrapper": "codex-native-ui",
         },
       }),
-    ).toBe(false);
+    ).toBe(true);
   });
 
   it("returns false for custom agents and missing labels", () => {
@@ -92,5 +146,20 @@ describe("shouldShowEffortPicker", () => {
   it("returns false for unrelated wrapper values", () => {
     const conv = { labels: { "omnigent.wrapper": "nessie" } };
     expect(shouldShowEffortPicker(conv)).toBe(false);
+  });
+});
+
+describe("shouldShowCodexPlanModeControl", () => {
+  it("returns true only for codex-native wrapper sessions", () => {
+    expect(
+      shouldShowCodexPlanModeControl({ labels: { "omnigent.wrapper": "codex-native-ui" } }),
+    ).toBe(true);
+    expect(
+      shouldShowCodexPlanModeControl({
+        labels: { "omnigent.wrapper": "claude-code-native-ui" },
+      }),
+    ).toBe(false);
+    expect(shouldShowCodexPlanModeControl({ labels: { "omnigent.ui": "terminal" } })).toBe(false);
+    expect(shouldShowCodexPlanModeControl(null)).toBe(false);
   });
 });

@@ -21,6 +21,9 @@ vi.mock("@/lib/browserNotifications", () => ({
 vi.mock("@/lib/nativeBridge", () => ({
   isNativeShell: vi.fn(),
   setBadgeCount: vi.fn().mockResolvedValue(undefined),
+  // Returns an unsubscribe fn; tests that exercise native click routing
+  // capture the registered callback via this mock's calls.
+  onNativeNotificationActivated: vi.fn().mockReturnValue(() => {}),
 }));
 
 // The turn-end notification body is enriched by an async fetch of the agent's
@@ -38,7 +41,7 @@ import {
   requestNotificationPermission,
   showNotification,
 } from "@/lib/browserNotifications";
-import { isNativeShell, setBadgeCount } from "@/lib/nativeBridge";
+import { isNativeShell, onNativeNotificationActivated, setBadgeCount } from "@/lib/nativeBridge";
 import { fetchLastAssistantText } from "@/lib/lastAssistantText";
 import { markConversationSeen } from "@/hooks/useUnseenConversations";
 import { useIdleNotifications } from "./useIdleNotifications";
@@ -48,6 +51,7 @@ const getPermMock = vi.mocked(getNotificationPermission);
 const requestPermMock = vi.mocked(requestNotificationPermission);
 const showMock = vi.mocked(showNotification);
 const isNativeMock = vi.mocked(isNativeShell);
+const onNativeActivatedMock = vi.mocked(onNativeNotificationActivated);
 const setBadgeMock = vi.mocked(setBadgeCount);
 const fetchPreviewMock = vi.mocked(fetchLastAssistantText);
 
@@ -95,6 +99,8 @@ beforeEach(() => {
   showMock.mockReset();
   requestPermMock.mockReset();
   setBadgeMock.mockClear();
+  onNativeActivatedMock.mockClear();
+  onNativeActivatedMock.mockReturnValue(() => {});
   fetchPreviewMock.mockReset();
   fetchPreviewMock.mockResolvedValue(undefined);
   getPermMock.mockReturnValue("granted");
@@ -158,6 +164,25 @@ describe("useIdleNotifications turn-end transitions", () => {
 
     showMock.mock.calls[0][0].onClick?.();
     // Click routes to the session's chat page.
+    expect(navigateMock).toHaveBeenCalledWith("/c/a");
+    // The desktop shell can't carry the onClick closure across IPC, so the
+    // same destination is also passed as a plain path for the native path.
+    expect(showMock.mock.calls[0][0].navigatePath).toBe("/c/a");
+  });
+
+  it("routes to the conversation when the desktop shell reports a notification click", async () => {
+    isNativeMock.mockReturnValue(true);
+    setConversations([conv("a", "running")]);
+    renderHook(() => useIdleNotifications());
+
+    // The hook registers one native-activation listener; grab its callback
+    // and simulate the shell delivering a clicked notification's path.
+    expect(onNativeActivatedMock).toHaveBeenCalledOnce();
+    const activatedCb = onNativeActivatedMock.mock.calls[0][0];
+    act(() => {
+      activatedCb("/c/a");
+    });
+
     expect(navigateMock).toHaveBeenCalledWith("/c/a");
   });
 

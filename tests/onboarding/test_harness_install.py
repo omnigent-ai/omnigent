@@ -85,6 +85,10 @@ def test_unknown_key_has_no_spec_and_is_not_installed() -> None:
         ("claude-native", "claude"),
         ("codex-native", "codex"),
         ("pi", "pi"),
+        # Native Cursor wraps the cursor-agent CLI (distinct from the SDK
+        # ``cursor`` harness, which needs no binary — see the test below).
+        ("cursor-native", "cursor-agent"),
+        ("native-cursor", "cursor-agent"),
     ],
 )
 def test_required_cli_for_cli_backed_harness(harness: str, binary: str) -> None:
@@ -99,6 +103,30 @@ def test_required_cli_for_cli_backed_harness(harness: str, binary: str) -> None:
     assert spec.binary == binary
 
 
+@pytest.mark.parametrize("harness", ["cursor-native", "native-cursor"])
+def test_setup_hint_for_native_cursor_points_at_vendor_installer(harness: str) -> None:
+    """Native Cursor's "not configured" hint names the curl installer + login,
+    never ``omnigent setup`` — which only configures the SDK ``cursor`` harness
+    (``cursor-sdk`` + ``CURSOR_API_KEY``) and never installs ``cursor-agent``.
+
+    A regression to the generic hint sends a native-Cursor user down a dead end
+    (the exact bug this fixes).
+    """
+    hint = hi.harness_setup_hint(harness)
+    assert "cursor-agent" in hint
+    assert "cursor.com/install" in hint
+    assert "cursor-agent login" in hint
+    assert "omnigent setup" not in hint
+
+
+@pytest.mark.parametrize("harness", ["claude-native", "codex", "pi", "claude-sdk", None])
+def test_setup_hint_defaults_to_omnigent_setup(harness: str | None) -> None:
+    """Harnesses whose CLI ``omnigent setup`` installs (npm CLIs) — and the
+    SDK / unknown / ``None`` cases — route to the ``omnigent setup`` hint."""
+    hint = hi.harness_setup_hint(harness)
+    assert "omnigent setup" in hint
+
+
 @pytest.mark.parametrize("harness", ["cursor", "claude-sdk", "openai-agents"])
 def test_sdk_harnesses_require_no_cli(harness: str) -> None:
     """SDK-based harnesses (incl. ``cursor``, which drives the cursor-sdk Python
@@ -111,7 +139,7 @@ def test_sdk_harnesses_require_no_cli(harness: str) -> None:
 
 @pytest.mark.parametrize(
     "harness",
-    ["claude-sdk", "codex", "openai-agents-sdk", "databricks_supervisor", "unknown"],
+    ["claude-sdk", "codex", "openai-agents-sdk", "unknown"],
 )
 def test_required_cli_none_for_sdk_or_unknown_harness(harness: str) -> None:
     """SDK-based / unknown harnesses need no CLI binary → ``None``.

@@ -53,8 +53,8 @@ Include if needed:
 
 When `executor.type: omnigent`, **`config.harness` is required** and must
 be one of: `claude-native` (Claude Code, full coding tools), `claude-sdk`,
-`codex-native`, `codex`, `openai-agents`, `open-responses`, `pi`,
-`databricks_supervisor`. (`claude` is an alias for `claude-native`.)
+`codex-native`, `codex`, `openai-agents`, `open-responses`, `pi`.
+(`claude` is an alias for `claude-native`.)
 
 Model selection is optional — if omitted, the executor resolves the
 provider's default model from the configured credentials (e.g. an
