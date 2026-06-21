@@ -221,6 +221,33 @@ def _pi_native_agents_body() -> str:
     )
 
 
+def _antigravity_native_agents_body() -> str:
+    """Stub body for ``GET /v1/agents``: the native Antigravity agent.
+
+    ``name: "antigravity-native-ui"`` + ``harness: "antigravity-native"`` is what
+    the frontend maps (via ``nativeCodingAgents``) to the display label
+    **"Antigravity"** and the antigravity-native wrapper labels. The wire
+    ``display_name`` is deliberately the raw ``"antigravity-native-ui"`` to prove
+    the picker derives "Antigravity" itself (``nativeDisplayNameForAgent`` ignores
+    the wire value) rather than echoing the server. Sole agent, so it auto-selects
+    and no explicit pick is needed.
+    """
+    return json.dumps(
+        {
+            "data": [
+                {
+                    "id": "ag_antigravity_e2e",
+                    "name": "antigravity-native-ui",
+                    "display_name": "antigravity-native-ui",
+                    "description": "Google's Gemini coding agent (agy CLI)",
+                    "harness": "antigravity-native",
+                    "skills": [],
+                }
+            ]
+        }
+    )
+
+
 def _hosts_body() -> str:
     """Stub body for ``GET /v1/hosts``: one online host the composer picks."""
     return json.dumps(
@@ -607,6 +634,88 @@ async def _drive_pi_native_start(base_url: str, session_id: str) -> None:
             assert body.get("labels") == {
                 "omnigent.ui": "terminal",
                 "omnigent.wrapper": "pi-native-ui",
+            }, body
+        finally:
+            await browser.close()
+
+
+def test_start_session_antigravity_native_picker_and_wrapper_labels(
+    seeded_session: tuple[str, str],
+) -> None:
+    """Native Antigravity: the picker shows "Antigravity" and create carries terminal labels.
+
+    Covers the user-facing Antigravity native-agent flow this PR adds:
+
+    1. **Picker label/icon** — the agent chip renders the harness-derived display
+       label **"Antigravity"** (via ``nativeCodingAgents``), NOT the raw agent name
+       ``"antigravity-native-ui"`` the server sends.
+    2. **Session-creation wrapper labels** — selecting Antigravity and sending must
+       POST ``/v1/sessions`` with the terminal-first wrapper labels
+       (``omnigent.ui: terminal`` + ``omnigent.wrapper: antigravity-native-ui``)
+       that make the runner launch the agy TUI and the web UI render the
+       Chat/Terminal view.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_antigravity_native_start(base_url, session_id))
+
+
+async def _drive_antigravity_native_start(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page,
+                created_session_id=session_id,
+                create_bodies=create_bodies,
+                agents_body=_antigravity_native_agents_body(),
+            )
+
+            # Neutralize agent discovery so the picker shows ONLY the stubbed
+            # built-in Antigravity (sessions other tests left behind on the shared
+            # e2e_ui server would otherwise leak in and, ranking ahead, auto-select).
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            # Antigravity auto-selects (sole agent). The chip shows the derived
+            # label "Antigravity" — and NOT "...native...": the raw agent name
+            # would surface "antigravity-native-ui" without the harness→display map.
+            agent_chip = page.get_by_test_id("new-chat-landing-agent-select")
+            await expect(agent_chip).to_contain_text("Antigravity")
+            await expect(agent_chip).not_to_contain_text("native")
+
+            await page.get_by_test_id("new-chat-landing-input").fill("explore the repo")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["agent_id"] == "ag_antigravity_e2e", body
+            assert body["host_id"] == _HOST_ID, body
+            assert body["workspace"] == "/work/repo", body
+            # The terminal-first wrapper labels drive the runner-owned agy TUI and
+            # the web UI's Chat/Terminal view.
+            assert body.get("labels") == {
+                "omnigent.ui": "terminal",
+                "omnigent.wrapper": "antigravity-native-ui",
             }, body
         finally:
             await browser.close()
