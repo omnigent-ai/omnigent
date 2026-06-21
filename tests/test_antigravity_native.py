@@ -40,6 +40,21 @@ def _mock_client(handler: object) -> httpx.AsyncClient:
     )
 
 
+@pytest.fixture(autouse=True)
+def _stub_agy_binary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Resolve the agy binary to a fixed name so launch tests need no real install.
+
+    ``build_agy_launch`` uses ``agy_binary_path()`` as ``argv[0]`` unconditionally,
+    and that raises ``RuntimeError`` when agy is absent from ``PATH`` — which is the
+    case in CI. Patch the name at the site where ``build_agy_launch`` looks it up
+    (its own module), plus the re-export in :mod:`omnigent.antigravity_native` used
+    by the direct-CLI launch path, so no test depends on agy being installed.
+    """
+    monkeypatch.setattr("omnigent.antigravity_native_launch.agy_binary_path", lambda: "agy")
+    monkeypatch.setattr(_mod, "agy_binary_path", lambda: "agy")
+
+
 async def test_launch_terminal_body_uses_ensure_native_terminal_not_bridge_inject() -> None:
     """
     The terminal-launch POST opts in via ``ensure_native_terminal``, not ``bridge_inject_dir``.
@@ -527,7 +542,6 @@ async def test_launch_and_record_threads_headless_skip_flag(
     ``spec.args``, not just the unit-level ``should_skip_permissions``.
     """
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
-    monkeypatch.setattr(_mod, "agy_binary_path", lambda: "agy")
 
     captured_args: list[str] = []
 
