@@ -12,7 +12,7 @@ test controls exactly what each agent says.
 
 Usage::
 
-    pytest tests/e2e/test_switch_agent_e2e.py -v --timeout=60 --no-skip-known
+    pytest tests/e2e/test_switch_agent_e2e.py -v --timeout=60
 """
 
 from __future__ import annotations

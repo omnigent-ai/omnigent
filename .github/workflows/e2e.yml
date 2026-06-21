@@ -163,14 +163,11 @@ jobs:
 
       - name: Run e2e tests
         timeout-minutes: 30
-        # The `force-all-tests` PR label bypasses tests/known_failures.yaml
-        # (matches the ci.yml / nightly.yml pattern).
         env:
           # Cron fallback must match the workflow_dispatch default above.
           PARALLELISM_INPUT: ${{ github.event.inputs.parallelism || '2' }}
           SHARD_ID: ${{ matrix.shard_id }}
           NUM_SHARDS: ${{ matrix.num_shards }}
-          FORCE_ALL_TESTS: ${{ contains(github.event.pull_request.labels.*.name, 'force-all-tests') }}
           # Schedule / dispatch are the full pass; PR and push skip @nightly.
           NIGHTLY_FULL: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
           # Stable per-shard prefix so the upload step finds the logs / junit.
@@ -190,10 +187,6 @@ jobs:
           mkdir -p "$E2E_TMP_BASE"
 
           EXTRA_ARGS=()
-          if [[ "$FORCE_ALL_TESTS" == "true" ]]; then
-            EXTRA_ARGS=(--no-skip-known)
-            echo "::notice::force-all-tests label present; bypassing tests/known_failures.yaml"
-          fi
           if [[ "$NIGHTLY_FULL" != "true" ]]; then
             EXTRA_ARGS+=(-m "not nightly")
           fi

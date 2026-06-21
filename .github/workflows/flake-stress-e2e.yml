@@ -24,7 +24,7 @@ name: Flake stress (E2E)
 #     -f test_target=tests/e2e/test_subagents.py
 #   gh workflow run flake-stress-e2e.yml --ref main \
 #     -f test_target='tests/e2e/test_routes.py::test_patch_session' \
-#     -f workers=1 -f attempts=30 -f extra_pytest_args=--no-skip-known
+#     -f workers=1 -f attempts=30 -f extra_pytest_args=-x
 
 on:
   workflow_dispatch:
@@ -53,7 +53,7 @@ on:
         required: false
         default: "default"
       extra_pytest_args:
-        description: "Extra pytest args appended to the command, e.g. '--no-skip-known' (default: empty)"
+        description: "Extra pytest args appended to the command, e.g. '-x' (default: empty)"
         required: false
         default: ""
 
