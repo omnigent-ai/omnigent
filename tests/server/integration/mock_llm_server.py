@@ -534,22 +534,33 @@ class QueuedResponse:
 
 
 class _ResponseQueue:
-    """Per-key FIFO queue of pre-configured responses."""
+    """Per-key FIFO queue of pre-configured responses.
+
+    An optional *fallback* response is returned when the queue is
+    exhausted.  Unlike regular entries, the fallback is NOT cleared by
+    :meth:`reset` — it persists for the lifetime of the queue instance
+    so session-level callers (e.g. a policy-classifier LLM configured
+    by ``live_server``) always receive a valid response even when
+    per-test ``reset_mock_llm`` calls clear the regular queue.
+    """
 
     def __init__(self) -> None:
         self.responses: list[QueuedResponse] = []
         self.index: int = 0
+        self.fallback: QueuedResponse | None = None
 
     def next(self) -> QueuedResponse:
-        """Consume the next response, or return a default."""
+        """Consume the next response, or return the fallback / default."""
         if self.index < len(self.responses):
             resp = self.responses[self.index]
             self.index += 1
             return resp
+        if self.fallback is not None:
+            return self.fallback
         return QueuedResponse()
 
     def reset(self) -> None:
-        """Clear the queue."""
+        """Clear the regular queue; the fallback is preserved."""
         self.responses.clear()
         self.index = 0
 
@@ -596,6 +607,11 @@ class MockState:
     def reset(self) -> None:
         """Clear all state (queues, captured requests, gates).
 
+        Queues that have a fallback response set (via ``POST /mock/set_fallback``)
+        are not deleted — their regular responses are cleared but the fallback
+        is preserved so session-level callers (e.g. the policy-classifier LLM)
+        continue to receive a valid response after per-test resets.
+
         Atomically swaps the pending-gates list before releasing
         so a handler that appends between the loop and the clear
         doesn't lose its gate.
@@ -604,7 +620,13 @@ class MockState:
         self.pending_gates = []
         for qr in old_gates:
             qr._gate.set()
-        self.queues.clear()
+        # Preserve queues that have a non-resettable fallback; delete others.
+        for key in list(self.queues):
+            queue = self.queues[key]
+            if queue.fallback is not None:
+                queue.reset()  # clear responses/index, keep fallback
+            else:
+                del self.queues[key]
         self.captured_requests.clear()
         self.request_count = 0
 
@@ -768,6 +790,29 @@ async def create_chat_completion(
         await qr._gate.wait()
 
     text = qr.text if not qr.tool_calls else ""
+    # Render queued tool_calls in Chat Completions format (harnesses on the
+    # openai-completions wire — e.g. pi's gateway models.json — POST here, not
+    # /v1/responses). Without this, a tool_call response collapsed to empty
+    # content and the tool round-trip silently produced nothing.
+    cc_tool_calls = (
+        [
+            {
+                "id": tc.get("call_id", "call-mock"),
+                "type": "function",
+                "function": {
+                    "name": tc.get("name", ""),
+                    "arguments": tc.get("arguments", "{}"),
+                },
+            }
+            for tc in qr.tool_calls
+        ]
+        if qr.tool_calls
+        else None
+    )
+    finish_reason = "tool_calls" if cc_tool_calls else "stop"
+    cc_message: dict[str, object] = {"role": "assistant", "content": text or None}
+    if cc_tool_calls:
+        cc_message["tool_calls"] = cc_tool_calls
     resp_id = _response_id()
     body_json = {
         "id": f"chatcmpl-{resp_id}",
@@ -776,8 +821,8 @@ async def create_chat_completion(
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
+                "message": cc_message,
+                "finish_reason": finish_reason,
             }
         ],
         "usage": {
@@ -787,6 +832,9 @@ async def create_chat_completion(
         },
     }
     if parsed.get("stream"):
+        delta: dict[str, object] = {"role": "assistant", "content": text or None}
+        if cc_tool_calls:
+            delta["tool_calls"] = [{"index": i, **tc} for i, tc in enumerate(cc_tool_calls)]
         chunk = {
             "id": f"chatcmpl-{resp_id}",
             "object": "chat.completion.chunk",
@@ -794,8 +842,8 @@ async def create_chat_completion(
             "choices": [
                 {
                     "index": 0,
-                    "delta": {"role": "assistant", "content": text},
-                    "finish_reason": "stop",
+                    "delta": delta,
+                    "finish_reason": finish_reason,
                 }
             ],
         }
@@ -849,9 +897,35 @@ async def configure(request: Request) -> dict[str, object]:
     return {"configured": True, "key": key, "count": count}
 
 
+@app.post("/mock/set_fallback")
+async def set_fallback(request: Request) -> dict[str, object]:
+    """Set a non-resettable fallback response for a queue key.
+
+    The fallback is returned when the regular queue for *key* is
+    exhausted.  Unlike regular entries (configured via
+    ``POST /mock/configure``), the fallback survives
+    ``POST /mock/reset`` — it persists for the lifetime of the server
+    process.  Use this for session-level queues that must return a
+    valid response even when per-test resets clear the regular queue
+    (e.g. the server-level policy-classifier LLM queue).
+
+    Body: ``{"key": "<key>", "text": "<response-text>"}``
+    """
+    body = await request.json()
+    key = body.get("key", _DEFAULT_KEY)
+    text = body.get("text", "Mock LLM response")
+    async with _state._lock:
+        queue = _state.get_queue(key)
+        queue.fallback = QueuedResponse(text=text)
+    return {"fallback_set": True, "key": key}
+
+
 @app.post("/mock/reset")
 async def reset() -> dict[str, bool]:
-    """Clear all state (all keyed queues, captured requests, gates)."""
+    """Clear all regular queues, captured requests, and gates.
+
+    Fallbacks set via ``POST /mock/set_fallback`` are preserved.
+    """
     async with _state._lock:
         _state.reset()
     return {"reset": True}

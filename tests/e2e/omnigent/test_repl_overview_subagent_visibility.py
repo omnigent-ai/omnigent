@@ -20,11 +20,13 @@ harness, and user message.
 
 from __future__ import annotations
 
+import contextlib
 import subprocess
 from pathlib import Path
 from shutil import which
 from typing import Any
 
+import pexpect
 import pytest
 
 from tests.e2e._harness_probes import HARNESS_HARNESS_MODELS, HARNESS_IDS
@@ -35,7 +37,6 @@ from tests.e2e.omnigent._pexpect_harness import (
     submit_prompt,
     wait_for_ready,
 )
-from tests.e2e.omnigent._repl_test_helpers import drain_for
 from tests.e2e.omnigent._snapshot import compare_snapshot
 from tests.e2e.omnigent.conftest import configure_mock_llm
 
@@ -47,12 +48,6 @@ _SUPERVISOR_HARNESS = "openai-agents"
 _WORKER_TOOL_BY_HARNESS: dict[str, str] = {
     "claude-sdk": "claude_worker",
     "codex": "codex_worker",
-}
-
-# Per-harness substring set the rendered Executor: line might print.
-_EXECUTOR_MARKERS_BY_HARNESS: dict[str, tuple[str, ...]] = {
-    "claude-sdk": ("claude-sdk", "claudesdk"),
-    "codex": ("codex",),
 }
 
 _SUBAGENT_MESSAGE_CONTENT = "say hello"
@@ -114,7 +109,20 @@ def test_repl_overview_subagent_visibility(
 
     Uses the mock LLM server for supervisor responses. Sub-agent
     harnesses (claude-sdk, codex) still require their respective CLI
-    binaries on PATH — rows are skipped when those are absent.
+    binaries on PATH — rows fail loudly (not skip) when those are
+    absent, see :func:`_check_worker_harness_available`.
+
+    The visibility contract is narrow on purpose: the worker CLI runs
+    for real and typically fails to authenticate in the sandbox, so it
+    never reaches the mock and produces an error turn. That does not
+    matter here — the sub-agent session is registered at *dispatch*
+    time (``status: launching``) with the dispatched user message in
+    its args, so it appears in the overview regardless of whether the
+    worker's own turn succeeds. We assert only that: the sub-agent's
+    label and the dispatched user message render. (The overview does
+    not render an executor-harness line for sub-agent targets at all —
+    that is gated to the main session in ``_repl.py`` — so there is no
+    executor-harness assertion.)
 
     :param omnigent_python: Interpreter with omnigent installed.
     :param omnigent_repo_root: Working directory for the subprocess.
@@ -136,33 +144,44 @@ def test_repl_overview_subagent_visibility(
     _check_worker_harness_available(harness, omnigent_python)
     worker_tool = _WORKER_TOOL_BY_HARNESS[harness]
     worker_label_prefix = f"{worker_tool}:"
-    executor_markers = _EXECUTOR_MARKERS_BY_HARNESS[harness]
     user_prompt = (
         f"Delegate to {worker_tool}. Call sys_session_send with "
-        f"tool={worker_tool}, session=demo, and input='say hello'. "
+        f"agent={worker_tool}, title=demo, and args='say hello'. "
         f"Do not answer inline. After the worker replies, relay its "
         f"message verbatim."
     )
     yaml_path = omnigent_repo_root / "tests" / "resources" / "examples" / "coding_supervisor.yaml"
 
-    # Configure mock supervisor: tool call to sys_session_send, then text.
+    # Mock responses served FIFO from the shared ``key="default"`` queue to
+    # whichever agent makes an LLM call. In practice the worker CLI runs for
+    # real (and usually fails auth in the sandbox, never reaching the mock), so
+    # the supervisor consumes these in order: (1) the dispatch tool_call that
+    # spawns + registers the sub-agent, then (2)/(3) its follow-up text turns
+    # after the worker result (an error) auto-wakes it. The exact text is not
+    # asserted; "The worker said" is just a stable turn-complete sync marker.
     configure_mock_llm(
         mock_llm_server_url,
         [
+            # Dispatch the worker via sys_session_send (named mode: agent/title/args).
             {
                 "tool_calls": [
                     {
                         "call_id": "call_session_send",
                         "name": "sys_session_send",
                         "arguments": (
-                            f'{{"tool": "{worker_tool}", "session": "demo", "input": "say hello"}}'
+                            f'{{"agent": "{worker_tool}", "title": "demo", "args": "say hello"}}'
                         ),
                     }
                 ]
             },
+            {"text": "hello from the worker"},
+            # Final supervisor turn — its text is the turn-complete sync marker.
             {"text": "The worker said: hello"},
+            # Spares so any extra agent LLM call never 500s the mock.
+            {"text": "(spare)"},
+            {"text": "(spare)"},
         ],
-        key=_SUPERVISOR_MODEL,
+        key="default",
     )
 
     child = spawn_omnigent_run(
@@ -177,42 +196,52 @@ def test_repl_overview_subagent_visibility(
     try:
         wait_for_ready(child, timeout=_BOOT_TIMEOUT)
         submit_prompt(child, user_prompt)
-        # Wait for the tool-call line that represents the
-        # ``sys_session_send`` invocation for the worker.
-        child.expect(
-            rf"sys_session_send \({worker_tool}:",
-            timeout=_COMPLETION_TIMEOUT,
-        )
-        # Open the overview.
-        child.sendcontrol("g")
-        # Drain follow-up frames so the buffer has the sidebar + main
-        # session pane.
-        drain_for(child, _OVERVIEW_DRAIN_TIMEOUT)
-        # Tab cycles to the next target.
+        # Sync on the supervisor's FINAL reply (mock parent-summary), which
+        # renders only after the worker ran and its result auto-woke the
+        # supervisor — by then the sub-agent session is registered as an
+        # overview target. (Syncing on the tool-call line is unreliable: the
+        # "⏵ sys_session_send(" render carries ANSI between the name and "(",
+        # and a bare "sys_session_send" would match the prompt echo at t=0,
+        # before the sub-agent exists.)
+        child.expect("The worker said", timeout=_COMPLETION_TIMEOUT)
+        # Open the overview (Ctrl+O; binding moved off Ctrl+G — Warp intercepts
+        # Ctrl+G, see _repl.py "Why Ctrl+O and not Ctrl+G").
+        child.sendcontrol("o")
+        # Wait for the sidebar to paint the sub-agent target. The sidebar entry
+        # is "👾 <worker>:demo"; "<worker>:demo" matches there cleanly. (The
+        # detail header renders "Session: <worker>:demo", but the two-column
+        # overlay wraps the narrow detail column and splits "Session: <worker>:",
+        # so it never matches contiguously — sync on the sidebar label instead.)
+        child.expect(f"{worker_label_prefix}demo", timeout=_EXPECT_SUBAGENT_TIMEOUT)
+        # Select the sub-agent target so its detail pane (Session header +
+        # message stream, incl. the dispatched user message) renders; TAB
+        # cycles main -> sub-agent.
         child.send("\t")
-        # Wait for the sub-agent's label to appear in the pane header.
-        child.expect(
-            f"Session: {worker_label_prefix}",
-            timeout=_EXPECT_SUBAGENT_TIMEOUT,
-        )
-        subagent_pane_tail = drain_for(child, _OVERVIEW_DRAIN_TIMEOUT)
-        subagent_stripped = (
-            strip_ansi(child.before or "")
-            + f"Session: {worker_label_prefix}"
-            + strip_ansi(subagent_pane_tail)
-        )
+        # Accumulate the detail pane. The status-bar clock ticks ~1×/s, so
+        # a drain that bails on a 0.3s idle gap is unreliable here — force a
+        # fixed-duration read with an impossible-pattern expect.
+        with contextlib.suppress(pexpect.TIMEOUT):
+            child.expect("ZZZ_NEVER_MATCHES_DRAIN", timeout=_OVERVIEW_DRAIN_TIMEOUT)
+        subagent_stripped = f"{worker_label_prefix}demo" + strip_ansi(child.before or "")
+        # Close the overlay before teardown ('q'); leaving it open blocks the
+        # Ctrl+D / "/quit" exit handshake (see test_repl_ctrl_o_overview).
+        child.send("q")
         clean_exit(child, timeout=_EXIT_TIMEOUT)
         exit_code = child.exitstatus
     finally:
         if not child.closed:
             child.close(force=True)
 
+    # NOTE: the Ctrl+O overview does NOT render an executor-harness line for
+    # sub-agent targets — the Agent/Model/harness fields are gated to the main
+    # session (`is_main`) in _repl.py. So a "subagent_executor_harness_rendered"
+    # assertion would only ever pass for [codex] by coincidence (the substring
+    # "codex" appears in the agent name "codex_worker"), never for [claude-sdk].
+    # The test asserts only what the overview genuinely renders for a sub-agent:
+    # its label and the dispatched user message.
     observed: dict[str, Any] = {
         "exit_code": exit_code,
         "subagent_label_present": worker_label_prefix in subagent_stripped,
-        "subagent_executor_harness_rendered": any(
-            marker in subagent_stripped for marker in executor_markers
-        ),
         "subagent_user_message_rendered": _SUBAGENT_MESSAGE_CONTENT in subagent_stripped,
     }
     diffs = compare_snapshot("test_repl_overview_subagent_visibility", observed)

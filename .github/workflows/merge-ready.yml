@@ -16,10 +16,9 @@ name: Merge Ready
 #                into continuous gate updates (green AND red).
 #
 # There is no CI bypass label. To land a PR despite red required checks,
-# either quarantine the offending flaky test (tests/known_failures.yaml) or,
-# for a genuine emergency, a repo admin uses GitHub's native "merge without
-# waiting for requirements" affordance (branch protection has
-# enforce_admins=false).
+# fix or delete the offending test; for a genuine emergency, a repo admin
+# uses GitHub's native "merge without waiting for requirements" affordance
+# (branch protection has enforce_admins=false).
 
 on:
   # `labeled` only; `workflow_run` re-evaluates on CI completion (same-repo PRs

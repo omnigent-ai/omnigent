@@ -230,13 +230,13 @@ jobs:
                       'anthropic': {
                           'base_url': gw + '/anthropic',
                           'api_key_ref': 'env:LLM_API_KEY',
-                          'models': {'default': 'databricks-claude-sonnet-4-6'},
+                          'models': {'default': 'databricks-claude-opus-4-8'},
                       },
                       'openai': {
                           'base_url': host + '/ai-gateway/codex/v1',
                           'api_key_ref': 'env:LLM_API_KEY',
                           'wire_api': 'responses',
-                          'models': {'default': 'databricks-gpt-5-4-mini'},
+                          'models': {'default': 'databricks-gpt-5-5'},
                       },
                   }
               }
@@ -302,7 +302,7 @@ jobs:
 
           IMPORTANT: Your output will be posted directly as a PR comment. Output
           ONLY the final structured review — no coordination messages, no status
-          updates about dispatching sub-agents, no "waiting for results" narration.
+          updates about dispatching sub-agents, no referring to "reviewers", no "waiting for results" narration.
           Begin your response with the exact marker <!-- POLLY_REVIEW_START -->
           on its own line, then the review content. Nothing before the marker
           will be shown.

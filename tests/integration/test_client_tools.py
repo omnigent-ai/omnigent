@@ -11,8 +11,6 @@ path, ``action_required`` function_calls are published to the live
 stream only and never persisted as conversation items (see
 ``tests/e2e/test_openai_coder_client_tools.py``), so snapshot polling
 would hang waiting for an item that never appears.
-
-Runs with either a real LLM or the mock LLM server.
 """
 
 from __future__ import annotations
