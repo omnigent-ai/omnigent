@@ -4,7 +4,7 @@ export const WRAPPER_LABEL_KEY = "omnigent.wrapper";
 export const UI_MODE_LABEL_KEY = "omnigent.ui";
 export const UI_MODE_TERMINAL_VALUE = "terminal";
 
-export type NativeCodingAgentIconKind = "claude" | "codex" | "pi" | "cursor";
+export type NativeCodingAgentIconKind = "claude" | "codex" | "pi" | "cursor" | "antigravity";
 export type NativeCodingAgentCapability = "permissionMode" | "approvalMode";
 
 export interface NativeCodingAgentSpec {
@@ -57,6 +57,20 @@ export const NATIVE_CODING_AGENTS = [
     iconKind: "pi",
     sortRank: 40,
   },
+  {
+    // Antigravity's native CLI (Gemini-family). Mirrors the server's
+    // canonical `antigravity-native` harness and the `antigravity-native-ui`
+    // wrapper the runner keys off to boot the terminal. Added ALONGSIDE the
+    // upstream in-process `antigravity` SDK harness (see BRAIN_HARNESS_LABELS
+    // in agentLabels.ts) — they are distinct rows.
+    key: "antigravity",
+    agentName: "antigravity-native-ui",
+    harness: "antigravity-native",
+    wrapperLabel: "antigravity-native-ui",
+    displayName: "Antigravity",
+    iconKind: "antigravity",
+    sortRank: 40,
+  },
 ] as const satisfies readonly NativeCodingAgentSpec[];
 
 const BY_AGENT_NAME: Map<string, NativeCodingAgentSpec> = new Map(
@@ -70,11 +84,13 @@ const BY_WRAPPER: Map<string, NativeCodingAgentSpec> = new Map(
 );
 
 // Reversed harness spellings that fold to a canonical native `harness`.
-// Mirrors omnigent.harness_aliases on the server: only `native-pi` is a
-// supported reversed alias (claude/codex use the canonical form).
+// Mirrors omnigent.harness_aliases.NATIVE_HARNESSES on the server, which
+// accepts both the canonical and reversed native spellings (claude/codex
+// only use the canonical form, so they need no reversed entry here).
 const HARNESS_ALIASES: Record<string, string> = {
   "native-pi": "pi-native",
   "native-cursor": "cursor-native",
+  "native-antigravity": "antigravity-native",
 };
 
 export function nativeCodingAgentForAgentName(

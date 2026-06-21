@@ -108,6 +108,12 @@ describe("useAvailableAgents", () => {
             harness: "pi-native",
           },
           {
+            id: "ag_agy_native",
+            name: "antigravity-native-ui",
+            description: null,
+            harness: "antigravity-native",
+          },
+          {
             id: "ag_nessie",
             name: "nessie",
             description: "Multi-agent coding orchestrator.",
@@ -160,6 +166,14 @@ describe("useAvailableAgents", () => {
         display_name: "Pi",
         description: null,
         harness: "pi-native",
+        skills: [],
+      },
+      {
+        id: "ag_agy_native",
+        name: "antigravity-native-ui",
+        display_name: "Antigravity",
+        description: null,
+        harness: "antigravity-native",
         skills: [],
       },
       {
