@@ -10891,14 +10891,17 @@ async def _create_session_from_existing_agent(
                 conversation_store,
             )
             for item in body.initial_items:
-                await _forward_event_to_runner(
+                await _dispatch_session_event_to_runner(
                     conv.id,
                     conv,
                     item,
                     conversation_store,
                     runner_client,
                     agent_name=agent.name,
+                    file_store=None,
+                    artifact_store=None,
                     created_by=_attribution_user(user_id),
+                    runner_router=runner_router,
                 )
     # Re-read rather than reusing the local ``conv``: the label-only branch
     # above and ``_forward_event_to_runner`` can mutate the row after it was
