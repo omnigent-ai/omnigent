@@ -903,6 +903,20 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
     } satisfies MessageDone;
   }
 
+  if (itemType === "error") {
+    return {
+      type: "error",
+      source: String(rec.source ?? ""),
+      toolName: null,
+      error: {
+        code: String(rec.code ?? ""),
+        message: String(rec.message ?? ""),
+      },
+      itemId,
+      responseId,
+    } satisfies ErrorEvent;
+  }
+
   if (itemType === "slash_command") {
     // Coerce a missing ``output`` (server-side exclude_none) to null
     // so downstream code branches on a single shape.

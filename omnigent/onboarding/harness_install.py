@@ -52,6 +52,10 @@ PI_KEY = "pi"
 # installer rather than npm — so it carries an ``install_hint``, not a ``package``.
 CURSOR_KEY = "cursor"
 
+# Kiro authenticates against its own backend and ships as a standalone native
+# installer, not an npm package managed by ``omnigent setup``.
+KIRO_KEY = "kiro"
+
 
 @dataclass(frozen=True)
 class HarnessInstallSpec:
@@ -124,6 +128,12 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         install_hint="curl https://cursor.com/install -fsS | bash",
         login_status_key="isAuthenticated",
     ),
+    KIRO_KEY: HarnessInstallSpec(
+        "Kiro",
+        "kiro-cli",
+        package=None,
+        install_hint="curl -fsSL https://cli.kiro.dev/install | bash",
+    ),
 }
 
 
@@ -132,9 +142,10 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
 # :data:`_HARNESS_INSTALL` family key. Only the CLI-backed harnesses appear
 # here — the ones that cannot launch without a binary on ``PATH``:
 # ``claude-native`` wraps the ``claude`` CLI, ``codex-native`` the ``codex``
-# CLI, ``pi`` / ``pi-native`` the ``pi`` CLI, and ``cursor-native`` /
-# ``native-cursor`` the ``cursor-agent`` CLI (the native Cursor TUI, installed
-# via Cursor's curl installer rather than npm — see its ``install_hint``).
+# CLI, ``pi`` / ``pi-native`` the ``pi`` CLI, ``cursor-native`` /
+# ``native-cursor`` the ``cursor-agent`` CLI, and ``kiro-native`` /
+# ``native-kiro`` the ``kiro-cli`` CLI. Cursor and Kiro install out-of-band
+# rather than through npm — see their ``install_hint`` values.
 # SDK-based harnesses run in-process and are deliberately absent, so they
 # resolve to "no CLI required": ``claude-sdk``, ``codex``, ``openai-agents-sdk``,
 # and the SDK ``cursor`` harness (which drives the ``cursor-sdk`` Python package
@@ -146,6 +157,8 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "pi-native": PI_KEY,
     "cursor-native": CURSOR_KEY,
     "native-cursor": CURSOR_KEY,
+    "kiro-native": KIRO_KEY,
+    "native-kiro": KIRO_KEY,
 }
 
 

@@ -306,6 +306,7 @@ function brandChildIcon(child: ChildSessionInfo): AgentRowIcon | null {
   if (nativeAgent?.iconKind === "codex") return CodexIcon;
   if (nativeAgent?.iconKind === "pi") return PiIcon;
   if (nativeAgent?.iconKind === "cursor") return CursorIcon;
+  if (nativeAgent?.iconKind === "kiro") return CursorIcon;
   // Exact match — substring checks would false-match names like "pipeline".
   if (child.tool === PI_AGENT_NAME) return PiIcon;
   return null;
@@ -464,7 +465,7 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
         ? CodexIcon
         : nativeAgent?.iconKind === "pi"
           ? PiIcon
-          : nativeAgent?.iconKind === "cursor"
+          : nativeAgent?.iconKind === "cursor" || nativeAgent?.iconKind === "kiro"
             ? CursorIcon
             : isNessie
               ? NessieIcon

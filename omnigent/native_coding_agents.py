@@ -8,6 +8,7 @@ from omnigent._wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE,
     CODEX_NATIVE_WRAPPER_VALUE,
     CURSOR_NATIVE_WRAPPER_VALUE,
+    KIRO_NATIVE_WRAPPER_VALUE,
     PI_NATIVE_WRAPPER_VALUE,
     UI_MODE_LABEL_KEY,
     UI_MODE_TERMINAL_VALUE,
@@ -75,11 +76,21 @@ CURSOR_NATIVE_CODING_AGENT = NativeCodingAgent(
     terminal_name="cursor",
 )
 
+KIRO_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="kiro",
+    display_name="Kiro",
+    agent_name="kiro-native-ui",
+    harness="kiro-native",
+    wrapper_label=KIRO_NATIVE_WRAPPER_VALUE,
+    terminal_name="kiro",
+)
+
 NATIVE_CODING_AGENTS: tuple[NativeCodingAgent, ...] = (
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
     PI_NATIVE_CODING_AGENT,
     CURSOR_NATIVE_CODING_AGENT,
+    KIRO_NATIVE_CODING_AGENT,
 )
 
 _BY_AGENT_NAME = {agent.agent_name: agent for agent in NATIVE_CODING_AGENTS}

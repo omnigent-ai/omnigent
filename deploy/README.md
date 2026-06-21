@@ -252,7 +252,7 @@ no user credentials ever enter the sandbox.
 (`ghcr.io/omnigent-ai/omnigent-host:latest`, published by CI from the `host`
 target of [`docker/Dockerfile`](docker/Dockerfile)), so the host starts in
 seconds instead of installing Omnigent at boot. The image ships the
-coding-harness CLIs (`claude`, `codex`, `pi`), so agents on any harness run
+coding-harness CLIs (`claude`, `codex`, `pi`, `kiro-cli`), so agents on any harness run
 in the sandbox with nothing extra to install. To run sandboxes from your own
 image instead (a fork, or extra tooling baked in), build the same `host`
 target and point the config at it:

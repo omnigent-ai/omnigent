@@ -21,7 +21,7 @@ export const CLAUDE_NATIVE_DEFAULT_LABEL = "Claude Code";
 export const CODEX_NATIVE_DEFAULT_LABEL = "Codex";
 export const PI_NATIVE_DEFAULT_LABEL = "Pi";
 
-export type ConversationIconKind = "claude" | "codex" | "pi" | "cursor" | "nessie" | null;
+export type ConversationIconKind = "claude" | "codex" | "pi" | "cursor" | "kiro" | "nessie" | null;
 
 // Display label for a session with no title and no native-wrapper name —
 // shown in the sidebar row and as the browser tab title fallback.

@@ -19,6 +19,17 @@ describe("nativeCodingAgentForHarness", () => {
     expect(nativeCodingAgentForHarness("native-pi")).toBe(nativeCodingAgentForHarness("pi-native"));
   });
 
+  it("resolves Kiro and folds the reversed native-kiro alias", () => {
+    const kiro = nativeCodingAgentForHarness("kiro-native");
+    expect(kiro).toMatchObject({
+      key: "kiro",
+      displayName: "Kiro",
+      harness: "kiro-native",
+      wrapperLabel: "kiro-native-ui",
+    });
+    expect(nativeCodingAgentForHarness("native-kiro")).toBe(kiro);
+  });
+
   it("leaves unknown / non-native harnesses unresolved", () => {
     expect(nativeCodingAgentForHarness("claude-sdk")).toBeUndefined();
     expect(nativeCodingAgentForHarness(null)).toBeUndefined();

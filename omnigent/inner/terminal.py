@@ -682,6 +682,8 @@ class TerminalInstance:
         if the same key also appears in ``env``, the strip wins.
         Intentional: ``env_unset`` is a leak-prevention boundary,
         not a soft default.
+    :param inherit_env: Whether to start from ``os.environ`` before applying
+        ``env`` / ``env_unset``.
     :param sandbox_policy: Optional sandbox wrapper policy.
     :param conversation_link: Optional web UI link for the owning
         conversation, e.g. ``"/c/conv_abc123"``.
@@ -703,6 +705,7 @@ class TerminalInstance:
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     env_unset: list[str] = field(default_factory=list)
+    inherit_env: bool = True
     sandbox_policy: SandboxPolicy | None = None
     conversation_link: str | None = None
     # Egress allow-list to enforce for this terminal. Populated
@@ -839,7 +842,7 @@ class TerminalInstance:
         # commands outside the sandbox. The host-side control plane
         # addresses the socket via ``self.socket_path`` directly and never
         # needs the env var; any inherited value is stripped below too.
-        env = dict(os.environ)
+        env = dict(os.environ) if self.inherit_env else {}
         env.pop("OMNIGENT_TMUX_SOCK", None)
         # Apply per-terminal env overrides (takes precedence over inherited env).
         env.update(self.env)
@@ -1666,6 +1669,7 @@ def create_terminal_instance(
         args=list(spec.args),
         env=dict(spec.env),
         env_unset=list(spec.env_unset),
+        inherit_env=spec.inherit_env,
         sandbox_policy=sandbox,
         conversation_link=conversation_link,
         egress_rules=egress_rules,

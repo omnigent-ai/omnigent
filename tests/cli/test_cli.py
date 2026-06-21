@@ -20,6 +20,7 @@ from click import ClickException
 from click.testing import CliRunner, Result
 
 from omnigent.cli import (
+    _CLICK_SUBCOMMANDS,
     _GLOBAL_CONFIG_KEYS,
     _adopt_ambient_credentials,
     _announce_auto_configured_credentials,
@@ -189,6 +190,17 @@ def _fake_run_codex_native_capture(
         :param kwargs: Whatever ``omnigent.codex_native.run_codex_native``
             is called with.
         """
+        captured.update(kwargs)
+
+    return _stub
+
+
+def _fake_run_kiro_native_capture(
+    captured: dict[str, object],
+) -> Callable[..., None]:
+    """Build a ``run_kiro_native`` stub that records its kwargs."""
+
+    def _stub(**kwargs: object) -> None:
         captured.update(kwargs)
 
     return _stub
@@ -516,6 +528,109 @@ def test_codex_command_session_and_resume_mutually_exclusive(
 
     assert result.exit_code != 0
     assert "mutually exclusive" in result.output
+
+
+def test_kiro_command_is_registered_in_click_help() -> None:
+    """``omnigent kiro`` is a true top-level Click command."""
+    result = CliRunner().invoke(cli, ["--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "kiro" in _CLICK_SUBCOMMANDS
+    assert "kiro" in result.output
+
+
+def test_kiro_command_parses_native_options_and_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``omnigent kiro`` routes mapped options to the native Kiro runner."""
+    captured: dict[str, object] = {}
+    monkeypatch.setattr("omnigent.cli._load_effective_config", lambda: {"server": "https://cfg"})
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda server: server)
+    monkeypatch.setattr(
+        "omnigent.kiro_native.run_kiro_native",
+        _fake_run_kiro_native_capture(captured),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "kiro",
+            "--model",
+            "auto",
+            "--effort",
+            "high",
+            "--agent",
+            "dev",
+            "--trust-tools",
+            "Read",
+            "--trust-all-tools",
+            "-p",
+            "hi",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["server"] == "https://cfg"
+    assert captured["session_id"] is None
+    assert captured["resume_picker"] is False
+    assert captured["model"] == "auto"
+    assert captured["prompt"] == "hi"
+    assert captured["kiro_args"] == (
+        "--effort",
+        "high",
+        "--agent",
+        "dev",
+        "--trust-tools",
+        "Read",
+        "--trust-all-tools",
+    )
+
+
+def test_kiro_command_bare_resume_requests_picker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``omnigent kiro --resume`` requests the Kiro-native picker."""
+    captured: dict[str, object] = {}
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda *_: "http://localhost:0")
+    monkeypatch.setattr(
+        "omnigent.kiro_native.run_kiro_native",
+        _fake_run_kiro_native_capture(captured),
+    )
+
+    result = CliRunner().invoke(cli, ["kiro", "--resume"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["session_id"] is None
+    assert captured["resume_picker"] is True
+
+
+def test_kiro_command_session_and_resume_mutually_exclusive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Invalid Kiro resume inputs fail before backend side effects."""
+    monkeypatch.setattr(
+        "omnigent.cli._ensure_backend",
+        lambda *_: pytest.fail("invalid args must not start the backend"),
+    )
+
+    result = CliRunner().invoke(cli, ["kiro", "--session", "conv_a", "--resume", "conv_b"])
+
+    assert result.exit_code != 0
+    assert "mutually exclusive" in result.output
+
+
+def test_kiro_command_rejects_kiro_resume_passthrough_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kiro-owned resume flags are reserved for internal cold-resume mapping."""
+    monkeypatch.setattr(
+        "omnigent.cli._ensure_backend",
+        lambda *_: pytest.fail("invalid args must not start the backend"),
+    )
+
+    result = CliRunner().invoke(cli, ["kiro", "--", "--resume-id", "kiro-session"])
+
+    assert result.exit_code != 0
+    assert "Kiro resume flags are reserved" in result.output
 
 
 # ── bundled-agent shorthands (omnigent polly / omnigent debby) ──────────

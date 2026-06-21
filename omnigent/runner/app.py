@@ -57,6 +57,7 @@ from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
     CURSOR_NATIVE_TERMINAL_ROLE,
+    KIRO_NATIVE_TERMINAL_ROLE,
     OMNIGENT_REPL_TERMINAL_ROLE,
     PI_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
@@ -438,6 +439,15 @@ class _PiNativeLaunchConfig:
     external_session_id: str | None
 
 
+@dataclasses.dataclass(frozen=True)
+class _KiroNativeLaunchConfig:
+    """Persisted launch config needed for runner-owned Kiro terminal setup."""
+
+    workspace: Path
+    terminal_launch_args: list[str] | None
+    external_session_id: str | None
+
+
 def _required_runner_env(name: str) -> str:
     """
     Return a required runner environment variable.
@@ -496,6 +506,68 @@ def _pi_session_workspace(session_workspace: str | None) -> Path:
     """
     raw = session_workspace or _required_runner_env("OMNIGENT_RUNNER_WORKSPACE")
     return Path(raw.strip()).expanduser().resolve()
+
+
+def _kiro_session_workspace(session_workspace: str | None) -> Path:
+    """Resolve the cwd for a runner-owned Kiro terminal."""
+    raw = session_workspace or _required_runner_env("OMNIGENT_RUNNER_WORKSPACE")
+    return Path(raw.strip()).expanduser().resolve()
+
+
+async def _kiro_native_launch_config(
+    *,
+    session_id: str,
+    server_client: httpx.AsyncClient | None,
+) -> _KiroNativeLaunchConfig:
+    """Fetch and validate persisted Kiro launch config for a session."""
+    if server_client is None:
+        raise RuntimeError("server_client is required for runner-owned Kiro terminals.")
+    try:
+        resp = await server_client.get(
+            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+            timeout=10.0,
+        )
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"Could not fetch Kiro launch config for {session_id!r}.") from exc
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"Could not fetch Kiro launch config for {session_id!r}: "
+            f"GET /v1/sessions returned {resp.status_code}."
+        )
+    try:
+        snapshot = resp.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Could not fetch Kiro launch config for {session_id!r}: invalid JSON."
+        ) from exc
+    if not isinstance(snapshot, dict):
+        raise RuntimeError(
+            f"Could not fetch Kiro launch config for {session_id!r}: "
+            "snapshot was not a JSON object."
+        )
+    terminal_launch_args = snapshot.get("terminal_launch_args")
+    if terminal_launch_args is not None and not (
+        isinstance(terminal_launch_args, list)
+        and all(isinstance(arg, str) for arg in terminal_launch_args)
+    ):
+        raise RuntimeError(f"Invalid terminal_launch_args for Kiro session {session_id!r}.")
+    session_workspace = snapshot.get("workspace")
+    if session_workspace is not None and (
+        not isinstance(session_workspace, str) or not session_workspace
+    ):
+        raise RuntimeError(f"Invalid workspace for Kiro session {session_id!r}.")
+    external_session_id = snapshot.get("external_session_id")
+    if external_session_id is not None and (
+        not isinstance(external_session_id, str) or not external_session_id.strip()
+    ):
+        raise RuntimeError(f"Invalid external_session_id for Kiro session {session_id!r}.")
+    return _KiroNativeLaunchConfig(
+        workspace=_kiro_session_workspace(session_workspace),
+        terminal_launch_args=terminal_launch_args,
+        external_session_id=external_session_id.strip()
+        if isinstance(external_session_id, str)
+        else None,
+    )
 
 
 async def _pi_native_launch_config(
@@ -993,6 +1065,102 @@ async def _auto_create_cursor_terminal(
     _register_auto_forwarder_task(session_id, _forwarder_task)
     _logger.info(
         "Auto-created cursor terminal + forwarder for session %s; forwarder_task=%s",
+        session_id,
+        _forwarder_task.get_name(),
+    )
+    return terminal_view
+
+
+async def _auto_create_kiro_terminal(
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+    publish_event: Callable[[str, dict[str, Any]], None],
+    *,
+    server_client: httpx.AsyncClient | None,
+) -> SessionResourceView:
+    """Auto-create the Kiro TUI terminal for a kiro-native session."""
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+    from omnigent.kiro_native import build_kiro_launch
+    from omnigent.kiro_native_bridge import (
+        KIRO_NATIVE_ENV_UNSET,
+        build_kiro_native_terminal_env,
+        prepare_bridge_dir,
+    )
+
+    launch_config = await _kiro_native_launch_config(
+        session_id=session_id,
+        server_client=server_client,
+    )
+    workspace_path = launch_config.workspace
+    if not workspace_path.exists():
+        raise RuntimeError(f"Kiro workspace does not exist for session {session_id!r}.")
+    workspace = str(workspace_path)
+    bridge_dir = prepare_bridge_dir(session_id)
+    kiro_launch = build_kiro_launch(
+        launch_config.terminal_launch_args or [],
+        resume_id=launch_config.external_session_id,
+    )
+    launch_epoch_ms = int(time.time() * 1000)
+    terminal_view = await resource_registry.launch_required_terminal(
+        session_id=session_id,
+        terminal_name="kiro",
+        session_key="main",
+        resource_role=KIRO_NATIVE_TERMINAL_ROLE,
+        spec=TerminalEnvSpec(
+            os_env=OSEnvSpec(type="caller_process", cwd=workspace),
+            command=kiro_launch.executable,
+            args=kiro_launch.argv[1:],
+            env=build_kiro_native_terminal_env(session_id),
+            env_unset=list(KIRO_NATIVE_ENV_UNSET),
+            inherit_env=False,
+            scrollback=100_000,
+            tmux_allow_passthrough=True,
+            tmux_start_on_attach=False,
+        ),
+    )
+    terminal_registry = resource_registry.terminal_registry
+    if terminal_registry is not None:
+        instance = terminal_registry.get(session_id, "kiro", "main")
+        if instance is not None and instance.running:
+            from omnigent.kiro_native_bridge import write_tmux_target
+
+            write_tmux_target(
+                bridge_dir,
+                socket_path=instance.socket_path,
+                tmux_target=instance.tmux_target,
+                requires_forwarder_ready=launch_config.external_session_id is not None,
+            )
+    publish_event(
+        session_id,
+        {
+            "type": "session.resource.created",
+            "resource": session_resource_view_to_dict(terminal_view),
+        },
+    )
+    from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
+
+    server_url = _required_runner_env("RUNNER_SERVER_URL")
+    _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
+
+    from omnigent.kiro_native_session_forwarder import supervise_kiro_session_forwarder
+
+    _forwarder_task = asyncio.create_task(
+        supervise_kiro_session_forwarder(
+            base_url=server_url,
+            headers={},
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            agent_name="kiro-native-ui",
+            workspace=workspace,
+            launch_epoch_ms=launch_epoch_ms,
+            expected_session_id=launch_config.external_session_id,
+            auth=_runner_auth,
+        ),
+        name=f"kiro-session-forwarder-{session_id}",
+    )
+    _register_auto_forwarder_task(session_id, _forwarder_task)
+    _logger.info(
+        "Auto-created kiro terminal + session forwarder for session %s; forwarder_task=%s",
         session_id,
         _forwarder_task.get_name(),
     )
@@ -4529,6 +4697,7 @@ def create_runner_app(
     _codex_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _pi_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _cursor_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    _kiro_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     # Per-session lock guarding the claude-native terminal auto-create in
     # ``create_session``. Two ``POST /v1/sessions`` calls can land
     # concurrently on a host-launched runner — ``_on_runner_connect``
@@ -5385,6 +5554,10 @@ def create_runner_app(
                 from omnigent.cursor_native_bridge import build_cursor_native_spawn_env
 
                 spawn_env = build_cursor_native_spawn_env(session_id)
+            if harness_name == "kiro-native" and spawn_env is None:
+                from omnigent.kiro_native_bridge import build_kiro_native_spawn_env
+
+                spawn_env = build_kiro_native_spawn_env(session_id)
             _session_spec_cache[session_id] = spec_entry
             from omnigent.llms.context_window import get_model_context_window
             from omnigent.runtime.workflow import _resolve_spec_model
@@ -5732,6 +5905,36 @@ def create_runner_app(
                     finally:
                         _publish_terminal_pending(_publish_event, session_id, False)
 
+        if harness_name == "kiro-native":
+            _kiro_ensure_lock = _kiro_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
+            async with _kiro_ensure_lock:
+                _tr = resource_registry.terminal_registry
+                _has_kiro_terminal = (
+                    _tr is not None and _tr.get(session_id, "kiro", "main") is not None
+                )
+                if not _has_kiro_terminal:
+                    _publish_terminal_pending(_publish_event, session_id, True)
+                    try:
+                        await _auto_create_kiro_terminal(
+                            session_id,
+                            resource_registry,
+                            _publish_event,
+                            server_client=server_client,
+                        )
+                    except Exception as exc:
+                        _logger.exception(
+                            "Failed to auto-create kiro terminal for %s",
+                            session_id,
+                        )
+                        _publish_native_terminal_start_error(
+                            _publish_event,
+                            session_id,
+                            "Kiro",
+                            exc,
+                        )
+                    finally:
+                        _publish_terminal_pending(_publish_event, session_id, False)
+
         # Auto-bootstrap the Omnigent REPL terminal for non-native
         # (SDK-harness) top-level sessions: host the framework's own TUI
         # (``omnigent attach``) in a tmux pane so the web UI can embed it
@@ -5999,6 +6202,7 @@ def create_runner_app(
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
         _cursor_terminal_ensure_locks.pop(session_id, None)
+        _kiro_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
 
@@ -6726,7 +6930,12 @@ def create_runner_app(
         # source — fall through and publish. Suppress only once we positively
         # know the harness/edge is terminal-owned.
         harness = _session_harness_name(conv_id)
-        if status != "failed" and harness in {"claude-native", "pi-native", "cursor-native"}:
+        if status != "failed" and harness in {
+            "claude-native",
+            "pi-native",
+            "cursor-native",
+            "kiro-native",
+        }:
             return
         if status == "idle" and harness == "codex-native":
             return
@@ -9440,6 +9649,10 @@ def create_runner_app(
             from omnigent.cursor_native_bridge import build_cursor_native_spawn_env
 
             spawn_env = build_cursor_native_spawn_env(conv_id)
+        if harness_name == "kiro-native" and spawn_env is None:
+            from omnigent.kiro_native_bridge import build_kiro_native_spawn_env
+
+            spawn_env = build_kiro_native_spawn_env(conv_id)
 
         agent_version = dispatch.agent_version if dispatch else body.get("agent_version")
         if agent_version is not None and conv_id in _version_cache:
@@ -10363,6 +10576,7 @@ def create_runner_app(
             # native terminal forwarders, so AP-forwarded output is the only
             # authoritative transcript source.
             if status in ("running", "waiting", "idle", "failed"):
+                resource_registry.note_external_session_status(conversation_id, status)
                 _fan_out_child_delta_to_parent(
                     conversation_id,
                     {"type": "session.status", "status": status},
@@ -11032,6 +11246,40 @@ def create_runner_app(
                         session_id,
                     )
                     return _native_terminal_start_error_response(exc, "Cursor")
+            return JSONResponse(
+                status_code=200,
+                content=session_resource_view_to_dict(terminal_view),
+            )
+
+        if (
+            body.get("ensure_native_terminal")
+            and terminal_name == "kiro"
+            and session_key == "main"
+        ):
+            kiro_terminal_id = terminal_resource_id("kiro", "main")
+            ensure_lock = _kiro_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
+            async with ensure_lock:
+                existing = await resource_registry.get_terminal_resource(
+                    session_id, kiro_terminal_id
+                )
+                if existing is not None:
+                    return JSONResponse(
+                        status_code=200,
+                        content=session_resource_view_to_dict(existing),
+                    )
+                try:
+                    terminal_view = await _auto_create_kiro_terminal(
+                        session_id,
+                        resource_registry,
+                        _publish_event,
+                        server_client=server_client,
+                    )
+                except Exception as exc:
+                    _logger.exception(
+                        "Kiro terminal ensure failed for session=%s",
+                        session_id,
+                    )
+                    return _native_terminal_start_error_response(exc, "Kiro")
             return JSONResponse(
                 status_code=200,
                 content=session_resource_view_to_dict(terminal_view),
@@ -12512,6 +12760,7 @@ def create_runner_app(
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
         _cursor_terminal_ensure_locks.pop(session_id, None)
+        _kiro_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         await resource_registry.cleanup_session(session_id)
         return JSONResponse(
@@ -12565,6 +12814,7 @@ def create_runner_app(
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
         _cursor_terminal_ensure_locks.pop(session_id, None)
+        _kiro_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         # Close terminals with ``session.resource.deleted`` events BEFORE
         # cleanup_session — cleanup_conversation would silently pop them

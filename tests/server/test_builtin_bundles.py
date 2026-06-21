@@ -24,6 +24,7 @@ from omnigent.server import app
 _BUILDERS = [
     ("_build_claude_native_bundle", "claude-native-ui.yaml", False),
     ("_build_codex_native_bundle", "codex-native-ui.yaml", False),
+    ("_build_kiro_native_bundle", "kiro-native-ui.yaml", False),
     ("_build_debby_bundle", "config.yaml", True),
     ("_build_polly_bundle", "config.yaml", True),
 ]

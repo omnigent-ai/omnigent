@@ -4371,13 +4371,20 @@ async def _persist_external_conversation_item(
     # The transcript is text-only, so without this the image is dropped
     # from durable history and disappears on every reload / navigation.
     cleared_pending_id: str | None = None
+    skipped_kiro_pending: list[pending_inputs.DrainedInput] = []
     if (
         item.type == "message"
         and isinstance(item.data, MessageData)
         and item.data.role == "user"
         and not item.data.is_meta
     ):
-        drained = pending_inputs.resolve_oldest(session_id)
+        if _is_kiro_native_session(conv):
+            text = _message_text(item.data.content) or ""
+            matched = pending_inputs.resolve_matching_text(session_id, text)
+            drained = matched.matched
+            skipped_kiro_pending = matched.skipped
+        else:
+            drained = pending_inputs.resolve_oldest(session_id)
         if drained is not None:
             cleared_pending_id = drained.pending_id
             item = _merge_pending_file_blocks(item, drained.content)
@@ -4393,6 +4400,12 @@ async def _persist_external_conversation_item(
             # No pending entry — direct terminal input. Fall back to the
             # identity authenticated on the forwarder's own request.
             item = item.model_copy(update={"created_by": created_by})
+    for skipped in skipped_kiro_pending:
+        await _persist_skipped_kiro_pending_input(
+            session_id,
+            skipped,
+            conversation_store,
+        )
     persisted_items = await asyncio.to_thread(conversation_store.append, session_id, [item])
     await _seed_missing_title_from_user_message(conv, item, conversation_store)
     persisted = persisted_items[0]
@@ -4401,6 +4414,48 @@ async def _persist_external_conversation_item(
     )
     _drive_terminal_resolved_elicitation(session_id, persisted)
     return persisted.id
+
+
+def _is_kiro_native_session(conv: Conversation) -> bool:
+    """Return whether a conversation is backed by the native Kiro terminal."""
+    return conv.labels.get("omnigent.wrapper") == "kiro-native-ui"
+
+
+async def _persist_skipped_kiro_pending_input(
+    session_id: str,
+    skipped: pending_inputs.DrainedInput,
+    conversation_store: ConversationStore,
+) -> None:
+    """Persist a Kiro web input that never appeared in Kiro's JSONL transcript."""
+    turn_id = generate_task_id()
+    user_item = NewConversationItem(
+        type="message",
+        response_id=turn_id,
+        data=MessageData(role="user", content=skipped.content),
+        created_by=skipped.created_by,
+    )
+    error = ErrorData(
+        source="execution",
+        code="kiro_native_prompt_not_recorded",
+        message=(
+            "Kiro did not accept this web message into its structured session transcript. "
+            "The native terminal may have shown the underlying error."
+        ),
+    )
+    persisted_items = await asyncio.to_thread(
+        conversation_store.append,
+        session_id,
+        [
+            user_item,
+            NewConversationItem(type="error", response_id=turn_id, data=error),
+        ],
+    )
+    _publish_input_consumed(
+        session_id,
+        persisted_items[0],
+        cleared_pending_id=skipped.pending_id,
+    )
+    _publish_external_conversation_item(session_id, persisted_items[1])
 
 
 def _merge_pending_file_blocks(
@@ -6089,8 +6144,7 @@ def _is_native_terminal_session(conv: Conversation) -> bool:
     Return whether a session is owned by a terminal-native wrapper.
 
     :param conv: Conversation row for the target session.
-    :returns: ``True`` for wrappers whose transcript forwarder is the
-        single writer for conversation history.
+    :returns: ``True`` for wrappers backed by a native terminal harness.
     """
     wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
     return native_coding_agent_for_wrapper_label(wrapper) is not None
@@ -7684,13 +7738,13 @@ async def _dispatch_session_event_to_runner(
     Callers stay harness-agnostic — the claude-native message bypass
     is encapsulated here. Two dispatch outcomes:
 
-    * **claude-native + ``type == "message"``**: web-chat user
+    * **transcript-forwarded native + ``type == "message"``**: web-chat user
       messages on these sessions must NOT be persisted by the AP
       server. The Omnigent would otherwise persist an AP-side copy AND
       let the transcript forwarder mirror the same message back
       (with its own store-assigned item id), so every web-typed
       prompt would land as two items in the chat panel. We forward
-      to the bound runner so the claude-native harness types the
+      to the bound runner so the native harness types the
       message into tmux; the transcript forwarder becomes the
       single writer for the conversation history. Returns a result
       with ``item_id=None`` (no AP-side persisted item) and a

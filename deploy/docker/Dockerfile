@@ -18,7 +18,8 @@
 # and server-launched managed hosts. It bakes the full omnigent
 # install plus the tools a host needs at runtime — git (workspaces /
 # worktrees), tmux (terminal sessions spawned by native harnesses),
-# and the coding-harness CLIs (claude / codex / pi, via Node) — and
+# and the coding-harness CLIs (claude / codex / pi, via Node; kiro-cli via
+# Kiro's installer) — and
 # skips everything server-only: no SPA bundle, no psycopg, no
 # uvicorn entrypoint. Modal's `Image.from_registry` requirements shape
 # it: built for linux/amd64, `python` + `pip` on $PATH, and CMD-only
@@ -147,9 +148,10 @@ FROM node:${NODE_VERSION}-slim AS node-runtime
 # git + tmux for harness runtime needs, bubblewrap to OS-sandbox the
 # native harness terminals (mandatory and fail-loud on Linux), curl + CA
 # certificates for outbound HTTPS and in-sandbox downloads, plus the
-# coding-harness CLIs (claude / codex / pi) so claude-sdk, claude-native,
-# codex, and pi agents can run in managed sandboxes without an in-sandbox
-# install. No SPA, no psycopg, no server entrypoint.
+# coding-harness CLIs (claude / codex / pi / kiro-cli) so claude-sdk,
+# claude-native, codex, pi, and kiro-native agents can run in managed
+# sandboxes without an in-sandbox install. No SPA, no psycopg, no server
+# entrypoint.
 #
 # Also carries two additions required only by the NVIDIA OpenShell provider
 # (deploy/openshell/README.md) and inert for the root-based providers
@@ -178,8 +180,9 @@ ENV PYTHONUNBUFFERED=1 \
     IS_SANDBOX=1
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git tmux bubblewrap curl ca-certificates \
-      iproute2 nftables \
+ && apt-get install -y --no-install-recommends \
+      git tmux bubblewrap curl ca-certificates unzip \
+       iproute2 nftables \
  && rm -rf /var/lib/apt/lists/*
 
 # OpenShell-required non-root user (see the header note). UID/GID in the high
@@ -221,6 +224,15 @@ RUN npm install -g --no-audit --no-fund \
       @openai/codex \
       @earendil-works/pi-coding-agent \
  && npm cache clean --force
+
+# Kiro CLI is not published as an npm package; use its official installer and
+# copy the resulting root-local binaries onto the global PATH for all sandbox
+# users.
+RUN curl -fsSL https://cli.kiro.dev/install | bash \
+ && install -m 0755 /root/.local/bin/kiro-cli /usr/local/bin/kiro-cli \
+ && if [ -f /root/.local/bin/kiro-cli-chat ]; then \
+      install -m 0755 /root/.local/bin/kiro-cli-chat /usr/local/bin/kiro-cli-chat; \
+    fi
 
 # Preserve /build/ — the venv's editable install .pth files reference
 # /build/omnigent and /build/sdks/* by absolute path. Copying these to

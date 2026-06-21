@@ -699,6 +699,11 @@ class TerminalEnvSpec:
         MCP servers that construct Databricks SDK clients and let
         the SDK's auth resolver pick up the parent's profile
         instead of the explicit token they were given).
+    :param inherit_env: Whether the terminal process starts from the
+        parent process environment before applying ``env`` / ``env_unset``.
+        Defaults to ``True`` for backward compatibility. Set to ``False``
+        for native CLI integrations that must receive an explicit allowlisted
+        environment instead of ambient host secrets.
     :param os_env: OS environment backing this terminal, ``"inherit"``,
         or ``None`` to use the default caller process environment.
     :param allow_cwd_override: Whether launch callers may override cwd.
@@ -719,6 +724,7 @@ class TerminalEnvSpec:
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     env_unset: list[str] = field(default_factory=list)
+    inherit_env: bool = True
     os_env: OSEnvSpec | str | None = None
     allow_cwd_override: bool = False
     allow_sandbox_override: bool = False

@@ -65,6 +65,38 @@ def test_codex_native_session_uses_codex_harness_for_web_messages() -> None:
     }
 
 
+def test_kiro_native_session_uses_kiro_harness_for_web_messages() -> None:
+    """Kiro-native web messages use the native bypass, like Codex."""
+    from omnigent.server.routes import sessions as sessions_routes
+
+    conv = _conversation_with_wrapper("kiro-native-ui")
+
+    assert sessions_routes._is_native_terminal_session(conv) is True
+    assert sessions_routes._build_native_terminal_message_event(conv, _message_event()) == {
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "hello"}],
+        "model": "kiro-native-ui",
+        "harness": "kiro-native",
+        "agent_id": "ag_native_test",
+    }
+
+
+def test_transcript_forwarded_native_sessions_use_native_bypass() -> None:
+    """Transcript-forwarded native sessions skip AP-side message persistence."""
+    from omnigent.server.routes import sessions as sessions_routes
+
+    assert sessions_routes._is_native_terminal_session(
+        _conversation_with_wrapper("claude-code-native-ui")
+    )
+    assert sessions_routes._is_native_terminal_session(
+        _conversation_with_wrapper("codex-native-ui")
+    )
+    assert sessions_routes._is_native_terminal_session(
+        _conversation_with_wrapper("kiro-native-ui")
+    )
+
+
 def test_unknown_wrapper_session_does_not_use_native_bypass() -> None:
     """
     Non-native wrapper labels must not enter the native terminal

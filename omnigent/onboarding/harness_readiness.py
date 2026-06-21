@@ -27,7 +27,12 @@ from __future__ import annotations
 import os
 
 from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
-from omnigent.onboarding.harness_install import CURSOR_KEY, PI_KEY, harness_cli_installed
+from omnigent.onboarding.harness_install import (
+    CURSOR_KEY,
+    KIRO_KEY,
+    PI_KEY,
+    harness_cli_installed,
+)
 from omnigent.onboarding.provider_config import (
     _EXECUTOR_TYPE_HARNESS_ALIASES,
     _HARNESS_FAMILY,
@@ -57,6 +62,10 @@ _PI_HARNESSES: frozenset[str] = frozenset({PI_SURFACE, "pi-native"})
 # a ``CURSOR_API_KEY`` instead. Without these entries they'd fail open like an
 # unknown harness, letting a binary-less launch die inside the executor.
 _CURSOR_NATIVE_HARNESSES: frozenset[str] = frozenset({"cursor-native", "native-cursor"})
+
+# Native Kiro harnesses boot the standalone ``kiro-cli`` TUI. Kiro has its own
+# auth backend and no Omnigent provider family, so readiness is binary presence.
+_KIRO_NATIVE_HARNESSES: frozenset[str] = frozenset({"kiro-native", "native-kiro"})
 
 
 def _canonical_harness(harness: str) -> str:
@@ -90,7 +99,7 @@ def _install_key(canonical: str) -> str:
 def harness_is_configured(harness: str) -> bool:
     """Return whether *harness* can be launched on this machine.
 
-    Only CLI-wrapping harnesses are assessed (native Claude/Codex and
+    Only CLI-wrapping harnesses are assessed (native Claude/Codex/Kiro and
     ``pi`` / ``pi-native``): they cannot run without their binary on
     ``PATH``, and that is the one thing the daemon can check reliably and
     locally. SDK harnesses and unknown harnesses always return ``True`` —
@@ -99,8 +108,8 @@ def harness_is_configured(harness: str) -> bool:
     break working launches.
 
     :param harness: A harness id, e.g. ``"claude-native"``, ``"codex"``,
-        ``"openai-agents"``, ``"agents_sdk"``, ``"pi"``, or
-        ``"pi-native"``.
+        ``"openai-agents"``, ``"agents_sdk"``, ``"kiro-native"``,
+        ``"pi"``, or ``"pi-native"``.
     :returns: ``True`` when launchable (CLI installed, or a harness the
         daemon doesn't gate); ``False`` only when a CLI-wrapping
         harness's binary is missing from ``PATH``.
@@ -114,6 +123,8 @@ def harness_is_configured(harness: str) -> bool:
         # state surfaces at run time; the daemon gates only on binary presence,
         # mirroring the other native harnesses.)
         return harness_cli_installed(CURSOR_KEY)
+    if canonical in _KIRO_NATIVE_HARNESSES:
+        return harness_cli_installed(KIRO_KEY)
     if canonical == CURSOR_KEY:
         # Cursor runs in-process via ``cursor-sdk`` and authenticates with a
         # ``CURSOR_API_KEY`` (a ``cursor-agent login`` does not apply). So,
@@ -157,5 +168,6 @@ def configured_harness_map() -> dict[str, bool]:
     spellings.update(HARNESS_ALIASES)
     spellings.update(_PI_HARNESSES)
     spellings.update(_CURSOR_NATIVE_HARNESSES)
+    spellings.update(_KIRO_NATIVE_HARNESSES)
     spellings.add(CURSOR_KEY)
     return {spelling: harness_is_configured(spelling) for spelling in spellings}

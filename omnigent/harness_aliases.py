@@ -8,6 +8,7 @@ from __future__ import annotations
 
 HARNESS_ALIASES: dict[str, str] = {
     "claude": "claude-sdk",
+    "native-kiro": "kiro-native",
     "native-pi": "pi-native",
     # The SDK package / runtime dispatch spelling; specs use "openai-agents".
     "openai-agents-sdk": "openai-agents",
@@ -33,6 +34,8 @@ NATIVE_HARNESSES: frozenset[str] = frozenset(
         "native-pi",
         "cursor-native",
         "native-cursor",
+        "kiro-native",
+        "native-kiro",
     }
 )
 

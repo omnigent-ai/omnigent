@@ -757,7 +757,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       // shows just `[llm]` with no hint as to what went wrong).
       yield {
         type: "error",
-        ctx: ctx(state),
+        ctx: ctx(state, event.itemId ?? null, event.responseId ?? null),
         message: event.error.message,
         source: event.source,
         code: event.error.code,

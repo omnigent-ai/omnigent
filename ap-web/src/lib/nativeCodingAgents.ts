@@ -4,7 +4,7 @@ export const WRAPPER_LABEL_KEY = "omnigent.wrapper";
 export const UI_MODE_LABEL_KEY = "omnigent.ui";
 export const UI_MODE_TERMINAL_VALUE = "terminal";
 
-export type NativeCodingAgentIconKind = "claude" | "codex" | "pi" | "cursor";
+export type NativeCodingAgentIconKind = "claude" | "codex" | "pi" | "cursor" | "kiro";
 export type NativeCodingAgentCapability = "permissionMode" | "approvalMode";
 
 export interface NativeCodingAgentSpec {
@@ -57,6 +57,15 @@ export const NATIVE_CODING_AGENTS = [
     iconKind: "pi",
     sortRank: 40,
   },
+  {
+    key: "kiro",
+    agentName: "kiro-native-ui",
+    harness: "kiro-native",
+    wrapperLabel: "kiro-native-ui",
+    displayName: "Kiro",
+    iconKind: "kiro",
+    sortRank: 50,
+  },
 ] as const satisfies readonly NativeCodingAgentSpec[];
 
 const BY_AGENT_NAME: Map<string, NativeCodingAgentSpec> = new Map(
@@ -75,6 +84,7 @@ const BY_WRAPPER: Map<string, NativeCodingAgentSpec> = new Map(
 const HARNESS_ALIASES: Record<string, string> = {
   "native-pi": "pi-native",
   "native-cursor": "cursor-native",
+  "native-kiro": "kiro-native",
 };
 
 export function nativeCodingAgentForAgentName(
