@@ -7473,6 +7473,9 @@ def _configure_harness_add(family: str | None = None) -> str | None:
             # custom name is useful (e.g. two configs for the same vendor), so
             # it's the only non-gateway path that still prompts for a name.
             others = other_key_providers()
+            if not others:  # ponytail: every catalog key-provider is already a preset/configured
+                click.echo("No other API-key providers left to add.")
+                return None
             _other_choice = select(
                 "Which provider?",
                 [provider_display_name(p) for p in others],
