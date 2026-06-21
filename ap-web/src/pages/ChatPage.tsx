@@ -27,6 +27,7 @@ import {
   Loader2Icon,
   MessageSquareIcon,
   PaperclipIcon,
+  PinIcon,
   SquareIcon,
   TerminalIcon,
   WifiOffIcon,
@@ -51,7 +52,12 @@ import {
   MessageContent,
 } from "@/components/ai-elements/message";
 import { Shimmer } from "@/components/ai-elements/shimmer";
-import { BlockRenderer, FilePathAwareMessageResponse } from "@/components/blocks/BlockRenderer";
+import {
+  BlockRenderer,
+  FilePathAwareMessageResponse,
+  PinnedElicitationIdContext,
+} from "@/components/blocks/BlockRenderer";
+import { ApprovalCard } from "@/components/blocks/ApprovalCard";
 import { CompactionMarker } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { parseSystemMessage } from "@/lib/systemMessage";
@@ -378,6 +384,29 @@ function saveDraftsToStorage(drafts: Map<string, { text: string; files: File[] }
 const sessionDrafts = loadDraftsFromStorage();
 
 /**
+ * The most recent still-pending elicitation across the transcript, or null.
+ *
+ * Walks the bubbles back-to-front (latest-first) so the newest pending prompt
+ * wins — the one a new selection would resolve. Used to pin the actionable
+ * choice card just above the composer (issue #206) instead of letting it scroll
+ * out of view mid-conversation. Pure + exported so the selection logic is
+ * unit-testable without rendering the component tree.
+ */
+export function selectPendingElicitation(
+  bubbles: Bubble[],
+): Extract<RenderItem, { kind: "elicitation" }> | null {
+  for (let i = bubbles.length - 1; i >= 0; i -= 1) {
+    const bubble = bubbles[i]!;
+    if (bubble.kind !== "assistant") continue;
+    for (let j = bubble.items.length - 1; j >= 0; j -= 1) {
+      const item = bubble.items[j]!;
+      if (item.kind === "elicitation" && item.status === "pending") return item;
+    }
+  }
+  return null;
+}
+
+/**
  * Single component that drives the chat surface. Streaming + history
  * state lives in `useChatStore` (a Zustand store at module scope), so
  * this component is reactive but not stateful — it observes the store
@@ -538,6 +567,14 @@ export function ChatPage() {
       buildPendingBubbles(pendingUserMessages, getCurrentAuthorId()),
     );
   }, [blocks, activeResponse, interruptedResponseIds, pendingUserMessages]);
+
+  // The most recent still-pending elicitation card across the transcript.
+  // While pending it is pinned just above the composer (issue #206) instead of
+  // rendering inline, so a decision prompt never scrolls up and out of view.
+  // Cleared once the user resolves it; the responded summary card then returns
+  // to its inline place in the scroll history. Walks back-to-front so the
+  // latest pending prompt wins (the one a new selection would resolve).
+  const pendingElicitation = useMemo(() => selectPendingElicitation(bubbles), [bubbles]);
 
   // Picker selection. ChatPage stays mounted across `/` to `/c/:id`,
   // so the pick survives sidebar clicks; resets on full page reload.
@@ -879,6 +916,7 @@ export function ChatPage() {
       onSend={onSend}
       onSendSlashCommand={onSendSlashCommand}
       onStop={onStop}
+      pendingElicitation={pendingElicitation}
       onShowReconnectHelp={() => {
         // Route the banner to the SAME dialog typing a message would: an
         // unbound coding clone opens the directory picker (bind + launch),
@@ -1138,6 +1176,13 @@ interface MainAgentSurfaceProps {
    * ``subAgentComposerLabel``.
    */
   subAgentLabel: string | null;
+  /**
+   * The most recent still-pending elicitation (choice/approval prompt), or
+   * ``null`` when none is pending. While non-null it is pinned just above the
+   * composer (issue #206) and its inline copy is suppressed via
+   * {@link PinnedElicitationIdContext} so only one interactive card exists.
+   */
+  pendingElicitation: Extract<RenderItem, { kind: "elicitation" }> | null;
 }
 
 /**
@@ -1202,6 +1247,7 @@ function MainAgentSurface({
   costRoutingVerdict,
   costRoutingEligible,
   subAgentLabel,
+  pendingElicitation,
 }: MainAgentSurfaceProps) {
   const terminalFirst = useTerminalFirst();
   // Mirrors ChatPage's `sandboxLaunching`: while the managed-sandbox
@@ -1330,108 +1376,117 @@ function MainAgentSurface({
 
   return (
     <>
-      {/* Wrapper div gives us a ref to scope the SelectionPopup to the
-          conversation area without requiring Conversation to forward refs. */}
-      <div ref={setConversationEl} className="relative flex min-h-0 flex-1 overflow-hidden">
-        {/* chat-scroll-fade masks the viewport's top edge so scrolling
+      <PinnedElicitationIdContext.Provider value={pendingElicitation?.elicitationId ?? null}>
+        {/* Wrapper div gives us a ref to scope the SelectionPopup to the
+            conversation area without requiring Conversation to forward refs. */}
+        <div ref={setConversationEl} className="relative flex min-h-0 flex-1 overflow-hidden">
+          {/* chat-scroll-fade masks the viewport's top edge so scrolling
             content dissolves into the canvas before reaching the
             ChatHeader overlay's controls (geometry in index.css). */}
-        <Conversation className="chat-scroll-fade flex-1">
-          {/* gap-4 overrides ConversationContent's default gap-8 so consecutive agent turns read as one thread. */}
-          <ConversationContent className={cn("mx-auto w-full gap-4 pt-20 pb-6", CHAT_COLUMN_WIDTH)}>
-            {/* Scroll helpers — must live inside StickToBottom to access context. */}
-            <ScrollToBottomOnSend nonce={sendScrollNonce} />
-            <ConversationScrollRefBridge onScroller={setScroller} />
-            <HistoryAutoLoader
-              hasMoreHistory={hasMoreHistory}
-              loadingMoreHistory={loadingMoreHistory}
-            />
-            {bubbles.length === 0 && !showWorkingIndicator ? (
-              // Cold launch: a centered spinner instead of the "ready to
-              // type" empty state (the create-then-send path uses the
-              // "row" variant). Two launch shapes land here: a
-              // terminal-first spin-up (gate on isTerminalFirst too —
-              // terminalStartingUp is set for non-terminal-first sessions
-              // as well) and a managed-sandbox launch, whose stage text
-              // renders in the same spot for ANY session type.
-              (terminalFirst?.isTerminalFirst && terminalFirst.terminalStartingUp) ||
-              sandboxLaunching ? (
-                <RunnerStartingIndicator variant="hero" />
+          <Conversation className="chat-scroll-fade flex-1">
+            {/* gap-4 overrides ConversationContent's default gap-8 so consecutive agent turns read as one thread. */}
+            <ConversationContent
+              className={cn("mx-auto w-full gap-4 pt-20 pb-6", CHAT_COLUMN_WIDTH)}
+            >
+              {/* Scroll helpers — must live inside StickToBottom to access context. */}
+              <ScrollToBottomOnSend nonce={sendScrollNonce} />
+              <ConversationScrollRefBridge onScroller={setScroller} />
+              <HistoryAutoLoader
+                hasMoreHistory={hasMoreHistory}
+                loadingMoreHistory={loadingMoreHistory}
+              />
+              {bubbles.length === 0 && !showWorkingIndicator ? (
+                // Cold launch: a centered spinner instead of the "ready to
+                // type" empty state (the create-then-send path uses the
+                // "row" variant). Two launch shapes land here: a
+                // terminal-first spin-up (gate on isTerminalFirst too —
+                // terminalStartingUp is set for non-terminal-first sessions
+                // as well) and a managed-sandbox launch, whose stage text
+                // renders in the same spot for ANY session type.
+                (terminalFirst?.isTerminalFirst && terminalFirst.terminalStartingUp) ||
+                sandboxLaunching ? (
+                  <RunnerStartingIndicator variant="hero" />
+                ) : (
+                  <ConversationEmptyState>
+                    <div className="space-y-1.5">
+                      <h3 className="text-2xl font-medium tracking-[-0.02em]">
+                        What should we work on?
+                      </h3>
+                      <p className="text-muted-foreground text-base">
+                        {agentsError
+                          ? `Failed to load agents: ${agentsError instanceof Error ? agentsError.message : String(agentsError)}`
+                          : "Send a message to get started."}
+                      </p>
+                    </div>
+                  </ConversationEmptyState>
+                )
               ) : (
-                <ConversationEmptyState>
-                  <div className="space-y-1.5">
-                    <h3 className="text-2xl font-medium tracking-[-0.02em]">
-                      What should we work on?
-                    </h3>
-                    <p className="text-muted-foreground text-base">
-                      {agentsError
-                        ? `Failed to load agents: ${agentsError instanceof Error ? agentsError.message : String(agentsError)}`
-                        : "Send a message to get started."}
-                    </p>
-                  </div>
-                </ConversationEmptyState>
-              )
-            ) : (
-              <>
-                {bubbles.map((bubble) => (
-                  <BubbleView key={bubbleKey(bubble)} bubble={bubble} />
-                ))}
-                {/* Working… shimmer between send and first rendered block.
+                <>
+                  {bubbles.map((bubble) => (
+                    <BubbleView key={bubbleKey(bubble)} bubble={bubble} />
+                  ))}
+                  {/* Working… shimmer between send and first rendered block.
                     Suppressed when the last bubble is a compaction spinner —
                     that bubble already owns the "in-progress" slot. aria-hidden:
                     the pinned pill owns the single aria-live region (see WorkingStatusPin). */}
-                {showWorkingIndicator && (
-                  <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
-                    <MessageContent>
-                      {/* py-0.5 = headroom for the bob: MessageContent is overflow-hidden
+                  {showWorkingIndicator && (
+                    <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
+                      <MessageContent>
+                        {/* py-0.5 = headroom for the bob: MessageContent is overflow-hidden
                           and would clip otto's head at the top of the bounce. */}
-                      <div className="flex items-center gap-1.5 py-0.5">
-                        <OttoIcon className="otto-working h-4 w-auto shrink-0" />
-                        <Shimmer className="text-xs font-mono" duration={1.5}>
-                          Working…
-                        </Shimmer>
-                      </div>
-                    </MessageContent>
-                  </Message>
-                )}
-                {/* Terminal-first spin-up cue beneath the just-sent first
+                        <div className="flex items-center gap-1.5 py-0.5">
+                          <OttoIcon className="otto-working h-4 w-auto shrink-0" />
+                          <Shimmer className="text-xs font-mono" duration={1.5}>
+                            Working…
+                          </Shimmer>
+                        </div>
+                      </MessageContent>
+                    </Message>
+                  )}
+                  {/* Terminal-first spin-up cue beneath the just-sent first
                     message: the prompt bubble renders immediately (no
                     runner-online send gate), but `showWorkingIndicator` stays
                     suppressed while the runner is offline, so without this the
                     user's message sits with no sign anything is happening.
                     Self-gates to null off the spin-up window; rendered only
                     when not already showing Working… so the two never stack. */}
-                {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
-              </>
-            )}
-          </ConversationContent>
-          <ConversationScrollButton />
-          {/* Outside ConversationContent so it's pinned to the viewport, not the scroll. See WorkingStatusPin.
+                  {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
+                </>
+              )}
+            </ConversationContent>
+            <ConversationScrollButton />
+            {/* Outside ConversationContent so it's pinned to the viewport, not the scroll. See WorkingStatusPin.
               Suppressed in a sub-agent session: the composer's "Chatting with sub-agent …" tray owns this slot. */}
-          <WorkingStatusPin show={showWorkingIndicator} suppress={subAgentLabel != null} />
-          <UserMessageNavConnected
-            goPrev={nav.goPrev}
-            goNext={nav.goNext}
-            canPrev={nav.canPrev}
-            canNext={nav.canNext}
-            hidden={userMessageIds.length === 0}
-          />
-        </Conversation>
-        {/* Hover the top edge to reveal a pill that loads all older history and
+            <WorkingStatusPin show={showWorkingIndicator} suppress={subAgentLabel != null} />
+            <UserMessageNavConnected
+              goPrev={nav.goPrev}
+              goNext={nav.goNext}
+              canPrev={nav.canPrev}
+              canNext={nav.canNext}
+              hidden={userMessageIds.length === 0}
+            />
+          </Conversation>
+          {/* Hover the top edge to reveal a pill that loads all older history and
             scrolls to the first message. Rendered here (a wrapper sibling of
             Conversation) rather than inside it so it escapes the chat-scroll-fade
             mask and can sit right at the fade border. */}
-        <JumpToTopButton
-          containerEl={containerEl}
-          scroller={scroller}
-          hasMoreHistory={hasMoreHistory}
-        />
-      </div>
+          <JumpToTopButton
+            containerEl={containerEl}
+            scroller={scroller}
+            hasMoreHistory={hasMoreHistory}
+          />
+        </div>
+      </PinnedElicitationIdContext.Provider>
       {/* Floating reply button — scoped to the conversation container. */}
       <SelectionPopup
         containerRef={conversationRef}
         onReply={(text) => setReplyQuotes((prev) => [...prev, text])}
       />
+
+      {/* Pending choice/approval prompt pinned just above the composer so it
+          stays visible as the conversation scrolls (issue #206). Suppressed
+          inline via PinnedElicitationIdContext above. */}
+      <PinnedElicitationBar elicitation={pendingElicitation} />
 
       <Composer
         disabled={disabled}
@@ -1580,6 +1635,56 @@ function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+/**
+ * The pending choice/elicitation card pinned just above the composer (issue #206).
+ *
+ * While a selection is pending, the actionable prompt is anchored at the
+ * bottom of the conversation — where attention naturally lands — instead of
+ * scrolling up and out of view with the explanatory output. The inline copy
+ * is suppressed via {@link PinnedElicitationIdContext} so only ONE interactive
+ * card exists; once the user resolves the prompt, this bar disappears (the
+ * elicitation is no longer pending) and the responded summary card returns to
+ * its inline place in the scroll history.
+ *
+ * Rendered as a flex sibling between the conversation wrapper and the Composer,
+ * so it occupies its natural height right above the input area (it does not
+ * scroll with the conversation). Centered to the chat column width to match
+ * the inline card and the composer.
+ */
+export function PinnedElicitationBar({
+  elicitation,
+}: {
+  elicitation: Extract<RenderItem, { kind: "elicitation" }> | null;
+}) {
+  if (!elicitation) return null;
+  return (
+    <div
+      data-testid="pinned-elicitation"
+      className={cn("mx-auto w-full px-6 pt-2", CHAT_COLUMN_WIDTH)}
+    >
+      <div className="mb-1.5 flex items-center gap-1.5 text-muted-foreground text-xs">
+        <PinIcon className="size-3.5" />
+        <span>Pinned · decision required</span>
+      </div>
+      <ApprovalCard
+        elicitationId={elicitation.elicitationId}
+        message={elicitation.message}
+        phase={elicitation.phase}
+        policyName={elicitation.policyName}
+        contentPreview={elicitation.contentPreview}
+        requestedSchema={elicitation.requestedSchema}
+        url={elicitation.url}
+        status={elicitation.status}
+        response={elicitation.response}
+        askUserQuestion={elicitation.askUserQuestion}
+        exitPlanMode={elicitation.exitPlanMode}
+        codexCommand={elicitation.codexCommand}
+        allowAllEdits={elicitation.allowAllEdits}
+      />
     </div>
   );
 }

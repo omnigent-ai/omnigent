@@ -14,7 +14,7 @@
 // spinners.
 
 import type { ReactNode } from "react";
-import { useMemo } from "react";
+import { createContext, useContext, useMemo } from "react";
 import type React from "react";
 import { defaultRemarkPlugins } from "streamdown";
 import remarkBreaks from "remark-breaks";
@@ -36,6 +36,26 @@ import { SlashCommandCard } from "./SlashCommandCard";
 import { TerminalCommandCard } from "./TerminalCommandCard";
 import { ErrorBanner, PolicyDeniedBanner, RetryIndicator } from "./StatusBlocks";
 import { ToolCard, ToolGroupSummary } from "./ToolCard";
+
+/**
+ * React context carrying the ``elicitationId`` of the choice/elicitation card
+ * currently pinned just above the composer (see ``PinnedElicitationBar`` in
+ * ``ChatPage``), or ``null`` when none is pending.
+ *
+ * While a selection is pending, the active choice box is rendered in a pinned
+ * slot above the composer so it stays in view as the conversation grows (issue
+ * #206). To avoid a duplicate interactive card, the inline copy is suppressed
+ * — but only the ONE card that the pinned slot mirrors (matched by
+ * ``elicitationId``); any other pending elicitations (e.g. a concurrent
+ * sub-agent prompt) keep rendering inline. Once the user resolves the prompt,
+ * ``status`` flips to ``"responded"`` so this suppression no longer applies and
+ * the responded summary card returns to its inline place in the scroll
+ * history.
+ *
+ * Default ``null`` keeps ``BlockRenderer`` self-contained when rendered outside
+ * the chat surface (no pinned slot), e.g. in isolated unit tests.
+ */
+export const PinnedElicitationIdContext = createContext<string | null>(null);
 
 /**
  * Inline-`code` renderer that turns workspace file paths (e.g.
@@ -283,6 +303,10 @@ interface BlockRendererProps {
 
 export function BlockRenderer({ items, sessionStatus }: BlockRendererProps) {
   const rendered: ReactNode[] = [];
+  // Read once here (not inside renderItem) so the rules of hooks hold:
+  // renderItem is called in a loop and would otherwise call useContext a
+  // variable number of times per render.
+  const pinnedElicitationId = useContext(PinnedElicitationIdContext);
   const isAgentActive = sessionStatus === "running" || sessionStatus === "waiting";
   const streamingRunStart = isAgentActive ? findStreamingRunStart(items) : -1;
   // Reasoning is "currently streaming" iff the agent is live AND this
@@ -320,20 +344,22 @@ export function BlockRenderer({ items, sessionStatus }: BlockRendererProps) {
             <ToolGroupSummary tools={grouped} count={run.length} />
             {standalone.length > 0 && (
               <div className="mt-1 ml-2 space-y-1 border-l pl-3 py-1 peer-data-[state=open]:mt-0">
-                {standalone.map((tool, idx) => renderItem(tool, runStart + idx, false))}
+                {standalone.map((tool, idx) =>
+                  renderItem(tool, runStart + idx, false, pinnedElicitationId),
+                )}
               </div>
             )}
           </div>,
         );
       } else {
         for (const tool of standalone) {
-          rendered.push(renderItem(tool, runStart, false));
+          rendered.push(renderItem(tool, runStart, false, pinnedElicitationId));
         }
       }
       continue;
     }
 
-    rendered.push(renderItem(item, i, i === reasoningStreamingIdx));
+    rendered.push(renderItem(item, i, i === reasoningStreamingIdx, pinnedElicitationId));
   }
 
   return <>{rendered}</>;
@@ -391,7 +417,12 @@ function isInProgressTool(item: RenderItem): boolean {
   return item.kind === "tool" && item.state === "input-available";
 }
 
-function renderItem(item: RenderItem, index: number, isReasoningStreaming: boolean): ReactNode {
+function renderItem(
+  item: RenderItem,
+  index: number,
+  isReasoningStreaming: boolean,
+  pinnedElicitationId: string | null,
+): ReactNode {
   const key = keyFor(item, index);
   switch (item.kind) {
     case "text":
@@ -467,6 +498,14 @@ function renderItem(item: RenderItem, index: number, isReasoningStreaming: boole
         />
       );
     case "elicitation":
+      // The pending card that the pinned slot above the composer mirrors is
+      // suppressed inline so the actionable prompt lives in one place (issue #206).
+      // Resolved cards (status === "responded") always render inline as the
+      // historical record; any other pending card (a different elicitationId)
+      // renders inline too — only the mirrored one is hoisted.
+      if (item.status === "pending" && pinnedElicitationId === item.elicitationId) {
+        return null;
+      }
       return (
         <ApprovalCard
           key={key}
