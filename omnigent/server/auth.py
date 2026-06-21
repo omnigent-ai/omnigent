@@ -251,7 +251,8 @@ class UnifiedAuthProvider(AuthProvider):
     def get_user_id(self, request: HTTPConnection) -> str | None:
         """Extract user identity from the active source.
 
-        - ``"header"``: Read ``X-Forwarded-Email`` header.
+        - ``"header"``: Read ``X-Forwarded-Email`` or Cloudflare Access
+          ``Cf-Access-Authenticated-User-Email`` header.
         - ``"oidc"`` / ``"accounts"``: Read ``__Host-ap_session``
           cookie, validate HS256 signature and expiry, return
           ``sub`` claim.
@@ -350,7 +351,9 @@ class UnifiedAuthProvider(AuthProvider):
             header is absent on a single-user local runtime; else
             ``None`` (→ 401).
         """
-        email = request.headers.get("X-Forwarded-Email")
+        email = request.headers.get("X-Forwarded-Email") or request.headers.get(
+            "Cf-Access-Authenticated-User-Email"
+        )
         if email:
             if email in _RESERVED_USERS:
                 return None

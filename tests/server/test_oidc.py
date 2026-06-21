@@ -159,6 +159,20 @@ def _mock_request(
     return mock
 
 
+def test_header_source_returns_cloudflare_access_email_header() -> None:
+    """Header source also accepts Cloudflare Access user email headers.
+
+    Cloudflare Access injects ``Cf-Access-Authenticated-User-Email`` rather
+    than ``X-Forwarded-Email``. Header mode should trust that value directly
+    without requiring an extra proxy rewrite.
+    """
+    provider = UnifiedAuthProvider(source="header")
+    request = _mock_request(
+        headers={"Cf-Access-Authenticated-User-Email": "alice@example.com"}
+    )
+    assert provider.get_user_id(request) == "alice@example.com"
+
+
 def test_header_source_returns_email_from_header() -> None:
     """Header source extracts user ID from X-Forwarded-Email.
 
