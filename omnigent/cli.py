@@ -7714,6 +7714,7 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         # it never happens on a bare `run`, so a user who only wants their
         # own provider is never routed through Databricks unexpectedly.
         from omnigent.onboarding.configure_models import family_label
+        from omnigent.onboarding.databricks_config import normalize_workspace_url
         from omnigent.onboarding.interactive import clear_screen
         from omnigent.onboarding.setup import login_databricks_workspace
         from omnigent.onboarding.ucode_setup import (
@@ -7735,7 +7736,17 @@ def _configure_harness_add(family: str | None = None) -> str | None:
             return None
         if not workspace_url.startswith(("http://", "https://")):
             workspace_url = f"https://{workspace_url}"
-        workspace_url = workspace_url.rstrip("/")
+        # Reduce to scheme://host. Users paste the URL from a browser address
+        # bar, whose `/browse?o=...` path breaks both the saved profile host
+        # and `ucode configure` (the Databricks CLI keys OAuth tokens by host,
+        # so a path-laden value yields "no access token").
+        normalized_workspace_url = normalize_workspace_url(workspace_url)
+        if normalized_workspace_url != workspace_url.rstrip("/"):
+            console.print(
+                f"  [dim]Using {normalized_workspace_url} — ignored the extra "
+                "path from the pasted URL.[/dim]"
+            )
+        workspace_url = normalized_workspace_url
 
         # 1. Authenticate the workspace (returns the ~/.databrickscfg profile
         #    name) and 2. run `ucode configure` against it for model serving —
