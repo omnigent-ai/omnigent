@@ -76,6 +76,7 @@ OMNIGENT_EXECUTOR_TYPE = "omnigent"
 OMNIGENT_HARNESSES = frozenset(
     {
         "antigravity",
+        "antigravity-native",
         "claude-native",
         "claude-sdk",
         "codex",
@@ -90,7 +91,14 @@ OMNIGENT_HARNESSES = frozenset(
 )
 # User-facing aliases accepted in specs and normalized before runtime dispatch.
 OMNIGENT_HARNESS_ALIASES = frozenset(
-    {"claude", "native-pi", "openai-agents-sdk", "agy", "google-antigravity"}
+    {
+        "claude",
+        "native-pi",
+        "native-antigravity",
+        "openai-agents-sdk",
+        "agy",
+        "google-antigravity",
+    }
 )
 _OMNIGENT_ACCEPTED_HARNESSES = OMNIGENT_HARNESSES | OMNIGENT_HARNESS_ALIASES
 

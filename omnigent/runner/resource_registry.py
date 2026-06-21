@@ -49,6 +49,11 @@ CODEX_NATIVE_TERMINAL_ROLE = "codex-native"
 CLAUDE_NATIVE_TERMINAL_ROLE = "claude-native"
 PI_NATIVE_TERMINAL_ROLE = "pi-native"
 CURSOR_NATIVE_TERMINAL_ROLE = "cursor-native"
+# Role marker for the runner-owned native Antigravity (agy) TUI terminal.
+# A generic terminal launched with ``terminal=antigravity`` shares the same
+# public resource id, so the ensure path uses this private marker to tell a
+# runner-owned agy TUI apart from an arbitrary terminal before reusing it.
+ANTIGRAVITY_NATIVE_TERMINAL_ROLE = "antigravity-native"
 # Role marker for the embedded Omnigent REPL terminal auto-created for
 # runner-hosted SDK sessions (``omnigent attach`` in a tmux pane — the
 # SDK mirror of the native terminals above). The attach WebSocket uses

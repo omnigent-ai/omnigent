@@ -54,6 +54,7 @@ from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runner import pending_approvals
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
+    ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
     CURSOR_NATIVE_TERMINAL_ROLE,
@@ -1634,6 +1635,375 @@ async def _codex_forward_known_thread(
                 await leftover_app_server.close()
 
 
+async def _auto_create_antigravity_terminal(
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+    publish_event: Callable[[str, dict[str, object]], None],
+    *,
+    server_client: httpx.AsyncClient | None = None,
+) -> SessionResourceView:
+    """
+    Auto-create the native Antigravity (agy) terminal for a session.
+
+    Called when the runner receives an antigravity-native session via
+    ``POST /v1/sessions`` or an explicit terminal-ensure request and no
+    terminal exists yet — the host-spawned (web-UI) case where no CLI
+    client is present to launch the terminal itself.
+
+    Unlike codex-native there is **no app-server**: agy self-hosts its
+    control surface, so this boots agy directly in a runner-owned tmux
+    terminal and runs the native transcript forwarder server-side so the
+    web chat view mirrors agy's conversation. It is structurally closer to
+    :func:`_auto_create_claude_terminal` (the terminal IS the agent
+    process and the forwarder is the single transcript writer) than to the
+    codex path. The terminal starts agy immediately
+    (``tmux_start_on_attach=False``) — UNLIKE the CLI launch in
+    :func:`omnigent.antigravity_native._launch_antigravity_terminal`, which
+    keeps ``start_on_attach=True`` for its human-TTY driver: this host-spawned
+    path has no TTY, and the executor must be able to drive agy's first turn
+    over tmux whether or not a web client has opened the Terminal panel (see
+    the ``tmux_start_on_attach`` note on the spec below).
+
+    **Permissions are web-attended, not headless.** The web client attaches
+    to the agy pane through the runner tunnel and answers agy's
+    ``request-review`` TUI prompt there, so the launch is treated as
+    *attended* (``headless=False``). Auto-bypass comes only from the user's
+    persisted ``terminal_launch_args`` (which carry
+    ``--dangerously-skip-permissions`` when the user asked for bypass) —
+    the same pass-through mechanism codex/claude use. A server-spawned
+    launch must NOT key headlessness on the runner process's (absent) TTY,
+    which would silently disable the per-tool prompt for a watching web
+    user.
+
+    Fresh sessions launch with no ``--conversation`` so agy mints and the
+    forwarder discovers its real id; resume sessions launch
+    ``--conversation <external_session_id>`` (agy's real id, persisted by a
+    prior run's forwarder).
+
+    :param session_id: Session/conversation identifier, e.g.
+        ``"conv_abc123"``.
+    :param resource_registry: Session resource registry used to launch the
+        agy terminal resource.
+    :param publish_event: The runner's per-session SSE emitter, used to
+        surface the new terminal on the live stream so the web UI's Terminal
+        toggle enables without a refresh.
+    :param server_client: Runner's Omnigent server HTTP client. Used to read
+        the persisted workspace, launch args, and the discovered agy
+        conversation id (``external_session_id``) for resume.
+    :returns: The created terminal resource view.
+    :raises RuntimeError: If the session snapshot or required runner env is
+        unavailable.
+    """
+    from omnigent.antigravity_native_bridge import (
+        ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
+        AntigravityNativeBridgeState,
+        clear_bridge_state,
+        ensure_agy_onboarding_complete,
+        prepare_bridge_dir,
+        read_bridge_state,
+        write_bridge_state,
+        write_tmux_target,
+    )
+    from omnigent.antigravity_native_forwarder import supervise_forwarder
+    from omnigent.antigravity_native_launch import build_agy_launch
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
+
+    if server_client is None:
+        raise RuntimeError("server_client is required for runner-owned Antigravity terminals.")
+    snapshot = await _session_payload_for_host_spawn_check(server_client, session_id)
+    if snapshot is None:
+        raise RuntimeError(f"Could not fetch Antigravity launch config for {session_id!r}.")
+
+    session_workspace = snapshot.get("workspace")
+    if session_workspace is not None and (
+        not isinstance(session_workspace, str) or not session_workspace
+    ):
+        raise RuntimeError(f"Invalid workspace for Antigravity session {session_id!r}.")
+    workspace = _codex_session_workspace(session_workspace)
+
+    # The user's pass-through agy args (e.g. ``--dangerously-skip-permissions``)
+    # persisted by the CLI/web launch. Appended verbatim — bypass only happens
+    # when the user put the flag here (see the docstring on web-attended perms).
+    raw_launch_args = snapshot.get("terminal_launch_args")
+    terminal_launch_args: tuple[str, ...] = ()
+    if raw_launch_args is not None:
+        if not (
+            isinstance(raw_launch_args, list) and all(isinstance(a, str) for a in raw_launch_args)
+        ):
+            raise RuntimeError(
+                f"Invalid terminal_launch_args for Antigravity session {session_id!r}."
+            )
+        terminal_launch_args = tuple(raw_launch_args)
+
+    # agy's real (discovered) conversation id, persisted by a prior run's
+    # forwarder. Present → resume; absent → fresh launch (the forwarder
+    # discovers and persists the id).
+    external_session_id = snapshot.get("external_session_id")
+    if external_session_id is not None and (
+        not isinstance(external_session_id, str) or not external_session_id
+    ):
+        raise RuntimeError(f"Invalid external_session_id for Antigravity session {session_id!r}.")
+    resume = bool(external_session_id)
+
+    # agy model label from the session's model_override (None lets agy default).
+    _model_override = snapshot.get("model_override")
+    model = _model_override if isinstance(_model_override, str) and _model_override else None
+
+    # Bridge id mirrors the CLI/harness derivation: the session's bridge-id
+    # label when present (so the spawn env built by
+    # ``build_antigravity_native_spawn_env`` and the forwarder share one dir),
+    # else the session id.
+    labels = snapshot.get("labels")
+    bridge_id = session_id
+    if isinstance(labels, dict):
+        _bid = labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY)
+        if isinstance(_bid, str) and _bid:
+            bridge_id = _bid
+
+    # Cancel any surviving forwarder BEFORE clearing its cursor/conversation
+    # state, else it re-posts with fresh dedup state alongside the one spawned
+    # below (mirrors the claude/codex auto-create teardown ordering).
+    await _cancel_auto_forwarder_task(session_id)
+    bridge_dir = prepare_bridge_dir(bridge_id)
+    # Snapshot the prior cursor BEFORE clearing so a same-conversation cold
+    # resume can salvage ``forwarded_step_index`` and skip already-mirrored
+    # steps (external items are not server-deduped). Mirrors
+    # ``antigravity_native._launch_and_record``.
+    prior_state = read_bridge_state(bridge_dir)
+    clear_bridge_state(bridge_dir)
+
+    # Pre-accept agy's first-run onboarding wizard (HOME-global) before launch:
+    # a host-spawned agy terminal has no TTY to answer it and would hang with a
+    # blank web UI. Mirrors the ``ensure_claude_workspace_trusted`` seed on the
+    # Claude auto-create path. Idempotent; offloaded to a thread (file I/O).
+    await asyncio.to_thread(ensure_agy_onboarding_complete)
+
+    argv, env_overrides = build_agy_launch(
+        conversation_id=external_session_id if resume else None,
+        model=model,
+        resume=resume,
+        # Web-attended: a web client drives agy's request-review prompt over the
+        # tunnel, so this is NOT headless. Bypass comes only via the pass-through
+        # args below (see docstring). permission_mode is left unset for the same
+        # reason — the runner has no separate per-tool mode to map here.
+        permission_mode=None,
+        headless=False,
+        extra_args=terminal_launch_args,
+    )
+
+    _logger.info(
+        "Antigravity terminal auto-create starting: session=%s workspace=%s resume=%s "
+        "bridge_dir=%s args_count=%d",
+        session_id,
+        workspace,
+        resume,
+        bridge_dir,
+        len(argv) - 1,
+    )
+
+    # Resolve every fallible input BEFORE registering the terminal resource, so a
+    # failure here (missing RUNNER_SERVER_URL, an unwritable bridge dir) leaves no
+    # forwarder-less terminal behind. A registered-but-forwarder-less terminal
+    # never self-heals: a later ensure sees the existing runner-owned terminal and
+    # returns without starting a forwarder, so the web UI stays blank. Only the
+    # non-raising terminal-bound work (tmux pane lookup, task spawn) runs after
+    # ``launch_terminal``.
+    #
+    # Reconstruct the server URL + refresh-capable auth from the runner's own
+    # environment, exactly like ``_auto_create_claude_terminal``.
+    from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
+
+    server_url = _required_runner_env("RUNNER_SERVER_URL")
+    auth_factory = _make_auth_token_factory()
+    auth_token = auth_factory() if auth_factory is not None else None
+    runner_headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+
+    # Preserve the resume cursor only when resuming the SAME agy conversation,
+    # so the forwarder skips steps already mirrored in the prior run; a fresh
+    # launch (or a mismatched prior id) resets to None and mirrors from step 0.
+    preserved_step_index: int | None = None
+    if resume and prior_state is not None and prior_state.conversation_id == external_session_id:
+        preserved_step_index = prior_state.forwarded_step_index
+    # Seed bridge state with the id known so far (the real id on resume; on a
+    # fresh launch a placeholder the forwarder overwrites with agy's discovered
+    # UUID, which it also PATCHes onto the session as external_session_id).
+    write_bridge_state(
+        bridge_dir,
+        AntigravityNativeBridgeState(
+            session_id=session_id,
+            conversation_id=external_session_id or _mint_runner_agy_conversation_id(),
+            forwarded_step_index=preserved_step_index,
+        ),
+    )
+
+    terminal_view = await resource_registry.launch_required_terminal(
+        session_id=session_id,
+        terminal_name="antigravity",
+        session_key="main",
+        resource_role=ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
+        spec=TerminalEnvSpec(
+            # caller_process + sandbox:none mirrors the antigravity-native agent
+            # spec (_materialize_antigravity_agent_spec). The terminal IS the
+            # agent, so this is a REQUIRED terminal (its death ends the session),
+            # like claude/codex/pi native. An explicit sandbox is mandatory:
+            # without it launch_required_terminal falls back to
+            # _default_sandbox_for_platform (linux_bwrap), which fails in the
+            # unprivileged uid-1000 host pods (bwrap needs userns) — agy needs
+            # no OS sandbox here (its own --sandbox flag governs tool access).
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=str(workspace),
+                sandbox=OSEnvSandboxSpec(type="none"),
+            ),
+            command=argv[0],
+            args=list(argv[1:]),
+            env=env_overrides,
+            # Match the local ``omnigent antigravity`` terminal scrollback.
+            scrollback=100_000,
+            # Let agy's full-screen TUI escape sequences reach the web xterm.
+            tmux_allow_passthrough=True,
+            # Start agy immediately (NOT on first client attach), matching the
+            # claude/codex auto-create paths. This host-spawned web flow has no
+            # human TTY: the executor drives the first turn by typing into agy's
+            # TUI over tmux (see ``inject_user_message_via_tui``) and the
+            # forwarder mirrors the result — both need agy running whether or not
+            # the user has opened the Terminal panel. agy runs headlessly in the
+            # tmux pane (the pty is enough; verified against agy 1.0.10), and a
+            # later web attach simply views the already-running pane. (The CLI
+            # ``omnigent antigravity`` path keeps start-on-attach: there a human
+            # TTY is the driver.)
+            tmux_start_on_attach=False,
+        ),
+    )
+
+    # Bind the forwarder's discovery to THIS session's own agy process via its
+    # tmux pane (pane pid → agy child → connect-RPC port), instead of guessing
+    # by newest brain dir — the brain root is shared by every agy on the host.
+    # ``_terminal_tmux_pane`` is fully defensive (never raises for a valid or
+    # absent terminal), so NOTHING fallible runs between the terminal
+    # registration above and the forwarder below — a partial failure can never
+    # leave a registered terminal without a forwarder (which a later ensure
+    # would see and return 200 for, never self-healing).
+    tmux_socket, tmux_target = _terminal_tmux_pane(
+        resource_registry, session_id, "antigravity", "main"
+    )
+
+    # Start the transcript forwarder server-side. The CLI client runs this on
+    # the wrapper path; on this host-spawned path the runner uses the server URL
+    # + refresh-capable auth resolved above. ``audit_policies=True`` enables the
+    # post-hoc tool-call policy audit (agy exposes no firing PreToolUse hook,
+    # so enforcement here is audit-only).
+    _forwarder_task = asyncio.create_task(
+        supervise_forwarder(
+            base_url=server_url,
+            headers=runner_headers,
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            tmux_socket=tmux_socket,
+            tmux_target=tmux_target,
+            model=model,
+            audit_policies=True,
+            auth=_RunnerDatabricksAuth(auth_factory),
+        ),
+        name=f"antigravity-forwarder-{session_id}",
+    )
+    _register_auto_forwarder_task(session_id, _forwarder_task)
+
+    # Advertise the tmux pane so the executor can deliver the FIRST web turn into
+    # the agy TUI (agy mints its conversation only after it processes input; the
+    # connect-RPC fast path cannot address a conversation that does not exist
+    # yet). Done AFTER the forwarder is registered and made best-effort/off-loop:
+    # this is a fallible filesystem write, and the "a registered runner-owned
+    # terminal implies a running forwarder" invariant requires nothing fallible
+    # to abort the launch between terminal registration and forwarder start. A
+    # write failure (or a truly remote runner with no local pane) leaves the
+    # forwarder running; the executor's first-turn bootstrap then surfaces a clear
+    # "tmux target was not advertised" error and a later ensure can re-advertise.
+    if tmux_socket is not None and tmux_target is not None:
+        try:
+            await asyncio.to_thread(
+                write_tmux_target,
+                bridge_dir,
+                socket_path=tmux_socket,
+                tmux_target=tmux_target,
+            )
+        except OSError:
+            _logger.warning(
+                "Could not advertise antigravity tmux target for session %s; the first "
+                "web turn's TUI bootstrap will report it until a later ensure re-advertises.",
+                session_id,
+                exc_info=True,
+            )
+
+    # Announce the terminal to clients ONLY after the forwarder is started and
+    # registered. ``session_resource_view_to_dict`` serialization + the publish
+    # are the LAST steps, so any failure happens before clients are told the
+    # terminal exists — preserving the "a registered runner-owned terminal
+    # implies a running forwarder" invariant the ensure path relies on.
+    publish_event(
+        session_id,
+        {
+            "type": "session.resource.created",
+            "resource": session_resource_view_to_dict(terminal_view),
+        },
+    )
+    _logger.info(
+        "Auto-created antigravity terminal + forwarder for session %s",
+        session_id,
+    )
+    return terminal_view
+
+
+def _mint_runner_agy_conversation_id() -> str:
+    """
+    Mint a placeholder agy conversation id for a fresh runner launch.
+
+    agy mints its own UUID and ignores any id we assign, so this seeds bridge
+    state only until the forwarder discovers agy's real id. Mirrors
+    :func:`omnigent.antigravity_native._mint_agy_conversation_id`.
+
+    :returns: An ``"agy_conv_<hex>"`` placeholder id.
+    """
+    return f"agy_conv_{uuid.uuid4().hex}"
+
+
+def _terminal_tmux_pane(
+    resource_registry: SessionResourceRegistry,
+    session_id: str,
+    terminal_name: str,
+    session_key: str,
+) -> tuple[Path | None, str | None]:
+    """
+    Return a launched terminal's tmux socket + target when locally reachable.
+
+    Used to bind the antigravity forwarder's conversation discovery to this
+    session's own agy pane. Returns ``(None, None)`` when the registry has no
+    live instance for the triple (the forwarder then uses its bounded-ambiguity
+    fallback).
+
+    :param resource_registry: Session resource registry exposing the terminal
+        registry.
+    :param session_id: Owning session/conversation id.
+    :param terminal_name: Terminal spec name, e.g. ``"antigravity"``.
+    :param session_key: Session key, e.g. ``"main"``.
+    :returns: ``(tmux_socket, tmux_target)`` or ``(None, None)``.
+    """
+    terminal_registry = resource_registry.terminal_registry
+    if terminal_registry is None:
+        return None, None
+    instance = terminal_registry.get(session_id, terminal_name, session_key)
+    if instance is None or not instance.running:
+        return None, None
+    # ``socket_path`` is a Path and ``tmux_target`` a str on the live terminal
+    # instance (see omnigent.inner.terminal). Guard defensively so a registry
+    # variant without them falls back to the forwarder's ambiguity path.
+    socket_path = getattr(instance, "socket_path", None)
+    target = getattr(instance, "tmux_target", None)
+    tmux_socket = Path(socket_path) if isinstance(socket_path, (str, Path)) else None
+    tmux_target = target if isinstance(target, str) and target else None
+    return tmux_socket, tmux_target
+
+
 async def _session_payload_for_host_spawn_check(
     server_client: httpx.AsyncClient | None,
     session_id: str,
@@ -1799,6 +2169,30 @@ def _is_runner_owned_codex_terminal(
     return (
         resource_registry.terminal_resource_role(resource.session_id, resource.id)
         == CODEX_NATIVE_TERMINAL_ROLE
+    )
+
+
+def _is_runner_owned_antigravity_terminal(
+    resource_registry: SessionResourceRegistry,
+    resource: SessionResourceView,
+) -> bool:
+    """
+    Return whether an existing ``antigravity/main`` terminal is the agy TUI.
+
+    A generic terminal launched with ``terminal=antigravity`` (e.g. the CLI
+    wrapper's own launch) has the same public resource id but is not the
+    runner-owned agy TUI created by :func:`_auto_create_antigravity_terminal`.
+    The resource registry carries the private role marker that distinguishes
+    them. Mirrors :func:`_is_runner_owned_codex_terminal`.
+
+    :param resource_registry: Runner resource registry that owns private
+        terminal role markers.
+    :param resource: Existing terminal resource view.
+    :returns: ``True`` when the resource is marked as Antigravity native.
+    """
+    return (
+        resource_registry.terminal_resource_role(resource.session_id, resource.id)
+        == ANTIGRAVITY_NATIVE_TERMINAL_ROLE
     )
 
 
@@ -4537,6 +4931,12 @@ def create_runner_app(
     # must serialize or both pass the "no terminal yet" test and double
     # launch (409 / rotation loop).
     _claude_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    # Same guard for the runner-owned native Antigravity (agy) terminal
+    # auto-created in ``create_session`` / the terminals-endpoint ensure path.
+    # Exposed on app.state below so teardown tests can assert it is pruned (a
+    # leaked Lock per session otherwise accumulates for the app's lifetime).
+    _antigravity_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    app.state.antigravity_terminal_ensure_locks = _antigravity_terminal_ensure_locks
     # Same guard for the Omnigent REPL (``omnigent attach``) terminal
     # auto-created for non-native SDK sessions.
     _repl_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
@@ -5385,6 +5785,20 @@ def create_runner_app(
                 from omnigent.cursor_native_bridge import build_cursor_native_spawn_env
 
                 spawn_env = build_cursor_native_spawn_env(session_id)
+            if harness_name == "antigravity-native" and spawn_env is None:
+                from omnigent.antigravity_native_bridge import (
+                    ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
+                    build_antigravity_native_spawn_env,
+                )
+
+                labels = await _session_labels_for_runner_spawn(
+                    server_client=server_client,
+                    session_id=session_id,
+                )
+                antigravity_bridge_id = labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY)
+                spawn_env = build_antigravity_native_spawn_env(
+                    session_id, bridge_id=antigravity_bridge_id
+                )
             _session_spec_cache[session_id] = spec_entry
             from omnigent.llms.context_window import get_model_context_window
             from omnigent.runtime.workflow import _resolve_spec_model
@@ -5732,6 +6146,59 @@ def create_runner_app(
                     finally:
                         _publish_terminal_pending(_publish_event, session_id, False)
 
+        if harness_name == "antigravity-native":
+            # Same concurrency guard as the claude/codex branches: two POST
+            # /v1/sessions (connect callback + relaunch handshake) — or a
+            # concurrent terminals-endpoint "ensure" — must not both pass the
+            # "no terminal yet" test and double-launch. agy is self-hosted, so
+            # there is no app-server; the runner just boots agy in a tmux
+            # terminal and runs the transcript forwarder server-side.
+            _antigravity_ensure_lock = _antigravity_terminal_ensure_locks.setdefault(
+                session_id, asyncio.Lock()
+            )
+            async with _antigravity_ensure_lock:
+                _tr = resource_registry.terminal_registry
+                _has_antigravity_terminal = (
+                    _tr is not None and _tr.get(session_id, "antigravity", "main") is not None
+                )
+                # The runner owns the terminal for every antigravity-native
+                # session (host-spawned, sub-agent, or CLI top-level). A missing
+                # snapshot means the runner cannot confirm the session, so skip.
+                _needs_terminal = (
+                    await _session_payload_for_host_spawn_check(server_client, session_id)
+                ) is not None
+                if not _has_antigravity_terminal and _needs_terminal:
+                    # Surface "terminal starting up" to the web UI before the
+                    # (potentially slow) launch, and clear it in finally so a
+                    # failure also drops the spinner rather than stranding it.
+                    _publish_terminal_pending(_publish_event, session_id, True)
+                    try:
+                        await _auto_create_antigravity_terminal(
+                            session_id,
+                            resource_registry,
+                            _publish_event,
+                            server_client=server_client,
+                        )
+                    except Exception as exc:
+                        _logger.exception(
+                            "Failed to auto-create antigravity terminal for %s",
+                            session_id,
+                        )
+                        _publish_native_terminal_start_error(
+                            _publish_event,
+                            session_id,
+                            "Antigravity",
+                            exc,
+                        )
+                    finally:
+                        _publish_terminal_pending(_publish_event, session_id, False)
+                elif not _needs_terminal:
+                    _logger.info(
+                        "Skipping antigravity terminal auto-create for %s; session "
+                        "snapshot was not available.",
+                        session_id,
+                    )
+
         # Auto-bootstrap the Omnigent REPL terminal for non-native
         # (SDK-harness) top-level sessions: host the framework's own TUI
         # (``omnigent attach``) in a tmux pane so the web UI can embed it
@@ -5999,6 +6466,7 @@ def create_runner_app(
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
         _cursor_terminal_ensure_locks.pop(session_id, None)
+        _antigravity_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
 
@@ -9440,6 +9908,20 @@ def create_runner_app(
             from omnigent.cursor_native_bridge import build_cursor_native_spawn_env
 
             spawn_env = build_cursor_native_spawn_env(conv_id)
+        if harness_name == "antigravity-native" and spawn_env is None:
+            from omnigent.antigravity_native_bridge import (
+                ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
+                build_antigravity_native_spawn_env,
+            )
+
+            labels = await _session_labels_for_runner_spawn(
+                server_client=server_client,
+                session_id=conv_id,
+            )
+            antigravity_bridge_id = labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY)
+            spawn_env = build_antigravity_native_spawn_env(
+                conv_id, bridge_id=antigravity_bridge_id
+            )
 
         agent_version = dispatch.agent_version if dispatch else body.get("agent_version")
         if agent_version is not None and conv_id in _version_cache:
@@ -11037,6 +11519,71 @@ def create_runner_app(
                 content=session_resource_view_to_dict(terminal_view),
             )
 
+        if (
+            body.get("ensure_native_terminal")
+            and terminal_name == "antigravity"
+            and session_key == "main"
+            # Only the web-UI / message-path ensure probe (which sends no
+            # ``spec``) boots the runner-owned agy terminal here. The
+            # ``omnigent antigravity`` CLI wrapper POSTs ``ensure_native_terminal``
+            # WITH a full ``spec`` (it owns the agy launch + its own client-side
+            # forwarder) and must fall through to the generic launch below —
+            # exactly the behavior its launch comment documents. Gating on the
+            # absent ``spec`` keeps the CLI path untouched while giving the web UI
+            # a runner-owned terminal + server-side forwarder.
+            and not body.get("spec")
+        ):
+            antigravity_terminal_id = terminal_resource_id("antigravity", "main")
+            ensure_lock = _antigravity_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
+            async with ensure_lock:
+                existing = await resource_registry.get_terminal_resource(
+                    session_id, antigravity_terminal_id
+                )
+                if existing is not None:
+                    if _is_runner_owned_antigravity_terminal(resource_registry, existing):
+                        return JSONResponse(
+                            status_code=200,
+                            content=session_resource_view_to_dict(existing),
+                        )
+                    _logger.info(
+                        "Replacing non-native antigravity terminal %s for session %s",
+                        antigravity_terminal_id,
+                        session_id,
+                    )
+                    closed = await resource_registry.close_terminal(
+                        session_id, antigravity_terminal_id
+                    )
+                    if not closed:
+                        return JSONResponse(
+                            status_code=409,
+                            content={
+                                "error": {
+                                    "code": "terminal_conflict",
+                                    "message": (
+                                        "Existing antigravity terminal is not a "
+                                        "runner-owned agy TUI and could not be closed."
+                                    ),
+                                }
+                            },
+                        )
+                try:
+                    terminal_view = await _auto_create_antigravity_terminal(
+                        session_id,
+                        resource_registry,
+                        _publish_event,
+                        server_client=server_client,
+                    )
+                except Exception as exc:
+                    _logger.exception(
+                        "Antigravity terminal ensure failed for session=%s",
+                        session_id,
+                    )
+                    return _native_terminal_start_error_response(exc, "Antigravity")
+                return JSONResponse(
+                    status_code=200,
+                    content=session_resource_view_to_dict(terminal_view),
+                )
+
         from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
         cwd_override = body.get("cwd")
@@ -12512,6 +13059,7 @@ def create_runner_app(
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
         _cursor_terminal_ensure_locks.pop(session_id, None)
+        _antigravity_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         await resource_registry.cleanup_session(session_id)
         return JSONResponse(
@@ -12565,6 +13113,7 @@ def create_runner_app(
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
         _cursor_terminal_ensure_locks.pop(session_id, None)
+        _antigravity_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         # Close terminals with ``session.resource.deleted`` events BEFORE
         # cleanup_session — cleanup_conversation would silently pop them
