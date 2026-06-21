@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
@@ -1047,6 +1047,129 @@ def _ensure_default_polly_agent(
         name=_POLLY_AGENT_NAME,
         bundle_bytes=_build_polly_bundle(),
     )
+
+
+# ── API-only landing (no web UI bundle) ────────────────
+# When the SPA bundle is absent — an API-only build, or an install that
+# skipped the web UI — a browser opening ``/`` or a deep link like
+# ``/c/<id>`` would otherwise hit FastAPI's bare ``{"detail": "Not Found"}``
+# JSON, which reads as broken. Serve a short explainer to BROWSERS only;
+# every programmatic client keeps the prior behavior (JSON metadata at
+# ``/``, JSON 404 elsewhere) so health probes and API consumers are
+# unaffected.
+
+# API namespaces always answer like an API (JSON 404) even to a browser, so
+# a mistyped or removed ``/api`` / ``/v1`` / ``/auth`` route never renders
+# the human explainer.
+_API_NAMESPACE_PREFIXES = ("api/", "v1/", "auth/")
+
+_API_ONLY_LANDING_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Omnigent — web UI not installed</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    max-width: 42rem; margin: 12vh auto; padding: 0 1.25rem;
+  }
+  h1 { font-size: 1.35rem; margin: 0 0 .5rem; }
+  h2 { font-size: 1.05rem; margin: 1.5rem 0 .25rem; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  pre {
+    background: rgba(127, 127, 127, .14); padding: .75rem 1rem;
+    border-radius: 8px; overflow-x: auto;
+  }
+  .muted { opacity: .7; font-size: .9rem; margin-top: 1.5rem; }
+  a { color: inherit; }
+</style>
+</head>
+<body>
+  <h1>Omnigent is running — but the web UI isn't installed</h1>
+  <p>
+    This server was built without the web UI (API-only mode), so there's
+    nothing to render in the browser here.
+  </p>
+  <h2>How to fix</h2>
+  <p>
+    Reinstall Omnigent with the web UI built. Make sure
+    <code>Node.js 22+</code> and <code>npm</code> are available and that
+    <code>OMNIGENT_SKIP_WEB_UI</code> is <em>not</em> set, then for example:
+  </p>
+  <pre>uv tool install --force --reinstall omnigent</pre>
+  <p class="muted">
+    The CLI works regardless, and the JSON API is at <a href="/docs">/docs</a>.
+    Details: <a href="https://github.com/omnigent-ai/omnigent#readme">omnigent-ai/omnigent</a>
+  </p>
+</body>
+</html>
+"""
+
+
+def _is_browser_navigation(request: Request) -> bool:
+    """Whether this request is a real browser top-level page navigation.
+
+    Prefers the purpose-built ``Sec-Fetch-Mode`` request header: browsers
+    set it to ``navigate`` ONLY on address-bar / link navigations, and to
+    ``cors`` / ``same-origin`` / ``no-cors`` on ``fetch``/XHR. Non-browser
+    clients (curl, requests, httpx, Go, Java, Node, health probes, …) never
+    send ``Sec-Fetch-*`` at all, so they fall through to the ``Accept``
+    check — and they default to ``*/*``, not ``text/html``. Net effect: only
+    a genuine browser navigation gets the HTML explainer; every programmatic
+    client — and even a browser ``fetch`` that happens to set
+    ``Accept: text/html`` — gets JSON. ``Sec-Fetch-Mode`` ships in all
+    current browsers (~2020+); the ``Accept`` fallback covers anything older
+    that omits it.
+
+    :param request: The incoming request.
+    :returns: ``True`` only for a browser top-level navigation.
+    """
+    sec_fetch_mode = request.headers.get("sec-fetch-mode")
+    if sec_fetch_mode is not None:
+        return sec_fetch_mode == "navigate"
+    return "text/html" in request.headers.get("accept", "")
+
+
+def _is_api_namespace_path(path: str) -> bool:
+    """Whether *path* targets an API namespace (``/api`` / ``/v1`` / ``/auth``).
+
+    Such paths must answer like an API (JSON 404) even to a browser, so a
+    mistyped or removed API route never renders the human explainer.
+
+    :param path: The unmatched request path (with or without a leading ``/``).
+    :returns: ``True`` when it begins with a known API namespace prefix.
+    """
+    return path.lstrip("/").startswith(_API_NAMESPACE_PREFIXES)
+
+
+def _api_only_landing(request: Request, *, status_code: int) -> Response:
+    """Content-negotiated response for a server with no web UI bundle.
+
+    A browser navigation (see :func:`_is_browser_navigation`) gets a short
+    HTML page explaining the API-only state and how to install the web UI.
+    Every other client gets the unchanged JSON: the ``{"service": ...}``
+    metadata at ``/`` (a 200, which Databricks Apps health-probes), and a
+    bare ``{"detail": "Not Found"}`` elsewhere — preserving the API-404
+    contract existing consumers may parse.
+
+    :param request: The incoming request (its ``Sec-Fetch-Mode`` / ``Accept``
+        headers select the representation).
+    :param status_code: ``200`` for the ``/`` landing, ``404`` for an
+        unmatched path.
+    :returns: An ``HTMLResponse`` for browser navigations, else a
+        ``JSONResponse``.
+    """
+    if _is_browser_navigation(request):
+        return HTMLResponse(_API_ONLY_LANDING_HTML, status_code=status_code)
+    if status_code == 200:
+        # Unchanged API-only landing metadata (Databricks Apps health probe).
+        return JSONResponse(
+            {"service": "omnigent", "status": "ok", "health": "/health", "docs": "/docs"}
+        )
+    # Exact FastAPI/Starlette default 404 body — API clients may depend on it.
+    return JSONResponse({"detail": "Not Found"}, status_code=status_code)
 
 
 def create_app(
@@ -2248,7 +2371,8 @@ def create_app(
             app.include_router(router, prefix=prefix, tags=tags)
 
     web_ui_dist = _WEB_UI_DIST
-    if web_ui_dist.is_dir() and (web_ui_dist / "index.html").is_file():
+    web_ui_present = web_ui_dist.is_dir() and (web_ui_dist / "index.html").is_file()
+    if web_ui_present:
         app.mount(
             "/",
             _RangeAwareGZipMiddleware(
@@ -2258,26 +2382,58 @@ def create_app(
             name="web-ui",
         )
     else:
+        # No SPA bundle (API-only build, or an install that skipped the web
+        # UI). Serve the landing at "/" here; the 404 handler below upgrades a
+        # browser navigation to any OTHER path (e.g. /c/<id>) to the same
+        # explainer. See _api_only_landing.
 
         @app.get("/", include_in_schema=False)
-        async def root() -> dict[str, str]:
-            """
-            Return API server metadata when no web UI build is bundled.
+        async def root(request: Request) -> Response:
+            """API-only landing: HTML explainer for browsers, JSON otherwise.
 
-            Databricks Apps opens the app URL at ``/`` in a browser.
-            API-only wheels intentionally omit the SPA assets, so serve
-            a small JSON landing response instead of FastAPI's generic
-            404. When a web UI build is present, the static mount above
-            owns ``/`` and this fallback is not registered.
-
-            :returns: Service metadata with health and docs paths.
+            Databricks Apps opens the app URL at ``/`` in a browser, and
+            health probes hit it programmatically. Browsers get a short page
+            explaining the API-only state and how to get the web UI;
+            non-browser clients get the unchanged ``{"service": ...}``
+            metadata. When a web UI build is present the static mount above
+            owns ``/`` and this is not registered.
             """
-            return {
-                "service": "omnigent",
-                "status": "ok",
-                "health": "/health",
-                "docs": "/docs",
-            }
+            return _api_only_landing(request, status_code=200)
+
+    @app.exception_handler(404)
+    async def _not_found_handler(request: Request, exc: StarletteHTTPException) -> Response:
+        """Make a 404 friendly for a browser hitting a no-web-UI server.
+
+        A browser deep link such as ``/c/<id>`` on an API-only server would
+        otherwise show a bare ``{"detail": "Not Found"}``; serve the HTML
+        explainer instead. Scoped tightly so nothing else changes:
+
+        - only when NO web UI is bundled (a real install's 404s are
+          untouched);
+        - only for a browser navigation (see :func:`_is_browser_navigation`)
+          to a non-API path — API namespaces and every programmatic client
+          keep JSON;
+        - only for the generic "Not Found" 404 of an UNMATCHED route — a
+          handler-raised 404 with a custom ``detail`` (e.g. "session not
+          found") passes through verbatim.
+
+        Because it keys on the 404 *status* rather than registering a route,
+        it never turns an unmounted route's POST 404 into a 405, and leaves
+        every non-404 response untouched.
+
+        :param request: The incoming request.
+        :param exc: The 404 ``HTTPException`` Starlette/FastAPI raised.
+        :returns: The HTML explainer for an API-only browser navigation, else
+            the default JSON 404 (preserving any custom ``detail``/headers).
+        """
+        if (
+            not web_ui_present
+            and exc.detail == "Not Found"
+            and _is_browser_navigation(request)
+            and not _is_api_namespace_path(request.url.path)
+        ):
+            return HTMLResponse(_API_ONLY_LANDING_HTML, status_code=404)
+        return JSONResponse({"detail": exc.detail}, status_code=404, headers=exc.headers)
 
     return app
 

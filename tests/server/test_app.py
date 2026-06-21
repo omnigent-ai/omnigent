@@ -1019,3 +1019,178 @@ def test_ensure_default_debby_agent_skips_when_bundle_absent(
     )
 
     assert seed_stores.agent_store.get_by_name(server_app._DEBBY_AGENT_NAME) is None
+
+
+def _build_api_only_app(db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FastAPI:
+    """Build an app with the web UI bundle ABSENT (the API-only branch).
+
+    The dev checkout has a built ``static/web-ui`` (so ``create_app`` would
+    mount the SPA), so point ``_WEB_UI_DIST`` at an empty path to force the
+    API-only fallback branch under test.
+    """
+    from omnigent.server.app import create_app
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_store import HostStore
+
+    monkeypatch.setattr(server_app, "_WEB_UI_DIST", tmp_path / "no-web-ui")
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    return create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        host_store=HostStore(db_uri),
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+    )
+
+
+# A modern browser top-level navigation: Sec-Fetch-Mode: navigate + an
+# HTML-leaning Accept. This is what actually opening a URL in the address bar
+# sends.
+_BROWSER_HEADERS = {
+    "accept": "text/html,application/xhtml+xml",
+    "sec-fetch-mode": "navigate",
+}
+
+
+@pytest.mark.asyncio
+async def test_api_only_browser_deep_link_gets_friendly_html(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A browser opening ``/c/<id>`` on a no-web-UI server gets a helpful HTML
+    page, not a bare JSON 404.
+
+    Guards the exact symptom users hit: a ``{"detail": "Not Found"}`` surprise
+    in the address bar. The page must name the state and the fix.
+    """
+    app = _build_api_only_app(db_uri, tmp_path, monkeypatch)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get("/c/conv_abc", headers=_BROWSER_HEADERS)
+    assert resp.status_code == 404
+    assert resp.headers["content-type"].startswith("text/html")
+    body = resp.text
+    assert "API-only" in body
+    assert "OMNIGENT_SKIP_WEB_UI" in body
+
+
+@pytest.mark.asyncio
+async def test_api_only_json_client_unknown_path_keeps_exact_404(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-browser client hitting an unknown path STILL gets the exact
+    ``404 {"detail": "Not Found"}`` it always did — no trap for API consumers
+    that parse that body. Covers both ``application/json`` and the default
+    ``*/*`` Accept.
+    """
+    app = _build_api_only_app(db_uri, tmp_path, monkeypatch)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        json_resp = await c.get("/c/conv_abc", headers={"accept": "application/json"})
+        star_resp = await c.get("/c/conv_abc", headers={"accept": "*/*"})
+    for resp in (json_resp, star_resp):
+        assert resp.status_code == 404
+        assert resp.json() == {"detail": "Not Found"}
+
+
+@pytest.mark.asyncio
+async def test_api_only_api_namespace_never_renders_html(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Even a browser hitting an unknown ``/api`` / ``/v1`` / ``/auth`` path
+    gets JSON 404 — API namespaces are never hijacked into the HTML explainer,
+    so a mistyped API route still reads as a 404 to everyone.
+    """
+    app = _build_api_only_app(db_uri, tmp_path, monkeypatch)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        for path in ("/v1/does-not-exist", "/api/nope", "/auth/whatever"):
+            resp = await c.get(path, headers=_BROWSER_HEADERS)
+            assert resp.status_code == 404, path
+            assert resp.json() == {"detail": "Not Found"}, path
+
+
+@pytest.mark.asyncio
+async def test_api_only_root_metadata_unchanged_for_non_browser(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``GET /`` for a non-browser client returns the unchanged ``200`` JSON
+    metadata — the Databricks Apps health-probe contract is preserved.
+    """
+    app = _build_api_only_app(db_uri, tmp_path, monkeypatch)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get("/", headers={"accept": "application/json"})
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "service": "omnigent",
+        "status": "ok",
+        "health": "/health",
+        "docs": "/docs",
+    }
+
+
+@pytest.mark.asyncio
+async def test_api_only_root_browser_gets_html(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``GET /`` from a browser returns the HTML explainer with a 200."""
+    app = _build_api_only_app(db_uri, tmp_path, monkeypatch)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get("/", headers=_BROWSER_HEADERS)
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/html")
+    assert "web UI" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_api_only_catch_all_does_not_shadow_real_routes(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The catch-all is registered after real routes, so ``/health`` still
+    serves ``{"status": "ok"}`` even when the client prefers HTML.
+    """
+    app = _build_api_only_app(db_uri, tmp_path, monkeypatch)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get("/health", headers=_BROWSER_HEADERS)
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_api_only_browser_fetch_with_html_accept_still_gets_json(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A browser ``fetch``/XHR (``Sec-Fetch-Mode: cors``) that happens to send
+    ``Accept: text/html`` STILL gets JSON, not the HTML explainer.
+
+    The strongest no-trap guarantee: keying on ``Sec-Fetch-Mode`` means an
+    XHR/fetch is never mistaken for a navigation even if its Accept leans
+    HTML, so the SPA's own API calls and any in-page client keep JSON.
+    """
+    app = _build_api_only_app(db_uri, tmp_path, monkeypatch)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get(
+            "/c/conv_abc",
+            headers={"accept": "text/html", "sec-fetch-mode": "cors"},
+        )
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": "Not Found"}
+
+
+@pytest.mark.asyncio
+async def test_api_only_old_browser_without_sec_fetch_falls_back_to_accept(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An older browser that omits ``Sec-Fetch-*`` falls back to the ``Accept``
+    heuristic: ``Accept: text/html`` with no ``Sec-Fetch-Mode`` gets HTML.
+    """
+    app = _build_api_only_app(db_uri, tmp_path, monkeypatch)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get("/c/conv_abc", headers={"accept": "text/html"})
+    assert resp.status_code == 404
+    assert resp.headers["content-type"].startswith("text/html")
