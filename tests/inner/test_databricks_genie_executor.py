@@ -21,6 +21,7 @@ from omnigent.inner.databricks_genie_executor import (
     DatabricksGenieExecutor,
     _extract_text,
     _latest_user_text,
+    _md_cell,
     _render_statement,
 )
 from omnigent.inner.executor import (
@@ -225,12 +226,15 @@ def test_query_answer_includes_sql_and_result_rows() -> None:
     assert "Here is the breakdown." in response
     assert 'Generated SQL ("By region"):' in response
     assert "totals per region" in response
-    assert "SELECT region, count(*) n FROM s GROUP BY region" in response
+    # SQL is wrapped in a fenced code block.
+    assert "```sql\nSELECT region, count(*) n FROM s GROUP BY region\n```" in response
+    # The result is a valid GFM table: header, delimiter, then data rows.
     assert "Result (2 rows):" in response
-    assert "region | n" in response
-    assert "EMEA | 1200" in response
-    # None cell rendered as empty string.
-    assert "APAC | " in response
+    assert "| region | n |" in response
+    assert "| --- | --- |" in response
+    assert "| EMEA | 1200 |" in response
+    # None cell rendered as an empty cell.
+    assert "| APAC |  |" in response
     # The result is fetched via the Statement Execution API by statement id.
     assert stmt_exec.get_calls == ["stmt-region"]
 
@@ -473,8 +477,23 @@ def test_latest_user_text_handles_multimodal_parts() -> None:
 
 
 # ---------------------------------------------------------------------------
-# _render_statement (pure helper) — table edge cases
+# _md_cell / _render_statement (pure helpers) — table formatting
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, ""),  # None → empty cell
+        ("plain", "plain"),  # passthrough
+        ("a\nb\tc  d", "a b c d"),  # newline/tab/double-space collapse to single spaces
+        ("  trim  ", "trim"),  # leading/trailing whitespace stripped
+        ("a|b", r"a\|b"),  # pipe escaped so it doesn't open a column
+        (1200, "1200"),  # non-str coerced via str()
+    ],
+)
+def test_md_cell(value: object, expected: str) -> None:
+    assert _md_cell(value) == expected
 
 
 def test_render_statement_no_rows_returns_empty() -> None:
@@ -482,13 +501,45 @@ def test_render_statement_no_rows_returns_empty() -> None:
     assert _render_statement(FakeStatementResponse(result=None)) == ""
 
 
-def test_render_statement_without_columns_renders_rows_only() -> None:
+def test_render_statement_without_columns_synthesizes_headers() -> None:
+    """With no schema, generic ``col1, col2`` headers keep the table valid GFM."""
     stmt = FakeStatementResponse(
         manifest=None,
         result=FakeResultData(data_array=[["a", "b"]]),
     )
     rendered = _render_statement(stmt)
-    assert rendered == "Result (1 row):\na | b"
+    assert rendered == "Result (1 row):\n\n| col1 | col2 |\n| --- | --- |\n| a | b |"
+
+
+def test_render_statement_emits_valid_gfm_table() -> None:
+    """Header row, delimiter row, blank-line separation, and pipe-bounded cells."""
+    stmt = FakeStatementResponse(
+        manifest=FakeManifest(schema=FakeSchema(columns=[FakeColumn("region"), FakeColumn("n")])),
+        result=FakeResultData(data_array=[["EMEA", "1200"]]),
+    )
+    assert _render_statement(stmt) == (
+        "Result (1 row):\n\n| region | n |\n| --- | --- |\n| EMEA | 1200 |"
+    )
+
+
+def test_render_statement_pads_ragged_rows() -> None:
+    """A row shorter than the column count is padded with empty cells."""
+    stmt = FakeStatementResponse(
+        manifest=FakeManifest(schema=FakeSchema(columns=[FakeColumn("a"), FakeColumn("b")])),
+        result=FakeResultData(data_array=[["x"]]),
+    )
+    assert _render_statement(stmt) == "Result (1 row):\n\n| a | b |\n| --- | --- |\n| x |  |"
+
+
+def test_render_statement_sanitizes_multiline_cells() -> None:
+    """A multi-line / pipe-bearing cell is collapsed to one row so the table holds."""
+    stmt = FakeStatementResponse(
+        manifest=FakeManifest(schema=FakeSchema(columns=[FakeColumn("review")])),
+        result=FakeResultData(data_array=[["line one\nline two | tail"]]),
+    )
+    assert _render_statement(stmt) == (
+        "Result (1 row):\n\n| review |\n| --- |\n| line one line two \\| tail |"
+    )
 
 
 def test_render_statement_truncates_beyond_cap() -> None:
@@ -500,8 +551,10 @@ def test_render_statement_truncates_beyond_cap() -> None:
     rendered = _render_statement(stmt)
     assert "Result (55 rows):" in rendered
     assert "… (5 more rows)" in rendered
-    # 1 header line + 1 column line + 50 rows + 1 omitted line.
-    assert rendered.count("\n") == 1 + 1 + 50
+    assert "| --- |" in rendered
+    # Exactly the first 50 rows are shown; row index 50+ is summarized away.
+    assert "| 49 |" in rendered
+    assert "| 50 |" not in rendered
 
 
 def test_render_statement_single_omitted_row_is_singular() -> None:

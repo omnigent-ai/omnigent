@@ -26,7 +26,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+import re
+from collections.abc import AsyncIterator, Sequence
 from datetime import timedelta
 
 from omnigent.inner.executor import (
@@ -104,18 +105,34 @@ def _latest_user_text(messages: list[Message]) -> str:
     return ""
 
 
+def _md_cell(value: object) -> str:
+    """Sanitize a value for one GitHub-Flavored-Markdown table cell.
+
+    Collapses internal whitespace (so a multi-line review stays on a single
+    table row instead of shattering the layout) and escapes pipes (so a value
+    containing ``|`` doesn't open a spurious column).
+
+    :param value: A raw cell value; ``None`` renders as an empty cell.
+    :returns: A single-line, pipe-safe cell string.
+    """
+    text = "" if value is None else str(value)
+    return re.sub(r"\s+", " ", text).strip().replace("|", r"\|")
+
+
 def _render_statement(statement: object) -> str:
-    """Render a SQL ``StatementResponse`` as a compact text table.
+    """Render a SQL ``StatementResponse`` as a GitHub-Flavored-Markdown table.
 
     Reads column names from ``statement.manifest.schema.columns[*].name`` and
     rows from ``statement.result.data_array`` (Genie returns cell values as
-    strings). Rows beyond :data:`_MAX_RESULT_ROWS` are summarized rather than
-    printed.
+    strings), emitting a ``| col | col |`` header, a ``| --- | --- |`` delimiter
+    row, and one ``| ... |`` line per row — the form the web UI renders as an
+    HTML table. Cells are sanitized via :func:`_md_cell`; rows beyond
+    :data:`_MAX_RESULT_ROWS` are summarized rather than printed.
 
     :param statement: A ``databricks.sdk.service.sql.StatementResponse`` (or any
         object exposing the same ``manifest`` / ``result`` shape).
-    :returns: A ``"Result (N rows):\\n<header>\\n<rows>"`` block, or ``""`` when
-        the statement carries no rows.
+    :returns: A ``"Result (N rows):\\n\\n<markdown table>"`` block, or ``""``
+        when the statement carries no rows.
     """
     data = getattr(statement, "result", None)
     rows = getattr(data, "data_array", None) if data is not None else None
@@ -126,19 +143,24 @@ def _render_statement(statement: object) -> str:
     schema = getattr(manifest, "schema", None) if manifest is not None else None
     columns = [str(getattr(col, "name", "")) for col in (getattr(schema, "columns", None) or [])]
 
-    lines: list[str] = []
-    if columns:
-        lines.append(" | ".join(columns))
     shown = rows[:_MAX_RESULT_ROWS]
-    for row in shown:
-        lines.append(" | ".join("" if cell is None else str(cell) for cell in row))
-    omitted = len(rows) - len(shown)
-    if omitted > 0:
-        lines.append(f"… ({omitted} more row{'s' if omitted != 1 else ''})")
+    width = max(len(columns), max(len(row) for row in shown))
+    headers = [columns[i] if i < len(columns) else f"col{i + 1}" for i in range(width)]
+
+    def _row(cells: Sequence[object]) -> str:
+        padded = (_md_cell(cells[i]) if i < len(cells) else "" for i in range(width))
+        return "| " + " | ".join(padded) + " |"
+
+    table = [_row(headers), "| " + " | ".join(["---"] * width) + " |"]
+    table.extend(_row(row) for row in shown)
 
     total = len(rows)
-    header = f"Result ({total} row{'s' if total != 1 else ''}):"
-    return header + "\n" + "\n".join(lines)
+    block = f"Result ({total} row{'s' if total != 1 else ''}):\n\n" + "\n".join(table)
+
+    omitted = total - len(shown)
+    if omitted > 0:
+        block += f"\n\n… ({omitted} more row{'s' if omitted != 1 else ''})"
+    return block
 
 
 class DatabricksGenieExecutor(Executor):
@@ -256,15 +278,15 @@ class DatabricksGenieExecutor(Executor):
         description = getattr(query, "description", None)
         sql = getattr(query, "query", None)
 
-        lines: list[str] = [f'Generated SQL ("{title}"):' if title else "Generated SQL:"]
+        blocks: list[str] = [f'Generated SQL ("{title}"):' if title else "Generated SQL:"]
         if description:
-            lines.append(str(description))
+            blocks.append(str(description))
         if sql:
-            lines.append(str(sql))
+            blocks.append(f"```sql\n{sql}\n```")
         table = self._fetch_statement_table(client, getattr(query, "statement_id", None))
         if table:
-            lines.append(table)
-        return "\n".join(lines)
+            blocks.append(table)
+        return "\n\n".join(blocks)
 
     def _format_message(self, client: object, message: object) -> str:
         """Assemble the turn's response text from a ``GenieMessage``.
