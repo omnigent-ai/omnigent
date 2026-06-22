@@ -17,8 +17,6 @@ import sys
 import urllib.parse
 from pathlib import Path
 
-import httpx
-
 from omnigent.codex_native_bridge import (
     read_bridge_state,
     read_codex_config_model,
@@ -28,6 +26,7 @@ from omnigent.native_policy_hook import (
     evaluation_response_to_hook_output,
     fail_closed_hook_output,
     hook_payload_to_evaluation_request,
+    post_evaluate_with_retry,
 )
 
 # Budget for the policy evaluation POST. Normally a quick
@@ -160,23 +159,10 @@ def _main_evaluate_policy(argv: list[str]) -> int:
 
     session_component = urllib.parse.quote(session_id, safe="")
     url = f"{ap_server_url.rstrip('/')}/v1/sessions/{session_component}/policies/evaluate"
-    try:
-        with httpx.Client(
-            headers=headers, timeout=httpx.Timeout(_EVALUATE_POLICY_TIMEOUT_S)
-        ) as client:
-            resp = client.post(url, json=eval_request)
-            resp.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        print(
-            f"omnigent codex evaluate-policy hook: Omnigent returned {exc.response.status_code}",
-            file=sys.stderr,
-        )
-        return _fail_closed()
-    except httpx.HTTPError as exc:
-        print(
-            f"omnigent codex evaluate-policy hook: Omnigent request failed: {exc}",
-            file=sys.stderr,
-        )
+    resp = post_evaluate_with_retry(
+        url, headers, eval_request, _EVALUATE_POLICY_TIMEOUT_S, "codex evaluate-policy hook"
+    )
+    if resp is None:
         return _fail_closed()
     if not resp.content:
         print("omnigent codex evaluate-policy hook: empty Omnigent response", file=sys.stderr)
