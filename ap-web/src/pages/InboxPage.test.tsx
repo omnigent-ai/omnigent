@@ -256,6 +256,56 @@ describe("InboxPage approval items", () => {
     );
   });
 
+  it("clears a stale verdict when a snapshot refresh still shows the elicitation as pending", async () => {
+    // WHY: when a hook retry re-parks the same elicitation id, the local
+    // `responded` entry from the first approval keeps the card stuck on
+    // "Approved". After the snapshot query delivers fresh data that still
+    // lists the id as pending, the stale verdict must be cleared so the
+    // approve button reappears.
+    const row = conversation({ id: "sess_1" });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [rawElicitation("eli_1", "Approve this?")],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const { rerender } = render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter>
+          <InboxPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    // Approve the card — it flips to responded.
+    fireEvent.click(await screen.findByRole("button", { name: "Stub Accept" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("approval-card")).toHaveAttribute("data-status", "responded"),
+    );
+
+    // Simulate a snapshot refresh that still lists the same elicitation
+    // (hook retry re-parked it). Update the row's updated_at so the
+    // query key changes, which triggers a refetch with fresh data.
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [rawElicitation("eli_1", "Approve this?")],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    const updatedRow = conversation({ id: "sess_1", updated_at: 1_700_000_001 });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([updatedRow]));
+    rerender(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter>
+          <InboxPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    // The stale verdict should be cleared — card reverts to pending.
+    await waitFor(() =>
+      expect(screen.getByTestId("approval-card")).toHaveAttribute("data-status", "pending"),
+    );
+  });
+
   it("routes the verdict to the child session when the prompt is mirrored", async () => {
     // WHY: a mirrored child prompt carries target_session_id; the resolve POST
     // must target that session, not the row it surfaced under.

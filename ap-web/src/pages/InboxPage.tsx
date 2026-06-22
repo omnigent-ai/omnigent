@@ -35,7 +35,7 @@
  * the prompt timing out) is what clears an approval.
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useQueries, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangleIcon,
@@ -98,7 +98,7 @@ export function InboxPage() {
   // server; persistent failures surface in the error banner below.
   const snapshotQueries = useQueries({
     queries: rows.map((row) => ({
-      queryKey: ["inbox-elicitations", row.id, row.pending_elicitations_count],
+      queryKey: ["inbox-elicitations", row.id, row.pending_elicitations_count, row.updated_at],
       queryFn: () => getSession(row.id),
       retry: 1,
     })),
@@ -110,6 +110,34 @@ export function InboxPage() {
     if (snapshot) sources.push({ row, pendingElicitations: snapshot.pendingElicitations ?? [] });
   });
   const items = collectInboxItems(sources);
+
+  // Clear stale optimistic verdicts when snapshot data refreshes.
+  // If a hook retry re-parks the same elicitation id after the user
+  // approved the previous attempt, the local `responded` entry would
+  // otherwise keep the card stuck on "Approved" indefinitely. When
+  // any snapshot query delivers fresh data (dataUpdatedAt advances),
+  // sweep verdicts whose id is still pending on the server — those
+  // approvals were consumed and the server re-parked the prompt.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const snapshotVersionKey = snapshotQueries.map((q) => q.dataUpdatedAt ?? 0).join(",");
+  const isFirstRender = useRef(true);
+  useEffect(() => {
+    // Skip the first render — there are no stale verdicts yet.
+    if (isFirstRender.current) {
+      isFirstRender.current = false;
+      return;
+    }
+    setResponded((prev) => {
+      if (Object.keys(prev).length === 0) return prev;
+      const pendingIds = new Set(items.map((i) => i.elicitation.elicitationId));
+      const stale = Object.keys(prev).filter((id) => pendingIds.has(id));
+      if (stale.length === 0) return prev;
+      const next = { ...prev };
+      for (const id of stale) delete next[id];
+      return next;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [snapshotVersionKey]);
 
   // "Settled" gating for the empty state: while the session list is
   // still paging or ANY snapshot is in flight, an empty `items` only
