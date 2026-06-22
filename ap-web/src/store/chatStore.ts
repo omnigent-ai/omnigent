@@ -3080,6 +3080,41 @@ function hasCommittedItem(blocks: AnyBlock[], itemId: string): boolean {
 }
 
 /**
+ * Insert a committed user-message block at its chronological position
+ * in the block list — before the first block of the response it
+ * triggered — rather than blindly appending.
+ *
+ * Non-native sessions persist and broadcast the consumed event
+ * synchronously with the POST, so the append lands before any
+ * assistant output and ordering is correct.  Native terminal sessions
+ * round-trip the user message through the CLI transcript; by the time
+ * ``session.input.consumed`` fires the assistant has already streamed
+ * blocks into the list.  Appending places the user bubble *after*
+ * (or in the middle of) the assistant output — the user's prompt
+ * disappears from the top of the chat.
+ *
+ * Heuristic: the active response (or, for completed turns, the
+ * response that matches the majority of trailing blocks) is the one
+ * the consumed message triggered.  Insert just before its first block
+ * so the walker emits ``[user_bubble, assistant_bubble]``.
+ */
+function insertUserBlock(blocks: AnyBlock[], userBlock: UserMessageBlock, activeResponseId: string | undefined): AnyBlock[] {
+  if (activeResponseId) {
+    const firstIdx = blocks.findIndex(
+      (b) => b.ctx.responseId === activeResponseId,
+    );
+    if (firstIdx >= 0) {
+      return [
+        ...blocks.slice(0, firstIdx),
+        userBlock,
+        ...blocks.slice(firstIdx),
+      ];
+    }
+  }
+  return [...blocks, userBlock];
+}
+
+/**
  * Build the committed user-message content from a consumed event,
  * preserving optimistic file blocks the native transcript drops.
  *
@@ -3614,22 +3649,18 @@ export function handleSessionEvent(event: StreamEvent): void {
             const matched = s.pendingUserMessages[idx]!;
             const content = committedContentFor(event, matched.content);
             if (content === null) return {};
+            const promoted = committedUserBlock(
+              event.itemId,
+              content,
+              matched.tempId,
+              event.createdBy ?? matched.author,
+            );
             return {
               pendingUserMessages: [
                 ...s.pendingUserMessages.slice(0, idx),
                 ...s.pendingUserMessages.slice(idx + 1),
               ],
-              // stableKey = the optimistic bubble's temp id → the
-              // promoted bubble keeps the same React key (no remount).
-              blocks: [
-                ...s.blocks,
-                committedUserBlock(
-                  event.itemId,
-                  content,
-                  matched.tempId,
-                  event.createdBy ?? matched.author,
-                ),
-              ],
+              blocks: insertUserBlock(s.blocks, promoted, s.activeResponse?.responseId),
             };
           }
         }
@@ -3639,30 +3670,24 @@ export function handleSessionEvent(event: StreamEvent): void {
         if (head) {
           const content = committedContentFor(event, head.content);
           if (content === null) return {};
+          const promoted = committedUserBlock(
+            event.itemId,
+            content,
+            head.tempId,
+            event.createdBy ?? head.author,
+          );
           return {
             pendingUserMessages: s.pendingUserMessages.slice(1),
-            // stableKey = the popped optimistic bubble's temp id so the
-            // promoted bubble keeps the same React key (no remount/flink).
-            blocks: [
-              ...s.blocks,
-              committedUserBlock(
-                event.itemId,
-                content,
-                head.tempId,
-                event.createdBy ?? head.author,
-              ),
-            ],
+            blocks: insertUserBlock(s.blocks, promoted, s.activeResponse?.responseId),
           };
         }
 
         // 3. Nothing pending — render the event payload fresh.
         const content = userContentFromEvent(event);
         if (content === null) return {};
+        const fresh = committedUserBlock(event.itemId, content, undefined, event.createdBy);
         return {
-          blocks: [
-            ...s.blocks,
-            committedUserBlock(event.itemId, content, undefined, event.createdBy),
-          ],
+          blocks: insertUserBlock(s.blocks, fresh, s.activeResponse?.responseId),
         };
       });
       return;

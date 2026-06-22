@@ -3852,6 +3852,94 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(state.blocks).toHaveLength(1);
       expect((state.blocks[0] as UserMessageBlock).ctx.itemId).toBe("msg_hi");
     });
+
+    it("inserts the promoted user block before the active response's blocks (native delayed consumed)", () => {
+      // Native terminal sessions round-trip the user message through
+      // the CLI transcript. By the time session.input.consumed fires,
+      // assistant blocks are already in the list. The committed user
+      // block must be inserted BEFORE the active response's blocks so
+      // the walker emits [user_bubble, assistant_bubble], not
+      // [assistant_bubble, user_bubble] (the disappearing-prompt bug).
+      const assistantBlock: AnyBlock = {
+        type: "text_done",
+        ctx: {
+          agent: null,
+          depth: 0,
+          turn: 0,
+          timestamp: 0,
+          responseId: "resp_current",
+          itemId: "msg_asst_1",
+        },
+        fullText: "Working on it…",
+        hasCodeBlocks: false,
+      };
+      useChatStore.setState({
+        blocks: [assistantBlock],
+        pendingUserMessages: [
+          { tempId: "pend_1", content: [{ type: "input_text", text: "fix the bug" }] },
+        ],
+        activeResponse: {
+          responseId: "resp_current",
+          state: "streaming",
+          error: null,
+        },
+      });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_user",
+        itemType: "message",
+        data: { role: "user", content: [{ type: "input_text", text: "fix the bug" }] },
+      });
+
+      const state = useChatStore.getState();
+      expect(state.blocks).toHaveLength(2);
+      // User block is BEFORE the assistant block.
+      expect(state.blocks[0]!.type).toBe("user_message");
+      expect((state.blocks[0] as UserMessageBlock).ctx.itemId).toBe("msg_user");
+      expect(state.blocks[1]).toBe(assistantBlock);
+      expect(state.pendingUserMessages).toEqual([]);
+    });
+
+    it("inserts a cross-client user message before the active response's blocks", () => {
+      // TUI-typed message arriving via consumed while the response is
+      // already streaming — same ordering fix as promoted pending bubbles.
+      const assistantBlock: AnyBlock = {
+        type: "text_done",
+        ctx: {
+          agent: null,
+          depth: 0,
+          turn: 0,
+          timestamp: 0,
+          responseId: "resp_live",
+          itemId: "msg_asst_live",
+        },
+        fullText: "hello",
+        hasCodeBlocks: false,
+      };
+      useChatStore.setState({
+        blocks: [assistantBlock],
+        pendingUserMessages: [],
+        activeResponse: {
+          responseId: "resp_live",
+          state: "streaming",
+          error: null,
+        },
+      });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_tui",
+        itemType: "message",
+        data: { role: "user", content: [{ type: "input_text", text: "from terminal" }] },
+      });
+
+      const state = useChatStore.getState();
+      expect(state.blocks).toHaveLength(2);
+      expect(state.blocks[0]!.type).toBe("user_message");
+      expect((state.blocks[0] as UserMessageBlock).ctx.itemId).toBe("msg_tui");
+      expect(state.blocks[1]).toBe(assistantBlock);
+    });
   });
 
   describe("slash_command (claude-native skill / surfaced command)", () => {
