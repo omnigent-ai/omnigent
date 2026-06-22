@@ -49,6 +49,7 @@ from urllib.parse import urlparse as _urlparse
 
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.onboarding.databricks_config import DATABRICKS_CLAUDE_DEFAULT_MODEL
+from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.spec.types import RetryPolicy
 
 from ._subprocess_lifecycle import close_subprocess_transport
@@ -620,6 +621,7 @@ _PI_ENV_ALLOW_EXACT: frozenset[str] = frozenset(
         "LOGNAME",
         "SHELL",
         "TZ",
+        OMNIGENT_SESSION_ENV_VAR,  # "inside Omnigent" marker (CLAUDE_CODE/CODEX analog)
     }
 )
 _STREAM_READ_CHUNK_SIZE = 65536

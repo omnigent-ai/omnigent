@@ -20,7 +20,10 @@ from pathlib import Path
 from typing import Any, TypeAlias, cast
 from urllib.parse import urlparse, urlunparse
 
-from omnigent.runner.identity import strip_runner_auth_secrets
+from omnigent.runner.identity import (
+    OMNIGENT_SESSION_ENV_VAR,
+    strip_runner_auth_secrets,
+)
 
 from .async_utils import run_sync_on_thread
 from .credential_proxy import (
@@ -121,6 +124,11 @@ _DEFAULT_ENV_PASSTHROUGH: tuple[str, ...] = (
     "PYTHONUNBUFFERED",
     "PYTHONDONTWRITEBYTECODE",
     "PYTHONFAULTHANDLER",
+    # Omnigent session marker: always pass the "inside Omnigent" marker
+    # through so an agent's sandboxed shell can detect the session, the
+    # way CLAUDE_CODE / CODEX are visible in their agents' shells. Set on
+    # the runner via runner.identity.OMNIGENT_SESSION_ENV_VAR.
+    OMNIGENT_SESSION_ENV_VAR,
 )
 
 
