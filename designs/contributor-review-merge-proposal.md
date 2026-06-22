@@ -16,7 +16,7 @@ Define how contributor (fork) PRs get **reviewed, approved, and merged** — kee
 ## Current state (audited)
 What already exists in `.github/workflows/`:
 - **`maintainer-approval.yml`** — the `Maintainer Approval` status is a required check that stays red until a maintainer approves. Runs on `pull_request_target` from `main`, reads `.github/MAINTAINER` at main's tip (a PR can't self-grant), checks out no PR code. This is the merge gate we're building the human process around.
-- **`merge-ready.yml`** — posts the single required `Merge Ready` status backing branch protection; supports `/merge` (write-access commenter) and the `automerge` label, and re-evaluates on CI completion. (There is no CI bypass label: land despite red required checks by quarantining the flaky test or via a repo admin's native bypass.)
+- **`merge-ready.yml`** — posts the single required `Merge Ready` status backing branch protection; supports `/merge` (write-access commenter) and the `automerge` label, and re-evaluates on CI completion. (There is no CI bypass label: land despite red required checks by fixing or deleting the failing test, or via a repo admin's native bypass.)
 - **`security-gate.yml` / `security-scan.yml`** — the no-secrets deterministic diff scan that gates CI (see the CI proposal).
 - **`code-coverage.yml` / `ui-code-coverage.yml`** — currently **report-only**: posts a `Coverage` status whose % rides in the description, never required, can't block merge.
 - **`pr-size.yml`** — applies `size/{XS..XL}` labels for reviewer triage only (informational; *not* a gate — see below).

@@ -258,11 +258,12 @@ jobs:
         # --ui-skip-build: the SPA was built in the previous step.
         # --tracing/--screenshot/--video default to off; retain-on-failure
         # keeps green runs cheap while capturing artifacts on failures.
-        # OPENAI_API_KEY / OPENAI_BASE_URL flow into the spawned server via
-        # the conftest's live_server fixture for the openai-agents harness.
+        # OPENAI_API_KEY / OPENAI_BASE_URL are set by the conftest's
+        # live_server fixture to point at the in-process mock LLM server —
+        # no real gateway credentials needed for the openai-agents harness.
+        # Native render-parity tests (claude-sdk/codex) still use the
+        # ~/.omnigent/config.yaml written in the step above.
         env:
-          OPENAI_API_KEY: ${{ env.LLM_API_KEY }}
-          OPENAI_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
           # Scheduled / manually dispatched runs are the full pass;
           # PR and push runs exclude @pytest.mark.nightly tests.
           NIGHTLY_FULL: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
@@ -365,3 +366,40 @@ jobs:
               echo "- 📜 server.log: _no artifact uploaded (glob matched nothing)_"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Explicitly re-dispatch Merge Ready (same-repo PR or fork-e2e push): the
+  # workflow_run hop is brittle and was dropped on #751/#792. No checkout,
+  # actions:write only; GITHUB_TOKEN workflow_dispatch is exempt from recursion.
+  merge-ready-rerun:
+    name: Merge Ready rerun
+    needs: e2e-ui
+    if: >-
+      always()
+      && needs.e2e-ui.result != 'skipped'
+      && (
+        (github.event_name == 'pull_request'
+          && github.event.pull_request.head.repo.full_name == github.repository)
+        || (github.event_name == 'push'
+          && startsWith(github.ref_name, 'fork-e2e/pr-'))
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      REF_NAME: ${{ github.ref_name }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Re-dispatch Merge Ready
+        run: |
+          set -euo pipefail
+          # same-repo PR -> event number; fork-e2e push -> parse fork-e2e/pr-<N>
+          PR="${PR_NUMBER:-${REF_NAME##*/pr-}}"
+          if ! [[ "$PR" =~ ^[0-9]+$ ]]; then
+            echo "::notice::could not resolve PR number (ref='$REF_NAME'); nothing to do."
+            exit 0
+          fi
+          echo "Re-dispatching merge-ready.yml for PR #$PR after $GITHUB_WORKFLOW."
+          gh workflow run merge-ready.yml --repo "$REPO" -f pr="$PR"

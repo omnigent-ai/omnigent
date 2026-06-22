@@ -47,41 +47,22 @@ its own session-scoped live server, same as `tests/e2e/`).
 
 ## Authoring rules
 
-- Keep every test under the CI per-test `--timeout=180` cap PER
-  ATTEMPT (turn polls are capped at 50s for this reason). Do not add
-  blanket `llm_flaky`/`flaky` markers; the one sanctioned exception is
-  the conftest's codex-only rerun (bursty empty-turn flake, #544/#599
-  class), which is safe because attempts stay under the cap.
+- Keep every test under the CI per-test `--timeout=180` cap (turn
+  polls are capped at 50s for this reason). Do not add `llm_flaky`
+  or `flaky` markers.
 - Prompts must be imperative and assertions must check literal
   markers (`uuid` hex), never just "some text came back".
 - New harness? Add a nightly.yml matrix leg and extend
   `_SUPPORTED_HARNESSES` in `conftest.py`.
 
-## Mock-LLM mode (also runs in the default suite)
+## Mock-LLM mode
 
-When invoked with NO `--llm-api-key`, this directory's `--integration`
-gate is lifted (`conftest.py::pytest_collection_modifyitems`) and the
-tests run against the always-on mock LLM server instead of a real
-gateway. `using_mock_llm` is True and `_is_mock_mode(config)` is the
-signal. The same files run in TWO CI job families: `Pytest
-(integration-mock)` (mock) and `Integration (claude-sdk|codex|
-openai-agents)` (real LLM, passes `--llm-api-key`).
+All tests run against the always-on mock LLM server (no real gateway
+credentials required). The `--integration` gate is lifted when no
+`--llm-api-key` is passed (`conftest.py::pytest_collection_modifyitems`).
 
-Two rules keep the two modes correct:
+One rule to keep queues clean:
 
-- **`mock_only` marker** — tests whose mock LLM is scripted with a
-  fixed tool-call sequence (e.g. the scripted server→client round-trip
-  tests) CANNOT run against a real LLM: it would 401 on the mock base
-  URL and could never reproduce the scripted call_ids/markers. Mark
-  those modules `pytestmark = pytest.mark.mock_only`; the central gate
-  in `conftest.py` skips them when a real `--llm-api-key` is supplied.
-  Do NOT mark dual-mode journeys (`test_smoke` / `test_multi_turn` /
-  `test_sharing` / `test_client_tools`) — they use the `default` queue
-  and are designed to run in both modes.
-  - A `if mock_llm_server_url is None: pytest.skip(...)` guard inside a
-    test body is DEAD CODE: the `mock_llm_server_url` fixture is "always
-    started regardless of --llm-api-key", so it never yields `None` and
-    the skip never fires. Use the `mock_only` marker, not that guard.
 - **Central queue reset** — `conftest.py` has an autouse,
   function-scoped `_reset_mock_llm_between_tests` fixture that clears the
   shared (session-scoped) mock server queues before and after every

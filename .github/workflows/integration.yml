@@ -1,12 +1,11 @@
 name: Integration Tests
 
-# Per-PR twin of nightly.yml's journey-suite matrix (tests/integration/),
-# once per wrapped harness against the real Databricks gateway. Burn-in:
-# NOT in merge-ready's REQUIRED list yet (reports for signal; flip in
-# .github/scripts/merge-ready/required.sh after a clean week). Triggers:
-# daily schedule, same-repo PR gate (secrets flow; fork PRs skip and run
-# via the fork-e2e/** push after fork-e2e-mirror.yml), the fork-e2e/**
-# push itself, and workflow_dispatch.
+# Per-PR journey-suite matrix (tests/integration/), once per wrapped harness
+# using the mock LLM server (no real gateway credentials required). All tests
+# are mock_only: they script the LLM responses via configure_mock_llm and run
+# against a local mock FastAPI server. Triggers: daily schedule, same-repo PR
+# gate (fork PRs skip and run via the fork-e2e/** push after
+# fork-e2e-mirror.yml), the fork-e2e/** push itself, and workflow_dispatch.
 
 on:
   schedule:
@@ -121,23 +120,6 @@ jobs:
         with:
           path: .venv
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
-      - name: Set LLM credentials
-        run: echo "LLM_API_KEY=${{ secrets.LLM_API_KEY }}" >> "$GITHUB_ENV"
-      - name: Write gateway profile (~/.databrickscfg)
-        env:
-          GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-        run: |
-          # Strip the /serving-endpoints suffix the conftest re-appends.
-          host="${GATEWAY_BASE_URL%/serving-endpoints}"
-          cat > "$HOME/.databrickscfg" <<EOF
-          [default]
-          host  = $host
-          token = $LLM_API_KEY
-          EOF
-          # PAT passthrough for the codex / claude-sdk auth commands.
-          echo "DATABRICKS_BEARER=$LLM_API_KEY" >> "$GITHUB_ENV"
-
       - name: Install project and dev dependencies
         run: uv sync --extra all --extra dev
 
@@ -188,11 +170,8 @@ jobs:
           # --timeout=180 caps a single hung test (see e2e.yml).
           env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u DATABRICKS_TOKEN \
             uv run pytest tests/integration/ \
-              --integration \
               --model "$MODEL" \
               --harness "$HARNESS" \
-              --profile default \
-              --llm-api-key "$LLM_API_KEY" \
               -n "$WORKERS" \
               --dist=loadscope \
               --timeout=180 \
@@ -221,3 +200,40 @@ jobs:
           path: artifacts/
           retention-days: 14
           if-no-files-found: ignore
+
+  # Explicitly re-dispatch Merge Ready (same-repo PR or fork-e2e push): the
+  # workflow_run hop is brittle and was dropped on #751/#792. No checkout,
+  # actions:write only; GITHUB_TOKEN workflow_dispatch is exempt from recursion.
+  merge-ready-rerun:
+    name: Merge Ready rerun
+    needs: integration
+    if: >-
+      always()
+      && needs.integration.result != 'skipped'
+      && (
+        (github.event_name == 'pull_request'
+          && github.event.pull_request.head.repo.full_name == github.repository)
+        || (github.event_name == 'push'
+          && startsWith(github.ref_name, 'fork-e2e/pr-'))
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      REF_NAME: ${{ github.ref_name }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Re-dispatch Merge Ready
+        run: |
+          set -euo pipefail
+          # same-repo PR -> event number; fork-e2e push -> parse fork-e2e/pr-<N>
+          PR="${PR_NUMBER:-${REF_NAME##*/pr-}}"
+          if ! [[ "$PR" =~ ^[0-9]+$ ]]; then
+            echo "::notice::could not resolve PR number (ref='$REF_NAME'); nothing to do."
+            exit 0
+          fi
+          echo "Re-dispatching merge-ready.yml for PR #$PR after $GITHUB_WORKFLOW."
+          gh workflow run merge-ready.yml --repo "$REPO" -f pr="$PR"
