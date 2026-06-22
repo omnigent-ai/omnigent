@@ -57,7 +57,7 @@ from tests.e2e.test_polly_e2e import (
 # tests/e2e/test_polly_subagent_model_e2e.py -> repo root is 2 parents up.
 _POLLY = _REPO / "examples" / "polly"
 # Mock runs are fast (no real model inference) so a short timeout is enough.
-_RUN_TIMEOUT_SEC = 120
+_RUN_TIMEOUT_SEC = 300
 
 # Models dispatched to each worker in the multi-dispatch test.
 # Under mock (no Databricks creds), the dispatch gate localizes models for
@@ -286,6 +286,9 @@ def test_polly_dispatches_distinct_models_per_worker(
             },
             # Second response: after tool results arrive, end the turn.
             {"text": "Dispatched all three workers. Waiting for inbox notices."},
+            # Third response: synthesis after sub-agents complete (or fail fast on
+            # the mock server with no queued responses).
+            {"text": "All three workers done. Model overrides verified."},
         ],
         key=_MOCK_BRAIN_MODEL,
     )
@@ -476,6 +479,8 @@ def test_polly_lists_models_then_dispatches_pi_from_list(
             },
             # Step 3: end the turn after dispatch.
             {"text": "Dispatched pi on a Claude model from the catalog."},
+            # Step 4: synthesis after pi completes (or fails fast on mock).
+            {"text": "Pi done. Model override verified."},
         ],
         key=_MOCK_BRAIN_MODEL,
     )
@@ -593,6 +598,8 @@ def test_polly_canonical_id_localized_for_gateway_child(
             },
             # End the turn after dispatch.
             {"text": "Dispatched pi on claude-opus-4-8. Waiting for inbox."},
+            # Synthesis after pi completes (or fails fast on mock).
+            {"text": "Pi done. Canonical id localized and persisted."},
         ],
         key=_MOCK_BRAIN_MODEL,
     )

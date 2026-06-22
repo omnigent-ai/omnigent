@@ -18225,30 +18225,31 @@ async def _get_session_snapshot(
     if runner_client is None:
         runner_client = get_runner_client()
 
-    status = _session_status_cache.get(session_id)
-    if status is None:
-        # Cache miss: either the server restarted, or the relay
-        # has not yet published the first ``"running"`` event
-        # for a freshly bound session (the relay's GET /stream
-        # is still in its tunnel handshake). Ask the runner for
-        # live status so we don't synthesize a stale ``"idle"``
-        # while a turn is actually in flight.
-        if runner_client is not None:
+    status = _session_status_from_cache(session_id)
+    if status == "idle":
+        # Cache miss (or truly idle): either the server restarted, or the
+        # relay has not yet published the first ``"running"`` event for a
+        # freshly bound session (the relay's GET /stream is still in its
+        # tunnel handshake). Ask the runner for live status so we don't
+        # synthesize a stale ``"idle"`` while a turn is actually in flight.
+        # ``_session_status_from_cache`` already collapses the fine-grained
+        # relay values (``"waiting"`` → ``"running"``), so the raw cache value
+        # is only needed here when it is actually missing (None).
+        if _session_status_cache.get(session_id) is None and runner_client is not None:
             try:
                 resp = await runner_client.get(
                     f"/v1/sessions/{session_id}",
                     timeout=5.0,
                 )
                 if resp.status_code == 200:
-                    status = resp.json().get("status", "idle")
-                    _session_status_cache[session_id] = status
+                    raw = resp.json().get("status", "idle")
+                    _session_status_cache[session_id] = raw
+                    status = _session_status_from_cache(session_id)
             except httpx.HTTPError:
                 _logger.debug(
                     "Runner status query failed for %s",
                     session_id,
                 )
-        if status is None:
-            status = "idle"
     # last_total_tokens and last_task_error come from the context-tokens
     # label written by the forwarder (tasks table has been removed).
     last_total_tokens: int | None = None

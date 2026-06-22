@@ -1775,7 +1775,11 @@ class _SessionsChatReplAdapter:
                         flush=True,
                     )
                 async for event in self._client.sessions.stream(self._session_id):
-                    if isinstance(event, _StatusEv) and event.status in ("idle", "failed"):
+                    if isinstance(event, _StatusEv) and event.status in (
+                        "idle",
+                        "waiting",
+                        "failed",
+                    ):
                         turn_done = getattr(self, "_turn_done", None)
                         if turn_done is not None:
                             turn_done.set()
@@ -2886,7 +2890,7 @@ async def run_repl(
                 # a stream-pump reconnect gap or before this REPL
                 # attached is lost — so also re-sync at each turn start.
                 _spawn_metadata_refresh()
-            elif event.status in ("idle", "failed"):
+            elif event.status in ("idle", "waiting", "failed"):
                 from omnigent_client import TextDone
 
                 # A SETUP-phase failure (spec resolution, spawn-env

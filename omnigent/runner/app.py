@@ -8001,7 +8001,20 @@ def create_runner_app(
             _publish_turn_status(conv_id, "failed", error=_normalize_turn_error(error))
         else:
             if not has_buffered:
-                _publish_turn_status(conv_id, "idle")
+                # Emit ``waiting`` instead of ``idle`` when the turn ended
+                # cleanly but sub-agents are still running. This lets the
+                # headless ``-p`` multi-turn loop (``_drain_extra_turns`` in
+                # ``chat.py``) distinguish an async orchestrator that parked
+                # on the inbox drain from a truly finished single-turn agent —
+                # both would otherwise emit ``idle`` here, making them
+                # indistinguishable without a "waiting" signal.
+                children = _subagent_work_by_parent.get(conv_id, set())
+                has_running_children = any(
+                    (e := _subagent_work_by_child.get(c)) is not None
+                    and e.status in ("launching", "running", "waiting")
+                    for c in children
+                )
+                _publish_turn_status(conv_id, "waiting" if has_running_children else "idle")
         if was_interrupted:
             _mark_subagent_terminal_and_wake(
                 conv_id,
