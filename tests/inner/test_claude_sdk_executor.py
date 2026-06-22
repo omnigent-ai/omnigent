@@ -672,6 +672,70 @@ class TestConstructor(unittest.TestCase):
 
         _run(_t())
 
+    def test_strict_mcp_config_defaults_on(self):
+        """Default executor isolates host MCP servers via ``strict_mcp_config``.
+
+        The regression this guards: a host-configured MCP server such as
+        ``chrome-devtools-mcp`` (visible Chrome by default) was being
+        launched mid-turn because the CLI inherits host MCP servers
+        whenever ``setting_sources`` resolves to ``["user", "project"]``
+        (which it must, to load host skills / CLAUDE.md). Passing
+        ``--strict-mcp-config`` keeps the skill / CLAUDE.md inheritance
+        but drops the silent MCP-server inheritance, so the default must
+        reach the SDK options as ``True``.
+        """
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        async def _t():
+            executor = ClaudeSDKExecutor(gateway=False, model="claude-opus-4-7")
+            captured: dict[str, object] = {}
+
+            async def fake_get_or_create_client(sdk, *, session_key, options, model):
+                captured["strict"] = getattr(options, "strict_mcp_config", None)
+                raise RuntimeError("stop after options built")
+
+            with patch.object(
+                executor,
+                "_get_or_create_client",
+                side_effect=fake_get_or_create_client,
+            ):
+                with self.assertRaises(RuntimeError):
+                    async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                        pass
+
+            self.assertIs(captured["strict"], True)
+
+        _run(_t())
+
+    def test_strict_mcp_config_opt_out(self):
+        """``strict_mcp_config=False`` restores host MCP-server inheritance."""
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        async def _t():
+            executor = ClaudeSDKExecutor(
+                gateway=False,
+                model="claude-opus-4-7",
+                strict_mcp_config=False,
+            )
+            captured: dict[str, object] = {}
+
+            async def fake_get_or_create_client(sdk, *, session_key, options, model):
+                captured["strict"] = getattr(options, "strict_mcp_config", None)
+                raise RuntimeError("stop after options built")
+
+            with patch.object(
+                executor,
+                "_get_or_create_client",
+                side_effect=fake_get_or_create_client,
+            ):
+                with self.assertRaises(RuntimeError):
+                    async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                        pass
+
+            self.assertIs(captured["strict"], False)
+
+        _run(_t())
+
     def test_force_close_client_uses_process_tree_termination(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 

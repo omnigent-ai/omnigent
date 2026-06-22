@@ -80,6 +80,18 @@ Env vars read at startup:
   stable plugin name (so bundled skills show as
   ``<agent>:<skill>`` rather than the bundle's tmpdir
   basename).
+- ``HARNESS_CLAUDE_SDK_STRICT_MCP_CONFIG``: ``"0"`` / ``"false"``
+  / ``"no"`` to OPT OUT of MCP-server isolation and let the
+  Claude CLI inherit the host's MCP servers (the operator's
+  ``~/.claude.json`` / ``~/.claude/settings.json``, a project
+  ``.mcp.json``, plugin servers). Defaults to strict
+  (isolated): the harness passes ``--strict-mcp-config`` so an
+  agent run uses only Omnigent's own MCP server and does NOT
+  silently boot host servers as a side effect of the
+  ``setting_sources=["user","project"]`` it needs for host
+  skills / CLAUDE.md. The motivating regression: a host
+  ``chrome-devtools-mcp`` (visible Chrome by default) popped
+  real browser windows on the user's machine mid-turn.
 """
 
 from __future__ import annotations
@@ -113,6 +125,7 @@ _ENV_RETRY_POLICY = "HARNESS_CLAUDE_SDK_RETRY_POLICY"
 _ENV_SKILLS_FILTER = "HARNESS_CLAUDE_SDK_SKILLS_FILTER"
 _ENV_BUNDLE_DIR = "HARNESS_CLAUDE_SDK_BUNDLE_DIR"
 _ENV_AGENT_NAME = "HARNESS_CLAUDE_SDK_AGENT_NAME"
+_ENV_STRICT_MCP_CONFIG = "HARNESS_CLAUDE_SDK_STRICT_MCP_CONFIG"
 _ENV_GATEWAY_BASE_URL = "HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"
 _ENV_GATEWAY_AUTH_COMMAND = "HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"
 _ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS = "HARNESS_CLAUDE_SDK_GATEWAY_AUTH_REFRESH_INTERVAL_MS"
@@ -249,6 +262,29 @@ def _resolve_skills_filter() -> str | list[str]:
     return "all"
 
 
+def _resolve_strict_mcp_config() -> bool:
+    """
+    Resolve the inner-executor ``strict_mcp_config`` from env config.
+
+    Reads :data:`_ENV_STRICT_MCP_CONFIG`. Defaults to ``True``
+    (host MCP servers isolated) so an agent run never silently
+    boots the operator's personal MCP servers — see the
+    motivating visible-Chrome-window regression in the module
+    docstring. Only an explicit opt-out value (``"0"`` /
+    ``"false"`` / ``"no"``, case-insensitive) flips it to
+    ``False`` to restore host MCP-server inheritance; anything
+    else (including an unset var or an unrecognized value) keeps
+    the safe default.
+
+    :returns: ``True`` to pass ``--strict-mcp-config`` (isolate
+        host MCP servers), ``False`` to inherit them.
+    """
+    raw = os.environ.get(_ENV_STRICT_MCP_CONFIG, "").strip().lower()
+    if raw in ("0", "false", "no"):
+        return False
+    return True
+
+
 def _build_claude_sdk_executor() -> Executor:
     """
     Construct a :class:`ClaudeSDKExecutor` from env-var config.
@@ -287,6 +323,7 @@ def _build_claude_sdk_executor() -> Executor:
         agent_name=agent_name,
         skills_filter=_resolve_skills_filter(),
         api_key_helper=os.environ.get(_ENV_API_KEY_HELPER) or None,
+        strict_mcp_config=_resolve_strict_mcp_config(),
     )
 
 

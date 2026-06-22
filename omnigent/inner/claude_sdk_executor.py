@@ -1111,6 +1111,7 @@ class ClaudeSDKExecutor(Executor):
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
         api_key_helper: str | None = None,
+        strict_mcp_config: bool = True,
     ) -> None:
         """Create a ClaudeSDKExecutor.
 
@@ -1184,6 +1185,29 @@ class ClaudeSDKExecutor(Executor):
                 Injected into ``_extra_env`` as
                 :data:`_CLAUDE_API_KEY_HELPER_ENV_KEY` so it reaches
                 the SDK's ``settings.apiKeyHelper`` option at turn time.
+            strict_mcp_config: When ``True`` (the default), pass
+                ``--strict-mcp-config`` to the Claude CLI so it uses ONLY
+                the MCP servers Omnigent declares (the in-process
+                ``omnigent`` SDK server) and IGNORES every MCP server the
+                CLI would otherwise auto-discover from the host: the
+                user's ``~/.claude.json`` / ``~/.claude/settings.json``,
+                a project ``.mcp.json``, and plugin-provided servers.
+                This is the safe default: a ``claude-sdk`` agent run must
+                NOT silently boot the operator's personal MCP servers as
+                a side effect of inheriting ``setting_sources=["user",
+                "project"]`` (which is needed for host skills / CLAUDE.md).
+                Without this guard, a host-configured server such as
+                ``chrome-devtools-mcp`` — which launches a VISIBLE Chrome
+                window by default (``--headless`` defaults to ``false``)
+                — pops real browser windows on the user's machine during
+                an otherwise headless agent turn. Set to ``False`` to opt
+                back in to host MCP-server inheritance (e.g. an operator
+                who deliberately wants the agent to reach their own
+                glean / jira / databricks MCP servers). ``--strict-mcp-
+                config`` affects ONLY MCP-server discovery; host skills
+                and CLAUDE.md still load via ``--setting-sources``, so
+                this default does not change the intended skill /
+                CLAUDE.md leak-through.
         """
         # Fail loud: a ``databricks-*`` model requires the gateway transport.
         if not gateway and model is not None and model.startswith("databricks-"):
@@ -1210,6 +1234,10 @@ class ClaudeSDKExecutor(Executor):
         self._bundle_dir = bundle_dir
         self._agent_name = agent_name
         self._skills_filter = skills_filter
+        # Isolate the agent from host-configured MCP servers by default.
+        # See the ``strict_mcp_config`` constructor arg for the full
+        # rationale (the visible-Chrome-window regression).
+        self._strict_mcp_config = strict_mcp_config
         # Write the bundle's plugin manifest now (idempotent) so that
         # ``--plugin-dir <bundle>`` produces clean
         # ``<agent-name>:<skill-name>`` labels in Claude's skill
@@ -2005,6 +2033,19 @@ class ClaudeSDKExecutor(Executor):
             "plugins": bundle_plugins,
             "extra_args": {"no-session-persistence": None},
             "max_buffer_size": 10 * 1024 * 1024,
+            # Gate host MCP-server inheritance. The CLI otherwise merges
+            # the SDK's ``--mcp-config`` (our in-process ``omnigent``
+            # server) WITH every MCP server it discovers from the host
+            # config (``~/.claude.json`` / ``~/.claude/settings.json``,
+            # project ``.mcp.json``, plugins) because ``setting_sources``
+            # resolves to ``["user", "project"]`` to load host skills /
+            # CLAUDE.md. ``--strict-mcp-config`` keeps the skill /
+            # CLAUDE.md inheritance but drops the silent MCP-server
+            # inheritance, so a host ``chrome-devtools-mcp`` (visible
+            # Chrome by default) no longer pops real browser windows
+            # mid-turn. Defaults on; an operator can opt back in to host
+            # MCP servers via ``strict_mcp_config=False``.
+            "strict_mcp_config": self._strict_mcp_config,
         }
         # Only forward ``setting_sources`` when explicitly set.
         # ``None`` lets the SDK apply its default

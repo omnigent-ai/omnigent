@@ -387,6 +387,78 @@ def test_skills_filter_env_var_malformed_json_falls_back_to_all(
     assert captured["skills_filter"] == "all"
 
 
+@pytest.mark.parametrize(
+    "raw_value, expected",
+    [
+        # Explicit opt-out values flip isolation off (case-insensitive).
+        ("0", False),
+        ("false", False),
+        ("False", False),
+        ("no", False),
+        ("NO", False),
+        # Anything else keeps the safe default (isolated).
+        ("1", True),
+        ("true", True),
+        ("yes", True),
+        ("", True),
+        ("garbage", True),
+    ],
+)
+def test_strict_mcp_config_env_var_parsing(
+    raw_value: str,
+    expected: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``HARNESS_CLAUDE_SDK_STRICT_MCP_CONFIG`` only opts OUT on explicit
+    falsey values; everything else stays isolated.
+
+    Isolation is the safe default: a ``claude-sdk`` run must not
+    silently boot the operator's host MCP servers (the visible-Chrome
+    regression). Only a deliberate ``0`` / ``false`` / ``no`` lets the
+    agent inherit host MCP servers, so an unset or unrecognized value
+    must NOT accidentally disable the guard.
+    """
+    monkeypatch.setenv("HARNESS_CLAUDE_SDK_STRICT_MCP_CONFIG", raw_value)
+    captured: dict[str, Any] = {}
+
+    def _fake_init(self: Any, **kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    with patch(
+        "omnigent.inner.claude_sdk_harness.ClaudeSDKExecutor.__init__",
+        _fake_init,
+    ):
+        claude_sdk_harness._build_claude_sdk_executor()
+
+    assert captured["strict_mcp_config"] is expected
+
+
+def test_strict_mcp_config_env_var_missing_defaults_to_isolated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unset ``HARNESS_CLAUDE_SDK_STRICT_MCP_CONFIG`` isolates host
+    MCP servers.
+
+    Legacy deployments that don't yet ship the env var must get the
+    safe behavior automatically — the whole point of the fix is that
+    no opt-in is required to stop host servers (like a visible
+    ``chrome-devtools-mcp``) from launching.
+    """
+    monkeypatch.delenv("HARNESS_CLAUDE_SDK_STRICT_MCP_CONFIG", raising=False)
+    captured: dict[str, Any] = {}
+
+    def _fake_init(self: Any, **kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    with patch(
+        "omnigent.inner.claude_sdk_harness.ClaudeSDKExecutor.__init__",
+        _fake_init,
+    ):
+        claude_sdk_harness._build_claude_sdk_executor()
+
+    assert captured["strict_mcp_config"] is True
+
+
 def test_bundle_dir_and_agent_name_env_vars_thread_through(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
