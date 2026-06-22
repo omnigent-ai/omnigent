@@ -675,6 +675,43 @@ class TimedFormatter(RichBlockFormatter):  # type: ignore[misc]
         return items
 
 
+def _emit_turn_elapsed_footer(
+    fmt: RichBlockFormatter,
+    host: TerminalHost,
+    *,
+    agent_name: str | None,
+) -> None:
+    """Emit a response-end block so a :class:`TimedFormatter` prints the
+    elapsed-time footer at turn end.
+
+    The REPL pairs ``format_response_start`` (and the live status-bar timer)
+    with each turn start, but its event loop never called the matching
+    ``format_response_end`` — so the persistent ``  Xs`` footer the timed
+    formatter renders was silently dropped for every turn. This closes that
+    gap. It's a no-op for a plain :class:`RichBlockFormatter` (whose
+    ``format_response_end`` emits nothing on a completed turn); only the timed
+    subclass appends the elapsed line, and only when a turn actually started
+    (it guards on a captured start time).
+
+    Status is fixed to ``"completed"``: a failed turn already renders its own
+    error line, so callers limit this to a successful end. ``BlockContext``'s
+    ``timestamp`` defaults to ``time.monotonic()`` at construction, so the
+    footer's elapsed is ``now - the start`` captured by
+    ``format_response_start``.
+
+    :param fmt: The active block formatter (the timed subclass, in the REPL).
+    :param host: Terminal host the footer is written to.
+    :param agent_name: Name of the agent that produced the turn (display only).
+    """
+    for item in fmt.format_response_end(
+        ResponseEndBlock(
+            status="completed",
+            ctx=BlockContext(agent=agent_name, depth=0, turn=0),
+        )
+    ):
+        host.output(item)
+
+
 class _ApprovalVerdict(enum.Enum):
     """
     How the user answered a policy approval prompt.
@@ -3341,6 +3378,18 @@ async def run_repl(
                 if tape_entry is not None and items_out:
                     _event_tape.mark_rendered(tape_entry, len(items_out))  # type: ignore[union-attr]
                 host.stop_timer()
+                # Pair the turn-start timer with a response-end footer so a
+                # TimedFormatter prints the elapsed "Xs" for the turn. The
+                # event loop sets the timer (format_response_start) but never
+                # called format_response_end, so the footer was dropped for
+                # every turn. A failed turn already shows an error line above,
+                # so this is limited to a successful (idle) end.
+                if event.status == "idle":
+                    _emit_turn_elapsed_footer(
+                        fmt,
+                        host,
+                        agent_name=session._agent_name,  # type: ignore[union-attr]
+                    )
                 turn_done = getattr(session, "_turn_done", None)
                 if turn_done is not None:
                     turn_done.set()
