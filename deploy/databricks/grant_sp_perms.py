@@ -116,12 +116,39 @@ def _upgrade_role_to_superuser(
             file=sys.stderr,
             flush=True,
         )
+        # Only a *typed* not-found result proves the role is gone. A bare
+        # ``except Exception`` would treat any probe failure (transient transport
+        # error, auth blip, 5xx) as "role gone" and fire a spurious restore — or
+        # worse, misread an intact role as deleted. Narrow to the SDK's not-found
+        # family so only a genuine "role missing" drives the recreate/restore
+        # path; every other probe error surfaces as an explicit INDETERMINATE
+        # state instead of being silently classified as gone.
+        from databricks.sdk.errors import NotFound
+
         try:
             database.get_database_instance_role(instance_name=instance_name, name=name)
-        except Exception:  # noqa: BLE001
-            # Probe says the role is gone despite the delete error — restore it.
+        except NotFound:
+            # Probe confirms the role is genuinely gone despite the delete error —
+            # the same deleted-and-not-recreated state as a post-delete failure,
+            # so restore it.
             _recreate_and_restore(delete_exc)
             return  # unreachable: _recreate_and_restore always raises.
+        except Exception as probe_exc:
+            # The probe failed for some OTHER reason, so we CANNOT conclude the
+            # role is gone. Treating this as "gone" would trigger a spurious
+            # restore; instead surface the indeterminate state clearly so the
+            # operator can verify and recreate only if it is actually missing.
+            # This still satisfies the crash-safety invariant: we never exit a
+            # possibly-deleted role silently — we raise explicit guidance.
+            raise RuntimeError(
+                f"Failed to delete role {name!r} while upgrading to "
+                f"DATABRICKS_SUPERUSER ({delete_exc!r}), and the follow-up probe "
+                f"to determine whether the role still exists also failed "
+                f"({probe_exc!r}). The role's state is INDETERMINATE: if it is "
+                "now missing, recreate it manually to restore DB auth; if it "
+                "still exists, nothing was modified. Re-run once the cause is "
+                "resolved."
+            ) from probe_exc
         # Role still exists; the delete had no effect. Nothing was destroyed.
         raise RuntimeError(
             f"Failed to delete role {name!r} while upgrading to "

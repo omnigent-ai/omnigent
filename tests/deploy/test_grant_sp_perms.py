@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import cast
 
 import pytest
+from databricks.sdk.errors import ResourceDoesNotExist
 from databricks.sdk.service import database as db
 
 from deploy.databricks.grant_sp_perms import _upgrade_role_to_superuser
@@ -49,11 +50,25 @@ class _FakeDatabase:
         # effect at all). Default: delete succeeds and removes the role.
         self.delete_error: Exception | None = None
         self.delete_removes_role: bool = True
+        # ``probe_error`` makes the *probe* call (the get after a failed delete)
+        # raise a non-not-found error, simulating a transient/unrelated probe
+        # failure that must NOT be misclassified as "role gone".
+        self.probe_error: Exception | None = None
 
     def get_database_instance_role(
         self, *, instance_name: str, name: str
     ) -> db.DatabaseInstanceRole:
-        return self.roles[name]
+        # The probe runs only after a delete has been attempted; the initial
+        # capture (before any delete) must keep working so we can inject a
+        # transient failure for the probe alone.
+        if self.probe_error is not None and self.delete_calls:
+            raise self.probe_error
+        try:
+            return self.roles[name]
+        except KeyError:
+            # Model the real SDK: a missing role raises a typed not-found error,
+            # not a bare KeyError.
+            raise ResourceDoesNotExist(f"role {name!r} not found") from None
 
     def delete_database_instance_role(
         self, *, instance_name: str, name: str, allow_missing: bool | None = None
@@ -220,6 +235,56 @@ def test_delete_raises_after_removing_role_then_restore_fails_is_missing() -> No
         _run(fake, desired)
     # The restore was attempted (and failed).
     assert len(fake.create_calls) == 1
+
+
+def test_delete_raises_then_genuine_not_found_probe_restores_role() -> None:
+    """Delete errors, then the probe returns a typed not-found → restore runs.
+
+    Companion to ``test_delete_raises_after_removing_role_restores_it`` that
+    pins the *typed* signal explicitly: the probe raising the SDK's not-found
+    error (``ResourceDoesNotExist``) — not just any exception — is what proves
+    the role is genuinely gone and drives the recreate/restore path.
+    """
+    original = _role(None)
+    fake = _FakeDatabase(original)
+    fake.delete_error = RuntimeError("delete timed out after removing role")
+    fake.delete_removes_role = True  # role gone → probe will raise not-found
+
+    desired = _role(db.DatabaseInstanceRoleMembershipRole.DATABRICKS_SUPERUSER)
+
+    with pytest.raises(RuntimeError, match="original role was restored"):
+        _run(fake, desired)
+
+    # The genuine not-found drove the restore: role is back, intact.
+    assert ROLE_NAME in fake.roles
+    assert fake.roles[ROLE_NAME].membership_role == original.membership_role
+    assert fake.delete_calls == [ROLE_NAME]
+    assert len(fake.create_calls) == 1
+    assert fake.create_calls[0].membership_role == original.membership_role
+
+
+def test_delete_raises_then_transient_probe_error_is_not_treated_as_gone() -> None:
+    """Delete errors, then the probe fails with a NON-not-found error.
+
+    A transient/unrelated probe failure must NOT be misclassified as "role
+    gone": doing so would fire a spurious restore (and could even double-create
+    an intact role). The function must instead surface a clear INDETERMINATE
+    error and attempt no recreate/restore at all.
+    """
+    original = _role(None)
+    fake = _FakeDatabase(original)
+    fake.delete_error = RuntimeError("delete RPC failed")
+    # The probe itself fails transiently — state of the role is unknowable here.
+    fake.probe_error = RuntimeError("probe failed: transient transport error")
+
+    desired = _role(db.DatabaseInstanceRoleMembershipRole.DATABRICKS_SUPERUSER)
+
+    with pytest.raises(RuntimeError, match="INDETERMINATE"):
+        _run(fake, desired)
+
+    # No spurious restore: nothing was recreated. The delete was attempted once.
+    assert fake.create_calls == []
+    assert fake.delete_calls == [ROLE_NAME]
 
 
 def test_delete_raises_while_role_still_exists_is_non_destructive() -> None:
