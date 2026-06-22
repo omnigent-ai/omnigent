@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import codecs
 import contextlib
 import json
 import os
@@ -1020,6 +1021,74 @@ def _assert_write_allowed(policy: SandboxPolicy, path: Path) -> None:
     raise PermissionError(f"Write access to '{path}' is blocked by sandbox.")
 
 
+# Bytes sampled to classify a file as text vs binary. A NUL byte or an invalid
+# UTF-8 sequence in this prefix marks the file binary (the same prefix-sniff
+# heuristic git uses), so a multi-MB binary is never read in full just to find
+# out it is not text.
+_BINARY_SNIFF_BYTES = 8192
+
+
+def _is_binary_file(path: Path) -> bool:
+    """Classify *path* as binary by inspecting only its first chunk.
+
+    Reads at most :data:`_BINARY_SNIFF_BYTES` and reports binary when those
+    bytes are not valid UTF-8. An incremental decoder is used with
+    ``final=False`` so a multi-byte character straddling the chunk boundary is
+    treated as *incomplete* (text), not invalid (binary).
+
+    :param path: Absolute path of the file to classify.
+    :returns: ``True`` if the prefix is not decodable as UTF-8.
+    """
+    with path.open("rb") as fh:
+        prefix = fh.read(_BINARY_SNIFF_BYTES)
+    try:
+        codecs.getincrementaldecoder("utf-8")("strict").decode(prefix, final=False)
+    except UnicodeDecodeError:
+        return True
+    return False
+
+
+def _read_binary_impl(path: Path, max_binary_bytes: int | None) -> OpResult:
+    """Read a binary file as base64, bounded by *max_binary_bytes*.
+
+    Only ``stat`` (for the total size) and at most *max_binary_bytes* are read
+    from disk, so a large file neither saturates memory nor inflates IPC.
+
+    :param path: Absolute path of the binary file.
+    :param max_binary_bytes: Byte cap. ``None`` returns a descriptor only (the
+        agent ``sys_os_read`` path); a positive int inlines up to that many
+        base64-encoded bytes (the filesystem-service path).
+    :returns: An :class:`OpResult` with ``encoding="base64"`` (see
+        :func:`_read_impl`).
+    """
+    total = path.stat().st_size
+    if max_binary_bytes is None:
+        # Agent tool path: return a descriptor only — inlining base64 the
+        # model cannot use would waste (and risk saturating) the context.
+        return {
+            "path": str(path),
+            "encoding": "base64",
+            "content": "",
+            "total_bytes": total,
+            # Not truncated — the content was deliberately not inlined.
+            "truncated": False,
+            "note": (
+                f"Binary file not inlined ({total} bytes). "
+                "View or download it via the file viewer."
+            ),
+        }
+    with path.open("rb") as fh:
+        payload = fh.read(max_binary_bytes)
+    return {
+        "path": str(path),
+        "content": base64.b64encode(payload).decode("ascii"),
+        "encoding": "base64",
+        "total_bytes": total,
+        "returned_bytes": len(payload),
+        "truncated": len(payload) < total,
+    }
+
+
 def _read_impl(
     path: Path,
     offset: int,
@@ -1029,11 +1098,11 @@ def _read_impl(
     """
     Read a file as UTF-8 text, or as base64-encoded bytes when it is binary.
 
-    The file is read as raw bytes and a strict UTF-8 decode is attempted.
-    Files that decode cleanly are returned as text with the usual
-    line-oriented ``offset``/``limit`` windowing. Files that do *not* decode
-    (images, archives, fonts, …) cannot be line-windowed, so they are capped
-    by *bytes* instead.
+    The file's first chunk is sniffed for UTF-8 validity (see
+    :func:`_is_binary_file`). Files that look like text are read and returned
+    with the usual line-oriented ``offset``/``limit`` windowing. Files that do
+    *not* (images, archives, fonts, …) cannot be line-windowed, so they are
+    capped by *bytes* instead, reading at most ``max_binary_bytes`` from disk.
 
     For binary files the behaviour depends on ``max_binary_bytes``:
 
@@ -1067,36 +1136,16 @@ def _read_impl(
     if max_binary_bytes is not None and max_binary_bytes < 1:
         return {"error": "max_binary_bytes must be >= 1"}
 
-    raw = path.read_bytes()
+    if _is_binary_file(path):
+        return _read_binary_impl(path, max_binary_bytes)
+
     try:
-        text = raw.decode("utf-8")
+        text = path.read_text(encoding="utf-8", errors="strict")
     except UnicodeDecodeError:
-        # Binary file: base64 cannot be line-windowed, so cap by bytes.
-        total = len(raw)
-        if max_binary_bytes is None:
-            # Agent tool path: return a descriptor only — inlining base64 the
-            # model cannot use would waste (and risk saturating) the context.
-            return {
-                "path": str(path),
-                "encoding": "base64",
-                "content": "",
-                "total_bytes": total,
-                # Not truncated — the content was deliberately not inlined.
-                "truncated": False,
-                "note": (
-                    f"Binary file not inlined ({total} bytes). "
-                    "View or download it via the file viewer."
-                ),
-            }
-        payload = raw[:max_binary_bytes]
-        return {
-            "path": str(path),
-            "content": base64.b64encode(payload).decode("ascii"),
-            "encoding": "base64",
-            "total_bytes": total,
-            "returned_bytes": len(payload),
-            "truncated": len(payload) < total,
-        }
+        # The sniffed prefix decoded cleanly but bytes further in did not (a
+        # file that is text up front and binary later). Fall back to the binary
+        # path so we never return garbled text.
+        return _read_binary_impl(path, max_binary_bytes)
 
     lines = text.splitlines(keepends=True)
     start = offset - 1

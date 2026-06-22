@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import tracemalloc
 from pathlib import Path
 
 from omnigent.inner.os_env import _read_impl, build_helper_env
@@ -144,3 +145,84 @@ def test_read_impl_binary_truncated_at_cap(tmp_path: Path) -> None:
     assert result["returned_bytes"] == 4
     assert result["total_bytes"] == len(_BINARY)
     assert result["truncated"] is True
+
+
+def _make_large_binary(path: Path, size: int) -> None:
+    """Write a sparse file with a binary prefix and a logical size of *size*.
+
+    The 8 KB binary prefix forces the prefix-sniff to classify it binary; the
+    ``truncate`` extends the (sparse) file to *size* without writing the bytes,
+    so the test stays cheap while exercising a large logical file.
+
+    :returns: None.
+    """
+    with path.open("wb") as fh:
+        fh.write(b"\xff\xfe\x00\x01" * 2_048)  # 8 KB of non-UTF-8 bytes
+        fh.truncate(size)
+
+
+def test_read_impl_binary_descriptor_does_not_read_whole_file(tmp_path: Path) -> None:
+    """The descriptor path is O(1): it stats the size, never reading content.
+
+    Regression guard for inlining the whole file (``path.read_bytes()``) just
+    to compute ``total_bytes`` — which would OOM on large workspace blobs.
+
+    :returns: None.
+    """
+    size = 256 * 1024 * 1024  # 256 MB logical, only ~8 KB on disk
+    f = tmp_path / "big.bin"
+    _make_large_binary(f, size)
+
+    tracemalloc.start()
+    try:
+        result = _read_impl(f, offset=1, limit=2_000)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert result["total_bytes"] == size
+    assert result["content"] == ""
+    # A full read would have allocated ~256 MB; bounded reads stay tiny.
+    assert peak < 10 * 1024 * 1024
+
+
+def test_read_impl_binary_cap_reads_only_the_cap(tmp_path: Path) -> None:
+    """The byte-capped path reads at most ``max_binary_bytes``, not the file.
+
+    :returns: None.
+    """
+    size = 256 * 1024 * 1024
+    f = tmp_path / "big.bin"
+    _make_large_binary(f, size)
+
+    tracemalloc.start()
+    try:
+        result = _read_impl(f, offset=1, limit=2_000, max_binary_bytes=16)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert result["returned_bytes"] == 16
+    assert result["total_bytes"] == size
+    assert result["truncated"] is True
+    assert peak < 10 * 1024 * 1024
+
+
+def test_read_impl_multibyte_char_straddling_sniff_boundary_is_text(tmp_path: Path) -> None:
+    """A multi-byte char split across the 8 KB sniff boundary stays text.
+
+    The incremental decoder must treat the truncated trailing sequence as
+    *incomplete*, not invalid — otherwise valid UTF-8 would be misread as
+    binary purely because of where the prefix happened to be cut.
+
+    :returns: None.
+    """
+    # 8 KB sniff window cuts the 3-byte '€' (0xE2 0x82 0xAC) at byte 8191.
+    text = "a" * 8_190 + "€" + "tail\n"
+    f = tmp_path / "wide.txt"
+    f.write_text(text, encoding="utf-8")
+
+    result = _read_impl(f, offset=1, limit=2_000)
+
+    assert result["encoding"] == "utf-8"
+    assert result["content"] == text
