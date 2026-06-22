@@ -6,8 +6,6 @@ import {
   MonitorCloudIcon,
   CircleHelpIcon,
   ChevronDownIcon,
-  ChevronLeftIcon,
-  ChevronRightIcon,
   GitBranchIcon,
   ArrowUpIcon,
   FileTextIcon,
@@ -72,7 +70,7 @@ import { AgentRowTooltip } from "@/components/AgentHoverCard";
 // returns agents newest-registered first (agent_store.list sorts by
 // created_at desc), so pin the order users expect; any agent not listed
 // here falls after, in server order.
-const AGENT_DISPLAY_ORDER = ["Claude Code", "Codex", "Pi", "Polly", "Debby"];
+const AGENT_DISPLAY_ORDER = ["Claude Code", "Codex", "Cursor", "Pi", "Polly", "Debby"];
 
 // Built-in agents (by name slug) — the long-lived agents the server
 // ships out of the box. The picker groups these first, then a divider,
@@ -82,6 +80,7 @@ const BUILTIN_AGENTS = new Set([
   "claude-native-ui", // Claude Code
   "codex-native-ui", // Codex
   "pi-native-ui", // Pi
+  "cursor-native-ui", // Cursor
   "polly",
   "debby",
 ]);
@@ -563,8 +562,8 @@ function PermissionModeOptions({
             onPointerEnter={() => setPreviewed(mode.value)}
             // pl only — the kit's pr-8 reserves room for the
             // absolutely-positioned check.
-            // text-sm for legibility in the Advanced menu.
-            className="rounded-sm pl-2 py-1 text-sm"
+            // text-xs matches the other footer-tray menus (host picker).
+            className="rounded-sm pl-2 py-1 text-xs"
           >
             {mode.label}
           </DropdownMenuRadioItem>
@@ -575,7 +574,7 @@ function PermissionModeOptions({
         data-testid="new-chat-landing-permission-detail"
         // One reserved line, not two: reserving the longest blurb's wrapped
         // second line left a permanent blank row under one-line blurbs.
-        className="min-h-5 px-2 pt-0.5 pb-1 text-sm leading-relaxed text-muted-foreground"
+        className="min-h-5 px-2 pt-0.5 pb-1 text-xs leading-relaxed text-muted-foreground"
       >
         {detail}
       </p>
@@ -612,7 +611,7 @@ function ApprovalModeOptions({
             data-testid={`new-chat-landing-approval-${mode.value}`}
             onFocus={() => setPreviewed(mode.value)}
             onPointerEnter={() => setPreviewed(mode.value)}
-            className="rounded-sm pl-2 py-1 text-sm"
+            className="rounded-sm pl-2 py-1 text-xs"
           >
             {mode.label}
           </DropdownMenuRadioItem>
@@ -621,7 +620,7 @@ function ApprovalModeOptions({
       <DropdownMenuSeparator />
       <p
         data-testid="new-chat-landing-approval-detail"
-        className="min-h-5 px-2 pt-0.5 pb-1 text-sm leading-relaxed text-muted-foreground"
+        className="min-h-5 px-2 pt-0.5 pb-1 text-xs leading-relaxed text-muted-foreground"
       >
         {detail}
       </p>
@@ -649,7 +648,7 @@ function BrainHarnessOptions({
 }) {
   return (
     <>
-      <div className="px-2 pt-1.5 pb-0.5 text-xs font-medium text-muted-foreground">
+      <div className="px-2 pt-1.5 pb-0.5 text-[11px] font-medium text-muted-foreground">
         Agent Harness
       </div>
       <DropdownMenuRadioGroup value={value} onValueChange={onValueChange}>
@@ -660,8 +659,8 @@ function BrainHarnessOptions({
             data-testid={`new-chat-landing-harness-${id}`}
             // pl only — the kit's pr-8 reserves room for the
             // absolutely-positioned check.
-            // text-sm for legibility in the Advanced menu.
-            className="rounded-sm pl-2 py-1 text-sm"
+            // text-xs matches the other footer-tray menus (host picker).
+            className="rounded-sm pl-2 py-1 text-xs"
           >
             <span className="flex-1">{label}</span>
             {harnessUnconfiguredOnHost(id, host) && (
@@ -677,26 +676,6 @@ function BrainHarnessOptions({
         ))}
       </DropdownMenuRadioGroup>
     </>
-  );
-}
-
-/**
- * True when ``agent`` exposes per-agent knobs in the picker's Advanced
- * settings sub-page: an overridable brain harness (bundle agents like
- * polly / debby), Claude Code's permission mode, or Codex's approval mode.
- *
- * Drives both the "Advanced settings" row's visibility and whether picking
- * the agent keeps the menu open (so the user can step into the sub-page)
- * instead of closing it like a plain agent pick.
- */
-function agentHasAdvancedSettings(
-  agent: Pick<AvailableAgent, "name" | "harness"> | null | undefined,
-): boolean {
-  const hasOverridableHarness = agent?.harness != null && agent.harness in BRAIN_HARNESS_LABELS;
-  return (
-    hasOverridableHarness ||
-    nativeAgentHasCapability(agent, "permissionMode") ||
-    nativeAgentHasCapability(agent, "approvalMode")
   );
 }
 
@@ -844,15 +823,6 @@ export function NewChatLandingScreen() {
   const [createError, setCreateError] = useState<string | null>(null);
   // "Connect a host" instructions modal, opened from the host dropdown.
   const [connectOpen, setConnectOpen] = useState(false);
-
-  // Agent picker dropdown. Controlled so picking an agent that has Advanced
-  // settings can keep the menu open instead of dismissing it. `agentMenuView`
-  // swaps the popover's contents in place between the agent list and the
-  // selected agent's Advanced settings — one surface, so it works on mobile
-  // (no off-screen flyout). Only the active view is mounted, so the popover
-  // auto-sizes to it and its items are the only ones in the focus order.
-  const [agentMenuOpen, setAgentMenuOpen] = useState(false);
-  const [agentMenuView, setAgentMenuView] = useState<"agents" | "advanced">("agents");
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
 
@@ -1104,16 +1074,13 @@ export function NewChatLandingScreen() {
         key={agent.id}
         data-testid={`new-chat-landing-agent-${agent.id}`}
         data-active={agent.id === effectiveAgentId ? "true" : undefined}
-        onSelect={(e) => {
+        onSelect={() => {
           // Switching agents drops the harness override so a
           // pick never leaks across agents.
           if (agent.id !== effectiveAgentId) setPickedHarness(null);
           setPickedAgentId(agent.id);
           // Explicit picks persist; auto-defaults never do.
           writeLastAgentId(agent.id);
-          // Agents with Advanced settings keep the menu open so the user
-          // can step into the sub-view; plain agents close on pick.
-          if (agentHasAdvancedSettings(agent)) e.preventDefault();
         }}
         className="items-start gap-2 rounded-sm px-2 py-1.5 text-sm data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
       >
@@ -1147,15 +1114,6 @@ export function NewChatLandingScreen() {
       </DropdownMenuItem>
     );
   };
-
-  // Never strand the user on an empty Advanced page: if the selected agent
-  // loses its knobs (e.g. the agent list refreshes and it disappears), fall
-  // back to the agent list.
-  useEffect(() => {
-    if (agentMenuView === "advanced" && !agentHasAdvancedSettings(selectedAgent)) {
-      setAgentMenuView("agents");
-    }
-  }, [agentMenuView, selectedAgent]);
 
   function selectHost(hostId: string) {
     // Re-selecting the current host is a no-op. Clearing the workspace here
@@ -1303,8 +1261,8 @@ export function NewChatLandingScreen() {
     // the hero reads better optically.
     <div className="flex flex-1 items-center justify-center" data-testid="new-chat-landing">
       {/* Padding lives inside the 840px cap, so the composer renders at
-          840 − 32 = 808px max; the parent flex centers it on wider screens. */}
-      <div className="flex w-full max-w-[840px] flex-col items-center gap-8 px-4 pt-8 pb-16">
+          840 − 80 = 760px max. */}
+      <div className="flex w-full max-w-[840px] flex-col items-center gap-8 px-10 pt-8 pb-16">
         <div className="flex flex-col items-center gap-3.5 sm:flex-row">
           <OttoEyes className="h-18 w-auto shrink-0" />
           <h1 className="text-center text-3xl font-medium tracking-[-0.03em] text-foreground sm:text-left">
@@ -1516,14 +1474,7 @@ export function NewChatLandingScreen() {
                   <IntelligentModelControl value={costControlMode} onChange={setCostControlMode} />
                 )}
                 {agentList.length > 0 ? (
-                  <DropdownMenu
-                    open={agentMenuOpen}
-                    onOpenChange={(open) => {
-                      setAgentMenuOpen(open);
-                      // Always reopen on the agent list, never on the Advanced view.
-                      if (!open) setAgentMenuView("agents");
-                    }}
-                  >
+                  <DropdownMenu>
                     <DropdownMenuTrigger asChild>
                       <Button
                         type="button"
@@ -1538,115 +1489,26 @@ export function NewChatLandingScreen() {
                         <ChevronDownIcon className="size-3.5 opacity-60" />
                       </Button>
                     </DropdownMenuTrigger>
-                    {/* side=bottom documents the intent: a short agent list
-                        that should always drop downward like the other composer
-                        menus. The contents swap in place between the agent list
-                        and the selected agent's Advanced settings — only the
-                        active view is mounted, so the popover sizes to it. */}
+                    {/* side=bottom documents the intent: the menu is a short
+                        agent list (harness / permission settings live in the
+                        footer tray's Advanced menu), so it should always drop
+                        downward like the other composer menus. */}
                     <DropdownMenuContent
                       align="end"
                       side="bottom"
-                      className="max-h-[var(--radix-dropdown-menu-content-available-height)] w-64 max-w-[calc(100vw-2rem)] overflow-y-auto p-1"
+                      className="max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-64 max-w-[calc(100vw-2rem)] overflow-y-auto p-1"
                     >
-                      {agentMenuView === "advanced" ? (
-                        <>
-                          {/* Advanced settings for the selected agent: the
-                              brain-harness override (bundle agents), Claude Code's
-                              permission mode, and Codex's approval mode. */}
-                          <DropdownMenuItem
-                            data-testid="new-chat-landing-advanced-back"
-                            onSelect={(e) => {
-                              // Step back to the list instead of closing the menu.
-                              e.preventDefault();
-                              setAgentMenuView("agents");
-                            }}
-                            className="gap-1.5 rounded-sm px-2 py-1.5 text-sm font-medium"
-                          >
-                            <ChevronLeftIcon className="size-4 shrink-0 opacity-70" />
-                            <span>Back</span>
-                          </DropdownMenuItem>
-                          <DropdownMenuSeparator />
-                          {selectedAgentDefaultHarness != null && (
-                            <BrainHarnessOptions
-                              value={pickedHarness ?? selectedAgentDefaultHarness}
-                              onValueChange={(h) =>
-                                // Picking the spec default clears the override so
-                                // the session tracks the spec.
-                                setPickedHarness(h === selectedAgentDefaultHarness ? null : h)
-                              }
-                              host={harnessWarningHost}
-                            />
-                          )}
-                          {/* Permission mode (Claude Code only) — claude-native
-                            has no overridable harness, so the two sections never
-                            co-render today; the separator covers a future agent
-                            with both. */}
-                          {supportsPermissionMode && (
-                            <>
-                              {selectedAgentDefaultHarness != null && <DropdownMenuSeparator />}
-                              <div className="px-2 pt-1.5 pb-0.5 text-xs font-medium text-muted-foreground">
-                                Permission mode
-                              </div>
-                              <PermissionModeOptions
-                                value={permissionMode}
-                                onValueChange={setPermissionMode}
-                              />
-                            </>
-                          )}
-                          {/* Approval mode (Codex only) — codex-native has no
-                            overridable harness, so the two sections never
-                            co-render today; the separator covers a future agent
-                            with both. */}
-                          {supportsApprovalMode && (
-                            <>
-                              {(selectedAgentDefaultHarness != null || supportsPermissionMode) && (
-                                <DropdownMenuSeparator />
-                              )}
-                              <div className="px-2 pt-1.5 pb-0.5 text-xs font-medium text-muted-foreground">
-                                Approval mode
-                              </div>
-                              <ApprovalModeOptions
-                                value={approvalMode}
-                                onValueChange={setApprovalMode}
-                              />
-                            </>
-                          )}
-                        </>
-                      ) : (
-                        <>
-                          {/* Built-in agents first, then a divider, then any
-                              custom (user-registered) agents. renderAgentRow is
-                              defined once and reused for both groups. The divider
-                              only renders when BOTH groups are non-empty, so a
-                              deployment with only custom agents (or only built-ins)
-                              never shows a leading/dangling separator. */}
-                          {builtinAgents.map((agent) => renderAgentRow(agent))}
-                          {builtinAgents.length > 0 && customAgents.length > 0 && (
-                            <DropdownMenuSeparator />
-                          )}
-                          {customAgents.map((agent) => renderAgentRow(agent))}
-                          {/* Advanced settings entry — only for the selected agent
-                              that exposes knobs. Swaps to the Advanced view rather
-                              than closing the menu. */}
-                          {agentHasAdvancedSettings(selectedAgent) && (
-                            <>
-                              <DropdownMenuSeparator />
-                              <DropdownMenuItem
-                                data-testid="new-chat-landing-advanced-entry"
-                                onSelect={(e) => {
-                                  e.preventDefault();
-                                  setAgentMenuView("advanced");
-                                }}
-                                className="gap-2 rounded-sm px-2 py-1.5 text-sm text-muted-foreground"
-                              >
-                                <SettingsIcon className="size-4 shrink-0 opacity-70" />
-                                <span className="flex-1">Advanced settings</span>
-                                <ChevronRightIcon className="size-3.5 shrink-0 opacity-60" />
-                              </DropdownMenuItem>
-                            </>
-                          )}
-                        </>
+                      {/* Built-in agents first, then a divider, then any
+                          custom (user-registered) agents. renderAgentRow is
+                          defined once and reused for both groups. The divider
+                          only renders when BOTH groups are non-empty, so a
+                          deployment with only custom agents (or only built-ins)
+                          never shows a leading/dangling separator. */}
+                      {builtinAgents.map((agent) => renderAgentRow(agent))}
+                      {builtinAgents.length > 0 && customAgents.length > 0 && (
+                        <DropdownMenuSeparator />
                       )}
+                      {customAgents.map((agent) => renderAgentRow(agent))}
                     </DropdownMenuContent>
                   </DropdownMenu>
                 ) : (
@@ -1961,6 +1823,73 @@ export function NewChatLandingScreen() {
                     </div>
                   </PopoverContent>
                 </Popover>
+              )}
+
+              {/* Advanced settings chip — per-agent knobs that don't warrant
+                their own chip: the brain-harness override (bundle agents),
+                Claude Code's permission mode, and Codex's approval mode.
+                Hidden when the selected agent has none. */}
+              {(selectedAgentDefaultHarness != null ||
+                supportsPermissionMode ||
+                supportsApprovalMode) && (
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <button
+                      type="button"
+                      className="flex h-6 items-center gap-1.5 rounded-full px-3 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
+                      data-testid="new-chat-landing-advanced-chip"
+                    >
+                      <SettingsIcon className="size-4 shrink-0" />
+                      <span className="truncate">Advanced</span>
+                      <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
+                    </button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent
+                    align="start"
+                    className="max-h-[var(--radix-dropdown-menu-content-available-height)] w-64 max-w-[calc(100vw-2rem)] overflow-y-auto p-1"
+                  >
+                    {selectedAgentDefaultHarness != null && (
+                      <BrainHarnessOptions
+                        value={pickedHarness ?? selectedAgentDefaultHarness}
+                        onValueChange={(h) =>
+                          // Picking the spec default clears the override so the
+                          // session tracks the spec.
+                          setPickedHarness(h === selectedAgentDefaultHarness ? null : h)
+                        }
+                        host={harnessWarningHost}
+                      />
+                    )}
+                    {/* Permission mode (Claude Code only) — claude-native has no
+                      overridable harness, so the two sections never co-render
+                      today; the separator covers a future agent with both. */}
+                    {supportsPermissionMode && (
+                      <>
+                        {selectedAgentDefaultHarness != null && <DropdownMenuSeparator />}
+                        <div className="px-2 pt-1.5 pb-0.5 text-[11px] font-medium text-muted-foreground">
+                          Permission mode
+                        </div>
+                        <PermissionModeOptions
+                          value={permissionMode}
+                          onValueChange={setPermissionMode}
+                        />
+                      </>
+                    )}
+                    {/* Approval mode (Codex only) — codex-native has no
+                      overridable harness, so the two sections never co-render
+                      today; the separator covers a future agent with both. */}
+                    {supportsApprovalMode && (
+                      <>
+                        {(selectedAgentDefaultHarness != null || supportsPermissionMode) && (
+                          <DropdownMenuSeparator />
+                        )}
+                        <div className="px-2 pt-1.5 pb-0.5 text-[11px] font-medium text-muted-foreground">
+                          Approval mode
+                        </div>
+                        <ApprovalModeOptions value={approvalMode} onValueChange={setApprovalMode} />
+                      </>
+                    )}
+                  </DropdownMenuContent>
+                </DropdownMenu>
               )}
             </div>
           </div>

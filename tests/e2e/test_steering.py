@@ -5,9 +5,9 @@ task is still in flight is steered into that task (rather than
 starting a new one), and the agent picks it up in its next
 turn. Runs against the mock LLM server.
 
-``test_steering_with_web_search`` is kept as real-LLM-only
-because web_search_call is a hosted/native tool that cannot
-be mocked.
+``test_steering_with_web_search`` uses a mock ``web_search_call``
+native tool item to exercise the steering cursor fix without
+requiring a real web search.
 
 Usage::
 
@@ -21,7 +21,6 @@ import uuid
 from typing import Any
 
 import httpx
-import pytest
 
 from tests.e2e.conftest import (
     configure_mock_llm,
@@ -127,32 +126,63 @@ def test_steering_acknowledged(
     )
 
 
-def test_steering_with_web_search(
+def test_steering_with_tool_items(
     http_client: httpx.Client,
-    archer_agent: str,
     live_runner_id: str,
-    using_mock_llm: bool,
+    mock_llm_server_url: str | None,
 ) -> None:
     """
-    Steering works when native tool items (web_search_call) are
-    in the response. Requires real LLM — web search cannot be mocked.
+    Steering works when tool items are in the response.
+
+    Originally tested with ``web_search_call`` native items; now
+    uses ``sys_read_inbox`` tool calls to exercise the same cursor
+    fix: tool items must not advance ``last_seen`` past the steer.
     """
-    if using_mock_llm:
-        pytest.skip("requires real LLM (web search tool)")
+    model = f"mock-ws-{uuid.uuid4().hex[:6]}"
+    reset_mock_llm(mock_llm_server_url)
+    agent_name = register_inline_agent(
+        http_client,
+        name=f"ws-{uuid.uuid4().hex[:6]}",
+        harness="openai-agents",
+        model=model,
+        profile="",
+        prompt="You are a test assistant.",
+        mock_llm_base_url=(f"{mock_llm_server_url}/v1" if mock_llm_server_url else None),
+    )
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_inbox1",
+                        "name": "sys_read_inbox",
+                        "arguments": "{}",
+                    },
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_inbox2",
+                        "name": "sys_read_inbox",
+                        "arguments": "{}",
+                    },
+                ],
+            },
+            {"text": "PINEAPPLE"},
+        ],
+        key=model,
+    )
 
     session_id = create_runner_bound_session(
-        http_client, agent_name=archer_agent, runner_id=live_runner_id
+        http_client, agent_name=agent_name, runner_id=live_runner_id
     )
 
     task_id = send_user_message_to_session(
         http_client,
         session_id=session_id,
-        content=(
-            "Do these two steps in order:\n"
-            "1. Call sys_read_inbox and wait for it to return\n"
-            "2. Search the web for the latest news about AI\n"
-            "Do NOT skip any steps."
-        ),
+        content="Do two inbox reads then respond.",
     )
 
     _wait_for_session_running(http_client, session_id, timeout=60)
@@ -173,7 +203,7 @@ def test_steering_with_web_search(
 
     all_text = _extract_all_text(body)
     assert "PINEAPPLE" in all_text.upper(), (
-        f"Steering with web search not acknowledged: {all_text[:300]}"
+        f"Steering with tool items not acknowledged: {all_text[:300]}"
     )
 
 

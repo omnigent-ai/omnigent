@@ -1,4 +1,4 @@
-"""E2E test: multi-turn recovery user journey.
+"""E2E test: multi-turn recovery user journey (mock LLM).
 
 Exercises the multi-turn conversation lifecycle:
 
@@ -12,49 +12,32 @@ and that the agent can reference prior context in follow-up responses.
 
 Usage::
 
-    pytest tests/e2e/test_journey_cancel_recover.py \
-        --llm-api-key $LLM_API_KEY -v
+    pytest tests/e2e/test_journey_cancel_recover.py -v
 """
 
 from __future__ import annotations
 
-from typing import Any
+import uuid
 
 import httpx
 import pytest
 
 from tests.e2e.conftest import (
+    configure_mock_llm,
     create_runner_bound_session,
     poll_session_until_terminal,
+    register_inline_agent,
+    reset_mock_llm,
     send_user_message_to_session,
 )
+from tests.e2e.helpers import final_assistant_text
 
 
-def _extract_all_text(body: dict[str, Any]) -> str:
-    """Concatenate all text blocks from a terminal response body.
-
-    Handles both Responses-style ``output_text`` blocks and session-
-    snapshot items that carry ``content`` lists with ``text`` keys.
-
-    :param body: The terminal response body from
-        :func:`poll_session_until_terminal`.
-    :returns: All assistant text joined by newlines.
-    """
-    parts: list[str] = []
-    for item in body.get("output", []):
-        if item.get("type") == "message" and item.get("role") == "assistant":
-            for block in item.get("content", []):
-                text = block.get("text")
-                if text:
-                    parts.append(text)
-    return "\n".join(parts)
-
-
-@pytest.mark.llm_flaky(reruns=2)
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_multi_turn_recovery_journey(
     http_client: httpx.Client,
-    archer_agent: str,
     live_runner_id: str,
+    mock_llm_server_url: str,
 ) -> None:
     """Full journey: send -> complete -> send codeword -> verify echo -> verify history.
 
@@ -63,25 +46,46 @@ def test_multi_turn_recovery_journey(
     establishes context; the second turn proves the agent can still
     process new input by echoing a distinctive codeword.
 
-    **What breaks if wrong:**
-
-    - If session state is corrupted between turns, the second turn
-      fails or produces garbage output.
-    - If conversation items are not persisted correctly, the history
-      check fails.
-    - If the runner-bound session dispatch path drops messages, the
-      agent never sees the codeword.
-
     :param http_client: HTTP client pointed at the live server.
-    :param archer_agent: Name of the registered archer agent.
     :param live_runner_id: Runner id for session binding.
+    :param mock_llm_server_url: Mock LLM server URL.
     """
-    # ── Step 1: Create a runner-bound session ──────────────────
-    session_id = create_runner_bound_session(
-        http_client, agent_name=archer_agent, runner_id=live_runner_id
+    codeword = "phoenix-delta-88"
+    model = f"mock-cancel-recover-{uuid.uuid4().hex[:6]}"
+
+    reset_mock_llm(mock_llm_server_url)
+    agent_name = register_inline_agent(
+        http_client,
+        name=f"cancel-recover-{uuid.uuid4().hex[:6]}",
+        harness="openai-agents",
+        model=model,
+        profile="",
+        prompt="You are a terse assistant. Echo back codewords exactly.",
+        mock_llm_base_url=f"{mock_llm_server_url}/v1",
     )
 
-    # ── Step 2: Send a first message and wait for completion ───
+    # Two turns: first returns octopus facts, second echoes the codeword.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "text": (
+                    "1. Octopuses have three hearts. "
+                    "2. They have blue blood. "
+                    "3. They can change color."
+                )
+            },
+            {"text": f"The codeword is: {codeword}"},
+        ],
+        key=model,
+    )
+
+    # -- Step 1: Create a runner-bound session --
+    session_id = create_runner_bound_session(
+        http_client, agent_name=agent_name, runner_id=live_runner_id
+    )
+
+    # -- Step 2: Send a first message and wait for completion --
     first_response_id = send_user_message_to_session(
         http_client,
         session_id=session_id,
@@ -98,11 +102,10 @@ def test_multi_turn_recovery_journey(
         f"First turn failed: status={first_body['status']!r}, error={first_body.get('error')}"
     )
 
-    first_text = _extract_all_text(first_body)
+    first_text = final_assistant_text(first_body)
     assert first_text.strip(), f"First turn produced no assistant text. Body: {first_body}"
 
-    # ── Step 3: Send a recovery message with a codeword ────────
-    codeword = "phoenix-delta-88"
+    # -- Step 3: Send a recovery message with a codeword --
     second_response_id = send_user_message_to_session(
         http_client,
         session_id=session_id,
@@ -112,7 +115,7 @@ def test_multi_turn_recovery_journey(
         ),
     )
 
-    # ── Step 4: Poll until the second turn completes ───────────
+    # -- Step 4: Poll until the second turn completes --
     second_body = poll_session_until_terminal(
         http_client,
         session_id=session_id,
@@ -123,18 +126,13 @@ def test_multi_turn_recovery_journey(
         f"Second turn failed: status={second_body['status']!r}, error={second_body.get('error')}"
     )
 
-    # ── Step 5: Verify the agent echoed the codeword ───────────
-    second_text = _extract_all_text(second_body)
+    # -- Step 5: Verify the agent echoed the codeword --
+    second_text = final_assistant_text(second_body)
     assert codeword in second_text.lower(), (
         f"Expected the agent to echo back '{codeword}'. Got: {second_text[:500]}"
     )
 
-    # ── Step 6: Verify full session history ────────────────────
-    # Fetch the session snapshot and verify the expected sequence:
-    #   1. User message (octopus question)
-    #   2. Assistant response (octopus facts)
-    #   3. User message (codeword request)
-    #   4. Assistant response (echoes codeword)
+    # -- Step 6: Verify full session history --
     final_resp = http_client.get(f"/v1/sessions/{session_id}")
     final_resp.raise_for_status()
     final_items = final_resp.json().get("items", [])

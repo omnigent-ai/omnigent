@@ -660,9 +660,11 @@ def test_bundled_agent_launches_with_first_available_credential(
 
     assert result.exit_code == 0, result.output
     # The first available credential was promoted to the anthropic default.
+    # A single-family (anthropic-only) provider renders its default as the
+    # compact `True` form — the whole served set, per _default_raw_value.
     saved = yaml.safe_load((tmp_path / "config.yaml").read_text())
     provider = saved["providers"]["anthropic_key"]
-    assert provider.get("default") in (True, ["anthropic"], "anthropic")
+    assert provider.get("default") is True
     # And the launch proceeded (the brain credential resolved).
     dispatch.assert_called_once()
     assert dispatch.call_args.kwargs["target"] == _bundled_example_path(shorthand)

@@ -285,10 +285,15 @@ def trace_id_from_response_id(response_id: str) -> str:
     if not response_id.startswith(_RESP_PREFIX):
         raise ValueError(f"Expected {_RESP_PREFIX!r} prefix, got {response_id!r}")
     hex_part = response_id[len(_RESP_PREFIX) :]
-    if len(hex_part) != _HEX_LEN:
+    if len(hex_part) > _HEX_LEN:
         raise ValueError(
-            f"Expected {_HEX_LEN} hex chars after prefix, got {len(hex_part)} in {response_id!r}"
+            f"Expected at most {_HEX_LEN} hex chars after prefix, "
+            f"got {len(hex_part)} in {response_id!r}"
         )
+    # Zero-pad short hex suffixes (e.g. 24-char harness-allocated
+    # IDs) to a valid 128-bit W3C trace ID. The padding preserves
+    # uniqueness — the original hex is a prefix of the trace ID.
+    hex_part = hex_part.ljust(_HEX_LEN, "0")
     try:
         int(hex_part, 16)
     except ValueError as exc:
@@ -603,6 +608,14 @@ def init() -> None:
         import mlflow.tracing
 
         mlflow.tracing.enable()
+
+        # Enable the inner tracing module so TracingContext spans are
+        # created for every agent turn. Without this, telemetry.init()
+        # sets up the OTel provider but no spans are emitted because the
+        # per-session tracing flag stays False.
+        from omnigent.inner.tracing import enable_tracing
+
+        enable_tracing()
     except ImportError:
         # mlflow is an optional dependency (`omnigent[tracing]`). When it
         # is absent, tracing is simply disabled — degrade quietly rather

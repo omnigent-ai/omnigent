@@ -79,6 +79,51 @@ def test_env_ref_resolves(_isolate: Path, monkeypatch: pytest.MonkeyPatch) -> No
     assert cursor_api_key_configured() is True
 
 
+def test_env_ref_strips_surrounding_whitespace(
+    _isolate: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A whitespace-padded ``env:`` key validates and resolves cleanly (F103).
+
+    A ``CURSOR_API_KEY`` exported with a stray leading/trailing newline (a
+    common ``export $(…)`` mishap) must strip before the ``crsr_`` prefix
+    check and before forwarding to the SDK — else the padding fails the
+    ``looks_like`` validation and reaches the harness verbatim.
+    """
+    monkeypatch.setenv("CURSOR_API_KEY", "\ncrsr_test\n")
+    _write_config(_isolate, {"cursor": {"api_key_ref": "env:CURSOR_API_KEY"}})
+    resolved = resolve_cursor_api_key()
+    assert resolved == "crsr_test"
+    assert looks_like_cursor_api_key(resolved)
+    assert cursor_api_key_configured() is True
+
+
+def test_empty_env_ref_reads_as_unconfigured(
+    _isolate: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A configured ``env:`` ref pointing at an EMPTY var reads as not-configured.
+
+    The shared ``resolve_secret`` ``env:`` branch only raises on an *unset*
+    variable, so an exported-but-empty ``CURSOR_API_KEY=""`` (or all-whitespace)
+    resolves to ``""``. The cursor layer must fold that to ``None`` so the setup
+    readout (``cursor_api_key_configured``) and the spawn-env builder agree —
+    both treat it as unset rather than claiming a key the runtime won't forward.
+    """
+    monkeypatch.setenv("CURSOR_API_KEY", "")
+    _write_config(_isolate, {"cursor": {"api_key_ref": "env:CURSOR_API_KEY"}})
+    assert resolve_cursor_api_key() is None
+    assert cursor_api_key_configured() is False
+
+
+def test_whitespace_only_env_ref_reads_as_unconfigured(
+    _isolate: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A configured ``env:`` ref pointing at an all-whitespace var is not-configured."""
+    monkeypatch.setenv("CURSOR_API_KEY", "   \n\t  ")
+    _write_config(_isolate, {"cursor": {"api_key_ref": "env:CURSOR_API_KEY"}})
+    assert resolve_cursor_api_key() is None
+    assert cursor_api_key_configured() is False
+
+
 def test_inline_api_key_field_accepted(_isolate: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A hand-edited inline ``api_key: $VAR`` is honored as a fallback shape."""
     monkeypatch.setenv("INLINE_CURSOR", "crsr_inline")

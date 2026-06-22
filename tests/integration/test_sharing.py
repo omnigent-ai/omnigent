@@ -65,11 +65,7 @@ def test_share_and_second_user_continues(
             model=model_name,
             profile=request.config.getoption("--profile"),
             prompt="You are a terse test assistant. Follow instructions exactly.",
-            mock_llm_base_url=(
-                f"{mock_llm_server_url}/v1"
-                if request.config.getoption("--llm-api-key") is None and mock_llm_server_url
-                else None
-            ),
+            mock_llm_base_url=f"{mock_llm_server_url}/v1",
         )
         sid = create_runner_bound_session(owner, agent_name=agent_name, runner_id=live_runner_id)
         body_1 = run_turn(

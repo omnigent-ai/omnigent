@@ -32,11 +32,20 @@ describe("theme mode helpers", () => {
     expect(normalizeResolvedTheme(undefined)).toBe("light");
   });
 
-  it("cycles system → dark → light → system on each click", () => {
-    // The cycle must visit every mode exactly once before wrapping;
-    // a wrong value here would skip a mode or trap the user in two states.
+  it("cycles system → dark → light → system without resolved theme", () => {
     expect(nextThemeMode("system")).toBe("dark");
     expect(nextThemeMode("dark")).toBe("light");
     expect(nextThemeMode("light")).toBe("system");
+  });
+
+  it("skips redundant transition when resolved theme matches next mode", () => {
+    expect(nextThemeMode("system", "dark")).toBe("light");
+    expect(nextThemeMode("system", "light")).toBe("dark");
+  });
+
+  it("does not skip when resolved theme differs from next mode", () => {
+    expect(nextThemeMode("system", "light")).toBe("dark");
+    expect(nextThemeMode("dark", "dark")).toBe("light");
+    expect(nextThemeMode("light", "light")).toBe("system");
   });
 });

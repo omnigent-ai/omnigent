@@ -2,17 +2,19 @@
 # Single source of truth for the Merge Ready outcome. Downstream steps
 # just consume `state`, `short_desc`, and `long_desc`.
 #
-# The gate is green iff every required check is green on its own merits.
-# There is no CI bypass: to land despite red required checks, quarantine the
-# flaky test (tests/known_failures.yaml) or have a repo admin use GitHub's
-# native "merge without waiting for requirements" affordance.
+# The gate is green iff every required check is green on its own merits
+# AND (for fork PRs) a maintainer has approved. There is no CI bypass: to
+# land despite red required checks, fix or delete the failing test, or
+# have a repo admin use GitHub's native "merge without waiting for
+# requirements" affordance.
 #
-#   CI eval  | state    | meaning
-#   ---------+----------+---------------------------
-#   success  | success  | CI green on its own merits
-#   failure  | failure  | CI red
+#   CI eval  | fork approval | state    | meaning
+#   ---------+---------------+----------+---------------------------------
+#   success  | n/a or true   | success  | CI green on its own merits
+#   success  | false         | failure  | fork PR awaiting maintainer approval
+#   failure  | any           | failure  | CI red
 #
-# Env in: EVAL, FAILED, FORK_NEEDS_E2E_LABEL (optional, default false)
+# Env in: EVAL, FAILED, FORK_NEEDS_E2E_APPROVAL (optional, default false)
 # Out:    state, short_desc, long_desc on $GITHUB_OUTPUT
 
 set -euo pipefail
@@ -28,13 +30,14 @@ else
 fi
 
 # Fork PRs never run e2e on their own: the fork `pull_request` run resolves to
-# an empty shard matrix, so the suite only runs once a maintainer applies the
-# `e2e-approved` label (which mirrors the head to a trusted fork-e2e/** branch).
-# Without it the e2e checks are satisfied-via-skip and the PR can go green with
-# e2e never having executed -- so nudge a maintainer to apply the label. Appended
-# to the comment only (long_desc); short_desc is the 140-char commit status.
-if [[ "${FORK_NEEDS_E2E_LABEL:-false}" == "true" ]]; then
-  LONG="$LONG"$'\n\n:information_source: e2e tests do not run automatically on fork PRs. A maintainer can apply the `e2e-approved` label to run the full e2e suite against this PR.'
+# an empty shard matrix, so the suite only runs once a maintainer approves the
+# PR (which mirrors the head to a trusted fork-e2e/** branch). Without approval
+# the e2e checks are satisfied-via-skip and the PR would go green with e2e never
+# having executed -- so block merge until a maintainer approves.
+if [[ "${FORK_NEEDS_E2E_APPROVAL:-false}" == "true" ]]; then
+  STATE=failure
+  SHORT="Awaiting maintainer approval for e2e"
+  LONG="$LONG"$'\n\n:no_entry: **E2e tests are required for fork PRs.** A maintainer must approve this PR or apply the `e2e-approved` label to trigger the e2e suite. The merge gate will stay red until e2e passes.'
 fi
 
 # GitHub commit-status descriptions max out at 140 chars.

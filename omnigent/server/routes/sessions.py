@@ -189,9 +189,11 @@ from omnigent.server.routes._content_type import (
     require_json_or_multipart_content_type,
 )
 from omnigent.server.routes._host_worktree import CreatedWorktree
+from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.schemas import (
     AgentObject,
     ChildSessionSummary,
+    CompletedEvent,
     ConversationDeleted,
     CreatedSessionResponse,
     ElicitationRequestEvent,
@@ -207,6 +209,7 @@ from omnigent.server.schemas import (
     PaginatedList,
     PermissionObject,
     PolicySummary,
+    ResponseObject,
     SandboxStatus,
     ServerStreamEvent,
     SessionAgentChangedEvent,
@@ -594,6 +597,10 @@ _HARNESS_ELICITATION_REPARK_GRACE_S = 10.0
 # Client-supplied re-attach ids, namespaced so they cannot collide
 # with Codex deterministic ids or server-minted ids.
 _CLAUDE_HOOK_ELICITATION_ID_RE = re.compile(r"^elicit_claude_[0-9a-f]{32}$")
+# Stable re-attach id for ``POST /policies/evaluate`` retries. Allows the
+# server to re-park the existing ASK elicitation rather than minting a new
+# approval card when a transient 5xx or connect-drop triggered a retry.
+_EVALUATE_HOOK_ELICITATION_ID_RE = re.compile(r"^elicit_evaluate_[0-9a-f]{32}$")
 
 # Cap on reaping a cancelled disconnect/terminal-resolved race task in
 # the harness-elicitation gate's cleanup. Reaping normally completes in
@@ -2350,7 +2357,11 @@ def _resolve_llm_model(conv: Conversation | None) -> str | None:
             agent.id, agent.bundle_location, expand_env=agent.session_id is None
         )
         return loaded.spec.llm.model if loaded.spec.llm else None
-    except (KeyError, AttributeError, ValueError, ImportError, OSError):
+    except (KeyError, AttributeError, ValueError, ImportError, OSError, RuntimeError):
+        # ``RuntimeError`` covers ``get_agent_cache()`` before the runtime is
+        # initialized: this is a best-effort display resolver (now also called
+        # on native cost-only broadcasts), so an uninitialized runtime must
+        # degrade to "model unknown" — the cost still records, just unattributed.
         return None
 
 
@@ -2830,14 +2841,32 @@ def _persist_native_cumulative_usage(
             + int(current.get("output_tokens", 0))
         )
 
-    # Resolve the model only when tokens are present — both the token-pricing
-    # branch and the per-model attribution below need it, and both are gated on
-    # tokens. Resolving lazily avoids calling ``_resolve_llm_model`` (which
-    # touches the runtime agent cache) on a cost-only broadcast. Computed once
-    # out of the pricing-only branch so attribution works even on an unpriced
-    # turn. The raw harness model id wins; falls back to the agent spec's model.
+    # Resolve the model for per-model attribution on any broadcast that carries
+    # tokens OR a priced cost — both the token-pricing branch and the per-model
+    # attribution below need it. A cost-only broadcast must resolve it too:
+    # claude-native forwards Claude Code's statusLine total (S) with NO token
+    # counts, so gating model resolution on tokens alone dropped that cost from
+    # ``by_model`` entirely — the per-model TOKEN USAGE view undercounted the
+    # session total by every native (sub-)agent's spend, while the flat
+    # ``total_cost_usd`` (and the Session-cost badge) still included it.
+    # Priority mirrors the relay path's ``_accumulate_session_usage``: the
+    # event's ``model`` (the statusLine's active model, forwarded alongside the
+    # cost) wins, then the session's ``model_override`` (the forwarder mirrors
+    # in-pane /model switches there), then the agent spec's static model.
+    # Computed once out of the pricing-only branch so attribution works even on
+    # an unpriced turn. (The agent-cache lookup in ``_resolve_llm_model`` is
+    # memoized, so resolving on cost-only polls is cheap.)
     has_tokens = cin is not None or cout is not None
-    model_name = (data.get("model") or _resolve_llm_model(conv)) if has_tokens else None
+    needs_model = has_tokens or cost is not None
+    model_name = (
+        (
+            data.get("model")
+            or (conv.model_override if conv and conv.model_override else None)
+            or _resolve_llm_model(conv)
+        )
+        if needs_model
+        else None
+    )
     if cost is not None:
         current["total_cost_usd"] = float(cost)
     elif has_tokens:
@@ -2861,8 +2890,9 @@ def _persist_native_cumulative_usage(
     # switch the current model absorbs the cumulative (splitting deferred —
     # keyed on the raw harness model id). Cost mirrors the flat
     # ``total_cost_usd`` so the per-model cost key is present iff priced.
-    # ``model_name`` is only set when tokens are present, so this is skipped
-    # for cost-only broadcasts (nothing to attribute per-model).
+    # ``model_name`` is set on token-bearing AND cost-bearing broadcasts, so a
+    # claude-native cost-only broadcast attributes its cumulative cost here too
+    # (token buckets stay absent — claude-native reports no token counts).
     if isinstance(model_name, str) and model_name:
         bucket = _model_usage_bucket(current, model_name)
         for key in _MODEL_TOKEN_KEYS:
@@ -3618,6 +3648,7 @@ async def _hold_native_ask_gate(
     engine: PolicyEngine,
     result: PolicyResult,
     conversation_store: ConversationStore,
+    elicitation_id: str | None = None,
 ) -> bool:
     """
     Hold a server-side ASK gate until a human resolves it.
@@ -3660,6 +3691,13 @@ async def _hold_native_ask_gate(
         the reason, deciding_policy, and withheld set_labels.
     :param conversation_store: Store used to mirror child-session
         prompts into ancestor streams.
+    :param elicitation_id: Optional stable re-attach id from the
+        calling hook, e.g. ``"elicit_evaluate_abc123"``. When supplied,
+        ``_publish_and_wait_for_harness_elicitation`` re-attaches to the
+        existing parked elicitation rather than publishing a new card —
+        used by ``POST /policies/evaluate`` retries so a hook retry after
+        a transient 5xx / connect-drop does not prompt the human twice.
+        ``None`` mints a fresh id (the default for non-retry callers).
     :returns: ``True`` iff a human accepted; ``False`` on decline /
         cancel / timeout / disconnect (fail closed).
     """
@@ -3675,11 +3713,11 @@ async def _hold_native_ask_gate(
     )
     # Per-policy ``ask_timeout`` override wins over the spec-level default.
     timeout_s = float(resolve_ask_timeout(engine, result))
-    # Mint the id up front so we can also surface this ASK in the native
-    # terminal (a tmux popup) before parking on the web verdict; both
-    # surfaces resolve the same id, so whichever answers first releases the
-    # gate.
-    elicitation_id = f"elicit_{secrets.token_hex(16)}"
+    # Use the caller-supplied id when present (hook retries re-attach to
+    # the same elicitation); otherwise mint a fresh one so we can surface
+    # this ASK in the native terminal before parking on the web verdict.
+    if elicitation_id is None:
+        elicitation_id = f"elicit_{secrets.token_hex(16)}"
     _spawn_native_approval_popup_forward(
         session_id, elicitation_id, params.message, result.deciding_policy
     )
@@ -7537,19 +7575,30 @@ async def _forward_event_to_runner(
             _resolve_message_content,
         )
 
-        try:
-            forwarded_data["content"] = _resolve_message_content(
-                forwarded_data["content"],
-                file_store,
-                artifact_store,
-                session_id=session_id,
-            )
-        except (ValueError, KeyError):
-            _logger.warning(
-                "File reference resolution failed for session=%s",
-                session_id,
-                exc_info=True,
-            )
+        _unresolved = [
+            b for b in forwarded_data["content"] if isinstance(b, dict) and "file_id" in b
+        ]
+        if _unresolved:
+            try:
+                forwarded_data["content"] = _resolve_message_content(
+                    forwarded_data["content"],
+                    file_store,
+                    artifact_store,
+                    session_id=session_id,
+                )
+                _logger.debug(
+                    "Resolved %d file_id block(s) for session=%s before forwarding",
+                    len(_unresolved),
+                    session_id,
+                )
+            except (ValueError, KeyError):
+                _logger.warning(
+                    "File reference resolution failed for session=%s "
+                    "(unresolved file_id blocks will reach the runner unresolved — "
+                    "runner will attempt fallback resolution)",
+                    session_id,
+                    exc_info=True,
+                )
 
     # Flatten SessionEventInput {type, data} into the runner's
     # discriminated-union shape {type, ...data_fields}. The runner's
@@ -8859,11 +8908,12 @@ def _same_provider_family(a: Agent, b: Agent) -> bool:
 def _agent_is_native(agent: Agent) -> bool:
     """Return whether an agent runs a native CLI harness.
 
-    Loads the agent's spec to read its ``harness_kind``. A native target
-    (claude-native / codex-native) is the only case where a fork needs the
-    transcript-rebuild carry path — SDK targets replay the Omnigent
-    transcript as context on their own. Returns ``False`` when the bundle
-    can't be loaded (treated as non-native).
+    Loads the agent's spec to read its ``harness_kind``. Native targets run
+    a vendor TUI in a terminal (claude-native / codex-native / pi-native /
+    cursor-native). This is broader than "can replay fork history" — only
+    claude/codex native carry the transcript-rebuild path; use
+    ``_agent_carries_native_fork_history`` for that narrower gate. Returns
+    ``False`` when the bundle can't be loaded (treated as non-native).
 
     :param agent: The agent whose harness to classify.
     :returns: ``True`` for a native CLI harness, else ``False``.
@@ -8879,6 +8929,43 @@ def _agent_is_native(agent: Agent) -> bool:
     except Exception:  # noqa: BLE001 — unloadable bundle → treat as non-native
         return False
     return is_native_harness(spec.executor.harness_kind)
+
+
+# Native harnesses that record a resumable session and can rebuild a fork's
+# transcript from copied Omnigent items. Both spellings are listed because
+# canonicalize_harness passes the reversed native ids through unchanged (only
+# "native-pi" is aliased) — same reasoning as model_override._CLAUDE_FAMILY_HARNESSES.
+# cursor/pi native are intentionally absent: they can't replay fork history.
+_FORK_HISTORY_NATIVE_HARNESSES: frozenset[str] = frozenset(
+    {"claude-native", "native-claude", "codex-native", "native-codex"}
+)
+
+
+def _agent_carries_native_fork_history(agent: Agent) -> bool:
+    """Return whether *agent*'s native harness can replay fork history.
+
+    Only claude-native / codex-native record a resumable native session and
+    can rebuild a fork's transcript from the copied Omnigent items. cursor-
+    native and pi-native are native CLIs but cannot carry chat history into a
+    fork (no resumable external_session_id and their TUIs can't import a
+    transcript), so stamping ``carry_history_into_native`` for them would be a
+    false promise — the fork launches fresh regardless. Returns ``False`` when
+    the bundle can't be loaded (treated as non-carrying).
+
+    :param agent: The agent whose harness to classify.
+    :returns: ``True`` only for fork-history-capable native harnesses.
+    """
+    from omnigent.harness_aliases import canonicalize_harness
+
+    try:
+        spec = (
+            get_agent_cache()
+            .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
+            .spec
+        )
+    except Exception:  # noqa: BLE001 — unloadable bundle → treat as non-carrying
+        return False
+    return canonicalize_harness(spec.executor.harness_kind) in _FORK_HISTORY_NATIVE_HARNESSES
 
 
 def _native_coding_agent_for_agent(agent: Agent) -> NativeCodingAgent | None:
@@ -8948,7 +9035,7 @@ async def _register_policy_elicitation(
         message=result.reason or "Approval required",
         requested_schema={},
         phase=Phase.TOOL_CALL.value,
-        policy_name=result.deciding_policy or "unknown",
+        policy_names=result.deciding_policies or ["unknown"],
         content_preview=arguments_preview[:1024],
     )
     # Approval state lives on the runner (in-memory
@@ -9346,6 +9433,43 @@ def _publish_policy_deny(session_id: str, reason: str) -> None:
             "message_id": f"deny_{secrets.token_hex(8)}",
             "index": 0,
         },
+    )
+
+
+def _publish_input_deny_terminal(session_id: str, conv: Conversation, reason: str) -> None:
+    """
+    Publish a terminal ``response.completed`` for an INPUT-phase DENY.
+
+    The short-circuit never forwards to a runner, so no runner-relayed
+    terminal ``response.*`` event is emitted. SSE consumers that drive a
+    turn off the live-tail (the headless ``-p`` client,
+    :class:`omnigent_client.SessionsChat.send`) iterate until a
+    turn-terminal event arrives and would otherwise block forever. The
+    output carries the same sentinel text so the terminal-snapshot fallback
+    also surfaces the deny.
+
+    :param session_id: Session/conversation identifier.
+    :param conv: Conversation whose agent/model name tags the response.
+    :param reason: Human-readable deny reason from the policy verdict.
+    """
+    sentinel = f"{_DENY_SENTINEL_PREFIX}{reason}]"
+    response = ResponseObject(
+        id=f"deny_{secrets.token_hex(8)}",
+        status="completed",
+        model=conv.agent_id or "policy",
+        created_at=int(time.time()),
+        completed_at=int(time.time()),
+        output=[
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": sentinel}],
+            }
+        ],
+    )
+    session_stream.publish(
+        session_id,
+        CompletedEvent(type="response.completed", response=response).model_dump(exclude_none=True),
     )
 
 
@@ -10500,6 +10624,8 @@ async def _create_session_from_existing_agent(
     user_id: str | None = None,
     permission_store: PermissionStore | None = None,
     liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None = None,
+    file_store: FileStore | None = None,
+    artifact_store: ArtifactStore | None = None,
 ) -> SessionResponse:
     """
     Create a session bound to an already-registered agent.
@@ -10525,6 +10651,10 @@ async def _create_session_from_existing_agent(
         ``parent_session_id`` and session-scoped ``agent_id``.
     :param liveness_lookup: Optional session-scoped liveness lookup
         to populate ``SessionResponse.runner_online``.
+    :param file_store: Optional file metadata store for resolving
+        ``file_id`` references in ``initial_items`` before forwarding
+        to the runner.
+    :param artifact_store: Optional binary content store for the same.
     :returns: The newly created session snapshot.
     :raises OmnigentError: 404 if no agent matches ``body.agent_id``;
         403/404 if ``parent_session_id`` or session-scoped ``agent_id``
@@ -10797,6 +10927,8 @@ async def _create_session_from_existing_agent(
                     conversation_store,
                     runner_client,
                     agent_name=agent.name,
+                    file_store=file_store,
+                    artifact_store=artifact_store,
                     created_by=_attribution_user(user_id),
                 )
     # Re-read rather than reusing the local ``conv``: the label-only branch
@@ -12023,7 +12155,14 @@ def create_sessions_router(
         # CSRF hardening: this route dispatches on Content-Type (JSON vs
         # multipart bundled-create), so reject text/plain and other simple
         # types up front while still allowing both legitimate body shapes.
-        dependencies=[Depends(require_json_or_multipart_content_type)],
+        # The multipart shape is CORS-safelisted, so the content-type guard
+        # alone can't stop a cross-site bundle upload — require_trusted_origin
+        # closes that gap (allows absent Origin for non-browser SDK/runner
+        # clients; in local mode a present Origin must be loopback).
+        dependencies=[
+            Depends(require_json_or_multipart_content_type),
+            Depends(require_trusted_origin),
+        ],
     )
     async def create_session(
         request: Request,
@@ -12094,6 +12233,8 @@ def create_sessions_router(
             user_id=user_id,
             permission_store=permission_store,
             liveness_lookup=liveness_lookup,
+            file_store=file_store,
+            artifact_store=artifact_store,
         )
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.
@@ -13520,7 +13661,12 @@ def create_sessions_router(
         # items (the converters consume Omnigent's normalized item shape, so
         # the source harness doesn't matter). SDK targets replay the
         # transcript as context regardless, so the marker is inert for them.
-        carry_history_into_native = await asyncio.to_thread(_agent_is_native, base_agent)
+        # Only claude/codex native can replay fork history; cursor/pi native
+        # can't (no resumable session, TUI can't import a transcript), so don't
+        # stamp a carry-history promise they'd silently break with a fresh launch.
+        carry_history_into_native = await asyncio.to_thread(
+            _agent_carries_native_fork_history, base_agent
+        )
         # The source's native session id is only resumable by a target in the
         # SAME provider family — a Claude target can't clone a Codex rollout.
         # Cross-family, the store must skip the fork-source directive so the
@@ -13708,7 +13854,12 @@ def create_sessions_router(
         copy_model_settings = await asyncio.to_thread(
             _same_provider_family, current_agent, target_agent
         )
-        carry_history_into_native = await asyncio.to_thread(_agent_is_native, target_agent)
+        # Only claude/codex native can replay fork history; cursor/pi native
+        # can't (no resumable session, TUI can't import a transcript), so don't
+        # stamp a carry-history promise they'd silently break with a fresh launch.
+        carry_history_into_native = await asyncio.to_thread(
+            _agent_carries_native_fork_history, target_agent
+        )
         presentation_labels = await asyncio.to_thread(_presentation_labels_for_agent, target_agent)
 
         # Resolve the built-in the session is leaving so the UI can offer a
@@ -14136,6 +14287,20 @@ def create_sessions_router(
                 f"Expected one of {list(_PROTO_EVENT_TYPE_TO_PHASE)}.",
                 code=ErrorCode.INVALID_INPUT,
             )
+        # Optional stable re-attach id for hook retries. Validated but not
+        # required — absent on non-retrying callers (old hooks, direct API use).
+        raw_elicitation_id = payload.get("_omnigent_elicitation_id")
+        hook_elicitation_id: str | None = None
+        if raw_elicitation_id is not None:
+            if not isinstance(raw_elicitation_id, str) or not (
+                _EVALUATE_HOOK_ELICITATION_ID_RE.fullmatch(raw_elicitation_id)
+            ):
+                raise OmnigentError(
+                    "Policy evaluate '_omnigent_elicitation_id' must match "
+                    "'elicit_evaluate_' + 32 hex chars.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            hook_elicitation_id = raw_elicitation_id
         data = event.get("data") or {}
 
         conv = conversation_store.get_conversation(session_id)
@@ -14251,6 +14416,7 @@ def create_sessions_router(
                             engine=engine,
                             result=result,
                             conversation_store=conversation_store,
+                            elicitation_id=hook_elicitation_id,
                         )
                         verdict_body: dict[str, Any] = (
                             {"result": "POLICY_ACTION_ALLOW"}
@@ -15162,6 +15328,12 @@ def create_sessions_router(
         "/sessions/{session_id}/resources/files",
         status_code=201,
         response_model=None,
+        # CSRF hardening: this route only accepts multipart/form-data, which
+        # is CORS-safelisted, so a content-type guard can't stop a cross-site
+        # upload. require_trusted_origin closes the gap (allows absent Origin
+        # for the non-browser SDK/runner clients; in local mode a present
+        # Origin must be loopback).
+        dependencies=[Depends(require_trusted_origin)],
     )
     async def upload_session_file(
         request: Request,
@@ -16084,6 +16256,9 @@ def create_sessions_router(
                     conversation_store,
                     agent_store,
                 )
+                # Terminal response.completed before idle so live-tail
+                # consumers (the headless ``-p`` client) unblock.
+                _publish_input_deny_terminal(session_id, conv, reason)
                 _publish_status(session_id, "idle")
                 # Return the same shape the client expects from POST
                 # /events so postEvent doesn't throw on an unexpected
@@ -16111,6 +16286,8 @@ def create_sessions_router(
                     conversation_store,
                     agent_store,
                 )
+                # Terminal response.completed before idle (see message branch).
+                _publish_input_deny_terminal(session_id, conv, reason)
                 _publish_status(session_id, "idle")
                 return {"queued": False, "denied": True, "reason": reason}
         elif (

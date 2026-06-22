@@ -1422,6 +1422,9 @@ class _SessionsChatReplAdapter:
         if session.agent_name:
             self._agent_name = session.agent_name
         self._bound_runner_id = session.runner_id
+        # Don't clobber a runner if it is revived after timeout
+        if self._runner_recover is None and session.runner_id:
+            self._runner_id = session.runner_id
         self._reasoning_effort = session.reasoning_effort
         self._model_override = session.model_override
         self._llm_model = session.llm_model

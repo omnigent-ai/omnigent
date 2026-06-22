@@ -52,35 +52,35 @@ function assert(name, cond, detail) {
 
 (async () => {
   // 1. inner PR: owners SabhyaC26,TomeHirata,dhruv0811,dbczumar. Loads make the
-  //    two lowest deterministic: dhruv0811(0), dbczumar(1) win.
+  //    single lowest deterministic: dhruv0811(0) wins.
   let r = await run({
     files: ["omnigent/inner/foo.py"],
     load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1 },
   });
-  assert("inner picks 2 lowest-load owners", JSON.stringify(r.added) === JSON.stringify(["dbczumar", "dhruv0811"]), JSON.stringify(r));
+  assert("inner picks the lowest-load owner", JSON.stringify(r.added) === JSON.stringify(["dhruv0811"]), JSON.stringify(r));
 
-  // 2. unowned path -> full pool; lowest two by load chosen.
+  // 2. unowned path -> full pool; lowest by load chosen.
   r = await run({
     files: ["README.md"],
     load: { PattaraS: 9, "serena-ruan": 9, dhruv0811: 9, TomeHirata: 9, SabhyaC26: 9,
             "daniellok-db": 9, hzub: 0, dbczumar: 1, fanzeyi: 9, "ckcuslife-source": 9,
             bbqiu: 9, Edwinhe03: 9 },
   });
-  assert("unowned -> 2 lowest from full pool", JSON.stringify(r.added) === JSON.stringify(["dbczumar", "hzub"]), JSON.stringify(r));
+  assert("unowned -> lowest from full pool", JSON.stringify(r.added) === JSON.stringify(["hzub"]), JSON.stringify(r));
 
-  // 3. db has only 2 owners (fanzeyi, SabhyaC26) -> both selected.
-  r = await run({ files: ["omnigent/db/x.py"], load: {} });
-  assert("db (2 owners) -> both", JSON.stringify(r.added) === JSON.stringify(["SabhyaC26", "fanzeyi"]), JSON.stringify(r));
+  // 3. db area (fanzeyi, SabhyaC26) -> the lower-load one selected.
+  r = await run({ files: ["omnigent/db/x.py"], load: { SabhyaC26: 1 } });
+  assert("db -> lowest-load owner", JSON.stringify(r.added) === JSON.stringify(["fanzeyi"]), JSON.stringify(r));
 
-  // 4. reconcile: all 4 inner owners already requested; keep 2 lowest-load,
-  //    remove the other 2.
+  // 4. reconcile: all 4 inner owners already requested; keep the lowest-load,
+  //    remove the other 3.
   r = await run({
     files: ["omnigent/inner/foo.py"],
     load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1 },
     current: ["SabhyaC26", "TomeHirata", "dhruv0811", "dbczumar"],
   });
-  assert("reconcile removes the 2 highest-load already-requested",
-    JSON.stringify(r.removed) === JSON.stringify(["SabhyaC26", "TomeHirata"]) && r.added.length === 0,
+  assert("reconcile removes the 3 higher-load already-requested",
+    JSON.stringify(r.removed) === JSON.stringify(["SabhyaC26", "TomeHirata", "dbczumar"]) && r.added.length === 0,
     JSON.stringify(r));
 
   // 5. mixed current: a managed reviewer not in `desired` is removed, while an
@@ -93,26 +93,26 @@ function assert(name, cond, detail) {
   assert("mixed: managed removed, external preserved",
     r.removed.includes("SabhyaC26") &&
     !r.removed.includes("some-external-human") &&
-    JSON.stringify(r.added) === JSON.stringify(["dbczumar", "dhruv0811"]),
+    JSON.stringify(r.added) === JSON.stringify(["dhruv0811"]),
     JSON.stringify(r));
 
-  // 6. single-owner area (sandbox -> @SabhyaC26): tops up to 2 from the pool.
+  // 6. single-owner area (sandbox -> @SabhyaC26): the lone owner is selected.
   r = await run({
     files: ["omnigent/sandbox/x.py"],
     load: { SabhyaC26: 0, hzub: 0, dhruv0811: 9, dbczumar: 9, TomeHirata: 9, PattaraS: 9,
             "serena-ruan": 9, "daniellok-db": 9, fanzeyi: 9, "ckcuslife-source": 9, bbqiu: 9, Edwinhe03: 9 },
   });
-  assert("single-owner area tops up to 2",
-    r.added.length === 2 && r.added.includes("SabhyaC26"), JSON.stringify(r));
+  assert("single-owner area picks that owner",
+    JSON.stringify(r.added) === JSON.stringify(["SabhyaC26"]), JSON.stringify(r));
 
-  // 7. multi-area PR (inner + tools): candidate pool is the UNION; a tools-only
-  //    owner (PattaraS) and an inner owner (dhruv0811) can both be picked.
+  // 7. multi-area PR (inner + tools): candidate pool is the UNION; the lowest-load
+  //    across both areas wins -- here a tools-only owner (PattaraS).
   r = await run({
     files: ["omnigent/inner/a.py", "omnigent/tools/b.py"],
     load: { SabhyaC26: 9, TomeHirata: 9, dbczumar: 9, PattaraS: 0, dhruv0811: 1 },
   });
   assert("multi-area unions both areas' owners",
-    r.added.includes("PattaraS") && r.added.includes("dhruv0811") && r.added.length === 2,
+    JSON.stringify(r.added) === JSON.stringify(["PattaraS"]),
     JSON.stringify(r));
 
   // 8. scope guard: non-fork PR -> nothing assigned.
