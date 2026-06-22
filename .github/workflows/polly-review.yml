@@ -292,12 +292,14 @@ jobs:
           ```
 
           ## Instructions
-          Review the diff against the PR description. Report:
-          1. **Blocking issues** — bugs, security problems, correctness errors, data loss risks.
-          2. **Security analysis** — carefully check the security implications of the changes. Look for injection vulnerabilities (SQL, command, template), authentication/authorization bypasses, secret exposure, unsafe deserialization, path traversal, SSRF, and any change that weakens an existing security boundary. Flag even subtle issues.
-          3. **Non-blocking suggestions** — style, naming, performance, test coverage gaps.
-          4. **Summary** — one-paragraph overall assessment.
+          Review the diff against the PR description. Focus on what actually matters:
+          1. **Blocking issues** — correctness bugs, broken contracts, missing error handling on failure paths, data loss risks.
+          2. **Security vulnerabilities** — injection (SQL, command, template), authentication/authorization bypasses, secret exposure, unsafe deserialization, path traversal, SSRF, and any change that weakens an existing security boundary. Flag even subtle issues.
+          3. **UX regressions** — changes that make a feature unusable, misleading, or visibly broken for end users.
+          4. **Non-blocking notes** — design concerns or edge cases worth flagging (brief).
+          5. **Summary** — one-paragraph overall assessment.
 
+          Do NOT comment on code style, formatting, naming conventions, or other cosmetic issues — omit them entirely.
           Be concise. Do not restate the diff. Focus on what matters.
 
           IMPORTANT: Your output will be posted directly as a PR comment. Output
