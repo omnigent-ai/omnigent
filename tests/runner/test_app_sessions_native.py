@@ -62,7 +62,6 @@ from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
-    CURSOR_NATIVE_TERMINAL_ROLE,
     OMNIGENT_REPL_TERMINAL_ROLE,
     PI_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
@@ -11065,9 +11064,7 @@ async def _run_auto_create_cursor_terminal(
     workspace.mkdir()
     monkeypatch.setattr(cursor_native_bridge, "_BRIDGE_ROOT", tmp_path / "cursor-bridge")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
-    monkeypatch.setattr(
-        "omnigent.cursor_native.resolve_cursor_executable", lambda: "cursor-agent"
-    )
+    monkeypatch.setattr("omnigent.cursor_native.resolve_cursor_executable", lambda: "cursor-agent")
 
     async def _no_op_forwarder(**kwargs: Any) -> None:
         del kwargs

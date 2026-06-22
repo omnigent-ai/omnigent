@@ -924,9 +924,7 @@ async def _auto_create_cursor_terminal(
     # the passthrough launch args (``omnigent cursor -- --model X`` or the joined
     # ``--model=X`` form) wins, so only inject when the user did not already pin
     # one — otherwise cursor-agent would see two ``--model`` values.
-    if not any(
-        arg in ("--model", "-m") or arg.startswith("--model=") for arg in cursor_args
-    ):
+    if not any(arg in ("--model", "-m") or arg.startswith("--model=") for arg in cursor_args):
         spec_model = _cursor_native_model_from_spec(agent_spec)
         if spec_model is not None:
             cursor_args.extend(["--model", spec_model])
