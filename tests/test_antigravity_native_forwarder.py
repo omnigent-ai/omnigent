@@ -37,7 +37,6 @@ from omnigent.antigravity_native_forwarder import (
     _audit_batch,
     _audit_tool_calls_from_events,
     _AuditOutcome,
-    _highest_step_below,
     _ToolCallIdAllocator,
     forward_antigravity_transcript_to_session,
     step_to_events,
@@ -1346,6 +1345,34 @@ def test_parser_emits_out_of_order_lower_step(_isolate_bridge_and_brain: Path) -
     assert _feed_jsonl(parser, [_planner_text_step(text="s13-again", step_index=13)]) == []
 
 
+def test_parser_seeds_delivered_set_suppresses_by_membership(
+    _isolate_bridge_and_brain: Path,
+) -> None:
+    """Resume by SET membership re-posts a not-yet-written out-of-order lower step.
+
+    Core of Finding 1: a prior run acked the batch {12, 14} (step 13 had not been
+    written yet) and persisted ``forwarded_steps={...,12,14}``. On restart the
+    parser is seeded with that SET. agy then writes the out-of-order step 13.
+    A ``<=`` floor at 14 would suppress 13 (13 ≤ 14) and silently drop it; SET
+    membership re-posts it (13 ∉ the set) while still suppressing the genuinely
+    acked 12 and 14.
+    """
+    parser = TranscriptParser(
+        conversation_id=_CID,
+        emit_status=False,
+        initial_delivered_steps=frozenset({0, 2, 12, 14}),
+    )
+    # Already-acked steps are suppressed by membership (NOT by a <= floor).
+    assert _feed_jsonl(parser, [_planner_text_step(text="s12", step_index=12)]) == []
+    assert _feed_jsonl(parser, [_planner_text_step(text="s14", step_index=14)]) == []
+    # The not-yet-acked, out-of-order LOWER step 13 (< 14) MUST still post.
+    out = _feed_jsonl(parser, [_planner_text_step(text="s13", step_index=13)])
+    assert {e.step_index for e in out if e.event_type == "external_conversation_item"} == {13}
+    # A brand-new higher step also posts.
+    out = _feed_jsonl(parser, [_planner_text_step(text="s15", step_index=15)])
+    assert {e.step_index for e in out if e.event_type == "external_conversation_item"} == {15}
+
+
 async def test_restart_with_persisted_cursor_emits_only_new_steps(
     monkeypatch: pytest.MonkeyPatch, _isolate_bridge_and_brain: Path
 ) -> None:
@@ -1466,6 +1493,131 @@ async def test_restart_with_persisted_cursor_emits_only_new_steps(
     state2 = read_bridge_state(bridge_dir)
     assert state2 is not None
     assert state2.forwarded_step_index == 4
+
+
+async def test_restart_does_not_drop_out_of_order_step_written_after_cursor(
+    monkeypatch: pytest.MonkeyPatch, _isolate_bridge_and_brain: Path
+) -> None:
+    """
+    Regression (Finding 1): a restart must NOT drop a lower step agy wrote out of
+    order AFTER a higher one that the cursor already acked.
+
+    The exact failure the SET cursor fixes (the old ``<=`` floor could not):
+    run 1 acks the batch {0, 2, 12, 14} — step 13 had NOT been written yet — and
+    persists it. agy then writes the out-of-order step 13 (lower than the acked
+    14). On restart, a ``<=``-14 floor would suppress 13 (13 ≤ 14) and silently
+    drop it; the SET cursor re-posts 13 (13 ∉ {0,2,12,14}) while still suppressing
+    the genuinely acked prefix.
+
+    This is the cross-BATCH case the in-batch out-of-order tests do not cover:
+    the lower step arrives only after the cursor was persisted and the forwarder
+    restarted.
+    """
+    brain = _isolate_bridge_and_brain
+    monkeypatch.setattr(forwarder, "_conversation_is_owned_by_live_agy", lambda cid: True)
+    bridge_dir = prepare_bridge_dir("bridge-ooo-restart")
+    write_bridge_state(
+        bridge_dir,
+        AntigravityNativeBridgeState(
+            session_id="conv_ooo",
+            conversation_id="agy_conv_minted",
+        ),
+    )
+    # Run-1 transcript: steps 0, 2, 12, 14 — step 13 is NOT here yet (agy writes
+    # it out of order, only later).
+    transcript = _write_transcript(
+        brain,
+        _CID,
+        [
+            _user_input_step(text="hi", step_index=0),
+            _planner_text_step(text="ans2", step_index=2),
+            _planner_text_step(text="ans12", step_index=12),
+            _planner_text_step(text="ans14", step_index=14),
+        ],
+    )
+
+    async def _fast_sleep(seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(forwarder, "_sleep", _fast_sleep)
+
+    # ── Run 1: ack {0,2,12,14}, persist the SET cursor, then cancel. ──
+    sink1 = _EventSink()
+
+    async def _run_first() -> None:
+        await forward_antigravity_transcript_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv_ooo",
+            bridge_dir=bridge_dir,
+            poll_interval_s=0.001,
+            discovery_floor=0.0,
+            ap_transport=sink1.transport(),
+            transcript_discovery_timeout_s=5.0,
+        )
+
+    task1 = asyncio.create_task(_run_first())
+    for _ in range(400):
+        state = read_bridge_state(bridge_dir)
+        if state is not None and state.forwarded_step_index == 14:
+            break
+        await asyncio.sleep(0.005)
+    task1.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task1
+
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    # The set cursor records EXACTLY the acked steps (13 is absent, not skipped).
+    assert state.forwarded_steps == (0, 2, 12, 14)
+    assert state.forwarded_step_index == 14  # backward-compat max mirror
+
+    # ── agy now writes the out-of-order LOWER step 13, then we RESTART. ──
+    with transcript.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_planner_text_step(text="lost-step-13", step_index=13)) + "\n")
+
+    sink2 = _EventSink()
+
+    async def _run_second() -> None:
+        await forward_antigravity_transcript_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv_ooo",
+            bridge_dir=bridge_dir,
+            poll_interval_s=0.001,
+            discovery_floor=0.0,
+            ap_transport=sink2.transport(),
+            transcript_discovery_timeout_s=5.0,
+        )
+
+    task2 = asyncio.create_task(_run_second())
+    # Wait until step 13 has been acked (its index joins the set).
+    for _ in range(400):
+        state2 = read_bridge_state(bridge_dir)
+        acked = state2.forwarded_steps if state2 is not None else None
+        if acked is not None and 13 in acked:
+            break
+        await asyncio.sleep(0.005)
+    task2.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task2
+
+    second_item_texts = [
+        d["item_data"]["content"][0]["text"]
+        for t, d in sink2.events
+        if t == "external_conversation_item"
+        and isinstance(d.get("item_data"), dict)
+        and d["item_data"].get("content")
+    ]
+    # The out-of-order step 13 is re-posted, NOT dropped; the acked prefix is not
+    # duplicated.
+    assert second_item_texts == ["lost-step-13"], (
+        f"restart must re-post the out-of-order step 13 exactly once and nothing "
+        f"else; got {second_item_texts!r}"
+    )
+    state2 = read_bridge_state(bridge_dir)
+    assert state2 is not None
+    assert state2.forwarded_steps == (0, 2, 12, 13, 14)
 
 
 async def test_restart_with_no_new_steps_emits_nothing(
@@ -1717,21 +1869,60 @@ async def test_post_events_out_of_order_failed_lower_step_freezes_below_it(
     assert delivery.fully_delivered is False
 
 
-def test_highest_step_below_handles_out_of_order_events() -> None:
-    """The audit freeze ceiling takes the max step_index below the boundary even
-    when events arrive out of order (agy 1.0.10) — not a positional scan that
-    stops at the first index >= boundary, which would lower the ceiling and
-    re-warn an already-audited step on restart.
+async def test_post_events_out_of_order_returns_exact_delivered_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``delivered_steps`` is the EXACT set of acked steps, not just a high-water.
+
+    The set (unioned into ``forwarded_steps``) is what lets a restart re-post a
+    not-yet-written out-of-order lower step instead of suppressing it under a
+    ``<=`` floor: the resume path checks membership, so a step absent from the set
+    is never mistaken for already-acked. With a lower step (13) failing AFTER a
+    higher one (14) delivered, the failed step and everything at/above it are
+    excluded, so the acked set is exactly {12}.
     """
+
+    async def _fake_post(
+        client: object, session_id: str, *, event_type: str, data: dict[str, Any]
+    ) -> object:
+        return _FakeResponse(503 if data["step"] == 13 else 200)
+
+    monkeypatch.setattr(forwarder, "_post_session_event", _fake_post)
     events = [
-        _event("external_conversation_item", 12),
-        _event("external_conversation_item", 14),  # >= boundary, mid-list
-        _event("external_conversation_item", 13),  # < boundary, arrives AFTER 14
+        OutboundEvent("external_conversation_item", {"step": 12}, step_index=12),
+        OutboundEvent("external_conversation_item", {"step": 14}, step_index=14),
+        OutboundEvent("external_conversation_item", {"step": 13}, step_index=13),
+        OutboundEvent("external_conversation_item", {"step": 15}, step_index=15),
     ]
-    # boundary=14: highest delivered step below 14 is 13, despite 14 preceding it.
-    assert forwarder._highest_step_below(events, 14) == 13
-    # No step strictly below the boundary -> None.
-    assert forwarder._highest_step_below(events, 12) is None
+    delivery = await forwarder._post_events(object(), "conv_x", events)  # type: ignore[arg-type]
+    # Only step 12 is below the failed step 13; 14, 15 are at/above the gap and
+    # excluded so a restart re-posts them.
+    assert delivery.delivered_steps == frozenset({12})
+    assert delivery.contiguous_high_water == 12
+    assert delivery.fully_delivered is False
+
+
+async def test_post_events_out_of_order_all_delivered_returns_full_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When every out-of-order step delivers, ``delivered_steps`` is the whole set."""
+
+    async def _fake_post(
+        client: object, session_id: str, *, event_type: str, data: dict[str, Any]
+    ) -> object:
+        return _FakeResponse(200)
+
+    monkeypatch.setattr(forwarder, "_post_session_event", _fake_post)
+    events = [
+        OutboundEvent("external_conversation_item", {"step": 12}, step_index=12),
+        OutboundEvent("external_conversation_item", {"step": 14}, step_index=14),
+        OutboundEvent("external_conversation_item", {"step": 13}, step_index=13),
+        OutboundEvent("external_conversation_item", {"step": 15}, step_index=15),
+    ]
+    delivery = await forwarder._post_events(object(), "conv_x", events)  # type: ignore[arg-type]
+    assert delivery.delivered_steps == frozenset({12, 13, 14, 15})
+    assert delivery.contiguous_high_water == 15
+    assert delivery.fully_delivered is True
 
 
 async def test_tail_persists_delivered_cursor_below_failed_step(
@@ -2613,17 +2804,6 @@ async def test_forwarder_posts_degrade_notice_once_when_audit_enabled(
 
 
 # ── gov FIX A: at-least-once policy audit (never silently drop a violation) ──
-
-
-def test_highest_step_below_caps_at_non_contiguous_boundary() -> None:
-    """The cursor ceiling is the highest delivered step strictly below the gap."""
-    events = [_event("external_conversation_item", s) for s in (0, 2, 4, 6)]
-    # Freeze point is step 4: commit 0 and 2, never 4 or 6.
-    assert _highest_step_below(events, 4) == 2
-    # Freeze point is the first step: nothing may commit.
-    assert _highest_step_below(events, 0) is None
-    # No gap below any step beyond the last: the whole prefix commits.
-    assert _highest_step_below(events, 99) == 6
 
 
 async def test_audit_batch_returns_freeze_point_on_warning_post_failure(

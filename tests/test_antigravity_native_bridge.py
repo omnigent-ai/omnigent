@@ -22,6 +22,7 @@ from omnigent.antigravity_native_bridge import (
     read_tmux_info,
     update_conversation_id,
     update_forwarded_step_index,
+    update_forwarded_steps,
     write_bridge_state,
     write_tmux_target,
 )
@@ -536,6 +537,219 @@ def test_update_forwarded_step_index_noop_when_no_state(bridge_dir: Path) -> Non
     """update_forwarded_step_index is a no-op (no raise) when no state exists."""
     update_forwarded_step_index(bridge_dir, 3)  # must not raise
     assert read_bridge_state(bridge_dir) is None
+
+
+def test_update_forwarded_step_index_preserves_steps_set(bridge_dir: Path) -> None:
+    """The legacy int writer must not drop an existing ``forwarded_steps`` set."""
+    write_bridge_state(
+        bridge_dir,
+        AntigravityNativeBridgeState(
+            session_id="conv_abc",
+            conversation_id="agy_conv",
+            forwarded_step_index=2,
+            forwarded_steps=(0, 2),
+        ),
+    )
+    update_forwarded_step_index(bridge_dir, 4)
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.forwarded_step_index == 4
+    assert state.forwarded_steps == (0, 2)  # set preserved verbatim
+
+
+# ---------------------------------------------------------------------------
+# forwarded_steps (Finding 1: SET resume cursor for out-of-order step writes)
+# ---------------------------------------------------------------------------
+
+
+def test_forwarded_steps_roundtrips_sorted(bridge_dir: Path) -> None:
+    """The acked-step SET roundtrips as a sorted tuple (deterministic on disk)."""
+    write_bridge_state(
+        bridge_dir,
+        AntigravityNativeBridgeState(
+            session_id="conv_abc",
+            conversation_id="agy_conv",
+            forwarded_step_index=14,
+            forwarded_steps=(14, 0, 12, 2),
+        ),
+    )
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.forwarded_steps == (0, 2, 12, 14)
+
+
+def test_forwarded_steps_defaults_none_on_legacy_state(bridge_dir: Path) -> None:
+    """A state.json without ``forwarded_steps`` reads back ``None`` (legacy resume).
+
+    The forwarder then falls back to the ``forwarded_step_index`` ``<=`` floor —
+    a state written before this field existed must still resume, not crash.
+    """
+    (bridge_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "session_id": "conv_abc",
+                "conversation_id": "agy_conv",
+                "forwarded_step_index": 4,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.forwarded_steps is None
+    assert state.forwarded_step_index == 4
+
+
+def test_read_bridge_state_filters_bad_step_set_elements(bridge_dir: Path) -> None:
+    """Non-int / bool / negative elements are dropped; the rest survive sorted.
+
+    ``bool`` is an ``int`` subclass, so a stray ``true`` must not be read as step
+    1; a negative value or non-int element is hand-edit/corruption noise. Dropping
+    only re-posts (at-least-once), never drops a real step.
+    """
+    (bridge_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "session_id": "conv_abc",
+                "conversation_id": "agy_conv",
+                "forwarded_steps": [2, True, -1, "5", 1.5, 0, 4],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.forwarded_steps == (0, 2, 4)
+
+
+def test_read_bridge_state_non_list_step_set_is_none(bridge_dir: Path) -> None:
+    """A ``forwarded_steps`` that is not a list reads back ``None`` (legacy floor)."""
+    (bridge_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "session_id": "conv_abc",
+                "conversation_id": "agy_conv",
+                "forwarded_steps": "0,2,4",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.forwarded_steps is None
+
+
+def test_update_forwarded_steps_unions_monotonically(bridge_dir: Path) -> None:
+    """
+    ``update_forwarded_steps`` unions into the stored set and never shrinks it.
+
+    The cursor is the exact set of acked steps; a later batch adds its steps, and
+    a stale/out-of-order write can never un-ack one. ``forwarded_step_index`` is
+    kept as the max for backward-compat / downgrade observability.
+    """
+    write_bridge_state(
+        bridge_dir,
+        AntigravityNativeBridgeState(session_id="conv_abc", conversation_id="agy_conv"),
+    )
+    update_forwarded_steps(bridge_dir, {12, 14})
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.forwarded_steps == (12, 14)
+    assert state.forwarded_step_index == 14  # max mirror
+
+    # The out-of-order lower step 13 lands in a later batch — it is ADDED, the
+    # earlier acks are kept.
+    update_forwarded_steps(bridge_dir, {13})
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.forwarded_steps == (12, 13, 14)
+    assert state.forwarded_step_index == 14
+
+    # A re-delivered (already-acked) batch is a no-op — set unchanged.
+    update_forwarded_steps(bridge_dir, {12, 13})
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.forwarded_steps == (12, 13, 14)
+
+
+def test_update_forwarded_steps_noop_when_no_state(bridge_dir: Path) -> None:
+    """``update_forwarded_steps`` is a no-op (no raise) when no state exists."""
+    update_forwarded_steps(bridge_dir, {3})  # must not raise
+    assert read_bridge_state(bridge_dir) is None
+
+
+def test_update_forwarded_steps_materializes_legacy_floor(bridge_dir: Path) -> None:
+    """
+    Upgrading a legacy ``<=``-floor state seeds the SET with the acked prefix.
+
+    Regression for the upgrade-duplication seam: a state written before
+    ``forwarded_steps`` existed records an acked prefix only as
+    ``forwarded_step_index`` (e.g. 4 ⇒ steps 0..4 acked). The first set write must
+    fold that floor into the set; otherwise it would record only the NEW step and a
+    later restart — seeing ``forwarded_steps`` present — would ignore the floor and
+    re-post the whole legacy prefix.
+    """
+    # Legacy state: a floor of 4, NO forwarded_steps set.
+    (bridge_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "session_id": "conv_abc",
+                "conversation_id": "agy_conv",
+                "forwarded_step_index": 4,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    # A new batch acks step 6 (out-of-order step 5 not yet written).
+    update_forwarded_steps(bridge_dir, {6})
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    # The legacy prefix [0..4] is materialized into the set alongside the new 6 —
+    # NOT just {6}. (The non-existent odd indices in [0..4] are harmless: they
+    # never appear in the transcript, so suppressing them is a no-op.)
+    assert state.forwarded_steps == (0, 1, 2, 3, 4, 6)
+    assert state.forwarded_step_index == 6
+
+
+def test_update_conversation_id_resets_steps_set_on_new_conversation(bridge_dir: Path) -> None:
+    """A genuinely new agy conversation clears the acked-step SET (and int mirror)."""
+    write_bridge_state(
+        bridge_dir,
+        AntigravityNativeBridgeState(
+            session_id="conv_abc",
+            conversation_id="agy_conv_old",
+            forwarded_step_index=14,
+            forwarded_steps=(0, 2, 14),
+        ),
+    )
+    update_conversation_id(bridge_dir, "agy_conv_new")
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == "agy_conv_new"
+    assert state.forwarded_steps is None
+    assert state.forwarded_step_index is None
+
+
+def test_update_conversation_id_preserves_steps_set_on_same_conversation(bridge_dir: Path) -> None:
+    """Re-persisting the SAME conversation id keeps the acked-step SET intact."""
+    write_bridge_state(
+        bridge_dir,
+        AntigravityNativeBridgeState(
+            session_id="conv_abc",
+            conversation_id="agy_conv",
+            forwarded_step_index=14,
+            forwarded_steps=(0, 2, 14),
+        ),
+    )
+    update_conversation_id(bridge_dir, "agy_conv")
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.forwarded_steps == (0, 2, 14)
+    assert state.forwarded_step_index == 14
 
 
 def test_update_conversation_id_resets_cursor_on_id_change(bridge_dir: Path) -> None:

@@ -16,8 +16,12 @@ Differences from the Codex / Claude wrappers (Phase 1 scope):
   (:func:`omnigent.antigravity_native_forwarder.supervise_forwarder`) so agy's
   conversation mirrors into the Omnigent chat view (read path). Web-UI turns are
   injected back into the native agy conversation (the write path) by the native
-  executor (:mod:`omnigent.inner.antigravity_native_executor`) via its
-  connect-RPC ``SendAgentMessage`` call.
+  executor (:mod:`omnigent.inner.antigravity_native_executor`) by typing the
+  message into the running agy TUI over tmux send-keys
+  (:func:`omnigent.antigravity_native_bridge.inject_user_message_via_tui`) — NOT
+  via the connect-RPC ``SendAgentMessage`` method, which agy logs as a
+  ``SYSTEM_MESSAGE`` the forwarder mirrors rather than running as a turn (see the
+  "Why the TUI, not connect-RPC" note in the executor module).
 * **Per-session identity is discovered, not assigned.** agy mints its own UUID
   conversation and ignores the launcher's ``ANTIGRAVITY_CONVERSATION_ID``
   (verified empirically). A fresh launch sets nothing for identity; the
@@ -871,13 +875,19 @@ async def _launch_and_record(
             socket_path=launched.tmux_socket,
             tmux_target=launched.tmux_target,
         )
-    # Preserve the forwarded_step_index cursor when resuming the same
-    # conversation so the forwarder skips already-mirrored steps.  On a fresh
-    # launch (or when the prior state is absent / names a different id) leave
-    # the cursor as None so the new transcript is mirrored from step 0.
+    # Preserve the resume cursor when resuming the same conversation so the
+    # forwarder skips already-mirrored steps. The authoritative cursor is the
+    # ``forwarded_steps`` SET (membership suppression); the int is its max mirror.
+    # BOTH must be carried over — dropping the set here would fall the forwarder
+    # back to the ``<=`` int floor on resume and re-drop a not-yet-written
+    # out-of-order lower step (Finding 1). On a fresh launch (or when the prior
+    # state is absent / names a different id) leave both as None so the new
+    # transcript is mirrored from step 0.
     preserved_step_index: int | None = None
+    preserved_steps: tuple[int, ...] | None = None
     if resume and prior_state is not None and prior_state.conversation_id == conversation_id:
         preserved_step_index = prior_state.forwarded_step_index
+        preserved_steps = prior_state.forwarded_steps
     # Seed bridge state with the conversation id known so far (the real id on
     # resume; the placeholder on a fresh launch). The forwarder overwrites the
     # placeholder with agy's discovered UUID — and PATCHes it onto the Omnigent
@@ -889,6 +899,7 @@ async def _launch_and_record(
             session_id=session_id,
             conversation_id=conversation_id,
             forwarded_step_index=preserved_step_index,
+            forwarded_steps=preserved_steps,
         ),
     )
     _update_progress(startup_progress, "Antigravity terminal ready.")

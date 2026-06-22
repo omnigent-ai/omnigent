@@ -1821,9 +1821,15 @@ async def _auto_create_antigravity_terminal(
     # Preserve the resume cursor only when resuming the SAME agy conversation,
     # so the forwarder skips steps already mirrored in the prior run; a fresh
     # launch (or a mismatched prior id) resets to None and mirrors from step 0.
+    # The authoritative cursor is the ``forwarded_steps`` SET (membership
+    # suppression); the int is its max mirror. BOTH must be carried over —
+    # dropping the set here falls the forwarder back to the ``<=`` int floor and
+    # re-drops a not-yet-written out-of-order lower step (Finding 1).
     preserved_step_index: int | None = None
+    preserved_steps: tuple[int, ...] | None = None
     if resume and prior_state is not None and prior_state.conversation_id == external_session_id:
         preserved_step_index = prior_state.forwarded_step_index
+        preserved_steps = prior_state.forwarded_steps
     # Seed bridge state with the id known so far (the real id on resume; on a
     # fresh launch a placeholder the forwarder overwrites with agy's discovered
     # UUID, which it also PATCHes onto the session as external_session_id).
@@ -1833,6 +1839,7 @@ async def _auto_create_antigravity_terminal(
             session_id=session_id,
             conversation_id=external_session_id or _mint_runner_agy_conversation_id(),
             forwarded_step_index=preserved_step_index,
+            forwarded_steps=preserved_steps,
         ),
     )
 

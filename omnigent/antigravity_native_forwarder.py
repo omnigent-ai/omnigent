@@ -125,7 +125,7 @@ from omnigent.antigravity_native_bridge import (
     bridge_root,
     read_bridge_state,
     update_conversation_id,
-    update_forwarded_step_index,
+    update_forwarded_steps,
 )
 from omnigent.antigravity_native_rpc import (
     conversation_id_owned_by_pid,
@@ -685,31 +685,41 @@ class TranscriptParser:
     :param emit_status: When ``True``, emit ``external_session_status``
         running/idle edges at turn boundaries. The tail loop also persists the
         running/idle state to bridge state separately.
-    :param initial_step_high_water: Highest agy ``step_index`` already
-        *delivered* before this parser was constructed, read from the persisted
-        DURABLE cursor (``forwarded_step_index``) on a forwarder (re)start. Steps
-        at or below it are suppressed so a restart or ``--resume`` re-reads the
-        transcript from offset 0 without re-posting the already-mirrored prefix.
-        ``-1`` (the default) means "nothing delivered yet", so ``step_index=0``
-        is accepted on the first feed.
+    :param initial_step_high_water: LEGACY ``<=`` resume floor — steps at or below
+        it are suppressed. Seeded ONLY from a legacy bridge state's
+        ``forwarded_step_index`` (one written before ``forwarded_steps`` existed);
+        for a new-format resume it is ``-1`` and :attr:`initial_delivered_steps`
+        carries the cursor instead. ``-1`` (the default) means "nothing delivered
+        by floor", so ``step_index=0`` is accepted on the first feed. NOT advanced
+        to the per-batch high-water on resume — doing so would suppress a
+        not-yet-written out-of-order lower step (see :attr:`initial_delivered_steps`).
+    :param initial_delivered_steps: The exact SET of agy ``step_index`` values
+        already *acked* before this parser was constructed, read from the persisted
+        ``forwarded_steps`` cursor on a (re)start. A step is suppressed iff it is a
+        MEMBER of this set (NOT ``<=`` a floor), because agy writes ``step_index``
+        both non-contiguously AND out of order: a ``<=`` floor advanced past a
+        ``{12, 14}`` batch would drop a later-arriving ``13``. The default (empty)
+        means "no set cursor" — a fresh launch or a legacy resume that uses
+        :attr:`initial_step_high_water` instead.
     """
 
     conversation_id: str
     emit_status: bool = True
     initial_step_high_water: int = -1
+    initial_delivered_steps: frozenset[int] = frozenset()
     _buffer: str = ""
-    # PARSE-time dedup (in-memory, live-run only). A step is suppressed iff its
-    # step_index is at/below the resume floor (``initial_step_high_water``, the
-    # persisted DURABLE delivery cursor — already mirrored before this run) OR its
-    # step_index was already emitted this run (``_seen_steps`` — a from-0 re-read
-    # after an in-place truncation, or a same-poll re-read). A per-run seen-set,
-    # NOT a strict high-water, because agy 1.0.10 can write step_index OUT OF
-    # ORDER (e.g. 14 before 13 — verified live against the real binary); a strict
-    # high-water would suppress the later-but-lower index as a false duplicate and
-    # silently DROP that step from the mirror. ``_step_high_water`` is retained as
-    # the highest-PARSED marker (for ``step_high_water``); it is NOT the dedup
-    # criterion and NOT the durable resume cursor (which the tail loop advances
-    # from the per-step DELIVERY result; see ``_post_events``).
+    # PARSE-time dedup (in-memory, live-run only). A step is suppressed iff it was
+    # acked before this run (``initial_delivered_steps`` SET membership, or the
+    # legacy ``initial_step_high_water`` ``<=`` floor) OR its step_index was already
+    # emitted this run (``_seen_steps`` — a from-0 re-read after an in-place
+    # truncation, or a same-poll re-read). Both the resume cursor and the in-run
+    # dedup are MEMBERSHIP tests, NOT a strict high-water, because agy 1.0.10 can
+    # write step_index OUT OF ORDER (e.g. 14 before 13 — verified live against the
+    # real binary); a strict high-water would suppress the later-but-lower index as
+    # a false duplicate and silently DROP that step from the mirror. ``_step_high_water``
+    # is retained as the highest-PARSED marker (for ``step_high_water``); it is NOT
+    # the dedup criterion and NOT the durable resume cursor (which the tail loop
+    # advances from the per-step DELIVERY result; see ``_post_events``).
     _step_high_water: int = -1
     _seen_steps: set[int] = field(default_factory=set)
     _allocator: _ToolCallIdAllocator | None = None
@@ -788,11 +798,19 @@ class TranscriptParser:
         step_index = step.get(_FIELD_STEP_INDEX)
         if not isinstance(step_index, int):
             return []
-        if step_index <= self.initial_step_high_water or step_index in self._seen_steps:
-            # Already delivered before this run (resume floor) or already emitted
-            # this run (a from-0 re-read after truncation / same-poll re-read).
-            # Membership test (not a high-water) so a later-but-lower step_index —
-            # agy 1.0.10 writes them out of order — is NOT mistaken for a duplicate.
+        if (
+            step_index in self.initial_delivered_steps
+            or step_index <= self.initial_step_high_water
+            or step_index in self._seen_steps
+        ):
+            # Suppress iff: acked before this run (``initial_delivered_steps`` — the
+            # SET cursor, MEMBERSHIP not ``<=``, so a not-yet-written out-of-order
+            # lower step is re-posted not dropped), OR below a legacy ``<=`` resume
+            # floor (only set when resuming a pre-``forwarded_steps`` state), OR
+            # already emitted this run (``_seen_steps`` — a from-0 re-read after
+            # truncation / same-poll re-read). The seen-set (not a high-water) means
+            # a later-but-lower step_index — agy 1.0.10 writes them out of order —
+            # is NOT mistaken for a duplicate within the run either.
             _logger.debug(
                 "agy forwarder skipping already-processed step: conversation=%s step_index=%s",
                 self.conversation_id,
@@ -1402,30 +1420,41 @@ def _agy_conversation_id_from_state(
     return None
 
 
-def _persisted_step_high_water(bridge_dir: Path, conversation_id: str) -> int:
+def _persisted_resume_cursor(bridge_dir: Path, conversation_id: str) -> tuple[int, frozenset[int]]:
     """
-    Return the dedup high-water seed for a (re)started forwarder run.
+    Return the parser's resume-cursor seed for a (re)started forwarder run.
 
-    Reads the persisted ``forwarded_step_index`` resume cursor from bridge state
-    and returns it as the parser's initial high-water, but only when it belongs
-    to *conversation_id* — a cursor recorded for a *different* (prior) agy
-    conversation must not suppress the new transcript's steps. The mismatch
-    case is defensive: ``_resolve_transcript_once`` already resets the cursor on
-    a conversation change when it persists the newly discovered id.
+    Reads the persisted cursor from bridge state, but only when it belongs to
+    *conversation_id* — a cursor recorded for a *different* (prior) agy
+    conversation must not suppress the new transcript's steps. The mismatch case
+    is defensive: ``_resolve_transcript_once`` already resets the cursor on a
+    conversation change when it persists the newly discovered id.
+
+    Two seed shapes, mutually exclusive:
+
+    * **New format** (``forwarded_steps`` recorded): return ``(-1, the set)`` — the
+      legacy ``<=`` floor is disabled and the parser suppresses by SET membership.
+      This is what avoids dropping a not-yet-written out-of-order lower step on
+      restart (a ``<=`` floor at the batch high-water would suppress it).
+    * **Legacy format** (only ``forwarded_step_index``): return
+      ``(that index, empty set)`` — the old ``<=`` floor, so a state written by a
+      prior build still resumes (it cannot represent the set).
 
     :param bridge_dir: Native Antigravity bridge directory.
     :param conversation_id: agy conversation id the forwarder resolved for this
         run, e.g. ``"68caaeac-..."``.
-    :returns: The highest already-mirrored ``step_index`` for this conversation,
-        or ``-1`` when none is recorded (fresh launch) or the cursor belongs to
-        a different conversation.
+    :returns: ``(initial_step_high_water, initial_delivered_steps)`` for this
+        conversation. ``(-1, frozenset())`` when nothing is recorded (fresh
+        launch) or the cursor belongs to a different conversation.
     """
     state = read_bridge_state(bridge_dir)
-    if state is None or state.forwarded_step_index is None:
-        return -1
-    if state.conversation_id != conversation_id:
-        return -1
-    return state.forwarded_step_index
+    if state is None or state.conversation_id != conversation_id:
+        return -1, frozenset()
+    if state.forwarded_steps is not None:
+        return -1, frozenset(state.forwarded_steps)
+    if state.forwarded_step_index is not None:
+        return state.forwarded_step_index, frozenset()
+    return -1, frozenset()
 
 
 def _json_string(value: dict[str, object]) -> str | None:
@@ -1875,40 +1904,21 @@ async def _maybe_interrupt_turn(conversation_id: str) -> None:
     await interrupt_turn(port, conversation_id)
 
 
-def _highest_step_below(events: Iterable[OutboundEvent], boundary: int) -> int | None:
-    """
-    Return the highest ``step_index`` among *events* strictly below *boundary*.
-
-    Used by the at-least-once audit gate (gov FIX A) to cap the durable cursor
-    just below the first un-audited step: the cursor may commit every delivered
-    step before the freeze point but not the freeze point itself.  agy
-    ``step_index`` is non-contiguous (e.g. 0→2→4) AND written out of order
-    (verified live against the real binary), so the ceiling is the max over
-    values ``< boundary``, not a positional scan that stops at the first index
-    ``>= boundary`` (which would miss a lower index that arrives later).
-
-    :param events: The mirror-delivered prefix (any order).
-    :param boundary: The first un-audited step index (exclusive upper bound).
-    :returns: The highest delivered ``step_index`` ``< boundary``, or ``None``
-        when no delivered step precedes the boundary (the freeze point is the
-        first step, so the cursor must not advance at all this batch).
-    """
-    highest: int | None = None
-    for event in events:
-        if event.step_index < boundary and (highest is None or event.step_index > highest):
-            highest = event.step_index
-    return highest
-
-
 @dataclass(frozen=True)
 class _BatchDelivery:
     """
     Per-batch delivery outcome used to advance the durable resume cursor.
 
-    :param contiguous_high_water: Highest ``step_index`` delivered *contiguously*
-        in this batch — that step and every earlier batch step had ALL their
-        events delivered. ``None`` when the batch was empty, produced no events,
-        or its very first step failed.
+    :param delivered_steps: The SET of ``step_index`` values fully delivered in
+        this batch with NO failed step at a lower index — the gap-free delivered
+        prefix over step VALUES (not arrival order). The caller unions this into
+        the persisted ``forwarded_steps`` cursor. A set (not just the high-water)
+        so the resume cursor records EXACTLY which steps were acked: a step absent
+        from it — including a not-yet-written out-of-order lower step — is re-posted
+        on restart instead of being suppressed by a ``<=`` floor.
+    :param contiguous_high_water: ``max(delivered_steps)`` or ``None`` when empty.
+        Retained as the gap-free watermark for the at-least-once audit gate and
+        logging; the durable cursor itself is the set.
     :param fully_delivered: ``True`` iff every event in the batch was delivered
         (no POST failed). When ``False`` the run has hit a delivery gap, so the
         caller must FREEZE the durable cursor for the rest of the run: a later
@@ -1916,6 +1926,7 @@ class _BatchDelivery:
         failed step (that would permanently skip it on resume).
     """
 
+    delivered_steps: frozenset[int]
     contiguous_high_water: int | None
     fully_delivered: bool
 
@@ -1931,7 +1942,7 @@ async def _post_events(
     Events for a step may arrive interleaved and out of ``step_index`` order
     (agy 1.0.10 writes the transcript out of order). This posts each and tracks
     per-step delivery keyed by ``step_index`` so the caller can advance the
-    DURABLE resume cursor (``forwarded_step_index``) only as far as is safe.
+    DURABLE resume cursor (``forwarded_steps``) only as far as is safe.
 
     Delivery success is per the shared retry helper: a POST is considered
     delivered only when :func:`_post_session_event` returns a ``< 400`` response.
@@ -1939,11 +1950,10 @@ async def _post_events(
     transport errors after all retries) and a final ``>= 400`` are both treated
     as NOT delivered.
 
-    :attr:`_BatchDelivery.contiguous_high_water` is the highest fully-delivered
-    step with NO failed step at a lower ``step_index`` — a gap-free watermark over
-    step VALUES (not arrival order), so an out-of-order batch never advances the
-    cursor past a failed lower step (which would drop it on resume) nor short of a
-    fully-delivered tail (which would re-post it on restart). The failed step and
+    :attr:`_BatchDelivery.delivered_steps` is the SET of fully-delivered steps
+    with NO failed step at a lower ``step_index`` — the gap-free delivered prefix
+    over step VALUES (not arrival order), so an out-of-order batch never acks past
+    a failed lower step (which would drop it on resume). The failed step and
     everything at/above it are excluded so a restart re-posts them (an acceptable
     duplicate for a higher step that did succeed, versus permanent step loss).
     Posting still continues for every event (the live UI benefits).
@@ -1951,8 +1961,8 @@ async def _post_events(
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id.
     :param events: Ordered events to POST (grouped by step, increasing index).
-    :returns: A :class:`_BatchDelivery` carrying the contiguous delivered
-        high-water and whether the whole batch delivered.
+    :returns: A :class:`_BatchDelivery` carrying the delivered step set, its
+        gap-free high-water, and whether the whole batch delivered.
     """
     # Per-step delivery keyed by step_index (NOT arrival order): a step is
     # delivered iff EVERY event for it succeeded, regardless of how the events
@@ -1965,19 +1975,20 @@ async def _post_events(
         if not delivered:
             fully_delivered = False
         step_ok[event.step_index] = step_ok.get(event.step_index, True) and delivered
-    # Gap-free contiguous high-water over step VALUES: the highest fully-delivered
-    # step that has NO failed step at a lower index. Computed from the step_index
-    # sets (not arrival order) so an out-of-order batch (e.g. 12, 14, 13, 15)
-    # advances the cursor to the true gap-free prefix — never past a failed lower
-    # step (a resume drop) and never short of a fully-delivered tail (a restart
-    # re-post).
+    # Gap-free delivered set over step VALUES: every fully-delivered step that has
+    # NO failed step at a lower index. Computed from the step_index sets (not
+    # arrival order) so an out-of-order batch (e.g. 12, 14, 13, 15) acks the true
+    # gap-free prefix — never past a failed lower step (a resume drop). The caller
+    # unions this set into the persisted cursor; ``contiguous_high_water`` is its
+    # max, kept for the audit gate + logging.
     failed_steps = [step for step, ok in step_ok.items() if not ok]
     min_failed = min(failed_steps) if failed_steps else None
-    delivered_below_gap = [
+    delivered_steps = frozenset(
         step for step, ok in step_ok.items() if ok and (min_failed is None or step < min_failed)
-    ]
-    contiguous_high_water = max(delivered_below_gap) if delivered_below_gap else None
+    )
+    contiguous_high_water = max(delivered_steps) if delivered_steps else None
     return _BatchDelivery(
+        delivered_steps=delivered_steps,
         contiguous_high_water=contiguous_high_water,
         fully_delivered=fully_delivered,
     )
@@ -2104,27 +2115,30 @@ async def forward_antigravity_transcript_to_session(
     if resolved is None:
         return
     conversation_id, transcript_path = resolved
-    # Seed the dedup high-water from the persisted resume cursor so a (re)start
+    # Seed the dedup cursor from the persisted resume cursor so a (re)start
     # — supervisor crash-restart OR ``omnigent antigravity --resume`` — re-reads
-    # the transcript from offset 0 but re-POSTs only steps beyond what was
-    # already mirrored. Only honor the cursor when it belongs to THIS
-    # conversation id (a stale cursor from a prior conversation must not suppress
-    # a new transcript's steps); ``_resolve_transcript`` already reset it on a
-    # conversation change via ``update_conversation_id``.
-    initial_step_high_water = await asyncio.to_thread(
-        _persisted_step_high_water, bridge_dir, conversation_id
+    # the transcript from offset 0 but re-POSTs only steps NOT already acked. The
+    # new-format cursor is the SET of acked steps (membership suppression); a
+    # legacy state seeds the old ``<=`` floor instead. Only honor the cursor when
+    # it belongs to THIS conversation id (a stale cursor from a prior conversation
+    # must not suppress a new transcript's steps); ``_resolve_transcript`` already
+    # reset it on a conversation change via ``update_conversation_id``.
+    initial_step_high_water, initial_delivered_steps = await asyncio.to_thread(
+        _persisted_resume_cursor, bridge_dir, conversation_id
     )
     _logger.info(
         "agy forwarder tailing transcript: session=%s conversation=%s path=%s "
-        "resume_from_step_index=%s",
+        "resume_from_step_index=%s resume_acked_steps=%d",
         session_id,
         conversation_id,
         transcript_path,
         initial_step_high_water,
+        len(initial_delivered_steps),
     )
     parser = TranscriptParser(
         conversation_id=conversation_id,
         initial_step_high_water=initial_step_high_water,
+        initial_delivered_steps=initial_delivered_steps,
     )
     async with httpx.AsyncClient(
         base_url=base_url,
@@ -2177,18 +2191,21 @@ async def _tail_transcript(
     PARSE high-water-mark dedup makes re-reads *within the run* idempotent, so a
     reopened/rewound file never double-posts.
 
-    After each batch the DURABLE resume cursor ``forwarded_step_index`` is
-    persisted to bridge state (:func:`update_forwarded_step_index`) so a later
-    forwarder (re)start — supervisor crash-restart OR ``--resume`` — seeds its
-    dedup from it and re-POSTs only steps beyond it. Crucially the cursor is
-    advanced from the per-step DELIVERY result returned by :func:`_post_events`
-    (the highest step delivered *contiguously*, stopping at the first failed
-    POST), NOT from the parser's PARSE high-water. Persisting the parse high-
-    water would mark a step whose POST failed as forwarded and permanently skip
-    it on resume (silent data loss); advancing only the delivered cursor means a
-    failed step is re-posted on resume instead — an acceptable duplicate. A
-    failed POST therefore freezes the cursor below it even though the parser has
-    already advanced past it in memory.
+    After each batch the DURABLE resume cursor ``forwarded_steps`` (the SET of
+    acked step indices) is unioned into bridge state (:func:`update_forwarded_steps`)
+    so a later forwarder (re)start — supervisor crash-restart OR ``--resume`` —
+    seeds its dedup from it and re-POSTs only steps NOT in the set. Crucially the
+    cursor records the per-step DELIVERY result returned by :func:`_post_events`
+    (the gap-free delivered prefix, stopping at the first failed POST), NOT the
+    parser's PARSE high-water. Persisting the parse high-water would mark a step
+    whose POST failed as forwarded and permanently skip it on resume (silent data
+    loss); recording only the delivered set means a failed step is re-posted on
+    resume instead — an acceptable duplicate. A failed POST therefore freezes the
+    cursor below it even though the parser has already advanced past it in memory.
+    The cursor is a SET, not a ``<=`` high-water, specifically so a lower step agy
+    writes out of order *after* a higher one (e.g. ``13`` after ``14``) in a batch
+    that lands after the cursor was last persisted is re-posted on restart rather
+    than suppressed by a floor that already passed it.
 
     **At-least-once policy audit (gov FIX A).** When ``audit_policies`` is on,
     the cursor advance is *also* gated on audit success: a step commits only once
@@ -2304,20 +2321,15 @@ async def _tail_transcript(
             # for the un-acked tail on restart — the product owner's chosen
             # at-least-once tradeoff (the warning route has no server-side dedup).
             #
-            # Audit ONLY the contiguously mirror-delivered prefix of this batch
-            # (steps <= ``delivery.contiguous_high_water``), never stalled/past-
-            # mirror-gap steps: a step that failed to MIRROR is re-delivered AND
-            # re-audited together on restart. Fail-open: an eval/transport error
-            # does NOT freeze (see :func:`_audit_batch`); only an evaluated-
-            # violation whose warning POST failed does.
-            committed_high_water = delivery.contiguous_high_water
-            if (
-                audit_policies
-                and cursor_may_advance
-                and delivery.contiguous_high_water is not None
-            ):
-                mirror_high_water = delivery.contiguous_high_water
-                delivered_prefix = [e for e in events if e.step_index <= mirror_high_water]
+            # Audit ONLY the mirror-delivered prefix of this batch (steps in
+            # ``delivery.delivered_steps``), never stalled/past-mirror-gap steps: a
+            # step that failed to MIRROR is re-delivered AND re-audited together on
+            # restart. Fail-open: an eval/transport error does NOT freeze (see
+            # :func:`_audit_batch`); only an evaluated-violation whose warning POST
+            # failed does.
+            committed_steps = delivery.delivered_steps
+            if audit_policies and cursor_may_advance and delivery.delivered_steps:
+                delivered_prefix = [e for e in events if e.step_index in delivery.delivered_steps]
                 audit = await _audit_batch(
                     ap_client,
                     session_id,
@@ -2326,23 +2338,27 @@ async def _tail_transcript(
                     model=model,
                 )
                 if audit.first_unaudited_step is not None:
-                    # Freeze: cap the cursor below the first un-acked violation so
-                    # a restart re-audits it, and stall the run so no later batch
+                    # Freeze: drop the un-acked step and everything at/above it so a
+                    # restart re-audits them, and stall the run so no later batch
                     # advances past the gap (mirrors the mirror-delivery freeze).
-                    committed_high_water = _highest_step_below(
-                        delivered_prefix, audit.first_unaudited_step
+                    committed_steps = frozenset(
+                        step
+                        for step in delivery.delivered_steps
+                        if step < audit.first_unaudited_step
                     )
                     delivery_stalled = True
             # Advance the DURABLE cursor from the gated DELIVERY+AUDIT result, NOT
             # the parser's PARSE high-water: advancing on parse would mark a
-            # failed-POST step as forwarded and permanently skip it on resume.
-            # The persist helper is monotonic, so a no-progress write is a no-op
-            # and a frozen cursor never rewinds.
-            if cursor_may_advance and committed_high_water is not None:
+            # failed-POST step as forwarded and permanently skip it on resume. The
+            # persist helper unions monotonically, so a no-progress write is a no-op
+            # and a frozen cursor never rewinds. The cursor is the SET of acked
+            # steps (not a ``<=`` high-water) so a not-yet-written out-of-order
+            # lower step is re-posted on restart, not dropped.
+            if cursor_may_advance and committed_steps:
                 await asyncio.to_thread(
-                    update_forwarded_step_index,
+                    update_forwarded_steps,
                     bridge_dir,
-                    committed_high_water,
+                    committed_steps,
                 )
         await _sleep(poll_interval_s)
 

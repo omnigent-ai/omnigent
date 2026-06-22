@@ -1838,3 +1838,88 @@ def test_internal_errored_tool_complete_emits_output_with_real_call_id() -> None
         "must NOT carry call_id=='' — every downstream consumer pairs strictly "
         "by call_id and discards an empty-id output, orphaning the result."
     )
+
+
+# ── ToolCallComplete suppression scoped to dispatched call ids ──────────────
+#
+# A tool routed through ``_stable_tool_executor`` → ``ctx.dispatch_tool`` already
+# has its ``function_call_output`` emitted by ``dispatch_tool`` when the Future
+# resolves; ``_stable_tool_executor`` records that call_id in
+# ``_dispatched_call_ids`` so ``_translate_event`` suppresses the duplicate inner
+# ``ToolCallComplete``. The suppression is keyed to the SET — NOT the old blanket
+# ``_current_ctx is not None`` rule, which also swallowed internally-run tools and
+# left them as perpetual in-progress cards. These two tests pin both arms of that
+# branch (it is shared code guarding claude/codex from duplicate outputs).
+
+
+def test_dispatched_id_tool_complete_is_suppressed() -> None:
+    """A ToolCallComplete whose call_id was dispatched (round-tripped) is suppressed.
+
+    ``_stable_tool_executor`` (the ``ctx.dispatch_tool`` path) is the single output
+    source for a dispatched tool — ``dispatch_tool`` already emitted its
+    ``function_call_output``. Emitting another here would duplicate it on the SSE
+    stream and produce a ghost "Waiting for output" card in the Web UI. So a
+    ``ToolCallComplete`` carrying a dispatched id must produce NO emit.
+    """
+    from omnigent.inner.executor import ToolCallComplete, ToolCallStatus
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext()
+
+    call_id = "tc_dispatched_1"
+    # Mark the id as dispatched, exactly as ``_stable_tool_executor`` does after
+    # routing the call through ``ctx.dispatch_tool``.
+    adapter._dispatched_call_ids.add(call_id)
+
+    adapter._translate_event(
+        ToolCallComplete(
+            name="sys_terminal_launch",
+            status=ToolCallStatus.SUCCESS,
+            result="dispatched-output",
+            metadata={"call_id": call_id},
+        ),
+        ctx,  # type: ignore[arg-type]
+    )
+
+    assert ctx.emitted == [], (
+        f"a dispatched id's ToolCallComplete must be suppressed (dispatch_tool is "
+        f"its single output source); got {[e.item.get('type') for e in ctx.emitted]}. "
+        f"A second function_call_output here duplicates the result and leaves a "
+        f"ghost 'Waiting for output' card in the Web UI."
+    )
+
+
+def test_non_dispatched_id_tool_complete_emits_output() -> None:
+    """A ToolCallComplete whose id was NOT dispatched DOES emit its output.
+
+    Complements the suppression test: the gate is scoped to ``_dispatched_call_ids``,
+    not a blanket suppression. A tool the inner SDK ran internally (no
+    ``dispatch_tool`` round-trip) has its completion as the ONLY output source, so
+    it must surface a paired ``function_call_output``.
+    """
+    from omnigent.inner.executor import ToolCallComplete, ToolCallStatus
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext()
+
+    call_id = "tc_internal_1"
+    # Note: call_id is intentionally NOT added to _dispatched_call_ids.
+    adapter._translate_event(
+        ToolCallComplete(
+            name="run_command",
+            status=ToolCallStatus.SUCCESS,
+            result="internal-output",
+            metadata={"call_id": call_id},
+        ),
+        ctx,  # type: ignore[arg-type]
+    )
+
+    fco_items = [e for e in ctx.emitted if e.item.get("type") == "function_call_output"]
+    assert len(fco_items) == 1, (
+        f"a non-dispatched ToolCallComplete is its tool's only output source and "
+        f"must emit exactly one function_call_output; got "
+        f"{[e.item.get('type') for e in ctx.emitted]}"
+    )
+    assert fco_items[0].item.get("call_id") == call_id

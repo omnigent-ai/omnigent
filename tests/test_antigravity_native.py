@@ -7,6 +7,7 @@ runner.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -408,13 +409,15 @@ async def test_launch_and_record_resume_same_conv_preserves_forwarded_step_index
 
     bridge_dir = prepare_bridge_dir(bridge_id)
 
-    # Pre-seed: simulate a prior run that forwarded up to step 14.
+    # Pre-seed: simulate a prior run that acked the SET {0, 2, 14} (step 13 was
+    # written out of order and not yet acked when the run ended).
     write_bridge_state(
         bridge_dir,
         AntigravityNativeBridgeState(
             session_id="conv_abc123",
             conversation_id=_REAL_UUID,
             forwarded_step_index=14,
+            forwarded_steps=(0, 2, 14),
         ),
     )
 
@@ -436,6 +439,13 @@ async def test_launch_and_record_resume_same_conv_preserves_forwarded_step_index
     assert after.forwarded_step_index == 14, (
         "cursor must be preserved on same-conversation cold resume; "
         f"got {after.forwarded_step_index}"
+    )
+    # The authoritative SET cursor MUST also survive the resume rewrite — dropping
+    # it would fall the forwarder back to the <=14 floor and re-drop the
+    # out-of-order step 13 (Finding 1 regression).
+    assert after.forwarded_steps == (0, 2, 14), (
+        "the forwarded_steps SET must be preserved on same-conversation cold "
+        f"resume; got {after.forwarded_steps}"
     )
 
 
@@ -460,13 +470,14 @@ async def test_launch_and_record_fresh_launch_resets_forwarded_step_index(
 
     bridge_dir = prepare_bridge_dir(bridge_id)
 
-    # Pre-seed: prior run left cursor=14 with the real UUID.
+    # Pre-seed: prior run left the cursor set {0, 2, 14} with the real UUID.
     write_bridge_state(
         bridge_dir,
         AntigravityNativeBridgeState(
             session_id="conv_abc123",
             conversation_id=_REAL_UUID,
             forwarded_step_index=14,
+            forwarded_steps=(0, 2, 14),
         ),
     )
 
@@ -488,6 +499,10 @@ async def test_launch_and_record_fresh_launch_resets_forwarded_step_index(
     assert after is not None, "bridge state must exist after _launch_and_record"
     assert after.forwarded_step_index is None, (
         f"cursor must be reset on fresh launch; got {after.forwarded_step_index}"
+    )
+    # Both cursor representations reset on a fresh launch (mismatched id).
+    assert after.forwarded_steps is None, (
+        f"forwarded_steps SET must be reset on fresh launch; got {after.forwarded_steps}"
     )
 
 
@@ -571,3 +586,126 @@ async def test_launch_and_record_threads_headless_skip_flag(
         )
 
     assert "--dangerously-skip-permissions" in captured_args
+
+
+# ---------------------------------------------------------------------------
+# _attach_terminal teardown: the eager terminal-close decision
+# ---------------------------------------------------------------------------
+
+
+def _prepared(reattached: bool) -> _mod.PreparedAntigravityTerminal:
+    """
+    Build a PreparedAntigravityTerminal for the attach-teardown tests.
+
+    A non-None tmux socket/target makes the direct-attach branch eligible (the
+    tests stub the attach itself), isolating the ``finally`` close decision.
+
+    :param reattached: Whether this invocation reused an existing terminal.
+    :returns: A prepared terminal with placeholder ids and tmux metadata.
+    """
+    return _mod.PreparedAntigravityTerminal(
+        session_id="conv_close",
+        terminal_id="term_close",
+        bridge_dir=Path("/tmp/agy-close-test"),
+        tmux_socket=Path("/tmp/agy-close-test.sock"),
+        tmux_target="main",
+        reattached=reattached,
+    )
+
+
+async def _run_attach_and_capture_close(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    reattached: bool,
+    outcome: _mod._AttachOutcome,
+) -> list[str]:
+    """
+    Drive ``_attach_terminal`` with stubbed attach + forwarder + close, returning
+    the terminal ids passed to ``_close_antigravity_terminal`` (empty = not closed).
+
+    The forwarder is stubbed to run until cancelled (so the ``finally`` teardown
+    exercises its cancel path); the direct tmux attach is stubbed to return the
+    chosen *outcome* without touching tmux.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param reattached: ``prepared.reattached`` for this run.
+    :param outcome: The ``_AttachOutcome`` the (stubbed) attach returns.
+    :returns: Terminal ids ``_close_antigravity_terminal`` was called with.
+    """
+    closed_terminal_ids: list[str] = []
+
+    async def _fake_forwarder(**_kwargs: object) -> None:
+        # Run until the finally-block cancels the task, like the real forwarder.
+        await asyncio.Event().wait()
+
+    async def _fake_direct_attach(_socket: Path, _target: str) -> _mod._AttachOutcome:
+        return outcome
+
+    async def _fake_close(**kwargs: object) -> None:
+        closed_terminal_ids.append(str(kwargs["terminal_id"]))
+
+    monkeypatch.setattr(_mod, "supervise_forwarder", _fake_forwarder)
+    monkeypatch.setattr(_mod, "_can_attach_direct_tmux", lambda _prepared: True)
+    monkeypatch.setattr(_mod, "_attach_direct_tmux", _fake_direct_attach)
+    monkeypatch.setattr(_mod, "_close_antigravity_terminal", _fake_close)
+
+    await _mod._attach_terminal(
+        base_url="http://test",
+        headers={},
+        prepared=_prepared(reattached),
+        recover=None,
+        model=None,
+    )
+    return closed_terminal_ids
+
+
+async def test_attach_terminal_closes_on_real_exit_when_owned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real exit (EXITED) of a terminal THIS invocation owns closes it.
+
+    The owning launcher is responsible for teardown; not closing here would leak
+    the agy terminal resource on a normal quit.
+    """
+    closed = await _run_attach_and_capture_close(
+        monkeypatch, reattached=False, outcome=_mod._AttachOutcome.EXITED
+    )
+    assert closed == ["term_close"]
+
+
+async def test_attach_terminal_skips_close_on_detach(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tmux DETACH must NOT close the terminal — agy keeps running for re-attach.
+
+    Detaching is "leave it running"; closing here would kill a live agy session
+    the user intends to come back to.
+    """
+    closed = await _run_attach_and_capture_close(
+        monkeypatch, reattached=False, outcome=_mod._AttachOutcome.DETACHED
+    )
+    assert closed == []
+
+
+async def test_attach_terminal_skips_close_when_reattached_even_on_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reattached invocation must NOT close on exit — it does not own teardown.
+
+    This invocation reused a terminal another launcher created; closing it on our
+    exit would tear down a resource we do not own (the over-close seam).
+    """
+    closed = await _run_attach_and_capture_close(
+        monkeypatch, reattached=True, outcome=_mod._AttachOutcome.EXITED
+    )
+    assert closed == []
+
+
+async def test_attach_terminal_skips_close_when_reattached_and_detached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reattached AND detached: both reasons to skip close — and it is skipped."""
+    closed = await _run_attach_and_capture_close(
+        monkeypatch, reattached=True, outcome=_mod._AttachOutcome.DETACHED
+    )
+    assert closed == []

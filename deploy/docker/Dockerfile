@@ -238,10 +238,29 @@ RUN npm install -g --no-audit --no-fund \
 # runtime user's). So install to the default, then move the single self-contained
 # binary onto a system PATH dir every user shares. ``test -x`` fails the build
 # loudly if the layout ever changes again.
+#
+# Version pin: the native harness is behaviorally coupled to a specific agy build
+# (its out-of-order transcript writes, connect-RPC quirks, and TUI injection are
+# all verified against 1.0.10 — grep ``agy 1.0.10`` under omnigent/antigravity_native*).
+# The official bootstrapper has NO version flag — it always fetches the LATEST
+# build from its auto-updater manifest (verified: only ``-d/--dir`` and ``-h`` are
+# accepted; it does SHA512-verify the payload, but only against that latest-pointing
+# manifest). So the DOWNLOAD itself cannot be pinned here. Instead we pin the
+# ACCEPTED version and FAIL THE BUILD if the installer served a different one —
+# turning a future silent harness break (a newer agy whose behavior diverged) into
+# a visible, conscious bump. To adopt a new agy: re-verify the coupled behavior,
+# then bump AGY_EXPECTED_VERSION (override at build with --build-arg if needed).
+ARG AGY_EXPECTED_VERSION=1.0.10
 RUN curl -fsSL https://antigravity.google/cli/install.sh | bash \
  && install -m 0755 "${HOME:-/root}/.local/bin/agy" /usr/local/bin/agy \
  && test -x /usr/local/bin/agy \
- && /usr/local/bin/agy --version
+ && installed_agy_version="$(/usr/local/bin/agy --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)" \
+ && if [ "$installed_agy_version" != "$AGY_EXPECTED_VERSION" ]; then \
+      echo "ERROR: agy installer served version '${installed_agy_version:-<unparseable>}', but the native harness is pinned to '$AGY_EXPECTED_VERSION'." >&2; \
+      echo "       The bootstrapper has no version flag (always latest). Re-verify the harness against the new agy, then bump AGY_EXPECTED_VERSION." >&2; \
+      exit 1; \
+    fi \
+ && echo "agy ${AGY_EXPECTED_VERSION} pinned and verified"
 
 # Preserve /build/ — the venv's editable install .pth files reference
 # /build/omnigent and /build/sdks/* by absolute path. Copying these to
