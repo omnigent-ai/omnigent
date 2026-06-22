@@ -255,6 +255,18 @@ def browser_type_launch_args(
         launch_args["headless"] = True
     elif not pytestconfig.getoption("--headed", default=False):
         launch_args.setdefault("headless", True)
+    # The pinned Playwright Docker image (the visual-snapshot renderer, both in
+    # ui-snapshot.yml and the local regen script) runs as root, where Chromium
+    # refuses to start without --no-sandbox; --disable-dev-shm-usage avoids the
+    # container's small /dev/shm. Neither flag changes rasterized output, so a
+    # baseline stays identical to a sandboxed run. Env-gated so the unpinned
+    # e2e-ui runners (non-root) are unaffected.
+    if os.environ.get("OMNIGENT_PW_NO_SANDBOX"):
+        launch_args["args"] = [
+            *launch_args.get("args", []),
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+        ]
     return launch_args
 
 
