@@ -2417,3 +2417,55 @@ def test_antigravity_install_now_invokes_runner_without_index(
     assert "install" in argv
     # No index URL / proxy is baked into committed code.
     assert not any("index" in part or "://" in part for part in argv)
+
+
+def _other_key_add_menu_index(family: str) -> int:
+    """Return the 1-based numbered-fallback position of "Other provider — API key".
+
+    Computed from the live per-family add menu rather than hardcoded, so a
+    reordering of :func:`add_menu_options` doesn't aim this test's piped stdin
+    at the wrong row.
+
+    :param family: The harness surface whose add menu is inspected.
+    :returns: The 1-based index of the catch-all ``other``-key option.
+    """
+    from omnigent.onboarding.configure_models import add_menu_options_for_family
+    from omnigent.onboarding.provider_config import KEY_KIND
+
+    opts = add_menu_options_for_family(family)
+    return next(i for i, o in enumerate(opts) if o.kind == KEY_KIND and o.other) + 1
+
+
+def test_configure_harnesses_add_other_key_no_remaining_providers_aborts_cleanly(
+    isolated_config, monkeypatch
+) -> None:
+    """Picking "Other provider — API key" with no catalog providers left aborts
+    cleanly instead of crashing.
+
+    Regression for #820: when every catch-all key provider is already configured,
+    ``other_key_providers()`` returns ``[]`` and the secondary ``select`` was
+    handed an empty option list, raising ``ValueError: select() requires at least
+    one option`` out of ``omnigent setup``. The add branch must detect the empty
+    list, tell the user, and return — exit code 0, no traceback. Driven under Pi
+    (the surface from the report), with the harness CLI forced installed so the
+    drill-in reaches the add menu.
+    """
+    from omnigent.onboarding.provider_config import PI_SURFACE
+
+    # Force the harness CLI "installed" so the Pi drill-in shows the add menu
+    # rather than the install prompt, and pretend the catch-all catalog is
+    # exhausted (the real-world trigger: all of Groq/DeepSeek/… already added).
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: True
+    )
+    monkeypatch.setattr("omnigent.onboarding.configure_models.other_key_providers", list)
+
+    other = _other_key_add_menu_index(PI_SURFACE)
+    # L1 3=Pi → L2 1=+Add → add menu <other>=Other provider — API key → L2 q=back → L1 q=exit.
+    stdin = "\n".join(["3", "1", str(other), "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+
+    # Pre-fix this exited non-zero with a ValueError; the guard makes it graceful.
+    assert result.exit_code == 0, result.output
+    assert result.exception is None, result.exception
+    assert "No other API-key providers" in result.output

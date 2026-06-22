@@ -238,12 +238,17 @@ class PolicyEngine:
            d. Action-list validation and the classifier-only
               carve-out for FunctionPolicy and PromptPolicy.
            e. Accumulate ``set_labels`` writes.
+           f. If the policy returned ``data``, feed it back
+              as ``ctx.content`` so the next policy transforms
+              the already-transformed payload (sequential
+              chaining across the pipeline).
         2. On DENY: short-circuit. Apply accumulated writes
            from any ALLOWing predecessors, then return the
            DENY result (with ``deciding_policy`` set).
         3. After the loop, if any policy ASKed: return an ASK
            result carrying accumulated (but unapplied)
-           writes — the caller applies them only on approve
+           writes and the full ``deciding_policies`` list —
+           the caller applies them only on approve
            (POLICIES.md §7.2).
         4. Otherwise: apply writes, return ALLOW.
 
@@ -267,10 +272,11 @@ class PolicyEngine:
         accumulated: dict[str, str] = {}
         accumulated_state: list[StateUpdate] = []
         ask_reasons: list[str] = []
-        deciding_ask_policy: str | None = None
-        # Last non-None data from any ALLOW-or-ASK policy. If multiple
-        # policies return data, the last one wins — callers that need
-        # chained transforms should compose them in a single callable.
+        deciding_ask_policies: list[str] = []
+        # Sequentially accumulated data: each policy that returns data
+        # has its output fed back into ctx.content so the next policy
+        # in the chain transforms the already-transformed payload rather
+        # than the original. The final value is the fully-composed result.
         composed_data: Any = None
         context = self._context()
 
@@ -308,12 +314,14 @@ class PolicyEngine:
                 )
             if result.data is not None:
                 composed_data = result.data
+                # Feed the transformed payload forward so the next policy
+                # in the chain sees this policy's output, not the original.
+                ctx = replace(ctx, content=composed_data)
             if result.action == PolicyAction.ASK:
                 ask_reasons.append(
                     f"{policy.spec.name}: {result.reason or 'approval required'}",
                 )
-                if deciding_ask_policy is None:
-                    deciding_ask_policy = policy.spec.name
+                deciding_ask_policies.append(policy.spec.name)
 
         if ask_reasons:
             # DO NOT apply label writes or state updates here — the ASK
@@ -326,7 +334,7 @@ class PolicyEngine:
                 reason="; ".join(ask_reasons),
                 set_labels=dict(accumulated) if accumulated else None,
                 state_updates=list(accumulated_state) if accumulated_state else None,
-                deciding_policy=deciding_ask_policy,
+                deciding_policies=deciding_ask_policies,
                 data=composed_data,
             )
         if not read_only:
@@ -337,7 +345,6 @@ class PolicyEngine:
             reason=None,
             set_labels=dict(accumulated) if accumulated else None,
             state_updates=list(accumulated_state) if accumulated_state else None,
-            deciding_policy=None,
             data=composed_data,
         )
 
@@ -381,7 +388,7 @@ class PolicyEngine:
             reason=reason,
             set_labels=dict(accumulated) if accumulated else None,
             state_updates=list(accumulated_state) if accumulated_state else None,
-            deciding_policy=deciding_policy,
+            deciding_policies=[deciding_policy],
         )
 
     def _should_fire(
@@ -784,7 +791,7 @@ class PolicyEngine:
         Stateless policies — the default — no-op.
 
         Mirrors the omnigent-native semantics in
-        :meth:`omnigent.inner.policies.PolicyEngine.reset_turn`.
+        :meth:`omnigent.runtime.policies.engine.PolicyEngine.reset_turn`.
         Without this hook, legacy ``max_tool_calls_per_turn``
         callables silently degrade to per-session limits under
         Omnigent mode.

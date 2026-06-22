@@ -10,18 +10,11 @@
 # `if:` skip of a matrixed job would instead leave one check-run with an
 # unexpanded `Integration (${{ matrix.name }})` name.
 #
-# One leg per wrapped harness, no pytest-shard splitting: the journey suite is
-# a handful of tests per leg. The `Integration (...)` leg-name prefix is load-
-# bearing -- nightly.yml's notify jq filter keys on it.
-#
-# Model pinning rationale:
-# - claude-sdk on sonnet-4-6: tier 4, most TPM headroom.
-# - codex on gpt-5-5: gpt-5-4-mini hit 429s historically; also halve its
-#   workers (least rate-limit headroom; burn-in failures were codex-only,
-#   clustered at peak PR traffic).
-# - openai-agents on gpt-5-4-mini: green there historically.
-# OMNIGENT_TEST_MODEL_SPREAD in the workflow may rebalance within the same
-# provider/tier pool (tests/_model_pools.py).
+# Single openai-agents leg: all tests now run against the mock LLM server.
+# claude-sdk and codex reject "mock-model" as an unknown model (they validate
+# against the Databricks model catalog even when mock_llm_base_url is set), so
+# only openai-agents works without real credentials. The model name is unused
+# in mock mode (model_name fixture returns "mock-model" regardless).
 #
 # Env in:  EVENT_NAME (github.event_name), IS_DRAFT, IS_FORK (both may be empty
 #          on non-PR events).
@@ -46,9 +39,7 @@ fi
 
 read -r -d '' matrix <<'JSON' || true
 {"include":[
-{"name":"claude-sdk","harness":"claude-sdk","model":"databricks-claude-sonnet-4-6","workers":4},
-{"name":"openai-agents","harness":"openai-agents","model":"databricks-gpt-5-4-mini","workers":4},
-{"name":"codex","harness":"codex","model":"databricks-gpt-5-5","workers":2}
+{"name":"openai-agents","harness":"openai-agents","model":"databricks-gpt-5-4-mini","workers":4}
 ]}
 JSON
 # Collapse to one line so the GITHUB_OUTPUT key=value contract holds.

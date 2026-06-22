@@ -1,12 +1,11 @@
 name: Integration Tests
 
-# Per-PR twin of nightly.yml's journey-suite matrix (tests/integration/),
-# once per wrapped harness against the real Databricks gateway. Burn-in:
-# NOT in merge-ready's REQUIRED list yet (reports for signal; flip in
-# .github/scripts/merge-ready/required.sh after a clean week). Triggers:
-# daily schedule, same-repo PR gate (secrets flow; fork PRs skip and run
-# via the fork-e2e/** push after fork-e2e-mirror.yml), the fork-e2e/**
-# push itself, and workflow_dispatch.
+# Per-PR journey-suite matrix (tests/integration/), once per wrapped harness
+# using the mock LLM server (no real gateway credentials required). All tests
+# are mock_only: they script the LLM responses via configure_mock_llm and run
+# against a local mock FastAPI server. Triggers: daily schedule, same-repo PR
+# gate (fork PRs skip and run via the fork-e2e/** push after
+# fork-e2e-mirror.yml), the fork-e2e/** push itself, and workflow_dispatch.
 
 on:
   schedule:
@@ -121,23 +120,6 @@ jobs:
         with:
           path: .venv
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
-      - name: Set LLM credentials
-        run: echo "LLM_API_KEY=${{ secrets.LLM_API_KEY }}" >> "$GITHUB_ENV"
-      - name: Write gateway profile (~/.databrickscfg)
-        env:
-          GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-        run: |
-          # Strip the /serving-endpoints suffix the conftest re-appends.
-          host="${GATEWAY_BASE_URL%/serving-endpoints}"
-          cat > "$HOME/.databrickscfg" <<EOF
-          [default]
-          host  = $host
-          token = $LLM_API_KEY
-          EOF
-          # PAT passthrough for the codex / claude-sdk auth commands.
-          echo "DATABRICKS_BEARER=$LLM_API_KEY" >> "$GITHUB_ENV"
-
       - name: Install project and dev dependencies
         run: uv sync --extra all --extra dev
 
@@ -188,11 +170,8 @@ jobs:
           # --timeout=180 caps a single hung test (see e2e.yml).
           env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u DATABRICKS_TOKEN \
             uv run pytest tests/integration/ \
-              --integration \
               --model "$MODEL" \
               --harness "$HARNESS" \
-              --profile default \
-              --llm-api-key "$LLM_API_KEY" \
               -n "$WORKERS" \
               --dist=loadscope \
               --timeout=180 \

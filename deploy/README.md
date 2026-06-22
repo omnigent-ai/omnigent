@@ -73,6 +73,9 @@ deploy/
 ├── trycloudflare/     ← Cloudflare quick tunnel (public URL for a LOCAL server)
 │   └── README.md
 │
+├── tailscale/         ← Tailscale (private access from phone/tablet/laptop
+│   └── README.md         via tailnet; Funnel for cloud sandbox dial-back)
+│
 ├── daytona/           ← Daytona sandbox-provider guide + the Cloudflare
 │   ├── wrangler.toml     Worker egress relay for its free tier; NOT a
 │   ├── src/index.js      server deploy target. See its README.md.
@@ -108,6 +111,7 @@ deploy/
 | Deploy serverless (scale-to-zero, no VM/Postgres to manage) | Cloudflare Containers + D1 + R2 | [`cloudflare/README.md`](cloudflare/README.md): `wrangler deploy` |
 | Stand up a quick demo (no DB to provision) | HF Spaces | [`hf-spaces/README.md`](hf-spaces/README.md): Docker Space, SQLite |
 | Share a server running on your **laptop**: demo it to teammates, or let remote runners & cloud sandboxes connect back to it (nothing to deploy) | Cloudflare quick tunnel | `cloudflared tunnel --url http://localhost:6767` |
+| Access your server privately from **your phone, tablet, or other personal devices** without exposing it to the internet | Tailscale | [`tailscale/README.md`](tailscale/README.md): `tailscale serve https / http://localhost:8000` |
 | Cloud Run / Kubernetes / other | Docker image | [`docker/README.md`](docker/README.md), then point your platform at the image |
 
 All deploy paths share the same image (`docker/Dockerfile`): a slim Python

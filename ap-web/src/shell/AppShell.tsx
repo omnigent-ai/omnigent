@@ -60,6 +60,7 @@ import {
 import { TerminalsPanel } from "./TerminalsPanel";
 import { TodoPanel } from "./TodoPanel";
 import { PermissionsModal } from "@/components/PermissionsModal";
+import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDialogContext";
 import { WorkspacePanel } from "./WorkspacePanel";
@@ -1221,6 +1222,9 @@ export function AppShell() {
               </DialogContent>
             </Dialog>
           )}
+          {/* Keyboard-shortcuts reference. Self-contained (owns its open state +
+              ⌘/Ctrl+/ opener); ungated so it works on every route. */}
+          <KeyboardShortcutsDialog />
         </ForkDialogContextProvider>
       </TerminalFirstContextProvider>
     </FileViewerContext.Provider>
