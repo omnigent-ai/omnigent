@@ -197,7 +197,7 @@ dev = [
     # known-good release for consistency with pytest-shard above.
     "pytest-timeout==2.4.0",
     # Retry LLM-driven inner tests up to 2 extra times on codex; see
-    # ``pytest_collection_modifyitems`` in ``tests/inner/conftest.py``.
+    # ``pytest_collection_modifyitems`` in ``tests/unit/inner/conftest.py``.
     # Pinned exactly to a known-stable release for consistency with
     # pytest-shard / pytest-timeout above. 16.2+ is required under
     # pytest 9: 14.0 predates pytest 9 and corrupts fixture-finalizer
@@ -224,7 +224,7 @@ dev = [
     "respx>=0.21,<1",
     "boto3>=1.30,<2",
     # The Cloudflare D1 SQLAlchemy dialect, exercised by the D1 FTS integration
-    # test (tests/db/test_d1_fts_dialect.py) via respx + sqlite3.
+    # test (tests/unit/db/test_d1_fts_dialect.py) via respx + sqlite3.
     "sqlalchemy-cloudflare-d1==0.3.10",
 ]
 
@@ -263,15 +263,19 @@ include = ["omnigent*"]
 [tool.pytest.ini_options]
 # auto mode: async tests without @pytest.mark.asyncio() are auto-
 # collected as asyncio. Inner (omnigent-legacy) tests rely on
-# this. SDK tests (tests/frontends/sdk/) use explicit markers;
+# this. SDK tests (tests/unit/frontends/sdk/) use explicit markers;
 # both work under auto.
 asyncio_mode = "auto"
-testpaths = ["tests"]
-# tests/e2e, tests/e2e_ui, and tests/e2e_live all require real LLM
-# credentials and/or extra setup (Databricks profile; npm build +
-# Playwright browsers for the UI suite; a deployed Databricks App URL
-# for the live suite). Opt-in via explicit pytest invocation.
-addopts = "--ignore=tests/e2e --ignore=tests/e2e_ui --ignore=tests/e2e_live --ignore=tests/integration"
+# Tier-first layout: the top-level tests/ subfolder IS the CI execution
+# lane. tests/unit/ is the default PR-gate suite (fast, in-process, mock
+# LLM, no real creds). The opt-in lanes — tests/e2e, tests/e2e_ui,
+# tests/e2e_live, tests/integration, tests/codex_parity — are siblings of
+# tests/unit and so are NOT collected by this default testpaths; each runs
+# via its own workflow/job with an explicit pytest invocation (real LLM
+# credentials and/or extra setup: Databricks profile; npm build + Playwright
+# browsers for the UI suite; a deployed Databricks App URL for the live
+# suite; --codex-parity + the codex CLI for parity).
+testpaths = ["tests/unit"]
 # Default per-test wallclock cap. Catches infinite hangs in any
 # suite (unit, inner, integration, e2e) without bothering tests
 # that actually finish. The longest legitimate integration tests
@@ -285,7 +289,7 @@ addopts = "--ignore=tests/e2e --ignore=tests/e2e_ui --ignore=tests/e2e_live --ig
 # pytest-timeout README.
 timeout = 300
 timeout_method = "thread"
-# SDK tests under ``tests/frontends/sdk/`` import the
+# SDK tests under ``tests/unit/frontends/sdk/`` import the
 # ``omnigent_client`` and ``omnigent_ui_sdk`` packages that
 # live in ``sdks/python-client/`` and ``sdks/ui/`` respectively.
 # Without this pythonpath the imports fail at collection time

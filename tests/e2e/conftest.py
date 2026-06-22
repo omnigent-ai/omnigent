@@ -219,7 +219,7 @@ def mock_llm_server_url(
     proc = subprocess.Popen(
         [
             sys.executable,
-            str(_REPO_ROOT / "tests" / "server" / "integration" / "mock_llm_server.py"),
+            str(_REPO_ROOT / "tests" / "unit" / "server" / "integration" / "mock_llm_server.py"),
             str(mock_port),
         ],
         env={**os.environ, "PYTHONPATH": str(_REPO_ROOT)},

@@ -147,10 +147,10 @@ streaming, harness.
 ```bash
 # Unit tests (use --frozen; the cwsandbox extra is unsatisfiable on public PyPI here)
 uv run --frozen --extra dev python -m pytest \
-  tests/inner/test_antigravity_executor.py \
-  tests/inner/test_antigravity_harness.py \
-  tests/runtime/test_antigravity_spawn_env.py \
-  tests/onboarding/test_antigravity_auth.py -q
+  tests/unit/inner/test_antigravity_executor.py \
+  tests/unit/inner/test_antigravity_harness.py \
+  tests/unit/runtime/test_antigravity_spawn_env.py \
+  tests/unit/onboarding/test_antigravity_auth.py -q
 # (or, if uv re-resolve is blocked on your host: .venv/bin/python -m pytest <same paths> -q)
 ```
 

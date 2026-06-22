@@ -14,7 +14,7 @@ Proves the full path landed by the stdio-MCP work:
           render, into this test's stdout.
 
 No mocks in the whole chain. The MCP server is
-``tests/tools/fixtures/echo_stdio_mcp_server.py`` (a FastMCP
+``tests/unit/tools/fixtures/echo_stdio_mcp_server.py`` (a FastMCP
 subprocess this test spawns at run time); the LLM is OpenAI's
 real ``gpt-4o-mini`` endpoint reached via ``$OPENAI_API_KEY``.
 
@@ -68,7 +68,7 @@ _PROBE = "ap-stdio-mcp-probe-7431"
 
 # Assistant reply MUST include this exact fragment for the test
 # to pass. The echo MCP server returns ``f"echo: {text}"`` (see
-# ``tests/tools/fixtures/echo_stdio_mcp_server.py``); the LLM
+# ``tests/unit/tools/fixtures/echo_stdio_mcp_server.py``); the LLM
 # should either pass that back verbatim or paraphrase around it.
 # Either way, ``echo: <probe>`` proves the tool body ran inside
 # the MCP subprocess and its output flowed back through the
@@ -84,7 +84,7 @@ _TIMEOUT_SEC = 180
 
 # Echo MCP fixture path, resolved against the repo root at
 # runtime so the test doesn't assume a cwd.
-_ECHO_MCP_REL = Path("tests/tools/fixtures/echo_stdio_mcp_server.py")
+_ECHO_MCP_REL = Path("tests/unit/tools/fixtures/echo_stdio_mcp_server.py")
 
 
 def _skip_without_openai_key() -> str:

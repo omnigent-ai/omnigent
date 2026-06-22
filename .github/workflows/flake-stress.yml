@@ -11,7 +11,7 @@ name: Flake stress
 #
 # Examples:
 #   gh workflow run flake-stress.yml --ref main \
-#     -f test_target=tests/server/integration/test_routes_responses.py
+#     -f test_target=tests/unit/server/integration/test_routes_responses.py
 #   gh workflow run flake-stress.yml --ref main \
 #     -f test_target='tests/foo.py::test_x[case1]' \
 #     -f workers=1 -f extra_pytest_args=-x
@@ -20,7 +20,7 @@ on:
   workflow_dispatch:
     inputs:
       test_target:
-        description: "Pytest target: path or node-id; space-separated list ok (e.g. tests/server/integration/test_routes_responses.py)"
+        description: "Pytest target: path or node-id; space-separated list ok (e.g. tests/unit/server/integration/test_routes_responses.py)"
         required: true
       target_branch:
         description: "Branch or SHA to check out for the test (default: main)"

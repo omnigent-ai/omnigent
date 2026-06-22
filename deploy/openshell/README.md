@@ -392,5 +392,5 @@ and the managed-config parsing:
 
 ```bash
 pip install -e '.[openshell,dev]'
-pytest tests/onboarding/sandboxes/test_openshell.py tests/server/test_managed_hosts.py
+pytest tests/unit/onboarding/sandboxes/test_openshell.py tests/unit/server/test_managed_hosts.py
 ```

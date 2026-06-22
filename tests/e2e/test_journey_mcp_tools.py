@@ -49,7 +49,9 @@ _PROBE = "mcp-journey-probe-8192"
 _SUCCESS_MARKER = f"echo: {_PROBE}"
 
 # Echo MCP server path relative to the repo root.
-_ECHO_MCP_SERVER = _REPO_ROOT / "tests" / "tools" / "fixtures" / "echo_stdio_mcp_server.py"
+_ECHO_MCP_SERVER = (
+    _REPO_ROOT / "tests" / "unit" / "tools" / "fixtures" / "echo_stdio_mcp_server.py"
+)
 
 
 # ── Helpers ────────────────────────────────────────────────

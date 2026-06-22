@@ -7,7 +7,7 @@
 # so the SDK auto-defaults ``setting_sources=["user","project"]``
 # and discovers the named skills under those scopes.
 #
-# Used by tests/runtime/test_workflow.py::
+# Used by tests/unit/runtime/test_workflow.py::
 # test_skills_filter_pipeline_e2e to verify list values
 # round-trip through the JSON-encoded ``HARNESS_CLAUDE_SDK_SKILLS_FILTER``
 # env var with element order preserved.

@@ -126,7 +126,7 @@ jobs:
       - name: Install binary dependencies
         # Mirrors e2e.yml. `--ignore-scripts` blocks npm postinstall hooks;
         # we run claude-code's install.cjs explicitly (audited, no network).
-        # `bubblewrap` backs the `linux_bwrap` sandbox in tests/inner/*.
+        # `bubblewrap` backs the `linux_bwrap` sandbox in tests/unit/inner/*.
         working-directory: .github/ci-deps
         run: |
           set -euo pipefail

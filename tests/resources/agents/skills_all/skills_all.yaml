@@ -7,7 +7,7 @@
 # entirely (the default), but pinned explicitly so tests don't
 # have to rely on the unset-default semantics.
 #
-# Used by tests/runtime/test_workflow.py::
+# Used by tests/unit/runtime/test_workflow.py::
 # test_skills_filter_pipeline_e2e to verify that the AP-runtime →
 # claude-sdk harness env-var bridge round-trips ``"all"``
 # unchanged (the regression that motivated wiring this through

@@ -4,7 +4,7 @@ name: CI
 # split across directory-based matrix groups (runtime-*, server-*, inner-rest,
 # tools, repl-sdk, spec-llms, misc) so slow files don't bottleneck one runner;
 # the slowest groups use `--dist=worksteal` to fan tests out within a file. The
-# `misc` group is a catch-all so new top-level tests/<dir>/ are picked up
+# `misc` group is a catch-all so new tests/unit/<dir>/ are picked up
 # automatically. Draft PRs are skipped (ready_for_review re-fires the workflow).
 # A `coverage-report` job combines per-shard coverage for code-coverage.yml.
 
@@ -47,46 +47,46 @@ jobs:
       matrix:
         include:
           - group: runtime-harnesses
-            paths: tests/runtime/harnesses
+            paths: tests/unit/runtime/harnesses
             dist: worksteal
           - group: runtime-policies
-            paths: tests/runtime/policies
+            paths: tests/unit/runtime/policies
           - group: runtime-core
             paths: >-
-              tests/runtime
-              --ignore=tests/runtime/harnesses
-              --ignore=tests/runtime/policies
+              tests/unit/runtime
+              --ignore=tests/unit/runtime/harnesses
+              --ignore=tests/unit/runtime/policies
             dist: worksteal
           - group: inner-rest
-            paths: tests/inner
+            paths: tests/unit/inner
           - group: tools
-            paths: tests/tools tests/test_errors.py
+            paths: tests/unit/tools tests/unit/test_errors.py
           - group: repl-sdk
-            paths: tests/frontends tests/repl tests/terminals
+            paths: tests/unit/frontends tests/unit/repl tests/unit/terminals
           # Isolates the park-on-future elicitation/permission/policy files so a
           # wedge there stalls one small job, not the whole server shard.
           - group: server-approvals
             paths: >-
-              tests/server/integration/test_sessions_permission_request_hook.py
-              tests/server/integration/test_sessions_elicitation_resolve_url.py
-              tests/server/integration/test_sessions_policy_evaluate.py
+              tests/unit/server/integration/test_sessions_permission_request_hook.py
+              tests/unit/server/integration/test_sessions_elicitation_resolve_url.py
+              tests/unit/server/integration/test_sessions_policy_evaluate.py
             workers: "4"
           # worksteal: the biggest file would otherwise pin one worker past the
           # shard's balanced wall time. server/conftest fixtures are function-scoped.
           - group: server-integration
             paths: >-
-              tests/server/integration
-              --ignore=tests/server/integration/test_sessions_permission_request_hook.py
-              --ignore=tests/server/integration/test_sessions_elicitation_resolve_url.py
-              --ignore=tests/server/integration/test_sessions_policy_evaluate.py
+              tests/unit/server/integration
+              --ignore=tests/unit/server/integration/test_sessions_permission_request_hook.py
+              --ignore=tests/unit/server/integration/test_sessions_elicitation_resolve_url.py
+              --ignore=tests/unit/server/integration/test_sessions_policy_evaluate.py
             workers: "4"
             dist: worksteal
           # Historical name; stays in merge-ready's REQUIRED list.
           - group: server-rest
-            paths: tests/server --ignore=tests/server/integration tests/onboarding
+            paths: tests/unit/server --ignore=tests/unit/server/integration tests/unit/onboarding
             workers: "4"
           - group: spec-llms
-            paths: tests/spec tests/llms
+            paths: tests/unit/spec tests/unit/llms
           # Integration journey tests with mock LLM (no API key).
           # workers=0 (serial): session-scoped live_server + mock_llm_server
           # fixtures spawn subprocesses that must share one mock server;
@@ -94,24 +94,24 @@ jobs:
           - group: integration-mock
             paths: tests/integration
             workers: "0"
-          # Catch-all so new top-level tests/<dir>/ are covered automatically.
+          # Catch-all so new tests/unit/<dir>/ are covered automatically.
+          # Opt-in lanes (tests/e2e, tests/e2e_ui, tests/integration,
+          # tests/codex_parity) are siblings of tests/unit, so the
+          # tests/unit base never collects them — no --ignore needed.
           - group: misc
             paths: >-
-              tests
-              --ignore=tests/e2e
-              --ignore=tests/integration
-              --ignore=tests/runtime
-              --ignore=tests/inner
-              --ignore=tests/tools
-              --ignore=tests/test_errors.py
-              --ignore=tests/frontends
-              --ignore=tests/repl
-              --ignore=tests/terminals
-              --ignore=tests/server
-              --ignore=tests/onboarding
-              --ignore=tests/spec
-              --ignore=tests/llms
-              --ignore=tests/codex_parity
+              tests/unit
+              --ignore=tests/unit/runtime
+              --ignore=tests/unit/inner
+              --ignore=tests/unit/tools
+              --ignore=tests/unit/test_errors.py
+              --ignore=tests/unit/frontends
+              --ignore=tests/unit/repl
+              --ignore=tests/unit/terminals
+              --ignore=tests/unit/server
+              --ignore=tests/unit/onboarding
+              --ignore=tests/unit/spec
+              --ignore=tests/unit/llms
 
     steps:
       - name: Check out repo

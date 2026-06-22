@@ -1,11 +1,11 @@
 # tests/integration/ — per-harness journey suite
 
 Real-server, real-LLM journeys run once per wrapped harness. These
-replace the per-harness signal lost when `tests/inner/test_integration.py`
+replace the per-harness signal lost when `tests/unit/inner/test_integration.py`
 was deleted with the legacy in-process runtime (PR #1800), but they
 exercise the production server/runner path, not the legacy one.
 
-Not to be confused with `tests/server/integration/`, which is the
+Not to be confused with `tests/unit/server/integration/`, which is the
 mock-LLM server integration suite that runs in the default CI matrix.
 
 ## How it runs

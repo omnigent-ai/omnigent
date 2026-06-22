@@ -260,17 +260,17 @@ header — it is independent of how the credential is supplied).
 
 ## Tests
 
-- `tests/inner/test_credential_proxy.py` — source resolution
+- `tests/unit/inner/test_credential_proxy.py` — source resolution
   (env/file/command), the swap-on-access default (nothing injected, no
   synthetic minted), opt-in synthetic minting, and the `gh_basic` shape
   (git host swap-on-access, api host env injection).
-- `tests/inner/egress/test_proxy.py` — swap-on-access injection on a
+- `tests/unit/inner/egress/test_proxy.py` — swap-on-access injection on a
   bare request, synthetic→real swap for basic/bearer/token against a
   real capturing upstream, the wrong-host 403 leak guard, and
   non-synthetic pass-through.
-- `tests/spec/test_parser.py` — round-trip + fail-loud for all four
+- `tests/unit/spec/test_parser.py` — round-trip + fail-loud for all four
   types, plus `env`-optional (swap-on-access) parsing.
-- `tests/inner/sandbox/test_egress_e2e.py` — real-sandbox e2e:
+- `tests/unit/inner/sandbox/test_egress_e2e.py` — real-sandbox e2e:
   swap-on-access injects Basic auth on a bare request while the sandbox
   holds neither the secret nor a placeholder; `https_bearer` with `env`
   performs the full env-injection → proxy swap → upstream-sees-real-token

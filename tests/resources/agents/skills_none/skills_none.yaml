@@ -6,7 +6,7 @@
 # so the underlying CLI sees ``--setting-sources=`` (empty) and
 # does NOT walk ``~/.claude/skills/`` / ``<cwd>/.claude/skills/``.
 #
-# Used by tests/runtime/test_workflow.py::
+# Used by tests/unit/runtime/test_workflow.py::
 # test_skills_filter_pipeline_e2e. The original user-reported
 # regression was specifically this case — ``skills: none`` in
 # examples/hello_world.yaml had no effect on the live REPL

@@ -408,7 +408,7 @@ def lowered_idle_thresholds(monkeypatch: pytest.MonkeyPatch) -> None:
     Lower the terminal-idle thresholds so watcher tests don't burn
     ten real seconds per assertion.
 
-    Mirrors :class:`tests.inner.test_terminal.TestTerminalIdleNotifications.setUp`
+    Mirrors :class:`tests.unit.inner.test_terminal.TestTerminalIdleNotifications.setUp`
     from the legacy class-based suite. Defaults marker substrings
     to empty so tests that don't exercise the marker track see
     pure diff semantics regardless of the production list — tests

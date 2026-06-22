@@ -178,7 +178,7 @@ def mock_llm_server_url(
     """
     Start a mock LLM server for the test session.
 
-    Spawns ``tests/server/integration/mock_llm_server.py`` as a
+    Spawns ``tests/unit/server/integration/mock_llm_server.py`` as a
     subprocess and waits for its ``/stats`` endpoint to respond.
     The fixture yields the base URL (e.g.
     ``http://127.0.0.1:<port>``) and kills the process on teardown.
@@ -193,7 +193,9 @@ def mock_llm_server_url(
     proc = subprocess.Popen(
         [
             sys.executable,
-            str(_OMNIGENT_REPO / "tests" / "server" / "integration" / "mock_llm_server.py"),
+            str(
+                _OMNIGENT_REPO / "tests" / "unit" / "server" / "integration" / "mock_llm_server.py"
+            ),
             str(mock_port),
         ],
         env={**os.environ, "PYTHONPATH": str(_OMNIGENT_REPO)},
