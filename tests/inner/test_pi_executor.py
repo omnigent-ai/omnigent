@@ -2665,8 +2665,9 @@ def test_databricks_default_model_is_resolvable_in_models_json() -> None:
 def test_models_json_lists_only_gateway_verified_models() -> None:
     """
     The hardcoded model lists match the set verified live against the
-    Databricks gateway on the API paths pi uses (Anthropic Messages for
-    Claude, Chat Completions for GPT).
+    Databricks gateway endpoint metadata and the API paths pi uses
+    (Anthropic Messages for Claude, OpenAI-compatible serving endpoints for
+    GPT).
 
     Failure direction matters: a missing working id silently shrinks pi's
     model menu; a reintroduced broken id (``sonnet-4-5-v2`` rejects
@@ -2682,10 +2683,24 @@ def test_models_json_lists_only_gateway_verified_models() -> None:
         "databricks-claude-sonnet-4-5",
     ]
     openai_ids = [m["id"] for m in providers["databricks"]["models"]]
-    assert openai_ids == ["databricks-gpt-5-4-mini", "databricks-gpt-5-4"]
+    assert openai_ids == [
+        "databricks-gpt-5-4-mini",
+        "databricks-gpt-5-4",
+        "databricks-gpt-5-5",
+        "databricks-gpt-5-5-pro",
+    ]
     # The llama serving endpoint no longer exists; the provider stays as
     # the routing home for future non-Claude/GPT endpoints.
     assert providers["databricks-completions"]["models"] == []
+
+
+def test_models_json_uses_oss_verified_gpt_55_caps() -> None:
+    """GPT-5.5 endpoint metadata on the OSS profile advertises 128K output."""
+    models = _build_models_json("https://host.example.com", "tok")
+    by_id = {m["id"]: m for m in models["providers"]["databricks"]["models"]}
+    for model_id in ("databricks-gpt-5-5", "databricks-gpt-5-5-pro"):
+        assert by_id[model_id]["contextWindow"] == 400000
+        assert by_id[model_id]["maxTokens"] == 128000
 
 
 if __name__ == "__main__":

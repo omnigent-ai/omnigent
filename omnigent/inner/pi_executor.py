@@ -559,6 +559,20 @@ _DATABRICKS_RESPONSES_MODELS = [
         "maxTokens": 32768,
     },
     {"id": "databricks-gpt-5-4", "name": "GPT-5.4", "contextWindow": 1047576, "maxTokens": 32768},
+    {
+        "id": "databricks-gpt-5-5",
+        "name": "GPT-5.5",
+        # OSS profile endpoint metadata: 400K total context, 128K max output.
+        "contextWindow": 400000,
+        "maxTokens": 128000,
+    },
+    {
+        "id": "databricks-gpt-5-5-pro",
+        "name": "GPT-5.5 Pro",
+        # OSS profile endpoint metadata: 400K total context, 128K max output.
+        "contextWindow": 400000,
+        "maxTokens": 128000,
+    },
 ]
 
 _DATABRICKS_ANTHROPIC_MODELS = [
