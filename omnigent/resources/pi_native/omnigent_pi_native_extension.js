@@ -12,6 +12,51 @@ function readConfig() {
   }
 }
 
+/**
+ * Evaluate a TOOL_CALL policy for a native Pi tool via the Omnigent server's
+ * session-level HTTP endpoint (POST /v1/sessions/{sessionId}/policies/evaluate).
+ *
+ * This is the same endpoint used by the Claude Code and Codex native hooks.
+ * It does NOT require an active Omnigent turn context on the harness side —
+ * the endpoint evaluates against the session's full policy set directly.
+ * Fail-open (null) on any transport or parse error so a transient server
+ * outage never wedges Pi mid-turn.
+ */
+async function evalNativePolicyHttp(config, toolName, args) {
+  if (
+    !config ||
+    !config.serverUrl ||
+    !config.sessionId ||
+    typeof fetch !== "function"
+  )
+    return null;
+  const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/policies/evaluate`;
+  const body = JSON.stringify({
+    event: {
+      type: "PHASE_TOOL_CALL",
+      target: "",
+      data: { name: toolName, arguments: args },
+      context: {},
+    },
+  });
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(config.authHeaders || {}) },
+      body,
+    });
+    if (!resp.ok) return null;
+    const json = await resp.json();
+    if (json.result === "POLICY_ACTION_DENY") {
+      return { block: true, reason: json.reason || "blocked by Omnigent policy" };
+    }
+    return { block: false, reason: "" };
+  } catch (_err) {
+    // Keep Pi responsive if Omnigent is temporarily unavailable.
+    return null;
+  }
+}
+
 function textFromContent(content) {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -530,6 +575,19 @@ module.exports = function (pi) {
     );
     if (blocked) {
       return { block: true, reason: "Interrupted by user" };
+    }
+    // Evaluate TOOL_CALL policy via the Omnigent server's session-level HTTP
+    // endpoint. This works even after the harness turn has completed (which
+    // happens immediately for pi-native — just enqueue + TurnComplete), so
+    // the verdict is always evaluated against live session policies regardless
+    // of whether an Omnigent turn is currently in flight.
+    const verdict = await evalNativePolicyHttp(
+      config,
+      (event && event.toolName) || "",
+      (event && event.input) || {},
+    );
+    if (verdict && verdict.block) {
+      return { block: true, reason: verdict.reason || "blocked by Omnigent policy" };
     }
   });
 
