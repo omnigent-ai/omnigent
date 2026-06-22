@@ -1015,12 +1015,21 @@ async def _attach_terminal(
         audit context, or ``None`` when the user did not pin a model.
     :returns: None after the attach exits.
     """
-    # Mirror agy's transcript into the Omnigent session for the chat view, the
-    # same way the CLI client owns the codex/claude native forwarder. The
+    # Mirror agy's transcript into the Omnigent session for the chat view. The
     # forwarder discovers agy's real conversation id under the brain root, so it
     # only needs the bridge dir + session id. Cancelled in ``finally`` before the
     # terminal teardown, mirroring ``_attach_with_forwarder`` (codex) and the
     # claude attach path.
+    #
+    # ONLY run a CLI-side forwarder when WE launched the terminal (not
+    # reattached). The runner OWNS a runner-created terminal and auto-creates
+    # "terminal + forwarder" together (``runner/app.py``
+    # ``_auto_create_antigravity_terminal``), so a second CLI-side forwarder on a
+    # reattached terminal would DOUBLE-MIRROR every step — two tailers POSTing the
+    # same agy transcript (verified live as duplicated chat messages + a duplicate
+    # one-time degrade notice). The non-reattached fallback (the CLI launched its
+    # own terminal because the runner produced none) has no runner forwarder, so
+    # there the CLI must forward.
     #
     # The forwarder snapshots ``headers`` at construction. For the local server
     # that is fine (no auth). For a remote server ``recover`` refreshes the
@@ -1040,19 +1049,21 @@ async def _attach_terminal(
     # hook, so a tool cannot be blocked before it runs; the audit surfaces a
     # warning after the fact + a one-time audit-only degrade notice). The model
     # is threaded so a model-scoped policy evaluates against the user's agy model.
-    forwarder = asyncio.create_task(
-        supervise_forwarder(
-            base_url=base_url,
-            headers=headers,
-            session_id=prepared.session_id,
-            bridge_dir=prepared.bridge_dir,
-            tmux_socket=prepared.tmux_socket,
-            tmux_target=prepared.tmux_target,
-            model=model,
-            audit_policies=True,
-        ),
-        name="antigravity-native-transcript-forwarder",
-    )
+    forwarder: asyncio.Task[None] | None = None
+    if not prepared.reattached:
+        forwarder = asyncio.create_task(
+            supervise_forwarder(
+                base_url=base_url,
+                headers=headers,
+                session_id=prepared.session_id,
+                bridge_dir=prepared.bridge_dir,
+                tmux_socket=prepared.tmux_socket,
+                tmux_target=prepared.tmux_target,
+                model=model,
+                audit_policies=True,
+            ),
+            name="antigravity-native-transcript-forwarder",
+        )
     outcome = _AttachOutcome.EXITED
     try:
         if _can_attach_direct_tmux(prepared):
@@ -1071,9 +1082,10 @@ async def _attach_terminal(
                 close_attach_on_terminal_gone=True,
             )
     finally:
-        forwarder.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await forwarder
+        if forwarder is not None:
+            forwarder.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await forwarder
         if not prepared.reattached and outcome is not _AttachOutcome.DETACHED:
             await _close_antigravity_terminal(
                 base_url=base_url,

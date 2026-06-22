@@ -789,3 +789,74 @@ async def test_attach_terminal_skips_close_when_reattached_and_detached(
         monkeypatch, reattached=True, outcome=_mod._AttachOutcome.DETACHED
     )
     assert closed == []
+
+
+async def _run_attach_and_capture_forwarder(
+    monkeypatch: pytest.MonkeyPatch, *, reattached: bool
+) -> int:
+    """
+    Drive ``_attach_terminal`` and count how many times the CLI starts a forwarder.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param reattached: ``prepared.reattached`` for this run.
+    :returns: Number of ``supervise_forwarder`` invocations (0 or 1).
+    """
+    starts = 0
+
+    def _counting_forwarder(**_kwargs: object) -> object:
+        # Count the CALL synchronously (deterministic) — not the task body, which
+        # may be cancelled by the finally before it runs. Returns a coroutine so
+        # ``asyncio.create_task(supervise_forwarder(...))`` still works.
+        nonlocal starts
+        starts += 1
+
+        async def _runner() -> None:
+            await asyncio.Event().wait()
+
+        return _runner()
+
+    async def _fake_direct_attach(_socket: Path, _target: str) -> _mod._AttachOutcome:
+        return _mod._AttachOutcome.EXITED
+
+    async def _fake_close(**_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(_mod, "supervise_forwarder", _counting_forwarder)
+    monkeypatch.setattr(_mod, "_can_attach_direct_tmux", lambda _prepared: True)
+    monkeypatch.setattr(_mod, "_attach_direct_tmux", _fake_direct_attach)
+    monkeypatch.setattr(_mod, "_close_antigravity_terminal", _fake_close)
+
+    await _mod._attach_terminal(
+        base_url="http://test",
+        headers={},
+        prepared=_prepared(reattached),
+        recover=None,
+        model=None,
+    )
+    return starts
+
+
+async def test_attach_terminal_skips_cli_forwarder_when_reattached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reattaching to a runner-owned terminal must NOT start a CLI-side forwarder.
+
+    The runner auto-creates "terminal + forwarder" together and owns the mirror
+    for a runner-owned terminal. A second CLI-side forwarder would double-mirror
+    every step (two tailers POSTing the same agy transcript) — verified live as
+    duplicated chat messages. So when ``reattached`` the CLI defers to the runner.
+    """
+    starts = await _run_attach_and_capture_forwarder(monkeypatch, reattached=True)
+    assert starts == 0, "reattached path must defer forwarding to the runner (no double-mirror)"
+
+
+async def test_attach_terminal_runs_cli_forwarder_when_not_reattached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the CLI launched its own terminal (fallback), it DOES run the forwarder.
+
+    No runner-owned terminal exists in that case, so the CLI is the only mirror
+    source and must forward.
+    """
+    starts = await _run_attach_and_capture_forwarder(monkeypatch, reattached=False)
+    assert starts == 1, "non-reattached (CLI-launched) path must run the CLI forwarder"
