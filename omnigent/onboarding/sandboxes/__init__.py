@@ -67,6 +67,11 @@ _LAUNCHERS: dict[str, str] = {
     # `omnigent[e2b]` extra), imported lazily like modal/daytona.
     "e2b": "omnigent.onboarding.sandboxes.e2b:E2BSandboxLauncher",
     "openshell": "omnigent.onboarding.sandboxes.openshell:OpenShellSandboxLauncher",
+    # Declaw (https://declaw.ai) secure microVM sandboxes via the official
+    # `declaw` SDK (the `omnigent[declaw]` extra), imported lazily like the
+    # others. The only provider that attaches a security policy (PII /
+    # injection / network / vault / governance) at provision time.
+    "declaw": "omnigent.onboarding.sandboxes.declaw:DeclawSandboxLauncher",
 }
 
 

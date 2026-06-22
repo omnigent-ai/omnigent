@@ -11,6 +11,8 @@ from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
 
 from omnigent.db.utils import now_epoch
+from omnigent.onboarding.sandboxes.declaw import DeclawSandboxLauncher
+from omnigent.onboarding.sandboxes.declaw import managed_token_ttl_s as declaw_managed_token_ttl_s
 from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s as e2b_managed_token_ttl_s
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
@@ -412,6 +414,107 @@ def test_parse_e2b_template_rejects_non_string(monkeypatch: pytest.MonkeyPatch) 
                 "provider": "e2b",
                 "server_url": "https://s.example.com",
                 "e2b": {"template": ""},
+            }
+        )
+
+
+def test_parse_valid_declaw_config_builds_parameterized_factory() -> None:
+    """
+    The documented declaw YAML shape parses into a config whose factory
+    constructs a DeclawSandboxLauncher carrying the template alias, env
+    passthrough, vault refs, and the (structurally-validated) security block,
+    with the declaw token TTL derived from the sandbox lifetime.
+    """
+    cfg = parse_sandbox_config(
+        {
+            "provider": "declaw",
+            "server_url": "https://srv.example.com/",
+            "declaw": {
+                "template": "omnigent-host",
+                "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
+                "vault_refs": {"OPENAI_API_KEY": "openai-prod"},
+                "security": {
+                    "mode": "balanced",
+                    "pii": {"enabled": True, "action": "redact"},
+                    "network": {"allow": ["api.github.com"]},
+                },
+            },
+        }
+    )
+    assert cfg is not None
+    assert cfg.server_url == "https://srv.example.com"
+    assert cfg.token_ttl_s == declaw_managed_token_ttl_s()
+    assert cfg.managed_launch_supported is True
+    assert cfg.provider == "declaw"
+    launcher = cfg.launcher_factory()
+    assert isinstance(launcher, DeclawSandboxLauncher)
+    assert launcher._template_ref == "omnigent-host"
+    assert launcher._env_names == ("OPENAI_API_KEY", "GIT_TOKEN")
+    assert launcher._vault_refs == {"OPENAI_API_KEY": "openai-prod"}
+    assert launcher._security["mode"] == "balanced"
+    assert launcher._security["pii"] == {"enabled": True, "action": "redact"}
+
+
+def test_parse_declaw_without_section_defaults() -> None:
+    """
+    `provider: declaw` + `server_url` is a complete config: template,
+    security, env, and vault refs are optional and reach the launcher as None
+    (its own env-var fallbacks / secure-by-default policy apply).
+    """
+    cfg = parse_sandbox_config({"provider": "declaw", "server_url": "https://s.example.com"})
+    assert cfg is not None
+    launcher = cfg.launcher_factory()
+    assert isinstance(launcher, DeclawSandboxLauncher)
+    assert launcher._template_ref is None
+    assert launcher._env_names is None
+    assert launcher._security is None
+    assert launcher._vault_refs is None
+
+
+def test_parse_declaw_section_unknown_key_rejected() -> None:
+    """A typo'd key in the declaw block fails loud at parse time."""
+    with pytest.raises(ValueError, match=r"sandbox\.declaw.*unknown key"):
+        parse_sandbox_config(
+            {
+                "provider": "declaw",
+                "server_url": "https://s.example.com",
+                "declaw": {"templatte": "typo"},
+            }
+        )
+
+
+def test_parse_declaw_security_unknown_key_rejected() -> None:
+    """An unknown key inside the nested security block fails loud."""
+    with pytest.raises(ValueError, match=r"sandbox\.declaw\.security.*unknown key"):
+        parse_sandbox_config(
+            {
+                "provider": "declaw",
+                "server_url": "https://s.example.com",
+                "declaw": {"security": {"pii": {}, "not_a_knob": True}},
+            }
+        )
+
+
+def test_parse_declaw_security_leaf_type_checked() -> None:
+    """A mistyped security leaf (string where a mapping is expected) fails loud."""
+    with pytest.raises(ValueError, match=r"sandbox\.declaw\.security\.pii"):
+        parse_sandbox_config(
+            {
+                "provider": "declaw",
+                "server_url": "https://s.example.com",
+                "declaw": {"security": {"pii": "yes"}},
+            }
+        )
+
+
+def test_parse_declaw_vault_refs_malformed_fails_loud() -> None:
+    """vault_refs must be a name→name mapping, not a list."""
+    with pytest.raises(ValueError, match=r"sandbox\.declaw\.vault_refs"):
+        parse_sandbox_config(
+            {
+                "provider": "declaw",
+                "server_url": "https://s.example.com",
+                "declaw": {"vault_refs": ["not", "a", "mapping"]},
             }
         )
 
