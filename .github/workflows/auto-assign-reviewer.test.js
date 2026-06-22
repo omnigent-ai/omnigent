@@ -15,19 +15,25 @@ function mkOpenPRs(loadMap) {
 
 // author defaults to a non-maintainer; fork defaults to true -- so the scope
 // guard passes and the selection logic runs (the cases that assert on picks).
-async function run({ files, load = {}, current = [], author = "someexternaldev", fork = true }) {
+async function run({ files, load = {}, current = [], currentAssignees = [], author = "someexternaldev", fork = true }) {
   const listFiles = () => {}; listFiles._tag = "files";
   const list = () => {}; list._tag = "open";
-  const added = [], removed = [];
+  const added = [], removed = [], assigned = [], unassigned = [];
   const github = {
     paginate: async (fn) => (fn._tag === "files"
       ? files.map((f) => ({ filename: f }))
       : mkOpenPRs(load)),
-    rest: { pulls: {
-      listFiles, list,
-      requestReviewers: async ({ reviewers }) => added.push(...reviewers),
-      removeRequestedReviewers: async ({ reviewers }) => removed.push(...reviewers),
-    } },
+    rest: {
+      pulls: {
+        listFiles, list,
+        requestReviewers: async ({ reviewers }) => added.push(...reviewers),
+        removeRequestedReviewers: async ({ reviewers }) => removed.push(...reviewers),
+      },
+      issues: {
+        addAssignees: async ({ assignees }) => assigned.push(...assignees),
+        removeAssignees: async ({ assignees }) => unassigned.push(...assignees),
+      },
+    },
   };
   const context = {
     repo: { owner: "omnigent-ai", repo: "omnigent" },
@@ -38,11 +44,12 @@ async function run({ files, load = {}, current = [], author = "someexternaldev",
       head: { repo: { full_name: fork ? "external-contributor/omnigent" : "omnigent-ai/omnigent" } },
       base: { repo: { full_name: "omnigent-ai/omnigent" } },
       requested_reviewers: current.map((l) => ({ login: l })),
+      assignees: currentAssignees.map((l) => ({ login: l })),
     } },
   };
   const core = { info: () => {}, warning: (m) => console.log("WARN", m) };
   await script({ github, context, core });
-  return { added: added.sort(), removed: removed.sort() };
+  return { added: added.sort(), removed: removed.sort(), assigned: assigned.sort(), unassigned: unassigned.sort() };
 }
 
 function assert(name, cond, detail) {
@@ -58,6 +65,7 @@ function assert(name, cond, detail) {
     load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1 },
   });
   assert("inner picks the lowest-load owner", JSON.stringify(r.added) === JSON.stringify(["dhruv0811"]), JSON.stringify(r));
+  assert("inner: reviewer also added as assignee", JSON.stringify(r.assigned) === JSON.stringify(["dhruv0811"]), JSON.stringify(r));
 
   // 2. unowned path -> full pool; lowest by load chosen.
   r = await run({
@@ -78,9 +86,13 @@ function assert(name, cond, detail) {
     files: ["omnigent/inner/foo.py"],
     load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1 },
     current: ["SabhyaC26", "TomeHirata", "dhruv0811", "dbczumar"],
+    currentAssignees: ["SabhyaC26", "TomeHirata", "dhruv0811", "dbczumar"],
   });
   assert("reconcile removes the 3 higher-load already-requested",
     JSON.stringify(r.removed) === JSON.stringify(["SabhyaC26", "TomeHirata", "dbczumar"]) && r.added.length === 0,
+    JSON.stringify(r));
+  assert("reconcile: removes the 3 stale assignees, keeps dhruv0811",
+    JSON.stringify(r.unassigned) === JSON.stringify(["SabhyaC26", "TomeHirata", "dbczumar"]) && r.assigned.length === 0,
     JSON.stringify(r));
 
   // 5. mixed current: a managed reviewer not in `desired` is removed, while an
@@ -89,11 +101,17 @@ function assert(name, cond, detail) {
     files: ["omnigent/inner/foo.py"],
     load: { dhruv0811: 0, dbczumar: 1, SabhyaC26: 5, TomeHirata: 4 },
     current: ["SabhyaC26", "some-external-human"],
+    currentAssignees: ["SabhyaC26", "some-external-human"],
   });
   assert("mixed: managed removed, external preserved",
     r.removed.includes("SabhyaC26") &&
     !r.removed.includes("some-external-human") &&
     JSON.stringify(r.added) === JSON.stringify(["dhruv0811"]),
+    JSON.stringify(r));
+  assert("mixed: new reviewer assigned, stale managed assignee removed, external assignee preserved",
+    JSON.stringify(r.assigned) === JSON.stringify(["dhruv0811"]) &&
+    r.unassigned.includes("SabhyaC26") &&
+    !r.unassigned.includes("some-external-human"),
     JSON.stringify(r));
 
   // 6. single-owner area (sandbox -> @SabhyaC26): the lone owner is selected.

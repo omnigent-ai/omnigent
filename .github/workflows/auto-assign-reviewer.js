@@ -162,8 +162,30 @@ module.exports = async ({ github, context, core }) => {
       owner, repo, pull_number: pr.number, reviewers: toRemove,
     });
   }
+
+  // --- Also sync assignees to mirror the desired reviewer set so PRs are
+  // filterable by assignee in the GitHub UI.
+  const currentAssignees = (pr.assignees || []).map((a) => a.login);
+  const currentAssigneesLc = new Set(currentAssignees.map((a) => a.toLowerCase()));
+  const toAddAssignees = desired.filter((u) => !currentAssigneesLc.has(u.toLowerCase()));
+  const toRemoveAssignees = currentAssignees.filter(
+    (u) => managed.has(u.toLowerCase()) && !desiredLc.has(u.toLowerCase())
+  );
+
+  if (toAddAssignees.length) {
+    await github.rest.issues.addAssignees({
+      owner, repo, issue_number: pr.number, assignees: toAddAssignees,
+    });
+  }
+  if (toRemoveAssignees.length) {
+    await github.rest.issues.removeAssignees({
+      owner, repo, issue_number: pr.number, assignees: toRemoveAssignees,
+    });
+  }
+
   core.info(
     `Reviewers -> [${desired.join(", ")}]` +
-      ` (area pool ${areaOwners.size || "∅→full"}, +${toAdd.length}/-${toRemove.length}).`
+      ` (area pool ${areaOwners.size || "∅→full"}, +${toAdd.length}/-${toRemove.length})` +
+      ` | Assignees +${toAddAssignees.length}/-${toRemoveAssignees.length}.`
   );
 };
