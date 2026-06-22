@@ -1056,9 +1056,11 @@ async def _auto_create_goose_terminal(
             os_env=OSEnvSpec(type="caller_process", cwd=workspace),
             command=goose_command,
             args=goose_args,
-            # ANSI theme keeps the pane cheap to scrape; Goose's provider/model
-            # come from the user's own `goose configure` (KTD4).
-            env={"GOOSE_CLI_THEME": "ansi"},
+            # ANSI theme keeps the pane cheap to scrape; GOOSE_TELEMETRY_OFF
+            # suppresses Goose's first-run "share usage data?" prompt, which
+            # would otherwise block the headless pane on a fresh install. Goose's
+            # provider/model come from the user's own `goose configure` (KTD4).
+            env={"GOOSE_CLI_THEME": "ansi", "GOOSE_TELEMETRY_OFF": "1"},
             scrollback=100_000,
             tmux_allow_passthrough=True,
             tmux_start_on_attach=False,
