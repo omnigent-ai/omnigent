@@ -13,10 +13,11 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 
 const setTheme = vi.fn();
 let currentTheme: string | undefined;
+let resolvedTheme: string | undefined;
 let embedded: boolean;
 
 vi.mock("next-themes", () => ({
-  useTheme: () => ({ theme: currentTheme, setTheme }),
+  useTheme: () => ({ theme: currentTheme, resolvedTheme, setTheme }),
 }));
 
 vi.mock("@/lib/embedded", () => ({
@@ -35,6 +36,7 @@ function renderMenu() {
 
 beforeEach(() => {
   currentTheme = "system";
+  resolvedTheme = undefined;
   embedded = false;
 });
 
@@ -92,5 +94,21 @@ describe("ThemeModeMenu", () => {
     currentTheme = "sepia";
     renderMenu();
     expect(screen.getByRole("button", { name: "Switch to Dark" })).toBeInTheDocument();
+  });
+
+  it("skips dark when system already resolves to dark", () => {
+    currentTheme = "system";
+    resolvedTheme = "dark";
+    renderMenu();
+    fireEvent.click(screen.getByRole("button", { name: "Switch to Light" }));
+    expect(setTheme).toHaveBeenCalledWith("light");
+  });
+
+  it("skips light when system already resolves to light", () => {
+    currentTheme = "system";
+    resolvedTheme = "light";
+    renderMenu();
+    fireEvent.click(screen.getByRole("button", { name: "Switch to Dark" }));
+    expect(setTheme).toHaveBeenCalledWith("dark");
   });
 });
