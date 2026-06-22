@@ -2666,6 +2666,70 @@ async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exc", "expected_cause"),
+    [
+        (TimeoutError("no thread/started observed"), "startup timed out"),
+        (
+            RuntimeError("event stream ended"),
+            "event stream ended before a thread was created",
+        ),
+    ],
+)
+async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    exc: Exception,
+    expected_cause: str,
+) -> None:
+    """
+    The startup breadcrumb must describe the actual failure mode: a timeout
+    reads as "startup timed out", while a RuntimeError (TUI exited / event
+    stream ended) must NOT be mislabeled as a timeout.
+    """
+    from omnigent import codex_native_forwarder
+    from omnigent.codex_native_bridge import read_bridge_startup_error
+    from omnigent.runner.app import (
+        _AUTO_CODEX_APP_SERVERS,
+        _codex_discover_thread_and_forward,
+    )
+
+    class _Client:
+        async def close(self) -> None:
+            return None
+
+    class _AppServer:
+        async def close(self) -> None:
+            return None
+
+    async def _raise(*_args: object, **_kwargs: object) -> str:
+        raise exc
+
+    monkeypatch.setattr(codex_native_forwarder, "wait_for_thread_started", _raise)
+
+    session_id = "conv_codex_startup_error_test"
+    _AUTO_CODEX_APP_SERVERS[session_id] = _AppServer()
+    try:
+        await _codex_discover_thread_and_forward(
+            session_id=session_id,
+            bridge_dir=tmp_path,
+            codex_ws_url="ws://127.0.0.1:1",
+            codex_home=tmp_path / "codex-home",
+            event_client=_Client(),  # type: ignore[arg-type]
+        )
+    finally:
+        _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+    recorded = read_bridge_startup_error(tmp_path)
+    assert recorded is not None
+    assert expected_cause in recorded
+    assert type(exc).__name__ in recorded
+    # A RuntimeError must never be described as a timeout.
+    if not isinstance(exc, TimeoutError):
+        assert "timed out" not in recorded
+
+
+@pytest.mark.asyncio
 async def test_create_session() -> None:
     """``POST /v1/sessions`` spawns harness and returns SessionResponse shape."""
     app, pm, _hc = _build_lifecycle_app()

@@ -1509,9 +1509,14 @@ async def _codex_discover_thread_and_forward(
                 session_id,
             )
             # Bridge state is never written here; leave the real cause for the executor (#59).
+            cause = (
+                "startup timed out"
+                if isinstance(exc, TimeoutError)
+                else "event stream ended before a thread was created"
+            )
             write_bridge_startup_error(
                 bridge_dir,
-                f"Codex app-server never started a thread (startup timed out: "
+                f"Codex app-server never started a thread ({cause}: "
                 f"{type(exc).__name__}). See the runner log near 'native-codex "
                 "routing' for the resolved provider/model.",
             )
