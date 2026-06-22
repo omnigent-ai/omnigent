@@ -128,7 +128,7 @@ async def _await_elicitation(
     elicitation = ElicitationRequest(
         message=result.reason or "",
         phase=phase.value,
-        policy_name=result.deciding_policy or "",
+        policy_names=result.deciding_policies or [""],
         content_preview=_truncate(content_preview, limit=1024),
     )
     params_json = build_elicitation_params_json(elicitation)
@@ -222,6 +222,8 @@ def build_elicitation_request_event(
         "policy_name": elicitation.policy_name,
         "content_preview": elicitation.content_preview,
     }
+    if len(elicitation.policy_names) > 1:
+        params["policy_names"] = elicitation.policy_names
     if url is not None:
         params["url"] = url
 

@@ -304,7 +304,7 @@ async def test_pending_verdict_registers_elicitation():
     ask_result = PolicyResult(
         action=PolicyAction.ASK,
         reason="Requires user approval",
-        deciding_policy="approve_shell",
+        deciding_policies=["approve_shell"],
     )
 
     async def _eval(_ctx: Any) -> PolicyResult:
@@ -362,7 +362,7 @@ async def test_pending_verdict_carries_per_policy_ask_timeout():
     ask_result = PolicyResult(
         action=PolicyAction.ASK,
         reason="Requires user approval",
-        deciding_policy="approve_shell",
+        deciding_policies=["approve_shell"],
     )
 
     async def _eval(_ctx: Any) -> PolicyResult:
@@ -685,7 +685,7 @@ async def test_input_ask_approved_falls_through_to_allow():
     ask_result = PolicyResult(
         action=PolicyAction.ASK,
         reason="Deleting files requires approval",
-        deciding_policy="llm_prompt_classifier_policy",
+        deciding_policies=["llm_prompt_classifier_policy"],
     )
 
     async def _eval(_ctx: Any) -> PolicyResult:
@@ -764,7 +764,7 @@ async def test_input_ask_declined_denies():
     ask_result = PolicyResult(
         action=PolicyAction.ASK,
         reason="Deleting files requires approval",
-        deciding_policy="llm_prompt_classifier_policy",
+        deciding_policies=["llm_prompt_classifier_policy"],
     )
 
     async def _eval(_ctx: Any) -> PolicyResult:

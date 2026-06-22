@@ -113,7 +113,7 @@ def _composed_ask(
         action=PolicyAction.ASK,
         reason=reason,
         set_labels=set_labels,
-        deciding_policy=deciding_policy,
+        deciding_policies=[deciding_policy],
     )
 
 
@@ -248,7 +248,7 @@ def test_params_json_serializes_all_fields() -> None:
     req = ElicitationRequest(
         message="needs review",
         phase="tool_call",
-        policy_name="confirm_shell",
+        policy_names=["confirm_shell"],
         content_preview="ls -la",
     )
     data = json.loads(_params_json(req))
@@ -274,7 +274,7 @@ def test_elicitation_request_event_shape() -> None:
     req = ElicitationRequest(
         message="needs review",
         phase="tool_call",
-        policy_name="confirm_shell",
+        policy_names=["confirm_shell"],
         content_preview="ls -la",
     )
     event = _elicitation_request_event("elicit_xyz", req)
@@ -308,7 +308,7 @@ def test_elicitation_request_event_url_mode(monkeypatch: pytest.MonkeyPatch) -> 
     req = ElicitationRequest(
         message="approve shell?",
         phase="tool_call",
-        policy_name="shell_gate",
+        policy_names=["shell_gate"],
         content_preview="rm -rf /",
     )
     event = _elicitation_request_event("elicit_abc", req, session_id="conv_123")
@@ -328,7 +328,7 @@ def test_elicitation_request_event_form_mode_explicit(monkeypatch: pytest.Monkey
     req = ElicitationRequest(
         message="approve?",
         phase="tool_call",
-        policy_name="gate",
+        policy_names=["gate"],
         content_preview="ls",
     )
     event = _elicitation_request_event("elicit_abc", req, session_id="conv_123")
@@ -348,7 +348,7 @@ def test_elicitation_request_event_no_session_id_stays_form(
     req = ElicitationRequest(
         message="approve?",
         phase="tool_call",
-        policy_name="gate",
+        policy_names=["gate"],
         content_preview="",
     )
     event = _elicitation_request_event("elicit_abc", req)
