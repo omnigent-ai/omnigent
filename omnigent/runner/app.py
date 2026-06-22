@@ -5428,8 +5428,12 @@ def create_runner_app(
                 # Prefer the spec's declared executor.context_window over the
                 # model-catalog lookup so a high-window agent (e.g. a 1M Claude
                 # brain) isn't compacted against the 128K catalog default.
+                # No model override is known at create time (it's applied later
+                # via the persisted session / ``/model``), so this pre-seed uses
+                # the spec model; the per-turn dispatch path reconciles the
+                # budget once a turn carries an active override.
                 _ctx_window = resolve_effective_context_window(
-                    spec.executor.context_window, _model
+                    spec.executor.context_window, _model, model_override=None
                 )
                 if _ctx_window is not None:
                     _compaction_contexts[session_id] = {
@@ -9109,7 +9113,19 @@ def create_runner_app(
         if conv not in _session_histories:
             _session_histories[conv] = await _load_history_as_input(conv)
 
-        if conv not in _compaction_contexts:
+        # Per-turn model pin (user /model, or the advisor's optimize verdict).
+        # It overrides the spec model, so the budget must size against it —
+        # exactly like the server ring (executor.context_window describes only
+        # the spec model).
+        _turn_override = msg_body.get("model_override") or None
+        _cached_cc = _compaction_contexts.get(conv)
+        # (Re)compute when not yet cached, or when an active override no longer
+        # matches the cached entry's effective model — e.g. a mid-session
+        # /model pin, or the create-time pre-seed which can't know the override
+        # and would otherwise keep budgeting the declared window forever.
+        if _cached_cc is None or (
+            _turn_override is not None and _cached_cc.get("model") != _turn_override
+        ):
             from omnigent.llms.context_window import resolve_effective_context_window
 
             _model: str | None = None
@@ -9126,12 +9142,17 @@ def create_runner_app(
             # Prefer the spec's declared executor.context_window over the
             # model-catalog lookup (see resolve_effective_context_window):
             # keeps a high-window agent from compacting against the 128K
-            # catalog default.
-            _ctx_window = resolve_effective_context_window(_spec_ctx_window, _model)
+            # catalog default — but an active override bypasses the declared
+            # window and sizes against the override model's real window.
+            _ctx_window = resolve_effective_context_window(
+                _spec_ctx_window, _model, model_override=_turn_override
+            )
             if _ctx_window is not None:
                 _compaction_contexts[conv] = {
                     "context_window": _ctx_window,
-                    "model": _model,
+                    # Store the effective model so count_tokens tokenizes
+                    # against the model the turn actually runs on.
+                    "model": _turn_override or _model,
                     "config": _compaction_cfg,
                 }
 

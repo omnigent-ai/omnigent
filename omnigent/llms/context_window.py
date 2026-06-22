@@ -269,7 +269,10 @@ def get_model_context_window(model: str) -> int:
 
 
 def resolve_effective_context_window(
-    spec_context_window: int | None, model: str | None
+    spec_context_window: int | None,
+    model: str | None,
+    *,
+    model_override: str | None = None,
 ) -> int | None:
     """
     Resolve the context window to use for compaction budgeting.
@@ -279,20 +282,31 @@ def resolve_effective_context_window(
     stating the size the model actually serves for this agent (e.g. a 1M
     Claude window); the catalog lookup falls back to a conservative 128K
     default for models it can't resolve, which would otherwise compact far
-    too early. Mirrors what the server already does for its display ring
-    (``server/routes/sessions.py``).
+    too early.
+
+    Mirrors the server's display ring (``server/routes/sessions.py``):
+    ``executor.context_window`` describes only the *spec* model, so an active
+    ``model_override`` bypasses the declared window and sizes against the
+    override model's real catalog window instead. Without this, overriding a
+    1M-window agent down to a small-window model would budget compaction
+    against 1M and under-compact past the real model's limit.
 
     :param spec_context_window: ``executor.context_window`` from the spec,
         or ``None`` when the author declared no explicit window.
-    :param model: The effective model identifier, or ``None``.
-    :returns: The declared window when set; otherwise the model's catalog
-        window via :func:`get_model_context_window`; ``None`` when neither
-        a declared window nor a model is available.
+    :param model: The spec-declared / default model identifier, or ``None``.
+    :param model_override: The active per-session model override, or ``None``.
+        When set, the declared window is ignored and the override model's
+        catalog window is used (matching the server ring).
+    :returns: The declared window when set and no override is active;
+        otherwise the effective model's catalog window via
+        :func:`get_model_context_window`; ``None`` when neither a usable
+        window nor a model is available.
     """
-    if spec_context_window is not None:
+    effective_model = model_override if model_override is not None else model
+    if spec_context_window is not None and model_override is None:
         return spec_context_window
-    if model:
-        return get_model_context_window(model)
+    if effective_model:
+        return get_model_context_window(effective_model)
     return None
 
 
