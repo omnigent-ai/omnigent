@@ -654,10 +654,14 @@ class PolicyEngine:
                     return result
                 if result.action == PolicyAction.ASK and worst_result is None:
                     worst_result = result
-        self._apply_label_changes(accumulated_set_labels)
         if worst_result is not None:
+            # DO NOT apply label changes here — the ASK verdict is pending
+            # user approval. Labels are withheld and carried in the result
+            # so the caller can apply them only on approve, preserving the
+            # "no side effects from a denied ASK" invariant.
             worst_result.set_labels = accumulated_set_labels
             return worst_result
+        self._apply_label_changes(accumulated_set_labels)
         return PolicyResult(action=PolicyAction.ALLOW, set_labels=accumulated_set_labels)
 
     def _apply_label_changes(self, set_labels: dict[str, str]) -> None:

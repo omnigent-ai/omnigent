@@ -430,6 +430,76 @@ class TestPolicyEngine(unittest.TestCase):
 
         _run(_t())
 
+    def test_ask_does_not_apply_label_changes(self):
+        """Label writes from an ASK policy must not land until the user approves.
+
+        Calling _apply_label_changes before returning an ASK result would write
+        labels to the session even if the user later denies — violating the
+        "no side effects from a denied ASK" invariant. Labels must be carried
+        in the result and applied only on approve.
+        """
+        applied: list[tuple[str, str]] = []
+
+        class _FakeSession:
+            labels: dict[str, str] = {}
+
+            def _apply_root_label_update(self, key: str, value: str) -> None:
+                applied.append((key, value))
+
+        async def _t() -> None:
+            e = PolicyEngine(
+                {
+                    "a": FunctionPolicy(
+                        name="a",
+                        on=["request"],
+                        callable=lambda c, p: PolicyResult(
+                            action=PolicyAction.ASK,
+                            reason="approve?",
+                            set_labels={"taint": "high"},
+                        ),
+                    ),
+                }
+            )
+            e.bind_session(_FakeSession())
+            r = await e.evaluate("t", "request")
+            self.assertEqual(r.action, PolicyAction.ASK)
+            # Labels must be carried in the result for the caller to apply on approve.
+            self.assertEqual(r.set_labels, {"taint": "high"})
+            # Labels must NOT have been written to the session yet.
+            self.assertEqual(applied, [])
+
+        _run(_t())
+
+    def test_allow_applies_label_changes(self):
+        """Label writes from an ALLOW policy are applied immediately."""
+        applied: list[tuple[str, str]] = []
+
+        class _FakeSession:
+            labels: dict[str, str] = {}
+
+            def _apply_root_label_update(self, key: str, value: str) -> None:
+                applied.append((key, value))
+
+        async def _t() -> None:
+            e = PolicyEngine(
+                {
+                    "a": FunctionPolicy(
+                        name="a",
+                        on=["request"],
+                        callable=lambda c, p: PolicyResult(
+                            action=PolicyAction.ALLOW,
+                            set_labels={"status": "ok"},
+                        ),
+                    ),
+                }
+            )
+            e.bind_session(_FakeSession())
+            r = await e.evaluate("t", "request")
+            self.assertEqual(r.action, PolicyAction.ALLOW)
+            self.assertEqual(applied, [("status", "ok")])
+
+        _run(_t())
+
 
 async def _evaluate_capturing(
     callable_fn: Callable[[list[tuple[Any, ...]]], Callable[..., Any]],
