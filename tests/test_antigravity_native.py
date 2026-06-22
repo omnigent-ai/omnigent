@@ -409,6 +409,82 @@ async def test_daemon_fresh_launch_reattaches_to_runner_autocreated_terminal(
     assert prepared.tmux_target == "main"
 
 
+async def test_local_fresh_launch_reattaches_to_runner_autocreated_terminal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    The LOCAL (non-daemon) prepare path also reattaches to the runner-owned terminal.
+
+    Regression for the double-launch/double-forward gap on the default
+    ``omnigent antigravity`` path: the local server spawns a CLI runner, and
+    binding it triggers the runner's ``_auto_create_antigravity_terminal`` exactly
+    as the daemon path does. ``_prepare_antigravity_terminal`` must reattach to that
+    runner-owned terminal after the bind — NOT call ``_launch_and_record`` (whose
+    ``clear_bridge_state`` wipes the runner's bridge state and whose redundant
+    terminal POST 500s, and which on ``reattached=False`` also starts a second CLI
+    ``supervise_forwarder`` → double-mirror). The original fix (7df3ba4d/f4ce3ce8)
+    only patched ``_prepare_antigravity_terminal_via_daemon``; this guards the
+    local-server path.
+    """
+    import omnigent.antigravity_native_bridge as bridge_mod
+
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    terminal_id = antigravity_terminal_resource_id()
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        # The runner has auto-created the terminal by the time we poll (post-bind).
+        if request.method == "GET" and path.endswith(f"/resources/terminals/{terminal_id}"):
+            return httpx.Response(
+                200,
+                json={
+                    "id": terminal_id,
+                    "metadata": {
+                        "running": True,
+                        "tmux_socket": "/tmp/s.sock",
+                        "tmux_target": "main",
+                    },
+                },
+            )
+        raise AssertionError(f"unexpected request: {request.method} {path}")
+
+    async def _create(*args: object, **kwargs: object) -> str:
+        return "conv_local_fresh"
+
+    async def _boom_launch(*args: object, **kwargs: object) -> object:
+        raise AssertionError(
+            "local fresh launch must reattach to the runner-owned terminal, not relaunch "
+            "(double-launch clobbers the runner's bridge state and double-mirrors)"
+        )
+
+    async def _noop(*args: object, **kwargs: object) -> object:
+        return None
+
+    monkeypatch.setattr(_mod, "_create_antigravity_session", _create)
+    monkeypatch.setattr(_mod, "_launch_and_record", _boom_launch)
+    monkeypatch.setattr(_mod, "_bind_session_runner", _noop)
+
+    async with _mock_client(_handler) as client:
+        _patch_prepare_client(monkeypatch, client)
+        prepared = await _mod._prepare_antigravity_terminal(
+            base_url="http://127.0.0.1:0",
+            headers={},
+            session_id=None,
+            runner_id="runner_local_1",
+            session_bundle=b"bundle",
+            antigravity_args=(),
+            command="agy",
+            model=None,
+            startup_progress=None,
+        )
+
+    assert prepared.reattached is True, (
+        "local fresh launch must reattach to the runner-owned terminal"
+    )
+    assert prepared.terminal_id == terminal_id
+    assert prepared.tmux_target == "main"
+
+
 # ---------------------------------------------------------------------------
 # _launch_and_record: forwarded_step_index cursor preservation (Fix 3)
 # ---------------------------------------------------------------------------

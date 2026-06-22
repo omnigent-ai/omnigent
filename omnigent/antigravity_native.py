@@ -616,6 +616,40 @@ async def _prepare_antigravity_terminal(
 
         if runner_id is not None:
             await _bind_session_runner(client, session_id, runner_id)
+            # The runner OWNS the antigravity terminal: binding triggers its
+            # idempotent auto-create (``runner/app.py``
+            # ``_auto_create_antigravity_terminal``), which fires for every
+            # antigravity-native session — including on the local server, whose
+            # CLI runner subprocess runs the same auto-create. Reattach to that
+            # runner-owned terminal instead of launching our own: a redundant
+            # ``_launch_and_record`` 500s ("terminal antigravity:main … already
+            # observed as required") AND its ``clear_bridge_state`` wipes the bridge
+            # state the runner wrote (every web turn then fails "Antigravity native
+            # bridge state is missing"), and on ``reattached=False``
+            # ``_attach_terminal`` starts a SECOND ``supervise_forwarder`` →
+            # double-mirror. The pre-bind existing-terminal check above can't catch
+            # this — the runner only auto-creates AFTER the bind. A CLI launch stays
+            # as a defensive fallback when the runner produced no terminal in the
+            # window. Mirrors ``_prepare_antigravity_terminal_via_daemon``.
+            autocreated = await _await_runner_antigravity_terminal(
+                client, session_id, _RUNNER_TERMINAL_AUTOCREATE_TIMEOUT_S
+            )
+            if autocreated is not None:
+                if antigravity_args or model is not None:
+                    click.echo(
+                        "Ignoring Antigravity launch args/model for the runner-owned "
+                        "terminal; restart the session terminal to apply them.",
+                        err=True,
+                    )
+                _update_progress(startup_progress, "Antigravity terminal ready.")
+                return PreparedAntigravityTerminal(
+                    session_id=session_id,
+                    terminal_id=autocreated.terminal_id,
+                    bridge_dir=bridge_dir_for_bridge_id(bridge_id),
+                    tmux_socket=autocreated.tmux_socket,
+                    tmux_target=autocreated.tmux_target,
+                    reattached=True,
+                )
         launched = await _launch_and_record(
             client,
             session_id=session_id,
