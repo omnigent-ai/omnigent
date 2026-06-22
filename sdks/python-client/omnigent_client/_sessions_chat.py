@@ -1105,6 +1105,14 @@ class SessionsChat:
                     if not text_parts:
                         text_parts.extend(_assistant_text_from_response(event.response.output))
                     break
+                elif isinstance(event, SessionStatusEvent) and event.status in (
+                    "waiting",
+                    "idle",
+                ):
+                    # Break on terminal status events so the async generator
+                    # closes cleanly (avoids "aclose(): already running" when
+                    # asyncio.timeout fires mid-stream).
+                    break
                 elif isinstance(event, _TURN_TERMINAL_EVENT_TYPES):
                     break
 
