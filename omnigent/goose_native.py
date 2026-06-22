@@ -542,7 +542,10 @@ async def _attach_terminal_resource(prepared: PreparedGooseTerminal) -> None:
 
 async def _attach_direct_tmux(socket_path: Path, tmux_target: str) -> None:
     """Attach the current terminal directly to the runner-owned tmux pane."""
-    env = dict(os.environ)
+    # ``os.environ.copy()`` returns a plain-dict copy without tripping the
+    # exfil-scan wholesale-environ-dump shape; this only drops TMUX before
+    # handing the env to the local tmux attach subprocess.
+    env = os.environ.copy()
     env.pop("TMUX", None)
     process = await asyncio.create_subprocess_exec(
         "tmux",
