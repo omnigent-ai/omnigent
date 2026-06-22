@@ -81,6 +81,7 @@ import {
   MONACO_SPLIT_BREAKPOINT,
   type SaveStatus,
   detectLang,
+  isImageFile,
   openHtmlArtifactInNewTab,
 } from "./codeViewerHelpers";
 import { CommentsPanel, type ActiveSelection } from "./CommentsPanel";
@@ -574,8 +575,13 @@ function FileViewerBody({
   // View mode toggle — preview is the default for md/html, source for everything else.
   const lang = detectLang(path);
   const isPreviewable = lang === "markdown" || lang === "html";
+  // Images render through CodeViewer's <ImageViewer> regardless of view mode;
+  // they have no source/diff representation, so diff is suppressed for them
+  // (Monaco would otherwise render the base64 payload as garbage text).
+  const isImage = isImageFile(path, fileQuery.data?.content_type);
   // Show Δ button only when the file appears in the session's changed-files list.
-  const isDiffAvailable = changedFiles.data?.data.some((f) => f.path === path) ?? false;
+  const isDiffAvailable =
+    !isImage && (changedFiles.data?.data.some((f) => f.path === path) ?? false);
   const isDeletedFile =
     changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false;
 
