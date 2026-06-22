@@ -876,7 +876,7 @@ def test_function_policy_reset_turn_invokes_callable_attribute(
     on the wrapped callable and invoke it. This is how legacy
     omnigent policies like ``max_tool_calls_per_turn`` clear
     per-turn accumulators between turns — see
-    :meth:`omnigent.inner.policies.FunctionPolicy.reset_turn`
+    :meth:`omnigent.runtime.policies.engine.PolicyEngine.reset_turn`
     for the native implementation we mirror.
 
     What breaks if this fails: the rate-limit factory in

@@ -791,7 +791,7 @@ class PolicyEngine:
         Stateless policies — the default — no-op.
 
         Mirrors the omnigent-native semantics in
-        :meth:`omnigent.inner.policies.PolicyEngine.reset_turn`.
+        :meth:`omnigent.runtime.policies.engine.PolicyEngine.reset_turn`.
         Without this hook, legacy ``max_tool_calls_per_turn``
         callables silently degrade to per-session limits under
         Omnigent mode.
