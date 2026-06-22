@@ -1,0 +1,95 @@
+name: UI Snapshot Failure Comment
+
+# When the UI Snapshot compare gate fails on a PR, upsert a PR comment with how
+# to update the baseline -- tailored for same-repo PRs (the `update-ui-snapshot`
+# label) and fork PRs (adopt the run's rendered PNG, since CI can't push to a
+# fork).
+#
+# A fork `pull_request` run gets a read-only token and can't comment, so this
+# runs as `workflow_run` in the BASE-repo context (writable token). Crucially it
+# NEVER checks out or runs PR/fork code -- it only reads the completed run's
+# metadata (head SHA + repo, run URL) and posts a comment.
+#
+# NOTE: `workflow_run` only triggers from the copy of this file on the DEFAULT
+# branch, so it activates once merged to main -- it does not fire on its own PR.
+
+on:
+  workflow_run:
+    workflows: ["UI Snapshot"]
+    types: [completed]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ui-snapshot-fail-comment-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: true
+
+jobs:
+  comment:
+    name: Upsert baseline-update instructions
+    # Only failed compare runs that came from a PR (push/dispatch have no PR).
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Upsert the failure comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euo pipefail
+          # workflow_run.pull_requests is empty for forks, so resolve the PR from
+          # the head SHA (works for same-repo and fork). No open PR -> nothing to do.
+          pr=$(gh api "repos/$REPO/commits/$HEAD_SHA/pulls" --jq '.[0].number // empty' 2>/dev/null || true)
+          if [ -z "$pr" ]; then
+            echo "No open PR for $HEAD_SHA; nothing to comment."
+            exit 0
+          fi
+
+          # List every update path that applies to where the branch lives. All
+          # render in the same pinned image, so any of them matches this gate.
+          # (workflow_dispatch is for non-PR branches; see the README.) This job
+          # runs on ubuntu-latest, so bash arrays are fine.
+          if [ "$HEAD_REPO" = "$REPO" ]; then
+            opts=(
+              "- **Label the PR (recommended):** add the \`update-ui-snapshot\` label — the bot regenerates the baseline in the pinned image, pushes it back here, and re-runs the checks."
+              "- **Locally with Docker:** run \`tests/e2e_ui/visual/regen_baseline_docker.sh\`, review the PNG, then commit + push."
+            )
+          else
+            opts=(
+              "- **Locally with Docker:** run \`tests/e2e_ui/visual/regen_baseline_docker.sh\` (renders in the same pinned image), review the PNG, then commit + push."
+              "- **Without Docker:** run \`tests/e2e_ui/visual/update_baseline_from_pr.sh $pr\` to adopt this run's render, review the PNG, then commit + push."
+              "  _(The \`update-ui-snapshot\` label can't help on a fork — CI can't push to a fork branch.)_"
+            )
+          fi
+
+          marker="<!-- ui-snapshot-fail-comment -->"
+          # printf (not a heredoc) so backticks stay literal and there are no
+          # leading-space markdown surprises. \` is a literal backtick.
+          body=$(printf '%s\n' \
+            "$marker" \
+            "❌ **UI Snapshot** doesn't match the committed baseline." \
+            "" \
+            "If this UI change is intentional, update the baseline — each path renders in the same pinned image, so the result matches this gate:" \
+            "" \
+            "${opts[@]}" \
+            "" \
+            "Diff PNGs (\`expected_\`=baseline, \`actual_\`=your render, \`diff_\`) are in the [run]($RUN_URL) artifact. Full guide: \`tests/e2e_ui/visual/README.md\`.")
+
+          jq -n --arg b "$body" '{body: $b}' > "$RUNNER_TEMP/payload.json"
+
+          # Upsert so repeated failures update one comment instead of spamming.
+          existing=$(gh api --paginate "repos/$REPO/issues/$pr/comments" \
+            --jq ".[] | select(.body | contains(\"$marker\")) | .id" | head -n1 || true)
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$existing" --input "$RUNNER_TEMP/payload.json" --silent
+          else
+            gh api -X POST "repos/$REPO/issues/$pr/comments" --input "$RUNNER_TEMP/payload.json" --silent
+          fi

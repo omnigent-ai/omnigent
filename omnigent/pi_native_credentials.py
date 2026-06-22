@@ -27,6 +27,7 @@ from typing import Any
 
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
+    CHAT_WIRE_API,
     DATABRICKS_KIND,
     GATEWAY_KIND,
     KEY_KIND,
@@ -138,10 +139,17 @@ def _inline_family_pi_provider(
     :returns: The Pi provider config, or ``None`` when no usable family with a
         base URL and credential is configured.
     """
-    for family_name, api in (("anthropic", "anthropic-messages"), ("openai", "openai-responses")):
+    for family_name in ("anthropic", "openai"):
         family = entry.family(family_name)
         if family is None or not family.base_url:
             continue
+        # Determine the API type based on family and wire_api setting.
+        if family_name == "anthropic":
+            api = "anthropic-messages"
+        elif family.wire_api == CHAT_WIRE_API:
+            api = "openai-completions"
+        else:
+            api = "openai-responses"
         # A static key (or $VAR) — Pi reads a literal/env apiKey directly; an
         # auth_command becomes a "!command" Pi resolves at request time.
         if family.api_key:
