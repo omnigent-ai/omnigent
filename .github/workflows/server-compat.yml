@@ -16,10 +16,6 @@ name: Server Backwards-Compat
 #   schedule            nightly; pins the latest non-rc release tag.
 
 on:
-  # TEMP(backcompat validation): run on PR pushes so these jobs execute on
-  # Actions before #896 merges (workflow_dispatch needs the file on main).
-  # REVERT before merge — backcompat is meant to be dispatch/nightly only.
-  pull_request:
   workflow_dispatch:
     inputs:
       server_version:
