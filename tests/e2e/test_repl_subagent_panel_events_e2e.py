@@ -28,11 +28,12 @@ import threading
 from typing import Any
 
 import httpx
+import pytest
 from omnigent_client._sessions import SessionsNamespace
 
 from tests.e2e.conftest import (
     create_runner_bound_session,
-    poll_until_terminal,
+    poll_session_until_terminal,
     send_user_message_to_session,
 )
 
@@ -75,6 +76,7 @@ def test_parent_stream_and_child_sessions_expose_subagents(
     archer_agent: str,
     live_runner_id: str,
     llm_api_key: str,
+    using_mock_llm: bool,
 ) -> None:
     """A real sub-agent run emits the SSE child events the badge consumes and
     lists the child via ``child_sessions`` (the tree poll's source).
@@ -86,7 +88,17 @@ def test_parent_stream_and_child_sessions_expose_subagents(
         server-side sub-agents — no native CLI required).
     :param live_runner_id: Registered runner the session binds to.
     :param llm_api_key: Gates the test on a configured LLM key.
+    :param using_mock_llm: True when no ``--llm-api-key`` was passed. The mock
+        LLM returns canned text, never the ``sys_session_send`` tool call that
+        spawns the sub-agent, so this test needs a real LLM to exercise its
+        data contract — skip cleanly rather than failing on a missing child.
     """
+    if using_mock_llm:
+        pytest.skip(
+            "needs a real --llm-api-key: the mock LLM never emits the "
+            "sys_session_send tool call that spawns the sub-agent this test "
+            "asserts on."
+        )
     session_id = create_runner_bound_session(
         http_client, agent_name=archer_agent, runner_id=live_runner_id
     )
@@ -132,8 +144,15 @@ def test_parent_stream_and_child_sessions_expose_subagents(
             "sentences. Wait for its result before you finish."
         ),
     )
-    body = poll_until_terminal(http_client, response_id, timeout=240)
-    assert body["status"] == "completed", f"Sub-agent run failed: {body.get('error')}"
+    # Runner-native session: poll the session snapshot, NOT
+    # ``GET /v1/responses/{id}`` (which a runner-bound turn never creates — that
+    # route falls through to the web SPA and returns HTML, 200, so a naive
+    # ``.json()`` blows up before any assertion). The snapshot helper reports
+    # terminal as ``idle``.
+    body = poll_session_until_terminal(
+        http_client, session_id=session_id, response_id=response_id, timeout=240
+    )
+    assert body["status"] in ("idle", "completed"), f"Sub-agent run failed: {body.get('error')}"
 
     stop.set()
     tail.join(timeout=10)
