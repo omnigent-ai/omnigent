@@ -16,10 +16,9 @@ name: Merge Ready
 #                into continuous gate updates (green AND red).
 #
 # There is no CI bypass label. To land a PR despite red required checks,
-# either quarantine the offending flaky test (tests/known_failures.yaml) or,
-# for a genuine emergency, a repo admin uses GitHub's native "merge without
-# waiting for requirements" affordance (branch protection has
-# enforce_admins=false).
+# fix or delete the offending test; for a genuine emergency, a repo admin
+# uses GitHub's native "merge without waiting for requirements" affordance
+# (branch protection has enforce_admins=false).
 
 on:
   # `labeled` only; `workflow_run` re-evaluates on CI completion (same-repo PRs
@@ -106,7 +105,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Check out scripts
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           ref: main             # trusted gate scripts; never the PR head
           sparse-checkout: .github/scripts/merge-ready

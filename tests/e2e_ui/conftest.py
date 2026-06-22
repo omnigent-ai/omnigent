@@ -2,8 +2,9 @@
 
 The suite spawns a real ``omnigent server --agent`` subprocess against
 ``examples/hello_world.yaml`` and drives the rendered SPA with
-Playwright. The agent calls a real LLM, so the suite is excluded from
-the default ``pytest`` run via ``--ignore=tests/e2e_ui`` in
+Playwright. The server is wired to a mock LLM server so the suite
+runs deterministically without real credentials. The suite is excluded
+from the default ``pytest`` run via ``--ignore=tests/e2e_ui`` in
 ``pyproject.toml`` and gated to ``workflow_dispatch`` in CI for now.
 
 Local usage::
@@ -89,11 +90,10 @@ _BUILD_OUTPUT = _REPO_ROOT / "omnigent" / "server" / "static" / "web-ui"
 # validator at registration time (no shim defaults applied), so the
 # YAML must carry an explicit ``executor`` block — otherwise the
 # server rejects with ``executor.config.harness: required when
-# executor.type is 'omnigent'``. The legacy ``serve --omnigent`` path
-# filled ``model: databricks-gpt-5-4`` in via ``_apply_overrides_to_yaml``
-# and let harness auto-pick resolve it to ``openai-agents``; we mirror
-# the same effective config here so the test agent is byte-identical
-# to what the previous fixture spawned.
+# executor.type is 'omnigent'``. The mock LLM server handles
+# The model name (databricks-gpt-5-4) is used for harness routing only;
+# harness auto-picks ``openai-agents`` and routes requests to the
+# in-process mock rather than a real provider.
 _TEST_AGENT_YAML = """\
 name: hello_world
 prompt: You are a friendly assistant. Say hello and answer questions.
@@ -394,6 +394,137 @@ def _find_free_port() -> int:
     )
 
 
+# ---------------------------------------------------------------------------
+# Mock LLM server fixtures and helpers
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def mock_llm_server_url(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[str]:
+    """Start a mock LLM server for the test session.
+
+    The mock server is a lightweight FastAPI/uvicorn subprocess that
+    serves an OpenAI-compatible ``/v1/`` endpoint. The ``live_server``
+    fixture points the spawned omnigent server at this URL so all agent
+    LLM calls hit the mock rather than a real provider.
+
+    :param tmp_path_factory: Pytest temp path factory for logs.
+    :returns: The mock server base URL, e.g. ``"http://127.0.0.1:51235"``.
+    """
+    mock_port = _find_free_port()
+    mock_log = tmp_path_factory.mktemp("mock_llm_logs") / "mock_llm.log"
+    log_handle = open(mock_log, "w")  # noqa: SIM115
+
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(_REPO_ROOT / "tests" / "server" / "integration" / "mock_llm_server.py"),
+            str(mock_port),
+        ],
+        env={**os.environ, "PYTHONPATH": str(_REPO_ROOT)},
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+    )
+    base_url = f"http://127.0.0.1:{mock_port}"
+
+    # Wait for the mock server to be ready
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        try:
+            resp = httpx.get(f"{base_url}/stats", timeout=1.0)
+            if resp.status_code == 200:
+                break
+        except httpx.ConnectError:
+            # Expected while the mock server is still booting.
+            pass
+        time.sleep(0.1)
+    else:
+        proc.kill()
+        log_handle.close()
+        log_contents = mock_log.read_text() if mock_log.exists() else ""
+        raise RuntimeError(
+            f"Mock LLM server didn't start within 10s.\nLog at {mock_log}:\n{log_contents[-2000:]}"
+        )
+
+    try:
+        yield base_url
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        log_handle.close()
+
+
+def configure_mock_llm(
+    mock_url: str,
+    responses: list[dict[str, Any]],
+    *,
+    key: str = "default",
+) -> None:
+    """Configure a keyed response queue on the mock LLM server.
+
+    Each dict in *responses* maps to a ``QueuedResponse`` on the mock
+    server. The *key* determines which queue the responses are stored in
+    — the mock server routes each request to the queue whose key matches
+    the request's ``model`` field.
+
+    :param mock_url: Mock server base URL.
+    :param responses: List of response configs. Keys:
+        ``text``, ``tool_calls``, ``block``, ``stream``,
+        ``error``, ``status_code``.
+    :param key: Queue key — typically the model name baked into the
+        agent spec. Defaults to ``"default"`` (matches any model
+        not assigned to a more specific queue).
+    """
+    resp = httpx.post(
+        f"{mock_url}/mock/configure",
+        json={"key": key, "responses": responses},
+        timeout=5.0,
+    )
+    resp.raise_for_status()
+
+
+def reset_mock_llm(mock_url: str) -> None:
+    """Clear all regular keyed queues, captured requests, and gates.
+
+    Fallbacks set via :func:`set_fallback_mock_llm` are preserved.
+
+    :param mock_url: Mock server base URL.
+    """
+    resp = httpx.post(f"{mock_url}/mock/reset", timeout=5.0)
+    resp.raise_for_status()
+
+
+def set_fallback_mock_llm(
+    mock_url: str,
+    key: str,
+    text: str,
+) -> None:
+    """Set a non-resettable fallback response for a queue key.
+
+    The fallback is returned when the regular queue for *key* is
+    exhausted. Unlike regular entries, the fallback survives
+    :func:`reset_mock_llm` — use it for session-level queues that
+    must return a valid response even when per-test resets clear the
+    regular queue (e.g. the server-level policy-classifier LLM queue).
+
+    :param mock_url: Mock server base URL.
+    :param key: Queue key (typically the server's ``llm.model``).
+    :param text: Fallback response text.
+    """
+    resp = httpx.post(
+        f"{mock_url}/mock/set_fallback",
+        json={"key": key, "text": text},
+        timeout=5.0,
+    )
+    resp.raise_for_status()
+
+
 @pytest.fixture(scope="session")
 def built_spa(request: pytest.FixtureRequest) -> None:
     """
@@ -541,6 +672,7 @@ def _spawn_runner_against_external_server(
 @pytest.fixture(scope="session")
 def live_server(
     built_spa: None,
+    mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
     request: pytest.FixtureRequest,
 ) -> Iterator[str]:
@@ -554,13 +686,15 @@ def live_server(
     Teardown is SIGTERM with a 10s grace period, escalating to
     SIGKILL.
 
-    The agent calls a real LLM. The hello_world spec defaults to
-    Databricks-hosted Claude via the FM API, so locally the user's
-    ``~/.databrickscfg`` must have a working profile; in CI the
-    workflow exchanges OAuth credentials before pytest runs.
+    The spawned server is wired to the session-scoped mock LLM server
+    via ``OPENAI_BASE_URL`` so all agent LLM calls are served by the
+    mock without any real provider credentials.
 
     :param built_spa: Required to ensure the static SPA bundle is on
         disk before the server boots and tries to mount it.
+    :param mock_llm_server_url: Session-scoped mock LLM server URL;
+        injected into the server's environment so the openai-agents
+        harness hits the mock instead of a real provider.
     :param tmp_path_factory: Pytest temp path factory for the log,
         the SQLite DB, and the artifact dir — all per-session, so
         the test never reads from or writes to the user's default
@@ -609,11 +743,18 @@ def live_server(
     # helper uses (tests/_helpers/live_server.py:160-167).
     # OMNIGENT_RUNNER_TUNNEL_TOKEN lets the server accept
     # exactly the sibling runner's WebSocket tunnel.
+    mock_url = mock_llm_server_url
     env = {
         **os.environ,
         "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
         "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token,
         "OMNIGENT_BUILTIN_AGENT_DIRS": os.pathsep.join(builtin_dirs),
+        # Point the openai-agents harness at the mock LLM server so no
+        # real provider credentials are needed.
+        "OPENAI_BASE_URL": f"{mock_url}/v1",
+        "OPENAI_API_KEY": "mock-key",
+        # Strip any ambient Anthropic credentials so they don't leak in.
+        "ANTHROPIC_API_KEY": "",
     }
     log_handle = open(log_path, "w")  # noqa: SIM115 — handle lives for Popen lifetime; closed in finally
     proc = subprocess.Popen(
@@ -731,6 +872,10 @@ def live_server(
     # test_stale_stream) can respawn one via :func:`_ensure_runner_online`.
     _server_state["binding_token"] = binding_token
     _server_state["server_url"] = base_url
+
+    # Set a non-resettable fallback for the policy-classifier LLM queue so
+    # every per-test reset leaves the server's guardrails path functional.
+    set_fallback_mock_llm(mock_url, "_policy_llm_", '{"action": "allow", "reason": ""}')
 
     try:
         yield base_url

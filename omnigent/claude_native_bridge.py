@@ -185,8 +185,8 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
     Return the trusted parent for an allowed bridge directory.
 
     Claude-native files live below the uid-scoped temp bridge root.
-    Codex-native reuses the relay/MCP implementation but keeps bridge
-    files below ``~/.omnigent/codex-native``. Both roots use the same
+    Codex- and Cursor-native reuse the relay/MCP implementation but keep bridge
+    files below their own bridge roots. All roots use the same
     owner-only ancestor validation; only the trusted anchor differs.
 
     :param target: Normalized bridge directory path being created or validated,
@@ -211,9 +211,15 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
             trusted_parent = codex_root.parent.parent
         return _absolute_syntactic_path(trusted_parent)
 
+    from omnigent.cursor_native_bridge import bridge_root as cursor_bridge_root
+
+    cursor_root = _absolute_syntactic_path(cursor_bridge_root())
+    if target.is_relative_to(cursor_root):
+        return _absolute_syntactic_path(cursor_root.parent.parent)
+
     raise RuntimeError(
         f"bridge dir {target!s} is not under an allowed bridge root "
-        f"({claude_root!s}, {codex_root!s})"
+        f"({claude_root!s}, {codex_root!s}, {cursor_root!s})"
     )
 
 
@@ -3314,8 +3320,29 @@ def _stdio_jsonrpc_loop(
         active tool relay.
     :returns: None when stdin reaches EOF.
     """
-    for raw_line in sys.stdin:
-        line = raw_line.strip()
+    use_content_length = False
+    while True:
+        raw_line = sys.stdin.buffer.readline()
+        if raw_line == b"":
+            return
+        if raw_line.lower().startswith(b"content-length:"):
+            use_content_length = True
+            try:
+                length = int(raw_line.decode("ascii", errors="ignore").split(":", 1)[1].strip())
+            except ValueError:
+                continue
+            while True:
+                header = sys.stdin.buffer.readline()
+                if header in {b"\r\n", b"\n", b""}:
+                    break
+            if length <= 0:
+                continue
+            raw_payload = sys.stdin.buffer.read(length)
+            if len(raw_payload) != length:
+                return
+            line = raw_payload.decode("utf-8", errors="replace").strip()
+        else:
+            line = raw_line.decode("utf-8", errors="replace").strip()
         if not line:
             continue
         try:
@@ -3350,7 +3377,7 @@ def _stdio_jsonrpc_loop(
                 # -32603 is the JSON-RPC 2.0 "Internal error" code.
                 "error": {"code": -32603, "message": f"internal error: {exc}"},
             }
-        _write_jsonrpc(response, stdout_lock)
+        _write_jsonrpc(response, stdout_lock, framed=use_content_length)
 
 
 def _handle_mcp_request(
@@ -3651,17 +3678,29 @@ def _build_tools(config: dict[str, Any]) -> tuple[dict[str, Tool], Callable[[], 
     return tools, _close_tools
 
 
-def _write_jsonrpc(payload: dict[str, Any], stdout_lock: threading.Lock) -> None:
+def _write_jsonrpc(
+    payload: dict[str, Any],
+    stdout_lock: threading.Lock,
+    *,
+    framed: bool = False,
+) -> None:
     """
     Write one JSON-RPC message to stdout.
 
     :param payload: JSON-RPC object to serialize.
     :param stdout_lock: Lock protecting stdout.
+    :param framed: When ``True``, write MCP ``Content-Length`` framed output.
     :returns: None.
     """
     raw = json.dumps(payload, separators=(",", ":"))
     with stdout_lock:
-        print(raw, flush=True)
+        if framed:
+            encoded = raw.encode("utf-8")
+            sys.stdout.buffer.write(f"Content-Length: {len(encoded)}\r\n\r\n".encode("ascii"))
+            sys.stdout.buffer.write(encoded)
+            sys.stdout.buffer.flush()
+        else:
+            print(raw, flush=True)
 
 
 def _model_from_transcript_entry(entry: dict[str, Any]) -> str | None:

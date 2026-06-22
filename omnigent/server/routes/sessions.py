@@ -597,6 +597,10 @@ _HARNESS_ELICITATION_REPARK_GRACE_S = 10.0
 # Client-supplied re-attach ids, namespaced so they cannot collide
 # with Codex deterministic ids or server-minted ids.
 _CLAUDE_HOOK_ELICITATION_ID_RE = re.compile(r"^elicit_claude_[0-9a-f]{32}$")
+# Stable re-attach id for ``POST /policies/evaluate`` retries. Allows the
+# server to re-park the existing ASK elicitation rather than minting a new
+# approval card when a transient 5xx or connect-drop triggered a retry.
+_EVALUATE_HOOK_ELICITATION_ID_RE = re.compile(r"^elicit_evaluate_[0-9a-f]{32}$")
 
 # Cap on reaping a cancelled disconnect/terminal-resolved race task in
 # the harness-elicitation gate's cleanup. Reaping normally completes in
@@ -3644,6 +3648,7 @@ async def _hold_native_ask_gate(
     engine: PolicyEngine,
     result: PolicyResult,
     conversation_store: ConversationStore,
+    elicitation_id: str | None = None,
 ) -> bool:
     """
     Hold a server-side ASK gate until a human resolves it.
@@ -3686,6 +3691,13 @@ async def _hold_native_ask_gate(
         the reason, deciding_policy, and withheld set_labels.
     :param conversation_store: Store used to mirror child-session
         prompts into ancestor streams.
+    :param elicitation_id: Optional stable re-attach id from the
+        calling hook, e.g. ``"elicit_evaluate_abc123"``. When supplied,
+        ``_publish_and_wait_for_harness_elicitation`` re-attaches to the
+        existing parked elicitation rather than publishing a new card —
+        used by ``POST /policies/evaluate`` retries so a hook retry after
+        a transient 5xx / connect-drop does not prompt the human twice.
+        ``None`` mints a fresh id (the default for non-retry callers).
     :returns: ``True`` iff a human accepted; ``False`` on decline /
         cancel / timeout / disconnect (fail closed).
     """
@@ -3701,11 +3713,11 @@ async def _hold_native_ask_gate(
     )
     # Per-policy ``ask_timeout`` override wins over the spec-level default.
     timeout_s = float(resolve_ask_timeout(engine, result))
-    # Mint the id up front so we can also surface this ASK in the native
-    # terminal (a tmux popup) before parking on the web verdict; both
-    # surfaces resolve the same id, so whichever answers first releases the
-    # gate.
-    elicitation_id = f"elicit_{secrets.token_hex(16)}"
+    # Use the caller-supplied id when present (hook retries re-attach to
+    # the same elicitation); otherwise mint a fresh one so we can surface
+    # this ASK in the native terminal before parking on the web verdict.
+    if elicitation_id is None:
+        elicitation_id = f"elicit_{secrets.token_hex(16)}"
     _spawn_native_approval_popup_forward(
         session_id, elicitation_id, params.message, result.deciding_policy
     )
@@ -14254,6 +14266,20 @@ def create_sessions_router(
                 f"Expected one of {list(_PROTO_EVENT_TYPE_TO_PHASE)}.",
                 code=ErrorCode.INVALID_INPUT,
             )
+        # Optional stable re-attach id for hook retries. Validated but not
+        # required — absent on non-retrying callers (old hooks, direct API use).
+        raw_elicitation_id = payload.get("_omnigent_elicitation_id")
+        hook_elicitation_id: str | None = None
+        if raw_elicitation_id is not None:
+            if not isinstance(raw_elicitation_id, str) or not (
+                _EVALUATE_HOOK_ELICITATION_ID_RE.fullmatch(raw_elicitation_id)
+            ):
+                raise OmnigentError(
+                    "Policy evaluate '_omnigent_elicitation_id' must match "
+                    "'elicit_evaluate_' + 32 hex chars.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            hook_elicitation_id = raw_elicitation_id
         data = event.get("data") or {}
 
         conv = conversation_store.get_conversation(session_id)
@@ -14369,6 +14395,7 @@ def create_sessions_router(
                             engine=engine,
                             result=result,
                             conversation_store=conversation_store,
+                            elicitation_id=hook_elicitation_id,
                         )
                         verdict_body: dict[str, Any] = (
                             {"result": "POLICY_ACTION_ALLOW"}

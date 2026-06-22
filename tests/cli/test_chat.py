@@ -3253,6 +3253,8 @@ class _FakeAPClient:
 
 def _fake_sessions_chat_cls(
     query_impl: Callable[[str], object],
+    *,
+    extra_turns: list[str] | None = None,
 ) -> type:
     """
     Build a ``SessionsChat`` replacement whose ``query`` is ``query_impl``.
@@ -3265,15 +3267,38 @@ def _fake_sessions_chat_cls(
     :param query_impl: Async callable taking the prompt and returning a
         :class:`QueryResult` or raising, e.g. one that raises
         ``OmnigentError("turn failed")``.
+    :param extra_turns: Optional list of text strings to return from
+        successive ``await_turn()`` calls, simulating async orchestrator
+        auto-wakes. When exhausted ``await_turn`` returns empty text and
+        ``status`` returns ``"idle"``.
     :returns: A class usable as a drop-in for ``SessionsChat``.
     """
+    _extra = list(extra_turns or [])
 
     class _FakeSessionsChat:
         def __init__(self, **_kwargs: object) -> None:
-            pass
+            self._status = "waiting" if _extra else "idle"
+            self._pending = list(_extra)
+
+        @property
+        def status(self) -> str:
+            return self._status
+
+        async def refresh(self) -> None:
+            # After await_turn drains a turn, mark idle when nothing left.
+            if not self._pending:
+                self._status = "idle"
 
         async def query(self, prompt: str) -> object:
             return await query_impl(prompt)
+
+        async def await_turn(self, *, timeout: float | None = None) -> QueryResult:
+            if self._pending:
+                text = self._pending.pop(0)
+                if not self._pending:
+                    self._status = "idle"
+                return QueryResult(text=text, files=[])
+            return QueryResult(text="", files=[])
 
     return _FakeSessionsChat
 
@@ -3413,6 +3438,42 @@ async def test_query_sessions_once_returns_text_without_reconcile_on_success(
     result = await _run_one_shot(client, _return_text, monkeypatch)
     assert result == "direct answer"
     assert client.sessions.list_items_calls == 0  # no reconcile on success
+
+
+async def test_query_sessions_once_multi_turn_async_orchestrator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Extra auto-woken turns are collected and joined with the first turn's text.
+
+    Simulates an async orchestrator (e.g. polly) that dispatches sub-agents
+    in turn 1, then is auto-woken for turn 2 when they complete. The headless
+    ``-p`` path must not exit after turn 1 — it must follow the session until
+    idle and concatenate all turns.
+
+    If this fails, multi-turn orchestrators like polly will always produce
+    partial output (only turn 1's narration, never the final synthesis).
+    """
+    monkeypatch.setattr(
+        "omnigent_client.SessionsChat",
+        _fake_sessions_chat_cls(
+            _return_text,
+            extra_turns=["<!-- POLLY_REVIEW_START -->\n## Summary\nLooks good."],
+        ),
+    )
+    client = _FakeAPClient([], list_items_must_not_be_called=True)
+    result = await _query_sessions_once(
+        client=client,
+        agent_name="polly",
+        tool_handler=None,
+        prompt="review this PR",
+        session_bundle=b"bundle-bytes",
+        session_bundle_filename="agent.tar.gz",
+        runner_id="runner_test",
+    )
+    assert result is not None
+    assert "direct answer" in result
+    assert "<!-- POLLY_REVIEW_START -->" in result
+    assert "Looks good." in result
 
 
 async def test_persisted_turn_text_anchors_on_last_user_message() -> None:

@@ -411,14 +411,12 @@ def test_fork_with_agent_switch_carries_history(
             [{"text": "OK"}],
             key=source_model,
         )
-        # The claude-sdk harness replays the forked transcript as context
-        # when binding the switched fork, which sends an initial
-        # /v1/messages request before the user's recall turn. Queue two
-        # responses: a throwaway for the replay and the codeword for the
-        # actual recall.
+        # The fork+switch passes the copied transcript as context to the
+        # first real LLM call (the recall turn itself) — no separate
+        # replay request is made. Queue only the codeword for the recall.
         configure_mock_llm(
             mock_llm_server_url,
-            [{"text": "OK"}, {"text": _CODEWORD_1}],
+            [{"text": _CODEWORD_1}],
             key=target_model,
         )
     else:

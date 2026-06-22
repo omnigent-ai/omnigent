@@ -8,14 +8,25 @@ not here, so these need no tmux or cursor-agent.
 
 from __future__ import annotations
 
+import json
+import subprocess
 from pathlib import Path
+
+import pytest
 
 from omnigent.cursor_native_bridge import (
     BRIDGE_DIR_ENV_VAR,
     _paste_payload_bytes,
+    allow_mcp_tools_in_cli_config,
+    approve_mcp_server_for_workspace,
     bridge_dir_for_session_id,
     build_cursor_native_spawn_env,
+    build_mcp_config,
+    cursor_project_key,
+    enable_mcp_for_workspace,
     read_tmux_info,
+    write_mcp_bridge_config,
+    write_mcp_config,
     write_tmux_target,
 )
 from omnigent.inner.cursor_native_executor import (
@@ -109,6 +120,110 @@ class TestBridge:
 
     def test_read_tmux_info_missing(self, tmp_path: Path) -> None:
         assert read_tmux_info(tmp_path) is None
+
+    def test_build_mcp_config_registers_omnigent_relay(self, tmp_path: Path) -> None:
+        config = build_mcp_config(tmp_path, python_executable="python-test")
+        server = config["mcpServers"]["omnigent"]
+        assert server["command"] == "python-test"
+        assert server["args"] == [
+            "-I",
+            "-m",
+            "omnigent.claude_native_bridge",
+            "serve-mcp",
+            "--bridge-dir",
+            str(tmp_path),
+        ]
+        assert "sys_session_send" in server["autoApprove"]
+        assert "sys_os_shell" in server["autoApprove"]
+        assert server["autoApprove"] == sorted(server["autoApprove"])
+        assert server["env"]["TMPDIR"]
+
+    def test_write_mcp_config_is_workspace_scoped(self, tmp_path: Path, monkeypatch) -> None:
+        workspace = tmp_path / "workspace"
+        bridge_dir = tmp_path / "bridge"
+        monkeypatch.setattr(
+            "omnigent.cursor_native_bridge.approve_mcp_server_for_workspace",
+            lambda _workspace: pytest.fail("approval must happen after tool relay starts"),
+        )
+        path = write_mcp_config(workspace, bridge_dir, python_executable="python-test")
+
+        assert path == workspace / ".cursor" / "mcp.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["mcpServers"]["omnigent"]["command"] == "python-test"
+        assert json.loads((bridge_dir / "bridge.json").read_text(encoding="utf-8"))["token"]
+
+    def test_write_mcp_bridge_config_is_idempotent(self, tmp_path: Path) -> None:
+        write_mcp_bridge_config(tmp_path)
+        first = (tmp_path / "bridge.json").read_text(encoding="utf-8")
+        write_mcp_bridge_config(tmp_path)
+        assert (tmp_path / "bridge.json").read_text(encoding="utf-8") == first
+
+    def test_cursor_project_key_matches_cursor_workspace_state(self) -> None:
+        assert cursor_project_key(Path("/Users/corey.zumar")) == "Users-corey.zumar"
+
+    def test_enable_mcp_for_workspace_removes_disabled_entry(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        disabled_path = (
+            tmp_path / ".cursor" / "projects" / "Users-corey.zumar" / "mcp-disabled.json"
+        )
+        disabled_path.parent.mkdir(parents=True)
+        disabled_path.write_text('["omnigent", "other"]\n', encoding="utf-8")
+
+        enable_mcp_for_workspace(Path("/Users/corey.zumar"))
+
+        assert json.loads(disabled_path.read_text(encoding="utf-8")) == ["other"]
+
+    def test_allow_mcp_tools_in_cli_config_adds_specific_allow_rules(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        config_path = tmp_path / ".cursor" / "cli-config.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(
+            '{"permissions": {"allow": ["Shell(ls)", "Mcp(omnigent:sys_os_read)"]}}\n',
+            encoding="utf-8",
+        )
+
+        allow_mcp_tools_in_cli_config()
+
+        allow = json.loads(config_path.read_text(encoding="utf-8"))["permissions"]["allow"]
+        assert "Shell(ls)" in allow
+        assert allow.count("Mcp(omnigent:sys_os_read)") == 1
+        assert "Mcp(omnigent:sys_session_send)" in allow
+
+    def test_approve_mcp_server_for_workspace_uses_cursor_cli(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        calls: list[dict[str, object]] = []
+
+        monkeypatch.setattr(
+            "omnigent.cursor_native.resolve_cursor_executable",
+            lambda: "/bin/cursor-agent-test",
+        )
+
+        def fake_run(*args, **kwargs):
+            calls.append({"args": args, "kwargs": kwargs})
+            return subprocess.CompletedProcess(args[0], 0)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        approve_mcp_server_for_workspace(tmp_path)
+
+        assert calls == [
+            {
+                "args": (["/bin/cursor-agent-test", "mcp", "enable", "omnigent"],),
+                "kwargs": {
+                    "cwd": tmp_path,
+                    "stdin": subprocess.DEVNULL,
+                    "stdout": subprocess.DEVNULL,
+                    "stderr": subprocess.DEVNULL,
+                    "timeout": 15,
+                    "check": False,
+                },
+            }
+        ]
 
 
 class TestRegistration:
