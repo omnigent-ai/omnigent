@@ -8,6 +8,8 @@ handling, mocked via ``respx``), and the selector wiring (no
 
 from __future__ import annotations
 
+import pathlib
+
 import httpx
 import pytest
 import respx
@@ -19,6 +21,13 @@ from omnigent.tools.builtins.web_search_duckduckgo import (
     _format_results,
     _parse_results,
     _search_duckduckgo,
+)
+
+# A real captured html.duckduckgo.com/html/ body (query "wikipedia",
+# captured 2026-06). Re-capture with tests/tools/fixtures/refresh_ddg_fixture.py
+# when the live drift canary (tests/e2e_live/) goes red.
+_DDG_GOLDEN = (pathlib.Path(__file__).parent / "fixtures" / "ddg_html_2026-06.html").read_text(
+    encoding="utf-8"
 )
 
 # A realistic slice of html.duckduckgo.com/html/: two organic results
@@ -268,3 +277,97 @@ def test_decode_result_href_preserves_encoded_ampersand_in_target() -> None:
     target survives."""
     href = "//duckduckgo.com/l/?uddg=https%3A%2F%2Fa.com%2Fx%26y%3D1&amp;rut=z"
     assert _decode_result_href(href) == "https://a.com/x&y=1"
+
+
+# Verbatim slice of a LIVE html.duckduckgo.com/html/ response (captured
+# 2026-06). Note the current markup drift the parser must tolerate:
+#   * href is now a DIRECT url, NOT the //duckduckgo.com/l/?uddg= redirect
+#   * result__a carries rel="nofollow"
+#   * snippets embed <b>...</b> highlight tags
+_LIVE_DIRECT_HTML = (
+    '<div class="result results_links results_links_deep web-result">'
+    '<a rel="nofollow" class="result__a" href="https://claude.ai/">'
+    "Sign in - Claude</a>"
+    '<a class="result__snippet" href="https://claude.ai/">'
+    "<b>Claude</b> is an AI assistant by <b>Anthropic</b>, "
+    "designed to assist with creative tasks.</a>"
+    "</div>"
+)
+
+
+def test_parse_results_live_direct_url_markup() -> None:
+    """Parse the shape DDG actually serves today (verified live): a direct
+    ``href`` (no ``/l/?uddg=`` redirect), ``rel="nofollow"`` on ``result__a``,
+    and ``<b>`` highlight tags inside the snippet. The parser passes the direct
+    URL through, ignores ``rel``, and strips the bold tags to plain text.
+
+    This is the regression guard for the exact markup drift the reviewer flagged
+    as fragile — it already happened, and the backend handles it."""
+    results = _parse_results(_LIVE_DIRECT_HTML)
+    assert len(results) == 1
+    assert results[0]["url"] == "https://claude.ai/"
+    assert results[0]["title"] == "Sign in - Claude"
+    assert "<b>" not in results[0]["snippet"]
+    assert results[0]["snippet"] == (
+        "Claude is an AI assistant by Anthropic, designed to assist with creative tasks."
+    )
+
+
+def test_parse_results_returns_partial_when_parser_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the underlying HTMLParser ever raises mid-stream, ``_parse_results``
+    must not propagate it — it returns whatever was parsed before the fault.
+    (``html.parser`` is tolerant enough that no real input triggers this, so we
+    inject the failure to prove the H2 guard.)"""
+    import omnigent.tools.builtins.web_search_duckduckgo as ddg
+
+    def _boom(self: ddg._ResultParser, data: str) -> None:
+        self.results.append({"title": "Partial", "url": "https://a.com", "snippet": "s"})
+        raise RuntimeError("parser blew up mid-stream")
+
+    monkeypatch.setattr(ddg._ResultParser, "feed", _boom)
+    out = ddg._parse_results("<anything>")  # must not raise
+    assert out == [{"title": "Partial", "url": "https://a.com", "snippet": "s"}]
+
+
+# ── recorded real-response fixture: parse a genuine captured DDG page offline ──
+
+
+def test_parse_real_captured_ddg_page_structure() -> None:
+    """Parse a REAL captured html.duckduckgo.com/html/ body (captured 2026-06).
+    Asserts structure, not upstream content, so it can't flake on result churn
+    — but it WILL catch a markup change that the inline fixtures don't model."""
+    results = _parse_results(_DDG_GOLDEN)
+    assert len(results) >= 5, f"expected several organic results, got {len(results)}"
+    for r in results:
+        assert r["title"], r  # non-empty title
+        assert r["url"].startswith(("http://", "https://")), r["url"]
+        assert "duckduckgo.com/l/" not in r["url"], r["url"]  # redirect fully decoded
+        assert "/y.js" not in r["url"], r["url"]  # no ad / JS link leaked
+        assert "<b>" not in r["snippet"], r["snippet"]  # highlight tags stripped
+
+
+@respx.mock
+def test_search_duckduckgo_over_real_captured_page() -> None:
+    """The full HTTP path renders the real captured body to numbered blocks."""
+    respx.post(_DDG_HTML_URL).mock(return_value=httpx.Response(200, text=_DDG_GOLDEN))
+    out = _search_duckduckgo("wikipedia", {})
+    assert out.startswith("1. ")
+    assert out != "No results found."
+
+
+def test_parse_results_snippet_in_non_anchor_tag() -> None:
+    """Drift guard (parser hardening): the snippet is captured by CSS class even
+    when DDG moves it out of an ``<a>`` into a ``<div>`` (with nested children),
+    and capture ends only when that ``<div>`` closes — not an inner one."""
+    html = (
+        '<a class="result__a" href="https://example.com/p">Title</a>'
+        '<div class="result__snippet">A snippet '
+        "<div>with a nested wrapper</div> and a tail.</div>"
+    )
+    results = _parse_results(html)
+    assert len(results) == 1
+    assert results[0]["url"] == "https://example.com/p"
+    assert results[0]["title"] == "Title"
+    assert results[0]["snippet"] == "A snippet with a nested wrapper and a tail."
