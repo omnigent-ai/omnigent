@@ -1568,59 +1568,60 @@ function BulkActionBar({
           >
             Clear
           </Button>
-          {count > 0 && (
-            <div className="flex items-center gap-1.5 md:hidden">
-              {allSelectedSameArchiveGroup && nonArchivedSelected.length > 0 && (
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  className="h-7 gap-1.5 text-xs"
-                  disabled={isBusy}
-                  onClick={handleArchive}
-                >
-                  {bulkArchive.isPending ? (
-                    <Loader2Icon className="size-3 animate-spin" />
-                  ) : (
-                    <ArchiveIcon className="size-3" />
-                  )}
-                  Archive
-                </Button>
-              )}
-              {allSelectedSameArchiveGroup && archivedSelected.length > 0 && (
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  className="h-7 gap-1.5 text-xs"
-                  disabled={isBusy}
-                  onClick={handleUnarchive}
-                >
-                  {bulkArchive.isPending ? (
-                    <Loader2Icon className="size-3 animate-spin" />
-                  ) : (
-                    <ArchiveRestoreIcon className="size-3" />
-                  )}
-                  Unarchive
-                </Button>
-              )}
+          <div className="flex items-center gap-1.5 md:hidden">
+            {allSelectedSameArchiveGroup && nonArchivedSelected.length > 0 && (
               <Button
                 type="button"
                 variant="outline"
                 size="sm"
-                className="h-7 gap-1.5 text-xs text-destructive"
-                disabled={isBusy || ownedSelected.length === 0}
-                onClick={() => setConfirmDeleteOpen(true)}
+                className="h-7 gap-1.5 text-xs"
+                disabled={isBusy}
+                onClick={handleArchive}
               >
-                {bulkDelete.isPending ? (
+                {bulkArchive.isPending ? (
                   <Loader2Icon className="size-3 animate-spin" />
                 ) : (
-                  <Trash2Icon className="size-3" />
+                  <ArchiveIcon className="size-3" />
                 )}
-                Delete {ownedSelected.length > 0 ? ownedSelected.length : ""}
+                Archive
               </Button>
-            </div>
-          )}
+            )}
+            {allSelectedSameArchiveGroup && archivedSelected.length > 0 && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-7 gap-1.5 text-xs"
+                disabled={isBusy}
+                onClick={handleUnarchive}
+              >
+                {bulkArchive.isPending ? (
+                  <Loader2Icon className="size-3 animate-spin" />
+                ) : (
+                  <ArchiveRestoreIcon className="size-3" />
+                )}
+                Unarchive
+              </Button>
+            )}
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className={cn(
+                "h-7 gap-1.5 text-xs",
+                ownedSelected.length > 0 && "text-destructive",
+              )}
+              disabled={isBusy || ownedSelected.length === 0}
+              onClick={() => setConfirmDeleteOpen(true)}
+            >
+              {bulkDelete.isPending ? (
+                <Loader2Icon className="size-3 animate-spin" />
+              ) : (
+                <Trash2Icon className="size-3" />
+              )}
+              Delete {ownedSelected.length > 0 ? ownedSelected.length : ""}
+            </Button>
+          </div>
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
@@ -1639,62 +1640,63 @@ function BulkActionBar({
           </Tooltip>
         </div>
 
-        {count > 0 && (
-          <div className="hidden items-center gap-1.5 px-2 md:flex">
-            {allSelectedSameArchiveGroup && nonArchivedSelected.length > 0 && (
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                className="h-7 gap-1.5 text-xs"
-                disabled={isBusy}
-                onClick={handleArchive}
-                data-testid="bulk-archive"
-              >
-                {bulkArchive.isPending ? (
-                  <Loader2Icon className="size-3 animate-spin" />
-                ) : (
-                  <ArchiveIcon className="size-3" />
-                )}
-                Archive
-              </Button>
-            )}
-            {allSelectedSameArchiveGroup && archivedSelected.length > 0 && (
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                className="h-7 gap-1.5 text-xs"
-                disabled={isBusy}
-                onClick={handleUnarchive}
-                data-testid="bulk-unarchive"
-              >
-                {bulkArchive.isPending ? (
-                  <Loader2Icon className="size-3 animate-spin" />
-                ) : (
-                  <ArchiveRestoreIcon className="size-3" />
-                )}
-                Unarchive
-              </Button>
-            )}
+        <div className="hidden items-center gap-1.5 px-2 md:flex">
+          {allSelectedSameArchiveGroup && nonArchivedSelected.length > 0 && (
             <Button
               type="button"
               variant="outline"
               size="sm"
-              className="h-7 gap-1.5 text-xs text-destructive"
-              disabled={isBusy || ownedSelected.length === 0}
-              onClick={() => setConfirmDeleteOpen(true)}
-              data-testid="bulk-delete"
+              className="h-7 gap-1.5 text-xs"
+              disabled={isBusy}
+              onClick={handleArchive}
+              data-testid="bulk-archive"
             >
-              {bulkDelete.isPending ? (
+              {bulkArchive.isPending ? (
                 <Loader2Icon className="size-3 animate-spin" />
               ) : (
-                <Trash2Icon className="size-3" />
+                <ArchiveIcon className="size-3" />
               )}
-              Delete {ownedSelected.length > 0 ? ownedSelected.length : ""}
+              Archive
             </Button>
-          </div>
-        )}
+          )}
+          {allSelectedSameArchiveGroup && archivedSelected.length > 0 && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-7 gap-1.5 text-xs"
+              disabled={isBusy}
+              onClick={handleUnarchive}
+              data-testid="bulk-unarchive"
+            >
+              {bulkArchive.isPending ? (
+                <Loader2Icon className="size-3 animate-spin" />
+              ) : (
+                <ArchiveRestoreIcon className="size-3" />
+              )}
+              Unarchive
+            </Button>
+          )}
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className={cn(
+              "h-7 gap-1.5 text-xs",
+              ownedSelected.length > 0 && "text-destructive",
+            )}
+            disabled={isBusy || ownedSelected.length === 0}
+            onClick={() => setConfirmDeleteOpen(true)}
+            data-testid="bulk-delete"
+          >
+            {bulkDelete.isPending ? (
+              <Loader2Icon className="size-3 animate-spin" />
+            ) : (
+              <Trash2Icon className="size-3" />
+            )}
+            Delete {ownedSelected.length > 0 ? ownedSelected.length : ""}
+          </Button>
+        </div>
 
         {(bulkArchive.isError || bulkDelete.isError) && (
           <p className="text-xs text-destructive" role="alert">
