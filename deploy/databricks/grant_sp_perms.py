@@ -27,6 +27,78 @@ from __future__ import annotations
 
 import argparse
 import sys
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from databricks.sdk.service import database as db
+
+
+def _upgrade_role_to_superuser(
+    database: db.DatabaseAPI,
+    instance_name: str,
+    name: str,
+    desired_role: db.DatabaseInstanceRole,
+) -> None:
+    """Crash-safe upgrade of an existing role to DATABRICKS_SUPERUSER.
+
+    The Lakebase role API (databricks-sdk 0.115.0) exposes only
+    create/delete/get/list — there is no update/alter/patch verb (verified
+    against ``DatabaseAPI``), so the only way to change ``membership_role`` is
+    delete + recreate. A naive delete-then-create leaves the role permanently
+    gone if the recreate fails for any reason, breaking DB auth until manual
+    repair.
+
+    This makes the operation recoverable: it captures the existing role's full
+    config first, deletes, then attempts the recreate inside a try/except. On
+    ANY failure of the recreate it best-effort restores the original role from
+    the captured config and re-raises with a clear error. Invariant: the role
+    is never left deleted-and-not-recreated on a failure path.
+    """
+    # Capture the existing role's full config BEFORE any destructive action so
+    # we can restore it verbatim if the recreate fails.
+    captured = database.get_database_instance_role(instance_name=instance_name, name=name)
+    if captured.membership_role == desired_role.membership_role:
+        print("Role already has DATABRICKS_SUPERUSER — nothing to do.", flush=True)
+        return
+
+    print(
+        f"Upgrading role {name!r} to DATABRICKS_SUPERUSER (delete + recreate with membership).",
+        flush=True,
+    )
+    database.delete_database_instance_role(
+        instance_name=instance_name, name=name, allow_missing=True
+    )
+    try:
+        database.create_database_instance_role(
+            instance_name=instance_name, database_instance_role=desired_role
+        )
+    except Exception as exc:
+        # The role is now deleted but not recreated — an irrecoverable state for
+        # DB auth. Best-effort restore the original role from the captured
+        # config, then re-raise so the operator knows the upgrade failed.
+        print(
+            f"Recreate of role {name!r} failed ({exc!r}); "
+            "restoring the original role from captured config.",
+            file=sys.stderr,
+            flush=True,
+        )
+        try:
+            database.create_database_instance_role(
+                instance_name=instance_name, database_instance_role=captured
+            )
+        except Exception as restore_exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"Failed to upgrade role {name!r} to DATABRICKS_SUPERUSER AND "
+                f"failed to restore the original role ({restore_exc!r}). The "
+                "role is now MISSING on the instance — recreate it manually to "
+                "restore DB auth."
+            ) from exc
+        raise RuntimeError(
+            f"Failed to upgrade role {name!r} to DATABRICKS_SUPERUSER "
+            f"({exc!r}); the original role was restored, so DB auth is intact "
+            "but the role was NOT elevated. Re-run once the cause is resolved."
+        ) from exc
+    print("Role upgraded to DATABRICKS_SUPERUSER.", flush=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -94,30 +166,19 @@ def main(argv: list[str] | None = None) -> int:
     # has the DATABRICKS_SUPERUSER membership — otherwise a role created earlier
     # without it would silently stay un-upgraded and first-boot migrations would
     # fail. The role API has no update verb, so the equivalent of
-    # ``ALTER ROLE ... WITH SUPERUSER`` is delete + recreate with the membership.
+    # ``ALTER ROLE ... WITH SUPERUSER`` is delete + recreate with the membership,
+    # done crash-safely (capture + rollback) so a failed recreate can't leave
+    # the role permanently missing.
     if not args.superuser:
         print("Nothing to do (no --superuser requested).", flush=True)
         return 0
 
-    existing = workspace_client.database.get_database_instance_role(
-        instance_name=args.instance, name=sp_client_id
+    _upgrade_role_to_superuser(
+        workspace_client.database,
+        instance_name=args.instance,
+        name=sp_client_id,
+        desired_role=role,
     )
-    if existing.membership_role == role.membership_role:
-        print("Role already has DATABRICKS_SUPERUSER — nothing to do.", flush=True)
-        return 0
-
-    print(
-        f"Upgrading role {sp_client_id!r} to DATABRICKS_SUPERUSER "
-        "(delete + recreate with membership).",
-        flush=True,
-    )
-    workspace_client.database.delete_database_instance_role(
-        instance_name=args.instance, name=sp_client_id, allow_missing=True
-    )
-    workspace_client.database.create_database_instance_role(
-        instance_name=args.instance, database_instance_role=role
-    )
-    print("Role upgraded to DATABRICKS_SUPERUSER.", flush=True)
     return 0
 
 
