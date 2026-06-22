@@ -2258,39 +2258,52 @@ async def _query_sessions_once(
     # sub-agents and are auto-woken by inbox completions across multiple
     # turns.
     #
-    # Fast-exit signal: ``chat.last_turn_saw_waiting`` is set by
-    # ``_collect_query`` / ``await_turn`` when a ``session.status: waiting``
-    # SSE event is observed during that turn. The event is emitted by the
-    # runtime when the agent parks on the async-work drain (i.e. it
-    # dispatched sub-agents and ended its turn to wait for inbox
-    # completions). Single-turn agents never emit this event, so their
-    # flag is always ``False`` and they fast-exit in ~100 ms.
+    # Why not _collect_query for the fast-exit signal: the runtime emits
+    # ``session.status: waiting`` AFTER ``response.completed`` (the runner
+    # finishes dispatching tools, then enters the async drain). _collect_query
+    # exits at CompletedEvent and never sees the subsequent "waiting".
     #
-    # Why not refresh() for the fast-exit check: the snapshot API collapses
-    # the fine-grained ``"waiting"`` relay status to ``"idle"`` after the
-    # turn loop exits, even when sub-agents are still running. The SSE event
-    # observed during the turn is the authoritative signal.
+    # Why not refresh() for the fast-exit signal: the snapshot API collapses
+    # the ``"waiting"`` relay status to ``"idle"`` once the turn loop exits,
+    # even while sub-agents are still running.
     #
-    # Per-turn timeout: sub-agents dispatched by an async orchestrator can
-    # take many minutes. _ASYNC_TURN_TIMEOUT_S gives each inbox auto-wake
-    # turn room to arrive; the global _LOOP_TIMEOUT_S caps the total run.
+    # Probe approach: subscribe to the live stream for a short window after
+    # the first turn. The "waiting" event arrives O(ms–s) after CompletedEvent
+    # (runner dispatches tools, spawns sub-agents, then parks). The probe
+    # catches it before sub-agents have a chance to complete.
+    #
+    # ``await_turn`` resets ``last_turn_saw_waiting`` to False on
+    # ``session.status: running`` (synthesis starting), so the flag cleanly
+    # reflects only the most recent dispatch state after each call.
+    #
+    # Single-turn agents: no "waiting" event ever → probe times out in
+    # _STATUS_PROBE_TIMEOUT_S (~30 s) and the loop exits.
     _MAX_EXTRA_TURNS = 30
-    _ASYNC_TURN_TIMEOUT_S = 900.0  # 15 min per inbox-wake turn
+    _STATUS_PROBE_TIMEOUT_S = 30.0  # probe window to catch session.status:waiting
+    _PER_TURN_TIMEOUT_S = 120.0  # race-window guard for subsequent turns
     _LOOP_TIMEOUT_S = 1800.0  # 30 min total
 
     async def _drain_extra_turns() -> None:
+        # Probe: subscribe to catch the session.status:waiting event emitted
+        # after the first turn's CompletedEvent. If no dispatch happened (single-
+        # turn agent), the probe times out and we exit. If the synthesis also
+        # completes within the probe window, its text is collected here too.
+        probe = await chat.await_turn(timeout=_STATUS_PROBE_TIMEOUT_S)
+        if probe.text:
+            all_text_parts.append(probe.text)
+        if not chat.last_turn_saw_waiting:
+            return  # No pending dispatch: single-turn agent or synthesis caught.
+        # Async orchestrator confirmed. Loop until synthesis text arrives.
+        # Each await_turn resets last_turn_saw_waiting on "running" (synthesis
+        # start), so the flag is False after a clean synthesis and True only
+        # if the synthesizer itself dispatched more sub-agents.
         for _ in range(_MAX_EXTRA_TURNS):
-            # Fast-exit: if the previous turn never parked on the async
-            # drain, there are no pending sub-agents that could auto-wake
-            # this session. Single-turn agents always exit here.
-            if not chat.last_turn_saw_waiting:
-                return
-            # Previous turn dispatched sub-agents; wait for the inbox
-            # auto-wake that triggers the synthesis turn. Use a generous
-            # timeout because sub-agents may run for several minutes.
-            extra = await chat.await_turn(timeout=_ASYNC_TURN_TIMEOUT_S)
+            extra = await chat.await_turn(timeout=_PER_TURN_TIMEOUT_S)
             if extra.text:
                 all_text_parts.append(extra.text)
+            if not chat.last_turn_saw_waiting:
+                return  # Synthesis done, no further dispatch.
+            # Timed out (race window) or new dispatch: continue.
         logger.warning(
             "headless -p hit the %d-turn guard for session %s; "
             "the orchestrator may still be running",

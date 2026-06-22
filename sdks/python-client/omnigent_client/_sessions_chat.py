@@ -1128,8 +1128,15 @@ class SessionsChat:
                     if not text_parts:
                         text_parts.extend(_assistant_text_from_response(event.response.output))
                     break
-                elif isinstance(event, SessionStatusEvent) and event.status == "waiting":
-                    self._last_turn_saw_waiting = True
+                elif isinstance(event, SessionStatusEvent):
+                    if event.status == "waiting":
+                        # Agent parked on inbox drain — sub-agents dispatched.
+                        self._last_turn_saw_waiting = True
+                    elif event.status == "running":
+                        # New turn started (e.g. inbox auto-wake for synthesis).
+                        # Reset: the dispatch wait is over; if the synthesis
+                        # itself dispatches, it will set the flag again.
+                        self._last_turn_saw_waiting = False
                 elif isinstance(event, _TURN_TERMINAL_EVENT_TYPES):
                     break
 

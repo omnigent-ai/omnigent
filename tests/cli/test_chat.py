@@ -3278,10 +3278,13 @@ def _fake_sessions_chat_cls(
     class _FakeSessionsChat:
         def __init__(self, **_kwargs: object) -> None:
             self._pending = list(_extra)
-            # Mirrors the real SessionsChat flag: set after query() when
-            # extra_turns are pending (simulating an async orchestrator that
-            # dispatched sub-agents), then updated by await_turn().
-            self._last_turn_saw_waiting: bool = bool(_extra)
+            self._last_turn_saw_waiting: bool = False
+            # The first await_turn call is the probe. It returns empty text
+            # and sets last_turn_saw_waiting=True when sub-agents are pending
+            # (simulating the session.status:waiting event that arrives after
+            # the first turn's CompletedEvent). Subsequent calls return the
+            # synthesis text and reset the flag.
+            self._probe_done: bool = False
 
         @property
         def last_turn_saw_waiting(self) -> bool:
@@ -3292,10 +3295,17 @@ def _fake_sessions_chat_cls(
 
         async def await_turn(self, *, timeout: float | None = None) -> QueryResult:
             self._last_turn_saw_waiting = False
+            if not self._probe_done:
+                self._probe_done = True
+                # Probe: signal dispatch if sub-agents are pending, but return
+                # no text (they haven't completed yet).
+                if self._pending:
+                    self._last_turn_saw_waiting = True
+                return QueryResult(text="", files=[])
+            # Synthesis turns: pop and return text; signal further dispatch if
+            # more turns remain.
             if self._pending:
                 text = self._pending.pop(0)
-                # If more turns remain, the synthesized turn also dispatched
-                # sub-agents — signal that so the loop keeps going.
                 self._last_turn_saw_waiting = bool(self._pending)
                 return QueryResult(text=text, files=[])
             return QueryResult(text="", files=[])
