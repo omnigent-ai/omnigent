@@ -11,8 +11,23 @@ spec:
   policyTypes:
     - Egress
   egress:
-    # Allow the server pod to reach the OpenShell gateway over gRPC.
-    # Replace the port/CIDR with your gateway's actual endpoint.
+    # DNS — required for any name resolution (kube-dns / CoreDNS).
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Database — the base config connects via DATABASE_URL on port 5432.
+    # Tighten the CIDR to your database host or use a namespaceSelector
+    # if the database runs in-cluster.
+    - ports:
+        - protocol: TCP
+          port: 5432
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+    # OpenShell gateway gRPC — replace the CIDR with your gateway's
+    # actual endpoint to restrict egress to only that host.
     - ports:
         - protocol: TCP
           port: 443

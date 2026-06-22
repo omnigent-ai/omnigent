@@ -5,6 +5,7 @@ namespace: omnigent
 
 resources:
   - ../../base
+  - server-config.yaml
   - gateway-networkpolicy.yaml
   - sandbox-rbac.yaml
   - sandbox-clusterrole.yaml

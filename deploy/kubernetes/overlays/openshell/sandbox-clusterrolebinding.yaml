@@ -1,3 +1,9 @@
+# Bind the sandbox-manager ClusterRole to the OpenShell GATEWAY's
+# ServiceAccount — the gateway is the component that calls the
+# Kubernetes API to manage sandbox pods/CRDs, not the Omnigent server.
+#
+# Replace the subject below with your gateway's actual ServiceAccount
+# name and namespace.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
@@ -10,5 +16,5 @@ roleRef:
   name: openshell-sandbox-manager
 subjects:
   - kind: ServiceAccount
-    name: omnigent
-    namespace: omnigent
+    name: openshell-gateway
+    namespace: openshell-system

@@ -3,14 +3,8 @@ kind: ConfigMap
 metadata:
   name: omnigent-config
 data:
-  # --- sandbox provider ---------------------------------------------------
-  OMNIGENT_SANDBOX_PROVIDER: "openshell"
-  # Public URL that sandboxes dial back to (must be reachable from the
-  # sandbox network namespace — add it to OpenShell's egress policy).
-  OMNIGENT_SANDBOX_SERVER_URL: "https://omnigent.example.com"
-  # Gateway name resolved by the SDK's from_active_cluster(); leave empty
-  # to use the active gateway from ~/.config/openshell/active_gateway.
-  OPENSHELL_GATEWAY: ""
+  # Point the server at the sandbox config file mounted by the overlay.
+  OMNIGENT_CONFIG: "/data/server-config.yaml"
   # Env var names the host forwards to runner subprocesses — required so
   # the runner inherits the sandbox's proxy vars for egress.
   OMNIGENT_RUNNER_ENV_PASSTHROUGH: "https_proxy,http_proxy,HTTPS_PROXY,HTTP_PROXY,NO_PROXY,no_proxy"

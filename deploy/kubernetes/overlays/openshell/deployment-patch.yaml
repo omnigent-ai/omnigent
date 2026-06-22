@@ -9,16 +9,18 @@ spec:
       containers:
         - name: omnigent
           volumeMounts:
-            - name: artifacts
-              mountPath: /data/artifacts
             - name: openshell-gateway
               mountPath: /home/omnigent/.config/openshell
               readOnly: true
+            - name: server-config
+              mountPath: /data/server-config.yaml
+              subPath: config.yaml
+              readOnly: true
       volumes:
-        - name: artifacts
-          persistentVolumeClaim:
-            claimName: omnigent-artifacts
         - name: openshell-gateway
           secret:
             secretName: openshell-gateway-config
             optional: true
+        - name: server-config
+          configMap:
+            name: omnigent-server-config
