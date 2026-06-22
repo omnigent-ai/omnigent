@@ -41,9 +41,10 @@ repos:
         language: system
         entry: npm --prefix ap-web exec -- prettier --write
         files: ^ap-web/.*\.(css|html|js|jsx|json|md|mdx|ts|tsx|yaml|yml)$
-        # Exclude generated assets: web-ui build output and Apple Icon
-        # Composer `.icon` bundles (machine-formatted; prettier fights the tooling).
-        exclude: ^(omnigent/server/static/web-ui/assets/|ap-web/electron/icons/.*\.icon/)
+        # Exclude generated assets: web-ui build output, Xcode asset catalogs,
+        # and Apple Icon Composer `.icon` bundles (machine-formatted; prettier
+        # fights the tooling).
+        exclude: ^(omnigent/server/static/web-ui/assets/|ap-web/.*\.xcassets/|ap-web/.*\.icon/)
 
       # Local `uv` runs rewrite uv.lock's registry to whatever index is
       # configured on the developer's machine (e.g. the Databricks PyPI

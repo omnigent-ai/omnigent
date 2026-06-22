@@ -24,10 +24,12 @@
 // desktop width is set instantly but the timeout is harmless.
 
 import { TerminalIcon, XIcon } from "lucide-react";
+import type { CSSProperties } from "react";
 import { useEffect, useRef, useState } from "react";
 import { TerminalView } from "@/components/blocks/TerminalView";
 import { Button } from "@/components/ui/button";
 import { useResizablePanel } from "@/hooks/useResizablePanel";
+import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { terminalTabKey } from "@/hooks/useTerminals";
 import { cn } from "@/lib/utils";
 import { NewTerminalButton } from "./NewTerminalButton";
@@ -86,6 +88,14 @@ export function TerminalsPanel({
     columnHandleProps,
   } = useTerminalSplit(conversationId);
   const { panelWidth, handleProps, isDesktop } = useResizablePanel(open);
+  const keyboardInset = useIOSNativeKeyboardInset(open);
+  const panelStyle: CSSProperties | undefined =
+    fluid || keyboardInset > 0
+      ? {
+          ...(!fluid ? { width: panelWidth } : {}),
+          ...(keyboardInset > 0 ? { paddingBottom: keyboardInset } : {}),
+        }
+      : { width: panelWidth };
   const [prevOpen, setPrevOpen] = useState(open);
   if (open !== prevOpen) {
     setPrevOpen(open);
@@ -142,7 +152,7 @@ export function TerminalsPanel({
       data-state={open ? "open" : "closed"}
       data-expanded={expanded}
       data-fluid={fluid}
-      style={fluid ? undefined : { width: panelWidth }}
+      style={panelStyle}
       className={cn(
         "flex flex-col overflow-hidden bg-card transition-[translate,border-color,border-width] duration-150 ease-out",
         "fixed inset-0 z-50 shadow-lg",

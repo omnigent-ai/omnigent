@@ -58,6 +58,7 @@ import { parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { cn } from "@/lib/utils";
+import { isIOSShell, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -73,6 +74,7 @@ import { usePermissions } from "@/hooks/usePermissions";
 import type { CodexModelOption, SandboxStatus, Session, SessionStatus } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
+import { useIOSNativeKeyboardVisible } from "@/hooks/useIOSNativeKeyboardInset";
 import type { MessageContentBlock } from "@/lib/blocks";
 import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
@@ -1162,6 +1164,80 @@ export function shouldShowTerminalSurface(
   );
 }
 
+function useNativeServerSwitcherForMainSurface(surface: HTMLElement | null, active: boolean) {
+  useEffect(() => {
+    if (!isIOSShell()) return;
+    if (!active) {
+      setNativeServerSwitcherHidden(true);
+      return;
+    }
+
+    let frame = 0;
+    const sync = () => {
+      frame = 0;
+      setNativeServerSwitcherHidden(!isSurfaceFrontmost(surface));
+    };
+    const schedule = () => {
+      if (frame !== 0) cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(sync);
+    };
+
+    schedule();
+
+    const observer =
+      typeof MutationObserver !== "undefined" ? new MutationObserver(schedule) : null;
+    observer?.observe(document.body, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      attributeFilter: ["class", "style", "aria-hidden", "data-state", "data-collapsed", "open"],
+    });
+
+    window.addEventListener("resize", schedule);
+    window.addEventListener("orientationchange", schedule);
+    window.addEventListener("scroll", schedule, true);
+    window.addEventListener("transitionend", schedule, true);
+    window.addEventListener("animationend", schedule, true);
+    window.addEventListener("focusin", schedule, true);
+    window.addEventListener("focusout", schedule, true);
+    window.visualViewport?.addEventListener("resize", schedule);
+    window.visualViewport?.addEventListener("scroll", schedule);
+
+    return () => {
+      if (frame !== 0) cancelAnimationFrame(frame);
+      observer?.disconnect();
+      window.removeEventListener("resize", schedule);
+      window.removeEventListener("orientationchange", schedule);
+      window.removeEventListener("scroll", schedule, true);
+      window.removeEventListener("transitionend", schedule, true);
+      window.removeEventListener("animationend", schedule, true);
+      window.removeEventListener("focusin", schedule, true);
+      window.removeEventListener("focusout", schedule, true);
+      window.visualViewport?.removeEventListener("resize", schedule);
+      window.visualViewport?.removeEventListener("scroll", schedule);
+      setNativeServerSwitcherHidden(true);
+    };
+  }, [active, surface]);
+}
+
+function isSurfaceFrontmost(surface: HTMLElement | null): boolean {
+  if (!surface) return false;
+  const rect = surface.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return false;
+
+  const xInset = Math.min(24, Math.max(1, rect.width / 4));
+  const yInset = Math.min(24, Math.max(1, rect.height / 4));
+  const x = clamp(window.innerWidth / 2, rect.left + xInset, rect.right - xInset);
+  const y = clamp(rect.top + rect.height * 0.38, rect.top + yInset, rect.bottom - yInset);
+  const topElement = document.elementFromPoint(x, y);
+  return topElement !== null && surface.contains(topElement);
+}
+
+function clamp(value: number, min: number, max: number): number {
+  if (max < min) return min;
+  return Math.min(Math.max(value, min), max);
+}
+
 /**
  * The conversation scroll surface + composer — the content of the
  * "Main Agent" tab (and also the standalone view on `/`).
@@ -1272,6 +1348,11 @@ function MainAgentSurface({
     conversationRef.current = el;
     setContainerEl(el);
   }, []);
+  const [terminalSurfaceEl, setTerminalSurfaceEl] = useState<HTMLElement | null>(null);
+  useNativeServerSwitcherForMainSurface(
+    showTerminal ? terminalSurfaceEl : containerEl,
+    !!conversationId,
+  );
   // The conversation's scroll container + the StickToBottom controls needed to
   // override its bottom-lock, lifted out of the context by
   // ConversationScrollRefBridge so the pinned-but-unmasked JumpToTopButton can
@@ -1318,6 +1399,7 @@ function MainAgentSurface({
         <MainTerminalView
           conversationId={conversationId}
           initialTerminalKey={terminalFirst?.terminalViewKey}
+          onSurfaceElement={setTerminalSurfaceEl}
           // Non-owners attach read-only: a shared PTY can't attribute
           // input per-user, so only the owner may type. They drive the
           // agent via the composer instead. Server enforces this too.
@@ -1338,7 +1420,12 @@ function MainAgentSurface({
             ChatHeader overlay's controls (geometry in index.css). */}
         <Conversation className="chat-scroll-fade flex-1">
           {/* gap-4 overrides ConversationContent's default gap-8 so consecutive agent turns read as one thread. */}
-          <ConversationContent className={cn("mx-auto w-full gap-4 pt-20 pb-6", CHAT_COLUMN_WIDTH)}>
+          <ConversationContent
+            className={cn(
+              "chat-conversation-content mx-auto w-full gap-4 pt-20 pb-6",
+              CHAT_COLUMN_WIDTH,
+            )}
+          >
             {/* Scroll helpers — must live inside StickToBottom to access context. */}
             <ScrollToBottomOnSend nonce={sendScrollNonce} />
             <ConversationScrollRefBridge onScroller={setScroller} />
@@ -2020,6 +2107,10 @@ export function ConnectionIndicator({
   onShowReconnectHelp: () => void;
 }) {
   const terminalFirst = useTerminalFirst();
+  const keyboardVisible = useIOSNativeKeyboardVisible(
+    terminalFirst?.isTerminalFirst === true,
+    terminalFirst?.view === "chat",
+  );
   const sandboxStatus = useChatStore((s) => s.sandboxStatus);
   if (sandboxStatus !== null) {
     // A failed launch owns this band with its reason. An IN-FLIGHT
@@ -2072,6 +2163,7 @@ export function ConnectionIndicator({
     // being the agent. The shell view carries its own close affordance
     // (MainTerminalView's X) back to chat.
     if (terminalFirst.isShellView) return null;
+    if (keyboardVisible) return null;
     return <ConnectedTerminalFirstPill ctx={terminalFirst} />;
   }
 
@@ -2192,14 +2284,14 @@ function ConnectedTerminalFirstPill({
   return (
     <div
       className={cn(
-        "mx-auto flex w-full items-center justify-center px-6 pb-1.5",
+        "terminal-first-switcher-container mx-auto flex w-full items-center justify-center px-6 pb-1.5",
         CHAT_COLUMN_WIDTH,
       )}
     >
       <div
         role="group"
         aria-label="View mode"
-        className="flex items-center gap-1 rounded-full border border-border bg-card/90 p-1 text-xs shadow-sm"
+        className="terminal-first-switcher flex items-center gap-1 rounded-full border border-border bg-card/90 p-1 text-xs shadow-sm"
       >
         <div className="flex items-center gap-0.5">
           <button
@@ -2208,7 +2300,7 @@ function ConnectedTerminalFirstPill({
             aria-label="Chat"
             onClick={() => setView("chat")}
             className={cn(
-              "flex cursor-pointer items-center gap-1 rounded-full px-2 py-0.5 transition-colors",
+              "terminal-first-switcher-option flex cursor-pointer items-center gap-1 rounded-full px-2 py-0.5 transition-colors",
               view === "chat"
                 ? "bg-muted text-foreground"
                 : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
@@ -2225,7 +2317,7 @@ function ConnectedTerminalFirstPill({
             title={terminalStartingUp ? "Terminal is starting up…" : undefined}
             onClick={() => setView("terminal")}
             className={cn(
-              "flex cursor-pointer items-center gap-1 rounded-full px-2 py-0.5 transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+              "terminal-first-switcher-option flex cursor-pointer items-center gap-1 rounded-full px-2 py-0.5 transition-colors disabled:cursor-not-allowed disabled:opacity-50",
               view === "terminal"
                 ? "bg-muted text-foreground"
                 : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
@@ -2992,13 +3084,27 @@ export function Composer({
   // the input, which would delete the draft. Only save when the user
   // has actually changed the value since the last restore.
   const dirtyRef = useRef(false);
+  // On mobile, programmatic focus immediately summons the software keyboard.
+  // Keep desktop's fast-type affordance, but let mobile users explicitly tap
+  // the composer when switching back from Terminal or changing sessions.
+  const [isMobile, setIsMobile] = useState(
+    () => typeof window !== "undefined" && window.matchMedia("(max-width: 767px)").matches,
+  );
+  const isMobileRef = useRef(isMobile);
+  isMobileRef.current = isMobile;
+  useEffect(() => {
+    const mq = window.matchMedia("(max-width: 767px)");
+    const handler = (e: MediaQueryListEvent) => setIsMobile(e.matches);
+    mq.addEventListener("change", handler);
+    return () => mq.removeEventListener("change", handler);
+  }, []);
 
   useEffect(() => {
     const restored = conversationId ? sessionDrafts.get(conversationId) : undefined;
     setValue(restored?.text ?? "");
     setFiles(restored?.files ?? []);
     dirtyRef.current = false;
-    textareaRef.current?.focus();
+    if (!isMobileRef.current) textareaRef.current?.focus();
 
     return () => {
       if (!conversationId || !dirtyRef.current) return;
@@ -3018,7 +3124,7 @@ export function Composer({
   // focus when the count grows — removing a quote shouldn't steal focus.
   const prevQuoteCountRef = useRef(replyQuotes.length);
   useEffect(() => {
-    if (replyQuotes.length > prevQuoteCountRef.current) {
+    if (!isMobileRef.current && replyQuotes.length > prevQuoteCountRef.current) {
       textareaRef.current?.focus();
     }
     prevQuoteCountRef.current = replyQuotes.length;
@@ -3223,20 +3329,6 @@ export function Composer({
       executeSlashCommand(cmd, "");
     }
   };
-
-  // On mobile-sized viewports the on-screen keyboard has no easy way to
-  // produce Shift+Enter, so Enter-to-send would lock users out of multi-line
-  // composition entirely. Below Tailwind's `md` breakpoint, fall back to
-  // native textarea behavior (Enter = newline) and require tapping Send.
-  const [isMobile, setIsMobile] = useState(
-    () => typeof window !== "undefined" && window.matchMedia("(max-width: 767px)").matches,
-  );
-  useEffect(() => {
-    const mq = window.matchMedia("(max-width: 767px)");
-    const handler = (e: MediaQueryListEvent) => setIsMobile(e.matches);
-    mq.addEventListener("change", handler);
-    return () => mq.removeEventListener("change", handler);
-  }, []);
 
   // Auto-grow the textarea from 1 row up to 10 rows, then let it scroll.
   useAutoGrowTextarea(textareaRef, value);
@@ -3489,7 +3581,10 @@ export function Composer({
   return (
     <form
       onSubmit={handleSubmit}
-      className={cn("px-4 md:px-6", isTerminalFirst ? "pb-1.5" : "pb-3")}
+      className={cn(
+        "chat-composer-form px-4 md:px-6",
+        isTerminalFirst ? "terminal-first-composer-form pb-1.5" : "pb-3",
+      )}
     >
       {/* Hidden file input for the attach button */}
       <input

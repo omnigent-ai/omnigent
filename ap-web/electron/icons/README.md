@@ -1,7 +1,8 @@
 # App icons
 
-- `AppIcon.icon` — source of truth for the macOS icon: an Apple Icon
-  Composer bundle (layered artwork + gradient background).
+- `../../platform-assets/AppIcon.icon` — source of truth for the Apple
+  platform icon: an Apple Icon Composer bundle (layered artwork + gradient
+  background), shared by Electron and iOS.
 - `Assets.car` + `icon.icns` — compiled from `AppIcon.icon` by `actool`
   (checked in so builds don't require Xcode 26+). `Assets.car` gives the
   native dynamic icon on macOS 26+ (liquid glass, light/dark/tinted);
@@ -20,7 +21,7 @@ Requires Xcode 26+ (Icon Composer `.icon` support in actool):
 ```bash
 cd ap-web/electron/icons
 TMP=$(mktemp -d)
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun actool AppIcon.icon \
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun actool ../../platform-assets/AppIcon.icon \
   --compile "$TMP" --platform macosx --minimum-deployment-target 11.0 \
   --app-icon AppIcon --output-partial-info-plist "$TMP/partial.plist"
 cp "$TMP/Assets.car" Assets.car
