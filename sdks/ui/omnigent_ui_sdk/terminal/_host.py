@@ -3687,7 +3687,15 @@ class TerminalHost:
             # Left-arrow to return to the top-level session.
             hint_items = list(self._toolbar_hints)
             if self.has_any_subagents():
-                hint_items.append("↓ agents")
+                # Sit the ``↓ agents`` hint right after the ``/help`` entry so
+                # it rides with the primary hints instead of trailing the row.
+                # Falls back to the end when there's no ``/help`` (e.g. a host
+                # constructed with a custom hint list).
+                insert_at = next(
+                    (i + 1 for i, h in enumerate(hint_items) if h.startswith("/help")),
+                    len(hint_items),
+                )
+                hint_items.insert(insert_at, "↓ agents")
             if self._is_inside_subagent():
                 hint_items.append("← back")
             hints = " " + " · ".join(hint_items) + " "

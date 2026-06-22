@@ -1225,6 +1225,27 @@ def test_subagent_badge_replaces_sleeping_while_active() -> None:
     assert "↓ agents" in toolbar  # the gesture hint is advertised
 
 
+def test_subagent_hint_sits_right_after_help() -> None:
+    """The ``↓ agents`` hint is placed immediately after the ``/help`` entry
+    (riding with the primary hints), not trailing the row."""
+    host = TerminalHost(
+        model_name="test",
+        toolbar_hints=["/help help", "Ctrl+O debug", "Esc cancel", "Ctrl+C exit"],
+    )
+    host.upsert_subagent("conv_c1", parent_id="conv_main", child={"tool": "reviewer", **_busy()})
+    toolbar = _formatted_text_plain(host.build_toolbar())
+    assert "/help help · ↓ agents · Ctrl+O debug" in toolbar
+
+
+def test_subagent_hint_appends_when_no_help_entry() -> None:
+    """With no ``/help`` entry (custom hint list), the ``↓ agents`` hint falls
+    back to the end of the row rather than being dropped."""
+    host = TerminalHost(model_name="test", toolbar_hints=["esc cancel", "ctrl+c exit"])
+    host.upsert_subagent("conv_c1", parent_id="conv_main", child={"tool": "reviewer", **_busy()})
+    toolbar = _formatted_text_plain(host.build_toolbar())
+    assert "ctrl+c exit · ↓ agents" in toolbar
+
+
 def test_subagent_badge_pluralizes_and_returns_to_sleeping() -> None:
     """The count pluralizes, and the badge returns to ``sleeping`` once the
     last sub-agent reaches a terminal status."""
