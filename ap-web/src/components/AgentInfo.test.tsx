@@ -8,8 +8,11 @@ import { useChatStore } from "@/store/chatStore";
 // Mock the policies data layer so SessionPoliciesSection and AddPolicyDialog
 // render deterministically without network. The add/delete mutations expose
 // `mutate` spies we can assert on.
-const addMutate = vi.fn();
-const deleteMutate = vi.fn();
+const { addMutate, deleteMutate, copyTextMock } = vi.hoisted(() => ({
+  addMutate: vi.fn(),
+  deleteMutate: vi.fn(),
+  copyTextMock: vi.fn(() => Promise.resolve()),
+}));
 const policiesData = { current: [] as unknown[] };
 const registryData = { current: [] as unknown[] };
 vi.mock("@/hooks/usePolicies", () => ({
@@ -18,11 +21,13 @@ vi.mock("@/hooks/usePolicies", () => ({
   useAddPolicy: () => ({ mutate: addMutate, isPending: false, isError: false, error: null }),
   useDeletePolicy: () => ({ mutate: deleteMutate }),
 }));
+vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 
 import { AgentInfoButton, AgentInfoContent, agentDisplayLabel } from "./AgentInfo";
 
 afterEach(() => {
   cleanup();
+  copyTextMock.mockClear();
 });
 
 function renderButton(agent: Agent | undefined) {
@@ -150,6 +155,21 @@ describe("AgentInfoButton session cost row", () => {
     // The rest of the popover still renders (agent name proves it opened).
     expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
     expect(screen.queryByTestId("agent-info-session-cost")).toBeNull();
+  });
+});
+
+describe("AgentInfoButton session id row", () => {
+  it("shows and copies the active session id in the popover", async () => {
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_info123");
+
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+
+    expect(screen.getByTestId("agent-info-session-id")).toHaveTextContent("conv_info123");
+    fireEvent.click(screen.getByTestId("agent-info-copy-session-id"));
+
+    expect(copyTextMock).toHaveBeenCalledTimes(1);
+    expect(copyTextMock).toHaveBeenCalledWith("conv_info123");
+    expect(await screen.findByRole("button", { name: "Copied session ID" })).toBeInTheDocument();
   });
 });
 
