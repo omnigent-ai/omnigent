@@ -21,6 +21,7 @@ model sees it).
 from __future__ import annotations
 
 import json
+import secrets
 import sys
 import time
 
@@ -301,11 +302,22 @@ def post_evaluate_with_retry(
     :data:`_EVALUATE_POLICY_RETRY_BUDGET_S`. Returns the successful response,
     or ``None`` if the budget is exhausted or a non-retryable error occurs.
 
+    A stable ``_omnigent_elicitation_id`` is minted once and stamped on
+    every attempt. When the server parks an ASK gate and the connection
+    drops (5xx or :class:`httpx.ConnectError`), the retry re-POSTs the
+    same id so the server re-attaches to the existing elicitation rather
+    than minting a new one — mirroring the ``_post_hook_with_reattach``
+    idiom used by the ``PermissionRequest`` hook. This prevents a
+    second approval card from appearing when the first was already
+    published before the error.
+
     4xx responses are final — a bad request won't succeed on retry. Other
     mid-stream errors (e.g. :class:`httpx.ReadTimeout`) are also not retried:
-    a read timeout can indicate a long-polling ASK gate being severed, and
-    retrying would open a new server-side elicitation, prompting the human
-    twice. The caller is responsible for fail-closed handling on ``None``.
+    a read timeout fires *after* the server received the request and may
+    mean the long-polling ASK gate was severed mid-wait; retrying with the
+    same id will re-park the existing elicitation (no duplicate card), but
+    the caller's fail-closed path is equivalent and simpler. The caller is
+    responsible for fail-closed handling on ``None``.
 
     :param url: Absolute URL of the evaluate endpoint.
     :param headers: Auth headers for the Omnigent server.
@@ -317,13 +329,19 @@ def post_evaluate_with_retry(
     :returns: Successful :class:`httpx.Response`, or ``None`` when retries
         are exhausted or the error is non-retryable.
     """
+    # Mint one stable id for the whole retry sequence. Each retry re-sends
+    # it so the server can re-park the SAME elicitation rather than opening
+    # a second approval card. The ``elicit_evaluate_`` namespace is validated
+    # server-side by ``_EVALUATE_HOOK_ELICITATION_ID_RE``.
+    elicitation_id = f"elicit_evaluate_{secrets.token_hex(16)}"
+    request_body = {**eval_request, "_omnigent_elicitation_id": elicitation_id}
     deadline = time.monotonic() + _EVALUATE_POLICY_RETRY_BUDGET_S
     backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
     timeout = httpx.Timeout(read_timeout, connect=_EVALUATE_POLICY_CONNECT_TIMEOUT_S)
     while True:
         try:
             with httpx.Client(headers=headers, timeout=timeout) as client:
-                resp = client.post(url, json=eval_request)
+                resp = client.post(url, json=request_body)
                 resp.raise_for_status()
                 return resp
         except httpx.HTTPStatusError as exc:
