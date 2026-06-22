@@ -113,7 +113,7 @@ def _composed_ask(
         action=PolicyAction.ASK,
         reason=reason,
         set_labels=set_labels,
-        deciding_policy=deciding_policy,
+        deciding_policies=[deciding_policy],
     )
 
 

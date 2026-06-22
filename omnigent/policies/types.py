@@ -209,22 +209,15 @@ class PolicyResult:
         accumulated and intends to apply on this decision
         (filtering already done). ``None`` when the policy
         wrote no labels, e.g. ``{"integrity": "0"}``.
-    :param deciding_policy: Name of the policy whose action
-        drove the composed result. Engine-set only —
-        single-policy results leave it ``None``. On DENY: the
-        first short-circuiting policy. On ASK: the first
-        ASKing policy in YAML order. On ALLOW: ``None``.
-        Powers the ``deciding_policy`` outer-span attribute
-        (POLICIES.md §11.5) and the per-policy ``ask_timeout``
-        lookup (§7.2).
-    :param deciding_policies: Names of ALL policies that
-        returned ASK for the composed result. Engine-set only —
-        single-policy results and non-ASK results leave it
-        ``None``. Carries the full set of ASK deciders so
-        callers can surface each policy's context (e.g. per-
-        policy timeout, observability) when multiple policies
-        gate the same request. ``deciding_policy`` is always
-        ``deciding_policies[0]`` for backward compatibility.
+    :param deciding_policies: Names of all policies that drove
+        the composed result. Engine-set only — single-policy
+        results leave it ``None``. On DENY: a single-element
+        list with the short-circuiting policy. On ASK: all
+        ASKing policies in YAML order. On ALLOW: ``None``.
+        ``deciding_policy`` is a computed property returning
+        ``deciding_policies[0]`` (or ``None`` when unset);
+        all existing callers that read ``.deciding_policy``
+        work unchanged.
     :param data: Optional replacement payload returned by the
         policy callable. When present on an ALLOW result, the
         enforcement site substitutes this value for the original
@@ -252,10 +245,18 @@ class PolicyResult:
     action: PolicyAction
     reason: str | None = None
     set_labels: dict[str, str] | None = None
-    deciding_policy: str | None = None
     deciding_policies: list[str] | None = None
     data: Any = None
     state_updates: list[StateUpdate] | None = None
+
+    @property
+    def deciding_policy(self) -> str | None:
+        """First deciding policy name, or ``None``.
+
+        Derived from ``deciding_policies[0]`` so callers that
+        read ``.deciding_policy`` work without change.
+        """
+        return self.deciding_policies[0] if self.deciding_policies else None
 
 
 @dataclass(frozen=True)

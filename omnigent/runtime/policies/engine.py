@@ -334,7 +334,6 @@ class PolicyEngine:
                 reason="; ".join(ask_reasons),
                 set_labels=dict(accumulated) if accumulated else None,
                 state_updates=list(accumulated_state) if accumulated_state else None,
-                deciding_policy=deciding_ask_policies[0],
                 deciding_policies=deciding_ask_policies,
                 data=composed_data,
             )
@@ -390,7 +389,7 @@ class PolicyEngine:
             reason=reason,
             set_labels=dict(accumulated) if accumulated else None,
             state_updates=list(accumulated_state) if accumulated_state else None,
-            deciding_policy=deciding_policy,
+            deciding_policies=[deciding_policy],
         )
 
     def _should_fire(
