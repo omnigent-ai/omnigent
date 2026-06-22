@@ -1032,15 +1032,20 @@ def _is_binary_file(path: Path) -> bool:
     """Classify *path* as binary by inspecting only its first chunk.
 
     Reads at most :data:`_BINARY_SNIFF_BYTES` and reports binary when those
-    bytes are not valid UTF-8. An incremental decoder is used with
-    ``final=False`` so a multi-byte character straddling the chunk boundary is
-    treated as *incomplete* (text), not invalid (binary).
+    bytes contain a NUL or are not valid UTF-8. The NUL check matters because
+    ``\x00`` *is* valid UTF-8, so a UTF-16/NUL-laden file would otherwise be
+    misread as text; checking for it explicitly matches git's heuristic. An
+    incremental decoder is used with ``final=False`` so a multi-byte character
+    straddling the chunk boundary is treated as *incomplete* (text), not
+    invalid (binary).
 
     :param path: Absolute path of the file to classify.
-    :returns: ``True`` if the prefix is not decodable as UTF-8.
+    :returns: ``True`` if the prefix contains a NUL or is not decodable UTF-8.
     """
     with path.open("rb") as fh:
         prefix = fh.read(_BINARY_SNIFF_BYTES)
+    if b"\x00" in prefix:
+        return True
     try:
         codecs.getincrementaldecoder("utf-8")("strict").decode(prefix, final=False)
     except UnicodeDecodeError:

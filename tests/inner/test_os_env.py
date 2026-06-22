@@ -226,3 +226,22 @@ def test_read_impl_multibyte_char_straddling_sniff_boundary_is_text(tmp_path: Pa
 
     assert result["encoding"] == "utf-8"
     assert result["content"] == text
+
+
+def test_read_impl_nul_byte_file_classified_binary(tmp_path: Path) -> None:
+    """A NUL byte marks a file binary even though ``\\x00`` is valid UTF-8.
+
+    UTF-16/NUL-laden files decode cleanly as UTF-8, so without an explicit NUL
+    check they'd be misread as text and line-windowed into garbage.
+
+    :returns: None.
+    """
+    # UTF-16-LE-style ASCII: every byte is valid UTF-8, but the interleaved
+    # NULs make this binary.
+    f = tmp_path / "utf16.bin"
+    f.write_bytes(b"H\x00e\x00l\x00l\x00o\x00")
+
+    result = _read_impl(f, offset=1, limit=2_000)
+
+    assert result["encoding"] == "base64"
+    assert result["total_bytes"] == 10

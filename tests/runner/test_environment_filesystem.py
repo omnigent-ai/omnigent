@@ -205,7 +205,8 @@ async def test_read_text_byte_cap_truncates_on_utf8_boundary(
     ``UnicodeDecodeError`` (500) when the response path later decodes them.
     The read path must truncate on a valid boundary instead.
     """
-    # "é" is 2 bytes (0xC3 0xA9) in UTF-8; a 1-byte cap lands mid-codepoint.
+    # "é" is 2 bytes (0xC3 0xA9) in UTF-8; on "aé" a 2-byte cap keeps the "a"
+    # and lands mid-codepoint inside "é".
     (workspace / "accents.txt").write_text("aé")
 
     os_env = create_os_environment(
