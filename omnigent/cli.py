@@ -7363,6 +7363,7 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         AddOption,
         add_menu_options,
         add_menu_options_for_family,
+        build_bedrock_provider_entry,
         build_cli_config_provider_entry,
         build_databricks_provider_entry,
         build_gateway_provider_entry,
@@ -7377,6 +7378,7 @@ def _configure_harness_add(family: str | None = None) -> str | None:
     from omnigent.onboarding.interactive import console, prompt_text, select
     from omnigent.onboarding.provider_config import (
         ANTHROPIC_FAMILY,
+        BEDROCK_KIND,
         CHAT_WIRE_API,
         CLI_CONFIG_KIND,
         DATABRICKS_KIND,
@@ -7679,6 +7681,40 @@ def _configure_harness_add(family: str | None = None) -> str | None:
             families=families,
             wire_api=wire_api,
             models=models,
+        )
+
+    elif kind == BEDROCK_KIND:
+        # Bedrock drives the native Claude terminal in AWS Bedrock mode. It
+        # authenticates from AWS_BEARER_TOKEN_BEDROCK in the env at launch
+        # (Claude Code ignores apiKeyHelper once Bedrock mode is on), so offer
+        # to reference an exported token, else store a pasted one in the keychain.
+        name = prompt_text("Name for this Bedrock provider", default="bedrock")
+        base_url = prompt_text(
+            "Bedrock base_url (regional runtime endpoint, or your Bedrock-compatible gateway)",
+            default="https://bedrock-runtime.us-east-1.amazonaws.com",
+        )
+        if os.environ.get("AWS_BEARER_TOKEN_BEDROCK") and click.confirm(
+            "Detected AWS_BEARER_TOKEN_BEDROCK in the environment — use it?", default=True
+        ):
+            api_key_ref = "env:AWS_BEARER_TOKEN_BEDROCK"
+        else:
+            pasted = prompt_text("Amazon Bedrock API key (bearer token)", hide_input=True)
+            secret_store.store_secret(name, pasted)
+            api_key_ref = f"keychain:{name}"
+        # Bedrock has no catalog default and Claude's own default model is
+        # usually not enabled on a Bedrock account, so pin an explicit id.
+        default_model = (
+            prompt_text(
+                "Default model (Bedrock inference-profile id, e.g. "
+                "us.anthropic.claude-opus-4-5-20251101-v1:0)"
+            ).strip()
+            or None
+        )
+        family = ANTHROPIC_FAMILY
+        entry = build_bedrock_provider_entry(
+            base_url=base_url,
+            api_key_ref=api_key_ref,
+            default_model=default_model,
         )
 
     else:  # databricks

@@ -43,6 +43,7 @@ from omnigent.onboarding.detected import (
 )
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
+    BEDROCK_KIND,
     CLI_CONFIG_KIND,
     DATABRICKS_KIND,
     OPENAI_FAMILY,
@@ -512,6 +513,9 @@ def configure_agent_harness_with_provider(
     - ``databricks`` — delegate to the existing ucode path keyed on the
       provider's profile, reusing :func:`configure_agent_harness_with_ucode`
       so the ``polly`` / Databricks coding-agent flow is unchanged.
+    - ``bedrock`` — rejected (raises): AWS Bedrock mode is wired only into
+      the native ``omnigent claude`` launch, not the in-process / gateway
+      harnesses.
 
     :param env: Mutable spawn-env dict, modified in place.
     :param entry: The resolved provider entry to apply.
@@ -532,6 +536,22 @@ def configure_agent_harness_with_provider(
             "or Vertex AI) and does not support generic providers or gateway "
             "routing. Set executor.auth to an api_key, or executor.config "
             "vertex/project/location, instead of a 'providers:' entry.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if entry.kind == BEDROCK_KIND:
+        # Bedrock mode is wired only into the native ``omnigent claude`` launch
+        # (:func:`omnigent.claude_native._bedrock_config_for_native_claude`),
+        # which sets CLAUDE_CODE_USE_BEDROCK + AWS_BEARER_TOKEN_BEDROCK directly.
+        # The in-process / gateway harnesses have no Bedrock path, so emitting
+        # the generic ``HARNESS_*_GATEWAY_*`` vars would silently point the
+        # harness at the Bedrock endpoint as if it spoke the Anthropic Messages
+        # API and fail at request time. Fail loud instead.
+        raise OmnigentError(
+            f"provider {entry.name!r} (kind 'bedrock') is only supported by the "
+            f"native 'omnigent claude' terminal, not the {harness_type!r} harness. "
+            "For agents / 'omnigent run', use a 'gateway' provider "
+            "(OpenAI/Anthropic-compatible endpoint), or a 'databricks' / 'key' "
+            "provider.",
             code=ErrorCode.INVALID_INPUT,
         )
     if entry.kind == SUBSCRIPTION_KIND:

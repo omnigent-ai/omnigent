@@ -283,6 +283,11 @@ def test_set_default_provider_pi_scope_round_trips_and_moves() -> None:
             True,
         ),
         ({"kind": "databricks", "profile": "my-ws"}, True),
+        # Bedrock mode is native-`omnigent claude` only — pi cannot use it.
+        (
+            {"kind": "bedrock", "anthropic": {"base_url": "https://x", "api_key_ref": "env:K"}},
+            False,
+        ),
         # A CLI login is unusable outside its own CLI — never pi-capable.
         ({"kind": "subscription", "cli": "claude"}, False),
     ],
@@ -427,3 +432,36 @@ def test_describe_active_credential_cli_config() -> None:
     # No inline endpoint/model: both live in the CLI's own config.
     assert cred.base_url is None
     assert cred.model is None
+
+
+def test_bedrock_kind_rejected_for_non_native_harnesses() -> None:
+    """`kind: bedrock` is native-`omnigent claude` only; in-process harnesses fail loud.
+
+    ``configure_agent_harness_with_provider`` has no Bedrock path — emitting the
+    generic ``HARNESS_*_GATEWAY_*`` vars would silently point claude-sdk / pi at
+    the Bedrock endpoint as if it were the Anthropic Messages API. Each non-native
+    harness must raise rather than mis-configure.
+    """
+    from omnigent.errors import ErrorCode
+    from omnigent.runtime.workflow import configure_agent_harness_with_provider
+
+    entry = load_providers(
+        {
+            "providers": {
+                "b": {
+                    "kind": "bedrock",
+                    "anthropic": {
+                        "base_url": "https://bedrock-runtime.us-east-1.amazonaws.com",
+                        "api_key": "k",
+                        "models": {"default": "us.anthropic.claude-haiku-4-5-20251001-v1:0"},
+                    },
+                }
+            }
+        }
+    )["b"]
+    for harness in ("claude-sdk", "pi"):
+        env: dict[str, str] = {}
+        with pytest.raises(OmnigentError) as exc:
+            configure_agent_harness_with_provider(env, entry, harness_type=harness)
+        assert exc.value.code == ErrorCode.INVALID_INPUT
+        assert env == {}  # nothing written before the raise

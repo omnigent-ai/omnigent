@@ -5751,6 +5751,99 @@ def test_provider_config_for_native_claude_uses_auth_command_verbatim() -> None:
     }
 
 
+def test_bedrock_config_for_native_claude_static_key() -> None:
+    """A ``bedrock`` provider sets the Bedrock env trio and no apiKeyHelper.
+
+    Bedrock mode authenticates from ``AWS_BEARER_TOKEN_BEDROCK`` in the env and
+    ignores ``apiKeyHelper``, so a static key must land in the env (never a
+    helper) and the base_url maps to ``ANTHROPIC_BEDROCK_BASE_URL``.
+    """
+    from omnigent.onboarding.provider_config import load_providers
+
+    entry = load_providers(
+        {
+            "providers": {
+                "nexus": {
+                    "kind": "bedrock",
+                    "anthropic": {
+                        "base_url": "https://bedrock-runtime.us-east-1.amazonaws.com",
+                        "api_key": "absk-test",
+                        "models": {"default": "us.anthropic.claude-opus-4-5-20251101-v1:0"},
+                    },
+                }
+            }
+        }
+    )["nexus"]
+
+    cfg = claude_native._bedrock_config_for_native_claude(entry)
+    assert cfg is not None
+    assert cfg.env == {
+        "ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock-runtime.us-east-1.amazonaws.com",
+        "AWS_BEARER_TOKEN_BEDROCK": "absk-test",
+        "CLAUDE_CODE_USE_BEDROCK": "1",
+        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+    }
+    # Bedrock ignores apiKeyHelper; the credential rides the env, not a helper.
+    assert cfg.api_key_helper is None
+    assert cfg.model == "us.anthropic.claude-opus-4-5-20251101-v1:0"
+
+
+def test_bedrock_config_for_native_claude_resolves_auth_command() -> None:
+    """A ``bedrock`` provider with only an ``auth_command`` mints the token.
+
+    Regression: the credential gate previously read ``family.api_key`` alone, so
+    an ``auth_command``-only config (a natural fit for rotating Bedrock bearer
+    tokens) silently fell back to Claude's own login. The command's stdout must
+    become ``AWS_BEARER_TOKEN_BEDROCK`` since Bedrock mode ignores apiKeyHelper.
+    """
+    from omnigent.onboarding.provider_config import load_providers
+
+    entry = load_providers(
+        {
+            "providers": {
+                "nexus": {
+                    "kind": "bedrock",
+                    "anthropic": {
+                        "base_url": "https://gw.example/bedrock",
+                        "auth_command": "printf minted-bedrock-token",
+                        "models": {"default": "us.anthropic.claude-haiku-4-5-20251001-v1:0"},
+                    },
+                }
+            }
+        }
+    )["nexus"]
+
+    cfg = claude_native._bedrock_config_for_native_claude(entry)
+    assert cfg is not None
+    assert cfg.env["AWS_BEARER_TOKEN_BEDROCK"] == "minted-bedrock-token"
+    assert cfg.api_key_helper is None
+
+
+def test_bedrock_config_for_native_claude_non_anthropic_returns_none() -> None:
+    """A ``bedrock`` provider not serving the anthropic surface → ``None``.
+
+    The native Claude path only routes anthropic-surface providers; anything
+    else falls back to Claude Code's own login.
+    """
+    from omnigent.onboarding.provider_config import load_providers
+
+    entry = load_providers(
+        {
+            "providers": {
+                "nexus": {
+                    "kind": "bedrock",
+                    "openai": {
+                        "base_url": "https://gw.example/openai",
+                        "api_key": "sk-o",
+                    },
+                }
+            }
+        }
+    )["nexus"]
+
+    assert claude_native._bedrock_config_for_native_claude(entry) is None
+
+
 def test_resolve_native_claude_config_spec_provider_default(
     _isolated_provider_config: Path,
 ) -> None:

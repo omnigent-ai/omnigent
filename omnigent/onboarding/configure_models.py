@@ -462,6 +462,15 @@ def add_menu_options() -> list[AddOption]:
             KEY_KIND,
             other=True,
         ),
+        # AWS Bedrock / Bedrock-compatible gateway — anthropic-only, drives the
+        # native ``omnigent claude`` terminal in Bedrock mode. Listed last so it
+        # never shifts the first-party / extras order users already know.
+        _opt(
+            "Amazon Bedrock — API key",
+            "AWS Bedrock or a Bedrock-compatible gateway for the native Claude "
+            "terminal (omnigent claude). Claude only.",
+            BEDROCK_KIND,
+        ),
     ]
 
 
@@ -481,6 +490,10 @@ def _add_option_families(opt: AddOption) -> frozenset[str]:
     """
     if opt.kind == GATEWAY_KIND or opt.kind == DATABRICKS_KIND:
         return frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE})
+    if opt.kind == BEDROCK_KIND:
+        # Bedrock mode drives only the native Claude terminal (anthropic
+        # family); codex/pi reject it, so it never serves their surfaces.
+        return frozenset({ANTHROPIC_FAMILY})
     if opt.kind == SUBSCRIPTION_KIND:
         if opt.cli == "claude":
             return frozenset({ANTHROPIC_FAMILY})
@@ -723,6 +736,36 @@ def build_key_provider_entry(
     if wire_api is not None and family == OPENAI_FAMILY:
         family_block["wire_api"] = wire_api
     return {"kind": KEY_KIND, family: family_block}
+
+
+def build_bedrock_provider_entry(
+    base_url: str,
+    api_key_ref: str,
+    default_model: str | None,
+) -> dict[str, object]:
+    """Build a ``kind: bedrock`` provider entry body (config shape).
+
+    A Bedrock provider serves only the ``anthropic`` family and drives the
+    native ``omnigent claude`` terminal in AWS Bedrock mode (the in-process /
+    gateway harnesses reject it). ``base_url`` is the regional Bedrock-runtime
+    endpoint or a Bedrock-compatible gateway; ``api_key_ref`` resolves the AWS
+    bearer token delivered via ``AWS_BEARER_TOKEN_BEDROCK``.
+
+    :param base_url: The Bedrock endpoint, e.g.
+        ``"https://bedrock-runtime.us-east-1.amazonaws.com"``.
+    :param api_key_ref: The secret reference, e.g. ``"keychain:bedrock"`` or
+        ``"env:AWS_BEARER_TOKEN_BEDROCK"``.
+    :param default_model: A Bedrock model id / inference profile, e.g.
+        ``"us.anthropic.claude-opus-4-5-20251101-v1:0"``, or ``None`` to omit
+        the ``models`` block (not recommended — Claude then picks its own
+        default, usually not enabled on a Bedrock account).
+    :returns: A provider entry body, e.g. ``{"kind": "bedrock", "anthropic":
+        {"base_url": "...", "api_key_ref": "...", "models": {"default": "..."}}}``.
+    """
+    family_block: dict[str, object] = {"base_url": base_url, "api_key_ref": api_key_ref}
+    if default_model:
+        family_block["models"] = {"default": default_model}
+    return {"kind": BEDROCK_KIND, ANTHROPIC_FAMILY: family_block}
 
 
 def default_base_url_for_family(family: str) -> str:

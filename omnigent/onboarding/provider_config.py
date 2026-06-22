@@ -885,7 +885,13 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
         ``frozenset({"anthropic", "openai", "pi"})`` for a Databricks
         profile.
     """
-    if entry.kind in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND, BEDROCK_KIND):
+    if entry.kind == BEDROCK_KIND:
+        # Bedrock mode is native-``omnigent claude`` only — the in-process /
+        # gateway harnesses (incl. pi) reject it (see
+        # configure_agent_harness_with_provider). Surface only its real
+        # family (anthropic), never the pi scope.
+        return frozenset(entry.families)
+    if entry.kind in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND):
         return frozenset(entry.families) | {PI_SURFACE}
     if entry.kind in (SUBSCRIPTION_KIND, CLI_CONFIG_KIND):
         if entry.cli == "claude":
