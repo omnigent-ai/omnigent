@@ -3433,14 +3433,34 @@ class TerminalHost:
         rows.extend(self.subagent_menu_rows())
         return rows
 
+    def _active_subagent_menu_index(self) -> int:
+        """Index of the display row for the session currently being viewed.
+
+        When the user has dived into a sub-agent, opening the menu should
+        pre-select that sub-agent's row (so ``↓`` then ``Enter`` is a no-op and
+        the highlight reflects where you actually are), not always reset to the
+        ``main`` row. Falls back to 0 (``main``) when the active session is
+        unknown or not present in the menu.
+        """
+        getter = self.active_session_id_getter
+        active = getter() if getter is not None else None
+        if active is None:
+            return 0
+        for i, (sid, _label) in enumerate(self._subagent_menu_display_rows()):
+            if sid == active:
+                return i
+        return 0
+
     def _open_subagent_menu(self) -> None:
         """Open the inline menu (no-op when the tree is empty). Opens whenever
         ANY node exists — active OR finished — so finished children stay
-        reachable for revisit / chat (web parity)."""
+        reachable for revisit / chat (web parity). The selection starts on the
+        row for the session you're currently viewing (the dived-into sub-agent,
+        or ``main`` at the top level)."""
         if not self.has_any_subagents():
             return
         self._subagent_menu_open = True
-        self._subagent_menu_index = 0
+        self._subagent_menu_index = self._active_subagent_menu_index()
         self._subagent_menu_scroll = 0
         self._invalidate_prompt()
 

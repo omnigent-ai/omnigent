@@ -1568,6 +1568,31 @@ def test_subagent_menu_navigation_moves_selection() -> None:
     assert host._selected_subagent_id() == "conv_c1"
 
 
+def test_subagent_menu_opens_on_main_at_top_level() -> None:
+    """At the top level (active session == root) the menu opens on ``main``."""
+    host = TerminalHost(model_name="test")
+    _seed_busy_tree(host, 2)  # sets _subagent_root = "conv_main"
+    host.active_session_id_getter = lambda: "conv_main"
+    host._open_subagent_menu()
+    assert host._selected_subagent_id() == "conv_main"
+
+
+def test_subagent_menu_opens_on_current_subagent_after_dive_in() -> None:
+    """Reopening the menu while viewing a sub-agent pre-selects THAT sub-agent's
+    row, not ``main`` — so the highlight reflects where you actually are."""
+    host = TerminalHost(model_name="test")
+    _seed_busy_tree(host, 3)  # conv_c0, conv_c1, conv_c2 under conv_main
+    # Simulate having dived into conv_c1 (active session != root).
+    host.active_session_id_getter = lambda: "conv_c1"
+    host._open_subagent_menu()
+    assert host._selected_subagent_id() == "conv_c1"
+    # An unknown active session (e.g. mid-switch) falls back to main.
+    host._close_subagent_menu()
+    host.active_session_id_getter = lambda: "conv_gone"
+    host._open_subagent_menu()
+    assert host._selected_subagent_id() == "conv_main"
+
+
 def test_subagent_menu_caps_visible_rows_at_five() -> None:
     """Long trees scroll within a 5-row window so the input bar can't lift
     more than that many lines up the terminal."""
