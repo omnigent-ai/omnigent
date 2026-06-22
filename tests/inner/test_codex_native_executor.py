@@ -12,10 +12,11 @@ import pytest
 from omnigent.codex_native_bridge import (
     CodexNativeBridgeState,
     read_bridge_state,
+    write_bridge_startup_error,
     write_bridge_state,
 )
 from omnigent.inner.codex_native_executor import CodexNativeExecutor
-from omnigent.inner.executor import TurnComplete
+from omnigent.inner.executor import ExecutorError, TurnComplete
 
 # A 1x1 transparent PNG, base64-encoded — a real decodable image small
 # enough to embed, used to prove image blocks are materialized to disk
@@ -648,3 +649,33 @@ async def test_concurrent_steering_during_turn_start_is_not_dropped(
     )
     # Exactly one turn was started — no double-start race.
     assert methods.count("turn/start") == 1, f"expected exactly one turn/start; got {methods}"
+
+
+def test_run_turn_surfaces_recorded_startup_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A missing bridge state surfaces the recorded startup cause, not the
+    generic "bridge state is missing" (issue #59).
+    """
+
+    async def _no_sleep(_seconds: float) -> None:
+        """No-op the poll backoff so the missing-state path is fast."""
+
+    # asyncio.run does not depend on asyncio.sleep, so patching it is safe.
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    write_bridge_startup_error(
+        tmp_path,
+        "Codex app-server never started a thread within the startup timeout.",
+    )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    events = _collect_turn_events(executor, "hello")
+
+    assert len(events) == 1
+    error = events[0]
+    assert isinstance(error, ExecutorError)
+    assert "never started" in error.message
+    assert "startup timeout" in error.message
+    assert error.message != "Codex native bridge state is missing"

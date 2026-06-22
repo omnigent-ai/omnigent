@@ -18,6 +18,7 @@ CODEX_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_CODEX_NATIVE_BRIDGE_DIR"
 CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID"
 
 _STATE_FILE = "state.json"
+_STARTUP_ERROR_FILE = "startup_error.json"
 # Must match ``_CONFIG_FILE`` in ``claude_native_bridge.py`` because
 # ``serve-mcp`` reads this filename for the token.
 _MCP_CONFIG_FILE = "bridge.json"
@@ -345,10 +346,55 @@ def clear_bridge_state(bridge_dir: Path) -> None:
     :param bridge_dir: Native Codex bridge directory.
     :returns: None.
     """
+    for name in (_STATE_FILE, _STARTUP_ERROR_FILE):
+        try:
+            (bridge_dir / name).unlink()
+        except FileNotFoundError:
+            continue
+
+
+def write_bridge_startup_error(bridge_dir: Path, message: str) -> None:
+    """
+    Record why a native Codex app-server never started its thread (issue #59).
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param message: Human-readable failure cause.
+    :returns: None.
+    """
     try:
-        (bridge_dir / _STATE_FILE).unlink()
-    except FileNotFoundError:
-        return
+        bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = bridge_dir / _STARTUP_ERROR_FILE
+        fd, tmp_name = tempfile.mkstemp(prefix=f"{_STARTUP_ERROR_FILE}.", dir=str(bridge_dir))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump({"message": message}, handle, sort_keys=True)
+                handle.write("\n")
+            os.replace(tmp_name, path)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+    except OSError:
+        return  # best-effort; the real failure is already logged
+
+
+def read_bridge_startup_error(bridge_dir: Path) -> str | None:
+    """
+    Read a recorded native Codex startup-failure message, if any.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: The recorded failure cause, or ``None`` if absent/unreadable.
+    """
+    path = bridge_dir / _STARTUP_ERROR_FILE
+    if not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    message = raw.get("message")
+    return message if isinstance(message, str) and message else None
 
 
 def read_bridge_state(bridge_dir: Path) -> CodexNativeBridgeState | None:
