@@ -785,9 +785,7 @@ class ToolManager:
             try:
                 tool.shutdown()
             except Exception:
-                _logger.warning(
-                    "tool %s shutdown failed", tool.name(), exc_info=True
-                )
+                _logger.warning("tool %s shutdown failed", tool.name(), exc_info=True)
 
     def get_tool_names(self) -> list[str]:
         """
