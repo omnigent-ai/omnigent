@@ -1,18 +1,21 @@
-// ⌘[ / ⌘] (Ctrl+[ / Ctrl+] on Win/Linux) toggle the left (Conversations) and
-// right (Workspace) sidebars. Siblings to the session-switch (⌘↑/↓) and approve
-// (⌘↵) hotkeys; like them they fire even in a focused text field, so a panel
-// can be collapsed mid-compose.
+// ⌘⌥[ / ⌘⌥] (Ctrl+Alt+[ / Ctrl+Alt+] on Win/Linux) toggle the left
+// (Conversations) and right (Workspace) sidebars. Siblings to the session-switch
+// (⌘↑/↓) and approve (⌘↵) hotkeys; like them they fire even inside a focused
+// text field, so a panel can be collapsed mid-compose.
 //
-// NOTE: on macOS ⌘[ / ⌘] are the browser's Back / Forward gestures, so the
-// handler calls preventDefault to claim them for the sidebars. Bind ONCE at the
+// Why this chord: the bare ⌘[ / ⌘] are the browser's Back/Forward gestures, and
+// single ⌘+punctuation combos (e.g. ⌘\) get swallowed by global hotkey utilities
+// (Raycast/Rectangle/…) before the page ever sees them. Adding ⌥ dodges both —
+// it's not a browser gesture and is essentially never grabbed system-wide — and
+// it shares the ⌘⌥ chord with ChatPage's message-nav hotkey. Bind ONCE at the
 // app shell, where the sidebar open-state lives.
 
 import { useEffect, useRef } from "react";
 
 export interface SidebarToggleHandlers {
-  /** Flip the left (Conversations) sidebar. Bound to ⌘/Ctrl + [. */
+  /** Flip the left (Conversations) sidebar. Bound to ⌘/Ctrl + ⌥/Alt + [. */
   onToggleLeft: () => void;
-  /** Flip the right (Workspace) sidebar. Bound to ⌘/Ctrl + ]. */
+  /** Flip the right (Workspace) sidebar. Bound to ⌘/Ctrl + ⌥/Alt + ]. */
   onToggleRight: () => void;
 }
 
@@ -24,15 +27,25 @@ export function useSidebarToggleHotkeys(handlers: SidebarToggleHandlers): void {
 
   useEffect(() => {
     const handler = (e: globalThis.KeyboardEvent): void => {
-      // Cmd/Ctrl, not Alt/Shift (mirrors the session-switch / approve guards).
-      if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
+      // Require Cmd/Ctrl AND Alt (the ⌘⌥ message-nav chord) and additionally
+      // reject Shift, so ⌘⌥⇧ combos stay free for future bindings.
+      if (!(e.metaKey || e.ctrlKey) || !e.altKey || e.shiftKey) return;
+      // AltGr often reports as Ctrl+Alt; ignore it so intl-layout typing doesn't
+      // accidentally toggle sidebars while focused in an editor/composer.
+      if (e.getModifierState("AltGraph")) return;
       // Ignore auto-repeat: holding the chord would flap the panel open/closed.
       if (e.repeat) return;
-      if (e.key === "[") {
-        e.preventDefault(); // also suppresses the macOS browser Back gesture
+      // Match the physical key, not the character: ⌥ turns "[" / "]" into "“" /
+      // "‘" on macOS, but e.code is stable across layouts and modifiers.
+      // Claim the chord: preventDefault drops any default action and
+      // stopPropagation keeps it from reaching other keydown listeners.
+      if (e.code === "BracketLeft") {
+        e.preventDefault();
+        e.stopPropagation();
         latest.current.onToggleLeft();
-      } else if (e.key === "]") {
-        e.preventDefault(); // also suppresses the macOS browser Forward gesture
+      } else if (e.code === "BracketRight") {
+        e.preventDefault();
+        e.stopPropagation();
         latest.current.onToggleRight();
       }
     };
