@@ -258,20 +258,25 @@ jobs:
         # --ui-skip-build: the SPA was built in the previous step.
         # --tracing/--screenshot/--video default to off; retain-on-failure
         # keeps green runs cheap while capturing artifacts on failures.
-        # OPENAI_API_KEY / OPENAI_BASE_URL flow into the spawned server via
-        # the conftest's live_server fixture for the openai-agents harness.
+        # OPENAI_API_KEY / OPENAI_BASE_URL are set by the conftest's
+        # live_server fixture to point at the in-process mock LLM server —
+        # no real gateway credentials needed for the openai-agents harness.
+        # Native render-parity tests (claude-sdk/codex) still use the
+        # ~/.omnigent/config.yaml written in the step above.
         env:
-          OPENAI_API_KEY: ${{ env.LLM_API_KEY }}
-          OPENAI_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
           # Scheduled / manually dispatched runs are the full pass;
           # PR and push runs exclude @pytest.mark.nightly tests.
           NIGHTLY_FULL: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
           SHARD_ID: ${{ matrix.shard_id }}
           NUM_SHARDS: ${{ matrix.num_shards }}
         run: |
-          EXTRA_ARGS=()
+          # Always exclude @visual: the UI diff snapshot runs in its own
+          # pinned-runner gate (ui-snapshot.yml) so its baseline matches the
+          # comparison environment; on this unpinned ubuntu-latest it would
+          # flake on font drift. Add the nightly exclusion for PR/push runs.
+          MARKER="not visual"
           if [[ "$NIGHTLY_FULL" != "true" ]]; then
-            EXTRA_ARGS+=(-m "not nightly")
+            MARKER="$MARKER and not nightly"
           fi
           # --splits/--group partition the suite via a strided slice (see
           # pytest_collection_modifyitems in tests/e2e_ui/conftest.py), which
@@ -285,7 +290,7 @@ jobs:
             --tracing=retain-on-failure \
             --screenshot=only-on-failure \
             --video=retain-on-failure \
-            "${EXTRA_ARGS[@]}" \
+            -m "$MARKER" \
             || { rc=$?; [ "$rc" -eq 5 ] && echo "::notice::No tests collected in this shard; treating as a pass." || exit "$rc"; }
 
       - name: Upload Playwright traces / videos / screenshots on failure

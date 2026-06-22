@@ -860,6 +860,7 @@ async def _auto_create_cursor_terminal(
     *,
     server_client: httpx.AsyncClient | None,
     ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
 ) -> SessionResourceView:
     """
     Auto-create the Cursor TUI terminal for a cursor-native session.
@@ -875,6 +876,10 @@ async def _auto_create_cursor_terminal(
         terminal.
     :param publish_event: Runner session event publisher.
     :param server_client: Runner Omnigent server client.
+    :param agent_spec: Optional resolved agent spec for the session. When it
+        declares a cursor-agent model (``executor.model``), that model is passed
+        to the TUI via ``--model`` unless the user already pinned one through the
+        passthrough launch args.
     :returns: Created terminal resource view.
     """
     from omnigent.cursor_native import resolve_cursor_executable
@@ -915,6 +920,15 @@ async def _auto_create_cursor_terminal(
     cursor_args = list(launch_config.terminal_launch_args or [])
     if "--approve-mcps" not in cursor_args:
         cursor_args.append("--approve-mcps")
+    # Honor the spec's pinned model (``--model`` flag / config.yaml ``model:``)
+    # by launching cursor-agent with ``--model <model>``. An explicit model in
+    # the passthrough launch args (``omnigent cursor -- --model X`` or the joined
+    # ``--model=X`` form) wins, so only inject when the user did not already pin
+    # one — otherwise cursor-agent would see two ``--model`` values.
+    if not any(arg in ("--model", "-m") or arg.startswith("--model=") for arg in cursor_args):
+        spec_model = _cursor_native_model_from_spec(agent_spec)
+        if spec_model is not None:
+            cursor_args.extend(["--model", spec_model])
     terminal_view = await resource_registry.launch_required_terminal(
         session_id=session_id,
         terminal_name="cursor",
@@ -1621,6 +1635,7 @@ async def _codex_discover_thread_and_forward(
     """
     from omnigent.codex_native_bridge import (
         CodexNativeBridgeState,
+        write_bridge_startup_error,
         write_bridge_state,
     )
     from omnigent.codex_native_forwarder import (
@@ -1635,7 +1650,7 @@ async def _codex_discover_thread_and_forward(
     try:
         try:
             thread_id = await wait_for_thread_started(event_client)
-        except (TimeoutError, RuntimeError):
+        except (TimeoutError, RuntimeError) as exc:
             # Expected failure modes of wait_for_thread_started: the TUI exited
             # at startup, or the event stream ended before a thread was
             # created. Stop forwarding (cleanup runs in ``finally``); any other
@@ -1643,6 +1658,18 @@ async def _codex_discover_thread_and_forward(
             _logger.exception(
                 "Codex TUI never started a thread for %s; chat will not forward",
                 session_id,
+            )
+            # Bridge state is never written here; leave the real cause for the executor (#59).
+            cause = (
+                "startup timed out"
+                if isinstance(exc, TimeoutError)
+                else "event stream ended before a thread was created"
+            )
+            write_bridge_startup_error(
+                bridge_dir,
+                f"Codex app-server never started a thread ({cause}: "
+                f"{type(exc).__name__}). See the runner log near 'native-codex "
+                "routing' for the resolved provider/model.",
             )
             return
 
@@ -1890,6 +1917,37 @@ def _codex_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -
         return None
     model = spec.executor.config.get("model")
     return model if isinstance(model, str) and model else None
+
+
+def _cursor_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> str | None:
+    """
+    Read the cursor-agent model id to launch the native TUI with, from a spec.
+
+    Reads the canonical ``spec.executor.model`` field (the same field the
+    in-process cursor SDK harness consumes via ``_resolve_spec_model``). A
+    gateway-routed id (``databricks-*``) is not a valid ``cursor-agent`` model
+    id, so it is dropped (with a warning) — the caller then omits ``--model`` and
+    ``cursor-agent`` keeps its configured default rather than erroring on launch.
+
+    :param agent_spec: Agent spec object, or a resolved wrapper carrying a
+        ``spec`` attribute. ``None`` means no spec was available.
+    :returns: A cursor-agent model id, e.g. ``"sonnet-4-thinking"``, or ``None``
+        when the spec declares no usable cursor model.
+    """
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    if spec is None:
+        return None
+    model = spec.executor.model
+    if not isinstance(model, str) or not model:
+        return None
+    if model.startswith(("databricks-", "databricks/")):
+        _logger.warning(
+            "cursor-native: pinned model %r is not a cursor-agent model id; "
+            "launching cursor-agent on its configured default instead.",
+            model,
+        )
+        return None
+    return model
 
 
 def _agent_os_env_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> Any | None:
@@ -5853,12 +5911,17 @@ def create_runner_app(
                 if not _has_cursor_terminal:
                     _publish_terminal_pending(_publish_event, session_id, True)
                     try:
+                        try:
+                            _cursor_spec = await _resolve_session_agent_spec(session_id)
+                        except OmnigentError:
+                            _cursor_spec = None
                         await _auto_create_cursor_terminal(
                             session_id,
                             resource_registry,
                             _publish_event,
                             server_client=server_client,
                             ensure_comment_relay=_ensure_comment_relay_started,
+                            agent_spec=_cursor_spec,
                         )
                     except Exception as exc:
                         _logger.exception(
@@ -8257,7 +8320,20 @@ def create_runner_app(
             _publish_turn_status(conv_id, "failed", error=_normalize_turn_error(error))
         else:
             if not has_buffered:
-                _publish_turn_status(conv_id, "idle")
+                # Emit ``waiting`` instead of ``idle`` when the turn ended
+                # cleanly but sub-agents are still running. This lets the
+                # headless ``-p`` multi-turn loop (``_drain_extra_turns`` in
+                # ``chat.py``) distinguish an async orchestrator that parked
+                # on the inbox drain from a truly finished single-turn agent —
+                # both would otherwise emit ``idle`` here, making them
+                # indistinguishable without a "waiting" signal.
+                children = _subagent_work_by_parent.get(conv_id, set())
+                has_running_children = any(
+                    (e := _subagent_work_by_child.get(c)) is not None
+                    and e.status in ("launching", "running", "waiting")
+                    for c in children
+                )
+                _publish_turn_status(conv_id, "waiting" if has_running_children else "idle")
         if was_interrupted:
             _mark_subagent_terminal_and_wake(
                 conv_id,
@@ -11285,12 +11361,20 @@ def create_runner_app(
                         content=session_resource_view_to_dict(existing),
                     )
                 try:
+                    # The spec only feeds optional ``--model`` injection, so a
+                    # resolution failure must not block launching the terminal —
+                    # fall back to None like the Pi ensure path above.
+                    try:
+                        cursor_agent_spec = await _resolve_session_agent_spec(session_id)
+                    except OmnigentError:
+                        cursor_agent_spec = None
                     terminal_view = await _auto_create_cursor_terminal(
                         session_id,
                         resource_registry,
                         _publish_event,
                         server_client=server_client,
                         ensure_comment_relay=_ensure_comment_relay_started,
+                        agent_spec=cursor_agent_spec,
                     )
                 except Exception as exc:
                     _logger.exception(
@@ -13632,9 +13716,10 @@ _HARNESS_MODEL_ENV_KEY: dict[str, str] = {
     "pi": "HARNESS_PI_MODEL",
     "openai-agents": "HARNESS_OPENAI_AGENTS_MODEL",
     "cursor": "HARNESS_CURSOR_MODEL",
-    # cursor-native intentionally omitted: cursor-agent acp uses its configured
-    # default model and the executor ignores a model pin, so it is also absent
-    # from model_override._SDK_MODEL_OVERRIDE_HARNESSES. Keep all three in sync.
+    # cursor-native is intentionally omitted here (and from
+    # model_override._SDK_MODEL_OVERRIDE_HARNESSES): like the other native CLIs
+    # (claude-native, codex-native) it honors the spec model via a launch
+    # ``--model`` arg in _auto_create_cursor_terminal, not via an env var.
     "antigravity": "HARNESS_ANTIGRAVITY_MODEL",
 }
 

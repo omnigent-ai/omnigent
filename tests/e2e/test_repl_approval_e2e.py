@@ -26,7 +26,7 @@ Prerequisites:
 
 Usage::
 
-    python -m pytest tests/e2e/test_repl_approval_e2e.py -v --timeout=180 --no-skip-known
+    python -m pytest tests/e2e/test_repl_approval_e2e.py -v --timeout=180
 """
 
 from __future__ import annotations
@@ -37,6 +37,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -74,6 +75,46 @@ def _strip_ansi(text: str) -> str:
     :returns: Plain text suitable for substring assertions.
     """
     return _ANSI_RE.sub("", text)
+
+
+def _wait_for_function_call_outputs(
+    mock_llm_server_url: str,
+    *,
+    timeout: float = 120.0,
+    poll_interval: float = 0.5,
+) -> str:
+    """
+    Poll the mock server until the tool round-trip's
+    ``function_call_output`` is recorded, then return the joined outputs.
+
+    Waits on the *exact* post-condition the callers assert on (a
+    recorded ``function_call_output``) rather than sampling
+    :func:`get_mock_requests` once after a proxy signal (the follow-up
+    text rendering). The REPL can render the follow-up reply a beat
+    before the mock server finishes persisting the request that carried
+    the output, so a single sample races and returns ``''`` (~3% flake
+    observed on CI shard 2). Polling the real signal removes the race;
+    ``timeout`` is only a safety cap, not the thing we time against.
+
+    :param mock_llm_server_url: Mock server URL.
+    :param timeout: Max seconds to wait for the output to be recorded.
+    :param poll_interval: Seconds between polls.
+    :returns: Space-joined ``function_call_output`` values (``''`` if
+        none were recorded within ``timeout``).
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        reqs = get_mock_requests(mock_llm_server_url)
+        outputs = [
+            item.get("output", "")
+            for req in reqs
+            for item in (req.get("input") or [])
+            if isinstance(item, dict) and item.get("type") == "function_call_output"
+        ]
+        joined = " ".join(str(o) for o in outputs)
+        if outputs or time.monotonic() >= deadline:
+            return joined
+        time.sleep(poll_interval)
 
 
 @pytest.fixture(scope="module")
@@ -148,7 +189,9 @@ def repl_env(
     return env
 
 
-def _configure_mock_text(mock_llm_server_url: str, texts: list[str]) -> None:
+def _configure_mock_text(
+    mock_llm_server_url: str, texts: list[str], *, match: str | None = None
+) -> None:
     """
     Pre-load the mock LLM server with simple text responses.
 
@@ -160,11 +203,17 @@ def _configure_mock_text(mock_llm_server_url: str, texts: list[str]) -> None:
     :param mock_llm_server_url: Mock server base URL.
     :param texts: Ordered list of response texts the mock should
         return, one per LLM call.
+    :param match: Optional content-routing token (the unique user
+        message this test sends). When set, these responses are served
+        only to requests whose user input contains the token, isolating
+        this test's queue from a stray/late request fired by another
+        test on the shared mock (#523 cross-test contamination).
     """
     reset_mock_llm(mock_llm_server_url)
     configure_mock_llm(
         mock_llm_server_url,
         [{"text": t} for t in texts],
+        match=match,
     )
 
 
@@ -172,6 +221,8 @@ def _configure_mock_tool_then_text(
     mock_llm_server_url: str,
     tool_calls: list[dict[str, str]],
     follow_up_text: str,
+    *,
+    match: str | None = None,
 ) -> None:
     """
     Configure a tool-call response followed by a text response.
@@ -184,6 +235,11 @@ def _configure_mock_tool_then_text(
     :param tool_calls: Tool call dicts (``call_id``, ``name``,
         ``arguments``).
     :param follow_up_text: Text for the second LLM call.
+    :param match: Optional content-routing token (the unique user
+        message this test sends). When set, these responses are served
+        only to requests whose user input contains the token, isolating
+        this test's queue from a stray/late request fired by another
+        test on the shared mock (#523 cross-test contamination).
     """
     reset_mock_llm(mock_llm_server_url)
     configure_mock_llm(
@@ -192,6 +248,7 @@ def _configure_mock_tool_then_text(
             {"tool_calls": tool_calls},
             {"text": follow_up_text},
         ],
+        match=match,
     )
 
 
@@ -202,6 +259,7 @@ def _configure_mock_subagent_spawn(
     *,
     sub_agent_responses: list[dict[str, Any]],
     parent_summary: str,
+    match: str | None = None,
 ) -> None:
     """
     Configure a parent→sub-agent→parent mock LLM exchange.
@@ -227,6 +285,12 @@ def _configure_mock_subagent_spawn(
     :param sub_agent_responses: Response dicts the sub-agent's own
         LLM call(s) consume, in order.
     :param parent_summary: Parent's final text response.
+    :param match: Optional content-routing token. Works here only
+        because the sub-agent is delegated *message* — so both the
+        parent (user message) and the sub-agent (delegated task) carry
+        the token, and the single ordered queue serves both in order
+        while a stray request from another test (no token) cannot draw
+        from it (#523 isolation).
     """
     reset_mock_llm(mock_llm_server_url)
     spawn = {
@@ -247,6 +311,7 @@ def _configure_mock_subagent_spawn(
             {"text": "(spare)"},
             {"text": "(spare)"},
         ],
+        match=match,
     )
 
 
@@ -325,8 +390,7 @@ def _wait_for_turn_complete(child: Any, timeout: float = 45.0) -> None:
     ``\\d+\\.\\d+s`` decimal "elapsed" footer, but the current REPL
     never renders one — the only elapsed readout is the integer
     ``streaming… Ns`` segment that disappears on completion. Waiting
-    for that stale pattern times out even though the turn finished,
-    which is the second half of the REPL-pexpect quarantine family.
+    for that stale pattern times out even though the turn finished.
 
     A single ``· ready`` expect is enough: every send/approve site
     leaves the toolbar in ``state: running`` (the turn is dispatched,
@@ -387,7 +451,9 @@ def test_repl_single_approval_allows_llm_response(
     multiple ``⚠ approval required`` banners. Counting on
     the ANSI-stripped buffer is the regression guard.
     """
-    _configure_mock_text(mock_llm_server_url, ["Hi there! How can I help you today?"])
+    _configure_mock_text(
+        mock_llm_server_url, ["Hi there! How can I help you today?"], match="approve-llm-resp"
+    )
     child = pexpect.spawn(
         ap_cli,
         ["run", str(_ASK_DEMO_DIR)],
@@ -403,7 +469,7 @@ def test_repl_single_approval_allows_llm_response(
         # Send the user message and wait for the approval
         # banner. 'approval required' is the human-readable
         # header emitted by the REPL's _make_approval_prompt.
-        child.send("Hello" + "\r")
+        child.send("Hello approve-llm-resp" + "\r")
         child.expect("approval required", timeout=30)
         # The preview line should echo what we just typed —
         # confirms the server-side INPUT-phase eval and the
@@ -483,7 +549,7 @@ def test_repl_refusal_shows_deny_sentinel(
     """
     # No LLM call expected on refuse — configure a dummy response
     # so the mock doesn't 500 if the server unexpectedly calls it.
-    _configure_mock_text(mock_llm_server_url, ["should not appear"])
+    _configure_mock_text(mock_llm_server_url, ["should not appear"], match="deny-sentinel")
     child = pexpect.spawn(
         ap_cli,
         ["run", str(_ASK_DEMO_DIR)],
@@ -496,7 +562,7 @@ def test_repl_refusal_shows_deny_sentinel(
     try:
         _wait_for_prompt_ready(child, timeout=60)
 
-        child.send("Hello" + "\r")
+        child.send("Hello deny-sentinel" + "\r")
         child.expect("approval required", timeout=30)
         child.expect("Hello", timeout=5)
 
@@ -546,6 +612,7 @@ def test_repl_two_turns_fires_one_approval_per_turn(
             "Hello! Nice to meet you.",
             "Sure thing, got it!",
         ],
+        match="two-turns-guard",
     )
     child = pexpect.spawn(
         ap_cli,
@@ -560,7 +627,7 @@ def test_repl_two_turns_fires_one_approval_per_turn(
         _wait_for_prompt_ready(child, timeout=60)
 
         # Turn 1: approve, wait for reply.
-        child.send("Hello" + "\r")
+        child.send("Hello two-turns-guard" + "\r")
         child.expect("approval required", timeout=30)
         child.send("y" + "\r")
         child.expect("approved", timeout=5)
@@ -660,6 +727,7 @@ def test_repl_approve_always_caches_for_later_turns(
             "Hello there!",
             "Following up as requested.",
         ],
+        match="approve-cache",
     )
     child = pexpect.spawn(
         ap_cli,
@@ -674,7 +742,7 @@ def test_repl_approve_always_caches_for_later_turns(
         _wait_for_prompt_ready(child, timeout=60)
 
         # Turn 1: approve always.
-        child.send("Hello" + "\r")
+        child.send("Hello approve-cache" + "\r")
         child.expect("approval required", timeout=30)
         child.send("a" + "\r")
         # Echo line confirms the REPL parsed "a" as
@@ -760,6 +828,7 @@ def test_repl_tool_call_approval_allows_tool_to_run(
             }
         ],
         follow_up,
+        match="testing123",
     )
     child = pexpect.spawn(
         ap_cli,
@@ -793,14 +862,7 @@ def test_repl_tool_call_approval_allows_tool_to_run(
         child.expect(follow_up, timeout=120)
         # The echo tool runs; its output prefix 'echo:' should reach the
         # LLM's function_call_output on the follow-up call.
-        reqs = get_mock_requests(mock_llm_server_url)
-        outputs = [
-            item.get("output", "")
-            for req in reqs
-            for item in (req.get("input") or [])
-            if isinstance(item, dict) and item.get("type") == "function_call_output"
-        ]
-        joined = " ".join(str(o) for o in outputs)
+        joined = _wait_for_function_call_outputs(mock_llm_server_url)
         assert "echo: testing123" in joined, (
             "Tool output did not reach the LLM's function_call_output after "
             f"approval.\nfunction_call_outputs: {joined[:800]}"
@@ -843,6 +905,7 @@ def test_repl_tool_call_refusal_blocks_tool(
             }
         ],
         follow_up,
+        match="testing456",
     )
     child = pexpect.spawn(
         ap_cli,
@@ -868,14 +931,7 @@ def test_repl_tool_call_refusal_blocks_tool(
         # separate TOOL_RESULT substitution path.) The regression
         # guard: a denial is recorded AND the raw echo output must
         # NEVER reach the conversation.
-        reqs = get_mock_requests(mock_llm_server_url)
-        outputs = [
-            item.get("output", "")
-            for req in reqs
-            for item in (req.get("input") or [])
-            if isinstance(item, dict) and item.get("type") == "function_call_output"
-        ]
-        joined = " ".join(str(o) for o in outputs)
+        joined = _wait_for_function_call_outputs(mock_llm_server_url)
         assert "denied" in joined.lower(), (
             "Tool-call denial marker did not appear in the LLM's "
             "function_call_output — refusal enforcement may have "
@@ -945,9 +1001,10 @@ def test_repl_subagent_ask_does_not_tunnel_banner_to_root(
     _configure_mock_subagent_spawn(
         mock_llm_server_url,
         "worker",
-        "say hello",
+        "say hello subagent-ask",
         sub_agent_responses=[{"text": worker_reply}],
         parent_summary="Parent summarized the worker.",
+        match="subagent-ask",
     )
     child = pexpect.spawn(
         ap_cli,
@@ -964,7 +1021,7 @@ def test_repl_subagent_ask_does_not_tunnel_banner_to_root(
             timeout=90,
             welcome_pattern="e2e.subagent.gate",
         )
-        child.send("say hello" + "\r")
+        child.send("say hello subagent-ask" + "\r")
         # The full turn — spawn, sub-agent run, inbox collect, parent
         # summary — completes without ever parking on a banner.
         _wait_for_turn_complete(child, timeout=90)
@@ -1043,6 +1100,7 @@ def test_repl_label_driven_ask_approves(
             "Got it, banana trigger noted.",
             "Continuing as requested.",
         ],
+        match="label-approve",
     )
     child = pexpect.spawn(
         ap_cli,
@@ -1061,7 +1119,7 @@ def test_repl_label_driven_ask_approves(
         )
         # Turn 1: trigger taint — no ASK fires this turn
         # (condition checks the pre-evaluation snapshot).
-        child.send("hello BANANA_TRIGGER" + "\r")
+        child.send("hello BANANA_TRIGGER label-approve" + "\r")
         # The LLM still replies normally. Wait for turn end.
         _wait_for_turn_complete(child, timeout=45)
         turn_one = child.before or ""
@@ -1123,6 +1181,7 @@ def test_repl_label_driven_ask_refuse_shows_sentinel(
             "Banana trigger received.",
             "should not appear",
         ],
+        match="label-refuse",
     )
     child = pexpect.spawn(
         ap_cli,
@@ -1140,7 +1199,7 @@ def test_repl_label_driven_ask_refuse_shows_sentinel(
             welcome_pattern="e2e.label.ask.gate",
         )
         # Turn 1: taint.
-        child.send("hi BANANA_TRIGGER" + "\r")
+        child.send("hi BANANA_TRIGGER label-refuse" + "\r")
         _wait_for_turn_complete(child, timeout=45)
         _read_pending(child, seconds=1.0)
 
@@ -1204,7 +1263,7 @@ def test_repl_output_ask_does_not_prompt_in_repl(
     "same fix applies to OUTPUT" follow-up there does not hold.)
     """
     reply = "output-passthrough-reply-marker"
-    _configure_mock_text(mock_llm_server_url, [reply])
+    _configure_mock_text(mock_llm_server_url, [reply], match="output-noprompt")
     child = pexpect.spawn(
         ap_cli,
         ["run", str(_OUTPUT_GATE_DIR)],
@@ -1220,7 +1279,7 @@ def test_repl_output_ask_does_not_prompt_in_repl(
             timeout=60,
             welcome_pattern="e2e.output.gate",
         )
-        child.send("say hi" + "\r")
+        child.send("say hi output-noprompt" + "\r")
         # The reply renders without ever parking on a banner. Sync on the
         # reply marker (deterministic content) rather than the cosmetic
         # `· ready` idle-settle, which can race/not-render under CI load.
@@ -1267,7 +1326,7 @@ def test_repl_output_ask_passes_reply_through_no_sentinel(
     substituted. Verified live against the mock.)
     """
     reply = "output-verbatim-reply-marker"
-    _configure_mock_text(mock_llm_server_url, [reply])
+    _configure_mock_text(mock_llm_server_url, [reply], match="output-passthru")
     child = pexpect.spawn(
         ap_cli,
         ["run", str(_OUTPUT_GATE_DIR)],
@@ -1283,7 +1342,7 @@ def test_repl_output_ask_passes_reply_through_no_sentinel(
             timeout=60,
             welcome_pattern="e2e.output.gate",
         )
-        child.send("say hi" + "\r")
+        child.send("say hi output-passthru" + "\r")
         # The raw reply reaches the user verbatim (no DENY substitution).
         # Sync on the reply marker itself — its appearance IS the proof the
         # output passed through ungated.
@@ -1361,6 +1420,7 @@ def test_repl_tool_result_ask_does_not_prompt_in_repl(
             }
         ],
         follow_up,
+        match="pineapple",
     )
     child = pexpect.spawn(
         ap_cli,
@@ -1396,14 +1456,7 @@ def test_repl_tool_result_ask_does_not_prompt_in_repl(
         )
         # The raw tool output reached the LLM untouched (no deny
         # sentinel) — the ASK passed through rather than blocking.
-        reqs = get_mock_requests(mock_llm_server_url)
-        outputs = [
-            item.get("output", "")
-            for req in reqs
-            for item in (req.get("input") or [])
-            if isinstance(item, dict) and item.get("type") == "function_call_output"
-        ]
-        joined = " ".join(str(o) for o in outputs)
+        joined = _wait_for_function_call_outputs(mock_llm_server_url)
         assert "echo: pineapple" in joined, (
             "Expected the raw echo output to reach the LLM's "
             "function_call_output (TOOL_RESULT ASK is a no-op today), but "
@@ -1455,6 +1508,7 @@ def test_repl_tool_result_ask_passes_output_through(
             }
         ],
         follow_up,
+        match="mangosteen",
     )
     child = pexpect.spawn(
         ap_cli,
@@ -1474,12 +1528,11 @@ def test_repl_tool_result_ask_passes_output_through(
         child.send("mangosteen" + "\r")
         # Sync on the post-tool follow-up reply: it only renders after the
         # LLM's second call, which requires the function_call_output round-trip
-        # to have completed (and thus been recorded by the mock server).
-        # Polling get_mock_requests right after `· ready` can race the mock
-        # server's request recording (~3% flake observed) — expecting the
-        # follow-up text first makes the round-trip recording deterministic.
-        # 120s headroom for REPL turn latency under CI worker contention
-        # (#523 family); within the --timeout=180 pytest cap.
+        # to have completed. 120s headroom for REPL turn latency under CI
+        # worker contention (#523 family); within the --timeout=180 pytest cap.
+        # (The follow-up render is a proxy; the function_call_output assertion
+        # below waits on the real signal via _wait_for_function_call_outputs,
+        # which polls until the mock has recorded the output.)
         child.expect(follow_up, timeout=120)
         full_turn = _strip_ansi((child.before or "") + follow_up)
         assert "approval required" not in full_turn, (
@@ -1487,14 +1540,7 @@ def test_repl_tool_result_ask_passes_output_through(
             f"mid-flight ASK is not implemented (see #765).\nCaptured:\n{full_turn[:1500]}"
         )
         # No deny sentinel: today's path does not suppress the output.
-        reqs = get_mock_requests(mock_llm_server_url)
-        outputs = [
-            item.get("output", "")
-            for req in reqs
-            for item in (req.get("input") or [])
-            if isinstance(item, dict) and item.get("type") == "function_call_output"
-        ]
-        joined = " ".join(str(o) for o in outputs)
+        joined = _wait_for_function_call_outputs(mock_llm_server_url)
         assert "echo: mangosteen" in joined, (
             "The raw echo output did not reach the LLM — TOOL_RESULT ASK "
             f"is a no-op today and must not suppress it.\noutputs: {joined[:800]}"
@@ -1561,7 +1607,16 @@ def test_repl_subagent_tool_call_ask_does_not_tunnel_banner_to_root(
     worker_reply = "worker-reply-render-marker"
     parent_summary = "parent-summary-render-marker"
     reset_mock_llm(mock_llm_server_url)
-    # Parent queue (model gpt-4o): spawn toolworker, then summarize.
+    # Both queues are content-routed on DISTINCT, mutually-non-substring
+    # tokens so parent and sub-agent calls split correctly AND neither
+    # queue is reachable by model fallback (closes the gpt-4o / gpt-4o-mini
+    # contamination vectors entirely — #523 isolation):
+    #   - "statool-parent" appears ONLY in the root user message, so the
+    #     parent's calls (and its post-spawn continuation) route here. The
+    #     delegated-task token lives in a function_call, not user content,
+    #     so it never leaks into the parent's user text.
+    #   - "statool-worker" appears ONLY in the task delegated to the
+    #     toolworker, so the sub-agent's calls route to its own queue.
     configure_mock_llm(
         mock_llm_server_url,
         [
@@ -1571,7 +1626,11 @@ def test_repl_subagent_tool_call_ask_does_not_tunnel_banner_to_root(
                         "call_id": "sa1",
                         "name": "sys_session_send",
                         "arguments": json.dumps(
-                            {"agent": "toolworker", "title": "t", "args": "return the word durian"}
+                            {
+                                "agent": "toolworker",
+                                "title": "t",
+                                "args": "return the word durian statool-worker",
+                            }
                         ),
                     }
                 ]
@@ -1580,9 +1639,9 @@ def test_repl_subagent_tool_call_ask_does_not_tunnel_banner_to_root(
             {"text": "(spare)"},
             {"text": "(spare)"},
         ],
-        key="gpt-4o",
+        match="statool-parent",
     )
-    # Toolworker queue (model gpt-4o-mini): call echo, then reply.
+    # Toolworker queue — content-routed on the delegated-task token.
     configure_mock_llm(
         mock_llm_server_url,
         [
@@ -1599,7 +1658,7 @@ def test_repl_subagent_tool_call_ask_does_not_tunnel_banner_to_root(
             {"text": "(spare)"},
             {"text": "(spare)"},
         ],
-        key="gpt-4o-mini",
+        match="statool-worker",
     )
     child = pexpect.spawn(
         ap_cli,
@@ -1616,7 +1675,7 @@ def test_repl_subagent_tool_call_ask_does_not_tunnel_banner_to_root(
             timeout=90,
             welcome_pattern="e2e.subagent.tool.gate",
         )
-        child.send("return the word durian" + "\r")
+        child.send("return the word durian statool-parent" + "\r")
         # Deterministic content-marker sync: the parent's summary text
         # renders only after the sub-agent ran echo end-to-end and its
         # result landed in the inbox. Keying on the marker (not the

@@ -5,9 +5,16 @@ Migrated to mock LLM: uses canned tool-call responses to trigger
 
 Uses ``examples/terminal_workers.yaml`` so the REPL hosts a
 terminal-supervisor. Sends a prompt that (via the mock response)
-invokes ``sys_terminal_launch``, waits for the completion line, opens
+invokes ``sys_terminal_launch``, waits for the turn to complete, opens
 the overview, cycles to the terminal target, and asserts the overview
 pane renders the tmux ``attach`` instruction line.
+
+The supervisor runs the ``openai-agents`` harness (not the YAML's
+default ``open-responses``): under the mock LLM server, ``open-responses``
+fails to spawn on the runner (``harness_spawn_failed`` / ``runner_error``)
+so the terminal never launches — a mock-incompatibility analogous to the
+documented ``claude-sdk`` case, not a stale marker. ``openai-agents`` is
+mock-compatible and exercises the same terminal-launch + overview path.
 
 **What breaks if this fails:**
 - ``_collect_overview_targets`` stops including terminal instances.
@@ -18,10 +25,12 @@ pane renders the tmux ``attach`` instruction line.
 
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 from shutil import which
 from typing import Any
 
+import pexpect
 import pytest
 
 from tests.e2e.omnigent._pexpect_harness import (
@@ -31,12 +40,11 @@ from tests.e2e.omnigent._pexpect_harness import (
     submit_prompt,
     wait_for_ready,
 )
-from tests.e2e.omnigent._repl_test_helpers import drain_for
 from tests.e2e.omnigent._snapshot import compare_snapshot
 from tests.e2e.omnigent.conftest import configure_mock_llm
 
 _MODEL = "mock-overview-terminal"
-_HARNESS = "open-responses"
+_HARNESS = "openai-agents"
 
 _PROMPT = (
     'Call sys_terminal_launch(terminal="shell", session="probe") '
@@ -124,29 +132,30 @@ def test_repl_overview_terminal_visibility(
     try:
         wait_for_ready(child, timeout=_BOOT_TIMEOUT)
         submit_prompt(child, _PROMPT)
-        # Wait for the ``sys_terminal_launch`` completion line.
-        # Once it appears, the launch has finished and
-        # ``_terminal_instances[("shell", "probe")]`` is registered.
-        child.expect(
-            r"• sys_terminal_launch \(\d+ms\)",
-            timeout=_COMPLETION_TIMEOUT,
-        )
-        # Drain the completion line so the subsequent overview render
-        # isn't masked by tool-call tail bytes.
-        drain_for(child, 2.0)
-        # Open the overview.
-        child.sendcontrol("g")
-        drain_for(child, _OVERVIEW_DRAIN_TIMEOUT)
-        # Tab cycles through targets: main → shell:probe.
+        # Sync on the supervisor's FINAL reply text, which renders only after
+        # sys_terminal_launch executed and registered the terminal as an
+        # overview target. (The old "• sys_terminal_launch (Nms)" completion
+        # line is retired — the tool-call now renders as
+        # "⏵ sys_terminal_launch({...})" — and that line carries ANSI between
+        # the name and "(", so syncing on it is unreliable.)
+        child.expect("launching the terminal", timeout=_COMPLETION_TIMEOUT)
+        # Open the overview (Ctrl+O; binding moved off Ctrl+G — Warp intercepts
+        # Ctrl+G, see _repl.py "Why Ctrl+O and not Ctrl+G").
+        child.sendcontrol("o")
+        # Wait for the sidebar to paint the terminal target ("💻 shell:probe").
+        child.expect(_TERMINAL_LABEL, timeout=_EXPECT_TERMINAL_TIMEOUT)
+        # Tab cycles main → shell:probe so the terminal detail pane (the tmux
+        # attach instructions, "tmux -S <sock> attach …") renders.
         child.send("\t")
-        # Wait for the terminal pane's "Terminal:" header to render.
-        child.expect(f"Terminal: {_TERMINAL_LABEL}", timeout=_EXPECT_TERMINAL_TIMEOUT)
-        terminal_pane_tail = drain_for(child, _OVERVIEW_DRAIN_TIMEOUT)
-        terminal_stripped = (
-            strip_ansi(child.before or "")
-            + f"Terminal: {_TERMINAL_LABEL}"
-            + strip_ansi(terminal_pane_tail)
-        )
+        # Accumulate the detail pane. The status-bar clock ticks ~1×/s, so a
+        # drain that bails on a 0.3s idle gap is unreliable — force a
+        # fixed-duration read with an impossible-pattern expect.
+        with contextlib.suppress(pexpect.TIMEOUT):
+            child.expect("ZZZ_NEVER_MATCHES_DRAIN", timeout=_OVERVIEW_DRAIN_TIMEOUT)
+        terminal_stripped = _TERMINAL_LABEL + strip_ansi(child.before or "")
+        # Close the overlay before teardown ('q'); leaving it open blocks the
+        # Ctrl+D / "/quit" exit handshake (see test_repl_ctrl_o_overview).
+        child.send("q")
         clean_exit(child, timeout=_EXIT_TIMEOUT)
         exit_code = child.exitstatus
     finally:
