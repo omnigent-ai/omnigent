@@ -346,18 +346,23 @@ def test_nimble_max_results_clamped() -> None:
 # ── No search_provider set ───────────────────────────
 
 
-def test_no_search_provider_returns_help_message(tool_ctx: ToolContext) -> None:
+def test_no_search_provider_defaults_to_duckduckgo(
+    tool_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """
-    Without search_provider in config, the tool returns a message
-    explaining how to configure it. Lists all supported backends.
+    Without ``search_provider``, web_search defaults to the keyless
+    DuckDuckGo backend so it works out of the box (no credentials needed),
+    rather than returning a configuration error. (Previously this returned a
+    "set search_provider" help message; an agent with no key then had no way
+    to search and would escalate to a heavyweight browser tool.)
     """
-    tool = WebSearchTool(llm_provider="anthropic")
-    result = tool.invoke(json.dumps({"query": "test"}), tool_ctx)
+    import omnigent.tools.builtins.web_search_duckduckgo as ddg
 
-    assert "search_provider" in result, f"Should tell user to set search_provider. Got: {result}"
-    assert "google" in result.lower()
-    assert "perplexity" in result.lower()
-    assert "nimble" in result.lower()
+    monkeypatch.setattr(ddg, "_search_duckduckgo", lambda q, c: f"DDG results for {q}")
+    tool = WebSearchTool(llm_provider="anthropic")
+    result = tool.invoke(json.dumps({"query": "test query"}), tool_ctx)
+
+    assert result == "DDG results for test query"
 
 
 # ── Spec config passed through ───────────────────────
