@@ -665,7 +665,7 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
           <SectionLabel>Session ID</SectionLabel>
           <div className="flex items-center gap-2">
             <code
-              className="min-w-0 flex-1 truncate rounded bg-muted px-1.5 py-1 font-mono text-xs text-muted-foreground"
+              className="min-w-0 flex-1 truncate py-1 font-mono text-xs text-muted-foreground"
               data-testid="agent-info-session-id"
               title={sessionId}
             >
@@ -693,7 +693,7 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
         <div className="flex flex-col gap-1.5">
           <SectionLabel>Session cost</SectionLabel>
           <span
-            className="text-sm tabular-nums text-muted-foreground"
+            className="font-mono text-xs tabular-nums text-muted-foreground"
             data-testid="agent-info-session-cost"
           >
             {formatSessionCostUsd(sessionCostUsd)}
