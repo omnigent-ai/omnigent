@@ -184,6 +184,9 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.template: str | None = None
         self.secrets: list[str] | None = None
         self.env: list[str] | None = None
+        self.endpoint: str | None = None
+        self.home_dir: str | None = None
+        self.registry: dict[str, object] | None = None
         self.base_url: str | None = None
         self.gateway_profile: str | None = None
         self.snapshot_name: str | None = None
@@ -339,6 +342,41 @@ def install_fake_daytona_launcher(
         return fake
 
     monkeypatch.setattr(daytona_mod, "DaytonaSandboxLauncher", _ctor)
+
+
+def install_fake_boxlite_launcher(
+    monkeypatch: Any,  # pytest.MonkeyPatch — Any avoids importing pytest in a helpers module
+    fake: FakeSandboxLauncher,
+) -> None:
+    """
+    Substitute the fake for ``BoxliteSandboxLauncher`` at its public seam.
+
+    The managed flow constructs ``BoxliteSandboxLauncher(endpoint=…,
+    image=…, env=…)``; the shim records all three on the fake and hands
+    the fake back, so production code runs unmodified against it.
+
+    :param monkeypatch: The test's ``pytest.MonkeyPatch``.
+    :param fake: The fake launcher to substitute.
+    """
+    import omnigent.onboarding.sandboxes.boxlite as boxlite_mod
+
+    def _ctor(
+        *,
+        endpoint: str | None = None,
+        image: str | None = None,
+        env: list[str] | None = None,
+        home_dir: str | None = None,
+        registry: dict[str, object] | None = None,
+    ) -> FakeSandboxLauncher:
+        """Stand-in constructor recording the construction wiring."""
+        fake.endpoint = endpoint
+        fake.image = image
+        fake.env = env
+        fake.home_dir = home_dir
+        fake.registry = registry
+        return fake
+
+    monkeypatch.setattr(boxlite_mod, "BoxliteSandboxLauncher", _ctor)
 
 
 def install_fake_islo_launcher(

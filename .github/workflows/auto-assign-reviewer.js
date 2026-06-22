@@ -1,4 +1,4 @@
-// Repo-level reviewer assignment: assign EXACTLY 2 load-balanced reviewers to
+// Repo-level reviewer assignment: assign EXACTLY 1 load-balanced reviewer to
 // FORK PRs authored by a NON-maintainer, preferring the owners of the area(s)
 // the PR touches.
 //
@@ -21,7 +21,7 @@
 // so a manually-added reviewer outside that set is left untouched.
 module.exports = async ({ github, context, core }) => {
   const fs = require("fs");
-  const TARGET = 2;
+  const TARGET = 1;
   const { owner, repo } = context.repo;
   const pr = context.payload.pull_request;
   if (!pr || pr.draft) {
@@ -130,8 +130,8 @@ module.exports = async ({ github, context, core }) => {
     return out;
   };
 
-  // Desired = 2 lowest-load from candidates; top up from the full pool if an
-  // area has fewer than 2 owners.
+  // Desired = 1 lowest-load from candidates; top up from the full pool if an
+  // area has fewer than 1 owner.
   let desired = takeLowest(candidates, TARGET);
   if (desired.length < TARGET) {
     const have = new Set(desired.map((u) => u.toLowerCase()).concat(author));
@@ -142,7 +142,7 @@ module.exports = async ({ github, context, core }) => {
 
   // --- Reconcile current requested reviewers to exactly `desired`. Normally
   // nothing is pre-requested, but on a reopened PR (or after a manual add) this
-  // keeps the set at the 2 balanced picks.
+  // keeps the set at the 1 balanced pick.
   const current = (pr.requested_reviewers || []).map((r) => r.login);
   const currentLc = new Set(current.map((c) => c.toLowerCase()));
   const toAdd = desired.filter((u) => !currentLc.has(u.toLowerCase()));
@@ -162,8 +162,30 @@ module.exports = async ({ github, context, core }) => {
       owner, repo, pull_number: pr.number, reviewers: toRemove,
     });
   }
+
+  // --- Also sync assignees to mirror the desired reviewer set so PRs are
+  // filterable by assignee in the GitHub UI.
+  const currentAssignees = (pr.assignees || []).map((a) => a.login);
+  const currentAssigneesLc = new Set(currentAssignees.map((a) => a.toLowerCase()));
+  const toAddAssignees = desired.filter((u) => !currentAssigneesLc.has(u.toLowerCase()));
+  const toRemoveAssignees = currentAssignees.filter(
+    (u) => managed.has(u.toLowerCase()) && !desiredLc.has(u.toLowerCase())
+  );
+
+  if (toAddAssignees.length) {
+    await github.rest.issues.addAssignees({
+      owner, repo, issue_number: pr.number, assignees: toAddAssignees,
+    });
+  }
+  if (toRemoveAssignees.length) {
+    await github.rest.issues.removeAssignees({
+      owner, repo, issue_number: pr.number, assignees: toRemoveAssignees,
+    });
+  }
+
   core.info(
     `Reviewers -> [${desired.join(", ")}]` +
-      ` (area pool ${areaOwners.size || "∅→full"}, +${toAdd.length}/-${toRemove.length}).`
+      ` (area pool ${areaOwners.size || "∅→full"}, +${toAdd.length}/-${toRemove.length})` +
+      ` | Assignees +${toAddAssignees.length}/-${toRemoveAssignees.length}.`
   );
 };

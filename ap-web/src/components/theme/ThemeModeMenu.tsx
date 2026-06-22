@@ -31,9 +31,9 @@ export function ThemeModeMenu() {
   // Embedded: the host owns the theme and `embed.tsx` forces light, so a theme
   // switcher would be a no-op. Hide it.
   const isEmbedded = useIsEmbedded();
-  const { theme, setTheme } = useTheme();
+  const { theme, resolvedTheme, setTheme } = useTheme();
   const mode = normalizeThemeMode(theme);
-  const next = nextThemeMode(mode);
+  const next = nextThemeMode(mode, resolvedTheme);
   const NextIcon = themeModeIcons[next];
   const action = `Switch to ${themeModeLabels[next]}`;
 
