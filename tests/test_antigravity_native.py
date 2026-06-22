@@ -304,6 +304,10 @@ async def test_daemon_resume_cold_falls_through_to_launch(
     monkeypatch.setattr(_mod, "wait_for_runner_online", _noop)
     monkeypatch.setattr(_mod, "launch_or_reuse_daemon_runner", _noop)
     monkeypatch.setattr(_mod, "_bind_session_runner", _noop)
+    # The runner produces no terminal in this scenario (handler always 404s), so
+    # shorten the post-bind wait to keep the fallback-to-launch test fast.
+    monkeypatch.setattr(_mod, "_RUNNER_TERMINAL_AUTOCREATE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(_mod, "_RUNNER_TERMINAL_POLL_INTERVAL_S", 0.01)
 
     async with _mock_client(_handler) as client:
         _patch_prepare_client(monkeypatch, client)
@@ -327,6 +331,82 @@ async def test_daemon_resume_cold_falls_through_to_launch(
     assert isinstance(launch_kwargs, dict)
     assert launch_kwargs["resume"] is True
     assert launch_kwargs["conversation_id"] == "68caaeac-2eaf-4e2c-9b95-721b022f4903"
+
+
+async def test_daemon_fresh_launch_reattaches_to_runner_autocreated_terminal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A fresh launch reattaches to the runner's auto-created terminal, not relaunch.
+
+    Regression for the double-launch bug: binding the runner triggers the runner's
+    auto-create of the antigravity terminal (``runner/app.py``
+    ``_auto_create_antigravity_terminal``). The CLI must then reattach to that
+    runner-owned terminal — NOT call ``_launch_and_record`` (whose
+    ``clear_bridge_state`` wipes the bridge state the runner just wrote, breaking
+    web-turn injection with "Antigravity native bridge state is missing", while its
+    redundant terminal POST 500s). The pre-bind reattach check (resume path) cannot
+    catch this because the runner only auto-creates AFTER the bind.
+    """
+    import omnigent.antigravity_native_bridge as bridge_mod
+
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    terminal_id = antigravity_terminal_resource_id()
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        # The runner has auto-created the terminal by the time we poll (post-bind).
+        if request.method == "GET" and path.endswith(f"/resources/terminals/{terminal_id}"):
+            return httpx.Response(
+                200,
+                json={
+                    "id": terminal_id,
+                    "metadata": {
+                        "running": True,
+                        "tmux_socket": "/tmp/s.sock",
+                        "tmux_target": "main",
+                    },
+                },
+            )
+        raise AssertionError(f"unexpected request: {request.method} {path}")
+
+    async def _create(*args: object, **kwargs: object) -> str:
+        return "conv_fresh123"
+
+    async def _boom_launch(*args: object, **kwargs: object) -> object:
+        raise AssertionError(
+            "fresh launch must reattach to the runner-owned terminal, not relaunch "
+            "(double-launch clobbers the runner's bridge state)"
+        )
+
+    async def _noop(*args: object, **kwargs: object) -> object:
+        return None
+
+    monkeypatch.setattr(_mod, "_create_antigravity_session", _create)
+    monkeypatch.setattr(_mod, "_launch_and_record", _boom_launch)
+    monkeypatch.setattr(_mod, "wait_for_host_online", _noop)
+    monkeypatch.setattr(_mod, "wait_for_runner_online", _noop)
+    monkeypatch.setattr(_mod, "launch_or_reuse_daemon_runner", _noop)
+    monkeypatch.setattr(_mod, "_bind_session_runner", _noop)
+
+    async with _mock_client(_handler) as client:
+        _patch_prepare_client(monkeypatch, client)
+        prepared = await _mod._prepare_antigravity_terminal_via_daemon(
+            base_url="http://127.0.0.1:0",
+            headers={},
+            session_id=None,
+            session_bundle=b"bundle",
+            antigravity_args=(),
+            command="agy",
+            model=None,
+            host_id="host_1",
+            workspace="/tmp/ws",
+            startup_progress=None,
+        )
+
+    assert prepared.reattached is True, "fresh launch must reattach to the runner-owned terminal"
+    assert prepared.terminal_id == terminal_id
+    assert prepared.tmux_target == "main"
 
 
 # ---------------------------------------------------------------------------

@@ -34,10 +34,14 @@ Differences from the Codex / Claude wrappers (Phase 1 scope):
   ``--add-dir`` is needed.
 * **Auth is inherited from ``~/.gemini``** — no credential seeding.
 
-Because the runner has no agy auto-create branch, the CLI launches the agy
-terminal itself via the terminal resource API in **both** local-server and
-remote-server modes (the remote path binds a daemon runner first, then POSTs
-the same explicit terminal spec).
+The runner OWNS the agy terminal: binding a runner triggers its idempotent
+auto-create of the antigravity terminal (``runner/app.py``
+``_auto_create_antigravity_terminal``) for every antigravity-native session. So
+the CLI reattaches to that runner-owned terminal after binding rather than
+launching its own — a double launch 500s ("already observed as required") and
+clobbers the runner's bridge state (breaking web-turn injection). A CLI-side
+launch (:func:`_launch_and_record`) remains only as a defensive fallback for the
+unexpected case where the runner produces no terminal in the wait window.
 """
 
 from __future__ import annotations
@@ -49,6 +53,7 @@ import logging
 import os
 import shutil
 import sys
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -634,6 +639,45 @@ async def _prepare_antigravity_terminal(
     )
 
 
+# Binding a runner triggers the runner's idempotent auto-create of the
+# antigravity terminal (``runner/app.py`` ``_auto_create_antigravity_terminal``),
+# which OWNS the terminal for every antigravity-native session. After bind, wait
+# this long for that runner-owned terminal to appear before falling back to a
+# CLI-side launch — the fallback only fires when the runner produced none.
+_RUNNER_TERMINAL_AUTOCREATE_TIMEOUT_S = 20.0
+_RUNNER_TERMINAL_POLL_INTERVAL_S = 0.25
+
+
+async def _await_runner_antigravity_terminal(
+    client: httpx.AsyncClient,
+    session_id: str,
+    timeout_s: float,
+) -> LaunchedAntigravityTerminal | None:
+    """
+    Poll for the runner-auto-created agy terminal after a runner bind.
+
+    The runner auto-creates the antigravity terminal asynchronously once a runner
+    binds, so a fresh/cold-resume CLI launch must wait for it and reattach instead
+    of launching its own (a double-launch 500s AND ``_launch_and_record``'s
+    ``clear_bridge_state`` would wipe the bridge state the runner wrote, breaking
+    web-turn injection). Uses ``time.monotonic`` for the deadline.
+
+    :param client: HTTP client pointed at the Omnigent server.
+    :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
+    :param timeout_s: Max seconds to wait for the runner-owned terminal.
+    :returns: The runner-owned terminal details, or ``None`` if none appeared
+        within *timeout_s* (the caller then launches one itself).
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        found = await _find_running_antigravity_terminal(client, session_id)
+        if found is not None:
+            return found
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(_RUNNER_TERMINAL_POLL_INTERVAL_S)
+
+
 async def _prepare_antigravity_terminal_via_daemon(
     *,
     base_url: str,
@@ -650,10 +694,13 @@ async def _prepare_antigravity_terminal_via_daemon(
     startup_progress: RunnerStartupProgress | None = None,
 ) -> PreparedAntigravityTerminal:
     """
-    Create/resolve a session through a daemon runner and launch agy.
+    Create/resolve a session through a daemon runner and attach to agy.
 
-    Binds a daemon-spawned runner to the session, then POSTs the agy
-    terminal resource directly (the runner has no agy auto-create branch).
+    Binds a daemon-spawned runner to the session, then reattaches to the
+    runner-owned agy terminal that the bind auto-creates (the runner owns the
+    terminal for every antigravity-native session). Only launches the terminal
+    itself (:func:`_launch_and_record`) as a fallback when the runner produced
+    none within :data:`_RUNNER_TERMINAL_AUTOCREATE_TIMEOUT_S`.
 
     :param base_url: Omnigent server base URL.
     :param headers: HTTP auth headers for Omnigent requests.
@@ -747,6 +794,36 @@ async def _prepare_antigravity_terminal_via_daemon(
         # Must run AFTER wait_for_runner_online — unregistered runners reject
         # the bind. Mirrors the Codex/Claude daemon prepare ordering.
         await _bind_session_runner(client, session_id, runner_id)
+        # The runner OWNS the antigravity terminal: binding triggers its idempotent
+        # auto-create (``runner/app.py`` ``_auto_create_antigravity_terminal``,
+        # which fires for every antigravity-native session). Reattach to that
+        # runner-owned terminal instead of launching our own. Launching here would
+        # (a) 500 ("terminal antigravity:main … already observed as required") and
+        # (b) ``_launch_and_record``'s ``clear_bridge_state`` would wipe the bridge
+        # state the runner wrote, so every web turn would fail with "Antigravity
+        # native bridge state is missing". The pre-bind reattach check can't catch
+        # this — the runner only auto-creates AFTER the bind. Falling through to a
+        # CLI launch stays as a defensive fallback for the (unexpected) case where
+        # the runner produced no terminal in the window.
+        autocreated = await _await_runner_antigravity_terminal(
+            client, session_id, _RUNNER_TERMINAL_AUTOCREATE_TIMEOUT_S
+        )
+        if autocreated is not None:
+            if antigravity_args or model is not None:
+                click.echo(
+                    "Ignoring Antigravity launch args/model for the runner-owned "
+                    "terminal; restart the session terminal to apply them.",
+                    err=True,
+                )
+            _update_progress(startup_progress, "Antigravity terminal ready.")
+            return PreparedAntigravityTerminal(
+                session_id=session_id,
+                terminal_id=autocreated.terminal_id,
+                bridge_dir=bridge_dir_for_bridge_id(bridge_id),
+                tmux_socket=autocreated.tmux_socket,
+                tmux_target=autocreated.tmux_target,
+                reattached=True,
+            )
         launched = await _launch_and_record(
             client,
             session_id=session_id,
