@@ -2836,6 +2836,9 @@ async def run_repl(
             SessionAgentChangedEvent as _AgentChangedEv,
         )
         from omnigent.server.schemas import (
+            SessionChildSessionUpdatedEvent as _ChildEv,
+        )
+        from omnigent.server.schemas import (
             SessionInputConsumedEvent as _SICEv,
         )
         from omnigent.server.schemas import (
@@ -2845,6 +2848,16 @@ async def run_repl(
         tape_entry = None
         if _event_tape is not None:
             tape_entry = _event_tape.record_raw(event, path="sessions")
+
+        # Live sub-agent (child session) status → the bottom-toolbar segment,
+        # so the user sees background sub-agents running. The runner fans these
+        # deltas out onto the parent stream as session.child_session.updated;
+        # sub-agents keep running after the parent's turn goes idle, so the
+        # segment is driven purely by these deltas (added while running,
+        # dropped on terminal), not by the parent's turn boundary.
+        if isinstance(event, _ChildEv):
+            host.apply_child_session_update(event.child_session_id, event.child)
+            return
 
         if isinstance(event, _StatusEv):
             if tape_entry is not None:
