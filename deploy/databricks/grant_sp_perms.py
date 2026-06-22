@@ -42,6 +42,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     from databricks.sdk import WorkspaceClient
+    from databricks.sdk import errors as db_errors
     from databricks.sdk.service import database as db
 
     workspace_client = WorkspaceClient()
@@ -82,13 +83,41 @@ def main(argv: list[str] | None = None) -> int:
             instance_name=args.instance, database_instance_role=role
         )
         print("Role created.", flush=True)
-    except Exception as exc:  # noqa: BLE001 — surface a useful message, stay idempotent
-        # Already-exists is success for this idempotent grant.
-        if "exist" in str(exc).lower() or "already" in str(exc).lower():
-            print("Role already exists — nothing to do.", flush=True)
-            return 0
-        print(f"Failed to create database instance role: {exc}", file=sys.stderr)
-        return 1
+        return 0
+    except db_errors.ResourceAlreadyExists:
+        # Idempotent: the role already exists. Re-raise anything else (a 4xx/5xx
+        # that is NOT a duplicate-role error must not be swallowed) by only
+        # catching the SDK's typed already-exists error.
+        print(f"Role {sp_client_id!r} already exists.", flush=True)
+
+    # The role exists. If the caller asked for --superuser, make sure it actually
+    # has the DATABRICKS_SUPERUSER membership — otherwise a role created earlier
+    # without it would silently stay un-upgraded and first-boot migrations would
+    # fail. The role API has no update verb, so the equivalent of
+    # ``ALTER ROLE ... WITH SUPERUSER`` is delete + recreate with the membership.
+    if not args.superuser:
+        print("Nothing to do (no --superuser requested).", flush=True)
+        return 0
+
+    existing = workspace_client.database.get_database_instance_role(
+        instance_name=args.instance, name=sp_client_id
+    )
+    if existing.membership_role == role.membership_role:
+        print("Role already has DATABRICKS_SUPERUSER — nothing to do.", flush=True)
+        return 0
+
+    print(
+        f"Upgrading role {sp_client_id!r} to DATABRICKS_SUPERUSER "
+        "(delete + recreate with membership).",
+        flush=True,
+    )
+    workspace_client.database.delete_database_instance_role(
+        instance_name=args.instance, name=sp_client_id, allow_missing=True
+    )
+    workspace_client.database.create_database_instance_role(
+        instance_name=args.instance, database_instance_role=role
+    )
+    print("Role upgraded to DATABRICKS_SUPERUSER.", flush=True)
     return 0
 
 

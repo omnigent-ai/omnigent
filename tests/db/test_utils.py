@@ -166,18 +166,31 @@ def test_static_postgres_uri_path_unchanged(monkeypatch: pytest.MonkeyPatch) -> 
     try:
         # Standard (non-Lakebase) recycle window, unchanged from before.
         assert engine.pool._recycle == _SERVER_POOL_RECYCLE_SECONDS == 1800
-        # No token-refresh listener was wired onto a static-password engine.
-        captured: dict[str, object] = {"password": "from-url"}
 
-        def _spy(_d: object, _r: object, _a: list[object], cparams: dict[str, object]) -> None:
-            cparams["password"] = "REWRITTEN"
+        # Positively assert NO ``do_connect`` listener is registered at all on
+        # the static-password engine. The token-refresh path is the only thing
+        # in this module that attaches a ``do_connect`` listener (see
+        # :func:`_install_lakebase_token_refresh`), so an empty listener set
+        # proves it did not run. Enumerating the engine's actual registered
+        # listeners (rather than checking ``event.contains`` for some specific
+        # function we happen to know about) means a regression that *always*
+        # installs the listener — under any function name — fails this test.
+        registered = list(engine.dialect.dispatch.do_connect)
+        assert registered == [], (
+            "static-password Postgres engine must carry no do_connect "
+            f"token-refresh listener, found: {registered!r}"
+        )
 
-        # If a real listener were attached it would also fire here, but the
-        # point is the engine carries none of ours: contains() is False.
+        # Cross-check with the real install helper: had it run on this engine,
+        # the listener it installs would be present. Confirm it is absent.
         from sqlalchemy import event
 
-        assert not event.contains(engine, "do_connect", _spy)
-        assert captured["password"] == "from-url"
+        installed = _install_lakebase_token_refresh(engine, lambda: "tok")
+        assert event.contains(engine, "do_connect", installed)
+        # And before that install, the count was zero (asserted above); after
+        # it, exactly one — proving the enumeration above is sensitive to a
+        # real listener rather than vacuously empty.
+        assert len(list(engine.dialect.dispatch.do_connect)) == 1
     finally:
         engine.dispose()
 

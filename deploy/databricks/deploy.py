@@ -93,7 +93,7 @@ def main(argv: list[str] | None = None) -> None:
         "\nDeployed. Start the app and grant Lakebase access:\n"
         f"  databricks bundle run omnigent_server -t {args.target}\n"
         f"  python {Path(__file__).parent / 'grant_sp_perms.py'} "
-        "--app-name omnigent-server --instance <lakebase-instance>",
+        "--app-name omnigent-server --instance <lakebase-instance> --superuser",
         flush=True,
     )
 
