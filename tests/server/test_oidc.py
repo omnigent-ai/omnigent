@@ -17,6 +17,7 @@ from omnigent.server.auth import (
     RESERVED_USER_LOCAL,
     UnifiedAuthProvider,
     create_auth_provider,
+    resolve_auth_header,
 )
 from omnigent.server.oidc import (
     OIDCConfig,
@@ -252,6 +253,72 @@ def test_header_source_login_url_is_none() -> None:
     """
     provider = UnifiedAuthProvider(source="header")
     assert provider.login_url is None
+
+
+def test_header_source_reads_custom_header_name() -> None:
+    """An explicit ``header_name`` reads identity from that header.
+
+    Models a deploy behind Cloudflare Access, which authenticates
+    with ``Cf-Access-Authenticated-User-Email`` rather than the
+    ``X-Forwarded-Email`` default (issue #877).
+    """
+    provider = UnifiedAuthProvider(
+        source="header",
+        header_name="Cf-Access-Authenticated-User-Email",
+    )
+    request = _mock_request(
+        headers={"Cf-Access-Authenticated-User-Email": "alice@example.com"},
+    )
+    assert provider.get_user_id(request) == "alice@example.com"
+
+
+def test_header_source_custom_header_ignores_default_header() -> None:
+    """With a custom header set, the default header no longer authenticates.
+
+    This is the security-relevant half of the override: an operator
+    who points the server at the proxy's header must NOT also leave
+    the old ``X-Forwarded-Email`` as a second accepted identity, or a
+    client could spoof identity through the header the proxy doesn't
+    strip.
+    """
+    provider = UnifiedAuthProvider(
+        source="header",
+        header_name="Cf-Access-Authenticated-User-Email",
+        local_single_user=False,
+    )
+    request = _mock_request(headers={"X-Forwarded-Email": "attacker@example.com"})
+    assert provider.get_user_id(request) is None
+
+
+def test_header_source_resolves_header_name_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``header_name=None`` resolves from ``OMNIGENT_AUTH_HEADER``.
+
+    The deploy path configures the header name via env var, not a
+    constructor argument — this pins the env-resolution path.
+    """
+    monkeypatch.setenv("OMNIGENT_AUTH_HEADER", "Cf-Access-Authenticated-User-Email")
+    provider = UnifiedAuthProvider(source="header")
+    request = _mock_request(
+        headers={"Cf-Access-Authenticated-User-Email": "alice@example.com"},
+    )
+    assert provider.get_user_id(request) == "alice@example.com"
+
+
+def test_resolve_auth_header_defaults_to_x_forwarded_email(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unset/empty ``OMNIGENT_AUTH_HEADER`` falls back to the default.
+
+    The override must be strictly additive: the overwhelming majority
+    of header-mode deploys (and every existing test) rely on
+    ``X-Forwarded-Email`` being the default.
+    """
+    monkeypatch.delenv("OMNIGENT_AUTH_HEADER", raising=False)
+    assert resolve_auth_header() == "X-Forwarded-Email"
+    monkeypatch.setenv("OMNIGENT_AUTH_HEADER", "   ")
+    assert resolve_auth_header() == "X-Forwarded-Email"
 
 
 # ── UnifiedAuthProvider (oidc source) ────────────────────────────

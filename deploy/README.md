@@ -352,7 +352,7 @@ overrides this auto-selection.
 |---|---|---|
 | `accounts` (deploy default) | Standalone deploy, no external IdP: built-in username/password with first-user-is-admin bootstrap and UI-based invites. Opt in with `OMNIGENT_AUTH_ENABLED=1` (and no OIDC vars). | Set `OMNIGENT_ACCOUNTS_COOKIE_SECRET` (or let `bootstrap.sh` mint it) and `OMNIGENT_ACCOUNTS_BASE_URL` (public URL). On first boot, set the admin password via the web Create-admin form, the terminal prompt, or `--admin-password` / `OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD`. |
 | `oidc` | Standalone deploy with your own IdP: server handles the full login flow | Set `OMNIGENT_AUTH_ENABLED=1` and the `OMNIGENT_OIDC_*` env vars; the presence of `OMNIGENT_OIDC_ISSUER` selects OIDC (or pin `OMNIGENT_AUTH_PROVIDER=oidc`). Requires HTTPS (the session cookie uses the `__Host-` prefix). |
-| `header` | Behind an existing SSO proxy (oauth2-proxy, AWS ALB OIDC, Tailscale Funnel, …) that injects `X-Forwarded-Email` | The default when `OMNIGENT_AUTH_ENABLED` is off; or pin `OMNIGENT_AUTH_PROVIDER=header`. Proxy MUST strip any inbound copy of the header from clients. Missing headers are always rejected. |
+| `header` | Behind an existing SSO proxy (oauth2-proxy, AWS ALB OIDC, Cloudflare Access, Tailscale Funnel, …) that injects an identity header | The default when `OMNIGENT_AUTH_ENABLED` is off; or pin `OMNIGENT_AUTH_PROVIDER=header`. Reads `X-Forwarded-Email` by default; set `OMNIGENT_AUTH_HEADER` for proxies that use another name (e.g. `Cf-Access-Authenticated-User-Email`). Proxy MUST strip any inbound copy of the header from clients. Missing headers are always rejected. |
 
 ### Single sign-on (OIDC)
 
@@ -412,18 +412,28 @@ generic OIDC), see
 > reverse proxy.
 
 `header` mode (`OMNIGENT_AUTH_PROVIDER=header`) takes the caller's identity
-from the `X-Forwarded-Email` request header. It exists for deployments that
-sit behind an SSO proxy (oauth2-proxy, Cloudflare Access, an ALB/OIDC
-listener, Databricks Apps) that authenticates the user and injects that
-header on every request.
+from a trusted request header — `X-Forwarded-Email` by default. It exists for
+deployments that sit behind an SSO proxy (oauth2-proxy, Cloudflare Access, an
+ALB/OIDC listener, Databricks Apps) that authenticates the user and injects
+that header on every request.
+
+Proxies that authenticate with a different header name set
+`OMNIGENT_AUTH_HEADER` to that name instead of standing up an extra hop to
+rename it. For example, behind **Cloudflare Access** (which provides the
+authenticated email in `Cf-Access-Authenticated-User-Email`):
+
+```dotenv
+OMNIGENT_AUTH_PROVIDER=header
+OMNIGENT_AUTH_HEADER=Cf-Access-Authenticated-User-Email
+```
 
 In header mode **the server trusts whatever that header says**. If no proxy
 sets it, requests are rejected (`401`) rather than silently sharing one
 identity. But a *misconfigured* proxy is still dangerous: if the proxy
-doesn't **strip** any client-supplied `X-Forwarded-Email` before forwarding,
-anyone can impersonate anyone by sending the header themselves. Getting this
-wrong exposes every user's sessions, conversation history, tool output, and
-files to every other caller.
+doesn't **strip** any client-supplied copy of the identity header before
+forwarding, anyone can impersonate anyone by sending the header themselves.
+Getting this wrong exposes every user's sessions, conversation history, tool
+output, and files to every other caller.
 
 **For almost everyone, use built-in `accounts` (the default in these
 deploys) or `oidc`**; both authenticate users at the server with no proxy to
