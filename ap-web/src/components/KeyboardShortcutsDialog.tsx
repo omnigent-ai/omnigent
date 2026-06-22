@@ -42,6 +42,7 @@ export const MOD_KEY = IS_MAC ? "⌘" : "Ctrl";
 // Glyphs match the in-app tooltips (e.g. UserMessageNav's "⌘⌥↑").
 const ENTER = "↵";
 const SHIFT = "⇧";
+const ALT = IS_MAC ? "⌥" : "Alt";
 const UP = "↑";
 const DOWN = "↓";
 
@@ -82,6 +83,13 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
     items: [
       { label: "Previous session", keys: [MOD_KEY, UP] },
       { label: "Next session", keys: [MOD_KEY, DOWN] },
+    ],
+  },
+  {
+    title: "View",
+    items: [
+      { label: "Toggle conversations sidebar", keys: [MOD_KEY, ALT, "["] },
+      { label: "Toggle workspace sidebar", keys: [MOD_KEY, ALT, "]"] },
     ],
   },
   {
