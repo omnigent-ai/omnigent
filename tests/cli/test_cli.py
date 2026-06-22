@@ -25,6 +25,7 @@ from omnigent.cli import (
     _announce_auto_configured_credentials,
     _bundle,
     _bundled_example_path,
+    _dispatch_native_terminal_harness,
     _dispatch_run,
     _ensure_sqlite_parent_dir,
     _expand_config_env_vars,
@@ -4375,3 +4376,103 @@ def test_ensure_sqlite_parent_dir_noop_for_memory_and_non_sqlite(tmp_path: Path)
     _ensure_sqlite_parent_dir("postgresql://user:pw@db.example.com:5432/omnigent")
 
     assert list(tmp_path.iterdir()) == []
+
+
+def test_dispatch_native_terminal_harness_cursor_launches_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``run --harness cursor-native`` dispatches to the cursor TUI wrapper.
+
+    Regression for duplicate user messages: the materialized-launcher REPL
+    drove an Omnigent turn (which persists its own user item) on top of the
+    cursor forwarder mirroring the same message back, recording each message
+    twice. Native terminal harnesses must launch their wrapper directly so the
+    TUI is the single source of turns. A top-level ``--model`` is forwarded as a
+    passthrough ``--model`` flag.
+    """
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda _s: "http://localhost:0")
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        "omnigent.cursor_native.run_cursor_native",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    handled = _dispatch_native_terminal_harness(
+        harness="cursor-native",
+        server=None,
+        model="composer-2.5",
+        prompt=None,
+        system_prompt=None,
+        resume_conversation_id="conv_abc123",
+        resume_picker=False,
+        resume_latest=False,
+        fork_session_id=None,
+        ephemeral=False,
+        auto_open_conversation=True,
+    )
+
+    assert handled is True
+    assert captured == {
+        "server": "http://localhost:0",
+        "session_id": "conv_abc123",
+        "resume_picker": False,
+        "auto_open_conversation": True,
+        "cursor_args": ("--model", "composer-2.5"),
+    }
+
+
+def test_dispatch_native_terminal_harness_ignores_non_native(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-native harness returns False and never touches the backend.
+
+    The SDK harnesses (``cursor``, ``codex``, ``claude-sdk``, ...) must keep
+    falling through to the materialized-launcher REPL.
+    """
+
+    def _must_not_run(_server: str | None) -> str:
+        raise AssertionError("_ensure_backend called for a non-native harness")
+
+    monkeypatch.setattr("omnigent.cli._ensure_backend", _must_not_run)
+
+    handled = _dispatch_native_terminal_harness(
+        harness="openai-agents",
+        server=None,
+        model=None,
+        prompt=None,
+        system_prompt=None,
+        resume_conversation_id=None,
+        resume_picker=False,
+        resume_latest=False,
+        fork_session_id=None,
+        ephemeral=False,
+        auto_open_conversation=False,
+    )
+
+    assert handled is False
+
+
+def test_dispatch_native_terminal_harness_rejects_unsupported_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One-shot / fork / --continue have no analog in the TUI wrapper — fail loud."""
+
+    def _must_not_run(_server: str | None) -> str:
+        raise AssertionError("_ensure_backend called despite unsupported flags")
+
+    monkeypatch.setattr("omnigent.cli._ensure_backend", _must_not_run)
+
+    with pytest.raises(ClickException, match="does not support -p/--prompt"):
+        _dispatch_native_terminal_harness(
+            harness="cursor-native",
+            server=None,
+            model=None,
+            prompt="hello",
+            system_prompt=None,
+            resume_conversation_id=None,
+            resume_picker=False,
+            resume_latest=False,
+            fork_session_id=None,
+            ephemeral=False,
+            auto_open_conversation=False,
+        )
