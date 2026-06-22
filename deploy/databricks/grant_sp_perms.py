@@ -49,10 +49,13 @@ def _upgrade_role_to_superuser(
     repair.
 
     This makes the operation recoverable: it captures the existing role's full
-    config first, deletes, then attempts the recreate inside a try/except. On
-    ANY failure of the recreate it best-effort restores the original role from
-    the captured config and re-raises with a clear error. Invariant: the role
-    is never left deleted-and-not-recreated on a failure path.
+    config first, then performs delete + recreate as a single recoverable
+    transaction. Both the delete and the recreate are wrapped: if the recreate
+    fails (or the delete fails *after* having removed the role server-side) it
+    best-effort restores the original role from the captured config and re-raises
+    with a clear error. Invariant: on no path is the role left
+    deleted-and-not-recreated WITHOUT raising the explicit MISSING-role guidance
+    to the operator.
     """
     # Capture the existing role's full config BEFORE any destructive action so
     # we can restore it verbatim if the recreate fails.
@@ -61,24 +64,17 @@ def _upgrade_role_to_superuser(
         print("Role already has DATABRICKS_SUPERUSER — nothing to do.", flush=True)
         return
 
-    print(
-        f"Upgrading role {name!r} to DATABRICKS_SUPERUSER (delete + recreate with membership).",
-        flush=True,
-    )
-    database.delete_database_instance_role(
-        instance_name=instance_name, name=name, allow_missing=True
-    )
-    try:
-        database.create_database_instance_role(
-            instance_name=instance_name, database_instance_role=desired_role
-        )
-    except Exception as exc:
-        # The role is now deleted but not recreated — an irrecoverable state for
-        # DB auth. Best-effort restore the original role from the captured
-        # config, then re-raise so the operator knows the upgrade failed.
+    def _recreate_and_restore(cause: Exception) -> None:
+        """Restore the original role after the role has been deleted.
+
+        Called when the role is known/believed gone server-side and the desired
+        recreate has not succeeded. Best-effort restores the captured config;
+        if THAT also fails the role is genuinely missing, so raise the distinct
+        MISSING-role error with manual-repair guidance.
+        """
         print(
-            f"Recreate of role {name!r} failed ({exc!r}); "
-            "restoring the original role from captured config.",
+            f"Restoring the original role {name!r} from captured config "
+            f"after failure ({cause!r}).",
             file=sys.stderr,
             flush=True,
         )
@@ -92,12 +88,58 @@ def _upgrade_role_to_superuser(
                 f"failed to restore the original role ({restore_exc!r}). The "
                 "role is now MISSING on the instance — recreate it manually to "
                 "restore DB auth."
-            ) from exc
+            ) from cause
         raise RuntimeError(
             f"Failed to upgrade role {name!r} to DATABRICKS_SUPERUSER "
-            f"({exc!r}); the original role was restored, so DB auth is intact "
+            f"({cause!r}); the original role was restored, so DB auth is intact "
             "but the role was NOT elevated. Re-run once the cause is resolved."
-        ) from exc
+        ) from cause
+
+    print(
+        f"Upgrading role {name!r} to DATABRICKS_SUPERUSER (delete + recreate with membership).",
+        flush=True,
+    )
+    try:
+        database.delete_database_instance_role(
+            instance_name=instance_name, name=name, allow_missing=True
+        )
+    except Exception as delete_exc:
+        # The delete RPC errored — but the role may already be gone server-side
+        # (e.g. the delete took effect and then the transport timed out before
+        # the response). Probe the actual role state to decide: if the role is
+        # gone we're in the same deleted-and-not-recreated state as a post-delete
+        # failure, so run the recreate/restore path; if it still exists nothing
+        # destructive happened, so raise a clear error without recreating.
+        print(
+            f"Delete of role {name!r} failed ({delete_exc!r}); "
+            "probing whether the role still exists.",
+            file=sys.stderr,
+            flush=True,
+        )
+        try:
+            database.get_database_instance_role(instance_name=instance_name, name=name)
+        except Exception:  # noqa: BLE001
+            # Probe says the role is gone despite the delete error — restore it.
+            _recreate_and_restore(delete_exc)
+            return  # unreachable: _recreate_and_restore always raises.
+        # Role still exists; the delete had no effect. Nothing was destroyed.
+        raise RuntimeError(
+            f"Failed to delete role {name!r} while upgrading to "
+            f"DATABRICKS_SUPERUSER ({delete_exc!r}); the role still exists and "
+            "was NOT modified, so DB auth is intact. Re-run once the cause is "
+            "resolved."
+        ) from delete_exc
+
+    try:
+        database.create_database_instance_role(
+            instance_name=instance_name, database_instance_role=desired_role
+        )
+    except Exception as exc:  # noqa: BLE001
+        # The role is now deleted but not recreated — an irrecoverable state for
+        # DB auth. Best-effort restore the original role from the captured
+        # config, then re-raise so the operator knows the upgrade failed.
+        # (_recreate_and_restore always raises.)
+        _recreate_and_restore(exc)
     print("Role upgraded to DATABRICKS_SUPERUSER.", flush=True)
 
 

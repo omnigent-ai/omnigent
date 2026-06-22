@@ -43,6 +43,12 @@ class _FakeDatabase:
         self.fail_create_membership: object = object()  # sentinel: never matches
         self.create_calls: list[db.DatabaseInstanceRole] = []
         self.delete_calls: list[str] = []
+        # ``delete_error`` makes the delete RPC raise; ``delete_removes_role``
+        # controls whether the role is actually gone server-side when it does
+        # (i.e. delete took effect then the transport failed vs. delete had no
+        # effect at all). Default: delete succeeds and removes the role.
+        self.delete_error: Exception | None = None
+        self.delete_removes_role: bool = True
 
     def get_database_instance_role(
         self, *, instance_name: str, name: str
@@ -53,6 +59,10 @@ class _FakeDatabase:
         self, *, instance_name: str, name: str, allow_missing: bool | None = None
     ) -> None:
         self.delete_calls.append(name)
+        if self.delete_error is not None:
+            if self.delete_removes_role:
+                self.roles.pop(name, None)
+            raise self.delete_error
         self.roles.pop(name, None)
 
     def create_database_instance_role(
@@ -153,3 +163,85 @@ def test_successful_upgrade_elevates_role() -> None:
         fake.roles[ROLE_NAME].membership_role
         == db.DatabaseInstanceRoleMembershipRole.DATABRICKS_SUPERUSER
     )
+
+
+def test_delete_raises_after_removing_role_restores_it() -> None:
+    """Delete RPC errors *after* the role is gone server-side → restore it.
+
+    Models a delete that takes effect then fails on the response (timeout /
+    transport error). The probe sees the role is gone, so the function must run
+    the recreate/restore path exactly like a post-delete recreate failure: the
+    original role is restored, DB auth stays intact, and it re-raises so the
+    operator knows the upgrade did not complete.
+    """
+    original = _role(None)
+    fake = _FakeDatabase(original)
+    fake.delete_error = RuntimeError("delete timed out after removing role")
+    fake.delete_removes_role = True  # role is actually gone server-side
+
+    desired = _role(db.DatabaseInstanceRoleMembershipRole.DATABRICKS_SUPERUSER)
+
+    with pytest.raises(RuntimeError, match="original role was restored"):
+        _run(fake, desired)
+
+    # Invariant: the role is NOT left missing — the restore put it back.
+    assert ROLE_NAME in fake.roles
+    assert fake.roles[ROLE_NAME].membership_role == original.membership_role
+    assert fake.delete_calls == [ROLE_NAME]
+    # Only the restore (captured/original config) was created — the desired
+    # superuser recreate is never attempted on the delete-error path.
+    assert len(fake.create_calls) == 1
+    assert fake.create_calls[0].membership_role == original.membership_role
+
+
+def test_delete_raises_after_removing_role_then_restore_fails_is_missing() -> None:
+    """Delete removes the role, then the restore also fails → MISSING error.
+
+    Same delete-after-removal scenario, but the best-effort restore can't bring
+    the role back. The role is genuinely gone, so the function must raise the
+    distinct MISSING-role error with manual-repair guidance.
+    """
+    original = _role(None)
+    fake = _FakeDatabase(original)
+    fake.delete_error = RuntimeError("delete timed out after removing role")
+    fake.delete_removes_role = True
+
+    def _always_fail(
+        *, instance_name: str, database_instance_role: db.DatabaseInstanceRole
+    ) -> db.DatabaseInstanceRole:
+        fake.create_calls.append(database_instance_role)
+        raise RuntimeError("simulated restore failure")
+
+    fake.create_database_instance_role = _always_fail  # type: ignore[method-assign]
+
+    desired = _role(db.DatabaseInstanceRoleMembershipRole.DATABRICKS_SUPERUSER)
+
+    with pytest.raises(RuntimeError, match="role is now MISSING"):
+        _run(fake, desired)
+    # The restore was attempted (and failed).
+    assert len(fake.create_calls) == 1
+
+
+def test_delete_raises_while_role_still_exists_is_non_destructive() -> None:
+    """Delete RPC errors but the role still exists → no destructive outcome.
+
+    Models a delete that had no effect at all. The probe sees the role still
+    present, so the function must raise a clear error WITHOUT recreating
+    anything, and the role must remain intact and unmodified.
+    """
+    original = _role(None)
+    fake = _FakeDatabase(original)
+    fake.delete_error = RuntimeError("delete rejected, role untouched")
+    fake.delete_removes_role = False  # delete had no effect
+
+    desired = _role(db.DatabaseInstanceRoleMembershipRole.DATABRICKS_SUPERUSER)
+
+    with pytest.raises(RuntimeError, match="still exists and was NOT modified"):
+        _run(fake, desired)
+
+    # Invariant: nothing was destroyed — the role is present and unchanged, and
+    # no recreate was attempted.
+    assert ROLE_NAME in fake.roles
+    assert fake.roles[ROLE_NAME].membership_role == original.membership_role
+    assert fake.delete_calls == [ROLE_NAME]
+    assert fake.create_calls == []
