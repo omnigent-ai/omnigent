@@ -47,6 +47,7 @@ from dataclasses import dataclass, field
 from typing import Any, TypeAlias
 from urllib.parse import urlparse as _urlparse
 
+from omnigent.inner.native_attachments import parse_data_uri
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.onboarding.databricks_config import DATABRICKS_CLAUDE_DEFAULT_MODEL
 from omnigent.spec.types import RetryPolicy
@@ -509,14 +510,28 @@ def _find_pi_cli() -> str | None:
 # override these provider URLs; the host-derived defaults remain for legacy
 # profile-only usage.
 
+# Each static entry declares ``input: ["text", "image"]`` for the same reason
+# the dynamic-registration path does (see _build_models_json): Pi's
+# transformMessages strips image blocks unless the model entry advertises
+# image input. These are all vision-capable models, and the run model is often
+# a static id — in which case _build_models_json's append is skipped, so the
+# capability has to be declared here too or attached images are silently
+# dropped (#515/#516).
 _DATABRICKS_RESPONSES_MODELS = [
     {
         "id": "databricks-gpt-5-4-mini",
         "name": "GPT-5.4 Mini",
         "contextWindow": 1047576,
         "maxTokens": 32768,
+        "input": ["text", "image"],
     },
-    {"id": "databricks-gpt-5-4", "name": "GPT-5.4", "contextWindow": 1047576, "maxTokens": 32768},
+    {
+        "id": "databricks-gpt-5-4",
+        "name": "GPT-5.4",
+        "contextWindow": 1047576,
+        "maxTokens": 32768,
+        "input": ["text", "image"],
+    },
 ]
 
 _DATABRICKS_ANTHROPIC_MODELS = [
@@ -526,12 +541,14 @@ _DATABRICKS_ANTHROPIC_MODELS = [
         # Gateway-verified caps: >1000000 input rejects, 128001+ output rejects.
         "contextWindow": 1000000,
         "maxTokens": 128000,
+        "input": ["text", "image"],
     },
     {
         "id": "databricks-claude-sonnet-4-6",
         "name": "Claude Sonnet 4.6",
         "contextWindow": 1000000,
         "maxTokens": 128000,
+        "input": ["text", "image"],
     },
     {
         "id": "databricks-claude-sonnet-4-5",
@@ -539,6 +556,7 @@ _DATABRICKS_ANTHROPIC_MODELS = [
         # Gateway rejects this model past ~200k input.
         "contextWindow": 200000,
         "maxTokens": 16384,
+        "input": ["text", "image"],
     },
 ]
 
@@ -1020,20 +1038,6 @@ def _extract_latest_user_content(
     return ""
 
 
-def _parse_data_uri(uri: str) -> tuple[str, str]:
-    """Parse a ``data:`` URI into ``(media_type, base64_payload)``.
-
-    :param uri: A data URI, e.g. ``"data:image/png;base64,iVBOR..."``.
-    :returns: Tuple of ``(media_type, base64_payload)``.
-    :raises ValueError: If ``uri`` is not a ``data:`` URI.
-    """
-    if not uri.startswith("data:"):
-        raise ValueError(f"Not a data URI: {uri[:40]!r}")
-    header, _, payload = uri[5:].partition(",")
-    media_type = header.replace(";base64", "")
-    return media_type, payload
-
-
 def _split_pi_prompt(blocks: list[dict[str, Any]]) -> tuple[str, list[dict[str, str]]]:
     """Split content blocks into Pi's prompt ``message`` text and ``images``.
 
@@ -1065,8 +1069,10 @@ def _split_pi_prompt(blocks: list[dict[str, Any]]) -> tuple[str, list[dict[str, 
                     "cannot fetch external URLs or resolve file references "
                     f"(got {str(image_url)[:48]!r})."
                 )
-            media_type, data = _parse_data_uri(image_url)
-            images.append({"type": "image", "data": data, "mimeType": media_type})
+            parsed = parse_data_uri(image_url)
+            images.append(
+                {"type": "image", "data": parsed.base64_payload, "mimeType": parsed.mime_type}
+            )
     return "\n".join(text_parts), images
 
 

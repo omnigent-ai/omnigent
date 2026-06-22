@@ -396,6 +396,18 @@ class TestBuildModelsJson(unittest.TestCase):
         entry = next(e for e in provider["models"] if e["id"] == model)
         self.assertEqual(entry.get("input"), ["text", "image"])
 
+    def test_static_model_declared_image_capable(self):
+        # #516 review: a STATIC (pre-registered) vision model must also
+        # advertise image input. The dynamic-registration append is gated on
+        # the model not already being listed, so a default model like GPT-5.4
+        # (openai-completions) or Claude would otherwise keep an input-less
+        # entry and have its images stripped.
+        for model in ("databricks-gpt-5-4", "databricks-claude-opus-4-8"):
+            result = _build_models_json("https://host.example.com", "tok", model=model)
+            provider = result["providers"][_pi_provider_for_model(model)]
+            entry = next(e for e in provider["models"] if e["id"] == model)
+            self.assertEqual(entry.get("input"), ["text", "image"], model)
+
     def test_base_urls_use_host(self):
         result = _build_models_json("https://host.example.com/", "tok")
         p = result["providers"]
