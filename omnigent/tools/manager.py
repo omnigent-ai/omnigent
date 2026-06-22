@@ -143,9 +143,8 @@ class ToolManager:
         self._srt_available = is_srt_available()
         self._uv_available = shutil.which("uv") is not None
         # Track the OS environment instance the spec opts into so
-        # ``shutdown`` (which we currently don't ship — TODO) can
-        # close it cleanly. ``None`` when the spec didn't declare
-        # ``os_env``.
+        # ``shutdown`` can close it cleanly. ``None`` when the spec
+        # didn't declare ``os_env``.
         self._os_env: OSEnvironment | None = None
         self._register_skill_tools()
         self._register_builtin_tools()
@@ -762,8 +761,33 @@ class ToolManager:
         self._started = True
 
     def shutdown(self) -> None:
-        """Idempotent teardown."""
+        """Idempotent teardown: close OS environment and shut down tools.
+
+        Closes the OS environment that was created during registration
+        (skipped when the environment was pre-resolved from the
+        ``SessionResourceRegistry`` — the registry owns that lifecycle).
+        Then calls ``shutdown()`` on every registered tool so
+        subprocess-backed tools can kill lingering child processes.
+
+        Safe to call multiple times; the second call is a no-op.
+        """
         self._started = False
+
+        os_env = self._os_env
+        if os_env is not None and self._pre_resolved_os_env is None:
+            self._os_env = None
+            try:
+                os_env.close()
+            except Exception:
+                _logger.warning("os_env.close() failed during shutdown", exc_info=True)
+
+        for tool in self._tools.values():
+            try:
+                tool.shutdown()
+            except Exception:
+                _logger.warning(
+                    "tool %s shutdown failed", tool.name(), exc_info=True
+                )
 
     def get_tool_names(self) -> list[str]:
         """
