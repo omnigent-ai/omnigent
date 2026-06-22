@@ -538,7 +538,7 @@ def test_add_menu_options_ordering() -> None:
         "Databricks — workspace",
         "Other provider — API key",
         # Bedrock is appended last so it never shifts the established order.
-        "Amazon Bedrock — API key",
+        "AWS Bedrock — API key",
     ]
 
     # Codex (openai) scoped: API key, subscription, Gateway, OpenRouter,
@@ -562,7 +562,7 @@ def test_add_menu_options_ordering() -> None:
         "Claude — subscription (Pro/Max)",
         "Gateway — custom base URL + key (e.g. OpenRouter)",
         "Databricks — workspace",
-        "Amazon Bedrock — API key",
+        "AWS Bedrock — API key",
     ]
 
 
@@ -2495,9 +2495,9 @@ def test_build_bedrock_provider_entry_shape() -> None:
 def test_configure_models_add_bedrock_writes_entry_and_secret(
     isolated_config, monkeypatch
 ) -> None:
-    """Adding 'Amazon Bedrock — API key' from the Claude menu writes a kind: bedrock entry.
+    """Adding 'AWS Bedrock — API key' from the Claude menu writes a kind: bedrock entry.
 
-    Drives the new interactive path: Claude harness → +Add → 'Amazon Bedrock —
+    Drives the new interactive path: Claude harness → +Add → 'AWS Bedrock —
     API key' (last in the Claude-scoped menu) → name, base_url, pasted bearer
     token, Bedrock model id. Asserts the persisted ``kind: bedrock`` body, the
     keychain secret, and that it auto-becomes the anthropic default. A
@@ -2506,7 +2506,7 @@ def test_configure_models_add_bedrock_writes_entry_and_secret(
     """
     # No exported token → the paste→keychain path (deterministic prompts).
     monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
-    # L1 1=Claude → L2 1=+Add → Claude menu 5='Amazon Bedrock — API key'
+    # L1 1=Claude → L2 1=+Add → Claude menu 5='AWS Bedrock — API key'
     # (1=Anthropic key, 2=Claude sub, 3=Gateway, 4=Databricks, 5=Bedrock) →
     # name; base_url; pasted key; default model → L2 q=back → L1 q=exit.
     stdin = (
@@ -2538,3 +2538,17 @@ def test_configure_models_add_bedrock_writes_entry_and_secret(
     # A bedrock provider serves the anthropic surface, so it auto-claims the
     # (previously empty) Claude default.
     assert get_default_provider(cfg, "anthropic").name == "mybr"
+
+
+def test_credential_label_bedrock_not_duplicated() -> None:
+    """A bedrock credential reads 'AWS Bedrock', never 'Bedrock Bedrock'.
+
+    The entry name is user-chosen (the default is 'bedrock'); naming the
+    credential after the provider id used to render 'Bedrock Bedrock'. The
+    generic default collapses to 'AWS Bedrock'; a custom name is qualified.
+    """
+    from omnigent.onboarding.configure_models import credential_label
+    from omnigent.onboarding.provider_config import BEDROCK_KIND
+
+    assert credential_label(BEDROCK_KIND, "bedrock") == "AWS Bedrock"
+    assert credential_label(BEDROCK_KIND, "nexus") == "AWS Bedrock (nexus)"

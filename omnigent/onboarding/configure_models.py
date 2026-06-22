@@ -334,7 +334,14 @@ def credential_label(
     if kind == KEY_KIND:
         return f"{provider_display_name(provider_name)} API Key"
     if kind == BEDROCK_KIND:
-        return f"{provider_display_name(provider_name)} Bedrock"
+        # The credential is always AWS Bedrock; the entry name is user-chosen
+        # (like a gateway), so naming it after the provider id gave "Bedrock
+        # Bedrock". Show "AWS Bedrock", qualified by the entry name only when it
+        # isn't the generic default — clean for the common single-provider case,
+        # still distinguishable when several are configured.
+        if provider_name == BEDROCK_KIND:
+            return "AWS Bedrock"
+        return f"AWS Bedrock ({provider_name})"
     return provider_display_name(provider_name)
 
 
@@ -466,7 +473,7 @@ def add_menu_options() -> list[AddOption]:
         # native ``omnigent claude`` terminal in Bedrock mode. Listed last so it
         # never shifts the first-party / extras order users already know.
         _opt(
-            "Amazon Bedrock — API key",
+            "AWS Bedrock — API key",
             "AWS Bedrock or a Bedrock-compatible gateway for the native Claude "
             "terminal (omnigent claude). Claude only.",
             BEDROCK_KIND,
