@@ -282,10 +282,6 @@ def test_anthropic_family_ignores_wire_api() -> None:
     """The Anthropic family always uses anthropic-messages, ignoring wire_api.
 
     The wire_api setting is only meaningful for the OpenAI family.
-    Errors: (BLE001 — any resolution failure must not break launch
-    # The contract is "any resolution failure → fall back to Pi's
-    # own login", so the resolver must swallow it and return ``None`` rather than
-    # let the exception fail the Pi terminal launch.
     """
     config = {
         "providers": {
