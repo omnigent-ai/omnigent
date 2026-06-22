@@ -359,9 +359,15 @@ def test_conversation_id_owned_by_pid_none_when_port_unresolved(
     No resolvable connect-RPC port for the pid → ``None`` (keep polling).
 
     A still-cold-starting agy has not bound its port yet; the resolver must not
-    bind anything and the caller keeps polling rather than guessing.
+    bind anything and the caller keeps polling rather than guessing. Both port
+    sources are stubbed empty: the pid-scoped ``discover_language_server_port``
+    AND the ``_candidate_agy_rpc_ports`` fallback (the resolver falls back to
+    every live agy port when lsof can't attribute the socket — see the source).
+    Stubbing only the former leaves the fallback scanning REAL agy processes,
+    so this test would flake on any host/CI runner with a concurrent agy.
     """
     monkeypatch.setattr(rpc, "discover_language_server_port", lambda pid: None)
+    monkeypatch.setattr(rpc, "_candidate_agy_rpc_ports", list)
     calls: list[tuple[int, str]] = []
 
     def _matches(port: int, cid: str) -> bool:
@@ -370,7 +376,7 @@ def test_conversation_id_owned_by_pid_none_when_port_unresolved(
 
     monkeypatch.setattr(rpc, "_conversation_matches", _matches)
     assert rpc.conversation_id_owned_by_pid(72753, [_CID_A, _CID_B]) is None
-    # Without a port there is nothing to confirm against.
+    # No port from either source → nothing to confirm against.
     assert calls == []
 
 
