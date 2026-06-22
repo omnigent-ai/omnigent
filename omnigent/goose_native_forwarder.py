@@ -51,6 +51,21 @@ _SUPERVISOR_HEALTHY_UPTIME_S = 60.0
 
 _STATE_FILE = "goose_forwarder.json"
 
+# Sqlite read errors are swallowed in the helpers below (a live DB is briefly
+# unreadable mid-checkpoint, so returning empty and retrying is correct). But a
+# *persistent* error (schema drift, wrong path) would otherwise leave the chat
+# view silently empty forever — so surface each distinct error string once.
+_warned_sqlite_errors: set[str] = set()
+
+
+def _warn_sqlite_once(context: str, exc: sqlite3.Error) -> None:
+    """Log a distinct sqlite error at warning level once (dedup by message)."""
+    key = f"{context}:{exc}"
+    if key in _warned_sqlite_errors:
+        return
+    _warned_sqlite_errors.add(key)
+    _logger.warning("goose forwarder sqlite error during %s: %s", context, exc)
+
 # The executor injects ``[Attached: <path>]`` markers for web-UI attachments
 # before pasting into the TUI; strip them from the mirrored bubble (the path is
 # an internal bridge detail).
@@ -150,7 +165,8 @@ def _resolve_goose_session_id(db_path: Path, session_name: str) -> str | None:
             "SELECT id FROM sessions WHERE name = ? ORDER BY created_at DESC LIMIT 1",
             (session_name,),
         ).fetchone()
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        _warn_sqlite_once("session resolution", exc)
         return None
     finally:
         con.close()
@@ -263,7 +279,8 @@ def _read_new_items(
             "WHERE session_id = ? AND id > ? ORDER BY id",
             (goose_session_id, last_id),
         ).fetchall()
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        _warn_sqlite_once("message read", exc)
         return []
     finally:
         con.close()

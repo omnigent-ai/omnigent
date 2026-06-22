@@ -218,8 +218,14 @@ def _session_alive(socket_path: str, tmux_target: str) -> bool:
 
 
 def _submit_needle(content: str) -> str:
-    """A stable single-line substring used to confirm the paste rendered in the pane."""
-    for line in content.splitlines():
+    """A stable single-line substring used to confirm the paste rendered in the pane.
+
+    Anchored to the LAST qualifying line, not the first: the tail of a freshly
+    pasted message is far less likely to already be visible in the pane (a prior
+    turn's echo, scrollback) than its opening line, so matching it is a tighter
+    signal that *this* paste committed before we send Enter.
+    """
+    for line in reversed(content.splitlines()):
         stripped = line.strip()
         if len(stripped) >= 4:
             return stripped[:24]

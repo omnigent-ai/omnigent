@@ -1045,8 +1045,20 @@ async def _auto_create_goose_terminal(
     )
     workspace = os.path.realpath(str(launch_config.workspace))
     goose_command = resolve_goose_executable()
-    # `goose session --name <id>` so the forwarder resolves sessions.id by name.
-    goose_args = ["session", "--name", session_id, *(launch_config.terminal_launch_args or [])]
+    # Launch-unique Goose session name. `goose session --name X` (without
+    # --resume) creates a NEW sessions row each launch (verified, Goose 1.38),
+    # so a per-launch-unique name lets the forwarder bind to EXACTLY this
+    # launch's row — never an older same-conversation row left by a prior
+    # cold-resume. This closes the "replay the whole transcript on restart"
+    # risk: discovery resolves one session, and the wiped bridge cursor
+    # (clear_goose_bridge_state above) starts it at the new row's first message.
+    goose_session_name = f"{session_id}-{int(time.time() * 1000)}"
+    goose_args = [
+        "session",
+        "--name",
+        goose_session_name,
+        *(launch_config.terminal_launch_args or []),
+    ]
     terminal_view = await resource_registry.launch_required_terminal(
         session_id=session_id,
         terminal_name="goose",
@@ -1110,7 +1122,7 @@ async def _auto_create_goose_terminal(
             session_id=session_id,
             bridge_dir=bridge_dir,
             agent_name="goose-native-ui",
-            goose_session_name=session_id,
+            goose_session_name=goose_session_name,
             auth=_runner_auth,
         ),
         name=f"goose-forwarder-{session_id}",
@@ -6165,6 +6177,11 @@ def create_runner_app(
         _goose_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
+        # Stop any TUI→web transcript forwarder (cursor-/goose-native) for this
+        # session: on teardown the embedded terminal is gone, so a still-running
+        # supervisor would poll a dead store and POST to a deleted session
+        # forever. Idempotent when no forwarder was registered.
+        await _cancel_auto_forwarder_task(session_id)
 
         if process_manager is not None:
             await process_manager.forward_cancel(session_id)
