@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: omnigent
+spec:
+  template:
+    spec:
+      serviceAccountName: omnigent
+      containers:
+        - name: omnigent
+          volumeMounts:
+            - name: openshell-gateway
+              mountPath: /home/omnigent/.config/openshell
+              readOnly: true
+            - name: server-config
+              mountPath: /data/server-config.yaml
+              subPath: config.yaml
+              readOnly: true
+      volumes:
+        - name: openshell-gateway
+          secret:
+            secretName: openshell-gateway-config
+            optional: true
+        - name: server-config
+          configMap:
+            name: omnigent-server-config
