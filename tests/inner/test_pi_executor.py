@@ -366,6 +366,14 @@ def test_split_pi_prompt_text_only_has_no_images():
     assert images == []
 
 
+def test_split_pi_prompt_rejects_non_data_uri_image():
+    # A non-data-URI input_image (e.g. a file reference) cannot be forwarded
+    # inline to Pi, so it raises a clear ValueError -- run_turn catches this and
+    # surfaces it as an ExecutorError instead of crashing the turn (#516 review).
+    with pytest.raises(ValueError, match="inline data URI"):
+        _split_pi_prompt([{"type": "input_image", "image_url": "file-abc123"}])
+
+
 # _build_models_json tests
 # ---------------------------------------------------------------------------
 

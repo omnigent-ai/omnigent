@@ -1060,9 +1060,10 @@ def _split_pi_prompt(blocks: list[dict[str, Any]]) -> tuple[str, list[dict[str, 
             image_url = block.get("image_url")
             if not isinstance(image_url, str) or not image_url.startswith("data:"):
                 raise ValueError(
-                    "input_image block must carry an inline data URI in "
-                    "'image_url'. Upload the image via the session files API "
-                    "and reference it by file_id."
+                    "input_image 'image_url' must be an inline data URI "
+                    "('data:<mime>;base64,...'); Pi forwards images inline and "
+                    "cannot fetch external URLs or resolve file references "
+                    f"(got {str(image_url)[:48]!r})."
                 )
             media_type, data = _parse_data_uri(image_url)
             images.append({"type": "image", "data": data, "mimeType": media_type})
@@ -1901,7 +1902,13 @@ class PiExecutor(Executor):
         message: str
         images: list[dict[str, str]] = []
         if isinstance(prompt, list):
-            message, images = _split_pi_prompt(prompt)
+            try:
+                message, images = _split_pi_prompt(prompt)
+            except ValueError as exc:
+                # A malformed multimodal block must surface as an executor error
+                # like every other failure path here, not crash the turn.
+                yield ExecutorError(message=f"Failed to prepare prompt for Pi: {exc}")
+                return
         else:
             message = prompt
         cmd_id = f"turn_{id(messages)}"
