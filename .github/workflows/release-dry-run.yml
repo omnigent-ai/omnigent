@@ -1,0 +1,218 @@
+# Nightly release dry-run. Builds the three version-locked release
+# distributions (the `omnigent` core wheel with the `ap-web` UI bundled in,
+# plus the `omnigent-client` and `omnigent-ui-sdk` SDK wheels) and runs the
+# release readiness gates — WITHOUT publishing anywhere. The point is to catch
+# packaging regressions (a broken web-UI build, a wheel that won't build, a
+# lockstep version drift, a CLI that won't import) the morning they land on
+# `main`, instead of at release time.
+#
+# This mirrors the build + gates in `release-omnigent.yml` (minus every publish
+# step) so it keeps working once that deprecated fallback is deleted.
+#
+# What it does NOT cover (these live only in the secure-release repo
+# `databricks/secure-public-registry-releases-eng`, behind SAML/EMU): the
+# mandatory dependency scan and OIDC Trusted Publishing. Full-fidelity coverage
+# would need a cross-org token + security sign-off; see RELEASING.md.
+#
+# Scheduled runs target `main` (cron only fires on the default branch). To
+# dry-run a release branch or an RC tag (e.g. when `branch-X.Y` / `vX.Y.ZrcN`
+# is cut), use "Run workflow" and pick the ref — checkout defaults to it.
+name: Release dry-run
+
+on:
+  schedule:
+    # 09:00 UTC nightly. Offset from the 07:00 UTC docker promote in
+    # oss-publish-images.yml so the two daily crons don't pile up.
+    - cron: "0 9 * * *"
+  # Manual run uses the Actions ref selector (main / branch-X.Y / a tag); the
+  # checkout below defaults to that ref, so no explicit input is needed.
+  workflow_dispatch: {}
+
+# Least privilege at the top level; the notify job widens to issues: write.
+permissions:
+  contents: read
+
+# Serialize per ref so an overlapping manual run can't race the nightly.
+concurrency:
+  group: release-dry-run-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  dry-run:
+    # Gated to this repository; inert in forks and mirrors.
+    if: github.repository == 'omnigent-ai/omnigent'
+    runs-on: ubuntu-latest
+    # Bound a hung run under GitHub's 6-hour default (real work takes minutes).
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Set up uv (clean public resolution, no proxy cache)
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4
+        with:
+          enable-cache: false
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+
+      # 1. Build the web UI FIRST into the package tree, clean. Ordering is
+      #    load-bearing: the wheel packages on-disk files, so the bundle must
+      #    exist before `uv build`. `rm -rf` backstops Vite's emptyOutDir
+      #    against stale bundles; `npm ci` installs the exact locked deps.
+      #    `--legacy-peer-deps` matches how ap-web's lockfile is generated and
+      #    validated everywhere else (required for the React 19 peer conflict).
+      - name: Build web UI (clean, fresh)
+        run: |
+          rm -rf omnigent/server/static/web-ui
+          npm --prefix ap-web ci --legacy-peer-deps
+          npm --prefix ap-web run build # Vite outDir -> omnigent/server/static/web-ui
+
+      # 2. GATE: the three packages version-lock together, so every package
+      #    carries one identical version and every cross-package dep is an exact
+      #    `==` pin to it. This self-consistency check works on `main` (where the
+      #    version is e.g. 0.2.0.dev0) and on release branches. When the run is
+      #    against a vX.Y.Z[rcN] tag, additionally require version == tag.
+      - name: Verify lockstep versions and pins
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          uv run --no-project python - <<'PY'
+          import os
+          import sys
+          import tomllib
+
+          # Every package carries the same version; every cross-package dep is
+          # an exact `==<version>` pin (the lockstep contract).
+          packages = {
+              "pyproject.toml": ("omnigent-client", "omnigent-ui-sdk"),
+              "sdks/python-client/pyproject.toml": ("omnigent",),
+              "sdks/ui/pyproject.toml": ("omnigent-client",),
+          }
+          errors = []
+          versions = {}
+          for path, sibling_pins in packages.items():
+              with open(path, "rb") as f:
+                  project = tomllib.load(f)["project"]
+              versions[path] = project["version"]
+              print(f"{path}: version={project['version']}")
+              for name in sibling_pins:
+                  pin = f"{name}=={project['version']}"
+                  if pin not in project["dependencies"]:
+                      errors.append(f"{path} dependencies missing exact pin {pin!r}")
+
+          distinct = set(versions.values())
+          if len(distinct) != 1:
+              errors.append(f"package versions are not lockstep: {versions}")
+
+          # On a tag ref, the tag must match the (single) package version.
+          if os.environ.get("REF_TYPE") == "tag":
+              tag = os.environ["REF_NAME"].removeprefix("v")
+              for path, version in versions.items():
+                  if version != tag:
+                      errors.append(f"{path} version {version} does not match tag v{tag}")
+
+          if errors:
+              for e in errors:
+                  print(f"::error::{e}")
+              sys.exit(1)
+          PY
+
+      # 3. Build sdist + wheel for all three into one dist/. The SDKs are
+      #    path-deps (not a uv workspace), so each needs its own build.
+      - name: Build sdists + wheels
+        run: |
+          uv build --out-dir dist
+          uv build sdks/python-client --out-dir dist
+          uv build sdks/ui --out-dir dist
+          ls -la dist/
+
+      # 4. Metadata sanity check (long-description renders, fields valid).
+      - name: twine check
+        run: uvx twine check dist/*
+
+      # 5. GATE: the UI bundle must be inside the core wheel; fail loud if
+      #    missing/empty. The glob matches only the core wheel (SDK wheels
+      #    are omnigent_client-* / omnigent_ui_sdk-*).
+      - name: Assert web-UI bundle shipped in the wheel
+        run: |
+          uv run --no-project python - <<'PY'
+          import glob
+          import sys
+          import zipfile
+
+          whls = sorted(glob.glob("dist/omnigent-*.whl"))
+          if not whls:
+              sys.exit("no core omnigent wheel found in dist/")
+          whl = whls[-1]
+          names = zipfile.ZipFile(whl).namelist()
+          ui = [n for n in names if "server/static/web-ui/" in n]
+          has_index = any(n.endswith("server/static/web-ui/index.html") for n in ui)
+          print(f"{whl}: {len(ui)} web-ui files, index.html present = {has_index}")
+          sys.exit(0 if (ui and has_index) else "WEB-UI BUNDLE MISSING FROM WHEEL")
+          PY
+
+      # 6. GATE: the wheels install together and the CLI entry point imports,
+      #    resolving deps from public PyPI (catches proxy-only deps).
+      - name: Smoke-install the built wheels
+        run: |
+          uv venv --python 3.12 /tmp/omnigent-smoke
+          uv pip install --python /tmp/omnigent-smoke/bin/python dist/*.whl
+          /tmp/omnigent-smoke/bin/omnigent --version
+
+      # 7. Persist the built artifacts for inspection.
+      - name: Upload built distributions
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-omnigent
+          path: dist/
+
+  # On a failed NIGHTLY run, open (or update) a single tracking issue; close it
+  # when a later nightly goes green. Manual dispatches stay quiet — whoever
+  # clicked "Run workflow" sees the result directly.
+  notify:
+    needs: dry-run
+    if: always() && github.event_name == 'schedule' && github.repository == 'omnigent-ai/omnigent'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      LABEL: release-dry-run-failure
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Open or update the tracking issue (on failure)
+        if: needs.dry-run.result == 'failure'
+        run: |
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" \
+            --label "$LABEL" --state open --json number --jq '.[0].number')"
+          # printf keeps the YAML block indentation out of the rendered body.
+          body="$(printf '%s\n\n%s\n' \
+            "Nightly release dry-run failed: ${RUN_URL}" \
+            "The release build/gates broke on \`main\`. Triage before the next release — see the run logs linked above.")"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" \
+              --body "Still failing as of $(date -u +%Y-%m-%dT%H:%MZ): ${RUN_URL}"
+          else
+            gh label create "$LABEL" --repo "$GITHUB_REPOSITORY" \
+              --color B60205 --description "Nightly release dry-run is failing" 2>/dev/null || true
+            gh issue create --repo "$GITHUB_REPOSITORY" \
+              --label "$LABEL" \
+              --title "Nightly release dry-run failing" \
+              --body "$body"
+          fi
+
+      - name: Close the tracking issue (on success)
+        if: needs.dry-run.result == 'success'
+        run: |
+          for n in $(gh issue list --repo "$GITHUB_REPOSITORY" \
+            --label "$LABEL" --state open --json number --jq '.[].number'); do
+            gh issue comment "$n" --repo "$GITHUB_REPOSITORY" \
+              --body "Green again as of $(date -u +%Y-%m-%dT%H:%MZ): ${RUN_URL}. Closing."
+            gh issue close "$n" --repo "$GITHUB_REPOSITORY"
+          done
