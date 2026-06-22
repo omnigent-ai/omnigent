@@ -264,6 +264,7 @@ def configure_mock_llm(
     responses: list[dict[str, Any]],
     *,
     key: str = "default",
+    match: str | None = None,
 ) -> None:
     """
     Configure a keyed response queue on the mock LLM server.
@@ -283,6 +284,16 @@ def configure_mock_llm(
         configure_mock_llm(url, [{"text": "LGTM"}],
                            key="mock-reviewer")
 
+    Pass *match* to route by request CONTENT instead of model: the queue
+    serves any request whose ``role="user"`` input contains the token.
+    This lets a test claim its own queue by the unique message it sends,
+    so a stray/late request from another test can't draw from it — the
+    fix for the #523 cross-test contamination flake without per-test
+    mock servers::
+
+        configure_mock_llm(url, [...], match="mangosteen-tr")
+        # and the test does child.send("mangosteen-tr ...")
+
     :param mock_llm_server_url: Mock server URL or ``None``.
     :param responses: List of response configs. Keys:
         ``text``, ``tool_calls``, ``block``, ``stream``,
@@ -290,12 +301,23 @@ def configure_mock_llm(
     :param key: Queue key — typically the model name baked into the
         agent spec. Defaults to ``"default"`` (matches any model
         not assigned to a more specific queue).
+    :param match: Optional content-routing token. When set, the queue is
+        selected if this token appears in the request's user input,
+        regardless of ``model``. Use a deliberately-unique token (the
+        message the test sends). Also used as the queue *key* when *key*
+        is left at its default, so each match-routed queue is distinct.
     """
     if mock_llm_server_url is None:
         return
+    payload: dict[str, Any] = {
+        "key": match if (match is not None and key == "default") else key,
+        "responses": responses,
+    }
+    if match is not None:
+        payload["match"] = match
     resp = httpx.post(
         f"{mock_llm_server_url}/mock/configure",
-        json={"key": key, "responses": responses},
+        json=payload,
         timeout=5.0,
     )
     resp.raise_for_status()
