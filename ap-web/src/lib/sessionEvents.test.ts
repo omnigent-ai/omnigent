@@ -707,6 +707,77 @@ describe("response.elicitation_request (FLAT envelope)", () => {
     const ev = out[0] as ElicitationRequest;
     expect(ev.allowAllEdits).toBe(false);
   });
+
+  it("lifts the remember_scope hint with a host for WebFetch prompts", () => {
+    // The server stamps ``remember_scope`` on non-edit tool
+    // PermissionRequests so the card can offer "Approve & don't ask
+    // again for <host>". For WebFetch the host scopes the rule, so it
+    // must survive parsing.
+    const out = parse("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_webfetch",
+      params: {
+        mode: "form",
+        message: "Claude wants to call **WebFetch**",
+        phase: "pre_tool_use",
+        policy_name: "claude_native_permission",
+        content_preview: 'WebFetch({"url": "https://github.com/a/b"})',
+        requestedSchema: {},
+        tool_name: "WebFetch",
+        remember_scope: { tool: "WebFetch", host: "github.com" },
+      },
+    });
+
+    expect(out).toHaveLength(1);
+    const ev = out[0] as ElicitationRequest;
+    expect(ev.rememberScope).toEqual({ tool: "WebFetch", host: "github.com" });
+  });
+
+  it("lifts a tool-wide remember_scope hint (no host)", () => {
+    // Non-WebFetch tools (here Bash) get a tool-wide scope: ``tool``
+    // only, no ``host``. The card labels the button by the tool name.
+    const out = parse("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_bash_remember",
+      params: {
+        mode: "form",
+        message: "Claude wants to call **Bash**",
+        phase: "pre_tool_use",
+        policy_name: "claude_native_permission",
+        content_preview: "Bash({})",
+        requestedSchema: {},
+        tool_name: "Bash",
+        remember_scope: { tool: "Bash" },
+      },
+    });
+
+    expect(out).toHaveLength(1);
+    const ev = out[0] as ElicitationRequest;
+    expect(ev.rememberScope).toEqual({ tool: "Bash", host: undefined });
+  });
+
+  it("leaves rememberScope null when the hint is absent", () => {
+    // Edit tools / ExitPlanMode / AskUserQuestion carry no
+    // ``remember_scope``; the button must stay hidden.
+    const out = parse("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_edit_no_remember",
+      params: {
+        mode: "form",
+        message: "Claude wants to call **Edit**",
+        phase: "pre_tool_use",
+        policy_name: "claude_native_permission",
+        content_preview: "Edit({})",
+        requestedSchema: {},
+        tool_name: "Edit",
+        allow_all_edits: true,
+      },
+    });
+
+    expect(out).toHaveLength(1);
+    const ev = out[0] as ElicitationRequest;
+    expect(ev.rememberScope).toBeNull();
+  });
 });
 
 describe("response.elicitation_resolved (FLAT envelope)", () => {

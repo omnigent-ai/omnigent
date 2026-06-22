@@ -299,6 +299,7 @@ export function InboxPage() {
                   exitPlanMode={item.elicitation.exitPlanMode}
                   codexCommand={item.elicitation.codexCommand}
                   allowAllEdits={item.elicitation.allowAllEdits}
+                  rememberScope={item.elicitation.rememberScope}
                   onSubmit={makeSubmit(item)}
                 />
               )}

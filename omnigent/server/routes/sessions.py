@@ -571,6 +571,95 @@ def _allow_all_edits_eligible(tool_name: str, permission_mode: str | None) -> bo
     )
 
 
+# Tools that own a dedicated approval affordance and therefore must NOT
+# get the generic "don't ask again" (persistent allow-rule) button:
+# ``ExitPlanMode`` (plan-review card with its own auto-mode action) and
+# ``AskUserQuestion`` (interactive answer form, not a yes/no gate). Edit
+# tools are excluded separately via ``_CLAUDE_NATIVE_EDIT_TOOLS`` — they
+# take the ``setMode``/``acceptEdits`` path instead of an allow rule.
+_CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS: frozenset[str] = frozenset(
+    {"ExitPlanMode", "AskUserQuestion"}
+)
+
+
+def _allow_remember_eligible(tool_name: str, permission_mode: str | None) -> bool:
+    """
+    Whether a claude-native PermissionRequest may offer / honor the
+    persistent "don't ask again" affordance — a session-scoped allow
+    rule for the gated tool (WebFetch domain, or tool-wide otherwise).
+
+    This restores native Claude Code parity for NON-edit tools: the
+    native TUI lets the user approve a tool/domain once and adds an
+    allow rule so same-scope calls stop prompting. The web UI used to
+    collapse every prompt into binary Approve/Reject and never wrote a
+    rule, so e.g. each WebFetch — even same-domain github.com URLs —
+    re-prompted forever.
+
+    Eligible for any tool that ISN'T an edit tool (those take the
+    ``acceptEdits`` ``setMode`` path) and isn't one of the tools with a
+    bespoke card (see ``_CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS``),
+    under any mode that still prompts. ``bypassPermissions`` never
+    prompts (the hook doesn't even fire), so a rule there would be
+    inert. Used at BOTH the stamp site (drives the UI button) and the
+    verdict site (gates the ``addRules`` decision), so the server never
+    honors a client-supplied ``remember`` flag on a tool/mode the
+    affordance was never offered for.
+
+    :param tool_name: The gated tool from Claude's PermissionRequest
+        payload, e.g. ``"WebFetch"`` or ``"Bash"``.
+    :param permission_mode: Claude's current permission mode from the
+        payload, e.g. ``"default"`` / ``"plan"`` / ``"acceptEdits"`` /
+        ``None`` when absent.
+    :returns: ``True`` iff the affordance applies.
+    """
+    return (
+        tool_name not in _CLAUDE_NATIVE_EDIT_TOOLS
+        and tool_name not in _CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS
+        and permission_mode != "bypassPermissions"
+    )
+
+
+def _claude_native_remember_host(tool_name: str, tool_input: Any) -> str | None:
+    """
+    Derive the domain host that a WebFetch "don't ask again" rule should
+    scope to, from the gated tool's input.
+
+    For ``WebFetch`` the persistent rule is scoped to the request's
+    host (``WebFetch(domain:<host>)`` in Claude rule syntax), so
+    approving ``https://github.com/a/b`` stops prompting for
+    ``https://github.com/c/d`` too — but not for other domains. Any
+    other tool (or a WebFetch with a missing/unparseable URL) returns
+    ``None``, which the callers treat as a tool-wide scope.
+
+    Only ``http`` / ``https`` URLs yield a domain scope: WebFetch
+    domain permissions are semantically HTTP(S)-oriented, so a
+    non-HTTP scheme (``ftp://``, ``file://``, …) falls back to a
+    tool-wide rule rather than persisting a ``domain:<host>`` that
+    would never match a real fetch.
+
+    :param tool_name: The gated tool from Claude's PermissionRequest
+        payload.
+    :param tool_input: The tool's input dict (``None``/non-dict tolerated).
+    :returns: The lowercased host (no port), or ``None`` when no
+        domain scope applies.
+    """
+    if tool_name != "WebFetch" or not isinstance(tool_input, dict):
+        return None
+    url = tool_input.get("url")
+    if not isinstance(url, str) or not url:
+        return None
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return None
+    if parsed.scheme.lower() not in ("http", "https"):
+        return None
+    host = parsed.hostname
+    # urlparse already lowercases ``hostname`` and strips the port and
+    # any userinfo; lower() again makes the documented invariant explicit.
+    return host.lower() if host else None
+
+
 # Server-side wait budget for Codex app-server requests forwarded by
 # ``omnigent codex``. Held at one day like the Claude permission hook:
 # a terminal-side answer ends the wait early via the app-server's
@@ -14053,12 +14142,29 @@ def create_sessions_router(
             extras["cwd"] = cwd
         if permission_mode is not None:
             extras["permission_mode"] = permission_mode
-        # Stamp the "Accept & allow all edits" hint (drives the UI's
-        # third button) only for edit-tool prompts under a still-prompting
-        # mode — see _allow_all_edits_eligible. The verdict site re-checks
-        # the same predicate before honoring the flag.
+        # The card offers ONE persistent-approval affordance, picked by
+        # the gated tool — the two hints below are mutually exclusive
+        # (disjoint eligibility), never two buttons competing on one card.
+        #
+        # Edit tools → "Accept & allow all edits" (switches the session to
+        # acceptEdits via setMode). Stamped only for edit-tool prompts
+        # under a still-prompting mode — see _allow_all_edits_eligible.
+        # The verdict site re-checks the same predicate before honoring it.
         if _allow_all_edits_eligible(tool_name, permission_mode):
             extras["allow_all_edits"] = True
+        # Non-edit eligible tools → "don't ask again" (installs a
+        # session-scoped allow rule via addRules). Stamped only when the
+        # affordance applies — see _allow_remember_eligible.
+        # ``remember_scope`` carries the gated tool and, for WebFetch, the
+        # request host so the UI can label the button ("… for github.com"
+        # vs "… for WebFetch"); the verdict site re-derives the same scope
+        # before honoring the flag, never trusting a client-supplied rule.
+        if _allow_remember_eligible(tool_name, permission_mode):
+            remember_scope: dict[str, Any] = {"tool": tool_name}
+            remember_host = _claude_native_remember_host(tool_name, tool_input)
+            if remember_host is not None:
+                remember_scope["host"] = remember_host
+            extras["remember_scope"] = remember_scope
         # When Claude's built-in AskUserQuestion tool is the one
         # needing permission, the PermissionRequest payload
         # already carries the full questions + options structure
@@ -14188,6 +14294,43 @@ def create_sessions_router(
             # gate is needed.
             decision["updatedPermissions"] = [
                 {"type": "setMode", "mode": "default", "destination": "session"}
+            ]
+        # "Approve & don't ask again" — the user approved this non-edit
+        # tool AND asked to stop prompting for the same scope. Echo an
+        # ``addRules`` permission update so Claude Code installs a
+        # session-scoped allow rule, exactly as the native TUI's "don't
+        # ask again" option does. The shape matches the Agent SDK's
+        # ``PermissionUpdate`` union (``addRules``): ``rules`` is a list
+        # of ``{toolName, ruleContent?}`` — ``ruleContent`` omitted means
+        # the whole tool; ``destination: "session"`` scopes it to this
+        # session so it resets on the next one. The claude-native hook
+        # forwards this decision verbatim to Claude Code.
+        #
+        # The host is re-derived server-side from the gated tool's input
+        # rather than trusting any client-supplied rule, and gated by the
+        # same ``_allow_remember_eligible`` predicate the button was
+        # offered under — so a forged ``remember`` flag on an ineligible
+        # tool (e.g. an edit tool, which takes the setMode path) can't
+        # smuggle in an allow rule. Mutually exclusive with the edit-tool
+        # ``allow_all_edits``/ExitPlanMode branches above (disjoint tool
+        # sets), so it never overwrites their ``updatedPermissions``.
+        if (
+            behavior == "allow"
+            and isinstance(result.content, dict)
+            and result.content.get("remember") is True
+            and _allow_remember_eligible(tool_name, permission_mode)
+        ):
+            rule: dict[str, Any] = {"toolName": tool_name}
+            remember_host = _claude_native_remember_host(tool_name, tool_input)
+            if remember_host is not None:
+                rule["ruleContent"] = f"domain:{remember_host}"
+            decision["updatedPermissions"] = [
+                {
+                    "type": "addRules",
+                    "rules": [rule],
+                    "behavior": "allow",
+                    "destination": "session",
+                }
             ]
         body = {
             "hookSpecificOutput": {
