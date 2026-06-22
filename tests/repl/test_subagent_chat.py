@@ -122,29 +122,70 @@ def test_status_label_pending_outranks_busy_and_warm_idle_not_done() -> None:
 # ── Poll discovery gate (D / F7) ───────────────────────────────────────────
 
 
-def test_should_discover_polls_while_nodes_exist() -> None:
-    """Polls while any node exists (keep statuses + nested levels live)."""
+def test_should_discover_polls_while_active_or_observing() -> None:
+    """Polls while a sub-agent is running, or while the user is observing one.
+
+    Keyed on live work (active sub-agent) and on diving into a child — whose
+    own stream can't refresh its row, so the poll is what keeps it fresh.
+    """
+    # An active sub-agent keeps statuses + nested levels live.
     assert _should_discover_subagents(
-        "conv_main", has_any_subagents=True, last_polled_root="conv_main"
+        "conv_main",
+        has_active_subagents=True,
+        observing_subagent=False,
+        last_polled_root="conv_main",
+    )
+    # Diving into a child (nothing else running) still polls so its row stays fresh.
+    assert _should_discover_subagents(
+        "conv_main",
+        has_active_subagents=False,
+        observing_subagent=True,
+        last_polled_root="conv_main",
+    )
+
+
+def test_should_stop_polling_when_idle_at_top_level() -> None:
+    """Once everything settles at the top level the loop goes quiet — retained
+    finished sub-agents no longer change status, so polling them is pure waste.
+    A child that later resumes re-arms the poll via the active stream's SSE."""
+    assert not _should_discover_subagents(
+        "conv_main",
+        has_active_subagents=False,
+        observing_subagent=False,
+        last_polled_root="conv_main",
     )
 
 
 def test_should_discover_runs_discovery_on_root_change() -> None:
     """A resumed / switched root with NO nodes yet still polls once — the
     discovery that repopulates the selector without fresh SSE (the D fix)."""
-    # Root just changed (never polled) -> discover even with zero nodes.
+    # Root just changed (never polled) -> discover even with nothing active.
     assert _should_discover_subagents(
-        "conv_resumed", has_any_subagents=False, last_polled_root=None
+        "conv_resumed",
+        has_active_subagents=False,
+        observing_subagent=False,
+        last_polled_root=None,
     )
     assert _should_discover_subagents(
-        "conv_new", has_any_subagents=False, last_polled_root="conv_old"
+        "conv_new",
+        has_active_subagents=False,
+        observing_subagent=False,
+        last_polled_root="conv_old",
     )
-    # Same root already discovered + no nodes -> stop polling (SSE re-triggers).
+    # Same root already discovered + nothing active -> stop polling (SSE re-triggers).
     assert not _should_discover_subagents(
-        "conv_new", has_any_subagents=False, last_polled_root="conv_new"
+        "conv_new",
+        has_active_subagents=False,
+        observing_subagent=False,
+        last_polled_root="conv_new",
     )
     # No root -> never poll.
-    assert not _should_discover_subagents(None, has_any_subagents=True, last_polled_root=None)
+    assert not _should_discover_subagents(
+        None,
+        has_active_subagents=True,
+        observing_subagent=True,
+        last_polled_root=None,
+    )
 
 
 class _DiscoverySessions:

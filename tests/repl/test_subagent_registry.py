@@ -264,7 +264,8 @@ def test_run_repl_wires_subagent_plumbing() -> None:
         "the root-tracking no longer guards on _interactive_child — co-driving "
         "a child could re-root the selector onto it, breaking Left-arrow back."
     )
-    assert "polled_root" in src and "has_any_subagents" in src, (
+    assert "polled_root" in src and "has_active_subagents" in src, (
         "the discovery poll regressed — a resumed / switched session with "
-        "existing children won't repopulate the selector without fresh SSE."
+        "existing children won't repopulate the selector without fresh SSE, "
+        "or the poll no longer gates on active work and spins forever idle."
     )

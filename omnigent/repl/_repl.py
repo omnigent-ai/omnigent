@@ -3771,18 +3771,27 @@ async def run_repl(
         # Periodically re-fetch the tree so nested (grandchild) levels + live
         # statuses stay current — the SSE stream only carries the active
         # session's direct children. The root-sync runs every tick (cheap, no
-        # I/O) so the root stays accurate. The tree re-fetch fires when there is
-        # ANY node to keep live (active OR retained-finished) OR when the root
-        # just changed — the latter is the discovery poll that repopulates the
-        # selector after a resume / ``/switch`` into a session that already has
-        # children, which would otherwise never poll (no SSE, no nodes yet).
+        # I/O) so the root stays accurate. The tree re-fetch fires while there
+        # is live work to track — an active sub-agent, or a child the user has
+        # dived into (whose own stream can't refresh its row) — OR when the root
+        # just changed (the discovery poll that repopulates the selector after a
+        # resume / ``/switch`` into a session that already has children, which
+        # would otherwise never poll: no SSE, no nodes yet). It deliberately
+        # goes quiet once everything settles at the top level: a finished
+        # sub-agent's status no longer changes, so polling retained-but-terminal
+        # nodes forever is pure waste; a child that later resumes re-arms the
+        # poll via the active stream's ``session.child_session.updated``.
         while True:
             try:
                 _sync_subagent_root()
                 root_id = subagent_root[0]
+                observing_subagent = getattr(session, "_readonly_view", False) or getattr(
+                    session, "_interactive_child", False
+                )
                 if _should_discover_subagents(
                     root_id,
-                    has_any_subagents=host.has_any_subagents(),
+                    has_active_subagents=host.has_active_subagents(),
+                    observing_subagent=observing_subagent,
                     last_polled_root=polled_root[0],
                 ):
                     await _refresh_subagents()
@@ -5766,27 +5775,44 @@ async def _list_all_conversation_items(
 def _should_discover_subagents(
     root_id: str | None,
     *,
-    has_any_subagents: bool,
+    has_active_subagents: bool,
+    observing_subagent: bool,
     last_polled_root: str | None,
 ) -> bool:
     """Decide whether the background loop should (re-)fetch the sub-agent tree.
 
-    Re-fetches while ANY node exists — active OR retained-finished — to keep
-    statuses + nested (grandchild) levels live; AND runs a one-shot discovery
-    when the ROOT just changed (``last_polled_root != root_id``) even with no
-    nodes registered yet. The discovery branch is the fix for a resumed /
-    ``/switch``-ed session that already has children: there's no fresh SSE to
-    seed them and ``has_any_subagents`` is False, so without it the selector
-    would stay empty.
+    Re-fetches while there is live work to track, AND runs a one-shot discovery
+    when the ROOT just changed. Concretely, polls when:
+
+    * ``has_active_subagents`` — a sub-agent anywhere in the tree is still
+      running, so its (and any grandchild's) status keeps changing; or
+    * ``observing_subagent`` — the user has dived into a child (read-only or
+      co-driving). The active stream is then the child's own, which carries the
+      child's events but NOT a ``session.child_session.updated`` about itself,
+      so the poll is the only thing that keeps the dived-into child's row (and
+      the badge) fresh while chatting; or
+    * ``last_polled_root != root_id`` — the root just changed: a one-shot
+      discovery that repopulates the selector for a resumed / ``/switch``-ed
+      session that already has children (no fresh SSE to seed them).
+
+    Deliberately keyed on *active* work, NOT merely "any node exists": finished
+    sub-agents are retained in the selector indefinitely (web parity), but a
+    terminal child's status no longer changes, so polling it forever is pure
+    waste. Once everything settles at the top level the loop goes quiet; a child
+    that later resumes does so on the active (root) stream, whose SSE
+    ``session.child_session.updated`` re-arms ``has_active_subagents`` and the
+    poll wakes again.
 
     :param root_id: The current tree root (top-level session id), or ``None``.
-    :param has_any_subagents: Whether the host registry holds any node.
+    :param has_active_subagents: Whether any sub-agent is still running.
+    :param observing_subagent: Whether the user is currently viewing/co-driving
+        a child (so the parent-rooted poll is what keeps that child fresh).
     :param last_polled_root: The root the loop last ran discovery for.
     :returns: ``True`` to fetch the tree this tick.
     """
     if root_id is None:
         return False
-    return has_any_subagents or last_polled_root != root_id
+    return has_active_subagents or observing_subagent or last_polled_root != root_id
 
 
 def _apply_child_session_event(
