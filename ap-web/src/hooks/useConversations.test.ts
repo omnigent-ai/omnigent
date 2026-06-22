@@ -15,8 +15,8 @@ import {
   useBulkDeleteConversations,
   useBulkStopSessions,
   useConversations,
-  useCollections,
-  useMoveToCollection,
+  useGroups,
+  useMoveToGroup,
   useRenameConversation,
   useStopAndDeleteConversation,
   useStopSession,
@@ -662,19 +662,19 @@ describe("useBulkStopSessions", () => {
   });
 });
 
-describe("useCollections", () => {
-  it("GETs /v1/sessions/collections and returns the collection list", async () => {
-    const collections = ["Customer X", "Sprint 42"];
-    fetchMock.mockResolvedValueOnce(mockResponse(collections));
+describe("useGroups", () => {
+  it("GETs /v1/sessions/groups and returns the group list", async () => {
+    const groups = ["Customer X", "Sprint 42"];
+    fetchMock.mockResolvedValueOnce(mockResponse(groups));
 
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
-    const { result } = renderHook(() => useCollections(), { wrapper });
+    const { result } = renderHook(() => useGroups(), { wrapper });
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/collections");
-    expect(result.current.data).toEqual(collections);
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/groups");
+    expect(result.current.data).toEqual(groups);
   });
 
   it("throws on non-2xx", async () => {
@@ -682,14 +682,14 @@ describe("useCollections", () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
-    const { result } = renderHook(() => useCollections(), { wrapper });
+    const { result } = renderHook(() => useGroups(), { wrapper });
 
     await waitFor(() => expect(result.current.isError).toBe(true));
   });
 });
 
-describe("useMoveToCollection", () => {
-  it("PATCHes /v1/sessions/{id} with the collection label", async () => {
+describe("useMoveToGroup", () => {
+  it("PATCHes /v1/sessions/{id} with the group label", async () => {
     fetchMock.mockResolvedValueOnce(
       mockResponse({
         id: "conv_move",
@@ -697,24 +697,24 @@ describe("useMoveToCollection", () => {
         title: "t",
         created_at: 0,
         updated_at: 1,
-        labels: { collection: "Sprint 42" },
+        labels: { group: "Sprint 42" },
       }),
     );
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
-    const { result } = renderHook(() => useMoveToCollection(), { wrapper });
+    const { result } = renderHook(() => useMoveToGroup(), { wrapper });
 
-    result.current.mutate({ id: "conv_move", collection: "Sprint 42" });
+    result.current.mutate({ id: "conv_move", group: "Sprint 42" });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_move");
     expect(init.method).toBe("PATCH");
-    expect(JSON.parse(init.body as string)).toEqual({ labels: { collection: "Sprint 42" } });
+    expect(JSON.parse(init.body as string)).toEqual({ labels: { group: "Sprint 42" } });
   });
 
-  it("invalidates both the conversations and collections queries on success", async () => {
+  it("invalidates both the conversations and groups queries on success", async () => {
     fetchMock.mockResolvedValueOnce(
       mockResponse({
         id: "conv_move",
@@ -729,14 +729,14 @@ describe("useMoveToCollection", () => {
     const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
-    const { result } = renderHook(() => useMoveToCollection(), { wrapper });
+    const { result } = renderHook(() => useMoveToGroup(), { wrapper });
 
-    result.current.mutate({ id: "conv_move", collection: "" });
+    result.current.mutate({ id: "conv_move", group: "" });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
     // Both keys must refresh: conversations so the row re-groups into its new
-    // section, collections so the sidebar counts update.
+    // section, groups so the sidebar counts update.
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
-    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["collections"] });
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["groups"] });
   });
 });

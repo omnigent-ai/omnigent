@@ -11,6 +11,8 @@ import {
   FileTextIcon,
   FolderIcon,
   ImageIcon,
+  BookmarkIcon,
+  BookmarkPlusIcon,
   PaperclipIcon,
   PlusIcon,
   SettingsIcon,
@@ -59,6 +61,7 @@ import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
 import type { Conversation } from "@/hooks/useConversations";
+import { useGroups } from "@/hooks/useConversations";
 import { OttoEyes } from "@/components/OttoEyes";
 import { SkillPills } from "@/components/SkillPills";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
@@ -688,6 +691,7 @@ export function NewChatLandingScreen() {
   // Sessions the caller can access, to warn when a new session would share a
   // working directory with a live one (see the conflict tooltip below).
   const { data: directorySessions } = useDirectorySessions(true);
+  const { data: groups = [] } = useGroups();
 
   const agentList = useMemo(() => {
     const displayRank = (name: string) => {
@@ -798,6 +802,11 @@ export function NewChatLandingScreen() {
   const [sandboxRepoBranch, setSandboxRepoBranch] = useState<string>("");
   const [workspace, setWorkspace] = useState<string>("");
   const [branchName, setBranchName] = useState<string>("");
+  const [selectedGroup, setSelectedGroup] = useState<string | null>(null);
+  const [groupSearch, setGroupSearch] = useState<string>("");
+  const [groupPopoverOpen, setGroupPopoverOpen] = useState(false);
+  const [newGroupInput, setNewGroupInput] = useState<string>("");
+  const [showNewGroupInput, setShowNewGroupInput] = useState(false);
   const [baseBranch, setBaseBranch] = useState<string>("");
   // Permission mode for Claude Code (claude --permission-mode). Only
   // meaningful for the claude-native wrapper; ignored otherwise. Lives in
@@ -1208,6 +1217,18 @@ export function NewChatLandingScreen() {
       const data = (await res.json()) as { id: string };
       // Sandbox creates have no user-picked workspace to remember.
       if (!sandboxSelected) addRecent(workspaceTrimmed);
+      // Apply group label if the user picked one — fire-and-forget, same
+      // as the conversations refetch below. A failure here doesn't block
+      // navigation; the user can always move the session via the kebab.
+      if (selectedGroup) {
+        void authenticatedFetch(`/v1/sessions/${data.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ labels: { group: selectedGroup } }),
+        }).then(() => {
+          void queryClient.invalidateQueries({ queryKey: ["groups"] });
+        });
+      }
       // Fire-and-forget: don't block navigation on the sidebar list refresh.
       // The background refetch (or the WS session_added push) backfills the
       // new session's row within ~1s of landing in the chat; the chat itself
@@ -1824,6 +1845,122 @@ export function NewChatLandingScreen() {
                   </PopoverContent>
                 </Popover>
               )}
+
+              {/* Group chip — optional; assigns the new session to an
+                existing group or creates one inline. Skipped = session
+                lands under Recent (same as today). */}
+              <DropdownMenu
+                open={groupPopoverOpen}
+                onOpenChange={(open) => {
+                  setGroupPopoverOpen(open);
+                  if (!open) {
+                    setGroupSearch("");
+                    setShowNewGroupInput(false);
+                    setNewGroupInput("");
+                  }
+                }}
+              >
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    className="flex h-6 items-center gap-1.5 rounded-full px-3 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
+                    data-testid="new-chat-landing-group-chip"
+                  >
+                    <BookmarkIcon className="size-4 shrink-0" />
+                    <span className={`max-w-32 truncate ${selectedGroup ? "text-foreground" : ""}`}>
+                      {selectedGroup ?? "No group"}
+                    </span>
+                    <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start" className="w-56 p-1">
+                  <div className="px-2 py-1.5">
+                    <input
+                      type="text"
+                      className="w-full rounded-md border border-input bg-background px-2 py-1 text-xs outline-none focus-visible:border-ring"
+                      placeholder="Search groups…"
+                      value={groupSearch}
+                      onChange={(e) => setGroupSearch(e.target.value)}
+                      onKeyDown={(e) => e.stopPropagation()}
+                      data-testid="new-chat-group-search"
+                    />
+                  </div>
+                  <DropdownMenuSeparator />
+                  {groups
+                    .filter((c) => c.toLowerCase().includes(groupSearch.toLowerCase()))
+                    .map((c) => (
+                      <DropdownMenuItem
+                        key={c}
+                        onSelect={() => {
+                          setSelectedGroup(c === selectedGroup ? null : c);
+                          setGroupPopoverOpen(false);
+                        }}
+                        data-active={c === selectedGroup ? "true" : undefined}
+                        className="text-xs data-[active=true]:bg-accent/60"
+                        data-testid="new-chat-group-option"
+                      >
+                        <BookmarkIcon className="size-3.5 text-muted-foreground" />
+                        <span className="truncate">{c}</span>
+                      </DropdownMenuItem>
+                    ))}
+                  {groups.length === 0 && !showNewGroupInput && (
+                    <div className="px-2 py-1.5 text-xs text-muted-foreground">No groups yet.</div>
+                  )}
+                  <DropdownMenuSeparator />
+                  {showNewGroupInput ? (
+                    <div className="px-2 py-1.5">
+                      <input
+                        autoFocus
+                        type="text"
+                        className="w-full rounded-md border border-input bg-background px-2 py-1 text-xs outline-none focus-visible:border-ring"
+                        placeholder="Group name…"
+                        value={newGroupInput}
+                        onChange={(e) => setNewGroupInput(e.target.value)}
+                        onKeyDown={(e) => {
+                          e.stopPropagation();
+                          if (e.key === "Enter" && newGroupInput.trim()) {
+                            setSelectedGroup(newGroupInput.trim());
+                            setGroupPopoverOpen(false);
+                          }
+                          if (e.key === "Escape") {
+                            setShowNewGroupInput(false);
+                            setNewGroupInput("");
+                          }
+                        }}
+                        data-testid="new-chat-new-group-input"
+                      />
+                    </div>
+                  ) : (
+                    <DropdownMenuItem
+                      onSelect={(e) => {
+                        e.preventDefault();
+                        setShowNewGroupInput(true);
+                      }}
+                      className="text-xs text-muted-foreground"
+                      data-testid="new-chat-new-group"
+                    >
+                      <BookmarkPlusIcon className="size-3.5" />
+                      New group…
+                    </DropdownMenuItem>
+                  )}
+                  {selectedGroup && (
+                    <>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem
+                        onSelect={() => {
+                          setSelectedGroup(null);
+                          setGroupPopoverOpen(false);
+                        }}
+                        className="text-xs text-muted-foreground"
+                        data-testid="new-chat-remove-group"
+                      >
+                        <XIcon className="size-3.5" />
+                        Remove from group
+                      </DropdownMenuItem>
+                    </>
+                  )}
+                </DropdownMenuContent>
+              </DropdownMenu>
 
               {/* Advanced settings chip — per-agent knobs that don't warrant
                 their own chip: the brain-harness override (bundle agents),

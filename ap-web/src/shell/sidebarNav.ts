@@ -7,11 +7,11 @@ export const PINNED_CONVERSATION_IDS_STORAGE_KEY = "omnigent:pinned-conversation
 // Keyed by display title — stable identifiers for these fixed groups.
 export const COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY = "omnigent:collapsed-sidebar-sections";
 
-// Names of collection sections the user has expanded. Collections default to
-// COLLAPSED (so the sidebar stays short as collection count grows), so this is
-// the inverse of the fixed-section collapse set: a collection shows its rows only
+// Names of group sections the user has expanded. Groups default to
+// COLLAPSED (so the sidebar stays short as group count grows), so this is
+// the inverse of the fixed-section collapse set: a group shows its rows only
 // when its name is present here.
-export const EXPANDED_COLLECTION_SECTIONS_STORAGE_KEY = "omnigent:expanded-collection-sections";
+export const EXPANDED_GROUP_SECTIONS_STORAGE_KEY = "omnigent:expanded-group-sections";
 
 // Snapshot of the active chat's updated_at at the moment the user
 // entered it. Used as the sort key for the active row so subsequent

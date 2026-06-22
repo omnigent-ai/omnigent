@@ -604,14 +604,14 @@ export function usePinnedConversationBackfill(
   }, [resolvedIds]);
 }
 
-// ── Collection hooks ─────────────────────────────────────────────────────────────
+// ── Group hooks ─────────────────────────────────────────────────────────────
 
-/** Fetch all collection names from `GET /v1/sessions/collections`. */
-export function useCollections() {
+/** Fetch all group names from `GET /v1/sessions/groups`. */
+export function useGroups() {
   return useQuery<string[]>({
-    queryKey: ["collections"],
+    queryKey: ["groups"],
     queryFn: async () => {
-      const res = await authenticatedFetch("/v1/sessions/collections");
+      const res = await authenticatedFetch("/v1/sessions/groups");
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
       return (await res.json()) as string[];
     },
@@ -619,34 +619,57 @@ export function useCollections() {
   });
 }
 
-async function moveConversationToCollection(id: string, collection: string): Promise<Conversation> {
+async function moveConversationToGroup(id: string, group: string): Promise<Conversation> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    // Empty string signals "remove from collection" (server deletes the label row).
-    body: JSON.stringify({ labels: { collection } }),
+    // Empty string signals "remove from group" (server deletes the label row).
+    body: JSON.stringify({ labels: { group } }),
   });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as Conversation;
 }
 
+export function useBulkMoveToGroup() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ ids, group }: { ids: string[]; group: string }) => {
+      const results = await Promise.allSettled(ids.map((id) => moveConversationToGroup(id, group)));
+      const failed: string[] = [];
+      for (let i = 0; i < results.length; i++) {
+        if (results[i].status === "rejected") failed.push(ids[i]);
+        else
+          markConversationSeen(
+            ids[i],
+            (results[i] as PromiseFulfilledResult<Conversation>).value.updated_at,
+          );
+      }
+      if (failed.length > 0) throw { failed, total: ids.length };
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      void queryClient.invalidateQueries({ queryKey: ["groups"] });
+    },
+  });
+}
+
 /**
- * Move a session to a collection (or remove it from all collections when `collection=""`).
+ * Move a session to a group (or remove it from all groups when `group=""`).
  *
  * Invalidates both the conversations list (so sidebar sections re-group) and
- * the collections list (so counts update). Patch-in-place is skipped here — collection
+ * the groups list (so counts update). Patch-in-place is skipped here — group
  * changes affect which sidebar section a session belongs to, so a full
  * re-render of the list is correct.
  */
-export function useMoveToCollection() {
+export function useMoveToGroup() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, collection }: { id: string; collection: string }) =>
-      moveConversationToCollection(id, collection),
+    mutationFn: ({ id, group }: { id: string; group: string }) =>
+      moveConversationToGroup(id, group),
     onSuccess: (updated) => {
       markConversationSeen(updated.id, updated.updated_at);
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
-      void queryClient.invalidateQueries({ queryKey: ["collections"] });
+      void queryClient.invalidateQueries({ queryKey: ["groups"] });
     },
   });
 }

@@ -4178,43 +4178,43 @@ def test_append_many_batches_stay_contiguous(
     assert len(listed.data) == total
 
 
-# ── Collections (conversation_labels key="collection") ───────
+# ── Groups (conversation_labels key="group") ───────
 
 
-def test_list_collections_returns_distinct_names_sorted(
+def test_list_groups_returns_distinct_names_sorted(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """``list_collections`` returns each distinct collection name once, ordered
-    alphabetically. Sessions with no collection label don't create phantom
-    collections, and a collection shared by two sessions appears a single time."""
+    """``list_groups`` returns each distinct group name once, ordered
+    alphabetically. Sessions with no group label don't create phantom
+    groups, and a group shared by two sessions appears a single time."""
     a1 = conversation_store.create_conversation()
     a2 = conversation_store.create_conversation()
     b1 = conversation_store.create_conversation()
     conversation_store.create_conversation()  # unfiled — must not appear
 
-    conversation_store.set_labels(a1.id, {"collection": "Sprint 42"})
-    conversation_store.set_labels(a2.id, {"collection": "Sprint 42"})
-    conversation_store.set_labels(b1.id, {"collection": "Customer X"})
+    conversation_store.set_labels(a1.id, {"group": "Sprint 42"})
+    conversation_store.set_labels(a2.id, {"group": "Sprint 42"})
+    conversation_store.set_labels(b1.id, {"group": "Customer X"})
 
     # Alphabetical, de-duplicated. A missing DISTINCT would list "Sprint 42"
     # twice.
-    assert conversation_store.list_collections() == ["Customer X", "Sprint 42"]
+    assert conversation_store.list_groups() == ["Customer X", "Sprint 42"]
 
 
-def test_list_collections_empty_when_no_collection_labels(
+def test_list_groups_empty_when_no_group_labels(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """Non-collection labels (e.g. guardrail keys) never surface as collections."""
+    """Non-group labels (e.g. guardrail keys) never surface as groups."""
     conv = conversation_store.create_conversation()
     conversation_store.set_labels(conv.id, {"integrity": "1", "sensitivity": "public"})
-    assert conversation_store.list_collections() == []
+    assert conversation_store.list_groups() == []
 
 
-def test_list_collections_scoped_by_accessible_by(
+def test_list_groups_scoped_by_accessible_by(
     conversation_store: SqlAlchemyConversationStore,
     db_uri: str,
 ) -> None:
-    """When ``accessible_by`` is set, only collections on sessions the user has a
+    """When ``accessible_by`` is set, only groups on sessions the user has a
     permission row for are returned — mirroring the list_conversations ACL."""
     from omnigent.stores.permission_store.sqlalchemy_store import (
         SqlAlchemyPermissionStore,
@@ -4222,8 +4222,8 @@ def test_list_collections_scoped_by_accessible_by(
 
     mine = conversation_store.create_conversation()
     theirs = conversation_store.create_conversation()
-    conversation_store.set_labels(mine.id, {"collection": "Mine"})
-    conversation_store.set_labels(theirs.id, {"collection": "Theirs"})
+    conversation_store.set_labels(mine.id, {"group": "Mine"})
+    conversation_store.set_labels(theirs.id, {"group": "Theirs"})
 
     perms = SqlAlchemyPermissionStore(db_uri)
     for user in ("alice@example.com", "bob@example.com"):
@@ -4231,19 +4231,19 @@ def test_list_collections_scoped_by_accessible_by(
     perms.grant("alice@example.com", mine.id, 4)
     perms.grant("bob@example.com", theirs.id, 4)
 
-    # Alice only sees her collection; Theirs is invisible to her.
-    assert conversation_store.list_collections(accessible_by="alice@example.com") == ["Mine"]
+    # Alice only sees her group; Theirs is invisible to her.
+    assert conversation_store.list_groups(accessible_by="alice@example.com") == ["Mine"]
 
 
 def test_delete_label_removes_only_target_key(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
     """``delete_label`` drops the named key and leaves siblings intact — so
-    removing a session from its collection doesn't wipe guardrail labels."""
+    removing a session from its group doesn't wipe guardrail labels."""
     conv = conversation_store.create_conversation()
-    conversation_store.set_labels(conv.id, {"collection": "X", "integrity": "1"})
+    conversation_store.set_labels(conv.id, {"group": "X", "integrity": "1"})
 
-    conversation_store.delete_label(conv.id, "collection")
+    conversation_store.delete_label(conv.id, "group")
 
     got = conversation_store.get_conversation(conv.id)
     assert got is not None
@@ -4255,47 +4255,47 @@ def test_delete_label_is_noop_when_absent(
 ) -> None:
     """Deleting a label that doesn't exist is a no-op, not an error."""
     conv = conversation_store.create_conversation()
-    conversation_store.delete_label(conv.id, "collection")  # must not raise
+    conversation_store.delete_label(conv.id, "group")  # must not raise
     got = conversation_store.get_conversation(conv.id)
     assert got is not None
     assert got.labels == {}
 
 
-def test_list_conversations_filters_by_collection(
+def test_list_conversations_filters_by_group(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """``collection="X"`` returns only sessions carrying that exact collection label."""
+    """``group="X"`` returns only sessions carrying that exact group label."""
     filed = conversation_store.create_conversation()
     other = conversation_store.create_conversation()
     conversation_store.create_conversation()  # unfiled
 
-    conversation_store.set_labels(filed.id, {"collection": "X"})
-    conversation_store.set_labels(other.id, {"collection": "Y"})
+    conversation_store.set_labels(filed.id, {"group": "X"})
+    conversation_store.set_labels(other.id, {"group": "Y"})
 
-    ids = {c.id for c in conversation_store.list_conversations(collection="X").data}
+    ids = {c.id for c in conversation_store.list_conversations(group="X").data}
     assert ids == {filed.id}
 
 
-def test_list_conversations_empty_collection_returns_unfiled(
+def test_list_conversations_empty_group_returns_unfiled(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """``collection=""`` returns only sessions with NO collection label (Unfiled)."""
+    """``group=""`` returns only sessions with NO group label (Unfiled)."""
     filed = conversation_store.create_conversation()
     unfiled = conversation_store.create_conversation()
-    conversation_store.set_labels(filed.id, {"collection": "X"})
+    conversation_store.set_labels(filed.id, {"group": "X"})
 
-    ids = {c.id for c in conversation_store.list_conversations(collection="").data}
+    ids = {c.id for c in conversation_store.list_conversations(group="").data}
     assert unfiled.id in ids
     assert filed.id not in ids
 
 
-def test_list_conversations_collection_none_disables_filter(
+def test_list_conversations_group_none_disables_filter(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """``collection=None`` (the default) returns filed and unfiled alike."""
+    """``group=None`` (the default) returns filed and unfiled alike."""
     filed = conversation_store.create_conversation()
     unfiled = conversation_store.create_conversation()
-    conversation_store.set_labels(filed.id, {"collection": "X"})
+    conversation_store.set_labels(filed.id, {"group": "X"})
 
     ids = {c.id for c in conversation_store.list_conversations().data}
     assert ids >= {filed.id, unfiled.id}

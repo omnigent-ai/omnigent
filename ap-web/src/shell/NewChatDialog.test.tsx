@@ -48,6 +48,9 @@ vi.mock("@/hooks/useDirectorySessions", () => ({
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useRunnerHealthRegistration: vi.fn(),
 }));
+vi.mock("@/hooks/useConversations", () => ({
+  useGroups: vi.fn(() => ({ data: [] })),
+}));
 
 const authenticatedFetchMock = vi.mocked(authenticatedFetch);
 const useHostsMock = vi.mocked(useHosts);

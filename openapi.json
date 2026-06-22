@@ -4803,7 +4803,7 @@
           },
           {
             "in": "query",
-            "name": "collection",
+            "name": "group",
             "required": false,
             "schema": {
               "anyOf": [
@@ -4814,7 +4814,7 @@
                   "type": "null"
                 }
               ],
-              "title": "Collection"
+              "title": "Group"
             }
           }
         ],
@@ -4862,10 +4862,10 @@
         ]
       }
     },
-    "/v1/sessions/collections": {
+    "/v1/sessions/groups": {
       "get": {
-        "description": "Return all collection names for the authenticated user, ordered\nalphabetically.\n\nCollections are implicit: they exist while at least one session\nhas a ``conversation_labels`` row with ``key=\"collection\"``.\n\n:returns: List of collection names.",
-        "operationId": "list_session_collections_v1_sessions_collections_get",
+        "description": "Return all group names for the authenticated user, ordered\nalphabetically.\n\nGroups are implicit: they exist while at least one session\nhas a ``conversation_labels`` row with ``key=\"group\"``.\n\n:returns: List of group names.",
+        "operationId": "list_session_groups_v1_sessions_groups_get",
         "responses": {
           "200": {
             "content": {
@@ -4876,7 +4876,7 @@
             "description": "Successful Response"
           }
         },
-        "summary": "List Session Collections",
+        "summary": "List Session Groups",
         "tags": [
           "sessions"
         ]

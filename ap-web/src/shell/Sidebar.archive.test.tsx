@@ -38,8 +38,8 @@ vi.mock("@/hooks/useConversations", () => ({
   useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useStopSession: () => mocks.stop,
-  useCollections: () => ({ data: [] }),
-  useMoveToCollection: () => ({ mutate: vi.fn() }),
+  useGroups: () => ({ data: [] }),
+  useMoveToGroup: () => ({ mutate: vi.fn() }),
 }));
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));

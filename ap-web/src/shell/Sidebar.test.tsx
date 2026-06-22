@@ -11,12 +11,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 
-// Collection mocks are declared via vi.hoisted so they exist before the hoisted
-// vi.mock factory runs. collectionsMock is mutated per-test to drive collection
-// sections; moveToCollectionSpy captures kebab-menu "Move to collection" calls.
-const { collectionsMock, moveToCollectionSpy } = vi.hoisted(() => ({
-  collectionsMock: [] as string[],
-  moveToCollectionSpy: vi.fn(),
+// Group mocks are declared via vi.hoisted so they exist before the hoisted
+// vi.mock factory runs. groupsMock is mutated per-test to drive group
+// sections; moveToGroupSpy captures kebab-menu "Move to group" calls.
+const { groupsMock, moveToGroupSpy } = vi.hoisted(() => ({
+  groupsMock: [] as string[],
+  moveToGroupSpy: vi.fn(),
 }));
 
 // Mutation hooks are only invoked on row actions; stub them. useConversations
@@ -32,11 +32,11 @@ vi.mock("@/hooks/useConversations", () => ({
   usePinnedConversationBackfill: () => [],
   useRenameConversation: () => ({ mutate: vi.fn() }),
   useStopSession: () => ({ mutate: vi.fn() }),
-  // Collection feature: the sidebar reads the collection list to build collection
-  // sections, and rows fire useMoveToCollection from the kebab menu. Both must
+  // Group feature: the sidebar reads the group list to build group
+  // sections, and rows fire useMoveToGroup from the kebab menu. Both must
   // be stubbed or the Sidebar throws on render.
-  useCollections: () => ({ data: collectionsMock }),
-  useMoveToCollection: () => ({ mutate: moveToCollectionSpy }),
+  useGroups: () => ({ data: groupsMock }),
+  useMoveToGroup: () => ({ mutate: moveToGroupSpy }),
 }));
 // Header / dialog children that pull their own context — stub to keep the
 // test scoped to the conversation list + funnel.
@@ -112,8 +112,8 @@ function renderSidebar(open = true) {
 beforeEach(() => {
   useConvMock.mockReset();
   localStorage.clear();
-  collectionsMock.length = 0;
-  moveToCollectionSpy.mockReset();
+  groupsMock.length = 0;
+  moveToGroupSpy.mockReset();
 });
 afterEach(cleanup);
 
@@ -320,37 +320,35 @@ describe("Sidebar load-more vs collapsed Recent", () => {
   });
 });
 
-// Collection feature: sessions carrying a `collection` label are peeled out of
-// "Recent" into a dedicated section named after the collection, rendered between
-// Pinned and Recent. The collection list comes from useCollections() (mocked here).
-describe("Sidebar collection sections", () => {
-  it("groups sessions by their collection label, separate from Recent", () => {
-    collectionsMock.push("Customer X");
+// Group feature: sessions carrying a `group` label are peeled out of
+// "Recent" into a dedicated section named after the group, rendered between
+// Pinned and Recent. The group list comes from useGroups() (mocked here).
+describe("Sidebar group sections", () => {
+  it("groups sessions by their group label, separate from Recent", () => {
+    groupsMock.push("Customer X");
     mockConversations([
       conv("conv_unfiled", "Claude Code"),
-      conv("conv_filed", "Claude Code", { labels: { collection: "Customer X" } }),
+      conv("conv_filed", "Claude Code", { labels: { group: "Customer X" } }),
     ]);
     renderSidebar();
 
-    // Collections default collapsed, so the row is hidden until the header is
+    // Groups default collapsed, so the row is hidden until the header is
     // clicked. The unfiled session stays visible in Recent regardless.
     const recentSection = screen.getByText("Recent").closest("section")!;
     expect(within(recentSection).getByText("conv_unfiled")).toBeInTheDocument();
     expect(within(recentSection).queryByText("conv_filed")).toBeNull();
     expect(screen.queryByText("conv_filed")).toBeNull();
 
-    // Expanding the collection reveals its session under the collection section.
+    // Expanding the group reveals its session under the group section.
     fireEvent.click(screen.getByRole("button", { name: /Customer X/ }));
-    const collectionSection = screen.getByText("Customer X").closest("section")!;
-    expect(within(collectionSection).getByText("conv_filed")).toBeInTheDocument();
+    const groupSection = screen.getByText("Customer X").closest("section")!;
+    expect(within(groupSection).getByText("conv_filed")).toBeInTheDocument();
     expect(within(recentSection).queryByText("conv_filed")).toBeNull();
   });
 
-  it("starts collections collapsed and shows their session count", () => {
-    collectionsMock.push("Customer X");
-    mockConversations([
-      conv("conv_filed", "Claude Code", { labels: { collection: "Customer X" } }),
-    ]);
+  it("starts groups collapsed and shows their session count", () => {
+    groupsMock.push("Customer X");
+    mockConversations([conv("conv_filed", "Claude Code", { labels: { group: "Customer X" } })]);
     renderSidebar();
 
     // Header is present (with the rendered count) but the row is hidden, and
@@ -361,30 +359,30 @@ describe("Sidebar collection sections", () => {
     expect(screen.queryByText("conv_filed")).toBeNull();
   });
 
-  it("keeps a pinned session inside its collection, sorted first", () => {
-    collectionsMock.push("Customer X");
+  it("keeps a pinned session inside its group, sorted first", () => {
+    groupsMock.push("Customer X");
     mockConversations([
-      conv("conv_plain", "Claude Code", { labels: { collection: "Customer X" } }),
-      conv("conv_pinned", "Claude Code", { labels: { collection: "Customer X" } }),
+      conv("conv_plain", "Claude Code", { labels: { group: "Customer X" } }),
+      conv("conv_pinned", "Claude Code", { labels: { group: "Customer X" } }),
     ]);
     // Pin one of the collectioned sessions via localStorage (client-side pins).
     localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_pinned"]));
     renderSidebar();
 
-    // No global "Pinned" section — the pinned session stays in its collection.
+    // No global "Pinned" section — the pinned session stays in its group.
     expect(screen.queryByText("Pinned")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: /Customer X/ }));
-    const collectionSection = screen.getByText("Customer X").closest("section")!;
-    const rows = within(collectionSection).getAllByRole("link");
-    // Pinned row sorts to the top of the collection.
+    const groupSection = screen.getByText("Customer X").closest("section")!;
+    const rows = within(groupSection).getAllByRole("link");
+    // Pinned row sorts to the top of the group.
     expect(rows[0]).toHaveTextContent("conv_pinned");
     expect(rows[1]).toHaveTextContent("conv_plain");
   });
 
-  it("does not render a collection section when useCollections returns nothing", () => {
-    // A session with a stale collection label but no matching collection entry stays
-    // in Recent — collections are driven by the collection list, not the labels alone.
-    mockConversations([conv("conv_filed", "Claude Code", { labels: { collection: "Ghost" } })]);
+  it("does not render a group section when useGroups returns nothing", () => {
+    // A session with a stale group label but no matching group entry stays
+    // in Recent — groups are driven by the group list, not the labels alone.
+    mockConversations([conv("conv_filed", "Claude Code", { labels: { group: "Ghost" } })]);
     renderSidebar();
 
     expect(screen.queryByText("Ghost")).toBeNull();
@@ -393,31 +391,31 @@ describe("Sidebar collection sections", () => {
   });
 });
 
-// A collapsed collection bubbles up its hidden rows' marker, using the same
+// A collapsed group bubbles up its hidden rows' marker, using the same
 // SessionStateBadge a row shows. Only while collapsed.
-describe("Sidebar collapsed collection marker", () => {
-  it("shows the row's session-state badge on a collapsed collection", () => {
-    collectionsMock.push("Customer X");
+describe("Sidebar collapsed group marker", () => {
+  it("shows the row's session-state badge on a collapsed group", () => {
+    groupsMock.push("Customer X");
     mockConversations([
       conv("conv_awaiting", "Claude Code", {
-        labels: { collection: "Customer X" },
+        labels: { group: "Customer X" },
         pending_elicitations_count: 1,
       }),
     ]);
     renderSidebar();
 
     // Collapsed by default → the row is hidden, but its "Needs response"
-    // marker surfaces on the collection header.
+    // marker surfaces on the group header.
     const header = screen.getByRole("button", { name: /Customer X/ });
     expect(header).toHaveAttribute("aria-expanded", "false");
     expect(within(header).getByText("Needs response")).toBeInTheDocument();
   });
 
-  it("drops the header marker once the collection is expanded", () => {
-    collectionsMock.push("Customer X");
+  it("drops the header marker once the group is expanded", () => {
+    groupsMock.push("Customer X");
     mockConversations([
       conv("conv_awaiting", "Claude Code", {
-        labels: { collection: "Customer X" },
+        labels: { group: "Customer X" },
         pending_elicitations_count: 1,
       }),
     ]);
@@ -430,11 +428,9 @@ describe("Sidebar collapsed collection marker", () => {
     expect(within(header).queryByText("Needs response")).toBeNull();
   });
 
-  it("shows no header marker when no collectioned row has one", () => {
-    collectionsMock.push("Customer X");
-    mockConversations([
-      conv("conv_plain", "Claude Code", { labels: { collection: "Customer X" } }),
-    ]);
+  it("shows no header marker when no grouped row has one", () => {
+    groupsMock.push("Customer X");
+    mockConversations([conv("conv_plain", "Claude Code", { labels: { group: "Customer X" } })]);
     renderSidebar();
 
     const header = screen.getByRole("button", { name: /Customer X/ });
@@ -506,27 +502,27 @@ describe("Sidebar pin marker visibility", () => {
   });
 });
 
-// The kebab menu's "Move to collection" item opens the collection picker; selecting a
-// collection fires useMoveToCollection with the row id and chosen collection name.
-describe("Sidebar move-to-collection action", () => {
-  it("moves a session into a collection selected from the picker", async () => {
-    collectionsMock.push("Sprint 42");
+// The kebab menu's "Move to group" item opens the group picker; selecting a
+// group fires useMoveToGroup with the row id and chosen group name.
+describe("Sidebar move-to-group action", () => {
+  it("moves a session into a group selected from the picker", async () => {
+    groupsMock.push("Sprint 42");
     mockConversations([conv("conv_move", "Claude Code")]);
     renderSidebar();
 
     // Open the row's kebab menu (Radix opens on pointerdown, not click), then
-    // open the "Move to collection" submenu flyout.
+    // open the "Move to group" submenu flyout.
     const row = screen.getByRole("link", { name: /conv_move/ }).closest("li")!;
     fireEvent.pointerDown(within(row).getByRole("button", { name: "Conversation actions" }), {
       button: 0,
       ctrlKey: false,
     });
-    fireEvent.click(await screen.findByTestId("move-to-collection"));
+    fireEvent.click(await screen.findByTestId("move-to-group"));
 
-    // Collections render as menu items inside the submenu; picking one fires the
-    // mutation with id + collection.
+    // Groups render as menu items inside the submenu; picking one fires the
+    // mutation with id + group.
     fireEvent.click(await screen.findByRole("menuitem", { name: /Sprint 42/ }));
-    expect(moveToCollectionSpy).toHaveBeenCalledWith({ id: "conv_move", collection: "Sprint 42" });
+    expect(moveToGroupSpy).toHaveBeenCalledWith({ id: "conv_move", group: "Sprint 42" });
   });
 });
 

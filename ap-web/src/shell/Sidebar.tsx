@@ -18,8 +18,8 @@ import {
   ChevronRightIcon,
   CircleStopIcon,
   ClockIcon,
-  FolderIcon,
-  FolderInputIcon,
+  BookmarkIcon,
+  BookmarkPlusIcon,
   GitBranchIcon,
   InboxIcon,
   ListChecksIcon,
@@ -51,6 +51,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuSub,
   DropdownMenuSubContent,
   DropdownMenuSubTrigger,
@@ -61,9 +62,10 @@ import {
   useArchiveConversation,
   useBulkArchiveConversations,
   useBulkDeleteConversations,
-  useCollections,
+  useBulkMoveToGroup,
+  useGroups,
   useConversations,
-  useMoveToCollection,
+  useMoveToGroup,
   usePinnedConversationBackfill,
   useRenameConversation,
   useStopAndDeleteConversation,
@@ -90,7 +92,7 @@ import {
   COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY,
   computeNextActiveOverride,
   conversationDisplayLabel,
-  EXPANDED_COLLECTION_SECTIONS_STORAGE_KEY,
+  EXPANDED_GROUP_SECTIONS_STORAGE_KEY,
   normalizePinnedConversationIds,
   PINNED_CONVERSATION_IDS_STORAGE_KEY,
   sortByUpdatedAtDesc,
@@ -468,8 +470,8 @@ function ConversationList({
     [conversationsQuery.data],
   );
 
-  // Collection names for grouping sessions by their "collection" label.
-  const { data: collectionNames = [] } = useCollections();
+  // Group names for grouping sessions by their "group" label.
+  const { data: groupNames = [] } = useGroups();
 
   // Backfill pinned sessions that aren't in the loaded set.
   const loadedIds = useMemo(() => new Set(allConversations.map((c) => c.id)), [allConversations]);
@@ -494,23 +496,23 @@ function ConversationList({
     const allWithBackfill = [...allConversations, ...pinnedBackfill];
     const notArchived = allWithBackfill.filter((c) => c.archived !== true);
 
-    // Collections are built first. A collectioned session STAYS in its collection even
-    // when pinned (B2): pinning sorts the row to the top of its collection rather
+    // Groups are built first. A grouped session STAYS in its group even
+    // when pinned (B2): pinning sorts the row to the top of its group rather
     // than pulling it out into the global Pinned section. Archived rows are
-    // excluded — they belong to the Archived group regardless of collection label.
-    const collectedIds = new Set<string>();
-    const collectionGroups: { name: string; conversations: Conversation[] }[] = collectionNames
+    // excluded — they belong to the Archived group regardless of group label.
+    const groupedIds = new Set<string>();
+    const groupSections: { name: string; conversations: Conversation[] }[] = groupNames
       .map((name) => {
-        const inCollection = notArchived.filter((c) => c.labels?.["collection"] === name);
-        inCollection.forEach((c) => collectedIds.add(c.id));
+        const inGroup = notArchived.filter((c) => c.labels?.["group"] === name);
+        inGroup.forEach((c) => groupedIds.add(c.id));
         // Pinned-first, then by recency — both buckets share the same sort.
         const conversations = [
           ...sortByUpdatedAtDesc(
-            inCollection.filter((c) => pinnedSet.has(c.id)),
+            inGroup.filter((c) => pinnedSet.has(c.id)),
             activeOverride,
           ),
           ...sortByUpdatedAtDesc(
-            inCollection.filter((c) => !pinnedSet.has(c.id)),
+            inGroup.filter((c) => !pinnedSet.has(c.id)),
             activeOverride,
           ),
         ];
@@ -519,17 +521,17 @@ function ConversationList({
       .filter((g) => g.conversations.length > 0);
 
     // The global Pinned section now holds only pinned sessions that are NOT
-    // in a collection — collectioned pins live under their collection instead.
+    // in a group — grouped pins live under their group instead.
     const pinned = sortByUpdatedAtDesc(
-      notArchived.filter((c) => pinnedSet.has(c.id) && !collectedIds.has(c.id)),
+      notArchived.filter((c) => pinnedSet.has(c.id) && !groupedIds.has(c.id)),
       activeOverride,
     );
     const pinnedIdSet = new Set(pinned.map((c) => c.id));
 
     // Recent / Shared: the remainder — not archived, not globally pinned, and
-    // not in any collection.
+    // not in any group.
     const rest = allConversations.filter(
-      (c) => c.archived !== true && !pinnedIdSet.has(c.id) && !collectedIds.has(c.id),
+      (c) => c.archived !== true && !pinnedIdSet.has(c.id) && !groupedIds.has(c.id),
     );
     const sessions = sortByUpdatedAtDesc(rest.filter(isOwnedByViewer), activeOverride);
     const shared = sortByUpdatedAtDesc(
@@ -540,8 +542,8 @@ function ConversationList({
       allWithBackfill.filter((c) => c.archived === true),
       activeOverride,
     );
-    return { pinned, sessions, shared, archived, collectionGroups };
-  }, [allConversations, pinnedBackfill, pinnedSet, activeOverride, collectionNames]);
+    return { pinned, sessions, shared, archived, groupSections };
+  }, [allConversations, pinnedBackfill, pinnedSet, activeOverride, groupNames]);
 
   // Collapsed section titles — persisted like pins so the preference
   // survives reloads. Lifted here (not per-section state) because the
@@ -559,18 +561,16 @@ function ConversationList({
     });
   }, []);
 
-  // Collections default to COLLAPSED, so we track the inverse — names the user has
-  // expanded — persisted across reloads. A collection shows its rows only while
+  // Groups default to COLLAPSED, so we track the inverse — names the user has
+  // expanded — persisted across reloads. A group shows its rows only while
   // its name is in this set.
-  const [expandedCollections, setExpandedCollections] = useState<string[]>(
-    readExpandedCollectionSections,
-  );
-  const toggleCollectionExpanded = useCallback((collectionName: string) => {
-    setExpandedCollections((prev) => {
-      const next = prev.includes(collectionName)
-        ? prev.filter((n) => n !== collectionName)
-        : [...prev, collectionName];
-      writeExpandedCollectionSections(next);
+  const [expandedGroups, setExpandedGroups] = useState<string[]>(readExpandedGroupSections);
+  const toggleGroupExpanded = useCallback((groupName: string) => {
+    setExpandedGroups((prev) => {
+      const next = prev.includes(groupName)
+        ? prev.filter((n) => n !== groupName)
+        : [...prev, groupName];
+      writeExpandedGroupSections(next);
       return next;
     });
   }, []);
@@ -580,18 +580,18 @@ function ConversationList({
   const orderedConversationIds = useMemo(() => {
     const visible = (title: string, list: readonly Conversation[]) =>
       collapsedSections.includes(title) ? [] : list;
-    // Collections are collapsed unless explicitly expanded (inverse of the fixed
+    // Groups are collapsed unless explicitly expanded (inverse of the fixed
     // sections above).
-    const collectionVisible = (name: string, list: readonly Conversation[]) =>
-      expandedCollections.includes(name) ? list : [];
+    const groupVisible = (name: string, list: readonly Conversation[]) =>
+      expandedGroups.includes(name) ? list : [];
     return [
-      ...sections.collectionGroups.flatMap((g) => collectionVisible(g.name, g.conversations)),
+      ...sections.groupSections.flatMap((g) => groupVisible(g.name, g.conversations)),
       ...visible("Pinned", sections.pinned),
       ...visible("Recent", sections.sessions),
       ...visible("Shared with me", sections.shared),
       ...visible("Archived", sections.archived),
     ].map((c) => c.id);
-  }, [sections, collapsedSections, expandedCollections]);
+  }, [sections, collapsedSections, expandedGroups]);
   useSessionSwitchHotkey(orderedConversationIds, activeId);
 
   // Only normalize pinned ids once all pages are loaded; a pin that
@@ -633,7 +633,7 @@ function ConversationList({
     sections.sessions.length +
     sections.shared.length +
     sections.archived.length +
-    sections.collectionGroups.reduce((sum, g) => sum + g.conversations.length, 0);
+    sections.groupSections.reduce((sum, g) => sum + g.conversations.length, 0);
 
   // Section structure comes from the muted micro-headers + whitespace
   // alone (Linear-style) — no divider rules between groups.
@@ -643,18 +643,18 @@ function ConversationList({
         <p className="px-2 py-1 text-muted-foreground text-xs">{emptyMessage}</p>
       ) : (
         <>
-          {sections.collectionGroups.map((group) => (
+          {sections.groupSections.map((group) => (
             <ConversationSection
               key={group.name}
               title={group.name}
-              icon={<FolderIcon className="size-3 mr-1 inline-block" />}
+              icon={<BookmarkIcon className="size-3 mr-1 inline-block" />}
               count={group.conversations.length}
-              marker={collectionMarkerState(group.conversations)}
+              marker={groupMarkerState(group.conversations)}
               conversations={group.conversations}
               pinnedConversationIds={pinnedConversationIds}
-              // Collections default collapsed: shown only when explicitly expanded.
-              collapsed={!expandedCollections.includes(group.name)}
-              onToggleCollapsed={() => toggleCollectionExpanded(group.name)}
+              // Groups default collapsed: shown only when explicitly expanded.
+              collapsed={!expandedGroups.includes(group.name)}
+              onToggleCollapsed={() => toggleGroupExpanded(group.name)}
               onRowClick={onRowClick}
               onTogglePinned={onTogglePinned}
               selectionMode={selectionMode}
@@ -754,12 +754,12 @@ function ConversationList({
 }
 
 /**
- * Aggregate the sidebar marker for a collection from its conversations, using
+ * Aggregate the sidebar marker for a group from its conversations, using
  * the same precedence a row uses (awaiting > unseen > running). Returned as a
- * {@link SessionState} so a collapsed collection header can render the exact
+ * {@link SessionState} so a collapsed group header can render the exact
  * same {@link SessionStateBadge} the rows do. ``null`` = no marker.
  */
-function collectionMarkerState(conversations: Conversation[]): SessionState | null {
+function groupMarkerState(conversations: Conversation[]): SessionState | null {
   let awaiting = 0;
   let unseen = false;
   let running = false;
@@ -910,7 +910,7 @@ function ConversationRow({
   const rename = useRenameConversation();
   const del = useStopAndDeleteConversation();
   const archive = useArchiveConversation();
-  const moveToCollection = useMoveToCollection();
+  const moveToGroup = useMoveToGroup();
   // Archive stops the runner first (resource hygiene): a hidden session
   // shouldn't keep a runner alive. This is NOT the user-facing Stop action
   // (the kebab's "Stop session" item below, backed by its own mutation) —
@@ -1285,17 +1285,17 @@ function ConversationRow({
             )}
             {canEdit && (
               <DropdownMenuSub>
-                <DropdownMenuSubTrigger data-testid="move-to-collection">
-                  <FolderInputIcon className="size-3.5" />
-                  Move to collection
+                <DropdownMenuSubTrigger data-testid="move-to-group">
+                  <BookmarkPlusIcon className="size-3.5" />
+                  Move to…
                 </DropdownMenuSubTrigger>
                 <DropdownMenuSubContent className="w-56 p-1">
                   {/* A native submenu flyout — no separate popover layer, so no
                       open/dismiss race with the parent menu. */}
-                  <CollectionPickerMenu
-                    currentCollection={conversation.labels?.["collection"] ?? null}
-                    onSelect={(collection) => {
-                      moveToCollection.mutate({ id: conversation.id, collection });
+                  <GroupPickerMenu
+                    currentGroup={conversation.labels?.["group"] ?? null}
+                    onSelect={(group) => {
+                      moveToGroup.mutate({ id: conversation.id, group });
                       setMenuOpen(false);
                     }}
                   />
@@ -1565,27 +1565,27 @@ function ArchivingRow({ label }: { label: string }) {
   );
 }
 
-// ── CollectionPickerMenu ─────────────────────────────────────────────────────────
+// ── GroupPickerMenu ─────────────────────────────────────────────────────────
 
 /**
- * Collection picker rendered as the body of a {@link DropdownMenuSubContent}.
+ * Group picker rendered as the body of a {@link DropdownMenuSubContent}.
  *
  * Lives inside the kebab menu's submenu flyout rather than a separate popover —
  * that avoids the open/dismiss race that made a standalone popover flash open
- * and vanish. The search / new-collection inputs stop key events from bubbling so
+ * and vanish. The search / new-group inputs stop key events from bubbling so
  * the menu's built-in typeahead and arrow-key navigation don't hijack typing.
  */
-function CollectionPickerMenu({
-  currentCollection,
+function GroupPickerMenu({
+  currentGroup,
   onSelect,
 }: {
-  currentCollection: string | null;
-  onSelect: (collection: string) => void;
+  currentGroup: string | null;
+  onSelect: (group: string) => void;
 }) {
-  const { data: collections = [] } = useCollections();
+  const { data: groups = [] } = useGroups();
   const [search, setSearch] = useState("");
   const [creatingNew, setCreatingNew] = useState(false);
-  const [newCollectionName, setNewCollectionName] = useState("");
+  const [newGroupName, setNewGroupName] = useState("");
   const newInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -1595,13 +1595,13 @@ function CollectionPickerMenu({
   }, [creatingNew]);
 
   const filtered = search
-    ? collections.filter((name) => name.toLowerCase().includes(search.toLowerCase()))
-    : collections;
+    ? groups.filter((name) => name.toLowerCase().includes(search.toLowerCase()))
+    : groups;
 
-  function handleNewCollectionCommit() {
-    const name = newCollectionName.trim();
+  function handleNewGroupCommit() {
+    const name = newGroupName.trim();
     setCreatingNew(false);
-    setNewCollectionName("");
+    setNewGroupName("");
     if (name) onSelect(name);
   }
 
@@ -1614,7 +1614,7 @@ function CollectionPickerMenu({
       <div className="px-2 py-1.5">
         <input
           className="w-full rounded border border-input bg-transparent px-2 py-1 text-xs outline-none placeholder:text-muted-foreground"
-          placeholder="Search collections…"
+          placeholder="Search groups…"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           onKeyDown={swallowKeys}
@@ -1623,36 +1623,34 @@ function CollectionPickerMenu({
       <div className="max-h-48 overflow-y-auto">
         {filtered.map((name) => (
           <DropdownMenuItem key={name} onSelect={() => onSelect(name)}>
-            <FolderIcon className="size-3.5 shrink-0" />
+            <BookmarkIcon className="size-3.5 shrink-0" />
             <span className="flex-1 truncate text-left">{name}</span>
-            {currentCollection === name && (
-              <CheckMarkIcon className="size-3.5 shrink-0 text-primary" />
-            )}
+            {currentGroup === name && <CheckMarkIcon className="size-3.5 shrink-0 text-primary" />}
           </DropdownMenuItem>
         ))}
         {filtered.length === 0 && !creatingNew && (
-          <p className="px-2 py-1.5 text-xs text-muted-foreground">No collections yet.</p>
+          <p className="px-2 py-1.5 text-xs text-muted-foreground">No groups yet.</p>
         )}
       </div>
       <div className="border-t pt-1">
         {creatingNew ? (
           <div className="flex items-center gap-1 px-2 py-1">
-            <FolderIcon className="size-3.5 shrink-0 text-muted-foreground" />
+            <BookmarkIcon className="size-3.5 shrink-0 text-muted-foreground" />
             <input
               ref={newInputRef}
               className="flex-1 bg-transparent text-xs outline-none"
-              placeholder="Collection name…"
-              value={newCollectionName}
-              onChange={(e) => setNewCollectionName(e.target.value)}
+              placeholder="Group name…"
+              value={newGroupName}
+              onChange={(e) => setNewGroupName(e.target.value)}
               onKeyDown={(e) => {
                 e.stopPropagation();
                 if (e.key === "Enter") {
                   e.preventDefault();
-                  handleNewCollectionCommit();
+                  handleNewGroupCommit();
                 }
                 if (e.key === "Escape") {
                   setCreatingNew(false);
-                  setNewCollectionName("");
+                  setNewGroupName("");
                 }
               }}
             />
@@ -1665,15 +1663,18 @@ function CollectionPickerMenu({
               setCreatingNew(true);
             }}
           >
-            <FolderIcon className="size-3.5 shrink-0" />
-            New collection…
+            <BookmarkPlusIcon className="size-3.5 shrink-0" />
+            New group…
           </DropdownMenuItem>
         )}
-        {currentCollection && (
-          <DropdownMenuItem variant="destructive" onSelect={() => onSelect("")}>
-            <XIcon className="size-3.5 shrink-0" />
-            Remove from collection
-          </DropdownMenuItem>
+        {currentGroup && (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onSelect={() => onSelect("")}>
+              <XIcon className="size-3.5 shrink-0" />
+              Remove from group
+            </DropdownMenuItem>
+          </>
         )}
       </div>
     </>
@@ -1791,6 +1792,8 @@ function BulkActionBar({
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
   const bulkArchive = useBulkArchiveConversations();
   const bulkDelete = useBulkDeleteConversations();
+  const bulkMoveToGroup = useBulkMoveToGroup();
+  const { data: groups = [] } = useGroups();
 
   const selectedConversations = useMemo(
     () => allConversations.filter((c) => selectedIds.has(c.id)),
@@ -1815,11 +1818,24 @@ function BulkActionBar({
   const allSelectedSameArchiveGroup =
     ownedSelected.length > 0 && (archivedSelected.length === 0 || nonArchivedSelected.length === 0);
 
+  const allNonArchivedInGroup = useMemo(
+    () => nonArchivedSelected.length > 0 && nonArchivedSelected.every((c) => !!c.labels?.["group"]),
+    [nonArchivedSelected],
+  );
+
   const count = selectedIds.size;
   const allSelected = count > 0 && count === allConversations.length;
-  const isBusy = bulkArchive.isPending || bulkDelete.isPending;
+  const isBusy = bulkArchive.isPending || bulkDelete.isPending || bulkMoveToGroup.isPending;
 
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
+  const [groupSearch, setGroupSearch] = useState("");
+
+  function handleMoveToGroup(group: string) {
+    const ids = nonArchivedSelected.map((c) => c.id);
+    if (ids.length === 0) return;
+    setGroupSearch("");
+    bulkMoveToGroup.mutate({ ids, group }, { onSuccess: () => onDeselectAll() });
+  }
 
   function handleArchive() {
     if (nonArchivedSelected.length === 0) return;
@@ -1888,6 +1904,64 @@ function BulkActionBar({
           </Button>
           {count > 0 && (
             <div className="flex items-center gap-1.5 md:hidden">
+              {allSelectedSameArchiveGroup && nonArchivedSelected.length > 0 && (
+                <DropdownMenu
+                  onOpenChange={(open) => {
+                    if (!open) setGroupSearch("");
+                  }}
+                >
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="h-7 gap-1.5 text-xs"
+                      disabled={isBusy}
+                      data-testid="bulk-move-to-group"
+                    >
+                      {bulkMoveToGroup.isPending ? (
+                        <Loader2Icon className="size-3 animate-spin" />
+                      ) : (
+                        <BookmarkPlusIcon className="size-3" />
+                      )}
+                      Move…
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="start" className="w-52 p-1">
+                    <div className="px-2 py-1.5">
+                      <input
+                        type="text"
+                        className="w-full rounded-md border border-input bg-background px-2 py-1 text-xs outline-none focus-visible:border-ring"
+                        placeholder="Search groups…"
+                        value={groupSearch}
+                        onChange={(e) => setGroupSearch(e.target.value)}
+                        onKeyDown={(e) => e.stopPropagation()}
+                      />
+                    </div>
+                    <DropdownMenuSeparator />
+                    {groups
+                      .filter((g) => g.toLowerCase().includes(groupSearch.toLowerCase()))
+                      .map((g) => (
+                        <DropdownMenuItem key={g} onSelect={() => handleMoveToGroup(g)}>
+                          <BookmarkIcon className="size-3.5 shrink-0" />
+                          <span className="truncate">{g}</span>
+                        </DropdownMenuItem>
+                      ))}
+                    {groups.length === 0 && (
+                      <p className="px-2 py-1.5 text-xs text-muted-foreground">No groups yet.</p>
+                    )}
+                    {allNonArchivedInGroup && (
+                      <>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem onSelect={() => handleMoveToGroup("")}>
+                          <XIcon className="size-3.5 shrink-0" />
+                          Remove from group
+                        </DropdownMenuItem>
+                      </>
+                    )}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              )}
               {allSelectedSameArchiveGroup && nonArchivedSelected.length > 0 && (
                 <Button
                   type="button"
@@ -1959,6 +2033,60 @@ function BulkActionBar({
 
         {count > 0 && (
           <div className="hidden items-center gap-1.5 px-2 md:flex">
+            {allSelectedSameArchiveGroup && nonArchivedSelected.length > 0 && (
+              <DropdownMenu
+                onOpenChange={(open) => {
+                  if (!open) setGroupSearch("");
+                }}
+              >
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-7 gap-1.5 text-xs"
+                    disabled={isBusy}
+                    data-testid="bulk-move-to-group"
+                  >
+                    {bulkMoveToGroup.isPending ? (
+                      <Loader2Icon className="size-3 animate-spin" />
+                    ) : (
+                      <BookmarkPlusIcon className="size-3" />
+                    )}
+                    Move to…
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start" className="w-52 p-1">
+                  <div className="px-2 py-1.5">
+                    <input
+                      type="text"
+                      className="w-full rounded-md border border-input bg-background px-2 py-1 text-xs outline-none focus-visible:border-ring"
+                      placeholder="Search groups…"
+                      value={groupSearch}
+                      onChange={(e) => setGroupSearch(e.target.value)}
+                      onKeyDown={(e) => e.stopPropagation()}
+                    />
+                  </div>
+                  <DropdownMenuSeparator />
+                  {groups
+                    .filter((g) => g.toLowerCase().includes(groupSearch.toLowerCase()))
+                    .map((g) => (
+                      <DropdownMenuItem key={g} onSelect={() => handleMoveToGroup(g)}>
+                        <BookmarkIcon className="size-3.5 shrink-0" />
+                        <span className="truncate">{g}</span>
+                      </DropdownMenuItem>
+                    ))}
+                  {groups.length === 0 && (
+                    <p className="px-2 py-1.5 text-xs text-muted-foreground">No groups yet.</p>
+                  )}
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem onSelect={() => handleMoveToGroup("")}>
+                    <XIcon className="size-3.5 shrink-0" />
+                    Remove from group
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            )}
             {allSelectedSameArchiveGroup && nonArchivedSelected.length > 0 && (
               <Button
                 type="button"
@@ -2126,12 +2254,12 @@ function writeCollapsedSidebarSections(titles: string[]) {
   }
 }
 
-// Collections default to collapsed, so the persisted set is the EXPANDED names
-// (empty by default = every collection starts collapsed).
-function readExpandedCollectionSections(): string[] {
+// Groups default to collapsed, so the persisted set is the EXPANDED names
+// (empty by default = every group starts collapsed).
+function readExpandedGroupSections(): string[] {
   if (typeof window === "undefined") return [];
   try {
-    const raw = window.localStorage.getItem(EXPANDED_COLLECTION_SECTIONS_STORAGE_KEY);
+    const raw = window.localStorage.getItem(EXPANDED_GROUP_SECTIONS_STORAGE_KEY);
     if (!raw) return [];
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
@@ -2141,10 +2269,10 @@ function readExpandedCollectionSections(): string[] {
   }
 }
 
-function writeExpandedCollectionSections(names: string[]) {
+function writeExpandedGroupSections(names: string[]) {
   if (typeof window === "undefined") return;
   try {
-    window.localStorage.setItem(EXPANDED_COLLECTION_SECTIONS_STORAGE_KEY, JSON.stringify(names));
+    window.localStorage.setItem(EXPANDED_GROUP_SECTIONS_STORAGE_KEY, JSON.stringify(names));
   } catch {
     // Same as collapse state — a lost local preference is harmless.
   }

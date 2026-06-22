@@ -12497,32 +12497,32 @@ def create_sessions_router(
             )
         return result
 
-    # ── GET /sessions/collections ────────────────────────────────────
+    # ── GET /sessions/groups ────────────────────────────────────
     #
     # MUST be registered before ``GET /sessions/{session_id}``: FastAPI
-    # matches routes in registration order, so a literal ``/sessions/collections``
+    # matches routes in registration order, so a literal ``/sessions/groups``
     # would otherwise be captured by the ``{session_id}`` path param and 404
     # as a missing conversation.
 
     @router.get(
-        "/sessions/collections",
+        "/sessions/groups",
         response_model=None,
     )
-    async def list_session_collections(
+    async def list_session_groups(
         request: Request,
     ) -> list[str]:
         """
-        Return all collection names for the authenticated user, ordered
+        Return all group names for the authenticated user, ordered
         alphabetically.
 
-        Collections are implicit: they exist while at least one session
-        has a ``conversation_labels`` row with ``key="collection"``.
+        Groups are implicit: they exist while at least one session
+        has a ``conversation_labels`` row with ``key="group"``.
 
-        :returns: List of collection names.
+        :returns: List of group names.
         """
         user_id = _require_user(request, auth_provider)
         return await asyncio.to_thread(
-            conversation_store.list_collections,
+            conversation_store.list_groups,
             accessible_by=user_id,
         )
 
@@ -12651,7 +12651,7 @@ def create_sessions_router(
         search_query: str | None = Query(default=None),
         include_archived: bool = Query(default=False),
         kind: str = Query(default="default", pattern="^(default|sub_agent|any)$"),
-        collection: str | None = Query(default=None),
+        group: str | None = Query(default=None),
     ) -> PaginatedList:
         """
         List sessions with cursor-based pagination.
@@ -12728,7 +12728,7 @@ def create_sessions_router(
             sort_by=sort_by,
             search_query=normalized_query,
             include_archived=include_archived,
-            collection=collection,
+            group=group,
         )
         # list_conversations may return rows with agent_id=None for
         # legacy conversations; skip them before building the batch IDs.
@@ -13494,12 +13494,12 @@ def create_sessions_router(
                 _codex_plan_enabled,
                 _runner_result,
             )
-        # The "collection" label is special: an empty-string value means "remove
-        # from collection" (delete the label row) rather than upsert an empty value.
+        # The "group" label is special: an empty-string value means "remove
+        # from group" (delete the label row) rather than upsert an empty value.
         # Split it out before the bulk upsert so other labels are unaffected.
-        if labels_to_set and labels_to_set.get("collection") == "":
-            labels_to_set = {k: v for k, v in labels_to_set.items() if k != "collection"}
-            await asyncio.to_thread(conversation_store.delete_label, session_id, "collection")
+        if labels_to_set and labels_to_set.get("group") == "":
+            labels_to_set = {k: v for k, v in labels_to_set.items() if k != "group"}
+            await asyncio.to_thread(conversation_store.delete_label, session_id, "group")
         if labels_to_set:
             await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_set)
         if requested_codex_collaboration_mode is not None:

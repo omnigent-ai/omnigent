@@ -62,6 +62,9 @@ vi.mock("@/hooks/useDirectorySessions", () => ({
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useRunnerHealthRegistration: () => new Map<string, boolean>(),
 }));
+vi.mock("@/hooks/useConversations", () => ({
+  useGroups: () => ({ data: [] }),
+}));
 
 function host(overrides: Partial<Host> = {}): Host {
   return {
