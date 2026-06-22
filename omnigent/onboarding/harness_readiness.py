@@ -173,5 +173,6 @@ def configured_harness_map() -> dict[str, bool]:
     spellings.update(HARNESS_ALIASES)
     spellings.update(_PI_HARNESSES)
     spellings.update(_CURSOR_NATIVE_HARNESSES)
+    spellings.update(_GOOSE_NATIVE_HARNESSES)
     spellings.add(CURSOR_KEY)
     return {spelling: harness_is_configured(spelling) for spelling in spellings}
