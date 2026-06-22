@@ -64,6 +64,15 @@ _LOCAL_SINGLE_USER_ENV = "OMNIGENT_LOCAL_SINGLE_USER"
 _AUTH_HEADER_ENV = "OMNIGENT_AUTH_HEADER"
 _DEFAULT_AUTH_HEADER = "X-Forwarded-Email"
 
+# Optional prefix stripped from the identity header value in header-auth
+# mode. Some trusted proxies namespace the identity they inject — most
+# notably Google IAP, whose ``X-Goog-Authenticated-User-Email`` carries an
+# ``accounts.google.com:`` prefix (value
+# ``accounts.google.com:user@example.com``). Stripping it yields the bare
+# email used everywhere else. Unset (the default) strips nothing. See
+# :func:`resolve_auth_header_strip_prefix`.
+_AUTH_HEADER_STRIP_PREFIX_ENV = "OMNIGENT_AUTH_HEADER_STRIP_PREFIX"
+
 LEVEL_READ = 1
 LEVEL_EDIT = 2
 LEVEL_MANAGE = 3
@@ -122,6 +131,26 @@ def resolve_auth_header() -> str:
     """
     raw = os.environ.get(_AUTH_HEADER_ENV, "").strip()
     return raw or _DEFAULT_AUTH_HEADER
+
+
+def resolve_auth_header_strip_prefix() -> str:
+    """Resolve the prefix stripped from the identity header value.
+
+    Reads ``OMNIGENT_AUTH_HEADER_STRIP_PREFIX`` and returns it
+    (surrounding whitespace trimmed), or ``""`` when unset or empty —
+    the default, meaning the header value is used as-is.
+
+    The motivating case is Google IAP: point
+    ``OMNIGENT_AUTH_HEADER=X-Goog-Authenticated-User-Email`` at IAP's
+    identity header and set
+    ``OMNIGENT_AUTH_HEADER_STRIP_PREFIX=accounts.google.com:`` so the
+    namespaced value ``accounts.google.com:user@example.com`` resolves to
+    the bare ``user@example.com``. Kept generic rather than IAP-specific
+    so any proxy that namespaces its identity header is supported.
+
+    :returns: The prefix to strip, or ``""`` to strip nothing.
+    """
+    return os.environ.get(_AUTH_HEADER_STRIP_PREFIX_ENV, "").strip()
 
 
 _auth_enabled_deprecation_warned = False
@@ -247,6 +276,14 @@ class UnifiedAuthProvider(AuthProvider):
         ``OMNIGENT_AUTH_HEADER`` at construction, falling back to
         ``X-Forwarded-Email`` (see :func:`resolve_auth_header`).
         Only consulted in header mode. Tests pass an explicit name.
+    :param header_strip_prefix: A prefix stripped from the identity
+        header value in header mode — e.g. ``accounts.google.com:`` so
+        Google IAP's ``accounts.google.com:user@example.com`` resolves
+        to the bare email. ``None`` (the default) resolves from
+        ``OMNIGENT_AUTH_HEADER_STRIP_PREFIX`` at construction, falling
+        back to ``""`` (strip nothing; see
+        :func:`resolve_auth_header_strip_prefix`). Only consulted in
+        header mode. Tests pass an explicit prefix.
     """
 
     def __init__(
@@ -256,6 +293,7 @@ class UnifiedAuthProvider(AuthProvider):
         accounts_config: AccountsConfig | None = None,
         local_single_user: bool | None = None,
         header_name: str | None = None,
+        header_strip_prefix: str | None = None,
     ) -> None:
         self._source = source
         self._oidc_config = oidc_config
@@ -264,6 +302,11 @@ class UnifiedAuthProvider(AuthProvider):
             local_single_user if local_single_user is not None else local_single_user_enabled()
         )
         self._header_name = header_name if header_name is not None else resolve_auth_header()
+        self._header_strip_prefix = (
+            header_strip_prefix
+            if header_strip_prefix is not None
+            else resolve_auth_header_strip_prefix()
+        )
         self._cookie_cache: dict[str, tuple[str, float]] = {}
 
     @property
@@ -376,6 +419,14 @@ class UnifiedAuthProvider(AuthProvider):
         by default, overridable via ``OMNIGENT_AUTH_HEADER`` — e.g.
         ``Cf-Access-Authenticated-User-Email`` for Cloudflare Access).
 
+        When :attr:`_header_strip_prefix` is set (from
+        ``OMNIGENT_AUTH_HEADER_STRIP_PREFIX``), it is removed from the
+        front of the header value first — e.g. Google IAP's
+        ``X-Goog-Authenticated-User-Email`` value
+        ``accounts.google.com:user@example.com`` becomes the bare
+        ``user@example.com``. A value that is only the prefix (empty
+        after stripping) is rejected, like a reserved name.
+
         When the header is present, its value is used as the identity
         (reserved names like ``"local"`` are rejected). When absent,
         the request is rejected (``None`` → 401): a missing or
@@ -397,7 +448,9 @@ class UnifiedAuthProvider(AuthProvider):
         """
         email = request.headers.get(self._header_name)
         if email:
-            if email in _RESERVED_USERS:
+            if self._header_strip_prefix:
+                email = email.removeprefix(self._header_strip_prefix)
+            if not email or email in _RESERVED_USERS:
                 return None
             return email
         if self._local_single_user:
