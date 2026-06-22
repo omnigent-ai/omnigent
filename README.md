@@ -112,6 +112,67 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
 </details>
 
 <details>
+<summary>Troubleshooting npm EACCES when Omnigent installs a harness CLI</summary>
+
+Some harness setup flows install a vendor CLI with npm, for example the Claude
+Code CLI via `npm install -g @anthropic-ai/claude-code`. If npm's global prefix
+is owned by root, setup may fail with an `EACCES` permission-denied error even
+though Node.js and npm are installed correctly.
+
+Check the install target before retrying:
+
+```bash
+npm prefix -g
+npm config get prefix
+ls -ld "$(npm prefix -g)"
+```
+
+If the directory shown by `npm prefix -g` is `/usr/local`, `/opt/homebrew`, or
+another system directory that your user does not own, avoid retrying with
+`sudo npm install -g`. Using `sudo` for global npm installs can leave
+root-owned files in your home directory and can make later CLI upgrades fail in
+less obvious ways.
+
+Prefer one of these safer fixes:
+
+1. Use a Node version manager such as `nvm`, `fnm`, or `volta`, then install an
+   active Node.js 22 LTS release for your user. After opening a new shell,
+   `npm prefix -g` should point inside your home directory or the version
+   manager's directory, not a root-owned system path.
+2. Or configure a user-owned npm prefix:
+
+   ```bash
+   mkdir -p "$HOME/.local/npm-global" "$HOME/.local/bin"
+   npm config set prefix "$HOME/.local/npm-global"
+   printf '\nexport PATH="$HOME/.local/npm-global/bin:$PATH"\n' >> ~/.zshrc
+   exec "$SHELL" -l
+   ```
+
+3. Retry the Omnigent setup flow, or install the missing CLI directly without
+   `sudo`:
+
+   ```bash
+   npm install -g @anthropic-ai/claude-code
+   command -v claude
+   claude --version
+   omnigent setup
+   ```
+
+If `command -v claude` still prints nothing, confirm that the npm global `bin`
+directory is on `PATH`:
+
+```bash
+npm bin -g 2>/dev/null || echo "$(npm prefix -g)/bin"
+echo "$PATH" | tr ':' '\n'
+```
+
+On macOS, adding the npm global `bin` directory to `~/.zshrc` and starting a
+new terminal is usually enough. On Linux, update the shell startup file that
+your terminal actually reads, such as `~/.bashrc`, `~/.profile`, or `~/.zshrc`.
+
+</details>
+
+<details>
 <summary>Updating to a new release</summary>
 
 When a newer release is on PyPI, Omnigent shows a one-line notice (once per
