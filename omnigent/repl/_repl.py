@@ -765,6 +765,48 @@ class _ApprovalState:
         self._current_phase = None
 
 
+class _FieldInputState:
+    """Collect free-form field values one at a time via the main input loop.
+
+    Same future-based pattern as :class:`_ApprovalState` — no direct
+    ``input()`` calls so ``prompt_toolkit``'s ``patch_stdout`` is
+    never disrupted.
+    """
+
+    def __init__(self) -> None:
+        self._future: asyncio.Future[str] | None = None
+        self._field_name: str | None = None
+
+    @property
+    def pending(self) -> bool:
+        return self._future is not None and not self._future.done()
+
+    @property
+    def field_name(self) -> str | None:
+        return self._field_name
+
+    def begin(self, field_name: str) -> asyncio.Future[str]:
+        if self._future is not None and not self._future.done():
+            self._future.set_result("")
+        self._field_name = field_name
+        self._future = asyncio.get_running_loop().create_future()
+        return self._future
+
+    def resolve(self, text: str) -> bool:
+        if self._future is None or self._future.done():
+            return False
+        self._future.set_result(text)
+        self._future = None
+        self._field_name = None
+        return True
+
+    def cancel(self) -> None:
+        if self._future is not None and not self._future.done():
+            self._future.set_result("")
+        self._future = None
+        self._field_name = None
+
+
 def _build_elicitation_content_from_schema(
     schema: dict[str, object],
 ) -> dict[str, object] | None:
@@ -1080,6 +1122,9 @@ class _SessionsChatReplAdapter:
         on_session_start: Callable[[str], None] | None = None,
         harness: str | None = None,
         attach_only: bool = False,
+        field_input_state: _FieldInputState | None = None,
+        host: TerminalHost | None = None,
+        fmt: RichBlockFormatter | None = None,
     ) -> None:
         """
         Wire the adapter; do NOT issue any HTTP calls.
@@ -1122,12 +1167,19 @@ class _SessionsChatReplAdapter:
             never bind/recover a runner (turns post to the session's
             existing host-bound runner). Used by ``omnigent attach``.
             ``False`` (default) is the runner-owning ``run`` path.
+        :param field_input_state: Shared state for collecting schema
+            field values interactively via the main input loop.
+        :param host: Terminal output channel for rendering field prompts.
+        :param fmt: Formatter for styling field prompts.
         """
         self._client = client
         self._agent_id: str | None = None
         self._agent_name = agent_name
         self._tool_callables = tool_callables
         self._hooks = hooks or StreamHooks()
+        self._field_input_state = field_input_state
+        self._host = host
+        self._fmt = fmt
         self._session_id: str | None = session_id
         self._session_bundle = session_bundle
         self._session_bundle_filename = session_bundle_filename
@@ -2159,11 +2211,11 @@ class _SessionsChatReplAdapter:
             if content is not None:
                 resolve_payload["content"] = content
             elif schema.get("properties"):
-                # Schema has properties we can't auto-fill — the REPL
-                # can't render arbitrary forms. Decline and tell the
-                # user to use the web UI.
-                # TODO: render schema fields as terminal input prompts.
-                resolve_payload["action"] = "decline"
+                prompted = await self._prompt_schema_fields(schema)
+                if prompted is not None:
+                    resolve_payload["content"] = prompted
+                else:
+                    resolve_payload["action"] = "decline"
 
         try:
             # URL-based elicitation: deliver the verdict to the
@@ -2182,6 +2234,108 @@ class _SessionsChatReplAdapter:
                 # The harness already received the verdict — treat as no-op.
                 return
             raise
+
+    async def _prompt_schema_fields(
+        self,
+        schema: dict[str, object],
+    ) -> dict[str, str | int | float | bool | list[str] | None] | None:
+        """Prompt the user for each schema property via the main input loop.
+
+        Returns the filled content dict, or ``None`` if the interactive
+        state is unavailable (e.g. no ``_field_input_state`` wired up).
+        """
+        from rich.text import Text  # noqa: PLC0415
+
+        fis = self._field_input_state
+        host = self._host
+        fmt = self._fmt
+        if fis is None or host is None or fmt is None:
+            return None
+
+        properties = schema.get("properties")
+        if not properties or not isinstance(properties, dict):
+            return None
+
+        required = set(schema.get("required", []))  # type: ignore[arg-type]
+        content: dict[str, str | int | float | bool | list[str] | None] = {}
+
+        for key, prop in properties.items():
+            if not isinstance(prop, dict):
+                return None
+
+            prop_type = prop.get("type", "string")
+            description = prop.get("description", "")
+            default = prop.get("default")
+            enum_vals = prop.get("enum")
+            one_of = prop.get("oneOf")
+
+            # Build the prompt label.
+            label_parts: list[str] = [f"   {key}"]
+            if description:
+                label_parts.append(f" — {description}")
+            hint_parts: list[str] = []
+            if one_of and isinstance(one_of, list):
+                opts = [str(o.get("const", "")) for o in one_of if isinstance(o, dict) and "const" in o]
+                if opts:
+                    hint_parts.append("/".join(opts))
+            elif enum_vals and isinstance(enum_vals, list):
+                hint_parts.append("/".join(str(v) for v in enum_vals))
+            elif prop_type == "boolean":
+                hint_parts.append("true/false")
+            else:
+                hint_parts.append(str(prop_type))
+            if default is not None:
+                hint_parts.append(f"default: {default}")
+            if key not in required:
+                hint_parts.append("optional")
+            hint = ", ".join(hint_parts)
+            label_parts.append(f" [{hint}]")
+
+            host.output(
+                Text.from_markup(
+                    f"   [{fmt.accent}]{''.join(label_parts)}[/{fmt.accent}]",
+                ),
+            )
+
+            raw = await fis.begin(key)
+
+            # Use default when the user submits empty input.
+            if not raw.strip():
+                if default is not None:
+                    content[key] = default
+                elif key not in required:
+                    continue
+                else:
+                    return None
+                continue
+
+            # Parse according to type.
+            val: str | int | float | bool | None = raw.strip()
+            if prop_type == "boolean":
+                val = val.lower() in ("true", "1", "yes", "y")  # type: ignore[union-attr]
+            elif prop_type == "integer":
+                try:
+                    val = int(val)  # type: ignore[arg-type]
+                except ValueError:
+                    return None
+            elif prop_type == "number":
+                try:
+                    val = float(val)  # type: ignore[arg-type]
+                except ValueError:
+                    return None
+
+            # Validate enum constraints.
+            if one_of and isinstance(one_of, list):
+                valid = [o.get("const") for o in one_of if isinstance(o, dict) and "const" in o]
+                if val not in valid:
+                    return None
+            elif enum_vals and isinstance(enum_vals, list):
+                if val not in enum_vals:
+                    return None
+
+            content[key] = val
+
+        return content
 
     async def _unbind_runner_soft(self, session_id: str) -> None:
         """
@@ -2677,6 +2831,7 @@ async def run_repl(
     # normal prompt_toolkit input path avoids the stdin /
     # patch_stdout fight that a direct input() call produced.
     approval_state = _ApprovalState()
+    field_input_state = _FieldInputState()
     hooks = StreamHooks(
         on_elicitation_request=_make_elicitation_prompt(
             host, fmt, approval_state, server_url=server_url
@@ -2714,6 +2869,9 @@ async def run_repl(
         on_session_start=on_session_start,
         harness=harness,
         attach_only=attach_only,
+        field_input_state=field_input_state,
+        host=host,
+        fmt=fmt,
     )
     # Make per-invocation log paths visible to slash commands such as
     # /logs without broadening the slash-command dispatch signature.
@@ -3376,6 +3534,18 @@ async def run_repl(
     async def on_input(text: str, attachments: list[PendingAttachment] | None = None) -> None:
         nonlocal conversation_id, is_streaming
 
+        # Pending schema field input: consume this line as the
+        # current field's value before any other routing.
+        if field_input_state.pending:
+            field_name = field_input_state.field_name or "field"
+            host.output(
+                Text.from_markup(
+                    f"   [{fmt.muted}]› {field_name}: {text}[/{fmt.muted}]",
+                ),
+            )
+            field_input_state.resolve(text)
+            return
+
         # Pending policy approval: consume this input as the
         # verdict BEFORE slash-command / normal-send routing.
         # The hook is awaiting a future; resolving it wakes
@@ -3477,6 +3647,7 @@ async def run_repl(
             # hook's future doesn't leak waiting for a verdict
             # that will never come.
             approval_state.cancel()
+            field_input_state.cancel()
             # Best-effort — server may already have finished.
             with contextlib.suppress(Exception):
                 await asyncio.shield(session.cancel())
