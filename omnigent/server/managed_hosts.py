@@ -136,10 +136,20 @@ _logger = logging.getLogger(__name__)
 # ManagedSandboxConfig directly are not constrained by either set —
 # their launcher factory IS the support.)
 SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
-    {"lakebox", "modal", "daytona", "boxlite", "cwsandbox", "islo", "e2b", "openshell"}
+    {
+        "lakebox",
+        "modal",
+        "daytona",
+        "boxlite",
+        "cwsandbox",
+        "islo",
+        "e2b",
+        "openshell",
+        "kubernetes",
+    }
 )
 PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
-    {"modal", "daytona", "boxlite", "cwsandbox", "islo", "e2b", "openshell"}
+    {"modal", "daytona", "boxlite", "cwsandbox", "islo", "e2b", "openshell", "kubernetes"}
 )
 
 # How long a managed launch waits for the sandboxed host to register
@@ -185,6 +195,14 @@ ISLO_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 # sandbox re-authenticating across tunnel reconnects while still expiring
 # tokens of sandboxes nobody deleted. A relaunch mints a fresh token.
 OPENSHELL_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
+
+# Launch-token lifetime for the YAML kubernetes path. Runner Pods have no
+# platform lifetime cap (they run until deleted by managed-session teardown),
+# so the bound is policy, not platform: the same 7-day window as
+# Daytona/Islo/OpenShell keeps a long-lived host re-authenticating across tunnel
+# reconnects while still expiring tokens of Pods nobody deleted. A relaunch
+# mints a fresh token (and the per-Pod token Secret is replaced).
+KUBERNETES_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 
 # The cwsandbox launch-token TTL is NOT a constant: CW Sandbox's lifetime is
 # operator-overridable (OMNIGENT_CWSANDBOX_MAX_LIFETIME_S), so the TTL is
@@ -678,6 +696,19 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             cluster=_parse_provider_string(raw, "openshell", "cluster"),
         )
         token_ttl_s = OPENSHELL_MANAGED_TOKEN_TTL_S
+    elif provider == "kubernetes":
+        launcher_factory = _kubernetes_launcher_factory(
+            image=_parse_provider_image(raw, "kubernetes"),
+            env=_parse_provider_env(raw, "kubernetes"),
+            namespace=_parse_provider_string(raw, "kubernetes", "namespace"),
+            secret_name=_parse_provider_string(raw, "kubernetes", "secret_name"),
+            service_account=_parse_provider_string(raw, "kubernetes", "service_account"),
+            node_selector=_parse_provider_str_mapping(raw, "kubernetes", "node_selector"),
+            kubeconfig=_parse_provider_string(raw, "kubernetes", "kubeconfig"),
+            in_cluster=_parse_provider_bool(raw, "kubernetes", "in_cluster"),
+            resources=_parse_kubernetes_resources(raw),
+        )
+        token_ttl_s = KUBERNETES_MANAGED_TOKEN_TTL_S
     else:
         launcher_factory = _unsupported_launcher_factory(provider)
         # Never consulted (the factory rejects before any token is
@@ -1417,6 +1448,246 @@ def _parse_provider_positive_int(raw: dict[str, object], provider: str, key: str
     return value
 
 
+def _parse_provider_bool(raw: dict[str, object], provider: str, key: str) -> bool | None:
+    """
+    Extract and validate an optional boolean provider field.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :param provider: Provider block name, e.g. ``"kubernetes"``.
+    :param key: Field name under the provider block, e.g. ``"in_cluster"``.
+    :returns: The boolean, or ``None`` when omitted.
+    :raises ValueError: When the field is present but is not a real boolean (a
+        YAML ``"true"`` string or an int are rejected — a silently-coerced flag
+        would change the cluster-config source).
+    """
+    section = _parse_provider_section(raw, provider)
+    if section is None:
+        return None
+    value = section.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise ValueError(f"server config 'sandbox.{provider}.{key}' must be a boolean")
+    return value
+
+
+def _parse_provider_str_mapping(
+    raw: dict[str, object], provider: str, key: str
+) -> dict[str, str] | None:
+    """
+    Extract and validate an optional provider string→string mapping field.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :param provider: Provider block name, e.g. ``"kubernetes"``.
+    :param key: Field name under the provider block, e.g. ``"node_selector"``.
+    :returns: The validated mapping, or ``None`` when omitted.
+    :raises ValueError: When the field is present but not a mapping of non-empty
+        string keys to non-empty string values.
+    """
+    section = _parse_provider_section(raw, provider)
+    if section is None:
+        return None
+    value = section.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, dict) or not all(
+        isinstance(k, str) and k.strip() and isinstance(v, str) and v.strip()
+        for k, v in value.items()
+    ):
+        raise ValueError(
+            f"server config 'sandbox.{provider}.{key}' must be a mapping of "
+            "non-empty string keys to non-empty string values, e.g. "
+            "{'disktype': 'ssd'}"
+        )
+    return {k.strip(): v.strip() for k, v in value.items()}
+
+
+# RFC 1123 / Kubernetes identifier forms for parse-time validation of
+# ``sandbox.kubernetes`` names (mirrored, fixed-by-spec, in the launcher for its
+# env-var overrides — see omnigent.onboarding.sandboxes.kubernetes).
+_DNS1123_LABEL_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+_DNS1123_SUBDOMAIN_RE = re.compile(
+    r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+)
+_K8S_LABEL_SEGMENT_RE = re.compile(r"^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$")
+# Kubernetes resource quantity, e.g. "500m", "2", "1Gi", "1.5" — a number with
+# an optional binary/decimal suffix.
+_K8S_QUANTITY_RE = re.compile(r"^\d+(\.\d+)?([eE][-+]?\d+)?[a-zA-Z]{0,2}i?$")
+
+
+def _validate_dns1123_label(value: str | None, field: str) -> None:
+    """Reject a ``sandbox.kubernetes.<field>`` that is not a DNS-1123 label."""
+    if value is None:
+        return
+    if len(value) > 63 or not _DNS1123_LABEL_RE.fullmatch(value):
+        raise ValueError(
+            f"server config 'sandbox.kubernetes.{field}' is not a valid "
+            f"Kubernetes name (RFC 1123 DNS label, max 63 chars): {value!r}"
+        )
+
+
+def _validate_dns1123_subdomain(value: str | None, field: str) -> None:
+    """Reject a ``sandbox.kubernetes.<field>`` that is not a DNS-1123 subdomain."""
+    if value is None:
+        return
+    if len(value) > 253 or not _DNS1123_SUBDOMAIN_RE.fullmatch(value):
+        raise ValueError(
+            f"server config 'sandbox.kubernetes.{field}' is not a valid "
+            f"Kubernetes name (RFC 1123 DNS subdomain): {value!r}"
+        )
+
+
+def _validate_label_key(key: str) -> bool:
+    """Return whether *key* is a valid Kubernetes label key (optional prefix)."""
+    prefix, slash, name = key.rpartition("/")
+    if slash and (not prefix or len(prefix) > 253 or not _DNS1123_SUBDOMAIN_RE.match(prefix)):
+        return False
+    return bool(name) and len(name) <= 63 and bool(_K8S_LABEL_SEGMENT_RE.match(name))
+
+
+def _validate_kubernetes_identifiers(
+    namespace: str | None,
+    secret_name: str | None,
+    service_account: str | None,
+    node_selector: dict[str, str] | None,
+) -> None:
+    """
+    Validate the YAML ``sandbox.kubernetes`` identifiers at parse time.
+
+    :raises ValueError: When a name is not an RFC 1123 DNS subdomain/label or a
+        node-selector entry is not a valid Kubernetes label key/value.
+    """
+    _validate_dns1123_label(namespace, "namespace")
+    _validate_dns1123_subdomain(secret_name, "secret_name")
+    _validate_dns1123_subdomain(service_account, "service_account")
+    for key, value in (node_selector or {}).items():
+        if not _validate_label_key(key):
+            raise ValueError(
+                f"server config 'sandbox.kubernetes.node_selector' has an "
+                f"invalid label key: {key!r}"
+            )
+        if value and (len(value) > 63 or not _K8S_LABEL_SEGMENT_RE.match(value)):
+            raise ValueError(
+                f"server config 'sandbox.kubernetes.node_selector[{key}]' has "
+                f"an invalid label value: {value!r}"
+            )
+
+
+def _parse_kubernetes_resources(raw: dict[str, object]) -> dict[str, object] | None:
+    """
+    Extract and validate the optional ``sandbox.kubernetes.resources`` block.
+
+    Shape: ``{requests?: {cpu?, memory?}, limits?: {cpu?, memory?}}`` — every
+    level optional, each ``cpu`` / ``memory`` a non-empty Kubernetes quantity
+    string. Validated at parse time so an operator typo fails server startup
+    instead of the first managed launch; an omitted field keeps the default.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :returns: The validated resources block, or ``None`` when omitted.
+    :raises ValueError: When the block or any field has the wrong shape.
+    """
+    section = _parse_provider_section(raw, "kubernetes")
+    if section is None:
+        return None
+    value = section.get("resources")
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError(
+            "server config 'sandbox.kubernetes.resources' must be a mapping with "
+            "optional 'requests' / 'limits' blocks"
+        )
+    normalized: dict[str, object] = {}
+    for tier, tier_value in value.items():
+        if tier not in ("requests", "limits"):
+            raise ValueError(
+                f"server config 'sandbox.kubernetes.resources' has an unknown key "
+                f"{tier!r} (expected 'requests' or 'limits')"
+            )
+        if not isinstance(tier_value, dict):
+            raise ValueError(
+                f"server config 'sandbox.kubernetes.resources.{tier}' must be a "
+                "mapping of 'cpu' / 'memory' to quantity strings"
+            )
+        norm_tier: dict[str, str] = {}
+        for field, field_value in tier_value.items():
+            if field not in ("cpu", "memory"):
+                raise ValueError(
+                    f"server config 'sandbox.kubernetes.resources.{tier}' has an "
+                    f"unknown key {field!r} (expected 'cpu' or 'memory')"
+                )
+            if not isinstance(field_value, str) or not field_value.strip():
+                raise ValueError(
+                    f"server config 'sandbox.kubernetes.resources.{tier}.{field}' "
+                    "must be a non-empty quantity string, e.g. '500m' or '2Gi'"
+                )
+            quantity = field_value.strip()
+            if not _K8S_QUANTITY_RE.match(quantity):
+                raise ValueError(
+                    f"server config 'sandbox.kubernetes.resources.{tier}.{field}' "
+                    f"is not a valid Kubernetes quantity: {field_value!r} "
+                    "(e.g. '500m', '2', '1Gi')"
+                )
+            norm_tier[field] = quantity
+        normalized[tier] = norm_tier
+    return normalized
+
+
+def _kubernetes_launcher_factory(
+    *,
+    image: str | None,
+    env: list[str] | None,
+    namespace: str | None,
+    secret_name: str | None,
+    service_account: str | None,
+    node_selector: dict[str, str] | None,
+    kubeconfig: str | None,
+    in_cluster: bool | None,
+    resources: dict[str, object] | None,
+) -> Callable[[], SandboxLauncher]:
+    """
+    Build the launcher factory for the YAML ``provider: kubernetes`` path.
+
+    :param image: Registry image with omnigent pre-installed, or ``None`` for
+        the official prebaked host image (env-overridable).
+    :param env: Names of server-process environment variables injected into
+        every Pod as literal ``env``, or ``None``. Prefer *secret_name* for
+        credentials.
+    :param namespace: Namespace to create Pods in, or ``None`` for the default.
+    :param secret_name: Pre-created Secret projected into every Pod via
+        ``envFrom`` (harness credentials), or ``None``.
+    :param service_account: ServiceAccount the Pods run as, or ``None``.
+    :param node_selector: Extra node selector labels merged with the mandatory
+        amd64 constraint, or ``None``.
+    :param kubeconfig: Explicit kubeconfig path for the out-of-cluster fallback,
+        or ``None``.
+    :param in_cluster: Force the cluster-config source, or ``None`` to try
+        in-cluster then fall back to kubeconfig.
+    :param resources: Validated ``resources`` block, or ``None`` for defaults.
+    :returns: A factory producing parameterized Kubernetes launchers.
+    :raises ValueError: When a name or node-selector label is malformed.
+    """
+    _validate_kubernetes_identifiers(namespace, secret_name, service_account, node_selector)
+
+    def _build() -> SandboxLauncher:
+        """Construct the Kubernetes launcher (lazy SDK import inside)."""
+        from omnigent.onboarding.sandboxes.kubernetes import KubernetesSandboxLauncher
+
+        return KubernetesSandboxLauncher(
+            image=image,
+            env=env,
+            namespace=namespace,
+            secret_name=secret_name,
+            service_account=service_account,
+            node_selector=node_selector,
+            kubeconfig=kubeconfig,
+            in_cluster=in_cluster,
+            resources=resources,
+        )
+
+    return _build
+
+
 async def launch_managed_host(
     *,
     config: ManagedSandboxConfig,
@@ -1471,7 +1742,7 @@ async def launch_managed_host(
     host_name = f"managed-{host_id[len('host_') : len('host_') + 8]}"
     try:
         await asyncio.to_thread(launcher.prepare)
-        sandbox_id = await asyncio.to_thread(launcher.provision, host_name)
+        sandbox_id = await _acquire_managed_sandbox_id(launcher, host_name)
     except click.ClickException as exc:
         raise HTTPException(
             status_code=502,
@@ -1547,7 +1818,7 @@ async def relaunch_managed_host(
     await _terminate_sandbox_best_effort(launcher, host)
     try:
         await asyncio.to_thread(launcher.prepare)
-        sandbox_id = await asyncio.to_thread(launcher.provision, host.name)
+        sandbox_id = await _acquire_managed_sandbox_id(launcher, host.name)
     except click.ClickException as exc:
         raise HTTPException(
             status_code=502,
@@ -1628,17 +1899,33 @@ async def _arm_and_start_host(
         token_expires_at=now_epoch() + config.token_ttl_s,
     )
     try:
-        workspace = await asyncio.to_thread(
-            _start_host_in_sandbox,
-            launcher,
-            sandbox_id,
-            token=token,
-            host_id=host_id,
-            host_name=host_name,
-            server_url=config.server_url,
-            repo=repo,
-            on_stage=on_stage,
-        )
+        if launcher.starts_host_at_provision:
+            # Entrypoint-as-host (kubernetes): the token was registered above
+            # before the sandbox exists, so provisioning starts the host with a
+            # token that already resolves — no exec-in step.
+            workspace = await asyncio.to_thread(
+                _provision_host_in_sandbox,
+                launcher,
+                sandbox_id,
+                token=token,
+                host_id=host_id,
+                host_name=host_name,
+                server_url=config.server_url,
+                repo=repo,
+                on_stage=on_stage,
+            )
+        else:
+            workspace = await asyncio.to_thread(
+                _start_host_in_sandbox,
+                launcher,
+                sandbox_id,
+                token=token,
+                host_id=host_id,
+                host_name=host_name,
+                server_url=config.server_url,
+                repo=repo,
+                on_stage=on_stage,
+            )
         await _wait_for_host_online(host_store, host_id)
     except Exception as exc:
         # Broad on purpose: any post-provision failure — launcher CLI
@@ -1661,6 +1948,71 @@ async def _arm_and_start_host(
             detail=f"managed sandbox host startup failed: {message}",
         ) from exc
     return workspace
+
+
+async def _acquire_managed_sandbox_id(launcher: SandboxLauncher, name: str) -> str:
+    """
+    Obtain the sandbox id for a launch, per the launcher's start model.
+
+    Exec-model providers create the sandbox now (:meth:`provision`, which waits
+    for it). Entrypoint-as-host providers create it later — as part of starting
+    the host (:meth:`provision_managed_host`) — so here only PRE-GENERATE the id
+    (:meth:`new_managed_sandbox_id`); registering the launch token against it
+    before the sandbox exists closes the host dial-back race entirely.
+
+    :param launcher: The provider launcher.
+    :param name: Human-readable label for the sandbox.
+    :returns: The sandbox id (provider-assigned or pre-generated).
+    :raises click.ClickException: When an exec-model provision fails.
+    """
+    if launcher.starts_host_at_provision:
+        return launcher.new_managed_sandbox_id(name)
+    return await asyncio.to_thread(launcher.provision, name)
+
+
+def _provision_host_in_sandbox(
+    launcher: SandboxLauncher,
+    sandbox_id: str,
+    *,
+    token: str,
+    host_id: str,
+    host_name: str,
+    server_url: str,
+    repo: RepoWorkspace | None = None,
+    on_stage: Callable[[str], None] | None = None,
+) -> str:
+    """
+    Start ``omnigent host`` by provisioning an entrypoint-as-host sandbox.
+
+    The entrypoint-model counterpart to :func:`_start_host_in_sandbox`: it
+    unpacks *repo* into the primitive clone fields the launcher API takes (the
+    onboarding layer must not import the server's :class:`RepoWorkspace`) and
+    delegates to the launcher's ``provision_managed_host``, which creates the
+    workspace, clones the repository, and starts the host as the sandbox boots.
+
+    :param launcher: The provider launcher (``starts_host_at_provision``).
+    :param sandbox_id: The pre-generated sandbox id from
+        :func:`_acquire_managed_sandbox_id`.
+    :param token: The raw launch token (delivered out of band by the launcher).
+    :param host_id: Server-chosen host identity.
+    :param host_name: Server-chosen host display name.
+    :param server_url: URL of this server the host dials back to.
+    :param repo: Repository to clone as the workspace, or ``None``.
+    :param on_stage: Progress observer; see :func:`launch_managed_host`.
+    :returns: The absolute in-sandbox workspace path.
+    :raises click.ClickException: If provisioning or host startup fails.
+    """
+    return launcher.provision_managed_host(
+        sandbox_id,
+        token=token,
+        host_id=host_id,
+        host_name=host_name,
+        server_url=server_url,
+        repo_url=repo.url if repo is not None else None,
+        repo_branch=repo.branch if repo is not None else None,
+        repo_name=repo.repo_name if repo is not None else None,
+        on_stage=on_stage,
+    )
 
 
 def _start_host_in_sandbox(

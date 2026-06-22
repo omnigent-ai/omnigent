@@ -188,6 +188,23 @@ security contexts:
 kubectl kustomize deploy/kubernetes/overlays/openshift-postgres/ | oc apply -f -
 ```
 
+## On-demand sandbox runners
+
+The `overlays/sandbox-runners/` overlay turns on the **`kubernetes`** managed
+sandbox provider: a `host_type: managed` session spawns one runner Pod that runs
+`omnigent host` as its entrypoint and dials back over the launch-token tunnel. It
+adds a dedicated runner namespace, a least-privilege server SA (scoped Pod +
+Secret rights, **no `pods/exec`**), and the `sandbox:` server config. The server
+image must be built with the `kubernetes` extra
+(`--build-arg OMNIGENT_EXTRAS=kubernetes`). See
+`overlays/sandbox-runners/README.md` for the full guide.
+
+```bash
+# edit overlays/sandbox-runners/runner-credentials.yaml + the image in
+# kustomization.yaml first
+kubectl apply -k deploy/kubernetes/overlays/sandbox-runners
+```
+
 ## Verify the deployment
 
 Check the rollout and reach the server without a public domain:

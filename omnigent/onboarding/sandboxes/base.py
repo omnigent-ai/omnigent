@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, ClassVar
 import click
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
     from pathlib import Path
 
 
@@ -184,6 +184,16 @@ class SandboxLauncher(ABC):
     # ``host_type="managed"`` instead of a mid-flow capability error.
     supports_cli_bootstrap: ClassVar[bool] = True
 
+    # Whether the host process starts as part of provisioning — i.e. the
+    # sandbox's entrypoint IS ``omnigent host`` — rather than being started by
+    # the server exec-ing into an already-running sandbox. Providers that set
+    # this implement :meth:`provision_managed_host` + :meth:`new_managed_sandbox_id`
+    # instead of ``provision`` + ``run``; the managed-launch path branches on it
+    # (see :func:`omnigent.server.managed_hosts._arm_and_start_host`). Kubernetes
+    # sets it (a Pod runs the host as its container command); SDK providers that
+    # exec into a sleeping sandbox leave it ``False``.
+    starts_host_at_provision: ClassVar[bool] = False
+
     @abstractmethod
     def prepare(self) -> None:
         """
@@ -207,6 +217,71 @@ class SandboxLauncher(ABC):
             ``"lovable-wattlebird-1530"``.
         :raises click.ClickException: If provisioning fails.
         """
+
+    def new_managed_sandbox_id(self, name: str) -> str:
+        """
+        Pre-generate the sandbox id for a launch that starts the host at
+        provision time (:attr:`starts_host_at_provision`).
+
+        Such providers create the sandbox and start the host in one step
+        (:meth:`provision_managed_host`), so the managed-launch path needs the
+        id BEFORE that step in order to register the launch token first — the
+        token must resolve by the time the host's entrypoint dials back. The id
+        must be unique per launch and a valid sandbox name for the provider.
+
+        :param name: Human-readable label, e.g. ``"managed-a1b2c3d4"``.
+        :returns: The pre-generated sandbox id.
+        :raises SandboxCapabilityError: For providers that start the host by
+            exec (the default) — they take the id from :meth:`provision`.
+        """
+        raise self._capability_error("pre-generate a managed sandbox id")
+
+    def provision_managed_host(
+        self,
+        sandbox_id: str,
+        *,
+        token: str,
+        host_id: str,
+        host_name: str,
+        server_url: str,
+        repo_url: str | None = None,
+        repo_branch: str | None = None,
+        repo_name: str | None = None,
+        on_stage: Callable[[str], None] | None = None,
+    ) -> str:
+        """
+        Provision a sandbox whose entrypoint starts ``omnigent host``.
+
+        The provider-side counterpart to the exec-model
+        :func:`omnigent.server.managed_hosts._start_host_in_sandbox`, for
+        providers where the sandbox's entrypoint IS the host
+        (:attr:`starts_host_at_provision`). It creates the workspace, optionally
+        clones the repository, and starts the host with its identity + token in
+        the environment — all as the sandbox boots, with no exec-in step — then
+        returns the in-sandbox workspace path. The token is registered before
+        this call, so the host authenticates the moment it dials back.
+
+        :param sandbox_id: The id from :meth:`new_managed_sandbox_id`, used as
+            the sandbox's name.
+        :param token: The raw launch token the host authenticates with — must
+            be delivered to the host out of band (e.g. a Secret), never written
+            to a recorded surface.
+        :param host_id: Server-chosen host identity, e.g. ``"host_a1b2c3d4..."``.
+        :param host_name: Server-chosen host display name, e.g.
+            ``"managed-a1b2c3d4"``.
+        :param server_url: URL of this server the host dials back to.
+        :param repo_url: Repository clone URL, or ``None`` for an empty
+            workspace.
+        :param repo_branch: Branch to clone, or ``None`` for the default branch.
+        :param repo_name: Directory the clone lands in under the workspace, or
+            ``None`` when *repo_url* is ``None``.
+        :param on_stage: Progress observer invoked with the stage entered (e.g.
+            ``"starting"``); may run on a worker thread. ``None`` disables it.
+        :returns: The absolute in-sandbox workspace path.
+        :raises SandboxCapabilityError: For exec-model providers (the default).
+        :raises click.ClickException: When provisioning or host startup fails.
+        """
+        raise self._capability_error("provision a host-running sandbox")
 
     def attach(self, sandbox_id: str) -> None:
         """

@@ -18,6 +18,7 @@ from omnigent.server.managed_hosts import (
     BOXLITE_MANAGED_TOKEN_TTL_S,
     DAYTONA_MANAGED_TOKEN_TTL_S,
     ISLO_MANAGED_TOKEN_TTL_S,
+    KUBERNETES_MANAGED_TOKEN_TTL_S,
     MODAL_MANAGED_TOKEN_TTL_S,
     OPENSHELL_MANAGED_TOKEN_TTL_S,
     ManagedSandboxConfig,
@@ -40,6 +41,7 @@ from tests.server.helpers import (
     install_fake_daytona_launcher,
     install_fake_e2b_launcher,
     install_fake_islo_launcher,
+    install_fake_kubernetes_launcher,
     install_fake_modal_launcher,
     install_fake_openshell_launcher,
 )
@@ -464,6 +466,90 @@ def test_parse_openshell_without_section_defaults(
     assert fake.image is None
     assert fake.env is None
     assert fake.cluster is None
+
+
+def test_parse_valid_kubernetes_config_builds_parameterized_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The documented kubernetes YAML shape parses into a config whose factory
+    constructs Kubernetes launchers carrying namespace / Secret / SA / node
+    selector / in-cluster / resources, with the 7-day token TTL.
+    """
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://omnigent.omnigent.svc.cluster.local/",
+            "kubernetes": {
+                "image": "ghcr.io/me/omnigent-host:latest",
+                "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
+                "namespace": "omnigent-sandboxes",
+                "secret_name": "omnigent-creds",
+                "service_account": "omnigent-runner",
+                "node_selector": {"omnigent.ai/runner-ready": "true"},
+                "in_cluster": True,
+                "resources": {"requests": {"cpu": "500m"}, "limits": {"memory": "8Gi"}},
+            },
+        }
+    )
+    assert cfg is not None
+    assert cfg.server_url == "http://omnigent.omnigent.svc.cluster.local"
+    assert cfg.token_ttl_s == KUBERNETES_MANAGED_TOKEN_TTL_S
+    assert cfg.managed_launch_supported is True
+    assert cfg.provider == "kubernetes"
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.image == "ghcr.io/me/omnigent-host:latest"
+    assert fake.env == ["OPENAI_API_KEY", "GIT_TOKEN"]
+    assert fake.namespace == "omnigent-sandboxes"
+    assert fake.secret_name == "omnigent-creds"
+    assert fake.service_account == "omnigent-runner"
+    assert fake.node_selector == {"omnigent.ai/runner-ready": "true"}
+    assert fake.in_cluster is True
+    assert fake.resources == {"requests": {"cpu": "500m"}, "limits": {"memory": "8Gi"}}
+
+
+def test_parse_kubernetes_without_section_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    `provider: kubernetes` + `server_url` is a complete config: optional fields
+    reach the launcher as None so its env-var fallbacks / defaults apply.
+    """
+    cfg = parse_sandbox_config(
+        {"provider": "kubernetes", "server_url": "http://s.svc.cluster.local"}
+    )
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.namespace is None
+    assert fake.secret_name is None
+    assert fake.in_cluster is None
+    assert fake.resources is None
+
+
+@pytest.mark.parametrize(
+    ("kubernetes_block", "expected_fragment"),
+    [
+        ({"namespace": "Bad_NS"}, "sandbox.kubernetes.namespace"),
+        ({"node_selector": {"omnigent.ai/x": "Bad Value"}}, "node_selector"),
+        ({"resources": {"requests": {"cpu": "not a quantity!"}}}, "valid Kubernetes quantity"),
+        ({"resources": {"requests": {"disk": "1Gi"}}}, "unknown key"),
+        ({"in_cluster": "yes"}, "must be a boolean"),
+    ],
+)
+def test_parse_kubernetes_invalid_block_fails_loud(
+    kubernetes_block: dict[str, object], expected_fragment: str
+) -> None:
+    """An operator typo in the kubernetes block fails parse loud, not at launch."""
+    with pytest.raises(ValueError, match=expected_fragment):
+        parse_sandbox_config(
+            {
+                "provider": "kubernetes",
+                "server_url": "http://s.svc.cluster.local",
+                "kubernetes": kubernetes_block,
+            }
+        )
 
 
 @pytest.mark.parametrize(
@@ -1130,6 +1216,127 @@ async def test_launch_clone_failure_terminates_and_deletes_host(db_uri: str) -> 
     assert host_store.list_hosts(_OWNER) == []
     # The host never started — the clone failed first.
     assert fake.host_starts == []
+
+
+class _EntrypointFakeLauncher(FakeSandboxLauncher):
+    """
+    An entrypoint-as-host fake (like the kubernetes launcher): the sandbox is
+    created — and the host started — by ``provision_managed_host``, not by a
+    bare ``provision`` + exec.
+
+    Records the ``provision_managed_host`` call and, to assert the token is
+    armed BEFORE provisioning, captures whether the token already resolves at
+    call time (then simulates the host dialing back).
+    """
+
+    provider: ClassVar[str] = "kubernetes"
+    starts_host_at_provision: ClassVar[bool] = True
+
+    def __init__(self, host_store: HostStore) -> None:
+        super().__init__()
+        self._host_store = host_store
+        self.provision_calls: list[dict[str, object]] = []
+        self.token_resolved_at_provision: bool = False
+
+    def new_managed_sandbox_id(self, name: str) -> str:
+        """Pre-generate the sandbox id (recorded, deterministic)."""
+        self.provisioned_names.append(name)
+        return f"omnigent-pod-{len(self.provisioned_names)}"
+
+    def provision(self, name: str) -> str:
+        """The entrypoint model must never call bare provision."""
+        raise AssertionError("entrypoint launcher must not call provision()")
+
+    def run(self, sandbox_id: str, command: str, *, check: bool = True):
+        """The entrypoint model must never exec a command in."""
+        raise AssertionError("entrypoint launcher must not exec via run()")
+
+    def provision_managed_host(
+        self,
+        sandbox_id: str,
+        *,
+        token: str,
+        host_id: str,
+        host_name: str,
+        server_url: str,
+        repo_url: str | None = None,
+        repo_branch: str | None = None,
+        repo_name: str | None = None,
+        on_stage=None,
+    ) -> str:
+        """Record the call, prove the token already resolves, and connect."""
+        self.provision_calls.append(
+            {
+                "sandbox_id": sandbox_id,
+                "token": token,
+                "host_id": host_id,
+                "server_url": server_url,
+                "repo_url": repo_url,
+                "repo_name": repo_name,
+            }
+        )
+        # The token was registered before provisioning, so it resolves now.
+        self.token_resolved_at_provision = self._host_store.resolve_launch_token(token) is not None
+        # Simulate the host's entrypoint dialing back over the tunnel.
+        self._host_store.upsert_on_connect(host_id=host_id, name=host_name, owner=_OWNER)
+        return f"/home/omnigent/workspace/{repo_name}" if repo_name else "/home/omnigent/workspace"
+
+
+async def test_launch_entrypoint_provider_arms_token_before_provisioning(db_uri: str) -> None:
+    """
+    Entrypoint-as-host seam: the launch path pre-generates the sandbox id,
+    registers the token, THEN calls provision_managed_host (never provision /
+    run) — so the host authenticates the moment its entrypoint dials back.
+    """
+    host_store = HostStore(db_uri)
+    fake = _EntrypointFakeLauncher(host_store)
+
+    result = await launch_managed_host(
+        config=_injected_config(fake),
+        owner=_OWNER,
+        host_store=host_store,
+        repo=parse_repo_workspace("https://github.com/org/repo.git#main"),
+    )
+
+    # provision_managed_host ran once, with the pre-generated id and repo info.
+    assert len(fake.provision_calls) == 1
+    call = fake.provision_calls[0]
+    assert call["sandbox_id"] == "omnigent-pod-1"
+    assert call["server_url"] == "https://srv.example.com"
+    assert call["repo_url"] == "https://github.com/org/repo.git"
+    assert call["repo_name"] == "repo"
+    # The token was already resolvable when provisioning ran (no dial-back race).
+    assert fake.token_resolved_at_provision is True
+    # The workspace (cloned dir) is returned and the host is online + bound.
+    assert result.workspace == "/home/omnigent/workspace/repo"
+    host = host_store.get_host(result.host_id)
+    assert host is not None
+    assert host.status == "online"
+    assert host.sandbox_provider == "kubernetes"
+    assert host.sandbox_id == "omnigent-pod-1"
+
+
+async def test_launch_entrypoint_provider_cleans_up_on_provision_failure(db_uri: str) -> None:
+    """
+    A provision_managed_host failure tears the sandbox down (by the
+    pre-generated id) and deletes the host row, exactly like the exec path.
+    """
+    host_store = HostStore(db_uri)
+
+    class _Failing(_EntrypointFakeLauncher):
+        def provision_managed_host(self, sandbox_id: str, **kwargs: object) -> str:
+            raise click.ClickException("pod could not be scheduled")
+
+    fake = _Failing(host_store)
+    with pytest.raises(HTTPException) as exc:
+        await launch_managed_host(
+            config=_injected_config(fake), owner=_OWNER, host_store=host_store
+        )
+    assert exc.value.status_code == 502
+    assert "pod could not be scheduled" in exc.value.detail
+    # The pre-generated sandbox was terminated and no host row survives.
+    assert fake.terminated == ["omnigent-pod-1"]
+    assert host_store.list_hosts(_OWNER) == []
 
 
 # ── relaunch_managed_host ───────────────────────────────────

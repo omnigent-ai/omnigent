@@ -137,6 +137,15 @@ RUN test -f ./omnigent/server/static/web-ui/index.html \
 # [databricks] extra in pyproject — so add it explicitly here.
 RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} 'psycopg[binary]>=3.1,<4'
 
+# Optional managed-sandbox provider extras for the SERVER (the launcher imports
+# the provider SDK — e.g. the kubernetes client for `sandbox.provider:
+# kubernetes`). Off by default; the runner host image needs none of these. Build
+# with `--build-arg OMNIGENT_EXTRAS=kubernetes` (comma-separate for several).
+ARG OMNIGENT_EXTRAS=
+RUN if [ -n "${OMNIGENT_EXTRAS}" ]; then \
+        uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} -e ".[${OMNIGENT_EXTRAS}]"; \
+    fi
+
 # ── Node alias stage ─────────────────────────────────────
 # Pure alias so the host stage can COPY node out of a version-pinned
 # image; contributes no layers of its own.
