@@ -42,8 +42,8 @@ import contextlib
 import os
 import platform
 import threading
-from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, ClassVar
+from collections.abc import Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
 
 import click
 
@@ -57,6 +57,10 @@ if TYPE_CHECKING:
     from collections.abc import Coroutine
 
     import boxlite as boxlite_sdk
+
+
+# Coroutine result marshalled back through the shared loop (see _run).
+_T = TypeVar("_T")
 
 
 # ── Constants ──────────────────────────────────────────
@@ -94,20 +98,32 @@ _TERMINATE_TIMEOUT_S: float = 120.0
 
 _loop_lock = threading.Lock()
 _shared_loop: asyncio.AbstractEventLoop | None = None
+_loop_thread: threading.Thread | None = None
 
 
 def _get_loop() -> asyncio.AbstractEventLoop:
-    """Return the shared boxlite event loop, starting its daemon thread once."""
-    global _shared_loop
+    """
+    Return the shared boxlite event loop, starting its daemon thread once.
+
+    Recreates the loop (and thread) if a prior one was closed or its thread
+    died — else a dead loop would brick every later boxlite call for the
+    process lifetime.
+    """
+    global _shared_loop, _loop_thread
     with _loop_lock:
-        if _shared_loop is None:
+        alive = (
+            _shared_loop is not None
+            and not _shared_loop.is_closed()
+            and _loop_thread is not None
+            and _loop_thread.is_alive()
+        )
+        if not alive:
             loop = asyncio.new_event_loop()
-            threading.Thread(
-                target=loop.run_forever,
-                name="boxlite-runtime",
-                daemon=True,
-            ).start()
+            thread = threading.Thread(target=loop.run_forever, name="boxlite-runtime", daemon=True)
+            thread.start()
             _shared_loop = loop
+            _loop_thread = thread
+        assert _shared_loop is not None  # set just above when not alive
         return _shared_loop
 
 
@@ -117,7 +133,7 @@ def _get_loop() -> asyncio.AbstractEventLoop:
 _CANCEL_GRACE_S: float = 30.0
 
 
-def _run(coro: Coroutine, *, timeout: float) -> object:
+def _run(coro: Coroutine[Any, Any, _T], *, timeout: float) -> _T:
     """
     Run *coro* on the shared loop and block for its result.
 
@@ -130,7 +146,7 @@ def _run(coro: Coroutine, *, timeout: float) -> object:
         (``concurrent.futures.TimeoutError`` if cancellation itself hangs).
     """
 
-    async def _bounded() -> object:
+    async def _bounded() -> _T:
         return await asyncio.wait_for(coro, timeout)
 
     future = asyncio.run_coroutine_threadsafe(_bounded(), _get_loop())
@@ -349,7 +365,7 @@ class BoxliteSandboxLauncher(SandboxLauncher):
             raise click.ClickException(
                 "boxlite local mode requires KVM, but /dev/kvm was not found. "
                 "Enable KVM and add the server user to the 'kvm' group, or point "
-                "sandbox.boxlite.endpoint at a remote `boxlite serve`."
+                "sandbox.boxlite.cloud.endpoint at a remote `boxlite serve`."
             )
 
     def provision(self, name: str) -> str:
@@ -384,7 +400,7 @@ class BoxliteSandboxLauncher(SandboxLauncher):
                 auto_remove=False,
             )
             box = await runtime.create(options, name=name)
-            return box.id
+            return str(box.id)
 
         # On failure, remove any box create() made server-side before it was
         # cancelled: we never got the id, so an orphan would leak untracked.
@@ -432,7 +448,9 @@ class BoxliteSandboxLauncher(SandboxLauncher):
         """
         _ensure_sdk()
 
-        async def _drain(getter: object, sink: list[str], *, echo: bool) -> None:
+        async def _drain(
+            getter: Callable[[], Any], sink: list[str], *, echo: bool, err: bool = False
+        ) -> None:
             """
             Drain a stream into *sink*. The SDK's ``stdout()`` / ``stderr()``
             RAISE (they do not return ``None``) when the stream is unavailable,
@@ -449,7 +467,7 @@ class BoxliteSandboxLauncher(SandboxLauncher):
                 text = line if isinstance(line, str) else line.decode("utf-8", "replace")
                 sink.append(text)
                 if echo and text.strip():
-                    click.echo(text.rstrip("\n"))
+                    click.echo(text.rstrip("\n"), err=err)
 
         async def _do() -> tuple[int, str, str, str | None]:
             runtime = await self._aruntime()
@@ -471,7 +489,7 @@ class BoxliteSandboxLauncher(SandboxLauncher):
             # deadlock if the command fills the other's buffer (git-clone stderr).
             await asyncio.gather(
                 _drain(execution.stdout, out_parts, echo=True),
-                _drain(execution.stderr, err_parts, echo=False),
+                _drain(execution.stderr, err_parts, echo=True, err=True),
             )
             result = await execution.wait()
             return (
@@ -493,9 +511,11 @@ class BoxliteSandboxLauncher(SandboxLauncher):
                 f"Remote command failed to execute on box '{sandbox_id}': {exc}"
             ) from exc
         if check and exit_code != 0:
-            # Surface the diagnostic message (e.g. container init death) — a
-            # non-zero exit with no stdout is otherwise opaque.
-            detail = f" — {error_message}" if error_message else ""
+            # Surface the provider message AND a stderr tail (e.g. git-clone
+            # "fatal: ..."); a bare exit code is otherwise opaque.
+            stderr_tail = stderr.strip()[-800:]
+            reasons = [r for r in (error_message, stderr_tail) if r]
+            detail = f" — {' | '.join(reasons)}" if reasons else ""
             raise click.ClickException(
                 f"Remote command failed on box '{sandbox_id}' "
                 f"(exit {exit_code}): {command}{detail}"

@@ -521,6 +521,12 @@ ignore_missing_imports = true
 module = "openshell.*"
 ignore_missing_imports = true
 
+# boxlite is an optional dep (the `boxlite` extra); same lazy-import posture
+# as modal above.
+[[tool.mypy.overrides]]
+module = "boxlite.*"
+ignore_missing_imports = true
+
 [[tool.mypy.overrides]]
 module = "grpc.*"
 ignore_missing_imports = true

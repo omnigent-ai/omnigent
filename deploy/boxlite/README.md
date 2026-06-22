@@ -107,6 +107,13 @@ The `local:` block applies to local mode only and is mutually exclusive with
 `Boxlite.default()` runtime. Registry credentials are read from the named server
 env vars at provision time — values never live in the config file.
 
+> **Security:** `transport: https` (the default) and `skip_verify: false` keep
+> the registry pull encrypted and certificate-verified. `transport: http` sends
+> the pull credentials in **cleartext**, and `skip_verify: true` disables TLS
+> verification — use them only on a trusted local network. Likewise, a cloud
+> `endpoint` with an `http://` scheme ships `BOXLITE_API_KEY` in cleartext;
+> prefer `https://`.
+
 ### Environment variables
 
 | Variable | Purpose |

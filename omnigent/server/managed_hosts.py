@@ -956,14 +956,19 @@ def _parse_boxlite_mode(
         the *home_dir*/*registry* pair (local) is ever populated.
     :raises ValueError: On a malformed or ambiguous mode config.
     """
+    # Test for KEY PRESENCE, not value: a bare `cloud:`/`local:` YAML key
+    # parses to None, which must be rejected as malformed — not silently
+    # fall through to LOCAL mode (a `cloud:` typo would then run locally).
+    local_present = "local" in section
+    cloud_present = "cloud" in section
     local_block = section.get("local")
     cloud_block = section.get("cloud")
-    if local_block is not None and cloud_block is not None:
+    if local_present and cloud_present:
         raise ValueError(
             "server config 'sandbox.boxlite' must set at most one of 'local' or "
             "'cloud' — the two modes are mutually exclusive"
         )
-    if cloud_block is not None:
+    if cloud_present:
         if not isinstance(cloud_block, dict):
             raise ValueError("server config 'sandbox.boxlite.cloud' must be a mapping")
         _reject_unknown_boxlite_keys(cloud_block, {"endpoint"}, "sandbox.boxlite.cloud")
@@ -975,7 +980,7 @@ def _parse_boxlite_mode(
             )
         return endpoint.strip(), None, None
     # Local mode (the default when neither block is present).
-    if local_block is None:
+    if not local_present:
         return None, None, None
     if not isinstance(local_block, dict):
         raise ValueError("server config 'sandbox.boxlite.local' must be a mapping")

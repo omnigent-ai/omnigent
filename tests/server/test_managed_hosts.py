@@ -532,6 +532,17 @@ def test_parse_openshell_without_section_defaults(
             {"provider": "boxlite", "server_url": "https://s", "boxlite": {"local": "x"}},
             "sandbox.boxlite.local",
         ),
+        # A bare `cloud:` / `local:` YAML key (value None) is malformed — it must
+        # be rejected, not silently fall through to LOCAL mode (a `cloud:` typo
+        # would otherwise run locally with no diagnostic).
+        (
+            {"provider": "boxlite", "server_url": "https://s", "boxlite": {"cloud": None}},
+            "sandbox.boxlite.cloud",
+        ),
+        (
+            {"provider": "boxlite", "server_url": "https://s", "boxlite": {"local": None}},
+            "sandbox.boxlite.local",
+        ),
         (
             {
                 "provider": "boxlite",

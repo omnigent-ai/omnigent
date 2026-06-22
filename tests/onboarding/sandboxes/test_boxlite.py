@@ -663,6 +663,18 @@ def test_run_surfaces_error_message_on_failure(fake_boxlite: _FakeBoxliteState) 
         launcher.run(box_id, "false")
 
 
+def test_run_failure_detail_includes_stderr(fake_boxlite: _FakeBoxliteState) -> None:
+    """
+    A non-zero exit must surface the captured stderr (e.g. a git-clone
+    "fatal: ..."), not just the exit code — else the real reason is dropped.
+    """
+    launcher = BoxliteSandboxLauncher()
+    box_id = launcher.provision("a")
+    fake_boxlite.boxes[box_id].exec_queue.append((128, [], ["fatal: repository not found"]))
+    with pytest.raises(click.ClickException, match="fatal: repository not found"):
+        launcher.run(box_id, "git clone ...")
+
+
 def test_provision_timeout_cancels_coroutine(
     fake_boxlite: _FakeBoxliteState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -719,6 +731,26 @@ def test_terminate_does_not_swallow_unrelated_not_found_error(
     fake_boxlite.remove_raises = _FakeBoxliteError("image manifest not found")
     with pytest.raises(click.ClickException, match="manifest not found"):
         launcher.terminate(box_id)
+
+
+# ── shared event loop liveness ──────────────────────────────
+
+
+def test_get_loop_recreates_dead_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A closed/dead shared loop is replaced, not reused — a dead loop must not
+    permanently brick every later boxlite call for the process lifetime.
+    """
+    dead = asyncio.new_event_loop()
+    dead.close()
+    monkeypatch.setattr(blmod, "_shared_loop", dead, raising=False)
+    monkeypatch.setattr(blmod, "_loop_thread", None, raising=False)
+
+    loop = blmod._get_loop()
+
+    assert loop is not dead
+    assert not loop.is_closed()
+    loop.call_soon_threadsafe(loop.stop)  # let the recreated daemon thread exit
 
 
 def test_run_tolerates_unavailable_streams(fake_boxlite: _FakeBoxliteState) -> None:
