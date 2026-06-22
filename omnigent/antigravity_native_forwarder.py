@@ -1958,6 +1958,14 @@ async def _post_events(
     duplicate for a higher step that did succeed, versus permanent step loss).
     Posting still continues for every event (the live UI benefits).
 
+    The at-least-once duplicate is also SUB-step: a single step bundles a
+    ``message`` plus N ``function_call`` items (and status edges), and delivery is
+    tracked per ``step_index`` (a step is delivered iff EVERY event for it
+    succeeded). So if item k of a step fails, the WHOLE step re-posts on restart —
+    re-emitting the already-committed sibling items 1..k-1 (the events route has no
+    server-side dedup). Same at-least-once tradeoff as the step-level one, one
+    granularity down.
+
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id.
     :param events: Ordered events to POST (grouped by step, increasing index).

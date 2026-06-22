@@ -24,11 +24,13 @@ How agy exposes a control surface (verified end-to-end; see
   (``ANTIGRAVITY_SIDECAR_WEB_PORT`` is a sidecar-plugin no-op), so they are
   discovered from the loopback socket table — ``lsof`` per agy pid, falling back
   to ``/proc/net/tcp`` on hosts where ``lsof`` cannot attribute the socket.
-* Ownership probe: ``POST .../GetConversationMetadata`` with
-  ``{"metadata": {"rootConversationId": "<conversationId>"}}`` returns HTTP 200
-  echoing that id for a hosted conversation, and HTTP 500 ("trajectory not
-  found") for an unknown one — so the forwarder can confirm which live agy owns a
-  brain dir before binding it.
+* Ownership probe: ``POST .../GetConversationMetadata`` with REQUEST body
+  ``{"conversationId": "<id>"}`` returns HTTP 200 whose RESPONSE echoes that id at
+  ``metadata.rootConversationId`` for a hosted conversation, and HTTP 500
+  ("trajectory not found") for an unknown one — so the forwarder can confirm which
+  live agy owns a brain dir before binding it. (Request and response shapes
+  differ: the id is sent flat as ``conversationId`` and echoed nested under
+  ``metadata``.)
 
 Port discovery is **port-first**: it enumerates candidate loopback connect-RPC
 ports (see :func:`_candidate_agy_rpc_ports`) and, for each, checks whether its
