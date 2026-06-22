@@ -151,3 +151,120 @@ def test_web_search_explicit_duckduckgo_provider(
 
     monkeypatch.setattr(ddg, "_search_duckduckgo", lambda q, c: "DDG-OK")
     assert _search("hi", {"search_provider": "duckduckgo"}) == "DDG-OK"
+
+
+# ── robustness: HTML scraping is best-effort, so it must degrade, never crash ──
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.RemoteProtocolError("peer closed connection"),
+        httpx.ReadError("connection reset"),
+        httpx.DecodingError("bad gzip"),
+    ],
+)
+def test_search_duckduckgo_transport_errors_no_raise(exc: httpx.HTTPError) -> None:
+    """A flaky/rate-limiting DDG endpoint raises RemoteProtocol/Read/Decoding
+    errors — none of which are ``TransportError`` — and they must surface as a
+    readable string, not crash the tool. (Regression: the old narrow catch let
+    these escape.)"""
+    respx.post(_DDG_HTML_URL).mock(side_effect=exc)
+    assert _search_duckduckgo("q", {}).startswith("DuckDuckGo search error")
+
+
+@respx.mock
+def test_search_duckduckgo_connect_error() -> None:
+    """A connect failure still surfaces as a readable error (broadened catch)."""
+    respx.post(_DDG_HTML_URL).mock(side_effect=httpx.ConnectError("no route"))
+    assert _search_duckduckgo("q", {}).startswith("DuckDuckGo search error")
+
+
+@respx.mock
+def test_search_duckduckgo_rate_limit_429() -> None:
+    """The 429 throttle still surfaces its status number (HTTPStatusError stays
+    distinct from the broadened transport catch)."""
+    respx.post(_DDG_HTML_URL).mock(return_value=httpx.Response(429))
+    assert _search_duckduckgo("q", {}) == "DuckDuckGo search error: HTTP 429"
+
+
+@respx.mock
+def test_search_duckduckgo_blocked_200_is_empty() -> None:
+    """A 200 block/anomaly page (no ``result__a``) yields "No results found." —
+    we intentionally do NOT phrase-match block pages, so it's indistinguishable
+    from a genuine zero-result query (best-effort contract)."""
+    blocked = (
+        "<html><body><div class='no-results'>"
+        "If this persists, please let us know. Performed automatically."
+        "</div></body></html>"
+    )
+    respx.post(_DDG_HTML_URL).mock(return_value=httpx.Response(200, text=blocked))
+    assert _search_duckduckgo("q", {}) == "No results found."
+
+
+@respx.mock
+def test_search_duckduckgo_empty_body() -> None:
+    """An empty 200 body degrades to "No results found." over the full path."""
+    respx.post(_DDG_HTML_URL).mock(return_value=httpx.Response(200, text=""))
+    assert _search_duckduckgo("q", {}) == "No results found."
+
+
+@respx.mock
+def test_search_duckduckgo_garbage_body() -> None:
+    """Garbage HTML degrades gracefully (never raises) over the full path."""
+    respx.post(_DDG_HTML_URL).mock(
+        return_value=httpx.Response(200, text="<<garbage && >> not html")
+    )
+    assert _search_duckduckgo("q", {}) == "No results found."
+
+
+@respx.mock
+def test_search_duckduckgo_caps_rendered_output_at_max_results() -> None:
+    """More than _MAX_RESULTS results render only the first _MAX_RESULTS — the
+    cap is tied to the rendered string, not just the parsed list."""
+    block = (
+        '<a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fe.com%2F{n}">'
+        "Title {n}</a>"
+        '<a class="result__snippet" '
+        'href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fe.com%2F{n}">snip {n}</a>'
+    )
+    html = "".join(block.format(n=i) for i in range(_MAX_RESULTS + 5))
+    respx.post(_DDG_HTML_URL).mock(return_value=httpx.Response(200, text=html))
+    out = _search_duckduckgo("q", {})
+    assert f"{_MAX_RESULTS}. " in out
+    assert f"{_MAX_RESULTS + 1}. " not in out
+
+
+@respx.mock
+def test_search_duckduckgo_sends_browser_user_agent() -> None:
+    """The request carries a browser-like UA — the endpoint blocks/empties
+    requests without one, so this is a load-bearing contract."""
+    route = respx.post(_DDG_HTML_URL).mock(return_value=httpx.Response(200, text=_FIXTURE_HTML))
+    _search_duckduckgo("q", {})
+    assert route.calls.last.request.headers["user-agent"].startswith("Mozilla/5.0")
+
+
+def test_parse_results_empty_and_garbage() -> None:
+    """The parser returns [] (never raises) for empty or non-HTML input."""
+    assert _parse_results("") == []
+    assert _parse_results("<<< not really html & broken >>>") == []
+
+
+def test_parse_results_truncated_html_no_raise() -> None:
+    """Truncated markup (stream cut mid-result) degrades gracefully — no raise,
+    at most a partial result; it never crashes search."""
+    html = (
+        '<div class="result"><a class="result__a" '
+        'href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fa.com">Titl'
+    )
+    results = _parse_results(html)  # must not raise
+    assert len(results) <= 1
+
+
+def test_decode_result_href_preserves_encoded_ampersand_in_target() -> None:
+    """A redirect whose target has an encoded ``&`` (``%26``) plus a literal
+    ``&amp;`` separator decodes to the correct URL — the query inside the
+    target survives."""
+    href = "//duckduckgo.com/l/?uddg=https%3A%2F%2Fa.com%2Fx%26y%3D1&amp;rut=z"
+    assert _decode_result_href(href) == "https://a.com/x&y=1"
