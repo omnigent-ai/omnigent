@@ -57,10 +57,11 @@ env:
   # the v0.32.0 release sends default image/workdir/capacity fields that make Islo sandbox
   # creation fail ("ubuntu:26.04" boxes never start). The build lives in the local
   # ./.github/actions/build-crabbox composite action.
+  # #428 is now MERGED (8/8 green); the pin tracks its merged head until a release ships it.
   # TODO: once a tagged crabbox release includes #428, replace the "Build Crabbox" step in
   # both jobs with a checksum-verified `gh release download <version>` and delete that action.
   CRABBOX_PR: "428"
-  CRABBOX_REF: 1053c50c6350b032dae76b8a486d65835849733c
+  CRABBOX_REF: 2526192f135c2293d3ee2ed799895dc51adc5e30
   # GH_TOKEN is consumed by `crabbox job run` for GitHub Actions lease hydration (crabbox
   # shells out to `gh`); keep it even though the build step itself no longer needs it.
   GH_TOKEN: ${{ github.token }}
