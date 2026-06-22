@@ -1,0 +1,126 @@
+name: Bump Version
+
+# Bumps the project version across ALL lockstep locations in one PR:
+# the three pyproject.toml files (each package's [project].version plus
+# its sibling ==pins) and the regenerated uv.lock. Modeled on MLflow's
+# dev/update_mlflow_versions.py (pre-release / post-release), adapted to
+# this repo's three-package layout.
+#
+# scripts/update_versions.py does the deterministic text edits (anchored
+# on package name, so unrelated version literals are never touched);
+# this workflow wraps it with `uv lock`, a consistency check, and an
+# auto-opened PR.
+#
+# NOTE: the PR is created with GITHUB_TOKEN, so by GitHub policy it does
+# NOT trigger other workflows (CI won't auto-run on it). Push an empty
+# commit or re-open the PR to kick CI, or swap in a PAT if that matters.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "pre-release = stamp new_version exactly. post-release = set main to the next .dev0 after releasing new_version."
+        required: true
+        type: choice
+        options:
+          - pre-release
+          - post-release
+        default: pre-release
+      new_version:
+        description: "Target version (pre-release) or just-released version (post-release), e.g. 0.1.2 or 0.1.2rc1"
+        required: true
+      base_branch:
+        description: "Branch to base the bump PR on"
+        required: false
+        default: main
+
+concurrency:
+  group: bump-version-${{ github.event.inputs.new_version }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ github.event.inputs.base_branch }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version-file: ".python-version"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
+        with:
+          enable-cache: true
+
+      - name: Bump versions
+        env:
+          # Bind untrusted inputs to env and validate before use; never
+          # interpolate ${{ }} into the shell (mirrors e2e.yml hardening).
+          MODE: ${{ github.event.inputs.mode }}
+          NEW_VERSION: ${{ github.event.inputs.new_version }}
+        run: |
+          case "$MODE" in
+            pre-release|post-release) ;;
+            *) echo "Invalid mode: $MODE" >&2; exit 1 ;;
+          esac
+          # Conservative PEP 440 shape: release, a/b/rc pre-release, or .devN/.postN.
+          if ! [[ "$NEW_VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?((a|b|rc)[0-9]+)?(\.post[0-9]+)?(\.dev[0-9]+)?$ ]]; then
+            echo "Invalid version: $NEW_VERSION" >&2; exit 1
+          fi
+          uv run --no-project --python 3.12 --with packaging \
+            python scripts/update_versions.py "$MODE" --new-version "$NEW_VERSION"
+
+      - name: Regenerate lockfile
+        run: uv lock
+
+      - name: Verify all locations agree
+        run: uv run --no-project --python 3.12 --with packaging python scripts/update_versions.py check
+
+      - name: Open bump PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ github.event.inputs.mode }}
+          NEW_VERSION: ${{ github.event.inputs.new_version }}
+          BASE: ${{ github.event.inputs.base_branch }}
+        run: |
+          # The resolved version is what landed in the files (in post-release
+          # mode it's the computed .dev0, not the input).
+          resolved="$(uv run --no-project --python 3.12 --with packaging \
+            python scripts/update_versions.py check)"
+          branch="bot/bump-version-${resolved}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "::notice::No version changes to commit (already at ${resolved})."
+            exit 0
+          fi
+          git commit -s -m "Bump version to ${resolved}"
+          git push --force-with-lease origin "$branch"
+
+          existing="$(gh pr list --head "$branch" --base "$BASE" --json number --jq '.[0].number')"
+          if [ -n "$existing" ]; then
+            echo "::notice::PR #${existing} already open for ${branch}; pushed update."
+            exit 0
+          fi
+          gh pr create \
+            --base "$BASE" \
+            --head "$branch" \
+            --title "Bump version to ${resolved}" \
+            --body "Automated version bump via \`.github/workflows/bump-version.yml\` (mode: \`${MODE}\`, input: \`${NEW_VERSION}\`).
+
+          Rewrote \`[project].version\` and sibling \`==\` pins across all three packages (\`pyproject.toml\`, \`sdks/python-client\`, \`sdks/ui\`) and regenerated \`uv.lock\`.
+
+          Generated by \`scripts/update_versions.py\`. CI does not auto-trigger on GITHUB_TOKEN PRs — re-open or push to run it."
