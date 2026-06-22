@@ -4,11 +4,14 @@ Provides a pluggable :class:`AuthProvider` ABC and a
 :class:`UnifiedAuthProvider` that supports three identity sources,
 selected via the ``OMNIGENT_AUTH_PROVIDER`` env var:
 
-- ``"header"`` (default): reads ``X-Forwarded-Email`` header from
-  a trusted upstream proxy. Requests without the header are
-  rejected (401) unless the server was explicitly started as a
-  single-user local runtime (``OMNIGENT_LOCAL_SINGLE_USER=1``),
-  in which case they fall back to the reserved ``"local"`` user.
+- ``"header"`` (default): reads the ``X-Forwarded-Email`` header
+  from a trusted upstream proxy (override the header name with
+  ``OMNIGENT_AUTH_HEADER``, e.g.
+  ``Cf-Access-Authenticated-User-Email`` for Cloudflare Access).
+  Requests without the header are rejected (401) unless the server
+  was explicitly started as a single-user local runtime
+  (``OMNIGENT_LOCAL_SINGLE_USER=1``), in which case they fall back
+  to the reserved ``"local"`` user.
 - ``"oidc"``: reads the ``__Host-ap_session`` signed cookie minted
   after a full OIDC authorization-code+PKCE login flow.
 - ``"accounts"``: same signed cookie machinery as OIDC, but minted
@@ -53,6 +56,14 @@ _TRUTHY_STRINGS = ("1", "true", "yes")
 # routes/host_tunnel.py.
 _LOCAL_SINGLE_USER_ENV = "OMNIGENT_LOCAL_SINGLE_USER"
 
+# Name of the trusted identity header read in header-auth mode.
+# Overridable so deploys behind a proxy that uses a different header
+# name (e.g. Cloudflare Access' ``Cf-Access-Authenticated-User-Email``)
+# work without an extra proxy transform. Defaults to the oauth2-proxy /
+# Databricks Apps convention. See :func:`resolve_auth_header`.
+_AUTH_HEADER_ENV = "OMNIGENT_AUTH_HEADER"
+_DEFAULT_AUTH_HEADER = "X-Forwarded-Email"
+
 LEVEL_READ = 1
 LEVEL_EDIT = 2
 LEVEL_MANAGE = 3
@@ -90,6 +101,27 @@ def local_single_user_enabled() -> bool:
     :returns: ``True`` when the single-user marker is set and truthy.
     """
     return env_var_is_truthy(_LOCAL_SINGLE_USER_ENV)
+
+
+def resolve_auth_header() -> str:
+    """Resolve the trusted identity header name for header-auth mode.
+
+    Reads ``OMNIGENT_AUTH_HEADER`` and falls back to
+    :data:`_DEFAULT_AUTH_HEADER` (``X-Forwarded-Email``) when unset or
+    empty. Header names are case-insensitive per RFC 7230, so the value
+    is used as-is — Starlette's ``request.headers`` lookup is itself
+    case-insensitive.
+
+    The override exists so a deploy behind a proxy that authenticates
+    with a differently-named header can point the server at it directly,
+    e.g. ``OMNIGENT_AUTH_HEADER=Cf-Access-Authenticated-User-Email`` for
+    Cloudflare Access, instead of standing up an extra hop to rename the
+    header to ``X-Forwarded-Email``.
+
+    :returns: The header name to read identity from in header mode.
+    """
+    raw = os.environ.get(_AUTH_HEADER_ENV, "").strip()
+    return raw or _DEFAULT_AUTH_HEADER
 
 
 _auth_enabled_deprecation_warned = False
@@ -203,13 +235,18 @@ class UnifiedAuthProvider(AuthProvider):
         ``source`` is ``"accounts"``, ``None`` otherwise.
     :param local_single_user: When ``True``, header mode falls back
         to the reserved ``"local"`` identity for requests without
-        ``X-Forwarded-Email`` — the explicit single-user posture of
+        the identity header — the explicit single-user posture of
         the user's own loopback server. When ``False``, such
         requests are rejected (``None`` → 401, fail closed).
         ``None`` (the default) resolves from
         ``OMNIGENT_LOCAL_SINGLE_USER`` at construction (see
         :func:`local_single_user_enabled`). Only consulted in
         header mode. Tests pass an explicit bool.
+    :param header_name: The trusted identity header read in header
+        mode. ``None`` (the default) resolves from
+        ``OMNIGENT_AUTH_HEADER`` at construction, falling back to
+        ``X-Forwarded-Email`` (see :func:`resolve_auth_header`).
+        Only consulted in header mode. Tests pass an explicit name.
     """
 
     def __init__(
@@ -218,6 +255,7 @@ class UnifiedAuthProvider(AuthProvider):
         oidc_config: OIDCConfig | None = None,
         accounts_config: AccountsConfig | None = None,
         local_single_user: bool | None = None,
+        header_name: str | None = None,
     ) -> None:
         self._source = source
         self._oidc_config = oidc_config
@@ -225,6 +263,7 @@ class UnifiedAuthProvider(AuthProvider):
         self._local_single_user = (
             local_single_user if local_single_user is not None else local_single_user_enabled()
         )
+        self._header_name = header_name if header_name is not None else resolve_auth_header()
         self._cookie_cache: dict[str, tuple[str, float]] = {}
 
     @property
@@ -251,7 +290,9 @@ class UnifiedAuthProvider(AuthProvider):
     def get_user_id(self, request: HTTPConnection) -> str | None:
         """Extract user identity from the active source.
 
-        - ``"header"``: Read ``X-Forwarded-Email`` header.
+        - ``"header"``: Read the configured identity header
+          (default ``X-Forwarded-Email``; see
+          :func:`resolve_auth_header`).
         - ``"oidc"`` / ``"accounts"``: Read ``__Host-ap_session``
           cookie, validate HS256 signature and expiry, return
           ``sub`` claim.
@@ -329,7 +370,11 @@ class UnifiedAuthProvider(AuthProvider):
         return user_id
 
     def _check_header(self, request: HTTPConnection) -> str | None:
-        """Read the ``X-Forwarded-Email`` header and return the user ID.
+        """Read the trusted identity header and return the user ID.
+
+        The header name is :attr:`_header_name` (``X-Forwarded-Email``
+        by default, overridable via ``OMNIGENT_AUTH_HEADER`` — e.g.
+        ``Cf-Access-Authenticated-User-Email`` for Cloudflare Access).
 
         When the header is present, its value is used as the identity
         (reserved names like ``"local"`` are rejected). When absent,
@@ -350,7 +395,7 @@ class UnifiedAuthProvider(AuthProvider):
             header is absent on a single-user local runtime; else
             ``None`` (→ 401).
         """
-        email = request.headers.get("X-Forwarded-Email")
+        email = request.headers.get(self._header_name)
         if email:
             if email in _RESERVED_USERS:
                 return None
@@ -366,9 +411,11 @@ def create_auth_provider() -> AuthProvider:
 
     Defaults to ``"header"`` when the env var is unset — a bare
     ``omnigent server`` is single-user, no-login out of the box.
-    Header mode rejects requests without ``X-Forwarded-Email``
-    (401, fail closed — see :meth:`UnifiedAuthProvider._check_header`)
-    unless the server is an explicit single-user local runtime
+    Header mode rejects requests without the configured identity
+    header (default ``X-Forwarded-Email``, overridable via
+    ``OMNIGENT_AUTH_HEADER``) — 401, fail closed; see
+    :meth:`UnifiedAuthProvider._check_header` — unless the server
+    is an explicit single-user local runtime
     (``OMNIGENT_LOCAL_SINGLE_USER=1``, set by the managed local
     spawn paths and the canonical bare loopback ``omnigent
     server``), where the absent header falls back to the reserved
@@ -389,7 +436,11 @@ def create_auth_provider() -> AuthProvider:
     leaves it off. An explicit ``OMNIGENT_AUTH_PROVIDER`` always wins
     over this switch — it only governs the env-unset default. Deploys
     behind an SSO proxy that injects ``X-Forwarded-Email`` set
-    ``OMNIGENT_AUTH_PROVIDER=header`` (Databricks Apps, oauth2-proxy).
+    ``OMNIGENT_AUTH_PROVIDER=header`` (Databricks Apps, oauth2-proxy);
+    proxies that authenticate with a different header name also set
+    ``OMNIGENT_AUTH_HEADER`` (e.g.
+    ``Cf-Access-Authenticated-User-Email`` for Cloudflare Access — see
+    :func:`resolve_auth_header`).
 
     (``OMNIGENT_AUTH_ENABLED`` is the renamed opt-in gate,
     commit ``b23e886e``, formerly ``OMNIGENT_ACCOUNTS_ENABLED``:

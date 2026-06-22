@@ -32,7 +32,7 @@ prompt: |
   ```
   {
     "type": "bug" | "enhancement" | "documentation" | null,
-    "components": ["comp:server" | "comp:runner" | "comp:repr" | "comp:web-ui" | "comp:policies" | "comp:harnesses" | "comp:infra"],
+    "components": ["comp:server" | "comp:runner" | "comp:repr" | "comp:web-ui" | "comp:tui" | "comp:policies" | "comp:harnesses" | "comp:infra"],
     "priority": "P0-critical" | "P1-high" | "P2-medium" | "P3-low" | null,
     "needs_info": true | false,
     "help_wanted": true | false,
@@ -58,6 +58,7 @@ prompt: |
   - `comp:runner` — the agent runner, execution engine
   - `comp:repr` — serialization, representation layer
   - `comp:web-ui` — the web frontend (ap-web)
+  - `comp:tui` — the terminal UI, REPL, and CLI
   - `comp:policies` — safety policies, guardrails
   - `comp:harnesses` — SDK harnesses (Claude, Cursor, Antigravity, etc.)
   - `comp:infra` — CI/CD, GitHub Actions workflows, Docker, deployment, packaging

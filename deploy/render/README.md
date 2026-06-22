@@ -22,8 +22,9 @@ The `render.yaml` blueprint at the repo root defines:
   `render.yaml` (`image.creds`); once public, the pull is anonymous.
 - **omnigent-db** (`basic-256mb` managed Postgres) — `DATABASE_URL` is injected
   into the service automatically
-- **artifact-data** (10 GB persistent disk) — mounted at `/data/artifacts` so
-  agent bundle storage survives redeploys
+- **artifact-data** (10 GB persistent disk) — mounted at `/data` so server
+  config, first-boot credentials, cookie secrets, and agent artifacts survive
+  redeploys. Artifacts live under `/data/artifacts`.
 
 ## Quickstart (built-in accounts — the default)
 

@@ -158,7 +158,7 @@ class FunctionPolicy(Policy):
         would accumulate forever and a "15 calls per turn"
         limit would silently degrade to "15 calls per session"
         under Omnigent mode — see
-        :meth:`omnigent.inner.policies.FunctionPolicy.reset_turn`
+        :meth:`omnigent.runtime.policies.engine.PolicyEngine.reset_turn`
         for the native equivalent we mirror.
 
         Stateless callables (no ``reset_turn`` attribute) are a

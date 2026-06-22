@@ -14,9 +14,10 @@ Each case asserts what the server+UI can guarantee WITHOUT a host or a real
 native CLI: the fork is created on the TARGET agent, the copied transcript
 renders, and the fork's labels route the runner correctly —
 
-  - native targets stamp ``omnigent.fork.carry_history`` (the runner must
-    rebuild the native transcript; absent → the clone would launch fresh
-    and lose history) and the TARGET ``omnigent.wrapper`` (so the clone
+  - native targets that can replay fork history stamp
+    ``omnigent.fork.carry_history`` (the runner must rebuild the native
+    transcript; absent → the clone would launch fresh and lose history) and
+    every native target stamps the TARGET ``omnigent.wrapper`` (so the clone
     opens in the right UI mode, not the source's chat mode);
   - the SDK target stamps neither (an SDK target replays the transcript as
     context, and plain chat has no wrapper).
@@ -81,11 +82,9 @@ def _agent_id_by_name(base_url: str, name: str) -> str:
         # SDK → Codex: SAME-family native target. Same carry-history rebuild
         # path; the wrapper flips to the codex-native terminal UI.
         pytest.param("codex-native-ui", "codex-native-ui", True, id="sdk-to-codex"),
-        # SDK → Pi: native, but multi-family (its harness family is null), so
-        # the picker would drop it unless gated on isNativeHarness too. This is
-        # the case #230 fixes — the option must be offerable, and the fork must
-        # flip to the Pi terminal UI with carry-history stamped.
-        pytest.param("pi-native-ui", "pi-native-ui", True, id="sdk-to-pi"),
+        # SDK → Pi: native, but it cannot replay fork history, so the fork
+        # must flip to the Pi terminal UI without carry-history stamped.
+        pytest.param("pi-native-ui", "pi-native-ui", False, id="sdk-to-pi"),
     ],
 )
 def test_fork_switch_agent_carries_history(
@@ -104,7 +103,8 @@ def test_fork_switch_agent_carries_history(
     :param expected_wrapper: TARGET ``omnigent.wrapper`` value, or ``None``
         when the target runs as plain chat (SDK).
     :param expect_carry_history: Whether the fork must stamp the
-        carry-history label (true only for native targets).
+        carry-history label (true only for native targets that can replay
+        fork history, currently claude/codex native).
     """
     base_url, session_id = seeded_session
     target_agent_id = _agent_id_by_name(base_url, target_name)
@@ -171,17 +171,19 @@ def test_fork_switch_agent_carries_history(
     )
     if expect_carry_history:
         assert labels.get(_CARRY_HISTORY_LABEL_KEY) == "1", (
-            f"native-target fork must stamp carry-history, got {labels!r}"
-        )
-        assert labels.get(_WRAPPER_LABEL_KEY) == expected_wrapper, (
-            f"native-target fork must present as {expected_wrapper!r}, got {labels!r}"
+            f"history-capable native target must stamp carry-history, got {labels!r}"
         )
     else:
         assert _CARRY_HISTORY_LABEL_KEY not in labels, (
-            f"SDK-target fork must not stamp carry-history, got {labels!r}"
+            f"target must not stamp carry-history, got {labels!r}"
         )
+    if expected_wrapper is None:
         assert _WRAPPER_LABEL_KEY not in labels, (
             f"SDK-target fork must stay in chat mode (no wrapper), got {labels!r}"
+        )
+    else:
+        assert labels.get(_WRAPPER_LABEL_KEY) == expected_wrapper, (
+            f"native-target fork must present as {expected_wrapper!r}, got {labels!r}"
         )
 
 

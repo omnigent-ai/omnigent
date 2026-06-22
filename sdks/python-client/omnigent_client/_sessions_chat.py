@@ -1090,6 +1090,66 @@ class SessionsChat:
             return self._stream_query(input, files=files)
         return await self._collect_query(input, files=files)
 
+    async def await_turn(self, *, timeout: float | None = 1200.0) -> QueryResult:
+        """
+        Collect the next auto-triggered turn without posting a message.
+
+        Used by headless runners to follow async orchestrator sessions
+        across multiple turns. Unlike :meth:`query`, no user message is
+        posted — this helper subscribes to the live stream and waits for
+        the server to start a new turn (e.g. an inbox auto-wake when a
+        sub-agent completes), then collects its text output.
+
+        A ``timeout`` guards against the race window where the turn
+        already completed before the subscription opened. If no terminal
+        event arrives within ``timeout`` seconds, the coroutine returns
+        an empty :class:`QueryResult` so the caller can refresh session
+        status and decide how to proceed.
+
+        :param timeout: Seconds to wait for the turn to complete. ``None``
+            waits indefinitely. Defaults to 1200 (20 minutes).
+        :returns: :class:`QueryResult` with the turn's text (may be empty
+            if the turn completed before we subscribed).
+        :raises OmnigentError: Propagated from :meth:`stream` if the
+            session does not exist.
+        """
+        text_parts: list[str] = []
+        produced: list[File] = []
+
+        async def _collect() -> None:
+            async for event in self.stream():
+                if isinstance(event, OutputTextDeltaEvent):
+                    if event.delta:
+                        text_parts.append(event.delta)
+                elif isinstance(event, OutputItemDoneEvent) and not text_parts:
+                    text_parts.extend(_assistant_text_from_output_item(event.item))
+                elif isinstance(event, OutputFileDoneEvent):
+                    produced.append(await self._fetch_file(event))
+                elif isinstance(event, CompletedEvent):
+                    if not text_parts:
+                        text_parts.extend(_assistant_text_from_response(event.response.output))
+                    break
+                elif isinstance(event, SessionStatusEvent) and event.status in (
+                    "waiting",
+                    "idle",
+                ):
+                    # Break on terminal status events so the async generator
+                    # closes cleanly (avoids "aclose(): already running" when
+                    # asyncio.timeout fires mid-stream).
+                    break
+                elif isinstance(event, _TURN_TERMINAL_EVENT_TYPES):
+                    break
+
+        try:
+            async with asyncio.timeout(timeout):
+                await _collect()
+        except asyncio.TimeoutError:
+            # Timeout is expected when the session completes before the deadline
+            # or the race window is missed; return whatever text was collected so
+            # far per the method contract (empty QueryResult is valid).
+            pass
+        return QueryResult(text="".join(text_parts), files=produced)
+
     async def _collect_query(
         self,
         input: str | list[dict[str, Any]],

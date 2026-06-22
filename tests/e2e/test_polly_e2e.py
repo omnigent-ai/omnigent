@@ -1,11 +1,13 @@
-"""Small, opt-in e2e smoke for the polly coding orchestrator (examples/polly).
+"""Small mock-LLM e2e smoke for the polly coding orchestrator (examples/polly).
 
-Real model: boots the claude-sdk orchestrator bundle against a
-LOCAL server and confirms it completes a turn. This exercises the parts a
-structural spec-load test can't - the claude-sdk harness authenticating
-against the `oss` workspace (via the global-config auth block), the sub-agents
-(implementation + review) registering, the server-side polly
-function-policies resolving, and a turn streaming back through the run path.
+Mock mode: boots a throwaway LOCAL server from this working tree (which carries
+the in-tree ``omnigent.inner.nessie.policies`` module that polly's guardrails
+resolve server-side), rewrites the polly bundle's executor to use
+``openai-agents`` harness wired to the mock LLM server, and runs a one-shot
+``omnigent run`` subprocess against it. This exercises the parts a structural
+spec-load test can't — bundle load, server-side guardrail policy resolution,
+and a turn streaming back through the run path — without requiring real OAuth
+credentials or proprietary model access.
 
 Why a local server (not bare ``omnigent run``): polly's guardrail policies
 (``omnigent.inner.nessie.policies`` — the package keeps its historical
@@ -16,25 +18,26 @@ the turn 500s at event-execution. We therefore stand up a throwaway local
 ``omnigent server`` from this working tree - which DOES carry the polly
 code - and point ``run --server`` at it.
 
-OPT-IN. polly needs the dev-box toolset that CI runners don't have: a
-logged-in `oss` Databricks OAuth profile that the claude-sdk orchestrator and
-the claude-native / codex-native sub-agents route through.
-So it is gated behind ``OMNIGENT_E2E_POLLY=1`` and is not collected in the
-default suite. Run it manually after touching the polly bundle, its skills, or
-the claude-sdk / openai-agents auth paths:
+Mock helpers and fixture names are exported from this module so the sibling
+cost-advisor and subagent-model tests can re-use them directly:
 
-    OMNIGENT_E2E_POLLY=1 uv run --extra dev python -m pytest \
-        tests/e2e/test_polly_e2e.py -v
+    from tests.e2e.test_polly_e2e import (
+        _SERVER_BOOT_TIMEOUT_SEC,
+        _free_port,
+        _wait_for_health,
+        _mock_env,
+        _mock_polly_spec_dir,
+    )
 
-The full multi-agent loop (decompose -> fanout to implementation sub-agents ->
-cross-review -> integrate) is a heavier follow-up; this smoke just guards the
-substrate so a blank-turn regression (auth, harness, bundle load, policy
-resolution) is caught.
+Run it manually after touching the polly bundle, its skills, or the
+openai-agents auth paths::
+
+    pytest tests/e2e/test_polly_e2e.py -v
 """
 
 from __future__ import annotations
 
-import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -46,58 +49,20 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+import yaml
 
 # tests/e2e/test_polly_e2e.py -> repo root is 2 parents up.
 _REPO = Path(__file__).resolve().parents[2]
 _POLLY = _REPO / "examples" / "polly"
-_PROFILE = "oss"
-_RUN_TIMEOUT_SEC = 300
+_RUN_TIMEOUT_SEC = 180
 _SERVER_BOOT_TIMEOUT_SEC = 90
-# Long enough to prove a real model reply, short enough to flag an empty turn.
+# Long enough to prove a real reply came back, short enough to flag an empty turn.
 _MIN_REPLY_CHARS = 12
 
-pytestmark = pytest.mark.skipif(
-    os.environ.get("OMNIGENT_E2E_POLLY") != "1",
-    reason=(
-        "polly e2e needs the dev-box toolset (oss OAuth login) absent on CI - "
-        "set OMNIGENT_E2E_POLLY=1 to opt in."
-    ),
-)
-
-
-def _clean_env() -> dict[str, str]:
-    """
-    Build a subprocess env with token vars stripped so the ``oss`` profile's
-    OAuth (resolved by the harnesses via the global-config auth block)
-    isn't shadowed.
-
-    :returns: A copy of ``os.environ`` with onboarding/update-check disabled and
-        credential env vars that would override profile auth removed.
-    """
-    env = dict(os.environ)
-    env["OMNIGENT_SKIP_ONBOARD"] = "1"
-    env["OMNIGENT_NO_UPDATE_CHECK"] = "1"
-    # The ``--profile`` CLI flag was removed from the omnigent CLI; the
-    # supported replacement is an ``auth:`` block in the global config.
-    # Write it into an isolated ``OMNIGENT_CONFIG_HOME`` so the spawned
-    # CLI/harnesses route Databricks auth through the ``oss`` profile.
-    config_home = Path(tempfile.mkdtemp(prefix="omnigent-polly-config-"))
-    (config_home / "config.yaml").write_text(
-        f"auth:\n  type: databricks\n  profile: {_PROFILE}\n",
-        encoding="utf-8",
-    )
-    env["OMNIGENT_CONFIG_HOME"] = str(config_home)
-    env["DATABRICKS_CONFIG_PROFILE"] = _PROFILE
-    for stale in (
-        "DATABRICKS_TOKEN",
-        "ANTHROPIC_API_KEY",
-        "OPENAI_API_KEY",
-        "CLAUDE_CODE",
-        "CLAUDECODE",
-        "CODEX",
-    ):
-        env.pop(stale, None)
-    return env
+# Model key for the polly brain in mock mode. The mock server routes responses
+# by the ``model`` field in the POST /v1/responses body, so the spec's executor
+# model must match the key used in configure_mock_llm.
+_MOCK_BRAIN_MODEL = "mock-polly-brain"
 
 
 def _free_port() -> int:
@@ -132,6 +97,183 @@ def _wait_for_health(base_url: str, deadline: float) -> None:
     raise TimeoutError(f"local server at {base_url} never became healthy: {last_err}")
 
 
+def _mock_env(mock_llm_server_url: str) -> dict[str, str]:
+    """
+    Build a subprocess env with mock LLM credentials injected.
+
+    Strips real credential env vars (Databricks, Anthropic, Claude/Codex
+    binaries) and injects ``OPENAI_BASE_URL`` and ``OPENAI_API_KEY`` so the
+    ``openai-agents`` harness routes to the mock LLM server. An isolated
+    ``OMNIGENT_CONFIG_HOME`` prevents the spawned process from touching
+    the developer's real omnigent state.
+
+    :param mock_llm_server_url: The mock LLM server base URL, e.g.
+        ``"http://127.0.0.1:12345"``.  The function appends ``/v1`` so the
+        harness hits ``/v1/responses``.
+    :returns: A copy of ``os.environ`` with credentials stripped and mock
+        overrides set.
+    """
+    env = dict(__import__("os").environ)
+    env["OMNIGENT_SKIP_ONBOARD"] = "1"
+    env["OMNIGENT_NO_UPDATE_CHECK"] = "1"
+    # Write an isolated config home so the spawned process doesn't inherit the
+    # developer's real auth config.
+    config_home = Path(tempfile.mkdtemp(prefix="omnigent-polly-mock-config-"))
+    (config_home / "config.yaml").write_text("", encoding="utf-8")
+    env["OMNIGENT_CONFIG_HOME"] = str(config_home)
+    # Strip credentials that would shadow or conflict with mock access.
+    # Covers Databricks, Anthropic/Claude, OpenAI, AWS, GCP, Azure, GitHub,
+    # and any other credential vars that should not leak into mock subprocesses.
+    _CREDENTIAL_VARS = (
+        # Databricks
+        "DATABRICKS_TOKEN",
+        "DATABRICKS_HOST",
+        "DATABRICKS_CLIENT_ID",
+        "DATABRICKS_CLIENT_SECRET",
+        "DATABRICKS_CONFIG_PROFILE",
+        "DATABRICKS_ACCOUNT_ID",
+        # Anthropic / Claude SDK
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "CLAUDE_CODE",
+        "CLAUDECODE",
+        # OpenAI / Codex (will be overridden below, but strip first)
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "CODEX",
+        # AWS
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_DEFAULT_REGION",
+        # GCP / Google
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_CLOUD_PROJECT",
+        "GCP_PROJECT",
+        "GCLOUD_PROJECT",
+        # Azure
+        "AZURE_CLIENT_ID",
+        "AZURE_CLIENT_SECRET",
+        "AZURE_TENANT_ID",
+        "AZURE_SUBSCRIPTION_ID",
+        # GitHub
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "GITHUB_APP_ID",
+        "GITHUB_APP_PRIVATE_KEY",
+    )
+    for stale in _CREDENTIAL_VARS:
+        env.pop(stale, None)
+    # Point the openai-agents harness at the mock server.
+    env["OPENAI_BASE_URL"] = f"{mock_llm_server_url}/v1"
+    env["OPENAI_API_KEY"] = "mock-key"
+    return env
+
+
+def _mock_polly_spec_dir(
+    tmp_path: Path,
+    mock_llm_server_url: str,
+    *,
+    brain_model: str = _MOCK_BRAIN_MODEL,
+    extra_executor_config: dict | None = None,
+    polly_src: Path = _POLLY,
+    rewrite_sub_agent_harnesses: bool = False,
+) -> Path:
+    """
+    Copy the polly bundle into *tmp_path* and rewrite it to use the mock LLM.
+
+    Switches the executor harness from ``claude-sdk`` to ``openai-agents``,
+    sets a deterministic model key (so ``configure_mock_llm`` can target it),
+    and bakes a ``connection`` block pointing at the mock server so both the
+    brain harness and the runner-side cost judge call the mock rather than a
+    real provider.
+
+    :param tmp_path: Per-test temp dir to write the spec copy into.
+    :param mock_llm_server_url: The mock LLM server base URL, e.g.
+        ``"http://127.0.0.1:12345"``.
+    :param brain_model: Model key to bake into ``executor.model``; must
+        match the key passed to ``configure_mock_llm``.
+    :param extra_executor_config: Optional additional keys merged into
+        ``executor.config`` after the harness rewrite (e.g. ``cost_optimize``
+        for the cost-advisor tests).
+    :param polly_src: Source polly bundle directory; defaults to the
+        shipped ``examples/polly``.
+    :param rewrite_sub_agent_harnesses: When ``True``, rewrite each
+        sub-agent's ``config.yaml`` to replace native CLI harnesses
+        (``pi``, ``pi-native``, ``claude-native``, ``codex-native``, etc.)
+        with ``openai-agents``.  Use this when a test only needs the child
+        *session row* to be created (e.g. to verify ``model_override``) and
+        doesn't need the native binary to actually run — avoids failures on
+        machines where the binary is absent from ``PATH``.
+    :returns: Path to the copied polly bundle directory.
+    """
+    # Native harnesses that require a CLI binary on PATH.  Replaced with
+    # ``openai-agents`` (SDK-based, no binary needed) when
+    # ``rewrite_sub_agent_harnesses`` is True.
+    _NATIVE_HARNESSES = frozenset(
+        {
+            "claude-native",
+            "native-claude",
+            "codex-native",
+            "native-codex",
+            "pi",
+            "pi-native",
+            "native-pi",
+            "cursor-native",
+            "native-cursor",
+        }
+    )
+
+    dst = tmp_path / "polly"
+    shutil.copytree(polly_src, dst, symlinks=False)
+    config_path = dst / "config.yaml"
+    spec = yaml.safe_load(config_path.read_text())
+    executor = spec.setdefault("executor", {})
+    # Rewrite executor to use openai-agents so the mock server is honoured.
+    executor_config = executor.pop("config", {}) or {}
+    executor_config["harness"] = "openai-agents"
+    if extra_executor_config:
+        executor_config.update(extra_executor_config)
+    executor["config"] = executor_config
+    # Set a deterministic model key the mock server queues against.
+    executor["model"] = brain_model
+    # Bake an auth block (type: api_key) so the workflow layer sets
+    # HARNESS_OPENAI_AGENTS_API_KEY and HARNESS_OPENAI_AGENTS_GATEWAY_BASE_URL
+    # pointing at the mock server, bypassing all profile / env-var resolution.
+    executor["auth"] = {
+        "type": "api_key",
+        "api_key": "mock-key",
+        "base_url": f"{mock_llm_server_url}/v1",
+    }
+    # Also bake a connection block so the runner-side cost judge (which calls
+    # the LLM client directly, not through the harness) also routes to mock.
+    executor["connection"] = {
+        "base_url": f"{mock_llm_server_url}/v1",
+        "api_key": "mock-key",
+    }
+    config_path.write_text(yaml.safe_dump(spec, sort_keys=False))
+
+    if rewrite_sub_agent_harnesses:
+        # Rewrite each sub-agent's config.yaml so native harnesses (which
+        # need a CLI binary on PATH) become ``openai-agents`` (SDK-based).
+        # This lets tests verify the child session row is created with the
+        # correct model_override without requiring the binary to be installed.
+        agents_dir = dst / "agents"
+        if agents_dir.is_dir():
+            for sub_config in agents_dir.glob("*/config.yaml"):
+                sub_spec = yaml.safe_load(sub_config.read_text())
+                sub_executor = sub_spec.get("executor") or {}
+                sub_cfg = sub_executor.get("config") or {}
+                harness = sub_cfg.get("harness") or sub_executor.get("type") or ""
+                if harness in _NATIVE_HARNESSES:
+                    sub_cfg["harness"] = "openai-agents"
+                    sub_executor["config"] = sub_cfg
+                    sub_spec["executor"] = sub_executor
+                    sub_config.write_text(yaml.safe_dump(sub_spec, sort_keys=False))
+
+    return dst
+
+
 @pytest.fixture
 def local_polly_server(tmp_path: Path) -> Iterator[str]:
     """
@@ -149,6 +291,13 @@ def local_polly_server(tmp_path: Path) -> Iterator[str]:
     base_url = f"http://127.0.0.1:{port}"
     db_uri = f"sqlite:///{tmp_path / 'polly_e2e.db'}"
     artifacts = tmp_path / "artifacts"
+    import os
+
+    env = {
+        **os.environ,
+        "OMNIGENT_SKIP_ONBOARD": "1",
+        "OMNIGENT_NO_UPDATE_CHECK": "1",
+    }
     proc = subprocess.Popen(
         [
             sys.executable,
@@ -165,7 +314,7 @@ def local_polly_server(tmp_path: Path) -> Iterator[str]:
             str(artifacts),
         ],
         cwd=str(_REPO),
-        env=_clean_env(),
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -181,50 +330,72 @@ def local_polly_server(tmp_path: Path) -> Iterator[str]:
             proc.kill()
 
 
-def test_polly_orchestrator_boots_and_responds(local_polly_server: str) -> None:
+def test_polly_orchestrator_boots_and_responds(
+    local_polly_server: str,
+    mock_llm_server_url: str,
+    tmp_path: Path,
+) -> None:
     """
-    ``omnigent run examples/polly --server <local> -p <prompt>``
-    (with the ``oss`` profile supplied via the global-config auth block)
-    exits 0 and emits a non-trivial reply.
+    ``omnigent run <mock-polly> --server <local> -p <prompt>``
+    exits 0 and emits a non-trivial reply via the mock LLM server.
 
     Proves the bundle loads end-to-end against a server that carries polly's
-    code: the claude-sdk orchestrator authenticates (the profile
-    auth fix), the sub-agents register without aborting startup,
-    the server-side guardrail policies resolve, and a turn completes. A blank
-    reply here is the exact failure that masqueraded as "no output" before the
-    auth fix — so this is the regression guard for the substrate.
+    code: the openai-agents harness initialises, the sub-agents register
+    without aborting startup, the server-side guardrail policies resolve, and
+    a turn completes. A blank reply here is the exact failure that masqueraded
+    as "no output" before the auth fix — so this is the regression guard for
+    the substrate.
 
     :param local_polly_server: Base URL of the in-tree local server fixture.
+    :param mock_llm_server_url: Base URL of the mock LLM server fixture.
+    :param tmp_path: Per-test temp dir for the mock polly spec copy.
     """
+    from tests.e2e.conftest import configure_mock_llm, reset_mock_llm
+
+    reset_mock_llm(mock_llm_server_url)
+    polly_dir = _mock_polly_spec_dir(tmp_path, mock_llm_server_url)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "text": (
+                    "I am polly, a multi-agent coding orchestrator. "
+                    "I handle coding tasks by planning the work and delegating "
+                    "implementation to specialized sub-agents."
+                )
+            }
+        ],
+        key=_MOCK_BRAIN_MODEL,
+    )
+
     result = subprocess.run(
         [
             sys.executable,
             "-m",
             "omnigent",
             "run",
-            str(_POLLY),
+            str(polly_dir),
             "--server",
             local_polly_server,
             "-p",
             "In one short sentence, what are you and how do you handle a coding task?",
         ],
         cwd=str(_REPO),
-        env=_clean_env(),
+        env=_mock_env(mock_llm_server_url),
         capture_output=True,
         text=True,
         timeout=_RUN_TIMEOUT_SEC,
     )
 
     # Exit 0 proves boot + turn completion; a harness that aborts startup,
-    # an auth 401, or a server-side policy that fails to resolve would
-    # surface here as a non-zero exit.
+    # or a server-side policy that fails to resolve would surface here as
+    # a non-zero exit.
     assert result.returncode == 0, (
         f"polly run exited {result.returncode}\n--- stdout ---\n{result.stdout}\n"
         f"--- stderr ---\n{result.stderr}"
     )
     reply = result.stdout.strip()
-    # A real model reply, not an empty turn. The pre-auth-fix bug produced an
-    # empty stdout with exit 0; this length check is what would have caught it.
+    # A real reply, not an empty turn.
     assert len(reply) >= _MIN_REPLY_CHARS, (
         f"polly produced no/short reply ({len(reply)} chars): {reply!r}\n"
         f"--- stderr ---\n{result.stderr}"

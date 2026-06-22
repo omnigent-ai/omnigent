@@ -29,7 +29,9 @@ from omnigent.claude_native_bridge import (
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.native_policy_hook import (
     evaluation_response_to_hook_output,
+    fail_closed_hook_output,
     hook_payload_to_evaluation_request,
+    post_evaluate_with_retry,
 )
 
 # Client-side budget for the permission-request long-poll to AP. Held
@@ -743,9 +745,20 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     ``additionalContext`` (Claude sees the warning but the tool result
     is already committed — PostToolUse hooks are observational).
 
-    On transport failures the hook returns exit 0 with no output,
-    which Claude Code treats as "no opinion". Fail-open design
-    ensures a network blip doesn't block every tool call.
+    Failure handling is phase-aware (mirroring the runner-side default
+    from PR #163). Once the session is known to be governed (an active
+    session id and a configured ``ap_server_url``) and the round-trip to
+    ``/policies/evaluate`` cannot yield a usable verdict — the server is
+    unreachable, returns non-2xx, or returns an empty / malformed body —
+    a ``PreToolUse`` (``PHASE_TOOL_CALL``) call fails CLOSED with a
+    ``deny`` (this hook is the sole enforcement point for native tools, so
+    a transient outage must not silently let a gated call through), while
+    ``UserPromptSubmit`` and ``PostToolUse`` fail OPEN. Pre-evaluation
+    conditions that mean the session simply is not governed — no active
+    session, no ``ap_server_url``, an unparseable hook payload, or an
+    ``mcp__omnigent__*`` tool already gated on the relay path — still
+    return exit 0 with no output ("no opinion") so non-Omnigent tool
+    calls are never blocked.
 
     :param argv: CLI argv after the ``evaluate-policy`` subcommand,
         e.g. ``["--bridge-dir", "/tmp/x"]``.
@@ -800,23 +813,30 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     if status_model:
         context["model"] = status_model
 
+    # The session is governed (active id + ap_server_url) and we have a
+    # policy-relevant event: from here a failure to obtain a usable verdict
+    # fails CLOSED for the tool-call gate (see ``fail_closed_hook_output``).
+    def _fail_closed() -> int:
+        out = fail_closed_hook_output(hook_event)
+        if out is not None:
+            sys.stdout.write(json.dumps(out))
+        return 0
+
     url = f"{ap_server_url.rstrip('/')}/v1/sessions/{url_component(session_id)}/policies/evaluate"
-    try:
-        with httpx.Client(
-            headers=headers, timeout=httpx.Timeout(_EVALUATE_POLICY_TIMEOUT_S)
-        ) as client:
-            resp = client.post(url, json=eval_request)
-            resp.raise_for_status()
-    except httpx.HTTPError as exc:
-        print(f"omnigent evaluate-policy hook: Omnigent request failed: {exc}", file=sys.stderr)
-        return 0
+    resp = post_evaluate_with_retry(
+        url, headers, eval_request, _EVALUATE_POLICY_TIMEOUT_S, "evaluate-policy hook"
+    )
+    if resp is None:
+        return _fail_closed()
     if not resp.content:
-        return 0
+        print("omnigent evaluate-policy hook: empty Omnigent response", file=sys.stderr)
+        return _fail_closed()
 
     try:
         eval_response = resp.json()
     except json.JSONDecodeError:
-        return 0
+        print("omnigent evaluate-policy hook: malformed Omnigent response", file=sys.stderr)
+        return _fail_closed()
 
     hook_output = evaluation_response_to_hook_output(hook_event, eval_response)
     if hook_output is not None:

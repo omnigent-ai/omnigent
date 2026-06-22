@@ -34,6 +34,18 @@ OMNIGENT_INTERNAL_WS_ORIGIN = "omnigent://internal"
 # CLI flows leave it unset (agent sees the project root directly).
 RUNNER_ISOLATE_SESSION_ENV_VAR = "OMNIGENT_RUNNER_ISOLATE_SESSION"
 
+# Marker env var stamped into every agent-facing environment so any
+# process launched inside an Omnigent agent session can detect it is
+# running under Omnigent. This is the analog of Claude Code's
+# ``CLAUDE_CODE`` / ``CLAUDECODE`` and Codex's ``CODEX``. It is set once
+# on the runner process (see :mod:`omnigent.runner._entry`) and inherited
+# by harness workers, terminals, and the in-process SDK harnesses. The
+# deny-by-default env scrubbers (os_env sandbox, codex CLI, pi CLI) name
+# it in their passthrough allowlists so this one marker survives the
+# scrub.
+OMNIGENT_SESSION_ENV_VAR = "OMNIGENT"
+OMNIGENT_SESSION_ENV_VALUE = "1"
+
 # Env vars carrying the runner's control-plane auth secret. The tunnel
 # binding token is seeded into the runner process by the launcher and
 # reused as the runner-side request auth token, but must never reach a

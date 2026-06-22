@@ -49,7 +49,6 @@ from collections.abc import Iterator
 from typing import Any
 
 import httpx
-import pytest
 
 from tests.e2e.conftest import configure_mock_llm, send_user_message_to_session
 from tests.integration.conftest import JourneySession
@@ -141,9 +140,6 @@ def test_client_tool_round_trip(
     full server->client round-trip the SSE-parser unit tests
     never reach.
     """
-    if mock_llm_server_url is None:
-        pytest.skip("requires the mock LLM server (mock mode)")
-
     marker = f"D6-ROUND-TRIP-{uuid.uuid4().hex[:8]}"
     call_id = f"call_{uuid.uuid4().hex[:8]}"
     sid = journey_session.session_id
@@ -268,9 +264,6 @@ def test_direct_cancel_parks_then_interrupts_cleanly(
     sessions surface the runner synthesizes the idle terminal +
     history instead, and that synthesized shape is what clients see.
     """
-    if mock_llm_server_url is None:
-        pytest.skip("requires the mock LLM server (mock mode)")
-
     call_id = f"call_{uuid.uuid4().hex[:8]}"
     sid = journey_session.session_id
 

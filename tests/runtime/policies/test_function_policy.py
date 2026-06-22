@@ -876,7 +876,7 @@ def test_function_policy_reset_turn_invokes_callable_attribute(
     on the wrapped callable and invoke it. This is how legacy
     omnigent policies like ``max_tool_calls_per_turn`` clear
     per-turn accumulators between turns — see
-    :meth:`omnigent.inner.policies.FunctionPolicy.reset_turn`
+    :meth:`omnigent.runtime.policies.engine.PolicyEngine.reset_turn`
     for the native implementation we mirror.
 
     What breaks if this fails: the rate-limit factory in
@@ -1092,28 +1092,36 @@ async def test_engine_propagates_data_to_composed_allow(
 
 
 @pytest.mark.asyncio
-async def test_engine_last_data_wins_across_multiple_policies(
+async def test_engine_data_chains_sequentially_across_policies(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """When multiple policies return ``data``, the last one wins.
+    """Each policy that returns ``data`` receives the previous
+    policy's output as ``event["data"]`` (i.e. ``ctx.content``),
+    not the original content.
 
-    Rationale: each subsequent policy in the chain operates on
-    the context, and the final transform is the one the enforcement
-    site should apply. Callers that need ordered chaining must
-    compose that in a single callable.
+    The canonical use case: a two-stage redaction pipeline where
+    the first policy scrubs PII and the second strips secrets —
+    the second policy must see the already-PII-scrubbed payload,
+    not the raw original.
     """
-    first_data = {"query": "first-transform"}
-    last_data = {"query": "last-transform"}
+    seen_by_second: list[dict] = []
+
+    def first(_event: dict) -> PolicyResult:
+        return PolicyResult(
+            action=PolicyAction.ALLOW,
+            data={"query": "after-first"},
+        )
+
+    def second(event: dict) -> PolicyResult:
+        seen_by_second.append(event["data"])
+        return PolicyResult(
+            action=PolicyAction.ALLOW,
+            data={"query": "after-second"},
+        )
 
     policies = [
-        FunctionPolicy(
-            _spec(name="first", phase=Phase.TOOL_CALL),
-            lambda event: PolicyResult(action=PolicyAction.ALLOW, data=first_data),
-        ),
-        FunctionPolicy(
-            _spec(name="last", phase=Phase.TOOL_CALL),
-            lambda event: PolicyResult(action=PolicyAction.ALLOW, data=last_data),
-        ),
+        FunctionPolicy(_spec(name="first", phase=Phase.TOOL_CALL), first),
+        FunctionPolicy(_spec(name="second", phase=Phase.TOOL_CALL), second),
     ]
     engine = _build_engine(conversation_store, policies)
     result = await engine.evaluate(
@@ -1124,10 +1132,13 @@ async def test_engine_last_data_wins_across_multiple_policies(
         )
     )
     assert result.action == PolicyAction.ALLOW
-    assert result.data == last_data, (
-        f"Last policy's data must win; got {result.data!r}. "
-        f"If 'first-transform', the engine kept the first data instead of the last."
+    # The second policy must have seen the first policy's output.
+    assert seen_by_second == [{"query": "after-first"}], (
+        f"Second policy must receive first policy's data as content; "
+        f"got {seen_by_second!r}. If 'original', the engine didn't chain."
     )
+    # The composed result carries the last transform in the chain.
+    assert result.data == {"query": "after-second"}
 
 
 # ── Gap 7: legacy (content, phase) callable shim ─────────────────────────────
