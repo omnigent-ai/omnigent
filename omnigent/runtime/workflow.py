@@ -2229,25 +2229,36 @@ def _find_spec_by_name(
     a full clone of the parent (runaway recursion via ``sys_session_send``
     when the parent is a coordinator). To keep that fallback safe, the
     researcher is reconstructed deterministically from the parent (the
-    same pure builder ``WebFetchTool`` uses) instead of returning ``None``.
+    same pure builder ``WebFetchTool`` uses) instead of returning ``None``,
+    but only when the parent actually declares the ``web_fetch`` builtin.
+    That builtin is the sole reason the researcher ever exists, so a parent
+    without it has no such child and the name falls through to normal
+    resolution (``None``). Reconstructing unconditionally would let a
+    caller-controlled ``sub_agent_name`` coerce any parent into a
+    shell-capable researcher (``build_researcher_spec`` synthesizes an
+    ``OSEnvSpec``), widening the parent's tool boundary.
 
     :param spec: The root agent spec to search.
     :param name: The sub-agent name to find,
         e.g. ``"researcher"``.
     :returns: The matching sub-agent spec, the reconstructed
-        ``__web_researcher`` spec on a resolve-miss, or ``None`` if not
-        found.
+        ``__web_researcher`` spec when the parent declares ``web_fetch``
+        and the name matches, or ``None`` otherwise.
     """
     found = _search_sub_agent_tree(spec, name)
     if found is not None:
         return found
     # Built-in web_fetch researcher: derived from the parent, never
     # persisted in the bundle, so reconstruct it on a resolve-miss rather
-    # than letting callers fall back to the parent spec. Imported lazily to
-    # keep the tools layer off this module's import path.
-    from omnigent.tools.builtins.web_fetch import RESEARCHER_NAME, build_researcher_spec
+    # than letting callers fall back to the parent spec. Gated on the parent
+    # declaring the ``web_fetch`` builtin, the only reason the researcher
+    # exists (``WebFetchTool.__init__`` appends it). Imported lazily to keep
+    # the tools layer off this module's import path.
+    from omnigent.tools.builtins.web_fetch import RESEARCHER_NAME
 
-    if name == RESEARCHER_NAME:
+    if name == RESEARCHER_NAME and any(entry.name == "web_fetch" for entry in spec.tools.builtins):
+        from omnigent.tools.builtins.web_fetch import build_researcher_spec
+
         return build_researcher_spec(spec)
     return None
 

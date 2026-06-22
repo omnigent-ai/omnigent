@@ -24,13 +24,15 @@ from __future__ import annotations
 from omnigent.runtime.workflow import _find_spec_by_name
 from omnigent.spec.types import (
     AgentSpec,
+    BuiltinToolConfig,
     ExecutorSpec,
     LLMConfig,
+    ToolsConfig,
 )
 from omnigent.tools.builtins.web_fetch import RESEARCHER_NAME, build_researcher_spec
 
 
-def _coordinator_parent() -> AgentSpec:
+def _coordinator_parent(*, web_fetch: bool = True) -> AgentSpec:
     """A coordinator-style parent as re-parsed from its persisted bundle.
 
     Critically, it does NOT contain ``__web_researcher`` in ``sub_agents`` --
@@ -38,14 +40,21 @@ def _coordinator_parent() -> AgentSpec:
     never serialized, so a fresh bundle parse lacks it. The ``panelist`` child
     stands in for the real sub-agents a grounded coordinator declares.
 
+    :param web_fetch: When ``True`` (default), the parent declares the
+        ``web_fetch`` builtin in ``tools.builtins`` -- the authored config
+        that is the sole reason ``__web_researcher`` exists, and which IS
+        serialized into the bundle. When ``False``, the parent never enabled
+        web_fetch, so it has no researcher child.
     :returns: A parent :class:`AgentSpec` without the researcher in its tree.
     """
     panelist = AgentSpec(spec_version=1, name="panelist")
+    builtins = [BuiltinToolConfig(name="web_fetch")] if web_fetch else []
     return AgentSpec(
         spec_version=1,
         name="concordia",
         llm=LLMConfig(model="openai/gpt-5.4"),
         executor=ExecutorSpec(max_iterations=40),
+        tools=ToolsConfig(builtins=builtins),
         sub_agents=[panelist],
     )
 
@@ -56,9 +65,12 @@ def test_web_researcher_resolves_to_lean_researcher_on_bundle_reparse() -> None:
     Fails before the fix (the resolver returns ``None``, so every swap site
     falls back to the parent spec and boots the child as a parent clone).
     """
-    parent = _coordinator_parent()
-    # Precondition: the re-parsed bundle does not carry the researcher.
+    parent = _coordinator_parent(web_fetch=True)
+    # Precondition: the re-parsed bundle does not carry the researcher...
     assert RESEARCHER_NAME not in [s.name for s in parent.sub_agents]
+    # ...but it DOES declare web_fetch, the authored builtin that is the sole
+    # reason the researcher exists and which is serialized into the bundle.
+    assert "web_fetch" in [b.name for b in parent.tools.builtins]
 
     resolved = _find_spec_by_name(parent, RESEARCHER_NAME)
 
@@ -80,6 +92,24 @@ def test_web_researcher_resolves_to_lean_researcher_on_bundle_reparse() -> None:
     # parent's provider.
     assert resolved.llm is not None
     assert resolved.llm.model == "openai/gpt-5.4"
+
+
+def test_web_researcher_not_synthesized_without_web_fetch_builtin() -> None:
+    """Boundary regression: a parent that never enabled ``web_fetch`` must NOT
+    get a synthesized ``__web_researcher``.
+
+    ``__web_researcher`` only exists because ``WebFetchTool.__init__`` appends
+    it, so a parent without the ``web_fetch`` builtin has no such child.
+    Resolving the researcher name against that parent must fall through to
+    normal resolution and return ``None`` rather than reconstruct a
+    shell-capable child (``build_researcher_spec`` synthesizes an ``OSEnvSpec``)
+    from a caller-controlled ``sub_agent_name``.
+    """
+    parent = _coordinator_parent(web_fetch=False)
+    # Precondition: this parent genuinely lacks the web_fetch builtin.
+    assert "web_fetch" not in [b.name for b in parent.tools.builtins]
+
+    assert _find_spec_by_name(parent, RESEARCHER_NAME) is None
 
 
 def test_declared_sub_agent_still_resolves_from_tree() -> None:
