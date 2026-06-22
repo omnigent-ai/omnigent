@@ -35,11 +35,20 @@ import re
 #   - closing brackets / quotes / angle that commonly delimit URLs
 #     in prose ("(see https://example.com)", "<https://...>",
 #     '"https://..."').
+#   - ANY C0 control byte or DEL (``\x00-\x1f``, ``\x7f``) — critically the
+#     ESC (``\x1b``) that introduces an SGR/OSC escape. Rich renders an
+#     autolinked URL as ``\x1b[..m<url>\x1b[0m`` (styled + reset); without
+#     excluding ESC, the URL class swallows the trailing ``\x1b[0m`` reset
+#     and embeds it INSIDE the OSC 8 link target built below
+#     (``\x1b]8;;<url>\x1b[0m\x1b\\``), a malformed hyperlink that terminals
+#     render by leaking the reset's tail ``0m`` as visible text before the
+#     URL. Real URLs never contain raw control bytes (they are
+#     percent-encoded), so excluding them is always safe.
 # Trailing punctuation (``.,;:!?``) is stripped in the substitution
 # callback rather than excluded by the regex — e.g. "Visit
 # https://example.com." should fire OSC 8 over the URL but leave
 # the period after the close-OSC8.
-_URL = r"https?://[^\s\)\]\>\"'<]+"
+_URL = r"https?://[^\s\)\]\>\"'<\x00-\x1f\x7f]+"
 
 # Match a complete pre-existing OSC 8 hyperlink block so we don't
 # re-wrap a URL that was already linkified (some agent paths emit
