@@ -1,0 +1,56 @@
+# Databricks Apps manifest for the Omnigent server.
+#
+# Reference: https://docs.databricks.com/aws/en/dev-tools/databricks-apps/app-runtime
+#
+# Single replica BY DESIGN: the runner registry lives in server process
+# memory, so every request / SSE stream / runner WebSocket must land on one
+# instance. A Databricks App runs a single container per app — do NOT add any
+# horizontal scale-out. See README.md ("Single-replica constraint").
+#
+# Port: Databricks injects DATABRICKS_APP_PORT (defaults to 8000) and the app
+# must bind it. `app.py` surfaces it as PORT for the shared entrypoint, so no
+# port is hard-coded in the command below.
+
+command:
+  - "python"
+  - "app.py"
+
+env:
+  # ── Lakebase (managed Postgres) ────────────────────────────────────────
+  # The Lakebase database resource is attached to the app (via databricks.yml
+  # or the Apps UI); Databricks then auto-injects PGHOST / PGUSER / PGDATABASE
+  # / PGPORT, from which app.py composes a password-less DATABASE_URL.
+  #
+  # OMNIGENT_LAKEBASE_INSTANCE names the instance whose short-lived OAuth token
+  # the server mints per connection (omnigent/db/utils.py). REQUIRED — set it
+  # to your Lakebase database instance name. Its presence is what enables the
+  # token-refresh path; without it the password-less URL cannot authenticate.
+  - name: OMNIGENT_LAKEBASE_INSTANCE
+    value: "omnigent-db"
+
+  # ── Artifact store (persistent) ────────────────────────────────────────
+  # The Apps container filesystem is EPHEMERAL — a redeploy wipes it — so point
+  # ARTIFACT_DIR at a Unity Catalog Volume (FUSE-mounted, durable, shared).
+  # Uploaded agent bundles and the build cache then survive restarts/redeploys.
+  - name: ARTIFACT_DIR
+    value: "/Volumes/main/omnigent/artifacts"
+  # Alternatively, use an S3/R2 object store instead of a Volume (uncomment;
+  # the entrypoint selects S3ArtifactStore when this is set). Requires the
+  # bucket's credentials in the environment (e.g. via a secret resource).
+  # - name: OMNIGENT_ARTIFACT_URI
+  #   value: "s3://my-bucket/omnigent-artifacts"
+
+  # ── Auth ───────────────────────────────────────────────────────────────
+  # Databricks fronts the app with an identity-aware proxy that forwards the
+  # signed-in user in X-Forwarded-Email; header auth reads it. (app.py also
+  # defaults to this, set here too so it is explicit in the manifest.)
+  - name: OMNIGENT_AUTH_PROVIDER
+    value: "header"
+
+  # ── Secrets (optional) ─────────────────────────────────────────────────
+  # Map Databricks secrets to env vars with `valueFrom` instead of `value`.
+  # Example — switch to your own OIDC IdP instead of the Databricks proxy:
+  # - name: OMNIGENT_OIDC_CLIENT_SECRET
+  #   valueFrom: "omnigent-oidc-client-secret"
+  # (declare the matching `secret` resource in databricks.yml so the app's
+  # service principal can read the secret scope/key.)

@@ -1,0 +1,53 @@
+# Databricks Asset Bundle (DAB) for the Omnigent server, deployed as a
+# Databricks App backed by a Lakebase (managed Postgres) database.
+#
+#   databricks bundle validate -t dev
+#   python deploy/databricks/deploy.py -t dev    # builds wheel + bundle deploy
+#   databricks bundle run omnigent_server -t dev # start the app
+#
+# Full walkthrough: deploy/databricks/README.md. Validate the schema with
+# `databricks bundle validate` before relying on it — the Apps + Lakebase
+# resource surface is evolving (Public Preview).
+
+bundle:
+  name: omnigent-server
+
+variables:
+  lakebase_instance:
+    description: >-
+      Name of the Lakebase database instance the app connects to. Must match
+      OMNIGENT_LAKEBASE_INSTANCE in src/app.yaml so the per-connection OAuth
+      token is minted for the right instance.
+    default: omnigent-db
+  lakebase_database:
+    description: Postgres database name inside the Lakebase instance.
+    default: omnigent
+
+resources:
+  apps:
+    omnigent_server:
+      name: omnigent-server
+      description: Omnigent agent server (single replica; in-memory runner registry).
+      # The app source folder — contains app.py, app.yaml, requirements.txt,
+      # and the wheel copied in by deploy.py. `databricks bundle deploy`
+      # uploads it and honors .gitignore (which is why the wheel is NOT
+      # gitignored — see the repo-root .gitignore note).
+      source_code_path: ./src
+      resources:
+        # Binding a Lakebase database resource auto-injects PGHOST / PGUSER /
+        # PGDATABASE / PGPORT into the app environment. The app's service
+        # principal needs CAN_CONNECT_AND_CREATE on the instance — granted by
+        # deploy/databricks/grant_sp_perms.py after the first deploy creates
+        # the SP.
+        - name: database
+          database:
+            instance_name: ${var.lakebase_instance}
+            database_name: ${var.lakebase_database}
+            permission: CAN_CONNECT_AND_CREATE
+
+targets:
+  dev:
+    mode: development
+    default: true
+  prod:
+    mode: production

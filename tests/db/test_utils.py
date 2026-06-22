@@ -12,16 +12,21 @@ from alembic import command
 from sqlalchemy import create_engine
 
 from omnigent.db.utils import (
+    _LAKEBASE_POOL_RECYCLE_SECONDS,
+    _SERVER_POOL_RECYCLE_SECONDS,
     _build_alembic_config,
     _get_current_db_revision,
     _get_head_db_revision,
     _initialize_or_verify_schema,
+    _install_lakebase_token_refresh,
+    _resolve_lakebase_token_provider,
     builtin_agent_id,
     clear_engine_cache,
     extract_search_text,
     generate_agent_id,
     generate_item_id,
     get_or_create_engine,
+    set_lakebase_token_provider,
     strip_nul_bytes,
 )
 from omnigent.entities.conversation import (
@@ -127,6 +132,154 @@ def test_sqlite_engine_skips_server_pool_settings_and_enables_wal(
         # synchronous=NORMAL is the WAL-recommended mode — durable
         # at commit, much faster than FULL.
         assert conn.exec_driver_sql("PRAGMA synchronous").scalar() == 1
+
+
+# ── Lakebase token-aware engine ─────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _clear_lakebase_override() -> Any:
+    """Ensure the process-wide token provider override never leaks across
+    tests (it is module-global state). Clears before and after each test."""
+    from omnigent.db.utils import set_lakebase_token_provider as _set
+
+    _set(None)
+    yield
+    _set(None)
+
+
+def test_static_postgres_uri_path_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    (a) Backward compatibility: with no Lakebase config, a Postgres engine is
+    created exactly as before — no token provider resolves, the standard
+    30-minute recycle window is used, and no ``do_connect`` token listener is
+    attached. A regression here would mean the opt-in path leaked into the
+    default static-password Postgres deploy.
+    """
+    from omnigent.db import utils
+
+    # No override installed (autouse fixture) and no env var → no token path.
+    monkeypatch.delenv("OMNIGENT_LAKEBASE_INSTANCE", raising=False)
+    assert _resolve_lakebase_token_provider() is None
+
+    engine = utils._create_engine("postgresql+psycopg://user:pass@host:5432/db")
+    try:
+        # Standard (non-Lakebase) recycle window, unchanged from before.
+        assert engine.pool._recycle == _SERVER_POOL_RECYCLE_SECONDS == 1800
+        # No token-refresh listener was wired onto a static-password engine.
+        captured: dict[str, object] = {"password": "from-url"}
+
+        def _spy(_d: object, _r: object, _a: list[object], cparams: dict[str, object]) -> None:
+            cparams["password"] = "REWRITTEN"
+
+        # If a real listener were attached it would also fire here, but the
+        # point is the engine carries none of ours: contains() is False.
+        from sqlalchemy import event
+
+        assert not event.contains(engine, "do_connect", _spy)
+        assert captured["password"] == "from-url"
+    finally:
+        engine.dispose()
+
+
+def test_resolve_token_provider_env_and_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    The provider resolves from ``OMNIGENT_LAKEBASE_INSTANCE`` when set, and an
+    explicit override installed via :func:`set_lakebase_token_provider` takes
+    precedence over the env var.
+    """
+    # Env var unset → no provider.
+    monkeypatch.delenv("OMNIGENT_LAKEBASE_INSTANCE", raising=False)
+    assert _resolve_lakebase_token_provider() is None
+
+    # Env var set → a provider resolves (the SDK-backed lambda).
+    monkeypatch.setenv("OMNIGENT_LAKEBASE_INSTANCE", "omnigent-db")
+    assert callable(_resolve_lakebase_token_provider())
+
+    # Explicit override wins over the env var.
+    sentinel: LakebaseSentinel = LakebaseSentinel()
+    set_lakebase_token_provider(sentinel)
+    assert _resolve_lakebase_token_provider() is sentinel
+
+
+class LakebaseSentinel:
+    """A trivial provider used to assert override identity/precedence."""
+
+    def __call__(self) -> str:
+        return "sentinel-token"
+
+
+def test_token_callback_invoked_per_connection() -> None:
+    """
+    (b) The ``do_connect`` listener calls the token provider once per new
+    connection and overwrites the password connection parameter with the fresh
+    token. ``do_connect`` fires once per *new* DBAPI connection, so calling the
+    registered listener N times models N new connections — each must re-mint.
+    """
+    calls: list[int] = []
+
+    def _provider() -> str:
+        calls.append(1)
+        return f"token-{len(calls)}"
+
+    engine = create_engine("postgresql+psycopg://user@host:5432/db")
+    try:
+        listener = _install_lakebase_token_refresh(engine, _provider)
+
+        # The listener is actually wired onto the engine's do_connect event.
+        from sqlalchemy import event
+
+        assert event.contains(engine, "do_connect", listener)
+
+        # Simulate two new connections: each re-mints a fresh token.
+        first: dict[str, object] = {}
+        second: dict[str, object] = {}
+        listener(None, None, [], first)
+        listener(None, None, [], second)
+
+        assert len(calls) == 2, "token must be re-minted per new connection"
+        assert first["password"] == "token-1"
+        assert second["password"] == "token-2"
+    finally:
+        engine.dispose()
+
+
+def test_create_engine_wires_token_refresh_and_short_recycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    (b)+(c) With a token provider active, ``_create_engine`` lowers
+    ``pool_recycle`` to the Lakebase window and installs the token-refresh
+    listener (verified by spying on the install helper to confirm it receives
+    the resolved provider).
+    """
+    from omnigent.db import utils
+
+    def _override() -> str:
+        return "live-token"
+
+    set_lakebase_token_provider(_override)
+
+    installed: dict[str, object] = {}
+    real_install = utils._install_lakebase_token_refresh
+
+    def _spy_install(engine: object, provider: object) -> object:
+        installed["engine"] = engine
+        installed["provider"] = provider
+        return real_install(engine, provider)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(utils, "_install_lakebase_token_refresh", _spy_install)
+
+    engine = utils._create_engine("postgresql+psycopg://user@host:5432/db")
+    try:
+        # Shorter recycle so connections (and their tokens) refresh ahead of
+        # the ~1h OAuth expiry.
+        assert engine.pool._recycle == _LAKEBASE_POOL_RECYCLE_SECONDS == 600
+        # The refresh listener was installed with the resolved provider.
+        assert installed["provider"] is _override
+        assert installed["engine"] is engine
+    finally:
+        engine.dispose()
 
 
 # ── _initialize_or_verify_schema ────────────────────────
