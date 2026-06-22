@@ -1607,10 +1607,7 @@ function BulkActionBar({
               type="button"
               variant="outline"
               size="sm"
-              className={cn(
-                "h-7 gap-1.5 text-xs",
-                ownedSelected.length > 0 && "text-destructive",
-              )}
+              className={cn("h-7 gap-1.5 text-xs", ownedSelected.length > 0 && "text-destructive")}
               disabled={isBusy || ownedSelected.length === 0}
               onClick={() => setConfirmDeleteOpen(true)}
             >
@@ -1681,10 +1678,7 @@ function BulkActionBar({
             type="button"
             variant="outline"
             size="sm"
-            className={cn(
-              "h-7 gap-1.5 text-xs",
-              ownedSelected.length > 0 && "text-destructive",
-            )}
+            className={cn("h-7 gap-1.5 text-xs", ownedSelected.length > 0 && "text-destructive")}
             disabled={isBusy || ownedSelected.length === 0}
             onClick={() => setConfirmDeleteOpen(true)}
             data-testid="bulk-delete"
