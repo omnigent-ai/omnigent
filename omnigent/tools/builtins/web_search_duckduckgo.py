@@ -71,45 +71,64 @@ def _decode_result_href(href: str) -> str | None:
 class _ResultParser(HTMLParser):
     """Extract ``(title, url, snippet)`` triples from DDG HTML results.
 
-    DDG renders each result as an ``<a class="result__a" href=redirect>title``
-    anchor followed by an ``<a class="result__snippet">snippet`` anchor. We
-    capture anchor text by CSS class and attach the snippet to the most recent
-    result. Ad / JS links (no decodable target) are skipped.
+    DDG renders each result as an ``<a class="result__a" href=...>title``
+    anchor followed by a ``class="result__snippet"`` element. We capture text
+    by CSS class — the title/URL from the anchor, the snippet from whatever
+    element carries the class (it need not be an ``<a>``) — and attach the
+    snippet to the most recent result. Ad / JS links (no decodable target) are
+    skipped.
     """
 
     def __init__(self) -> None:
         super().__init__()
         self.results: list[dict[str, str]] = []
-        # Which anchor we are currently inside: "title" | "snippet" | None.
+        # Which field we are currently capturing: "title" | "snippet" | None.
         self._mode: str | None = None
+        # The tag that opened the current capture, plus nesting depth, so we
+        # stop only when THAT element closes — not an inner same-name child.
+        self._mode_tag: str | None = None
+        self._depth = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        """Begin capturing when entering a result title/snippet anchor."""
-        if tag != "a":
+        """Begin capturing when entering a result title/snippet element."""
+        if self._mode is not None:
+            # Already capturing: a same-name child only deepens nesting; keep
+            # capturing its text until the original element closes.
+            if tag == self._mode_tag:
+                self._depth += 1
             return
         attr = dict(attrs)
         classes = (attr.get("class") or "").split()
-        if "result__a" in classes:
+        if tag == "a" and "result__a" in classes:
+            # Title (and the URL) always come from the result anchor.
             url = _decode_result_href(attr.get("href") or "")
             if url is not None:
                 self.results.append({"title": "", "url": url, "snippet": ""})
                 self._mode = "title"
-            else:
-                self._mode = None
+                self._mode_tag = tag
+                self._depth = 1
         elif "result__snippet" in classes and self.results:
+            # Snippet may live in any element — DDG has moved it out of the
+            # <a> before — so match on the class, not the tag (drift guard).
             self._mode = "snippet"
+            self._mode_tag = tag
+            self._depth = 1
 
     def handle_data(self, data: str) -> None:
-        """Accumulate anchor text into the current result's title/snippet."""
+        """Accumulate element text into the current result's title/snippet."""
         if self._mode == "title" and self.results:
             self.results[-1]["title"] += data
         elif self._mode == "snippet" and self.results:
             self.results[-1]["snippet"] += data
 
     def handle_endtag(self, tag: str) -> None:
-        """Stop capturing at the end of an anchor."""
-        if tag == "a":
-            self._mode = None
+        """Stop capturing when the element that opened the current field closes."""
+        if self._mode is not None and tag == self._mode_tag:
+            self._depth -= 1
+            if self._depth <= 0:
+                self._mode = None
+                self._mode_tag = None
+                self._depth = 0
 
 
 def _parse_results(html: str) -> list[dict[str, str]]:
