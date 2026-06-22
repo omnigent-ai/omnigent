@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import re
 import subprocess
 import sys
 import tarfile
@@ -4378,6 +4379,32 @@ def test_ensure_sqlite_parent_dir_noop_for_memory_and_non_sqlite(tmp_path: Path)
     assert list(tmp_path.iterdir()) == []
 
 
+def _native_dispatch_kwargs(**overrides: object) -> dict[str, object]:
+    """Build ``_dispatch_native_terminal_harness`` kwargs with safe defaults.
+
+    Keeps the call sites focused on the one or two fields each test exercises,
+    and means a new parameter only updates this helper rather than every test.
+    """
+    base: dict[str, object] = {
+        "harness": "cursor-native",
+        "server": None,
+        "model": None,
+        "prompt": None,
+        "system_prompt": None,
+        "tools": None,
+        "log": False,
+        "debug_events": False,
+        "resume_conversation_id": None,
+        "resume_picker": False,
+        "resume_latest": False,
+        "fork_session_id": None,
+        "ephemeral": False,
+        "auto_open_conversation": False,
+    }
+    base.update(overrides)
+    return base
+
+
 def test_dispatch_native_terminal_harness_cursor_launches_wrapper(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4398,17 +4425,11 @@ def test_dispatch_native_terminal_harness_cursor_launches_wrapper(
     )
 
     handled = _dispatch_native_terminal_harness(
-        harness="cursor-native",
-        server=None,
-        model="composer-2.5",
-        prompt=None,
-        system_prompt=None,
-        resume_conversation_id="conv_abc123",
-        resume_picker=False,
-        resume_latest=False,
-        fork_session_id=None,
-        ephemeral=False,
-        auto_open_conversation=True,
+        **_native_dispatch_kwargs(
+            model="composer-2.5",
+            resume_conversation_id="conv_abc123",
+            auto_open_conversation=True,
+        )
     )
 
     assert handled is True
@@ -4435,44 +4456,110 @@ def test_dispatch_native_terminal_harness_ignores_non_native(
 
     monkeypatch.setattr("omnigent.cli._ensure_backend", _must_not_run)
 
-    handled = _dispatch_native_terminal_harness(
-        harness="openai-agents",
-        server=None,
-        model=None,
-        prompt=None,
-        system_prompt=None,
-        resume_conversation_id=None,
-        resume_picker=False,
-        resume_latest=False,
-        fork_session_id=None,
-        ephemeral=False,
-        auto_open_conversation=False,
-    )
+    handled = _dispatch_native_terminal_harness(**_native_dispatch_kwargs(harness="openai-agents"))
 
     assert handled is False
 
 
+@pytest.mark.parametrize(
+    ("override", "expected_flag"),
+    [
+        ({"prompt": "hi"}, "-p/--prompt"),
+        ({"system_prompt": "be terse"}, "--system-prompt"),
+        ({"tools": "fs"}, "--tools"),
+        ({"log": True}, "--log"),
+        ({"debug_events": True}, "--debug-events"),
+        ({"fork_session_id": "conv_src"}, "--fork"),
+        ({"ephemeral": True}, "--no-session"),
+    ],
+)
 def test_dispatch_native_terminal_harness_rejects_unsupported_flags(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, override: dict[str, object], expected_flag: str
 ) -> None:
-    """One-shot / fork / --continue have no analog in the TUI wrapper — fail loud."""
+    """REPL-only flags have no analog in the TUI wrapper — fail loud, don't drop.
+
+    Covers Copilot's finding that ``--tools`` / ``--log`` / ``--debug-events``
+    were silently ignored on the native-harness path.
+    """
 
     def _must_not_run(_server: str | None) -> str:
         raise AssertionError("_ensure_backend called despite unsupported flags")
 
     monkeypatch.setattr("omnigent.cli._ensure_backend", _must_not_run)
 
-    with pytest.raises(ClickException, match="does not support -p/--prompt"):
-        _dispatch_native_terminal_harness(
+    with pytest.raises(ClickException, match=re.escape(f"does not support {expected_flag}")):
+        _dispatch_native_terminal_harness(**_native_dispatch_kwargs(**override))
+
+
+def test_dispatch_native_terminal_harness_continue_resumes_latest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--continue`` resolves the harness's latest conversation, not an error.
+
+    Regression guard for the resume path: before this, ``--continue`` was listed
+    as unsupported and raised. It must instead resolve the most-recent
+    ``cursor-native-ui`` conversation and hand that to the wrapper as the
+    session id.
+    """
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda _s: "http://localhost:0")
+    seen: dict[str, object] = {}
+
+    def _fake_latest(*, base_url: str, agent_name: str, headers: object) -> str:
+        seen["base_url"] = base_url
+        seen["agent_name"] = agent_name
+        return "conv_latest"
+
+    monkeypatch.setattr("omnigent.chat._resolve_latest_conversation_id", _fake_latest)
+    monkeypatch.setattr("omnigent.chat._remote_headers", lambda **_kw: {})
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        "omnigent.cursor_native.run_cursor_native",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    handled = _dispatch_native_terminal_harness(**_native_dispatch_kwargs(resume_latest=True))
+
+    assert handled is True
+    # Resolved against the cursor-native agent identity, then passed as session_id.
+    assert seen == {"base_url": "http://localhost:0", "agent_name": "cursor-native-ui"}
+    assert captured["session_id"] == "conv_latest"
+
+
+def test_dispatch_native_terminal_harness_explicit_id_skips_latest_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit ``--resume <id>`` wins over ``--continue`` (no latest lookup)."""
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda _s: "http://localhost:0")
+
+    def _must_not_lookup(**_kw: object) -> str:
+        raise AssertionError("latest-conversation lookup ran despite an explicit id")
+
+    monkeypatch.setattr("omnigent.chat._resolve_latest_conversation_id", _must_not_lookup)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        "omnigent.cursor_native.run_cursor_native",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    _dispatch_native_terminal_harness(
+        **_native_dispatch_kwargs(resume_conversation_id="conv_explicit", resume_latest=True)
+    )
+
+    assert captured["session_id"] == "conv_explicit"
+
+
+def test_run_agent_with_native_terminal_harness_is_rejected() -> None:
+    """``run AGENT --harness cursor-native`` is rejected (the TUI is the agent).
+
+    The native TUI ignores the AGENT spec, and routing it through the REPL would
+    double-record every message — so the combination has no coherent meaning.
+    """
+    with pytest.raises(ClickException, match="ignores an AGENT spec"):
+        _dispatch_run(
+            target="examples/hello_world.yaml",
+            tools=None,
             harness="cursor-native",
-            server=None,
             model=None,
-            prompt="hello",
+            prompt=None,
             system_prompt=None,
-            resume_conversation_id=None,
-            resume_picker=False,
-            resume_latest=False,
-            fork_session_id=None,
-            ephemeral=False,
-            auto_open_conversation=False,
         )
