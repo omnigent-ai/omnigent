@@ -4487,8 +4487,11 @@ def test_dispatch_native_terminal_harness_rejects_unsupported_flags(
 
     monkeypatch.setattr("omnigent.cli._ensure_backend", _must_not_run)
 
-    with pytest.raises(ClickException, match=re.escape(f"does not support {expected_flag}")):
+    # The rejected flag is named in the error, and it's framed as "remove them"
+    # (not "use the subcommand" — the subcommand doesn't accept these either).
+    with pytest.raises(ClickException, match=re.escape(expected_flag)) as excinfo:
         _dispatch_native_terminal_harness(**_native_dispatch_kwargs(**override))
+    assert "remove them" in str(excinfo.value)
 
 
 def test_dispatch_native_terminal_harness_continue_resumes_latest(
@@ -4523,6 +4526,28 @@ def test_dispatch_native_terminal_harness_continue_resumes_latest(
     # Resolved against the cursor-native agent identity, then passed as session_id.
     assert seen == {"base_url": "http://localhost:0", "agent_name": "cursor-native-ui"}
     assert captured["session_id"] == "conv_latest"
+
+
+def test_dispatch_native_terminal_harness_continue_with_no_prior_fails_loud(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--continue`` with nothing to continue errors, not a silent fresh start.
+
+    The user explicitly asked to resume; passing the unresolved ``None`` through
+    as ``session_id`` would silently open a new session. Matches the REPL's
+    ``_resolve_resume_target`` "No prior conversation" behavior.
+    """
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda _s: "http://localhost:0")
+    monkeypatch.setattr("omnigent.chat._resolve_latest_conversation_id", lambda **_kw: None)
+    monkeypatch.setattr("omnigent.chat._remote_headers", lambda **_kw: {})
+
+    def _must_not_launch(**_kw: object) -> None:
+        raise AssertionError("wrapper launched despite no conversation to continue")
+
+    monkeypatch.setattr("omnigent.cursor_native.run_cursor_native", _must_not_launch)
+
+    with pytest.raises(ClickException, match="No prior conversation"):
+        _dispatch_native_terminal_harness(**_native_dispatch_kwargs(resume_latest=True))
 
 
 def test_dispatch_native_terminal_harness_explicit_id_skips_latest_lookup(

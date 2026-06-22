@@ -5006,10 +5006,14 @@ def _dispatch_native_terminal_harness(
         if active
     ]
     if unsupported:
+        # These are REPL-only options with no analog in the TUI — and the
+        # dedicated subcommand doesn't accept them either (it would treat them
+        # as passthrough args), so tell the user to drop them rather than
+        # redirect. ``--model`` and session selection (--resume/--continue) ARE
+        # honored here.
         raise click.ClickException(
-            f"`run --harness {harness}` launches the {native_agent.display_name} TUI "
-            f"directly and does not support {', '.join(unsupported)}. "
-            f"Use `omnigent {native_agent.terminal_name}` for those options."
+            f"`run --harness {harness}` launches the {native_agent.display_name} TUI directly; "
+            f"the REPL-only option(s) {', '.join(unsupported)} have no effect there — remove them."
         )
 
     server = _ensure_backend(server)
@@ -5027,6 +5031,13 @@ def _dispatch_native_terminal_harness(
             agent_name=native_agent.agent_name,
             headers=_remote_headers(server_url=server),
         )
+        # The user explicitly asked to continue; if there's nothing to continue,
+        # fail loud rather than silently starting fresh (matches the REPL's
+        # _resolve_resume_target behavior).
+        if session_id is None:
+            raise click.ClickException(
+                f"No prior conversation for agent {native_agent.agent_name!r}."
+            )
 
     common = {
         "server": server,
