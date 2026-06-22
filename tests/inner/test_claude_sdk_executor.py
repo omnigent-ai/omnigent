@@ -100,7 +100,7 @@ class TestConstructor(unittest.TestCase):
         self.assertIsNone(executor._os_env_spec)
         self.assertIsNone(executor._cwd)
         self.assertIsNone(executor._model_override)
-        self.assertEqual(executor._permission_mode, "bypassPermissions")
+        self.assertEqual(executor._permission_mode, "auto")
         self.assertIsNone(executor._tool_executor)
         self.assertEqual(executor._clients, {})
         self.assertEqual(executor._crashed_sessions, {})

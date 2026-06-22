@@ -1099,7 +1099,7 @@ class ClaudeSDKExecutor(Executor):
         cwd: str | None = None,
         os_env: OSEnvSpec | None = None,
         model: str | None = None,
-        permission_mode: str = "bypassPermissions",
+        permission_mode: str = "auto",
         gateway: bool = False,
         databricks_profile: str | None = None,
         gateway_host: str | None = None,
@@ -1123,8 +1123,8 @@ class ClaudeSDKExecutor(Executor):
                 sandbox the Claude CLI process itself on supported Linux
                 hosts, but does not enable native OS tools.
             model: Override the model name.
-            permission_mode: SDK permission mode (default: bypassPermissions
-                so the agent can run autonomously).
+            permission_mode: SDK permission mode (default: auto
+                so the agent runs autonomously with background safety checks).
             gateway: If True, route through a vendor-neutral gateway
                 (base URL + bearer-token command + model). Enables the
                 gateway path regardless of which producer fed it (the
@@ -1890,8 +1890,10 @@ class ClaudeSDKExecutor(Executor):
         # the scaffold's ``dispatch_tool`` path, giving the runner
         # visibility, timeouts, and error recovery.
         #
-        # In ``bypassPermissions`` mode, pre-approve all MCP tools so
-        # the agent can act autonomously without any per-call gate.
+        # In ``auto`` and ``bypassPermissions`` modes, pre-approve all
+        # MCP tools so the agent can act autonomously without a per-call
+        # human-consent gate.  ``auto`` still runs background safety
+        # checks; ``bypassPermissions`` skips all gates entirely.
         # In any other mode (``default``, ``acceptEdits``, etc.), leave
         # ``allowed_tools`` empty so every tool call goes through the
         # SDK's ``can_use_tool`` callback — which routes to the AP
@@ -1899,8 +1901,8 @@ class ClaudeSDKExecutor(Executor):
         # When ``allowed_tools`` is empty the SDK omits ``--allowedTools``
         # entirely, letting Claude's normal permission flow apply.
         allowed_tools: list[str] = []
-        if self._permission_mode == "bypassPermissions":
-            # Allow all Omnigent MCP tools (no per-call gate needed)
+        if self._permission_mode in ("auto", "bypassPermissions"):
+            # Allow all Omnigent MCP tools (no per-call human gate needed)
             for schema in tools:
                 raw_tname = schema.get("name")
                 # Claude SDK's ``allowed_tools`` requires concrete strings;
