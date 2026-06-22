@@ -127,9 +127,7 @@ def resolve_goose_executable(
     command = _configured_goose_command(env)
     resolved = which(command)
     if resolved is None:
-        install_url = (
-            "https://github.com/block/goose/releases/download/stable/download_cli.sh"
-        )
+        install_url = "https://github.com/block/goose/releases/download/stable/download_cli.sh"
         raise click.ClickException(
             "Native Goose requires the 'goose' CLI on PATH. Install it with: "
             f"brew install block-goose-cli (or curl -fsSL {install_url} | bash), "

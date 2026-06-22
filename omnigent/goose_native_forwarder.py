@@ -66,6 +66,7 @@ def _warn_sqlite_once(context: str, exc: sqlite3.Error) -> None:
     _warned_sqlite_errors.add(key)
     _logger.warning("goose forwarder sqlite error during %s: %s", context, exc)
 
+
 # The executor injects ``[Attached: <path>]`` markers for web-UI attachments
 # before pasting into the TUI; strip them from the mirrored bubble (the path is
 # an internal bridge detail).
