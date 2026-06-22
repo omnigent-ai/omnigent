@@ -39,6 +39,7 @@ from .executor import (
     ExecutorError,
     ExecutorEvent,
     Message,
+    ReasoningChunk,
     TextChunk,
     ToolArgs,
     ToolCallComplete,
@@ -1581,6 +1582,15 @@ class _CodexAppServerSession:
                     prior = message_buffers.get(item_id)
                     message_buffers[item_id] = (prior if prior is not None else "") + delta
                     yield TextChunk(text=delta)
+                    continue
+
+                if method in ("item/reasoning/textDelta", "item/reasoning/summaryTextDelta"):
+                    if not _event_turn_matches(params):
+                        continue
+                    raw_reasoning_delta = params.get("delta")
+                    if not isinstance(raw_reasoning_delta, str) or not raw_reasoning_delta:
+                        continue
+                    yield ReasoningChunk(delta=raw_reasoning_delta, event_type="reasoning_text")
                     continue
 
                 if method == "item/completed":

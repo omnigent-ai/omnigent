@@ -54,14 +54,23 @@ export function normalizeResolvedTheme(value: string | undefined): ResolvedTheme
  * click pins dark, the next pins light, and the next returns to
  * following the OS preference.
  *
+ * When the resolved appearance is provided, redundant transitions are
+ * skipped — e.g. "system" already rendering as dark jumps straight to
+ * light instead of offering "Switch to Dark".
+ *
  * @param mode Current selectable theme mode, e.g. `"dark"`.
+ * @param resolvedTheme The actual rendered palette, e.g. `"dark"`.
  * @returns The mode to apply on the next click, e.g. `"light"`.
  */
-export function nextThemeMode(mode: ThemeMode): ThemeMode {
+export function nextThemeMode(mode: ThemeMode, resolvedTheme?: string): ThemeMode {
   const cycle: Record<ThemeMode, ThemeMode> = {
     system: "dark",
     dark: "light",
     light: "system",
   };
-  return cycle[mode];
+  const next = cycle[mode];
+  if (resolvedTheme && next !== "system" && next === resolvedTheme) {
+    return cycle[next];
+  }
+  return next;
 }

@@ -367,7 +367,7 @@ name: my_agent
 prompt: You are a helpful data analyst.
 
 executor:
-  harness: claude-sdk          # or: codex, codex-native, claude-native, cursor, openai-agents, pi, antigravity
+  harness: claude-sdk          # or: claude-native, codex, codex-native, cursor, cursor-native, openai-agents, pi, pi-native, antigravity
 
 tools:
   # A local Python function (schema auto-generated from the signature)

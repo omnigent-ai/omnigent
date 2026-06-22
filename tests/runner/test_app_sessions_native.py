@@ -45,6 +45,7 @@ from omnigent.runner.app import (
     _agent_os_env_from_spec,
     _auto_create_claude_terminal,
     _auto_create_codex_terminal,
+    _auto_create_cursor_terminal,
     _auto_create_pi_terminal,
     _auto_create_repl_terminal,
     _deliver_subagent_wake_post,
@@ -2663,6 +2664,70 @@ async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
     assert closed["client"] is True
     assert closed["app_server"] is True
     assert session_id not in _AUTO_CODEX_APP_SERVERS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exc", "expected_cause"),
+    [
+        (TimeoutError("no thread/started observed"), "startup timed out"),
+        (
+            RuntimeError("event stream ended"),
+            "event stream ended before a thread was created",
+        ),
+    ],
+)
+async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    exc: Exception,
+    expected_cause: str,
+) -> None:
+    """
+    The startup breadcrumb must describe the actual failure mode: a timeout
+    reads as "startup timed out", while a RuntimeError (TUI exited / event
+    stream ended) must NOT be mislabeled as a timeout.
+    """
+    from omnigent import codex_native_forwarder
+    from omnigent.codex_native_bridge import read_bridge_startup_error
+    from omnigent.runner.app import (
+        _AUTO_CODEX_APP_SERVERS,
+        _codex_discover_thread_and_forward,
+    )
+
+    class _Client:
+        async def close(self) -> None:
+            return None
+
+    class _AppServer:
+        async def close(self) -> None:
+            return None
+
+    async def _raise(*_args: object, **_kwargs: object) -> str:
+        raise exc
+
+    monkeypatch.setattr(codex_native_forwarder, "wait_for_thread_started", _raise)
+
+    session_id = "conv_codex_startup_error_test"
+    _AUTO_CODEX_APP_SERVERS[session_id] = _AppServer()
+    try:
+        await _codex_discover_thread_and_forward(
+            session_id=session_id,
+            bridge_dir=tmp_path,
+            codex_ws_url="ws://127.0.0.1:1",
+            codex_home=tmp_path / "codex-home",
+            event_client=_Client(),  # type: ignore[arg-type]
+        )
+    finally:
+        _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+    recorded = read_bridge_startup_error(tmp_path)
+    assert recorded is not None
+    assert expected_cause in recorded
+    assert type(exc).__name__ in recorded
+    # A RuntimeError must never be described as a timeout.
+    if not isinstance(exc, TimeoutError):
+        assert "timed out" not in recorded
 
 
 @pytest.mark.asyncio
@@ -9110,14 +9175,31 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
         on_exit = callbacks.get("on_exit")
         assert callable(on_exit)
         on_exit()
-        # The harness subprocess release is the terminal's last lifecycle step;
-        # wait on it as the settle signal, then inspect the published events.
+        # Terminal-exit cleanup fans out across two independent background
+        # tasks: one publishes the resource events, a second releases the
+        # harness subprocess. Their completion order is not guaranteed, so
+        # settle on BOTH the published ``deleted`` event and the subprocess
+        # release — accumulating drained events each tick — rather than using
+        # the release as a proxy for the publish (which raced: the release
+        # task could finish first, leaving the drain empty).
+        deleted_event = {
+            "type": "session.resource.deleted",
+            "resource_id": "terminal_worker_main",
+            "resource_type": "terminal",
+            "session_id": conv_id,
+        }
+        queued_events: list[dict[str, Any]] = []
+        parent_events: list[dict[str, Any]] = []
         for _ in range(1000):
-            if pm.released:
+            queued_events.extend(
+                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+            )
+            parent_events.extend(
+                _drain_session_event_queue(_session_event_queues_ref.get(parent_id))
+            )
+            if pm.released and deleted_event in queued_events:
                 break
             await asyncio.sleep(0)
-        queued_events = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
-        parent_events = _drain_session_event_queue(_session_event_queues_ref.get(parent_id))
     finally:
         _session_event_queues_ref.pop(conv_id, None)
         _session_event_queues_ref.pop(parent_id, None)
@@ -9127,12 +9209,7 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
 
     # The terminal resource is still removed...
     assert terminal_registry.get(conv_id, "worker", "main") is None
-    assert {
-        "type": "session.resource.deleted",
-        "resource_id": "terminal_worker_main",
-        "resource_type": "terminal",
-        "session_id": conv_id,
-    } in queued_events
+    assert deleted_event in queued_events
     # ...but no failure is published, and the parent is not woken as failed.
     assert [
         event
@@ -10539,6 +10616,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
             session_key: str,
             spec: Any,
             resource_role: str | None = None,
+            parent_os_env: Any = None,
         ) -> SessionResourceView:
             """Record the launch and return a terminal resource view."""
             captured["terminal_name"] = terminal_name
@@ -10569,6 +10647,114 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     assert captured["spec"].command == "pi"
     # The fresh terminal is surfaced on the live stream for the Terminal toggle.
     assert any(evt.get("type") == "session.resource.created" for evt in published)
+
+
+@pytest.mark.asyncio
+async def test_auto_create_pi_terminal_inherits_agent_sandbox(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Pi-native auto-create must honour the agent's ``os_env.sandbox``.
+
+    Regression for the sandbox-override bug: the pi-native auto-create path
+    built a fresh ``TerminalEnvSpec`` whose ``os_env`` carried no ``sandbox``
+    and passed no ``parent_os_env``, so ``launch_required_terminal`` fell back
+    to ``_default_sandbox_for_platform`` (``linux_bwrap`` on Linux) and ignored
+    the agent YAML.  A pi-native agent that declares
+    ``os_env.sandbox.type: none`` was wrongly forced into bwrap, which failed
+    on a hardened host.
+
+    Asserts the launched terminal spec's ``os_env.sandbox`` is the agent's
+    ``none`` sandbox (not the platform default) and that the agent's ``os_env``
+    is threaded through as the launch ``parent_os_env`` so the rest of the
+    policy (egress_rules / env_passthrough) is also inherited.
+
+    :param tmp_path: Pytest-provided temporary directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    import omnigent.pi_native as pi_native
+    import omnigent.pi_native_bridge as pi_native_bridge
+    import omnigent.pi_native_credentials as pi_native_credentials
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+    monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
+    monkeypatch.setattr(pi_native_credentials, "resolve_pi_native_provider", lambda: None)
+
+    async def _fake_launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
+        return _PiNativeLaunchConfig(
+            workspace=tmp_path,
+            server_url="http://127.0.0.1:8000",
+            terminal_launch_args=None,
+            external_session_id=None,
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        """Captures the launched terminal spec and parent os_env."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """Record the spec + parent_os_env and return a resource view."""
+            del terminal_name, session_key
+            captured["spec"] = spec
+            captured["parent_os_env"] = parent_os_env
+            return SessionResourceView(
+                id="terminal_pi_main",
+                type="terminal",
+                session_id=session_id,
+                name="pi:main",
+                metadata={"terminal_name": "pi", "session_key": "main", "running": True},
+            )
+
+    # An agent that declares sandbox: none (runs unconfined; outer
+    # container/VM is the security boundary).
+    agent_os_env = OSEnvSpec(
+        type="caller_process",
+        cwd=".",
+        sandbox=OSEnvSandboxSpec(type="none"),
+    )
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="pi_code",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "pi-native", "model": "pi-default"},
+        ),
+        os_env=agent_os_env,
+    )
+
+    await _auto_create_pi_terminal(
+        "conv_pi_sandbox_none",
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, _evt: None,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        agent_spec=agent_spec,
+    )
+
+    launched_sandbox = captured["spec"].os_env.sandbox
+    assert launched_sandbox is not None, (
+        "auto-create dropped the agent's sandbox; launch_required_terminal will "
+        "fall back to _default_sandbox_for_platform (bwrap), overriding sandbox: none"
+    )
+    assert launched_sandbox.type == "none"
+    # The whole os_env is threaded through as the inheritance parent.
+    assert captured["parent_os_env"] is agent_os_env
 
 
 @pytest.mark.asyncio
@@ -10918,6 +11104,171 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     assert "databricks auth token --fake-helper" in " ".join(spec.args)
 
     await fake_client.aclose()
+
+
+async def _run_auto_create_cursor_terminal(
+    *,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    agent_spec: AgentSpec | None,
+    terminal_launch_args: list[str] | None,
+) -> Any:
+    """Drive ``_auto_create_cursor_terminal`` and return the captured launch spec.
+
+    Stubs the cursor-agent binary lookup, the transcript forwarder, and the
+    runner auth factory so the model-injection branch runs without a real
+    ``cursor-agent`` install or Databricks credentials. The session snapshot
+    (workspace + ``terminal_launch_args``) is served from an in-memory
+    ``httpx.MockTransport``, and a fake registry records the ``spec`` passed to
+    ``launch_required_terminal`` so the test can assert on ``spec.args``.
+    """
+    from omnigent.runner import _entry as _runner_entry
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    monkeypatch.setattr(cursor_native_bridge, "_BRIDGE_ROOT", tmp_path / "cursor-bridge")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr("omnigent.cursor_native.resolve_cursor_executable", lambda: "cursor-agent")
+
+    async def _no_op_forwarder(**kwargs: Any) -> None:
+        del kwargs
+
+    monkeypatch.setattr(
+        "omnigent.cursor_native_forwarder.supervise_cursor_forwarder",
+        _no_op_forwarder,
+    )
+    # The forwarder is stubbed, so the auth it would carry is never used — keep
+    # the factory from reaching for ambient Databricks credentials in tests.
+    monkeypatch.setattr(_runner_entry, "_make_auth_token_factory", lambda *a, **k: None)
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        """Captures the launched terminal spec; no real terminal registry."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """Record the spec and return a terminal resource view."""
+            del terminal_name, session_key, resource_role, parent_os_env
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_cursor_main",
+                type="terminal",
+                session_id=session_id,
+                name="cursor:main",
+                metadata={"terminal_name": "cursor", "session_key": "main", "running": True},
+            )
+
+    snapshot = {"workspace": str(workspace), "terminal_launch_args": terminal_launch_args}
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, json=snapshot)),
+    )
+    try:
+        await _auto_create_cursor_terminal(
+            "conv_cursor_model",
+            _FakeResourceRegistry(),  # type: ignore[arg-type]
+            lambda _sid, _evt: None,
+            server_client=fake_client,
+            ensure_comment_relay=None,
+            agent_spec=agent_spec,
+        )
+    finally:
+        await fake_client.aclose()
+    return captured["spec"]
+
+
+@pytest.mark.asyncio
+async def test_auto_create_cursor_terminal_injects_spec_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spec-pinned cursor model is threaded into the cursor-agent launch args.
+
+    The web-UI / daemon path launches ``cursor-agent`` from the runner, so the
+    session's ``executor.model`` (from ``--model`` or config.yaml ``model:``)
+    must reach the TUI as ``--model <id>`` — the regression #933 fixes.
+    """
+    spec = await _run_auto_create_cursor_terminal(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        agent_spec=AgentSpec(
+            spec_version=1, name="cursor", executor=ExecutorSpec(model="sonnet-4-thinking")
+        ),
+        terminal_launch_args=None,
+    )
+    assert spec.command == "cursor-agent"
+    assert "--model" in spec.args
+    assert spec.args[spec.args.index("--model") + 1] == "sonnet-4-thinking"
+
+
+@pytest.mark.parametrize(
+    "passthrough",
+    [
+        # Both the split (``-- --model X``) and joined (``--model=X``) forms a
+        # user can pass through must suppress injection — otherwise cursor-agent
+        # sees two ``--model`` values and selection is ambiguous.
+        ["--model", "gpt-5"],
+        ["--model=gpt-5"],
+        ["-m", "gpt-5"],
+    ],
+    ids=["split", "joined", "short"],
+)
+@pytest.mark.asyncio
+async def test_auto_create_cursor_terminal_user_model_wins(
+    passthrough: list[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A user-pinned passthrough model wins; the spec model is not injected."""
+    spec = await _run_auto_create_cursor_terminal(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        agent_spec=AgentSpec(
+            spec_version=1, name="cursor", executor=ExecutorSpec(model="sonnet-4-thinking")
+        ),
+        terminal_launch_args=passthrough,
+    )
+    # Exactly the user's args survive — no second ``--model`` / spec model added.
+    assert spec.args.count("--model") == passthrough.count("--model")
+    assert "sonnet-4-thinking" not in spec.args
+
+
+@pytest.mark.parametrize(
+    "spec_model",
+    [None, "", "databricks-claude-opus", "databricks/claude-opus"],
+    ids=["none", "empty", "databricks-dash", "databricks-slash"],
+)
+@pytest.mark.asyncio
+async def test_auto_create_cursor_terminal_omits_model_when_unusable(
+    spec_model: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No usable cursor model id → no ``--model`` (cursor-agent keeps its default).
+
+    Gateway-routed ``databricks-*`` ids are not cursor-agent model ids, so they
+    are dropped rather than passed through (which would error on launch).
+    """
+    spec = await _run_auto_create_cursor_terminal(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        agent_spec=AgentSpec(
+            spec_version=1, name="cursor", executor=ExecutorSpec(model=spec_model)
+        ),
+        terminal_launch_args=None,
+    )
+    assert "--model" not in spec.args
 
 
 @pytest.mark.parametrize(

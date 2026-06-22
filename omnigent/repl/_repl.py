@@ -1422,6 +1422,9 @@ class _SessionsChatReplAdapter:
         if session.agent_name:
             self._agent_name = session.agent_name
         self._bound_runner_id = session.runner_id
+        # Don't clobber a runner if it is revived after timeout
+        if self._runner_recover is None and session.runner_id:
+            self._runner_id = session.runner_id
         self._reasoning_effort = session.reasoning_effort
         self._model_override = session.model_override
         self._llm_model = session.llm_model
@@ -1772,7 +1775,11 @@ class _SessionsChatReplAdapter:
                         flush=True,
                     )
                 async for event in self._client.sessions.stream(self._session_id):
-                    if isinstance(event, _StatusEv) and event.status in ("idle", "failed"):
+                    if isinstance(event, _StatusEv) and event.status in (
+                        "idle",
+                        "waiting",
+                        "failed",
+                    ):
                         turn_done = getattr(self, "_turn_done", None)
                         if turn_done is not None:
                             turn_done.set()
@@ -2883,7 +2890,7 @@ async def run_repl(
                 # a stream-pump reconnect gap or before this REPL
                 # attached is lost — so also re-sync at each turn start.
                 _spawn_metadata_refresh()
-            elif event.status in ("idle", "failed"):
+            elif event.status in ("idle", "waiting", "failed"):
                 from omnigent_client import TextDone
 
                 # A SETUP-phase failure (spec resolution, spawn-env

@@ -33,18 +33,25 @@ import { highlightCode } from "@/components/ai-elements/code-block";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { type Comment } from "@/hooks/useComments";
-import { useFileContent } from "@/hooks/useFileContent";
+import {
+  type FileContentResponse,
+  fileContentToBlob,
+  useFileContent,
+} from "@/hooks/useFileContent";
 import { useCanEdit } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
 import { MarkdownRichTextViewer } from "./MarkdownRichTextViewer";
 import {
   type ActiveSelection,
   type SaveStatus,
+  HTML_PREVIEW_SANDBOX,
   detectLang,
   getSelectionOffsets,
   indexToLine,
   isBinaryPath,
+  isImageFile,
   lineOverlapsSelection,
+  prepareHtmlPreviewDoc,
 } from "./codeViewerHelpers";
 import { renderLineTokens } from "./codeViewerRendering";
 import { TruncatedBanner } from "./TruncatedBanner";
@@ -68,6 +75,74 @@ function MarkdownPreview({ content }: { content: string }) {
   return (
     <div className="px-6 py-4 overflow-auto h-full prose dark:prose-invert prose-sm max-w-none">
       <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// ImageViewer — render an image file via a blob URL
+// ---------------------------------------------------------------------------
+
+// A subtle checkerboard so transparent regions of PNG/WebP/SVG are visible
+// against either light or dark backgrounds.
+const CHECKERBOARD_STYLE: React.CSSProperties = {
+  backgroundImage:
+    "linear-gradient(45deg, rgba(128,128,128,0.15) 25%, transparent 25%)," +
+    "linear-gradient(-45deg, rgba(128,128,128,0.15) 25%, transparent 25%)," +
+    "linear-gradient(45deg, transparent 75%, rgba(128,128,128,0.15) 75%)," +
+    "linear-gradient(-45deg, transparent 75%, rgba(128,128,128,0.15) 75%)",
+  backgroundSize: "16px 16px",
+  backgroundPosition: "0 0, 0 8px, 8px -8px, -8px 0",
+};
+
+function ImageViewer({ data, path }: { data: FileContentResponse; path: string }) {
+  const [url, setUrl] = useState<string | null>(null);
+  const [errored, setErrored] = useState(false);
+
+  // Create the object URL in an effect and revoke it on cleanup so the blob is
+  // released when the file changes or the viewer unmounts (avoids a leak).
+  useEffect(() => {
+    // A truncated image is a partial (corrupt) byte stream — mounting it would
+    // flash a broken-image icon before onError fires. Skip the blob and go
+    // straight to the error/banner UI.
+    if (data.truncated) {
+      setUrl(null);
+      setErrored(true);
+      return;
+    }
+    setErrored(false);
+    const objectUrl = URL.createObjectURL(fileContentToBlob(data));
+    setUrl(objectUrl);
+    return () => URL.revokeObjectURL(objectUrl);
+  }, [data]);
+
+  const filename = path.split("/").pop() ?? path;
+
+  const body = errored ? (
+    <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+      {data.truncated
+        ? "Image is too large to preview (truncated by the server)."
+        : "Unable to render image."}
+    </div>
+  ) : (
+    <div className="flex min-h-0 flex-1 items-center justify-center overflow-auto p-4">
+      {url && (
+        <img
+          src={url}
+          alt={filename}
+          onError={() => setErrored(true)}
+          className="max-h-full max-w-full object-contain"
+          style={CHECKERBOARD_STYLE}
+        />
+      )}
+    </div>
+  );
+
+  if (!data.truncated) return body;
+  return (
+    <div className="flex h-full flex-col">
+      <TruncatedBanner />
+      {body}
     </div>
   );
 }
@@ -361,6 +436,9 @@ export function CodeViewer({
       </div>
     );
   }
+  if (fileQuery.data && isImageFile(path, fileQuery.data.content_type)) {
+    return <ImageViewer data={fileQuery.data} path={path} />;
+  }
   if (fileQuery.data?.encoding === "base64" || isBinaryPath(path)) {
     return (
       <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
@@ -392,8 +470,9 @@ export function CodeViewer({
         <MarkdownPreview content={content} />
       ) : (
         <iframe
-          srcDoc={content}
-          sandbox=""
+          srcDoc={prepareHtmlPreviewDoc(content)}
+          // oxlint-disable-next-line eslint-plugin-react(iframe-missing-sandbox)
+          sandbox={HTML_PREVIEW_SANDBOX}
           title="HTML preview"
           className="w-full h-full border-0"
         />
