@@ -213,7 +213,9 @@ def _content_text(content_json: str) -> str:
     return ""
 
 
-def _message_to_item(msg_id: int, role: object, content_json: object, agent_name: str) -> _MirrorItem | None:
+def _message_to_item(
+    msg_id: int, role: object, content_json: object, agent_name: str
+) -> _MirrorItem | None:
     """Convert one ``messages`` row to a mirror item, or ``None`` to skip it."""
     if not isinstance(role, str) or not isinstance(content_json, str):
         return None
