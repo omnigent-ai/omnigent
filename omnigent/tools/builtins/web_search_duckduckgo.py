@@ -120,7 +120,13 @@ def _parse_results(html: str) -> list[dict[str, str]]:
         whitespace-normalized ``title``, ``url``, and ``snippet``.
     """
     parser = _ResultParser()
-    parser.feed(html)
+    try:
+        parser.feed(html)
+    except Exception:  # malformed markup must never crash search — degrade instead
+        _logger.warning(
+            "DuckDuckGo HTML parse failed; returning any partial results",
+            exc_info=True,
+        )
     out: list[dict[str, str]] = []
     for r in parser.results:
         title = " ".join(r["title"].split())
@@ -168,6 +174,12 @@ def _search_duckduckgo(query: str, config: dict[str, str]) -> str:
         resp.raise_for_status()
     except httpx.HTTPStatusError as exc:
         return f"DuckDuckGo search error: HTTP {exc.response.status_code}"
-    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+    except httpx.HTTPError as exc:
+        # Broad on purpose: a flaky / rate-limiting DDG endpoint raises
+        # RemoteProtocolError / ReadError / DecodingError (peer reset, dropped
+        # body, bad gzip or charset) — all ``httpx.HTTPError`` but NOT
+        # ``TransportError`` — and these must surface as a readable string,
+        # never crash the tool. The HTTPStatusError branch above stays first
+        # so a status code (e.g. the 429 throttle signal) still shows its number.
         return f"DuckDuckGo search error: {exc}"
     return _format_results(_parse_results(resp.text))
