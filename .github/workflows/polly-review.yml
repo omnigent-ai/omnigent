@@ -321,22 +321,22 @@ jobs:
 
           prompt=$(cat /tmp/review_prompt.txt)
 
-          # Run the claude_code sub-agent directly (not the Polly orchestrator).
-          # Polly is an async multi-turn orchestrator: in one-shot mode it
-          # dispatches sub-agents, ends its first turn, and exits — the inbox
-          # notifications never arrive and review_text is always empty.
-          # The claude_code sub-agent is a single-turn REVIEW worker that
-          # completes in one pass and prints the review to stdout.
-          uv run omnigent run examples/polly/agents/claude_code/ \
-            -p "REVIEW: $prompt" \
+          # Run Polly headlessly with -p; it starts a local server, sends
+          # one turn, prints the assistant response, and exits.
+          # --no-session: ephemeral run, no persistent session state.
+          uv run omnigent run examples/polly/ \
+            -p "$prompt" \
             --no-session \
             2>polly-stderr.log \
             | tee /tmp/polly_output.txt \
             || { echo "::warning::Polly review exited non-zero"; cat polly-stderr.log; }
 
-          # Strip any preamble before the sentinel we asked the model to emit.
-          # Fallback: first markdown heading. If neither is found, write empty
-          # string so the post step is skipped.
+          # Strip any sub-agent coordination preamble that leaks before
+          # the actual review.  Primary: look for the sentinel we asked the
+          # model to emit.  Fallback: first markdown heading.  If neither is
+          # found the output is intermediate narration (subagents timed out
+          # before synthesis) — write empty string so the post step is skipped
+          # and raw coordination messages are never posted as a PR comment.
           python3 -c "
           import re, pathlib
           raw = pathlib.Path('/tmp/polly_output.txt').read_text()

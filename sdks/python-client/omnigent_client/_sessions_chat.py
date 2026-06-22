@@ -356,6 +356,28 @@ class SessionsChat:
         # agent_id, so we cache the verdict to avoid hammering
         # ``client.agents.get`` on every ``send()`` call.
         self._tool_callables_validated: bool = False
+        # Set to ``True`` when the most-recently completed turn emitted a
+        # ``session.status: waiting`` event — the signal that the agent
+        # parked on the async-work drain (e.g. polly dispatching sub-agents).
+        # Reset at the start of each :meth:`_collect_query` /
+        # :meth:`await_turn` call so it reflects only the last turn.
+        # Read by the headless multi-turn loop in ``chat.py`` to decide
+        # whether to wait for an inbox auto-wake or fast-exit.
+        self._last_turn_saw_waiting: bool = False
+
+    @property
+    def last_turn_saw_waiting(self) -> bool:
+        """
+        ``True`` if the most-recently completed turn emitted
+        ``session.status: waiting``.
+
+        Set by :meth:`_collect_query` and :meth:`await_turn`; reset at
+        the start of each call so it only reflects the last turn. The
+        headless multi-turn loop in ``chat.py`` reads this to distinguish
+        async orchestrators (need inbox auto-wake) from single-turn agents
+        (can fast-exit after the first turn).
+        """
+        return self._last_turn_saw_waiting
 
     @classmethod
     async def create(
@@ -1089,6 +1111,7 @@ class SessionsChat:
         :raises OmnigentError: Propagated from :meth:`stream` if the
             session does not exist.
         """
+        self._last_turn_saw_waiting = False
         text_parts: list[str] = []
         produced: list[File] = []
 
@@ -1105,6 +1128,8 @@ class SessionsChat:
                     if not text_parts:
                         text_parts.extend(_assistant_text_from_response(event.response.output))
                     break
+                elif isinstance(event, SessionStatusEvent) and event.status == "waiting":
+                    self._last_turn_saw_waiting = True
                 elif isinstance(event, _TURN_TERMINAL_EVENT_TYPES):
                     break
 
@@ -1140,6 +1165,7 @@ class SessionsChat:
         :raises RuntimeError: If a file artifact is observed but no
             ``files_getter`` was wired.
         """
+        self._last_turn_saw_waiting = False
         text_parts: list[str] = []
         produced: list[File] = []
         async for event in self.send(input, files=files):
@@ -1152,6 +1178,8 @@ class SessionsChat:
                 text_parts.extend(_assistant_text_from_response(event.response.output))
             elif isinstance(event, OutputFileDoneEvent):
                 produced.append(await self._fetch_file(event))
+            elif isinstance(event, SessionStatusEvent) and event.status == "waiting":
+                self._last_turn_saw_waiting = True
         return QueryResult(text="".join(text_parts), files=produced)
 
     def _stream_query(

@@ -2258,39 +2258,39 @@ async def _query_sessions_once(
     # sub-agents and are auto-woken by inbox completions across multiple
     # turns.
     #
-    # Fast-exit: refresh() at the TOP of each iteration catches the common
-    # case (single-turn agent, session already idle) with one HTTP round-
-    # trip (~100 ms) instead of waiting up to _PER_TURN_TIMEOUT_S for a
-    # stream subscription to time out.
+    # Fast-exit signal: ``chat.last_turn_saw_waiting`` is set by
+    # ``_collect_query`` / ``await_turn`` when a ``session.status: waiting``
+    # SSE event is observed during that turn. The event is emitted by the
+    # runtime when the agent parks on the async-work drain (i.e. it
+    # dispatched sub-agents and ended its turn to wait for inbox
+    # completions). Single-turn agents never emit this event, so their
+    # flag is always ``False`` and they fast-exit in ~100 ms.
     #
-    # Race window: a turn MAY complete in the gap between the top-of-loop
-    # refresh() showing "waiting" and await_turn() opening its subscription.
-    # The window is O(ms) in practice (subagents take seconds). If it fires,
-    # await_turn() times out, the bottom refresh() shows "idle", and we exit
-    # — the only cost is one _PER_TURN_TIMEOUT_S wait and possibly missing
-    # that turn's text.
+    # Why not refresh() for the fast-exit check: the snapshot API collapses
+    # the fine-grained ``"waiting"`` relay status to ``"idle"`` after the
+    # turn loop exits, even when sub-agents are still running. The SSE event
+    # observed during the turn is the authoritative signal.
     #
-    # Timeouts: 120 s per turn bounds the race-window penalty. A global
-    # 1800 s wall-clock budget caps the loop regardless of turn count.
+    # Per-turn timeout: sub-agents dispatched by an async orchestrator can
+    # take many minutes. _ASYNC_TURN_TIMEOUT_S gives each inbox auto-wake
+    # turn room to arrive; the global _LOOP_TIMEOUT_S caps the total run.
     _MAX_EXTRA_TURNS = 30
-    _PER_TURN_TIMEOUT_S = 120.0
-    _LOOP_TIMEOUT_S = 1800.0
+    _ASYNC_TURN_TIMEOUT_S = 900.0   # 15 min per inbox-wake turn
+    _LOOP_TIMEOUT_S = 1800.0        # 30 min total
 
     async def _drain_extra_turns() -> None:
         for _ in range(_MAX_EXTRA_TURNS):
-            # Fast-exit for single-turn agents.
-            await chat.refresh()
-            if chat.status not in ("waiting", "running", "launching"):
+            # Fast-exit: if the previous turn never parked on the async
+            # drain, there are no pending sub-agents that could auto-wake
+            # this session. Single-turn agents always exit here.
+            if not chat.last_turn_saw_waiting:
                 return
-            # Session still active; subscribe before the next check to
-            # reduce (not eliminate) the race where a turn completes
-            # between refresh and subscribe.
-            extra = await chat.await_turn(timeout=_PER_TURN_TIMEOUT_S)
+            # Previous turn dispatched sub-agents; wait for the inbox
+            # auto-wake that triggers the synthesis turn. Use a generous
+            # timeout because sub-agents may run for several minutes.
+            extra = await chat.await_turn(timeout=_ASYNC_TURN_TIMEOUT_S)
             if extra.text:
                 all_text_parts.append(extra.text)
-            await chat.refresh()
-            if chat.status not in ("waiting", "running", "launching"):
-                return
         logger.warning(
             "headless -p hit the %d-turn guard for session %s; "
             "the orchestrator may still be running",
