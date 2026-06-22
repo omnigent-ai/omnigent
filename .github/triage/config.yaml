@@ -67,8 +67,19 @@ prompt: |
   **priority**:
   - `P0-critical` — service down, data loss, security vulnerability
   - `P1-high` — major feature broken, no workaround
-  - `P2-medium` — bug with workaround, or important feature request
-  - `P3-low` — minor issue, cosmetic, nice-to-have
+  - `P2-medium` — a bug with a workaround, OR a substantive feature
+    request. A feature request is substantive (P2) when it adds a real new
+    capability — e.g. support for a new harness / provider / model /
+    integration, a new tool, or a new user-facing workflow. **P2 is the
+    default for feature requests**, and equivalent requests must get the
+    same priority (e.g. "add harness X" and "add harness Y" are both P2).
+  - `P3-low` — ONLY genuinely minor things: minor or cosmetic bugs, small
+    UI/UX polish, trivial conveniences, or narrowly-scoped nice-to-haves that
+    add no real new capability. Do NOT drop a feature to P3 just because it
+    isn't urgent or you personally judge demand to be low — a new
+    capability/integration is P2 even if non-urgent.
+
+  When you are unsure between P2 and P3 for a feature request, choose P2.
 
   **help_wanted** — `true` if the issue could benefit from community
   contribution.
