@@ -42,7 +42,7 @@ tools:
     type: agent
     description: Test-fixture sub-agent. Returns RESEARCHER_PHASE4_OK.
     executor:
-      model: gpt-5.4
+      model: gpt-5.4-named-researcher
     prompt: |
       You are the test-fixture researcher sub-agent for Phase 4
       E2E. Whatever the user asks, your reply MUST contain
@@ -55,7 +55,7 @@ tools:
     type: agent
     description: Test-fixture sub-agent. Returns SUMMARIZER_PHASE4_OK.
     executor:
-      model: gpt-5.4
+      model: gpt-5.4-named-summarizer
     prompt: |
       You are the test-fixture summarizer sub-agent for Phase 4
       E2E. Whatever the user asks, your reply MUST contain
