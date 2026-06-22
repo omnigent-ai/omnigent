@@ -12,10 +12,10 @@
 # Used by the issue triage workflow for P0/P1 auto-assignment.
 bbqiu server,runner,harnesses,repr
 daniellok-db server,runner,harnesses,web-ui
-dhruv0811 server,runner,harnesses,repr,infra
-fanzeyi server,runner,harnesses,repr
+dhruv0811 server,runner,harnesses,repr,infra,tui
+fanzeyi server,runner,harnesses,repr,tui
 PattaraS server,runner,harnesses,infra
-SabhyaC26 server,runner,harnesses,repr
-TomeHirata server,runner,harnesses,policies,infra
+SabhyaC26 server,runner,harnesses,repr,tui
+TomeHirata server,runner,harnesses,policies,infra,tui
 serena-ruan server,runner,harnesses,web-ui,infra
 hzub web-ui
