@@ -571,6 +571,109 @@ def _allow_all_edits_eligible(tool_name: str, permission_mode: str | None) -> bo
     )
 
 
+# Tools that own a dedicated approval affordance and therefore must NOT
+# get the generic "don't ask again" (persistent allow-rule) button:
+# ``ExitPlanMode`` (plan-review card with its own auto-mode action) and
+# ``AskUserQuestion`` (interactive answer form, not a yes/no gate). Edit
+# tools are excluded separately via ``_CLAUDE_NATIVE_EDIT_TOOLS`` — they
+# take the ``setMode``/``acceptEdits`` path instead of an allow rule.
+_CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS: frozenset[str] = frozenset(
+    {"ExitPlanMode", "AskUserQuestion"}
+)
+
+
+def _allow_remember_eligible(tool_name: str, permission_mode: str | None) -> bool:
+    """
+    Whether a claude-native PermissionRequest may offer / honor the
+    persistent "don't ask again" affordance — a session-scoped allow
+    rule for the gated tool (WebFetch domain, or tool-wide otherwise).
+
+    This restores native Claude Code parity for NON-edit tools: the
+    native TUI lets the user approve a tool/domain once and adds an
+    allow rule so same-scope calls stop prompting. The web UI used to
+    collapse every prompt into binary Approve/Reject and never wrote a
+    rule, so e.g. each WebFetch — even same-domain github.com URLs —
+    re-prompted forever.
+
+    Eligible for any tool that ISN'T an edit tool (those take the
+    ``acceptEdits`` ``setMode`` path) and isn't one of the tools with a
+    bespoke card (see ``_CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS``),
+    under any mode that still prompts. ``bypassPermissions`` never
+    prompts (the hook doesn't even fire), so a rule there would be
+    inert. Used at BOTH the stamp site (drives the UI button) and the
+    verdict site (gates the ``addRules`` decision), so the server never
+    honors a client-supplied ``remember`` flag on a tool/mode the
+    affordance was never offered for.
+
+    :param tool_name: The gated tool from Claude's PermissionRequest
+        payload, e.g. ``"WebFetch"`` or ``"Bash"``.
+    :param permission_mode: Claude's current permission mode from the
+        payload, e.g. ``"default"`` / ``"plan"`` / ``"acceptEdits"`` /
+        ``None`` when absent.
+    :returns: ``True`` iff the affordance applies.
+    """
+    return (
+        tool_name not in _CLAUDE_NATIVE_EDIT_TOOLS
+        and tool_name not in _CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS
+        and permission_mode != "bypassPermissions"
+    )
+
+
+def _claude_native_remember_host(tool_name: str, tool_input: Any) -> str | None:
+    """
+    Derive the domain host that a WebFetch "don't ask again" rule should
+    scope to, from the gated tool's input.
+
+    For ``WebFetch`` the persistent rule is scoped to the request's
+    host (``WebFetch(domain:<host>)`` in Claude rule syntax), so
+    approving ``https://github.com/a/b`` stops prompting for
+    ``https://github.com/c/d`` too — but not for other domains. Any
+    other tool (or a WebFetch with a missing/unparseable URL) returns
+    ``None``, which the callers treat as a tool-wide scope.
+
+    Only ``http`` / ``https`` URLs yield a domain scope: WebFetch
+    domain permissions are semantically HTTP(S)-oriented, so a
+    non-HTTP scheme (``ftp://``, ``file://``, …) falls back to a
+    tool-wide rule rather than persisting a ``domain:<host>`` that
+    would never match a real fetch.
+
+    :param tool_name: The gated tool from Claude's PermissionRequest
+        payload.
+    :param tool_input: The tool's input dict (``None``/non-dict tolerated).
+    :returns: The lowercased host (no port), bracketed when it is an IPv6
+        literal (``[2001:db8::1]``), or ``None`` when no domain scope
+        applies.
+    """
+    if tool_name != "WebFetch" or not isinstance(tool_input, dict):
+        return None
+    url = tool_input.get("url")
+    if not isinstance(url, str) or not url:
+        return None
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return None
+    if parsed.scheme.lower() not in ("http", "https"):
+        return None
+    host = parsed.hostname
+    if not host:
+        return None
+    # urlparse already lowercases ``hostname`` and strips the port and
+    # any userinfo; lower() again makes the documented invariant explicit.
+    host = host.lower()
+    # urlparse strips the brackets off an IPv6 literal authority
+    # (``[2001:db8::1]`` → ``2001:db8::1``), but Claude's
+    # ``domain:<host>`` rule grammar is colon-delimited, so a bare
+    # colon-laden IPv6 atom persists a broken/inert rule (the user
+    # clicks "don't ask again" and keeps getting prompted). A registered
+    # domain name can never contain a colon, so a ``:`` here is an
+    # unambiguous IPv6 literal — re-bracket it so the emitted rule is
+    # ``domain:[2001:db8::1]``.
+    if ":" in host:
+        return f"[{host}]"
+    return host
+
+
 # Server-side wait budget for Codex app-server requests forwarded by
 # ``omnigent codex``. Held at one day like the Claude permission hook:
 # a terminal-side answer ends the wait early via the app-server's
@@ -597,6 +700,10 @@ _HARNESS_ELICITATION_REPARK_GRACE_S = 10.0
 # Client-supplied re-attach ids, namespaced so they cannot collide
 # with Codex deterministic ids or server-minted ids.
 _CLAUDE_HOOK_ELICITATION_ID_RE = re.compile(r"^elicit_claude_[0-9a-f]{32}$")
+# Stable re-attach id for ``POST /policies/evaluate`` retries. Allows the
+# server to re-park the existing ASK elicitation rather than minting a new
+# approval card when a transient 5xx or connect-drop triggered a retry.
+_EVALUATE_HOOK_ELICITATION_ID_RE = re.compile(r"^elicit_evaluate_[0-9a-f]{32}$")
 
 # Cap on reaping a cancelled disconnect/terminal-resolved race task in
 # the harness-elicitation gate's cleanup. Reaping normally completes in
@@ -3644,6 +3751,7 @@ async def _hold_native_ask_gate(
     engine: PolicyEngine,
     result: PolicyResult,
     conversation_store: ConversationStore,
+    elicitation_id: str | None = None,
 ) -> bool:
     """
     Hold a server-side ASK gate until a human resolves it.
@@ -3686,6 +3794,13 @@ async def _hold_native_ask_gate(
         the reason, deciding_policy, and withheld set_labels.
     :param conversation_store: Store used to mirror child-session
         prompts into ancestor streams.
+    :param elicitation_id: Optional stable re-attach id from the
+        calling hook, e.g. ``"elicit_evaluate_abc123"``. When supplied,
+        ``_publish_and_wait_for_harness_elicitation`` re-attaches to the
+        existing parked elicitation rather than publishing a new card —
+        used by ``POST /policies/evaluate`` retries so a hook retry after
+        a transient 5xx / connect-drop does not prompt the human twice.
+        ``None`` mints a fresh id (the default for non-retry callers).
     :returns: ``True`` iff a human accepted; ``False`` on decline /
         cancel / timeout / disconnect (fail closed).
     """
@@ -3701,11 +3816,11 @@ async def _hold_native_ask_gate(
     )
     # Per-policy ``ask_timeout`` override wins over the spec-level default.
     timeout_s = float(resolve_ask_timeout(engine, result))
-    # Mint the id up front so we can also surface this ASK in the native
-    # terminal (a tmux popup) before parking on the web verdict; both
-    # surfaces resolve the same id, so whichever answers first releases the
-    # gate.
-    elicitation_id = f"elicit_{secrets.token_hex(16)}"
+    # Use the caller-supplied id when present (hook retries re-attach to
+    # the same elicitation); otherwise mint a fresh one so we can surface
+    # this ASK in the native terminal before parking on the web verdict.
+    if elicitation_id is None:
+        elicitation_id = f"elicit_{secrets.token_hex(16)}"
     _spawn_native_approval_popup_forward(
         session_id, elicitation_id, params.message, result.deciding_policy
     )
@@ -7563,19 +7678,30 @@ async def _forward_event_to_runner(
             _resolve_message_content,
         )
 
-        try:
-            forwarded_data["content"] = _resolve_message_content(
-                forwarded_data["content"],
-                file_store,
-                artifact_store,
-                session_id=session_id,
-            )
-        except (ValueError, KeyError):
-            _logger.warning(
-                "File reference resolution failed for session=%s",
-                session_id,
-                exc_info=True,
-            )
+        _unresolved = [
+            b for b in forwarded_data["content"] if isinstance(b, dict) and "file_id" in b
+        ]
+        if _unresolved:
+            try:
+                forwarded_data["content"] = _resolve_message_content(
+                    forwarded_data["content"],
+                    file_store,
+                    artifact_store,
+                    session_id=session_id,
+                )
+                _logger.debug(
+                    "Resolved %d file_id block(s) for session=%s before forwarding",
+                    len(_unresolved),
+                    session_id,
+                )
+            except (ValueError, KeyError):
+                _logger.warning(
+                    "File reference resolution failed for session=%s "
+                    "(unresolved file_id blocks will reach the runner unresolved — "
+                    "runner will attempt fallback resolution)",
+                    session_id,
+                    exc_info=True,
+                )
 
     # Flatten SessionEventInput {type, data} into the runner's
     # discriminated-union shape {type, ...data_fields}. The runner's
@@ -9012,7 +9138,7 @@ async def _register_policy_elicitation(
         message=result.reason or "Approval required",
         requested_schema={},
         phase=Phase.TOOL_CALL.value,
-        policy_name=result.deciding_policy or "unknown",
+        policy_names=result.deciding_policies or ["unknown"],
         content_preview=arguments_preview[:1024],
     )
     # Approval state lives on the runner (in-memory
@@ -10601,6 +10727,8 @@ async def _create_session_from_existing_agent(
     user_id: str | None = None,
     permission_store: PermissionStore | None = None,
     liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None = None,
+    file_store: FileStore | None = None,
+    artifact_store: ArtifactStore | None = None,
 ) -> SessionResponse:
     """
     Create a session bound to an already-registered agent.
@@ -10626,6 +10754,10 @@ async def _create_session_from_existing_agent(
         ``parent_session_id`` and session-scoped ``agent_id``.
     :param liveness_lookup: Optional session-scoped liveness lookup
         to populate ``SessionResponse.runner_online``.
+    :param file_store: Optional file metadata store for resolving
+        ``file_id`` references in ``initial_items`` before forwarding
+        to the runner.
+    :param artifact_store: Optional binary content store for the same.
     :returns: The newly created session snapshot.
     :raises OmnigentError: 404 if no agent matches ``body.agent_id``;
         403/404 if ``parent_session_id`` or session-scoped ``agent_id``
@@ -10898,6 +11030,8 @@ async def _create_session_from_existing_agent(
                     conversation_store,
                     runner_client,
                     agent_name=agent.name,
+                    file_store=file_store,
+                    artifact_store=artifact_store,
                     created_by=_attribution_user(user_id),
                 )
     # Re-read rather than reusing the local ``conv``: the label-only branch
@@ -12202,6 +12336,8 @@ def create_sessions_router(
             user_id=user_id,
             permission_store=permission_store,
             liveness_lookup=liveness_lookup,
+            file_store=file_store,
+            artifact_store=artifact_store,
         )
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.
@@ -13981,11 +14117,13 @@ def create_sessions_router(
                 "PermissionRequest hook body 'tool_input' must be an object when present.",
                 code=ErrorCode.INVALID_INPUT,
             )
-        # ``tool_use_id`` is not stable on Claude Code's
-        # PermissionRequest payload, and newer builds can write the
-        # transcript ``function_call`` (tool_use) before this hook
-        # returns — so neither can correlate/resolve the parked
-        # request. The parked wait ends on one of three signals: an
+        # Claude Code's PermissionRequest payload carries no
+        # ``tool_use_id`` (verified against a real payload — the field
+        # is absent, not merely unstable; the id is only minted when the
+        # tool call is emitted, AFTER this permission check). And newer
+        # builds can write the transcript ``function_call`` (tool_use)
+        # before this hook returns — so neither can correlate/resolve the
+        # parked request. The parked wait ends on one of three signals: an
         # explicit web verdict, hook disconnect, or the mirrored
         # ``function_call_output`` (tool_result) for this gated tool,
         # which — unlike the tool_use — is written only AFTER the
@@ -14020,12 +14158,29 @@ def create_sessions_router(
             extras["cwd"] = cwd
         if permission_mode is not None:
             extras["permission_mode"] = permission_mode
-        # Stamp the "Accept & allow all edits" hint (drives the UI's
-        # third button) only for edit-tool prompts under a still-prompting
-        # mode — see _allow_all_edits_eligible. The verdict site re-checks
-        # the same predicate before honoring the flag.
+        # The card offers ONE persistent-approval affordance, picked by
+        # the gated tool — the two hints below are mutually exclusive
+        # (disjoint eligibility), never two buttons competing on one card.
+        #
+        # Edit tools → "Accept & allow all edits" (switches the session to
+        # acceptEdits via setMode). Stamped only for edit-tool prompts
+        # under a still-prompting mode — see _allow_all_edits_eligible.
+        # The verdict site re-checks the same predicate before honoring it.
         if _allow_all_edits_eligible(tool_name, permission_mode):
             extras["allow_all_edits"] = True
+        # Non-edit eligible tools → "don't ask again" (installs a
+        # session-scoped allow rule via addRules). Stamped only when the
+        # affordance applies — see _allow_remember_eligible.
+        # ``remember_scope`` carries the gated tool and, for WebFetch, the
+        # request host so the UI can label the button ("… for github.com"
+        # vs "… for WebFetch"); the verdict site re-derives the same scope
+        # before honoring the flag, never trusting a client-supplied rule.
+        if _allow_remember_eligible(tool_name, permission_mode):
+            remember_scope: dict[str, Any] = {"tool": tool_name}
+            remember_host = _claude_native_remember_host(tool_name, tool_input)
+            if remember_host is not None:
+                remember_scope["host"] = remember_host
+            extras["remember_scope"] = remember_scope
         # When Claude's built-in AskUserQuestion tool is the one
         # needing permission, the PermissionRequest payload
         # already carries the full questions + options structure
@@ -14156,6 +14311,43 @@ def create_sessions_router(
             decision["updatedPermissions"] = [
                 {"type": "setMode", "mode": "default", "destination": "session"}
             ]
+        # "Approve & don't ask again" — the user approved this non-edit
+        # tool AND asked to stop prompting for the same scope. Echo an
+        # ``addRules`` permission update so Claude Code installs a
+        # session-scoped allow rule, exactly as the native TUI's "don't
+        # ask again" option does. The shape matches the Agent SDK's
+        # ``PermissionUpdate`` union (``addRules``): ``rules`` is a list
+        # of ``{toolName, ruleContent?}`` — ``ruleContent`` omitted means
+        # the whole tool; ``destination: "session"`` scopes it to this
+        # session so it resets on the next one. The claude-native hook
+        # forwards this decision verbatim to Claude Code.
+        #
+        # The host is re-derived server-side from the gated tool's input
+        # rather than trusting any client-supplied rule, and gated by the
+        # same ``_allow_remember_eligible`` predicate the button was
+        # offered under — so a forged ``remember`` flag on an ineligible
+        # tool (e.g. an edit tool, which takes the setMode path) can't
+        # smuggle in an allow rule. Mutually exclusive with the edit-tool
+        # ``allow_all_edits``/ExitPlanMode branches above (disjoint tool
+        # sets), so it never overwrites their ``updatedPermissions``.
+        if (
+            behavior == "allow"
+            and isinstance(result.content, dict)
+            and result.content.get("remember") is True
+            and _allow_remember_eligible(tool_name, permission_mode)
+        ):
+            rule: dict[str, Any] = {"toolName": tool_name}
+            remember_host = _claude_native_remember_host(tool_name, tool_input)
+            if remember_host is not None:
+                rule["ruleContent"] = f"domain:{remember_host}"
+            decision["updatedPermissions"] = [
+                {
+                    "type": "addRules",
+                    "rules": [rule],
+                    "behavior": "allow",
+                    "destination": "session",
+                }
+            ]
         body = {
             "hookSpecificOutput": {
                 "hookEventName": "PermissionRequest",
@@ -14254,6 +14446,20 @@ def create_sessions_router(
                 f"Expected one of {list(_PROTO_EVENT_TYPE_TO_PHASE)}.",
                 code=ErrorCode.INVALID_INPUT,
             )
+        # Optional stable re-attach id for hook retries. Validated but not
+        # required — absent on non-retrying callers (old hooks, direct API use).
+        raw_elicitation_id = payload.get("_omnigent_elicitation_id")
+        hook_elicitation_id: str | None = None
+        if raw_elicitation_id is not None:
+            if not isinstance(raw_elicitation_id, str) or not (
+                _EVALUATE_HOOK_ELICITATION_ID_RE.fullmatch(raw_elicitation_id)
+            ):
+                raise OmnigentError(
+                    "Policy evaluate '_omnigent_elicitation_id' must match "
+                    "'elicit_evaluate_' + 32 hex chars.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            hook_elicitation_id = raw_elicitation_id
         data = event.get("data") or {}
 
         conv = conversation_store.get_conversation(session_id)
@@ -14369,6 +14575,7 @@ def create_sessions_router(
                             engine=engine,
                             result=result,
                             conversation_store=conversation_store,
+                            elicitation_id=hook_elicitation_id,
                         )
                         verdict_body: dict[str, Any] = (
                             {"result": "POLICY_ACTION_ALLOW"}
@@ -18177,30 +18384,31 @@ async def _get_session_snapshot(
     if runner_client is None:
         runner_client = get_runner_client()
 
-    status = _session_status_cache.get(session_id)
-    if status is None:
-        # Cache miss: either the server restarted, or the relay
-        # has not yet published the first ``"running"`` event
-        # for a freshly bound session (the relay's GET /stream
-        # is still in its tunnel handshake). Ask the runner for
-        # live status so we don't synthesize a stale ``"idle"``
-        # while a turn is actually in flight.
-        if runner_client is not None:
+    status = _session_status_from_cache(session_id)
+    if status == "idle":
+        # Cache miss (or truly idle): either the server restarted, or the
+        # relay has not yet published the first ``"running"`` event for a
+        # freshly bound session (the relay's GET /stream is still in its
+        # tunnel handshake). Ask the runner for live status so we don't
+        # synthesize a stale ``"idle"`` while a turn is actually in flight.
+        # ``_session_status_from_cache`` already collapses the fine-grained
+        # relay values (``"waiting"`` → ``"running"``), so the raw cache value
+        # is only needed here when it is actually missing (None).
+        if _session_status_cache.get(session_id) is None and runner_client is not None:
             try:
                 resp = await runner_client.get(
                     f"/v1/sessions/{session_id}",
                     timeout=5.0,
                 )
                 if resp.status_code == 200:
-                    status = resp.json().get("status", "idle")
-                    _session_status_cache[session_id] = status
+                    raw = resp.json().get("status", "idle")
+                    _session_status_cache[session_id] = raw
+                    status = _session_status_from_cache(session_id)
             except httpx.HTTPError:
                 _logger.debug(
                     "Runner status query failed for %s",
                     session_id,
                 )
-        if status is None:
-            status = "idle"
     # last_total_tokens and last_task_error come from the context-tokens
     # label written by the forwarder (tasks table has been removed).
     last_total_tokens: int | None = None

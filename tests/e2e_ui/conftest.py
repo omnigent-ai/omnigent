@@ -2,8 +2,9 @@
 
 The suite spawns a real ``omnigent server --agent`` subprocess against
 ``examples/hello_world.yaml`` and drives the rendered SPA with
-Playwright. The agent calls a real LLM, so the suite is excluded from
-the default ``pytest`` run via ``--ignore=tests/e2e_ui`` in
+Playwright. The server is wired to a mock LLM server so the suite
+runs deterministically without real credentials. The suite is excluded
+from the default ``pytest`` run via ``--ignore=tests/e2e_ui`` in
 ``pyproject.toml`` and gated to ``workflow_dispatch`` in CI for now.
 
 Local usage::
@@ -31,6 +32,7 @@ pytest tmp dir so the test never touches the user's default
 
 from __future__ import annotations
 
+import contextlib
 import io
 import os
 import signal
@@ -38,8 +40,9 @@ import socket
 import subprocess
 import sys
 import tarfile
+import textwrap
 import time
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -89,17 +92,19 @@ _BUILD_OUTPUT = _REPO_ROOT / "omnigent" / "server" / "static" / "web-ui"
 # validator at registration time (no shim defaults applied), so the
 # YAML must carry an explicit ``executor`` block — otherwise the
 # server rejects with ``executor.config.harness: required when
-# executor.type is 'omnigent'``. The legacy ``serve --omnigent`` path
-# filled ``model: databricks-gpt-5-4`` in via ``_apply_overrides_to_yaml``
-# and let harness auto-pick resolve it to ``openai-agents``; we mirror
-# the same effective config here so the test agent is byte-identical
-# to what the previous fixture spawned.
+# executor.type is 'omnigent'``. The model name (gpt-4o-mini) is a plain
+# (non-``databricks-``) name on purpose: the openai-agents harness then
+# resolves no provider auth and falls back to ``OPENAI_BASE_URL`` (the
+# in-process mock) rather than routing to the Databricks gateway, which
+# would need real credentials CI does not have. A ``databricks-``-prefixed
+# model forces Databricks DEFAULT-profile auth (see
+# omnigent/runtime/workflow.py) and fails with DatabricksAuthError in CI.
 _TEST_AGENT_YAML = """\
 name: hello_world
 prompt: You are a friendly assistant. Say hello and answer questions.
 
 executor:
-  model: databricks-gpt-5-4
+  model: gpt-4o-mini
   config:
     harness: openai-agents
 
@@ -166,7 +171,7 @@ name: {_FILES_PROBE_NO_ENV_AGENT_NAME}
 prompt: You are a terse assistant with no filesystem.
 
 executor:
-  model: databricks-gpt-5-4
+  model: gpt-4o-mini
   config:
     harness: openai-agents
 """
@@ -175,7 +180,7 @@ name: {_FILES_PROBE_ENV_AGENT_NAME}
 prompt: You are a terse assistant with a filesystem.
 
 executor:
-  model: databricks-gpt-5-4
+  model: gpt-4o-mini
   config:
     harness: openai-agents
 
@@ -255,6 +260,18 @@ def browser_type_launch_args(
         launch_args["headless"] = True
     elif not pytestconfig.getoption("--headed", default=False):
         launch_args.setdefault("headless", True)
+    # The pinned Playwright Docker image (the visual-snapshot renderer, both in
+    # ui-snapshot.yml and the local regen script) runs as root, where Chromium
+    # refuses to start without --no-sandbox; --disable-dev-shm-usage avoids the
+    # container's small /dev/shm. Neither flag changes rasterized output, so a
+    # baseline stays identical to a sandboxed run. Env-gated so the unpinned
+    # e2e-ui runners (non-root) are unaffected.
+    if os.environ.get("OMNIGENT_PW_NO_SANDBOX"):
+        launch_args["args"] = [
+            *launch_args.get("args", []),
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+        ]
     return launch_args
 
 
@@ -392,6 +409,144 @@ def _find_free_port() -> int:
         f"Could not find a free e2e UI port outside dev ports "
         f"{sorted(DEV_PORTS)} after {max_attempts} attempts"
     )
+
+
+# ---------------------------------------------------------------------------
+# Mock LLM server fixtures and helpers
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def mock_llm_server_url(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[str]:
+    """Start a mock LLM server for the test session.
+
+    The mock server is a lightweight FastAPI/uvicorn subprocess that
+    serves an OpenAI-compatible ``/v1/`` endpoint. The ``live_server``
+    fixture points the spawned omnigent server at this URL so all agent
+    LLM calls hit the mock rather than a real provider.
+
+    :param tmp_path_factory: Pytest temp path factory for logs.
+    :returns: The mock server base URL, e.g. ``"http://127.0.0.1:51235"``.
+    """
+    mock_port = _find_free_port()
+    mock_log = tmp_path_factory.mktemp("mock_llm_logs") / "mock_llm.log"
+    log_handle = open(mock_log, "w")  # noqa: SIM115
+
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(_REPO_ROOT / "tests" / "server" / "integration" / "mock_llm_server.py"),
+            str(mock_port),
+        ],
+        env={**os.environ, "PYTHONPATH": str(_REPO_ROOT)},
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+    )
+    base_url = f"http://127.0.0.1:{mock_port}"
+
+    # Wait for the mock server to be ready
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        try:
+            resp = httpx.get(f"{base_url}/stats", timeout=1.0)
+            if resp.status_code == 200:
+                break
+        except httpx.ConnectError:
+            # Expected while the mock server is still booting.
+            pass
+        time.sleep(0.1)
+    else:
+        proc.kill()
+        log_handle.close()
+        log_contents = mock_log.read_text() if mock_log.exists() else ""
+        raise RuntimeError(
+            f"Mock LLM server didn't start within 10s.\nLog at {mock_log}:\n{log_contents[-2000:]}"
+        )
+
+    try:
+        yield base_url
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        log_handle.close()
+
+
+def configure_mock_llm(
+    mock_url: str,
+    responses: list[dict[str, Any]],
+    *,
+    key: str = "default",
+    match: str | None = None,
+) -> None:
+    """Configure a keyed response queue on the mock LLM server.
+
+    Each dict in *responses* maps to a ``QueuedResponse`` on the mock
+    server. The *key* determines which queue the responses are stored in
+    — the mock server routes each request to the queue whose key matches
+    the request's ``model`` field. When *match* is set, the queue fires
+    whenever the user text contains that substring, regardless of model.
+
+    :param mock_url: Mock server base URL.
+    :param responses: List of response configs. Keys:
+        ``text``, ``tool_calls``, ``block``, ``stream``,
+        ``error``, ``status_code``.
+    :param key: Queue key — typically the model name baked into the
+        agent spec. Defaults to ``"default"`` (matches any model
+        not assigned to a more specific queue).
+    :param match: Optional substring to match against the user text for
+        content-based routing (in addition to model-name routing).
+    """
+    body: dict[str, Any] = {"key": key, "responses": responses}
+    if match is not None:
+        body["match"] = match
+    resp = httpx.post(
+        f"{mock_url}/mock/configure",
+        json=body,
+        timeout=5.0,
+    )
+    resp.raise_for_status()
+
+
+def reset_mock_llm(mock_url: str) -> None:
+    """Clear all regular keyed queues, captured requests, and gates.
+
+    Fallbacks set via :func:`set_fallback_mock_llm` are preserved.
+
+    :param mock_url: Mock server base URL.
+    """
+    resp = httpx.post(f"{mock_url}/mock/reset", timeout=5.0)
+    resp.raise_for_status()
+
+
+def set_fallback_mock_llm(
+    mock_url: str,
+    key: str,
+    text: str,
+) -> None:
+    """Set a non-resettable fallback response for a queue key.
+
+    The fallback is returned when the regular queue for *key* is
+    exhausted. Unlike regular entries, the fallback survives
+    :func:`reset_mock_llm` — use it for session-level queues that
+    must return a valid response even when per-test resets clear the
+    regular queue (e.g. the server-level policy-classifier LLM queue).
+
+    :param mock_url: Mock server base URL.
+    :param key: Queue key (typically the server's ``llm.model``).
+    :param text: Fallback response text.
+    """
+    resp = httpx.post(
+        f"{mock_url}/mock/set_fallback",
+        json={"key": key, "text": text},
+        timeout=5.0,
+    )
+    resp.raise_for_status()
 
 
 @pytest.fixture(scope="session")
@@ -541,6 +696,7 @@ def _spawn_runner_against_external_server(
 @pytest.fixture(scope="session")
 def live_server(
     built_spa: None,
+    mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
     request: pytest.FixtureRequest,
 ) -> Iterator[str]:
@@ -554,13 +710,15 @@ def live_server(
     Teardown is SIGTERM with a 10s grace period, escalating to
     SIGKILL.
 
-    The agent calls a real LLM. The hello_world spec defaults to
-    Databricks-hosted Claude via the FM API, so locally the user's
-    ``~/.databrickscfg`` must have a working profile; in CI the
-    workflow exchanges OAuth credentials before pytest runs.
+    The spawned server is wired to the session-scoped mock LLM server
+    via ``OPENAI_BASE_URL`` so all agent LLM calls are served by the
+    mock without any real provider credentials.
 
     :param built_spa: Required to ensure the static SPA bundle is on
         disk before the server boots and tries to mount it.
+    :param mock_llm_server_url: Session-scoped mock LLM server URL;
+        injected into the server's environment so the openai-agents
+        harness hits the mock instead of a real provider.
     :param tmp_path_factory: Pytest temp path factory for the log,
         the SQLite DB, and the artifact dir — all per-session, so
         the test never reads from or writes to the user's default
@@ -609,11 +767,18 @@ def live_server(
     # helper uses (tests/_helpers/live_server.py:160-167).
     # OMNIGENT_RUNNER_TUNNEL_TOKEN lets the server accept
     # exactly the sibling runner's WebSocket tunnel.
+    mock_url = mock_llm_server_url
     env = {
         **os.environ,
         "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
         "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token,
         "OMNIGENT_BUILTIN_AGENT_DIRS": os.pathsep.join(builtin_dirs),
+        # Point the openai-agents harness at the mock LLM server so no
+        # real provider credentials are needed.
+        "OPENAI_BASE_URL": f"{mock_url}/v1",
+        "OPENAI_API_KEY": "mock-key",
+        # Strip any ambient Anthropic credentials so they don't leak in.
+        "ANTHROPIC_API_KEY": "",
     }
     log_handle = open(log_path, "w")  # noqa: SIM115 — handle lives for Popen lifetime; closed in finally
     proc = subprocess.Popen(
@@ -661,6 +826,11 @@ def live_server(
         "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
         "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
         "RUNNER_SERVER_URL": base_url,
+        # Route the openai-agents harness to the mock LLM server so no
+        # real provider credentials are needed for agent turns. Without
+        # these the openai SDK falls back to real OpenAI, which fails.
+        "OPENAI_BASE_URL": f"{mock_url}/v1",
+        "OPENAI_API_KEY": "mock-key",
     }
     runner_proc = subprocess.Popen(
         [sys.executable, "-m", "omnigent.runner._entry"],
@@ -731,6 +901,15 @@ def live_server(
     # test_stale_stream) can respawn one via :func:`_ensure_runner_online`.
     _server_state["binding_token"] = binding_token
     _server_state["server_url"] = base_url
+    _server_state["mock_llm_url"] = mock_url
+
+    # Set a non-resettable fallback for the policy-classifier LLM queue so
+    # every per-test reset leaves the server's guardrails path functional.
+    set_fallback_mock_llm(mock_url, "_policy_llm_", '{"action": "allow", "reason": ""}')
+    # Fallback for the openai-agents harness: any agent turn that doesn't
+    # match a content-based queue gets a generic reply (sufficient for tests
+    # that only assert an assistant bubble appears, not its exact content).
+    set_fallback_mock_llm(mock_url, "gpt-4o-mini", "Mock LLM response.")
 
     try:
         yield base_url
@@ -891,6 +1070,7 @@ def _ensure_runner_online(
         return None
 
     binding_token = str(_server_state["binding_token"])
+    mock_url = str(_server_state.get("mock_llm_url", ""))
     runner_tmp = tmp_path_factory.mktemp("e2e_ui_respawn_runner")
     log_path = runner_tmp / "runner.log"
     log_handle = open(log_path, "w")  # noqa: SIM115 — fd dup'd into child; closed below
@@ -901,6 +1081,11 @@ def _ensure_runner_online(
         "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
         "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
         "RUNNER_SERVER_URL": base_url,
+        # Mirror the live_server runner's mock-LLM routing so the
+        # respawned runner's harness also hits the mock.
+        **(
+            {"OPENAI_BASE_URL": f"{mock_url}/v1", "OPENAI_API_KEY": "mock-key"} if mock_url else {}
+        ),
     }
     proc = subprocess.Popen(
         [sys.executable, "-m", "omnigent.runner._entry"],
@@ -1030,7 +1215,7 @@ prompt: |
   other tools.
 
 executor:
-  model: databricks-gpt-5-4
+  model: gpt-4o-mini
   config:
     harness: openai-agents
 
@@ -1076,6 +1261,7 @@ def terminal_agent(live_server: str) -> Iterator[str]:
 @pytest.fixture
 def terminal_session(
     terminal_agent: str,
+    mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[tuple[str, str]]:
     """Create a runner-bound session using the terminal-capable agent.
@@ -1088,6 +1274,9 @@ def terminal_session(
 
     :param terminal_agent: Live server base URL with the terminal agent
         registered.
+    :param mock_llm_server_url: Session-scoped mock LLM server URL; used to
+        queue the deterministic launch/send/confirm tool sequence the agent
+        runs in response to "spin up zsh".
     :param tmp_path_factory: Pytest temp path factory (for a respawn log).
     :returns: ``(base_url, session_id)``.
     """
@@ -1097,6 +1286,46 @@ def terminal_session(
     import tarfile
 
     live_server = terminal_agent
+
+    # The "spin up zsh" prompt drives three ordered LLM turns: launch the
+    # terminal, type the file-writing command, then confirm. Content-route on
+    # the prompt text so the queue fires only for this fixture's turns, and
+    # order the three responses to match the agent's prompted sequence.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_launch",
+                        "name": "sys_terminal_launch",
+                        "arguments": _json.dumps({"terminal": "zsh", "session": "main"}),
+                    }
+                ]
+            },
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_send",
+                        "name": "sys_terminal_send",
+                        "arguments": _json.dumps(
+                            {
+                                "terminal": "zsh",
+                                "session": "main",
+                                "text": (
+                                    f"printf '%s\\n' '{_TERMINAL_PANEL_FILE_CONTENT}' "
+                                    f"> {_TERMINAL_PANEL_FILE}"
+                                ),
+                            }
+                        ),
+                    }
+                ]
+            },
+            {"text": "The zsh terminal is running and the file was written."},
+        ],
+        key="terminal-spin-up-zsh",
+        match="spin up zsh",
+    )
     respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
     # Create a session with the terminal agent bundle inline.
@@ -1212,7 +1441,7 @@ prompt: |
   sub-agent session via `sys_session_send` — NEVER spawn a second one.
 
 executor:
-  model: databricks-gpt-5-4
+  model: gpt-4o-mini
   harness: openai-agents
 
 tools:
@@ -1222,7 +1451,7 @@ tools:
       Deep Thought, the supercomputer built to compute the Answer to the
       Ultimate Question of Life, the Universe, and Everything.
     executor:
-      model: databricks-gpt-5-4
+      model: gpt-4o-mini
       harness: openai-agents
     prompt: |
       You are Deep Thought from The Hitchhiker's Guide to the Galaxy.
@@ -1348,7 +1577,7 @@ prompt: |
   other command or call any other tool.
 
 executor:
-  model: databricks-gpt-5-4
+  model: gpt-4o-mini
   config:
     harness: openai-agents
 
@@ -1376,6 +1605,7 @@ guardrails:
 @pytest.fixture
 def approval_session(
     live_server: str,
+    mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[tuple[str, str]]:
     """Create a runner-bound session whose agent triggers an approval prompt.
@@ -1386,16 +1616,49 @@ def approval_session(
     ``guardrails`` blocks that path supports — see ``examples/polly``).
 
     :param live_server: Spawned server fixture.
+    :param mock_llm_server_url: Session-scoped mock LLM server URL; used to
+        pre-configure the ``sys_os_shell`` tool call the approval agent emits.
     :param tmp_path_factory: Pytest temp path factory (for a respawn log).
     :returns: ``(base_url, session_id)``. Send a "run the command" turn to
         raise the gated-push approval.
     """
     import json as _json
+    import uuid as _uuid
+
+    # Each approval_session gets a unique model name so the mock queue is
+    # isolated between test runs. Using content-based routing (match=) on a
+    # shared model name caused a race: the previous test's runner (making its
+    # post-approval second LLM call) would steal the freshly-configured queue
+    # from the next test. A unique model per fixture call eliminates that race
+    # entirely — no other request will ever use this model key.
+    approval_model = f"approval-probe-{_uuid.uuid4().hex[:8]}"
+    # Substitute the unique model into the agent spec.
+    agent_yaml_text = _APPROVAL_AGENT_YAML.replace("gpt-4o-mini", approval_model)
+
+    # First LLM call: return the gated sys_os_shell tool call.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_git_push",
+                        "name": "sys_os_shell",
+                        "arguments": _json.dumps({"command": "git push origin main"}),
+                    }
+                ]
+            }
+        ],
+        key=approval_model,
+    )
+    # Fallback for the second LLM call (after the tool result arrives): the
+    # agent prompt asks for one short sentence, so any text suffices.
+    set_fallback_mock_llm(mock_llm_server_url, approval_model, "Command executed.")
 
     respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
 
-    yaml_bytes = _APPROVAL_AGENT_YAML.encode()
+    yaml_bytes = agent_yaml_text.encode()
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         # Strict path: arcname config.yaml keeps it on the spec_version:1
@@ -1509,6 +1772,8 @@ def server_pid(live_server: str) -> int:
 # 1 + executor.config.harness routes through the strict parser; arcname
 # config.yaml keeps it on that path.
 _CUSTOM_AGENT_NAME = "echo_probe"
+_CLAUDE_MOCK_MODEL = "claude-3-5-sonnet-20241022"
+_CODEX_MOCK_MODEL = "gpt-4o"
 _CUSTOM_AGENT_YAML = f"""\
 spec_version: 1
 name: {_CUSTOM_AGENT_NAME}
@@ -1518,7 +1783,7 @@ prompt: |
   and nothing else — no preamble, no quotes, no trailing punctuation.
 
 executor:
-  model: databricks-gpt-5-4
+  model: gpt-4o-mini
   config:
     harness: openai-agents
 """
@@ -1866,6 +2131,141 @@ def native_codex_session(
             # Escalate to SIGKILL if the runner ignores SIGTERM, so a wedged
             # process can't raise in teardown and leak / fail unrelated tests
             # (matching terminal_session / seeded_session_pair).
+            try:
+                respawned.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned.kill()
+                respawned.wait(timeout=5)
+
+
+@contextlib.contextmanager
+def _temp_omnigent_mock_config(
+    mock_llm_server_url: str, harness: str
+) -> Generator[None, None, None]:
+    """Temporarily write a mock provider config to ~/.omnigent/config.yaml.
+
+    The runner reads this at terminal-creation time, so it only needs to be
+    in place between the PATCH that binds a session to the runner (which
+    triggers auto-boot) and the terminal connecting. Restores the original
+    file (or removes it) on exit.
+
+    :param mock_llm_server_url: Base URL of the mock LLM server, e.g.
+        ``"http://127.0.0.1:51235"``. No /v1 suffix — each SDK appends it.
+    :param harness: ``"claude"`` or ``"codex"``.
+    """
+    config_dir = Path.home() / ".omnigent"
+    config_path = config_dir / "config.yaml"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    original = config_path.read_text() if config_path.exists() else None
+
+    if harness == "claude":
+        mock_config = textwrap.dedent(f"""\
+            providers:
+              mock-claude:
+                kind: key
+                default: [anthropic]
+                anthropic:
+                  base_url: "{mock_llm_server_url}"
+                  api_key: "mock-key"
+                  models:
+                    default: {_CLAUDE_MOCK_MODEL}
+            """)
+    else:  # codex
+        mock_config = textwrap.dedent(f"""\
+            providers:
+              mock-codex:
+                kind: key
+                default: [openai]
+                openai:
+                  base_url: "{mock_llm_server_url}"
+                  api_key: "mock-key"
+                  wire_api: responses
+                  models:
+                    default: {_CODEX_MOCK_MODEL}
+            """)
+
+    config_path.write_text(mock_config)
+    try:
+        yield
+    finally:
+        if original is not None:
+            config_path.write_text(original)
+        else:
+            config_path.unlink(missing_ok=True)
+
+
+@pytest.fixture
+def native_claude_mock_session(
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A runner-bound claude-native session whose LLM backend depends on env.
+
+    When ``LLM_API_KEY`` is set in the environment (local dev / CI with real
+    credentials), the existing ``~/.omnigent/config.yaml`` is left untouched so
+    the runner boots Claude Code against the real gateway. When ``LLM_API_KEY``
+    is absent, a mock anthropic provider config is written to
+    ``~/.omnigent/config.yaml`` and restored on teardown.
+
+    :param live_server: Spawned server fixture; its runner is reused.
+    :param mock_llm_server_url: Session-scoped mock LLM server base URL.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``.
+    """
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    use_mock = not os.environ.get("LLM_API_KEY")
+    if use_mock:
+        ctx: Any = _temp_omnigent_mock_config(mock_llm_server_url, "claude")
+    else:
+        ctx = contextlib.nullcontext()
+    with ctx:
+        session_id = _create_native_claude_session(live_server, runner_id)
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
+            try:
+                respawned.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned.kill()
+                respawned.wait(timeout=5)
+
+
+@pytest.fixture
+def native_codex_mock_session(
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A runner-bound codex-native session whose LLM backend depends on env.
+
+    Mirrors :func:`native_claude_mock_session` for the Codex wrapper: uses
+    mock LLM when ``LLM_API_KEY`` is absent, real gateway when it is set.
+
+    :param live_server: Spawned server fixture; its runner is reused.
+    :param mock_llm_server_url: Session-scoped mock LLM server base URL.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``.
+    """
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    use_mock = not os.environ.get("LLM_API_KEY")
+    if use_mock:
+        ctx: Any = _temp_omnigent_mock_config(mock_llm_server_url, "codex")
+    else:
+        ctx = contextlib.nullcontext()
+    with ctx:
+        session_id = _create_native_codex_session(live_server, runner_id)
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
             try:
                 respawned.wait(timeout=5)
             except subprocess.TimeoutExpired:

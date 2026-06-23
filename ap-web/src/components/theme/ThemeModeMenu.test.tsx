@@ -1,11 +1,11 @@
 // Tests for ThemeModeMenu — the compact sidebar button that cycles the theme
 // system → dark → light on each click.
 //
-// The button previews the *next* mode: its aria-label/title and icon describe
-// the mode the next click applies (see nextThemeMode). It hides entirely when
+// The icon shows the *current* mode, while the aria-label/title announce the
+// *next* mode the click will apply (see nextThemeMode). It hides entirely when
 // embedded (the host owns the theme). `next-themes` and `@/lib/embedded` are
-// mocked so each test pins the current theme and embed state; the real
-// themeMode helpers (pure) run unmocked.
+// mocked so each test pins the current theme, system theme, and embed state;
+// the real themeMode helpers (pure) run unmocked.
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -13,10 +13,11 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 
 const setTheme = vi.fn();
 let currentTheme: string | undefined;
+let systemTheme: string | undefined;
 let embedded: boolean;
 
 vi.mock("next-themes", () => ({
-  useTheme: () => ({ theme: currentTheme, setTheme }),
+  useTheme: () => ({ theme: currentTheme, systemTheme, setTheme }),
 }));
 
 vi.mock("@/lib/embedded", () => ({
@@ -35,6 +36,7 @@ function renderMenu() {
 
 beforeEach(() => {
   currentTheme = "system";
+  systemTheme = undefined;
   embedded = false;
 });
 
@@ -92,5 +94,36 @@ describe("ThemeModeMenu", () => {
     currentTheme = "sepia";
     renderMenu();
     expect(screen.getByRole("button", { name: "Switch to Dark" })).toBeInTheDocument();
+  });
+
+  it("skips dark when the system theme is dark", () => {
+    // WHY: at "system" on a dark OS, pinning dark would render identically, so
+    // the cycle jumps straight to light.
+    currentTheme = "system";
+    systemTheme = "dark";
+    renderMenu();
+    fireEvent.click(screen.getByRole("button", { name: "Switch to Light" }));
+    expect(setTheme).toHaveBeenCalledWith("light");
+  });
+
+  it("does not offer light first when the system theme is light", () => {
+    // WHY: from "system" the cycle's first stop is dark regardless of OS, so a
+    // light OS still advances to dark before anything else.
+    currentTheme = "system";
+    systemTheme = "light";
+    renderMenu();
+    fireEvent.click(screen.getByRole("button", { name: "Switch to Dark" }));
+    expect(setTheme).toHaveBeenCalledWith("dark");
+  });
+
+  it("skips light when an explicit dark theme sits on a light system", () => {
+    // WHY: dark's next stop is light, but a light OS already renders light, so
+    // skip the redundant hop and go straight to system. This is the asymmetry
+    // the system-theme check fixes — `resolvedTheme` would have offered light.
+    currentTheme = "dark";
+    systemTheme = "light";
+    renderMenu();
+    fireEvent.click(screen.getByRole("button", { name: "Switch to System" }));
+    expect(setTheme).toHaveBeenCalledWith("system");
   });
 });

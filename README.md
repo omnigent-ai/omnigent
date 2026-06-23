@@ -368,7 +368,7 @@ name: my_agent
 prompt: You are a helpful data analyst.
 
 executor:
-  harness: claude-sdk          # or: codex, codex-native, claude-native, cursor, openai-agents, pi, antigravity, opencode
+  harness: claude-sdk          # or: claude-native, codex, codex-native, cursor, cursor-native, openai-agents, pi, pi-native, antigravity, qwen, opencode
 
 tools:
   # A local Python function (schema auto-generated from the signature)
@@ -399,3 +399,13 @@ Polly at [`examples/polly/`](https://github.com/omnigent-ai/omnigent/tree/main/e
 ## Contributing
 
 Contributions are welcome. See [CONTRIBUTING.md](https://github.com/omnigent-ai/omnigent/blob/main/CONTRIBUTING.md) for how to set up your environment, run the checks, and open a pull request.
+
+
+### Contributors
+
+Thanks to all of our amazing contributors!
+
+<a href="https://github.com/omnigent-ai/omnigent/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=omnigent-ai/omnigent" />
+</a>
+

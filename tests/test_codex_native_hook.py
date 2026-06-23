@@ -10,7 +10,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent import codex_native_hook
+from omnigent import codex_native_hook, native_policy_hook
 from omnigent.codex_native_bridge import (
     CodexNativeBridgeState,
     codex_home_for_bridge_dir,
@@ -195,7 +195,7 @@ def test_pre_tool_use_converts_posts_and_returns_deny(
         ap_server_url="http://127.0.0.1:8787",
         ap_auth_headers={"Authorization": "Bearer test-token"},
     )
-    monkeypatch.setattr(codex_native_hook.httpx, "Client", _DenyHttpxClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _DenyHttpxClient)
 
     exit_code = _run_hook(
         bridge_dir,
@@ -247,7 +247,7 @@ def test_user_prompt_submit_converts_posts_and_blocks(
         ap_server_url="http://127.0.0.1:8787",
         ap_auth_headers={"Authorization": "Bearer test-token"},
     )
-    monkeypatch.setattr(codex_native_hook.httpx, "Client", _DenyHttpxClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _DenyHttpxClient)
 
     exit_code = _run_hook(
         bridge_dir,
@@ -293,7 +293,7 @@ def test_pre_tool_use_stamps_model_from_config(
         ap_server_url="http://127.0.0.1:8787",
         ap_auth_headers={"Authorization": "Bearer test-token"},
     )
-    monkeypatch.setattr(codex_native_hook.httpx, "Client", _DenyHttpxClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _DenyHttpxClient)
 
     exit_code = _run_hook(
         bridge_dir,
@@ -327,7 +327,7 @@ def test_pre_tool_use_stamps_harness_without_config_model(
         ap_server_url="http://127.0.0.1:8787",
         ap_auth_headers={"Authorization": "Bearer test-token"},
     )
-    monkeypatch.setattr(codex_native_hook.httpx, "Client", _DenyHttpxClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _DenyHttpxClient)
 
     exit_code = _run_hook(
         bridge_dir,
@@ -356,7 +356,7 @@ def test_missing_bridge_state_is_fail_open(
     """
     monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "codex-native")
     empty_dir = prepare_bridge_dir("bridge_no_state")
-    monkeypatch.setattr(codex_native_hook.httpx, "Client", _RaisesIfCalled)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _RaisesIfCalled)
 
     exit_code = _run_hook(
         empty_dir,
@@ -381,7 +381,7 @@ def test_missing_policy_config_is_fail_open(
     local run with no Omnigent server), so there is nothing to enforce against.
     The hook returns 0 with no output and does not touch the network.
     """
-    monkeypatch.setattr(codex_native_hook.httpx, "Client", _RaisesIfCalled)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _RaisesIfCalled)
 
     exit_code = _run_hook(
         bridge_dir,
@@ -408,7 +408,8 @@ def test_pre_tool_use_fails_closed_when_verdict_unavailable(
     CLOSED (deny) instead of "no opinion" — the bypass reported in #536.
     """
     write_policy_hook_config(bridge_dir, ap_server_url="http://127.0.0.1:8787", ap_auth_headers={})
-    monkeypatch.setattr(codex_native_hook.httpx, "Client", make_failing_client(mode))
+    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", make_failing_client(mode))
 
     exit_code = _run_hook(
         bridge_dir,
@@ -453,7 +454,8 @@ def test_non_tool_call_phases_fail_open_on_error(
     runner-side ``FAIL_CLOSED_PHASES`` (PR #163).
     """
     write_policy_hook_config(bridge_dir, ap_server_url="http://127.0.0.1:8787", ap_auth_headers={})
-    monkeypatch.setattr(codex_native_hook.httpx, "Client", make_failing_client("connect_error"))
+    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", make_failing_client("connect_error"))
 
     exit_code = _run_hook(bridge_dir, payload, monkeypatch)
 

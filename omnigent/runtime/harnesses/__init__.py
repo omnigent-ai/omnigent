@@ -87,6 +87,9 @@ _HARNESS_MODULES: dict[str, str] = {
     # non-interactive mode via ``opencode run --format json``,
     # parsing the line-delimited JSON event stream.
     "opencode": "omnigent.inner.opencode_harness",
+    # Qwen Code harness wrap. See omnigent/inner/qwen_harness.py.
+    # Drives the ``qwen`` CLI in ACP mode (``qwen --acp``) for agent execution.
+    "qwen": "omnigent.inner.qwen_harness",
 }
 
 __all__ = ["_HARNESS_MODULES"]

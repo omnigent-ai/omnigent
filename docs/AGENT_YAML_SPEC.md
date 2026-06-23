@@ -49,7 +49,7 @@ resolved from the YAML file's directory.
 
 ```yaml
 executor:
-  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, pi, antigravity, opencode, ...
+  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, pi, antigravity, qwen, opencode, ...
   model: databricks-claude-opus-4-7
   auth:
     type: databricks
@@ -108,6 +108,21 @@ CLI flags such as `--harness` and `--model` can override or supply missing
 executor values for a run. Databricks credentials come from the spec's
 `executor.auth` block or your `omnigent setup` provider config — there is
 no profile flag.
+
+## Qwen Code
+
+`harness: qwen` runs the agent through [Qwen Code](https://github.com/QwenLM/qwen)
+(`npm install -g @qwen-code/qwen-code`). It drives the `qwen` CLI in ACP mode
+(`qwen --acp`).
+
+```yaml
+executor:
+  harness: qwen                # aliases: qwen-code
+  model: qwen/qwen-2.5-coder
+```
+
+CLI flags such as `--harness qwen` and `--model <id>` can override or supply
+missing executor values.
 
 ## Local OS access
 

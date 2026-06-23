@@ -4,8 +4,8 @@ Drives the REPL under pexpect, types the first half of a
 prompt, sends ``Ctrl+J`` to insert a newline mid-input, types the
 second half, and finally submits with Enter. Asserts the full
 multi-line message reached the agent by looking for BOTH halves
-in the rendered ``You>`` banner that the REPL echoes to
-scrollback before streaming the assistant response.
+in the user turn the REPL echoes to scrollback (under the ``❯``
+prompt glyph) before streaming the assistant response (under ``◆``).
 
 Design reference: ``designs/OMNIGENT_INTEGRATION.md`` §Phase 0
 REPL pexpect suite — "Multi-line input".
@@ -107,8 +107,11 @@ def test_repl_multiline_ctrl_j_insert(
         "exit_code": exit_code,
         "first_line_present": _FIRST_LINE in combined_stripped,
         "second_line_present": _SECOND_LINE in combined_stripped,
-        "user_banner_present": "You>" in combined_stripped,
-        "agent_banner_present": "Agent>" in combined_stripped,
+        # The turn banners are glyphs now, not the legacy "You>"/"Agent>"
+        # text labels: the user prompt echoes under "❯" and the assistant
+        # reply under "◆" (e.g. "❯ line-one-alpha" / "◆ <reply>").
+        "user_banner_present": "❯" in combined_stripped,
+        "agent_banner_present": "◆" in combined_stripped,
     }
     diffs = compare_snapshot("test_repl_multiline", observed)
     assert diffs == [], (

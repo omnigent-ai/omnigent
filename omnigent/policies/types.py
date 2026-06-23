@@ -209,14 +209,15 @@ class PolicyResult:
         accumulated and intends to apply on this decision
         (filtering already done). ``None`` when the policy
         wrote no labels, e.g. ``{"integrity": "0"}``.
-    :param deciding_policy: Name of the policy whose action
-        drove the composed result. Engine-set only —
-        single-policy results leave it ``None``. On DENY: the
-        first short-circuiting policy. On ASK: the first
-        ASKing policy in YAML order. On ALLOW: ``None``.
-        Powers the ``deciding_policy`` outer-span attribute
-        (POLICIES.md §11.5) and the per-policy ``ask_timeout``
-        lookup (§7.2).
+    :param deciding_policies: Names of all policies that drove
+        the composed result. Engine-set only — single-policy
+        results leave it ``None``. On DENY: a single-element
+        list with the short-circuiting policy. On ASK: all
+        ASKing policies in YAML order. On ALLOW: ``None``.
+        ``deciding_policy`` is a computed property returning
+        ``deciding_policies[0]`` (or ``None`` when unset);
+        all existing callers that read ``.deciding_policy``
+        work unchanged.
     :param data: Optional replacement payload returned by the
         policy callable. When present on an ALLOW result, the
         enforcement site substitutes this value for the original
@@ -225,6 +226,10 @@ class PolicyResult:
         phase). ``None`` means "use original content unchanged".
         ``Any`` because the shape varies by phase: a dict of
         tool arguments on TOOL_CALL, a string on TOOL_RESULT.
+        When multiple policies transform data, each policy
+        receives the previous policy's output as its input —
+        the engine feeds the composed result back as
+        ``ctx.content`` before dispatching to the next policy.
     :param state_updates: Ordered list of :class:`StateUpdate`
         operations to apply to the engine's ``session_state``.
         Each entry specifies a key, an action (``SET``,
@@ -240,9 +245,18 @@ class PolicyResult:
     action: PolicyAction
     reason: str | None = None
     set_labels: dict[str, str] | None = None
-    deciding_policy: str | None = None
+    deciding_policies: list[str] | None = None
     data: Any = None
     state_updates: list[StateUpdate] | None = None
+
+    @property
+    def deciding_policy(self) -> str | None:
+        """First deciding policy name, or ``None``.
+
+        Derived from ``deciding_policies[0]`` so callers that
+        read ``.deciding_policy`` work without change.
+        """
+        return self.deciding_policies[0] if self.deciding_policies else None
 
 
 @dataclass(frozen=True)
@@ -272,10 +286,12 @@ class ElicitationRequest:
         e.g. ``"request"`` or ``"tool_call"``. Surfaces in the
         elicitation event's extras so the renderer can label the
         prompt.
-    :param policy_name: Name of the deciding (first-in-YAML-order)
-        ASKing policy. Drives per-policy ``ask_timeout`` lookup,
-        observability, and the renderer's "policy X says..." label.
-        e.g. ``"pii_redact"``.
+    :param policy_names: Names of all ASKing policies that contributed
+        to this elicitation, in YAML order. Always a non-empty list.
+        ``policy_name`` is a computed property returning
+        ``policy_names[0]`` — existing callers that read
+        ``.policy_name`` work without change.
+        e.g. ``["pii_redact"]`` or ``["pii_redact", "cost_gate"]``.
     :param content_preview: Truncated snapshot of the content being
         gated. Lets a human reviewer see what they're approving
         without overwhelming the UI on a 50 KB payload. Surfaces in
@@ -284,9 +300,18 @@ class ElicitationRequest:
 
     message: str
     phase: str
-    policy_name: str
+    policy_names: list[str]
     content_preview: str
     requested_schema: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def policy_name(self) -> str:
+        """First ASKing policy name.
+
+        Derived from ``policy_names[0]`` so callers that read
+        ``.policy_name`` work without change.
+        """
+        return self.policy_names[0] if self.policy_names else ""
 
 
 @dataclass

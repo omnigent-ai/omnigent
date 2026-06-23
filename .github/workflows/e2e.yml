@@ -1,7 +1,8 @@
 name: E2E Tests
 
-# Runs the `tests/e2e/` suite against a live LLM (Databricks gateway):
-# sub-agent spawning, parking, tunneled client tools, PATCH/GET routes.
+# Runs the `tests/e2e/` suite against the in-process mock LLM server.
+# All tests use mock LLM by default; real-credential tests skip cleanly
+# when no DATABRICKS_TOKEN is present.
 #
 # Triggers:
 #   schedule            09:00 UTC daily (alongside nightly.yml).
@@ -99,6 +100,9 @@ jobs:
     # (forks run via the fork-e2e/** mirror push), so no shard runs for them.
     needs: setup
     runs-on: ubuntu-latest
+    # Job-level cap (composite-action run steps can't set timeout-minutes):
+    # ~30 min of tests + setup, replacing the old per-step 30-min backstop.
+    timeout-minutes: 35
     strategy:
       # One red shard shouldn't cancel siblings -- we want every shard's signal.
       fail-fast: false
@@ -115,165 +119,16 @@ jobs:
           # Push (fork-e2e/**) and dispatch fall back to the branch / ref.
           ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.event.inputs.branch || github.ref }}
 
-      - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+      # Steps below are shared verbatim with server-compat.yml's backcompat-e2e
+      # job via the composite action, so the two never drift. server_version
+      # is omitted here -> normal gate (tests the checked-out server, mock LLM).
+      - name: Run e2e suite
+        uses: ./.github/actions/e2e-run
         with:
-          python-version-file: ".python-version"
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
-        with:
-          enable-cache: true
-
-
-
-
-      - name: Cache virtualenv
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4
-        with:
-          path: .venv
-          key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
-      - name: Set LLM credentials
-        run: echo "LLM_API_KEY=${{ secrets.LLM_API_KEY }}" >> "$GITHUB_ENV"
-      - name: Write gateway profile (~/.databrickscfg)
-        env:
-          GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-        run: |
-          # Strip the /serving-endpoints suffix the conftest re-appends.
-          host="${GATEWAY_BASE_URL%/serving-endpoints}"
-          cat > "$HOME/.databrickscfg" <<EOF
-          [default]
-          host  = $host
-          token = $LLM_API_KEY
-          EOF
-          # PAT passthrough for the codex / claude-sdk auth commands.
-          echo "DATABRICKS_BEARER=$LLM_API_KEY" >> "$GITHUB_ENV"
-
-      - name: Install project and dev dependencies
-        run: |
-          uv sync --extra all --extra dev
-
-      - name: Install binary dependencies
-        # npm install against .github/ci-deps/package.json with
-        # --ignore-scripts to block postinstall on every package. The
-        # claude-code stub binary needs its install.cjs (audited:
-        # platform detect + same-tree hardlink, no network/exec) so we run
-        # that one explicitly; codex and pi have no install scripts and
-        # ship prebuilt CLIs, so --ignore-scripts + the PATH line below
-        # make them runnable directly.
-        #
-        # bubblewrap: the linux_bwrap sandbox backend fails loud if `bwrap`
-        # is missing, and the e2e runner runs real agents with os_env. The
-        # apparmor sysctl mirrors ci.yml (Ubuntu 24.04 blocks unprivileged
-        # user namespaces, which bwrap's unshare(CLONE_NEWUSER) needs).
-        working-directory: .github/ci-deps
-        run: |
-          sudo apt-get install -y tmux bubblewrap
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          npm install --ignore-scripts
-          node node_modules/@anthropic-ai/claude-code/install.cjs
-          echo "${GITHUB_WORKSPACE}/.github/ci-deps/node_modules/.bin" >> "$GITHUB_PATH"
-
-
-
-      - name: Run e2e tests
-        timeout-minutes: 30
-        # The `force-all-tests` PR label bypasses tests/known_failures.yaml
-        # (matches the ci.yml / nightly.yml pattern).
-        env:
-          # Cron fallback must match the workflow_dispatch default above.
-          PARALLELISM_INPUT: ${{ github.event.inputs.parallelism || '2' }}
-          SHARD_ID: ${{ matrix.shard_id }}
-          NUM_SHARDS: ${{ matrix.num_shards }}
-          FORCE_ALL_TESTS: ${{ contains(github.event.pull_request.labels.*.name, 'force-all-tests') }}
-          # Schedule / dispatch are the full pass; PR and push skip @nightly.
-          NIGHTLY_FULL: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
-          # Stable per-shard prefix so the upload step finds the logs / junit.
-          E2E_TMP_BASE: /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ matrix.shard_id }}
-          # Per-worker progress log (#426): fsynced START/END per test so we
-          # recover the last-started test when a runner wedges.
-          PYTEST_PROGRESS_LOG_DIR: /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ matrix.shard_id }}/progress
-          OMNIGENT_TOKEN_USAGE_JSON: /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ matrix.shard_id }}/tokens.json
-          # Spread interchangeable gateway models across tests (deterministic
-          # per nodeid; tests/_model_pools.py).
-          OMNIGENT_TEST_MODEL_SPREAD: '1'
-          # Drain gpt-5-4 from the pool: its FMAPI quota is far below the
-          # others, so tests hashed to it fail on sustained 429s.
-          OMNIGENT_TEST_MODEL_POOL_GPT: 'databricks-gpt-5-5,databricks-gpt-5-4-mini'
-        run: |
-          # Validate parallelism (untrusted input -- bind to env, never
-          # interpolate a GitHub expression into the shell).
-          if ! [[ "$PARALLELISM_INPUT" =~ ^[1-9][0-9]?$ ]]; then
-            echo "Invalid parallelism input: $PARALLELISM_INPUT (expected 1-99)" >&2
-            exit 1
-          fi
-          WORKERS="$PARALLELISM_INPUT"
-          mkdir -p "$E2E_TMP_BASE"
-
-          EXTRA_ARGS=()
-          if [[ "$FORCE_ALL_TESTS" == "true" ]]; then
-            EXTRA_ARGS=(--no-skip-known)
-            echo "::notice::force-all-tests label present; bypassing tests/known_failures.yaml"
-          fi
-          if [[ "$NIGHTLY_FULL" != "true" ]]; then
-            EXTRA_ARGS+=(-m "not nightly")
-          fi
-
-          # --junitxml emits per-test results eagerly so diagnostics survive
-          # a wall-clock overrun. --shard-id/--num-shards chunk the node IDs.
-          # --timeout=180 caps each test; --timeout-method=thread because our
-          # pty/subprocess children don't get SIGALRM. --max-worker-restart=0
-          # fails the shard fast instead of letting loadscope requeue deadlock
-          # the controller (the 2026-06-11 shard-2 wedge).
-          uv run pytest tests/e2e/ \
-            --llm-api-key "$LLM_API_KEY" \
-            --profile default \
-            --harness databricks \
-            -n "$WORKERS" \
-            --dist=loadscope \
-            --max-worker-restart=0 \
-            --shard-id="$SHARD_ID" \
-            --num-shards="$NUM_SHARDS" \
-            --timeout=180 \
-            --timeout-method=thread \
-            --basetemp="$E2E_TMP_BASE" \
-            --junitxml="$E2E_TMP_BASE/junit.xml" \
-            -v --tb=long --showlocals --log-level=INFO -r a \
-            "${EXTRA_ARGS[@]}" \
-            || { rc=$?; [ "$rc" -eq 5 ] && echo "::notice::No tests collected in this shard; treating as a pass." || exit "$rc"; }
-
-      - name: Upload server logs on failure
-        # cancelled() too: failure() misses step timeouts (#426).
-        if: failure() || cancelled()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
-        with:
-          # Per-shard name so parallel uploads don't collide.
-          name: e2e-server-logs-${{ github.run_id }}-shard${{ matrix.shard_id }}
-          # Whitelist diagnostic files (basetemp also holds large per-test
-          # DBs / tarballs). `warn` not `ignore` so a broken path is loud.
-          path: |
-            /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ matrix.shard_id }}/**/server.log
-            /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ matrix.shard_id }}/**/runner.log
-            /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ matrix.shard_id }}/**/.omnigent/logs/**/*.log
-            /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ matrix.shard_id }}/junit.xml
-            /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ matrix.shard_id }}/progress/progress-*.log
-          retention-days: 7
-          if-no-files-found: warn
-          # Daemon logs live under hidden `.omnigent/` dirs, which v4 skips
-          # by default -- without this the `.omnigent/logs` glob matches nothing.
-          include-hidden-files: true
-
-      - name: Upload token usage
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
-        with:
-          name: e2e-tokens-${{ github.run_id }}-shard${{ matrix.shard_id }}
-          path: /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ matrix.shard_id }}/tokens*.json
-          retention-days: 14
-          # `warn` not `ignore`: every shard makes LLM calls, so a missing
-          # tokens file means the recorder broke.
-          if-no-files-found: warn
+          shard_id: ${{ matrix.shard_id }}
+          num_shards: ${{ matrix.num_shards }}
+          parallelism: ${{ github.event.inputs.parallelism || '2' }}
+          nightly_full: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
 
   # Explicitly re-dispatch Merge Ready (same-repo PR or fork-e2e push): the
   # workflow_run hop is brittle and was dropped on #751/#792. No checkout,

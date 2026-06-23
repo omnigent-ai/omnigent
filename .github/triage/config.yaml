@@ -32,7 +32,7 @@ prompt: |
   ```
   {
     "type": "bug" | "enhancement" | "documentation" | null,
-    "components": ["comp:server" | "comp:runner" | "comp:repr" | "comp:web-ui" | "comp:policies" | "comp:harnesses" | "comp:infra"],
+    "components": ["comp:server" | "comp:runner" | "comp:repr" | "comp:web-ui" | "comp:tui" | "comp:policies" | "comp:harnesses" | "comp:infra"],
     "priority": "P0-critical" | "P1-high" | "P2-medium" | "P3-low" | null,
     "needs_info": true | false,
     "help_wanted": true | false,
@@ -58,6 +58,7 @@ prompt: |
   - `comp:runner` — the agent runner, execution engine
   - `comp:repr` — serialization, representation layer
   - `comp:web-ui` — the web frontend (ap-web)
+  - `comp:tui` — the terminal UI, REPL, and CLI
   - `comp:policies` — safety policies, guardrails
   - `comp:harnesses` — SDK harnesses (Claude, Cursor, Antigravity, etc.)
   - `comp:infra` — CI/CD, GitHub Actions workflows, Docker, deployment, packaging
@@ -66,8 +67,19 @@ prompt: |
   **priority**:
   - `P0-critical` — service down, data loss, security vulnerability
   - `P1-high` — major feature broken, no workaround
-  - `P2-medium` — bug with workaround, or important feature request
-  - `P3-low` — minor issue, cosmetic, nice-to-have
+  - `P2-medium` — a bug with a workaround, OR a substantive feature
+    request. A feature request is substantive (P2) when it adds a real new
+    capability — e.g. support for a new harness / provider / model /
+    integration, a new tool, or a new user-facing workflow. **P2 is the
+    default for feature requests**, and equivalent requests must get the
+    same priority (e.g. "add harness X" and "add harness Y" are both P2).
+  - `P3-low` — ONLY genuinely minor things: minor or cosmetic bugs, small
+    UI/UX polish, trivial conveniences, or narrowly-scoped nice-to-haves that
+    add no real new capability. Do NOT drop a feature to P3 just because it
+    isn't urgent or you personally judge demand to be low — a new
+    capability/integration is P2 even if non-urgent.
+
+  When you are unsure between P2 and P3 for a feature request, choose P2.
 
   **help_wanted** — `true` if the issue could benefit from community
   contribution.

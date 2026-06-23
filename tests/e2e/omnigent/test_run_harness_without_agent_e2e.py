@@ -75,18 +75,31 @@ def test_run_harness_without_agent_live_repl_round_trip(
     marker = f"{probe.marker}_RUN_HARNESS_WITHOUT_AGENT"
     prompt = _PROMPT_TEMPLATE.format(marker=marker)
 
+    # claude-code issues a warmup/title call before the turn that consumes one
+    # queued response, so the turn call needs another; queue a few markers.
+    responses = [{"text": marker}] * (4 if probe.harness == "claude-sdk" else 1)
     configure_mock_llm(
         mock_llm_server_url,
-        [{"text": marker}],
+        responses,
         key=model,
     )
+
+    # claude-sdk speaks the Anthropic wire, not OPENAI_*. Point it at the mock
+    # and pass a static gateway token via ANTHROPIC_AUTH_TOKEN (Authorization:
+    # Bearer) -- the docs-sanctioned custom-gateway auth. ANTHROPIC_API_KEY
+    # (x-api-key) would trigger claude-code's external-key validation, which
+    # the mock cannot satisfy ("Invalid API key").
+    env = dict(mock_credentials_env)
+    if probe.harness == "claude-sdk":
+        env["ANTHROPIC_BASE_URL"] = mock_llm_server_url
+        env["ANTHROPIC_AUTH_TOKEN"] = "mock-key"
 
     child = spawn_omnigent_run(
         omnigent_python=omnigent_python,
         yaml_path=None,
         model=model,
         harness=probe.harness,
-        env=mock_credentials_env,
+        env=env,
         cwd=omnigent_repo_root,
         timeout=_SPAWN_TIMEOUT,
         initial_prompt=prompt,
@@ -138,6 +151,13 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     glibc.
 
     ``cursor-native`` is excluded for the union of both reasons above.
+
+    ``qwen`` is excluded because it does not follow the shared
+    ``HARNESS_<HARNESS>_GATEWAY``/``DATABRICKS_PROFILE`` probe wiring that
+    this matrix (and ``test_harness_wrap_e2e.py``) drive harnesses with: its
+    wrap routes through ``HARNESS_QWEN_GATEWAY_BASE_URL`` /
+    ``HARNESS_QWEN_GATEWAY_AUTH_COMMAND`` instead. Its live round-trip is
+    covered by the dedicated ``test_per_harness_qwen.py`` suite.
     """
     expected_live_harnesses = set(OMNIGENT_HARNESSES).intersection(_HARNESS_MODULES) - {
         "claude-native",
@@ -146,5 +166,6 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "cursor",
         "cursor-native",
         "antigravity",
+        "qwen",
     }
     assert {probe.harness for probe in HARNESS_PROBES} == expected_live_harnesses

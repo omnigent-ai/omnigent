@@ -765,6 +765,64 @@ class _ApprovalState:
         self._current_phase = None
 
 
+class _FieldInputState:
+    """Collect free-form field values one at a time via the main input loop.
+
+    Same future-based pattern as :class:`_ApprovalState` — no direct
+    ``input()`` calls so ``prompt_toolkit``'s ``patch_stdout`` is
+    never disrupted.
+    """
+
+    def __init__(self) -> None:
+        self._future: asyncio.Future[str] | None = None
+        self._field_name: str | None = None
+        # Set by ``cancel`` so the field-collection loop can tell an
+        # abort (Esc on the turn) apart from an empty submit and stop
+        # prompting rather than advancing to — and re-prompting for —
+        # the next field after the turn is already gone.
+        self._aborted: bool = False
+
+    @property
+    def pending(self) -> bool:
+        return self._future is not None and not self._future.done()
+
+    @property
+    def field_name(self) -> str | None:
+        return self._field_name
+
+    @property
+    def aborted(self) -> bool:
+        """:returns: ``True`` if collection was cancelled mid-prompt."""
+        return self._aborted
+
+    def begin(self, field_name: str) -> asyncio.Future[str]:
+        # A fresh prompt is never pre-aborted. Cleared here (not in the
+        # collection loop) so the flag spans exactly one begin/await
+        # cycle: the loop reads it the instant the await returns, and
+        # the only await between fields IS this ``begin``.
+        self._aborted = False
+        if self._future is not None and not self._future.done():
+            self._future.set_result("")
+        self._field_name = field_name
+        self._future = asyncio.get_running_loop().create_future()
+        return self._future
+
+    def resolve(self, text: str) -> bool:
+        if self._future is None or self._future.done():
+            return False
+        self._future.set_result(text)
+        self._future = None
+        self._field_name = None
+        return True
+
+    def cancel(self) -> None:
+        self._aborted = True
+        if self._future is not None and not self._future.done():
+            self._future.set_result("")
+        self._future = None
+        self._field_name = None
+
+
 def _build_elicitation_content_from_schema(
     schema: dict[str, object],
 ) -> dict[str, object] | None:
@@ -1080,6 +1138,9 @@ class _SessionsChatReplAdapter:
         on_session_start: Callable[[str], None] | None = None,
         harness: str | None = None,
         attach_only: bool = False,
+        field_input_state: _FieldInputState | None = None,
+        host: TerminalHost | None = None,
+        fmt: RichBlockFormatter | None = None,
     ) -> None:
         """
         Wire the adapter; do NOT issue any HTTP calls.
@@ -1122,12 +1183,19 @@ class _SessionsChatReplAdapter:
             never bind/recover a runner (turns post to the session's
             existing host-bound runner). Used by ``omnigent attach``.
             ``False`` (default) is the runner-owning ``run`` path.
+        :param field_input_state: Shared state for collecting schema
+            field values interactively via the main input loop.
+        :param host: Terminal output channel for rendering field prompts.
+        :param fmt: Formatter for styling field prompts.
         """
         self._client = client
         self._agent_id: str | None = None
         self._agent_name = agent_name
         self._tool_callables = tool_callables
         self._hooks = hooks or StreamHooks()
+        self._field_input_state = field_input_state
+        self._host = host
+        self._fmt = fmt
         self._session_id: str | None = session_id
         self._session_bundle = session_bundle
         self._session_bundle_filename = session_bundle_filename
@@ -1775,7 +1843,11 @@ class _SessionsChatReplAdapter:
                         flush=True,
                     )
                 async for event in self._client.sessions.stream(self._session_id):
-                    if isinstance(event, _StatusEv) and event.status in ("idle", "failed"):
+                    if isinstance(event, _StatusEv) and event.status in (
+                        "idle",
+                        "waiting",
+                        "failed",
+                    ):
                         turn_done = getattr(self, "_turn_done", None)
                         if turn_done is not None:
                             turn_done.set()
@@ -2162,11 +2234,18 @@ class _SessionsChatReplAdapter:
             if content is not None:
                 resolve_payload["content"] = content
             elif schema.get("properties"):
-                # Schema has properties we can't auto-fill — the REPL
-                # can't render arbitrary forms. Decline and tell the
-                # user to use the web UI.
-                # TODO: render schema fields as terminal input prompts.
-                resolve_payload["action"] = "decline"
+                # Never leave the elicitation unresolved: any failure
+                # while prompting (or a user abort) declines, so the
+                # agent turn doesn't hang waiting on a verdict that the
+                # background task would otherwise never POST.
+                try:
+                    prompted = await self._prompt_schema_fields(schema)
+                except Exception:  # noqa: BLE001
+                    prompted = None
+                if prompted is not None:
+                    resolve_payload["content"] = prompted
+                else:
+                    resolve_payload["action"] = "decline"
 
         try:
             # URL-based elicitation: deliver the verdict to the
@@ -2185,6 +2264,150 @@ class _SessionsChatReplAdapter:
                 # The harness already received the verdict — treat as no-op.
                 return
             raise
+
+    async def _prompt_schema_fields(
+        self,
+        schema: dict[str, object],
+    ) -> dict[str, str | int | float | bool | list[str] | None] | None:
+        """Prompt the user for each schema property via the main input loop.
+
+        Returns the filled content dict, or ``None`` if the interactive
+        state is unavailable (e.g. no ``_field_input_state`` wired up).
+        """
+        from rich.text import Text
+
+        fis = self._field_input_state
+        host = self._host
+        fmt = self._fmt
+        if fis is None or host is None or fmt is None:
+            return None
+
+        properties = schema.get("properties")
+        if not properties or not isinstance(properties, dict):
+            return None
+
+        required = set(schema.get("required", []))  # type: ignore[arg-type]
+        content: dict[str, str | int | float | bool | list[str] | None] = {}
+
+        for key, prop in properties.items():
+            if not isinstance(prop, dict):
+                return None
+
+            prop_type = prop.get("type", "string")
+            description = prop.get("description", "")
+            default = prop.get("default")
+            enum_vals = prop.get("enum")
+            one_of = prop.get("oneOf")
+
+            # Build the prompt label.
+            label_parts: list[str] = [f"   {key}"]
+            if description:
+                label_parts.append(f" — {description}")
+            hint_parts: list[str] = []
+            if one_of and isinstance(one_of, list):
+                opts = [
+                    str(o.get("const", "")) for o in one_of if isinstance(o, dict) and "const" in o
+                ]
+                if opts:
+                    hint_parts.append("/".join(opts))
+            elif enum_vals and isinstance(enum_vals, list):
+                hint_parts.append("/".join(str(v) for v in enum_vals))
+            elif prop_type == "boolean":
+                hint_parts.append("true/false")
+            else:
+                hint_parts.append(str(prop_type))
+            if default is not None:
+                hint_parts.append(f"default: {default}")
+            if key not in required:
+                hint_parts.append("optional")
+            hint = ", ".join(hint_parts)
+            label_parts.append(f" [{hint}]")
+
+            # Render as plain styled text, NOT markup: the label embeds
+            # server-controlled schema text (description, enum values,
+            # key) that ``Text.from_markup`` would parse as Rich tags —
+            # a stray ``[`` silently mangles the line and an unbalanced
+            # one raises ``MarkupError``, which would crash this
+            # background task and hang the elicitation.
+            host.output(Text("   " + "".join(label_parts), style=fmt.accent))
+
+            # Re-prompt the same field on bad input rather than discarding
+            # everything: a single typo on field N shouldn't decline the
+            # whole form. The user aborts the turn with Esc (→ ``aborted``).
+            while True:
+                raw = await fis.begin(key)
+                if fis.aborted:
+                    return None
+
+                stripped = raw.strip()
+                if not stripped:
+                    if default is not None:
+                        content[key] = default
+                    elif key in required:
+                        host.output(
+                            Text(
+                                f"     ↳ {key} is required — enter a value (Esc cancels)",
+                                style=fmt.warning,
+                            ),
+                        )
+                        continue
+                    # Optional with no default: leave unset.
+                    break
+
+                # Parse according to type.
+                val: str | int | float | bool = stripped
+                if prop_type == "boolean":
+                    val = stripped.lower() in ("true", "1", "yes", "y")
+                elif prop_type == "integer":
+                    try:
+                        val = int(stripped)
+                    except ValueError:
+                        host.output(
+                            Text(
+                                f"     ↳ expected a whole number, got {stripped!r}",
+                                style=fmt.warning,
+                            ),
+                        )
+                        continue
+                elif prop_type == "number":
+                    try:
+                        val = float(stripped)
+                    except ValueError:
+                        host.output(
+                            Text(
+                                f"     ↳ expected a number, got {stripped!r}",
+                                style=fmt.warning,
+                            ),
+                        )
+                        continue
+
+                # Validate enum constraints.
+                if one_of and isinstance(one_of, list):
+                    valid = [
+                        o.get("const") for o in one_of if isinstance(o, dict) and "const" in o
+                    ]
+                    if val not in valid:
+                        host.output(
+                            Text(
+                                f"     ↳ choose one of: {', '.join(str(v) for v in valid)}",
+                                style=fmt.warning,
+                            ),
+                        )
+                        continue
+                elif enum_vals and isinstance(enum_vals, list):
+                    if val not in enum_vals:
+                        host.output(
+                            Text(
+                                f"     ↳ choose one of: {', '.join(str(v) for v in enum_vals)}",
+                                style=fmt.warning,
+                            ),
+                        )
+                        continue
+
+                content[key] = val
+                break
+
+        return content
 
     async def _unbind_runner_soft(self, session_id: str) -> None:
         """
@@ -2680,6 +2903,7 @@ async def run_repl(
     # normal prompt_toolkit input path avoids the stdin /
     # patch_stdout fight that a direct input() call produced.
     approval_state = _ApprovalState()
+    field_input_state = _FieldInputState()
     hooks = StreamHooks(
         on_elicitation_request=_make_elicitation_prompt(
             host, fmt, approval_state, server_url=server_url
@@ -2717,6 +2941,9 @@ async def run_repl(
         on_session_start=on_session_start,
         harness=harness,
         attach_only=attach_only,
+        field_input_state=field_input_state,
+        host=host,
+        fmt=fmt,
     )
     # Make per-invocation log paths visible to slash commands such as
     # /logs without broadening the slash-command dispatch signature.
@@ -2886,7 +3113,7 @@ async def run_repl(
                 # a stream-pump reconnect gap or before this REPL
                 # attached is lost — so also re-sync at each turn start.
                 _spawn_metadata_refresh()
-            elif event.status in ("idle", "failed"):
+            elif event.status in ("idle", "waiting", "failed"):
                 from omnigent_client import TextDone
 
                 # A SETUP-phase failure (spec resolution, spawn-env
@@ -3379,6 +3606,18 @@ async def run_repl(
     async def on_input(text: str, attachments: list[PendingAttachment] | None = None) -> None:
         nonlocal conversation_id, is_streaming
 
+        # Pending schema field input: consume this line as the
+        # current field's value before any other routing.
+        if field_input_state.pending:
+            field_name = field_input_state.field_name or "field"
+            # Plain styled text: ``field_name`` (server schema) and
+            # ``text`` (user input) must not be parsed as Rich markup.
+            host.output(
+                Text(f"   › {field_name}: {text}", style=fmt.muted),
+            )
+            field_input_state.resolve(text)
+            return
+
         # Pending policy approval: consume this input as the
         # verdict BEFORE slash-command / normal-send routing.
         # The hook is awaiting a future; resolving it wakes
@@ -3480,6 +3719,7 @@ async def run_repl(
             # hook's future doesn't leak waiting for a verdict
             # that will never come.
             approval_state.cancel()
+            field_input_state.cancel()
             # Best-effort — server may already have finished.
             with contextlib.suppress(Exception):
                 await asyncio.shield(session.cancel())

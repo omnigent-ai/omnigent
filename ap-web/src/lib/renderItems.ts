@@ -19,6 +19,7 @@
 // Pure function. No React, no DOM. Tested in `renderItems.test.ts`.
 
 import type { AnyBlock, MessageContentBlock, ToolExecution, ToolResultBlock } from "./blocks";
+import type { RememberScope } from "./types";
 import type { ActiveResponse } from "@/store/types";
 
 /**
@@ -112,6 +113,7 @@ export type RenderItem =
         execPolicyAmendment: string[] | null;
       } | null;
       allowAllEdits?: boolean;
+      rememberScope?: RememberScope | null;
     };
 
 /** A bubble cluster. The page maps over these. */
@@ -696,6 +698,7 @@ function buildAssistantItems(
         exitPlanMode: b.exitPlanMode,
         codexCommand: b.codexCommand,
         allowAllEdits: b.allowAllEdits,
+        rememberScope: b.rememberScope,
       });
       i += 1;
       continue;

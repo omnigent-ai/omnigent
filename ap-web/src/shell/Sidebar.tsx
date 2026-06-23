@@ -71,6 +71,7 @@ import { sumPendingApprovals } from "@/lib/inbox";
 import { cn } from "@/lib/utils";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
+import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import { ThemeModeMenu } from "@/components/theme/ThemeModeMenu";
 import { AccountMenu } from "./AccountMenu";
@@ -80,6 +81,7 @@ import {
   computeNextActiveOverride,
   conversationDisplayLabel,
   normalizePinnedConversationIds,
+  orderByPinnedSequence,
   PINNED_CONVERSATION_IDS_STORAGE_KEY,
   sortByUpdatedAtDesc,
   togglePinnedConversationId,
@@ -95,6 +97,14 @@ const TIME_MARKER_SLOT_CLASS =
 interface SidebarProps {
   open: boolean;
   onClose: () => void;
+  /**
+   * Live open fraction (0 = closed, 1 = open) while the iOS shell's left-edge
+   * swipe is dragging the sidebar; `null` when not dragging. When set, the
+   * mobile overlay tracks it directly (transition suppressed) so the drawer
+   * follows the finger; on release the parent clears it and toggles `open`,
+   * letting the CSS transition animate to the resting state.
+   */
+  dragProgress?: number | null;
 }
 
 /**
@@ -133,7 +143,7 @@ function useActiveNavItem(): { isNewChatPage: boolean; isInboxPage: boolean } {
  *     scrollback is fine; users typically want the conversations list
  *     to stay visible while they switch around.
  */
-export function Sidebar({ open, onClose }: SidebarProps) {
+export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("");
   const [pinnedConversationIds, setPinnedConversationIds] = useState(readPinnedConversationIds);
@@ -224,6 +234,12 @@ export function Sidebar({ open, onClose }: SidebarProps) {
   // full-screen overlay (``fixed inset-0``) and the variable is ignored.
   const { width: sidebarWidth, handleProps: resizeHandleProps } = useResizableSidebar();
 
+  // While the iOS edge-swipe is dragging, the overlay is on-screen and
+  // interactive even though `open` hasn't flipped yet — treat a live drag as
+  // visually open so it isn't `inert`/`aria-hidden` mid-gesture.
+  const dragging = dragProgress != null;
+  const effectiveOpen = open || dragging;
+
   return (
     <aside
       aria-label="Conversations"
@@ -244,7 +260,13 @@ export function Sidebar({ open, onClose }: SidebarProps) {
         // there the sidebar pushes content aside, so nothing sits behind it.
         "max-md:bg-card-solid",
         "fixed inset-0 z-50",
-        open ? "translate-x-0" : "-translate-x-full",
+        // Mobile only: animate the slide so the iOS edge-swipe settles
+        // smoothly on release. Suppressed inline while a drag is live (the
+        // overlay must track the finger 1:1). Scoped to transform so it can't
+        // re-introduce the width-animation lag the base comment warns about,
+        // and gated to mobile so the desktop floating card is unaffected.
+        "max-md:transition-transform max-md:duration-200 max-md:ease-out",
+        effectiveOpen ? "translate-x-0" : "-translate-x-full",
         // Desktop: a floating card. Detached from the window edges by a
         // margin, rounded, and lifted off the bg-sidebar canvas with a
         // full border + shadow. Width (the user-resizable variable) animates
@@ -255,14 +277,23 @@ export function Sidebar({ open, onClose }: SidebarProps) {
           ? "md:m-2 md:w-[var(--sidebar-width)] md:rounded-xl md:border md:border-border md:shadow-lg"
           : "md:m-0 md:w-0 md:border-0",
       )}
-      style={{ "--sidebar-width": `${sidebarWidth}px` } as CSSProperties}
+      style={
+        {
+          "--sidebar-width": `${sidebarWidth}px`,
+          // Track the finger: map the 0→1 open fraction to translateX
+          // -100%→0% and kill the transition so it follows the drag exactly.
+          ...(dragging
+            ? { transform: `translateX(${(dragProgress - 1) * 100}%)`, transition: "none" }
+            : null),
+        } as CSSProperties
+      }
       // Hide from the accessibility tree when closed so screen readers
       // don't see the empty-state contents while focus is elsewhere.
-      aria-hidden={!open}
-      data-collapsed={!open || undefined}
+      aria-hidden={!effectiveOpen}
+      data-collapsed={!effectiveOpen || undefined}
       // Match the keyboard-focus story: when closed, the sidebar's
       // children shouldn't receive tabs.
-      inert={!open}
+      inert={!effectiveOpen}
     >
       {/* Right-edge resize handle (desktop only), mirroring the right rail's
           left-edge handle. Hidden on mobile, where the sidebar is a
@@ -477,9 +508,12 @@ function ConversationList({
   const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
   const sections = useMemo(() => {
     const allWithBackfill = [...allConversations, ...pinnedBackfill];
-    const pinned = sortByUpdatedAtDesc(
+    // Pinned rows are ordered strictly by when they were pinned (newest pin
+    // at the bottom), not by `updated_at` — a pinned session shouldn't jump
+    // when it gets a new message.
+    const pinned = orderByPinnedSequence(
       allWithBackfill.filter((c) => pinnedSet.has(c.id) && c.archived !== true),
-      activeOverride,
+      pinnedConversationIds,
     );
     const pinnedIdSet = new Set(pinned.map((c) => c.id));
     const active = allConversations.filter((c) => !pinnedIdSet.has(c.id) && c.archived !== true);
@@ -493,7 +527,7 @@ function ConversationList({
       activeOverride,
     );
     return { pinned, sessions, shared, archived };
-  }, [allConversations, pinnedBackfill, pinnedSet, activeOverride]);
+  }, [allConversations, pinnedBackfill, pinnedSet, pinnedConversationIds, activeOverride]);
 
   // Collapsed section titles — persisted like pins so the preference
   // survives reloads. Lifted here (not per-section state) because the
@@ -524,6 +558,14 @@ function ConversationList({
     ].map((c) => c.id);
   }, [sections, collapsedSections]);
   useSessionSwitchHotkey(orderedConversationIds, activeId);
+
+  // Cmd/Ctrl+1..9/0 jumps to the first ten pinned sessions (desktop only;
+  // see the hook). Empty when the Pinned section is collapsed.
+  const pinnedSessionIds = useMemo(
+    () => (collapsedSections.includes("Pinned") ? [] : sections.pinned.map((c) => c.id)),
+    [sections.pinned, collapsedSections],
+  );
+  usePinnedSessionHotkeys(pinnedSessionIds, activeId);
 
   // Only normalize pinned ids once all pages are loaded; a pin that
   // lives on an unloaded page should not be dropped prematurely
@@ -913,7 +955,7 @@ function ConversationRow({
           !selectionMode &&
             (sessionState?.kind === "awaiting" ? "pr-44 md:pr-28" : "pr-28 md:pr-16"),
           selectionMode && "pr-10",
-          isActive && "bg-muted font-semibold",
+          isActive && "bg-muted",
           selectionMode && isSelected && "bg-primary/5",
         )}
         onClick={(e) => {
@@ -939,7 +981,7 @@ function ConversationRow({
             shared) were removed to keep rows text-clean; pinned rows still
             group under "Pinned". */}
         <div className="flex w-full items-center gap-1.5">
-          <span className={cn("relative min-w-0 truncate", hasUnseenMessages && "font-semibold")}>
+          <span className="relative min-w-0 truncate">
             {label}
             {hasUnseenMessages && <span className="sr-only"> (unread)</span>}
           </span>
@@ -1568,59 +1610,57 @@ function BulkActionBar({
           >
             Clear
           </Button>
-          {count > 0 && (
-            <div className="flex items-center gap-1.5 md:hidden">
-              {allSelectedSameArchiveGroup && nonArchivedSelected.length > 0 && (
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  className="h-7 gap-1.5 text-xs"
-                  disabled={isBusy}
-                  onClick={handleArchive}
-                >
-                  {bulkArchive.isPending ? (
-                    <Loader2Icon className="size-3 animate-spin" />
-                  ) : (
-                    <ArchiveIcon className="size-3" />
-                  )}
-                  Archive
-                </Button>
-              )}
-              {allSelectedSameArchiveGroup && archivedSelected.length > 0 && (
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  className="h-7 gap-1.5 text-xs"
-                  disabled={isBusy}
-                  onClick={handleUnarchive}
-                >
-                  {bulkArchive.isPending ? (
-                    <Loader2Icon className="size-3 animate-spin" />
-                  ) : (
-                    <ArchiveRestoreIcon className="size-3" />
-                  )}
-                  Unarchive
-                </Button>
-              )}
+          <div className="flex items-center gap-1.5 md:hidden">
+            {allSelectedSameArchiveGroup && nonArchivedSelected.length > 0 && (
               <Button
                 type="button"
                 variant="outline"
                 size="sm"
-                className="h-7 gap-1.5 text-xs text-destructive"
-                disabled={isBusy || ownedSelected.length === 0}
-                onClick={() => setConfirmDeleteOpen(true)}
+                className="h-7 gap-1.5 text-xs"
+                disabled={isBusy}
+                onClick={handleArchive}
               >
-                {bulkDelete.isPending ? (
+                {bulkArchive.isPending ? (
                   <Loader2Icon className="size-3 animate-spin" />
                 ) : (
-                  <Trash2Icon className="size-3" />
+                  <ArchiveIcon className="size-3" />
                 )}
-                Delete {ownedSelected.length > 0 ? ownedSelected.length : ""}
+                Archive
               </Button>
-            </div>
-          )}
+            )}
+            {allSelectedSameArchiveGroup && archivedSelected.length > 0 && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-7 gap-1.5 text-xs"
+                disabled={isBusy}
+                onClick={handleUnarchive}
+              >
+                {bulkArchive.isPending ? (
+                  <Loader2Icon className="size-3 animate-spin" />
+                ) : (
+                  <ArchiveRestoreIcon className="size-3" />
+                )}
+                Unarchive
+              </Button>
+            )}
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className={cn("h-7 gap-1.5 text-xs", ownedSelected.length > 0 && "text-destructive")}
+              disabled={isBusy || ownedSelected.length === 0}
+              onClick={() => setConfirmDeleteOpen(true)}
+            >
+              {bulkDelete.isPending ? (
+                <Loader2Icon className="size-3 animate-spin" />
+              ) : (
+                <Trash2Icon className="size-3" />
+              )}
+              Delete {ownedSelected.length > 0 ? ownedSelected.length : ""}
+            </Button>
+          </div>
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
@@ -1639,62 +1679,60 @@ function BulkActionBar({
           </Tooltip>
         </div>
 
-        {count > 0 && (
-          <div className="hidden items-center gap-1.5 px-2 md:flex">
-            {allSelectedSameArchiveGroup && nonArchivedSelected.length > 0 && (
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                className="h-7 gap-1.5 text-xs"
-                disabled={isBusy}
-                onClick={handleArchive}
-                data-testid="bulk-archive"
-              >
-                {bulkArchive.isPending ? (
-                  <Loader2Icon className="size-3 animate-spin" />
-                ) : (
-                  <ArchiveIcon className="size-3" />
-                )}
-                Archive
-              </Button>
-            )}
-            {allSelectedSameArchiveGroup && archivedSelected.length > 0 && (
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                className="h-7 gap-1.5 text-xs"
-                disabled={isBusy}
-                onClick={handleUnarchive}
-                data-testid="bulk-unarchive"
-              >
-                {bulkArchive.isPending ? (
-                  <Loader2Icon className="size-3 animate-spin" />
-                ) : (
-                  <ArchiveRestoreIcon className="size-3" />
-                )}
-                Unarchive
-              </Button>
-            )}
+        <div className="hidden items-center gap-1.5 px-2 md:flex">
+          {allSelectedSameArchiveGroup && nonArchivedSelected.length > 0 && (
             <Button
               type="button"
               variant="outline"
               size="sm"
-              className="h-7 gap-1.5 text-xs text-destructive"
-              disabled={isBusy || ownedSelected.length === 0}
-              onClick={() => setConfirmDeleteOpen(true)}
-              data-testid="bulk-delete"
+              className="h-7 gap-1.5 text-xs"
+              disabled={isBusy}
+              onClick={handleArchive}
+              data-testid="bulk-archive"
             >
-              {bulkDelete.isPending ? (
+              {bulkArchive.isPending ? (
                 <Loader2Icon className="size-3 animate-spin" />
               ) : (
-                <Trash2Icon className="size-3" />
+                <ArchiveIcon className="size-3" />
               )}
-              Delete {ownedSelected.length > 0 ? ownedSelected.length : ""}
+              Archive
             </Button>
-          </div>
-        )}
+          )}
+          {allSelectedSameArchiveGroup && archivedSelected.length > 0 && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-7 gap-1.5 text-xs"
+              disabled={isBusy}
+              onClick={handleUnarchive}
+              data-testid="bulk-unarchive"
+            >
+              {bulkArchive.isPending ? (
+                <Loader2Icon className="size-3 animate-spin" />
+              ) : (
+                <ArchiveRestoreIcon className="size-3" />
+              )}
+              Unarchive
+            </Button>
+          )}
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className={cn("h-7 gap-1.5 text-xs", ownedSelected.length > 0 && "text-destructive")}
+            disabled={isBusy || ownedSelected.length === 0}
+            onClick={() => setConfirmDeleteOpen(true)}
+            data-testid="bulk-delete"
+          >
+            {bulkDelete.isPending ? (
+              <Loader2Icon className="size-3 animate-spin" />
+            ) : (
+              <Trash2Icon className="size-3" />
+            )}
+            Delete {ownedSelected.length > 0 ? ownedSelected.length : ""}
+          </Button>
+        </div>
 
         {(bulkArchive.isError || bulkDelete.isError) && (
           <p className="text-xs text-destructive" role="alert">
@@ -1749,7 +1787,7 @@ function BulkActionBar({
  *
  * SSR-safe (returns false when window is undefined).
  */
-function isMobileViewport(): boolean {
+export function isMobileViewport(): boolean {
   if (typeof window === "undefined") return false;
   return !window.matchMedia("(min-width: 768px)").matches;
 }

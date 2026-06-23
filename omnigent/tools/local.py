@@ -495,6 +495,10 @@ class LocalPythonTool(Tool):
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
 
+    def shutdown(self) -> None:
+        """Kill any remaining in-flight subprocesses on teardown."""
+        self.cancel()
+
 
 def _write_srt_settings_file(state_root: str) -> str:
     """Write a per-invocation srt settings file for stateful tools.

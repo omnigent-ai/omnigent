@@ -19,6 +19,19 @@ export interface ConversationRef {
 }
 
 /**
+ * Scope of a claude-native "don't ask again" persistent allow rule,
+ * stamped by the PermissionRequest endpoint for non-edit eligible
+ * tools. ``tool`` is the gated tool; ``host`` is the WebFetch request
+ * domain when present (a domain-scoped rule), absent for a tool-wide
+ * rule. Shared by the elicitation event (`events.ts`), the reduced
+ * block (`blocks.ts`), and the ApprovalCard that renders the button.
+ */
+export interface RememberScope {
+  tool: string;
+  host?: string;
+}
+
+/**
  * An un-consumed web-composer user message replayed from the session
  * snapshot. Native-terminal sessions don't persist a web message at
  * POST time (the transcript forwarder is the single writer), so the

@@ -43,6 +43,7 @@ from omnigent.onboarding.detected import (
 )
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
+    BEDROCK_KIND,
     CLI_CONFIG_KIND,
     DATABRICKS_KIND,
     OPENAI_FAMILY,
@@ -140,7 +141,7 @@ _logger = logging.getLogger(__name__)
 
 
 AgentHarnessType = Literal[
-    "claude-sdk", "codex", "pi", "openai-agents-sdk", "antigravity", "opencode"
+    "claude-sdk", "codex", "pi", "openai-agents-sdk", "antigravity", "opencode", "qwen"
 ]
 
 
@@ -223,6 +224,16 @@ _UCODE_HARNESS_CONFIGS: dict[AgentHarnessType, UcodeHarnessConfig] = {
         base_urls_key=None,
         host_key="HARNESS_OPENAI_AGENTS_GATEWAY_HOST",
         auth_key="HARNESS_OPENAI_AGENTS_GATEWAY_AUTH_COMMAND",
+        refresh_key=None,
+    ),
+    "qwen": UcodeHarnessConfig(
+        agent_name="qwen",
+        model_key="HARNESS_QWEN_MODEL",
+        base_url_key="HARNESS_QWEN_GATEWAY_BASE_URL",
+        base_url_family="openai",
+        base_urls_key=None,
+        host_key="HARNESS_QWEN_GATEWAY_HOST",
+        auth_key="HARNESS_QWEN_GATEWAY_AUTH_COMMAND",
         refresh_key=None,
     ),
     # NB: ``antigravity`` is intentionally absent. Unlike the gateway
@@ -385,6 +396,8 @@ _PROVIDER_HARNESS_FAMILY: dict[AgentHarnessType, str] = {
     # the OpenAI-compatible wire (OpenRouter / LiteLLM / Databricks gateway),
     # so it consumes the ``openai`` family like openai-agents-sdk.
     "antigravity": OPENAI_FAMILY,
+    # Qwen Code routes through OpenAI-compatible providers (like Kimi v1).
+    "qwen": OPENAI_FAMILY,
 }
 
 # Maps harnesses that gate the vendor-neutral gateway transport on a
@@ -397,6 +410,7 @@ _HARNESS_GATEWAY_FLAG: dict[AgentHarnessType, str] = {
     "claude-sdk": "HARNESS_CLAUDE_SDK_GATEWAY",
     "codex": "HARNESS_CODEX_GATEWAY",
     "pi": "HARNESS_PI_GATEWAY",
+    "qwen": "HARNESS_QWEN_GATEWAY",
 }
 
 # Maps a generic-provider family to the key pi uses in its
@@ -423,6 +437,7 @@ _HARNESS_DATABRICKS_PROFILE: dict[AgentHarnessType, str] = {
     # lets callers that iterate the dict (e.g. the legacy reset paths)
     # see opencode without crashing.
     "opencode": "HARNESS_OPENCODE_DATABRICKS_PROFILE",
+    "qwen": "HARNESS_QWEN_DATABRICKS_PROFILE",
     # NB: no ``antigravity`` — it has no Databricks/gateway path (Gemini-native).
 }
 
@@ -520,6 +535,9 @@ def configure_agent_harness_with_provider(
     - ``databricks`` — delegate to the existing ucode path keyed on the
       provider's profile, reusing :func:`configure_agent_harness_with_ucode`
       so the ``polly`` / Databricks coding-agent flow is unchanged.
+    - ``bedrock`` — rejected (raises): AWS Bedrock mode is wired only into
+      the native ``omnigent claude`` launch, not the in-process / gateway
+      harnesses.
 
     :param env: Mutable spawn-env dict, modified in place.
     :param entry: The resolved provider entry to apply.
@@ -540,6 +558,22 @@ def configure_agent_harness_with_provider(
             "or Vertex AI) and does not support generic providers or gateway "
             "routing. Set executor.auth to an api_key, or executor.config "
             "vertex/project/location, instead of a 'providers:' entry.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if entry.kind == BEDROCK_KIND:
+        # Bedrock mode is wired only into the native ``omnigent claude`` launch
+        # (:func:`omnigent.claude_native._bedrock_config_for_native_claude`),
+        # which sets CLAUDE_CODE_USE_BEDROCK + AWS_BEARER_TOKEN_BEDROCK directly.
+        # The in-process / gateway harnesses have no Bedrock path, so emitting
+        # the generic ``HARNESS_*_GATEWAY_*`` vars would silently point the
+        # harness at the Bedrock endpoint as if it spoke the Anthropic Messages
+        # API and fail at request time. Fail loud instead.
+        raise OmnigentError(
+            f"provider {entry.name!r} (kind 'bedrock') is only supported by the "
+            f"native 'omnigent claude' terminal, not the {harness_type!r} harness. "
+            "For agents / 'omnigent run', use a 'gateway' provider "
+            "(OpenAI/Anthropic-compatible endpoint), or a 'databricks' / 'key' "
+            "provider.",
             code=ErrorCode.INVALID_INPUT,
         )
     if entry.kind == SUBSCRIPTION_KIND:
@@ -1420,6 +1454,67 @@ def _build_pi_spawn_env(
     os_env_payload = _serialize_os_env(spec.os_env)
     if os_env_payload is not None:
         env["HARNESS_PI_OS_ENV"] = os_env_payload
+    return env
+
+
+def _build_qwen_spawn_env(
+    spec: AgentSpec,
+    *,
+    workdir: Path | None = None,
+) -> dict[str, str]:
+    """
+    Build the env-var dict the qwen harness wrap reads.
+
+    Maps spec.executor fields → the ``HARNESS_QWEN_*`` env vars
+    defined in ``omnigent/inner/qwen_harness.py``. Mirrors
+    :func:`_build_claude_sdk_spawn_env` /
+    :func:`_build_codex_spawn_env`.
+
+    :param spec: The agent spec.
+    :param workdir: The bundle's on-disk path (extracted by the agent
+        cache). Accepted for signature parity with the other
+        ``_build_*_spawn_env`` builders; the qwen wrap does not yet
+        consume a bundle dir (no skills bridge — see docs/QWEN_FOLLOWUPS.md).
+    :returns: A dict of env-var overrides for
+        :meth:`HarnessProcessManager.get_client(env=...)`.
+    """
+    env: dict[str, str] = {}
+    model = _resolve_spec_model(spec)
+    if model is not None:
+        env["HARNESS_QWEN_MODEL"] = model
+
+    # Generic-provider branch (slotted ahead of the legacy-profile /
+    # databricks-prefix path): a ProviderAuth on the spec, or — when the spec
+    # declares no auth — the per-family global default. qwen routes through
+    # OpenAI-compatible providers.
+    provider = _resolve_provider_for_build(spec, harness_type="qwen")
+    if provider is not None:
+        configure_agent_harness_with_provider(env, provider, harness_type="qwen")
+    else:
+        # Same routing heuristic as the claude-sdk variant: profile set OR
+        # model starts with ``databricks-`` / ``databricks/``.
+        profile = spec.executor.config.get("profile")
+        use_databricks = bool(profile) or (
+            model is not None and model.startswith(("databricks-", "databricks/"))
+        )
+        if use_databricks:
+            env["HARNESS_QWEN_GATEWAY"] = "true"
+            if profile:
+                env["HARNESS_QWEN_DATABRICKS_PROFILE"] = str(profile)
+        configure_agent_harness_with_ucode(
+            env,
+            str(profile) if profile else None,
+            harness_type="qwen",
+        )
+    # NB: no skills bridge for qwen yet. Unlike the claude-sdk / codex
+    # variants, the qwen wrap (omnigent/inner/qwen_harness.py) and
+    # QwenExecutor have no skills concept, so emitting
+    # HARNESS_QWEN_SKILLS_FILTER / _AGENT_NAME / _BUNDLE_DIR would set env
+    # nothing reads. Wire those through when skills land — see
+    # docs/QWEN_FOLLOWUPS.md.
+    os_env_payload = _serialize_os_env(spec.os_env)
+    if os_env_payload is not None:
+        env["HARNESS_QWEN_OS_ENV"] = os_env_payload
     return env
 
 

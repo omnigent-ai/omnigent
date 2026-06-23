@@ -554,7 +554,7 @@ _DENY_CANADA_POLICY_CONFIG = {
 # Server-level LLM model key — the PolicyLLMClient uses the
 # model from the server's ``llm:`` config, which in mock mode
 # is always ``"mock-model"``.
-_SERVER_LLM_MODEL = "mock-model"
+_SERVER_LLM_MODEL = "_policy_llm_"
 
 
 def test_prompt_policy_allow_path_reaches_llm(
@@ -566,10 +566,10 @@ def test_prompt_policy_allow_path_reaches_llm(
     Non-Canadian input → classifier ALLOWs → agent LLM runs →
     assistant text comes back.
 
-    The mock server's ``"mock-model"`` queue is pre-seeded with an
-    ALLOW verdict so the prompt_policy classifier returns ALLOW
-    without any real LLM call.  The agent model is a separate mock
-    key so the two queues don't interfere.
+    The ``live_server`` fixture sets a non-resettable ALLOW fallback on
+    the ``"mock-model"`` classifier queue so parallel workers' resets
+    cannot starve the classifier. The agent model uses a separate UUID
+    queue so the two don't interfere.
 
     :param http_client: HTTP client pointed at the live server.
     :param live_runner_id: Runner id for the session.
@@ -578,12 +578,6 @@ def test_prompt_policy_allow_path_reaches_llm(
     agent_model = f"mock-pp-allow-{uuid.uuid4().hex[:6]}"
 
     reset_mock_llm(mock_llm_server_url)
-    # Classifier verdict: ALLOW (non-Canadian input).
-    configure_mock_llm(
-        mock_llm_server_url,
-        [{"text": '{"action": "allow", "reason": ""}'}],
-        key=_SERVER_LLM_MODEL,
-    )
     # Agent's own LLM response (reached only after ALLOW).
     configure_mock_llm(
         mock_llm_server_url,
