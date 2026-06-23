@@ -72,7 +72,7 @@ async def _drain_until_elicitation(
     elicitation future, so subscribing here is the simplest way to
     learn the id without monkey-patching ``uuid``. Returning the
     whole event lets callers also inspect the params block for the
-    Claude-native extras (``tool_use_id``, ``cwd``, ``permission_mode``).
+    Claude-native extras (``cwd``, ``permission_mode``).
 
     :param session_id: Session to subscribe to.
     :param timeout_s: Maximum seconds to wait for the elicitation
@@ -128,6 +128,9 @@ async def _claude_permission_payload(tool_name: str = "Bash") -> dict[str, Any]:
     :param tool_name: Tool Claude wants to call.
     :returns: JSON-serializable payload mirroring Claude Code's
         published wire shape for the ``PermissionRequest`` event.
+        Deliberately carries no ``tool_use_id``: the real
+        PermissionRequest payload has no per-call id (it is minted only
+        when the tool call is emitted, after this permission check).
     """
     return {
         "session_id": "claude_sess_abc",
@@ -137,7 +140,6 @@ async def _claude_permission_payload(tool_name: str = "Bash") -> dict[str, Any]:
         "hook_event_name": "PermissionRequest",
         "tool_name": tool_name,
         "tool_input": {"command": "ls -la"},
-        "tool_use_id": "tool_use_xyz",
     }
 
 
@@ -440,7 +442,6 @@ async def _claude_webfetch_payload(url: str = "https://github.com/cli/cli") -> d
         "hook_event_name": "PermissionRequest",
         "tool_name": "WebFetch",
         "tool_input": {"url": url, "prompt": "summarize"},
-        "tool_use_id": "tool_use_wf",
     }
 
 
@@ -711,8 +712,8 @@ async def test_permission_request_hook_forwards_cwd_and_permission_mode(
     ``permission_mode`` lets the UI badge the card with the mode
     Claude is in (``"default"`` / ``"acceptEdits"`` / ``"plan"``).
 
-    Note: ``tool_use_id`` is intentionally not asserted here.
-    Claude Code's PermissionRequest payload doesn't carry one
+    Note: ``tool_use_id`` is intentionally absent — the fixtures omit
+    it because Claude Code's PermissionRequest payload doesn't carry one
     (the id is only minted when the tool call is emitted, AFTER
     the permission check). The UI's auto-clear falls back to a
     "first pending" heuristic instead — see

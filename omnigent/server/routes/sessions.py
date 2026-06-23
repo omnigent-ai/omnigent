@@ -14117,11 +14117,13 @@ def create_sessions_router(
                 "PermissionRequest hook body 'tool_input' must be an object when present.",
                 code=ErrorCode.INVALID_INPUT,
             )
-        # ``tool_use_id`` is not stable on Claude Code's
-        # PermissionRequest payload, and newer builds can write the
-        # transcript ``function_call`` (tool_use) before this hook
-        # returns — so neither can correlate/resolve the parked
-        # request. The parked wait ends on one of three signals: an
+        # Claude Code's PermissionRequest payload carries no
+        # ``tool_use_id`` (verified against a real payload — the field
+        # is absent, not merely unstable; the id is only minted when the
+        # tool call is emitted, AFTER this permission check). And newer
+        # builds can write the transcript ``function_call`` (tool_use)
+        # before this hook returns — so neither can correlate/resolve the
+        # parked request. The parked wait ends on one of three signals: an
         # explicit web verdict, hook disconnect, or the mirrored
         # ``function_call_output`` (tool_result) for this gated tool,
         # which — unlike the tool_use — is written only AFTER the
