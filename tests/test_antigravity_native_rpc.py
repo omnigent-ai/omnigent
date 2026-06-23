@@ -1456,3 +1456,82 @@ async def test_stream_agent_state_updates_rejects_non_loopback_url(
     monkeypatch.setattr(rpc, "_ASYNC_HTTP_TRANSPORT", httpx.MockTransport(_unexpected))
     with pytest.raises(ValueError, match="non-loopback connect-RPC URL"):
         await _collect(52548, _CONVERSATION_ID)
+
+
+# ---------------------------------------------------------------------------
+# Functional-RPC timeout: the four functional calls use _RPC_CALL_TIMEOUT_S, the
+# discovery probes keep the tight _PROBE_TIMEOUT_S
+# ---------------------------------------------------------------------------
+
+
+def _capture_sync_client_timeouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[float]:
+    """Spy on ``_sync_client`` to record every per-request timeout it is built with.
+
+    Returns the list the spy appends to; the real client is still constructed so
+    the RPC's MockTransport request/response path runs unchanged.
+    """
+    timeouts: list[float] = []
+    real_sync_client = rpc._sync_client
+
+    def _spy(timeout: float) -> httpx.Client:
+        timeouts.append(timeout)
+        return real_sync_client(timeout)
+
+    monkeypatch.setattr(rpc, "_sync_client", _spy)
+    return timeouts
+
+
+def test_functional_rpcs_use_rpc_call_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The four functional RPCs build their client with ``_RPC_CALL_TIMEOUT_S``.
+
+    A tight discovery-probe timeout (2s) misused here would raise a transport
+    ``TimeoutException`` against a momentarily busy agy; the caller does not retry
+    — the interaction bridge only retries on the "input not registered" substring
+    (a timed-out human-answer delivery would be permanently abandoned) and the
+    cold-start does NOT retry ``StartCascade`` (a slow ack would deadlock the
+    placeholder conversation id). The functional calls therefore get the generous
+    ``_RPC_CALL_TIMEOUT_S`` headroom.
+    """
+    monkeypatch.setattr(
+        rpc,
+        "_HTTP_TRANSPORT",
+        httpx.MockTransport(lambda r: httpx.Response(200, json={"steps": []})),
+    )
+
+    timeouts = _capture_sync_client_timeouts(monkeypatch)
+    rpc.get_trajectory_steps(52548, "c")
+    rpc.cancel_cascade_steps(52548, "c")
+    rpc.handle_user_interaction(
+        52548, "c", trajectory_id="t", step_index=0, payload={"permission": {"allow": True}}
+    )
+    rpc.send_user_cascade_message(52548, "c", "hi", plan_model="MODEL_X")
+    rpc.start_cascade(52548, "c")
+
+    assert timeouts == [rpc._RPC_CALL_TIMEOUT_S] * 5
+
+
+def test_discovery_probes_keep_probe_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The discovery/probe RPCs keep the tight ``_PROBE_TIMEOUT_S``.
+
+    Scanning several candidate ports must stay fast, so ``Heartbeat`` /
+    ``GetConversationMetadata`` (during discovery) / ``GetAvailableModels`` keep
+    the short probe budget — they were NOT widened to the functional timeout.
+    """
+    monkeypatch.setattr(
+        rpc,
+        "_HTTP_TRANSPORT",
+        httpx.MockTransport(
+            lambda r: httpx.Response(
+                200, json={"metadata": {"rootConversationId": "c"}, "models": {}}
+            )
+        ),
+    )
+
+    timeouts = _capture_sync_client_timeouts(monkeypatch)
+    rpc._heartbeat_ok(52548)
+    rpc._conversation_matches(52548, "c")
+    rpc.get_available_models(52548)
+
+    assert timeouts == [rpc._PROBE_TIMEOUT_S] * 3

@@ -1537,3 +1537,115 @@ async def test_two_turn_usage_is_cumulative(
     assert usage_events[1][1]["cumulative_input_tokens"] == 2000
     assert usage_events[1][1]["cumulative_output_tokens"] == 100
     assert usage_events[1][1]["cumulative_cache_read_input_tokens"] == 200
+
+
+# ---------------------------------------------------------------------------
+# _is_assistant_text_close_step: the turn-close edge fires only on DONE
+# ---------------------------------------------------------------------------
+
+
+def test_close_step_false_for_generating_planner_with_text() -> None:
+    """A GENERATING planner with text but no tool calls does NOT close the turn.
+
+    Regression: the IDLE status edge must fire only on the DONE closing step.
+    A GENERATING frame already carries growing ``modifiedResponse`` text with no
+    ``toolCalls`` yet, so without the DONE gate the reader would close the turn
+    (the spinner) mid-response on the stream path.
+    """
+    generating = {
+        "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+        "status": "CORTEX_STEP_STATUS_GENERATING",
+        "plannerResponse": {"modifiedResponse": "Partial answer so far"},
+    }
+    assert reader._is_assistant_text_close_step(generating) is False
+
+
+def test_close_step_true_for_done_planner_with_text() -> None:
+    """The SAME step at status DONE (text, no tool calls) DOES close the turn."""
+    done = {
+        "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+        "status": "CORTEX_STEP_STATUS_DONE",
+        "plannerResponse": {
+            "modifiedResponse": "Partial answer so far",
+            "response": "Partial answer so far",
+        },
+    }
+    assert reader._is_assistant_text_close_step(done) is True
+
+
+def test_close_step_false_for_done_planner_with_tool_calls() -> None:
+    """A DONE planner that still issues a tool call does NOT close the turn.
+
+    Confirms the DONE gate did not regress the tool-call carve-out: a planner
+    step that invokes a tool is followed by the tool result (and possibly more
+    planner steps), so it must not be treated as the closing edge.
+    """
+    done_with_tool = {
+        "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+        "status": "CORTEX_STEP_STATUS_DONE",
+        "plannerResponse": {
+            "response": "Running a command",
+            "toolCalls": [{"id": "call_1"}],
+        },
+    }
+    assert reader._is_assistant_text_close_step(done_with_tool) is False
+
+
+# ---------------------------------------------------------------------------
+# Stream re-entry backoff: an immediate clean trailer must not busy-spin
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stream_reentry_backoff_between_clean_immediate_returns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A stream that returns immediately with no frames backs off between re-entries.
+
+    Regression for the busy-spin: if agy returns an immediate clean trailer (no
+    frames) repeatedly, ``_stream_loop`` must NOT re-POST the stream at zero
+    delay — it must await ``_STREAM_REENTRY_BACKOFF_S`` between re-entries.
+
+    The ``stop`` predicate here fires once the stream has been entered
+    ``target_entries`` times, so the assertion is tied to stream re-entries (not
+    to how many times ``stop`` is consulted per loop turn). Each backoff is gated
+    on ``not stop()`` AFTER the stream returns, so the run records exactly one
+    backoff per re-entry that is followed by another entry.
+    """
+    empty_stream = _FrameScript([])  # each entry yields no frames, returns at once
+    backoff_sleeps: list[float] = []
+
+    async def _record_sleep(seconds: float) -> None:
+        backoff_sleeps.append(seconds)
+
+    target_entries = 3
+
+    def _stop_after_entries() -> bool:
+        # Stop once the stream has been (re-)entered the target number of times.
+        return empty_stream.calls >= target_entries
+
+    monkeypatch.setattr(reader, "stream_agent_state_updates", empty_stream)
+    monkeypatch.setattr(reader, "get_trajectory_steps", _StepScript([[]]))
+    monkeypatch.setattr(reader, "post_session_event_with_retry", _PostSink())
+    monkeypatch.setattr(reader, "_sleep", _record_sleep)
+
+    async def _noop_pending(_cid: str, _port: int, _pending: PendingInteraction) -> None:
+        return None
+
+    await reader.supervise_reader(
+        _bridge_dir(tmp_path),
+        _SESSION_ID,
+        client=cast(httpx.AsyncClient, object()),
+        on_pending_interaction=cast(Any, _noop_pending),
+        poll_interval_s=0.0,
+        stop=_stop_after_entries,
+    )
+
+    # The stream was re-entered exactly target_entries times (no crash, no
+    # fallback to the poll loop), and every backoff recorded was the re-entry
+    # backoff — proving the loop did NOT busy-spin re-POSTing at zero delay, and
+    # that only the re-entry backoff (not the poll-interval sleep) ran.
+    assert empty_stream.calls == target_entries
+    assert backoff_sleeps and all(s == reader._STREAM_REENTRY_BACKOFF_S for s in backoff_sleeps)

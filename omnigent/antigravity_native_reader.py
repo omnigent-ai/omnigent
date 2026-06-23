@@ -98,6 +98,15 @@ _logger = logging.getLogger(__name__)
 # keeps the mirror responsive without hammering the loopback server.
 _DEFAULT_POLL_INTERVAL_S = 0.25
 
+# Backoff between connect-stream re-entries in :func:`_stream_loop`. In steady
+# state the re-opened stream blocks awaiting frames, so this delay is paid only
+# once per turn-settle (negligible). It bounds a busy-spin if agy ever returns an
+# immediate clean trailer repeatedly (plausible right after cold-start before any
+# turn, or a transient non-streamable state), which would otherwise re-POST the
+# stream at zero delay and pin a CPU — the poll fallback only triggers on an
+# exception, never a clean immediate return.
+_STREAM_REENTRY_BACKOFF_S = 0.5
+
 # POST retry policy, kept identical to the transcript forwarder's so mirrored
 # items are delivered with the same transient-retry semantics. Conversation
 # items persist with a random primary key and are NOT deduped server-side, so an
@@ -340,9 +349,15 @@ def _is_assistant_text_close_step(step: dict[str, object]) -> bool:
     planner steps, follow).
 
     :param step: One RPC step dict.
-    :returns: ``True`` when the step is a PLANNER_RESPONSE with non-empty text
-        and an empty/absent ``toolCalls`` list.
+    :returns: ``True`` when the step is a DONE PLANNER_RESPONSE with non-empty
+        text and an empty/absent ``toolCalls`` list.
     """
+    # The turn-close edge must fire only on the DONE closing step. A GENERATING
+    # planner frame already carries growing ``modifiedResponse`` text with no
+    # ``toolCalls`` yet, so without this gate ``_emit_step`` would fire the IDLE
+    # status edge mid-response (the spinner closes early) on the stream path.
+    if step.get("status") != _STATUS_DONE:
+        return False
     if step.get("type") != _TYPE_PLANNER_RESPONSE:
         return False
     planner = step.get("plannerResponse")
@@ -759,9 +774,12 @@ async def _stream_loop(
     The stream is consumed and then RE-ENTERED while ``stop`` stays falsy (a real
     connect stream returns when the turn settles, so re-entry resumes live updates
     for the next turn). ``stop`` is consulted once per re-entry, mirroring the
-    poll loop. A transport ``httpx.HTTPError`` or a connect-trailer
-    ``AntigravityRpcError`` propagates to the caller, which falls back to the poll
-    loop.
+    poll loop, and a small :data:`_STREAM_REENTRY_BACKOFF_S` sleep separates
+    re-entries so an immediate clean trailer cannot busy-spin re-POSTing the
+    stream at zero delay (the steady-state stream blocks awaiting frames, so the
+    delay is paid only once per turn-settle). A transport ``httpx.HTTPError`` or a
+    connect-trailer ``AntigravityRpcError`` propagates to the caller, which falls
+    back to the poll loop.
 
     :param port: Validated connect-RPC port.
     :param cascade_id: agy cascade id (equal to the conversation id).
@@ -787,6 +805,11 @@ async def _stream_loop(
                     state=state,
                     on_pending_interaction=on_pending_interaction,
                 )
+        # Backoff before re-opening the stream so an immediate clean trailer
+        # (no frames) cannot busy-spin re-POSTing at zero delay. Skipped when
+        # asked to stop so a shutdown is not delayed by the settle backoff.
+        if not stop():
+            await _sleep(_STREAM_REENTRY_BACKOFF_S)
 
 
 def _frame_steps(frame: dict[str, object]) -> list[dict[str, object]]:

@@ -2759,6 +2759,74 @@ async def test_auto_create_antigravity_resume_skips_cold_start(
 
 
 @pytest.mark.asyncio
+async def test_cold_start_agy_conversation_returns_early_on_real_id_in_bridge_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The runner cold-start refuses to run when bridge state already holds a real id.
+
+    Defense-in-depth mirroring the CLI cold-start (``antigravity_native.py``): the
+    caller only invokes this on a fresh launch (``if not resume:``), but if bridge
+    state already names a NON-placeholder conversation id, cold-starting would
+    create a second empty conversation and clobber the real id. The guard must
+    early-return BEFORE probing for a port or calling ``StartCascade`` — so even a
+    future caller that forgets the resume gate cannot cold-start over a real id.
+    """
+    import omnigent.antigravity_native_bridge as bridge_mod
+    import omnigent.antigravity_native_rpc as rpc_mod
+    import omnigent.runner.app as runner_app_mod
+
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    session_id = "conv_agy_guard"
+    real_id = "68caaeac-2eaf-4e2c-9b95-721b022f4903"  # NOT an agy_conv_* placeholder
+    assert not bridge_mod.is_placeholder_conversation_id(real_id)
+
+    bridge_dir = bridge_mod.prepare_bridge_dir(session_id)
+    bridge_mod.write_bridge_state(
+        bridge_dir,
+        bridge_mod.AntigravityNativeBridgeState(
+            session_id=session_id,
+            conversation_id=real_id,
+        ),
+    )
+
+    # The cold-start must touch NEITHER the port-scan NOR StartCascade.
+    def _no_ports() -> list[int]:
+        raise AssertionError("cold-start must not probe for a port when the id is real")
+
+    start_cascade_calls: list[tuple[int, str]] = []
+
+    def _fake_start_cascade(port: int, cascade_id: str, **_kwargs: Any) -> None:
+        start_cascade_calls.append((port, cascade_id))
+
+    monkeypatch.setattr(rpc_mod, "_candidate_agy_rpc_ports", _no_ports)
+    monkeypatch.setattr(rpc_mod, "start_cascade", _fake_start_cascade)
+
+    patch_calls: list[tuple[str, dict[str, Any]]] = []
+
+    class _RecordingServerClient:
+        async def patch(self, url: str, *, json: dict[str, Any], **_kwargs: Any) -> httpx.Response:
+            patch_calls.append((url, json))
+            return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
+
+    result = await runner_app_mod._cold_start_agy_conversation(
+        bridge_dir,
+        session_id,
+        server_client=cast(httpx.AsyncClient, _RecordingServerClient()),
+    )
+
+    # Returns the existing real id, and never cold-started or re-PATCHed.
+    assert result == real_id
+    assert start_cascade_calls == []
+    assert patch_calls == []
+    # Bridge state is untouched (still the real id, not a fresh cold-start id).
+    state = bridge_mod.read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == real_id
+
+
+@pytest.mark.asyncio
 async def test_auto_create_antigravity_cold_start_port_timeout_keeps_placeholder(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

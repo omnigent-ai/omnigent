@@ -2073,7 +2073,10 @@ async def _cold_start_agy_conversation(
     agy's actual conversation — the read-path replacement for the forwarder's
     ``_patch_external_session_id``. Only the fresh-launch caller invokes this
     (``if not resume:``); a resume already holds agy's real id, so it neither
-    cold-starts nor re-PATCHes.
+    cold-starts nor re-PATCHes. As defense-in-depth (mirroring the CLI cold-start),
+    this ALSO early-returns the existing id when bridge state already holds a
+    non-placeholder conversation id, so it can never cold-start over a real id even
+    if a future caller forgets the resume gate.
 
     **Best-effort, never raises.** A bootstrap failure (no port within
     *timeout_s*, or ``StartCascade`` erroring) must NOT abort the auto-create:
@@ -2095,12 +2098,26 @@ async def _cold_start_agy_conversation(
     :returns: The real (cold-started) cascade/conversation id on success, or
         ``None`` when no port answered in time or ``StartCascade`` failed.
     """
-    from omnigent.antigravity_native_bridge import update_conversation_id
+    from omnigent.antigravity_native_bridge import (
+        is_placeholder_conversation_id,
+        read_bridge_state,
+        update_conversation_id,
+    )
     from omnigent.antigravity_native_rpc import (
         AntigravityRpcError,
         _candidate_agy_rpc_ports,
         start_cascade,
     )
+
+    # Defense-in-depth (mirrors the CLI cold-start in ``antigravity_native.py``):
+    # the caller only invokes this on a fresh launch (``if not resume:``), but a
+    # non-placeholder id in bridge state means agy's real conversation already
+    # exists — cold-starting would create a second empty conversation and clobber
+    # the real id. Refuse so this can never cold-start over a real id even if a
+    # future caller forgets the resume gate.
+    state = await asyncio.to_thread(read_bridge_state, bridge_dir)
+    if state is not None and not is_placeholder_conversation_id(state.conversation_id):
+        return state.conversation_id
 
     deadline = time.monotonic() + timeout_s
     port: int | None = None

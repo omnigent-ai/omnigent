@@ -99,6 +99,18 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 # fast.
 _PROBE_TIMEOUT_S = 2.0
 
+# Timeout for the FUNCTIONAL connect-RPCs (cold-start, turn delivery, interaction
+# answer, step reads, cancel) — generous headroom over the tight discovery-probe
+# budget. The functional calls hit a known, owned, loopback port, so the only
+# reason one would exceed a couple of seconds is a momentarily busy agy; the tight
+# ``_PROBE_TIMEOUT_S`` would then raise a transport ``TimeoutException`` that the
+# caller does not retry — the interaction bridge only retries on "input not
+# registered" (abandoning a human-answer delivery), and the cold-start does NOT
+# retry ``StartCascade`` at all (a slow ack would leave the placeholder id
+# deadlocked). This deadline still bounds a truly-hung agy so a functional call
+# cannot block forever.
+_RPC_CALL_TIMEOUT_S = 30.0
+
 # Timeout policy for the persistent ``StreamAgentStateUpdates`` long-poll. The
 # connect-stream stays open across the whole turn (and idles between turns), so
 # the READ timeout is disabled (``None``) — a tight per-read deadline would abort
@@ -431,7 +443,7 @@ def get_trajectory_steps(port: int, cascade_id: str) -> list[dict[str, object]]:
     """
     url = _rpc_url(port, _METHOD_GET_CASCADE_TRAJECTORY_STEPS)
     _assert_loopback_url(url)
-    with _sync_client(_PROBE_TIMEOUT_S) as client:
+    with _sync_client(_RPC_CALL_TIMEOUT_S) as client:
         response = client.post(
             url,
             headers={"Content-Type": "application/json"},
@@ -462,7 +474,7 @@ def cancel_cascade_steps(port: int, cascade_id: str) -> bool:
     url = _rpc_url(port, _METHOD_CANCEL_CASCADE_STEPS)
     _assert_loopback_url(url)
     try:
-        with _sync_client(_PROBE_TIMEOUT_S) as client:
+        with _sync_client(_RPC_CALL_TIMEOUT_S) as client:
             response = client.post(
                 url,
                 headers={"Content-Type": "application/json"},
@@ -526,7 +538,7 @@ def handle_user_interaction(
         "interaction": {"trajectoryId": trajectory_id, "stepIndex": step_index, **payload},
     }
     try:
-        with _sync_client(_PROBE_TIMEOUT_S) as client:
+        with _sync_client(_RPC_CALL_TIMEOUT_S) as client:
             response = client.post(
                 url,
                 headers={"Content-Type": "application/json"},
@@ -589,7 +601,7 @@ def send_user_cascade_message(
         "cascadeConfig": {"plannerConfig": {"planModel": plan_model}},
     }
     try:
-        with _sync_client(_PROBE_TIMEOUT_S) as client:
+        with _sync_client(_RPC_CALL_TIMEOUT_S) as client:
             response = client.post(
                 url,
                 headers={"Content-Type": "application/json"},
@@ -643,7 +655,7 @@ def start_cascade(
     _assert_loopback_url(url)
     body: dict[str, object] = {"cascadeId": cascade_id, "source": source}
     try:
-        with _sync_client(_PROBE_TIMEOUT_S) as client:
+        with _sync_client(_RPC_CALL_TIMEOUT_S) as client:
             response = client.post(
                 url,
                 headers={"Content-Type": "application/json"},
