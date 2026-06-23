@@ -1049,10 +1049,16 @@ def _split_pi_prompt(blocks: list[dict[str, Any]]) -> tuple[str, list[dict[str, 
     sees the image (#515).
 
     :param blocks: Responses-API content block dicts (``input_text`` /
-        ``input_image``). Non-text, non-image blocks have no Pi channel and are
-        skipped.
+        ``input_image``). An unsupported block type (e.g. ``input_file``,
+        which carries a resolved attachment data URI) raises ``ValueError``
+        rather than being silently dropped: Pi's prompt RPC has no channel
+        for it, and the previous ``json.dumps(prompt)`` path at least
+        surfaced its content as text, so a silent skip would be a data-loss
+        regression. ``run_turn`` turns the error into an ``ExecutorError``.
     :returns: ``(message, images)`` — joined text and a list of Pi
         ``ImageContent`` dicts.
+    :raises ValueError: On a malformed ``input_image`` or an unsupported
+        block type.
     """
     text_parts: list[str] = []
     images: list[dict[str, str]] = []
@@ -1072,6 +1078,13 @@ def _split_pi_prompt(blocks: list[dict[str, Any]]) -> tuple[str, list[dict[str, 
             parsed = parse_data_uri(image_url)
             images.append(
                 {"type": "image", "data": parsed.base64_payload, "mimeType": parsed.mime_type}
+            )
+        else:
+            raise ValueError(
+                f"Unsupported content block type {block_type!r} for the Pi "
+                "harness: only 'input_text' and 'input_image' (inline data "
+                "URI) blocks can be forwarded. Dropping it silently would lose "
+                "the attachment, so the turn fails loudly instead."
             )
     return "\n".join(text_parts), images
 
@@ -1910,9 +1923,7 @@ class PiExecutor(Executor):
         if isinstance(prompt, list):
             try:
                 message, images = _split_pi_prompt(prompt)
-            except ValueError as exc:
-                # A malformed multimodal block must surface as an executor error
-                # like every other failure path here, not crash the turn.
+            except Exception as exc:  # noqa: BLE001 — prompt-prep boundary: any failure (malformed/unsupported block, bad data URI) surfaces as ExecutorError, never an uncaught crash, matching the send_command path below
                 yield ExecutorError(message=f"Failed to prepare prompt for Pi: {exc}")
                 return
         else:

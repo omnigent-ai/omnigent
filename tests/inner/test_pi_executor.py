@@ -374,6 +374,14 @@ def test_split_pi_prompt_rejects_non_data_uri_image():
         _split_pi_prompt([{"type": "input_image", "image_url": "file-abc123"}])
 
 
+def test_split_pi_prompt_rejects_unsupported_block_type():
+    # #516 review: an input_file (or any non-text/non-image) block has no Pi
+    # channel. Dropping it silently would lose the attachment (a regression vs
+    # the old json.dumps path), so it must raise -> ExecutorError, not vanish.
+    with pytest.raises(ValueError, match="Unsupported content block type"):
+        _split_pi_prompt([{"type": "input_file", "file_data": "data:application/pdf;base64,AAAA"}])
+
+
 # _build_models_json tests
 # ---------------------------------------------------------------------------
 
