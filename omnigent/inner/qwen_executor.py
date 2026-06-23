@@ -302,6 +302,7 @@ class QwenExecutor(Executor):
                 if line:
                     logger.debug("qwen stderr: %s", line)
         except asyncio.CancelledError:
+            # Expected on shutdown (close() cancels this task); exit quietly.
             pass
         except Exception as exc:  # noqa: BLE001
             logger.debug("qwen stderr reader stopped: %s", exc)
@@ -346,6 +347,8 @@ class QwenExecutor(Executor):
                     # Notification or unknown — forward to run_turn queue.
                     await self._queue.put(msg)
         except (asyncio.CancelledError, EOFError):
+            # Expected on shutdown (close() cancels this task) or stream EOF;
+            # exit quietly without surfacing an error.
             pass
         except Exception as exc:
             logger.exception("qwen stdout reader error: %s", exc)

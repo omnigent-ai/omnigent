@@ -8930,7 +8930,6 @@ def _qwen_auth_configured() -> bool:
 
     :returns: ``True`` when auth is detectable, else ``False``.
     """
-    import json
     from pathlib import Path
 
     if any(

@@ -156,13 +156,7 @@ async def test_read_stdout_resolves_pending_future() -> None:
 
     response_line = json.dumps({"jsonrpc": "2.0", "id": 42, "result": {"ok": True}}) + "\n"
 
-    # Fake stdout that yields one line then EOF.
-    async def fake_readline_gen():
-        yield response_line.encode()
-        # EOF
-        while True:
-            await asyncio.sleep(0)
-
+    # Fake stdout that yields one line then EOF (b"" on the second readline).
     mock_stdout = AsyncMock()
     calls = [response_line.encode(), b""]
     mock_stdout.readline = AsyncMock(side_effect=calls)

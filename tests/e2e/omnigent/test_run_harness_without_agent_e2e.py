@@ -151,6 +151,13 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     glibc.
 
     ``cursor-native`` is excluded for the union of both reasons above.
+
+    ``qwen`` is excluded because it does not follow the shared
+    ``HARNESS_<HARNESS>_GATEWAY``/``DATABRICKS_PROFILE`` probe wiring that
+    this matrix (and ``test_harness_wrap_e2e.py``) drive harnesses with: its
+    wrap routes through ``HARNESS_QWEN_GATEWAY_BASE_URL`` /
+    ``HARNESS_QWEN_GATEWAY_AUTH_COMMAND`` instead. Its live round-trip is
+    covered by the dedicated ``test_per_harness_qwen.py`` suite.
     """
     expected_live_harnesses = set(OMNIGENT_HARNESSES).intersection(_HARNESS_MODULES) - {
         "claude-native",
@@ -159,5 +166,6 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "cursor",
         "cursor-native",
         "antigravity",
+        "qwen",
     }
     assert {probe.harness for probe in HARNESS_PROBES} == expected_live_harnesses
