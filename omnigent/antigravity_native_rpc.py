@@ -53,8 +53,9 @@ import ipaddress
 import json
 import logging
 import os
+import struct
 import subprocess
-from collections.abc import Iterable
+from collections.abc import AsyncIterator, Iterable
 from urllib.parse import urlparse
 
 import httpx
@@ -80,6 +81,7 @@ _METHOD_CANCEL_CASCADE_STEPS = "CancelCascadeSteps"
 _METHOD_HANDLE_CASCADE_USER_INTERACTION = "HandleCascadeUserInteraction"
 _METHOD_SEND_USER_CASCADE_MESSAGE = "SendUserCascadeMessage"
 _METHOD_GET_AVAILABLE_MODELS = "GetAvailableModels"
+_METHOD_STREAM_AGENT_STATE_UPDATES = "StreamAgentStateUpdates"
 
 _LOOPBACK = "127.0.0.1"
 
@@ -91,6 +93,26 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 # GetConversationMetadata), kept tight so scanning several candidate ports stays
 # fast.
 _PROBE_TIMEOUT_S = 2.0
+
+# Timeout policy for the persistent ``StreamAgentStateUpdates`` long-poll. The
+# connect-stream stays open across the whole turn (and idles between turns), so
+# the READ timeout is disabled (``None``) — a tight per-read deadline would abort
+# the stream during normal think-time. The connect/write/pool deadlines stay
+# short so a port that never accepts the connection fails fast (the reader is
+# expected to reconnect / fall back to polling) rather than hanging the caller.
+_STREAM_TIMEOUT_S = 10.0
+_STREAM_TIMEOUT = httpx.Timeout(_STREAM_TIMEOUT_S, read=None)
+
+# connect-protocol stream framing: each frame is ``[flag: 1B][len: 4B BE][payload]``.
+# The 5-byte fixed header precedes a ``len``-byte payload. The flag is a bitfield:
+# bit 0 (``0x01``) marks a COMPRESSED payload (agy sends uncompressed — a set bit
+# means the JSON decode would be wrong, so the client raises); bit 1 (``0x02``)
+# marks the end-of-stream TRAILER (stop iterating; the payload may carry trailer
+# metadata or an error). ``flag == 0x00`` is a DATA message (payload is the JSON
+# ``update`` object the generator yields).
+_FRAME_HEADER_LEN = 5
+_FRAME_FLAG_COMPRESSED = 0x01
+_FRAME_FLAG_TRAILER = 0x02
 
 # ``lsof`` flags: ``-a`` ANDs the filters (without it ``-p`` and ``-i`` are ORed
 # and the pid filter is ignored), ``-nP`` skips name/port resolution (fast),
@@ -183,18 +205,21 @@ def _sync_client(timeout: float) -> httpx.Client:
     return httpx.Client(verify=False, timeout=timeout, transport=_HTTP_TRANSPORT)
 
 
-def _async_client(timeout: float) -> httpx.AsyncClient:
+def _async_client(timeout: httpx.Timeout | float) -> httpx.AsyncClient:
     """
     Build an async httpx client for a connect-RPC call.
 
-    Reserved for :func:`interrupt_turn`'s future POST (see the transport-seam
-    note above); it has no live caller while the interrupt is wired off. Cert
-    verification is disabled because agy's loopback cert is self-signed; this is
-    safe only because every request URL is checked by :func:`_assert_loopback_url`
-    before it is sent, so the client never trusts an unverified cert from a
-    non-loopback host.
+    Backs the :func:`stream_agent_state_updates` connect server-stream (a
+    persistent long-poll, which is why callers pass an :class:`httpx.Timeout`
+    with the read deadline disabled rather than a flat float). Cert verification
+    is disabled because agy's loopback cert is self-signed; this is safe only
+    because every request URL is checked by :func:`_assert_loopback_url` before
+    it is sent, so the client never trusts an unverified cert from a non-loopback
+    host.
 
-    :param timeout: Per-request timeout in seconds.
+    :param timeout: Per-request timeout — a flat seconds float, or an
+        :class:`httpx.Timeout` for finer control (e.g. the streaming client
+        disables the read deadline so the long-poll is not aborted mid-turn).
     :returns: An ``httpx.AsyncClient`` with cert verification disabled
         (loopback, self-signed) and the test transport when one is installed.
     """
@@ -624,6 +649,105 @@ def get_available_models(port: int) -> dict[str, object]:
     response.raise_for_status()
     body = response.json()  # ValueError on non-JSON 200 propagates (documented)
     return body if isinstance(body, dict) else {}
+
+
+def _encode_connect_envelope(payload: dict[str, object]) -> bytes:
+    """
+    Encode a single connect-protocol request message.
+
+    The connect server-stream request body is ONE enveloped message:
+    ``[flag: 1B = 0x00][length: 4B big-endian uint32][payload]`` where the
+    payload is the JSON request object and ``length`` is its byte count. This is
+    the same 5-byte ``[flag][BE-len]`` framing used on the response side, with an
+    uncompressed (flag ``0x00``) payload.
+
+    :param payload: The request object, e.g. ``{"conversationId": "<id>"}``.
+    :returns: The framed request body bytes.
+    """
+    raw = json.dumps(payload).encode("utf-8")
+    return bytes([0x00]) + struct.pack(">I", len(raw)) + raw
+
+
+async def stream_agent_state_updates(
+    port: int, conversation_id: str
+) -> AsyncIterator[dict[str, object]]:
+    """
+    Stream agent-state updates for ``conversation_id`` over connect server-stream.
+
+    Opens a persistent ``StreamAgentStateUpdates`` POST (connect protocol,
+    ``Content-Type: application/connect+json``) and yields each DATA frame's
+    parsed JSON ``update`` object as it arrives, stopping cleanly on the
+    end-of-stream trailer. The first frame carries a snapshot
+    (``update.mainTrajectoryUpdate.stepsUpdate.steps[]``); subsequent frames are
+    cumulative snapshots that grow while a step is generating (the Task T-D
+    reader owns prefix-diffing for ``output_text_delta`` parity).
+
+    Framing (live-verified, agy 1.0.10 — see design §10.2). The request body is a
+    single connect-enveloped message (see :func:`_encode_connect_envelope`). The
+    response is a byte stream of frames, each ``[flag: 1B][length: 4B BE][payload:
+    length B]``:
+
+    * ``flag == 0x00`` — DATA: ``payload`` is the JSON ``update`` object (yielded).
+    * ``flag & 0x02`` (:data:`_FRAME_FLAG_TRAILER`) — end-of-stream trailer:
+      iteration stops; the payload may carry trailer metadata or an error and is
+      NOT yielded.
+    * ``flag & 0x01`` (:data:`_FRAME_FLAG_COMPRESSED`) — compressed payload: agy
+      sends uncompressed, so a set bit means a decode mismatch — raises
+      :class:`AntigravityRpcError` rather than feeding compressed bytes to the
+      JSON parser.
+
+    Reassembly is buffer-based because frames can be split across network chunks
+    AND several frames can arrive in one chunk: a ``bytearray`` accumulates bytes
+    and, each pass, a frame is sliced out only when the buffer holds the full
+    5-byte header AND the full declared payload — otherwise the loop awaits more
+    bytes. One chunk is never assumed to equal one frame.
+
+    The stream uses :data:`_STREAM_TIMEOUT` (no read deadline) because the
+    long-poll idles between turns; a tight per-read timeout would abort it during
+    normal think-time.
+
+    :param port: Validated connect-RPC port, e.g. ``52548``.
+    :param conversation_id: agy conversation id (equal to the cascade id) to
+        stream updates for.
+    :returns: An async iterator over DATA frames' parsed JSON dicts, in arrival
+        order, ending when the trailer frame is seen or the stream closes.
+    :raises AntigravityRpcError: On a compressed frame (unexpected from agy). The
+        Task T-D reader is responsible for reconnect/poll-fallback on transport
+        errors, which propagate as ``httpx.HTTPError`` from the underlying stream.
+    """
+    url = _rpc_url(port, _METHOD_STREAM_AGENT_STATE_UPDATES)
+    _assert_loopback_url(url)
+    body = _encode_connect_envelope({"conversationId": conversation_id})
+    async with (
+        _async_client(_STREAM_TIMEOUT) as client,
+        client.stream(
+            "POST",
+            url,
+            headers={"Content-Type": "application/connect+json"},
+            content=body,
+        ) as response,
+    ):
+        buffer = bytearray()
+        async for chunk in response.aiter_bytes():
+            buffer.extend(chunk)
+            while len(buffer) >= _FRAME_HEADER_LEN:
+                flag = buffer[0]
+                (length,) = struct.unpack(">I", buffer[1:_FRAME_HEADER_LEN])
+                frame_end = _FRAME_HEADER_LEN + length
+                if len(buffer) < frame_end:
+                    break  # full payload not arrived yet — await more bytes
+                payload = bytes(buffer[_FRAME_HEADER_LEN:frame_end])
+                del buffer[:frame_end]
+                if flag & _FRAME_FLAG_COMPRESSED:
+                    raise AntigravityRpcError(
+                        f"agy sent a compressed connect-stream frame (flag={flag:#04x}); "
+                        "compression is unsupported"
+                    )
+                if flag & _FRAME_FLAG_TRAILER:
+                    return  # end-of-stream trailer: stop (payload not yielded)
+                parsed = json.loads(payload)
+                if isinstance(parsed, dict):
+                    yield parsed
 
 
 def _list_agy_pids() -> list[int]:

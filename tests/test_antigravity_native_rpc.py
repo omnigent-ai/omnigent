@@ -8,7 +8,9 @@ each RPC's URL / headers / body shape is asserted without a real socket.
 from __future__ import annotations
 
 import json
+import struct
 import subprocess
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
@@ -1065,3 +1067,231 @@ def test_get_available_models_raises_on_500(monkeypatch: pytest.MonkeyPatch) -> 
     )
     with pytest.raises(httpx.HTTPStatusError):
         rpc.get_available_models(52548)
+
+
+# ---------------------------------------------------------------------------
+# stream_agent_state_updates (connect server-stream, Task T-C)
+# ---------------------------------------------------------------------------
+#
+# These tests drive the connect-protocol server-stream client over a STREAMING
+# ``httpx.MockTransport`` response (a custom ``httpx.AsyncByteStream`` whose
+# chunks are hand-crafted framed bytes). The framing is load-bearing: a bug in
+# reassembly corrupts or drops live token deltas, so the tests pin the request
+# envelope and exercise the three reassembly hazards — multiple frames in one
+# chunk, one frame split across chunks, and the trailer terminating the stream.
+
+
+def _frame(flag: int, payload: bytes) -> bytes:
+    """
+    Build one connect-protocol frame: ``[flag: 1B][length: 4B BE][payload]``.
+
+    Mirrors the wire format the client must parse. ``flag == 0x00`` is a data
+    message (payload is the JSON ``update`` object); ``flag & 0x02`` marks the
+    end-of-stream trailer.
+
+    :param flag: The 1-byte frame flag (e.g. ``0x00`` data, ``0x02`` trailer).
+    :param payload: The frame payload bytes (JSON for a data frame).
+    :returns: The fully framed bytes ready to concatenate into a stream.
+    """
+    return bytes([flag]) + struct.pack(">I", len(payload)) + payload
+
+
+def _data_frame(obj: dict[str, object]) -> bytes:
+    """Build a ``flag==0x00`` data frame whose payload is ``obj`` as JSON."""
+    return _frame(0x00, json.dumps(obj).encode("utf-8"))
+
+
+class _ByteChunks(httpx.AsyncByteStream):
+    """
+    An ``httpx.AsyncByteStream`` that yields a fixed list of byte chunks.
+
+    Used to drive ``stream_agent_state_updates`` over ``MockTransport`` with
+    EXACT control of chunk boundaries (``aiter_bytes`` preserves them), so the
+    split-frame reassembly path can be exercised deterministically.
+    """
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for chunk in self._chunks:
+            yield chunk
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def _collect(port: int, conversation_id: str) -> list[dict[str, object]]:
+    """Drive the async generator to completion, collecting its yielded dicts."""
+    return [update async for update in rpc.stream_agent_state_updates(port, conversation_id)]
+
+
+def _stream_transport(chunks: list[bytes], seen: dict[str, object]) -> httpx.MockTransport:
+    """
+    Build a ``MockTransport`` that records the request and replies with a stream.
+
+    Captures the request URL / content-type / body bytes into ``seen`` (so the
+    connect envelope can be asserted) and returns a 200 streaming response whose
+    body is ``chunks`` (hand-crafted frames).
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["content_type"] = request.headers.get("content-type")
+        seen["body"] = request.content
+        return httpx.Response(200, stream=_ByteChunks(chunks))
+
+    return httpx.MockTransport(handler)
+
+
+async def test_stream_agent_state_updates_request_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The POST body is a single connect-enveloped frame and the content-type is
+    ``application/connect+json``.
+
+    The request body MUST be ``[0x00][BE-uint32 len][{"conversationId": ...}]``
+    (a connect-enveloped message), not a bare JSON object — agy's connect-stream
+    endpoint rejects an unframed body. Asserts the exact URL, header, and the
+    byte-level envelope so a refactor cannot silently drop the framing.
+    """
+    seen: dict[str, object] = {}
+    trailer = _frame(0x02, b"")
+    monkeypatch.setattr(rpc, "_ASYNC_HTTP_TRANSPORT", _stream_transport([trailer], seen))
+    await _collect(52548, _CONVERSATION_ID)
+
+    assert seen["url"] == (
+        "https://127.0.0.1:52548/exa.language_server_pb.LanguageServerService/"
+        "StreamAgentStateUpdates"
+    )
+    assert seen["content_type"] == "application/connect+json"
+    body = seen["body"]
+    assert isinstance(body, (bytes, bytearray))
+    # Envelope: flag byte 0x00, then a 4-byte big-endian length, then the payload.
+    assert body[0] == 0x00
+    payload_len = struct.unpack(">I", body[1:5])[0]
+    payload = body[5:]
+    assert payload_len == len(payload)
+    assert json.loads(payload) == {"conversationId": _CONVERSATION_ID}
+
+
+async def test_stream_agent_state_updates_yields_data_frames_in_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A stream of several data frames + a trailer yields the parsed dicts in order.
+
+    The happy path: each ``flag==0x00`` frame's JSON payload is yielded as a
+    dict, in arrival order, and the trailer ends iteration cleanly.
+    """
+    updates: list[dict[str, object]] = [
+        {"mainTrajectoryUpdate": {"stepsUpdate": {"steps": [{"stepIndex": 0}]}}},
+        {"mainTrajectoryUpdate": {"stepsUpdate": {"steps": [{"stepIndex": 1}]}}},
+        {"conversationId": _CONVERSATION_ID},
+    ]
+    chunks = [_data_frame(u) for u in updates] + [_frame(0x02, b"")]
+    monkeypatch.setattr(rpc, "_ASYNC_HTTP_TRANSPORT", _stream_transport(chunks, {}))
+    assert await _collect(52548, _CONVERSATION_ID) == updates
+
+
+async def test_stream_agent_state_updates_reassembles_split_and_packed_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Frames split across chunks AND multiple frames in one chunk reassemble.
+
+    The critical reassembly case. The transport yields chunk boundaries that do
+    NOT line up with frame boundaries: frame A is split across two chunks, while
+    frames B and C arrive packed together in a single chunk. The client must
+    maintain a byte buffer and emit exactly A, B, C — never assuming one chunk
+    equals one frame.
+    """
+    frame_a = _data_frame({"n": "a", "pad": "x" * 50})
+    frame_b = _data_frame({"n": "b"})
+    frame_c = _data_frame({"n": "c"})
+    trailer = _frame(0x02, b"")
+
+    split = len(frame_a) // 2
+    chunks = [
+        frame_a[:split],  # first half of A (header may itself be split here)
+        frame_a[split:] + frame_b,  # rest of A, then B fully — boundary mid-chunk
+        frame_c + trailer,  # C and the trailer packed together
+    ]
+    monkeypatch.setattr(rpc, "_ASYNC_HTTP_TRANSPORT", _stream_transport(chunks, {}))
+    assert await _collect(52548, _CONVERSATION_ID) == [
+        {"n": "a", "pad": "x" * 50},
+        {"n": "b"},
+        {"n": "c"},
+    ]
+
+
+async def test_stream_agent_state_updates_header_split_across_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A 5-byte frame header itself split across chunks reassembles correctly.
+
+    The buffer must not attempt to read the header until it holds the full 5
+    bytes (1 flag + 4 length). Here the first chunk carries only 2 bytes of the
+    header, so the loop must await more before parsing.
+    """
+    frame = _data_frame({"hello": "world"})
+    chunks = [frame[:2], frame[2:], _frame(0x02, b"")]
+    monkeypatch.setattr(rpc, "_ASYNC_HTTP_TRANSPORT", _stream_transport(chunks, {}))
+    assert await _collect(52548, _CONVERSATION_ID) == [{"hello": "world"}]
+
+
+async def test_stream_agent_state_updates_trailer_ends_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A trailer frame (``flag & 0x02``) stops iteration even if more bytes follow.
+
+    The end-of-stream trailer is authoritative: any data frame after it must NOT
+    be yielded. Guards against over-reading a stream that agy has signalled
+    complete.
+    """
+    chunks = [
+        _data_frame({"n": "first"}),
+        _frame(0x02, b'{"someTrailer": true}'),  # trailer (payload ignored)
+        _data_frame({"n": "after-trailer-must-be-ignored"}),
+    ]
+    monkeypatch.setattr(rpc, "_ASYNC_HTTP_TRANSPORT", _stream_transport(chunks, {}))
+    assert await _collect(52548, _CONVERSATION_ID) == [{"n": "first"}]
+
+
+async def test_stream_agent_state_updates_raises_on_compressed_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A compressed frame (``flag & 0x01``) raises rather than mis-decoding.
+
+    agy sends uncompressed frames; a compressed flag would mean the JSON decode
+    is wrong. The client must raise a clear error instead of feeding compressed
+    bytes to ``json.loads`` (which would surface as a confusing decode error).
+    """
+    chunks = [_frame(0x01, b"\x1f\x8b compressed junk")]
+    monkeypatch.setattr(rpc, "_ASYNC_HTTP_TRANSPORT", _stream_transport(chunks, {}))
+    with pytest.raises(rpc.AntigravityRpcError, match="compress"):
+        await _collect(52548, _CONVERSATION_ID)
+
+
+async def test_stream_agent_state_updates_rejects_non_loopback_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A non-loopback stream URL is refused before the ``verify=False`` client runs.
+
+    Shares the loopback guard with the unary RPCs: a discovered port that ever
+    resolved off-host must be refused, since ``verify=False`` would otherwise
+    silently trust any cert.
+    """
+    monkeypatch.setattr(rpc, "_rpc_url", lambda port, method: "https://10.0.0.1:1234/svc/Method")
+
+    def _unexpected(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("request must not be sent for a non-loopback URL")
+
+    monkeypatch.setattr(rpc, "_ASYNC_HTTP_TRANSPORT", httpx.MockTransport(_unexpected))
+    with pytest.raises(ValueError, match="non-loopback connect-RPC URL"):
+        await _collect(52548, _CONVERSATION_ID)
