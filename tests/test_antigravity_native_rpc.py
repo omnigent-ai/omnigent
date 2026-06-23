@@ -722,3 +722,51 @@ def test_conversation_id_owned_by_pid_falls_back_when_lsof_blind(
         rpc, "_conversation_matches", lambda port, cid: cid == _CID_A and port == 44955
     )
     assert rpc.conversation_id_owned_by_pid(72753, [_CID_A, _CID_B]) == _CID_A
+
+
+# ---------------------------------------------------------------------------
+# get_trajectory_steps / cancel_cascade_steps (unary RPC, Task 2)
+# ---------------------------------------------------------------------------
+
+
+def test_get_trajectory_steps_posts_cascade_id_and_returns_steps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``get_trajectory_steps`` POSTs ``{"cascadeId": ...}`` to
+    ``GetCascadeTrajectorySteps`` and returns the ``steps`` list from the
+    response body.
+
+    Asserts the exact URL, JSON body, and parsed list shape so a refactor
+    cannot silently change the wire contract consumed by the read driver.
+    """
+    seen: dict[str, object] = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["url"] = str(req.url)
+        seen["body"] = req.content
+        return httpx.Response(
+            200, json={"steps": [{"stepIndex": 0, "status": "CORTEX_STEP_STATUS_DONE"}]}
+        )
+
+    monkeypatch.setattr(rpc, "_HTTP_TRANSPORT", httpx.MockTransport(handler))
+    steps = rpc.get_trajectory_steps(52548, "conv-uuid")
+    assert seen["url"] == (
+        "https://127.0.0.1:52548/exa.language_server_pb.LanguageServerService/"
+        "GetCascadeTrajectorySteps"
+    )
+    assert json.loads(seen["body"]) == {"cascadeId": "conv-uuid"}  # type: ignore[arg-type]
+    assert steps[0]["stepIndex"] == 0
+
+
+def test_cancel_cascade_steps_true_on_200(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    ``cancel_cascade_steps`` POSTs ``{"cascadeId": ...}`` to
+    ``CancelCascadeSteps`` and returns ``True`` when the server responds 200.
+    """
+    monkeypatch.setattr(
+        rpc,
+        "_HTTP_TRANSPORT",
+        httpx.MockTransport(lambda r: httpx.Response(200, json={})),
+    )
+    assert rpc.cancel_cascade_steps(52548, "conv-uuid") is True

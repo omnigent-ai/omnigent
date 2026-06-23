@@ -75,6 +75,8 @@ _METHOD_GET_CONVERSATION_METADATA = "GetConversationMetadata"
 # are unconfirmed on a live process. The best-effort interrupt
 # (:func:`interrupt_turn`) is therefore wired OFF by default; see its TODO.
 _METHOD_FORCE_STOP_CASCADE_TREE = "ForceStopCascadeTree"
+_METHOD_GET_CASCADE_TRAJECTORY_STEPS = "GetCascadeTrajectorySteps"
+_METHOD_CANCEL_CASCADE_STEPS = "CancelCascadeSteps"
 
 _LOOPBACK = "127.0.0.1"
 
@@ -373,6 +375,59 @@ def _conversation_matches(port: int, conversation_id: str) -> bool:
     if not isinstance(metadata, dict):
         return False
     return metadata.get("rootConversationId") == conversation_id
+
+
+def get_trajectory_steps(port: int, cascade_id: str) -> list[dict[str, object]]:
+    """
+    Return the trajectory steps for ``cascade_id`` from the agy on ``port``.
+
+    POSTs ``{"cascadeId": cascade_id}`` to ``GetCascadeTrajectorySteps`` and
+    returns the ``steps`` list from the response body (empty list when the key
+    is absent). Used by the read driver to poll incremental step progress.
+
+    :param port: Validated connect-RPC port, e.g. ``52548``.
+    :param cascade_id: agy cascade id (equal to the conversation id) to query.
+    :returns: List of step dicts, each containing at least ``stepIndex`` and
+        ``status`` (may be empty when no steps have been recorded yet).
+    :raises httpx.HTTPError: On transport-level failures (callers should catch).
+    """
+    url = _rpc_url(port, _METHOD_GET_CASCADE_TRAJECTORY_STEPS)
+    _assert_loopback_url(url)
+    with _sync_client(_PROBE_TIMEOUT_S) as client:
+        response = client.post(
+            url,
+            headers={"Content-Type": "application/json"},
+            content=json.dumps({"cascadeId": cascade_id}).encode("utf-8"),
+        )
+    return list(response.json().get("steps", []))
+
+
+def cancel_cascade_steps(port: int, cascade_id: str) -> bool:
+    """
+    Request cancellation of the active cascade steps for ``cascade_id``.
+
+    POSTs ``{"cascadeId": cascade_id}`` to ``CancelCascadeSteps`` and returns
+    ``True`` when the server responds with a non-error HTTP status (< 400).
+    Fails open (returns ``False``) on any transport error so the executor can
+    treat it as best-effort.
+
+    :param port: Validated connect-RPC port, e.g. ``52548``.
+    :param cascade_id: agy cascade id (equal to the conversation id) to cancel.
+    :returns: ``True`` when the server accepted the cancel (HTTP < 400),
+        ``False`` on any error or rejection.
+    """
+    url = _rpc_url(port, _METHOD_CANCEL_CASCADE_STEPS)
+    _assert_loopback_url(url)
+    try:
+        with _sync_client(_PROBE_TIMEOUT_S) as client:
+            response = client.post(
+                url,
+                headers={"Content-Type": "application/json"},
+                content=json.dumps({"cascadeId": cascade_id}).encode("utf-8"),
+            )
+    except httpx.HTTPError:
+        return False
+    return response.status_code < 400
 
 
 def _list_agy_pids() -> list[int]:
