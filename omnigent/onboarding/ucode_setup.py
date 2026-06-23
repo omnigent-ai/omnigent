@@ -8,6 +8,7 @@ from collections.abc import Sequence
 
 import click
 
+from omnigent.onboarding.databricks_config import normalize_workspace_url
 from omnigent.onboarding.ucode_state import read_ucode_state
 
 _UCODE_AGENT_NAMES: tuple[str, ...] = ("claude", "codex", "pi")
@@ -62,7 +63,7 @@ def build_ucode_configure_command(
         *ucode_command,
         "configure",
         "--workspaces",
-        ",".join(workspace_url.rstrip("/") for workspace_url in workspace_urls),
+        ",".join(normalize_workspace_url(url) for url in workspace_urls),
         "--agents",
         ",".join(agents),
     ]
