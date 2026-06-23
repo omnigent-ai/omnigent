@@ -80,13 +80,14 @@ import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
 import { useProjects, PROJECT_LABEL_KEY } from "@/hooks/useConversations";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
-import { composerAttachmentKey } from "@/store/chatStore";
+import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import {
+  buildMentionPreamble,
   detectMentionAt,
-  type MentionItem,
   mentionItemPath,
-  mentionMarkerFor,
   type MentionState,
+  parseMentionToken,
+  rankMentionEntries,
 } from "@/lib/composerMentions";
 import { OttoEyes } from "@/components/OttoEyes";
 import { SkillPills } from "@/components/SkillPills";
@@ -1952,15 +1953,9 @@ export function NewChatLandingScreen() {
   // workspace API; each tagged path is delivered as an "[Attached: …]" marker
   // prepended to the first message, which the runner reads from that workspace.
   const [mention, setMention] = useState<MentionState | null>(null);
-  const [mentionIndex, setMentionIndex] = useState(-1);
-  const [mentionedItems, setMentionedItems] = useState<MentionItem[]>([]);
   const mentionEnabled =
     isNativeTerminalAgent && !sandboxSelected && !!selectedHostId && workspaceValid;
-  const mentionRawToken = mention?.query ?? "";
-  const mentionSlash = mentionRawToken.lastIndexOf("/");
-  const mentionDir = mentionSlash >= 0 ? mentionRawToken.slice(0, mentionSlash) : "";
-  const mentionFilter =
-    mentionSlash >= 0 ? mentionRawToken.slice(mentionSlash + 1) : mentionRawToken;
+  const { dir: mentionDir, filter: mentionFilter } = parseMentionToken(mention?.query ?? "");
   const workspaceRoot = workspaceTrimmed.replace(/\/+$/, "");
   // Absolute dir to list = workspace root + the drilled sub-path.
   const mentionAbsDir =
@@ -1969,12 +1964,11 @@ export function NewChatLandingScreen() {
     mentionEnabled && mention ? selectedHostId : null,
     mentionAbsDir,
   );
-  const MENTION_MATCH_CAP = 50;
-  // Map host entries (absolute paths) to workspace-relative WorkspaceFile rows
-  // the shared FileMentionMenu renders: folders first, filtered, capped.
+  // Map host entries (absolute paths) to workspace-relative WorkspaceFile rows,
+  // then rank (folders-first, filtered, capped) via the shared helper.
   const mentionEntries: WorkspaceFile[] = useMemo(() => {
     if (!mentionEnabled || !mention) return [];
-    return (mentionFsQuery.data?.entries ?? [])
+    const rows = (mentionFsQuery.data?.entries ?? [])
       .filter((e) => e.type === "directory" || e.type === "file")
       .map(
         (e): WorkspaceFile => ({
@@ -1986,61 +1980,31 @@ export function NewChatLandingScreen() {
           bytes: e.bytes,
           modified_at: e.modified_at,
         }),
-      )
-      .filter((e) => e.name.toLowerCase().includes(mentionFilter.toLowerCase()))
-      .sort((a, b) => {
-        if (a.type !== b.type) return a.type === "directory" ? -1 : 1;
-        return a.name.localeCompare(b.name);
-      })
-      .slice(0, MENTION_MATCH_CAP);
+      );
+    return rankMentionEntries(rows, mentionFilter);
   }, [mentionEnabled, mention, mentionFsQuery.data, mentionFilter, workspaceRoot]);
   const mentionOpen = mentionEntries.length > 0;
   // Closed-but-loading window: don't let Enter send the half-typed "@dir/".
   const mentionListingPending = mentionEnabled && mention != null && mentionFsQuery.isLoading;
 
-  // Pre-select the top row whenever the listing changes (same reset as slash).
-  const prevMentionMatchesRef = useRef<string[]>([]);
-  const mentionEntryKeys = mentionEntries.map((e) => `${e.type}:${e.path}`);
-  if (
-    mentionEntryKeys.length !== prevMentionMatchesRef.current.length ||
-    mentionEntryKeys.some((k, i) => k !== prevMentionMatchesRef.current[i])
-  ) {
-    prevMentionMatchesRef.current = mentionEntryKeys;
-    setMentionIndex(mentionEntryKeys.length > 0 ? 0 : -1);
-  }
-
-  const attachMention = (path: string, isDir: boolean) => {
-    if (!mention) return;
-    setMessage(message.slice(0, mention.start) + message.slice(mention.end));
-    const item: MentionItem = { path, isDir };
-    const itemKey = composerAttachmentKey(item);
-    setMentionedItems((prev) =>
-      prev.some((it) => composerAttachmentKey(it) === itemKey) ? prev : [...prev, item],
-    );
-    setMention(null);
-    setMentionIndex(-1);
-    queueMicrotask(() => {
-      const ta = textareaRef.current;
-      if (ta) ta.setSelectionRange(mention.start, mention.start);
-      ta?.focus();
-    });
-  };
-  const openMentionDir = (path: string) => {
-    if (!mention) return;
-    const inserted = `@${path}/`;
-    const next = message.slice(0, mention.start) + inserted + message.slice(mention.end);
-    setMessage(next);
-    const caret = mention.start + inserted.length;
-    setMention({ query: `${path}/`, start: mention.start, end: caret });
-    setMentionIndex(0);
-    queueMicrotask(() => {
-      const ta = textareaRef.current;
-      if (ta) ta.setSelectionRange(caret, caret);
-      ta?.focus();
-    });
-  };
-  const removeMentionedItem = (index: number) =>
-    setMentionedItems((prev) => prev.filter((_, i) => i !== index));
+  // Shared selection/chip/keyboard glue — see useMentionBrowser. Only the
+  // host-filesystem source + token state above are launcher-specific.
+  const {
+    mentionIndex,
+    mentionedItems,
+    attachMention,
+    openMentionDir,
+    removeMentionedItem,
+    handleKeyDown: handleMentionKeyDown,
+    dismiss: dismissMention,
+  } = useMentionBrowser({
+    mention,
+    setMention,
+    mentionEntries,
+    text: message,
+    setText: setMessage,
+    textareaRef,
+  });
 
   const canSubmit =
     message.trim().length > 0 &&
@@ -2275,13 +2239,9 @@ export function NewChatLandingScreen() {
       // the same wording the native executors emit and that title-seeding
       // strips. The runner, rooted at this workspace, reads the on-disk file
       // from the marker; no upload happens. Folders carry a trailing "/".
-      const mentionPreamble =
-        mentionedItems.length > 0
-          ? mentionedItems
-              .map((it) => mentionMarkerFor(selectedAgent?.harness ?? null, mentionItemPath(it)))
-              .join("\n") + "\n\n"
-          : "";
-      const initialPrompt = mentionPreamble + sanitizeInitialPrompt(message);
+      const initialPrompt =
+        buildMentionPreamble(mentionedItems, selectedAgent?.harness ?? null) +
+        sanitizeInitialPrompt(message);
       // A first message matching one of the agent's bundled skills is
       // handed off as a structured invocation so ChatPage auto-sends it
       // as a `slash_command` event (server resolves the skill) instead
@@ -2415,10 +2375,7 @@ export function NewChatLandingScreen() {
               onBlur={() => {
                 // Dismiss the mention menu when focus leaves the textarea; menu
                 // rows preventDefault on mousedown so selecting one doesn't blur.
-                if (mention) {
-                  setMention(null);
-                  setMentionIndex(-1);
-                }
+                dismissMention();
               }}
               onCompositionStart={() => {
                 isComposingRef.current = true;
@@ -2431,39 +2388,10 @@ export function NewChatLandingScreen() {
                   return;
                 }
 
-                // "@"-mention menu navigation — mutually exclusive with the
-                // slash menu (a token can't be both), and takes priority over
-                // submission. Mirrors the in-session composer.
-                if (mentionOpen) {
-                  const active = mentionIndex >= 0 ? mentionEntries[mentionIndex] : undefined;
-                  if (e.key === "ArrowDown") {
-                    e.preventDefault();
-                    setMentionIndex((i) => (i + 1) % mentionEntries.length);
-                    return;
-                  }
-                  if (e.key === "ArrowUp") {
-                    e.preventDefault();
-                    setMentionIndex((i) => (i <= 0 ? mentionEntries.length - 1 : i - 1));
-                    return;
-                  }
-                  if (e.key === "Enter" && !e.shiftKey && active) {
-                    e.preventDefault();
-                    if (active.type === "directory") openMentionDir(active.path);
-                    else attachMention(active.path, false);
-                    return;
-                  }
-                  if (e.key === "Tab" && active) {
-                    e.preventDefault();
-                    attachMention(active.path, active.type === "directory");
-                    return;
-                  }
-                  if (e.key === "Escape") {
-                    e.preventDefault();
-                    setMention(null);
-                    setMentionIndex(-1);
-                    return;
-                  }
-                }
+                // "@"-mention menu navigation (shared useMentionBrowser) —
+                // mutually exclusive with the slash menu (a token can't be both)
+                // and takes priority over submission.
+                if (handleMentionKeyDown(e)) return;
 
                 // While the skills menu is open, ArrowUp/Down navigate it and
                 // Enter/Tab complete the highlighted item — these take

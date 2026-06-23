@@ -111,12 +111,16 @@ import {
 } from "@/store/chatStore";
 import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 import {
+  buildMentionPreamble,
   detectMentionAt,
   type MentionItem,
   mentionItemPath,
   mentionMarkerFor,
   type MentionState,
+  parseMentionToken,
+  rankMentionEntries,
 } from "@/lib/composerMentions";
+import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 // Re-exported so existing tests importing these from "./ChatPage" keep working
 // after the pure helpers moved to the shared lib.
 export { detectMentionAt, mentionMarkerFor };
@@ -3492,9 +3496,9 @@ export function Composer({
   // run in the workspace and read a file from an "[Attached: …]" marker, so a
   // tagged path is delivered by prepending that marker at send time — no
   // upload, the agent reads the on-disk file directly.
+  // Active "@"-mention token (owned here; the shared useMentionBrowser hook
+  // owns the selection index, tagged chips, and attach/drill/keyboard glue).
   const [mention, setMention] = useState<MentionState | null>(null);
-  const [mentionIndex, setMentionIndex] = useState(-1);
-  const [mentionedItems, setMentionedItems] = useState<MentionItem[]>([]);
   // Attachments pushed in from outside the composer (e.g. the file viewer's
   // "Attach to agent" button). Drained into ``mentionedItems`` below, then
   // cleared from the store so they aren't re-applied.
@@ -3510,33 +3514,6 @@ export function Composer({
   const backdropRef = useRef<HTMLDivElement>(null);
   const isStreaming = status === "streaming";
 
-  // Drain externally-queued attachments (file viewer "Attach to agent") into
-  // the local mention chips, deduping against what's already tagged, then
-  // clear the store queue so they aren't re-applied on the next render.
-  useEffect(() => {
-    if (pendingComposerAttachments.length === 0) return;
-    setMentionedItems((prev) => {
-      // Dedup against already-tagged chips AND within this batch (accumulate
-      // into ``seen`` as we go) so a duplicated queue can't double-apply.
-      const seen = new Set(prev.map(composerAttachmentKey));
-      const fresh: MentionItem[] = [];
-      for (const a of pendingComposerAttachments) {
-        const k = composerAttachmentKey(a);
-        if (seen.has(k)) continue;
-        seen.add(k);
-        fresh.push(a);
-      }
-      return fresh.length > 0 ? [...prev, ...fresh] : prev;
-    });
-    useChatStore.getState().clearPendingComposerAttachments();
-    textareaRef.current?.focus();
-    // Defense-in-depth against the cross-session leak: if the composer unmounts
-    // while an entry is still queued (route change, panel close, the
-    // loading-conversation gate during a session switch), clear the queue so
-    // the next-mounted composer doesn't drain a stale chip. ``switchTo`` also
-    // resets the queue, but this closes the non-switch unmount paths too.
-    return () => useChatStore.getState().clearPendingComposerAttachments();
-  }, [pendingComposerAttachments]);
   // Read-only when either the user lacks a write grant OR the session
   // is structurally non-interactive (``readOnlyReason``). The
   // structural reason takes priority for the placeholder text since it
@@ -3696,8 +3673,6 @@ export function Composer({
   // Tint the `/skill` token blue while the draft reads as a slash command, so
   // the command shape is signalled as the user types it.
   const composerIsCommand = files.length === 0 && isSlashCommandText(value);
-  const hasDraft = value.trim().length > 0 || files.length > 0 || mentionedItems.length > 0;
-  const showInterruptButton = isWorking && !hasDraft;
   const toggleCodexPlanMode = async () => {
     if (planModeBusy) return;
     setCommandError(null);
@@ -3739,11 +3714,7 @@ export function Composer({
   // is how nested files are reached (recursion via navigation, mirroring
   // the terminal's git-tracked walk). At any level the user can attach a
   // single file or the whole folder.
-  const MENTION_MATCH_CAP = 50;
-  const mentionRawToken = mention?.query ?? "";
-  const mentionSlash = mentionRawToken.lastIndexOf("/");
-  const mentionDir = mentionSlash >= 0 ? mentionRawToken.slice(0, mentionSlash) : "";
-  const mentionFilter = mentionSlash >= 0 ? mentionRawToken.slice(mentionSlash + 1) : mentionRawToken;
+  const { dir: mentionDir, filter: mentionFilter } = parseMentionToken(mention?.query ?? "");
   // Root listing reuses the gate's useWorkspaceAllFiles; a sub-directory
   // uses the lazy per-dir hook (disabled — null path — at the root). Both
   // return files AND directories with a ``type`` discriminator.
@@ -3754,20 +3725,9 @@ export function Composer({
   const mentionSourceEntries: WorkspaceFile[] = mentionDir
     ? (mentionDirQuery.data ?? [])
     : (workspaceFilesQuery.data?.data ?? []);
-  // Folders first (navigation targets on top), then files; each filtered by
-  // the typed segment and capped so a huge directory can't render thousands
-  // of rows. The cap trims only the *list*, never what gets delivered.
+  // Folders first, filtered by the typed segment, capped (see rankMentionEntries).
   const mentionEntries: WorkspaceFile[] =
-    mentionEnabled && mention
-      ? mentionSourceEntries
-          .filter((e) => e.name.toLowerCase().includes(mentionFilter.toLowerCase()))
-          .sort((a, b) => {
-            if (a.type !== b.type) return a.type === "directory" ? -1 : 1;
-            return a.name.localeCompare(b.name);
-          })
-          .slice(0, MENTION_MATCH_CAP)
-      : [];
-  const mentionOpen = mentionEntries.length > 0;
+    mentionEnabled && mention ? rankMentionEntries(mentionSourceEntries, mentionFilter) : [];
   // True while a mention token is active but its listing hasn't resolved yet:
   // the cold-boot root fetch, or a sub-directory's first load after drilling
   // in. During this window ``mentionEntries`` is transiently empty (so the
@@ -3780,74 +3740,66 @@ export function Composer({
     mention != null &&
     (mentionDir ? mentionDirQuery.isLoading : workspaceFilesQuery.isLoading);
 
-  // Pre-select the top row whenever the listing changes — same rationale as
-  // the slash menu's reset (lets Enter/Tab act on the top hit without
-  // arrowing first). Keyed by type+path so a file and a dir of the same name
-  // are distinct.
-  const prevMentionMatchesRef = useRef<string[]>([]);
-  const mentionEntryKeys = mentionEntries.map((e) => `${e.type}:${e.path}`);
-  if (
-    mentionEntryKeys.length !== prevMentionMatchesRef.current.length ||
-    mentionEntryKeys.some((k, i) => k !== prevMentionMatchesRef.current[i])
-  ) {
-    prevMentionMatchesRef.current = mentionEntryKeys;
-    setMentionIndex(mentionEntryKeys.length > 0 ? 0 : -1);
-  }
+  // Shared selection/chip/keyboard glue (see useMentionBrowser). The token
+  // state and the data source above stay here; everything stateful is shared
+  // so this composer and the launcher can't drift. ``setText`` also flags the
+  // draft dirty so attach/drill participate in draft persistence.
+  const {
+    mentionIndex,
+    mentionOpen,
+    mentionedItems,
+    setMentionedItems,
+    attachMention,
+    openMentionDir,
+    removeMentionedItem,
+    handleKeyDown: handleMentionKeyDown,
+    dismiss: dismissMention,
+  } = useMentionBrowser({
+    mention,
+    setMention,
+    mentionEntries,
+    text: value,
+    setText: (next) => {
+      setValue(next);
+      dirtyRef.current = true;
+    },
+    textareaRef,
+    isMobile,
+  });
 
-  /**
-   * Attach a file or whole folder the user chose: strip the "@…" token from
-   * the textarea (a chip below carries it) and record the path. Delivered as
-   * an "[Attached: <path>]" marker at send time (see ``submit``), which the
-   * native vendor reads from its own workspace — no upload, full fidelity.
-   */
-  const attachMention = (path: string, isDir: boolean) => {
-    if (!mention) return;
-    const next = value.slice(0, mention.start) + value.slice(mention.end);
-    setValue(next);
-    dirtyRef.current = true;
-    // Dedup on the shared attachment key (path + dir-ness + range), the same
-    // identity the store queue and drain effect use — not path alone — so the
-    // "@" menu and the file viewer's "Attach to agent" never disagree about
-    // what counts as a duplicate.
-    const item: MentionItem = { path, isDir };
-    const itemKey = composerAttachmentKey(item);
-    setMentionedItems((prev) =>
-      prev.some((it) => composerAttachmentKey(it) === itemKey) ? prev : [...prev, item],
-    );
-    setMention(null);
-    setMentionIndex(-1);
-    // Restore the caret to where the token was so typing continues naturally.
-    queueMicrotask(() => {
-      const ta = textareaRef.current;
-      if (ta) ta.setSelectionRange(mention.start, mention.start);
-      ta?.focus();
+  // Depends on mentionedItems (from the hook above), so it's computed here.
+  const hasDraft = value.trim().length > 0 || files.length > 0 || mentionedItems.length > 0;
+  const showInterruptButton = isWorking && !hasDraft;
+
+  // Drain externally-queued attachments (file viewer "Attach to agent") into
+  // the local mention chips, deduping against what's already tagged, then
+  // clear the store queue so they aren't re-applied. Placed after
+  // ``useMentionBrowser`` since it owns ``setMentionedItems``.
+  useEffect(() => {
+    if (pendingComposerAttachments.length === 0) return;
+    setMentionedItems((prev) => {
+      // Dedup against already-tagged chips AND within this batch (accumulate
+      // into ``seen`` as we go) so a duplicated queue can't double-apply.
+      const seen = new Set(prev.map(composerAttachmentKey));
+      const fresh: MentionItem[] = [];
+      for (const a of pendingComposerAttachments) {
+        const k = composerAttachmentKey(a);
+        if (seen.has(k)) continue;
+        seen.add(k);
+        fresh.push(a);
+      }
+      return fresh.length > 0 ? [...prev, ...fresh] : prev;
     });
-  };
-
-  /**
-   * Open a folder: rewrite the "@…" token to "<dir>/" so the menu re-lists
-   * that directory, keeping the mention active (caret after the slash) so
-   * the user keeps navigating or filtering deeper.
-   */
-  const openMentionDir = (path: string) => {
-    if (!mention) return;
-    const inserted = `@${path}/`;
-    const next = value.slice(0, mention.start) + inserted + value.slice(mention.end);
-    setValue(next);
-    dirtyRef.current = true;
-    const caret = mention.start + inserted.length;
-    setMention({ query: `${path}/`, start: mention.start, end: caret });
-    setMentionIndex(0);
-    queueMicrotask(() => {
-      const ta = textareaRef.current;
-      if (ta) ta.setSelectionRange(caret, caret);
-      ta?.focus();
-    });
-  };
-
-  const removeMentionedItem = (index: number) => {
-    setMentionedItems((prev) => prev.filter((_, i) => i !== index));
-  };
+    useChatStore.getState().clearPendingComposerAttachments();
+    textareaRef.current?.focus();
+    // Defense-in-depth against the cross-session leak: if the composer unmounts
+    // while an entry is still queued (route change, panel close, the
+    // loading-conversation gate during a session switch), clear the queue so
+    // the next-mounted composer doesn't drain a stale chip. ``switchTo`` also
+    // resets the queue, but this closes the non-switch unmount paths too.
+    return () => useChatStore.getState().clearPendingComposerAttachments();
+    // setMentionedItems is a stable useState setter (from useMentionBrowser).
+  }, [pendingComposerAttachments, setMentionedItems]);
 
   /**
    * Execute a slash command by name + optional argument string.
@@ -4127,13 +4079,8 @@ export function Composer({
     // (codex says "Attached file:"). Folders carry a trailing "/" so the
     // agent knows to open the directory. The native vendor reads the on-disk
     // workspace file/folder from this marker; no upload happens.
-    const mentionPreamble =
-      mentionedItems.length > 0
-        ? mentionedItems
-            .map((it) => mentionMarkerFor(sessionHarness, mentionItemPath(it)))
-            .join("\n") + "\n\n"
-        : "";
-    const messageText = mentionPreamble + quotePreamble + trimmed;
+    const messageText =
+      buildMentionPreamble(mentionedItems, sessionHarness) + quotePreamble + trimmed;
     // Sending while a prior response is streaming is fine — the
     // server queues the message and delivers it to the running task
     // (or starts a fresh one once the current drains). Escape still
@@ -4175,41 +4122,10 @@ export function Composer({
       return;
     }
 
-    // "@"-mention menu navigation — same model as the slash menu below, and
-    // mutually exclusive with it (a mention token can't also read as a
+    // "@"-mention menu navigation (shared useMentionBrowser) — mutually
+    // exclusive with the slash menu below (a mention token can't also read as a
     // "/"-command). Takes priority over history recall and submission.
-    if (mentionOpen) {
-      const active = mentionIndex >= 0 ? mentionEntries[mentionIndex] : undefined;
-      if (e.key === "ArrowDown") {
-        e.preventDefault();
-        setMentionIndex((i) => (i + 1) % mentionEntries.length);
-        return;
-      }
-      if (e.key === "ArrowUp") {
-        e.preventDefault();
-        setMentionIndex((i) => (i <= 0 ? mentionEntries.length - 1 : i - 1));
-        return;
-      }
-      // Enter: open a folder (drill in) or attach a file. Tab: attach the
-      // highlighted row as a unit — whole folder or file — without drilling.
-      if (e.key === "Enter" && !e.shiftKey && !isMobile && active) {
-        e.preventDefault();
-        if (active.type === "directory") openMentionDir(active.path);
-        else attachMention(active.path, false);
-        return;
-      }
-      if (e.key === "Tab" && active) {
-        e.preventDefault();
-        attachMention(active.path, active.type === "directory");
-        return;
-      }
-      if (e.key === "Escape") {
-        e.preventDefault();
-        setMention(null);
-        setMentionIndex(-1);
-        return;
-      }
-    }
+    if (handleMentionKeyDown(e)) return;
 
     // When the suggestions menu is open, ArrowUp/Down navigate it and
     // Enter/Tab complete the highlighted item. These take priority over
@@ -4464,10 +4380,7 @@ export function Composer({
               // Menu rows ``preventDefault`` on mousedown so selecting an entry
               // keeps focus and does NOT blur — this only fires for genuine
               // focus-out, where the lingering menu would otherwise float.
-              if (mention) {
-                setMention(null);
-                setMentionIndex(-1);
-              }
+              dismissMention();
             }}
             onPaste={handlePaste}
             onScroll={(e) => {
