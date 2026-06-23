@@ -596,13 +596,17 @@ def map_step_to_events(
     * ``CORTEX_STEP_TYPE_USER_INPUT`` → ``[]`` (skipped — the user turn is
       already persisted by the direct ``POST /events`` hook; emitting it here
       would duplicate the user message).
-    * ``CORTEX_STEP_TYPE_PLANNER_RESPONSE`` → one ``message`` item (role
-      assistant) when ``plannerResponse.modifiedResponse`` (or ``response``)
-      is non-empty, then one ``function_call`` item per
-      ``plannerResponse.toolCalls`` entry. **No ``output_text_delta``** — that
-      is the live double-render fix.  ``modifiedResponse`` takes precedence
-      over ``response`` because it is the post-moderation text (both fields
-      present in the live fixtures; they are equal when no moderation occurred).
+    * ``CORTEX_STEP_TYPE_PLANNER_RESPONSE`` **at status DONE** → one ``message``
+      item (role assistant) when ``plannerResponse.modifiedResponse`` (or
+      ``response``) is non-empty, then one ``function_call`` item per
+      ``plannerResponse.toolCalls`` entry. A non-DONE (GENERATING) planner → ``[]``
+      here; its partial text is conveyed only via the streaming reader's
+      ``output_text_delta`` events, so committing a message pre-DONE would
+      double-render (and double-post on the poll path). **No ``output_text_delta``
+      from the mapper** — the committed item is delta-free (the live double-render
+      fix).  ``modifiedResponse`` takes precedence over ``response`` because it is
+      the post-moderation text (both fields present in the live DONE fixtures; they
+      are equal when no moderation occurred).
     * ``CORTEX_STEP_TYPE_RUN_COMMAND`` / ``LIST_DIRECTORY`` / ``ASK_QUESTION``
       (status DONE) → one ``function_call_output`` item carrying the result
       text, keyed on ``metadata.toolCall.id``.  WAITING steps → ``[]`` (no
@@ -631,8 +635,18 @@ def map_step_to_events(
 
     status = step.get("status")
 
-    # PLANNER_RESPONSE: emit assistant text message and/or function_call(s).
+    # PLANNER_RESPONSE: emit the COMMITTED assistant message and/or function_call(s),
+    # but ONLY at terminal (DONE) status. A pre-DONE planner (GENERATING) carries a
+    # growing partial ``modifiedResponse`` that the streaming reader conveys via
+    # incremental ``output_text_delta`` events; committing a message for it here too
+    # would double-render — and on the poll path (which does NOT intercept GENERATING)
+    # a step caught GENERATING then DONE would post TWO messages. Gating on DONE
+    # (symmetric with the tool-result gate below) yields exactly one committed message,
+    # with the FINAL text, on both the stream and poll paths. ERROR/other non-DONE →
+    # no committed item (any partial already streamed as deltas).
     if step_type == _TYPE_PLANNER_RESPONSE:
+        if status != _STATUS_DONE:
+            return []
         # Treat absent stepIndex as 0 (proto omits zero-valued scalar).
         idx = _step_index(step)
         step_idx = idx if idx is not None else 0

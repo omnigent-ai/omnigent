@@ -440,6 +440,50 @@ async def test_incremental_steps_each_post_once(
     assert sink.item_types() == ["message", "function_call", "function_call_output"]
 
 
+@pytest.mark.asyncio
+async def test_poll_planner_generating_then_done_posts_one_final_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """POLL path: a planner caught GENERATING then DONE posts ONE final message.
+
+    Regression for the double-render the rework prevents. The poll loop does NOT
+    intercept GENERATING (only the stream path emits deltas), and the mapper now
+    gates the committed planner message on DONE. So a poll that sees the planner
+    GENERATING ("Hi") then DONE ("Hi there") must post exactly one ``message``
+    whose text is the FINAL "Hi there" — not "Hi", and not two messages.
+    """
+    script = _StepScript(
+        [
+            [_generating_planner("Hi")],
+            [_done_planner("Hi there")],
+            [_done_planner("Hi there")],
+        ]
+    )
+    sink = _PostSink()
+
+    await _run(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        steps=script,
+        monkeypatch=monkeypatch,
+        iterations=3,
+    )
+
+    # Exactly one committed message (no GENERATING message, no double-post).
+    assert sink.item_types() == ["message"]
+    # And it carries the FINAL text.
+    messages = [
+        data for event_type, data in sink.posts if event_type == "external_conversation_item"
+    ]
+    item_data = cast(dict[str, Any], messages[0]["item_data"])
+    content = cast(list[dict[str, Any]], item_data["content"])
+    assert content[0]["text"] == "Hi there"
+    # The poll path emits no deltas.
+    assert sink.deltas() == []
+
+
 # ---------------------------------------------------------------------------
 # USER_INPUT posts nothing
 # ---------------------------------------------------------------------------
@@ -778,6 +822,13 @@ async def test_stream_done_emits_one_committed_message_after_deltas(
     assert max(delta_idxs) < committed_idx
     # Deltas concatenate to the full committed text.
     assert "".join(cast(str, d["delta"]) for d in sink.deltas()) == full
+    # The committed message carries the FINAL text (from the DONE step).
+    messages = [
+        data for event_type, data in sink.posts if event_type == "external_conversation_item"
+    ]
+    item_data = cast(dict[str, Any], messages[0]["item_data"])
+    content = cast(list[dict[str, Any]], item_data["content"])
+    assert content[0]["text"] == full
 
 
 @pytest.mark.asyncio
