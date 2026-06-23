@@ -492,8 +492,12 @@ def output_reasoning_delta_event(
     (``sse.ts`` maps ``response.reasoning_text.delta`` → its ``reasoning_delta``).
     Reasoning streams BEFORE the response (§10.2 ordering), and — unlike text —
     has no committed conversation item: the SPA finalizes the reasoning block when
-    the committed assistant ``message`` arrives, matching the in-process executor
-    (which emits the same SSE pair, never a committed reasoning item). The SPA's
+    the committed assistant ``message`` arrives. The in-process antigravity
+    executor reaches the same SPA state by a different route: it emits only the
+    ``reasoning_text`` deltas and relies on an IMPLICIT reasoning-start (the SPA
+    opens the block on the first ``reasoning_delta``), whereas this path emits an
+    EXPLICIT ``response.reasoning.started`` first; both end with no committed
+    reasoning item. The SPA's
     reasoning block is not keyed by a per-step id (unlike the text deltas'
     ``message_id``), so this carries no conversation id — only ``started`` and the
     growth ``delta``; ``step_index`` rides on the envelope for ordering/debug.

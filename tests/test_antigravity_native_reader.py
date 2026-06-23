@@ -185,6 +185,18 @@ def _frame(steps: list[dict[str, Any]]) -> dict[str, Any]:
     return {"mainTrajectoryUpdate": {"stepsUpdate": {"steps": copy.deepcopy(steps)}}}
 
 
+def _frame_with_conversation(steps: list[dict[str, Any]], conversation_id: str) -> dict[str, Any]:
+    """A stream frame that names its active conversation (design §10.5).
+
+    Each live frame carries ``update.conversationId``; a TUI ``/clear`` mints a
+    NEW id, so post-rotation frames begin naming it. The reader keys its
+    /clear-rotation guard off this field.
+    """
+    frame = _frame(steps)
+    frame["conversationId"] = conversation_id
+    return frame
+
+
 def _generating_planner(text: str, *, step_index: int = 2) -> dict[str, Any]:
     """A PLANNER_RESPONSE step mid-generation (status GENERATING).
 
@@ -1362,6 +1374,95 @@ async def test_stream_status_running_then_idle(
 
     assert sink.statuses() == ["running", "idle"]
     # USER_INPUT still posts no conversation item; the assistant message commits.
+    assert sink.item_types() == ["message"]
+
+
+# ---------------------------------------------------------------------------
+# Stream mode: /clear-rotation guard (design §10.5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stream_rotated_conversation_stops_and_warns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A frame naming a DIFFERENT conversation (TUI /clear) stops the reader.
+
+    The bound conversation is dead after a /clear rotation; continuing would
+    mirror a frozen conversation while the live one's turns are lost. The reader
+    must stop (not silently mirror the dead conversation) and log a warning. The
+    step in the rotated frame must NOT be mirrored.
+    """
+    user = _load("user_input")
+    done = _done_planner("From the dead conversation.")
+    frames = [
+        # First frame still names the bound conversation: mirrored normally.
+        _frame_with_conversation([user], _CASCADE_ID),
+        # Then a /clear rotation: a new conversation id appears. Its step must
+        # not be mirrored, and the reader must stop.
+        _frame_with_conversation([user, done], "rotated-conv-9999"),
+    ]
+    sink = _PostSink()
+
+    with caplog.at_level("WARNING"):
+        await _run_stream(
+            bridge_dir=_bridge_dir(tmp_path),
+            sink=sink,
+            stream=_FrameScript(frames),
+            poll_steps=_StepScript([[]]),
+            monkeypatch=monkeypatch,
+            iterations=2,
+        )
+
+    # The rotation warning was logged (failure is visible, not silent).
+    assert any(
+        "rotated away" in rec.message and "rotated-conv-9999" in rec.message
+        for rec in caplog.records
+    )
+    # The post-rotation assistant message was NOT mirrored (we stopped first).
+    assert sink.item_types() == []
+
+
+@pytest.mark.asyncio
+async def test_stream_same_conversation_frames_do_not_trigger_rotation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Frames naming the bound conversation (or omitting the id) are not rotations.
+
+    The guard must be false-positive-free on the normal path: a frame whose
+    ``conversationId`` matches the bound cascade id — and a frame that omits the
+    field entirely — must mirror normally without a rotation warning.
+    """
+    user = _load("user_input")
+    full = "All set."
+    frames = [
+        # Explicit matching id.
+        _frame_with_conversation([user], _CASCADE_ID),
+        # Field omitted (the existing _frame helper): must not be read as rotation.
+        _frame([user, _generating_planner(full)]),
+        _frame_with_conversation([user, _done_planner(full)], _CASCADE_ID),
+    ]
+    sink = _PostSink()
+
+    with caplog.at_level("WARNING"):
+        await _run_stream(
+            bridge_dir=_bridge_dir(tmp_path),
+            sink=sink,
+            stream=_FrameScript(frames),
+            poll_steps=_StepScript([[]]),
+            monkeypatch=monkeypatch,
+            iterations=1,
+        )
+
+    # No rotation warning, and the conversation mirrored end to end.
+    assert not any("rotated away" in rec.message for rec in caplog.records)
+    assert sink.statuses() == ["running", "idle"]
     assert sink.item_types() == ["message"]
 
 

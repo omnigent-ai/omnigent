@@ -17,9 +17,12 @@ Two functions are exported:
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
+
+_logger = logging.getLogger(__name__)
 
 
 def to_elicitation_params(pending: dict[str, Any]) -> ElicitationRequestParams:
@@ -170,10 +173,27 @@ def _agy_ask_question_response(
     On ``decline`` or ``cancel``, an empty ``responses`` list is returned
     so the caller can forward it without special-casing the verdict.
 
+    MULTI-QUESTION LIMITATION (minimal-safe guard): agy's ``askQuestion`` can
+    carry several ``questions[i]`` (each with its own option ids and
+    ``is_multi_select`` flag — see ``_merge_is_multi_select`` in
+    ``antigravity_native_steps``), and the agy wire wants one response entry PER
+    question. But :class:`ElicitationResult.content` is flat — it carries ONE
+    ``selectedOptionIds`` / ``writeInResponse``, with no per-question key — so the
+    SPA can only collect a single answer end-to-end. Broadcasting that single
+    answer to EVERY question (the prior behaviour) is semantically wrong: those
+    option ids belong to the first question and rarely map onto the others.
+
+    So we answer ONLY the first question with the verdict and leave the remaining
+    questions unanswered (logging the limitation), letting agy handle the rest on
+    its own terms rather than mis-answering them. A full per-question fix requires
+    a schema + SPA-form change (a per-question ``content`` shape) and is tracked
+    as a follow-up; single-question — the dominant, fully-working case — stays
+    correct because there is no "rest" to drop.
+
     :param result: Web-submitted elicitation verdict.
     :param spec: The ``askQuestion`` spec block; used to recover verbatim
-        question text for each response entry.
-    :returns: ``{"askQuestion": {"responses": [...]}}``
+        question text for the answered response entry.
+    :returns: ``{"askQuestion": {"responses": [...]}}`` with at most one entry.
     """
     if result.action != "accept" or not isinstance(result.content, dict):
         return {"askQuestion": {"responses": []}}
@@ -181,6 +201,29 @@ def _agy_ask_question_response(
     questions_raw = spec.get("questions")
     if not isinstance(questions_raw, list):
         return {"askQuestion": {"responses": []}}
+
+    # Only the first question with usable text can be answered: the flat result
+    # shape carries a single answer. Skip leading non-dict / text-less entries so
+    # a malformed first entry does not waste the one answer we can represent.
+    answerable = [
+        entry
+        for entry in questions_raw
+        if isinstance(entry, dict) and isinstance(entry.get("question"), str)
+    ]
+    if not answerable:
+        return {"askQuestion": {"responses": []}}
+
+    if len(answerable) > 1:
+        # Genuine multi-question: the flat verdict cannot represent per-question
+        # answers, so answer the first and leave the rest to agy. Do NOT broadcast.
+        _logger.warning(
+            "agy askQuestion carried %d questions but the elicitation result "
+            "represents a single answer; answering only the first question and "
+            "leaving the remaining %d to agy (flat ElicitationResult.content has "
+            "no per-question structure — full per-question support is a follow-up)",
+            len(answerable),
+            len(answerable) - 1,
+        )
 
     selected_ids: list[str] = []
     raw_ids = result.content.get("selectedOptionIds")
@@ -192,22 +235,14 @@ def _agy_ask_question_response(
     if isinstance(raw_write_in, str) and raw_write_in:
         write_in = raw_write_in
 
-    responses: list[dict[str, Any]] = []
-    for entry in questions_raw:
-        if not isinstance(entry, dict):
-            continue
-        question_text = entry.get("question")
-        if not isinstance(question_text, str):
-            continue
-        response: dict[str, Any] = {
-            "question": question_text,
-            "selectedOptionIds": selected_ids,
-        }
-        if write_in is not None:
-            response["writeInResponse"] = write_in
-        responses.append(response)
+    response: dict[str, Any] = {
+        "question": answerable[0]["question"],
+        "selectedOptionIds": selected_ids,
+    }
+    if write_in is not None:
+        response["writeInResponse"] = write_in
 
-    return {"askQuestion": {"responses": responses}}
+    return {"askQuestion": {"responses": [response]}}
 
 
 def _agy_permission_response(result: ElicitationResult) -> dict[str, Any]:

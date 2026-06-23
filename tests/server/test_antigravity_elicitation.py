@@ -54,6 +54,32 @@ _MULTI_SELECT_PENDING: dict[str, object] = {
     },
 }
 
+_MULTI_QUESTION_PENDING: dict[str, object] = {
+    "kind": "ask_question",
+    "trajectory_id": "traj-multi",
+    "step_index": 9,
+    "spec": {
+        "questions": [
+            {
+                "question": "What type of project?",
+                "is_multi_select": False,
+                "options": [
+                    {"id": "1", "text": "Web app"},
+                    {"id": "2", "text": "CLI tool"},
+                ],
+            },
+            {
+                "question": "Which language?",
+                "is_multi_select": False,
+                "options": [
+                    {"id": "1", "text": "Python"},
+                    {"id": "2", "text": "TypeScript"},
+                ],
+            },
+        ]
+    },
+}
+
 _PERMISSION_PENDING: dict[str, object] = {
     "kind": "permission",
     "trajectory_id": "traj-xyz",
@@ -260,6 +286,69 @@ class TestToInteractionPayloadAskQuestion:
         payload = to_interaction_payload("ask_question", result, self._spec())
         responses = payload["askQuestion"]["responses"]
         assert "writeInResponse" not in responses[0]
+
+
+class TestToInteractionPayloadMultiQuestion:
+    """Multi-question guard: a flat verdict must NOT broadcast to all questions."""
+
+    def _spec(self) -> dict[str, object]:
+        spec = _MULTI_QUESTION_PENDING["spec"]
+        assert isinstance(spec, dict)
+        return spec
+
+    def test_multi_question_answers_only_first(self) -> None:
+        # The flat ElicitationResult.content carries one answer; it belongs to the
+        # first question. Broadcasting it to BOTH questions (the prior behaviour)
+        # is semantically wrong, so only the first question is answered.
+        result = ElicitationResult(
+            action="accept",
+            content={"selectedOptionIds": ["2"]},
+        )
+        payload = to_interaction_payload("ask_question", result, self._spec())
+        responses = payload["askQuestion"]["responses"]
+        assert len(responses) == 1
+        assert responses[0]["question"] == "What type of project?"
+        assert responses[0]["selectedOptionIds"] == ["2"]
+
+    def test_multi_question_does_not_broadcast(self) -> None:
+        result = ElicitationResult(
+            action="accept",
+            content={"selectedOptionIds": ["2"]},
+        )
+        payload = to_interaction_payload("ask_question", result, self._spec())
+        responses = payload["askQuestion"]["responses"]
+        # The second question must NOT be answered with the first's option ids.
+        answered_questions = [r["question"] for r in responses]
+        assert "Which language?" not in answered_questions
+
+    def test_multi_question_logs_limitation(self, caplog: pytest.LogCaptureFixture) -> None:
+        result = ElicitationResult(
+            action="accept",
+            content={"selectedOptionIds": ["1"]},
+        )
+        with caplog.at_level("WARNING"):
+            to_interaction_payload("ask_question", result, self._spec())
+        assert any(
+            "askQuestion carried" in rec.message and "questions" in rec.message
+            for rec in caplog.records
+        )
+
+    def test_multi_question_decline_returns_empty(self) -> None:
+        result = ElicitationResult(action="decline")
+        payload = to_interaction_payload("ask_question", result, self._spec())
+        assert payload["askQuestion"]["responses"] == []
+
+    def test_single_question_does_not_log(self, caplog: pytest.LogCaptureFixture) -> None:
+        # The dominant single-question case must stay silent (no spurious warning).
+        single_spec = _ASK_QUESTION_PENDING["spec"]
+        assert isinstance(single_spec, dict)
+        result = ElicitationResult(
+            action="accept",
+            content={"selectedOptionIds": ["2"]},
+        )
+        with caplog.at_level("WARNING"):
+            to_interaction_payload("ask_question", result, single_spec)
+        assert not any("askQuestion carried" in rec.message for rec in caplog.records)
 
 
 # ── to_interaction_payload: permission ──────────────────────────────

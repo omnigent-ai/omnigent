@@ -820,6 +820,28 @@ async def _stream_loop(
     """
     while not stop():
         async for frame in stream_agent_state_updates(port, cascade_id):
+            # /clear-rotation guard (design §10.5): a TUI ``/clear`` mints a NEW
+            # cascade id and retires the bound one; each frame's
+            # ``update.conversationId`` names the now-active conversation. If it
+            # ever names a DIFFERENT conversation than the one this reader bound,
+            # the bound conversation is dead — continuing would mirror a stale,
+            # frozen conversation while the live one's turns are lost silently. We
+            # stop mirroring (the failure is now logged, not silent). Full
+            # automatic rotation — rebinding to the new conversation and rotating
+            # the Omnigent session, like the codex forwarder does — is a larger
+            # change tracked as a follow-up (T-G); for the headless runner path it
+            # is OBVIATED by the 1:1 design, and for the CLI-fallback TUI edge this
+            # detect+stop keeps the failure visible rather than silent.
+            if _frame_names_other_conversation(frame, cascade_id):
+                _logger.warning(
+                    "agy RPC reader: bound conversation %s was rotated away (a "
+                    "frame named conversation %s, likely a TUI /clear); stopping "
+                    "the reader rather than mirroring the now-dead conversation. "
+                    "Automatic re-bind/rotation is not yet implemented (follow-up).",
+                    cascade_id,
+                    _frame_conversation_id(frame),
+                )
+                return
             for step in _frame_steps(frame):
                 await _process_stream_step(
                     step,
@@ -858,6 +880,40 @@ def _frame_steps(frame: dict[str, object]) -> list[dict[str, object]]:
     if not isinstance(steps, list):
         return []
     return [step for step in steps if isinstance(step, dict)]
+
+
+def _frame_conversation_id(frame: dict[str, object]) -> str | None:
+    """
+    Extract ``update.conversationId`` from one ``StreamAgentStateUpdates`` frame.
+
+    Each stream frame names the active conversation (design §10.5); the field is
+    the rotation signal for a TUI ``/clear`` (which mints a new conversation id).
+    A frame without a string ``conversationId`` yields ``None``.
+
+    :param frame: One parsed DATA-frame ``update`` dict from the stream.
+    :returns: The frame's conversation id string, or ``None`` when absent.
+    """
+    conv = frame.get("conversationId")
+    return conv if isinstance(conv, str) and conv else None
+
+
+def _frame_names_other_conversation(frame: dict[str, object], cascade_id: str) -> bool:
+    """
+    Return whether a frame names a conversation OTHER than the bound cascade id.
+
+    A frame that omits ``conversationId`` (or carries an empty/non-string one)
+    is NOT treated as a rotation — only an explicit, different id is. This keeps
+    the guard false-positive-free on the normal same-conversation path (where the
+    field either matches or is absent) and fires only on a real rotation (design
+    §10.5: a TUI ``/clear`` mints a new id, so frames begin naming it).
+
+    :param frame: One parsed DATA-frame ``update`` dict from the stream.
+    :param cascade_id: The conversation id this reader bound at discovery.
+    :returns: ``True`` only when the frame names a different, non-empty
+        conversation id.
+    """
+    conv = _frame_conversation_id(frame)
+    return conv is not None and conv != cascade_id
 
 
 async def _process_committed_step(
