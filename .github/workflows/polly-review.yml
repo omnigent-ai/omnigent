@@ -345,6 +345,16 @@ jobs:
           permission-pull-requests: read
           permission-contents: read
 
+      - name: Mint App token
+        # Minted here (before iptables DROP) so the GitHub API call succeeds.
+        # Used later by the Post review comment step.
+        id: app-token
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true' && vars.OMNIGENT_BOT_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
+          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
+
       - name: Restrict egress to gateway and GitHub API
         # Use iptables to enforce egress at the kernel level — simpler and
         # more reliable than bwrap egress_rules, which requires a sandbox
@@ -368,6 +378,8 @@ jobs:
           sudo iptables -I OUTPUT 2 -o lo -j ACCEPT
           # Allow GitHub API (gh CLI for PR diff / context).
           sudo iptables -A OUTPUT -d api.github.com -j ACCEPT
+          # Allow tiktoken encoding downloads (cl100k_base etc).
+          sudo iptables -A OUTPUT -d openaipublic.blob.core.windows.net -j ACCEPT
           # Allow gateway (LLM calls).
           if [ -n "$GW_HOST" ]; then
             sudo iptables -A OUTPUT -d "$GW_HOST" -j ACCEPT
@@ -375,7 +387,7 @@ jobs:
           # Drop all other outbound traffic.
           sudo iptables -A OUTPUT -j DROP
 
-          echo "Egress restricted to: api.github.com${GW_HOST:+, $GW_HOST} + loopback"
+          echo "Egress restricted to: api.github.com, openaipublic.blob.core.windows.net${GW_HOST:+, $GW_HOST} + loopback"
 
       - name: Run Polly review
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
@@ -444,14 +456,6 @@ jobs:
             echo "::error::Review output contains LLM_API_KEY — aborting post to prevent secret exfiltration."
             exit 1
           fi
-
-      - name: Mint App token
-        id: app-token
-        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true' && vars.OMNIGENT_BOT_APP_ID != ''
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
-          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
 
       - name: Post review comment
         if: steps.polly.outputs.review_text != ''
