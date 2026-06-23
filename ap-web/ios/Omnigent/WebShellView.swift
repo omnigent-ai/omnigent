@@ -96,7 +96,9 @@ private struct ServerSwitcher: View {
       }
       .disabled(true)
 
-      let otherServers = recents.filter { URL(string: $0)?.omnigentOrigin != currentURL.omnigentOrigin }
+      let otherServers = recents.filter {
+        URL(string: $0)?.omnigentOrigin != currentURL.omnigentOrigin
+      }
       if !otherServers.isEmpty {
         Divider()
         ForEach(otherServers, id: \.self) { recent in

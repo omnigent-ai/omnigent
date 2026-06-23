@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import Omnigent
 
 final class WorkspaceURLExpanderTests: XCTestCase {

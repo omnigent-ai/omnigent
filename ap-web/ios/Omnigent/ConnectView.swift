@@ -154,16 +154,16 @@ struct ConnectView: View {
 
 private let defaultServerURL: String = {
   #if DEBUG
-  "http://localhost:6767"
+    "http://localhost:6767"
   #else
-  "https://"
+    "https://"
   #endif
 }()
 
 private let allowsInsecureHTTP: Bool = {
   #if DEBUG
-  true
+    true
   #else
-  false
+    false
   #endif
 }()
