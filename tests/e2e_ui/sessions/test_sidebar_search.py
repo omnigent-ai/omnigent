@@ -70,3 +70,25 @@ def test_search_filters_sessions(
     # filters server-side on the title, not just hides everything.
     search.fill(marker)
     expect(row).to_be_visible()
+
+
+def test_search_shortcut_opens_sidebar_and_focuses_search(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Ctrl+Shift+F opens the sidebar and selects the session search query."""
+    base_url, session_id = seeded_session
+    page.goto(f"{base_url}/c/{session_id}")
+
+    search = page.get_by_role("searchbox", name="Search sessions")
+    expect(search).to_be_visible(timeout=30_000)
+    search.fill("existing query")
+
+    page.get_by_role("button", name="Close sidebar").click()
+    expect(page.get_by_role("button", name="Open sidebar")).to_be_visible()
+
+    page.keyboard.press("Control+Shift+F")
+
+    expect(search).to_be_focused()
+    assert search.evaluate("el => el.selectionStart") == 0
+    assert search.evaluate("el => el.selectionEnd") == len("existing query")

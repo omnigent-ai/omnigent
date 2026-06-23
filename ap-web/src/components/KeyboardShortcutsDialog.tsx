@@ -44,6 +44,7 @@ const ENTER = "↵";
 const SHIFT = "⇧";
 const UP = "↑";
 const DOWN = "↓";
+const F = "F";
 
 interface Shortcut {
   label: string;
@@ -80,6 +81,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
   {
     title: "Navigation",
     items: [
+      { label: "Search sessions", keys: [MOD_KEY, SHIFT, F] },
       { label: "Previous session", keys: [MOD_KEY, UP] },
       { label: "Next session", keys: [MOD_KEY, DOWN] },
     ],

@@ -5,7 +5,7 @@
 // Recent / Shared with me / Archived).
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -83,13 +83,13 @@ function mockConversations(convs: Conversation[]) {
   useConvMock.mockImplementation(() => result(convs));
 }
 
-function renderSidebar(open = true) {
+function renderSidebar(open = true, onOpen = vi.fn()) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
       <TooltipProvider>
         <MemoryRouter initialEntries={["/"]}>
-          <Sidebar open={open} onClose={vi.fn()} />
+          <Sidebar open={open} onOpen={onOpen} onClose={vi.fn()} />
         </MemoryRouter>
       </TooltipProvider>
     </QueryClientProvider>,
@@ -103,6 +103,29 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("Sidebar session list", () => {
+  it("focuses and selects the session search input on Cmd/Ctrl+Shift+F", async () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    const search = screen.getByRole("searchbox", { name: "Search sessions" });
+    fireEvent.change(search, { target: { value: "claude" } });
+    fireEvent.keyDown(window, { key: "F", metaKey: true, shiftKey: true });
+
+    await waitFor(() => expect(search).toHaveFocus());
+    expect((search as HTMLInputElement).selectionStart).toBe(0);
+    expect((search as HTMLInputElement).selectionEnd).toBe("claude".length);
+  });
+
+  it("requests the sidebar to open before focusing search when collapsed", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    const onOpen = vi.fn();
+    renderSidebar(false, onOpen);
+
+    fireEvent.keyDown(window, { key: "F", metaKey: true, shiftKey: true });
+
+    expect(onOpen).toHaveBeenCalledTimes(1);
+  });
+
   it("renders no filter funnel and requests the list with archived included", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
