@@ -1564,11 +1564,16 @@ def _bedrock_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcode
                 check=True,
             )
         except (OSError, subprocess.SubprocessError) as exc:
+            # CalledProcessError / TimeoutExpired carry captured stderr; surface
+            # it so a misconfigured auth_command is diagnosable. stdout (which
+            # would hold the minted token) is deliberately never logged.
+            stderr = getattr(exc, "stderr", None)
             _logger.warning(
-                "native-claude: bedrock provider %r auth_command failed (%s) "
+                "native-claude: bedrock provider %r auth_command failed (%s)%s "
                 "— falling back to Claude Code's own login.",
                 entry.name,
                 exc,
+                f"\nstderr: {stderr.strip()}" if stderr else "",
             )
             return None
         token = result.stdout.strip()
