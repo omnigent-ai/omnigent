@@ -58,6 +58,7 @@ import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
+import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSwitcher";
 import type { Conversation } from "@/hooks/useConversations";
 import { OttoEyes } from "@/components/OttoEyes";
 import { SkillPills } from "@/components/SkillPills";
@@ -715,6 +716,12 @@ export function NewChatLandingScreen() {
     [agentList],
   );
 
+  // Surface element backing the iOS native server switcher overlay, which
+  // the in-session view shows too — the picker stays reachable while starting
+  // a new session. The hook hides it whenever the sidebar covers the surface.
+  const [landingSurface, setLandingSurface] = useState<HTMLElement | null>(null);
+  useNativeServerSwitcherForMainSurface(landingSurface, true);
+
   const [message, setMessage] = useState<string>("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const isComposingRef = useRef(false);
@@ -1259,7 +1266,11 @@ export function NewChatLandingScreen() {
   return (
     // pb-12 lifts the content slightly above the geometric center, where
     // the hero reads better optically.
-    <div className="flex flex-1 items-center justify-center" data-testid="new-chat-landing">
+    <div
+      ref={setLandingSurface}
+      className="flex flex-1 items-center justify-center"
+      data-testid="new-chat-landing"
+    >
       {/* Padding lives inside the 840px cap, so the composer renders at
           840 − 80 = 760px max. */}
       <div className="flex w-full max-w-[840px] flex-col items-center gap-8 px-10 pt-8 pb-16">

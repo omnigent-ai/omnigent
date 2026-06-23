@@ -1,7 +1,8 @@
 name: UI Snapshot
 
-# Single visual-regression gate for the empty "/" landing
-# (tests/e2e_ui/visual/test_landing_snapshot.py).
+# Visual-regression gate for the committed UI snapshots
+# (tests/e2e_ui/visual/test_*_snapshot.py -- the empty "/" landing, a mocked
+# chat conversation, etc.).
 #
 # Cross-OS rendering note: screenshots differ across rendering environments
 # (font rasterizer + hinting + anti-aliasing), so the committed baseline and the
@@ -18,16 +19,16 @@ name: UI Snapshot
 # in the job summary, so they are always one click away.
 #
 # Triggers:
-#   pull_request       compare the rendered landing against the committed
-#                      baseline; fail (with actual/expected/diff PNGs in the
+#   pull_request       compare the rendered pages against the committed
+#                      baselines; fail (with actual/expected/diff PNGs in the
 #                      artifact) on any mismatch. No secrets, so fork PRs run
 #                      fine.
-#   workflow_dispatch  regenerate the baseline with --update-snapshots in the
-#                      same pinned image; the regenerated PNG is in the
+#   workflow_dispatch  regenerate the baselines with --update-snapshots in the
+#                      same pinned image; the regenerated PNGs are in the
 #                      `ui-snapshot-<run_id>` artifact to download and commit.
 #                      Any collaborator may run this against an arbitrary `ref`;
-#                      the PNG is human-reviewed before it lands, so an
-#                      unreviewed ref can't change the baseline on its own.
+#                      the PNGs are human-reviewed before they land, so an
+#                      unreviewed ref can't change a baseline on its own.
 #
 # All baseline-update paths are documented in tests/e2e_ui/visual/README.md
 # (label the PR for same-repo branches, the local Docker script for forks).
@@ -62,7 +63,7 @@ env:
 
 jobs:
   ui-snapshot:
-    name: UI Snapshot (empty landing)
+    name: UI Snapshot (visual baselines)
     runs-on: ubuntu-24.04
     # Render in the digest-pinned Playwright image (browsers + fonts baked in),
     # so the committed baseline and the PR comparison are byte-identical and a
@@ -117,7 +118,7 @@ jobs:
           npm ci --legacy-peer-deps --no-audit --no-fund
           npm run build
 
-      - name: Compare (PR) or regenerate (dispatch) the landing snapshot
+      - name: Compare (PR) or regenerate (dispatch) the visual snapshots
         id: snapshot
         # --ui-skip-build: the SPA was built in the previous step. On
         # workflow_dispatch we pass --update-snapshots, which rewrites the

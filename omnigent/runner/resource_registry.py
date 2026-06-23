@@ -22,6 +22,8 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from cachetools import TTLCache
+
 from omnigent.entities.pagination import PagedList
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
@@ -56,6 +58,9 @@ GOOSE_NATIVE_TERMINAL_ROLE = "goose-native"
 # this marker to recreate the terminal when its tmux session has died
 # (the REPL exited or crashed) instead of rejecting the attach.
 OMNIGENT_REPL_TERMINAL_ROLE = "omnigent-repl"
+
+_IS_ALIVE_CACHE_TTL_S = 2.0
+_IS_ALIVE_CACHE_MAX = 256
 
 # Diff-track idle threshold (seconds) for the claude-native agent
 # terminal's status watcher. Claude Code redraws its busy line every
@@ -259,6 +264,10 @@ class SessionResourceRegistry:
         self._primary_envs: dict[str, OSEnvironment] = {}
         self._terminal_roles: dict[tuple[str, str], str] = {}
         self._terminal_lifecycles: dict[tuple[str, str], TerminalLifecycle] = {}
+        self._is_alive_cache: TTLCache[str, bool] = TTLCache(
+            maxsize=_IS_ALIVE_CACHE_MAX,
+            ttl=_IS_ALIVE_CACHE_TTL_S,
+        )
         self._lock = threading.Lock()
         # Optional callback ``(session_id, terminal_id) -> None`` invoked
         # (on the event loop) when a terminal's pane produces output, so
@@ -444,7 +453,6 @@ class SessionResourceRegistry:
         )
         return get_resource_by_id(page, resource_id)
 
-    # TODO(perf): cache is_alive() if terminal poll rate becomes a problem.
     async def get_terminal_resource(
         self,
         session_id: str,
@@ -458,6 +466,10 @@ class SessionResourceRegistry:
         any send/read/close path updates that flag. Terminal GET uses
         this method so clients do not reconnect to a stale socket that
         can only print tmux's ``"no sessions"`` error.
+
+        The ``is_alive()`` subprocess probe is cached for a short TTL
+        so rapid polling from web clients does not fork a ``tmux
+        has-session`` process on every request.
 
         :param session_id: Session/conversation identifier.
         :param terminal_id: Opaque terminal resource id,
@@ -475,7 +487,17 @@ class SessionResourceRegistry:
                 continue
             if not entry.instance.running:
                 return None
-            if not await entry.instance.is_alive():
+
+            cache_key = f"{session_id}:{terminal_id}"
+            cached = self._is_alive_cache.get(cache_key)
+            if cached is not None:
+                return terminal_resource_view(session_id, entry) if cached else None
+
+            alive = await entry.instance.is_alive()
+            if alive:
+                self._is_alive_cache[cache_key] = True
+            else:
+                self._is_alive_cache.pop(cache_key, None)
                 return None
             return terminal_resource_view(session_id, entry)
         return None

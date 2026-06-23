@@ -1,7 +1,8 @@
 """End-to-end tests for the @tool decorator (mock LLM).
 
 Verifies the full pipeline:
-- Agent with ``callable``-style tool declarations is registered inline.
+- Agent ships its @tool functions as Python source in the uploaded bundle
+  (tools/python/, auto-discovered) — loaded by file path on any server.
 - Mock LLM emits tool_calls with the correct arguments.
 - Tools run in the server subprocess; results return through the runner.
 - Mock LLM's follow-up response references the literal output values.
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from pathlib import Path
 
 import httpx
 import pytest
@@ -23,11 +25,19 @@ from tests.e2e.conftest import (
     configure_mock_llm,
     create_runner_bound_session,
     poll_session_until_terminal,
-    register_inline_agent,
+    register_dir_agent_with_mock_llm,
     reset_mock_llm,
     send_user_message_to_session,
 )
 from tests.e2e.helpers import final_assistant_text
+
+# Fixture agent whose @tool functions ship as Python source under
+# tools/python/ (auto-discovered, like the archer fixture), so the server
+# loads them by file path from the uploaded bundle on any version — no
+# dependency on the repo's tests/ tree being importable by the server.
+_DECORATOR_TOOLS_DIR = (
+    Path(__file__).resolve().parents[1] / "resources" / "agents" / "decorator-tools"
+)
 
 
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
@@ -45,28 +55,12 @@ def test_word_count_tool_e2e(
     model = f"mock-wordcount-{uuid.uuid4().hex[:6]}"
 
     reset_mock_llm(mock_llm_server_url)
-    agent_name = register_inline_agent(
+    agent_name = register_dir_agent_with_mock_llm(
         http_client,
+        agent_dir=_DECORATOR_TOOLS_DIR,
         name=f"wordcount-{uuid.uuid4().hex[:6]}",
-        harness="openai-agents",
         model=model,
-        profile="",
-        prompt=(
-            "You have a word_count tool. When asked to count words, "
-            "call the tool and report the result."
-        ),
         mock_llm_base_url=f"{mock_llm_server_url}/v1",
-        extra_config={
-            "tools": {
-                "word_count": {
-                    "type": "function",
-                    "description": "Count whitespace-delimited words in text.",
-                    "callable": (
-                        "tests.resources.examples.archer.tools.python.word_count.word_count"
-                    ),
-                },
-            },
-        },
     )
 
     # Turn 1: LLM calls word_count with a 7-word phrase.
@@ -130,38 +124,12 @@ def test_decorated_tools_varied_signatures_e2e(
     model = f"mock-decsig-{uuid.uuid4().hex[:6]}"
 
     reset_mock_llm(mock_llm_server_url)
-    agent_name = register_inline_agent(
+    agent_name = register_dir_agent_with_mock_llm(
         http_client,
+        agent_dir=_DECORATOR_TOOLS_DIR,
         name=f"decsig-{uuid.uuid4().hex[:6]}",
-        harness="openai-agents",
         model=model,
-        profile="",
-        prompt=(
-            "You have three tools: greet, format_record, compute. "
-            "Call them as instructed and report their literal outputs."
-        ),
         mock_llm_base_url=f"{mock_llm_server_url}/v1",
-        extra_config={
-            "tools": {
-                "greet": {
-                    "type": "function",
-                    "description": "Return a greeting for the given name.",
-                    "callable": ("tests._fixtures.agents._decorator_signatures_tools.greet"),
-                },
-                "format_record": {
-                    "type": "function",
-                    "description": "Format a person record as a one-line string.",
-                    "callable": (
-                        "tests._fixtures.agents._decorator_signatures_tools.format_record"
-                    ),
-                },
-                "compute": {
-                    "type": "function",
-                    "description": ("Multiply value by multiplier and echo the optional note."),
-                    "callable": ("tests._fixtures.agents._decorator_signatures_tools.compute"),
-                },
-            },
-        },
     )
 
     # Mock queue:

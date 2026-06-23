@@ -1844,6 +1844,140 @@ def _launcher_for_teardown(
     return launcher
 
 
+def host_resume_supported(
+    host: Host,
+    config: ManagedSandboxConfig | None,
+) -> bool:
+    """
+    Whether :func:`resume_managed_host` could wake this host in place.
+
+    ``True`` iff the host is bound to a sandbox whose provider has a
+    stop/resume lifecycle with a persistent volume
+    (:attr:`SandboxLauncher.can_resume`) and still matches the deployment's
+    current launcher. This is the SAME gate :func:`resume_managed_host`
+    applies before a wake, exposed so the open-session snapshot
+    (``SessionResponse.host_resumable``) can render a dormant such host as a
+    wakeable "asleep" state instead of the terminal ``host_offline``
+    dead-end.
+
+    :param host: The session's bound managed host.
+    :param config: The deployment's current sandbox config, or ``None``
+        when the ``sandbox:`` section has been removed since launch.
+    :returns: ``True`` when a wake would be attempted; ``False`` for a
+        non-managed / non-resumable provider, a dropped config, or a
+        host with no recorded ``sandbox_id``.
+    """
+    launcher = _launcher_for_teardown(host, config)
+    return launcher is not None and launcher.can_resume and host.sandbox_id is not None
+
+
+# ── Managed-host wake (resume a dormant host on demand) ─────────────────────
+
+# Per-host resume single-flight: one in-flight resume per host_id on this
+# replica, else two host processes flap the tunnel registration. Reused across a
+# host's many idle-stop/resume cycles, so not reaped — a .pop() could also race
+# a resume still holding it; one idle Lock per host woken is negligible.
+_resume_locks: dict[str, asyncio.Lock] = {}
+
+
+async def resume_managed_host(
+    host_id: str,
+    host_store: HostStore,
+    config: ManagedSandboxConfig | None,
+) -> None:
+    """
+    Wake a dormant managed host so a session bound to it can run again.
+
+    The send-message relaunch path calls this when a host-bound session has no
+    live runner. If the host is a *resumable* managed host — a provider whose
+    sandbox idle-stops but retains its persistent volume
+    (:attr:`SandboxLauncher.can_resume`) — and is currently offline, this
+    resumes the sandbox under the SAME sandbox id, re-arms its launch token,
+    re-execs ``omnigent host``, and waits for it to re-register. The caller's
+    existing relaunch then spawns a fresh runner.
+
+    No-op when the host is already online, is unknown, or its provider cannot
+    resume (e.g. Modal — the caller falls through to its normal host-offline
+    behavior, i.e. the user starts a new session). Single-flight and
+    idempotent: concurrent callers serialize on a per-host lock and re-check
+    liveness under it, so only the first wakes the host.
+
+    Unlike a launch, a failed wake does NOT tear the sandbox down — the volume
+    + workspace are the user's and must survive for a retry.
+
+    :param host_id: The session's bound host id, e.g. ``"host_a1b2c3d4..."``.
+    :param host_store: Persistent host registrations (cross-replica liveness).
+    :param config: The deployment's managed-sandbox config, or ``None`` when
+        the ``sandbox:`` section has been removed since launch.
+    :raises HTTPException: 502 when the resume or host restart fails.
+    """
+    if config is None:
+        return
+    # Cross-replica DB liveness (freshness-gated): never trust the per-replica
+    # registry alone. Cheap gate before taking the lock.
+    if await asyncio.to_thread(host_store.is_online, host_id):
+        return
+    host = await asyncio.to_thread(host_store.get_host, host_id)
+    if host is None:
+        return
+    # Provider-matched launcher (None if config dropped / provider changed).
+    # Resume needs a reattachable volume; others (e.g. Modal) fall through to
+    # the caller's host-offline path (the user starts a new session).
+    launcher = _launcher_for_teardown(host, config)
+    if launcher is None or not launcher.can_resume or host.sandbox_id is None:
+        return
+    sandbox_id = host.sandbox_id
+    # Single-flight per host (see _resume_locks).
+    resume_lock = _resume_locks.setdefault(host_id, asyncio.Lock())
+    async with resume_lock:
+        # Re-check under the lock: a concurrent waker may have brought the host
+        # online while we waited.
+        if await asyncio.to_thread(host_store.is_online, host_id):
+            return
+        _logger.info(
+            "Waking dormant managed host %s (sandbox %s, provider %s)",
+            host.host_id,
+            sandbox_id,
+            launcher.provider,
+        )
+        try:
+            await asyncio.to_thread(launcher.resume, sandbox_id)
+            # Mint a fresh token: the old one died with the host process's env
+            # (only its hash persists). register_managed_host's relaunch branch
+            # overwrites it in place, keeping the host_id's session bindings.
+            token = secrets.token_urlsafe(32)
+            await asyncio.to_thread(
+                host_store.register_managed_host,
+                host_id=host.host_id,
+                name=host.name,
+                owner=host.owner,
+                token=token,
+                provider=launcher.provider,
+                sandbox_id=sandbox_id,
+                token_expires_at=now_epoch() + config.token_ttl_s,
+            )
+            await asyncio.to_thread(
+                _start_host_in_sandbox,
+                launcher,
+                sandbox_id,
+                token=token,
+                host_id=host.host_id,
+                host_name=host.name,
+                server_url=config.server_url,
+                repo=None,  # the persistent volume already holds the workspace
+            )
+            await _wait_for_host_online(host_store, host.host_id)
+        except Exception as exc:
+            # A failed wake must NOT tear the sandbox down (the volume is the
+            # user's); just surface it.
+            if isinstance(exc, HTTPException):
+                raise
+            message = exc.message if isinstance(exc, click.ClickException) else str(exc)
+            raise HTTPException(
+                status_code=502, detail=f"managed host wake failed: {message}"
+            ) from exc
+
+
 async def terminate_managed_host(
     host: Host,
     host_store: HostStore,

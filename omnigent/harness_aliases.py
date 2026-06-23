@@ -18,6 +18,8 @@ HARNESS_ALIASES: dict[str, str] = {
     # User-facing reversed spelling for the Goose native-CLI harness; canonical
     # id is "goose-native".
     "native-goose": "goose-native",
+    # Qwen Code harness alias.
+    "qwen-code": "qwen",
 }
 
 # Canonical native-CLI harness spellings. These harnesses type messages into

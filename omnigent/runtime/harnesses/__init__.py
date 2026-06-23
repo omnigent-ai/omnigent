@@ -80,6 +80,9 @@ _HARNESS_MODULES: dict[str, str] = {
     # localharness binary; needs glibc >=~2.36). Drives Gemini 3.5 Flash by
     # default (also Claude / GPT-OSS), with Gemini API-key or Vertex AI auth.
     "antigravity": "omnigent.inner.antigravity_harness",
+    # Qwen Code harness wrap. See omnigent/inner/qwen_harness.py.
+    # Drives the ``qwen`` CLI in ACP mode (``qwen --acp``) for agent execution.
+    "qwen": "omnigent.inner.qwen_harness",
 }
 
 __all__ = ["_HARNESS_MODULES"]

@@ -44,10 +44,10 @@ env:
   # dedicated step, so the setup.py build would be a redundant npm hit.
   OMNIGENT_SKIP_WEB_UI: "true"
   # Scrub harness credentials the test server must not pick up.
-  # OPENAI_API_KEY / OPENAI_BASE_URL are NOT scrubbed here -- the "Run UI
-  # e2e tests" step sets them to the Databricks bearer + serving-endpoints
-  # URL so the spawned openai-agents hello_world agent can authenticate
-  # (the ~/.databrickscfg fallback didn't resolve our OAuth M2M in CI).
+  # OPENAI_API_KEY / OPENAI_BASE_URL are NOT scrubbed here — the
+  # conftest's live_server fixture overrides them to mock values
+  # (OPENAI_BASE_URL=<mock>/v1, OPENAI_API_KEY=mock-key) inside the
+  # spawned server subprocess, so ambient real credentials are a no-op.
   ANTHROPIC_API_KEY: ""
   DATABRICKS_TOKEN: ""
   CODEX: ""
@@ -132,11 +132,8 @@ jobs:
         with:
           path: .venv
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
-      - name: Set LLM credentials
-        run: echo "LLM_API_KEY=${{ secrets.LLM_API_KEY }}" >> "$GITHUB_ENV"
-
       - name: Install project + dev extras
-        run: uv sync --extra all --extra dev
+        run: uv sync --locked --extra all --extra dev
 
       - name: Install bubblewrap + tmux
         # bubblewrap: the UI tests open terminals under os_env, whose
@@ -203,66 +200,16 @@ jobs:
           npm install --ignore-scripts --no-audit --no-fund @openai/codex@0.139.0
           echo "${GITHUB_WORKSPACE}/.codex-cli/node_modules/.bin" >> "$GITHUB_PATH"
 
-      - name: Configure native-claude/codex gateway provider
-        # The native CLIs derive their gateway auth from omnigent provider
-        # config. Register the Databricks gateway as the default for both
-        # anthropic (Claude Code) and openai (Codex); the token reaches each
-        # CLI via an env:LLM_API_KEY ref, so no literal secret hits disk.
-        env:
-          GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-        run: |
-          mkdir -p "$HOME/.omnigent"
-          # The Anthropic Messages surface and the Codex Responses surface live
-          # at different paths off the same workspace host. GATEWAY_BASE_URL is
-          # <host>/serving-endpoints (the OpenAI-compatible surface); strip that
-          # suffix to recover the bare host for the codex /ai-gateway path.
-          host="${GATEWAY_BASE_URL%/serving-endpoints}"
-          cat > "$HOME/.omnigent/config.yaml" <<EOF
-          providers:
-            databricks-gateway:
-              kind: gateway
-              default: [anthropic, openai]
-              anthropic:
-                # Databricks serves the Anthropic Messages surface at
-                # <host>/serving-endpoints/anthropic (see
-                # omnigent/inner/pi_executor.py: claude_base_url). GATEWAY_BASE_URL
-                # is <host>/serving-endpoints (the OpenAI-compatible surface), so
-                # the /anthropic suffix is required — without it Claude Code POSTs
-                # to .../serving-endpoints/v1/messages and gets no reply.
-                base_url: "${GATEWAY_BASE_URL}/anthropic"
-                api_key_ref: "env:LLM_API_KEY"
-                # The default model id is read from models.default (not a
-                # top-level default_model key). Without it the provider
-                # resolves model=None, Claude Code launches with no --model and
-                # falls back to its built-in 'claude-sonnet-4-6', which the
-                # Databricks gateway rejects (the endpoint name is the
-                # 'databricks-' prefixed id).
-                models:
-                  default: databricks-claude-sonnet-4-6
-              openai:
-                # Databricks serves the Codex Responses surface at
-                # <host>/ai-gateway/codex/v1 (see omnigent/inner/codex_executor.py:
-                # _databricks_codex_base_url), NOT the /serving-endpoints
-                # OpenAI-compatible surface. wire_api must be 'responses' — codex
-                # >= 0.137 rejects 'chat' at config load.
-                base_url: "${host}/ai-gateway/codex/v1"
-                api_key_ref: "env:LLM_API_KEY"
-                wire_api: responses
-                # The codex model id the e2e codex leg pins (tests/_model_pools).
-                models:
-                  default: databricks-gpt-5-4-mini
-          EOF
-
       - name: Run UI e2e tests
         # --ui-skip-build: the SPA was built in the previous step.
         # --tracing/--screenshot/--video default to off; retain-on-failure
         # keeps green runs cheap while capturing artifacts on failures.
-        # OPENAI_API_KEY / OPENAI_BASE_URL are set by the conftest's
-        # live_server fixture to point at the in-process mock LLM server —
-        # no real gateway credentials needed for the openai-agents harness.
-        # Native render-parity tests (claude-sdk/codex) still use the
-        # ~/.omnigent/config.yaml written in the step above.
+        # The conftest's live_server fixture injects OPENAI_BASE_URL=mock/v1
+        # and OPENAI_API_KEY=mock-key into the runner subprocess env, so the
+        # openai-agents harness and policy classifier both hit the mock — no
+        # real credentials needed. Native render-parity tests write their own
+        # mock provider config via native_*_mock_session at terminal-creation
+        # time, so no ~/.omnigent/config.yaml is written in CI either.
         env:
           # Scheduled / manually dispatched runs are the full pass;
           # PR and push runs exclude @pytest.mark.nightly tests.

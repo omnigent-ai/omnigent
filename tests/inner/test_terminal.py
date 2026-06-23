@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import shutil
+import subprocess
 import sys
 import threading
 from dataclasses import dataclass
@@ -106,6 +109,324 @@ def test_threaded_idle_watcher_keeps_last_pane_text_on_exit(tmp_path: Path) -> N
 
     assert exited.wait(timeout=1.0)
     assert instance.last_pane_text() == "startup failed\ntry config"
+
+
+@dataclass
+class _ProcessWithStdout:
+    """
+    Subprocess stand-in that returns canned stdout (for ``is_alive`` probes).
+
+    :param stdout: Bytes the fake process writes to stdout.
+    :param returncode: Process exit status.
+    """
+
+    stdout: bytes = b""
+    returncode: int = 0
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        """
+        Return the canned stdout and empty stderr.
+
+        :returns: ``(stdout, stderr)`` byte strings.
+        """
+        return self.stdout, b""
+
+
+def test_threaded_idle_watcher_reports_exit_on_dead_pane(tmp_path: Path) -> None:
+    """
+    A dead pane (process exited, server kept by remain-on-exit) fires on_exit.
+
+    Issue #540: with ``remain-on-exit on`` the inner CLI's exit no longer takes
+    down the server, so ``capture-pane`` keeps succeeding. The watcher must
+    still report the exit by noticing the dead pane — otherwise the session
+    hangs, mistaking the frozen final frame for an idle agent. The last pane
+    text must survive so the exit can be diagnosed.
+
+    :param tmp_path: Temporary directory for the placeholder tmux socket.
+    """
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    exited = threading.Event()
+    # capture-pane still succeeds (server alive); the pane is dead.
+    instance._capture_pane_for_idle_or_none = lambda: "claude exited: boom\nbye"  # type: ignore[method-assign]
+    instance._pane_is_dead = lambda: True  # type: ignore[method-assign]
+
+    instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.01)
+
+    assert exited.wait(timeout=1.0)
+    assert instance.running is False
+    assert instance.last_pane_text() == "claude exited: boom\nbye"
+
+
+@pytest.mark.asyncio
+async def test_is_alive_false_when_pane_dead(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``is_alive`` reports False for a dead pane even though the session exists.
+
+    With ``remain-on-exit on`` the session outlives the inner process, so a
+    plain ``has-session`` would wrongly report the agent as alive. ``is_alive``
+    must probe ``#{pane_dead}`` and treat a dead pane as not-alive so the
+    existing death-driven teardown still fires.
+
+    :param tmp_path: Temporary directory for the placeholder tmux socket.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    captured: list[list[str]] = []
+
+    async def fake_create_subprocess_exec(
+        *cmd: str,
+        stdout: object,
+        stderr: object,
+    ) -> _ProcessWithStdout:
+        """Capture argv and report a dead pane (``#{pane_dead}`` -> ``1``)."""
+        del stdout, stderr
+        captured.append(list(cmd))
+        return _ProcessWithStdout(stdout=b"1\n", returncode=0)
+
+    monkeypatch.setattr(
+        terminal_mod,
+        "asyncio",
+        SimpleNamespace(
+            create_subprocess_exec=fake_create_subprocess_exec,
+            subprocess=terminal_mod.asyncio.subprocess,
+        ),
+    )
+
+    instance = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+    assert await instance.is_alive() is False
+    assert instance.running is False
+    # Must probe the pane-dead flag, not merely whether the session exists.
+    assert captured, "is_alive never forked a tmux probe"
+    assert captured[-1][-1] == "#{pane_dead}"
+
+
+@pytest.mark.asyncio
+async def test_is_alive_true_when_pane_live(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``is_alive`` reports True when the pane process is still running.
+
+    :param tmp_path: Temporary directory for the placeholder tmux socket.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+
+    async def fake_create_subprocess_exec(
+        *cmd: str,
+        stdout: object,
+        stderr: object,
+    ) -> _ProcessWithStdout:
+        """Report a live pane (``#{pane_dead}`` -> ``0``)."""
+        del cmd, stdout, stderr
+        return _ProcessWithStdout(stdout=b"0\n", returncode=0)
+
+    monkeypatch.setattr(
+        terminal_mod,
+        "asyncio",
+        SimpleNamespace(
+            create_subprocess_exec=fake_create_subprocess_exec,
+            subprocess=terminal_mod.asyncio.subprocess,
+        ),
+    )
+
+    instance = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+    assert await instance.is_alive() is True
+    assert instance.running is True
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
+@pytest.mark.asyncio
+async def test_server_survives_inner_process_exit_real_tmux(tmp_path: Path) -> None:
+    """
+    The private tmux server outlives an inner-process exit (issue #540).
+
+    Launches a real tmux terminal whose inner command exits immediately. With
+    the default ``exit-empty on`` the server would vanish and every later
+    control command would fail with ``no server running``. With
+    ``remain-on-exit on`` / ``exit-empty off`` the server and session must stay
+    up (so control commands keep working and the dead pane stays capturable)
+    while ``is_alive`` still reports the inner process as gone.
+
+    :param tmp_path: Temporary directory for the real tmux socket.
+    """
+    instance = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        command="sh",
+        args=["-c", "exit 0"],
+        keep_alive_after_exit=True,
+    )
+    try:
+        await instance.launch(cwd=tmp_path)
+
+        # Wait for the inner `sh` to exit. is_alive() flips running -> False
+        # once the pane is dead.
+        for _ in range(250):
+            if not await instance.is_alive():
+                break
+            await asyncio.sleep(0.02)
+        else:  # pragma: no cover - only on a hang/regression
+            raise AssertionError("inner process never reported as exited")
+
+        # The crux: the private tmux SERVER must still be reachable after the
+        # inner process exited — has-session succeeds rather than failing with
+        # "no server running on <socket>".
+        probe = subprocess.run(
+            [
+                "tmux",
+                "-S",
+                str(instance.socket_path),
+                "has-session",
+                "-t",
+                instance.tmux_target,
+            ],
+            capture_output=True,
+            timeout=5,
+        )
+        assert probe.returncode == 0, (
+            "tmux server/session died when the inner process exited — "
+            "exit-empty/remain-on-exit were not applied: "
+            f"{probe.stderr.decode().strip()!r}"
+        )
+    finally:
+        await instance.close()
+
+
+async def _capture_launch_argv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    keep_alive_after_exit: bool,
+) -> list[str]:
+    """
+    Launch a terminal with mocked tmux and return the single setup argv.
+
+    :param tmp_path: Temporary directory for the fake tmux socket.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param keep_alive_after_exit: Value for the instance's opt-in flag.
+    :returns: The flattened tmux launch argv.
+    """
+    captured: list[list[str]] = []
+
+    async def fake_create_subprocess_exec(
+        *cmd: str,
+        stdout: object,
+        stderr: object,
+        env: dict[str, str],
+    ) -> _SuccessfulProcess:
+        """Capture the tmux argv and return a successful process."""
+        del stdout, stderr, env
+        captured.append(list(cmd))
+        return _SuccessfulProcess()
+
+    monkeypatch.setattr(
+        terminal_mod,
+        "asyncio",
+        SimpleNamespace(
+            create_subprocess_exec=fake_create_subprocess_exec,
+            subprocess=terminal_mod.asyncio.subprocess,
+        ),
+    )
+
+    instance = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        keep_alive_after_exit=keep_alive_after_exit,
+    )
+    await instance.launch(cwd=tmp_path)
+    assert len(captured) == 1
+    return captured[0]
+
+
+@pytest.mark.parametrize("keep_alive", [True, False])
+def test_create_terminal_instance_propagates_keep_alive_after_exit(
+    tmp_path: Path,
+    keep_alive: bool,
+) -> None:
+    """
+    ``create_terminal_instance`` carries ``keep_alive_after_exit`` from the spec
+    to the instance.
+
+    Guards the single plumbing line that wires the claude-native opt-in (#540)
+    to the launch options: dropping it would silently ignore the flag and
+    reintroduce the server-death cascade with no other test failing.
+
+    :param tmp_path: Temporary directory used as the terminal cwd.
+    :param keep_alive: Spec value to propagate.
+    """
+    spec = TerminalEnvSpec(
+        command="bash",
+        os_env=OSEnvSpec(type="caller_process", cwd=str(tmp_path)),
+        keep_alive_after_exit=keep_alive,
+    )
+    result = create_terminal_instance(name="bash", session_key="s1", spec=spec)
+    try:
+        assert result.instance.keep_alive_after_exit is keep_alive
+    finally:
+        shutil.rmtree(result.instance.private_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_launch_keeps_server_alive_when_opted_in(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With ``keep_alive_after_exit`` set, launch sets remain-on-exit / exit-empty
+    so an inner-CLI exit can't reap the private tmux server (issue #540). ``-q``
+    keeps older tmux from failing launch on an unknown option.
+
+    :param tmp_path: Temporary directory for the fake tmux socket.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    cmd = await _capture_launch_argv(tmp_path, monkeypatch, keep_alive_after_exit=True)
+    assert contains_subsequence(cmd, ["set-option", "-gq", "remain-on-exit", "on"])
+    assert contains_subsequence(cmd, ["set-option", "-sq", "exit-empty", "off"])
+
+
+@pytest.mark.asyncio
+async def test_launch_omits_keep_alive_options_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Keeping the server alive past exit is opt-in: a default terminal must NOT
+    set remain-on-exit / exit-empty, preserving the ``has-session``-means-alive
+    contract for codex / cursor / REPL / generic terminals.
+
+    :param tmp_path: Temporary directory for the fake tmux socket.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    cmd = await _capture_launch_argv(tmp_path, monkeypatch, keep_alive_after_exit=False)
+    assert not contains_subsequence(cmd, ["set-option", "-gq", "remain-on-exit", "on"])
+    assert not contains_subsequence(cmd, ["set-option", "-sq", "exit-empty", "off"])
 
 
 @pytest.mark.asyncio

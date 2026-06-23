@@ -749,6 +749,10 @@ async def _auto_create_pi_terminal(
         terminal.
     :param publish_event: Runner session event publisher.
     :param server_client: Runner Omnigent server client.
+    :param agent_spec: The session's resolved agent spec, passed so the Pi
+        terminal inherits the agent's ``os_env.sandbox`` rather than falling
+        back to the platform default. ``None`` only when the session has no
+        spec; callers must not pass ``None`` to paper over a resolution error.
     :returns: Created terminal resource view.
     """
     from omnigent.conversation_browser import conversation_url
@@ -2697,6 +2701,14 @@ async def _auto_create_claude_terminal(
         # configuration rather than inheriting it from the runner.
         env_unset=["DATABRICKS_CONFIG_PROFILE"],
         scrollback=50000,
+        # Keep the private tmux server alive if the `claude` CLI exits (e.g. a
+        # sub-agent worker whose CLI exits right after rendering its prompt on
+        # some hosts — #540). Without this, that exit reaps the server and every
+        # later control command (send-keys / model / effort / interrupt / stop)
+        # fails with "no server running", and the delegated message is silently
+        # lost. With it, the dead pane persists (capturable for diagnostics) and
+        # the watcher reports the exit deterministically via `#{pane_dead}`.
+        keep_alive_after_exit=True,
     )
     _logger.info(
         "Claude terminal tmux launch requested: session=%s command=%s args_count=%d "
@@ -4690,6 +4702,9 @@ def create_runner_app(
     _version_cache: dict[str, int] = {}  # conversation_id → last seen agent_version
     _spec_cache: dict[str, Any] = {}  # agent_id → cached AgentSpec for terminal tools
     _resp_to_conv: dict[str, str] = {}  # harness response_id → conversation_id
+    # conv_id → live turn's response_id; gates the mid-turn injection forward so
+    # a buffered message isn't sent to a harness with no live turn (→ 204).
+    _live_response_id: dict[str, str] = {}
     _session_start_cache: dict[str, float] = {}  # session_id → registered start time
     _session_spec_cache: dict[str, Any | None] = {}  # session_id → session AgentSpec
     # Single source for the session's server snapshot. created_at,
@@ -5874,10 +5889,15 @@ def create_runner_app(
                 if not _has_pi_terminal:
                     _publish_terminal_pending(_publish_event, session_id, True)
                     try:
-                        try:
-                            _pi_spec = await _resolve_session_agent_spec(session_id)
-                        except OmnigentError:
-                            _pi_spec = None
+                        # Inherit the session's os_env.sandbox via its agent
+                        # spec. A genuine resolution error must propagate to the
+                        # outer handler (-> start error), not be swallowed to
+                        # agent_spec=None, which silently drops the sandbox
+                        # policy and falls back to the platform default (the
+                        # failure mode #569 fixed). _resolve_session_agent_spec
+                        # returns None legitimately when there is no spec; only
+                        # genuine errors raise.
+                        _pi_spec = await _resolve_session_agent_spec(session_id)
                         await _auto_create_pi_terminal(
                             session_id,
                             resource_registry,
@@ -6230,6 +6250,7 @@ def create_runner_app(
             with contextlib.suppress(asyncio.CancelledError):
                 await turn_task
         _session_message_buffers.pop(session_id, None)
+        _live_response_id.pop(session_id, None)
         _ingest_next_seq.pop(session_id, None)
         _ingest_now_serving.pop(session_id, None)
         _ingest_cond.pop(session_id, None)
@@ -8299,6 +8320,8 @@ def create_runner_app(
         """
 
         _active_turns.pop(conv_id, None)
+        # Turn ended: clear the live marker so a concurrent forward is skipped.
+        _live_response_id.pop(conv_id, None)
         # Skip the idle transient when a buffered message will start a
         # continuation turn immediately — `_check_and_start_next_turn`
         # publishes "running" microseconds later, and the in-between idle
@@ -8478,71 +8501,77 @@ def create_runner_app(
             e.g. ``"conv_abc123"``.
         """
 
-        buf = _session_message_buffers.get(session_id)
-        if not buf:
-            # Parent going idle: clear any wake-debounce flag left stuck by a
-            # mid-turn-consumed injection (re-arming if results are stranded),
-            # so the next sub-agent completion can wake the parent.
-            _rewake_parent_if_inbox_stranded(session_id)
-            return
+        # Serialize the drain + turn-start against a concurrent
+        # post_session_events via the same ingest gate so the two paths can't
+        # both start a turn (invariant I2; a second turn-driver POST → 204).
+        _seq = _ingest_next_seq.get(session_id, 0)
+        _ingest_next_seq[session_id] = _seq + 1
+        _cond = _ingest_cond.get(session_id)
+        if _cond is None:
+            _cond = asyncio.Condition()
+            _ingest_cond[session_id] = _cond
+        async with _cond:
+            while _ingest_now_serving.get(session_id, 0) != _seq:
+                await _cond.wait()
+        try:
+            if session_id in _active_turns:
+                # Concurrent path already started a turn — key membership (None
+                # sentinel or Task) per the runner-wide convention, so a
+                # streaming start (slot stays None) is also detected. That turn
+                # re-enters here on completion to drain the buffer.
+                return
 
-        if _is_native_harness(session_id):
-            # Native harnesses type only the latest user message per turn,
-            # so collapsing the buffer to its last entry would drop every
-            # earlier message from the terminal. Drain ONE message at a
-            # time, in order: this turn delivers ``next_body``, and its
-            # completion re-enters here for the next buffered message.
-            # No batching — each typed exactly once (RUNNER_MESSAGE_INGEST.md
-            # Part C).
-            next_body = buf.pop(0)
+            buf = _session_message_buffers.get(session_id)
             if not buf:
-                _session_message_buffers.pop(session_id, None)
-            _session_histories.setdefault(session_id, []).append(
-                {
-                    "type": "message",
-                    "role": next_body.get("role", "user"),
-                    "content": next_body.get("content", []),
-                }
-            )
-        else:
-            # LLM harnesses: drain ALL buffered messages into history so
-            # rapid-fire user input ("hi", "can", "you", "fix", "bugs")
-            # becomes a single continuation turn instead of one turn per
-            # word. The harness sees every message via history; the turn
-            # responds once.
-            all_bodies = list(buf)
-            buf.clear()
-            _session_message_buffers.pop(session_id, None)
+                _rewake_parent_if_inbox_stranded(session_id)
+                return
 
-            for body in all_bodies:
+            if _is_native_harness(session_id):
+                # Native harnesses type only the latest message per turn; drain
+                # one at a time, in order (RUNNER_MESSAGE_INGEST.md Part C).
+                next_body = buf.pop(0)
+                if not buf:
+                    _session_message_buffers.pop(session_id, None)
                 _session_histories.setdefault(session_id, []).append(
                     {
                         "type": "message",
-                        "role": body.get("role", "user"),
-                        "content": body.get("content", []),
+                        "role": next_body.get("role", "user"),
+                        "content": next_body.get("content", []),
                     }
                 )
-            next_body = all_bodies[-1]
+            else:
+                # LLM harnesses: drain ALL buffered messages into history so
+                # rapid-fire input becomes a single continuation turn.
+                all_bodies = list(buf)
+                buf.clear()
+                _session_message_buffers.pop(session_id, None)
 
-        # Register the continuation turn BEFORE the await so a
-        # concurrent POST sees an active turn (invariant I2).
-        _active_turns[session_id] = None
+                for body in all_bodies:
+                    _session_histories.setdefault(session_id, []).append(
+                        {
+                            "type": "message",
+                            "role": body.get("role", "user"),
+                            "content": body.get("content", []),
+                        }
+                    )
+                next_body = all_bodies[-1]
 
-        _publish_turn_status(session_id, "running")
-
-        # Use _run_turn_bg so the continuation turn gets full
-        # history, tool schemas, instructions — identical to a
-        # first turn. Without this, the harness only sees the
-        # raw buffered message with no prior context.
-        _turn_task = asyncio.create_task(
-            _run_turn_bg(next_body, session_id),
-            name=f"turn-cont-{session_id}",
-        )
-        _active_turns[session_id] = _turn_task
-        _turn_task.add_done_callback(
-            _background_tasks.discard,
-        )
-        _background_tasks.add(_turn_task)
+            # Reserve before the await so a concurrent POST sees an active turn.
+            _active_turns[session_id] = None
+            _publish_turn_status(session_id, "running")
+            _turn_task = asyncio.create_task(
+                _run_turn_bg(next_body, session_id),
+                name=f"turn-cont-{session_id}",
+            )
+            _active_turns[session_id] = _turn_task
+            _turn_task.add_done_callback(
+                _background_tasks.discard,
+            )
+            _background_tasks.add(_turn_task)
+        finally:
+            async with _cond:
+                _ingest_now_serving[session_id] = _seq + 1
+                _cond.notify_all()
 
     async def _post_subagent_wake_notice(parent_id: str, notice: str, child_id: str) -> None:
         """
@@ -9680,7 +9709,10 @@ def create_runner_app(
                 pass
         except asyncio.CancelledError:
             # Publish terminal status so the client doesn't sit on stale "running".
+            # This teardown bypasses _on_proxy_stream_end, so clear the live
+            # marker here too or the next turn's forward gate goes stale.
             _active_turns.pop(session_id, None)
+            _live_response_id.pop(session_id, None)
             _publish_turn_status(session_id, "idle")
             raise
         except _ContextWindowOverflow:
@@ -10003,6 +10035,8 @@ def create_runner_app(
                                     _response_id = resp_obj.get("id")
                                     if _response_id and conv_id:
                                         _resp_to_conv[_response_id] = conv_id
+                                        # Mark the turn live for the forward gate.
+                                        _live_response_id[conv_id] = _response_id
 
                                 # Defer publish for action_required
                                 # events that the runner dispatches
@@ -10485,7 +10519,15 @@ def create_runner_app(
                     # Part B). Native harnesses skip the forward entirely
                     # (Part C), so they don't need a correlation id; neither
                     # does a buffer-only park (no forward will be made).
-                    if not _native and not _awaiting_approval:
+                    # Forward as a live injection only when a turn is actually
+                    # streaming; otherwise it would start a rogue turn (→ 204).
+                    # The buffered copy still drives the post-turn continuation.
+                    _can_forward = (
+                        not _native
+                        and not _awaiting_approval
+                        and conversation_id in _live_response_id
+                    )
+                    if _can_forward:
                         message_body["injection_id"] = f"inj_{uuid.uuid4().hex[:16]}"
                     _logger.info(
                         "post_session_events: buffering message for active turn conv=%s "
@@ -10516,7 +10558,7 @@ def create_runner_app(
                     # SKIPPED while an approval is parked (``_awaiting_approval``):
                     # forwarding would steer the gated turn past a human
                     # approval (see the buffer-only rationale above).
-                    if not _native and not _awaiting_approval and process_manager is not None:
+                    if _can_forward and process_manager is not None:
                         try:
                             _hc = await process_manager.get_client(conversation_id, "any")
                             _injection_resp = await _hc.post(
@@ -10904,10 +10946,15 @@ def create_runner_app(
         # Resolve pending policy approval Futures.
         if body_type == "approval":
             _data = body.get("data") or body
-            _elic = _data.get("elicitation_id", "")
-            _action = _data.get("action", "")
-            _approved = _action == "accept"
-            pending_approvals.resolve(_elic, _approved)
+            pending_approvals.resolve(
+                _data.get("elicitation_id", ""), _data.get("action") == "accept"
+            )
+            # The server wraps the verdict as ``{"type": "approval", "data": {…}}``,
+            # but the harness scaffold's ``ApprovalEvent`` wants the fields at the
+            # top level — forwarding the envelope verbatim 422s and hangs the turn.
+            # Unwrap ``data`` to the top level (robust to added/renamed fields —
+            # the model ignores extras) and keep the discriminator.
+            body = {**_data, "type": "approval"}
 
         # Control event (interrupt / tool_result / approval): get a
         # harness client for this conversation and POST the body
@@ -11322,10 +11369,11 @@ def create_runner_app(
                         content=session_resource_view_to_dict(existing),
                     )
                 try:
-                    try:
-                        _pi_ensure_spec = await _resolve_session_agent_spec(session_id)
-                    except OmnigentError:
-                        _pi_ensure_spec = None
+                    # See _auto_create_pi_terminal: a genuine spec resolution
+                    # error must propagate to the outer handler (-> start error
+                    # response) rather than be swallowed to agent_spec=None,
+                    # which silently drops the agent's sandbox policy.
+                    _pi_ensure_spec = await _resolve_session_agent_spec(session_id)
                     terminal_view = await _auto_create_pi_terminal(
                         session_id,
                         resource_registry,
@@ -13721,6 +13769,7 @@ _HARNESS_MODEL_ENV_KEY: dict[str, str] = {
     # (claude-native, codex-native) it honors the spec model via a launch
     # ``--model`` arg in _auto_create_cursor_terminal, not via an env var.
     "antigravity": "HARNESS_ANTIGRAVITY_MODEL",
+    "qwen": "HARNESS_QWEN_MODEL",
 }
 
 
@@ -13754,6 +13803,7 @@ def _build_spawn_env_from_spec(
             _build_cursor_spawn_env,
             _build_openai_agents_sdk_spawn_env,
             _build_pi_spawn_env,
+            _build_qwen_spawn_env,
         )
 
         if harness == "claude-sdk":
@@ -13768,6 +13818,8 @@ def _build_spawn_env_from_spec(
             env = _build_cursor_spawn_env(spec, workdir=workdir)
         elif harness == "antigravity":
             env = _build_antigravity_spawn_env(spec)
+        elif harness == "qwen":
+            env = _build_qwen_spawn_env(spec, workdir=workdir)
         else:
             # Native terminal harnesses and unknown harnesses build env elsewhere.
             return None

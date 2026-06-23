@@ -157,9 +157,13 @@ def _install_fake_sdk(
             self.input_schema = input_schema
 
     class _FakeLocalAgentOptions:
-        def __init__(self, cwd: Any = None, custom_tools: Any = None, **_kw: Any) -> None:
+        def __init__(
+            self, cwd: Any = None, custom_tools: Any = None, auto_review: Any = None, **_kw: Any
+        ) -> None:
             self.cwd = cwd
             self.custom_tools = custom_tools
+            self.auto_review = auto_review
+            state.setdefault("local_options", []).append(self)
 
     class _FakeSendOptions:
         def __init__(self, on_delta: Any = None, **_kw: Any) -> None:
@@ -1177,8 +1181,8 @@ async def test_run_turn_native_tool_denied_by_policy(monkeypatch: pytest.MonkeyP
     # Then an ExecutorError with the denial reason.
     errors = [e for e in events if isinstance(e, ExecutorError)]
     assert len(errors) == 1
-    assert "denied by policy" in errors[0].message
     assert "bash" in errors[0].message
+    assert "denied" in errors[0].message
 
     # ToolCallRequest appears before ExecutorError, and nothing follows the error.
     req_idx = next(i for i, e in enumerate(events) if isinstance(e, ToolCallRequest))
@@ -1281,22 +1285,83 @@ def _policy_ask(ask_phase: str) -> Any:
     return evaluator
 
 
-async def test_run_turn_native_tool_ask_no_handler_fails_closed(
+async def test_run_turn_native_tool_no_handler_and_no_deny_allows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """ASK with no elicitation handler is fail-closed to DENY."""
+    """No elicitation handler and no DENY policy → native tool is allowed (pass-through)."""
     script = {
         "messages": [
             _assistant("Let me check."),
             _tool("bash", "t1", "running", args={"cmd": "ls"}),
+            _tool("bash", "t1", "completed", result="file.txt"),
+            _assistant("Done."),
+        ],
+        "status": "finished",
+        "result": "Done.",
+    }
+    _install_fake_sdk(monkeypatch, [script])
+    executor = CursorExecutor(api_key="crsr_x")
+    executor._policy_evaluator = _policy_ask("PHASE_TOOL_CALL")
+    # No _elicitation_handler → falls through to allow.
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    assert any(isinstance(e, TurnComplete) for e in events)
+    assert not any(isinstance(e, ExecutorError) for e in events)
+
+
+async def test_run_turn_native_tool_handler_approves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Elicitation handler (no policy evaluator) approves → turn continues."""
+    script = {
+        "messages": [
+            _assistant("Running."),
+            _tool("bash", "t1", "running", args={"cmd": "ls"}),
+            _tool("bash", "t1", "completed", result="file.txt"),
+            _assistant("Done."),
+        ],
+        "status": "finished",
+        "result": "Done.",
+    }
+    _install_fake_sdk(monkeypatch, [script])
+    executor = CursorExecutor(api_key="crsr_x")
+    # No policy evaluator — handler alone is sufficient to show the card.
+
+    async def _approve(_name: str, _args: dict[str, Any]) -> bool:
+        return True
+
+    executor._elicitation_handler = _approve
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    assert any(isinstance(e, TurnComplete) for e in events)
+    assert not any(isinstance(e, ExecutorError) for e in events)
+
+
+async def test_run_turn_native_tool_handler_denies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Elicitation handler (no policy evaluator) denies → turn aborted."""
+    script = {
+        "messages": [
+            _assistant("Running."),
+            _tool("bash", "t1", "running", args={"cmd": "rm -rf /"}),
         ],
         "status": "finished",
         "result": "",
     }
     _install_fake_sdk(monkeypatch, [script])
     executor = CursorExecutor(api_key="crsr_x")
-    executor._policy_evaluator = _policy_ask("PHASE_TOOL_CALL")
-    # No _elicitation_handler set → fail closed.
+
+    async def _deny(_name: str, _args: dict[str, Any]) -> bool:
+        return False
+
+    executor._elicitation_handler = _deny
     try:
         events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
     finally:
@@ -1304,14 +1369,55 @@ async def test_run_turn_native_tool_ask_no_handler_fails_closed(
 
     errors = [e for e in events if isinstance(e, ExecutorError)]
     assert len(errors) == 1
-    assert "auto-denied" in errors[0].message
+    assert "elicitation" in errors[0].message
+    assert not any(isinstance(e, TurnComplete) for e in events)
+
+
+async def test_run_turn_native_tool_policy_deny_skips_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Policy DENY blocks immediately without calling the elicitation handler."""
+    script = {
+        "messages": [
+            _assistant("Running."),
+            _tool("bash", "t1", "running", args={"cmd": "rm -rf /"}),
+        ],
+        "status": "finished",
+        "result": "",
+    }
+    _install_fake_sdk(monkeypatch, [script])
+    executor = CursorExecutor(api_key="crsr_x")
+
+    async def _deny_policy(phase: str, _data: dict[str, Any]) -> Any:
+        # Only deny TOOL_CALL; allow LLM phases so the turn reaches the tool.
+        action = "POLICY_ACTION_DENY" if phase == "PHASE_TOOL_CALL" else "POLICY_ACTION_ALLOW"
+        return SimpleNamespace(action=action, reason="admin blocked")
+
+    handler_called = False
+
+    async def _approve(_name: str, _args: dict[str, Any]) -> bool:
+        nonlocal handler_called
+        handler_called = True
+        return True
+
+    executor._policy_evaluator = _deny_policy
+    executor._elicitation_handler = _approve
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert len(errors) == 1
+    assert "admin blocked" in errors[0].message
+    assert not handler_called, "handler must not be called when policy hard-denies"
     assert not any(isinstance(e, TurnComplete) for e in events)
 
 
 async def test_run_turn_native_tool_ask_user_approves(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """ASK with elicitation handler that approves → turn continues."""
+    """Policy ASK + elicitation handler that approves → turn continues."""
     script = {
         "messages": [
             _assistant("Running."),
@@ -1342,7 +1448,7 @@ async def test_run_turn_native_tool_ask_user_approves(
 async def test_run_turn_native_tool_ask_user_denies(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """ASK with elicitation handler that denies → turn aborted."""
+    """Policy ASK + elicitation handler that denies → turn aborted."""
     script = {
         "messages": [
             _assistant("Running."),
@@ -1380,12 +1486,13 @@ async def test_ensure_session_writes_hooks_json(
 ) -> None:
     """After _ensure_session, .cursor/hooks.json exists in the workspace with the
     correct preToolUse config pointing at the hook script."""
-    _install_fake_sdk(monkeypatch, [{"messages": [_assistant("ok")], "result": "ok"}])
+    sdk_state = _install_fake_sdk(monkeypatch, [{"messages": [_assistant("ok")], "result": "ok"}])
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:6767")
     monkeypatch.setattr("sys.argv", ["runner", "--conversation-id", "conv_test123"])
     cwd = str(tmp_path)
     executor = CursorExecutor(api_key="crsr_x", cwd=cwd)
-    _ = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    assert events  # ensure _ensure_session ran
 
     # Assert BEFORE close (close cleans up the file).
     hooks_file = tmp_path / ".cursor" / "hooks.json"
@@ -1395,7 +1502,7 @@ async def test_ensure_session_writes_hooks_json(
     assert "preToolUse" in config["hooks"]
     hooks = config["hooks"]["preToolUse"]
     assert len(hooks) == 1
-    assert hooks[0]["timeout"] == 30
+    assert hooks[0]["timeout"] == 86400
     cmd = hooks[0]["command"]
     # The command points to the wrapper shell script, not the Python hook directly.
     assert "omnigent-hook.sh" in cmd
@@ -1407,6 +1514,12 @@ async def test_ensure_session_writes_hooks_json(
     assert "_OMNIGENT_SERVER_URL='http://127.0.0.1:6767'" in wrapper_text
     assert "_OMNIGENT_SESSION_ID='conv_test123'" in wrapper_text
     assert "cursor_policy_hook.py" in wrapper_text
+
+    # auto_review=True must be passed so cursor's own TUI approval prompts
+    # are bypassed in favour of the executor's native elicitation card.
+    local_opts = sdk_state.get("local_options", [])
+    assert local_opts, "LocalAgentOptions was never constructed"
+    assert local_opts[0].auto_review is True
 
     await executor.close()
     # Both files are cleaned up on close.
@@ -1462,6 +1575,16 @@ async def test_hooks_json_cleaned_up_on_close(
 # ---------------------------------------------------------------------------
 
 
+def _fake_evaluate_response(result_action: str, reason: str = "") -> Any:
+    """Build a fake httpx.Response-like object for post_evaluate_with_retry mocks."""
+    payload = {"result": result_action}
+    if reason:
+        payload["reason"] = reason
+    resp = SimpleNamespace()
+    resp.json = lambda: payload
+    return resp
+
+
 def test_cursor_policy_hook_allow(monkeypatch: pytest.MonkeyPatch) -> None:
     """Hook script returns allow when the server responds with ALLOW."""
     import io
@@ -1471,20 +1594,17 @@ def test_cursor_policy_hook_allow(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("_OMNIGENT_SESSION_ID", "conv_test")
 
     stdin_data = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}})
-    server_response = json.dumps({"result": "POLICY_ACTION_ALLOW", "reason": ""}).encode()
 
     from omnigent.inner import cursor_policy_hook
-
-    fake_resp = io.BytesIO(server_response)
-    fake_resp.read = fake_resp.read  # type: ignore[assignment]
-    fake_resp.__enter__ = lambda s: s  # type: ignore[attr-defined]
-    fake_resp.__exit__ = lambda s, *a: None  # type: ignore[attr-defined]
 
     stdout = io.StringIO()
     with (
         patch.object(sys, "stdin", io.StringIO(stdin_data)),
         patch.object(sys, "stdout", stdout),
-        patch("urllib.request.urlopen", return_value=fake_resp),
+        patch(
+            "omnigent.native_policy_hook.post_evaluate_with_retry",
+            return_value=_fake_evaluate_response("POLICY_ACTION_ALLOW"),
+        ),
     ):
         cursor_policy_hook.main()
 
@@ -1501,21 +1621,17 @@ def test_cursor_policy_hook_deny(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("_OMNIGENT_SESSION_ID", "conv_test")
 
     stdin_data = json.dumps({"tool_name": "Bash", "tool_input": {"command": "rm -rf /"}})
-    server_response = json.dumps(
-        {"result": "POLICY_ACTION_DENY", "reason": "dangerous command"}
-    ).encode()
 
     from omnigent.inner import cursor_policy_hook
-
-    fake_resp = io.BytesIO(server_response)
-    fake_resp.__enter__ = lambda s: s  # type: ignore[attr-defined]
-    fake_resp.__exit__ = lambda s, *a: None  # type: ignore[attr-defined]
 
     stdout = io.StringIO()
     with (
         patch.object(sys, "stdin", io.StringIO(stdin_data)),
         patch.object(sys, "stdout", stdout),
-        patch("urllib.request.urlopen", return_value=fake_resp),
+        patch(
+            "omnigent.native_policy_hook.post_evaluate_with_retry",
+            return_value=_fake_evaluate_response("POLICY_ACTION_DENY", "dangerous command"),
+        ),
     ):
         cursor_policy_hook.main()
 
@@ -1526,7 +1642,7 @@ def test_cursor_policy_hook_deny(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_cursor_policy_hook_network_error_fails_open(monkeypatch: pytest.MonkeyPatch) -> None:
-    """On network error, the hook script fails open (allows)."""
+    """post_evaluate_with_retry returning None (network error) causes the hook to fail open."""
     import io
     from unittest.mock import patch
 
@@ -1541,7 +1657,10 @@ def test_cursor_policy_hook_network_error_fails_open(monkeypatch: pytest.MonkeyP
     with (
         patch.object(sys, "stdin", io.StringIO(stdin_data)),
         patch.object(sys, "stdout", stdout),
-        patch("urllib.request.urlopen", side_effect=OSError("connection refused")),
+        patch(
+            "omnigent.native_policy_hook.post_evaluate_with_retry",
+            return_value=None,
+        ),
     ):
         cursor_policy_hook.main()
 
@@ -1571,7 +1690,7 @@ def test_cursor_policy_hook_no_env_fails_open(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_cursor_policy_hook_ask_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
-    """ASK verdict (unresolved approval) fails closed with deny."""
+    """ASK verdict (server couldn't resolve via the gate) fails closed with deny."""
     import io
     from unittest.mock import patch
 
@@ -1579,24 +1698,47 @@ def test_cursor_policy_hook_ask_fails_closed(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setenv("_OMNIGENT_SESSION_ID", "conv_test")
 
     stdin_data = json.dumps({"tool_name": "Write", "tool_input": {}})
-    server_response = json.dumps(
-        {"result": "POLICY_ACTION_ASK", "reason": "needs approval"}
-    ).encode()
 
     from omnigent.inner import cursor_policy_hook
-
-    fake_resp = io.BytesIO(server_response)
-    fake_resp.__enter__ = lambda s: s  # type: ignore[attr-defined]
-    fake_resp.__exit__ = lambda s, *a: None  # type: ignore[attr-defined]
 
     stdout = io.StringIO()
     with (
         patch.object(sys, "stdin", io.StringIO(stdin_data)),
         patch.object(sys, "stdout", stdout),
-        patch("urllib.request.urlopen", return_value=fake_resp),
+        patch(
+            "omnigent.native_policy_hook.post_evaluate_with_retry",
+            return_value=_fake_evaluate_response("POLICY_ACTION_ASK", "needs approval"),
+        ),
     ):
         cursor_policy_hook.main()
 
     result = json.loads(stdout.getvalue())
     assert result["permission"] == "deny"
     assert "requires approval" in result["agent_message"]
+
+
+def test_cursor_policy_hook_uses_long_read_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """post_evaluate_with_retry is called with 86400s read_timeout to stay alive for approval."""
+    import io
+    from unittest.mock import MagicMock, patch
+
+    monkeypatch.setenv("_OMNIGENT_SERVER_URL", "http://localhost:6767")
+    monkeypatch.setenv("_OMNIGENT_SESSION_ID", "conv_test")
+
+    stdin_data = json.dumps({"tool_name": "Bash", "tool_input": {}})
+
+    from omnigent.inner import cursor_policy_hook
+
+    mock_fn = MagicMock(return_value=_fake_evaluate_response("POLICY_ACTION_ALLOW"))
+    stdout = io.StringIO()
+    with (
+        patch.object(sys, "stdin", io.StringIO(stdin_data)),
+        patch.object(sys, "stdout", stdout),
+        patch("omnigent.native_policy_hook.post_evaluate_with_retry", mock_fn),
+    ):
+        cursor_policy_hook.main()
+
+    mock_fn.assert_called_once()
+    _call_kwargs = mock_fn.call_args
+    read_timeout = _call_kwargs.kwargs.get("read_timeout") or _call_kwargs.args[3]
+    assert read_timeout == 86400.0

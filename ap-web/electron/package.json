@@ -32,6 +32,15 @@
       "find/**/*",
       "icons/**/*"
     ],
+    "extraResources": [
+      {
+        "from": "../platform-assets",
+        "to": "platform-assets",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
     "mac": {
       "category": "public.app-category.developer-tools",
       "icon": "icons/icon.icns",
