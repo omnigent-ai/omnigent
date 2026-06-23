@@ -125,6 +125,14 @@ class _PostSink:
             data for event_type, data in self.posts if event_type == "external_output_text_delta"
         ]
 
+    def reasonings(self) -> list[dict[str, object]]:
+        """Return the ``data`` payload of every ``external_output_reasoning_delta``."""
+        return [
+            data
+            for event_type, data in self.posts
+            if event_type == "external_output_reasoning_delta"
+        ]
+
     def event_types(self) -> list[str]:
         """Return the ``type`` of every posted event, in order."""
         return [event_type for event_type, _data in self.posts]
@@ -191,6 +199,22 @@ def _generating_planner(text: str, *, step_index: int = 2) -> dict[str, Any]:
     planner.pop("response", None)
     planner["modifiedResponse"] = text
     cast(dict[str, Any], step["metadata"])["sourceTrajectoryStepInfo"]["stepIndex"] = step_index
+    return step
+
+
+def _generating_planner_with_thinking(
+    *, thinking: str, text: str = "", step_index: int = 2
+) -> dict[str, Any]:
+    """A GENERATING PLANNER_RESPONSE carrying a growing ``thinking`` block.
+
+    Gemini Thinking-model variants stream chain-of-thought at
+    ``plannerResponse.thinking`` (design §10.2) alongside the growing
+    ``modifiedResponse``. Built from :func:`_generating_planner` so the partial
+    text contract (``response`` absent, status GENERATING) is preserved; the
+    ``thinking`` field is added to model the reasoning stream.
+    """
+    step = _generating_planner(text, step_index=step_index)
+    cast(dict[str, Any], step["plannerResponse"])["thinking"] = thinking
     return step
 
 
@@ -1005,6 +1029,165 @@ async def test_stream_done_emits_one_committed_message_after_deltas(
     item_data = cast(dict[str, Any], messages[0]["item_data"])
     content = cast(list[dict[str, Any]], item_data["content"])
     assert content[0]["text"] == full
+
+
+@pytest.mark.asyncio
+async def test_stream_generating_emits_incremental_reasoning_deltas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """Growing ``thinking`` while GENERATING emits non-overlapping reasoning deltas.
+
+    Mirrors the text-delta contract for ``plannerResponse.thinking`` (design
+    §10.2): suffixes concatenate to the full reasoning, only the FIRST delta
+    carries ``started=True`` (so the server emits one ``response.reasoning.started``
+    before the block), and the rest carry ``started=False``.
+    """
+    full = "Let me consider the request, then outline a plan before answering."
+    cut1, cut2 = 12, 38
+    frames = [
+        _frame([_generating_planner_with_thinking(thinking=full[:cut1])]),
+        _frame([_generating_planner_with_thinking(thinking=full[:cut2])]),
+        _frame([_generating_planner_with_thinking(thinking=full)]),
+    ]
+    sink = _PostSink()
+
+    await _run_stream(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    reasonings = sink.reasonings()
+    # Three growing frames → three non-empty reasoning deltas.
+    assert [r["delta"] for r in reasonings] == [full[:cut1], full[cut1:cut2], full[cut2:]]
+    # Suffixes concatenate exactly to the full reasoning (no overlap, no gap).
+    assert "".join(cast(str, r["delta"]) for r in reasonings) == full
+    # Only the first delta starts a new reasoning block.
+    assert [r["started"] for r in reasonings] == [True, False, False]
+    # Reasoning has no committed conversation item (the step never reached DONE).
+    assert sink.item_types() == []
+
+
+@pytest.mark.asyncio
+async def test_stream_reasoning_precedes_text_and_has_no_committed_item(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """Reasoning deltas precede text deltas (§10.2); DONE commits ONE message only.
+
+    Asserts the §10.2 ordering (thinking before response) within the frame and
+    that reasoning, unlike text, never produces a committed conversation item —
+    only the assistant ``message`` is committed on DONE.
+    """
+    thinking = "First, parse intent. Then answer."
+    text = "Sure — here is the answer."
+    frames = [
+        _frame([_generating_planner_with_thinking(thinking="First, parse intent.", text="Sure")]),
+        _frame([_generating_planner_with_thinking(thinking=thinking, text=text)]),
+        _frame([_done_planner(text)]),
+    ]
+    sink = _PostSink()
+
+    await _run_stream(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    types = sink.event_types()
+    # Within each GENERATING frame the reasoning delta is posted before the text
+    # delta: the first reasoning post precedes the first text post.
+    first_reasoning = types.index("external_output_reasoning_delta")
+    first_text = types.index("external_output_text_delta")
+    assert first_reasoning < first_text
+    # Reasoning deltas concatenate to the full thinking text.
+    assert "".join(cast(str, r["delta"]) for r in sink.reasonings()) == thinking
+    # Exactly ONE committed item — the assistant message; NO committed reasoning.
+    assert sink.item_types() == ["message"]
+    # Every reasoning post is a delta (transient); none is a conversation item.
+    assert all(
+        event_type != "external_conversation_item"
+        or cast(dict[str, Any], data).get("item_type") != "reasoning"
+        for event_type, data in sink.posts
+    )
+
+
+@pytest.mark.asyncio
+async def test_stream_planner_without_thinking_emits_no_reasoning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A planner with no ``thinking`` field emits NO reasoning events (no regression).
+
+    The non-thinking model path must be untouched: text deltas still stream and
+    commit exactly as before, with zero reasoning deltas.
+    """
+    full = "Plain answer, no chain-of-thought."
+    frames = [
+        _frame([_generating_planner(full[:10])]),
+        _frame([_generating_planner(full)]),
+        _frame([_done_planner(full)]),
+    ]
+    sink = _PostSink()
+
+    await _run_stream(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    # No reasoning events at all.
+    assert sink.reasonings() == []
+    # Text streaming + commit unchanged: deltas concatenate to the committed text.
+    assert "".join(cast(str, d["delta"]) for d in sink.deltas()) == full
+    assert sink.item_types() == ["message"]
+
+
+@pytest.mark.asyncio
+async def test_stream_reasoning_no_growth_frame_emits_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A re-sent ``thinking`` snapshot (no growth) emits no duplicate reasoning delta.
+
+    Frames are cumulative; a frame that repeats the prior ``thinking`` must not
+    re-emit it. Only genuine growth produces a delta, and ``started`` fires once.
+    """
+    thinking = "Reasoning that stops growing."
+    frames = [
+        _frame([_generating_planner_with_thinking(thinking=thinking)]),
+        # Same thinking again (no growth) → no second reasoning delta.
+        _frame([_generating_planner_with_thinking(thinking=thinking)]),
+    ]
+    sink = _PostSink()
+
+    await _run_stream(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    reasonings = sink.reasonings()
+    # Exactly one reasoning delta (the no-growth re-send adds nothing).
+    assert [r["delta"] for r in reasonings] == [thinking]
+    assert [r["started"] for r in reasonings] == [True]
 
 
 @pytest.mark.asyncio

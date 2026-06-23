@@ -29,6 +29,7 @@ from omnigent.antigravity_native_steps import (
     OutboundEvent,
     _ToolCallIdAllocator,
     map_step_to_events,
+    output_reasoning_delta_event,
     pending_interaction,
 )
 
@@ -1021,3 +1022,68 @@ class TestPendingInteractionIsMultiSelect:
         orig_ri = original.get("requestedInteraction")
         assert isinstance(orig_ri, dict)
         assert ri == orig_ri
+
+
+# ---------------------------------------------------------------------------
+# Reasoning delta builder (output_reasoning_delta_event)
+# ---------------------------------------------------------------------------
+
+
+class TestOutputReasoningDeltaEvent:
+    """``output_reasoning_delta_event`` builds the transient reasoning delta."""
+
+    def test_shape_started_true(self) -> None:
+        """
+        The first reasoning delta of a step carries ``started=True``.
+
+        ``started`` tells the server to precede this delta with one
+        ``response.reasoning.started`` (the SPA's new-reasoning-block marker).
+        """
+        event = output_reasoning_delta_event(step_idx=2, delta="Let me think", started=True)
+        assert event.event_type == "external_output_reasoning_delta"
+        assert event.data == {"delta": "Let me think", "started": True}
+        assert event.step_index == 2
+
+    def test_shape_started_false(self) -> None:
+        """A continuation reasoning delta carries ``started=False``."""
+        event = output_reasoning_delta_event(step_idx=5, delta=" some more", started=False)
+        assert event.data == {"delta": " some more", "started": False}
+        assert event.step_index == 5
+
+    def test_no_message_id(self) -> None:
+        """
+        Reasoning deltas carry NO ``message_id``.
+
+        Unlike ``output_text_delta_event`` (whose ``message_id`` lets the SPA
+        coalesce text deltas into one block and reconcile against the committed
+        message), the SPA reasoning block is not keyed by a per-step id.
+        """
+        event = output_reasoning_delta_event(step_idx=2, delta="x", started=True)
+        assert "message_id" not in event.data
+
+
+class TestMapStepEmitsNoReasoning:
+    """The pure mapper never emits a reasoning item — reasoning is delta-only."""
+
+    def test_done_planner_with_thinking_emits_no_reasoning_item(self) -> None:
+        """
+        A DONE planner carrying ``thinking`` maps to message (+ tool calls) only.
+
+        Reasoning is surfaced solely as transient deltas by the streaming reader
+        (mirroring the in-process executor, which never commits a reasoning item).
+        The DONE-commit path must therefore not introduce a ``reasoning`` item or
+        any ``external_output_reasoning_delta``.
+        """
+        step = _load("planner_response_text")
+        cast(dict[str, Any], step["plannerResponse"])["thinking"] = "internal chain of thought"
+        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+
+        for event in events:
+            assert event.event_type != "external_output_reasoning_delta"
+            if event.event_type == "external_conversation_item":
+                assert event.data.get("item_type") != "reasoning"
+        # The committed assistant message is still produced (text unchanged).
+        item_types = [
+            e.data.get("item_type") for e in events if e.event_type == "external_conversation_item"
+        ]
+        assert "message" in item_types

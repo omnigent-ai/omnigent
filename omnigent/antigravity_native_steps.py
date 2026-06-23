@@ -476,6 +476,50 @@ def output_text_delta_event(
     )
 
 
+def output_reasoning_delta_event(
+    *,
+    step_idx: int,
+    delta: str,
+    started: bool,
+) -> OutboundEvent:
+    """
+    Build an incremental reasoning delta for a planner step's ``thinking``.
+
+    Gemini Thinking-model variants stream chain-of-thought at
+    ``plannerResponse.thinking`` (design §10.2), which grows across GENERATING
+    frames just like ``modifiedResponse``. The streaming reader prefix-diffs it
+    and emits a *suffix* delta per frame so the SPA paints a live reasoning block
+    (``sse.ts`` maps ``response.reasoning_text.delta`` → its ``reasoning_delta``).
+    Reasoning streams BEFORE the response (§10.2 ordering), and — unlike text —
+    has no committed conversation item: the SPA finalizes the reasoning block when
+    the committed assistant ``message`` arrives, matching the in-process executor
+    (which emits the same SSE pair, never a committed reasoning item). The SPA's
+    reasoning block is not keyed by a per-step id (unlike the text deltas'
+    ``message_id``), so this carries no conversation id — only ``started`` and the
+    growth ``delta``; ``step_index`` rides on the envelope for ordering/debug.
+
+    ``started`` is ``True`` only on the FIRST delta of a step's reasoning so the
+    server can precede it with a single ``response.reasoning.started`` (the
+    SPA's "thinking…" / new-block marker); later deltas pass ``False``.
+
+    :param step_idx: Owning step index (the planner step's trajectory index);
+        recorded on the envelope for ordering/debug parity with the text path.
+    :param delta: The NEW suffix of ``thinking`` since the last forwarded prefix
+        for this step — NOT the cumulative text.
+    :param started: ``True`` only on the first reasoning delta for the step, so the
+        server emits one ``response.reasoning.started`` before this delta.
+    :returns: One ``external_output_reasoning_delta`` event.
+    """
+    return OutboundEvent(
+        event_type="external_output_reasoning_delta",
+        data={
+            "delta": delta,
+            "started": started,
+        },
+        step_index=step_idx,
+    )
+
+
 def _message_event(
     *,
     conversation_id: str,

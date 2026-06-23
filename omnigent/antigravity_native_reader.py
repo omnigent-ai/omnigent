@@ -86,6 +86,7 @@ from omnigent.antigravity_native_steps import (
     _ToolCallIdAllocator,
     _trajectory_id,
     map_step_to_events,
+    output_reasoning_delta_event,
     output_text_delta_event,
     pending_interaction,
 )
@@ -645,6 +646,12 @@ class _ReaderState:
         already forwarded as deltas, so each frame emits only the NEW suffix.
         Cleared for a step when its committed ``message`` is posted (stream path
         only; the poll path never populates it).
+    :param reasoning_prefixes: Per-PLANNER ``step_index`` → the ``thinking`` text
+        already forwarded as reasoning deltas, mirroring ``prefixes`` for the
+        reasoning stream (design §10.2). A step's first entry doubles as the
+        "reasoning started" marker: absent ⇒ the next reasoning delta is the
+        step's first (carries ``started=True``). Cleared with ``prefixes`` when the
+        committed ``message`` is posted (stream path only).
     :param turn_active: Whether a turn is currently considered open (a RUNNING
         edge fired and no closing IDLE edge yet).
     :param posted_model_enum: The last model enum already mirrored via
@@ -675,6 +682,7 @@ class _ReaderState:
     seen: set[_StepKey]
     interacted: set[_StepKey]
     prefixes: dict[int, str] = field(default_factory=dict)
+    reasoning_prefixes: dict[int, str] = field(default_factory=dict)
     turn_active: bool = False
     posted_model_enum: str | None = None
     model_catalog: dict[str, object] | None = None
@@ -958,24 +966,34 @@ async def _process_stream_step(
 
     Dispatch by step ``status`` (design §10.2 discriminator):
 
-    * A GENERATING PLANNER_RESPONSE emits only the NEW ``modifiedResponse``
-      suffix as an ``output_text_delta`` (no committed item yet); the step is NOT
-      added to ``state.seen`` so its eventual DONE frame still commits.
+    * A GENERATING PLANNER_RESPONSE emits the NEW suffix of its growing reasoning
+      (``plannerResponse.thinking``) as an ``output_reasoning_delta`` and then the
+      NEW suffix of its growing text (``modifiedResponse``) as an
+      ``output_text_delta`` — reasoning FIRST (§10.2: thinking streams before the
+      response). No committed item yet; the step is NOT added to ``state.seen`` so
+      its eventual DONE frame still commits.
     * Any other step is routed through the committed path
       (:func:`_process_committed_step`): DONE planner → the committed ``message``
       (deltas already preceded it); tool-result DONE → ``function_call_output``;
-      WAITING → the bridge. Committing a planner step clears its delta prefix
-      tracker.
+      WAITING → the bridge. Committing a planner step clears its text + reasoning
+      prefix trackers.
 
     :param step: One RPC step dict from a stream frame.
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id to mirror into.
     :param cascade_id: agy cascade id (namespaces ids + message ids).
-    :param state: Per-run shared trackers (incl. the per-step prefix tracker).
+    :param state: Per-run shared trackers (incl. the per-step prefix trackers).
     :param on_pending_interaction: Async callback for a distinct interaction.
     :returns: None.
     """
     if _is_generating_planner(step):
+        # Reasoning precedes the response (§10.2), so emit its delta first.
+        await _emit_partial_reasoning_delta(
+            step,
+            client=client,
+            session_id=session_id,
+            reasoning_prefixes=state.reasoning_prefixes,
+        )
         await _emit_partial_delta(
             step,
             client=client,
@@ -993,12 +1011,13 @@ async def _process_stream_step(
         state=state,
         on_pending_interaction=on_pending_interaction,
     )
-    # Once committed, the live block is retired by the committed message; drop the
-    # prefix tracker so a later same-index step (e.g. an agy timeout-retry reusing
+    # Once committed, the live block is retired by the committed message; drop both
+    # prefix trackers so a later same-index step (e.g. an agy timeout-retry reusing
     # the slot) starts a fresh delta stream rather than diffing against stale text.
     idx = _step_index(step)
     if idx is not None:
         state.prefixes.pop(idx, None)
+        state.reasoning_prefixes.pop(idx, None)
 
 
 def _is_generating_planner(step: dict[str, object]) -> bool:
@@ -1031,6 +1050,26 @@ def _partial_planner_text(step: dict[str, object]) -> str | None:
         return None
     modified = planner.get("modifiedResponse")
     return modified if isinstance(modified, str) else None
+
+
+def _partial_planner_thinking(step: dict[str, object]) -> str | None:
+    """
+    Extract the growing reasoning text from a GENERATING planner step.
+
+    Gemini Thinking-model variants stream chain-of-thought at
+    ``plannerResponse.thinking`` (design §10.2), which grows across frames like
+    ``modifiedResponse``. Non-thinking models omit the field. Returns ``None``
+    when the planner block or the ``thinking`` field is missing (no reasoning to
+    surface — the no-regression case for plain text streaming).
+
+    :param step: A GENERATING PLANNER_RESPONSE step dict.
+    :returns: The current cumulative ``thinking`` text, or ``None``.
+    """
+    planner = step.get("plannerResponse")
+    if not isinstance(planner, dict):
+        return None
+    thinking = planner.get("thinking")
+    return thinking if isinstance(thinking, str) else None
 
 
 async def _emit_partial_delta(
@@ -1083,6 +1122,64 @@ async def _emit_partial_delta(
             ),
         )
     prefixes[idx] = text
+
+
+async def _emit_partial_reasoning_delta(
+    step: dict[str, object],
+    *,
+    client: httpx.AsyncClient,
+    session_id: str,
+    reasoning_prefixes: dict[int, str],
+) -> None:
+    """
+    Emit the NEW suffix of a GENERATING planner step's ``thinking`` as a delta.
+
+    The reasoning analogue of :func:`_emit_partial_delta`: ``thinking`` is a
+    cumulative snapshot per frame, so the reader prefix-diffs against the suffix
+    already forwarded for this step's ``step_index`` and emits only the growth.
+    A no-growth re-send (or a non-extending rewrite) emits nothing; the tracker
+    still advances so deltas never overlap and concatenate to the full reasoning.
+
+    The step's FIRST reasoning delta carries ``started=True`` (keyed off the
+    prefix tracker being absent for the step) so the server precedes it with one
+    ``response.reasoning.started``; later deltas pass ``False``. A planner with no
+    ``thinking`` field never enters the emit branch — no reasoning events, no
+    regression to the text stream. (No cascade id is needed: the SPA reasoning
+    block is not keyed by a per-step id the way the text deltas' ``message_id``
+    is — see :func:`output_reasoning_delta_event`.)
+
+    :param step: A GENERATING PLANNER_RESPONSE step dict.
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id to mirror into.
+    :param reasoning_prefixes: Per-``step_index`` forwarded-prefix tracker
+        (mutated here); a step's first emitted delta also records its membership.
+    :returns: None.
+    """
+    idx = _step_index(step)
+    if idx is None:
+        return
+    text = _partial_planner_thinking(step)
+    if text is None:
+        return
+    # Absent ⇒ this is the step's first reasoning delta (carries ``started``).
+    started = idx not in reasoning_prefixes
+    forwarded = reasoning_prefixes.get(idx, "")
+    # Mirror the text path: only forward growth that extends the forwarded prefix.
+    # A no-growth / non-extending frame emits nothing but still re-anchors the
+    # tracker. ``started`` is only consumed when an actual delta is emitted, so a
+    # first frame with empty ``thinking`` does not waste the marker.
+    if text.startswith(forwarded) and len(text) > len(forwarded):
+        suffix = text[len(forwarded) :]
+        await _post_event(
+            client,
+            session_id,
+            output_reasoning_delta_event(
+                step_idx=idx,
+                delta=suffix,
+                started=started,
+            ),
+        )
+        reasoning_prefixes[idx] = text
 
 
 async def _emit_step(
