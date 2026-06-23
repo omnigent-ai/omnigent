@@ -204,6 +204,40 @@ async def test_read_stdout_puts_notifications_on_queue() -> None:
     assert msg["method"] == "session/update"
 
 
+@pytest.mark.asyncio
+async def test_read_stdout_does_not_resolve_future_for_colliding_request() -> None:
+    """A server request whose id collides with a pending one is queued, not resolved.
+
+    qwen mints its own request ids; one can equal an outstanding _rpc_id. Such a
+    message has a "method", so it must route to the queue, not our future.
+    """
+    executor = QwenExecutor()
+
+    loop = asyncio.get_event_loop()
+    fut: asyncio.Future = loop.create_future()
+    executor._pending[2] = fut  # our pending session/prompt, id=2
+
+    # qwen sends a permission *request* that happens to reuse id=2.
+    request = {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "session/request_permission",
+        "params": {"toolCall": {"_meta": {"toolName": "run_shell_command"}}},
+    }
+    mock_stdout = AsyncMock()
+    mock_stdout.readline = AsyncMock(side_effect=[(json.dumps(request) + "\n").encode(), b""])
+    mock_proc = MagicMock()
+    mock_proc.stdout = mock_stdout
+    executor._proc = mock_proc
+
+    await executor._read_stdout()
+
+    assert not fut.done()  # our prompt future was NOT mis-resolved
+    assert 2 in executor._pending
+    queued = executor._queue.get_nowait()
+    assert queued["method"] == "session/request_permission"
+
+
 # ---------------------------------------------------------------------------
 # _ensure_session resets on "Session not found"
 # ---------------------------------------------------------------------------
@@ -321,6 +355,106 @@ async def test_run_turn_yields_text_chunks_and_turn_complete() -> None:
     assert text_chunks[0].text == "Hello!"
     assert len(turn_completes) == 1
     assert turn_completes[0].response == "Hello!"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_drains_all_chunks_before_completing() -> None:
+    """All buffered chunks are yielded even if the future resolves first.
+
+    The reader can enqueue several chunks AND resolve the prompt future before
+    run_turn drains the queue. Completion is gated on an empty queue, so no
+    chunk is lost to a premature return.
+    """
+    executor = QwenExecutor()
+    executor._initialized = True
+    executor._session_id = "sess-drain"
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+
+    session_id = executor._session_id
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            for piece in ("a", "b", "c"):
+                await executor._queue.put(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": session_id,
+                            "update": {
+                                "sessionUpdate": "agent_message_chunk",
+                                "content": {"type": "text", "text": piece},
+                            },
+                        },
+                    }
+                )
+            # Resolve immediately — chunks are still buffered in the queue.
+            fut = executor._pending.get(msg["id"])
+            if fut and not fut.done():
+                fut.set_result(
+                    {"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "end_turn"}}
+                )
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    events = [e async for e in executor.run_turn([{"role": "user", "content": "hi"}], [], "")]
+    text = "".join(e.text for e in events if isinstance(e, TextChunk))
+    completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert text == "abc"
+    assert len(completes) == 1
+    assert completes[0].response == "abc"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_approval_does_not_count_against_idle_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow human approval must not trip the response timeout.
+
+    With a tiny timeout and an elicitation handler slower than it, the turn must
+    still complete: the idle deadline resets after the approval round-trip.
+    """
+    monkeypatch.setattr("omnigent.inner.qwen_executor._PROMPT_TIMEOUT_SECONDS", 0.05)
+
+    executor = QwenExecutor()
+    executor._initialized = True
+    executor._session_id = "sess-slow"
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+
+    async def slow_handler(tool_name: str, tool_input: dict) -> bool:
+        await asyncio.sleep(0.25)  # 5x the timeout
+        return True
+
+    executor._elicitation_handler = slow_handler  # type: ignore[assignment]
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            # qwen asks permission before finishing the turn.
+            await executor._queue.put(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 999,
+                    "method": "session/request_permission",
+                    "params": {
+                        "toolCall": {"_meta": {"toolName": "run_shell_command"}},
+                        "options": [{"kind": "allow_once", "optionId": "ok"}],
+                    },
+                }
+            )
+        elif "result" in msg and msg.get("id") == 999:
+            # Our approval reply went out — now qwen completes the prompt.
+            rid = executor._rpc_id
+            fut = executor._pending.get(rid)
+            if fut and not fut.done():
+                fut.set_result({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    events = [e async for e in executor.run_turn([{"role": "user", "content": "rm it"}], [], "")]
+    assert any(isinstance(e, TurnComplete) for e in events)
+    assert not any(isinstance(e, ExecutorError) for e in events)
 
 
 # ---------------------------------------------------------------------------

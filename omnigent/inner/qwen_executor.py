@@ -336,13 +336,18 @@ class QwenExecutor(Executor):
                     continue
 
                 msg_id = msg.get("id")
-                if msg_id is not None and msg_id in self._pending:
+                # Match a response by "id + no method": qwen's own requests
+                # (e.g. session/request_permission) also carry an id from a
+                # counter that can collide with ours, so without the method
+                # check a colliding request would mis-resolve our prompt future
+                # and hang the turn.
+                if msg_id is not None and "method" not in msg and msg_id in self._pending:
                     # Response to one of our requests.
                     fut = self._pending.pop(msg_id)
                     if not fut.done():
                         fut.set_result(msg)
                 else:
-                    # Notification or unknown — forward to run_turn queue.
+                    # Notification or server-initiated request → run_turn queue.
                     await self._queue.put(msg)
         except (asyncio.CancelledError, EOFError):
             # Expected on shutdown (close() cancels this task) or stream EOF;
@@ -843,7 +848,9 @@ class QwenExecutor(Executor):
         }
         await self._send(prompt_request)
 
-        # Yield events until qwen signals turn completion.
+        # Idle-based deadline: reset on every inbound message (bottom of loop),
+        # so it bounds time-without-progress, not total turn length — a long
+        # human approval or slow stream won't trip a spurious timeout.
         deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
         accumulated_text: list[str] = []
 
@@ -853,8 +860,11 @@ class QwenExecutor(Executor):
                 yield ExecutorError(message="Timeout waiting for qwen response", retryable=True)
                 return
 
-            # Check if the final response arrived.
-            if fut.done():
+            # Complete only once the future is resolved AND the queue is drained.
+            # The reader resolves the future directly but enqueues chunks, and
+            # the response trails the chunk stream — a bare fut.done() check
+            # could return with chunks still buffered, truncating the response.
+            if fut.done() and self._queue.empty():
                 try:
                     response = fut.result()
                 except Exception as exc:  # noqa: BLE001
@@ -917,10 +927,14 @@ class QwenExecutor(Executor):
                     pass
 
             elif notification.get("id") is not None and notification.get("method"):
-                # An incoming *request* from qwen (e.g. session/request_permission).
-                # Dispatch by method — auto-approve permissions, method-not-found
-                # for anything else (we advertise no fs capability).
+                # Server-initiated request (e.g. session/request_permission):
+                # permission goes through policy + elicitation; anything else
+                # gets method-not-found. Blocks while the human decides.
                 await self._respond_to_agent_request(notification)
+
+            # Inbound message = progress; reset the idle deadline. Runs after the
+            # human-approval block above so a slow approval doesn't time out.
+            deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
 
     async def close_session(self, session_key: str) -> None:
         """Close a named session (no-op; sessions are per-process)."""
