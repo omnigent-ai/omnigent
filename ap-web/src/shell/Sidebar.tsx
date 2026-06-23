@@ -511,18 +511,22 @@ function ConversationList({
     });
   }, []);
 
+  // When a search is active, force all sections open so results in
+  // collapsed groups (especially Archived) are visible.
+  const effectiveCollapsedSections = searchQuery ? [] : collapsedSections;
+
   // Visible rows in render order (collapsed sections excluded) for the Cmd+↑/↓
   // session hotkey. Titles must match the <ConversationSection> props below.
   const orderedConversationIds = useMemo(() => {
     const visible = (title: string, list: readonly Conversation[]) =>
-      collapsedSections.includes(title) ? [] : list;
+      effectiveCollapsedSections.includes(title) ? [] : list;
     return [
       ...visible("Pinned", sections.pinned),
       ...visible("Recent", sections.sessions),
       ...visible("Shared with me", sections.shared),
       ...visible("Archived", sections.archived),
     ].map((c) => c.id);
-  }, [sections, collapsedSections]);
+  }, [sections, effectiveCollapsedSections]);
   useSessionSwitchHotkey(orderedConversationIds, activeId);
 
   // Only normalize pinned ids once all pages are loaded; a pin that
@@ -578,7 +582,7 @@ function ConversationList({
               title="Pinned"
               conversations={sections.pinned}
               pinnedConversationIds={pinnedConversationIds}
-              collapsedSections={collapsedSections}
+              collapsedSections={effectiveCollapsedSections}
               onToggleCollapsed={toggleSectionCollapsed}
               onRowClick={onRowClick}
               onTogglePinned={onTogglePinned}
@@ -592,7 +596,7 @@ function ConversationList({
               title="Recent"
               conversations={sections.sessions}
               pinnedConversationIds={pinnedConversationIds}
-              collapsedSections={collapsedSections}
+              collapsedSections={effectiveCollapsedSections}
               onToggleCollapsed={toggleSectionCollapsed}
               onRowClick={onRowClick}
               onTogglePinned={onTogglePinned}
@@ -606,7 +610,7 @@ function ConversationList({
               title="Shared with me"
               conversations={sections.shared}
               pinnedConversationIds={pinnedConversationIds}
-              collapsedSections={collapsedSections}
+              collapsedSections={effectiveCollapsedSections}
               onToggleCollapsed={toggleSectionCollapsed}
               onRowClick={onRowClick}
               onTogglePinned={onTogglePinned}
@@ -620,7 +624,7 @@ function ConversationList({
               title="Archived"
               conversations={sections.archived}
               pinnedConversationIds={pinnedConversationIds}
-              collapsedSections={collapsedSections}
+              collapsedSections={effectiveCollapsedSections}
               onToggleCollapsed={toggleSectionCollapsed}
               onRowClick={onRowClick}
               onTogglePinned={onTogglePinned}
@@ -631,7 +635,7 @@ function ConversationList({
           )}
           {/* Pagination extends the Recent list, so the button hides with
               it — a Load more under a collapsed group reads orphaned. */}
-          {hasMorePages && !collapsedSections.includes("Recent") && (
+          {hasMorePages && !effectiveCollapsedSections.includes("Recent") && (
             <button
               type="button"
               disabled={conversationsQuery.isFetchingNextPage}
