@@ -663,13 +663,17 @@ class TestRealIdPairing:
         rc_planner = _load("planner_response_tool_call_run_command")
         rc_planner_events = map_step_to_events(rc_planner, conversation_id=_CID, allocator=alloc)
         assert len(rc_planner_events) == 1
-        assert rc_planner_events[0].data["item_data"]["call_id"] == "cbawg2v8"  # type: ignore[index]
+        rc_item = rc_planner_events[0].data["item_data"]
+        assert isinstance(rc_item, dict)
+        assert rc_item["call_id"] == "cbawg2v8"
 
         # Emit PLANNER_RESPONSE for ask_question (id="jfizoalt")
         aq_planner = _load("planner_response_tool_call_ask_question")
         aq_planner_events = map_step_to_events(aq_planner, conversation_id=_CID, allocator=alloc)
         assert len(aq_planner_events) == 1
-        assert aq_planner_events[0].data["item_data"]["call_id"] == "jfizoalt"  # type: ignore[index]
+        aq_item = aq_planner_events[0].data["item_data"]
+        assert isinstance(aq_item, dict)
+        assert aq_item["call_id"] == "jfizoalt"
 
         # Now deliver ask_question DONE result FIRST (out of order vs run_command)
         aq_done = _load("ask_question_done")

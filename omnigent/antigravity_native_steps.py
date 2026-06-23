@@ -60,9 +60,6 @@ _TYPE_ASK_QUESTION = "CORTEX_STEP_TYPE_ASK_QUESTION"
 _STATUS_DONE = "CORTEX_STEP_STATUS_DONE"
 _STATUS_WAITING = "CORTEX_STEP_STATUS_WAITING"
 
-# RPC step source constant for user-submitted input steps.
-_SOURCE_USER = "CORTEX_STEP_SOURCE_USER_EXPLICIT"
-
 
 def _step_index(step: dict[str, object]) -> int | None:
     """
