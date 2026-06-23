@@ -34,6 +34,7 @@ from omnigent.tools.builtins import (
     SysSessionGetInfoTool,
     SysSessionListTool,
     SysSessionSendTool,
+    SysSessionShareTool,
     SysTimerCancelTool,
     SysTimerSetTool,
     UpdateCommentTool,
@@ -375,13 +376,16 @@ class ToolManager:
         Register the sub-agent tool surface.
 
         The read-only discovery tools — ``sys_session_list``,
-        ``sys_session_get_history``, and ``sys_session_get_info`` — are
-        registered for **every** agent. Any agent can be part of a
-        multi-agent session (most importantly a user-added agent that
-        declares no sub-agents of its own but needs to read
-        ``main``/siblings for context), so listing, peeking, and
+        ``sys_session_get_history``, and ``sys_session_get_info`` — plus
+        ``sys_session_share`` are registered for **every** agent. Any
+        agent can be part of a multi-agent session (most importantly a
+        user-added agent that declares no sub-agents of its own but needs
+        to read ``main``/siblings for context), so listing, peeking, and
         metadata reads are always available; access is enforced
         server-side (each proxies an auth-gated ``GET`` endpoint).
+        ``sys_session_share`` defaults to the caller's own session and
+        is likewise server-gated (the caller needs manage-level access),
+        so it is always advertised without granting extra authority.
         ``peek`` / ``get_info`` take a ``conversation_id`` (from
         ``sys_session_list`` or a prior ``sys_session_send`` handle),
         so they need no ``sub_specs`` map.
@@ -412,6 +416,11 @@ class ToolManager:
         self._tools[SysSessionListTool.name()] = SysSessionListTool()
         self._tools[SysSessionGetHistoryTool.name()] = SysSessionGetHistoryTool()
         self._tools[SysSessionGetInfoTool.name()] = SysSessionGetInfoTool()
+        # Session sharing: always available. Acts on the caller's own
+        # session by default; the server enforces that the caller holds
+        # manage-level access (the session owner does), so advertising it
+        # to every agent grants no authority the server wouldn't check.
+        self._tools[SysSessionShareTool.name()] = SysSessionShareTool()
 
         # send + close: opt-in via declared sub-agents or spawn: true.
         if not (self._spec.tools.agents or self._spec.spawn):

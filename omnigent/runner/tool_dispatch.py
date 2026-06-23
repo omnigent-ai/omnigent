@@ -207,13 +207,20 @@ _SUBAGENT_TOOLS = frozenset({"sys_session_send"})
 # as _execute_subagent_tool.
 _SESSION_CREATE_TOOLS = frozenset({"sys_session_create"})
 
-# Priority 5f.0: Session query tools — peek/list/close/get_info. The runner
-# has no in-process ConversationStore, so these read/mutate session state via
-# the Omnigent server's existing REST endpoints (GET /items, GET /child_sessions,
-# GET /sessions/{id}, PATCH /sessions/{id}) over server_client — same channel
-# and security posture as _execute_subagent_tool / _execute_comment_tool.
+# Priority 5f.0: Session query tools — peek/list/close/get_info/share. The
+# runner has no in-process ConversationStore, so these read/mutate session
+# state via the Omnigent server's existing REST endpoints (GET /items, GET
+# /child_sessions, GET /sessions/{id}, PATCH /sessions/{id}, PUT
+# /sessions/{id}/permissions) over server_client — same channel and security
+# posture as _execute_subagent_tool / _execute_comment_tool.
 _SESSION_QUERY_TOOLS = frozenset(
-    {"sys_session_get_history", "sys_session_list", "sys_session_close", "sys_session_get_info"}
+    {
+        "sys_session_get_history",
+        "sys_session_list",
+        "sys_session_close",
+        "sys_session_get_info",
+        "sys_session_share",
+    }
 )
 
 # Priority 5f.1: web_fetch — translates the LLM-facing query/url
@@ -2464,6 +2471,8 @@ async def _execute_session_query_tool(
       best-effort ``GET /v1/runners/{id}/status`` for connectivity)
     - ``sys_session_close`` → ``GET`` the target snapshot then ``PATCH
       /v1/sessions/{target}`` with a tombstoned title
+    - ``sys_session_share`` → ``PUT /v1/sessions/{target}/permissions``
+      with the grantee + numeric level
 
     Output shapes mirror the in-process tools in
     :mod:`omnigent.tools.builtins.spawn` so the LLM sees identical
@@ -2473,7 +2482,8 @@ async def _execute_session_query_tool(
     :func:`_execute_subagent_tool`.
 
     :param tool_name: ``"sys_session_get_history"``, ``"sys_session_list"``,
-        ``"sys_session_close"``, or ``"sys_session_get_info"``.
+        ``"sys_session_close"``, ``"sys_session_get_info"``, or
+        ``"sys_session_share"``.
     :param arguments: JSON-encoded arguments string from the LLM, e.g.
         ``'{"conversation_id": "conv_abc123", "tail_items": 5}'``.
     :param conversation_id: The calling session id, e.g. ``"conv_root1"``;
@@ -2497,6 +2507,8 @@ async def _execute_session_query_tool(
         return await _session_get_history_via_rest(args, server_client)
     if tool_name == "sys_session_get_info":
         return await _session_get_info_via_rest(args, conversation_id, server_client)
+    if tool_name == "sys_session_share":
+        return await _session_share_via_rest(args, conversation_id, server_client)
     return await _session_close_via_rest(args, conversation_id, server_client)
 
 
@@ -2600,6 +2612,66 @@ async def _session_get_info_via_rest(
             "pending_elicitations": pending,
             "pending_elicitation_count": len(pending),
         }
+    )
+
+
+async def _session_share_via_rest(
+    args: dict[str, Any],
+    conversation_id: str,
+    server_client: httpx.AsyncClient,
+) -> str:
+    """
+    Grant a user access to a session via ``PUT /v1/sessions/{id}/permissions``.
+
+    Resolves the target from ``args["session_id"]`` (falling back to the
+    caller's own ``conversation_id`` when omitted), maps the friendly
+    ``level`` name to the server's numeric level, and PUTs the grant.
+    Same channel and security posture as the other session REST tools:
+    the server enforces that ``server_client``'s identity holds
+    manage-level access on the target (the session owner does), and caps
+    public (``__public__``) grants at read.
+
+    Maps 404 to ``session_not_found`` and 401/403 to ``access_denied``.
+
+    :param args: Parsed tool arguments. Requires ``user_id`` (grantee
+        email or ``"__public__"``); optional ``level`` (``"read"``
+        default / ``"edit"`` / ``"manage"``) and ``session_id``.
+    :param conversation_id: The caller's own session id, used as the
+        default target when ``session_id`` is omitted.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: JSON ``{"shared": true, ...}`` on success, or a JSON
+        error object.
+    """
+    target = args.get("session_id") or conversation_id
+    if not isinstance(target, str) or not target:
+        return json.dumps({"error": "sys_session_share requires a non-empty 'session_id' string"})
+    user_id = args.get("user_id")
+    if not isinstance(user_id, str) or not user_id:
+        return json.dumps({"error": "sys_session_share requires a non-empty 'user_id'"})
+    # Friendly level name -> the server's numeric permission level
+    # (GrantPermissionRequest accepts 1=read, 2=edit, 3=manage).
+    level_by_name = {"read": 1, "edit": 2, "manage": 3}
+    level_name = args.get("level", "read")
+    if level_name not in level_by_name:
+        return json.dumps(
+            {"error": f"sys_session_share: level must be one of {sorted(level_by_name)}"}
+        )
+    try:
+        resp = await server_client.put(
+            f"/v1/sessions/{target}/permissions",
+            json={"user_id": user_id, "level": level_by_name[level_name]},
+            timeout=30.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"sys_session_share failed: {exc}"})
+    if resp.status_code == 404:
+        return json.dumps({"error": "session_not_found", "session_id": target})
+    if resp.status_code in (401, 403):
+        return json.dumps({"error": "access_denied", "session_id": target})
+    if resp.status_code >= 400:
+        return json.dumps({"error": f"sys_session_share returned {resp.status_code}"})
+    return json.dumps(
+        {"shared": True, "session_id": target, "user_id": user_id, "level": level_name}
     )
 
 

@@ -547,6 +547,93 @@ class SysSessionGetInfoTool(Tool):
         }
 
 
+class SysSessionShareTool(Tool):
+    """
+    Grant another user (or the public) access to a session.
+
+    ``session_id`` is optional — when omitted, the caller's own session
+    is shared, which is the common case ("share this session with X").
+    ``user_id`` is the grantee's email, or the sentinel ``"__public__"``
+    for anonymous read-only access. ``level`` is ``"read"`` (default),
+    ``"edit"``, or ``"manage"``; the server caps public grants at read.
+
+    Runner-dispatched: the runner proxies ``PUT
+    /v1/sessions/{id}/permissions`` using its authenticated server
+    client, so the grant runs with the session user's own identity and
+    is subject to the server's permission checks (the caller needs
+    manage-level access — which the session owner has). Returns
+    ``access_denied`` when the server refuses and ``session_not_found``
+    for an unknown id.
+    """
+
+    @classmethod
+    def name(cls) -> str:
+        """:returns: ``"sys_session_share"``."""
+        return "sys_session_share"
+
+    @classmethod
+    def description(cls) -> str:
+        """:returns: Human-readable description of the tool."""
+        return (
+            "Share a session with another user by granting them access. "
+            "Pass user_id (the grantee's email, or '__public__' for "
+            "anonymous read-only access) and an optional level "
+            "('read' default, 'edit', or 'manage'). Omit session_id to "
+            "share the calling session itself, or pass it to share "
+            "another session you manage. Requires manage-level access "
+            "(the session owner has it)."
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        """
+        Return the OpenAI-format tool schema.
+
+        :returns: Dict with ``"type": "function"`` and a ``"function"``
+            sub-dict; ``user_id`` is required, ``level`` and
+            ``session_id`` optional.
+        """
+        return {
+            "type": "function",
+            "function": {
+                "name": SysSessionShareTool.name(),
+                "description": SysSessionShareTool.description(),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "user_id": {
+                            "type": "string",
+                            "description": (
+                                "Grantee's email, e.g. "
+                                "'alice@example.com', or the sentinel "
+                                "'__public__' for anonymous read-only "
+                                "access."
+                            ),
+                        },
+                        "level": {
+                            "type": "string",
+                            "enum": ["read", "edit", "manage"],
+                            "description": (
+                                "Permission level to grant. Defaults to "
+                                "'read'. Public grants are capped at "
+                                "'read' regardless of this value."
+                            ),
+                        },
+                        "session_id": {
+                            "type": "string",
+                            "description": (
+                                "The session (conversation_id) to share, "
+                                "e.g. 'conv_abc123'. Omit to share the "
+                                "calling session itself."
+                            ),
+                        },
+                    },
+                    "required": ["user_id"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+
 class SysSessionCreateTool(Tool):
     """
     Create a child session from an existing agent or a local bundle.

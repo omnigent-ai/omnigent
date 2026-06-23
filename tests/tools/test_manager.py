@@ -58,6 +58,9 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_session_get_history",
         "sys_session_list",
         "sys_session_get_info",
+        # Session sharing is always available; it defaults to the caller's
+        # own session and the server enforces manage-level access.
+        "sys_session_share",
         # Read-only agent discovery tools are likewise always available
         # (global, permission-bounded reads of any accessible session's
         # agent / bundle).
@@ -315,6 +318,10 @@ def test_session_reads_registered_but_writes_gated_without_opt_in() -> None:
     # in _register_sub_agent_tools regressed and the orchestrator can't
     # check session status.
     assert "sys_session_get_info" in names
+    # Sharing is always available too: it defaults to the caller's own
+    # session and the server enforces manage-level access, so advertising
+    # it to every agent grants no authority the server wouldn't check.
+    assert "sys_session_share" in names
     assert "sys_session_send" not in names
     assert "sys_session_close" not in names
     assert "sys_session_create" not in names

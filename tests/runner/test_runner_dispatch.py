@@ -6217,6 +6217,131 @@ async def test_sys_session_get_info_maps_error_statuses(
 
 
 @pytest.mark.asyncio
+async def test_sys_session_share_defaults_to_caller_and_puts_grant() -> None:
+    """
+    Omitting ``session_id`` shares the caller's own session: the runner
+    PUTs to ``/v1/sessions/{conversation_id}/permissions`` with the
+    grantee and the numeric level mapped from the friendly name. If the
+    default-to-caller logic or the name->level mapping regressed, the
+    request path or body would be wrong (and an agent's "share this
+    session" would silently hit the wrong session or wrong level).
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    requests: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path, json.loads(request.content)))
+        return httpx.Response(
+            200,
+            json={"user_id": "alice@example.com", "conversation_id": "conv_caller", "level": 2},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_share",
+            arguments=json.dumps({"user_id": "alice@example.com", "level": "edit"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    # Exactly one PUT to the caller's own permissions sub-resource, with
+    # level "edit" mapped to the server's numeric 2 (1=read/2=edit/3=manage).
+    assert requests == [
+        (
+            "PUT",
+            "/v1/sessions/conv_caller/permissions",
+            {"user_id": "alice@example.com", "level": 2},
+        )
+    ]
+    result = json.loads(output)
+    assert result == {
+        "shared": True,
+        "session_id": "conv_caller",
+        "user_id": "alice@example.com",
+        "level": "edit",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status_code,expected_error",
+    [
+        pytest.param(404, "session_not_found", id="not-found"),
+        pytest.param(403, "access_denied", id="forbidden"),
+        pytest.param(401, "access_denied", id="unauthorized"),
+    ],
+)
+async def test_sys_session_share_maps_error_statuses(
+    status_code: int,
+    expected_error: str,
+) -> None:
+    """
+    A 404 maps to ``session_not_found``; 401/403 map to ``access_denied``
+    — a typed reason instead of a raw status, matching the sibling
+    session tools so the LLM can distinguish "no such session" from
+    "you can't manage it".
+
+    :param status_code: HTTP status the mocked Omnigent server returns.
+    :param expected_error: The typed error string the tool should emit.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json={"detail": "x"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_share",
+            arguments=json.dumps({"user_id": "alice@example.com", "session_id": "conv_x"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    result = json.loads(output)
+    assert result["error"] == expected_error
+    assert result["session_id"] == "conv_x"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_share_rejects_bad_level_without_calling_server() -> None:
+    """
+    An unknown ``level`` is rejected client-side before any PUT — so a
+    typo can't fall through to the server or silently skip the grant. A
+    request reaching the handler would mean the level validation
+    regressed.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    called = False
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_share",
+            arguments=json.dumps({"user_id": "alice@example.com", "level": "admin"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert called is False  # validation must short-circuit before the PUT
+    assert "level must be one of" in json.loads(output)["error"]
+
+
+@pytest.mark.asyncio
 async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() -> None:
     """
     ``sys_session_get_info`` projects ``GET /v1/sessions/{id}`` metadata
