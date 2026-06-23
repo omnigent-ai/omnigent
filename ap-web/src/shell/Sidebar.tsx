@@ -71,6 +71,7 @@ import { sumPendingApprovals } from "@/lib/inbox";
 import { cn } from "@/lib/utils";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
+import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import { ThemeModeMenu } from "@/components/theme/ThemeModeMenu";
 import { AccountMenu } from "./AccountMenu";
@@ -553,6 +554,14 @@ function ConversationList({
     ].map((c) => c.id);
   }, [sections, collapsedSections]);
   useSessionSwitchHotkey(orderedConversationIds, activeId);
+
+  // Cmd/Ctrl+1..9/0 jumps to the first ten pinned sessions (desktop only;
+  // see the hook). Empty when the Pinned section is collapsed.
+  const pinnedSessionIds = useMemo(
+    () => (collapsedSections.includes("Pinned") ? [] : sections.pinned.map((c) => c.id)),
+    [sections.pinned, collapsedSections],
+  );
+  usePinnedSessionHotkeys(pinnedSessionIds, activeId);
 
   // Only normalize pinned ids once all pages are loaded; a pin that
   // lives on an unloaded page should not be dropped prematurely

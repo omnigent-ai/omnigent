@@ -1,8 +1,17 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { KeyboardShortcutsDialog, openKeyboardShortcuts } from "./KeyboardShortcutsDialog";
 
+// The pinned-session row is desktop-only. Default to browser (false).
+const isNativeShell = vi.fn(() => false);
+vi.mock("@/lib/nativeBridge", () => ({
+  isNativeShell: () => isNativeShell(),
+}));
+
+beforeEach(() => {
+  isNativeShell.mockReturnValue(false);
+});
 afterEach(cleanup);
 
 // jsdom's navigator is non-mac, so the modifier glyph renders as "Ctrl".
@@ -43,5 +52,18 @@ describe("KeyboardShortcutsDialog", () => {
     openKeyboardShortcuts();
     // The event dispatch isn't wrapped in act(), so wait for the re-render.
     expect(await screen.findByText("Send message")).toBeTruthy();
+  });
+
+  it("hides the pinned-session shortcut in a plain browser", () => {
+    render(<KeyboardShortcutsDialog />);
+    toggleViaHotkey();
+    expect(screen.queryByText("Jump to pinned session (1–10)")).toBeNull();
+  });
+
+  it("shows the pinned-session shortcut in the Electron shell", () => {
+    isNativeShell.mockReturnValue(true);
+    render(<KeyboardShortcutsDialog />);
+    toggleViaHotkey();
+    expect(screen.getByText("Jump to pinned session (1–10)")).toBeTruthy();
   });
 });
