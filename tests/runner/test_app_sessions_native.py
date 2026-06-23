@@ -10535,6 +10535,10 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
     spec = captured["spec"]
     assert spec.command == "claude"
     assert spec.env["ENABLE_TOOL_SEARCH"] == "true"
+    # The claude-native terminal must opt into keeping its private tmux server
+    # alive past an inner-CLI exit, so a sub-agent worker whose `claude` exits
+    # early no longer cascades into "no server running" (#540).
+    assert spec.keep_alive_after_exit is True
     args = spec.args
     settings = json.loads(args[args.index("--settings") + 1])
     assert "PermissionRequest" in settings["hooks"]
