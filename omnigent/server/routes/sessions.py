@@ -17361,7 +17361,8 @@ def create_sessions_router(
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session/conversation identifier.
         :param environment_id: Environment resource id.
-        :returns: Flat list of changed filesystem entries with ``status``.
+        :returns: Flat list of changed filesystem entries with ``status`` and
+            optional ``staged`` / ``unstaged`` fields.
         """
         path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}/changes"
         await _validate_session(session_id, request, LEVEL_READ)
