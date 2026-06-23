@@ -3082,6 +3082,118 @@ async def test_tool_output_resolves_only_the_matching_same_name_prompt(
     pending_elicitations.reset_for_tests()
 
 
+async def test_resolved_prompt_output_does_not_clear_other_same_name_prompt(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A mirrored result for an ALREADY-RESOLVED prompt must not clear a
+    different, still-pending prompt of the same tool.
+
+    Reproduces the reported "Resolved elsewhere" bug for a parallel
+    same-tool batch (e.g. several ``Read`` prompts surfaced at once):
+
+    - Two ``Bash`` prompts park with distinct inputs: A (``ls``) and
+      B (``rm x``).
+    - The user approves A in the web UI. Its hook returns ``allow`` and
+      A leaves the parked set; B is still live and unanswered.
+    - Claude runs A's command; its ``function_call`` /
+      ``function_call_output`` mirror back. The result carries A's input
+      (``ls``), which matches no still-parked prompt — A is already gone.
+
+    The terminal-resolved fast path must NOT misattribute A's output to
+    the lone remaining candidate B: B's input (``rm x``) is not A's
+    (``ls``). Without the fix the ``len(candidates) == 1`` fallback flips
+    B to "Resolved elsewhere", forcing the user to the native terminal to
+    answer a prompt the web card silently abandoned. Companion to
+    ``test_tool_output_resolves_only_the_matching_same_name_prompt`` (the
+    exact-match case); this guards the no-match case.
+    """
+    from omnigent.runtime import pending_elicitations
+
+    pending_elicitations.reset_for_tests()
+    agent = await create_test_agent(client, "test-resolved-output-no-cross-clear")
+    session_id = await _create_session(client, agent["id"])
+
+    captured: list[dict[str, Any]] = []
+    capture_task = asyncio.create_task(_subscribe_into(session_id, captured))
+    await asyncio.sleep(0.05)
+
+    # Park two Bash prompts with distinct inputs.
+    payload_a = {**await _claude_permission_payload("Bash"), "tool_input": {"command": "ls"}}
+    payload_b = {**await _claude_permission_payload("Bash"), "tool_input": {"command": "rm x"}}
+    hook_a = asyncio.create_task(
+        client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=payload_a)
+    )
+    elicit_a = (
+        await _wait_for_event(
+            captured,
+            lambda e: e.get("type") == "response.elicitation_request",
+        )
+    )["elicitation_id"]
+    hook_b = asyncio.create_task(
+        client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=payload_b)
+    )
+    elicit_b = (
+        await _wait_for_event(
+            captured,
+            lambda e: (
+                e.get("type") == "response.elicitation_request"
+                and e.get("elicitation_id") != elicit_a
+            ),
+        )
+    )["elicitation_id"]
+    assert pending_elicitations.count_for(session_id) == 2
+
+    # The user approves A in the web UI; its hook returns allow and A
+    # leaves the parked set. B stays live and unanswered.
+    verdict_a = await _post_approval(client, session_id, elicit_a, "accept")
+    assert verdict_a.status_code == 202, verdict_a.text
+    assert (await hook_a).status_code == 200
+    assert pending_elicitations.count_for(session_id) == 1
+
+    # Claude runs A's command; mirror A's tool_use then tool_result. The
+    # result's input ("ls") matches no still-parked prompt (A is gone).
+    call_id = "toolu_bash_a"
+    await _post_external_conversation_item(
+        client,
+        session_id,
+        "function_call",
+        {
+            "agent": "Claude",
+            "name": "Bash",
+            "arguments": json.dumps({"command": "ls"}),
+            "call_id": call_id,
+        },
+        source_id="src_fc_a",
+        response_id="resp_a",
+    )
+    await _post_external_conversation_item(
+        client,
+        session_id,
+        "function_call_output",
+        {"call_id": call_id, "output": "file1\n"},
+        source_id="src_fco_a",
+        response_id="resp_a",
+    )
+
+    # Give any wrong resolution of B a chance to surface before asserting.
+    await asyncio.sleep(0.1)
+    resolved_b = [
+        e
+        for e in captured
+        if e.get("type") == "response.elicitation_resolved" and e.get("elicitation_id") == elicit_b
+    ]
+    assert resolved_b == [], "prompt B (command 'rm x') must stay live"
+    assert pending_elicitations.count_for(session_id) == 1
+
+    # Cleanup: resolve B via web verdict so its parked hook returns.
+    verdict_b = await _post_approval(client, session_id, elicit_b, "accept")
+    assert verdict_b.status_code == 202, verdict_b.text
+    await hook_b
+    capture_task.cancel()
+    pending_elicitations.reset_for_tests()
+
+
 async def test_pre_permission_tool_call_does_not_deny_permission_hook(
     client: httpx.AsyncClient,
 ) -> None:
