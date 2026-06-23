@@ -46,6 +46,11 @@ if TYPE_CHECKING:
 
 from .executor import Message
 
+# Imported lazily inside methods to avoid a hard runtime.telemetry
+# import at module load time. Helpers used: ``parse_provider_name``
+# (model-string → provider/model split) and ``should_capture_content``
+# (content gating via ``OMNIGENT_OTEL_CAPTURE_CONTENT``).
+
 logger = logging.getLogger(__name__)
 
 # MLflow span attributes / inputs / outputs accept arbitrary JSON-ish
@@ -126,6 +131,8 @@ class TracingContext:
         model: str | None = None,
     ) -> LiveSpan:
         """Begin the root AGENT span for a turn."""
+        from omnigent.runtime.telemetry import parse_provider_name, should_capture_content
+
         mlflow = _mlflow()
         parent = self._current_span
         # If the intended parent span has already been ended (e.g. the
@@ -138,19 +145,38 @@ class TracingContext:
             end_time_ns = parent.end_time_ns
             if isinstance(end_time_ns, int) and end_time_ns > 0:
                 parent_ended = True
-        attrs: dict[str, str] = {"agent.name": agent_name}
+        # Existing omnigent attributes plus the GenAI Agent Spans
+        # semantic-convention attributes so non-MLflow OTel backends
+        # render the span as an agent invocation. See
+        # https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-agent-spans/
+        attrs: dict[str, str] = {
+            "agent.name": agent_name,
+            "gen_ai.operation.name": "invoke_agent",
+            "gen_ai.agent.name": agent_name,
+        }
         if model:
             attrs["model"] = model
+            provider, model_name = parse_provider_name(model)
+            if provider:
+                attrs["gen_ai.provider.name"] = provider
+            if model_name:
+                attrs["gen_ai.request.model"] = model_name
         if parent_ended and parent is not None:
             attrs["parent_span_id"] = str(parent.span_id)
             parent = None
+        # Gate the user message on the content-capture flag. Agent name
+        # is metadata (always set on attributes), the user message is
+        # content (may contain PII / secrets).
+        inputs: dict[str, Any] = {}
+        if should_capture_content():
+            inputs["user_message"] = user_message
         span = cast(
             "LiveSpan",
             mlflow.start_span_no_context(
                 name=f"agent:{agent_name}",
                 span_type="AGENT",
                 parent_span=parent,
-                inputs={"user_message": user_message},
+                inputs=inputs,
                 attributes=attrs,
             ),
         )
@@ -177,9 +203,12 @@ class TracingContext:
         :param error: Optional error message attached as
             ``error.message``; also forces the status to ``"ERROR"``.
         """
+        from omnigent.runtime.telemetry import should_capture_content
+
         if span is None:
             return
-        span.set_outputs({"response": response})
+        if should_capture_content():
+            span.set_outputs({"response": response})
         if error:
             span.set_attribute("error.message", error)
             span.set_status("ERROR")
@@ -199,17 +228,31 @@ class TracingContext:
         model: str | None = None,
     ) -> LiveSpan:
         """Begin a CHAT_MODEL span for an executor.run_turn call."""
+        from omnigent.runtime.telemetry import parse_provider_name, should_capture_content
+
         mlflow = _mlflow()
-        attributes: dict[str, str] = {}
+        # GenAI semantic-convention attributes for the chat span. See
+        # https://opentelemetry.io/docs/specs/semconv/gen-ai/llm-spans/
+        attributes: dict[str, str] = {
+            "gen_ai.operation.name": "chat",
+        }
         if model:
             attributes["model"] = model
+            provider, model_name = parse_provider_name(model)
+            if provider:
+                attributes["gen_ai.provider.name"] = provider
+            if model_name:
+                attributes["gen_ai.request.model"] = model_name
+        inputs: dict[str, Any] = {}
+        if should_capture_content():
+            inputs["messages"] = _truncate_messages(messages)
         return cast(
             "LiveSpan",
             mlflow.start_span_no_context(
                 name="llm_call",
                 span_type="CHAT_MODEL",
                 parent_span=self._current_span,
-                inputs={"messages": _truncate_messages(messages)},
+                inputs=inputs,
                 attributes=attributes,
             ),
         )
@@ -221,13 +264,18 @@ class TracingContext:
         status: str = "OK",
         error: str | None = None,
     ) -> None:
+        from omnigent.runtime.telemetry import should_capture_content
+
         if span is None:
             return
-        # Pass the optional through to MLflow directly; ``None`` is a
-        # valid output value that renders as an explicitly-absent
-        # response in the trace UI, whereas ``""`` looks like the
-        # model returned an empty string.
-        span.set_outputs({"response": response_text})
+        # ``response_text`` is LLM-generated content. Gate on the
+        # content-capture flag so a default install does not leak
+        # responses into the trace UI. When capture is enabled, pass
+        # the optional through to MLflow directly: ``None`` is a valid
+        # output value that renders as an explicitly-absent response,
+        # whereas ``""`` looks like the model returned an empty string.
+        if should_capture_content():
+            span.set_outputs({"response": response_text})
         if error:
             span.set_attribute("error.message", error)
             span.set_status("ERROR")
@@ -241,14 +289,28 @@ class TracingContext:
         tool_args: dict[str, TraceValue],
     ) -> LiveSpan:
         """Begin a TOOL span."""
+        from omnigent.runtime.telemetry import should_capture_content
+
         mlflow = _mlflow()
+        # GenAI semantic-convention attributes for tool execution.
+        # ``tool.name`` mirrors the OTel GenAI tool-spans convention.
+        attributes: dict[str, str] = {
+            "gen_ai.operation.name": "execute_tool",
+            "tool.name": tool_name,
+        }
+        # ``tool`` (the name) is metadata, always included; ``args`` may
+        # contain secrets or credentials so is gated on content capture.
+        inputs: dict[str, Any] = {"tool": tool_name}
+        if should_capture_content():
+            inputs["args"] = _safe_serialize(tool_args)
         span = cast(
             "LiveSpan",
             mlflow.start_span_no_context(
                 name=f"tool:{tool_name}",
                 span_type="TOOL",
                 parent_span=self._current_span,
-                inputs={"tool": tool_name, "args": _safe_serialize(tool_args)},
+                inputs=inputs,
+                attributes=attributes,
             ),
         )
         self._current_span = span
@@ -263,9 +325,14 @@ class TracingContext:
         duration_ms: float = 0.0,
         parent_span: LiveSpan | None = None,
     ) -> None:
+        from omnigent.runtime.telemetry import should_capture_content
+
         if span is None:
             return
-        span.set_outputs({"result": _safe_serialize(result)})
+        # Tool results may contain credentials, file contents, or
+        # other sensitive payloads. Gate on content capture.
+        if should_capture_content():
+            span.set_outputs({"result": _safe_serialize(result)})
         if duration_ms:
             span.set_attribute("duration_ms", duration_ms)
         if error:
@@ -285,18 +352,21 @@ class TracingContext:
         content: TraceValue = None,
     ) -> LiveSpan:
         """Begin a GUARDRAIL span for a policy evaluation."""
+        from omnigent.runtime.telemetry import should_capture_content
+
         mlflow = _mlflow()
+        # Policy name + phase are metadata. ``content`` is the actual
+        # text being checked and may carry secrets; gate on the flag.
+        inputs: dict[str, Any] = {"policy": policy_name, "phase": phase}
+        if should_capture_content():
+            inputs["content"] = _safe_serialize(content)
         return cast(
             "LiveSpan",
             mlflow.start_span_no_context(
                 name=f"policy:{policy_name}",
                 span_type="GUARDRAIL",
                 parent_span=self._current_span,
-                inputs={
-                    "policy": policy_name,
-                    "phase": phase,
-                    "content": _safe_serialize(content),
-                },
+                inputs=inputs,
             ),
         )
 
