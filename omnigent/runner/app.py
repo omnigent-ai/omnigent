@@ -4565,6 +4565,9 @@ def create_runner_app(
     _version_cache: dict[str, int] = {}  # conversation_id → last seen agent_version
     _spec_cache: dict[str, Any] = {}  # agent_id → cached AgentSpec for terminal tools
     _resp_to_conv: dict[str, str] = {}  # harness response_id → conversation_id
+    # conv_id → live turn's response_id; gates the mid-turn injection forward so
+    # a buffered message isn't sent to a harness with no live turn (→ 204).
+    _live_response_id: dict[str, str] = {}
     _session_start_cache: dict[str, float] = {}  # session_id → registered start time
     _session_spec_cache: dict[str, Any | None] = {}  # session_id → session AgentSpec
     # Single source for the session's server snapshot. created_at,
@@ -6072,6 +6075,7 @@ def create_runner_app(
             with contextlib.suppress(asyncio.CancelledError):
                 await turn_task
         _session_message_buffers.pop(session_id, None)
+        _live_response_id.pop(session_id, None)
         _ingest_next_seq.pop(session_id, None)
         _ingest_now_serving.pop(session_id, None)
         _ingest_cond.pop(session_id, None)
@@ -8060,6 +8064,8 @@ def create_runner_app(
         """
 
         _active_turns.pop(conv_id, None)
+        # Turn ended: clear the live marker so a concurrent forward is skipped.
+        _live_response_id.pop(conv_id, None)
         # Skip the idle transient when a buffered message will start a
         # continuation turn immediately — `_check_and_start_next_turn`
         # publishes "running" microseconds later, and the in-between idle
@@ -8239,71 +8245,77 @@ def create_runner_app(
             e.g. ``"conv_abc123"``.
         """
 
-        buf = _session_message_buffers.get(session_id)
-        if not buf:
-            # Parent going idle: clear any wake-debounce flag left stuck by a
-            # mid-turn-consumed injection (re-arming if results are stranded),
-            # so the next sub-agent completion can wake the parent.
-            _rewake_parent_if_inbox_stranded(session_id)
-            return
+        # Serialize the drain + turn-start against a concurrent
+        # post_session_events via the same ingest gate so the two paths can't
+        # both start a turn (invariant I2; a second turn-driver POST → 204).
+        _seq = _ingest_next_seq.get(session_id, 0)
+        _ingest_next_seq[session_id] = _seq + 1
+        _cond = _ingest_cond.get(session_id)
+        if _cond is None:
+            _cond = asyncio.Condition()
+            _ingest_cond[session_id] = _cond
+        async with _cond:
+            while _ingest_now_serving.get(session_id, 0) != _seq:
+                await _cond.wait()
+        try:
+            if session_id in _active_turns:
+                # Concurrent path already started a turn — key membership (None
+                # sentinel or Task) per the runner-wide convention, so a
+                # streaming start (slot stays None) is also detected. That turn
+                # re-enters here on completion to drain the buffer.
+                return
 
-        if _is_native_harness(session_id):
-            # Native harnesses type only the latest user message per turn,
-            # so collapsing the buffer to its last entry would drop every
-            # earlier message from the terminal. Drain ONE message at a
-            # time, in order: this turn delivers ``next_body``, and its
-            # completion re-enters here for the next buffered message.
-            # No batching — each typed exactly once (RUNNER_MESSAGE_INGEST.md
-            # Part C).
-            next_body = buf.pop(0)
+            buf = _session_message_buffers.get(session_id)
             if not buf:
-                _session_message_buffers.pop(session_id, None)
-            _session_histories.setdefault(session_id, []).append(
-                {
-                    "type": "message",
-                    "role": next_body.get("role", "user"),
-                    "content": next_body.get("content", []),
-                }
-            )
-        else:
-            # LLM harnesses: drain ALL buffered messages into history so
-            # rapid-fire user input ("hi", "can", "you", "fix", "bugs")
-            # becomes a single continuation turn instead of one turn per
-            # word. The harness sees every message via history; the turn
-            # responds once.
-            all_bodies = list(buf)
-            buf.clear()
-            _session_message_buffers.pop(session_id, None)
+                _rewake_parent_if_inbox_stranded(session_id)
+                return
 
-            for body in all_bodies:
+            if _is_native_harness(session_id):
+                # Native harnesses type only the latest message per turn; drain
+                # one at a time, in order (RUNNER_MESSAGE_INGEST.md Part C).
+                next_body = buf.pop(0)
+                if not buf:
+                    _session_message_buffers.pop(session_id, None)
                 _session_histories.setdefault(session_id, []).append(
                     {
                         "type": "message",
-                        "role": body.get("role", "user"),
-                        "content": body.get("content", []),
+                        "role": next_body.get("role", "user"),
+                        "content": next_body.get("content", []),
                     }
                 )
-            next_body = all_bodies[-1]
+            else:
+                # LLM harnesses: drain ALL buffered messages into history so
+                # rapid-fire input becomes a single continuation turn.
+                all_bodies = list(buf)
+                buf.clear()
+                _session_message_buffers.pop(session_id, None)
 
-        # Register the continuation turn BEFORE the await so a
-        # concurrent POST sees an active turn (invariant I2).
-        _active_turns[session_id] = None
+                for body in all_bodies:
+                    _session_histories.setdefault(session_id, []).append(
+                        {
+                            "type": "message",
+                            "role": body.get("role", "user"),
+                            "content": body.get("content", []),
+                        }
+                    )
+                next_body = all_bodies[-1]
 
-        _publish_turn_status(session_id, "running")
-
-        # Use _run_turn_bg so the continuation turn gets full
-        # history, tool schemas, instructions — identical to a
-        # first turn. Without this, the harness only sees the
-        # raw buffered message with no prior context.
-        _turn_task = asyncio.create_task(
-            _run_turn_bg(next_body, session_id),
-            name=f"turn-cont-{session_id}",
-        )
-        _active_turns[session_id] = _turn_task
-        _turn_task.add_done_callback(
-            _background_tasks.discard,
-        )
-        _background_tasks.add(_turn_task)
+            # Reserve before the await so a concurrent POST sees an active turn.
+            _active_turns[session_id] = None
+            _publish_turn_status(session_id, "running")
+            _turn_task = asyncio.create_task(
+                _run_turn_bg(next_body, session_id),
+                name=f"turn-cont-{session_id}",
+            )
+            _active_turns[session_id] = _turn_task
+            _turn_task.add_done_callback(
+                _background_tasks.discard,
+            )
+            _background_tasks.add(_turn_task)
+        finally:
+            async with _cond:
+                _ingest_now_serving[session_id] = _seq + 1
+                _cond.notify_all()
 
     async def _post_subagent_wake_notice(parent_id: str, notice: str, child_id: str) -> None:
         """
@@ -9441,7 +9453,10 @@ def create_runner_app(
                 pass
         except asyncio.CancelledError:
             # Publish terminal status so the client doesn't sit on stale "running".
+            # This teardown bypasses _on_proxy_stream_end, so clear the live
+            # marker here too or the next turn's forward gate goes stale.
             _active_turns.pop(session_id, None)
+            _live_response_id.pop(session_id, None)
             _publish_turn_status(session_id, "idle")
             raise
         except _ContextWindowOverflow:
@@ -9760,6 +9775,8 @@ def create_runner_app(
                                     _response_id = resp_obj.get("id")
                                     if _response_id and conv_id:
                                         _resp_to_conv[_response_id] = conv_id
+                                        # Mark the turn live for the forward gate.
+                                        _live_response_id[conv_id] = _response_id
 
                                 # Defer publish for action_required
                                 # events that the runner dispatches
@@ -10242,7 +10259,15 @@ def create_runner_app(
                     # Part B). Native harnesses skip the forward entirely
                     # (Part C), so they don't need a correlation id; neither
                     # does a buffer-only park (no forward will be made).
-                    if not _native and not _awaiting_approval:
+                    # Forward as a live injection only when a turn is actually
+                    # streaming; otherwise it would start a rogue turn (→ 204).
+                    # The buffered copy still drives the post-turn continuation.
+                    _can_forward = (
+                        not _native
+                        and not _awaiting_approval
+                        and conversation_id in _live_response_id
+                    )
+                    if _can_forward:
                         message_body["injection_id"] = f"inj_{uuid.uuid4().hex[:16]}"
                     _logger.info(
                         "post_session_events: buffering message for active turn conv=%s "
@@ -10273,7 +10298,7 @@ def create_runner_app(
                     # SKIPPED while an approval is parked (``_awaiting_approval``):
                     # forwarding would steer the gated turn past a human
                     # approval (see the buffer-only rationale above).
-                    if not _native and not _awaiting_approval and process_manager is not None:
+                    if _can_forward and process_manager is not None:
                         try:
                             _hc = await process_manager.get_client(conversation_id, "any")
                             _injection_resp = await _hc.post(
