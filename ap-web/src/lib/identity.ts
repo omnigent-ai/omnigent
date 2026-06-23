@@ -15,6 +15,7 @@
  * into a login redirect.
  */
 
+import { stripBasePath, withBasePath } from "./basePath";
 import { getCachedServerInfo } from "./capabilities";
 import { getOmnigentHostConfig, hostFetch } from "./host";
 
@@ -45,7 +46,10 @@ let _serverLoginUrl: string | null = null;
  * every mode.
  */
 function _isOnLoginPath(): boolean {
-  const path = window.location.pathname;
+  // Compare against base-relative paths so the guard still recognizes the
+  // login/register pages when the app is served under a subpath proxy
+  // (e.g. `/proxy/6767/login`).
+  const path = stripBasePath(window.location.pathname);
   return path === "/login" || path === "/register" || path.startsWith("/auth/login");
 }
 
@@ -78,7 +82,7 @@ export async function resolveIdentity(): Promise<string | null> {
               const returnTo = encodeURIComponent(
                 window.location.pathname + window.location.search,
               );
-              window.location.href = `${data.login_url}?return_to=${returnTo}`;
+              window.location.href = `${withBasePath(data.login_url)}?return_to=${returnTo}`;
               return null;
             }
           }
@@ -171,7 +175,7 @@ export async function authenticatedFetch(
     // fallback for the brief window before capabilities resolves.)
     const loginUrl = getCachedServerInfo()?.login_url ?? _serverLoginUrl;
     if (loginUrl) {
-      window.location.href = `${loginUrl}?return_to=${encodeURIComponent(window.location.pathname + window.location.search)}`;
+      window.location.href = `${withBasePath(loginUrl)}?return_to=${encodeURIComponent(window.location.pathname + window.location.search)}`;
     }
   }
   return res;

@@ -50,6 +50,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { changePassword, type CurrentAccount, getMe, logout } from "@/lib/accountsApi";
+import { withBasePath } from "@/lib/basePath";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 
 export function AccountMenu() {
@@ -80,7 +81,7 @@ export function AccountMenu() {
   const onSignOut = useCallback(async () => {
     await logout();
     // Hard navigation so the chat store / react-query cache reset.
-    window.location.href = "/login";
+    window.location.href = withBasePath("/login");
   }, []);
 
   const resetPwForm = useCallback(() => {

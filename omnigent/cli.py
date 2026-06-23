@@ -2800,6 +2800,17 @@ def _assert_server_port_bindable(host: str, port: int) -> None:
         "ignored with a warning if an admin already exists."
     ),
 )
+@click.option(
+    "--base-path",
+    default=None,
+    help=(
+        "Public URL path prefix when serving behind a subpath reverse proxy, "
+        "e.g. --base-path /proxy/6767 for code-server's port proxy "
+        "(alternative to OMNIGENT_WEB_BASE_PATH). The Web UI prefixes its "
+        "API/WebSocket/asset URLs with this, and the server accepts requests "
+        "with or without the prefix. Default: served at the origin root."
+    ),
+)
 @click.pass_context
 def server(
     ctx: click.Context,
@@ -2812,6 +2823,7 @@ def server(
     agent_dirs: tuple[str, ...],
     auto_open: bool,
     admin_password: str | None,
+    base_path: str | None,
 ) -> None:
     """Start the Omnigent server in the foreground, or manage the background server.
 
@@ -2842,6 +2854,10 @@ def server(
         from ``--admin-password``, e.g. ``"hunter2"``. Folded into the
         ``OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD`` env var that
         bootstrap reads; ``None`` leaves the env var untouched.
+    :param base_path: Optional public URL path prefix from
+        ``--base-path``, e.g. ``"/proxy/6767"``. Folded into the
+        ``OMNIGENT_WEB_BASE_PATH`` env var that ``create_app`` reads;
+        ``None`` leaves the env var untouched.
     :returns: None.
     """
     if ctx.invoked_subcommand is not None:
@@ -2861,6 +2877,13 @@ def server(
     # because an admin already exists) is decided in bootstrap_admin.
     if admin_password:
         os.environ.setdefault("OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD", admin_password)
+
+    # --base-path is sugar for OMNIGENT_WEB_BASE_PATH, which create_app reads.
+    # An env var (not a create_app kwarg) so the same toggle reaches every
+    # startup path (Docker entrypoint, canonical local server, e2e harness)
+    # that builds the app outside this command. setdefault → explicit env wins.
+    if base_path:
+        os.environ.setdefault("OMNIGENT_WEB_BASE_PATH", base_path)
 
     # Translate --no-open into the env var the lifespan hook reads.
     # We use an env var rather than threading the flag through

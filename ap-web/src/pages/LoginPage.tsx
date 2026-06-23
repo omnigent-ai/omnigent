@@ -30,6 +30,7 @@ import { useSearchParams } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { getMe, login as loginRequest } from "@/lib/accountsApi";
+import { withBasePath } from "@/lib/basePath";
 
 const DEFAULT_RETURN_TO = "/";
 const LAST_USERNAME_KEY = "omnigent.lastLoginUsername";
@@ -205,21 +206,24 @@ export function LoginPage() {
  * trusting it.
  */
 function sanitizeReturnTo(raw: string | null): string {
-  if (raw === null || raw === "") return DEFAULT_RETURN_TO;
+  // The default lands the user at the app root under the active base path
+  // (e.g. `/proxy/6767/` behind a subpath proxy), not the origin root.
+  const fallback = withBasePath(DEFAULT_RETURN_TO);
+  if (raw === null || raw === "") return fallback;
   // Must be an absolute path, not protocol-relative (`//host`) or a
   // backslash variant (`/\host`) the URL parser rewrites to one.
   if (!raw.startsWith("/") || raw.startsWith("//") || raw.startsWith("/\\")) {
-    return DEFAULT_RETURN_TO;
+    return fallback;
   }
   try {
     const resolved = new URL(raw, window.location.origin);
-    if (resolved.origin !== window.location.origin) return DEFAULT_RETURN_TO;
+    if (resolved.origin !== window.location.origin) return fallback;
     // Re-serialize so the sink gets the parser's normalized path, never
     // the raw backslash-laden input.
     return resolved.pathname + resolved.search + resolved.hash;
   } catch {
     // `new URL` throws on malformed input — treat anything unparseable
     // as untrusted and fall back to the safe default.
-    return DEFAULT_RETURN_TO;
+    return fallback;
   }
 }

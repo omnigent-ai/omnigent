@@ -7,6 +7,7 @@ import { ThemeProvider } from "./components/theme/ThemeProvider";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { RunnerHealthProvider } from "./hooks/RunnerHealthProvider";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
+import { getBasePath } from "./lib/basePath";
 import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { CapabilitiesProvider } from "./lib/CapabilitiesContext";
 import { resolveIdentity } from "./lib/identity";
@@ -66,7 +67,7 @@ void _bootProbe.then((info) => {
         <QueryClientProvider client={queryClient}>
           <ThemeProvider>
             <TooltipProvider>
-              <BrowserRouter>
+              <BrowserRouter basename={getBasePath() || undefined}>
                 <SessionUpdatesProvider>
                   <RunnerHealthProvider>
                     <App />
