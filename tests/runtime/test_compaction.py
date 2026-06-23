@@ -13,6 +13,7 @@ from omnigent.entities import (
     FunctionCallOutputData,
     MessageData,
 )
+from omnigent.llms.context_window import resolve_effective_context_window
 from omnigent.llms.errors import RetryableLLMError
 from omnigent.llms.types import MessageOutput, OutputText, Response
 from omnigent.runtime.compaction import (
@@ -25,7 +26,6 @@ from omnigent.runtime.compaction import (
     count_tokens,
     summarize_history,
 )
-from omnigent.llms.context_window import resolve_effective_context_window
 from omnigent.spec.types import CompactionConfig
 
 # ---------------------------------------------------------------------------

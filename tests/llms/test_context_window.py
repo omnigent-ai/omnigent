@@ -46,9 +46,7 @@ def test_resolve_effective_context_window_falls_back_to_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """With no declared window, resolve via the model catalog lookup."""
-    monkeypatch.setattr(
-        context_window, "get_model_context_window", lambda model: 200_000
-    )
+    monkeypatch.setattr(context_window, "get_model_context_window", lambda model: 200_000)
     assert resolve_effective_context_window(None, "claude-opus-4-8") == 200_000
 
 
