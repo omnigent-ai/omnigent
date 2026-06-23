@@ -2555,7 +2555,7 @@ async def _run_antigravity_auto_create(
     session_id: str,
     snapshot: dict[str, Any],
     candidate_ports: list[int],
-) -> tuple[Any, list[tuple[int, str]], list[dict[str, Any]]]:
+) -> tuple[Any, list[tuple[int, str]], list[dict[str, Any]], list[tuple[str, dict[str, Any]]]]:
     """
     Drive ``_auto_create_antigravity_terminal`` with every live collaborator faked.
 
@@ -2571,7 +2571,8 @@ async def _run_antigravity_auto_create(
     :param snapshot: The Omnigent session snapshot the helper should read.
     :param candidate_ports: Ports ``_candidate_agy_rpc_ports`` yields (``[]`` →
         the bootstrap never finds a port).
-    :returns: ``(bridge_state_after, start_cascade_calls, reader_calls)``.
+    :returns: ``(bridge_state_after, start_cascade_calls, reader_calls,
+        external_session_id_patch_calls)``.
     """
     import omnigent.antigravity_native_bridge as bridge_mod
     import omnigent.antigravity_native_launch as launch_mod
@@ -2628,12 +2629,18 @@ async def _run_antigravity_auto_create(
 
     monkeypatch.setattr(rpc_mod, "start_cascade", _fake_start_cascade)
 
+    patch_calls: list[tuple[str, dict[str, Any]]] = []
+
     class _SnapshotServerClient:
-        """Server client returning the configured Antigravity launch snapshot."""
+        """Server client returning the snapshot + recording external_session_id PATCHes."""
 
         async def get(self, url: str, **_kwargs: Any) -> httpx.Response:
             assert url == f"/v1/sessions/{session_id}"
             return httpx.Response(200, json=snapshot, request=httpx.Request("GET", url))
+
+        async def patch(self, url: str, *, json: dict[str, Any], **_kwargs: Any) -> httpx.Response:
+            patch_calls.append((url, json))
+            return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
 
     class _FakeResourceRegistry:
         """Resource registry that records the required-terminal launch."""
@@ -2672,7 +2679,12 @@ async def _run_antigravity_auto_create(
         await runner_app_mod._cancel_auto_forwarder_task(session_id)
 
     bridge_dir = bridge_mod.bridge_dir_for_bridge_id(session_id)
-    return bridge_mod.read_bridge_state(bridge_dir), start_cascade_calls, reader_calls
+    return (
+        bridge_mod.read_bridge_state(bridge_dir),
+        start_cascade_calls,
+        reader_calls,
+        patch_calls,
+    )
 
 
 @pytest.mark.asyncio
@@ -2687,11 +2699,13 @@ async def test_auto_create_antigravity_cold_starts_real_conversation(
     for the TUI to lazily create it) so the executor's turn-1 has a real cascade
     id. This asserts the load-bearing integration: after the agy terminal launches
     and the connect-RPC port answers, the runner calls ``start_cascade`` with a
-    runner-generated id and writes THAT real id into bridge state — NOT the
-    ``agy_conv_*`` placeholder ``read_bridge_state`` would otherwise return.
+    runner-generated id, writes THAT real id into bridge state — NOT the
+    ``agy_conv_*`` placeholder ``read_bridge_state`` would otherwise return — and
+    PATCHes it onto the session as ``external_session_id`` so a later ``--resume``
+    continues it.
     """
     session_id = "conv_agy_coldstart"
-    state, start_cascade_calls, reader_calls = await _run_antigravity_auto_create(
+    state, start_cascade_calls, reader_calls, patch_calls = await _run_antigravity_auto_create(
         tmp_path,
         monkeypatch,
         session_id=session_id,
@@ -2707,6 +2721,10 @@ async def test_auto_create_antigravity_cold_starts_real_conversation(
     assert state is not None
     assert state.conversation_id == called_id
     assert not bridge_mod_is_placeholder(state.conversation_id)
+    # The same real id is PATCHed onto the session as external_session_id so a
+    # later --resume continues agy's actual conversation (the read-path
+    # replacement for the retired forwarder's _patch_external_session_id).
+    assert patch_calls == [(f"/v1/sessions/{session_id}", {"external_session_id": called_id})]
     # The RPC reader spawns (it replaced the transcript forwarder).
     assert len(reader_calls) == 1
 
@@ -2722,11 +2740,12 @@ async def test_auto_create_antigravity_resume_skips_cold_start(
     On resume the snapshot carries agy's real ``external_session_id`` (persisted
     by a prior run), so the conversation already exists and ``StartCascade`` must
     not be issued (it would create a second, empty one). Bridge state keeps the
-    resume id verbatim.
+    resume id verbatim, and — since no cold-start runs — no ``external_session_id``
+    PATCH is issued (it already holds the resume id).
     """
     session_id = "conv_agy_resume"
     resume_id = "68caaeac-2eaf-4e2c-9b95-721b022f4903"
-    state, start_cascade_calls, _reader_calls = await _run_antigravity_auto_create(
+    state, start_cascade_calls, _reader_calls, patch_calls = await _run_antigravity_auto_create(
         tmp_path,
         monkeypatch,
         session_id=session_id,
@@ -2736,6 +2755,7 @@ async def test_auto_create_antigravity_resume_skips_cold_start(
     assert start_cascade_calls == []
     assert state is not None
     assert state.conversation_id == resume_id
+    assert patch_calls == []
 
 
 @pytest.mark.asyncio
@@ -2745,14 +2765,15 @@ async def test_auto_create_antigravity_cold_start_port_timeout_keeps_placeholder
 ) -> None:
     """
     When no connect-RPC port answers, the cold-start is best-effort: the launch
-    still completes and leaves the placeholder id for the forwarder to overwrite.
+    still completes and leaves the placeholder id for the reader to bind.
 
     The cold-start must NOT abort the launch (which would leave a registered
-    terminal with no forwarder, never self-healing). With no port, ``start_cascade``
-    is never called and bridge state retains the ``agy_conv_*`` placeholder.
+    terminal with no reader, never self-healing). With no port, ``start_cascade``
+    is never called, bridge state retains the ``agy_conv_*`` placeholder, and no
+    ``external_session_id`` PATCH is issued (there is no real id to record).
     """
     session_id = "conv_agy_noport"
-    state, start_cascade_calls, reader_calls = await _run_antigravity_auto_create(
+    state, start_cascade_calls, reader_calls, patch_calls = await _run_antigravity_auto_create(
         tmp_path,
         monkeypatch,
         session_id=session_id,
@@ -2762,6 +2783,7 @@ async def test_auto_create_antigravity_cold_start_port_timeout_keeps_placeholder
     assert start_cascade_calls == []
     assert state is not None
     assert bridge_mod_is_placeholder(state.conversation_id)
+    assert patch_calls == []
     # The RPC reader still spawns regardless of the cold-start outcome.
     assert len(reader_calls) == 1
 
@@ -2856,10 +2878,10 @@ async def test_auto_create_antigravity_wires_reader_task_and_interaction_bridge(
             / "run_command_waiting.json"
         ).read_text()
     )
-    # ``_run_antigravity_reader``'s ``_get_steps`` closure binds
-    # ``get_trajectory_steps`` from the RPC module (a lazy function-local import),
-    # so patch it there (not the reader's re-export).
-    monkeypatch.setattr(rpc_mod, "get_trajectory_steps", lambda _port, _cid: [waiting_step])
+    # The shared ``run_reader_with_bridge`` helper's ``_get_steps`` closure binds
+    # ``get_trajectory_steps`` from the reader module's top-level import, so patch
+    # it there (matching how the reader's own poll-loop tests patch it).
+    monkeypatch.setattr(reader_mod, "get_trajectory_steps", lambda _port, _cid: [waiting_step])
     delivered: list[dict[str, Any]] = []
 
     def _fake_deliver(

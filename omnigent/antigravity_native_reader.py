@@ -1,7 +1,7 @@
 """RPC read driver for a native Antigravity (agy) session.
 
-This is the read-path driver that replaces the transcript-tail forwarder's read
-loop (:func:`omnigent.antigravity_native_forwarder.forward_antigravity_transcript_to_session`).
+This is the read-path driver that replaced the retired transcript-tail forwarder
+(``omnigent.antigravity_native_forwarder``, deleted in the Task 12 cutover).
 Instead of tailing agy's plaintext JSONL transcript, it polls agy's connect-RPC
 ``GetCascadeTrajectorySteps`` surface for trajectory steps, maps each new step to
 Omnigent conversation items, POSTs them, emits ``external_session_status`` edges
@@ -66,14 +66,6 @@ from omnigent.antigravity_native_bridge import (
     is_placeholder_conversation_id,
     read_bridge_state,
 )
-
-# These come from the forwarder, which still owns them until the Task 12 cutover
-# relocates them. The reader reuses the SAME ``OutboundEvent`` shape and the SAME
-# allocator so the mapped events post identically to the transcript path's.
-from omnigent.antigravity_native_forwarder import (
-    OutboundEvent,
-    _ToolCallIdAllocator,
-)
 from omnigent.antigravity_native_rpc import (
     AntigravityRpcError,
     _candidate_agy_rpc_ports,
@@ -82,15 +74,22 @@ from omnigent.antigravity_native_rpc import (
     get_trajectory_steps,
     stream_agent_state_updates,
 )
+
+# ``OutboundEvent`` + ``_ToolCallIdAllocator`` live in the mapper module since the
+# Task 12 cutover (relocated from the retired transcript forwarder). The reader
+# reuses the SAME event shape and allocator so the mapped events post identically.
 from omnigent.antigravity_native_steps import (
+    OutboundEvent,
     PendingInteraction,
     _step_index,
+    _ToolCallIdAllocator,
     _trajectory_id,
     map_step_to_events,
     output_text_delta_event,
     pending_interaction,
 )
 from omnigent.claude_native_bridge import url_component
+from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 
 _logger = logging.getLogger(__name__)
 
@@ -156,6 +155,22 @@ _EXTERNAL_MODEL_CHANGE = "external_model_change"
 # ``(cascade_id, port, pending)``.
 OnPendingInteraction = Callable[[str, int, PendingInteraction], Awaitable[None]]
 StopPredicate = Callable[[], bool]
+
+# Elicitation hook long-poll budget (shared by the runner + CLI reader wiring).
+# The ``antigravity-elicitation-request`` hook is a request/reply that blocks on a
+# human, so the request timeout is intentionally long (just over a day); a severed
+# long-poll (proxy idle cut, restarting server) is re-POSTed within this budget so
+# the SAME elicitation re-parks server-side rather than abandoning the approval
+# card. The first retry lands inside the server's re-park grace; later retries back
+# off. Mirrors the codex forwarder's elicitation re-POST policy.
+_AGY_ELICITATION_REQUEST_TIMEOUT_SECONDS = 86405.0
+_AGY_ELICITATION_CONNECT_TIMEOUT_SECONDS = 30.0
+_AGY_ELICITATION_RETRY_INITIAL_BACKOFF_SECONDS = 1.0
+_AGY_ELICITATION_RETRY_MAX_BACKOFF_SECONDS = 30.0
+
+# Omnigent client timeout for the reader's event-POST + telemetry traffic (NOT the
+# elicitation long-poll, which sets its own per-request timeout above).
+_READER_CLIENT_TIMEOUT_SECONDS = 30.0
 
 
 def _model_usage_from_step(step: dict[str, object]) -> dict[str, object] | None:
@@ -1256,3 +1271,244 @@ async def _ensure_catalog(state: _ReaderState) -> dict[str, object]:
         catalog = {}
     state.model_catalog = catalog
     return catalog
+
+
+# ── Shared reader wiring (elicitation bridge + supervise_reader spawn) ────────
+#
+# The runner's host-spawned web path and the CLI's ``omnigent antigravity``
+# attach fallback both run the SAME thing once agy is live: an Omnigent HTTP
+# client, a ``supervise_reader`` loop, and an ``on_pending_interaction`` callback
+# wired to the Task 8 interaction bridge (real-time elicitation over the Task 9
+# hook + RPC step reads + the default deliver). This wiring lives here so the two
+# callers share one definition instead of duplicating the bridge/elicitation
+# plumbing. (The retired transcript forwarder used a post-hoc policy audit instead
+# of real-time elicitation; that audit is gone — agy exposes no firing PreToolUse
+# hook, so a tool cannot be blocked before it runs, and the live elicitation card
+# is the honest enforcement surface.)
+
+
+async def _agy_elicitation_retry_sleep(seconds: float) -> None:
+    """
+    Indirection over :func:`asyncio.sleep` for the agy elicitation re-POST
+    backoff, so tests can stub it without clobbering the process-global
+    ``asyncio.sleep``. Mirrors
+    :func:`omnigent.codex_native_forwarder._elicitation_retry_sleep`.
+
+    :param seconds: Seconds to sleep, e.g. ``1.0``.
+    :returns: None.
+    """
+    await asyncio.sleep(seconds)
+
+
+async def _post_agy_elicitation_request(
+    client: httpx.AsyncClient,
+    session_id: str,
+    *,
+    elicitation_id: str,
+    params: ElicitationRequestParams,
+) -> httpx.Response | None:
+    """
+    POST one agy elicitation to the Omnigent hook, re-POSTing across severed
+    long-polls.
+
+    Mirrors :func:`omnigent.codex_native_forwarder._post_codex_elicitation_request`:
+    the hook is a long-poll request/reply that blocks on a human, so a single
+    failed POST must not abandon the prompt. The elicitation id is deterministic
+    per ``(cascade_id, trajectory_id, step_index)`` (built by
+    :func:`omnigent.antigravity_native_interactions.agy_elicitation_id`), so a
+    re-POST of the same body re-parks the SAME elicitation server-side (keeping
+    the approval card alive) and can collect a verdict that landed between
+    attempts. Transport errors and 5xx responses are retried within the
+    ``_AGY_ELICITATION_REQUEST_TIMEOUT_SECONDS`` budget; 2xx and 4xx are final.
+
+    :param client: HTTP client for Omnigent hook posts (the reader's client).
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param elicitation_id: Deterministic agy elicitation id, e.g.
+        ``"elicit_agy_<digest>"``.
+    :param params: The web-renderable elicitation params.
+    :returns: The final hook response, or ``None`` when the retry budget ran
+        out — the caller surfaces no verdict (agy's own WAITING timeout reclaims
+        the step).
+    """
+    url = f"/v1/sessions/{url_component(session_id)}/hooks/antigravity-elicitation-request"
+    body: dict[str, object] = {
+        "elicitation_id": elicitation_id,
+        "params": params.model_dump(),
+    }
+    timeout = httpx.Timeout(
+        _AGY_ELICITATION_REQUEST_TIMEOUT_SECONDS,
+        connect=_AGY_ELICITATION_CONNECT_TIMEOUT_SECONDS,
+    )
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _AGY_ELICITATION_REQUEST_TIMEOUT_SECONDS
+    backoff_s = _AGY_ELICITATION_RETRY_INITIAL_BACKOFF_SECONDS
+    while True:
+        response: httpx.Response | None = None
+        try:
+            response = await client.post(url, json=body, timeout=timeout)
+        except httpx.HTTPError:
+            _logger.warning(
+                "Antigravity elicitation hook POST failed; retrying: elicitation_id=%s",
+                elicitation_id,
+                exc_info=True,
+            )
+        if response is not None and response.status_code < 500:
+            return response
+        if response is not None:
+            # 5xx = proxy gateway error on a severed long-poll, or a restarting
+            # server — the verdict may still be pending, so re-POST.
+            _logger.warning(
+                "Antigravity elicitation hook returned %s; retrying: elicitation_id=%s",
+                response.status_code,
+                elicitation_id,
+            )
+        if loop.time() + backoff_s >= deadline:
+            _logger.warning(
+                "Antigravity elicitation hook retry budget exhausted: elicitation_id=%s",
+                elicitation_id,
+            )
+            return None
+        await _agy_elicitation_retry_sleep(backoff_s)
+        backoff_s = min(backoff_s * 2, _AGY_ELICITATION_RETRY_MAX_BACKOFF_SECONDS)
+
+
+async def _request_agy_elicitation(
+    client: httpx.AsyncClient,
+    session_id: str,
+    *,
+    elicitation_id: str,
+    params: ElicitationRequestParams,
+) -> ElicitationResult | None:
+    """
+    Production ``request_elicitation`` for the agy interaction bridge.
+
+    Publishes the elicitation under ``elicitation_id`` via the Task 9 hook
+    (``POST /v1/sessions/{id}/hooks/antigravity-elicitation-request``) and
+    long-poll-awaits the human verdict. Mirrors codex's
+    ``_codex_elicitation_hook_result`` body handling:
+
+    * a 2xx with a body → parse it as :class:`ElicitationResult`;
+    * a 2xx with an EMPTY body → ``None`` (the server timed out / saw the
+      upstream disconnect — agy's own WAITING timeout reclaims the step);
+    * a 4xx, an exhausted-retry ``None`` response, or a non-JSON / non-object
+      body → ``None`` (logged; no verdict delivered).
+
+    :param client: HTTP client for Omnigent hook posts (the reader's client).
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param elicitation_id: Deterministic agy elicitation id.
+    :param params: The web-renderable elicitation params.
+    :returns: The parsed :class:`ElicitationResult`, or ``None`` on
+        timeout / rejection / malformed body.
+    """
+    response = await _post_agy_elicitation_request(
+        client,
+        session_id,
+        elicitation_id=elicitation_id,
+        params=params,
+    )
+    if response is None:
+        return None
+    if response.status_code >= 400:
+        _logger.warning(
+            "Antigravity elicitation hook rejected request: status=%s elicitation_id=%s body=%s",
+            response.status_code,
+            elicitation_id,
+            response.text[:512],
+        )
+        return None
+    if not response.content:
+        _logger.info(
+            "Antigravity elicitation hook returned empty body; no verdict: elicitation_id=%s",
+            elicitation_id,
+        )
+        return None
+    try:
+        return ElicitationResult.model_validate(response.json())
+    except ValueError:
+        _logger.warning(
+            "Antigravity elicitation hook returned a non-ElicitationResult body: "
+            "elicitation_id=%s body=%s",
+            elicitation_id,
+            response.text[:512],
+        )
+        return None
+
+
+async def run_reader_with_bridge(
+    *,
+    base_url: str,
+    headers: dict[str, str],
+    auth: httpx.Auth | None,
+    session_id: str,
+    bridge_dir: Path,
+) -> None:
+    """
+    Run the agy RPC streaming reader + interaction bridge for one session.
+
+    The single, shared read-path entry point used by BOTH host-spawned (runner)
+    and CLI-fallback launches. It owns the long-lived Omnigent HTTP client (the
+    reader takes a client but does NOT own its lifecycle) and runs
+    :func:`supervise_reader`, wiring its ``on_pending_interaction`` callback to the
+    Task 8 interaction bridge:
+
+    * ``request_elicitation`` → :func:`_request_agy_elicitation` (POSTs the Task 9
+      ``antigravity-elicitation-request`` hook and long-poll-awaits the human),
+      mirroring codex's ``_handle_codex_elicitation_request``;
+    * ``get_steps`` → ``get_trajectory_steps(port, cascade_id)`` offloaded to a
+      worker thread (the RPC is synchronous);
+    * ``deliver`` → the bridge default (``handle_user_interaction`` in a thread).
+
+    The reader discovers the cascade id + connect-RPC port and hands BOTH to the
+    callback, so the bridge targets agy's live conversation without
+    re-discovering (which could bind a recycled/foreign port).
+
+    :param base_url: Omnigent server base URL, e.g. ``"http://127.0.0.1:6767"``.
+    :param headers: Auth headers for the Omnigent client (best-effort static
+        bearer; ``auth`` carries any refresh-capable flow).
+    :param auth: Refresh-capable httpx auth flow, or ``None`` when unauthenticated
+        (the local-server runner path and the CLI attach fallback, which have no
+        token to refresh — the bearer in ``headers``, if any, is used as-is).
+    :param session_id: Omnigent conversation id to mirror into, e.g.
+        ``"conv_abc123"``.
+    :param bridge_dir: Native Antigravity bridge directory for this session.
+    :returns: None. Runs until cancelled.
+    """
+    # Lazy import: the interaction bridge pulls server-route handlers; keeping it
+    # out of module import keeps the reader importable from the lightweight CLI
+    # process without eagerly loading the server stack.
+    from omnigent.antigravity_native_interactions import bridge_interaction
+
+    async with httpx.AsyncClient(
+        base_url=base_url,
+        headers=headers,
+        auth=auth,
+        timeout=httpx.Timeout(_READER_CLIENT_TIMEOUT_SECONDS),
+    ) as client:
+
+        async def _on_pending(cascade_id: str, port: int, pending: PendingInteraction) -> None:
+            """Drive the interaction bridge for one WAITING interaction."""
+
+            async def _request_elicitation(
+                eid: str, params: ElicitationRequestParams
+            ) -> ElicitationResult | None:
+                return await _request_agy_elicitation(
+                    client, session_id, elicitation_id=eid, params=params
+                )
+
+            async def _get_steps() -> list[dict[str, object]]:
+                return await asyncio.to_thread(get_trajectory_steps, port, cascade_id)
+
+            await bridge_interaction(
+                cascade_id,
+                pending,
+                port=port,
+                get_steps=_get_steps,
+                request_elicitation=_request_elicitation,
+            )
+
+        await supervise_reader(
+            bridge_dir,
+            session_id,
+            client=client,
+            on_pending_interaction=_on_pending,
+        )

@@ -21,10 +21,8 @@ from omnigent._wrapper_labels import ANTIGRAVITY_NATIVE_WRAPPER_VALUE, WRAPPER_L
 from omnigent.antigravity_native import antigravity_terminal_resource_id
 from omnigent.antigravity_native_bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
-    AntigravityNativeBridgeState,
     read_bridge_state,
     read_tmux_info,
-    write_bridge_state,
 )
 
 
@@ -422,9 +420,9 @@ async def test_local_fresh_launch_reattaches_to_runner_autocreated_terminal(
     runner-owned terminal after the bind — NOT call ``_launch_and_record`` (whose
     ``clear_bridge_state`` wipes the runner's bridge state and whose redundant
     terminal POST 500s, and which on ``reattached=False`` also starts a second CLI
-    ``supervise_forwarder`` → double-mirror). The original fix (7df3ba4d/f4ce3ce8)
-    only patched ``_prepare_antigravity_terminal_via_daemon``; this guards the
-    local-server path.
+    RPC reader → double-mirror). The original fix (7df3ba4d/f4ce3ce8) only patched
+    ``_prepare_antigravity_terminal_via_daemon``; this guards the local-server
+    path.
     """
     import omnigent.antigravity_native_bridge as bridge_mod
 
@@ -486,10 +484,9 @@ async def test_local_fresh_launch_reattaches_to_runner_autocreated_terminal(
 
 
 # ---------------------------------------------------------------------------
-# _launch_and_record: forwarded_step_index cursor preservation (Fix 3)
+# _launch_and_record: terminal launch + bridge-state seeding
 # ---------------------------------------------------------------------------
 
-_REAL_UUID = "68caaeac-2eaf-4e2c-9b95-721b022f4903"
 _PLACEHOLDER_ID = "agy_conv_fresh_placeholder"
 
 
@@ -537,129 +534,6 @@ async def test_launch_and_record_advertises_tmux_target_when_pane_exposed(
         )
     info = read_tmux_info(bridge_mod.bridge_dir_for_bridge_id(bridge_id))
     assert info == {"socket_path": "/tmp/agy/tmux.sock", "tmux_target": "main"}
-
-
-async def test_launch_and_record_resume_same_conv_preserves_forwarded_step_index(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """
-    Cold ``--resume`` of the SAME conversation preserves ``forwarded_step_index``.
-
-    Regression for the HIGH bug: before the fix, ``_launch_and_record`` called
-    ``clear_bridge_state`` unconditionally and then seeded state with
-    ``forwarded_step_index=None``.  On a cold resume the forwarder then started
-    at high-water -1 and re-POSTed the entire prior transcript.
-
-    This test pre-seeds bridge state with a real UUID and cursor=14, calls
-    ``_launch_and_record(resume=True, conversation_id=<that UUID>)``, and asserts
-    the cursor is still 14 in the written state.
-
-    :param monkeypatch: pytest monkeypatch fixture.
-    :param tmp_path: Temporary directory, used to isolate the bridge root.
-    :returns: None.
-    """
-    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
-
-    bridge_id = "bridge_resume_test"
-    from omnigent.antigravity_native_bridge import prepare_bridge_dir
-
-    bridge_dir = prepare_bridge_dir(bridge_id)
-
-    # Pre-seed: simulate a prior run that acked the SET {0, 2, 14} (step 13 was
-    # written out of order and not yet acked when the run ended).
-    write_bridge_state(
-        bridge_dir,
-        AntigravityNativeBridgeState(
-            session_id="conv_abc123",
-            conversation_id=_REAL_UUID,
-            forwarded_step_index=14,
-            forwarded_steps=(0, 2, 14),
-        ),
-    )
-
-    async with _mock_client(_terminal_launch_handler) as client:
-        await _mod._launch_and_record(
-            client,
-            session_id="conv_abc123",
-            bridge_id=bridge_id,
-            conversation_id=_REAL_UUID,
-            resume=True,
-            antigravity_args=(),
-            command="agy",
-            model=None,
-            startup_progress=None,
-        )
-
-    after = read_bridge_state(bridge_dir)
-    assert after is not None, "bridge state must exist after _launch_and_record"
-    assert after.forwarded_step_index == 14, (
-        "cursor must be preserved on same-conversation cold resume; "
-        f"got {after.forwarded_step_index}"
-    )
-    # The authoritative SET cursor MUST also survive the resume rewrite — dropping
-    # it would fall the forwarder back to the <=14 floor and re-drop the
-    # out-of-order step 13 (Finding 1 regression).
-    assert after.forwarded_steps == (0, 2, 14), (
-        "the forwarded_steps SET must be preserved on same-conversation cold "
-        f"resume; got {after.forwarded_steps}"
-    )
-
-
-async def test_launch_and_record_fresh_launch_resets_forwarded_step_index(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """
-    A fresh launch with a placeholder id resets ``forwarded_step_index`` to None.
-
-    The placeholder id used on a fresh launch will never match the prior run's
-    real UUID, so the cursor must be reset (not preserved) and the full new
-    transcript will be mirrored from step 0.
-
-    :param monkeypatch: pytest monkeypatch fixture.
-    :param tmp_path: Temporary directory, used to isolate the bridge root.
-    :returns: None.
-    """
-    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
-
-    bridge_id = "bridge_fresh_test"
-    from omnigent.antigravity_native_bridge import prepare_bridge_dir
-
-    bridge_dir = prepare_bridge_dir(bridge_id)
-
-    # Pre-seed: prior run left the cursor set {0, 2, 14} with the real UUID.
-    write_bridge_state(
-        bridge_dir,
-        AntigravityNativeBridgeState(
-            session_id="conv_abc123",
-            conversation_id=_REAL_UUID,
-            forwarded_step_index=14,
-            forwarded_steps=(0, 2, 14),
-        ),
-    )
-
-    # Fresh launch: pass a placeholder id (never matches the prior real UUID).
-    async with _mock_client(_terminal_launch_handler) as client:
-        await _mod._launch_and_record(
-            client,
-            session_id="conv_abc123",
-            bridge_id=bridge_id,
-            conversation_id=_PLACEHOLDER_ID,
-            resume=False,
-            antigravity_args=(),
-            command="agy",
-            model=None,
-            startup_progress=None,
-        )
-
-    after = read_bridge_state(bridge_dir)
-    assert after is not None, "bridge state must exist after _launch_and_record"
-    assert after.forwarded_step_index is None, (
-        f"cursor must be reset on fresh launch; got {after.forwarded_step_index}"
-    )
-    # Both cursor representations reset on a fresh launch (mismatched id).
-    assert after.forwarded_steps is None, (
-        f"forwarded_steps SET must be reset on fresh launch; got {after.forwarded_steps}"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -776,12 +650,13 @@ async def _run_attach_and_capture_close(
     outcome: _mod._AttachOutcome,
 ) -> list[str]:
     """
-    Drive ``_attach_terminal`` with stubbed attach + forwarder + close, returning
-    the terminal ids passed to ``_close_antigravity_terminal`` (empty = not closed).
+    Drive ``_attach_terminal`` with stubbed attach + reader + cold-start + close,
+    returning the terminal ids passed to ``_close_antigravity_terminal`` (empty =
+    not closed).
 
-    The forwarder is stubbed to run until cancelled (so the ``finally`` teardown
-    exercises its cancel path); the direct tmux attach is stubbed to return the
-    chosen *outcome* without touching tmux.
+    The reader is stubbed to run until cancelled (so the ``finally`` teardown
+    exercises its cancel path); the cold-start is a no-op; the direct tmux attach
+    is stubbed to return the chosen *outcome* without touching tmux.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param reattached: ``prepared.reattached`` for this run.
@@ -790,9 +665,12 @@ async def _run_attach_and_capture_close(
     """
     closed_terminal_ids: list[str] = []
 
-    async def _fake_forwarder(**_kwargs: object) -> None:
-        # Run until the finally-block cancels the task, like the real forwarder.
+    async def _fake_reader(**_kwargs: object) -> None:
+        # Run until the finally-block cancels the task, like the real reader.
         await asyncio.Event().wait()
+
+    async def _fake_cold_start(*_args: object, **_kwargs: object) -> None:
+        return None
 
     async def _fake_direct_attach(_socket: Path, _target: str) -> _mod._AttachOutcome:
         return outcome
@@ -800,7 +678,8 @@ async def _run_attach_and_capture_close(
     async def _fake_close(**kwargs: object) -> None:
         closed_terminal_ids.append(str(kwargs["terminal_id"]))
 
-    monkeypatch.setattr(_mod, "supervise_forwarder", _fake_forwarder)
+    monkeypatch.setattr(_mod, "run_reader_with_bridge", _fake_reader)
+    monkeypatch.setattr(_mod, "_cold_start_agy_conversation", _fake_cold_start)
     monkeypatch.setattr(_mod, "_can_attach_direct_tmux", lambda _prepared: True)
     monkeypatch.setattr(_mod, "_attach_direct_tmux", _fake_direct_attach)
     monkeypatch.setattr(_mod, "_close_antigravity_terminal", _fake_close)
@@ -810,7 +689,6 @@ async def _run_attach_and_capture_close(
         headers={},
         prepared=_prepared(reattached),
         recover=None,
-        model=None,
     )
     return closed_terminal_ids
 
@@ -867,27 +745,37 @@ async def test_attach_terminal_skips_close_when_reattached_and_detached(
     assert closed == []
 
 
-async def _run_attach_and_capture_forwarder(
+async def _run_attach_and_capture_reader(
     monkeypatch: pytest.MonkeyPatch, *, reattached: bool
-) -> int:
+) -> tuple[int, int]:
     """
-    Drive ``_attach_terminal`` and count how many times the CLI starts a forwarder.
+    Drive ``_attach_terminal`` and count the CLI reader + cold-start spawns.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param reattached: ``prepared.reattached`` for this run.
-    :returns: Number of ``supervise_forwarder`` invocations (0 or 1).
+    :returns: ``(reader_starts, cold_start_starts)`` — each 0 or 1.
     """
-    starts = 0
+    reader_starts = 0
+    cold_start_starts = 0
 
-    def _counting_forwarder(**_kwargs: object) -> object:
+    def _counting_reader(**_kwargs: object) -> object:
         # Count the CALL synchronously (deterministic) — not the task body, which
         # may be cancelled by the finally before it runs. Returns a coroutine so
-        # ``asyncio.create_task(supervise_forwarder(...))`` still works.
-        nonlocal starts
-        starts += 1
+        # ``asyncio.create_task(run_reader_with_bridge(...))`` still works.
+        nonlocal reader_starts
+        reader_starts += 1
 
         async def _runner() -> None:
             await asyncio.Event().wait()
+
+        return _runner()
+
+    def _counting_cold_start(*_args: object, **_kwargs: object) -> object:
+        nonlocal cold_start_starts
+        cold_start_starts += 1
+
+        async def _runner() -> None:
+            return None
 
         return _runner()
 
@@ -897,7 +785,8 @@ async def _run_attach_and_capture_forwarder(
     async def _fake_close(**_kwargs: object) -> None:
         return None
 
-    monkeypatch.setattr(_mod, "supervise_forwarder", _counting_forwarder)
+    monkeypatch.setattr(_mod, "run_reader_with_bridge", _counting_reader)
+    monkeypatch.setattr(_mod, "_cold_start_agy_conversation", _counting_cold_start)
     monkeypatch.setattr(_mod, "_can_attach_direct_tmux", lambda _prepared: True)
     monkeypatch.setattr(_mod, "_attach_direct_tmux", _fake_direct_attach)
     monkeypatch.setattr(_mod, "_close_antigravity_terminal", _fake_close)
@@ -907,32 +796,149 @@ async def _run_attach_and_capture_forwarder(
         headers={},
         prepared=_prepared(reattached),
         recover=None,
-        model=None,
     )
-    return starts
+    return reader_starts, cold_start_starts
 
 
-async def test_attach_terminal_skips_cli_forwarder_when_reattached(
+async def test_attach_terminal_skips_cli_reader_when_reattached(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Reattaching to a runner-owned terminal must NOT start a CLI-side forwarder.
+    """Reattaching to a runner-owned terminal must NOT start a CLI-side reader.
 
-    The runner auto-creates "terminal + forwarder" together and owns the mirror
-    for a runner-owned terminal. A second CLI-side forwarder would double-mirror
-    every step (two tailers POSTing the same agy transcript) — verified live as
-    duplicated chat messages. So when ``reattached`` the CLI defers to the runner.
+    The runner auto-creates "terminal + reader" together and owns the mirror for a
+    runner-owned terminal. A second CLI-side reader would double-mirror every step
+    (two readers POSTing the same agy conversation). So when ``reattached`` the CLI
+    defers to the runner — and skips cold-start too (the runner cold-starts).
     """
-    starts = await _run_attach_and_capture_forwarder(monkeypatch, reattached=True)
-    assert starts == 0, "reattached path must defer forwarding to the runner (no double-mirror)"
+    reader_starts, cold_start_starts = await _run_attach_and_capture_reader(
+        monkeypatch, reattached=True
+    )
+    assert reader_starts == 0, "reattached must defer mirroring to the runner (no double-mirror)"
+    assert cold_start_starts == 0, "reattached must not cold-start (runner owns it)"
 
 
-async def test_attach_terminal_runs_cli_forwarder_when_not_reattached(
+async def test_attach_terminal_runs_cli_reader_when_not_reattached(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When the CLI launched its own terminal (fallback), it DOES run the forwarder.
+    """When the CLI launched its own terminal (fallback), it DOES run the reader.
 
     No runner-owned terminal exists in that case, so the CLI is the only mirror
-    source and must forward.
+    source: it spawns the RPC reader AND a one-shot cold-start (which mints agy's
+    real cascade id so the reader binds it).
     """
-    starts = await _run_attach_and_capture_forwarder(monkeypatch, reattached=False)
-    assert starts == 1, "non-reattached (CLI-launched) path must run the CLI forwarder"
+    reader_starts, cold_start_starts = await _run_attach_and_capture_reader(
+        monkeypatch, reattached=False
+    )
+    assert reader_starts == 1, "non-reattached (CLI-launched) path must run the RPC reader"
+    assert cold_start_starts == 1, "non-reattached path must cold-start agy's conversation"
+
+
+# ---------------------------------------------------------------------------
+# _cold_start_agy_conversation — mint + persist + external_session_id PATCH
+# ---------------------------------------------------------------------------
+
+
+def _seed_bridge_state(bridge_dir: Path, conversation_id: str) -> None:
+    """Seed bridge state with a given conversation id for cold-start tests."""
+    from omnigent.antigravity_native_bridge import (
+        AntigravityNativeBridgeState,
+        write_bridge_state,
+    )
+
+    write_bridge_state(
+        bridge_dir,
+        AntigravityNativeBridgeState(session_id="conv_cs", conversation_id=conversation_id),
+    )
+
+
+async def test_cli_cold_start_mints_and_patches_external_session_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A placeholder-seeded CLI cold-start mints a real id, writes it, and PATCHes it.
+
+    The fresh-fallback path: bridge state holds the ``agy_conv_*`` placeholder, so
+    the cold-start ``StartCascade``s a real uuid4, persists it to bridge state
+    (replacing the placeholder), and PATCHes it onto the session as
+    ``external_session_id`` so a later ``--resume`` continues agy's conversation.
+    """
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_cs")
+    _seed_bridge_state(bridge_dir, "agy_conv_placeholder")
+
+    monkeypatch.setattr(_mod, "_candidate_agy_rpc_ports", lambda: [52548])
+    started: list[tuple[int, str]] = []
+    monkeypatch.setattr(_mod, "start_cascade", lambda port, cid: started.append((port, cid)))
+
+    patches: list[tuple[str, dict[str, object]]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        patches.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={})
+
+    real_async_client = httpx.AsyncClient
+
+    def _mock_async_client(**kwargs: object) -> httpx.AsyncClient:
+        kwargs.pop("transport", None)
+        return real_async_client(transport=httpx.MockTransport(_handler), **kwargs)
+
+    monkeypatch.setattr(_mod.httpx, "AsyncClient", _mock_async_client)
+
+    await _mod._cold_start_agy_conversation(
+        bridge_dir,
+        "conv_cs",
+        base_url="http://test",
+        headers={},
+        timeout_s=1.0,
+    )
+
+    # Minted exactly one cascade on the discovered port with a real (non-placeholder) id.
+    assert len(started) == 1
+    minted_port, minted_id = started[0]
+    assert minted_port == 52548
+    assert not _mod.is_placeholder_conversation_id(minted_id)
+    # The real id reached bridge state (placeholder replaced).
+    after = read_bridge_state(bridge_dir)
+    assert after is not None
+    assert after.conversation_id == minted_id
+    # The same id was PATCHed onto the session as external_session_id.
+    assert patches == [("/v1/sessions/conv_cs", {"external_session_id": minted_id})]
+
+
+async def test_cli_cold_start_skips_when_conversation_already_real(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A resume (non-placeholder id already seeded) skips cold-start AND the PATCH.
+
+    This is the guard that makes ``--resume`` work: the real prior id is already
+    seeded (and passed as ``--conversation``), so the cold-start must not mint a
+    fresh conversation (which would clobber the resumed id) and must not PATCH.
+    """
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_cs_resume")
+    real_id = "68caaeac-2eaf-4e2c-9b95-721b022f4903"
+    _seed_bridge_state(bridge_dir, real_id)
+
+    def _fail_ports() -> list[int]:
+        raise AssertionError("cold-start must not probe ports on a non-placeholder (resume) id")
+
+    monkeypatch.setattr(_mod, "_candidate_agy_rpc_ports", _fail_ports)
+
+    def _fail_client(**_kwargs: object) -> httpx.AsyncClient:
+        raise AssertionError("cold-start must not PATCH on a resume id")
+
+    monkeypatch.setattr(_mod.httpx, "AsyncClient", _fail_client)
+
+    await _mod._cold_start_agy_conversation(
+        bridge_dir,
+        "conv_cs",
+        base_url="http://test",
+        headers={},
+        timeout_s=1.0,
+    )
+
+    # Bridge state untouched — the resume id stands.
+    after = read_bridge_state(bridge_dir)
+    assert after is not None
+    assert after.conversation_id == real_id

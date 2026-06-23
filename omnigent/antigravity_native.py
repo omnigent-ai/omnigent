@@ -11,23 +11,24 @@ Differences from the Codex / Claude wrappers (Phase 1 scope):
 * **No separate app-server.** agy self-hosts its local control surface, so
   there is no app-server process to start, no ``--remote`` transport, and no
   thread-init handshake.
-* **Transcript mirroring (read path) and web-turn injection (write path).**
-  While attached, this wrapper runs the native transcript forwarder
-  (:func:`omnigent.antigravity_native_forwarder.supervise_forwarder`) so agy's
-  conversation mirrors into the Omnigent chat view (read path). Web-UI turns are
-  injected back into the native agy conversation (the write path) by the native
-  executor (:mod:`omnigent.inner.antigravity_native_executor`) by typing the
-  message into the running agy TUI over tmux send-keys
-  (:func:`omnigent.antigravity_native_bridge.inject_user_message_via_tui`) — NOT
-  via the connect-RPC ``SendAgentMessage`` method, which agy logs as a
-  ``SYSTEM_MESSAGE`` the forwarder mirrors rather than running as a turn (see the
-  "Why the TUI, not connect-RPC" note in the executor module).
-* **Per-session identity is discovered, not assigned.** agy mints its own UUID
-  conversation and ignores the launcher's ``ANTIGRAVITY_CONVERSATION_ID``
-  (verified empirically). A fresh launch sets nothing for identity; the
-  forwarder discovers agy's real id, persists it to bridge state, and PATCHes
-  it onto the Omnigent session as ``external_session_id``. A resume reads that
-  real id back and passes ``--conversation <id>`` (see
+* **RPC mirroring (read path) and RPC web-turn delivery (write path).** agy's
+  conversation mirrors into the Omnigent chat view via the RPC read driver
+  (:mod:`omnigent.antigravity_native_reader`), which polls/streams agy's
+  connect-RPC trajectory steps (the read path) — it superseded the transcript-tail
+  forwarder, retired in the Task 12 cutover. Web-UI turns are delivered into the
+  native agy conversation (the write path) by the native executor
+  (:mod:`omnigent.inner.antigravity_native_executor`) over the connect-RPC
+  ``SendUserCascadeMessage`` method, which agy records as a real ``USER_INPUT``
+  turn — NOT ``SendAgentMessage`` (recorded as a ``SYSTEM_MESSAGE``) and no longer
+  by typing into the TUI over tmux send-keys (see the executor module).
+* **Per-session identity is minted at cold-start, not assigned at launch.** agy
+  mints its own UUID conversation and ignores the launcher's
+  ``ANTIGRAVITY_CONVERSATION_ID`` (verified empirically). A fresh launch seeds an
+  ``agy_conv_*`` placeholder; the cold-start (:func:`_cold_start_agy_conversation`,
+  the runner's equivalent on the web path) then ``StartCascade``s a real id over
+  connect-RPC, writes it to bridge state (which the RPC reader binds), and PATCHes
+  it onto the session as ``external_session_id``. A resume reads that real id back
+  and passes ``--conversation <id>`` to continue agy's actual conversation (see
   :func:`omnigent.antigravity_native_launch.build_agy_launch`).
 * **Workspace = the agy terminal cwd.** agy runs tools in its process working
   directory, so the terminal cwd is pinned to the session working dir; no
@@ -85,16 +86,23 @@ from omnigent.antigravity_native_bridge import (
     bridge_dir_for_bridge_id,
     clear_bridge_state,
     ensure_agy_onboarding_complete,
+    is_placeholder_conversation_id,
     prepare_bridge_dir,
     read_bridge_state,
+    update_conversation_id,
     write_bridge_state,
     write_tmux_target,
 )
-from omnigent.antigravity_native_forwarder import supervise_forwarder
 from omnigent.antigravity_native_launch import (
     agy_binary_path,
     build_agy_launch,
     resolve_native_antigravity_launch,
+)
+from omnigent.antigravity_native_reader import run_reader_with_bridge
+from omnigent.antigravity_native_rpc import (
+    AntigravityRpcError,
+    _candidate_agy_rpc_ports,
+    start_cascade,
 )
 from omnigent.claude_native import (
     _attach_with_reconnect,
@@ -397,7 +405,6 @@ def _run_with_local_server(
                 headers={},
                 prepared=prepared,
                 recover=None,
-                model=model,
             )
             if resolved_session_id is None:
                 echo_native_resume_hint(
@@ -511,7 +518,6 @@ def _run_with_remote_server(
                 headers=headers,
                 prepared=prepared,
                 recover=_recover,
-                model=model,
             )
             if resolved_session_id is None:
                 echo_native_resume_hint(
@@ -626,9 +632,9 @@ async def _prepare_antigravity_terminal(
             # observed as required") AND its ``clear_bridge_state`` wipes the bridge
             # state the runner wrote (every web turn then fails "Antigravity native
             # bridge state is missing"), and on ``reattached=False``
-            # ``_attach_terminal`` starts a SECOND ``supervise_forwarder`` →
-            # double-mirror. The pre-bind existing-terminal check above can't catch
-            # this — the runner only auto-creates AFTER the bind. A CLI launch stays
+            # ``_attach_terminal`` starts a SECOND RPC reader → double-mirror. The
+            # pre-bind existing-terminal check above can't catch this — the runner
+            # only auto-creates AFTER the bind. A CLI launch stays
             # as a defensive fallback when the runner produced no terminal in the
             # window. Mirrors ``_prepare_antigravity_terminal_via_daemon``.
             autocreated = await _await_runner_antigravity_terminal(
@@ -788,7 +794,7 @@ async def _prepare_antigravity_terminal_via_daemon(
             # Reattach to an already-running runner-owned agy terminal instead of
             # relaunching. Without this the daemon resume path always falls to
             # ``_launch_and_record`` → unconditional ``clear_bridge_state``,
-            # which wipes the live forwarder's discovered ``conversation_id``;
+            # which wipes the runner reader's bound ``conversation_id``;
             # and ``reattached=False`` would make teardown close a terminal a
             # different launcher owns. Mirrors the local-server prepare path and
             # ``codex_native`` daemon resume. Runs before host-online/bind: a
@@ -900,11 +906,12 @@ async def _launch_and_record(
 
     Builds the agy argv (``--conversation <real-id>`` on resume), POSTs the
     terminal resource, and seeds the shared bridge state the
-    ``antigravity-native`` harness reads. The ``external_session_id`` capture
-    is NOT done here: agy mints its own UUID and ignores the launcher's id, so
-    only the forwarder — which discovers agy's real id at runtime — persists it
-    onto the Omnigent session (and into bridge state). Seeding the placeholder
-    here would make a later resume pass an id agy cannot find.
+    ``antigravity-native`` harness reads. agy's real id is NOT captured here: agy
+    mints its own UUID and ignores the launcher's id, so a fresh launch seeds an
+    ``agy_conv_*`` placeholder that the attach-time cold-start
+    (:func:`_cold_start_agy_conversation`) replaces with agy's real cascade id in
+    bridge state once agy is live. Seeding a guessed id here would make a later
+    resume pass an id agy cannot find.
 
     No agy process pid is captured here (and there is no ``agy_pid`` field in
     bridge state). The terminal is launched with ``tmux_start_on_attach=True``,
@@ -918,15 +925,10 @@ async def _launch_and_record(
     and trusting a recycled pid without the conversation check would risk
     injecting into a different live agy.
 
-    The ``forwarded_step_index`` resume cursor is preserved across a cold
-    ``--resume`` when the same agy conversation id is being resumed (i.e. the
-    prior run's ``state.json`` names the same UUID we are about to pass
-    ``--conversation``). Preserving it prevents the forwarder from re-POSTing
-    steps that were already mirrored in the prior session — external conversation
-    items are not server-deduped, so a reset cursor would replay the entire prior
-    transcript in the web chat.  A fresh launch uses a placeholder id that cannot
-    match the prior real UUID, so the cursor is always reset to ``None`` for
-    new conversations.
+    No durable read cursor is seeded: the RPC read driver that mirrors agy's
+    conversation (:mod:`omnigent.antigravity_native_reader`) keeps an in-memory
+    seen-set only — the transcript forwarder's ``forwarded_steps`` resume cursor
+    was retired in the Task 12 cutover.
 
     :param client: HTTP client pointed at the Omnigent server.
     :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
@@ -934,7 +936,7 @@ async def _launch_and_record(
     :param conversation_id: On resume, agy's real (discovered) conversation id
         to pass as ``--conversation``. On a fresh launch, the minted
         ``agy_conv_*`` placeholder used only to seed bridge state until the
-        forwarder discovers agy's real id.
+        cold-start mints agy's real id.
     :param resume: ``True`` to resume an existing agy conversation.
     :param antigravity_args: Raw pass-through agy args.
     :param command: agy executable to run.
@@ -948,16 +950,12 @@ async def _launch_and_record(
     :raises click.ClickException: If the terminal launch fails.
     """
     bridge_dir = prepare_bridge_dir(bridge_id)
-    # Snapshot the prior state BEFORE clearing so we can salvage the durable
-    # forwarded_step_index cursor on a same-conversation cold resume (see
-    # docstring above for the full rationale).
-    prior_state = await asyncio.to_thread(read_bridge_state, bridge_dir)
-    # Clear stale turn/conversation state so the forwarder rediscovers this
-    # run's real agy conversation id instead of binding to the previous run's.
+    # Clear stale turn/conversation state so a fresh launch rediscovers this run's
+    # real agy conversation id instead of binding to the previous run's.
     await asyncio.to_thread(clear_bridge_state, bridge_dir)
     # Pre-accept agy's first-run onboarding wizard (HOME-global) so a headless /
     # detached launch does not hang waiting for a TTY answer. Idempotent and
-    # offloaded to a thread (file I/O), mirroring the bridge-state writes above.
+    # offloaded to a thread (file I/O), mirroring the bridge-state writes below.
     await asyncio.to_thread(ensure_agy_onboarding_complete)
     argv, env_overrides = build_agy_launch(
         conversation_id=conversation_id if resume else None,
@@ -986,31 +984,17 @@ async def _launch_and_record(
             socket_path=launched.tmux_socket,
             tmux_target=launched.tmux_target,
         )
-    # Preserve the resume cursor when resuming the same conversation so the
-    # forwarder skips already-mirrored steps. The authoritative cursor is the
-    # ``forwarded_steps`` SET (membership suppression); the int is its max mirror.
-    # BOTH must be carried over — dropping the set here would fall the forwarder
-    # back to the ``<=`` int floor on resume and re-drop a not-yet-written
-    # out-of-order lower step (Finding 1). On a fresh launch (or when the prior
-    # state is absent / names a different id) leave both as None so the new
-    # transcript is mirrored from step 0.
-    preserved_step_index: int | None = None
-    preserved_steps: tuple[int, ...] | None = None
-    if resume and prior_state is not None and prior_state.conversation_id == conversation_id:
-        preserved_step_index = prior_state.forwarded_step_index
-        preserved_steps = prior_state.forwarded_steps
     # Seed bridge state with the conversation id known so far (the real id on
-    # resume; the placeholder on a fresh launch). The forwarder overwrites the
-    # placeholder with agy's discovered UUID — and PATCHes it onto the Omnigent
-    # session as ``external_session_id`` so a later resume passes a real id.
+    # resume; the ``agy_conv_*`` placeholder on a fresh launch — the attach-time
+    # cold-start replaces it with agy's real cascade id once agy is live, so the
+    # RPC reader binds the real conversation). No durable read cursor is seeded
+    # (the reader keeps an in-memory seen-set; the forwarder cursor was retired).
     await asyncio.to_thread(
         write_bridge_state,
         bridge_dir,
         AntigravityNativeBridgeState(
             session_id=session_id,
             conversation_id=conversation_id,
-            forwarded_step_index=preserved_step_index,
-            forwarded_steps=preserved_steps,
         ),
     )
     _update_progress(startup_progress, "Antigravity terminal ready.")
@@ -1023,7 +1007,6 @@ async def _attach_terminal(
     headers: dict[str, str],
     prepared: PreparedAntigravityTerminal,
     recover: Callable[[], Awaitable[None]] | None,
-    model: str | None = None,
 ) -> None:
     """
     Attach to the prepared agy terminal, tearing it down on real exit.
@@ -1034,10 +1017,35 @@ async def _attach_terminal(
     best-effort closed, unless this invocation reattached to a terminal
     another launcher owns.
 
-    While attached, the native transcript forwarder
-    (:func:`omnigent.antigravity_native_forwarder.supervise_forwarder`) runs in
-    the background so agy's conversation mirrors into the Omnigent chat view; it
-    is cancelled before terminal teardown.
+    **Read/write wiring on the CLI fallback only.** When the runner produced no
+    terminal and the CLI launched its own (``prepared.reattached is False``), this
+    spawns — for the attach's lifetime, cancelled in ``finally`` — the RPC read
+    driver (:func:`omnigent.antigravity_native_reader.run_reader_with_bridge`,
+    which mirrors agy's conversation into the Omnigent chat view and surfaces
+    WAITING interactions as real-time elicitations) and a one-shot cold-start
+    (:func:`_cold_start_agy_conversation`) that mints agy's real cascade id so the
+    reader can bind it. These run CONCURRENTLY with the attach because the CLI
+    terminal uses ``tmux_start_on_attach=True`` — agy does not exist until this
+    attach starts the pane, so cold-start cannot precede it; the cold-start's
+    port poll and the reader's discovery poll both wait agy out. When
+    ``prepared.reattached is True`` the runner OWNS the terminal and already runs
+    its own reader (``runner/app.py`` ``_auto_create_antigravity_terminal``), so
+    the CLI starts neither — a second reader would double-mirror every step.
+
+    .. note::
+        On this CLI fallback the human attaches to agy's TUI, which shows the
+        empty ``>`` banner: the cold-started conversation is a HEADLESS RPC
+        cascade that does not surface in the agy TUI (established by the cold-start
+        spike). The real conversation is that headless RPC one, driven by the web
+        UI through the reader + executor — so the TUI looking empty while web
+        turns flow is inherent to the RPC model, not a bug.
+
+        Unlike the retired transcript forwarder, the reader does NOT have
+        refresh-capable auth here: it snapshots ``headers`` (the local server has
+        none; a remote server's bearer is used for its lifetime — ``recover``
+        refreshes the *attach* headers on reconnect but not the reader's client).
+        The post-hoc policy audit the forwarder ran is dropped; real-time
+        elicitation is the enforcement surface now.
 
     :param base_url: Omnigent server base URL.
     :param headers: HTTP auth headers (mutated in place by ``recover``).
@@ -1045,58 +1053,32 @@ async def _attach_terminal(
     :param recover: Optional async reconnect-recovery callback. ``None``
         disables reconnect (the local-server flow owns the server
         lifecycle and has nothing to reconnect to).
-    :param model: agy model label stamped onto the forwarder's post-hoc policy
-        audit context, or ``None`` when the user did not pin a model.
     :returns: None after the attach exits.
     """
-    # Mirror agy's transcript into the Omnigent session for the chat view. The
-    # forwarder discovers agy's real conversation id under the brain root, so it
-    # only needs the bridge dir + session id. Cancelled in ``finally`` before the
-    # terminal teardown, mirroring ``_attach_with_forwarder`` (codex) and the
-    # claude attach path.
-    #
-    # ONLY run a CLI-side forwarder when WE launched the terminal (not
-    # reattached). The runner OWNS a runner-created terminal and auto-creates
-    # "terminal + forwarder" together (``runner/app.py``
-    # ``_auto_create_antigravity_terminal``), so a second CLI-side forwarder on a
-    # reattached terminal would DOUBLE-MIRROR every step — two tailers POSTing the
-    # same agy transcript (verified live as duplicated chat messages + a duplicate
-    # one-time degrade notice). The non-reattached fallback (the CLI launched its
-    # own terminal because the runner produced none) has no runner forwarder, so
-    # there the CLI must forward.
-    #
-    # The forwarder snapshots ``headers`` at construction. For the local server
-    # that is fine (no auth). For a remote server ``recover`` refreshes the
-    # attach headers on reconnect, but the forwarder's own HTTP client keeps the
-    # initial bearer token — token-expiry refresh for the forwarder needs the
-    # ``httpx.Auth`` plumbing the codex/claude paths use and is deferred (the
-    # transcript still mirrors for the bearer token's lifetime).
-    # Pass the runner-owned tmux pane so the forwarder can tie discovery to THIS
-    # session's own agy process (pane pid → agy child → its connect-RPC port),
-    # instead of guessing by newest brain dir. Only set when the pane is locally
-    # reachable (local server, or a remote server whose runner shares this host);
-    # for a truly remote runner these are ``None`` and the forwarder uses the
-    # bounded-ambiguity fallback. The forwarder re-checks reachability itself, so
-    # passing them unconditionally is safe.
-    # ``audit_policies=True`` turns on the POST-HOC tool-call policy audit (the
-    # only honest Omnigent enforcement here — agy exposes no firing PreToolUse
-    # hook, so a tool cannot be blocked before it runs; the audit surfaces a
-    # warning after the fact + a one-time audit-only degrade notice). The model
-    # is threaded so a model-scoped policy evaluates against the user's agy model.
-    forwarder: asyncio.Task[None] | None = None
+    reader: asyncio.Task[None] | None = None
+    cold_start: asyncio.Task[None] | None = None
     if not prepared.reattached:
-        forwarder = asyncio.create_task(
-            supervise_forwarder(
+        reader = asyncio.create_task(
+            run_reader_with_bridge(
                 base_url=base_url,
                 headers=headers,
+                # The CLI has no refresh-capable auth flow (the bearer in
+                # ``headers``, if any, is used as-is); only the runner threads an
+                # ``httpx.Auth``.
+                auth=None,
                 session_id=prepared.session_id,
                 bridge_dir=prepared.bridge_dir,
-                tmux_socket=prepared.tmux_socket,
-                tmux_target=prepared.tmux_target,
-                model=model,
-                audit_policies=True,
             ),
-            name="antigravity-native-transcript-forwarder",
+            name="antigravity-native-rpc-reader",
+        )
+        cold_start = asyncio.create_task(
+            _cold_start_agy_conversation(
+                prepared.bridge_dir,
+                prepared.session_id,
+                base_url=base_url,
+                headers=headers,
+            ),
+            name="antigravity-native-cold-start",
         )
     outcome = _AttachOutcome.EXITED
     try:
@@ -1116,10 +1098,11 @@ async def _attach_terminal(
                 close_attach_on_terminal_gone=True,
             )
     finally:
-        if forwarder is not None:
-            forwarder.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await forwarder
+        for task in (cold_start, reader):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
         if not prepared.reattached and outcome is not _AttachOutcome.DETACHED:
             await _close_antigravity_terminal(
                 base_url=base_url,
@@ -1127,6 +1110,153 @@ async def _attach_terminal(
                 session_id=prepared.session_id,
                 terminal_id=prepared.terminal_id,
             )
+
+
+# Cold-start port-discovery budget for the CLI fallback. agy's connect-RPC server
+# binds its loopback port a moment AFTER the process starts (per-process, BEFORE
+# any conversation exists), and on this path agy only starts when the attach opens
+# its pane — so the bootstrap polls. The wait is bounded so a never-binding agy
+# cannot pin the task; the reader's own discovery keeps polling afterward as a
+# fallback. Mirrors the runner's ``_AGY_COLD_START_PORT_TIMEOUT_S``.
+_AGY_COLD_START_PORT_TIMEOUT_S = 20.0
+_AGY_COLD_START_PORT_POLL_INTERVAL_S = 0.25
+
+
+async def _agy_cold_start_poll_sleep(seconds: float) -> None:
+    """
+    Sleep between agy cold-start port-discovery polls.
+
+    Indirection point so tests can stub the poll backoff without patching the
+    process-wide ``asyncio.sleep``. Mirrors
+    :func:`omnigent.runner.app._agy_cold_start_poll_sleep`.
+
+    :param seconds: Seconds to wait before the next port probe, e.g. ``0.25``.
+    :returns: None.
+    """
+    await asyncio.sleep(seconds)
+
+
+async def _cold_start_agy_conversation(
+    bridge_dir: Path,
+    session_id: str,
+    *,
+    base_url: str,
+    headers: dict[str, str],
+    timeout_s: float = _AGY_COLD_START_PORT_TIMEOUT_S,
+) -> None:
+    """
+    Cold-start agy's conversation over connect-RPC for the CLI fallback (best-effort).
+
+    The CLI-fallback analogue of the runner's
+    :func:`omnigent.runner.app._cold_start_agy_conversation`: once agy is live
+    (the attach started its pane), mint a real cascade over ``StartCascade`` and
+    write that id into bridge state, replacing the ``agy_conv_*`` placeholder
+    :func:`_launch_and_record` seeded — so the RPC reader binds the real
+    conversation and web turns resolve, instead of the reader polling the
+    placeholder forever. With a single CLI-launched agy on the host, its
+    connect-RPC port is the lone ``Heartbeat``-answering candidate (no
+    conversation exists yet to disambiguate several), so this polls
+    :func:`omnigent.antigravity_native_rpc._candidate_agy_rpc_ports` until a port
+    binds, then ``StartCascade``s a generated ``uuid4``.
+
+    The cold-started id is also PATCHed onto the Omnigent session as
+    ``external_session_id`` (best-effort, mirroring the runner cold-start and
+    codex/pi) so a later ``omnigent antigravity --resume`` reads it back and passes
+    ``--conversation <id>`` to continue agy's actual conversation — the read-path
+    replacement for the retired forwarder's ``_patch_external_session_id``.
+
+    Resume launches already hold agy's real id (seeded as a non-placeholder
+    ``conversation_id`` and passed as ``--conversation``), so cold-starting would
+    create a second empty conversation and overwrite the resumed id — this no-ops
+    when the seeded id is NOT a placeholder (the guard that makes ``--resume``
+    actually continue the prior conversation).
+
+    **Best-effort, never raises.** A failure (no state, no port within
+    *timeout_s*, ``StartCascade`` erroring, or the PATCH failing) leaves the
+    placeholder; the reader's discovery then binds agy's real id once a turn
+    creates the conversation. The sync RPC/poll work runs in
+    :func:`asyncio.to_thread` so the event loop is never blocked.
+
+    :param bridge_dir: Native Antigravity bridge directory whose ``state.json``
+        the real cold-started id is written into.
+    :param session_id: Owning session/conversation id (for log correlation and
+        the ``external_session_id`` PATCH target).
+    :param base_url: Omnigent server base URL for the ``external_session_id``
+        PATCH.
+    :param headers: HTTP auth headers for the PATCH (the local server has none; a
+        remote server's bearer is used as-is).
+    :param timeout_s: Total seconds to wait for agy's connect-RPC port to bind.
+    :returns: None.
+    """
+    state = await asyncio.to_thread(read_bridge_state, bridge_dir)
+    if state is None:
+        return
+    if not is_placeholder_conversation_id(state.conversation_id):
+        # Resume: agy's real id is already seeded (and passed as --conversation);
+        # cold-starting would create a second empty conversation and clobber the
+        # resumed id, defeating --resume.
+        return
+
+    deadline = time.monotonic() + timeout_s
+    port: int | None = None
+    while True:
+        candidates = await asyncio.to_thread(_candidate_agy_rpc_ports)
+        if candidates:
+            # The lone CLI-launched agy is the only Heartbeat-answering candidate
+            # at this point (no conversation exists to disambiguate several, so
+            # take the lowest validated port).
+            port = candidates[0]
+            break
+        if time.monotonic() >= deadline:
+            _logger.warning(
+                "Antigravity cold-start: no agy connect-RPC port bound within %.0fs for "
+                "session %s; leaving the placeholder for the reader to bind once a turn "
+                "creates the conversation.",
+                timeout_s,
+                session_id,
+            )
+            return
+        await _agy_cold_start_poll_sleep(_AGY_COLD_START_PORT_POLL_INTERVAL_S)
+
+    cascade_id = str(uuid.uuid4())
+    try:
+        await asyncio.to_thread(start_cascade, port, cascade_id)
+    except AntigravityRpcError:
+        _logger.warning(
+            "Antigravity cold-start: StartCascade failed on port %s for session %s; leaving "
+            "the placeholder for the reader to bind.",
+            port,
+            session_id,
+            exc_info=True,
+        )
+        return
+    # Persist the real id (replacing the placeholder) so ``read_bridge_state``
+    # returns it and the reader/executor address the cold-started conversation.
+    # Offloaded (file I/O).
+    await asyncio.to_thread(update_conversation_id, bridge_dir, cascade_id)
+    # PATCH the real id onto the session so a later ``--resume`` continues this
+    # conversation (best-effort; mirrors the runner cold-start + codex/pi). A
+    # short-lived client suffices for this one call.
+    try:
+        async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=10.0) as client:
+            await client.patch(
+                f"/v1/sessions/{url_component(session_id)}",
+                json={"external_session_id": cascade_id},
+            )
+    except httpx.HTTPError:
+        _logger.warning(
+            "Antigravity cold-start: failed to PATCH external_session_id=%s onto session %s; "
+            "the conversation is mirrored but `--resume` will cold-start fresh.",
+            cascade_id,
+            session_id,
+            exc_info=True,
+        )
+    _logger.info(
+        "Antigravity cold-start: created conversation %s on port %s for session %s",
+        cascade_id,
+        port,
+        session_id,
+    )
 
 
 def _can_attach_direct_tmux(prepared: PreparedAntigravityTerminal) -> bool:
@@ -1197,12 +1327,13 @@ async def _create_antigravity_session(
     """
     Create a bundled terminal-first Antigravity session.
 
-    Stamps the wrapper + terminal-UI labels and the bridge-id label. agy's
-    real conversation id is captured as ``external_session_id`` later, by the
-    forwarder, once it discovers the UUID agy actually used (agy ignores any id
-    the launcher assigns), mirroring how codex/claude-native capture their
-    thread/transcript id — except here the id is discovered at runtime rather
-    than known at launch.
+    Stamps the wrapper + terminal-UI labels and the bridge-id label.
+    ``external_session_id`` is left unset here: agy mints its own UUID and ignores
+    any id the launcher assigns, so the real id is established at runtime by the
+    cold-start (:func:`_cold_start_agy_conversation`), which writes it to bridge
+    state AND PATCHes it onto the session as ``external_session_id`` — the
+    read-path replacement for the retired forwarder's id capture, so a later
+    ``--resume`` continues agy's actual conversation.
 
     :param client: HTTP client pointed at the Omnigent server.
     :param bundle: Gzipped Antigravity wrapper agent bundle.
@@ -1306,8 +1437,9 @@ async def _launch_antigravity_terminal(
         # tags the terminal ``CLAUDE_NATIVE_TERMINAL_ROLE`` (which drives the
         # session's PTY-derived working status), and publishes Claude tmux
         # metadata. None of that is owned by antigravity teardown, and
-        # antigravity derives its working status from the transcript forwarder,
-        # not PTY activity. ``ensure_native_terminal`` is allowlisted the same
+        # antigravity derives its working status from the RPC reader's
+        # ``external_session_status`` edges, not PTY activity.
+        # ``ensure_native_terminal`` is allowlisted the same
         # way but the runner's claude/codex ``ensure`` branches are gated on
         # those terminal names, so for ``antigravity`` it falls through to the
         # plain generic launch with no Claude side effects. The antigravity

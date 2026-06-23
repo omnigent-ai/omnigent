@@ -1,11 +1,13 @@
 """Pure step→item mapper for the native Antigravity (agy) RPC stream.
 
-This module replaces the delta-emitting ``step_to_events`` in
-:mod:`omnigent.antigravity_native_forwarder` for the RPC-based read path (Task
-12 cutover will relocate :class:`~omnigent.antigravity_native_forwarder.OutboundEvent`
-and :class:`~omnigent.antigravity_native_forwarder._ToolCallIdAllocator` here).
+This module is the RPC-based read path's mapper, and (since the Task 12 cutover)
+the home of the shared event types it produces: :class:`OutboundEvent`, the
+:class:`_ToolCallIdAllocator`, and the ``_AGENT_NAME`` / ``_TOOL_ARG_DISPLAY_KEYS``
+constants. These were relocated here from the retired transcript forwarder; the
+RPC read driver (:mod:`omnigent.antigravity_native_reader`) imports them from
+this module.
 
-Key differences from the transcript-based ``step_to_events``:
+Key differences from the retired transcript-based ``step_to_events`` mapper:
 
 1. **No ``output_text_delta`` event.** The old forwarder emitted one delta per
    assistant text step so the web UI could render streamed text and then
@@ -27,9 +29,9 @@ Key differences from the transcript-based ``step_to_events``:
    (``metadata.toolCall.id``). The mapper uses those ids directly so
    ``function_call`` / ``function_call_output`` pairs are keyed by the real
    shared id (order-independent), not by FIFO position. The
-   :class:`~omnigent.antigravity_native_forwarder._ToolCallIdAllocator` is
-   retained as a fallback only for the resume-mid-turn case where a result
-   step lacks the ``metadata.toolCall.id`` field.
+   :class:`_ToolCallIdAllocator` is retained as a fallback only for the
+   resume-mid-turn case where a result step lacks the ``metadata.toolCall.id``
+   field.
 
 :func:`map_step_to_events` is the public API; all other symbols are private.
 """
@@ -38,16 +40,104 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass, field
 from typing import Literal, TypedDict
 
-from omnigent.antigravity_native_forwarder import (
-    _AGENT_NAME,
-    _TOOL_ARG_DISPLAY_KEYS,
-    OutboundEvent,
-    _ToolCallIdAllocator,
-)
-
 _logger = logging.getLogger(__name__)
+
+# Omnigent ``agent`` label stamped on mirrored assistant/function-call items so
+# the web UI attributes them to the native agy agent. Relocated here (Task 12
+# cutover) from the retired transcript forwarder.
+_AGENT_NAME = "antigravity-native-ui"
+
+# agy ``tool_calls`` entries' ``args`` always include these display-only fields
+# alongside the real tool arguments; they are stripped from the mirrored
+# function-call arguments. Relocated here (Task 12 cutover) from the retired
+# transcript forwarder.
+_TOOL_ARG_DISPLAY_KEYS = frozenset({"toolAction", "toolSummary"})
+
+
+@dataclass(frozen=True)
+class OutboundEvent:
+    """
+    One Omnigent session event to POST for an agy step.
+
+    Relocated here (Task 12 cutover) from the retired transcript forwarder; it is
+    the shared event shape produced by both this mapper and the RPC read driver
+    (:mod:`omnigent.antigravity_native_reader`).
+
+    :param event_type: Omnigent session event type, e.g.
+        ``"external_conversation_item"`` or ``"external_session_status"``.
+    :param data: Event ``data`` payload posted under
+        ``{"type": event_type, "data": data}``.
+    :param step_index: The agy step index this event was derived from. Retained
+        from the transcript-forwarder shape; the RPC read path does not advance a
+        durable per-step cursor (that was retired with the forwarder), so it
+        stamps a best-effort index and the field is informational there.
+    """
+
+    event_type: str
+    data: dict[str, object]
+    step_index: int
+
+
+@dataclass
+class _ToolCallIdAllocator:
+    """
+    Correlate agy tool invocations with their following result steps (fallback).
+
+    Relocated here (Task 12 cutover) from the retired transcript forwarder. The
+    RPC read path prefers the real agy-assigned ``id`` on both the invocation and
+    the result, so this positional allocator is used only as a fallback for the
+    resume-mid-turn case where a result step lacks ``metadata.toolCall.id``.
+
+    The pairing is FIFO: the oldest still-unmatched invocation owns the next
+    result. Ids are positional (``agy_call_<conversation>_<n>``) and the
+    invocation counter only advances when an invocation is actually emitted, so
+    replaying the same step prefix reproduces identical ids and pairings — which
+    is what dedup needs across a restart.
+
+    A result with no pending invocation (e.g. a transcript that begins mid-turn
+    on resume) gets its own standalone id so it is never silently dropped.
+
+    :param conversation_id: agy conversation id used to namespace ids, e.g.
+        ``"8ca97c49-..."``.
+    :param invocation_count: Number of invocation ids minted so far.
+    :param orphan_output_count: Number of standalone (unpaired) output ids
+        minted so far.
+    :param pending_call_ids: Invocation ids awaiting their result step, oldest
+        first.
+    """
+
+    conversation_id: str
+    invocation_count: int = 0
+    orphan_output_count: int = 0
+    pending_call_ids: list[str] = field(default_factory=list)
+
+    def claim_call_id(self) -> str:
+        """
+        Mint and enqueue a call id for one tool invocation.
+
+        :returns: Stable invocation call id, e.g. ``"agy_call_8ca97c49_0"``.
+        """
+        call_id = f"agy_call_{self.conversation_id}_{self.invocation_count}"
+        self.invocation_count += 1
+        self.pending_call_ids.append(call_id)
+        return call_id
+
+    def match_output_id(self) -> str:
+        """
+        Return the call id for the next tool result, pairing FIFO.
+
+        :returns: The oldest pending invocation's call id, or a fresh standalone
+            id (``agy_call_<conversation>_orphan_<n>``) when none is pending.
+        """
+        if self.pending_call_ids:
+            return self.pending_call_ids.pop(0)
+        call_id = f"agy_call_{self.conversation_id}_orphan_{self.orphan_output_count}"
+        self.orphan_output_count += 1
+        return call_id
+
 
 # RPC step type constants (CORTEX_STEP_TYPE_* enum values).
 _TYPE_USER_INPUT = "CORTEX_STEP_TYPE_USER_INPUT"
@@ -587,9 +677,10 @@ def map_step_to_events(
     Map one agy RPC step to Omnigent conversation-item events.
 
     This is the pure, no-delta, no-USER_INPUT mapping layer for the RPC-based
-    read path. It produces the same item types as
-    :func:`omnigent.antigravity_native_forwarder.step_to_events` minus the
-    ``external_output_text_delta`` event and minus the user-message mirror.
+    read path. It produces ``external_conversation_item`` events
+    (``message`` / ``function_call`` / ``function_call_output``) and emits no
+    ``external_output_text_delta`` and no user-message mirror (the user turn is
+    persisted by the direct ``POST /events`` hook).
 
     Mapping:
 

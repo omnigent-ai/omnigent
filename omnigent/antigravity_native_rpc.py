@@ -1,16 +1,20 @@
 """connect-RPC client for a running native Antigravity (agy) process.
 
-This is a **discovery / control helper** for
-:mod:`omnigent.antigravity_native_forwarder` (the read path that tails agy's
-transcript). It does NOT deliver turns: web/mobile turns are typed into the agy
-TUI over tmux (see :func:`omnigent.antigravity_native_bridge.inject_user_message_via_tui`
-and the executor), because a turn delivered over agy's ``SendAgentMessage`` RPC
-is recorded as a ``SYSTEM_MESSAGE`` ("not actually sent by the user"), not a
-``USER_INPUT`` — so the forwarder (which mirrors user turns from ``USER_INPUT``)
-would never commit the user's message. This module instead provides the two
-read-side capabilities the forwarder needs over agy's connect-RPC surface:
-**conversation-ownership discovery** and a (currently wired-off) **turn
-interrupt**.
+This is the **discovery / read / control helper** for the native agy paths: the
+RPC read driver (:mod:`omnigent.antigravity_native_reader`, which polls/streams
+trajectory steps to mirror agy's conversation) and the native executor
+(:mod:`omnigent.inner.antigravity_native_executor`, which delivers web/mobile
+turns). It provides, over agy's connect-RPC surface:
+
+* **conversation-ownership discovery** (:func:`resolve_language_server_port` /
+  :func:`get_trajectory_steps`) — the read side the reader binds to;
+* **turn delivery** via ``SendUserCascadeMessage``
+  (:func:`send_user_cascade_message`), which agy records as a real ``USER_INPUT``
+  turn — used by the executor instead of agy's ``SendAgentMessage`` RPC (which
+  agy records as a ``SYSTEM_MESSAGE``, "not actually sent by the user", and would
+  never mirror as a user turn) and instead of typing into the TUI over tmux;
+* **turn interrupt** via ``CancelCascadeSteps`` (:func:`cancel_cascade_steps`),
+  used by the executor's interrupt path.
 
 How agy exposes a control surface (verified end-to-end; see
 ``docs/claude/antigravity-sidecar-spike.md``):
@@ -27,10 +31,10 @@ How agy exposes a control surface (verified end-to-end; see
 * Ownership probe: ``POST .../GetConversationMetadata`` with REQUEST body
   ``{"conversationId": "<id>"}`` returns HTTP 200 whose RESPONSE echoes that id at
   ``metadata.rootConversationId`` for a hosted conversation, and HTTP 500
-  ("trajectory not found") for an unknown one — so the forwarder can confirm which
-  live agy owns a brain dir before binding it. (Request and response shapes
-  differ: the id is sent flat as ``conversationId`` and echoed nested under
-  ``metadata``.)
+  ("trajectory not found") for an unknown one — so a caller can confirm which
+  live agy owns a conversation before binding its port. (Request and response
+  shapes differ: the id is sent flat as ``conversationId`` and echoed nested
+  under ``metadata``.)
 
 Port discovery is **port-first**: it enumerates candidate loopback connect-RPC
 ports (see :func:`_candidate_agy_rpc_ports`) and, for each, checks whether its

@@ -25,8 +25,12 @@ import json
 from pathlib import Path
 from typing import Any, cast
 
-from omnigent.antigravity_native_forwarder import OutboundEvent, _ToolCallIdAllocator
-from omnigent.antigravity_native_steps import map_step_to_events, pending_interaction
+from omnigent.antigravity_native_steps import (
+    OutboundEvent,
+    _ToolCallIdAllocator,
+    map_step_to_events,
+    pending_interaction,
+)
 
 # ---------------------------------------------------------------------------
 # Fixture helpers

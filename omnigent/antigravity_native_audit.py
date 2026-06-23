@@ -1,4 +1,13 @@
-"""Post-hoc tool-call policy audit for the native Antigravity (agy) forwarder.
+"""Post-hoc tool-call policy audit helpers for native Antigravity (agy).
+
+.. note::
+    **Currently dormant.** This module's only consumer was the transcript
+    forwarder, retired in the Task 12 cutover. The RPC read path that superseded
+    it surfaces agy's ``request-review`` prompts as real-time Omnigent
+    elicitations (:mod:`omnigent.antigravity_native_interactions`) instead of a
+    post-hoc audit, so nothing wires these helpers today. They are kept (with
+    their unit tests) as the building blocks for a future post-hoc audit pass; the
+    references below to "the forwarder" are historical.
 
 **This is POST-HOC, NOT a blocking gate.** agy writes a transcript step only at
 ``DONE`` (after the tool has executed; there is no token streaming and no
@@ -27,9 +36,9 @@ This module owns the pure, unit-testable pieces of that flow:
   two conversation items the forwarder POSTs (the per-violation warning and the
   one-time audit-only degrade notice).
 
-The async POST + the OFF-by-default interrupt live in
-:mod:`omnigent.antigravity_native_forwarder` (they need the live Omnigent client
-and the connect-RPC port); they delegate the classification/rendering here.
+In the forwarder-era flow the async POST + the OFF-by-default interrupt lived in
+the (now-deleted) transcript forwarder, which needed the live Omnigent client and
+the connect-RPC port and delegated the classification/rendering here.
 
 **Phase used: ``PHASE_TOOL_CALL``.** Tool-name / cost / CEL deny policies fire on
 the ``tool_call`` phase (``event.type == "tool_call"``), so the audit must

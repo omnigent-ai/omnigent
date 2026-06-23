@@ -10,7 +10,6 @@ import os
 import subprocess
 import tempfile
 import time
-from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -164,35 +163,16 @@ class AntigravityNativeBridgeState:
         the forwarder overwrites once it discovers the real id.
     :param active_turn_id: Current agy turn id, if one is running,
         e.g. ``"turn_abc123"``.
-    :param forwarded_step_index: Highest agy transcript ``step_index`` the
-        forwarder has fully acked into the Omnigent session, or ``None`` before
-        any step has been acked. "Acked" means mirror-delivered AND — when the
-        post-hoc policy audit is enabled — fully audited (every violating tool
-        call's ``[Policy violation]`` warning POST delivered): the cursor advance
-        is gated on both, so a step at/below this index has had its mirror items
-        AND its violation warnings committed (at-least-once; see
-        :func:`omnigent.antigravity_native_forwarder._tail_transcript`).
-        Retained as a backward-compatible mirror of ``max(forwarded_steps)`` for
-        observability and downgrade safety; the authoritative resume cursor is
-        :attr:`forwarded_steps`. Persisted so a forwarder (re)start — a supervisor
-        crash-restart OR an ``omnigent antigravity --resume`` — re-POSTs only steps
-        *beyond* what was acked, instead of re-mirroring the whole transcript from
-        ``step_index`` 0 (external conversation items are persisted with a random
-        key and are NOT deduped server-side, so a re-post duplicates the transcript
-        — and a re-warn duplicates a ``[Policy violation]``, the accepted cost of
-        never silently dropping one).
-    :param forwarded_steps: The exact SET of agy transcript ``step_index`` values
-        the forwarder has fully acked for this conversation, or ``None`` on a
-        legacy state written before this field existed (fall back to the
-        :attr:`forwarded_step_index` ``<=`` floor then). This is the authoritative
-        resume cursor: a (re)start suppresses a step iff its index is a MEMBER of
-        this set, NOT ``<= forwarded_step_index``. The membership test is required
-        because agy ``step_index`` is BOTH non-contiguous (e.g. ``0→2→4``) AND
-        written out of order (e.g. ``14`` before ``13``, verified live): a ``<=``
-        floor advanced to ``14`` after acking a ``{12, 14}`` batch would suppress a
-        not-yet-written ``13`` on restart and silently drop it. With the set, an
-        un-acked ``13`` is simply absent and re-posted (at-least-once). The set
-        only grows (union per batch) and is reset on a conversation change.
+
+    .. note::
+        There is intentionally no durable read cursor. The retired transcript
+        forwarder persisted a ``forwarded_steps`` set (+ a ``forwarded_step_index``
+        mirror) so a tail (re)start did not re-mirror the whole JSONL. The RPC read
+        driver that superseded it (:mod:`omnigent.antigravity_native_reader`) keeps
+        an *in-memory* seen-set only and is recreated per session by the runner, so
+        no on-disk cursor is needed. Legacy ``forwarded_step_index`` /
+        ``forwarded_steps`` keys in an on-disk ``state.json`` are tolerated and
+        ignored on read.
 
     .. note::
         There is intentionally no ``agy_pid`` field. agy's pid is not stable to
@@ -211,8 +191,6 @@ class AntigravityNativeBridgeState:
     session_id: str
     conversation_id: str
     active_turn_id: str | None = None
-    forwarded_step_index: int | None = None
-    forwarded_steps: tuple[int, ...] | None = None
 
 
 def bridge_dir_for_bridge_id(bridge_id: str) -> Path:
@@ -281,14 +259,6 @@ def write_bridge_state(bridge_dir: Path, state: AntigravityNativeBridgeState) ->
                     "session_id": state.session_id,
                     "conversation_id": state.conversation_id,
                     "active_turn_id": state.active_turn_id,
-                    "forwarded_step_index": state.forwarded_step_index,
-                    # Sorted list for a deterministic on-disk payload; read back as
-                    # a set. ``None`` (legacy/no-cursor) is preserved as ``null``.
-                    "forwarded_steps": (
-                        sorted(state.forwarded_steps)
-                        if state.forwarded_steps is not None
-                        else None
-                    ),
                 },
                 handle,
                 sort_keys=True,
@@ -326,9 +296,12 @@ def read_bridge_state(bridge_dir: Path) -> AntigravityNativeBridgeState | None:
     """
     Read shared native Antigravity bridge state.
 
-    A legacy ``agy_pid`` key written by an older build is tolerated and
-    ignored (the field was removed — agy does not exist at launch, so the
-    executor always discovers the connect-RPC port at injection time).
+    Legacy ``agy_pid`` / ``forwarded_step_index`` / ``forwarded_steps`` keys
+    written by an older build are tolerated and ignored: ``agy_pid`` because agy
+    does not exist at launch (the executor always discovers the connect-RPC port
+    at injection time), and the two cursor keys because the durable read cursor
+    was retired with the transcript forwarder (the RPC reader keeps an in-memory
+    seen-set only).
 
     :param bridge_dir: Native Antigravity bridge directory.
     :returns: Parsed state, or ``None`` when no state exists or the file
@@ -346,7 +319,6 @@ def read_bridge_state(bridge_dir: Path) -> AntigravityNativeBridgeState | None:
     session_id = raw.get("session_id")
     conversation_id = raw.get("conversation_id")
     active_turn_id = raw.get("active_turn_id")
-    forwarded_step_index = raw.get("forwarded_step_index")
     # Validate required string fields are non-empty strings.
     if not isinstance(session_id, str) or not session_id:
         return None
@@ -355,42 +327,10 @@ def read_bridge_state(bridge_dir: Path) -> AntigravityNativeBridgeState | None:
     parsed_active_turn_id = (
         active_turn_id if isinstance(active_turn_id, str) and active_turn_id else None
     )
-    # ``bool`` is a subclass of ``int``; reject it so a stray ``true`` cannot be
-    # read back as a step index of 1. A negative value is also rejected (the
-    # high-water sentinel is -1 in memory, but only non-negative real indices
-    # are ever persisted).
-    parsed_forwarded_step_index = (
-        forwarded_step_index
-        if isinstance(forwarded_step_index, int)
-        and not isinstance(forwarded_step_index, bool)
-        and forwarded_step_index >= 0
-        else None
-    )
-    # ``forwarded_steps`` is the authoritative resume cursor (the explicit set of
-    # acked step indices). Absent → ``None`` (legacy state: fall back to the
-    # ``forwarded_step_index`` floor). Present-but-not-a-list, or any element that
-    # is not a non-negative int (reject bool — a subclass of int — so a stray
-    # ``true`` is not read back as step 1), is treated as absent rather than
-    # raising: the cursor is a regenerable cache, and re-deriving it from offset 0
-    # only re-posts (at-least-once), never drops.
-    forwarded_steps = raw.get("forwarded_steps")
-    parsed_forwarded_steps = (
-        tuple(
-            sorted(
-                value
-                for value in forwarded_steps
-                if isinstance(value, int) and not isinstance(value, bool) and value >= 0
-            )
-        )
-        if isinstance(forwarded_steps, list)
-        else None
-    )
     return AntigravityNativeBridgeState(
         session_id=session_id,
         conversation_id=conversation_id,
         active_turn_id=parsed_active_turn_id,
-        forwarded_step_index=parsed_forwarded_step_index,
-        forwarded_steps=parsed_forwarded_steps,
     )
 
 
@@ -403,15 +343,8 @@ def update_conversation_id(
     Update the agy conversation id in bridge state.
 
     Used when a native agy action creates a fresh conversation while the
-    Omnigent session stays the same.
-
-    The resume cursor (both the ``forwarded_steps`` set and its
-    ``forwarded_step_index`` mirror) is per-conversation: when *conversation_id*
-    differs from the stored one (a genuinely new agy conversation) the cursor is
-    reset to ``None`` so the new transcript is mirrored from its first step. When
-    it is unchanged (an idempotent re-persist on a forwarder restart that
-    rediscovered the same id) the cursor is preserved so already-mirrored steps
-    are not re-posted.
+    Omnigent session stays the same (e.g. the runner cold-start replacing the
+    ``agy_conv_*`` placeholder with agy's real cascade id).
 
     :param bridge_dir: Native Antigravity bridge directory.
     :param conversation_id: New agy conversation id, e.g.
@@ -423,105 +356,12 @@ def update_conversation_id(
     state = read_bridge_state(bridge_dir)
     if state is None:
         return
-    same_conversation = conversation_id == state.conversation_id
-    forwarded_step_index = state.forwarded_step_index if same_conversation else None
-    forwarded_steps = state.forwarded_steps if same_conversation else None
     write_bridge_state(
         bridge_dir,
         AntigravityNativeBridgeState(
             session_id=state.session_id,
             conversation_id=conversation_id,
             active_turn_id=active_turn_id,
-            forwarded_step_index=forwarded_step_index,
-            forwarded_steps=forwarded_steps,
-        ),
-    )
-
-
-def update_forwarded_step_index(bridge_dir: Path, forwarded_step_index: int) -> None:
-    """
-    Persist the highest agy transcript step index already mirrored.
-
-    Legacy ``<=``-floor cursor writer, retained for direct callers/tests.
-    :func:`update_forwarded_steps` is the cursor writer the forwarder uses now (it
-    records the exact acked SET, which the resume path needs to avoid dropping a
-    not-yet-written out-of-order step). Monotonic: a lower value than the stored
-    one is ignored, so an out-of-order or stale write can never rewind the cursor
-    and cause re-posts. A no-op when no state exists. The ``forwarded_steps`` set,
-    if any, is preserved verbatim (this writer only touches the int mirror).
-
-    :param bridge_dir: Native Antigravity bridge directory.
-    :param forwarded_step_index: Highest mirrored agy ``step_index``, e.g.
-        ``14``.
-    :returns: None.
-    """
-    state = read_bridge_state(bridge_dir)
-    if state is None:
-        return
-    stored = state.forwarded_step_index
-    if stored is not None and forwarded_step_index <= stored:
-        return
-    write_bridge_state(
-        bridge_dir,
-        AntigravityNativeBridgeState(
-            session_id=state.session_id,
-            conversation_id=state.conversation_id,
-            active_turn_id=state.active_turn_id,
-            forwarded_step_index=forwarded_step_index,
-            forwarded_steps=state.forwarded_steps,
-        ),
-    )
-
-
-def update_forwarded_steps(bridge_dir: Path, delivered_steps: Iterable[int]) -> None:
-    """
-    Persist (union into) the SET of agy transcript step indices already acked.
-
-    Called by the forwarder after each batch with the steps it fully acked this
-    batch (mirror-delivered AND, under audit, fully warned). The stored
-    :attr:`AntigravityNativeBridgeState.forwarded_steps` is the authoritative
-    resume cursor: a (re)start re-reads the transcript from offset 0 and suppresses
-    a step iff its index is a MEMBER of this set, so a step that was NEVER acked —
-    including a lower index agy wrote out of order *after* a higher one, in a batch
-    that landed after the cursor was last persisted — is absent and re-posted
-    (at-least-once) rather than silently dropped by a ``<=`` floor.
-
-    Monotonic by union: the set only grows, so a stale or out-of-order write can
-    never un-ack a step. The ``forwarded_step_index`` mirror is set to the max of
-    the union (backward-compat / downgrade observability). A no-op when no state
-    exists, or when *delivered_steps* adds nothing new.
-
-    :param bridge_dir: Native Antigravity bridge directory.
-    :param delivered_steps: Step indices acked this batch, e.g. ``{12, 14}``.
-    :returns: None.
-    """
-    state = read_bridge_state(bridge_dir)
-    if state is None:
-        return
-    if state.forwarded_steps is not None:
-        stored = set(state.forwarded_steps)
-    elif state.forwarded_step_index is not None:
-        # Upgrading a legacy ``<=``-floor state (no set yet): materialize the floor
-        # into the set so the already-acked prefix ``[0..floor]`` is preserved when
-        # we switch to set-mode. Suppressing the non-existent indices in that range
-        # on a later restart is harmless (they never appear). Without this, the
-        # first set write would record only the NEW steps, and the next restart —
-        # seeing ``forwarded_steps`` present — would ignore the floor and re-post
-        # (duplicate) the entire legacy prefix.
-        stored = set(range(state.forwarded_step_index + 1))
-    else:
-        stored = set()
-    union = stored | {step for step in delivered_steps if step >= 0}
-    if union == stored:
-        return
-    write_bridge_state(
-        bridge_dir,
-        AntigravityNativeBridgeState(
-            session_id=state.session_id,
-            conversation_id=state.conversation_id,
-            active_turn_id=state.active_turn_id,
-            forwarded_step_index=max(union),
-            forwarded_steps=tuple(sorted(union)),
         ),
     )
 

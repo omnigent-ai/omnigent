@@ -165,9 +165,13 @@ def should_skip_permissions(
       the SDK/headless flavors run unattended.
 
     For a non-bypass, interactive (attended) launch the flag is omitted so agy's
-    default ``request-review`` prompts the attached user per tool — Omnigent's
-    own policy gate is post-hoc/audit-only here (it cannot pre-empt the tool;
-    see :mod:`omnigent.antigravity_native_forwarder`).
+    default ``request-review`` prompts the user per tool — answered by the
+    attached TTY (CLI) or, on the host-spawned web path, surfaced as a real-time
+    Omnigent elicitation by the RPC read driver's interaction bridge (see
+    :mod:`omnigent.antigravity_native_reader` /
+    :mod:`omnigent.antigravity_native_interactions`). agy exposes no firing
+    pre-tool hook, so Omnigent cannot pre-empt a tool before it runs; the
+    elicitation card is the honest gate.
 
     .. warning:: The ``headless`` argument is currently derived from the
        launching process's TTY (``_launch_is_headless`` in
