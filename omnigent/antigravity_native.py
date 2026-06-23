@@ -6,6 +6,12 @@ It creates or binds an Omnigent session, launches ``agy`` in a runner-owned
 tmux terminal resource, then attaches the local TTY (directly to the
 runner's tmux when same-machine, else over the WebSocket PTY bridge).
 
+The RPC read driver (Task 12+) replaced the retired transcript-tail forwarder:
+the reader mirrors agy's steps over connect-RPC, and web turns are delivered via
+the ``SendUserCascadeMessage`` RPC, not by typing into the TUI over tmux
+send-keys. (Comments below that name those retired mechanisms only explain a
+specific current behaviour they were replaced by.)
+
 Differences from the Codex / Claude wrappers (Phase 1 scope):
 
 * **No separate app-server.** agy self-hosts its local control surface, so
@@ -14,13 +20,12 @@ Differences from the Codex / Claude wrappers (Phase 1 scope):
 * **RPC mirroring (read path) and RPC web-turn delivery (write path).** agy's
   conversation mirrors into the Omnigent chat view via the RPC read driver
   (:mod:`omnigent.antigravity_native_reader`), which polls/streams agy's
-  connect-RPC trajectory steps (the read path) — it superseded the transcript-tail
-  forwarder, retired in the Task 12 cutover. Web-UI turns are delivered into the
-  native agy conversation (the write path) by the native executor
+  connect-RPC trajectory steps. Web-UI turns are delivered into the native agy
+  conversation (the write path) by the native executor
   (:mod:`omnigent.inner.antigravity_native_executor`) over the connect-RPC
   ``SendUserCascadeMessage`` method, which agy records as a real ``USER_INPUT``
-  turn — NOT ``SendAgentMessage`` (recorded as a ``SYSTEM_MESSAGE``) and no longer
-  by typing into the TUI over tmux send-keys (see the executor module).
+  turn — NOT ``SendAgentMessage`` (recorded as a ``SYSTEM_MESSAGE``, which would
+  never mirror as a user turn; see the executor module).
 * **Per-session identity is minted at cold-start, not assigned at launch.** agy
   mints its own UUID conversation and ignores the launcher's
   ``ANTIGRAVITY_CONVERSATION_ID`` (verified empirically). A fresh launch seeds an
@@ -927,8 +932,7 @@ async def _launch_and_record(
 
     No durable read cursor is seeded: the RPC read driver that mirrors agy's
     conversation (:mod:`omnigent.antigravity_native_reader`) keeps an in-memory
-    seen-set only — the transcript forwarder's ``forwarded_steps`` resume cursor
-    was retired in the Task 12 cutover.
+    seen-set only.
 
     :param client: HTTP client pointed at the Omnigent server.
     :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
@@ -988,7 +992,7 @@ async def _launch_and_record(
     # resume; the ``agy_conv_*`` placeholder on a fresh launch — the attach-time
     # cold-start replaces it with agy's real cascade id once agy is live, so the
     # RPC reader binds the real conversation). No durable read cursor is seeded
-    # (the reader keeps an in-memory seen-set; the forwarder cursor was retired).
+    # (the reader keeps an in-memory seen-set).
     await asyncio.to_thread(
         write_bridge_state,
         bridge_dir,
@@ -1040,12 +1044,11 @@ async def _attach_terminal(
         UI through the reader + executor — so the TUI looking empty while web
         turns flow is inherent to the RPC model, not a bug.
 
-        Unlike the retired transcript forwarder, the reader does NOT have
-        refresh-capable auth here: it snapshots ``headers`` (the local server has
-        none; a remote server's bearer is used for its lifetime — ``recover``
-        refreshes the *attach* headers on reconnect but not the reader's client).
-        The post-hoc policy audit the forwarder ran is dropped; real-time
-        elicitation is the enforcement surface now.
+        The reader does NOT have refresh-capable auth here: it snapshots
+        ``headers`` (the local server has none; a remote server's bearer is used
+        for its lifetime — ``recover`` refreshes the *attach* headers on reconnect
+        but not the reader's client). There is no pre-tool policy audit on this
+        path; real-time elicitation is the enforcement surface now.
 
     :param base_url: Omnigent server base URL.
     :param headers: HTTP auth headers (mutated in place by ``recover``).

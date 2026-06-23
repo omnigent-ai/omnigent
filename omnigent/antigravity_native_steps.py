@@ -151,6 +151,24 @@ _STATUS_DONE = "CORTEX_STEP_STATUS_DONE"
 _STATUS_WAITING = "CORTEX_STEP_STATUS_WAITING"
 
 
+def _source_traj_info(step: dict[str, object]) -> dict[str, object] | None:
+    """
+    Return a step's ``metadata.sourceTrajectoryStepInfo`` block, or ``None``.
+
+    The shared accessor for :func:`_step_index` and :func:`_trajectory_id`, which
+    both read fields out of this block. Returns ``None`` when ``metadata`` or the
+    nested block is missing or not a dict.
+
+    :param step: One step dict from ``GetCascadeTrajectorySteps``.
+    :returns: The ``sourceTrajectoryStepInfo`` dict, or ``None`` when absent.
+    """
+    metadata = step.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    traj_info = metadata.get("sourceTrajectoryStepInfo")
+    return traj_info if isinstance(traj_info, dict) else None
+
+
 def _step_index(step: dict[str, object]) -> int | None:
     """
     Extract the trajectory step index from a RPC step dict.
@@ -164,11 +182,8 @@ def _step_index(step: dict[str, object]) -> int | None:
     :returns: The step index as ``int``, or ``None`` when absent or
         non-numeric.
     """
-    metadata = step.get("metadata")
-    if not isinstance(metadata, dict):
-        return None
-    traj_info = metadata.get("sourceTrajectoryStepInfo")
-    if not isinstance(traj_info, dict):
+    traj_info = _source_traj_info(step)
+    if traj_info is None:
         return None
     idx = traj_info.get("stepIndex")
     if isinstance(idx, int):
@@ -209,11 +224,8 @@ def _trajectory_id(step: dict[str, object]) -> str | None:
     :param step: One step dict from ``GetCascadeTrajectorySteps``.
     :returns: The trajectory id string, or ``None`` when absent.
     """
-    metadata = step.get("metadata")
-    if not isinstance(metadata, dict):
-        return None
-    traj_info = metadata.get("sourceTrajectoryStepInfo")
-    if not isinstance(traj_info, dict):
+    traj_info = _source_traj_info(step)
+    if traj_info is None:
         return None
     tid = traj_info.get("trajectoryId")
     return tid if isinstance(tid, str) else None

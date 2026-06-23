@@ -499,6 +499,42 @@ class AntigravityRpcError(Exception):
     """
 
 
+def _post_rpc_raising(port: int, method: str, body: dict[str, object]) -> None:
+    """
+    POST a JSON body to a functional connect-RPC method, raising on any failure.
+
+    The shared request tail for the functional, raise-on-error RPCs
+    (:func:`handle_user_interaction`, :func:`send_user_cascade_message`,
+    :func:`start_cascade`): build + loopback-check the URL, POST ``body`` as JSON
+    on a :data:`_RPC_CALL_TIMEOUT_S` sync client, and normalize failures so every
+    caller has a single :class:`AntigravityRpcError` type to catch — transport
+    errors are wrapped, and a non-2xx raises with the RAW response body text (NOT
+    ``raise_for_status()``) so callers can detect agy's overloaded error strings
+    (e.g. ``"input not registered for step N"``).
+
+    :param port: Validated connect-RPC port, e.g. ``52548``.
+    :param method: LanguageServerService method name, e.g.
+        ``"SendUserCascadeMessage"``.
+    :param body: The request object to JSON-encode and POST.
+    :returns: ``None`` on success (HTTP < 400).
+    :raises AntigravityRpcError: On a transport error (wrapped) or any HTTP
+        status >= 400 (message is the raw response body text).
+    """
+    url = _rpc_url(port, method)
+    _assert_loopback_url(url)
+    try:
+        with _sync_client(_RPC_CALL_TIMEOUT_S) as client:
+            response = client.post(
+                url,
+                headers={"Content-Type": "application/json"},
+                content=json.dumps(body).encode("utf-8"),
+            )
+    except httpx.HTTPError as e:
+        raise AntigravityRpcError(f"transport error contacting agy: {e}") from e
+    if response.status_code >= 400:
+        raise AntigravityRpcError(response.text)
+
+
 def handle_user_interaction(
     port: int,
     cascade_id: str,
@@ -533,23 +569,11 @@ def handle_user_interaction(
         body text is the message (NOT ``raise_for_status()``) so callers can
         detect the overloaded ``"input not registered for step N"`` string.
     """
-    url = _rpc_url(port, _METHOD_HANDLE_CASCADE_USER_INTERACTION)
-    _assert_loopback_url(url)
     body: dict[str, object] = {
         "cascadeId": cascade_id,
         "interaction": {"trajectoryId": trajectory_id, "stepIndex": step_index, **payload},
     }
-    try:
-        with _sync_client(_RPC_CALL_TIMEOUT_S) as client:
-            response = client.post(
-                url,
-                headers={"Content-Type": "application/json"},
-                content=json.dumps(body).encode("utf-8"),
-            )
-    except httpx.HTTPError as e:
-        raise AntigravityRpcError(f"transport error contacting agy: {e}") from e
-    if response.status_code >= 400:
-        raise AntigravityRpcError(response.text)
+    _post_rpc_raising(port, _METHOD_HANDLE_CASCADE_USER_INTERACTION, body)
 
 
 def send_user_cascade_message(
@@ -595,24 +619,12 @@ def send_user_cascade_message(
         model/validation errors (e.g. "neither PlanModel nor RequestedModel
         specified") directly. Mirrors :func:`handle_user_interaction`.
     """
-    url = _rpc_url(port, _METHOD_SEND_USER_CASCADE_MESSAGE)
-    _assert_loopback_url(url)
     body: dict[str, object] = {
         "cascadeId": cascade_id,
         "items": [{"text": text}],
         "cascadeConfig": {"plannerConfig": {"planModel": plan_model}},
     }
-    try:
-        with _sync_client(_RPC_CALL_TIMEOUT_S) as client:
-            response = client.post(
-                url,
-                headers={"Content-Type": "application/json"},
-                content=json.dumps(body).encode("utf-8"),
-            )
-    except httpx.HTTPError as e:
-        raise AntigravityRpcError(f"transport error contacting agy: {e}") from e
-    if response.status_code >= 400:
-        raise AntigravityRpcError(response.text)
+    _post_rpc_raising(port, _METHOD_SEND_USER_CASCADE_MESSAGE, body)
 
 
 def start_cascade(
@@ -653,20 +665,8 @@ def start_cascade(
         message (NOT ``raise_for_status()``) so the runner can surface agy's
         error verbatim. Mirrors :func:`send_user_cascade_message`.
     """
-    url = _rpc_url(port, _METHOD_START_CASCADE)
-    _assert_loopback_url(url)
     body: dict[str, object] = {"cascadeId": cascade_id, "source": source}
-    try:
-        with _sync_client(_RPC_CALL_TIMEOUT_S) as client:
-            response = client.post(
-                url,
-                headers={"Content-Type": "application/json"},
-                content=json.dumps(body).encode("utf-8"),
-            )
-    except httpx.HTTPError as e:
-        raise AntigravityRpcError(f"transport error contacting agy: {e}") from e
-    if response.status_code >= 400:
-        raise AntigravityRpcError(response.text)
+    _post_rpc_raising(port, _METHOD_START_CASCADE, body)
 
 
 def get_available_models(port: int) -> dict[str, object]:
