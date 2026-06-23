@@ -771,22 +771,33 @@ def _listing_for_provider(
 def _static_subscription_listing(provider: ResolvedModelProvider) -> ModelListing:
     """Build the curated static listing for a no-listing-API provider.
 
-    Covers the subscription CLI logins (claude / codex) and cursor — none of
-    which expose an enumerable listing at resolve time.
+    Covers the subscription CLI logins (claude / codex) and cursor. The
+    subscription CLIs expose no model-listing API at all, whereas cursor is
+    an SDK harness whose ``cursor-agent models`` command does exist but is
+    account-scoped/auth-gated and is not enumerated here — so each gets a
+    note that states the correct reason its listing is static.
 
     :param provider: A ``kind="subscription"`` provider descriptor.
     :returns: A ``source="static"`` listing with ``verified=False``.
     """
     ids = _SUBSCRIPTION_STATIC_MODELS.get(provider.cli or "", ())
+    if provider.cli == "cursor":
+        note = (
+            "curated static model set for the cursor-native SDK harness "
+            "(no listing API is enumerated here; availability depends on "
+            "the logged-in Cursor plan)"
+        )
+    else:
+        note = (
+            f"curated aliases for the {provider.cli or 'unknown'} CLI login "
+            "(subscription logins expose no model-listing API; availability "
+            "depends on the logged-in plan)"
+        )
     return ModelListing(
         source="static",
         verified=False,
         models=tuple(ModelEntry(id=i, family=model_family_token(i)) for i in ids),
-        note=(
-            f"curated aliases for the {provider.cli or 'unknown'} CLI login "
-            "(subscription logins expose no model-listing API; availability "
-            "depends on the logged-in plan)"
-        ),
+        note=note,
     )
 
 

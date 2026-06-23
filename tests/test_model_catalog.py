@@ -763,6 +763,36 @@ def test_cursor_native_listing_is_static_without_key(
     assert "gpt-5.5" in ids
 
 
+def test_cursor_native_listing_keeps_non_gpt_families(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Cursor's curated list survives intact across gpt/claude/gemini families.
+
+    Regression guard for the multi-model contract: cursor-native is treated as
+    a multi-vendor harness and is NOT in any single-vendor reject set, so the
+    family filter in ``list_models_for_worker`` must keep non-GPT ids too. If
+    someone later added cursor to a single-family set, the gemini/claude/
+    composer ids would be silently dropped and only GPT ids would survive —
+    this asserts representative non-GPT ids from
+    ``_SUBSCRIPTION_STATIC_MODELS["cursor"]`` stay present.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    _isolate_config(monkeypatch, tmp_path, "")
+    monkeypatch.delenv("CURSOR_API_KEY", raising=False)
+
+    spec = _worker_spec("cursor-native", model="gpt-5.5")
+    listing = list_models_for_worker(spec, "cursor-native")
+
+    assert listing.source == "static"
+    ids = {m.id for m in listing.models}
+    # Non-GPT families and the cursor-only aliases must all survive the filter.
+    assert "gemini-3.1-pro" in ids
+    assert "claude-opus-4-8" in ids
+    assert "composer-2.5" in ids
+
+
 def test_catalog_reports_cursor_subagent_as_static(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
