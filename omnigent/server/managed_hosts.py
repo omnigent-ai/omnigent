@@ -198,11 +198,16 @@ _HOST_LOG_PATH = "/tmp/omnigent-host.log"
 
 # How long a message POST waits for an in-flight managed launch to
 # settle before giving up (see ManagedLaunchTracker). Covers the full
-# launch pipeline: sandbox provision + host registration
-# (MANAGED_HOST_ONLINE_TIMEOUT_S) plus runner spawn/connect, with
-# slack. The wait resolves as soon as the launch settles — this bound
-# only matters when the background launch is itself stuck.
-MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S = MANAGED_HOST_ONLINE_TIMEOUT_S + 60
+# launch/wake pipeline ON TOP OF the host-registration wait
+# (MANAGED_HOST_ONLINE_TIMEOUT_S): the provider's provision/resume call
+# (StartSandbox has no fixed upper bound), the host-tunnel reconnect on
+# this replica, and the runner spawn/connect. The 120s slack must cover
+# all of those so a slow cold launch/wake doesn't time the parked message
+# out before the background launch settles — otherwise the first
+# post-dormancy turn is lost even though the wake later succeeds. The wait
+# resolves as soon as the launch settles, so this bound only bites a
+# genuinely slow launch.
+MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S = MANAGED_HOST_ONLINE_TIMEOUT_S + 120
 
 # Session label recording the repository-URL workspace a managed
 # session was created with (the raw ``<url>[#<branch>]`` request
