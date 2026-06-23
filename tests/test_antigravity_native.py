@@ -868,7 +868,7 @@ async def test_cli_cold_start_mints_and_patches_external_session_id(
     bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_cs")
     _seed_bridge_state(bridge_dir, "agy_conv_placeholder")
 
-    monkeypatch.setattr(_mod, "_candidate_agy_rpc_ports", lambda: [52548])
+    monkeypatch.setattr(_mod, "resolve_cold_start_agy_rpc_port", lambda _sock, _tgt: 52548)
     started: list[tuple[int, str]] = []
     monkeypatch.setattr(_mod, "start_cascade", lambda port, cid: started.append((port, cid)))
 
@@ -922,10 +922,10 @@ async def test_cli_cold_start_skips_when_conversation_already_real(
     real_id = "68caaeac-2eaf-4e2c-9b95-721b022f4903"
     _seed_bridge_state(bridge_dir, real_id)
 
-    def _fail_ports() -> list[int]:
+    def _fail_ports(_sock: object, _tgt: object) -> int | None:
         raise AssertionError("cold-start must not probe ports on a non-placeholder (resume) id")
 
-    monkeypatch.setattr(_mod, "_candidate_agy_rpc_ports", _fail_ports)
+    monkeypatch.setattr(_mod, "resolve_cold_start_agy_rpc_port", _fail_ports)
 
     def _fail_client(**_kwargs: object) -> httpx.AsyncClient:
         raise AssertionError("cold-start must not PATCH on a resume id")
@@ -961,7 +961,7 @@ async def test_cli_cold_start_logs_when_patch_rejected(
     bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_cs_reject")
     _seed_bridge_state(bridge_dir, "agy_conv_placeholder")
 
-    monkeypatch.setattr(_mod, "_candidate_agy_rpc_ports", lambda: [52548])
+    monkeypatch.setattr(_mod, "resolve_cold_start_agy_rpc_port", lambda _sock, _tgt: 52548)
     started: list[tuple[int, str]] = []
     monkeypatch.setattr(_mod, "start_cascade", lambda port, cid: started.append((port, cid)))
 
@@ -991,3 +991,102 @@ async def test_cli_cold_start_logs_when_patch_rejected(
     assert after is not None
     assert after.conversation_id == started[0][1]
     assert "rejected external_session_id PATCH (404)" in caplog.text
+
+
+async def test_cli_cold_start_scopes_to_pane_agy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    With several agy candidates, the CLI cold-start binds THIS session's pane agy.
+
+    Mirrors the runner cross-bind fix on the CLI fallback: when a pane is
+    threaded in and the pane-scoped resolver yields a port, ``StartCascade``
+    targets THAT port (61000) even though a lower foreign candidate (52548)
+    exists. Exercises the REAL ``resolve_cold_start_agy_rpc_port`` dispatch by
+    stubbing its rpc-module seams.
+    """
+    import omnigent.antigravity_native_rpc as rpc
+
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_cs_pane")
+    _seed_bridge_state(bridge_dir, "agy_conv_placeholder")
+
+    # The pane scopes to a higher agy's port; a lower FOREIGN candidate exists.
+    monkeypatch.setattr(rpc, "resolve_pane_agy_rpc_port", lambda _sock, _tgt: 61000)
+    monkeypatch.setattr(rpc, "_candidate_agy_rpc_ports", lambda: [52548, 61000])
+    started: list[tuple[int, str]] = []
+    monkeypatch.setattr(_mod, "start_cascade", lambda port, cid: started.append((port, cid)))
+
+    def _ok(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={})
+
+    real_async_client = httpx.AsyncClient
+
+    def _mock_async_client(**kwargs: object) -> httpx.AsyncClient:
+        kwargs.pop("transport", None)
+        return real_async_client(transport=httpx.MockTransport(_ok), **kwargs)
+
+    monkeypatch.setattr(_mod.httpx, "AsyncClient", _mock_async_client)
+
+    await _mod._cold_start_agy_conversation(
+        bridge_dir,
+        "conv_cs",
+        base_url="http://test",
+        headers={},
+        tmux_socket=tmp_path / "agy.sock",
+        tmux_target="main",
+        timeout_s=1.0,
+    )
+
+    # StartCascade fired on the PANE-SCOPED port, NOT candidates[0] (52548).
+    assert len(started) == 1
+    assert started[0][0] == 61000
+
+
+async def test_cli_cold_start_falls_back_when_no_pane(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    No local pane (``tmux_socket``/``tmux_target`` is ``None``) → lowest candidate.
+
+    Preserves the current CLI behavior for the WebSocket-attach / remote-runner
+    path that has no local tmux socket: the cold-start falls back to
+    ``_candidate_agy_rpc_ports()[0]`` and never consults the pane-scoped resolver.
+    """
+    import omnigent.antigravity_native_rpc as rpc
+
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_cs_nopane")
+    _seed_bridge_state(bridge_dir, "agy_conv_placeholder")
+
+    def _no_pane_scope(_sock: object, _tgt: object) -> int | None:
+        raise AssertionError("no pane → the pane-scoped resolver must not be consulted")
+
+    monkeypatch.setattr(rpc, "resolve_pane_agy_rpc_port", _no_pane_scope)
+    monkeypatch.setattr(rpc, "_candidate_agy_rpc_ports", lambda: [52548, 61000])
+    started: list[tuple[int, str]] = []
+    monkeypatch.setattr(_mod, "start_cascade", lambda port, cid: started.append((port, cid)))
+
+    def _ok(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={})
+
+    real_async_client = httpx.AsyncClient
+
+    def _mock_async_client(**kwargs: object) -> httpx.AsyncClient:
+        kwargs.pop("transport", None)
+        return real_async_client(transport=httpx.MockTransport(_ok), **kwargs)
+
+    monkeypatch.setattr(_mod.httpx, "AsyncClient", _mock_async_client)
+
+    await _mod._cold_start_agy_conversation(
+        bridge_dir,
+        "conv_cs",
+        base_url="http://test",
+        headers={},
+        tmux_socket=None,
+        tmux_target=None,
+        timeout_s=1.0,
+    )
+
+    assert len(started) == 1
+    assert started[0][0] == 52548  # lowest candidate, pane resolver never called

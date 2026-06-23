@@ -1909,28 +1909,10 @@ async def _auto_create_antigravity_terminal(
         ),
     )
 
-    # Cold-start the conversation over connect-RPC on a FRESH launch so the
-    # executor's turn-1 has a real cascade id (no send-keys, no waiting for the
-    # TUI to lazily mint one): the runner mints the cascade via ``StartCascade``,
-    # writes that real id into bridge state (replacing the ``agy_conv_*``
-    # placeholder seeded above), and PATCHes it onto the session as
-    # ``external_session_id`` so a later ``--resume`` continues it. Resume launches
-    # already hold agy's real id (``external_session_id``), so cold-starting would
-    # create a second empty conversation — skip it. Best-effort and NON-RAISING
-    # (see ``_cold_start_agy_conversation``): a failure leaves the placeholder and
-    # the reader simply keeps polling discovery until a real id appears, so this
-    # stays inside the "nothing fallible between terminal registration and reader
-    # start" window. Done BEFORE the reader spawns so the reader binds the real id.
-    if not resume:
-        await _cold_start_agy_conversation(
-            bridge_dir,
-            session_id,
-            server_client=server_client,
-            timeout_s=_AGY_COLD_START_PORT_TIMEOUT_S,
-        )
-
-    # Resolve THIS session's own agy tmux pane (pane pid → agy child) for the
-    # first-turn TUI bootstrap advertised below. The RPC reader discovers its own
+    # Resolve THIS session's own agy tmux pane (socket + target). Used to scope
+    # the cold-start's ``StartCascade`` port to the agy running under this
+    # session's pane (so a multi-agy host cannot cross-bind to a foreign agy) AND,
+    # below, for the first-turn TUI bootstrap. The RPC reader discovers its own
     # connect-RPC port from bridge state (cascade id → port), so it needs no pane;
     # the pane is still required so the executor can type the FIRST web turn into
     # agy's TUI before any conversation exists. ``_terminal_tmux_pane`` is fully
@@ -1941,6 +1923,30 @@ async def _auto_create_antigravity_terminal(
     tmux_socket, tmux_target = _terminal_tmux_pane(
         resource_registry, session_id, "antigravity", "main"
     )
+
+    # Cold-start the conversation over connect-RPC on a FRESH launch so the
+    # executor's turn-1 has a real cascade id (no send-keys, no waiting for the
+    # TUI to lazily mint one): the runner mints the cascade via ``StartCascade``,
+    # writes that real id into bridge state (replacing the ``agy_conv_*``
+    # placeholder seeded above), and PATCHes it onto the session as
+    # ``external_session_id`` so a later ``--resume`` continues it. The pane
+    # (resolved above) scopes the ``StartCascade`` port to THIS session's agy.
+    # Resume launches already hold agy's real id (``external_session_id``), so
+    # cold-starting would create a second empty conversation — skip it.
+    # Best-effort and NON-RAISING (see ``_cold_start_agy_conversation``): a failure
+    # leaves the placeholder and the reader simply keeps polling discovery until a
+    # real id appears, so this stays inside the "nothing fallible between terminal
+    # registration and reader start" window. Done BEFORE the reader spawns so the
+    # reader binds the real id.
+    if not resume:
+        await _cold_start_agy_conversation(
+            bridge_dir,
+            session_id,
+            server_client=server_client,
+            tmux_socket=tmux_socket,
+            tmux_target=tmux_target,
+            timeout_s=_AGY_COLD_START_PORT_TIMEOUT_S,
+        )
 
     # Start the RPC streaming reader + interaction bridge server-side (the read
     # path that replaced the retired transcript forwarder). It mirrors agy's
@@ -2050,6 +2056,8 @@ async def _cold_start_agy_conversation(
     session_id: str,
     *,
     server_client: httpx.AsyncClient | None = None,
+    tmux_socket: Path | None = None,
+    tmux_target: str | None = None,
     timeout_s: float = _AGY_COLD_START_PORT_TIMEOUT_S,
 ) -> str | None:
     """
@@ -2057,15 +2065,20 @@ async def _cold_start_agy_conversation(
 
     The fresh-launch bootstrap: the runner mints the conversation over
     ``StartCascade`` so the executor's turn-1 has a real cascade id, instead of
-    waiting for the agy TUI to lazily create one on its first typed turn. With a
-    single runner-launched agy on the host, its connect-RPC port is the lone
-    ``Heartbeat``-answering candidate (the conversation-ownership check that
-    disambiguates multiple agys is not usable yet — no conversation exists), so
-    this polls :func:`omnigent.antigravity_native_rpc._candidate_agy_rpc_ports`
-    until a port binds, then ``StartCascade``s a runner-generated ``uuid4`` and
-    writes THAT real id into bridge state (replacing the ``agy_conv_*``
-    placeholder) so :func:`read_bridge_state` returns the real id and the
-    reader/executor address the cold-started conversation directly.
+    waiting for the agy TUI to lazily create one on its first typed turn. The
+    connect-RPC port is resolved by
+    :func:`omnigent.antigravity_native_rpc.resolve_cold_start_agy_rpc_port`:
+    scoped to THIS session's own agy via its tmux pane (``tmux_socket`` /
+    ``tmux_target``) so a host running several agy instances (sub-agent fan-out /
+    shared runner) cannot ``StartCascade`` onto a FOREIGN agy and permanently
+    cross-bind the session — the conversation-ownership check that normally
+    disambiguates is not usable yet (no conversation exists). When no local pane
+    is reachable (remote runner) or the pane cannot be resolved, it falls back to
+    the lowest ``Heartbeat``-answering candidate (current behavior). This polls
+    that resolver until a port binds, then ``StartCascade``s a runner-generated
+    ``uuid4`` and writes THAT real id into bridge state (replacing the
+    ``agy_conv_*`` placeholder) so :func:`read_bridge_state` returns the real id
+    and the reader/executor address the cold-started conversation directly.
 
     The cold-started id is also PATCHed onto the Omnigent session as
     ``external_session_id`` (best-effort, mirroring codex/pi) so a later
@@ -2094,6 +2107,11 @@ async def _cold_start_agy_conversation(
     :param server_client: Runner Omnigent server client used for the
         ``external_session_id`` PATCH. ``None`` skips the PATCH (the cascade id is
         still written to bridge state).
+    :param tmux_socket: This session's tmux socket path, used to scope the
+        ``StartCascade`` port to the agy running under this session's pane.
+        ``None`` (remote runner / no local pane) falls back to the candidate scan.
+    :param tmux_target: This session's tmux target (e.g. ``"main"``), paired with
+        ``tmux_socket`` for the pane-scoped port resolution.
     :param timeout_s: Total seconds to wait for agy's connect-RPC port to bind.
     :returns: The real (cold-started) cascade/conversation id on success, or
         ``None`` when no port answered in time or ``StartCascade`` failed.
@@ -2105,7 +2123,7 @@ async def _cold_start_agy_conversation(
     )
     from omnigent.antigravity_native_rpc import (
         AntigravityRpcError,
-        _candidate_agy_rpc_ports,
+        resolve_cold_start_agy_rpc_port,
         start_cascade,
     )
 
@@ -2122,12 +2140,11 @@ async def _cold_start_agy_conversation(
     deadline = time.monotonic() + timeout_s
     port: int | None = None
     while True:
-        candidates = await asyncio.to_thread(_candidate_agy_rpc_ports)
-        if candidates:
-            # The lone runner-launched agy is the only Heartbeat-answering
-            # candidate at this point (no conversation exists to disambiguate
-            # several, so take the lowest validated port).
-            port = candidates[0]
+        # Scope to THIS session's pane agy (avoids binding a foreign agy on a
+        # multi-agy host); falls back to the lowest validated candidate when no
+        # local pane is reachable or the pane is not resolvable yet.
+        port = await asyncio.to_thread(resolve_cold_start_agy_rpc_port, tmux_socket, tmux_target)
+        if port is not None:
             break
         if time.monotonic() >= deadline:
             _logger.warning(

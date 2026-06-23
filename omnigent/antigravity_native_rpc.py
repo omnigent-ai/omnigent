@@ -60,6 +60,7 @@ import os
 import struct
 import subprocess
 from collections.abc import AsyncIterator, Iterable
+from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
@@ -947,6 +948,271 @@ def discover_language_server_port(pid: int) -> int | None:
             _logger.debug("agy connect-RPC port resolved: pid=%s port=%s", pid, port)
             return port
     return None
+
+
+# Bound on how deep the pane->agy descendant walk descends, so a pathological or
+# cyclic process table cannot make the walk run unbounded. The real pane subtree
+# is shallow (pane shell -> [sandbox launcher -> bwrap ->] agy), far under this.
+_MAX_PANE_SUBTREE_DEPTH = 32
+
+
+def _pane_pid(socket_path: Path, tmux_target: str) -> int | None:
+    """
+    Return the pid of the process running in a tmux pane (best-effort).
+
+    Runs ``tmux -S <socket> display-message -p -t <target> '#{pane_pid}'`` (the
+    same socket-scoped ``tmux`` invocation style as the bridge capture helpers)
+    and parses the single pid it prints. Isolated as a seam so tests can stub the
+    subprocess.
+
+    The pane pid is the process tmux ``exec``-ed into the pane, which is agy
+    itself on the simple ``exec agy`` launch and the sandbox launcher (an agy
+    ancestor) on a sandboxed launch — :func:`_agy_pid_in_pane_subtree` resolves
+    the actual agy pid from it.
+
+    :param socket_path: Private tmux socket path for this session's terminal.
+    :param tmux_target: Tmux target (session name), e.g. ``"main"``.
+    :returns: The pane's pid, or ``None`` when ``tmux`` is missing, the pane is
+        gone (non-zero exit), or the output is not a single integer.
+    """
+    try:
+        completed = subprocess.run(
+            [
+                "tmux",
+                "-S",
+                str(socket_path),
+                "display-message",
+                "-p",
+                "-t",
+                tmux_target,
+                "#{pane_pid}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_LSOF_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        _logger.debug(
+            "tmux display-message failed resolving pane pid for target=%s socket=%s",
+            tmux_target,
+            socket_path,
+            exc_info=True,
+        )
+        return None
+    if completed.returncode != 0:
+        return None
+    text = completed.stdout.strip()
+    return int(text) if text.isdigit() else None
+
+
+def _child_pids(pid: int) -> list[int]:
+    """
+    Return the direct child pids of ``pid`` (best-effort).
+
+    Prefers ``pgrep -P <pid>`` (portable across Linux + macOS); on a host without
+    ``pgrep`` (e.g. a minimal container) falls back to scanning
+    ``/proc/<child>/stat`` for a matching ``PPid``. Mirrors the dual-path
+    strategy of :func:`_list_agy_pids`. A failure yields ``[]`` (the subtree walk
+    then simply finds no agy via this branch).
+
+    :param pid: Parent process id.
+    :returns: Direct child pids, or ``[]`` when none / unresolvable.
+    """
+    try:
+        completed = subprocess.run(
+            ["pgrep", "-P", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=_LSOF_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        _logger.debug("pgrep -P failed; falling back to /proc for children of %s", pid)
+        return _child_pids_from_proc(pid)
+    return [int(line) for line in completed.stdout.split() if line.isdigit()]
+
+
+def _child_pids_from_proc(pid: int) -> list[int]:
+    """
+    Enumerate direct child pids of ``pid`` via ``/proc/<child>/stat`` (no pgrep).
+
+    The Linux-only fallback for :func:`_child_pids`. ``/proc/<child>/stat`` field
+    4 is the PPid; a child matches when its PPid equals ``pid``. The comm field
+    (field 2) is parenthesized and may contain spaces, so PPid is read relative to
+    the LAST ``)`` rather than by naive whitespace split. Unreadable or vanished
+    entries are skipped; a missing ``/proc`` (non-Linux) yields ``[]``.
+
+    :param pid: Parent process id.
+    :returns: Direct child pids, or ``[]``.
+    """
+    children: list[int] = []
+    try:
+        entries = os.listdir(_PROC_FS)
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(os.path.join(_PROC_FS, entry, "stat"), encoding="ascii") as handle:
+                stat = handle.read()
+        except OSError:
+            continue  # process exited between listdir and open
+        close_paren = stat.rfind(")")
+        if close_paren == -1:
+            continue
+        fields = stat[close_paren + 1 :].split()
+        # After the ``)``, fields are: state(0) ppid(1) ... so ppid is index 1.
+        if len(fields) > 1 and fields[1].isdigit() and int(fields[1]) == pid:
+            children.append(int(entry))
+    return children
+
+
+def _agy_pid_in_pane_subtree(pane_pid: int) -> int | None:
+    """
+    Return the agy pid running at or beneath a tmux pane's process (best-effort).
+
+    The pane process is agy itself on the simple ``exec agy`` launch (CLI /
+    non-sandbox) and a wrapper (sandbox launcher -> bwrap -> ... -> agy) on a
+    sandboxed launch. So: if the pane pid is itself a live agy pid, return it;
+    otherwise breadth-first walk the pane pid's descendants and return the first
+    that is a live agy pid. The walk is intersected with :func:`_list_agy_pids`
+    (the same ``bin/agy`` cmdline match used everywhere) so a non-agy descendant
+    is never mistaken for agy, and is depth- and visited-bounded so a cyclic or
+    pathological process table cannot hang it.
+
+    :param pane_pid: The tmux pane's process id (from :func:`_pane_pid`).
+    :returns: The agy pid in the pane's subtree, or ``None`` when none is found
+        (the caller then falls back to the host-wide candidate scan).
+    """
+    agy_pids = set(_list_agy_pids())
+    if not agy_pids:
+        return None
+    if pane_pid in agy_pids:
+        return pane_pid
+    # Breadth-first descent, bounded by depth and visited-set so a cyclic ppid
+    # graph (or a re-parented pid) cannot loop forever.
+    visited: set[int] = {pane_pid}
+    frontier = [pane_pid]
+    for _depth in range(_MAX_PANE_SUBTREE_DEPTH):
+        if not frontier:
+            break
+        next_frontier: list[int] = []
+        for parent in frontier:
+            for child in _child_pids(parent):
+                if child in visited:
+                    continue
+                if child in agy_pids:
+                    return child
+                visited.add(child)
+                next_frontier.append(child)
+        frontier = next_frontier
+    return None
+
+
+def resolve_pane_agy_rpc_port(socket_path: Path, tmux_target: str) -> int | None:
+    """
+    Resolve THIS session's own agy connect-RPC port via its tmux pane.
+
+    The cold-start's disambiguation seam: before any conversation exists there is
+    nothing to confirm ownership with (:func:`resolve_language_server_port` needs
+    a conversation id), so on a host running several agy instances the lowest
+    Heartbeat-answering candidate (:func:`_candidate_agy_rpc_ports`) could be a
+    FOREIGN agy. Scoping the port to the agy process actually running under this
+    session's tmux pane removes that ambiguity: pane -> pane pid
+    (:func:`_pane_pid`) -> agy pid in its subtree (:func:`_agy_pid_in_pane_subtree`)
+    -> that pid's Heartbeat-validated connect-RPC port
+    (:func:`discover_language_server_port`).
+
+    Best-effort and non-raising: ``None`` at any step (no local pane / tmux gone,
+    no agy resolvable in the pane subtree, or agy's port not bound yet) tells the
+    caller to fall back to the existing candidate scan — so single-agy hosts and
+    remote runners (no local socket) keep their current behavior.
+
+    :param socket_path: Private tmux socket path for this session's terminal.
+    :param tmux_target: Tmux target (session name), e.g. ``"main"``.
+    :returns: The pane agy's validated connect-RPC port, or ``None`` when it
+        cannot be scoped (the caller then uses the candidate fallback).
+    """
+    pane_pid = _pane_pid(socket_path, tmux_target)
+    if pane_pid is None:
+        return None
+    agy_pid = _agy_pid_in_pane_subtree(pane_pid)
+    if agy_pid is None:
+        _logger.debug(
+            "no agy process found in tmux pane subtree (pane_pid=%s, target=%s)",
+            pane_pid,
+            tmux_target,
+        )
+        return None
+    port = discover_language_server_port(agy_pid)
+    if port is not None:
+        _logger.info(
+            "agy connect-RPC port scoped to pane: target=%s agy_pid=%s port=%s",
+            tmux_target,
+            agy_pid,
+            port,
+        )
+    return port
+
+
+def resolve_cold_start_agy_rpc_port(
+    tmux_socket: Path | None,
+    tmux_target: str | None,
+) -> int | None:
+    """
+    Pick the connect-RPC port a cold-start should ``StartCascade`` onto.
+
+    Cold-start runs BEFORE any conversation exists, so the conversation-ownership
+    check that normally disambiguates several agys
+    (:func:`resolve_language_server_port`) is not yet usable. To avoid binding a
+    FOREIGN agy on a host running several (sub-agent fan-out / shared runner /
+    ``omnigent run --server`` multi-session), this scopes the port to THIS
+    session's own agy via its tmux pane (:func:`resolve_pane_agy_rpc_port`).
+
+    Falls back to the lowest Heartbeat-answering candidate
+    (:func:`_candidate_agy_rpc_ports`) when the pane is unavailable — a remote
+    runner with no local socket (``tmux_socket``/``tmux_target`` is ``None``), or
+    a pane whose agy pid / port cannot be resolved yet — so single-agy hosts and
+    remote runners keep their existing behavior. The fallback is logged so a
+    wrong-agy bind on a multi-agy host is diagnosable.
+
+    :param tmux_socket: This session's tmux socket path, or ``None`` when no local
+        pane is reachable (remote runner).
+    :param tmux_target: This session's tmux target, or ``None`` as above.
+    :returns: The port to ``StartCascade`` onto, or ``None`` when neither the
+        pane nor any candidate has bound yet (the caller keeps polling).
+    """
+    if tmux_socket is not None and tmux_target is not None:
+        scoped = resolve_pane_agy_rpc_port(tmux_socket, tmux_target)
+        if scoped is not None:
+            return scoped
+        _logger.debug(
+            "agy cold-start: pane-scoped port not resolvable yet (target=%s); "
+            "trying the host-wide candidate scan",
+            tmux_target,
+        )
+    candidates = _candidate_agy_rpc_ports()
+    if not candidates:
+        return None
+    port = candidates[0]
+    if tmux_socket is None or tmux_target is None:
+        _logger.debug(
+            "agy cold-start: no local tmux pane to scope to; using the lowest "
+            "candidate connect-RPC port %s (single-agy hosts and remote runners "
+            "are unaffected; a multi-agy host risks a wrong-agy bind)",
+            port,
+        )
+    else:
+        _logger.warning(
+            "agy cold-start: falling back to the lowest candidate connect-RPC port "
+            "%s for pane target=%s (pane->agy-pid->port unresolved); on a host with "
+            "several agy instances this can bind a foreign agy",
+            port,
+            tmux_target,
+        )
+    return port
 
 
 def _candidate_agy_rpc_ports() -> list[int]:

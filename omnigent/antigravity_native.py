@@ -101,7 +101,7 @@ from omnigent.antigravity_native_launch import (
 from omnigent.antigravity_native_reader import run_reader_with_bridge
 from omnigent.antigravity_native_rpc import (
     AntigravityRpcError,
-    _candidate_agy_rpc_ports,
+    resolve_cold_start_agy_rpc_port,
     start_cascade,
 )
 from omnigent.claude_native import (
@@ -1077,6 +1077,12 @@ async def _attach_terminal(
                 prepared.session_id,
                 base_url=base_url,
                 headers=headers,
+                # Scope the StartCascade port to THIS session's pane agy so a
+                # multi-agy host cannot cross-bind to a foreign agy. The attach
+                # already knows the pane (direct-tmux attaches use it); a remote
+                # runner with no local socket falls back to the candidate scan.
+                tmux_socket=prepared.tmux_socket,
+                tmux_target=prepared.tmux_target,
             ),
             name="antigravity-native-cold-start",
         )
@@ -1142,6 +1148,8 @@ async def _cold_start_agy_conversation(
     *,
     base_url: str,
     headers: dict[str, str],
+    tmux_socket: Path | None = None,
+    tmux_target: str | None = None,
     timeout_s: float = _AGY_COLD_START_PORT_TIMEOUT_S,
 ) -> None:
     """
@@ -1153,10 +1161,14 @@ async def _cold_start_agy_conversation(
     write that id into bridge state, replacing the ``agy_conv_*`` placeholder
     :func:`_launch_and_record` seeded — so the RPC reader binds the real
     conversation and web turns resolve, instead of the reader polling the
-    placeholder forever. With a single CLI-launched agy on the host, its
-    connect-RPC port is the lone ``Heartbeat``-answering candidate (no
-    conversation exists yet to disambiguate several), so this polls
-    :func:`omnigent.antigravity_native_rpc._candidate_agy_rpc_ports` until a port
+    placeholder forever. The connect-RPC port is resolved by
+    :func:`omnigent.antigravity_native_rpc.resolve_cold_start_agy_rpc_port`:
+    scoped to THIS session's own agy via its tmux pane (``tmux_socket`` /
+    ``tmux_target``) so a host running several agy instances cannot
+    ``StartCascade`` onto a FOREIGN agy (the conversation-ownership check that
+    normally disambiguates is not usable yet — no conversation exists), falling
+    back to the lowest ``Heartbeat``-answering candidate when no local pane is
+    reachable or it cannot be resolved. This polls that resolver until a port
     binds, then ``StartCascade``s a generated ``uuid4``.
 
     The cold-started id is also PATCHed onto the Omnigent session as
@@ -1185,6 +1197,11 @@ async def _cold_start_agy_conversation(
         PATCH.
     :param headers: HTTP auth headers for the PATCH (the local server has none; a
         remote server's bearer is used as-is).
+    :param tmux_socket: This session's tmux socket path, used to scope the
+        ``StartCascade`` port to the agy running under this session's pane.
+        ``None`` (no local pane) falls back to the candidate scan.
+    :param tmux_target: This session's tmux target (e.g. ``"main"``), paired with
+        ``tmux_socket`` for the pane-scoped port resolution.
     :param timeout_s: Total seconds to wait for agy's connect-RPC port to bind.
     :returns: None.
     """
@@ -1200,12 +1217,11 @@ async def _cold_start_agy_conversation(
     deadline = time.monotonic() + timeout_s
     port: int | None = None
     while True:
-        candidates = await asyncio.to_thread(_candidate_agy_rpc_ports)
-        if candidates:
-            # The lone CLI-launched agy is the only Heartbeat-answering candidate
-            # at this point (no conversation exists to disambiguate several, so
-            # take the lowest validated port).
-            port = candidates[0]
+        # Scope to THIS session's pane agy (avoids binding a foreign agy on a
+        # multi-agy host); falls back to the lowest validated candidate when no
+        # local pane is reachable or the pane is not resolvable yet.
+        port = await asyncio.to_thread(resolve_cold_start_agy_rpc_port, tmux_socket, tmux_target)
+        if port is not None:
             break
         if time.monotonic() >= deadline:
             _logger.warning(

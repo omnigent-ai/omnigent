@@ -2555,6 +2555,8 @@ async def _run_antigravity_auto_create(
     session_id: str,
     snapshot: dict[str, Any],
     candidate_ports: list[int],
+    pane: tuple[Path, str] | None = None,
+    pane_scoped_port: int | None = None,
 ) -> tuple[Any, list[tuple[int, str]], list[dict[str, Any]], list[tuple[str, dict[str, Any]]]]:
     """
     Drive ``_auto_create_antigravity_terminal`` with every live collaborator faked.
@@ -2562,15 +2564,25 @@ async def _run_antigravity_auto_create(
     No real agy is launched: ``build_agy_launch`` is stubbed to a no-op argv, the
     onboarding seed is a no-op, the resource registry records the launched spec,
     the forwarder is a counting stub, and the connect-RPC layer
-    (``_candidate_agy_rpc_ports`` / ``start_cascade``) is mocked so the cold-start
-    bootstrap runs without a socket.
+    (``_candidate_agy_rpc_ports`` / ``resolve_pane_agy_rpc_port`` / ``start_cascade``)
+    is mocked so the cold-start bootstrap runs without a socket.
+
+    The cold-start exercises the REAL
+    ``resolve_cold_start_agy_rpc_port`` dispatch: with no ``pane`` the pane is
+    absent (``_terminal_tmux_pane`` → ``(None, None)``) and it falls back to the
+    candidate scan; with a ``pane`` the pane-scoped resolver is consulted first.
 
     :param tmp_path: Temporary directory for isolated bridge state.
     :param monkeypatch: Pytest monkeypatch fixture.
     :param session_id: Session/conversation id under test.
     :param snapshot: The Omnigent session snapshot the helper should read.
     :param candidate_ports: Ports ``_candidate_agy_rpc_ports`` yields (``[]`` →
-        the bootstrap never finds a port).
+        the bootstrap never finds a candidate port).
+    :param pane: ``(tmux_socket, tmux_target)`` ``_terminal_tmux_pane`` returns,
+        or ``None`` (the default) → ``(None, None)`` (no local pane).
+    :param pane_scoped_port: The port ``resolve_pane_agy_rpc_port`` returns for
+        the pane (``None`` → the pane cannot be scoped, so the resolver falls
+        through to the candidate scan).
     :returns: ``(bridge_state_after, start_cascade_calls, reader_calls,
         external_session_id_patch_calls)``.
     """
@@ -2608,9 +2620,15 @@ async def _run_antigravity_auto_create(
         return _runner()
 
     monkeypatch.setattr(reader_mod, "supervise_reader", _counting_reader)
-    # No live pane in unit tests → the tmux advertise is skipped. Keep the
-    # bootstrap independent of tmux (the reader discovers its own RPC port).
-    monkeypatch.setattr(runner_app_mod, "_terminal_tmux_pane", lambda *_a, **_k: (None, None))
+    # The pane the runner resolves for cold-start scoping + the tmux advertise.
+    # Default ``None`` → no local pane (``(None, None)``), so the cold-start uses
+    # the candidate-scan fallback. A provided pane lets the test assert the
+    # pane-scoped port path.
+    resolved_pane = (None, None) if pane is None else pane
+    monkeypatch.setattr(runner_app_mod, "_terminal_tmux_pane", lambda *_a, **_k: resolved_pane)
+    # The pane-scoped resolver the REAL ``resolve_cold_start_agy_rpc_port``
+    # consults first when a pane is present.
+    monkeypatch.setattr(rpc_mod, "resolve_pane_agy_rpc_port", lambda _sock, _tgt: pane_scoped_port)
 
     # Mock the connect-RPC cold-start surface. Collapse the port-poll budget +
     # backoff so the no-port case bails immediately instead of waiting the real
@@ -2727,6 +2745,74 @@ async def test_auto_create_antigravity_cold_starts_real_conversation(
     assert patch_calls == [(f"/v1/sessions/{session_id}", {"external_session_id": called_id})]
     # The RPC reader spawns (it replaced the transcript forwarder).
     assert len(reader_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_create_antigravity_cold_start_scopes_to_pane_agy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With several agy candidates, cold-start binds THIS session's pane agy.
+
+    The cross-bind fix: on a host running several agy instances (sub-agent
+    fan-out / shared runner), ``StartCascade`` must target the agy actually
+    running under this session's tmux pane — NOT the lowest Heartbeat-answering
+    candidate, which could be a FOREIGN agy and permanently cross-bind the
+    session. With a resolvable pane the cold-start uses the pane-scoped port
+    (61000) even though a lower foreign candidate (52548) exists.
+    """
+    session_id = "conv_agy_paneScoped"
+    state, start_cascade_calls, _reader_calls, patch_calls = await _run_antigravity_auto_create(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+        snapshot={},
+        # Several agy ports on the host; 52548 is the lowest (a FOREIGN agy).
+        candidate_ports=[52548, 61000],
+        # This session's pane resolves to a DIFFERENT (higher) agy's port.
+        pane=(tmp_path / "agy.sock", "main"),
+        pane_scoped_port=61000,
+    )
+    # StartCascade fired on the PANE-SCOPED port, NOT candidates[0] (52548).
+    assert len(start_cascade_calls) == 1
+    called_port, called_id = start_cascade_calls[0]
+    assert called_port == 61000
+    assert not bridge_mod_is_placeholder(called_id)
+    assert state is not None
+    assert state.conversation_id == called_id
+    assert patch_calls == [(f"/v1/sessions/{session_id}", {"external_session_id": called_id})]
+
+
+@pytest.mark.asyncio
+async def test_auto_create_antigravity_cold_start_falls_back_when_no_pane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    No local pane (remote runner) → cold-start uses the lowest candidate port.
+
+    Preserves the current behavior on single-agy hosts and remote runners: when
+    ``_terminal_tmux_pane`` yields no socket/target the pane cannot be scoped, so
+    the cold-start falls back to ``_candidate_agy_rpc_ports()[0]``.
+    """
+    session_id = "conv_agy_noPaneFallback"
+    state, start_cascade_calls, _reader_calls, patch_calls = await _run_antigravity_auto_create(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+        snapshot={},
+        candidate_ports=[52548, 61000],
+        pane=None,  # remote runner / no local pane
+        pane_scoped_port=99999,  # must be ignored — there is no pane to scope to
+    )
+    assert len(start_cascade_calls) == 1
+    called_port, _called_id = start_cascade_calls[0]
+    assert called_port == 52548  # the lowest candidate, NOT the (ignored) pane port
+    assert state is not None
+    assert patch_calls == [
+        (f"/v1/sessions/{session_id}", {"external_session_id": state.conversation_id})
+    ]
 
 
 @pytest.mark.asyncio

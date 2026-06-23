@@ -1535,3 +1535,250 @@ def test_discovery_probes_keep_probe_timeout(monkeypatch: pytest.MonkeyPatch) ->
     rpc.get_available_models(52548)
 
     assert timeouts == [rpc._PROBE_TIMEOUT_S] * 3
+
+
+# ---------------------------------------------------------------------------
+# _pane_pid
+# ---------------------------------------------------------------------------
+
+
+def _fake_tmux_pane_pid(stdout: str, *, returncode: int = 0) -> subprocess.CompletedProcess[str]:
+    """Build a ``tmux display-message`` CompletedProcess for stubbing."""
+    return subprocess.CompletedProcess(
+        args=["tmux"], returncode=returncode, stdout=stdout, stderr=""
+    )
+
+
+def test_pane_pid_parses_display_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The pane pid is read from ``tmux display-message -p #{pane_pid}``."""
+    captured: list[list[str]] = []
+
+    def _fake_run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.append(argv)
+        return _fake_tmux_pane_pid("72753\n")
+
+    monkeypatch.setattr(rpc.subprocess, "run", _fake_run)
+    assert rpc._pane_pid(Path("/tmp/agy/tmux.sock"), "main") == 72753
+    # The exact tmux invocation: socket-scoped, the pane target, ``#{pane_pid}``.
+    assert captured == [
+        [
+            "tmux",
+            "-S",
+            "/tmp/agy/tmux.sock",
+            "display-message",
+            "-p",
+            "-t",
+            "main",
+            "#{pane_pid}",
+        ]
+    ]
+
+
+def test_pane_pid_none_on_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A dead pane (non-zero tmux exit) yields ``None`` so the caller falls back."""
+    monkeypatch.setattr(
+        rpc.subprocess,
+        "run",
+        lambda *_a, **_k: _fake_tmux_pane_pid("", returncode=1),
+    )
+    assert rpc._pane_pid(Path("/tmp/agy/tmux.sock"), "main") is None
+
+
+def test_pane_pid_none_on_nonnumeric_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Non-numeric tmux output (e.g. an error string) yields ``None``."""
+    monkeypatch.setattr(
+        rpc.subprocess,
+        "run",
+        lambda *_a, **_k: _fake_tmux_pane_pid("can't find pane\n"),
+    )
+    assert rpc._pane_pid(Path("/tmp/agy/tmux.sock"), "main") is None
+
+
+def test_pane_pid_none_when_tmux_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A missing ``tmux`` binary (OSError) yields ``None``, never raising."""
+
+    def _boom(*_a: object, **_k: object) -> subprocess.CompletedProcess[str]:
+        raise FileNotFoundError("tmux")
+
+    monkeypatch.setattr(rpc.subprocess, "run", _boom)
+    assert rpc._pane_pid(Path("/tmp/agy/tmux.sock"), "main") is None
+
+
+# ---------------------------------------------------------------------------
+# _agy_pid_in_pane_subtree
+# ---------------------------------------------------------------------------
+
+
+def test_agy_pid_in_pane_subtree_uses_pane_pid_when_it_is_agy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the pane process IS agy (the ``exec agy`` case), the pane pid is used.
+
+    The CLI / non-sandbox launch ``exec``s agy in the pane, so the pane pid is
+    agy's own pid — no descendant walk needed.
+    """
+    monkeypatch.setattr(rpc, "_list_agy_pids", lambda: [72753, 99999])
+    # _child_pids must NOT be consulted when the pane pid itself is agy.
+    monkeypatch.setattr(
+        rpc,
+        "_child_pids",
+        lambda _pid: (_ for _ in ()).throw(AssertionError("should not walk children")),
+    )
+    assert rpc._agy_pid_in_pane_subtree(72753) == 72753
+
+
+def test_agy_pid_in_pane_subtree_finds_agy_descendant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the pane runs a wrapper (sandbox launcher), agy is a descendant.
+
+    The sandbox launch makes the pane process the launcher → bwrap → ... → agy,
+    so the agy pid is found by walking the pane pid's subtree and intersecting
+    with the live agy pids.
+    """
+    # Tree: pane 100 -> 200 (bwrap) -> 300 (agy). agy pids = [300].
+    children = {100: [200], 200: [300], 300: []}
+    monkeypatch.setattr(rpc, "_list_agy_pids", lambda: [300])
+    monkeypatch.setattr(rpc, "_child_pids", lambda pid: children.get(pid, []))
+    assert rpc._agy_pid_in_pane_subtree(100) == 300
+
+
+def test_agy_pid_in_pane_subtree_none_when_no_agy_in_tree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No agy anywhere in the pane subtree yields ``None`` (caller falls back)."""
+    children = {100: [200], 200: []}
+    monkeypatch.setattr(rpc, "_list_agy_pids", lambda: [999])  # agy elsewhere, not in tree
+    monkeypatch.setattr(rpc, "_child_pids", lambda pid: children.get(pid, []))
+    assert rpc._agy_pid_in_pane_subtree(100) is None
+
+
+def test_agy_pid_in_pane_subtree_tolerates_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pathological parent cycle in the process table terminates (no hang)."""
+    # 100 -> 200 -> 100 (cycle); agy is not in the tree.
+    children = {100: [200], 200: [100]}
+    monkeypatch.setattr(rpc, "_list_agy_pids", lambda: [300])
+    monkeypatch.setattr(rpc, "_child_pids", lambda pid: children.get(pid, []))
+    assert rpc._agy_pid_in_pane_subtree(100) is None
+
+
+# ---------------------------------------------------------------------------
+# _child_pids
+# ---------------------------------------------------------------------------
+
+
+def test_child_pids_parses_pgrep_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Direct children are parsed from ``pgrep -P`` output."""
+    captured: list[list[str]] = []
+
+    def _fake_run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.append(argv)
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="200\n201\n", stderr="")
+
+    monkeypatch.setattr(rpc.subprocess, "run", _fake_run)
+    assert rpc._child_pids(100) == [200, 201]
+    assert captured == [["pgrep", "-P", "100"]]
+
+
+def test_child_pids_falls_back_to_proc(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """When ``pgrep`` is missing, children come from ``/proc/<child>/stat`` PPid.
+
+    Exercises the comm-with-spaces-and-parens edge: the PPid is read relative to
+    the LAST ``)`` so a process named ``(a) b)`` does not corrupt field offsets.
+    """
+
+    def _boom(*_a: object, **_k: object) -> subprocess.CompletedProcess[str]:
+        raise FileNotFoundError("pgrep")
+
+    monkeypatch.setattr(rpc.subprocess, "run", _boom)
+
+    # Fake /proc: child 200 has PPid 100; 201 has a paren-laden comm but PPid 100;
+    # 999 has PPid 1 (not a child); "self"/non-numeric entries are ignored.
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    (proc / "200").mkdir()
+    (proc / "200" / "stat").write_text("200 (agy) S 100 200 200 0 -1 0\n", encoding="ascii")
+    (proc / "201").mkdir()
+    (proc / "201" / "stat").write_text("201 (weird ) name) S 100 201 0\n", encoding="ascii")
+    (proc / "999").mkdir()
+    (proc / "999" / "stat").write_text("999 (init) S 1 999 0\n", encoding="ascii")
+    (proc / "self").mkdir()  # non-numeric entry must be skipped
+    monkeypatch.setattr(rpc, "_PROC_FS", str(proc))
+
+    assert sorted(rpc._child_pids(100)) == [200, 201]
+
+
+def test_child_pids_proc_empty_when_no_procfs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A missing ``/proc`` (non-Linux) yields ``[]`` from the fallback."""
+
+    def _boom(*_a: object, **_k: object) -> subprocess.CompletedProcess[str]:
+        raise FileNotFoundError("pgrep")
+
+    monkeypatch.setattr(rpc.subprocess, "run", _boom)
+    monkeypatch.setattr(rpc, "_PROC_FS", "/nonexistent-proc-xyz")
+    assert rpc._child_pids(100) == []
+
+
+# ---------------------------------------------------------------------------
+# resolve_pane_agy_rpc_port
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_pane_agy_rpc_port_scopes_to_pane_agy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pane's own agy pid drives ``discover_language_server_port``.
+
+    This is the cross-bind fix: the port comes from THIS session's pane agy, not
+    from the lowest of all agy ports on the host.
+    """
+    monkeypatch.setattr(rpc, "_pane_pid", lambda socket_path, target: 100)
+    monkeypatch.setattr(rpc, "_agy_pid_in_pane_subtree", lambda pid: 300)
+    discovered_for: list[int] = []
+
+    def _fake_discover(pid: int) -> int:
+        discovered_for.append(pid)
+        return 61000
+
+    monkeypatch.setattr(rpc, "discover_language_server_port", _fake_discover)
+    assert rpc.resolve_pane_agy_rpc_port(Path("/tmp/agy/tmux.sock"), "main") == 61000
+    assert discovered_for == [300]  # scoped to the pane's agy, not a host-wide scan
+
+
+def test_resolve_pane_agy_rpc_port_none_when_no_pane_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No resolvable pane pid → ``None`` (the caller uses the candidates fallback)."""
+    monkeypatch.setattr(rpc, "_pane_pid", lambda socket_path, target: None)
+    monkeypatch.setattr(
+        rpc,
+        "_agy_pid_in_pane_subtree",
+        lambda _pid: (_ for _ in ()).throw(AssertionError("unreachable")),
+    )
+    assert rpc.resolve_pane_agy_rpc_port(Path("/tmp/agy/tmux.sock"), "main") is None
+
+
+def test_resolve_pane_agy_rpc_port_none_when_no_agy_in_subtree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live pane with no agy in its subtree → ``None`` (fallback)."""
+    monkeypatch.setattr(rpc, "_pane_pid", lambda socket_path, target: 100)
+    monkeypatch.setattr(rpc, "_agy_pid_in_pane_subtree", lambda _pid: None)
+    monkeypatch.setattr(
+        rpc,
+        "discover_language_server_port",
+        lambda _pid: (_ for _ in ()).throw(AssertionError("unreachable")),
+    )
+    assert rpc.resolve_pane_agy_rpc_port(Path("/tmp/agy/tmux.sock"), "main") is None
+
+
+def test_resolve_pane_agy_rpc_port_none_when_port_not_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """agy resolved but not yet bound (discover returns None) → ``None``."""
+    monkeypatch.setattr(rpc, "_pane_pid", lambda socket_path, target: 100)
+    monkeypatch.setattr(rpc, "_agy_pid_in_pane_subtree", lambda _pid: 300)
+    monkeypatch.setattr(rpc, "discover_language_server_port", lambda _pid: None)
+    assert rpc.resolve_pane_agy_rpc_port(Path("/tmp/agy/tmux.sock"), "main") is None
