@@ -233,6 +233,7 @@ def _spawn_server_handler(
     file_meta: dict[str, dict[str, Any]],
     copy_status: int = 200,
     copy_error: dict[str, Any] | None = None,
+    deletes: list[str] | None = None,
 ):
     """
     Build a mock Omnigent-server handler for a fresh named spawn.
@@ -279,6 +280,10 @@ def _spawn_server_handler(
         if request.method == "POST" and path == f"/v1/sessions/{_CHILD_ID}/events":
             events.append(json.loads(request.content))
             return httpx.Response(202, json={"queued": True})
+        if request.method == "DELETE" and path == f"/v1/sessions/{_CHILD_ID}":
+            if deletes is not None:
+                deletes.append(_CHILD_ID)
+            return httpx.Response(200, json={"id": _CHILD_ID, "deleted": True})
         return httpx.Response(404, json={"error": str(request.url)})
 
     return _handler
@@ -463,6 +468,7 @@ async def test_send_with_bad_file_id_surfaces_copy_error_and_posts_nothing(
     """
     events: list[dict[str, Any]] = []
     copies: list[dict[str, Any]] = []
+    deletes: list[str] = []
     handler = _spawn_server_handler(
         events=events,
         copies=copies,
@@ -470,6 +476,7 @@ async def test_send_with_bad_file_id_surfaces_copy_error_and_posts_nothing(
         file_meta={},
         copy_status=404,
         copy_error={"error": {"message": "File 'file_bogus' not found in source session"}},
+        deletes=deletes,
     )
 
     output = await _run_spawn(
@@ -483,3 +490,6 @@ async def test_send_with_bad_file_id_surfaces_copy_error_and_posts_nothing(
     # Decisive: the copy was attempted but no (malformed) child event was posted.
     assert len(copies) == 1
     assert events == [], "no child event may be posted when the file copy fails"
+    # The freshly-created server child is torn down so it can't poison a
+    # retry with the same (agent, title) as a phantom existing child.
+    assert deletes == [_CHILD_ID], "failed spawn must delete the empty child session"

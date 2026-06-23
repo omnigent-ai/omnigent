@@ -1810,21 +1810,24 @@ async def test_copy_files_missing_source_file_is_all_or_nothing(
 
 
 @pytest.mark.asyncio
-async def test_copy_files_self_source_is_authorized(
+async def test_copy_files_self_source_is_rejected(
     file_client: httpx.AsyncClient,
     file_store: Any,
 ) -> None:
-    """The destination may name itself as the source (lineage includes self)."""
+    """A session may not name ITSELF as the source — lineage is ancestors only."""
     own = await _upload_file(file_client, "conv_c", "self.txt", b"mine")
+    before = file_store.list(session_id="conv_c").data
 
     resp = await file_client.post(
         "/v1/sessions/conv_c/resources/files:copy",
         json={"source_session_id": "conv_c", "file_ids": [own]},
     )
-    assert resp.status_code == 200, resp.text
-    new_id = resp.json()["mapping"][own]
-    assert new_id != own
-    assert file_store.get(new_id, session_id="conv_c") is not None
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["error"]["code"] == "forbidden"
+
+    # Nothing copied — the destination is unchanged.
+    after = file_store.list(session_id="conv_c").data
+    assert len(after) == len(before)
 
 
 @pytest.mark.asyncio

@@ -15702,18 +15702,23 @@ def create_sessions_router(
                 detail="file store not configured",
             )
 
-        # Lineage authorization: the source must be the destination
-        # itself or any ancestor up the parent_conversation_id chain.
-        authorized = {session_id, *_ancestor_session_ids(conversation_store, session_id)}
-        if body.source_session_id not in authorized:
+        # Lineage authorization: the source must be a STRICT ancestor up
+        # the parent_conversation_id chain. A session may not name itself
+        # as the source — the contract is "copy files down from a parent",
+        # and a top-level session has no lineage to copy from.
+        if body.source_session_id not in set(
+            _ancestor_session_ids(conversation_store, session_id)
+        ):
             raise OmnigentError(
-                "Source session is not in this session's lineage",
+                "Source session is not an ancestor of this session",
                 code=ErrorCode.FORBIDDEN,
             )
 
-        # Validate every source file before copying anything so a
-        # missing id fails the whole request without partial writes.
-        sources: list[StoredFile] = []
+        # Validate AND prefetch every source file before writing anything.
+        # Reading the bytes here (not just the metadata row) surfaces a
+        # missing blob before any child row is created, so the copy stays
+        # all-or-nothing under storage failures, not just missing metadata.
+        sources: list[tuple[StoredFile, bytes]] = []
         for file_id in body.file_ids:
             stored = file_store.get(file_id, session_id=body.source_session_id)
             if stored is None:
@@ -15721,28 +15726,38 @@ def create_sessions_router(
                     f"File '{file_id}' not found in source session",
                     code=ErrorCode.NOT_FOUND,
                 )
-            sources.append(stored)
+            sources.append((stored, artifact_store.get(stored.id)))
 
+        # Commit the copies. If any write fails mid-batch, roll back the
+        # rows/blobs already created so a partial copy never persists.
         mapping: dict[str, str] = {}
-        for stored in sources:
-            content = artifact_store.get(stored.id)
-            new = file_store.create(
-                session_id=session_id,
-                filename=stored.filename,
-                bytes=stored.bytes,
-                content_type=stored.content_type,
-            )
-            artifact_store.put(new.id, content)
-            mapping[stored.id] = new.id
-            resource = _stored_file_to_resource(session_id, new)
-            _publish_and_persist_resource_event(
-                session_id,
-                "session.resource.created",
-                resource_id=new.id,
-                resource_type="file",
-                conversation_store=conversation_store,
-                resource=resource,
-            )
+        created: list[str] = []
+        try:
+            for stored, content in sources:
+                new = file_store.create(
+                    session_id=session_id,
+                    filename=stored.filename,
+                    bytes=stored.bytes,
+                    content_type=stored.content_type,
+                )
+                created.append(new.id)
+                artifact_store.put(new.id, content)
+                mapping[stored.id] = new.id
+                resource = _stored_file_to_resource(session_id, new)
+                _publish_and_persist_resource_event(
+                    session_id,
+                    "session.resource.created",
+                    resource_id=new.id,
+                    resource_type="file",
+                    conversation_store=conversation_store,
+                    resource=resource,
+                )
+        except Exception:
+            for new_id in created:
+                with contextlib.suppress(Exception):
+                    file_store.delete(new_id, session_id=session_id)
+                    artifact_store.delete(new_id)
+            raise
 
         return CopyFilesResponse(
             session_id=session_id,

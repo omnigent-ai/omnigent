@@ -20,6 +20,7 @@ Tool categories:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import json
 import logging
@@ -1322,6 +1323,13 @@ async def _execute_subagent_tool(
     if content_error is not None:
         _runner_app.unregister_child_session(child_session_id)
         _runner_app.unregister_subagent_work(child_session_id)
+        # If we just created the server child session, tear it down too:
+        # session.created was already published, and leaving an empty child
+        # behind would poison a retry with the same (agent, title) — the
+        # next send would attach to the phantom instead of spawning clean.
+        if created_child:
+            with contextlib.suppress(httpx.HTTPError):
+                await server_client.delete(f"/v1/sessions/{child_session_id}", timeout=30.0)
         return content_error
 
     # Send the user message as a separate event so the server's
