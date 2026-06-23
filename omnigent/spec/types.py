@@ -968,8 +968,8 @@ class ToolRuntime(str, Enum):
 class SharePolicy(str, Enum):
     """How much session-sharing authority ``sys_session_share`` grants.
 
-    Maps the top-level ``share:`` YAML flag. The flag is the *only*
-    thing that enables the ``sys_session_share`` tool — it is
+    Maps the top-level ``agent_session_sharing:`` YAML flag. The flag is
+    the *only* thing that enables the ``sys_session_share`` tool — it is
     independent of ``spawn`` / ``tools.agents`` (which gate the
     spawn-lifecycle tools). Sharing mutates access control, so it is
     off by default and the public tier is a deliberate extra opt-in.
@@ -1472,10 +1472,12 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         ``sys_session_get_history`` / ``sys_session_get_info``)
         are always registered and are not affected by either
         opt-in.
-    :param share: Session-sharing authority granted to
-        ``sys_session_share``. YAML key is ``share:`` (top-level, like
-        ``spawn:``). This flag is the SOLE enabler of the share tool —
-        it is independent of ``spawn`` / ``tools.agents``. One of
+    :param agent_session_sharing: Authority for the agent to share the
+        session it is running in, via ``sys_session_share``. YAML key is
+        ``agent_session_sharing:`` (top-level, like ``spawn:``). This
+        flag is the SOLE enabler of that tool — it is independent of
+        ``spawn`` / ``tools.agents``, and has no bearing on sharing the
+        session through the server API or CLI. One of
         :class:`SharePolicy`: ``none`` (default — tool not registered),
         ``non-public`` (grant named users only), or ``public`` (also
         allow ``__public__`` anonymous read). **Defaults to
@@ -1525,4 +1527,4 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     terminals: dict[str, TerminalEnvSpec] | None = None
     timers: bool = False
     spawn: bool = False
-    share: SharePolicy = SharePolicy.NONE
+    agent_session_sharing: SharePolicy = SharePolicy.NONE

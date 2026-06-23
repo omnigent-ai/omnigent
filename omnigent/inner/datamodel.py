@@ -773,13 +773,15 @@ class AgentDef:
     # sub-agent types. Session reads are always on. YAML key:
     # ``spawn:``.
     spawn: bool = False
-    # Session-sharing authority for sys_session_share, the SOLE enabler
-    # of that tool (independent of spawn / declared agents). Raw YAML
-    # string from ``share:`` — "none" (default, tool off), "non-public"
-    # (grant named users), or "public" (also allow __public__ anonymous
-    # read). Kept as a str here (inner datamodel has no spec.types dep);
-    # mapped to SharePolicy when translated to an AgentSpec.
-    share: str = "none"
+    # Authority for the agent to share the session it runs in, via
+    # sys_session_share — the SOLE enabler of that tool (independent of
+    # spawn / declared agents, and unrelated to server-API / CLI
+    # sharing). Raw YAML string from ``agent_session_sharing:`` — "none"
+    # (default, tool off), "non-public" (grant named users), or "public"
+    # (also allow __public__ anonymous read). Kept as a str here (inner
+    # datamodel has no spec.types dep); mapped to SharePolicy when
+    # translated to an AgentSpec.
+    agent_session_sharing: str = "none"
     os_env: OSEnvSpec | None = None
     terminals: dict[str, TerminalEnvSpec] = field(default_factory=dict)
     skills: SkillRegistry = field(default_factory=dict)

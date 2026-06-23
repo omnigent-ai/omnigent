@@ -1177,9 +1177,10 @@ def agent_def_to_agent_spec(
         terminals=terminals,
         timers=agent_def.timers,
         spawn=agent_def.spawn,
-        # AgentDef.share is the raw YAML string ("none"/"non-public"/
-        # "public"); map it to the SharePolicy enum AgentSpec expects.
-        share=SharePolicy(agent_def.share),
+        # AgentDef.agent_session_sharing is the raw YAML string
+        # ("none"/"non-public"/"public"); map it to the SharePolicy enum
+        # AgentSpec expects.
+        agent_session_sharing=SharePolicy(agent_def.agent_session_sharing),
         skills_filter=skills_filter,
     )
 

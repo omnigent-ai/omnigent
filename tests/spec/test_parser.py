@@ -2357,16 +2357,16 @@ def test_parse_spawn_true_sets_flag(tmp_path: Path) -> None:
 
 def test_parse_share_defaults_to_none_when_omitted(agent_dir: Path) -> None:
     """
-    Without a top-level ``share:`` key the parsed ``AgentSpec.share`` is
-    :attr:`SharePolicy.NONE` — sharing is off by default, so
-    ``sys_session_share`` is not registered. A regression flipping the
-    default would expose the access-control mutation (incl. ``__public__``)
-    to every agent.
+    Without a top-level ``agent_session_sharing:`` key the parsed
+    ``AgentSpec.agent_session_sharing`` is :attr:`SharePolicy.NONE` —
+    sharing is off by default, so ``sys_session_share`` is not
+    registered. A regression flipping the default would expose the
+    access-control mutation (incl. ``__public__``) to every agent.
 
     :param agent_dir: Temporary agent directory fixture.
     """
     spec = parse(agent_dir)
-    assert spec.share is SharePolicy.NONE
+    assert spec.agent_session_sharing is SharePolicy.NONE
 
 
 @pytest.mark.parametrize(
@@ -2383,34 +2383,34 @@ def test_parse_share_maps_each_policy_string(
     expected: SharePolicy,
 ) -> None:
     """
-    Each recognized ``share:`` string round-trips to its
+    Each recognized ``agent_session_sharing:`` string round-trips to its
     :class:`SharePolicy` member. The flag is the sole enabler of
     ``sys_session_share`` (and ``public`` of the ``__public__`` tier);
     a parser regression dropping or mismapping it would silently change
     what the agent is allowed to expose.
 
     :param tmp_path: pytest-provided temporary directory.
-    :param value: The YAML ``share:`` string under test.
+    :param value: The YAML ``agent_session_sharing:`` string under test.
     :param expected: The :class:`SharePolicy` it must parse to.
     """
-    config = {"spec_version": 1, "name": "share-agent", "share": value}
+    config = {"spec_version": 1, "name": "share-agent", "agent_session_sharing": value}
     (tmp_path / "config.yaml").write_text(yaml.dump(config))
     spec = parse(tmp_path)
-    assert spec.share is expected
+    assert spec.agent_session_sharing is expected
 
 
 def test_parse_share_invalid_value_fails_loud(tmp_path: Path) -> None:
     """
-    An unrecognized ``share:`` value (here a plausible typo) raises
-    rather than silently disabling sharing — fail-loud, so a
-    misconfigured capability surfaces at parse time instead of becoming
+    An unrecognized ``agent_session_sharing:`` value (here a plausible
+    typo) raises rather than silently disabling sharing — fail-loud, so
+    a misconfigured capability surfaces at parse time instead of becoming
     a confusing "the tool isn't there" at runtime.
 
     :param tmp_path: pytest-provided temporary directory.
     """
-    config = {"spec_version": 1, "name": "bad-share", "share": "private"}
+    config = {"spec_version": 1, "name": "bad-share", "agent_session_sharing": "private"}
     (tmp_path / "config.yaml").write_text(yaml.dump(config))
-    with pytest.raises(OmnigentError, match="share:"):
+    with pytest.raises(OmnigentError, match="agent_session_sharing"):
         parse(tmp_path)
 
 

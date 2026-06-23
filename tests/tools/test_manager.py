@@ -419,14 +419,15 @@ def test_declared_agents_grant_send_close_but_not_create() -> None:
 
 def test_share_non_public_registers_share_tool_without_public() -> None:
     """
-    ``share: non-public`` alone (no spawn / declared agents) registers
-    ``sys_session_share`` — proving the flag is independently sufficient
-    AND does not drag in the spawn-lifecycle tools. The advertised
-    ``user_id`` schema must NOT mention ``__public__``, so the model is
-    not offered a grantee the runner would reject. If the gating
-    regressed to the spawn opt-in, share would be absent here.
+    ``agent_session_sharing: non-public`` alone (no spawn / declared
+    agents) registers ``sys_session_share`` — proving the flag is
+    independently sufficient AND does not drag in the spawn-lifecycle
+    tools. The advertised ``user_id`` schema must NOT mention
+    ``__public__``, so the model is not offered a grantee the runner
+    would reject. If the gating regressed to the spawn opt-in, share
+    would be absent here.
     """
-    mgr = ToolManager(AgentSpec(spec_version=1, share=SharePolicy.NON_PUBLIC))
+    mgr = ToolManager(AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.NON_PUBLIC))
     schemas = {s["function"]["name"]: s for s in mgr.get_tool_schemas()}
     assert "sys_session_share" in schemas
     # Sharing is decoupled from spawn — none of the spawn writes ride along.
@@ -442,13 +443,14 @@ def test_share_non_public_registers_share_tool_without_public() -> None:
 
 def test_share_public_registers_share_tool_advertising_public() -> None:
     """
-    ``share: public`` registers ``sys_session_share`` and the advertised
-    ``user_id`` schema DOES mention ``__public__`` — the only tier where
-    anonymous-read grants are permitted. If ``allow_public`` weren't
-    threaded from the flag into the tool, the public option would be
-    hidden (or, worse, advertised under non-public).
+    ``agent_session_sharing: public`` registers ``sys_session_share``
+    and the advertised ``user_id`` schema DOES mention ``__public__`` —
+    the only tier where anonymous-read grants are permitted. If
+    ``allow_public`` weren't threaded from the flag into the tool, the
+    public option would be hidden (or, worse, advertised under
+    non-public).
     """
-    mgr = ToolManager(AgentSpec(spec_version=1, share=SharePolicy.PUBLIC))
+    mgr = ToolManager(AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.PUBLIC))
     schemas = {s["function"]["name"]: s for s in mgr.get_tool_schemas()}
     assert "sys_session_share" in schemas
     user_id_desc = schemas["sys_session_share"]["function"]["parameters"]["properties"]["user_id"][

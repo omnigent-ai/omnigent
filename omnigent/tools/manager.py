@@ -387,18 +387,19 @@ class ToolManager:
         ``sys_session_list`` or a prior ``sys_session_send`` handle),
         so they need no ``sub_specs`` map.
 
-        ``sys_session_share`` is gated by its OWN dedicated ``share:``
-        flag (:class:`SharePolicy`), independent of the spawn grants.
-        Sharing MUTATES access control — it can expose a session to a
-        third party or, via ``__public__``, to anonymous read of the
-        full transcript — and the server can confirm the caller holds
-        manage-level access but cannot distinguish "the owner intended
-        this" from "the agent was prompt-injected into sharing". So it
-        is off unless the spec opts in: ``none`` (default) leaves it
-        unregistered; ``non-public`` registers it for granting named
-        users; ``public`` additionally lets it grant ``__public__``
-        (the tool advertises and enforces that extra tier via
-        ``allow_public``).
+        ``sys_session_share`` is gated by its OWN dedicated
+        ``agent_session_sharing:`` flag (:class:`SharePolicy`),
+        independent of the spawn grants (and unrelated to sharing via
+        the server API or CLI). Sharing MUTATES access control — it can
+        expose a session to a third party or, via ``__public__``, to
+        anonymous read of the full transcript — and the server can
+        confirm the caller holds manage-level access but cannot
+        distinguish "the owner intended this" from "the agent was
+        prompt-injected into sharing". So it is off unless the spec opts
+        in: ``none`` (default) leaves it unregistered; ``non-public``
+        registers it for granting named users; ``public`` additionally
+        lets it grant ``__public__`` (the tool advertises and enforces
+        that extra tier via ``allow_public``).
 
         The spawn-lifecycle tools are a SEPARATE opt-in, gated behind
         ``tools.agents`` (declared sub-agents) or the top-level
@@ -428,17 +429,18 @@ class ToolManager:
         self._tools[SysSessionGetHistoryTool.name()] = SysSessionGetHistoryTool()
         self._tools[SysSessionGetInfoTool.name()] = SysSessionGetInfoTool()
 
-        # Session sharing: opt-in via the dedicated ``share`` flag,
-        # independent of spawn / declared sub-agents. ``none`` leaves it
-        # unregistered; ``public`` additionally permits __public__ grants
-        # (the tool reflects that in its schema and the runner enforces
-        # it). It is its own flag — not folded into the spawn grant —
-        # because exposing a session is a distinct authority from
-        # spawning children, and the public tier warrants an explicit
-        # extra opt-in given the prompt-injection exposure.
-        if self._spec.share is not SharePolicy.NONE:
+        # Session sharing: opt-in via the dedicated
+        # ``agent_session_sharing`` flag, independent of spawn / declared
+        # sub-agents. ``none`` leaves it unregistered; ``public``
+        # additionally permits __public__ grants (the tool reflects that
+        # in its schema and the runner enforces it). It is its own flag —
+        # not folded into the spawn grant — because letting the agent
+        # expose a session is a distinct authority from spawning
+        # children, and the public tier warrants an explicit extra opt-in
+        # given the prompt-injection exposure.
+        if self._spec.agent_session_sharing is not SharePolicy.NONE:
             self._tools[SysSessionShareTool.name()] = SysSessionShareTool(
-                allow_public=self._spec.share is SharePolicy.PUBLIC,
+                allow_public=self._spec.agent_session_sharing is SharePolicy.PUBLIC,
             )
 
         # send + close: opt-in via declared sub-agents or spawn: true.

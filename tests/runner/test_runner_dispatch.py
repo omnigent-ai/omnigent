@@ -6247,7 +6247,7 @@ async def test_sys_session_share_defaults_to_caller_and_puts_grant() -> None:
             server_client=server_client,
             conversation_id="conv_caller",
             # Sharing a named user only needs the non-public tier enabled.
-            agent_spec=AgentSpec(spec_version=1, share=SharePolicy.NON_PUBLIC),
+            agent_spec=AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.NON_PUBLIC),
         )
 
     # Exactly one PUT to the caller's own permissions sub-resource, with
@@ -6304,7 +6304,7 @@ async def test_sys_session_share_maps_error_statuses(
             arguments=json.dumps({"user_id": "alice@example.com", "session_id": "conv_x"}),
             server_client=server_client,
             conversation_id="conv_caller",
-            agent_spec=AgentSpec(spec_version=1, share=SharePolicy.NON_PUBLIC),
+            agent_spec=AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.NON_PUBLIC),
         )
 
     result = json.loads(output)
@@ -6339,7 +6339,7 @@ async def test_sys_session_share_rejects_bad_level_without_calling_server() -> N
             server_client=server_client,
             conversation_id="conv_caller",
             # Share enabled (non-public) so the call reaches level validation.
-            agent_spec=AgentSpec(spec_version=1, share=SharePolicy.NON_PUBLIC),
+            agent_spec=AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.NON_PUBLIC),
         )
 
     assert called is False  # validation must short-circuit before the PUT
@@ -6378,9 +6378,9 @@ async def test_sys_session_share_surfaces_server_message_on_4xx() -> None:
             ),
             server_client=server_client,
             conversation_id="conv_caller",
-            # share: public lets __public__ pass the runner gate and reach
-            # the server, which is what rejects level>read for public.
-            agent_spec=AgentSpec(spec_version=1, share=SharePolicy.PUBLIC),
+            # agent_session_sharing: public lets __public__ pass the runner
+            # gate and reach the server, which rejects level>read for public.
+            agent_spec=AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.PUBLIC),
         )
 
     result = json.loads(output)
@@ -6402,14 +6402,15 @@ async def test_sys_session_share_disabled_without_share_flag(
     share_policy: SharePolicy | None,
 ) -> None:
     """
-    With no spec (``None``) or ``share: none``, the runner refuses the
-    grant client-side and never PUTs — the share flag is the real gate,
-    not just tool advertisement, so a prompt-injected call naming the
-    tool can't escalate. A PUT reaching the handler would mean the
-    runner-side policy gate regressed.
+    With no spec (``None``) or ``agent_session_sharing: none``, the
+    runner refuses the grant client-side and never PUTs — the
+    ``agent_session_sharing`` flag is the real gate, not just tool
+    advertisement, so a prompt-injected call naming the tool can't
+    escalate. A PUT reaching the handler would mean the runner-side
+    policy gate regressed.
 
-    :param share_policy: The spec's ``share`` policy under test (or
-        ``None`` for a missing spec).
+    :param share_policy: The spec's ``agent_session_sharing`` policy
+        under test (or ``None`` for a missing spec).
     """
     from omnigent.runner.tool_dispatch import execute_tool
 
@@ -6420,7 +6421,11 @@ async def test_sys_session_share_disabled_without_share_flag(
         called = True
         return httpx.Response(200, json={})
 
-    spec = None if share_policy is None else AgentSpec(spec_version=1, share=share_policy)
+    spec = (
+        None
+        if share_policy is None
+        else AgentSpec(spec_version=1, agent_session_sharing=share_policy)
+    )
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(_server_handler),
         base_url="http://server",
@@ -6440,8 +6445,9 @@ async def test_sys_session_share_disabled_without_share_flag(
 @pytest.mark.asyncio
 async def test_sys_session_share_non_public_rejects_public_grant() -> None:
     """
-    Under ``share: non-public`` a grant to a named user is allowed, but
-    a ``__public__`` grant is refused client-side before any PUT — the
+    Under ``agent_session_sharing: non-public`` a grant to a named user
+    is allowed, but a ``__public__`` grant is refused client-side before
+    any PUT — the
     non-public tier must not be able to expose the transcript anonymously
     even if the model (or an injection) asks for it. A PUT here would
     mean the public sub-gate regressed.
@@ -6464,7 +6470,7 @@ async def test_sys_session_share_non_public_rejects_public_grant() -> None:
             arguments=json.dumps({"user_id": "__public__", "session_id": "conv_x"}),
             server_client=server_client,
             conversation_id="conv_caller",
-            agent_spec=AgentSpec(spec_version=1, share=SharePolicy.NON_PUBLIC),
+            agent_spec=AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.NON_PUBLIC),
         )
 
     assert called is False  # public sub-gate must short-circuit before the PUT
@@ -6474,8 +6480,9 @@ async def test_sys_session_share_non_public_rejects_public_grant() -> None:
 @pytest.mark.asyncio
 async def test_sys_session_share_public_allows_public_grant() -> None:
     """
-    Under ``share: public`` a ``__public__`` read grant passes the runner
-    gate and PUTs to the permissions endpoint — the positive case the
+    Under ``agent_session_sharing: public`` a ``__public__`` read grant
+    passes the runner gate and PUTs to the permissions endpoint — the
+    positive case the
     non-public/none gates exclude. If the gate wrongly blocked it, public
     sharing would be impossible even when the spec explicitly opts in.
     """
@@ -6499,7 +6506,7 @@ async def test_sys_session_share_public_allows_public_grant() -> None:
             arguments=json.dumps({"user_id": "__public__"}),
             server_client=server_client,
             conversation_id="conv_caller",
-            agent_spec=AgentSpec(spec_version=1, share=SharePolicy.PUBLIC),
+            agent_spec=AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.PUBLIC),
         )
 
     # __public__ reached the server as a level-1 (read) grant on the caller.

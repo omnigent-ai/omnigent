@@ -213,12 +213,13 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     # the specified sub-agent types. Defaults to False — session
     # reads stay always-on, but every write grant is explicit.
     spawn = bool(raw.get("spawn", False))
-    # Top-level ``share:`` flag is the SOLE enabler of the
-    # ``sys_session_share`` tool, independent of ``spawn`` /
-    # ``tools.agents``. ``none`` (default) leaves it unregistered;
-    # ``non-public`` allows granting named users; ``public`` also
-    # allows ``__public__`` anonymous read.
-    share = _parse_share_policy(raw.get("share"))
+    # Top-level ``agent_session_sharing:`` flag is the SOLE enabler of
+    # the ``sys_session_share`` tool, independent of ``spawn`` /
+    # ``tools.agents`` (and unrelated to server-API / CLI sharing).
+    # ``none`` (default) leaves it unregistered; ``non-public`` allows
+    # granting named users; ``public`` also allows ``__public__``
+    # anonymous read.
+    agent_session_sharing = _parse_share_policy(raw.get("agent_session_sharing"))
 
     # Honor ``prompt:`` as the legacy alias for ``instructions:`` (per
     # ``_OMNIGENT_SYSTEM_PROMPT_KEYS``); ``instructions:`` wins if both set.
@@ -255,7 +256,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         terminals=terminals,
         timers=timers,
         spawn=spawn,
-        share=share,
+        agent_session_sharing=agent_session_sharing,
     )
 
 
@@ -1743,7 +1744,8 @@ def _resolve_instructions(root: Path, raw_value: object) -> str | None:
 
 def _parse_share_policy(raw: object) -> SharePolicy:
     """
-    Parse the top-level YAML ``share:`` field into a :class:`SharePolicy`.
+    Parse the top-level YAML ``agent_session_sharing:`` field into a
+    :class:`SharePolicy`.
 
     This flag is the sole enabler of the ``sys_session_share`` tool
     (independent of ``spawn`` / ``tools.agents``). Sharing mutates
@@ -1771,7 +1773,7 @@ def _parse_share_policy(raw: object) -> SharePolicy:
     except ValueError:
         valid = ", ".join(repr(p.value) for p in SharePolicy)
         raise OmnigentError(
-            f"top-level share: must be one of {valid}; got {raw!r}",
+            f"top-level agent_session_sharing: must be one of {valid}; got {raw!r}",
             code=ErrorCode.INVALID_INPUT,
         ) from None
 
