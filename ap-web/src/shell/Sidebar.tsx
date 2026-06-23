@@ -511,9 +511,30 @@ function ConversationList({
     });
   }, []);
 
-  // When a search is active, force all sections open so results in
-  // collapsed groups (especially Archived) are visible.
-  const effectiveCollapsedSections = searchQuery ? [] : collapsedSections;
+  // When a search query appears, auto-expand all sections so results
+  // in collapsed groups (especially Archived) are visible. The user
+  // can still manually collapse sections while searching. When the
+  // search is cleared, restore the persisted collapsed state.
+  const prevSearchQuery = useRef(searchQuery);
+  const [searchCollapsedSections, setSearchCollapsedSections] = useState<string[]>([]);
+  useEffect(() => {
+    const wasEmpty = !prevSearchQuery.current;
+    const isNonEmpty = !!searchQuery;
+    prevSearchQuery.current = searchQuery;
+    if (wasEmpty && isNonEmpty) {
+      setSearchCollapsedSections([]);
+    }
+  }, [searchQuery]);
+  const effectiveCollapsedSections = searchQuery ? searchCollapsedSections : collapsedSections;
+  const effectiveToggleSectionCollapsed = searchQuery
+    ? (sectionTitle: string) => {
+        setSearchCollapsedSections((prev) =>
+          prev.includes(sectionTitle)
+            ? prev.filter((t) => t !== sectionTitle)
+            : [...prev, sectionTitle],
+        );
+      }
+    : toggleSectionCollapsed;
 
   // Visible rows in render order (collapsed sections excluded) for the Cmd+↑/↓
   // session hotkey. Titles must match the <ConversationSection> props below.
@@ -583,7 +604,7 @@ function ConversationList({
               conversations={sections.pinned}
               pinnedConversationIds={pinnedConversationIds}
               collapsedSections={effectiveCollapsedSections}
-              onToggleCollapsed={toggleSectionCollapsed}
+              onToggleCollapsed={effectiveToggleSectionCollapsed}
               onRowClick={onRowClick}
               onTogglePinned={onTogglePinned}
               selectionMode={selectionMode}
@@ -597,7 +618,7 @@ function ConversationList({
               conversations={sections.sessions}
               pinnedConversationIds={pinnedConversationIds}
               collapsedSections={effectiveCollapsedSections}
-              onToggleCollapsed={toggleSectionCollapsed}
+              onToggleCollapsed={effectiveToggleSectionCollapsed}
               onRowClick={onRowClick}
               onTogglePinned={onTogglePinned}
               selectionMode={selectionMode}
@@ -611,7 +632,7 @@ function ConversationList({
               conversations={sections.shared}
               pinnedConversationIds={pinnedConversationIds}
               collapsedSections={effectiveCollapsedSections}
-              onToggleCollapsed={toggleSectionCollapsed}
+              onToggleCollapsed={effectiveToggleSectionCollapsed}
               onRowClick={onRowClick}
               onTogglePinned={onTogglePinned}
               selectionMode={selectionMode}
@@ -625,7 +646,7 @@ function ConversationList({
               conversations={sections.archived}
               pinnedConversationIds={pinnedConversationIds}
               collapsedSections={effectiveCollapsedSections}
-              onToggleCollapsed={toggleSectionCollapsed}
+              onToggleCollapsed={effectiveToggleSectionCollapsed}
               onRowClick={onRowClick}
               onTogglePinned={onTogglePinned}
               selectionMode={selectionMode}
