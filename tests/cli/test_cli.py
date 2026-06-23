@@ -24,6 +24,7 @@ from omnigent.cli import (
     _GLOBAL_CONFIG_KEYS,
     _adopt_ambient_credentials,
     _announce_auto_configured_credentials,
+    _build_host_daemon_env,
     _bundle,
     _bundled_example_path,
     _dispatch_native_terminal_harness,
@@ -118,6 +119,52 @@ def test_python_module_entrypoint_uses_unified_click_cli() -> None:
     assert "Commands:" in result.stdout
     assert "run" in result.stdout and "Attach the REPL to a LIVE session" in result.stdout
     assert "Omnigent quick chat" not in result.stdout
+
+
+def test_host_daemon_env_preserves_standard_proxy_vars(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    ``omnigent run`` spawns a background host daemon before it talks to
+    model backends. Corporate networks often rely on standard proxy vars,
+    so the host daemon must inherit them even though unrelated provider
+    secrets stay filtered by mode.
+    """
+    proxy_env = {
+        "HTTP_PROXY": "http://proxy.example.com:3128",
+        "HTTPS_PROXY": "http://proxy.example.com:3128",
+        "NO_PROXY": "localhost,127.0.0.1",
+        "ALL_PROXY": "socks5://proxy.example.com:1080",
+        "http_proxy": "http://lower-proxy.example.com:3128",
+        "https_proxy": "http://lower-proxy.example.com:3128",
+        "no_proxy": "localhost,127.0.0.1",
+        "all_proxy": "socks5://lower-proxy.example.com:1080",
+    }
+    for key, value in proxy_env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "corp")
+    monkeypatch.setenv("OPENAI_API_KEY", "sentinel-openai")
+
+    local_env = _build_host_daemon_env(server_url=None)
+    remote_env = _build_host_daemon_env(server_url="https://example.databricksapps.com")
+
+    assert {key: local_env.get(key) for key in proxy_env} == proxy_env
+    assert {key: remote_env.get(key) for key in proxy_env} == proxy_env
+    assert local_env["DATABRICKS_CONFIG_PROFILE"] == "corp"
+    assert remote_env["DATABRICKS_CONFIG_PROFILE"] == "corp"
+    assert local_env["OPENAI_API_KEY"] == "sentinel-openai"
+    assert "OPENAI_API_KEY" not in remote_env
+
+    from omnigent.host.connect import _RUNNER_ENV_ALLOWLIST, _build_runner_env
+
+    assert set(proxy_env).isdisjoint(_RUNNER_ENV_ALLOWLIST)
+    runner_env = _build_runner_env(
+        {**local_env, **proxy_env},
+        server_url="https://example.databricksapps.com",
+        runner_id="runner_proxy",
+        binding_token="token_proxy",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
+    assert set(proxy_env).isdisjoint(runner_env)
 
 
 @pytest.mark.parametrize(
