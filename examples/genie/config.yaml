@@ -1,0 +1,47 @@
+# Sales Genie — an Omnigent agent backed by a Databricks Genie space.
+#
+# This agent forwards each question to a remote Databricks AI/BI Genie space,
+# which answers natural-language questions over your curated data (returning a
+# text summary plus the SQL it generated and the result rows).
+#
+# Quick start:
+#
+#   1. Install the Databricks extra (provides databricks-sdk):
+#        uv tool install --force "omnigent[databricks]"
+#
+#   2. Authenticate with the Databricks CLI (writes ~/.databrickscfg):
+#        databricks auth login --host https://<your-workspace>.databricks.com
+#
+#   3. Put your Genie space id in `executor.model` and your profile name in
+#      `executor.auth.profile` below, then run:
+#        omnigent run examples/genie -p "What were total sales by region last quarter?"
+#
+# Find a space id in the Genie UI URL:
+#   https://<workspace>/genie/rooms/<SPACE_ID>
+
+spec_version: 1
+name: sales_genie
+description: >-
+  Answers questions over your data by conversing with a remote Databricks
+  Genie space (natural language → SQL), returning a summary, the generated
+  query, and the result rows.
+
+# The Genie space carries its own instructions, so this prompt is not sent to
+# Genie; it documents the agent's purpose.
+prompt: A data analyst backed by a Databricks Genie space.
+
+executor:
+  type: omnigent
+  config:
+    # Register the remote Genie space as this agent's harness.
+    harness: databricks-genie
+  # The Genie space id is the conversational unit, so it is carried in `model`.
+  # Replace with your space id (from the Genie room URL).
+  model: "REPLACE_WITH_GENIE_SPACE_ID"
+  # Auth via a Databricks CLI profile from ~/.databrickscfg
+  # (`databricks auth login` / `databricks configure`). Replace `DEFAULT` with
+  # your profile name, or drop the `auth:` block to use the default resolution
+  # (DATABRICKS_CONFIG_PROFILE env / [DEFAULT] section).
+  auth:
+    type: databricks
+    profile: DEFAULT

@@ -74,6 +74,13 @@ _HARNESS_MODULES: dict[str, str] = {
     # localharness binary; needs glibc >=~2.36). Drives Gemini 3.5 Flash by
     # default (also Claude / GPT-OSS), with Gemini API-key or Vertex AI auth.
     "antigravity": "omnigent.inner.antigravity_harness",
+    # Databricks Genie Spaces harness wrap. See
+    # omnigent/inner/databricks_genie_harness.py. In-process SDK harness that
+    # converses with a remote Genie space over the databricks-sdk Genie API; the
+    # space id is carried in ``executor.model`` and auth comes from a Databricks
+    # CLI profile (``databricks auth login`` → ``~/.databrickscfg``). Aliased
+    # ``genie`` (see omnigent/harness_aliases.py).
+    "databricks-genie": "omnigent.inner.databricks_genie_harness",
 }
 
 __all__ = ["_HARNESS_MODULES"]
