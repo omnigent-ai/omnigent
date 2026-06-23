@@ -4,6 +4,7 @@ import { Outlet, useParams, useSearchParams } from "@/lib/routing";
 import { useConversations } from "@/hooks/useConversations";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
+import { useViewToggleHotkey } from "@/hooks/useViewToggleHotkey";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
@@ -937,6 +938,11 @@ export function AppShell() {
       terminalStartingUp,
     ],
   );
+
+  // Cmd/Ctrl+P flips the center surface (chat <-> terminal) on terminal-first
+  // sessions — the keyboard accelerator for the Chat/Terminal pill. Desktop-
+  // only and inert elsewhere (the hook gates on isNativeShell + isTerminalFirst).
+  useViewToggleHotkey(terminalFirstContextValue);
 
   // Opener for the fork/clone dialog, shared with descendants via
   // ForkDialogContext. ChatPage's per-message "Fork from here" action is
