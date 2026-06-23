@@ -478,6 +478,83 @@ def test_shutdown_safe_without_start() -> None:
     mgr.shutdown()
 
 
+def test_shutdown_idempotent() -> None:
+    """Calling ``shutdown()`` twice does not raise."""
+    spec = _make_spec()
+    mgr = ToolManager(spec)
+    mgr.start()
+    mgr.shutdown()
+    mgr.shutdown()
+
+
+def test_shutdown_closes_os_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``shutdown()`` closes ``_os_env`` when it was self-created."""
+    spec = _make_spec()
+    mgr = ToolManager(spec)
+    mgr.start()
+
+    class _FakeOSEnv:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    fake_env = _FakeOSEnv()
+    mgr._os_env = fake_env  # type: ignore[assignment]
+    mgr._pre_resolved_os_env = None
+
+    mgr.shutdown()
+    assert fake_env.closed
+    assert mgr._os_env is None
+
+
+def test_shutdown_skips_pre_resolved_os_env() -> None:
+    """``shutdown()`` does NOT close a pre-resolved (shared) OS env."""
+    spec = _make_spec()
+
+    class _FakeOSEnv:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    shared_env = _FakeOSEnv()
+    mgr = ToolManager(spec, os_env=shared_env)  # type: ignore[arg-type]
+    mgr.start()
+    mgr.shutdown()
+    assert not shared_env.closed
+
+
+def test_shutdown_calls_tool_shutdown() -> None:
+    """``shutdown()`` calls ``shutdown()`` on every registered tool."""
+    from omnigent.tools.base import Tool
+
+    class _TrackingTool(Tool):
+        shut_down = False
+
+        @classmethod
+        def name(cls) -> str:
+            return "_tracking"
+
+        @classmethod
+        def description(cls) -> str:
+            return "test"
+
+        def get_schema(self) -> dict[str, Any]:
+            return {"type": "function", "function": {"name": "_tracking"}}
+
+        def shutdown(self) -> None:
+            self.shut_down = True
+
+    spec = _make_spec()
+    mgr = ToolManager(spec)
+    tracker = _TrackingTool()
+    mgr._tools["_tracking"] = tracker
+    mgr.start()
+    mgr.shutdown()
+    assert tracker.shut_down
+
+
 # ── Client-specified tools ────────────────────────────────
 
 

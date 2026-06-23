@@ -8,7 +8,7 @@ import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
-import { isMacElectronShell } from "@/lib/nativeBridge";
+import { isIOSShell, isMacElectronShell } from "@/lib/nativeBridge";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import {
   Dialog,
@@ -946,6 +946,7 @@ export function AppShell() {
           <div
             className="app-shell relative flex h-dvh bg-sidebar text-foreground"
             data-electron-mac={isMacElectronShell() ? "true" : undefined}
+            data-ios-native={isIOSShell() ? "true" : undefined}
           >
             {/* Frameless-window titlebar stand-in (macOS Electron only): the
           sidebar's electron top margin (see index.css) frees this strip of

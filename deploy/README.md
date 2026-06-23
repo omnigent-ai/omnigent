@@ -352,7 +352,7 @@ overrides this auto-selection.
 |---|---|---|
 | `accounts` (deploy default) | Standalone deploy, no external IdP: built-in username/password with first-user-is-admin bootstrap and UI-based invites. Opt in with `OMNIGENT_AUTH_ENABLED=1` (and no OIDC vars). | Set `OMNIGENT_ACCOUNTS_COOKIE_SECRET` (or let `bootstrap.sh` mint it) and `OMNIGENT_ACCOUNTS_BASE_URL` (public URL). On first boot, set the admin password via the web Create-admin form, the terminal prompt, or `--admin-password` / `OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD`. |
 | `oidc` | Standalone deploy with your own IdP: server handles the full login flow | Set `OMNIGENT_AUTH_ENABLED=1` and the `OMNIGENT_OIDC_*` env vars; the presence of `OMNIGENT_OIDC_ISSUER` selects OIDC (or pin `OMNIGENT_AUTH_PROVIDER=oidc`). Requires HTTPS (the session cookie uses the `__Host-` prefix). |
-| `header` | Behind an existing SSO proxy (oauth2-proxy, AWS ALB OIDC, Cloudflare Access, Tailscale Funnel, …) that injects an identity header | The default when `OMNIGENT_AUTH_ENABLED` is off; or pin `OMNIGENT_AUTH_PROVIDER=header`. Reads `X-Forwarded-Email` by default; set `OMNIGENT_AUTH_HEADER` for proxies that use another name (e.g. `Cf-Access-Authenticated-User-Email`). Proxy MUST strip any inbound copy of the header from clients. Missing headers are always rejected. |
+| `header` | Behind an existing SSO proxy (oauth2-proxy, AWS ALB OIDC, Cloudflare Access, Tailscale Funnel, …) that injects an identity header | The default when `OMNIGENT_AUTH_ENABLED` is off; or pin `OMNIGENT_AUTH_PROVIDER=header`. Reads `X-Forwarded-Email` by default; set `OMNIGENT_AUTH_HEADER` for proxies that use another name (e.g. `Cf-Access-Authenticated-User-Email`), and `OMNIGENT_AUTH_HEADER_STRIP_PREFIX=accounts.google.com:` for Google IAP. Proxy MUST strip any inbound copy of the header from clients. Missing headers are always rejected. |
 
 ### Single sign-on (OIDC)
 
@@ -425,6 +425,18 @@ authenticated email in `Cf-Access-Authenticated-User-Email`):
 ```dotenv
 OMNIGENT_AUTH_PROVIDER=header
 OMNIGENT_AUTH_HEADER=Cf-Access-Authenticated-User-Email
+```
+
+Some proxies namespace the identity they inject. **Google IAP** forwards the
+email in `X-Goog-Authenticated-User-Email` prefixed with `accounts.google.com:`
+(e.g. `accounts.google.com:user@example.com`). Set
+`OMNIGENT_AUTH_HEADER_STRIP_PREFIX` to drop that prefix and recover the bare
+email:
+
+```dotenv
+OMNIGENT_AUTH_PROVIDER=header
+OMNIGENT_AUTH_HEADER=X-Goog-Authenticated-User-Email
+OMNIGENT_AUTH_HEADER_STRIP_PREFIX=accounts.google.com:
 ```
 
 In header mode **the server trusts whatever that header says**. If no proxy

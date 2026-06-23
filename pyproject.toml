@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "omnigent"
-version = "0.2.0.dev0"
+version = "0.3.0.dev0"
 description = "Omnigent: declarative agent authoring and runtime framework"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -25,8 +25,8 @@ dependencies = [
     # one version, so a published `omnigent==X` must resolve the SDK wheels
     # built alongside it (release-omnigent.yml verifies these pins match the
     # release tag). Local/editable installs still resolve via tool.uv.sources.
-    "omnigent-client==0.2.0.dev0",
-    "omnigent-ui-sdk==0.2.0.dev0",
+    "omnigent-client==0.3.0.dev0",
+    "omnigent-ui-sdk==0.3.0.dev0",
     # Merged from omnigent + omnigent.
     "pyyaml>=6.0,<7",
     "openai>=1.0,<3",

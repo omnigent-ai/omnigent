@@ -4,5 +4,8 @@ dist
 src/components/ui
 package-lock.json
 
+# Xcode asset catalogs are tool-owned; Prettier fights Xcode's formatting.
+**/*.xcassets/**
+
 # Generated Apple Icon Composer bundles (machine-formatted; prettier fights the tooling)
-electron/icons/**/*.icon
+**/*.icon/**
