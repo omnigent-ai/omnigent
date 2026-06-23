@@ -1167,6 +1167,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "cursor",
         "debby",
         "debug",
+        "goose",
         "host",
         "lakebox",
         "login",
@@ -4575,6 +4576,86 @@ def cursor(
     )
 
 
+@cli.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+@click.option(
+    "--server",
+    default=None,
+    help=(
+        "Remote omnigent URL. Ensures the host daemon, asks the "
+        "daemon-spawned runner to launch the Goose TUI, and attaches this TTY. "
+        'Pass --server "" to auto-spawn a persistent local server in the '
+        "background and use that instead of a remote one."
+    ),
+)
+@click.option(
+    "-r",
+    "--resume",
+    "resume",
+    is_flag=False,
+    flag_value=_RESUME_PICKER_SENTINEL,
+    default=None,
+    help=(
+        "Resume a prior Omnigent conversation. With a conversation id "
+        "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
+        "opens an interactive picker scoped to goose-native sessions."
+    ),
+)
+@click.option(
+    "--session",
+    "session_id",
+    metavar="SESSION_ID",
+    default=None,
+    hidden=True,
+    help="Deprecated alias for ``--resume <id>``; kept for one release.",
+)
+@click.argument("goose_args", nargs=-1, type=click.UNPROCESSED)
+def goose(
+    server: str | None,
+    resume: str | None,
+    session_id: str | None,
+    goose_args: tuple[str, ...],
+) -> None:
+    """Launch the Goose TUI in an Omnigent terminal.
+
+    \b
+    Examples:
+      omnigent goose
+      omnigent goose --resume conv_abc123
+      omnigent goose --resume                 # interactive picker
+    """
+    choice = _split_resume_value(resume)
+    if session_id is not None and (choice.picker or choice.conversation_id is not None):
+        raise click.UsageError(
+            "--session and --resume are mutually exclusive; "
+            "prefer --resume (--session is deprecated).",
+        )
+
+    from omnigent.goose_native import run_goose_native
+
+    cfg = _load_effective_config()
+    if server is None:
+        server = cfg.get("server")
+    auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
+
+    server = _ensure_backend(server)
+    resolved_session_id = (
+        choice.conversation_id if choice.conversation_id is not None else session_id
+    )
+
+    run_goose_native(
+        server=server,
+        session_id=resolved_session_id,
+        resume_picker=choice.picker,
+        goose_args=goose_args,
+        auto_open_conversation=auto_open_conversation,
+    )
+
+
 def _run_bundled_agent(name: str, run_args: tuple[str, ...]) -> None:
     """Forward a bundled-agent subcommand to ``run`` on its packaged path.
 
@@ -4716,7 +4797,7 @@ def resume(
 _HARNESS_CHOICES_HELP = (
     "'claude' (alias for 'claude-sdk'), 'claude-sdk', 'codex', "
     "'cursor', "
-    "'openai-agents', 'open-responses', 'pi', 'antigravity', or 'qwen'"
+    "'openai-agents', 'open-responses', 'pi', 'antigravity', 'qwen', or 'goose'"
 )
 _HARNESS_HELP = f"Harness to use for a local agent: {_HARNESS_CHOICES_HELP}."
 _RUN_HARNESS_HELP = (
@@ -4752,6 +4833,9 @@ _DEFAULT_HARNESS_PROMPTS = {
         "You are Qwen Code, running through Omnigent. "
         "Help the user with software engineering tasks."
     ),
+    "goose": (
+        "You are Goose, running through Omnigent. Help the user with software engineering tasks."
+    ),
 }
 _DEFAULT_HARNESS_PROMPT = "You are a helpful coding agent running through Omnigent."
 
@@ -4761,7 +4845,7 @@ _DEFAULT_HARNESS_PROMPT = "You are a helpful coding agent running through Omnige
 # operations route through the Omnigent dispatch path (runner
 # visibility, timeouts, error recovery) instead of the harness's
 # internal built-in tools.
-_OS_ENV_HARNESSES: frozenset[str] = frozenset({"claude-sdk", "codex", "pi", "qwen"})
+_OS_ENV_HARNESSES: frozenset[str] = frozenset({"claude-sdk", "codex", "pi", "qwen", "goose"})
 
 
 def _validate_harness(harness: str) -> None:
@@ -9088,6 +9172,113 @@ def _manage_qwen_harness() -> None:
             status = None
 
 
+def _print_goose_auth_help() -> None:
+    """Print Goose's configuration options (Omnigent manages no Goose credential)."""
+    from omnigent.onboarding.interactive import console
+
+    console.print(
+        "\n  [bold]Configure Goose[/bold] (Omnigent stores no Goose credential):\n"
+        "    • Interactive: run [bold]goose configure[/bold] to pick a provider "
+        "and store its key (keyring or ~/.config/goose/config.yaml)\n"
+        "    • Env override: set [bold]GOOSE_PROVIDER[/bold] + [bold]GOOSE_MODEL[/bold] "
+        "(plus the provider's key, e.g. ANTHROPIC_API_KEY / OPENAI_API_KEY)\n"
+    )
+
+
+def _launch_goose_configure() -> str | None:
+    """Launch the interactive ``goose configure`` flow; return a status line.
+
+    ``goose configure`` is interactive (pick a provider, enter its key), so this
+    hands the terminal to ``goose``; when the user exits, re-read the configured
+    provider. Mirrors :func:`_launch_qwen_auth`.
+
+    :returns: A status line reflecting the post-configure provider state.
+    """
+    from omnigent.onboarding.goose_auth import goose_config_summary
+    from omnigent.onboarding.harness_install import (
+        GOOSE_KEY,
+        harness_cli_installed,
+        harness_install_spec,
+    )
+    from omnigent.onboarding.interactive import console
+
+    if not harness_cli_installed(GOOSE_KEY):
+        return "✗ goose CLI not found"
+    spec = harness_install_spec(GOOSE_KEY)
+    assert spec is not None
+    console.print(
+        "  [dim]Launching [bold]goose configure[/bold] — pick a provider and "
+        "enter its key, then return.[/dim]"
+    )
+    with contextlib.suppress(OSError, KeyboardInterrupt):
+        subprocess.run([spec.binary, "configure"], check=False)
+    summary = goose_config_summary()
+    if summary.provider:
+        model = f" ({summary.model})" if summary.model else ""
+        return f"✓ provider configured: {summary.provider}{model}"
+    return "Provider not detected yet"
+
+
+def _manage_goose_harness() -> None:
+    """Run the level-2 loop for Goose: ensure the CLI, then guide ``goose configure``.
+
+    Goose owns its own auth (keyring / ``~/.config/goose/config.yaml``) — Omnigent
+    stores no Goose credential — so, like the Qwen drill-in, this reports
+    best-effort configuration status and offers to launch ``goose configure``; it
+    does not store a key through Omnigent. A missing CLI gates the drill-in
+    (nothing to configure for a harness you can't run); Goose ships out-of-band
+    (brew / curl, no npm package), so we show its install hint rather than
+    auto-installing. Serves both ``goose-native`` (TUI) and the headless
+    ``goose`` (ACP) harness — both launch the same ``goose`` binary and read the
+    same config.
+
+    :returns: None. Side effects: may launch the interactive ``goose configure``.
+    """
+    from omnigent.onboarding.goose_auth import goose_config_summary
+    from omnigent.onboarding.harness_install import (
+        GOOSE_KEY,
+        harness_cli_installed,
+        harness_install_spec,
+    )
+    from omnigent.onboarding.interactive import console, select
+
+    # Gate on the CLI. Goose installs out-of-band (no npm package), so we can't
+    # auto-install — show the hint and return.
+    if not harness_cli_installed(GOOSE_KEY):
+        spec = harness_install_spec(GOOSE_KEY)
+        hint = spec.install_hint if spec and spec.install_hint else "brew install block-goose-cli"
+        console.print(
+            f"  Goose's CLI isn't installed. Install it with:\n    [bold]{hint}[/bold]\n"
+            "  then re-open this menu."
+        )
+        return
+
+    status: str | None = None
+    while True:
+        summary = goose_config_summary()
+        if summary.provider:
+            model = f" · {summary.model}" if summary.model else ""
+            header = f"Goose — provider configured: {summary.provider}{model}"
+        else:
+            header = "Goose — no provider configured yet"
+        rows: list[_HarnessMenuRow] = [
+            _HarnessMenuRow("Run goose configure", action="configure"),
+            _HarnessMenuRow("Show configuration options", action="help"),
+            _HarnessMenuRow("← Back", action="back"),
+        ]
+        idx = select(header, [r.label for r in rows], clear_on_exit=True, status=status)
+        if idx < 0:  # Esc / q
+            return
+        action = rows[idx].action
+        if action == "back":
+            return
+        if action == "configure":
+            status = _launch_goose_configure()
+        elif action == "help":
+            _print_goose_auth_help()
+            status = None
+
+
 def _manage_credential(provider: str, family: str) -> str | None:
     """Run the level-3 loop for one credential: make default / remove.
 
@@ -9378,11 +9569,14 @@ def _run_configure_harnesses_interactive() -> None:
         cursor_api_key_configured,
         cursor_sdk_installed,
     )
+    from omnigent.onboarding.goose_auth import goose_config_summary
     from omnigent.onboarding.harness_install import (
         CURSOR_KEY,
+        GOOSE_KEY,
         QWEN_KEY,
         harness_cli_installed,
         harness_install_command,
+        harness_install_spec,
     )
     from omnigent.onboarding.interactive import select
     from omnigent.onboarding.provider_config import (
@@ -9426,6 +9620,10 @@ def _run_configure_harnesses_interactive() -> None:
     # provider family (its v1 auth is the CLI's own env vars / ``/auth`` flow,
     # not an Omnigent credential), so it dispatches to its own drill-in.
     _QWEN = "\x00qwen"
+    # Sentinel marking the Goose row — like Qwen/Antigravity/Cursor it is not a
+    # provider family (Goose owns its own auth via ``goose configure``, not an
+    # Omnigent credential), so it dispatches to its own drill-in.
+    _GOOSE = "\x00goose"
     families = [ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE]
     while True:
         config = _load_global_config()
@@ -9556,6 +9754,37 @@ def _run_configure_harnesses_interactive() -> None:
         options.append(f"  {qwen_sub}")
         selectable.append(False)
         row_target.append(None)
+        # Goose (its own provider config — no provider family, like Cursor /
+        # Antigravity / Qwen). Goose owns its auth via ``goose configure``
+        # (keyring / ~/.config/goose/config.yaml); Omnigent stores no key, so
+        # "ready" means the CLI is installed AND a provider is configured
+        # (``goose_config_summary`` reads GOOSE_PROVIDER from env or the config
+        # file, so a fresh, unconfigured install never falsely shows as ready).
+        goose_installed = harness_cli_installed(GOOSE_KEY)
+        goose_summary = goose_config_summary() if goose_installed else None
+        goose_ready = goose_summary is not None and goose_summary.provider is not None
+        options.append(f"{'  ' if goose_ready else '[red]✗[/] '}Goose")
+        selectable.append(True)
+        row_target.append(_GOOSE)
+        if not goose_installed:
+            from rich.markup import escape as _rich_escape
+
+            goose_spec = harness_install_spec(GOOSE_KEY)
+            goose_hint = _rich_escape(
+                goose_spec.install_hint
+                if goose_spec and goose_spec.install_hint
+                else "brew install block-goose-cli"
+            )
+            goose_sub = f"[dim]not installed — open to install ({goose_hint})[/]"
+        elif goose_ready:
+            assert goose_summary is not None
+            goose_model = f" · {goose_summary.model}" if goose_summary.model else ""
+            goose_sub = f"[green]✓[/] {goose_summary.provider}{goose_model} configured"
+        else:
+            goose_sub = "[dim]installed — open to run goose configure[/]"
+        options.append(f"  {goose_sub}")
+        selectable.append(False)
+        row_target.append(None)
         options.append("Quit")
         selectable.append(True)
         row_target.append(_QUIT)
@@ -9576,6 +9805,8 @@ def _run_configure_harnesses_interactive() -> None:
             _manage_antigravity_harness()
         elif target == _QWEN:
             _manage_qwen_harness()
+        elif target == _GOOSE:
+            _manage_goose_harness()
         else:  # Quit row (or, defensively, a non-family row)
             return
 

@@ -33,6 +33,7 @@ import { Badge } from "@/components/ui/badge";
 import { ClaudeIcon } from "@/components/icons/ClaudeIcon";
 import { CodexIcon } from "@/components/icons/CodexIcon";
 import { CursorIcon } from "@/components/icons/CursorIcon";
+import { GooseIcon } from "@/components/icons/GooseIcon";
 import { NessieIcon } from "@/components/icons/NessieIcon";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { PiIcon } from "@/components/icons/PiIcon";
@@ -306,6 +307,7 @@ function brandChildIcon(child: ChildSessionInfo): AgentRowIcon | null {
   if (nativeAgent?.iconKind === "codex") return CodexIcon;
   if (nativeAgent?.iconKind === "pi") return PiIcon;
   if (nativeAgent?.iconKind === "cursor") return CursorIcon;
+  if (nativeAgent?.iconKind === "goose") return GooseIcon;
   // Exact match — substring checks would false-match names like "pipeline".
   if (child.tool === PI_AGENT_NAME) return PiIcon;
   return null;
@@ -466,9 +468,11 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
           ? PiIcon
           : nativeAgent?.iconKind === "cursor"
             ? CursorIcon
-            : isNessie
-              ? NessieIcon
-              : BotIcon;
+            : nativeAgent?.iconKind === "goose"
+              ? GooseIcon
+              : isNessie
+                ? NessieIcon
+                : BotIcon;
   // Native wrappers show the product name (mirroring the sidebar) instead
   // of the spec's YAML name (e.g. "claude-native-ui"); other agents show
   // their agent name, with "main" only while the session loads or when it

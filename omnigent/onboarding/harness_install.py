@@ -56,6 +56,12 @@ QWEN_KEY = "qwen"
 # installer rather than npm — so it carries an ``install_hint``, not a ``package``.
 CURSOR_KEY = "cursor"
 
+# Goose authenticates against its own config (``goose configure`` → keyring /
+# ``~/.config/goose/config.yaml``) with no Omnigent-managed credential, and ships
+# via Homebrew / a curl installer rather than npm — so it carries an
+# ``install_hint``, not a ``package``.
+GOOSE_KEY = "goose"
+
 
 @dataclass(frozen=True)
 class HarnessInstallSpec:
@@ -141,6 +147,12 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         install_hint="curl https://cursor.com/install -fsS | bash",
         login_status_key="isAuthenticated",
     ),
+    GOOSE_KEY: HarnessInstallSpec(
+        "Goose",
+        "goose",
+        package=None,
+        install_hint="brew install block-goose-cli",
+    ),
 }
 
 
@@ -164,6 +176,11 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "pi-native": PI_KEY,
     "cursor-native": CURSOR_KEY,
     "native-cursor": CURSOR_KEY,
+    "goose-native": GOOSE_KEY,
+    "native-goose": GOOSE_KEY,
+    # Headless Goose (``harness: goose``, drives ``goose acp``) wraps the same
+    # ``goose`` CLI as the native TUI, so it gates on the same binary.
+    GOOSE_KEY: GOOSE_KEY,
     QWEN_KEY: QWEN_KEY,
     "qwen-code": QWEN_KEY,
 }
