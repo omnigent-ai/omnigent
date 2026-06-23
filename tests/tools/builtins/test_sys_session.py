@@ -188,7 +188,7 @@ def test_send_schema_advertises_plain_string_and_purpose_object_args() -> None:
     # required, or plain-string sends would break.
     assert object_schema["required"] == ["input"]
     assert object_schema["additionalProperties"] is False
-    assert set(object_schema["properties"]) == {"input", "purpose", "model"}
+    assert set(object_schema["properties"]) == {"input", "purpose", "model", "file_ids"}
     assert "dispatch metadata" in object_schema["properties"]["purpose"]["description"]
     # The model property must say it is create-time-only and optional,
     # so the LLM doesn't attach it to continuation sends.
