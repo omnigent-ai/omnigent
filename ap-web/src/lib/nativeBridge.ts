@@ -51,6 +51,28 @@ interface NativeShellApi {
    * fallback so a newer SPA can still ask an older shell to hide the switcher.
    */
   setSidebarOpen?: (open: boolean) => void;
+  /**
+   * Drive the native Chat/Terminal switcher (iOS). The web app owns the truth
+   * and pushes the current mode, whether the terminal is reachable / booting,
+   * and whether the switcher should be shown at all. Absent on older shells,
+   * in which case the web renders its own in-page pill instead.
+   */
+  setViewMode?: (params: NativeViewModeParams) => void;
+  /** Subscribe to taps on the native switcher; returns an unsubscribe. */
+  onViewModeChanged?: (callback: (mode: NativeViewMode) => void) => () => void;
+}
+
+export type NativeViewMode = "chat" | "terminal";
+
+export interface NativeViewModeParams {
+  /** Currently selected view. */
+  mode: NativeViewMode;
+  /** Whether the Terminal option is selectable (a reachable PTY exists). */
+  terminalEnabled: boolean;
+  /** Terminal is booting but not yet openable — drives a spinner. */
+  terminalStartingUp?: boolean;
+  /** Whether the switcher should be shown at all right now. */
+  visible: boolean;
 }
 
 /**
@@ -221,6 +243,39 @@ export function setNativeServerSwitcherHidden(hidden: boolean): void {
 /** @deprecated Use setNativeServerSwitcherHidden. */
 export function setNativeSidebarOpen(open: boolean): void {
   setNativeServerSwitcherHidden(open);
+}
+
+/**
+ * Push the current Chat/Terminal state to the native switcher (iOS). The web
+ * app owns this state; the native bar is a thin control surface that renders it
+ * and reports taps back via {@link onNativeViewModeChanged}. No-op on shells
+ * without the native switcher (older iOS shells, Electron, plain browser) — the
+ * caller renders its own in-page pill there.
+ */
+export function setNativeViewMode(params: NativeViewModeParams): void {
+  const native = nativeApi();
+  if (!native?.setViewMode) return;
+  try {
+    native.setViewMode(params);
+  } catch (err) {
+    console.warn("[nativeBridge] native setViewMode failed:", err);
+  }
+}
+
+/**
+ * Subscribe to taps on the native Chat/Terminal switcher. The shell sends the
+ * mode the user selected; route it into the web view's own state. Returns an
+ * unsubscribe; a no-op outside a shell that exposes the native switcher.
+ */
+export function onNativeViewModeChanged(callback: (mode: NativeViewMode) => void): () => void {
+  const native = nativeApi();
+  if (!native?.onViewModeChanged) return () => {};
+  try {
+    return native.onViewModeChanged(callback);
+  } catch (err) {
+    console.warn("[nativeBridge] native onViewModeChanged failed:", err);
+    return () => {};
+  }
 }
 
 /**

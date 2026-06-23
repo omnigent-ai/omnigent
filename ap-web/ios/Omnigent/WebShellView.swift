@@ -42,6 +42,27 @@ struct WebShellView: View {
       .animation(.easeInOut(duration: 0.16), value: model.serverSwitcherHidden)
       .ignoresSafeArea(.keyboard)
       .background(DesignTokens.background(colorScheme).ignoresSafeArea())
+      .overlay(alignment: .bottom) {
+        // Always present, shown/hidden by opacity rather than insert/remove, so
+        // a transient visibility flip never slides the bar in and out. The web
+        // layer reserves a fixed footprint for it (`.omnigent-native-bottom-
+        // spacer` in index.css), so there's no size round-trip to coordinate.
+        ChatTerminalBar(
+          mode: $model.viewMode,
+          terminalEnabled: model.terminalEnabled,
+          terminalStartingUp: model.terminalStartingUp,
+          onSelect: { newMode in
+            model.viewMode = newMode
+            model.emitViewModeChanged(newMode)
+          }
+        )
+        .padding(.bottom, 6)
+        .opacity(model.bottomBarVisible ? 1 : 0)
+        .allowsHitTesting(model.bottomBarVisible)
+        .accessibilityHidden(!model.bottomBarVisible)
+        .animation(.easeInOut(duration: 0.2), value: model.bottomBarVisible)
+      }
+      .ignoresSafeArea(.keyboard)
     }
     .onChange(of: router.pendingNotificationPath) { _, _ in
       if let path = router.consumeNotificationPath() {

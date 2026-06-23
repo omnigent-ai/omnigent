@@ -103,16 +103,26 @@ struct OmnigentWebView: UIViewRepresentable {
       document.addEventListener("DOMContentLoaded", ensureViewportFit, { once: true });
     }
     const callbacks = new Set();
-    Object.defineProperty(window, "__omnigentNativeEmitNotificationActivated", {
-      configurable: false,
-      enumerable: false,
-      writable: false,
-      value(path) {
-        if (typeof path !== "string" || !path.startsWith("/")) return;
-        for (const callback of callbacks) {
-          try { callback(path); } catch {}
-        }
-      },
+    const viewModeCallbacks = new Set();
+    const defineEmit = (name, fn) => {
+      Object.defineProperty(window, name, {
+        configurable: false,
+        enumerable: false,
+        writable: false,
+        value: fn,
+      });
+    };
+    defineEmit("__omnigentNativeEmitNotificationActivated", (path) => {
+      if (typeof path !== "string" || !path.startsWith("/")) return;
+      for (const callback of callbacks) {
+        try { callback(path); } catch {}
+      }
+    });
+    defineEmit("__omnigentNativeEmitViewModeChanged", (mode) => {
+      if (mode !== "chat" && mode !== "terminal") return;
+      for (const callback of viewModeCallbacks) {
+        try { callback(mode); } catch {}
+      }
     });
     window.omnigentNative = Object.freeze({
       kind: "ios",
@@ -150,6 +160,21 @@ struct OmnigentWebView: UIViewRepresentable {
           method: "setServerSwitcherHidden",
           hidden: open === true,
         });
+      },
+      setViewMode(params) {
+        const mode = params && params.mode === "terminal" ? "terminal" : "chat";
+        window.webkit.messageHandlers.omnigentNative.postMessage({
+          method: "setViewMode",
+          mode,
+          terminalEnabled: !!(params && params.terminalEnabled),
+          terminalStartingUp: !!(params && params.terminalStartingUp),
+          visible: !!(params && params.visible),
+        });
+      },
+      onViewModeChanged(callback) {
+        if (typeof callback !== "function") return () => {};
+        viewModeCallbacks.add(callback);
+        return () => viewModeCallbacks.delete(callback);
       },
     });
   })();
@@ -206,6 +231,12 @@ struct OmnigentWebView: UIViewRepresentable {
         parent.model.serverSwitcherHidden = (body["hidden"] as? NSNumber)?.boolValue ?? true
       case "setSidebarOpen":
         parent.model.serverSwitcherHidden = (body["open"] as? NSNumber)?.boolValue ?? true
+      case "setViewMode":
+        let mode: WebViewMode = (body["mode"] as? String) == "terminal" ? .terminal : .chat
+        parent.model.viewMode = mode
+        parent.model.terminalEnabled = (body["terminalEnabled"] as? NSNumber)?.boolValue ?? false
+        parent.model.terminalStartingUp = (body["terminalStartingUp"] as? NSNumber)?.boolValue ?? false
+        parent.model.bottomBarVisible = (body["visible"] as? NSNumber)?.boolValue ?? false
       default:
         return
       }
