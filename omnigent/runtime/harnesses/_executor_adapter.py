@@ -695,7 +695,7 @@ class ExecutorAdapter(HarnessApp):
         or before a turn starts), returns ``False`` to deny by default
         rather than granting unreviewed permission.
 
-        :param tool_name: Tool name Claude wants to call, e.g. ``"Bash"``.
+        :param tool_name: Tool name the agent wants to call, e.g. ``"Bash"``.
         :param tool_input: Arguments dict for the tool call,
             e.g. ``{"command": "ls -la"}``.
         :returns: ``True`` when the user approves the tool call;

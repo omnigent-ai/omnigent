@@ -142,6 +142,9 @@ def test_configured_harness_map_covers_all_spellings(
         "antigravity",
         "agy",
         "google-antigravity",
+        # Qwen harnesses
+        "qwen",
+        "qwen-code",
     }
     assert set(result) == expected_keys
 
@@ -183,6 +186,7 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         "pi",
         "cursor-native",
         "native-cursor",
+        "qwen",
     ):
         assert result[cli] is False, f"{cli} should be gated on its CLI binary"
 

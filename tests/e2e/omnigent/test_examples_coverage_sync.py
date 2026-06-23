@@ -169,6 +169,12 @@ _ALT_COVERED: frozenset[str] = frozenset(
         # risk_score_agent: the built-in session-risk-score policy is
         # exercised in tests/runtime/policies/test_example_omnigent_yamls.py.
         "risk_score_agent",
+        # qwen_perm_test: qwen-harness permission fixture exercised by
+        # tests/inner/test_qwen_agent_integration.py against a mocked ACP
+        # subprocess. The live qwen round-trip lives in
+        # tests/e2e/omnigent/test_per_harness_qwen.py (skipped without a
+        # qwen CLI), not a test_example_<name>.py file.
+        "qwen_perm_test",
         # ── tests/resources/agents/ fixtures covered by name elsewhere ──
         # workspace-file-writer: loaded by the changed-files e2e tests
         # (test_filesystem_changed_files_e2e.py /
