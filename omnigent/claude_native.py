@@ -1534,6 +1534,11 @@ def _bedrock_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcode
     ``us.anthropic.claude-opus-4-5-20251101-v1:0`` — friendly aliases like
     ``claude-opus-4.5`` are rejected by Bedrock.
 
+    An ``auth_command`` is resolved to a token once, at launch — Bedrock mode
+    reads the token from the env and never re-invokes a helper — so a
+    short-lived/rotating token won't refresh mid-session; prefer a long-lived
+    credential for long runs.
+
     :param entry: A resolved provider entry with ``kind="bedrock"``.
     :returns: The launch config, or ``None`` when the provider does not serve
         the anthropic surface or carries no usable credential.
