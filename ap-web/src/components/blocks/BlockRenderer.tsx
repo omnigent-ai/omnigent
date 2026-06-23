@@ -483,6 +483,7 @@ function renderItem(item: RenderItem, index: number, isReasoningStreaming: boole
           exitPlanMode={item.exitPlanMode}
           codexCommand={item.codexCommand}
           allowAllEdits={item.allowAllEdits}
+          rememberScope={item.rememberScope}
         />
       );
   }
