@@ -53,6 +53,7 @@ import {
 } from "@/lib/nativeCodingAgents";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
+import { useClaudeProfiles, type ClaudeProfile } from "@/hooks/useClaudeProfiles";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
@@ -680,11 +681,65 @@ function BrainHarnessOptions({
   );
 }
 
+/**
+ * Claude Code account-profile radio rows (issue #503). Rendered in the
+ * footer-tray Advanced settings menu for claude-sdk agents when the
+ * operator has configured one or more ``claude_profiles`` entries.
+ * ``null`` (the leading "Default" row) sends no ``claude_profile`` so the
+ * runner uses its default ``~/.claude``; each named row sends the profile
+ * name, which the runner resolves to a per-profile ``CLAUDE_CONFIG_DIR``.
+ *
+ * @param value The currently picked profile name, or ``null`` for default.
+ * @param onValueChange Selection callback (receives the name or ``null``).
+ * @param profiles The operator-configured profiles (name + display).
+ */
+function ProfileOptions({
+  value,
+  onValueChange,
+  profiles,
+}: {
+  value: string | null;
+  onValueChange: (profile: string | null) => void;
+  profiles: ClaudeProfile[];
+}) {
+  return (
+    <>
+      <div className="px-2 pt-1.5 pb-0.5 text-[11px] font-medium text-muted-foreground">
+        Claude account
+      </div>
+      <DropdownMenuRadioGroup
+        value={value ?? "__default__"}
+        onValueChange={(v) => onValueChange(v === "__default__" ? null : v)}
+      >
+        <DropdownMenuRadioItem
+          key="__default__"
+          value="__default__"
+          data-testid="new-chat-landing-claude-profile-default"
+          className="rounded-sm pl-2 py-1 text-xs"
+        >
+          <span className="flex-1">Default (~/.claude)</span>
+        </DropdownMenuRadioItem>
+        {profiles.map((p) => (
+          <DropdownMenuRadioItem
+            key={p.name}
+            value={p.name}
+            data-testid={`new-chat-landing-claude-profile-${p.name}`}
+            className="rounded-sm pl-2 py-1 text-xs"
+          >
+            <span className="flex-1">{p.display || p.name}</span>
+          </DropdownMenuRadioItem>
+        ))}
+      </DropdownMenuRadioGroup>
+    </>
+  );
+}
+
 export function NewChatLandingScreen() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const serverUrl = getCliServerUrl();
   const { data: agents } = useAvailableAgents();
+  const { data: claudeProfiles } = useClaudeProfiles();
   const { data: hosts } = useHosts();
   // Sessions the caller can access, to warn when a new session would share a
   // working directory with a live one (see the conflict tooltip below).
@@ -820,6 +875,12 @@ export function NewChatLandingScreen() {
   // null = the agent spec's declared harness (no override sent); cleared on
   // every agent switch so a pick never leaks across agents.
   const [pickedHarness, setPickedHarness] = useState<string | null>(null);
+  // Per-session Claude Code account profile (issue #503). Selects which
+  // isolated CLAUDE_CONFIG_DIR the runner uses for the Claude Code CLI.
+  // null = no profile (defers to the runner's default ~/.claude); cleared
+  // on every agent switch so a pick never leaks across agents. Only shown
+  // when the operator has configured >=1 claude_profiles entry.
+  const [pickedProfile, setPickedProfile] = useState<string | null>(null);
   // Per-session cost-control switch ("Cost Optimized" pill). Unset
   // (null) defers to the agent spec's default and is omitted from
   // the create body.
@@ -1050,6 +1111,14 @@ export function NewChatLandingScreen() {
     selectedAgent?.harness != null && selectedAgent.harness in BRAIN_HARNESS_LABELS
       ? selectedAgent.harness
       : null;
+  // Effective harness after any Advanced-menu override. The Claude
+  // account profile picker (issue #503) is only meaningful for the
+  // claude-sdk harness — that's the one that spawns the `claude` CLI
+  // honoring CLAUDE_CONFIG_DIR. Other harnesses ignore the field, so
+  // hide the picker to avoid offering a no-op knob.
+  const effectiveHarness = pickedHarness ?? selectedAgentDefaultHarness ?? selectedAgent?.harness;
+  const profileList: ClaudeProfile[] = claudeProfiles ?? [];
+  const showProfilePicker = effectiveHarness === "claude-sdk" && profileList.length > 0;
   // The label suffixes the permission/approval mode / harness only when the
   // user explicitly changed it in the Advanced menu — defaults read as just
   // the agent name. pickedHarness is non-null only for an explicit
@@ -1085,6 +1154,8 @@ export function NewChatLandingScreen() {
           // Switching agents drops the harness override so a
           // pick never leaks across agents.
           if (agent.id !== effectiveAgentId) setPickedHarness(null);
+          // Same isolation for the Claude account profile pick.
+          if (agent.id !== effectiveAgentId) setPickedProfile(null);
           setPickedAgentId(agent.id);
           // Explicit picks persist; auto-defaults never do.
           writeLastAgentId(agent.id);
@@ -1206,6 +1277,10 @@ export function NewChatLandingScreen() {
           // kept the spec default (pickedHarness is null) so the session
           // tracks the agent's declared harness.
           harness_override: pickedHarness ?? undefined,
+          // Claude Code account profile pick (issue #503). Omitted when
+          // unset (null) so the session defers to the runner's default
+          // ~/.claude; the runner resolves the name to a CLAUDE_CONFIG_DIR.
+          claude_profile: pickedProfile ?? undefined,
         }),
       });
       if (!res.ok) {
@@ -1842,7 +1917,8 @@ export function NewChatLandingScreen() {
                 Hidden when the selected agent has none. */}
               {(selectedAgentDefaultHarness != null ||
                 supportsPermissionMode ||
-                supportsApprovalMode) && (
+                supportsApprovalMode ||
+                showProfilePicker) && (
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
                     <button
@@ -1862,11 +1938,17 @@ export function NewChatLandingScreen() {
                     {selectedAgentDefaultHarness != null && (
                       <BrainHarnessOptions
                         value={pickedHarness ?? selectedAgentDefaultHarness}
-                        onValueChange={(h) =>
+                        onValueChange={(h) => {
                           // Picking the spec default clears the override so the
                           // session tracks the spec.
-                          setPickedHarness(h === selectedAgentDefaultHarness ? null : h)
-                        }
+                          setPickedHarness(h === selectedAgentDefaultHarness ? null : h);
+                          // The profile picker only applies to claude-sdk;
+                          // switching to any other harness would leave a
+                          // stale `pickedProfile` that the runner ignores
+                          // but that would still be sent on create. Drop it
+                          // so the field never carries a no-op value.
+                          if (h !== "claude-sdk") setPickedProfile(null);
+                        }}
                         host={harnessWarningHost}
                       />
                     )}
@@ -1897,6 +1979,19 @@ export function NewChatLandingScreen() {
                           Approval mode
                         </div>
                         <ApprovalModeOptions value={approvalMode} onValueChange={setApprovalMode} />
+                      </>
+                    )}
+                    {/* Claude Code account profile (issue #503) — only for
+                      the claude-sdk harness and only when the operator has
+                      configured >=1 claude_profiles. */}
+                    {showProfilePicker && (
+                      <>
+                        <DropdownMenuSeparator />
+                        <ProfileOptions
+                          value={pickedProfile}
+                          onValueChange={setPickedProfile}
+                          profiles={profileList}
+                        />
                       </>
                     )}
                   </DropdownMenuContent>

@@ -552,6 +552,7 @@ class ConversationStore(ABC):
         harness_override: str | None = None,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
+        claude_profile: str | None = None,
     ) -> Conversation | None:
         """
         Update mutable fields on a conversation.
@@ -585,6 +586,11 @@ class ConversationStore(ABC):
             variant — the override is set once at session create and
             immutable thereafter (the harness process is spawned on
             the first turn).
+        :param claude_profile: Per-session Claude Code account profile
+            name (issue #503), e.g. ``"work"``. ``None`` leaves
+            unchanged. No ``_unset`` variant — set once at session
+            create and immutable thereafter (the harness bakes
+            ``CLAUDE_CONFIG_DIR`` into the spawn env on the first turn).
         :param terminal_launch_args: Per-session native-terminal
             pass-through args, e.g.
             ``["--dangerously-skip-permissions"]``. ``None`` leaves

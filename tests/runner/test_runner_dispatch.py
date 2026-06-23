@@ -1359,6 +1359,103 @@ def test_build_spawn_env_applies_model_override(
     assert overridden["HARNESS_CLAUDE_SDK_MODEL"] == "claude-sonnet-4-6"
 
 
+def test_build_spawn_env_per_session_claude_profile_overrides_spec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A per-session ``claude_profile`` override wins over the spec's
+    declared profile (issue #503).
+
+    This is the core precedence contract of the PR: the spec bakes its own
+    ``claude_profile`` into ``HARNESS_CLAUDE_SDK_CONFIG_DIR`` via
+    ``_build_claude_sdk_spawn_env`` (workflow.py), and the runner's
+    ``_build_spawn_env_from_spec`` then overrides it when the caller passes a
+    per-session ``claude_profile``. Without this, the new-chat account
+    picker's pick would be silently dropped in favor of the agent's default.
+
+    :param tmp_path: Pytest temp dir for an isolated provider + profile config.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n"
+        "  anthropic:\n"
+        "    kind: key\n"
+        "    default: true\n"
+        "    anthropic:\n"
+        "      base_url: https://api.anthropic.com\n"
+        "      api_key: $ANTHROPIC_API_KEY\n"
+        "claude_profiles:\n"
+        "  profiles:\n"
+        "    - name: work\n"
+        "      config_dir: /tmp/claude-work\n"
+        "    - name: personal\n"
+        "      config_dir: /tmp/claude-personal\n"
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="x",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "claude-sdk", "claude_profile": "work"},
+        ),
+    )
+
+    base = _build_spawn_env_from_spec(spec, "claude-sdk")
+    overridden = _build_spawn_env_from_spec(spec, "claude-sdk", claude_profile="personal")
+    assert base is not None and overridden is not None
+    # Baseline resolves the spec's declared profile ("work").
+    assert base["HARNESS_CLAUDE_SDK_CONFIG_DIR"] == "/tmp/claude-work"
+    # Per-session override ("personal") wins over the spec's "work".
+    assert overridden["HARNESS_CLAUDE_SDK_CONFIG_DIR"] == "/tmp/claude-personal"
+
+
+def test_build_spawn_env_unknown_claude_profile_warns_and_leaves_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unknown per-session profile name logs a warning and leaves
+    ``HARNESS_CLAUDE_SDK_CONFIG_DIR`` at its prior default (issue #503).
+
+    The runner owns the profile registry, so a name unknown to it must not
+    crash the turn and must not silently spawn against a bogus dir — it
+    falls back to the spec's dir (or ``~/.claude``) *and* logs so a
+    misconfigured wrong-account session is traceable.
+
+    :param tmp_path: Pytest temp dir for an isolated provider + profile config.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param caplog: Pytest log capture fixture.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n"
+        "  anthropic:\n"
+        "    kind: key\n"
+        "    default: true\n"
+        "    anthropic:\n"
+        "      base_url: https://api.anthropic.com\n"
+        "      api_key: $ANTHROPIC_API_KEY\n"
+        "claude_profiles:\n"
+        "  profiles:\n"
+        "    - name: work\n"
+        "      config_dir: /tmp/claude-work\n"
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="x",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        env = _build_spawn_env_from_spec(spec, "claude-sdk", claude_profile="ghost")
+    assert env is not None
+    # Unknown name → no config_dir baked in (CLI falls back to ~/.claude).
+    assert "HARNESS_CLAUDE_SDK_CONFIG_DIR" not in env
+    assert any("claude_profile" in rec.getMessage() for rec in caplog.records)
+
+
 @pytest.mark.asyncio
 async def test_resolve_harness_config_applies_harness_override(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

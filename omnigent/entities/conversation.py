@@ -124,6 +124,20 @@ class Conversation:
         Sub-agent sessions never inherit it (their own rows stay
         ``None``), so e.g. polly's workers keep their declared
         harnesses when the brain is overridden.
+    :param claude_profile: Per-session Claude Code account profile name
+        (issue #503), e.g. ``"work"``. ``None`` means use the agent
+        spec's ``executor.config.claude_profile`` (if declared), else
+        the CLI's default ``~/.claude``. Set at session creation via
+        ``POST /v1/sessions`` (the new-chat account picker) and
+        immutable thereafter — the runner bakes it into the harness
+        spawn env (``CLAUDE_CONFIG_DIR``) on the first turn, so a
+        later switch would not affect the already-spawned CLI. The
+        runner resolves the name to a config_dir against its local
+        ``~/.omnigent/config.yaml`` ``claude_profiles:`` block (see
+        :mod:`omnigent.onboarding.claude_profiles`); the stored value
+        is only the name, never a path or credential. Only meaningful
+        for the ``claude-sdk`` harness (which spawns the Claude CLI and
+        honors ``CLAUDE_CONFIG_DIR``); other harnesses ignore it.
     :param sub_agent_name: For sub-agent sessions (``kind="sub_agent"``),
         the sub-agent type name within the parent's spec tree,
         e.g. ``"summarizer"``. The runner uses this to resolve the
@@ -195,6 +209,7 @@ class Conversation:
     model_override: str | None = None
     cost_control_mode_override: str | None = None
     harness_override: str | None = None
+    claude_profile: str | None = None
     sub_agent_name: str | None = None
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None

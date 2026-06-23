@@ -1023,3 +1023,101 @@ async def _drive_fork_of_fork_dedup(base_url: str, session_id: str) -> None:
             await expect(page.get_by_role("menuitem")).to_have_count(2)
         finally:
             await browser.close()
+
+
+def test_start_session_select_claude_profile(seeded_session: tuple[str, str]) -> None:
+    """Picking a Claude Code account profile rides along to the create call.
+
+    Issue #503: a claude-sdk agent (Polly, auto-selected) with operator-
+    configured ``claude_profiles`` exposes the "Claude account" radio in
+    the footer-tray Advanced settings menu. Selecting the ``personal``
+    profile must reach ``POST /v1/sessions`` as ``claude_profile:
+    "personal"`` — mocked end to end, no live LLM / CLI invocation.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_claude_profile(base_url, session_id))
+
+
+async def _drive_claude_profile(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page,
+                created_session_id=session_id,
+                create_bodies=create_bodies,
+                agents_body=_bundle_agents_body(),
+            )
+
+            # Neutralize agent discovery so only the stubbed bundle agents
+            # feed the picker.
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            # Stub the profile-list endpoint: two operator-configured
+            # profiles. This is what gates the "Claude account" radio
+            # section (showProfilePicker = effectiveHarness == "claude-sdk"
+            # && profileList.length > 0).
+            async def handle_profiles(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "object": "list",
+                            "data": [
+                                {"name": "personal", "display": "Personal"},
+                                {"name": "work", "display": "Work (Anthropic)"},
+                            ],
+                        }
+                    ),
+                )
+
+            await page.route("**/v1/claude-profiles", handle_profiles)
+
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            # Polly auto-selects (first bundle agent); its harness is
+            # claude-sdk, so the footer-tray Advanced menu's "Claude
+            # account" section renders. Open the Advanced chip directly.
+            await page.get_by_test_id("new-chat-landing-advanced-chip").click()
+            # The Default + two named profile rows render.
+            await expect(
+                page.get_by_test_id("new-chat-landing-claude-profile-default")
+            ).to_be_visible()
+            await expect(
+                page.get_by_test_id("new-chat-landing-claude-profile-personal")
+            ).to_be_visible()
+            await expect(
+                page.get_by_test_id("new-chat-landing-claude-profile-work")
+            ).to_be_visible()
+            await page.get_by_test_id("new-chat-landing-claude-profile-personal").click()
+
+            await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["agent_id"] == "ag_polly_e2e", body
+            assert body["host_id"] == _HOST_ID, body
+            assert body["workspace"] == "/work/repo", body
+            assert body.get("claude_profile") == "personal", body
+        finally:
+            await browser.close()

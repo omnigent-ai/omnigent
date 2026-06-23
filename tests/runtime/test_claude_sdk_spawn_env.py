@@ -45,6 +45,7 @@ def _make_spec(
     model: str | None = "databricks-claude-sonnet-4-6",
     profile: str | None = None,
     auth: ApiKeyAuth | DatabricksAuth | None = None,
+    claude_profile: str | None = None,
 ) -> AgentSpec:
     """
     Build a minimal claude-sdk :class:`AgentSpec` for spawn-env tests.
@@ -55,6 +56,10 @@ def _make_spec(
         ``None`` omits it (no profile declared in YAML).
     :param auth: Typed auth object placed on ``spec.executor.auth``.
         ``None`` omits it (harness falls back to legacy / global config).
+    :param claude_profile: Per-session Claude Code account profile name
+        (issue #503) set via ``executor.config["claude_profile"]``.
+        ``None`` omits it (no profile override; runner defers to its
+        default ``~/.claude``).
     :returns: A populated :class:`AgentSpec`.
     """
     config: dict[str, object] = {"harness": "claude-sdk"}
@@ -62,6 +67,8 @@ def _make_spec(
         config["model"] = model
     if profile is not None:
         config["profile"] = profile
+    if claude_profile is not None:
+        config["claude_profile"] = claude_profile
     return AgentSpec(
         spec_version=1,
         name="test-claude-sdk",
@@ -243,3 +250,69 @@ def test_ucode_state_with_model_is_not_overridden_by_default(
     env = _build_claude_sdk_spawn_env(spec, workdir=None)
 
     assert env["HARNESS_CLAUDE_SDK_MODEL"] == "databricks-claude-sonnet-4-6"
+
+
+# ── Per-session Claude Code account profile (issue #503) ─────────────
+
+
+def test_claude_profile_in_spec_sets_config_dir_env_var(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    ``executor.config["claude_profile"] = "<name>"`` resolves the name
+    against the runner's ``claude_profiles`` config block and threads
+    the expanded ``config_dir`` into ``HARNESS_CLAUDE_SDK_CONFIG_DIR``,
+    which the claude-sdk harness injects as ``CLAUDE_CONFIG_DIR`` on the
+    spawned Claude CLI subprocess.
+
+    Failure means a per-agent profile pick is silently dropped and the
+    session shares the default ``~/.claude`` login.
+    """
+    cfg_home = tmp_path / "omnigent"
+    cfg_home.mkdir()
+    (cfg_home / "config.yaml").write_text(
+        "claude_profiles:\n"
+        "  profiles:\n"
+        "    - name: personal\n"
+        "      config_dir: /tmp/claude-personal\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(cfg_home))
+
+    spec = _make_spec(claude_profile="personal")
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CLAUDE_SDK_CONFIG_DIR"] == "/tmp/claude-personal"
+
+
+def test_claude_profile_unknown_name_leaves_config_dir_unset(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    An unknown profile name resolves to ``None`` →
+    ``HARNESS_CLAUDE_SDK_CONFIG_DIR`` is left unset so the CLI falls back
+    to its default ``~/.claude`` rather than spawning against a bogus dir.
+    """
+    cfg_home = tmp_path / "omnigent"
+    cfg_home.mkdir()
+    (cfg_home / "config.yaml").write_text(
+        "claude_profiles:\n  profiles:\n    - name: work\n      config_dir: /tmp/claude-work\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(cfg_home))
+
+    spec = _make_spec(claude_profile="ghost")
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+
+    assert "HARNESS_CLAUDE_SDK_CONFIG_DIR" not in env
+
+
+def test_claude_profile_absent_leaves_config_dir_unset() -> None:
+    """
+    No ``claude_profile`` in the spec → no ``HARNESS_CLAUDE_SDK_CONFIG_DIR``
+    (the isolation block is opt-in; agents that don't declare a profile keep
+    the CLI's default config dir).
+    """
+    spec = _make_spec()
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+    assert "HARNESS_CLAUDE_SDK_CONFIG_DIR" not in env

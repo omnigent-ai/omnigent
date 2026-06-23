@@ -107,6 +107,7 @@ def _to_conversation(
         model_override=row.model_override,
         cost_control_mode_override=row.cost_control_mode_override,
         harness_override=row.harness_override,
+        claude_profile=row.claude_profile,
         sub_agent_name=row.sub_agent_name,
         external_session_id=row.external_session_id,
         # NULL → None; a stored JSON array (e.g. ``"[]"`` or
@@ -1686,6 +1687,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         harness_override: str | None = None,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
+        claude_profile: str | None = None,
     ) -> Conversation | None:
         """
         Update mutable fields on a conversation.
@@ -1708,6 +1710,11 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param harness_override: Per-session brain-harness override,
             e.g. ``"pi"``. ``None`` leaves unchanged; set once at
             session create, no ``_unset`` variant.
+        :param claude_profile: Per-session Claude Code account profile
+            name (issue #503), e.g. ``"work"``. ``None`` leaves
+            unchanged; set once at session create, no ``_unset``
+            variant (the harness bakes it into the spawn env on the
+            first turn).
         :param terminal_launch_args: Per-session native-terminal
             pass-through args, e.g.
             ``["--dangerously-skip-permissions"]``. ``None`` leaves
@@ -1750,6 +1757,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 changed = True
             if harness_override is not None:
                 row.harness_override = harness_override
+                changed = True
+            if claude_profile is not None:
+                row.claude_profile = claude_profile
                 changed = True
             if terminal_launch_args is not None:
                 row.terminal_launch_args = json.dumps(terminal_launch_args)
@@ -2224,6 +2234,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # The brain-harness override is family-bound like the model,
                 # so it follows the same copy gate.
                 harness_override=source.harness_override if copy_model_settings else None,
+                # The Claude Code account profile is account-bound like
+                # the model, so it follows the same copy gate (issue #503).
+                claude_profile=source.claude_profile if copy_model_settings else None,
                 # Raw column-to-column copy of the JSON text; the
                 # fork should launch with the same native args.
                 terminal_launch_args=source.terminal_launch_args,

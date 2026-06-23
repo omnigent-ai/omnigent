@@ -109,6 +109,27 @@ class TestConstructor(unittest.TestCase):
         # (ANTHROPIC_MAX_RETRIES + ANTHROPIC_REQUEST_TIMEOUT_SECONDS).
         self.assertEqual(executor._extra_env, RetryPolicy().claude_cli.env())
 
+    def test_config_dir_injected_into_extra_env_as_claude_config_dir(self):
+        # Issue #503: a per-session config_dir is injected into _extra_env
+        # as CLAUDE_CONFIG_DIR so the SDK merges it into the spawned CLI
+        # subprocess env, isolating credentials/settings under that dir.
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        executor = ClaudeSDKExecutor(config_dir="/tmp/claude-personal")
+        self.assertEqual(executor._config_dir, "/tmp/claude-personal")
+        self.assertEqual(executor._extra_env["CLAUDE_CONFIG_DIR"], "/tmp/claude-personal")
+
+    def test_config_dir_none_leaves_claude_config_dir_unset(self):
+        # None preserves legacy single-account behavior: the CLI uses its
+        # default ~/.claude (no CLAUDE_CONFIG_DIR injected).
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+        from omnigent.spec.types import RetryPolicy
+
+        executor = ClaudeSDKExecutor(config_dir=None)
+        self.assertIsNone(executor._config_dir)
+        self.assertNotIn("CLAUDE_CONFIG_DIR", executor._extra_env)
+        self.assertEqual(executor._extra_env, RetryPolicy().claude_cli.env())
+
     def test_os_env_spec_with_no_sandbox_keeps_native_tools_enabled(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
         from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
