@@ -77,6 +77,7 @@ _METHOD_GET_CONVERSATION_METADATA = "GetConversationMetadata"
 _METHOD_FORCE_STOP_CASCADE_TREE = "ForceStopCascadeTree"
 _METHOD_GET_CASCADE_TRAJECTORY_STEPS = "GetCascadeTrajectorySteps"
 _METHOD_CANCEL_CASCADE_STEPS = "CancelCascadeSteps"
+_METHOD_HANDLE_CASCADE_USER_INTERACTION = "HandleCascadeUserInteraction"
 
 _LOOPBACK = "127.0.0.1"
 
@@ -450,9 +451,6 @@ class AntigravityRpcError(Exception):
     returns when the interaction has not yet been registered for the step
     (a race the Task 8 bridge must retry on).
     """
-
-
-_METHOD_HANDLE_CASCADE_USER_INTERACTION = "HandleCascadeUserInteraction"
 
 
 def handle_user_interaction(
