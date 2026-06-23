@@ -1,152 +1,134 @@
-name: Server Backwards-Compat
+name: Backwards-Compat
 
-# Runs main's e2e + integration suites against a PINNED OLDER server, to catch
-# backwards-incompatible server changes before release. Only the server
-# subprocess is the old build; the client, runner, and tests are all the
-# checked-out ref. See docs/SERVER_VERSION_COMPAT_CI.md.
+# Cross-version backwards-compatibility sweep against main's e2e + integration
+# suites, over the FULL pairwise (server, runner) version matrix.
 #
-# The actual test runs are the SAME composite actions the normal gates use
-# (.github/actions/e2e-run, .github/actions/integration-run) — invoked here
-# with `server_version` set. So these backcompat jobs run the suites byte-for-
-# byte the way e2e.yml / integration.yml do (mock LLM), differing only in that
-# the server subprocess is redirected to the old build. No drift.
+# The version universe is `main` (the checked-out code = client + tests, always)
+# plus every non-rc release tag; we cross every server version with every runner
+# version. Each cell pins the server and/or runner subprocess to that build
+# (a "main" axis value leaves that component on the checked-out code) while the
+# client and tests stay on main. The (main, main) cell is omitted — it pins
+# nothing and is exactly the normal e2e gate. So the matrix subsumes the old
+# single-pin jobs: (old, main) = Config 1; (main, old) = Config 2; (old, old) =
+# both old; etc. Runner and host are colocated, so the runner axis pins both.
+#
+# The test runs are the SAME composite actions the normal gates use
+# (.github/actions/e2e-run, integration-run); a cell differs only in which
+# subprocess(es) are the old build.
 #
 # Triggers:
-#   workflow_dispatch   manual; `server_version` input picks the old tag.
-#   schedule            nightly; pins the latest non-rc release tag.
+#   workflow_dispatch   manual; optional `versions` CSV overrides the set.
+#   schedule            every 12h; full pairwise over main + all non-rc tags.
 
 on:
   workflow_dispatch:
     inputs:
-      server_version:
-        description: "Old server tag to test against, e.g. v0.1.1. Empty = latest non-rc tag."
+      versions:
+        description: "Comma-separated version set for BOTH axes (e.g. 'main,v0.2.0'). Empty = main + all non-rc tags."
         required: false
         default: ""
   schedule:
-    # Every 4 hours.
-    - cron: "0 */4 * * *"
+    # Every 12 hours (00:00 and 12:00 UTC).
+    - cron: "0 */12 * * *"
 
 concurrency:
-  group: server-compat-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.inputs.server_version || github.sha }}
+  group: backcompat-${{ github.workflow }}-${{ github.sha }}
   cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
-  # Compute the SAME matrices the gates use (e2e-shard-matrix.sh /
-  # integration-matrix.sh), so backcompat runs exactly the shards/legs the real
-  # gate runs for this event — no hardcoded list to drift. Notably integration
-  # is openai-agents only: claude-sdk/codex reject the mock LLM's "mock-model"
-  # so the gate excludes them (see integration-matrix.sh); backcompat must too.
+  # Compute the full pairwise (server, runner) matrices. Integration is the
+  # single openai-agents leg (claude-sdk/codex reject the mock LLM's
+  # "mock-model"); e2e is sharded per cell. See backcompat-pairwise-matrix.sh.
   setup:
     name: setup
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      e2e_matrix: ${{ steps.e2e.outputs.matrix }}
-      integration_matrix: ${{ steps.integration.outputs.matrix }}
+      e2e_matrix: ${{ steps.matrix.outputs.e2e_matrix }}
+      integration_matrix: ${{ steps.matrix.outputs.integration_matrix }}
     steps:
-      - name: Check out CI scripts
+      - name: Check out CI scripts + tags
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           sparse-checkout: .github/scripts/ci
+          # Full history so `git tag` sees every release tag for the matrix.
+          fetch-depth: 0
           persist-credentials: false
-      - name: Compute e2e shard matrix
-        id: e2e
+      - name: Compute pairwise matrices
+        id: matrix
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          IS_DRAFT: ${{ github.event.pull_request.draft }}
-          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+          VERSIONS: ${{ github.event.inputs.versions }}
           NUM_SHARDS: "4"
-        run: bash .github/scripts/ci/e2e-shard-matrix.sh
-      - name: Compute integration matrix
-        id: integration
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          IS_DRAFT: ${{ github.event.pull_request.draft }}
-          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
-        run: bash .github/scripts/ci/integration-matrix.sh
+        run: bash .github/scripts/ci/backcompat-pairwise-matrix.sh
 
-  # tests/e2e against the pinned old server — same shards as e2e.yml.
+  # tests/e2e for every (server, runner) cell × shard.
   backcompat-e2e:
-    name: Backcompat e2e (server ${{ github.event.inputs.server_version || 'latest' }}, shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
+    name: Backcompat e2e (server ${{ matrix.server }} / runner ${{ matrix.runner }}, shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
     needs: setup
     runs-on: ubuntu-latest
     # Job-level cap (composite run steps can't set timeout-minutes); mirrors
-    # e2e.yml's ~30-min test budget + setup + old-server build.
-    timeout-minutes: 40
+    # e2e.yml's ~30-min test budget + setup + up to two old-build installs.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
-      max-parallel: 4
+      # Bound concurrency: the full matrix is large (versions² × shards). Tune
+      # here if the org's runner pool is over/under-subscribed.
+      max-parallel: 10
       matrix: ${{ fromJSON(needs.setup.outputs.e2e_matrix) }}
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
-          # Test the merge result on PRs (matches e2e.yml); fall back to the
-          # dispatched/triggering ref otherwise. fetch-depth 0 so the action
-          # can `git worktree add` the old release tag.
-          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.event.inputs.branch || github.ref }}
+          # fetch-depth 0 so the action can `git worktree add` the old tags.
+          ref: ${{ github.ref }}
           fetch-depth: 0
 
-      - name: Resolve old server version
-        id: resolve
-        env:
-          SERVER_VERSION_INPUT: ${{ github.event.inputs.server_version }}
-        run: |
-          tag="$SERVER_VERSION_INPUT"
-          if [ -z "$tag" ]; then
-            tag="$(git tag --sort=-v:refname | grep -vi rc | head -1)"
-          fi
-          echo "Resolved old server tag: $tag"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-
-      - name: Run e2e suite against old server
+      - name: Run e2e suite for this cell
         uses: ./.github/actions/e2e-run
         with:
-          server_version: ${{ steps.resolve.outputs.tag }}
+          # "main" axis -> empty input (use checked-out code); else the tag.
+          # GHA ternary: `!= 'main' && x || ''` (the naive `== 'main' && '' || x`
+          # breaks because '' is falsy and falls through to x).
+          server_version: ${{ matrix.server != 'main' && matrix.server || '' }}
+          runner_version: ${{ matrix.runner != 'main' && matrix.runner || '' }}
+          # Unique per cell so upload-artifact@v4 doesn't collide across the
+          # matrix (every integration cell shares the harness; e2e cells share
+          # a shard_id).
+          artifact_suffix: "-s${{ matrix.server }}-r${{ matrix.runner }}"
           shard_id: ${{ matrix.shard_id }}
           num_shards: ${{ matrix.num_shards }}
           parallelism: "2"
           nightly_full: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
 
-  # tests/integration against the pinned old server — same harness matrix as
-  # integration.yml.
+  # tests/integration for every (server, runner) cell (openai-agents leg).
   backcompat-integration:
-    name: Backcompat integration (server ${{ github.event.inputs.server_version || 'latest' }}, ${{ matrix.harness }})
+    name: Backcompat integration (server ${{ matrix.server }} / runner ${{ matrix.runner }}, ${{ matrix.harness }})
     needs: setup
     runs-on: ubuntu-latest
-    # Job-level cap (composite run steps can't set timeout-minutes); mirrors
-    # integration.yml's 30-min budget + the old-server build.
-    timeout-minutes: 35
+    timeout-minutes: 40
     strategy:
       fail-fast: false
-      # openai-agents only (per integration-matrix.sh) — same as the gate.
+      max-parallel: 5
       matrix: ${{ fromJSON(needs.setup.outputs.integration_matrix) }}
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
-          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.event.inputs.branch || github.ref }}
+          ref: ${{ github.ref }}
           fetch-depth: 0
 
-      - name: Resolve old server version
-        id: resolve
-        env:
-          SERVER_VERSION_INPUT: ${{ github.event.inputs.server_version }}
-        run: |
-          tag="$SERVER_VERSION_INPUT"
-          if [ -z "$tag" ]; then
-            tag="$(git tag --sort=-v:refname | grep -vi rc | head -1)"
-          fi
-          echo "Resolved old server tag: $tag"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-
-      - name: Run integration suite against old server
+      - name: Run integration suite for this cell
         uses: ./.github/actions/integration-run
         with:
-          server_version: ${{ steps.resolve.outputs.tag }}
+          server_version: ${{ matrix.server != 'main' && matrix.server || '' }}
+          runner_version: ${{ matrix.runner != 'main' && matrix.runner || '' }}
+          # Unique per cell so upload-artifact@v4 doesn't collide across the
+          # matrix (every integration cell shares the harness; e2e cells share
+          # a shard_id).
+          artifact_suffix: "-s${{ matrix.server }}-r${{ matrix.runner }}"
           harness: ${{ matrix.harness }}
           model: ${{ matrix.model }}
           workers: ${{ matrix.workers }}

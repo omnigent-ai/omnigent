@@ -35,6 +35,7 @@ from omnigent.inner.pi_executor import (
     _redact_argv_for_log,
     _safe_dumps,
     _sanitize_schema,
+    _split_pi_prompt,
     _ToolServer,
 )
 from omnigent.onboarding.databricks_config import DATABRICKS_CLAUDE_DEFAULT_MODEL
@@ -349,6 +350,73 @@ class TestPiProviderForModel(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# _split_pi_prompt tests
+# ---------------------------------------------------------------------------
+
+
+def test_split_pi_prompt_separates_text_and_images():
+    # #515: multimodal blocks must go to Pi's native message + images, not be
+    # JSON-encoded into the text (which the model reads as a literal blob).
+    message, images = _split_pi_prompt(
+        [
+            {"type": "input_text", "text": "what is in this image?"},
+            {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+        ]
+    )
+    assert message == "what is in this image?"
+    assert images == [{"type": "image", "data": "AAAA", "mimeType": "image/png"}]
+
+
+def test_split_pi_prompt_text_only_has_no_images():
+    message, images = _split_pi_prompt([{"type": "input_text", "text": "hi"}])
+    assert message == "hi"
+    assert images == []
+
+
+def test_split_pi_prompt_rejects_non_data_uri_image():
+    # A non-data-URI input_image (e.g. a file reference) cannot be forwarded
+    # inline to Pi, so it raises a clear ValueError -- run_turn catches this and
+    # surfaces it as an ExecutorError instead of crashing the turn (#516 review).
+    with pytest.raises(ValueError, match="inline data URI"):
+        _split_pi_prompt([{"type": "input_image", "image_url": "file-abc123"}])
+
+
+def test_split_pi_prompt_inlines_text_input_file():
+    # #516 review: a text-like input_file is decoded into the message (so the
+    # model can read it) rather than dropped or hard-failed — mirroring codex.
+    import base64 as _b64
+
+    payload = _b64.b64encode(b"hello from a file").decode()
+    message, images = _split_pi_prompt(
+        [
+            {"type": "input_text", "text": "summarize:"},
+            {"type": "input_file", "file_data": f"data:text/markdown;base64,{payload}"},
+        ]
+    )
+    assert message == "summarize:\nhello from a file"
+    assert images == []
+
+
+def test_split_pi_prompt_skips_binary_input_file():
+    # A binary input_file (e.g. PDF) can't be inlined as text; it's skipped
+    # (with a logged warning), not raised — the turn still runs.
+    message, images = _split_pi_prompt(
+        [
+            {"type": "input_text", "text": "hi"},
+            {"type": "input_file", "file_data": "data:application/pdf;base64,JVBERi0x"},
+        ]
+    )
+    assert message == "hi"
+    assert images == []
+
+
+def test_split_pi_prompt_rejects_genuinely_unknown_block_type():
+    # A block type Pi can't handle at all still fails loudly rather than
+    # silently vanishing -> run_turn surfaces it as an ExecutorError.
+    with pytest.raises(ValueError, match="Unsupported content block type"):
+        _split_pi_prompt([{"type": "input_audio", "audio": "..."}])
+
+
 # _build_models_json tests
 # ---------------------------------------------------------------------------
 
@@ -360,6 +428,28 @@ class TestBuildModelsJson(unittest.TestCase):
         self.assertIn("databricks", providers)
         self.assertIn("databricks-anthropic", providers)
         self.assertIn("databricks-completions", providers)
+
+    def test_dynamic_model_declared_image_capable(self):
+        # #515: a dynamically-registered model must advertise image input, or
+        # Pi's transformMessages strips every image block ("model does not
+        # support images") before the message reaches the provider.
+        model = "databricks-qwen2-5-vl-72b"
+        result = _build_models_json("https://host.example.com", "tok", model=model)
+        provider = result["providers"][_pi_provider_for_model(model)]
+        entry = next(e for e in provider["models"] if e["id"] == model)
+        self.assertEqual(entry.get("input"), ["text", "image"])
+
+    def test_static_model_declared_image_capable(self):
+        # #516 review: a STATIC (pre-registered) vision model must also
+        # advertise image input. The dynamic-registration append is gated on
+        # the model not already being listed, so a default model like GPT-5.4
+        # (openai-completions) or Claude would otherwise keep an input-less
+        # entry and have its images stripped.
+        for model in ("databricks-gpt-5-4", "databricks-claude-opus-4-8"):
+            result = _build_models_json("https://host.example.com", "tok", model=model)
+            provider = result["providers"][_pi_provider_for_model(model)]
+            entry = next(e for e in provider["models"] if e["id"] == model)
+            self.assertEqual(entry.get("input"), ["text", "image"], model)
 
     def test_base_urls_use_host(self):
         result = _build_models_json("https://host.example.com/", "tok")
@@ -2665,8 +2755,9 @@ def test_databricks_default_model_is_resolvable_in_models_json() -> None:
 def test_models_json_lists_only_gateway_verified_models() -> None:
     """
     The hardcoded model lists match the set verified live against the
-    Databricks gateway on the API paths pi uses (Anthropic Messages for
-    Claude, Chat Completions for GPT).
+    Databricks gateway endpoint metadata and the API paths pi uses
+    (Anthropic Messages for Claude, OpenAI-compatible serving endpoints for
+    GPT).
 
     Failure direction matters: a missing working id silently shrinks pi's
     model menu; a reintroduced broken id (``sonnet-4-5-v2`` rejects
@@ -2682,10 +2773,24 @@ def test_models_json_lists_only_gateway_verified_models() -> None:
         "databricks-claude-sonnet-4-5",
     ]
     openai_ids = [m["id"] for m in providers["databricks"]["models"]]
-    assert openai_ids == ["databricks-gpt-5-4-mini", "databricks-gpt-5-4"]
+    assert openai_ids == [
+        "databricks-gpt-5-4-mini",
+        "databricks-gpt-5-4",
+        "databricks-gpt-5-5",
+        "databricks-gpt-5-5-pro",
+    ]
     # The llama serving endpoint no longer exists; the provider stays as
     # the routing home for future non-Claude/GPT endpoints.
     assert providers["databricks-completions"]["models"] == []
+
+
+def test_models_json_uses_oss_verified_gpt_55_caps() -> None:
+    """GPT-5.5 endpoint metadata on the OSS profile advertises 128K output."""
+    models = _build_models_json("https://host.example.com", "tok")
+    by_id = {m["id"]: m for m in models["providers"]["databricks"]["models"]}
+    for model_id in ("databricks-gpt-5-5", "databricks-gpt-5-5-pro"):
+        assert by_id[model_id]["contextWindow"] == 400000
+        assert by_id[model_id]["maxTokens"] == 128000
 
 
 if __name__ == "__main__":
@@ -2714,9 +2819,11 @@ def test_build_models_json_registers_unknown_model_with_routed_provider() -> Non
         model="moonshotai/kimi-k2.6",
     )
     completions = result["providers"]["databricks-completions"]
-    # The run model is registered (bare-id entry, the shape ucode writes)
-    # under the provider _pi_provider_for_model routes it to…
-    assert {"id": "moonshotai/kimi-k2.6"} in completions["models"]
+    # The run model is registered (so Pi resolves it) under the provider
+    # _pi_provider_for_model routes it to, advertising image input so Pi
+    # doesn't strip attached images (#515).
+    entry = next((e for e in completions["models"] if e["id"] == "moonshotai/kimi-k2.6"), None)
+    assert entry == {"id": "moonshotai/kimi-k2.6", "input": ["text", "image"]}
     # …and that provider points at the generic gateway with the
     # Chat-Completions dialect OpenRouter speaks.
     assert completions["baseUrl"] == "https://openrouter.ai/api/v1"

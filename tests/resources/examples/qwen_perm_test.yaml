@@ -1,0 +1,19 @@
+# Qwen agent fixture for executor integration tests (mocked ACP subprocess).
+# Mirrors the manual tmp/qwen_perm_test.yaml: qwen harness with local OS access
+# so the agent's tools trigger session/request_permission. Uses the free
+# OpenRouter coder model so the config matches a real, runnable setup.
+name: qwen_perm_test
+prompt: |
+  You are a coding assistant with local file and shell access. When the user
+  asks you to create/edit a file or run a shell command, do it directly using
+  your tools — do not just describe the steps.
+
+executor:
+  harness: qwen
+  model: qwen/qwen3-coder:free
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none

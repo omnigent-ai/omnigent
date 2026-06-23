@@ -19,6 +19,7 @@
 		B1000000000000000000000A /* WebViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000A /* WebViewModel.swift */; };
 		B1000000000000000000000B /* OmnigentWebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000B /* OmnigentWebView.swift */; };
 		B1000000000000000000000C /* URL+Omnigent.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000C /* URL+Omnigent.swift */; };
+		B10000000000000000000011 /* ChatTerminalBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000011 /* ChatTerminalBar.swift */; };
 		B1000000000000000000000D /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000D /* Assets.xcassets */; };
 		B1000000000000000000000E /* AppIcon.icon in Resources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000E /* AppIcon.icon */; };
 		B20000000000000000000001 /* ServerURLTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000001 /* ServerURLTests.swift */; };
@@ -49,6 +50,7 @@
 		A1000000000000000000000A /* WebViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebViewModel.swift; sourceTree = "<group>"; };
 		A1000000000000000000000B /* OmnigentWebView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OmnigentWebView.swift; sourceTree = "<group>"; };
 		A1000000000000000000000C /* URL+Omnigent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "URL+Omnigent.swift"; sourceTree = "<group>"; };
+		A10000000000000000000011 /* ChatTerminalBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatTerminalBar.swift; sourceTree = "<group>"; };
 		A1000000000000000000000D /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		A1000000000000000000000E /* AppIcon.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; name = AppIcon.icon; path = "../platform-assets/AppIcon.icon"; sourceTree = "<group>"; };
 		A1000000000000000000000F /* Info-Debug.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Info-Debug.plist"; sourceTree = "<group>"; };
@@ -112,6 +114,7 @@
 				A1000000000000000000000A /* WebViewModel.swift */,
 				A1000000000000000000000B /* OmnigentWebView.swift */,
 				A1000000000000000000000C /* URL+Omnigent.swift */,
+				A10000000000000000000011 /* ChatTerminalBar.swift */,
 				A1000000000000000000000D /* Assets.xcassets */,
 				A1000000000000000000000F /* Info-Debug.plist */,
 				A10000000000000000000010 /* Info-Release.plist */,
@@ -249,6 +252,7 @@
 				B1000000000000000000000A /* WebViewModel.swift in Sources */,
 				B1000000000000000000000B /* OmnigentWebView.swift in Sources */,
 				B1000000000000000000000C /* URL+Omnigent.swift in Sources */,
+				B10000000000000000000011 /* ChatTerminalBar.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -401,6 +405,7 @@
 				DEVELOPMENT_TEAM = 8RMX4WU6F8;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = "Omnigent/Info-Debug.plist";
+				VERSIONING_SYSTEM = "apple-generic";
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -430,6 +435,7 @@
 				DEVELOPMENT_TEAM = 8RMX4WU6F8;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = "Omnigent/Info-Release.plist";
+				VERSIONING_SYSTEM = "apple-generic";
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

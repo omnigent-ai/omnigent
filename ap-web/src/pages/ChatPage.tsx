@@ -58,7 +58,13 @@ import { parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { cn } from "@/lib/utils";
-import { isIOSShell, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
+import { useSurfaceFrontmost } from "@/hooks/useNativeServerSwitcher";
+import {
+  isIOSShell,
+  onNativeViewModeChanged,
+  setNativeServerSwitcherHidden,
+  setNativeViewMode,
+} from "@/lib/nativeBridge";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -98,6 +104,7 @@ import { useSession } from "@/hooks/useSession";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useRefreshSessionStateOnRunnerOnline } from "@/hooks/useSessionOnlineRefresh";
 import {
+  type LivenessRow,
   type SessionLiveness,
   livenessRowFromSession,
   useSessionLiveness,
@@ -728,7 +735,15 @@ export function ChatPage() {
   // so `host_id` still reaches the hook — otherwise a host-bound, host-down
   // session misclassifies as `local_stranded` and shows the wrong reconnect
   // path. See `livenessRowFromSession`.
-  const livenessRow = activeConv ?? livenessRowFromSession(activeSession);
+  //
+  // Always source `host_resumable` from the session snapshot — the sidebar
+  // `Conversation` row doesn't carry it. activeSession is loaded for the open
+  // session, so a host-bound, host-down session whose host is a resumable
+  // managed host classifies as `host_asleep` (composer open, send wakes it)
+  // instead of dead-ending on `host_offline`.
+  const livenessRow: LivenessRow | null = activeConv
+    ? { ...activeConv, host_resumable: activeSession?.hostResumable ?? false }
+    : livenessRowFromSession(activeSession);
   const liveness = useSessionLiveness(urlConvId ?? undefined, livenessRow, {
     turnActive: status === "streaming",
   });
@@ -1164,80 +1179,6 @@ export function shouldShowTerminalSurface(
   );
 }
 
-function useNativeServerSwitcherForMainSurface(surface: HTMLElement | null, active: boolean) {
-  useEffect(() => {
-    if (!isIOSShell()) return;
-    if (!active) {
-      setNativeServerSwitcherHidden(true);
-      return;
-    }
-
-    let frame = 0;
-    const sync = () => {
-      frame = 0;
-      setNativeServerSwitcherHidden(!isSurfaceFrontmost(surface));
-    };
-    const schedule = () => {
-      if (frame !== 0) cancelAnimationFrame(frame);
-      frame = requestAnimationFrame(sync);
-    };
-
-    schedule();
-
-    const observer =
-      typeof MutationObserver !== "undefined" ? new MutationObserver(schedule) : null;
-    observer?.observe(document.body, {
-      subtree: true,
-      childList: true,
-      attributes: true,
-      attributeFilter: ["class", "style", "aria-hidden", "data-state", "data-collapsed", "open"],
-    });
-
-    window.addEventListener("resize", schedule);
-    window.addEventListener("orientationchange", schedule);
-    window.addEventListener("scroll", schedule, true);
-    window.addEventListener("transitionend", schedule, true);
-    window.addEventListener("animationend", schedule, true);
-    window.addEventListener("focusin", schedule, true);
-    window.addEventListener("focusout", schedule, true);
-    window.visualViewport?.addEventListener("resize", schedule);
-    window.visualViewport?.addEventListener("scroll", schedule);
-
-    return () => {
-      if (frame !== 0) cancelAnimationFrame(frame);
-      observer?.disconnect();
-      window.removeEventListener("resize", schedule);
-      window.removeEventListener("orientationchange", schedule);
-      window.removeEventListener("scroll", schedule, true);
-      window.removeEventListener("transitionend", schedule, true);
-      window.removeEventListener("animationend", schedule, true);
-      window.removeEventListener("focusin", schedule, true);
-      window.removeEventListener("focusout", schedule, true);
-      window.visualViewport?.removeEventListener("resize", schedule);
-      window.visualViewport?.removeEventListener("scroll", schedule);
-      setNativeServerSwitcherHidden(true);
-    };
-  }, [active, surface]);
-}
-
-function isSurfaceFrontmost(surface: HTMLElement | null): boolean {
-  if (!surface) return false;
-  const rect = surface.getBoundingClientRect();
-  if (rect.width <= 0 || rect.height <= 0) return false;
-
-  const xInset = Math.min(24, Math.max(1, rect.width / 4));
-  const yInset = Math.min(24, Math.max(1, rect.height / 4));
-  const x = clamp(window.innerWidth / 2, rect.left + xInset, rect.right - xInset);
-  const y = clamp(rect.top + rect.height * 0.38, rect.top + yInset, rect.bottom - yInset);
-  const topElement = document.elementFromPoint(x, y);
-  return topElement !== null && surface.contains(topElement);
-}
-
-function clamp(value: number, min: number, max: number): number {
-  if (max < min) return min;
-  return Math.min(Math.max(value, min), max);
-}
-
 /**
  * The conversation scroll surface + composer — the content of the
  * "Main Agent" tab (and also the standalone view on `/`).
@@ -1349,10 +1290,20 @@ function MainAgentSurface({
     setContainerEl(el);
   }, []);
   const [terminalSurfaceEl, setTerminalSurfaceEl] = useState<HTMLElement | null>(null);
-  useNativeServerSwitcherForMainSurface(
+  // True only while the chat/terminal surface is the frontmost thing on screen.
+  // Drives both native overlays so neither floats over an opened drawer.
+  const surfaceFrontmost = useSurfaceFrontmost(
     showTerminal ? terminalSurfaceEl : containerEl,
     !!conversationId,
   );
+  useEffect(() => {
+    if (!isIOSShell()) return;
+    setNativeServerSwitcherHidden(!surfaceFrontmost);
+  }, [surfaceFrontmost]);
+  useEffect(() => {
+    if (!isIOSShell()) return;
+    return () => setNativeServerSwitcherHidden(true);
+  }, []);
   // The conversation's scroll container + the StickToBottom controls needed to
   // override its bottom-lock, lifted out of the context by
   // ConversationScrollRefBridge so the pinned-but-unmasked JumpToTopButton can
@@ -1405,7 +1356,11 @@ function MainAgentSurface({
           // agent via the composer instead. Server enforces this too.
           readOnly={!isOwnerLevel(permissionLevel)}
         />
-        <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
+        <ConnectionIndicator
+          liveness={liveness}
+          onShowReconnectHelp={onShowReconnectHelp}
+          surfaceFrontmost={surfaceFrontmost}
+        />
       </>
     );
   }
@@ -1544,7 +1499,8 @@ function MainAgentSurface({
         showCodexPlanMode={showCodexPlanMode}
         isTerminalFirst={isTerminalFirst}
         isNativeWrapper={isNativeWrapper}
-        reconnectHint={liveness.kind === "runner_asleep"}
+        reconnectHint={liveness.kind === "runner_asleep" || liveness.kind === "host_asleep"}
+        sandboxAsleepHint={liveness.kind === "host_asleep"}
         unreachable={
           !sandboxLaunching &&
           (liveness.kind === "host_offline" || liveness.kind === "local_stranded")
@@ -1557,7 +1513,11 @@ function MainAgentSurface({
       {/* Chat/Terminal toggle for terminal-first sessions, reconnect-or-
           fork banner when unreachable, nothing otherwise. Sits below the
           composer so its position is consistent with the terminal view. */}
-      <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
+      <ConnectionIndicator
+        liveness={liveness}
+        onShowReconnectHelp={onShowReconnectHelp}
+        surfaceFrontmost={surfaceFrontmost}
+      />
     </>
   );
 }
@@ -2102,9 +2062,13 @@ export function SandboxFailedIndicator({ status }: { status: SandboxStatus }) {
 export function ConnectionIndicator({
   liveness,
   onShowReconnectHelp,
+  surfaceFrontmost = true,
 }: {
   liveness: SessionLiveness;
   onShowReconnectHelp: () => void;
+  // Whether the chat/terminal surface is frontmost (not under a drawer). Gates
+  // the native iOS bar so it doesn't float over an opened sidebar/panel.
+  surfaceFrontmost?: boolean;
 }) {
   const terminalFirst = useTerminalFirst();
   const keyboardVisible = useIOSNativeKeyboardVisible(
@@ -2112,6 +2076,28 @@ export function ConnectionIndicator({
     terminalFirst?.view === "chat",
   );
   const sandboxStatus = useChatStore((s) => s.sandboxStatus);
+  // Genuinely-unreachable states get the reconnect banner, for
+  // both terminal-first and regular sessions. `runner_asleep` (host up,
+  // runner relaunches on the next message), `host_asleep` (resumable managed
+  // host the server wakes on the next message), and `unknown` (pre-poll) are
+  // NOT unreachable — they're handled below.
+  const unreachable = liveness.kind === "host_offline" || liveness.kind === "local_stranded";
+
+  // In the iOS shell the Chat/Terminal toggle is the native Liquid Glass bar,
+  // not the in-page pill. Drive it from here (always mounted) with the SAME
+  // visibility the pill would have, expressed as a stable boolean so switching
+  // views never flickers the bar. Hook is called unconditionally (before any
+  // early return) to satisfy the rules of hooks.
+  const nativeBarVisible =
+    isIOSShell() &&
+    terminalFirst?.isTerminalFirst === true &&
+    !terminalFirst.isShellView &&
+    sandboxStatus?.stage !== "failed" &&
+    !unreachable &&
+    !keyboardVisible &&
+    surfaceFrontmost;
+  useNativeChatTerminalBar(terminalFirst, nativeBarVisible);
+
   if (sandboxStatus !== null) {
     // A failed launch owns this band with its reason. An IN-FLIGHT
     // launch renders in the chat thread (RunnerStartingIndicator)
@@ -2122,11 +2108,6 @@ export function ConnectionIndicator({
     }
     return null;
   }
-  // Genuinely-unreachable states get the reconnect banner, for
-  // both terminal-first and regular sessions. `runner_asleep` (host up,
-  // runner relaunches on the next message) and `unknown` (pre-poll) are
-  // NOT unreachable — they're handled below.
-  const unreachable = liveness.kind === "host_offline" || liveness.kind === "local_stranded";
   if (unreachable) {
     return (
       <button
@@ -2158,6 +2139,22 @@ export function ConnectionIndicator({
   // as the runner comes back. The strict `runner_online` still gates the
   // inline PTY *view* (it needs a live tunnel) — but not the toggle.
   if (terminalFirst?.isTerminalFirst) {
+    // In the iOS shell the toggle is the native bar (driven above). Render only
+    // a spacer reserving its fixed footprint so the composer clears it — and
+    // nothing when the bar is hidden.
+    if (isIOSShell()) {
+      // Chat reserves a touch less than terminal: the composer's own bottom
+      // content (the status line) already cushions the gap to the bar.
+      return nativeBarVisible ? (
+        <div
+          aria-hidden
+          className={cn(
+            "omnigent-native-bottom-spacer",
+            terminalFirst.view === "chat" && "omnigent-native-bottom-spacer--chat",
+          )}
+        />
+      ) : null;
+    }
     // A rail-opened shell owns the main view chrome-free — no pill: a
     // "Chat" option under someone else's shell misreads as the shell
     // being the agent. The shell view carries its own close affordance
@@ -2186,8 +2183,8 @@ export function ConnectionIndicator({
   }
 
   // `online`/`unknown` for a non-terminal-first session and
-  // `runner_asleep` for any session: status lives in the sidebar / the
-  // composer stays open, so render nothing here.
+  // `runner_asleep`/`host_asleep` for any session: status lives in the
+  // sidebar / the composer stays open, so render nothing here.
   return null;
 }
 
@@ -2267,8 +2264,63 @@ export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }
 }
 
 /**
+ * Mirrors the Chat/Terminal state onto the iOS shell's native Liquid Glass
+ * switcher and routes its taps back into `setView`. Driven by a stable
+ * `visible` boolean (not this hook's mount/unmount), so toggling Chat/Terminal
+ * updates the bar in place instead of flickering it hidden→shown. A no-op
+ * outside the iOS shell; the caller renders its own in-page pill there.
+ */
+function useNativeChatTerminalBar(
+  ctx: ReturnType<typeof useTerminalFirst> | null,
+  visible: boolean,
+): void {
+  const native = isIOSShell();
+  const view = ctx?.view ?? "chat";
+  const terminalsAvailable = ctx?.terminalsAvailable ?? false;
+  const terminalStartingUp = ctx?.terminalStartingUp ?? false;
+
+  // Keep `setView` reachable from the subscribe-once effect without
+  // resubscribing whenever the callback identity changes.
+  const setViewRef = useRef(ctx?.setView);
+  setViewRef.current = ctx?.setView;
+
+  // Push current state + visibility down whenever any of it changes.
+  useEffect(() => {
+    if (!native) return;
+    setNativeViewMode({
+      mode: view,
+      terminalEnabled: terminalsAvailable,
+      terminalStartingUp,
+      visible,
+    });
+  }, [native, view, terminalsAvailable, terminalStartingUp, visible]);
+
+  // Belt-and-suspenders: hide the bar if the host component ever unmounts.
+  useEffect(() => {
+    if (!native) return;
+    return () => {
+      setNativeViewMode({
+        mode: "chat",
+        terminalEnabled: false,
+        terminalStartingUp: false,
+        visible: false,
+      });
+    };
+  }, [native]);
+
+  // Route native taps back into the web layer.
+  useEffect(() => {
+    if (!native) return;
+    return onNativeViewModeChanged((mode) => setViewRef.current?.(mode));
+  }, [native]);
+}
+
+/**
  * Chat/Terminal segmented control for terminal-first sessions. Status
  * lives in the sidebar — this band is purely a view toggle.
+ *
+ * Only rendered outside the iOS shell; inside it the switcher is drawn natively
+ * (Liquid Glass) over the web view — see {@link useNativeChatTerminalBar}.
  */
 function ConnectedTerminalFirstPill({
   ctx,
@@ -2281,6 +2333,7 @@ function ConnectedTerminalFirstPill({
   // reachable: greyed-and-spinning reads as "loading", greyed-and-static as
   // "no terminal / stopped".
   const { view, setView, terminalsAvailable, terminalStartingUp } = ctx;
+
   return (
     <div
       className={cn(
@@ -2655,6 +2708,14 @@ interface ComposerProps {
    */
   reconnectHint?: boolean;
   /**
+   * The session is host-bound to a dormant resumable managed host that is
+   * offline (`host_asleep`): the composer stays enabled, and the placeholder
+   * tells the user their next message will resume the sandbox host (which can
+   * take a few minutes) so the wake latency is expected, not surprising.
+   * Ignored once a turn is streaming.
+   */
+  sandboxAsleepHint?: boolean;
+  /**
    * The session is unreachable (`host_offline` / `local_stranded`): a message
    * can't wake it. The composer is blocked (disabled) and the reconnect
    * banner below is the only affordance.
@@ -3021,6 +3082,7 @@ export function Composer({
   isTerminalFirst = false,
   isNativeWrapper = false,
   reconnectHint = false,
+  sandboxAsleepHint = false,
   unreachable = false,
   costRoutingVerdict = null,
   costRoutingEligible = false,
@@ -3728,9 +3790,11 @@ export function Composer({
                         ? "Waiting for agents…"
                         : isStreaming
                           ? "Send a follow-up (queued) — Esc to stop"
-                          : reconnectHint
-                            ? "Send a message to reconnect this session"
-                            : "Ask the agent anything…"
+                          : sandboxAsleepHint
+                            ? "Current session's host is offline. Next message will resume the sandbox host which can take minutes"
+                            : reconnectHint
+                              ? "Send a message to reconnect this session"
+                              : "Ask the agent anything…"
             }
             rows={1}
             disabled={disabled || isReadOnly || unreachable || hasPendingElicitation}

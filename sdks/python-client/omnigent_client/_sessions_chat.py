@@ -467,6 +467,30 @@ class SessionsChat:
         self._session = await self._namespace.get(self._session.id)
         return self._session
 
+    async def tree_busy(self, *, max_depth: int = 3) -> bool:
+        """Whether any sub-agent anywhere in this session's subtree is working.
+
+        Unlike :attr:`status` (per-session — it reads ``"idle"`` once this
+        session has delegated and returned to its own prompt, even while its
+        sub-agents run), this rolls up the whole sub-agent tree. A driver that
+        feeds the agent a simulated "your turn" whenever it yields can gate that
+        on real subtree activity:
+
+        .. code-block:: python
+
+            if not await chat.tree_busy():
+                await chat.send("your turn")  # only when nothing is still working
+
+        Point-in-time and recursive (capped at *max_depth*); delegates to
+        :meth:`SessionsNamespace.subtree_busy`, which applies the same canonical
+        "busy" definition as the CLI badge and the web ``SubagentsPanel``.
+
+        :param max_depth: Levels of the sub-agent tree to descend.
+        :returns: ``True`` while any descendant sub-agent is busy.
+        :raises OmnigentError: On non-2xx status.
+        """
+        return await self._namespace.subtree_busy(self._session.id, max_depth=max_depth)
+
     async def send(
         self,
         input: str | list[dict[str, Any]],

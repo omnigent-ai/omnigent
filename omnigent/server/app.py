@@ -1078,7 +1078,7 @@ def create_app(
 
     @app.exception_handler(OmnigentError)
     async def _handle_omnigent_error(
-        request: Request,  # noqa: ARG001 — FastAPI exception-handler signature requires (request, exc); we only use exc
+        request: Request,
         exc: OmnigentError,
     ) -> JSONResponse:
         """
@@ -1090,6 +1090,10 @@ def create_app(
         """
         if exc.http_status >= 500:
             _logger.error("Internal error: %s", exc.message, exc_info=True)
+        elif exc.http_status == 400 and request.url.path.endswith("/policies/evaluate"):
+            _logger.warning(
+                "Policy evaluate rejected 400 on %s: %s", request.url.path, exc.message
+            )
         return JSONResponse(
             status_code=exc.http_status,
             content={"error": {"code": exc.code, "message": exc.message}},

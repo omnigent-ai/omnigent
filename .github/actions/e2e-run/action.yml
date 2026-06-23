@@ -31,6 +31,21 @@ inputs:
       server subprocess to it (backwards-compat run).
     required: false
     default: ""
+  runner_version:
+    description: >
+      Empty = run the checked-out runner/host (normal gate). Set to a release
+      tag = build that old runner+host into a venv and redirect the runner and
+      host-daemon subprocesses to it (Config 2 backwards-compat run). Orthogonal
+      to server_version.
+    required: false
+    default: ""
+  artifact_suffix:
+    description: >
+      Appended to uploaded-artifact names so they stay unique across matrix
+      cells (e.g. "-sv0.2.0-rmain"). Default empty — the normal gate has one
+      cell per shard, so its names are already unique.
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -68,7 +83,7 @@ runs:
 
     - name: Install project and dev dependencies
       shell: bash
-      run: uv sync --extra all --extra dev
+      run: uv sync --locked --extra all --extra dev
 
     - name: Install binary dependencies
       # npm install against .github/ci-deps/package.json with --ignore-scripts
@@ -114,6 +129,31 @@ runs:
         "$venv/bin/omnigent" --version
         echo "OMNIGENT_COMPAT_SERVER_PYTHON=$venv/bin/python" >> "$GITHUB_ENV"
         echo "OMNIGENT_COMPAT_SERVER_VERSION=${tag#v}" >> "$GITHUB_ENV"
+
+    - name: Build pinned old runner/host (backwards-compat only)
+      # Only runs when runner_version is set (Config 2). Builds the released tag
+      # into an isolated venv and points the runner + host-daemon subprocesses
+      # at it via OMNIGENT_COMPAT_RUNNER_PYTHON (apply_runner_env drops the
+      # worktree PYTHONPATH/CWD shadow). Distinct paths from the server build so
+      # both can coexist. Requires fetch-depth 0 in the caller.
+      if: ${{ inputs.runner_version != '' }}
+      shell: bash
+      env:
+        RUNNER_VERSION_INPUT: ${{ inputs.runner_version }}
+      run: |
+        tag="$RUNNER_VERSION_INPUT"
+        if ! [[ "$tag" =~ ^v?[0-9]+\.[0-9]+(\.[0-9]+)?([a-z0-9.]*)?$ ]]; then
+          echo "Invalid runner_version: '$tag'" >&2; exit 1
+        fi
+        src="$RUNNER_TEMP/runner-src"
+        venv="$RUNNER_TEMP/runner-env"
+        git worktree add --detach "$src" "$tag"
+        uv venv --python 3.12 "$venv"
+        uv pip install --python "$venv/bin/python" \
+          -e "$src" -e "$src/sdks/python-client" -e "$src/sdks/ui"
+        "$venv/bin/omnigent" --version
+        echo "OMNIGENT_COMPAT_RUNNER_PYTHON=$venv/bin/python" >> "$GITHUB_ENV"
+        echo "OMNIGENT_COMPAT_RUNNER_VERSION=${tag#v}" >> "$GITHUB_ENV"
 
     - name: Run e2e tests
       shell: bash
@@ -165,7 +205,7 @@ runs:
       if: ${{ failure() || cancelled() }}
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
       with:
-        name: e2e-server-logs-${{ github.run_id }}-shard${{ inputs.shard_id }}
+        name: e2e-server-logs-${{ github.run_id }}-shard${{ inputs.shard_id }}${{ inputs.artifact_suffix }}
         path: |
           /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ inputs.shard_id }}/**/server.log
           /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ inputs.shard_id }}/**/runner.log
@@ -180,7 +220,7 @@ runs:
       if: ${{ always() }}
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
       with:
-        name: e2e-tokens-${{ github.run_id }}-shard${{ inputs.shard_id }}
+        name: e2e-tokens-${{ github.run_id }}-shard${{ inputs.shard_id }}${{ inputs.artifact_suffix }}
         path: /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ inputs.shard_id }}/tokens*.json
         retention-days: 14
         if-no-files-found: warn

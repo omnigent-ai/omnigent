@@ -463,6 +463,19 @@
     padding-bottom: calc(0.35rem + env(safe-area-inset-bottom, 0px));
   }
 
+  /* Reserve room for the native Liquid Glass switcher that floats over the web
+     view (the in-page pill is suppressed in the iOS shell). Fixed height: the
+     bar's footprint above the home-indicator inset (env). Chat sits 1rem
+     tighter — its composer status line already cushions the gap to the bar. */
+  [data-ios-native] .omnigent-native-bottom-spacer {
+    height: calc(3rem + env(safe-area-inset-bottom, 0px));
+    flex: none;
+  }
+
+  [data-ios-native] .omnigent-native-bottom-spacer--chat {
+    height: calc(2rem + env(safe-area-inset-bottom, 0px));
+  }
+
   [data-ios-native] .terminal-first-switcher {
     min-height: 46px;
     gap: 0.25rem;
@@ -646,6 +659,27 @@
 }
 [data-streamdown="code-block-body"] {
   font-size: 0.875em;
+}
+
+/* Word-wrap toggle for chat code blocks (see ChatCodeBlockPre in message.tsx).
+ * Streamdown renders the body with `overflow-x-auto` and the <code> with
+ * `white-space: pre`, so long lines scroll horizontally. When `.chat-code-wrap`
+ * is set we soft-wrap instead so everything fits the column width. */
+.chat-code-wrap [data-streamdown="code-block-body"] {
+  overflow-x: hidden;
+}
+.chat-code-wrap [data-streamdown="code-block-body"] pre,
+.chat-code-wrap [data-streamdown="code-block-body"] code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+/* Hang-indent wrapped continuation lines past the line-number gutter so they
+ * align with the code, not under the numbers. Gutter = before:w-6 (1.5rem) +
+ * before:mr-4 (1rem) = 2.5rem; the negative text-indent pulls the first line
+ * (and its ::before number) back to the left edge. */
+.chat-code-wrap [data-streamdown="code-block-body"] code > span {
+  padding-left: 2.5rem;
+  text-indent: -2.5rem;
 }
 
 /* Streamdown's <button> link-safety-modal variant and wrap-anywhere reset can

@@ -246,51 +246,63 @@ async def _sleep(seconds: float) -> None:
 
 async def _tmux_session_alive(socket_path: str, tmux_target: str) -> bool:
     """
-    Return whether the tmux session behind the bridge is still alive.
+    Return whether the agent behind the bridge is still alive.
 
-    Runs ``tmux -S <socket> has-session -t <target>`` against the same
-    private server the bridge attached to. This is what distinguishes a
-    *detach* (the ``tmux attach`` child exits but the session keeps
-    running, so ``has-session`` succeeds) from a genuine session exit
-    (Claude quit / the session was killed, so ``has-session`` fails).
+    Probes ``tmux -S <socket> list-panes -t <target> -F '#{pane_dead}'`` against
+    the same private server the bridge attached to. This distinguishes a *detach*
+    (the ``tmux attach`` child exits but the agent keeps running) from a genuine
+    exit (Claude quit / the session was killed). The pane-dead flag — not bare
+    session existence — is the signal because the claude-native terminal opts
+    into ``remain-on-exit`` (#540): there the session deliberately outlives the
+    inner CLI, so a plain ``has-session`` would wrongly report a crashed agent
+    as merely detached and the client would reconnect to a dead pane forever.
+    For terminals without ``remain-on-exit`` the inner process's exit destroys
+    the session, the probe exits non-zero, and the verdict is unchanged.
 
-    Fails conservative: any probe error (tmux missing, spawn failure,
-    timeout) returns ``False`` so the caller falls back to the
-    pre-existing terminal-gone close code rather than wrongly reporting
-    a dead session as alive.
+    Fails conservative: any probe error (tmux missing, spawn failure, timeout,
+    or a non-zero exit from a vanished session) returns ``False`` so the caller
+    falls back to the terminal-gone close code rather than wrongly reporting a
+    dead agent as alive.
 
     :param socket_path: Filesystem path to the tmux server socket,
         e.g. ``"/tmp/omnigent-xyz/tmux.sock"``.
     :param tmux_target: The ``-t`` target identifying the session,
         e.g. ``"main"``.
-    :returns: ``True`` only when ``has-session`` exits 0; ``False`` on
-        a missing session or any probe failure.
+    :returns: ``True`` only when the session exists and its pane process has
+        not exited; ``False`` on a missing/dead session or any probe failure.
     """
     try:
         proc = await asyncio.create_subprocess_exec(
             "tmux",
             "-S",
             socket_path,
-            "has-session",
+            "list-panes",
             "-t",
             tmux_target,
-            stdout=asyncio.subprocess.DEVNULL,
+            "-F",
+            "#{pane_dead}",
+            stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
     except (OSError, ValueError):
-        _logger.debug("tmux-attach: has-session spawn failed", exc_info=True)
+        _logger.debug("tmux-attach: pane-dead probe spawn failed", exc_info=True)
         return False
     try:
-        returncode = await asyncio.wait_for(
-            proc.wait(),
+        stdout, _ = await asyncio.wait_for(
+            proc.communicate(),
             timeout=_TMUX_HAS_SESSION_TIMEOUT_S,
         )
     except (asyncio.TimeoutError, OSError):
-        _logger.debug("tmux-attach: has-session probe timed out", exc_info=True)
+        _logger.debug("tmux-attach: pane-dead probe timed out", exc_info=True)
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
         return False
-    return returncode == 0
+    # ``list-panes`` errors on an unknown/dead session (unlike ``display-message``,
+    # which silently falls back to another pane). rc != 0 → session gone; a "1"
+    # line → the inner process exited but the session was kept alive by
+    # remain-on-exit. Both mean the agent is gone.
+    panes = stdout.decode().split()
+    return proc.returncode == 0 and bool(panes) and "1" not in panes
 
 
 async def _write_all_nonblocking(
