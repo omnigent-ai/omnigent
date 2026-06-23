@@ -579,6 +579,11 @@ def _allow_all_edits_eligible(tool_name: str, permission_mode: str | None) -> bo
 # any prompt a headless sub-agent left unanswered for >5 minutes.
 _CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S = 86400.0
 
+# Antigravity (agy) elicitation hook wait budget. Same 24-hour cap as
+# Codex: a terminal-side verdict (or agy's own WAITING timeout) ends the
+# wait early, so the long park never blocks native-TUI paths.
+_ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S = 86400.0
+
 # ``external_elicitation_resolved`` can arrive just before the matching
 # Codex hook registers, and a web verdict can land between a severed
 # long-poll and its retry. Pinned, NOT the hook wait budget: Codex ids
@@ -14469,6 +14474,97 @@ def create_sessions_router(
         body = codex_request.build_response(result)
         return Response(
             content=json.dumps(body),
+            media_type="application/json",
+        )
+
+    # ── POST /sessions/{session_id}/hooks/antigravity-elicitation-request ──
+
+    @router.post(
+        "/sessions/{session_id}/hooks/antigravity-elicitation-request",
+        response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def antigravity_elicitation_request_hook(
+        request: Request,
+        session_id: str,
+    ) -> Response:
+        """
+        Antigravity (agy) elicitation request endpoint.
+
+        Receives ``{"elicitation_id": <str>, "params": <ElicitationRequestParams>}``
+        from the interaction bridge (Task 8), which POSTs here when it
+        surfaces an agy WAITING interaction for the web UI. Parks the call
+        on the shared harness elicitation registry, emits the standard
+        ``response.elicitation_request`` SSE event, waits for the session
+        ``approval`` verdict, then returns the raw
+        :class:`~omnigent.server.schemas.ElicitationResult` so the bridge
+        can forward it to agy via ``HandleCascadeUserInteraction``.
+
+        This is intentionally simpler than the Codex hook: the bridge
+        (not the endpoint) builds the agy interaction payload via
+        ``to_interaction_payload``, so this endpoint only passes back
+        the verdict as-is.  The body shape is minimal and symmetric:
+        ``elicitation_id`` from the bridge's deterministic id function
+        (``agy_elicitation_id``), ``params`` as an
+        :class:`~omnigent.server.schemas.ElicitationRequestParams` dict.
+
+        :param request: FastAPI request carrying the agy elicitation body.
+        :param session_id: Omnigent conversation id from the URL path.
+        :returns: ``ElicitationResult`` JSON on user verdict; ``200`` with
+            empty body on timeout/disconnect (bridge interprets as ``None``).
+        :raises OmnigentError: 404 if the session does not exist, 400 if
+            the request body is malformed.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise OmnigentError(
+                f"Invalid JSON in antigravity elicitation hook body: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise OmnigentError(
+                "Antigravity elicitation hook body must be a JSON object.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        elicitation_id = payload.get("elicitation_id")
+        if not isinstance(elicitation_id, str) or not elicitation_id:
+            raise OmnigentError(
+                "Antigravity elicitation hook body must include a non-empty"
+                " 'elicitation_id' string.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        raw_params = payload.get("params")
+        if not isinstance(raw_params, dict):
+            raise OmnigentError(
+                "Antigravity elicitation hook body must include a 'params' object.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        try:
+            params = ElicitationRequestParams.model_validate(raw_params)
+        except Exception as exc:
+            raise OmnigentError(
+                f"Invalid 'params' in antigravity elicitation hook body: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        result = await _publish_and_wait_for_harness_elicitation(
+            request,
+            session_id=session_id,
+            params=params,
+            timeout_s=_ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S,
+            conversation_store=conversation_store,
+            elicitation_id=elicitation_id,
+        )
+        if result is None:
+            return Response(status_code=status.HTTP_200_OK)
+        return Response(
+            content=result.model_dump_json(),
             media_type="application/json",
         )
 
