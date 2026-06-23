@@ -13,11 +13,13 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { MessageSquarePlusIcon } from "lucide-react";
+import { AtSignIcon, MessageSquarePlusIcon } from "lucide-react";
 import type { OnMount } from "@monaco-editor/react";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
 import { getEmbedRoot } from "@/lib/host";
+import { useChatStore } from "@/store/chatStore";
+import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 
 // The IStandaloneCodeEditor instance, derived from the onMount signature so we
 // don't deep-import Monaco's types here. The diff editor's getModifiedEditor()
@@ -98,6 +100,12 @@ interface UseMonacoCommentLayerOptions {
   canComment: boolean;
   /** In-progress comment body; clicking away won't clear an active draft. */
   pendingBodyRef?: React.RefObject<string>;
+  /**
+   * Workspace-relative path of the file being viewed. When set on a native
+   * coding-agent session, an "Attach to agent" button appears beside "Add
+   * comment" that tags the selected line span into the chat composer.
+   */
+  path?: string;
 }
 
 /**
@@ -114,7 +122,10 @@ export function useMonacoCommentLayer({
   onSetActiveSelection,
   canComment,
   pendingBodyRef,
+  path,
 }: UseMonacoCommentLayerOptions): React.ReactNode {
+  const sessionHarness = useChatStore((s) => s.sessionHarness);
+  const canAttachToAgent = !!path && nativeCodingAgentForHarness(sessionHarness) !== undefined;
   const decorationsRef = useRef<DecorationsCollection | null>(null);
   // Floating "Add comment" button position in viewport coords, or null.
   const [buttonPos, setButtonPos] = useState<{ left: number; top: number } | null>(null);
@@ -272,25 +283,70 @@ export function useMonacoCommentLayer({
     setButtonPos(null);
   }, [editorRef]);
 
+  // Tag the selected line span into the chat composer. Monaco gives line
+  // numbers directly; a selection ending at column 1 of a line means the last
+  // line's content isn't included, so step back a line in that case.
+  const handleAttachToAgent = useCallback(() => {
+    const ed = editorRef.current;
+    const sel = ed?.getSelection();
+    if (!ed || !sel || sel.isEmpty() || !path) return;
+    const start = sel.getStartPosition();
+    const end = sel.getEndPosition();
+    const endLine = end.column === 1 && end.lineNumber > start.lineNumber ? end.lineNumber - 1 : end.lineNumber;
+    useChatStore.getState().addComposerAttachment({
+      path,
+      isDir: false,
+      lineRange: { start: start.lineNumber, end: endLine },
+    });
+    setButtonPos(null);
+  }, [editorRef, path]);
+
   if (!buttonPos) return null;
   // Rendered into document.body so ancestor CSS transforms don't break fixed
   // positioning.
   return createPortal(
-    <button
-      data-add-comment-btn
-      type="button"
-      // preventDefault on mousedown keeps the editor selection live so
-      // handleAddComment can read it.
-      onMouseDown={(e) => {
-        e.preventDefault();
-        handleAddComment();
+    <div
+      className="fixed z-50 flex items-center gap-1"
+      style={{
+        // Clamp so the (one- or two-) button group can't clip off the right
+        // edge near the viewport boundary (mirrors CodeViewer's clamp).
+        left: Math.min(
+          buttonPos.left,
+          Math.max(8, window.innerWidth - (canAttachToAgent ? 288 : 138)),
+        ),
+        top: buttonPos.top,
+        transform: "translateY(-100%)",
       }}
-      className="fixed z-50 flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-xs font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
-      style={{ left: buttonPos.left, top: buttonPos.top, transform: "translateY(-100%)" }}
     >
-      <MessageSquarePlusIcon className="size-3.5" />
-      Add comment
-    </button>,
+      <button
+        data-add-comment-btn
+        type="button"
+        // preventDefault on mousedown keeps the editor selection live so
+        // handleAddComment can read it.
+        onMouseDown={(e) => {
+          e.preventDefault();
+          handleAddComment();
+        }}
+        className="flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-xs font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
+      >
+        <MessageSquarePlusIcon className="size-3.5" />
+        Add comment
+      </button>
+      {canAttachToAgent && (
+        <button
+          data-attach-agent-btn
+          type="button"
+          onMouseDown={(e) => {
+            e.preventDefault();
+            handleAttachToAgent();
+          }}
+          className="flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-xs font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
+        >
+          <AtSignIcon className="size-3.5" />
+          Attach to agent
+        </button>
+      )}
+    </div>,
     getEmbedRoot() ?? document.body,
   );
 }

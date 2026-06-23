@@ -127,6 +127,7 @@ export function MonacoDiffViewer({
     onSetActiveSelection,
     canComment: canEdit,
     pendingBodyRef,
+    path,
   });
 
   const options = useMemo<DiffEditorProps["options"]>(

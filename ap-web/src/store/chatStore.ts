@@ -171,6 +171,30 @@ export interface StashedPending {
   committedTexts: string[];
 }
 
+/**
+ * A workspace path queued for the composer's "@"-mention chips. ``isDir``
+ * marks a folder (delivered with a trailing ``/``); ``lineRange`` marks a
+ * specific span of a file (delivered as ``path:start-end``), e.g. from the
+ * file viewer's "Attach to agent" button.
+ */
+export interface ComposerAttachment {
+  path: string;
+  isDir: boolean;
+  lineRange?: { start: number; end: number };
+}
+
+/**
+ * Identity key for a composer attachment, used to dedup the queue and the
+ * drained chips. Keyed on path + dir-ness + line range (not path alone) so a
+ * whole-file attach and a partial-line attach of the same file — or two
+ * distinct line ranges from the file viewer — remain separate, while an exact
+ * re-attach is collapsed. The single source of truth for "same attachment?"
+ * across the store queue, the drain effect, and ``attachMention``.
+ */
+export function composerAttachmentKey(a: ComposerAttachment): string {
+  return `${a.path}|${a.isDir}|${a.lineRange ? `${a.lineRange.start}-${a.lineRange.end}` : ""}`;
+}
+
 export interface ChatState {
   // Reactive — subscribed to by UI components.
   conversationId: string | null;
@@ -318,6 +342,13 @@ export interface ChatState {
   oldestItemId: string | null;
   /** Bubble that should pulse briefly (highlight on nav jump). */
   flashItemId: string | null;
+  /**
+   * Workspace files/folders queued to drop into the active composer's
+   * "@"-mention chips from outside the composer — e.g. the file viewer's
+   * "Attach to agent" button, which lives far from the composer in the tree.
+   * The composer drains this on change and clears it.
+   */
+  pendingComposerAttachments: ComposerAttachment[];
   /**
    * LLM model identifier from the bound agent's spec for the active
    * session, e.g. ``"anthropic/claude-sonnet-4-6"``. Populated from
@@ -492,6 +523,10 @@ export interface ChatState {
   loadMoreHistory: () => Promise<void>;
   /** Flash a bubble briefly; rapid calls reschedule so the latest target wins. */
   flashUserMessage: (itemId: string) => void;
+  /** Queue an "@"-mention chip into the active composer from outside it. */
+  addComposerAttachment: (attachment: ComposerAttachment) => void;
+  /** Drain the queued composer attachments (called by the composer). */
+  clearPendingComposerAttachments: () => void;
   /**
    * Compact the active session's context. Posts a ``compact`` event to the
    * server, which summarises the conversation history in-place. No-ops when
@@ -691,6 +726,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   loadingMoreHistory: false,
   oldestItemId: null,
   flashItemId: null,
+  pendingComposerAttachments: [],
   llmModel: null,
   sessionHarness: null,
   contextWindow: null,
@@ -1178,6 +1214,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
         codexModelOptions: [],
         terminalPending: false,
         viewers: [],
+        // Drop any queued "Attach to agent" chip that the outgoing session's
+        // composer hadn't drained yet, so it can't bleed into the incoming
+        // session's composer (which drains the store on mount). Same reset
+        // discipline as ``viewers`` above.
+        pendingComposerAttachments: [],
         sandboxStatus: null,
         abortController: null,
         historyGeneration: s.historyGeneration + 1,
@@ -1246,6 +1287,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set({ flashItemId: null });
     }, FLASH_DURATION_MS);
   },
+
+  addComposerAttachment: (attachment) => {
+    set((s) => {
+      const k = composerAttachmentKey(attachment);
+      if (s.pendingComposerAttachments.some((a) => composerAttachmentKey(a) === k)) return s;
+      return { pendingComposerAttachments: [...s.pendingComposerAttachments, attachment] };
+    });
+  },
+
+  clearPendingComposerAttachments: () => set({ pendingComposerAttachments: [] }),
 
   compact: async () => {
     const { conversationId } = get();

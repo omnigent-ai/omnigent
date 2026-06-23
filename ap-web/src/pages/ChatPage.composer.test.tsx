@@ -2,6 +2,18 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
+
+// Composer reads workspace files via a TanStack query hook (for "@"-file
+// mentions). These slash-command tests don't exercise that, so stub the hook
+// to avoid needing a QueryClientProvider around every bare render.
+vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/hooks/useWorkspaceChangedFiles")>();
+  return {
+    ...actual,
+    useWorkspaceAllFiles: () => ({ data: undefined }),
+    useWorkspaceDirectory: () => ({ data: undefined }),
+  };
+});
 import type { ElicitationBlock } from "@/lib/blocks";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Composer } from "./ChatPage";

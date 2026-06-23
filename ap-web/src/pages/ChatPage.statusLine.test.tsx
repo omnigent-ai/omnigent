@@ -2,6 +2,19 @@ import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useChatStore } from "@/store/chatStore";
+
+// Composer reads workspace files via a TanStack query hook (for "@"-file
+// mentions); these status-line tests don't exercise it, so stub the hook to
+// avoid wrapping every render in a QueryClientProvider.
+vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/hooks/useWorkspaceChangedFiles")>();
+  return {
+    ...actual,
+    useWorkspaceAllFiles: () => ({ data: undefined }),
+    useWorkspaceDirectory: () => ({ data: undefined }),
+  };
+});
+
 import { Composer, formatModelEffortStatusLabel } from "./ChatPage";
 
 // Pins the visibility rules for the status-line tray under the composer:
