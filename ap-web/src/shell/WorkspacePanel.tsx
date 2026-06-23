@@ -411,6 +411,7 @@ export function WorkspacePanel({
             conversationId={conversationId}
             path={selectedFilePath}
             onClose={onShowScopeView}
+            onCloseTab={() => onCloseFile(selectedFilePath)}
             onNavigateTo={openFileViewer}
             permissionLevel={permissionLevel}
             onCommentsOpenChange={onCommentsOpenChange}
