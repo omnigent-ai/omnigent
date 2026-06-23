@@ -28,6 +28,9 @@ from fastapi import FastAPI
 
 from omnigent import claude_native_bridge, codex_native_bridge, cursor_native_bridge
 from omnigent.antigravity_native_bridge import (
+    ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
+)
+from omnigent.antigravity_native_bridge import (
     is_placeholder_conversation_id as bridge_mod_is_placeholder,
 )
 from omnigent.claude_native_bridge import (
@@ -12533,6 +12536,262 @@ async def test_create_session_auto_create_guard_skips_rotation_targets(
         # The rotation target's terminal arrives via transfer. Auto-create
         # here is the regression: it 409s the transfer and loops the
         # rotation into unbounded session spawning.
+        assert created == [], f"Auto-create must be skipped for {scenario.case_id}; got {created}"
+
+
+@dataclass
+class _AntigravityAutoCreateScenario:
+    """
+    One parametrized case for the antigravity-native auto-create guard.
+
+    :param case_id: Human-readable scenario id used as the pytest id,
+        e.g. ``"clear_rotation_target_skips"``.
+    :param bridge_state_session: ``session_id`` to seed into the shared
+        bridge state, e.g. ``"conv_old"``. ``None`` seeds no bridge state
+        at all (models a genuinely fresh session).
+    :param terminal_under: Session id to seed a live ``antigravity:main``
+        terminal under in the registry, e.g. ``"conv_old"``. ``None``
+        seeds no terminal (models a dead/absent original terminal).
+    :param bridge_id_label: Value returned for the new session's
+        :data:`ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY` label, e.g.
+        ``"bridge_shared"`` for a rotation target (shares the original's
+        bridge) or ``"conv_new"`` for a fresh session (own bridge).
+    :param expect_auto_create: Whether the guard should invoke
+        ``_auto_create_antigravity_terminal`` for the new session.
+    """
+
+    case_id: str
+    bridge_state_session: str | None
+    terminal_under: str | None
+    bridge_id_label: str
+    expect_auto_create: bool
+
+
+class _AntigravitySnapshotServerClient:
+    """
+    Server-client stub for the antigravity auto-create guard route test.
+
+    Answers the two GETs the antigravity branch issues for ``conv_new``: the
+    session snapshot (``/v1/sessions/conv_new`` — non-``None`` so
+    ``_session_payload_for_host_spawn_check`` reports the session needs a
+    terminal) and the labels lookup (``/v1/sessions/conv_new/labels`` — returns
+    the bridge-id label so the transfer-inbound check can resolve the shared
+    bridge dir). A real stub class — not ``MagicMock`` — so an unexpected call
+    shape fails loudly instead of silently returning a mock.
+    """
+
+    def __init__(self, bridge_id_label: str) -> None:
+        """
+        :param bridge_id_label: Bridge id to report on the session's
+            ``labels``, e.g. ``"bridge_shared"``.
+        """
+        self._bridge_id_label = bridge_id_label
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        """
+        Return a canned snapshot or labels payload for *url*.
+
+        :param url: Request path, e.g. ``"/v1/sessions/conv_new"`` or
+            ``"/v1/sessions/conv_new/labels"``.
+        :returns: A response object exposing ``status_code`` and ``json()``
+            matching the subset the runner reads.
+        """
+        del kwargs
+        labels = {ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY: self._bridge_id_label}
+
+        class _Response:
+            """Minimal httpx-like response with the fields the runner reads."""
+
+            def __init__(self, payload: dict[str, Any]) -> None:
+                """:param payload: JSON body returned by ``json()``."""
+                self.status_code = 200
+                self._payload = payload
+
+            def json(self) -> dict[str, Any]:
+                """:returns: The canned JSON payload."""
+                return self._payload
+
+        if url.endswith("/labels"):
+            return _Response({"labels": labels})
+        # The session snapshot: non-None so the host-spawn check reports the
+        # session needs a terminal, and carries the same labels.
+        return _Response({"id": "conv_new", "labels": labels})
+
+
+_ANTIGRAVITY_AUTO_CREATE_SCENARIOS = [
+    # Rotation target: the bridge's active session (conv_old) still owns the
+    # live agy terminal that is about to be transferred onto conv_new.
+    _AntigravityAutoCreateScenario(
+        case_id="clear_rotation_target_skips",
+        bridge_state_session="conv_old",
+        terminal_under="conv_old",
+        bridge_id_label="bridge_shared",
+        expect_auto_create=False,
+    ),
+    # Fresh host-spawned session: its own bridge has no recorded state and no
+    # terminal, so it must bootstrap (cold-start) its own agy.
+    _AntigravityAutoCreateScenario(
+        case_id="fresh_session_creates",
+        bridge_state_session=None,
+        terminal_under=None,
+        bridge_id_label="conv_new",
+        expect_auto_create=True,
+    ),
+    # The bridge's recorded session is conv_new itself (e.g. a relaunch after
+    # the terminal died) — not a rotation, so auto-create proceeds.
+    _AntigravityAutoCreateScenario(
+        case_id="active_is_self_creates",
+        bridge_state_session="conv_new",
+        terminal_under=None,
+        bridge_id_label="bridge_shared",
+        expect_auto_create=True,
+    ),
+    # The bridge names a sibling (conv_old) but no live terminal exists under
+    # it — nothing to transfer in, so auto-create proceeds.
+    _AntigravityAutoCreateScenario(
+        case_id="dead_terminal_under_active_creates",
+        bridge_state_session="conv_old",
+        terminal_under=None,
+        bridge_id_label="bridge_shared",
+        expect_auto_create=True,
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario",
+    _ANTIGRAVITY_AUTO_CREATE_SCENARIOS,
+    ids=[s.case_id for s in _ANTIGRAVITY_AUTO_CREATE_SCENARIOS],
+)
+async def test_create_session_antigravity_auto_create_guard_skips_rotation_targets(
+    scenario: _AntigravityAutoCreateScenario,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The antigravity-native auto-create guard skips ``/clear`` rotation targets.
+
+    A ``/clear`` rotation binds the runner to a fresh Omnigent session, then
+    transfers the existing agy terminal onto it — agy is one long-lived process
+    hosting many cascades, so the rotation re-homes the SAME process. The bind
+    reaches the runner's ``POST /v1/sessions`` before the transfer runs, so the
+    new session momentarily has no terminal. Auto-creating a second agy here
+    cold-starts a brand-new process whose own ``external_session_id`` then 400s
+    the rotation's PATCH and loops it into unbounded session/process spawning
+    (the bug found by live e2e). The guard now skips auto-create when the new
+    session's bridge already has a *different* session owning a live
+    ``antigravity:main`` terminal — the one about to be transferred in. Mirrors
+    the claude-native guard test above.
+
+    Drives the real route with the real guard. Each scenario seeds the shared
+    bridge state's ``session_id`` and the terminal registry, then asserts whether
+    ``_auto_create_antigravity_terminal`` ran. Reverting the guard turns the
+    ``clear_rotation_target_skips`` case red (auto-create fires for a rotation
+    target again).
+    """
+    import omnigent.antigravity_native_bridge as bridge_mod
+
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+
+    # Seed the shared bridge state so the guard reads the original
+    # (terminal-owning) session as the bridge's active session.
+    if scenario.bridge_state_session is not None:
+        seed_dir = bridge_mod.prepare_bridge_dir(scenario.bridge_id_label)
+        bridge_mod.write_bridge_state(
+            seed_dir,
+            bridge_mod.AntigravityNativeBridgeState(
+                session_id=scenario.bridge_state_session,
+                conversation_id="cascade_old",
+            ),
+        )
+
+    # Seed a live antigravity:main terminal under the original session so the
+    # guard's registry probe finds the terminal that would be transferred.
+    # Poking ``_by_conversation`` directly is the established registry-test
+    # idiom — a real TerminalInstance without launching tmux.
+    terminal_registry = TerminalRegistry()
+    if scenario.terminal_under is not None:
+        instance = TerminalInstance(
+            name="antigravity",
+            session_key="main",
+            socket_path=tmp_path / "antigravity.sock",
+            private_dir=tmp_path / "antigravity",
+            running=True,
+        )
+        terminal_registry._by_conversation[scenario.terminal_under] = {
+            ("antigravity", "main"): instance
+        }
+
+    created: list[str] = []
+
+    async def _recording_auto_create(
+        session_id: str, resource_registry: Any, publish_event: Any, **_kwargs: Any
+    ) -> None:
+        """
+        Record the auto-create call instead of launching a real agy.
+
+        :param session_id: Session id the guard chose to auto-create for,
+            e.g. ``"conv_new"``.
+        :param resource_registry: Unused — the real launch path is stubbed.
+        :param publish_event: Unused — the real launch path is stubbed.
+        :param _kwargs: Absorbs keyword args added to the real function
+            (e.g. ``server_client``).
+        :returns: None.
+        """
+        del resource_registry, publish_event
+        created.append(session_id)
+
+    monkeypatch.setattr(
+        "omnigent.runner.app._auto_create_antigravity_terminal", _recording_auto_create
+    )
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "antigravity-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """
+        Return the antigravity-native spec for any agent id.
+
+        :param agent_id: Requested agent id (unused — fixed spec).
+        :param session_id: Requested session id (unused — fixed spec).
+        :returns: The antigravity-native :class:`AgentSpec`.
+        """
+        del agent_id, session_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=_AntigravitySnapshotServerClient(  # type: ignore[arg-type]
+            scenario.bridge_id_label
+        ),
+        terminal_registry=terminal_registry,
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_new", "agent_id": "ag_1"},
+        )
+    assert resp.status_code == 201, resp.text
+
+    if scenario.expect_auto_create:
+        # Fresh / no-live-sibling sessions must still bootstrap their own agy —
+        # the guard only suppresses true rotation targets. An empty ``created``
+        # here would mean the guard over-fired and a host-spawned session would
+        # never get a terminal.
+        assert created == ["conv_new"], (
+            f"Expected auto-create for {scenario.case_id}; got {created}"
+        )
+    else:
+        # The rotation target's terminal arrives via transfer. Auto-create here
+        # is the regression: it cold-starts a redundant agy that 400s the
+        # rotation's external_session_id PATCH and loops the rotation.
         assert created == [], f"Auto-create must be skipped for {scenario.case_id}; got {created}"
 
 

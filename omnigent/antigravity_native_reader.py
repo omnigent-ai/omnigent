@@ -1953,16 +1953,31 @@ async def _request_agy_elicitation(
 
 # ── Task T-G: /clear-rotation session rotation ───────────────────────────────
 #
-# A TUI ``/clear`` mints a NEW agy root cascade and leaves the bound one idle. The
-# reader detects it via ``GetAllCascadeTrajectories`` (see
-# :func:`_detect_rotated_cascade`) and then must move Omnigent ownership onto a
+# A TUI ``/clear`` mints a NEW agy root cascade ON THE SAME live agy process and
+# leaves the bound one idle. The reader detects it via ``GetAllCascadeTrajectories``
+# (see :func:`_detect_rotated_cascade`) and then must move Omnigent ownership onto a
 # fresh conversation bound to the NEW cascade — otherwise web turns keep targeting
 # the old (now-dead) conversation and streaming appears to end. This mirrors the
-# codex forwarder's ``_create_thread_replacement_session`` session-rotation API
-# sequence, adapted to the agy bridge: the replacement session inherits the OLD
-# session's bridge-id label (so it resolves to the SAME ``bridge_dir`` the reader
-# is already using — agy's bridge_dir is keyed off the launcher's bridge-id, not
-# the session id), and bridge state is rewritten with the new conversation id.
+# claude forwarder's ``_create_clear_replacement_session`` session-rotation
+# sequence: agy, like claude, is a SINGLE long-lived process hosting many cascades,
+# so the rotation TRANSFERS the existing terminal onto the replacement session
+# (it does NOT re-spawn agy) and inherits the OLD session's bridge-id label (so the
+# replacement resolves to the SAME ``bridge_dir`` the reader is already using — agy's
+# bridge_dir is keyed off the launcher's bridge-id, not the session id), then
+# rewrites bridge state with the new conversation id so the reader rebinds.
+#
+# THE LOOP BUG this fixes (found by live e2e): the prior implementation also PATCHed
+# the replacement session's ``external_session_id=new_cascade``. But POST
+# /v1/sessions for an antigravity-native session makes the runner auto-cold-start a
+# brand-new agy (``_auto_create_antigravity_terminal`` fired for EVERY such session),
+# which minted its OWN cascade AND set the new session's external_session_id; the
+# rotation's external_session_id PATCH then hit that already-set, set-once-immutable
+# field → 400 → rotation aborted, but the cold-start had already rebound the reader
+# to its fresh cascade → the detector re-fired → an infinite session-spawn loop. The
+# fix: drop the external_session_id PATCH entirely (claude never does it) AND gate
+# the runner's antigravity auto-create on an inbound-transfer check (mirroring
+# claude's ``_terminal_inbound`` guard) so the cold-start is skipped for a rotation
+# target and the existing agy is transferred instead.
 
 # Deterministic agy terminal resource id (matches
 # ``antigravity_native._TERMINAL_NAME`` / ``_TERMINAL_SESSION_KEY``). Single
@@ -2006,36 +2021,44 @@ async def _rotate_session_for_cascade(
     """
     Create + activate a replacement Omnigent session bound to a new agy cascade.
 
-    The Task T-G rotation effect: after a TUI ``/clear`` mints ``new_cascade_id``,
-    this moves Omnigent ownership onto a fresh conversation bound to that cascade,
-    MIRRORING codex's ``_create_thread_replacement_session`` API sequence (verified
-    against ``omnigent/codex_native_forwarder.py`` and
-    ``omnigent/server/routes/sessions.py``):
+    The Task T-G rotation effect: after a TUI ``/clear`` mints ``new_cascade_id`` on
+    the SAME live agy process, this moves Omnigent ownership onto a fresh
+    conversation bound to that cascade, MIRRORING claude's
+    ``_create_clear_replacement_session`` (verified against
+    ``omnigent/claude_native_forwarder.py``). agy — like claude — is ONE long-lived
+    process hosting multiple cascades; a ``/clear`` mints a new cascade on that same
+    process, so the rotation TRANSFERS the existing terminal onto the new session
+    (it does NOT re-spawn agy) and rewrites bridge state so the reader rebinds to the
+    new cascade on the SAME process:
 
     1. GET the old session snapshot (``agent_id`` / ``runner_id`` / ``labels``).
     2. POST ``/v1/sessions`` with the old ``agent_id`` + inherited ``labels`` — the
        labels carry agy's bridge-id (:data:`ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY`),
        so the NEW session resolves to the SAME ``bridge_dir`` the reader uses (agy's
        bridge_dir is keyed off the launcher's bridge-id, NOT the session id — so we
-       inherit the old label rather than stamping the old session id like codex
-       does, whose bridge_dir IS keyed off the session id).
+       inherit the old label, exactly as claude carries its ``BRIDGE_ID_LABEL_KEY``).
     3. PATCH the new session's ``runner_id`` to the old runner (so the same runner
        owns it), when the old session had one.
-    4. PATCH the new session's ``external_session_id`` to ``new_cascade_id`` (so a
-       later ``--resume`` continues agy's actual new conversation).
-    5. POST the terminal ``/transfer`` to move the live agy tmux pane old→new
-       (the pane keeps running under the new conversation).
-    6. Rewrite agy bridge state in ``bridge_dir`` with the new session id + new
+    4. POST the terminal ``/transfer`` to move the live agy tmux pane old→new (the
+       pane — the SAME agy process — keeps running under the new conversation).
+       NO ``external_session_id`` PATCH is made: unlike a resume launch, the new
+       cascade ``new_cascade_id`` is ALREADY live on the existing agy and reached via
+       the rewritten bridge state below, not via a later ``--resume``. (The old code
+       PATCHed it, which 400'd on the auto-cold-started session's already-set,
+       set-once-immutable field and looped the rotation — see the module header.)
+    5. Rewrite agy bridge state in ``bridge_dir`` with the new session id + new
        conversation id (the reader re-reads this on rebind to bind the new cascade).
-    7. PATCH the old session's ``runner_id`` to ``""`` to release it (best-effort;
+    6. PATCH the old session's ``runner_id`` to ``""`` to release it (best-effort;
        a failure is logged, not raised — the new session is already live).
 
-    Best-effort: ANY failure (snapshot, create, bind, external-id, transfer, state
-    write) is logged at WARNING and yields ``None``, and the caller keeps serving
-    the OLD binding rather than crashing or losing the reader. The bridge-state
-    rewrite is performed only AFTER the new session is created and bound, so a
-    mid-sequence failure never leaves bridge state pointing at a session that does
-    not exist.
+    Best-effort: ANY failure (snapshot, create, bind, transfer, state write) is
+    logged at WARNING and yields ``None``, and the caller keeps serving the OLD
+    binding rather than crashing or losing the reader. The bridge-state rewrite is
+    performed only AFTER the new session is created and bound, so a mid-sequence
+    failure never leaves bridge state pointing at a session that does not exist —
+    and, mirroring claude, it lands AFTER the transfer so the runner's auto-create
+    guard still sees the OLD session owning the terminal while the new session binds
+    (see :func:`omnigent.runner.app._antigravity_native_terminal_arrives_via_transfer`).
 
     :param client: Omnigent HTTP client (the reader's client).
     :param old_session_id: The Omnigent session being rotated away from.
@@ -2079,12 +2102,6 @@ async def _rotate_session_for_cascade(
                 json={"runner_id": runner_id},
             )
             bind_resp.raise_for_status()
-
-        external_resp = await client.patch(
-            f"/v1/sessions/{url_component(new_session_id)}",
-            json={"external_session_id": new_cascade_id},
-        )
-        external_resp.raise_for_status()
 
         transfer_resp = await client.post(
             (

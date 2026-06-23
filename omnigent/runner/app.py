@@ -3535,6 +3535,59 @@ async def _claude_native_terminal_arrives_via_transfer(
     return terminal_registry.get(active_session_id, "claude", "main") is not None
 
 
+async def _antigravity_native_terminal_arrives_via_transfer(
+    *,
+    server_client: httpx.AsyncClient | None,
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+) -> bool:
+    """
+    Return whether a live agy terminal will be transferred into a session.
+
+    The antigravity mirror of :func:`_claude_native_terminal_arrives_via_transfer`.
+    A TUI ``/clear`` rotation (see
+    :func:`omnigent.antigravity_native_reader._rotate_session_for_cascade`) binds the
+    runner to a fresh session, then transfers the existing agy terminal onto it —
+    agy is one long-lived process hosting many cascades, so the rotation re-homes the
+    SAME process rather than spawning a second one. Auto-creating a redundant agy
+    here would cold-start a brand-new agy whose own ``external_session_id`` then 400s
+    the rotation's PATCH and loops it (the bug this guard fixes). The shared bridge
+    state still names the live terminal-owning session at bind time (the rotation
+    rewrites it only AFTER the transfer), detected here so the caller skips
+    auto-create and lets the transfer deliver the terminal.
+
+    :param server_client: Omnigent client to resolve the bridge id label;
+        ``None`` can't confirm a rotation, so returns ``False``.
+    :param session_id: Newly-bound session id, e.g. ``"conv_new"``.
+    :param resource_registry: Registry probed for the original session's live
+        ``antigravity:main`` terminal.
+    :returns: ``True`` when a different session on the same bridge owns a live
+        ``antigravity:main`` terminal (transfer inbound), else ``False``.
+    """
+    terminal_registry = resource_registry.terminal_registry
+    if terminal_registry is None:
+        return False
+    # Lazy import keeps antigravity-native out of the generic runner import graph.
+    from omnigent.antigravity_native_bridge import (
+        ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
+        bridge_dir_for_bridge_id,
+        read_bridge_state,
+    )
+
+    if server_client is None:
+        return False
+    labels = await _session_labels_for_runner_spawn(
+        server_client=server_client,
+        session_id=session_id,
+    )
+    bridge_id = labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id
+    state = read_bridge_state(bridge_dir_for_bridge_id(bridge_id))
+    # Fresh bridge, or the new session is already active — nothing transfers in.
+    if state is None or state.session_id == session_id:
+        return False
+    return terminal_registry.get(state.session_id, "antigravity", "main") is not None
+
+
 _SESSION_LABEL_LOOKUP_TIMEOUT_SECONDS = 1.0
 
 
@@ -6442,7 +6495,26 @@ def create_runner_app(
                 _needs_terminal = (
                     await _session_payload_for_host_spawn_check(server_client, session_id)
                 ) is not None
-                if not _has_antigravity_terminal and _needs_terminal:
+                # A /clear rotation binds the runner to the new session before
+                # transferring the existing agy terminal onto it. Auto-creating
+                # here would cold-start a redundant agy whose own
+                # external_session_id then 400s the rotation's PATCH and loops it,
+                # so skip when the bridge's active session still owns the terminal
+                # being transferred in (mirrors the claude-native guard above).
+                _antigravity_inbound = False
+                if not _has_antigravity_terminal:
+                    _antigravity_inbound = await _antigravity_native_terminal_arrives_via_transfer(
+                        server_client=server_client,
+                        session_id=session_id,
+                        resource_registry=resource_registry,
+                    )
+                    _logger.info(
+                        "Antigravity terminal transfer-inbound check: session=%s "
+                        "terminal_inbound=%s",
+                        session_id,
+                        _antigravity_inbound,
+                    )
+                if not _has_antigravity_terminal and _needs_terminal and not _antigravity_inbound:
                     # Surface "terminal starting up" to the web UI before the
                     # (potentially slow) launch, and clear it in finally so a
                     # failure also drops the spinner rather than stranding it.
@@ -6467,6 +6539,12 @@ def create_runner_app(
                         )
                     finally:
                         _publish_terminal_pending(_publish_event, session_id, False)
+                elif _antigravity_inbound:
+                    _logger.info(
+                        "Skipping antigravity terminal auto-create for %s; a sibling "
+                        "session's terminal will transfer in (rotation target).",
+                        session_id,
+                    )
                 elif not _needs_terminal:
                     _logger.info(
                         "Skipping antigravity terminal auto-create for %s; session "
