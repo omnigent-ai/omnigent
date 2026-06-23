@@ -605,6 +605,17 @@ function FileViewerBody({
   const [previewableViewMode, setPreviewableViewMode] = useState<"editor" | "preview" | "source">(
     () => persistedPrefsRef.current.previewableViewMode,
   );
+  // A ?comment= deep link to a markdown file should open where the comment's
+  // anchor is highlighted in context. The read-only Preview can't render that
+  // highlight (only the rich-text editor and raw source can), so for that one
+  // deep-linked markdown file we bias the initial view to the editor — but only
+  // when the user's preference would otherwise land on Preview (a stored
+  // editor/source choice is already highlightable, so we respect it). Preview
+  // stays the default for normal opens; the bias is dropped the moment the user
+  // picks a mode and never applies to any other file.
+  const [deepLinkBiasPath, setDeepLinkBiasPath] = useState<string | null>(() =>
+    initialCommentIdRef.current ? path : null,
+  );
 
   // Persist the global view preferences so they survive a refresh. commentsOpen
   // is intentionally excluded — it's contextual (per-open), not a sticky
@@ -612,13 +623,18 @@ function FileViewerBody({
   useEffect(() => {
     writeFileViewPreferences({ diffActive, diffLayout, previewableViewMode });
   }, [diffActive, diffLayout, previewableViewMode]);
-  // Non-markdown previewable (HTML): "editor" falls back to "preview" — no rich-text mode.
-  // Markdown: "preview" is removed; treat as "source" if somehow set (e.g. shared state from an HTML file).
+  // Markdown supports all three previewable modes (preview / editor / source).
+  // HTML has no rich-text editor, so its "editor" preference falls back to the
+  // rendered preview; "preview" / "source" pass through for both. The shared
+  // preference still carries across file types — opening markdown in source
+  // then switching to an HTML file keeps you in source, etc.
   const fileViewMode: "editor" | "preview" | "source" = isPreviewable
-    ? lang !== "markdown" && previewableViewMode === "editor"
-      ? "preview"
-      : lang === "markdown" && previewableViewMode === "preview"
-        ? "source"
+    ? lang === "markdown"
+      ? deepLinkBiasPath === path && previewableViewMode === "preview"
+        ? "editor"
+        : previewableViewMode
+      : previewableViewMode === "editor"
+        ? "preview"
         : previewableViewMode
     : "source";
   // Derived effective view mode — diff takes priority when active and available.
@@ -690,38 +706,68 @@ function FileViewerBody({
     active?: boolean;
   };
   const toolbarActions: ToolbarAction[] = [];
-  if (isPreviewable && viewMode !== "diff") {
-    const previewLabel =
-      lang === "markdown"
-        ? viewMode === "editor"
-          ? "Source view"
-          : "Rich text editor"
-        : viewMode === "preview"
-          ? "View source"
-          : "View preview";
+  if (lang === "markdown" && viewMode !== "diff") {
+    // Markdown is a segmented control over three reachable modes: the rendered
+    // Preview (default, issue #970), the rich-text Editor, and raw Source.
+    // Switching away from the editor must guard unsaved edits; the read-only
+    // preview/source surfaces carry no edits, so they switch freely.
+    const switchTo = (mode: "preview" | "editor" | "source") => {
+      // No-op when already on this surface — re-selecting the active tab must
+      // not run the dirty guard (which would pop a discard dialog for nothing).
+      if (mode === viewMode) return;
+      // Clear the deep-link bias and set the absolute mode together, and only
+      // when the switch actually proceeds — so a guarded (dirty) switch the user
+      // cancels leaves both the bias and the editor intact.
+      const apply = () => {
+        setDeepLinkBiasPath(null);
+        setPreviewableViewMode(mode);
+      };
+      if (viewMode === "editor") {
+        guardDirty(apply);
+      } else {
+        apply();
+      }
+    };
+    toolbarActions.push(
+      {
+        key: "md-preview",
+        label: "Preview",
+        tooltip: "Rendered preview",
+        icon: <EyeIcon className="size-4" />,
+        active: viewMode === "preview",
+        onSelect: () => switchTo("preview"),
+      },
+      {
+        key: "md-edit",
+        label: "Edit",
+        tooltip: "Rich text editor",
+        icon: <PencilLineIcon className="size-4" />,
+        active: viewMode === "editor",
+        onSelect: () => switchTo("editor"),
+      },
+      {
+        key: "md-source",
+        label: "Source",
+        tooltip: "Raw Markdown source",
+        icon: <CodeIcon className="size-4" />,
+        active: viewMode === "source",
+        onSelect: () => switchTo("source"),
+      },
+    );
+  } else if (lang === "html" && viewMode !== "diff") {
+    // HTML has no rich-text editor — a single toggle flips preview ↔ source.
     toolbarActions.push({
       key: "preview",
-      label: previewLabel,
+      label: viewMode === "preview" ? "View source" : "View preview",
       icon:
-        lang === "markdown" ? (
-          viewMode === "editor" ? (
-            <CodeIcon className="size-4" />
-          ) : (
-            <PencilLineIcon className="size-4" />
-          )
-        ) : viewMode === "preview" ? (
-          <CodeIcon className="size-4" />
-        ) : (
-          <EyeIcon className="size-4" />
-        ),
+        viewMode === "preview" ? <CodeIcon className="size-4" /> : <EyeIcon className="size-4" />,
+      // Write the absolute target keyed off the RESOLVED viewMode, not the raw
+      // stored value: a shared "editor" preference (carried over from a markdown
+      // file) resolves to "preview" for HTML, so a functional updater keyed on
+      // "editor" would no-op the first click. Keying on viewMode makes one click
+      // always reach the other surface.
       onSelect: () => {
-        if (lang === "markdown") {
-          guardDirty(() =>
-            setPreviewableViewMode((mode) => (mode === "editor" ? "source" : "editor")),
-          );
-        } else {
-          setPreviewableViewMode((mode) => (mode === "preview" ? "source" : "preview"));
-        }
+        setPreviewableViewMode(viewMode === "preview" ? "source" : "preview");
       },
     });
   }
