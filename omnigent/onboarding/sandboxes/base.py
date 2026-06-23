@@ -206,7 +206,7 @@ class SandboxLauncher(ABC):
 
         Exec-model providers create the box here. Entrypoint-as-host providers
         (whose sandbox boots running the host) may instead just RESERVE the id
-        and defer materialization to :meth:`launch_host` — which lets the server
+        and defer materialization to :meth:`start_host` — which lets the server
         register the launch token against the id before the box exists, closing
         the host dial-back race by construction.
 
@@ -217,7 +217,7 @@ class SandboxLauncher(ABC):
         :raises click.ClickException: If provisioning fails.
         """
 
-    def launch_host(
+    def start_host(
         self,
         sandbox_id: str,
         *,

@@ -1871,7 +1871,7 @@ async def _arm_and_start_host(
     :param repo: Repository to clone as the workspace, or ``None``
         for an empty workspace.
     :param on_stage: Progress observer forwarded to the launcher's
-        ``launch_host``; see :func:`launch_managed_host`. ``None``
+        ``start_host``; see :func:`launch_managed_host`. ``None``
         disables progress reporting.
     :param keep_host_on_failure: ``True`` on a relaunch — failure
         cleanup terminates the new sandbox and revokes the token but
@@ -1893,12 +1893,12 @@ async def _arm_and_start_host(
     )
     try:
         # Uniform across providers: provision() fixed the sandbox id and the
-        # token was armed against it above, so launch_host starts the host with
+        # token was armed against it above, so start_host starts the host with
         # a token that already resolves. The exec-model default execs in; the
         # entrypoint model (k8s) creates the Pod that boots the host. *repo* is
         # unpacked into primitives — the launcher API takes no RepoWorkspace.
         workspace = await asyncio.to_thread(
-            launcher.launch_host,
+            launcher.start_host,
             sandbox_id,
             token=token,
             host_id=host_id,

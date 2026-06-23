@@ -10,13 +10,13 @@ provider can be listed and the module probed without it.
 
 The model is **entrypoint-as-host**: the Pod's container command IS
 ``omnigent host``. :meth:`~KubernetesSandboxLauncher.provision` only RESERVES
-the Pod name (no Pod yet); :meth:`~KubernetesSandboxLauncher.launch_host` then
+the Pod name (no Pod yet); :meth:`~KubernetesSandboxLauncher.start_host` then
 creates the Pod — an init container prepares the workspace (``mkdir`` + optional
 ``git clone``) and the main container runs the host under a tiny PID-1 reaper,
 which dials back over the existing managed launch-token tunnel. Because the host
 is never started by ``exec``-ing into an already-running container, this launcher
 needs no ``pods/exec`` rights and no exec transport — it implements only
-``prepare`` / ``provision`` / ``launch_host`` / ``terminate``.
+``prepare`` / ``provision`` / ``start_host`` / ``terminate``.
 
 Platform notes that shape this launcher:
 
@@ -147,7 +147,7 @@ _HOME_DIR: str = "/home/omnigent"
 _CONTAINER_NAME: str = "host"
 _INIT_CONTAINER_NAME: str = "workspace-prep"
 
-# Pod-start wait budget, consumed inside launch_host BEFORE the
+# Pod-start wait budget, consumed inside start_host BEFORE the
 # shared _wait_for_host_online poll, so a Pod that can't schedule / pull its
 # image / clone its repo fails fast with a clear reason instead of as a generic
 # online timeout. Kept tight; a cold image pull is the usual slow case.
@@ -732,7 +732,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
     :class:`SandboxLauncher` for on-demand Kubernetes Pods.
 
     Server-managed only and entrypoint-as-host: :meth:`provision` reserves a Pod
-    name, :meth:`launch_host` creates a per-Pod token Secret and a Pod whose init
+    name, :meth:`start_host` creates a per-Pod token Secret and a Pod whose init
     container prepares the workspace and whose main container runs
     ``omnigent host``, and :meth:`terminate` deletes both. All transport rides the
     official ``kubernetes`` client's ``CoreV1Api`` built into an isolated
@@ -978,7 +978,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         Local preflight: verify the Kubernetes client is installed.
 
         Cluster reachability is not pre-checked — the first
-        :meth:`launch_host` call surfaces a config/connection error with the same
+        :meth:`start_host` call surfaces a config/connection error with the same
         clear message and cleans up after itself, so a separate probe would only
         open a client pool with no later op to close it.
 
@@ -991,7 +991,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         Reserve a Pod name for a managed launch — no Pod is created here.
 
         Entrypoint-as-host: the Pod (which boots running ``omnigent host``) is
-        materialized by :meth:`launch_host`, not here. ``provision`` only mints
+        materialized by :meth:`start_host`, not here. ``provision`` only mints
         the DNS-label-safe Pod name, so the server can register the launch token
         against it BEFORE the Pod exists — closing the host dial-back race by
         construction.
@@ -1001,7 +1001,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         """
         return _new_pod_name(name)
 
-    def launch_host(
+    def start_host(
         self,
         sandbox_id: str,
         *,
@@ -1018,7 +1018,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         Create the token Secret + runner Pod and wait for the host to start.
 
         The entrypoint-as-host override of
-        :meth:`~omnigent.onboarding.sandboxes.base.SandboxLauncher.launch_host`
+        :meth:`~omnigent.onboarding.sandboxes.base.SandboxLauncher.start_host`
         (there is no exec bootstrap): the Pod's init container creates
         ``<HOME>/workspace`` and clones the repository (when requested), and its
         main container runs ``omnigent host``, which dials back over the
@@ -1114,7 +1114,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                 self._best_effort_delete(namespace, sandbox_id, secret_name)
                 raise
         finally:
-            # launch_host is the launcher's only API work on the launch path
+            # start_host is the launcher's only API work on the launch path
             # (the online wait that follows polls the host store), so release
             # the connection pool here on both paths.
             self._close_clients()

@@ -1222,9 +1222,9 @@ class _EntrypointFakeLauncher(FakeSandboxLauncher):
     """
     An entrypoint-as-host fake (like the kubernetes launcher): ``provision``
     only RESERVES the sandbox id (no box created), and the host is started by a
-    ``launch_host`` override — not the exec-model base default.
+    ``start_host`` override — not the exec-model base default.
 
-    Records the ``launch_host`` call and, to prove the token is armed BEFORE the
+    Records the ``start_host`` call and, to prove the token is armed BEFORE the
     host starts, captures whether the token already resolves at call time (then
     simulates the host dialing back).
     """
@@ -1234,8 +1234,8 @@ class _EntrypointFakeLauncher(FakeSandboxLauncher):
     def __init__(self, host_store: HostStore) -> None:
         super().__init__()
         self._host_store = host_store
-        self.launch_calls: list[dict[str, object]] = []
-        self.token_resolved_at_launch: bool = False
+        self.start_calls: list[dict[str, object]] = []
+        self.token_resolved_at_start: bool = False
 
     def provision(self, name: str) -> str:
         """Reserve a sandbox id (no box created); recorded + deterministic."""
@@ -1246,7 +1246,7 @@ class _EntrypointFakeLauncher(FakeSandboxLauncher):
         """The entrypoint model never execs in — the base default is overridden."""
         raise AssertionError("entrypoint launcher must not exec via run()")
 
-    def launch_host(
+    def start_host(
         self,
         sandbox_id: str,
         *,
@@ -1260,7 +1260,7 @@ class _EntrypointFakeLauncher(FakeSandboxLauncher):
         on_stage=None,
     ) -> str:
         """Record the call, prove the token already resolves, and connect."""
-        self.launch_calls.append(
+        self.start_calls.append(
             {
                 "sandbox_id": sandbox_id,
                 "token": token,
@@ -1270,8 +1270,8 @@ class _EntrypointFakeLauncher(FakeSandboxLauncher):
                 "repo_name": repo_name,
             }
         )
-        # The token was registered before launch_host, so it resolves now.
-        self.token_resolved_at_launch = self._host_store.resolve_launch_token(token) is not None
+        # The token was registered before start_host, so it resolves now.
+        self.token_resolved_at_start = self._host_store.resolve_launch_token(token) is not None
         # Simulate the host's entrypoint dialing back over the tunnel.
         self._host_store.upsert_on_connect(host_id=host_id, name=host_name, owner=_OWNER)
         return f"/home/omnigent/workspace/{repo_name}" if repo_name else "/home/omnigent/workspace"
@@ -1280,7 +1280,7 @@ class _EntrypointFakeLauncher(FakeSandboxLauncher):
 async def test_launch_entrypoint_provider_arms_token_before_launch_host(db_uri: str) -> None:
     """
     Entrypoint-as-host seam: the uniform launch path reserves the sandbox id via
-    provision(), registers the token, THEN calls launch_host (never run) — so the
+    provision(), registers the token, THEN calls start_host (never run) — so the
     host authenticates the moment its entrypoint dials back, with no race.
     """
     host_store = HostStore(db_uri)
@@ -1293,15 +1293,15 @@ async def test_launch_entrypoint_provider_arms_token_before_launch_host(db_uri: 
         repo=parse_repo_workspace("https://github.com/org/repo.git#main"),
     )
 
-    # launch_host ran once, with the reserved id and repo info.
-    assert len(fake.launch_calls) == 1
-    call = fake.launch_calls[0]
+    # start_host ran once, with the reserved id and repo info.
+    assert len(fake.start_calls) == 1
+    call = fake.start_calls[0]
     assert call["sandbox_id"] == "omnigent-pod-1"
     assert call["server_url"] == "https://srv.example.com"
     assert call["repo_url"] == "https://github.com/org/repo.git"
     assert call["repo_name"] == "repo"
-    # The token was already resolvable when launch_host ran (no dial-back race).
-    assert fake.token_resolved_at_launch is True
+    # The token was already resolvable when start_host ran (no dial-back race).
+    assert fake.token_resolved_at_start is True
     # The workspace (cloned dir) is returned and the host is online + bound.
     assert result.workspace == "/home/omnigent/workspace/repo"
     host = host_store.get_host(result.host_id)
@@ -1313,13 +1313,13 @@ async def test_launch_entrypoint_provider_arms_token_before_launch_host(db_uri: 
 
 async def test_launch_entrypoint_provider_cleans_up_on_launch_failure(db_uri: str) -> None:
     """
-    A launch_host failure tears the sandbox down (by the reserved id) and deletes
+    A start_host failure tears the sandbox down (by the reserved id) and deletes
     the host row, exactly like the exec path.
     """
     host_store = HostStore(db_uri)
 
     class _Failing(_EntrypointFakeLauncher):
-        def launch_host(self, sandbox_id: str, **kwargs: object) -> str:
+        def start_host(self, sandbox_id: str, **kwargs: object) -> str:
             raise click.ClickException("pod could not be scheduled")
 
     fake = _Failing(host_store)
