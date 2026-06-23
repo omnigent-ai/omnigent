@@ -6092,6 +6092,22 @@ async def _run_managed_wake(
             return
         runner_id: str | None = None
         host_conn = host_registry.get(conv.host_id) if host_registry is not None else None
+        if host_registry is not None and host_conn is None:
+            # resume_managed_host waits on cross-replica host-store liveness, not
+            # this replica's in-memory tunnel registry — the woken host's tunnel
+            # can lag here (or land on another replica). Poll briefly so the runner
+            # launches once it reconnects, instead of settling "ready" with no
+            # runner; fail clearly if it never shows rather than losing the turn.
+            _host_reconnect_deadline = time.monotonic() + _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S
+            while host_conn is None and time.monotonic() < _host_reconnect_deadline:
+                await asyncio.sleep(0.5)
+                host_conn = host_registry.get(conv.host_id)
+            if host_conn is None:
+                tracker.fail(session_id, "managed host did not reconnect after wake")
+                _publish_sandbox_status(
+                    session_id, "failed", "managed host did not reconnect after wake"
+                )
+                return
         if host_conn is not None:
             launch_attempt = await _launch_runner_on_host(
                 refreshed,
