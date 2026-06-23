@@ -9,15 +9,14 @@ dependency (``pip install 'omnigent[kubernetes]'``) imported lazily, so the
 provider can be listed and the module probed without it.
 
 The model is **entrypoint-as-host**: the Pod's container command IS
-``omnigent host``, so provisioning and host-start are one step
-(:meth:`KubernetesSandboxLauncher.provision_managed_host`). An init container
-prepares the workspace (``mkdir`` + optional ``git clone``); the main container
-then runs the host under a tiny PID-1 reaper, and the host dials back over the
-existing managed launch-token tunnel. Because the host is never started by
-``exec``-ing into an already-running container, this launcher needs no
-``pods/exec`` rights and no exec transport — it implements only
-``prepare`` / ``provision_managed_host`` / ``terminate`` (plus
-:meth:`new_managed_sandbox_id`).
+``omnigent host``. :meth:`~KubernetesSandboxLauncher.provision` only RESERVES
+the Pod name (no Pod yet); :meth:`~KubernetesSandboxLauncher.launch_host` then
+creates the Pod — an init container prepares the workspace (``mkdir`` + optional
+``git clone``) and the main container runs the host under a tiny PID-1 reaper,
+which dials back over the existing managed launch-token tunnel. Because the host
+is never started by ``exec``-ing into an already-running container, this launcher
+needs no ``pods/exec`` rights and no exec transport — it implements only
+``prepare`` / ``provision`` / ``launch_host`` / ``terminate``.
 
 Platform notes that shape this launcher:
 
@@ -148,7 +147,7 @@ _HOME_DIR: str = "/home/omnigent"
 _CONTAINER_NAME: str = "host"
 _INIT_CONTAINER_NAME: str = "workspace-prep"
 
-# Pod-start wait budget, consumed inside provision_managed_host BEFORE the
+# Pod-start wait budget, consumed inside launch_host BEFORE the
 # shared _wait_for_host_online poll, so a Pod that can't schedule / pull its
 # image / clone its repo fails fast with a clear reason instead of as a generic
 # online timeout. Kept tight; a cold image pull is the usual slow case.
@@ -732,19 +731,16 @@ class KubernetesSandboxLauncher(SandboxLauncher):
     """
     :class:`SandboxLauncher` for on-demand Kubernetes Pods.
 
-    Server-managed only and entrypoint-as-host:
-    :meth:`provision_managed_host` creates a per-Pod token Secret and a Pod whose
-    init container prepares the workspace and whose main container runs
-    ``omnigent host``; :meth:`terminate` deletes both. All transport rides the
+    Server-managed only and entrypoint-as-host: :meth:`provision` reserves a Pod
+    name, :meth:`launch_host` creates a per-Pod token Secret and a Pod whose init
+    container prepares the workspace and whose main container runs
+    ``omnigent host``, and :meth:`terminate` deletes both. All transport rides the
     official ``kubernetes`` client's ``CoreV1Api`` built into an isolated
     :class:`~kubernetes.client.Configuration` (no global client-state mutation),
     preferring in-cluster ServiceAccount config and falling back to a kubeconfig.
     """
 
     provider: ClassVar[str] = "kubernetes"
-    # Entrypoint-as-host: provisioning starts the host, so the managed-launch
-    # path uses provision_managed_host / new_managed_sandbox_id, not run/exec.
-    starts_host_at_provision: ClassVar[bool] = True
     # Managed-only: no CLI bootstrap, no local→sandbox port forward.
     supports_cli_bootstrap: ClassVar[bool] = False
     supports_local_port_forward: ClassVar[bool] = False
@@ -982,25 +978,30 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         Local preflight: verify the Kubernetes client is installed.
 
         Cluster reachability is not pre-checked — the first
-        :meth:`provision_managed_host` call surfaces a config/connection error
-        with the same clear message and cleans up after itself, so a separate
-        probe would only open a client pool with no later op to close it.
+        :meth:`launch_host` call surfaces a config/connection error with the same
+        clear message and cleans up after itself, so a separate probe would only
+        open a client pool with no later op to close it.
 
         :raises click.ClickException: When the client is not installed.
         """
         _ensure_sdk()
 
-    def new_managed_sandbox_id(self, name: str) -> str:
+    def provision(self, name: str) -> str:
         """
-        Pre-generate the runner Pod name, so the launch token can be registered
-        before the Pod (and its host) exist.
+        Reserve a Pod name for a managed launch — no Pod is created here.
+
+        Entrypoint-as-host: the Pod (which boots running ``omnigent host``) is
+        materialized by :meth:`launch_host`, not here. ``provision`` only mints
+        the DNS-label-safe Pod name, so the server can register the launch token
+        against it BEFORE the Pod exists — closing the host dial-back race by
+        construction.
 
         :param name: Human-readable label, e.g. ``"managed-a1b2c3d4"``.
-        :returns: A DNS-label-safe Pod name (see :func:`_new_pod_name`).
+        :returns: The reserved Pod name (see :func:`_new_pod_name`).
         """
         return _new_pod_name(name)
 
-    def provision_managed_host(
+    def launch_host(
         self,
         sandbox_id: str,
         *,
@@ -1016,16 +1017,18 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         """
         Create the token Secret + runner Pod and wait for the host to start.
 
-        The Pod's init container creates ``<HOME>/workspace`` and clones the
-        repository (when requested); its main container runs ``omnigent host``,
-        which dials back over the launch-token tunnel. Because the launcher
-        controls ``HOME`` (:data:`_HOME_DIR`), the workspace path is known
-        without asking the sandbox. The pod-start wait fast-fails (with the
-        container log tail) on a Pod that can't schedule, pull, or clone, BEFORE
-        the shared online poll — so the failure reason survives the cleanup that
-        deletes the Pod.
+        The entrypoint-as-host override of
+        :meth:`~omnigent.onboarding.sandboxes.base.SandboxLauncher.launch_host`
+        (there is no exec bootstrap): the Pod's init container creates
+        ``<HOME>/workspace`` and clones the repository (when requested), and its
+        main container runs ``omnigent host``, which dials back over the
+        launch-token tunnel. Because the launcher controls ``HOME``
+        (:data:`_HOME_DIR`), the workspace path is known without asking the
+        sandbox. The pod-start wait fast-fails (with the container log tail) on a
+        Pod that can't schedule, pull, or clone, BEFORE the shared online poll —
+        so the failure reason survives the cleanup that deletes the Pod.
 
-        :param sandbox_id: The Pod name from :meth:`new_managed_sandbox_id`.
+        :param sandbox_id: The Pod name from :meth:`provision`.
         :param token: The raw launch token, delivered via the per-Pod Secret.
         :param host_id: Server-chosen host identity.
         :param host_name: Server-chosen host display name.
@@ -1111,9 +1114,9 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                 self._best_effort_delete(namespace, sandbox_id, secret_name)
                 raise
         finally:
-            # provision_managed_host is the launcher's only API work on the
-            # launch path (the online wait that follows polls the host store),
-            # so release the connection pool here on both paths.
+            # launch_host is the launcher's only API work on the launch path
+            # (the online wait that follows polls the host store), so release
+            # the connection pool here on both paths.
             self._close_clients()
         click.echo(f"  → pod '{sandbox_id}' is starting the host")
         return clone_dir or workspace
@@ -1436,21 +1439,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
             err=True,
         )
 
-    # ── unsupported exec-model primitives ────────────────────
-
-    def provision(self, name: str) -> str:
-        """
-        Unsupported: this provider starts the host at provision time.
-
-        :param name: Unused.
-        :raises SandboxCapabilityError: Always — the managed-launch path uses
-            :meth:`provision_managed_host` (gated on
-            :attr:`starts_host_at_provision`), not bare ``provision``.
-        """
-        raise self._capability_error(
-            "provision a bare sandbox — it starts the host at provision time "
-            "(use provision_managed_host)"
-        )
+    # ── unsupported: no exec transport (the host is the Pod entrypoint) ──
 
     def run(self, sandbox_id: str, command: str, *, check: bool = True) -> RemoteCommandResult:
         """

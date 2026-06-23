@@ -541,7 +541,7 @@ def test_local_registry_missing_cred_env_fails_loud(
 def test_run_drains_output_and_returns_exit_code(fake_boxlite: _FakeBoxliteState) -> None:
     """
     ``run`` wraps the command in ``sh -lc``, drains the stdout stream, and
-    returns the exit code — the shape ``_start_host_in_sandbox`` relies on
+    returns the exit code — the shape ``SandboxLauncher.launch_host`` relies on
     for ``printf %s "$HOME"`` (no trailing newline, ``.strip()`` on the
     caller side).
     """

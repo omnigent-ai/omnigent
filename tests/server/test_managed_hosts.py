@@ -1220,38 +1220,33 @@ async def test_launch_clone_failure_terminates_and_deletes_host(db_uri: str) -> 
 
 class _EntrypointFakeLauncher(FakeSandboxLauncher):
     """
-    An entrypoint-as-host fake (like the kubernetes launcher): the sandbox is
-    created — and the host started — by ``provision_managed_host``, not by a
-    bare ``provision`` + exec.
+    An entrypoint-as-host fake (like the kubernetes launcher): ``provision``
+    only RESERVES the sandbox id (no box created), and the host is started by a
+    ``launch_host`` override — not the exec-model base default.
 
-    Records the ``provision_managed_host`` call and, to assert the token is
-    armed BEFORE provisioning, captures whether the token already resolves at
-    call time (then simulates the host dialing back).
+    Records the ``launch_host`` call and, to prove the token is armed BEFORE the
+    host starts, captures whether the token already resolves at call time (then
+    simulates the host dialing back).
     """
 
     provider: ClassVar[str] = "kubernetes"
-    starts_host_at_provision: ClassVar[bool] = True
 
     def __init__(self, host_store: HostStore) -> None:
         super().__init__()
         self._host_store = host_store
-        self.provision_calls: list[dict[str, object]] = []
-        self.token_resolved_at_provision: bool = False
+        self.launch_calls: list[dict[str, object]] = []
+        self.token_resolved_at_launch: bool = False
 
-    def new_managed_sandbox_id(self, name: str) -> str:
-        """Pre-generate the sandbox id (recorded, deterministic)."""
+    def provision(self, name: str) -> str:
+        """Reserve a sandbox id (no box created); recorded + deterministic."""
         self.provisioned_names.append(name)
         return f"omnigent-pod-{len(self.provisioned_names)}"
 
-    def provision(self, name: str) -> str:
-        """The entrypoint model must never call bare provision."""
-        raise AssertionError("entrypoint launcher must not call provision()")
-
     def run(self, sandbox_id: str, command: str, *, check: bool = True):
-        """The entrypoint model must never exec a command in."""
+        """The entrypoint model never execs in — the base default is overridden."""
         raise AssertionError("entrypoint launcher must not exec via run()")
 
-    def provision_managed_host(
+    def launch_host(
         self,
         sandbox_id: str,
         *,
@@ -1265,7 +1260,7 @@ class _EntrypointFakeLauncher(FakeSandboxLauncher):
         on_stage=None,
     ) -> str:
         """Record the call, prove the token already resolves, and connect."""
-        self.provision_calls.append(
+        self.launch_calls.append(
             {
                 "sandbox_id": sandbox_id,
                 "token": token,
@@ -1275,18 +1270,18 @@ class _EntrypointFakeLauncher(FakeSandboxLauncher):
                 "repo_name": repo_name,
             }
         )
-        # The token was registered before provisioning, so it resolves now.
-        self.token_resolved_at_provision = self._host_store.resolve_launch_token(token) is not None
+        # The token was registered before launch_host, so it resolves now.
+        self.token_resolved_at_launch = self._host_store.resolve_launch_token(token) is not None
         # Simulate the host's entrypoint dialing back over the tunnel.
         self._host_store.upsert_on_connect(host_id=host_id, name=host_name, owner=_OWNER)
         return f"/home/omnigent/workspace/{repo_name}" if repo_name else "/home/omnigent/workspace"
 
 
-async def test_launch_entrypoint_provider_arms_token_before_provisioning(db_uri: str) -> None:
+async def test_launch_entrypoint_provider_arms_token_before_launch_host(db_uri: str) -> None:
     """
-    Entrypoint-as-host seam: the launch path pre-generates the sandbox id,
-    registers the token, THEN calls provision_managed_host (never provision /
-    run) — so the host authenticates the moment its entrypoint dials back.
+    Entrypoint-as-host seam: the uniform launch path reserves the sandbox id via
+    provision(), registers the token, THEN calls launch_host (never run) — so the
+    host authenticates the moment its entrypoint dials back, with no race.
     """
     host_store = HostStore(db_uri)
     fake = _EntrypointFakeLauncher(host_store)
@@ -1298,15 +1293,15 @@ async def test_launch_entrypoint_provider_arms_token_before_provisioning(db_uri:
         repo=parse_repo_workspace("https://github.com/org/repo.git#main"),
     )
 
-    # provision_managed_host ran once, with the pre-generated id and repo info.
-    assert len(fake.provision_calls) == 1
-    call = fake.provision_calls[0]
+    # launch_host ran once, with the reserved id and repo info.
+    assert len(fake.launch_calls) == 1
+    call = fake.launch_calls[0]
     assert call["sandbox_id"] == "omnigent-pod-1"
     assert call["server_url"] == "https://srv.example.com"
     assert call["repo_url"] == "https://github.com/org/repo.git"
     assert call["repo_name"] == "repo"
-    # The token was already resolvable when provisioning ran (no dial-back race).
-    assert fake.token_resolved_at_provision is True
+    # The token was already resolvable when launch_host ran (no dial-back race).
+    assert fake.token_resolved_at_launch is True
     # The workspace (cloned dir) is returned and the host is online + bound.
     assert result.workspace == "/home/omnigent/workspace/repo"
     host = host_store.get_host(result.host_id)
@@ -1316,15 +1311,15 @@ async def test_launch_entrypoint_provider_arms_token_before_provisioning(db_uri:
     assert host.sandbox_id == "omnigent-pod-1"
 
 
-async def test_launch_entrypoint_provider_cleans_up_on_provision_failure(db_uri: str) -> None:
+async def test_launch_entrypoint_provider_cleans_up_on_launch_failure(db_uri: str) -> None:
     """
-    A provision_managed_host failure tears the sandbox down (by the
-    pre-generated id) and deletes the host row, exactly like the exec path.
+    A launch_host failure tears the sandbox down (by the reserved id) and deletes
+    the host row, exactly like the exec path.
     """
     host_store = HostStore(db_uri)
 
     class _Failing(_EntrypointFakeLauncher):
-        def provision_managed_host(self, sandbox_id: str, **kwargs: object) -> str:
+        def launch_host(self, sandbox_id: str, **kwargs: object) -> str:
             raise click.ClickException("pod could not be scheduled")
 
     fake = _Failing(host_store)
@@ -1334,7 +1329,7 @@ async def test_launch_entrypoint_provider_cleans_up_on_provision_failure(db_uri:
         )
     assert exc.value.status_code == 502
     assert "pod could not be scheduled" in exc.value.detail
-    # The pre-generated sandbox was terminated and no host row survives.
+    # The reserved sandbox was terminated and no host row survives.
     assert fake.terminated == ["omnigent-pod-1"]
     assert host_store.list_hosts(_OWNER) == []
 

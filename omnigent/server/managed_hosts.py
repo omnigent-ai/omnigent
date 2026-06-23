@@ -106,7 +106,6 @@ import asyncio
 import logging
 import re
 import secrets
-import shlex
 import time
 import uuid
 from collections.abc import Callable
@@ -117,11 +116,6 @@ import click
 from fastapi import HTTPException
 
 from omnigent.db.utils import now_epoch
-from omnigent.host.identity import (
-    HOST_ID_ENV_VAR,
-    HOST_NAME_ENV_VAR,
-    HOST_TOKEN_ENV_VAR,
-)
 from omnigent.stores.host_store import Host, HostStore
 
 if TYPE_CHECKING:
@@ -1742,7 +1736,7 @@ async def launch_managed_host(
     host_name = f"managed-{host_id[len('host_') : len('host_') + 8]}"
     try:
         await asyncio.to_thread(launcher.prepare)
-        sandbox_id = await _acquire_managed_sandbox_id(launcher, host_name)
+        sandbox_id = await asyncio.to_thread(launcher.provision, host_name)
     except click.ClickException as exc:
         raise HTTPException(
             status_code=502,
@@ -1818,7 +1812,7 @@ async def relaunch_managed_host(
     await _terminate_sandbox_best_effort(launcher, host)
     try:
         await asyncio.to_thread(launcher.prepare)
-        sandbox_id = await _acquire_managed_sandbox_id(launcher, host.name)
+        sandbox_id = await asyncio.to_thread(launcher.provision, host.name)
     except click.ClickException as exc:
         raise HTTPException(
             status_code=502,
@@ -1876,10 +1870,9 @@ async def _arm_and_start_host(
     :param sandbox_id: The provisioned sandbox, e.g. ``"sb-a1b2c3"``.
     :param repo: Repository to clone as the workspace, or ``None``
         for an empty workspace.
-    :param on_stage: Progress observer forwarded to
-        :func:`_start_host_in_sandbox`; see
-        :func:`launch_managed_host`. ``None`` disables progress
-        reporting.
+    :param on_stage: Progress observer forwarded to the launcher's
+        ``launch_host``; see :func:`launch_managed_host`. ``None``
+        disables progress reporting.
     :param keep_host_on_failure: ``True`` on a relaunch — failure
         cleanup terminates the new sandbox and revokes the token but
         keeps the host row. ``False`` (first launch) deletes the row.
@@ -1899,33 +1892,23 @@ async def _arm_and_start_host(
         token_expires_at=now_epoch() + config.token_ttl_s,
     )
     try:
-        if launcher.starts_host_at_provision:
-            # Entrypoint-as-host (kubernetes): the token was registered above
-            # before the sandbox exists, so provisioning starts the host with a
-            # token that already resolves — no exec-in step.
-            workspace = await asyncio.to_thread(
-                _provision_host_in_sandbox,
-                launcher,
-                sandbox_id,
-                token=token,
-                host_id=host_id,
-                host_name=host_name,
-                server_url=config.server_url,
-                repo=repo,
-                on_stage=on_stage,
-            )
-        else:
-            workspace = await asyncio.to_thread(
-                _start_host_in_sandbox,
-                launcher,
-                sandbox_id,
-                token=token,
-                host_id=host_id,
-                host_name=host_name,
-                server_url=config.server_url,
-                repo=repo,
-                on_stage=on_stage,
-            )
+        # Uniform across providers: provision() fixed the sandbox id and the
+        # token was armed against it above, so launch_host starts the host with
+        # a token that already resolves. The exec-model default execs in; the
+        # entrypoint model (k8s) creates the Pod that boots the host. *repo* is
+        # unpacked into primitives — the launcher API takes no RepoWorkspace.
+        workspace = await asyncio.to_thread(
+            launcher.launch_host,
+            sandbox_id,
+            token=token,
+            host_id=host_id,
+            host_name=host_name,
+            server_url=config.server_url,
+            repo_url=repo.url if repo is not None else None,
+            repo_branch=repo.branch if repo is not None else None,
+            repo_name=repo.repo_name if repo is not None else None,
+            on_stage=on_stage,
+        )
         await _wait_for_host_online(host_store, host_id)
     except Exception as exc:
         # Broad on purpose: any post-provision failure — launcher CLI
@@ -1948,197 +1931,6 @@ async def _arm_and_start_host(
             detail=f"managed sandbox host startup failed: {message}",
         ) from exc
     return workspace
-
-
-async def _acquire_managed_sandbox_id(launcher: SandboxLauncher, name: str) -> str:
-    """
-    Obtain the sandbox id for a launch, per the launcher's start model.
-
-    Exec-model providers create the sandbox now (:meth:`provision`, which waits
-    for it). Entrypoint-as-host providers create it later — as part of starting
-    the host (:meth:`provision_managed_host`) — so here only PRE-GENERATE the id
-    (:meth:`new_managed_sandbox_id`); registering the launch token against it
-    before the sandbox exists closes the host dial-back race entirely.
-
-    :param launcher: The provider launcher.
-    :param name: Human-readable label for the sandbox.
-    :returns: The sandbox id (provider-assigned or pre-generated).
-    :raises click.ClickException: When an exec-model provision fails.
-    """
-    if launcher.starts_host_at_provision:
-        return launcher.new_managed_sandbox_id(name)
-    return await asyncio.to_thread(launcher.provision, name)
-
-
-def _provision_host_in_sandbox(
-    launcher: SandboxLauncher,
-    sandbox_id: str,
-    *,
-    token: str,
-    host_id: str,
-    host_name: str,
-    server_url: str,
-    repo: RepoWorkspace | None = None,
-    on_stage: Callable[[str], None] | None = None,
-) -> str:
-    """
-    Start ``omnigent host`` by provisioning an entrypoint-as-host sandbox.
-
-    The entrypoint-model counterpart to :func:`_start_host_in_sandbox`: it
-    unpacks *repo* into the primitive clone fields the launcher API takes (the
-    onboarding layer must not import the server's :class:`RepoWorkspace`) and
-    delegates to the launcher's ``provision_managed_host``, which creates the
-    workspace, clones the repository, and starts the host as the sandbox boots.
-
-    :param launcher: The provider launcher (``starts_host_at_provision``).
-    :param sandbox_id: The pre-generated sandbox id from
-        :func:`_acquire_managed_sandbox_id`.
-    :param token: The raw launch token (delivered out of band by the launcher).
-    :param host_id: Server-chosen host identity.
-    :param host_name: Server-chosen host display name.
-    :param server_url: URL of this server the host dials back to.
-    :param repo: Repository to clone as the workspace, or ``None``.
-    :param on_stage: Progress observer; see :func:`launch_managed_host`.
-    :returns: The absolute in-sandbox workspace path.
-    :raises click.ClickException: If provisioning or host startup fails.
-    """
-    return launcher.provision_managed_host(
-        sandbox_id,
-        token=token,
-        host_id=host_id,
-        host_name=host_name,
-        server_url=server_url,
-        repo_url=repo.url if repo is not None else None,
-        repo_branch=repo.branch if repo is not None else None,
-        repo_name=repo.repo_name if repo is not None else None,
-        on_stage=on_stage,
-    )
-
-
-def _start_host_in_sandbox(
-    launcher: SandboxLauncher,
-    sandbox_id: str,
-    *,
-    token: str,
-    host_id: str,
-    host_name: str,
-    server_url: str,
-    repo: RepoWorkspace | None = None,
-    on_stage: Callable[[str], None] | None = None,
-) -> str:
-    """
-    Create the workspace and start ``omnigent host`` inside a sandbox.
-
-    When *repo* is set, the repository is cloned into
-    ``<workspace>/<repo_name>`` before the host starts, and that
-    directory becomes the returned workspace.
-
-    The host runs detached (``setsid``-backgrounded with its output in
-    :data:`_HOST_LOG_PATH`) so it outlives the exec session that
-    spawned it. Identity + credential ride the process environment —
-    nothing is written to the sandbox's config files.
-
-    :param launcher: The provider launcher holding the sandbox.
-    :param sandbox_id: The provisioned sandbox, e.g. ``"sb-a1b2c3"``.
-    :param token: The raw launch token the host authenticates with.
-    :param host_id: Server-chosen host identity, e.g.
-        ``"host_a1b2c3d4..."``.
-    :param host_name: Server-chosen host display name, e.g.
-        ``"managed-a1b2c3d4"``.
-    :param server_url: URL of this server the host dials back to,
-        e.g. ``"https://omnigent.example.com"``.
-    :param repo: Repository to clone as the workspace, or ``None``
-        for an empty workspace.
-    :param on_stage: Progress observer invoked with ``"cloning"``
-        before the repository clone (when *repo* is set) and
-        ``"starting"`` before the host process launches. Runs on
-        this (worker) thread, so it must be thread-safe. ``None``
-        disables progress reporting.
-    :returns: The absolute in-sandbox workspace path, e.g.
-        ``"/root/workspace"`` (or ``"/root/workspace/myrepo"`` when
-        *repo* is set).
-    :raises click.ClickException: If a sandbox command fails, the
-        clone fails, or the sandbox's ``$HOME`` cannot be resolved.
-    """
-    # The image (and the user it runs as) is operator-supplied, so the
-    # home directory isn't knowable statically — ask the sandbox.
-    home = launcher.run(sandbox_id, 'printf %s "$HOME"').stdout.strip()
-    if not home:
-        raise click.ClickException(
-            f"could not resolve $HOME inside sandbox '{sandbox_id}' — "
-            "the configured image must provide a usable shell environment"
-        )
-    workspace = f"{home}/workspace"
-    launcher.run(sandbox_id, f"mkdir -p {shlex.quote(workspace)}")
-    if repo is not None:
-        if on_stage is not None:
-            on_stage("cloning")
-        workspace = _clone_repo_workspace(launcher, sandbox_id, repo, workspace)
-    # "starting" covers from here through host registration — the
-    # caller's _wait_for_host_online poll resolves it.
-    if on_stage is not None:
-        on_stage("starting")
-    env_prefix = " ".join(
-        f"{key}={shlex.quote(value)}"
-        for key, value in (
-            (HOST_TOKEN_ENV_VAR, token),
-            (HOST_ID_ENV_VAR, host_id),
-            (HOST_NAME_ENV_VAR, host_name),
-        )
-    )
-    launcher.run_background(
-        sandbox_id,
-        f"{env_prefix} omnigent host --server {shlex.quote(server_url)}",
-        log_path=_HOST_LOG_PATH,
-    )
-    return workspace
-
-
-def _clone_repo_workspace(
-    launcher: SandboxLauncher,
-    sandbox_id: str,
-    repo: RepoWorkspace,
-    workspace: str,
-) -> str:
-    """
-    Clone a session's repository inside the sandbox.
-
-    Public repositories clone anonymously; private ones authenticate
-    through the host image's env-driven git credential helper when the
-    sandbox carries ``GIT_TOKEN`` (see deploy/modal/README.md "Git
-    credentials"). ``--single-branch`` keeps branch-pinned clones fast
-    on large repos; ``--`` separates options from the (user-supplied,
-    already-validated) URL so it can never be parsed as a flag.
-
-    :param launcher: The provider launcher holding the sandbox.
-    :param sandbox_id: The provisioned sandbox, e.g. ``"sb-a1b2c3"``.
-    :param repo: The parsed repository workspace to clone.
-    :param workspace: The sandbox workspace root the clone lands
-        under, e.g. ``"/root/workspace"``.
-    :returns: The cloned repository directory, e.g.
-        ``"/root/workspace/myrepo"``.
-    :raises click.ClickException: When the clone fails (bad URL, no
-        such branch, missing/insufficient credentials, …), with the
-        repository named for the create-session error surface.
-    """
-    clone_dir = f"{workspace}/{repo.repo_name}"
-    branch_args = (
-        f"--branch {shlex.quote(repo.branch)} --single-branch " if repo.branch is not None else ""
-    )
-    try:
-        launcher.run(
-            sandbox_id,
-            f"git clone {branch_args}-- {shlex.quote(repo.url)} {shlex.quote(clone_dir)}",
-        )
-    except click.ClickException as exc:
-        # Provider boundary: re-raise with the repository named so the
-        # create-session 502 says WHAT failed to clone, not just that a
-        # sandbox command exited non-zero.
-        raise click.ClickException(
-            f"failed to clone repository '{repo.url}'"
-            f"{f' (branch {repo.branch!r})' if repo.branch else ''}: {exc.message}"
-        ) from exc
-    return clone_dir
 
 
 async def _wait_for_host_online(host_store: HostStore, host_id: str) -> None:

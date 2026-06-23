@@ -351,12 +351,12 @@ def _launcher() -> KubernetesSandboxLauncher:
     )
 
 
-def test_provision_managed_host_creates_secret_then_pod_and_returns_workspace(
+def test_launch_host_creates_secret_then_pod_and_returns_workspace(
     fake_core: _FakeCore,
 ) -> None:
     """The happy path creates the token Secret BEFORE the Pod and returns the workspace."""
     fake_core.read_queue = [_pod(phase="Running")]
-    workspace = _launcher().provision_managed_host(
+    workspace = _launcher().launch_host(
         "omnigent-pod-1",
         token=_TOKEN,
         host_id="host_1",
@@ -372,10 +372,10 @@ def test_provision_managed_host_creates_secret_then_pod_and_returns_workspace(
     assert fake_core.deleted_pods == []
 
 
-def test_provision_managed_host_with_repo_returns_clone_dir(fake_core: _FakeCore) -> None:
+def test_launch_host_with_repo_returns_clone_dir(fake_core: _FakeCore) -> None:
     """With a repo, the returned workspace is the cloned directory under the workspace."""
     fake_core.read_queue = [_pod(phase="Running")]
-    workspace = _launcher().provision_managed_host(
+    workspace = _launcher().launch_host(
         "omnigent-pod-2",
         token=_TOKEN,
         host_id="host_2",
@@ -387,11 +387,11 @@ def test_provision_managed_host_with_repo_returns_clone_dir(fake_core: _FakeCore
     assert workspace == "/home/omnigent/workspace/repo"
 
 
-def test_provision_managed_host_cleans_up_on_create_failure(fake_core: _FakeCore) -> None:
+def test_launch_host_cleans_up_on_create_failure(fake_core: _FakeCore) -> None:
     """A failed Pod create reaps the already-created token Secret and raises."""
     fake_core.create_pod_error = _FakeApiException(status=500, reason="Internal Server Error")
     with pytest.raises(click.ClickException, match="create sandbox pod"):
-        _launcher().provision_managed_host(
+        _launcher().launch_host(
             "omnigent-pod-3",
             token=_TOKEN,
             host_id="host_3",
@@ -402,7 +402,7 @@ def test_provision_managed_host_cleans_up_on_create_failure(fake_core: _FakeCore
     assert "omnigent-pod-3" in fake_core.deleted_pods
 
 
-def test_provision_managed_host_fast_fails_on_clone_failure_with_log_tail(
+def test_launch_host_fast_fails_on_clone_failure_with_log_tail(
     fake_core: _FakeCore,
 ) -> None:
     """A non-zero init container (clone failed) fails fast with the git error log tail."""
@@ -414,7 +414,7 @@ def test_provision_managed_host_fast_fails_on_clone_failure_with_log_tail(
     ]
     fake_core.logs["workspace-prep"] = "fatal: repository 'https://x/y.git' not found"
     with pytest.raises(click.ClickException) as exc:
-        _launcher().provision_managed_host(
+        _launcher().launch_host(
             "omnigent-pod-4",
             token=_TOKEN,
             host_id="host_4",
@@ -430,7 +430,7 @@ def test_provision_managed_host_fast_fails_on_clone_failure_with_log_tail(
     assert "omnigent-pod-4-token" in fake_core.deleted_secrets
 
 
-def test_provision_managed_host_times_out_with_reason(
+def test_launch_host_times_out_with_reason(
     fake_core: _FakeCore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A Pod that never runs times out fast, surfacing the last waiting reason."""
@@ -448,7 +448,7 @@ def test_provision_managed_host_times_out_with_reason(
         ],
     )
     with pytest.raises(click.ClickException, match="did not start within"):
-        _launcher().provision_managed_host(
+        _launcher().launch_host(
             "omnigent-pod-5",
             token=_TOKEN,
             host_id="host_5",
@@ -484,10 +484,12 @@ def test_terminate_retries_transient_then_gives_up_best_effort(
     assert fake_core.deleted_secrets == ["omnigent-pod-8-token"]
 
 
-def test_provision_and_run_raise_capability_errors() -> None:
-    """The exec-model primitives are unsupported on the entrypoint provider."""
+def test_provision_reserves_pod_name_and_run_is_unsupported() -> None:
+    """provision reserves a Pod name (no Pod created); run has no exec transport."""
     launcher = _launcher()
-    with pytest.raises(SandboxCapabilityError):
-        launcher.provision("name")
+    # provision reserves the id — it does NOT create a Pod and does NOT raise.
+    name = launcher.provision("managed-abc")
+    assert name.startswith("omnigent-managed-abc-")
+    # run is unsupported: the host is the Pod entrypoint, there is no exec-in.
     with pytest.raises(SandboxCapabilityError):
         launcher.run("sb", "echo hi")
