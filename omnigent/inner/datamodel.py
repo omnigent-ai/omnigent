@@ -108,14 +108,53 @@ class History:
     def append(self, msg: Message) -> None:
         self.messages.append(msg)
 
-    def get_context_window(self, max_tokens: int | None = None) -> list[Message]:  # noqa: ARG002 — placeholder API; token-based trimming not yet implemented
-        """
-        Return messages that fit in the context window.
+    @staticmethod
+    def _estimate_tokens(msg: Message) -> int:
+        """Estimate token count for a message using chars/4 heuristic."""
+        text = msg.content if isinstance(msg.content, str) else str(msg.content)
+        return max(1, len(text) // 4)
 
-        For now, return all messages.  A real implementation would count tokens
-        and summarise older messages.
+    def get_context_window(self, max_tokens: int | None = None) -> list[Message]:
+        """Return messages that fit in the context window.
+
+        When *max_tokens* is ``None``, all messages are returned.
+        Otherwise, messages are selected to stay within the budget:
+        system messages are always kept, then the most recent
+        non-system messages are included newest-first until the
+        budget is exhausted.  Older messages beyond the budget are
+        dropped.
         """
-        return list(self.messages)
+        if max_tokens is None:
+            return list(self.messages)
+
+        system_msgs: list[Message] = []
+        non_system_msgs: list[Message] = []
+        for msg in self.messages:
+            if msg.role == "system":
+                system_msgs.append(msg)
+            else:
+                non_system_msgs.append(msg)
+
+        budget = max_tokens
+        result: list[Message] = []
+
+        for msg in system_msgs:
+            cost = self._estimate_tokens(msg)
+            if cost <= budget:
+                result.append(msg)
+                budget -= cost
+
+        kept: list[Message] = []
+        for msg in reversed(non_system_msgs):
+            cost = self._estimate_tokens(msg)
+            if cost <= budget:
+                kept.append(msg)
+                budget -= cost
+            else:
+                break
+        kept.reverse()
+        result.extend(kept)
+        return result
 
     def search(self, query: str) -> list[Message]:
         """Simple substring search over message content."""
