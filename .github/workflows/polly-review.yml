@@ -107,6 +107,10 @@ jobs:
             echo "::notice::Skipping Polly review — LLM credentials not available (fork PR or missing secrets)."
             echo "available=false" >> "$GITHUB_OUTPUT"
           else
+            # Mask the key so the runner redacts it from any log or output that
+            # echoes it literally — defense-in-depth against prompt injection
+            # that tricks Polly into including the key in its review text.
+            echo "::add-mask::${LLM_API_KEY}"
             echo "available=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -134,13 +138,13 @@ jobs:
 
       - name: Set up Python
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version-file: ".python-version"
 
       - name: Set up uv
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
-        uses: astral-sh/setup-uv@8d55fbecc275b1c35dbe060458839f8d30439ccf  # v3
+        uses: astral-sh/setup-uv@f0ec1fc3b38f5e7cd731bb6ce540c5af426746bb  # v6.1.0
         with:
           enable-cache: true
 
@@ -156,7 +160,7 @@ jobs:
 
       - name: Cache virtualenv
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
         with:
           path: .venv
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
@@ -330,14 +334,76 @@ jobs:
           pathlib.Path("/tmp/review_prompt.txt").write_text(prompt)
           PYEOF
 
+      - name: Mint read-only token for Polly
+        # Mint an installation token restricted to pull_requests:read +
+        # contents:read so Polly can use gh CLI to fetch the diff and PR
+        # context without inheriting the write-scoped github.token.
+        # Absent when the App isn't configured — Polly gets no GH_TOKEN.
+        id: polly-ro-token
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true' && vars.OMNIGENT_BOT_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          client-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
+          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
+          permission-pull-requests: read
+          permission-contents: read
+
+      - name: Write CI polly config with egress allowlist
+        # Write a CI-specific Polly config that restricts outbound HTTP to the
+        # gateway and GitHub API only, blocking exfiltration to arbitrary hosts.
+        # The gateway hostname is resolved from GATEWAY_BASE_URL at runtime so
+        # the allowlist is tight (no wildcards on the gateway side).
+        # Uses uv run python (PyYAML available in the venv) to read+rewrite the
+        # YAML config rather than shelling heredocs with untrusted values.
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        env:
+          GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+        run: |
+          uv run python3 -c "
+          import pathlib, os, shutil, urllib.parse
+          import yaml
+
+          gw = os.environ.get('GATEWAY_BASE_URL', '')
+          gw_host = urllib.parse.urlparse(gw).netloc if gw else ''
+
+          # Copy polly source tree so the source is not mutated.
+          src = pathlib.Path('examples/polly')
+          dst = pathlib.Path('/tmp/polly-ci')
+          shutil.copytree(src, dst, dirs_exist_ok=True)
+
+          cfg_path = dst / 'config.yaml'
+          cfg = yaml.safe_load(cfg_path.read_text())
+
+          # Allowlist: GitHub API (gh CLI reads) + gateway (LLM calls).
+          rules = [
+              'CONNECT api.github.com/**',
+              'GET api.github.com/**',
+              'POST api.github.com/**',
+          ]
+          if gw_host:
+              rules += [
+                  f'CONNECT {gw_host}/**',
+                  f'GET {gw_host}/**',
+                  f'POST {gw_host}/**',
+              ]
+
+          sandbox = {'type': 'linux_bwrap', 'egress_rules': rules}
+          cfg['os_env']['sandbox'] = sandbox
+          cfg['terminals']['shell']['os_env']['sandbox'] = dict(sandbox)
+
+          cfg_path.write_text(yaml.dump(cfg, default_flow_style=False, sort_keys=False))
+          print(f'CI polly config written (gateway: {gw_host or \"(none)\"}, {len(rules)} egress rules)')
+          "
+
       - name: Run Polly review
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
         id: polly
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-          # Read-only token so Polly can fetch the full diff and file list
-          # via gh CLI without a size cap.
-          GH_TOKEN: ${{ github.token }}
+          # Read-only token (pull_requests:read + contents:read) so Polly can
+          # fetch the full diff via gh CLI without a write primitive on
+          # attacker-controlled PR content. Absent when App isn't configured.
+          GH_TOKEN: ${{ steps.polly-ro-token.outputs.token }}
           POLLY_PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           POLLY_REPO: ${{ github.repository }}
         run: |
@@ -348,7 +414,9 @@ jobs:
           # Run Polly headlessly with -p; it starts a local server, sends
           # one turn, prints the assistant response, and exits.
           # --no-session: ephemeral run, no persistent session state.
-          uv run omnigent run examples/polly/ \
+          # Uses the CI config (/tmp/polly-ci/) which has egress_rules that
+          # restrict outbound HTTP to the gateway + GitHub API only.
+          uv run omnigent run /tmp/polly-ci/ \
             -p "$prompt" \
             --no-session \
             2>polly-stderr.log \
@@ -382,12 +450,26 @@ jobs:
           head -c 61440 /tmp/polly_output.txt >> "$GITHUB_OUTPUT"
           echo "${delim}" >> "$GITHUB_OUTPUT"
 
+      - name: Scan review output for secrets before posting
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          set -euo pipefail
+          # Abort if Polly's output contains the literal LLM API key — this
+          # catches prompt-injection attacks that trick Polly into echoing the
+          # secret into the PR comment.
+          if [ -n "$LLM_API_KEY" ] && grep -qF "$LLM_API_KEY" /tmp/polly_output.txt 2>/dev/null; then
+            echo "::error::Review output contains LLM_API_KEY — aborting post to prevent secret exfiltration."
+            exit 1
+          fi
+
       - name: Mint App token
         id: app-token
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true' && vars.OMNIGENT_BOT_APP_ID != ''
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
+          client-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
           private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
 
       - name: Post review comment
