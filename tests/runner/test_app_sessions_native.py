@@ -7917,6 +7917,12 @@ async def test_events_interrupt_on_native_session_injects_escape_without_marker(
         # runner's idle edge because the injection task completes before
         # the user-visible Codex turn.
         ("codex-native", ["running"]),
+        # antigravity-native shares codex's shape: the executor's
+        # SendUserCascadeMessage returns as soon as agy accepts the turn, so the
+        # RPC read driver (not the runner injection task) owns idle. Publishing
+        # the runner's idle here fires ~2s before agy's output streams and
+        # prematurely completes the response (the live-e2e "double-idle").
+        ("antigravity-native", ["running"]),
         # Non-terminal harnesses have no external lifecycle observer; the
         # runner turn remains their source of truth.
         ("openai-agents", ["running", "idle"]),

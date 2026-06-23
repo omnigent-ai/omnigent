@@ -7444,12 +7444,16 @@ def create_runner_app(
         message is injected — the model turn then runs entirely in the TUI.
         Publishing the turn-lifecycle ``idle`` here would race ahead of (and
         clobber) the watcher's ``running``, dropping the web "Working…" spinner
-        the moment the message is sent. For codex-native, the runner may
-        publish ``running`` when it accepts
-        a web turn for dispatch, but the Codex app-server forwarder owns
-        ``idle`` because the runner's injection task returns as soon as Codex
+        the moment the message is sent. For codex-native AND antigravity-native,
+        the runner may publish ``running`` when it accepts
+        a web turn for dispatch, but the native observer owns
+        ``idle`` because the runner's injection task returns as soon as the agent
         accepts the message, while the user-visible model turn may still be
-        active.
+        active — for codex-native the Codex app-server forwarder owns ``idle``;
+        for antigravity-native the RPC read driver owns it (the executor's
+        ``SendUserCascadeMessage`` returns as soon as agy accepts the turn, so the
+        runner's ``idle`` would fire ~2s before agy's reasoning/output streams,
+        prematurely completing the response — the double-idle the live e2e found).
 
         ``failed`` always publishes: a turn-setup error is not observable
         from terminal activity and must surface regardless of harness.
@@ -7471,7 +7475,7 @@ def create_runner_app(
         harness = _session_harness_name(conv_id)
         if status != "failed" and harness in {"claude-native", "pi-native", "cursor-native"}:
             return
-        if status == "idle" and harness == "codex-native":
+        if status == "idle" and harness in {"codex-native", "antigravity-native"}:
             return
         event: dict[str, Any] = {"type": "session.status", "status": status}
         if error is not None:
