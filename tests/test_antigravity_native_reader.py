@@ -27,11 +27,28 @@ Key assertions (the plan's Step 1 + status + error):
 * A WAITING step invokes ``on_pending_interaction`` exactly once (not on re-read).
 * RUNNING/IDLE ``external_session_status`` edges are emitted on transition only.
 * A ``get_trajectory_steps`` raising ``httpx.HTTPError`` does not crash the loop.
+
+Task T-D adds STREAM mode (live ``output_text_delta`` typing). The reader now
+prefers :func:`stream_agent_state_updates` (a scripted async generator of
+cumulative frames in the tests) and only falls back to the poll loop on a stream
+error. The stream-mode assertions:
+
+* Growing ``plannerResponse.modifiedResponse`` while a step is GENERATING emits
+  incremental ``external_output_text_delta`` events whose ``delta`` suffixes
+  concatenate to the full text, share a stable per-step ``message_id``, and never
+  overlap/duplicate.
+* The DONE frame emits exactly ONE committed ``message`` (via the mapper), AFTER
+  the deltas; a re-sent DONE (on-connect snapshot replay) does NOT re-post it.
+* A stream raising ``httpx.HTTPError`` / ``AntigravityRpcError`` falls back to the
+  poll loop (committed-only) without crashing the reader.
+* A WAITING frame hands its interaction to the bridge exactly once.
 """
 
 from __future__ import annotations
 
+import copy
 import json
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, cast
 
@@ -40,6 +57,7 @@ import pytest
 
 from omnigent import antigravity_native_reader as reader
 from omnigent.antigravity_native_bridge import read_bridge_state
+from omnigent.antigravity_native_rpc import AntigravityRpcError
 from omnigent.antigravity_native_steps import PendingInteraction
 
 # ---------------------------------------------------------------------------
@@ -99,6 +117,16 @@ class _PostSink:
                 out.append(status if isinstance(status, str) else "<none>")
         return out
 
+    def deltas(self) -> list[dict[str, object]]:
+        """Return the ``data`` payload of every ``external_output_text_delta``."""
+        return [
+            data for event_type, data in self.posts if event_type == "external_output_text_delta"
+        ]
+
+    def event_types(self) -> list[str]:
+        """Return the ``type`` of every posted event, in order."""
+        return [event_type for event_type, _data in self.posts]
+
 
 class _StepScript:
     """A scripted ``get_trajectory_steps`` returning one snapshot per call.
@@ -131,6 +159,144 @@ class _RaisingThenOk:
         if self.calls == 1:
             raise self._exc
         return [dict(step) for step in self._snapshot]
+
+
+# ---------------------------------------------------------------------------
+# Stream-mode scaffolding (Task T-D)
+# ---------------------------------------------------------------------------
+
+
+def _frame(steps: list[dict[str, Any]]) -> dict[str, Any]:
+    """Wrap a step list in a ``StreamAgentStateUpdates`` update frame.
+
+    Mirrors the live shape ``update.mainTrajectoryUpdate.stepsUpdate.steps[]``
+    (design §10.2) that :func:`stream_agent_state_updates` yields per frame.
+    """
+    return {"mainTrajectoryUpdate": {"stepsUpdate": {"steps": copy.deepcopy(steps)}}}
+
+
+def _generating_planner(text: str, *, step_index: int = 2) -> dict[str, Any]:
+    """A PLANNER_RESPONSE step mid-generation (status GENERATING).
+
+    Built from the committed ``planner_response_text`` fixture but with the
+    partial-text contract verified live (design §10.2): ``modifiedResponse``
+    holds the growing partial, ``response`` is ABSENT during generation, and
+    ``status == CORTEX_STEP_STATUS_GENERATING``.
+    """
+    step = copy.deepcopy(_load("planner_response_text"))
+    step["status"] = "CORTEX_STEP_STATUS_GENERATING"
+    planner = cast(dict[str, Any], step["plannerResponse"])
+    planner.pop("response", None)
+    planner["modifiedResponse"] = text
+    cast(dict[str, Any], step["metadata"])["sourceTrajectoryStepInfo"]["stepIndex"] = step_index
+    return step
+
+
+def _done_planner(text: str, *, step_index: int = 2) -> dict[str, Any]:
+    """A DONE PLANNER_RESPONSE step whose committed text is ``text``.
+
+    On DONE both ``response`` and ``modifiedResponse`` are present and equal
+    (design §10.2); the mapper emits one committed ``message`` from it.
+    """
+    step = copy.deepcopy(_load("planner_response_text"))
+    step["status"] = "CORTEX_STEP_STATUS_DONE"
+    planner = cast(dict[str, Any], step["plannerResponse"])
+    planner["response"] = text
+    planner["modifiedResponse"] = text
+    cast(dict[str, Any], step["metadata"])["sourceTrajectoryStepInfo"]["stepIndex"] = step_index
+    return step
+
+
+def _running_run_command() -> dict[str, Any]:
+    """A RUN_COMMAND step still executing (status RUNNING; no output yet).
+
+    Built from the DONE fixture but rolled back to RUNNING with its output
+    stripped — the pre-DONE shape the stream surfaces before the command
+    completes. The mapper emits nothing for it (output only at DONE).
+    """
+    step = copy.deepcopy(_load("run_command_done"))
+    step["status"] = "CORTEX_STEP_STATUS_RUNNING"
+    run_command = cast(dict[str, Any], step["runCommand"])
+    run_command.pop("combinedOutput", None)
+    return step
+
+
+class _FrameScript:
+    """A scripted ``stream_agent_state_updates`` async generator.
+
+    Yields one pre-built update frame per scripted entry, then ends cleanly (a
+    real stream long-polls; the test ends the turn by exhausting the script).
+    Records ``calls`` so a test can assert the stream was (re)entered.
+    """
+
+    def __init__(self, frames: list[dict[str, Any]]) -> None:
+        self._frames = frames
+        self.calls = 0
+
+    def __call__(self, port: int, conversation_id: str) -> AsyncIterator[dict[str, object]]:
+        self.calls += 1
+
+        async def _gen() -> AsyncIterator[dict[str, object]]:
+            for frame in self._frames:
+                yield copy.deepcopy(frame)
+
+        return _gen()
+
+
+class _RaisingStream:
+    """A ``stream_agent_state_updates`` that raises before yielding any frame."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+        self.calls = 0
+
+    def __call__(self, port: int, conversation_id: str) -> AsyncIterator[dict[str, object]]:
+        self.calls += 1
+
+        async def _gen() -> AsyncIterator[dict[str, object]]:
+            raise self._exc
+            yield {}  # pragma: no cover  (unreachable; marks this an async gen)
+
+        return _gen()
+
+
+async def _run_stream(
+    *,
+    bridge_dir: Path,
+    sink: _PostSink,
+    stream: object,
+    poll_steps: object,
+    monkeypatch: pytest.MonkeyPatch,
+    iterations: int,
+    on_pending: object | None = None,
+) -> None:
+    """Drive ``supervise_reader`` in STREAM mode for a bounded run.
+
+    Injects both the scripted ``stream_agent_state_updates`` (primary) and a
+    ``get_trajectory_steps`` (poll fallback). ``stop`` bounds the poll loop so a
+    fallback path still terminates; the stream script ends on its own.
+    """
+    monkeypatch.setattr(reader, "stream_agent_state_updates", stream)
+    monkeypatch.setattr(reader, "get_trajectory_steps", poll_steps)
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+
+    async def _noop_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(reader, "_sleep", _noop_sleep)
+
+    async def _default_pending(_pending: PendingInteraction) -> None:
+        return None
+
+    callback = on_pending if on_pending is not None else _default_pending
+    await reader.supervise_reader(
+        bridge_dir,
+        _SESSION_ID,
+        client=cast(httpx.AsyncClient, object()),
+        on_pending_interaction=cast(Any, callback),
+        poll_interval_s=0.0,
+        stop=_stop_after(iterations),
+    )
 
 
 def _stop_after(n: int) -> _StopAfter:
@@ -178,7 +344,17 @@ async def _run(
     iterations: int,
     on_pending: object | None = None,
 ) -> None:
-    """Drive ``supervise_reader`` for a bounded number of poll iterations."""
+    """Drive ``supervise_reader`` for a bounded number of poll iterations.
+
+    The reader is stream-primary (Task T-D), so to exercise the POLL path these
+    tests inject a ``stream_agent_state_updates`` that fails immediately —
+    forcing the documented graceful fallback to the (committed-only) poll loop.
+    """
+    monkeypatch.setattr(
+        reader,
+        "stream_agent_state_updates",
+        _RaisingStream(httpx.ConnectError("stream disabled for poll test")),
+    )
     monkeypatch.setattr(reader, "get_trajectory_steps", steps)
     monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
 
@@ -396,7 +572,13 @@ async def test_http_error_does_not_crash_loop(
     monkeypatch: pytest.MonkeyPatch,
     patched_discovery: None,
 ) -> None:
-    """An ``httpx.HTTPError`` on one poll is swallowed; the next poll recovers."""
+    """An ``httpx.HTTPError`` on one poll is swallowed; the next poll recovers.
+
+    The reader is stream-primary, so ``_run`` injects a failing stream first
+    (consuming one ``stop`` tick on entry); the poll loop then needs two of its
+    own iterations to exercise the raise-then-recover ``get_trajectory_steps``,
+    hence ``iterations=3``.
+    """
     text = _load("planner_response_text")
     steps = _RaisingThenOk(httpx.ConnectError("boom"), [text])
     sink = _PostSink()
@@ -406,7 +588,7 @@ async def test_http_error_does_not_crash_loop(
         sink=sink,
         steps=steps,
         monkeypatch=monkeypatch,
-        iterations=2,
+        iterations=3,
     )
 
     # First poll raised; second poll delivered the message — loop survived.
@@ -420,7 +602,11 @@ async def test_value_error_does_not_crash_loop(
     monkeypatch: pytest.MonkeyPatch,
     patched_discovery: None,
 ) -> None:
-    """A non-JSON 200 (``ValueError``) is swallowed too; the loop keeps polling."""
+    """A non-JSON 200 (``ValueError``) is swallowed too; the loop keeps polling.
+
+    ``iterations=3`` for the same reason as the HTTP-error case: one tick is
+    spent on the stream attempt before the poll loop runs its two iterations.
+    """
     text = _load("planner_response_text")
     steps = _RaisingThenOk(ValueError("not json"), [text])
     sink = _PostSink()
@@ -430,7 +616,7 @@ async def test_value_error_does_not_crash_loop(
         sink=sink,
         steps=steps,
         monkeypatch=monkeypatch,
-        iterations=2,
+        iterations=3,
     )
 
     assert steps.calls == 2
@@ -461,6 +647,13 @@ async def test_placeholder_conversation_id_waits_for_real_id(
     script = _StepScript([[text], [text]])
     sink = _PostSink()
 
+    # Stream-primary reader: force the (committed-only) poll fallback so this test
+    # exercises poll-path discovery rather than a real stream connection.
+    monkeypatch.setattr(
+        reader,
+        "stream_agent_state_updates",
+        _RaisingStream(httpx.ConnectError("stream disabled for poll test")),
+    )
     monkeypatch.setattr(reader, "get_trajectory_steps", script)
     monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
 
@@ -493,10 +686,368 @@ async def test_placeholder_conversation_id_waits_for_real_id(
         client=cast(httpx.AsyncClient, object()),
         on_pending_interaction=cast(Any, _on_pending),
         poll_interval_s=0.0,
-        stop=_stop_after(2),
+        # Budget covers: one discovery retry past the placeholder, the stream
+        # attempt (which fails), then the poll-fallback iteration that mirrors.
+        stop=_stop_after(4),
     )
 
     # The placeholder forced at least two cascade-id resolution passes, then the
     # reader bound the real id and mirrored the step.
     assert flip_calls["n"] >= 2
+    assert sink.item_types() == ["message"]
+
+
+# ---------------------------------------------------------------------------
+# Stream mode: incremental deltas during GENERATING, one committed message DONE
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stream_generating_emits_incremental_deltas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """Growing ``modifiedResponse`` while GENERATING emits non-overlapping deltas.
+
+    The deltas concatenate to the full partial text and share one stable
+    ``message_id`` for the step (so the SPA coalesces them into one live block).
+    """
+    full = "Hello! I am Antigravity, your AI coding assistant, ready to help."
+    cut1, cut2 = 6, 30  # "Hello!" then "Hello! I am Antigravity, your "
+    frames = [
+        _frame([_generating_planner(full[:cut1])]),
+        _frame([_generating_planner(full[:cut2])]),
+        _frame([_generating_planner(full)]),
+    ]
+    sink = _PostSink()
+
+    await _run_stream(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    deltas = sink.deltas()
+    # Three growing frames → three non-empty deltas.
+    assert [d["delta"] for d in deltas] == [full[:cut1], full[cut1:cut2], full[cut2:]]
+    # Suffixes concatenate exactly to the full text (no overlap, no gap).
+    assert "".join(cast(str, d["delta"]) for d in deltas) == full
+    # One stable per-step message_id; deltas are not final (committed item follows).
+    message_ids = {d["message_id"] for d in deltas}
+    assert message_ids == {f"antigravity:{_CASCADE_ID}:2:planner"}
+    assert all(d["final"] is False for d in deltas)
+    # No committed message yet — the step never reached DONE in this script.
+    assert sink.item_types() == []
+
+
+@pytest.mark.asyncio
+async def test_stream_done_emits_one_committed_message_after_deltas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """GENERATING deltas precede exactly ONE committed message on DONE."""
+    full = "Hello there, friend."
+    frames = [
+        _frame([_generating_planner("Hello")]),
+        _frame([_generating_planner(full)]),
+        _frame([_done_planner(full)]),
+    ]
+    sink = _PostSink()
+
+    await _run_stream(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    # Exactly one committed assistant message.
+    assert sink.item_types() == ["message"]
+    # Delta-first ordering: every delta is posted BEFORE the committed item.
+    types = sink.event_types()
+    committed_idx = types.index("external_conversation_item")
+    delta_idxs = [i for i, t in enumerate(types) if t == "external_output_text_delta"]
+    assert delta_idxs, "expected at least one delta before the committed message"
+    assert max(delta_idxs) < committed_idx
+    # Deltas concatenate to the full committed text.
+    assert "".join(cast(str, d["delta"]) for d in sink.deltas()) == full
+
+
+@pytest.mark.asyncio
+async def test_stream_resent_done_snapshot_does_not_repost(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A re-sent DONE step (on-connect snapshot replay) is deduped, not re-posted."""
+    full = "Done and done."
+    frames = [
+        _frame([_generating_planner(full)]),
+        _frame([_done_planner(full)]),
+        # Snapshot replay: the same DONE step arrives again in a later frame.
+        _frame([_done_planner(full)]),
+        _frame([_done_planner(full)]),
+    ]
+    sink = _PostSink()
+
+    await _run_stream(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    # Despite the DONE step repeating across three frames, one committed message.
+    assert sink.item_types() == ["message"]
+
+
+@pytest.mark.asyncio
+async def test_stream_on_connect_prior_done_snapshot_deduped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A prior-turn DONE step replayed on connect posts once, then never again."""
+    prior = _done_planner("Prior turn answer.", step_index=2)
+    # First frame is the on-connect snapshot of a prior (already-DONE) step; it
+    # repeats in the next frame (cumulative snapshot).
+    frames = [
+        _frame([prior]),
+        _frame([prior]),
+    ]
+    sink = _PostSink()
+
+    await _run_stream(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    # The committed prior step posts exactly once across the two snapshot frames.
+    assert sink.item_types() == ["message"]
+
+
+@pytest.mark.asyncio
+async def test_stream_tool_result_running_then_done_emits_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A tool step seen RUNNING then DONE still emits its output (no early dedup).
+
+    Regression guard: the stream observes every intermediate status, so a
+    RUN_COMMAND surfaces RUNNING (mapper → ``[]``) before DONE. Recording its
+    identity as ``seen`` on the RUNNING sighting would dedup the DONE frame and
+    DROP the ``function_call_output``; the settled-only de-dup prevents that.
+    """
+    tool_call = _load("planner_response_tool_call_run_command")
+    running = _running_run_command()
+    done = _load("run_command_done")
+    frames = [
+        _frame([tool_call, running]),
+        _frame([tool_call, running]),  # still running — re-sent snapshot
+        _frame([tool_call, done]),  # now complete
+        _frame([tool_call, done]),  # snapshot replay of the DONE step
+    ]
+    sink = _PostSink()
+
+    await _run_stream(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    # The invocation commits once and the output commits once (despite the step
+    # being seen RUNNING twice before DONE, and DONE being replayed once).
+    assert sink.item_types() == ["function_call", "function_call_output"]
+
+
+# ---------------------------------------------------------------------------
+# Stream mode: WAITING frame → bridge callback once
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stream_waiting_frame_invokes_callback_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A WAITING step delivered over the stream hands its interaction once."""
+    waiting = _load("ask_question_waiting")
+    frames = [_frame([waiting]), _frame([waiting]), _frame([waiting])]
+    sink = _PostSink()
+    captured: list[PendingInteraction] = []
+
+    async def _on_pending(pending: PendingInteraction) -> None:
+        captured.append(pending)
+
+    await _run_stream(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+        on_pending=_on_pending,
+    )
+
+    assert len(captured) == 1
+    assert captured[0]["kind"] == "ask_question"
+    assert captured[0]["trajectory_id"] == _CASCADE_ID
+
+
+# ---------------------------------------------------------------------------
+# Stream mode: status edges (USER_INPUT → RUNNING, assistant-text DONE → IDLE)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stream_status_running_then_idle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A user turn then a closing assistant-text step emit RUNNING then IDLE."""
+    user = _load("user_input")
+    full = "All set."
+    frames = [
+        _frame([user]),
+        _frame([user, _generating_planner(full)]),
+        _frame([user, _done_planner(full)]),
+    ]
+    sink = _PostSink()
+
+    await _run_stream(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    assert sink.statuses() == ["running", "idle"]
+    # USER_INPUT still posts no conversation item; the assistant message commits.
+    assert sink.item_types() == ["message"]
+
+
+# ---------------------------------------------------------------------------
+# Stream mode: a stream error falls back to the poll loop (no crash)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stream_http_error_falls_back_to_poll(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A stream ``httpx.HTTPError`` falls back to the committed-only poll loop."""
+    text = _load("planner_response_text")
+    stream = _RaisingStream(httpx.ConnectError("stream boom"))
+    poll = _StepScript([[text], [text]])
+    sink = _PostSink()
+
+    await _run_stream(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=stream,
+        poll_steps=poll,
+        monkeypatch=monkeypatch,
+        iterations=2,
+    )
+
+    # The stream was attempted, then the poll loop delivered the committed item.
+    assert stream.calls >= 1
+    assert poll.calls >= 1
+    # Poll path is committed-only (no deltas), so exactly one message, no deltas.
+    assert sink.item_types() == ["message"]
+    assert sink.deltas() == []
+
+
+@pytest.mark.asyncio
+async def test_stream_trailer_error_falls_back_to_poll(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """An ``AntigravityRpcError`` (connect trailer error) also falls back to poll."""
+    text = _load("planner_response_text")
+    stream = _RaisingStream(AntigravityRpcError("agy connect-stream error: boom"))
+    poll = _StepScript([[text], [text]])
+    sink = _PostSink()
+
+    await _run_stream(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=stream,
+        poll_steps=poll,
+        monkeypatch=monkeypatch,
+        iterations=2,
+    )
+
+    assert stream.calls >= 1
+    assert sink.item_types() == ["message"]
+    assert sink.deltas() == []
+
+
+@pytest.mark.asyncio
+async def test_stream_error_midway_falls_back_without_losing_prior_deltas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A stream that yields a delta then errors falls back without crashing.
+
+    Verifies the reader survives a mid-stream failure (deltas already forwarded
+    stay forwarded) and the poll loop then delivers the committed item.
+    """
+    full = "Half a message"
+    done_full = "Half a message, now complete."
+
+    class _DeltaThenRaise:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self, port: int, conversation_id: str) -> AsyncIterator[dict[str, object]]:
+            self.calls += 1
+
+            async def _gen() -> AsyncIterator[dict[str, object]]:
+                yield _frame([_generating_planner(full)])
+                raise httpx.ReadError("mid-stream drop")
+
+            return _gen()
+
+    stream = _DeltaThenRaise()
+    poll = _StepScript([[_done_planner(done_full)], [_done_planner(done_full)]])
+    sink = _PostSink()
+
+    await _run_stream(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=stream,
+        poll_steps=poll,
+        monkeypatch=monkeypatch,
+        iterations=2,
+    )
+
+    # The pre-error delta was forwarded.
+    assert [d["delta"] for d in sink.deltas()] == [full]
+    # The poll fallback delivered the committed message.
     assert sink.item_types() == ["message"]

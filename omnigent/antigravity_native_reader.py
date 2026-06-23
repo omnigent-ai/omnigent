@@ -56,6 +56,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
@@ -74,15 +75,18 @@ from omnigent.antigravity_native_forwarder import (
     _ToolCallIdAllocator,
 )
 from omnigent.antigravity_native_rpc import (
+    AntigravityRpcError,
     _candidate_agy_rpc_ports,
     _conversation_matches,
     get_trajectory_steps,
+    stream_agent_state_updates,
 )
 from omnigent.antigravity_native_steps import (
     PendingInteraction,
     _step_index,
     _trajectory_id,
     map_step_to_events,
+    output_text_delta_event,
     pending_interaction,
 )
 from omnigent.claude_native_bridge import url_component
@@ -112,6 +116,26 @@ _STATUS_IDLE = "idle"
 # keys turn transitions on.
 _TYPE_USER_INPUT = "CORTEX_STEP_TYPE_USER_INPUT"
 _TYPE_PLANNER_RESPONSE = "CORTEX_STEP_TYPE_PLANNER_RESPONSE"
+
+# Step status the STREAM path keys partial text on (Task T-D). A PLANNER_RESPONSE
+# step carries its growing partial at ``plannerResponse.modifiedResponse`` while
+# ``status == CORTEX_STEP_STATUS_GENERATING`` (``response`` is absent until DONE,
+# where ``response == modifiedResponse``). The reader emits incremental
+# ``output_text_delta`` events during GENERATING; the committed ``message`` is
+# left to the mapper (it gates on DONE itself) once the step settles. The DONE
+# constant is intentionally not duplicated here — the mapper owns that gate. See
+# design §10.2.
+_STATUS_GENERATING = "CORTEX_STEP_STATUS_GENERATING"
+
+# Terminal step statuses — a step in one of these will not produce further
+# content, so its identity is safe to record in the de-dup set (see
+# :func:`_is_settled`). DONE carries the committed output; ERROR means the step
+# failed before producing any. PENDING/RUNNING/WAITING/GENERATING are NOT
+# terminal: a tool-result step passes through them before DONE, so recording it
+# early would dedup and drop the eventual DONE output.
+_STATUS_DONE = "CORTEX_STEP_STATUS_DONE"
+_STATUS_ERROR = "CORTEX_STEP_STATUS_ERROR"
+_TERMINAL_STATUSES = frozenset({_STATUS_DONE, _STATUS_ERROR})
 
 # Dedup key for a step within a run. ``step_index`` is ``None`` for USER_INPUT
 # (no trajectory slot) and proto-omitted (treated as ``None`` here) for step 0;
@@ -388,12 +412,119 @@ async def supervise_reader(
         return
     cascade_id, port = discovered
 
-    allocator = _ToolCallIdAllocator(conversation_id=cascade_id)
-    seen: set[_StepKey] = set()
-    interacted: set[_StepKey] = set()
-    turn_active = False
+    # One allocator + one set of cross-poll/cross-frame trackers per reader run,
+    # shared by BOTH the stream path and the poll fallback so a fall-through after
+    # a partial stream does not re-post already-mirrored steps or re-open turns.
+    state = _ReaderState(
+        allocator=_ToolCallIdAllocator(conversation_id=cascade_id),
+        seen=set(),
+        interacted=set(),
+    )
 
-    while not should_stop():
+    # STREAM-primary (Task T-D): consume the connect server-stream for live
+    # ``output_text_delta`` typing parity. On a stream error (transport
+    # ``httpx.HTTPError`` or a connect-trailer ``AntigravityRpcError``) fall back
+    # to the committed-only poll loop — graceful degradation to Phase-1 behaviour
+    # — rather than letting the error kill the reader. The shared ``state`` makes
+    # the fallback idempotent against whatever the stream already delivered.
+    try:
+        await _stream_loop(
+            port=port,
+            cascade_id=cascade_id,
+            client=client,
+            session_id=session_id,
+            on_pending_interaction=on_pending_interaction,
+            state=state,
+            stop=should_stop,
+        )
+    except (httpx.HTTPError, AntigravityRpcError) as exc:
+        _logger.warning(
+            "agy RPC reader stream failed; falling back to poll (committed-only, "
+            "no live deltas): cascade=%s port=%s error=%r",
+            cascade_id,
+            port,
+            exc,
+        )
+        await _poll_loop(
+            port=port,
+            cascade_id=cascade_id,
+            client=client,
+            session_id=session_id,
+            on_pending_interaction=on_pending_interaction,
+            state=state,
+            poll_interval_s=poll_interval_s,
+            stop=should_stop,
+        )
+
+
+@dataclass
+class _ReaderState:
+    """
+    Per-run trackers shared across the stream loop and the poll fallback.
+
+    Kept in one object so a fall-through from a partially consumed stream to the
+    poll loop reuses the same de-dup/turn/interaction state — a step already
+    mirrored over the stream is not re-posted by the poll loop, and an open turn
+    is not re-opened.
+
+    :param allocator: Per-run fallback tool-call id allocator (real agy ids are
+        preferred by the mapper; this only covers resume-mid-turn results that
+        lack ``metadata.toolCall.id``).
+    :param seen: ``(trajectory_id, step_index)`` identities whose COMMITTED items
+        have been posted, so the on-connect snapshot replay (and steady-state
+        re-reads) post nothing.
+    :param interacted: Identities whose WAITING interaction was already handed to
+        the bridge, so a re-sent WAITING frame does not re-fire it.
+    :param prefixes: Per-PLANNER ``step_index`` → the length of ``modifiedResponse``
+        already forwarded as deltas, so each frame emits only the NEW suffix.
+        Cleared for a step when its committed ``message`` is posted (stream path
+        only; the poll path never populates it).
+    :param turn_active: Whether a turn is currently considered open (a RUNNING
+        edge fired and no closing IDLE edge yet).
+    """
+
+    allocator: _ToolCallIdAllocator
+    seen: set[_StepKey]
+    interacted: set[_StepKey]
+    prefixes: dict[int, str] = field(default_factory=dict)
+    turn_active: bool = False
+
+
+async def _poll_loop(
+    *,
+    port: int,
+    cascade_id: str,
+    client: httpx.AsyncClient,
+    session_id: str,
+    on_pending_interaction: OnPendingInteraction,
+    state: _ReaderState,
+    poll_interval_s: float,
+    stop: StopPredicate,
+) -> None:
+    """
+    Poll ``GetCascadeTrajectorySteps`` and mirror new committed steps.
+
+    The Phase-1 read path (committed-only, no live deltas) — now also the
+    graceful fallback when the stream errors. On each poll it reads the full
+    snapshot and, for every not-yet-seen step, emits the committed items + status
+    edges via :func:`_emit_step` and hands a WAITING step to the bridge once.
+
+    A poll failure — ``httpx.HTTPError`` (transport AND non-2xx) or ``ValueError``
+    (a non-JSON 200 body) — is logged and swallowed so a transient fault never
+    kills the loop; the next poll recovers.
+
+    :param port: Validated connect-RPC port.
+    :param cascade_id: agy cascade id (equal to the conversation id).
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id to mirror into.
+    :param on_pending_interaction: Async callback for a distinct WAITING
+        interaction.
+    :param state: Per-run shared trackers (de-dup, turn, interactions).
+    :param poll_interval_s: Seconds between polls.
+    :param stop: Predicate consulted once per iteration; ``True`` exits.
+    :returns: None.
+    """
+    while not stop():
         try:
             steps = await asyncio.to_thread(get_trajectory_steps, port, cascade_id)
         except httpx.HTTPError as exc:
@@ -420,26 +551,320 @@ async def supervise_reader(
             continue
 
         for step in steps:
-            key = _step_key(step)
-            if key in seen:
-                continue
-            seen.add(key)
-            turn_active = await _emit_step(
+            await _process_committed_step(
                 step,
                 client=client,
                 session_id=session_id,
                 cascade_id=cascade_id,
-                allocator=allocator,
-                turn_active=turn_active,
-            )
-            await _maybe_handle_interaction(
-                step,
-                key=key,
-                interacted=interacted,
+                state=state,
                 on_pending_interaction=on_pending_interaction,
             )
 
         await _sleep(poll_interval_s)
+
+
+async def _stream_loop(
+    *,
+    port: int,
+    cascade_id: str,
+    client: httpx.AsyncClient,
+    session_id: str,
+    on_pending_interaction: OnPendingInteraction,
+    state: _ReaderState,
+    stop: StopPredicate,
+) -> None:
+    """
+    Consume ``StreamAgentStateUpdates`` for live deltas + committed items.
+
+    For each frame's ``mainTrajectoryUpdate.stepsUpdate.steps[]`` (design §10.2):
+
+    * A PLANNER_RESPONSE step with ``status == GENERATING`` → compute the NEW
+      suffix of ``plannerResponse.modifiedResponse`` past the per-``step_index``
+      forwarded prefix and, when non-empty, emit one incremental
+      ``external_output_text_delta`` (stable per-step ``message_id``,
+      ``final=False``). The prefix tracker advances so the next frame emits only
+      the next suffix — deltas never overlap or duplicate.
+    * Any step reaching a committed state (DONE / non-planner result) → emit its
+      committed items via :func:`map_step_to_events`, deduped by
+      ``(trajectory_id, step_index)`` so the on-connect snapshot replay and the
+      cumulative re-sends do not double-post. For the planner step this is the
+      committed ``message`` (its deltas already preceded it, satisfying the
+      flush-barrier reconciliation contract); its prefix tracker is then cleared.
+    * A WAITING step → handed to the bridge exactly once.
+
+    The stream is consumed and then RE-ENTERED while ``stop`` stays falsy (a real
+    connect stream returns when the turn settles, so re-entry resumes live updates
+    for the next turn). ``stop`` is consulted once per re-entry, mirroring the
+    poll loop. A transport ``httpx.HTTPError`` or a connect-trailer
+    ``AntigravityRpcError`` propagates to the caller, which falls back to the poll
+    loop.
+
+    :param port: Validated connect-RPC port.
+    :param cascade_id: agy cascade id (equal to the conversation id).
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id to mirror into.
+    :param on_pending_interaction: Async callback for a distinct WAITING
+        interaction.
+    :param state: Per-run shared trackers (de-dup, turn, interactions, prefixes).
+    :param stop: Predicate consulted once per stream (re-)entry; ``True`` exits.
+    :returns: None.
+    :raises httpx.HTTPError: On a stream transport failure (caller falls back).
+    :raises AntigravityRpcError: On a connect end-of-stream trailer error (caller
+        falls back).
+    """
+    while not stop():
+        async for frame in stream_agent_state_updates(port, cascade_id):
+            for step in _frame_steps(frame):
+                await _process_stream_step(
+                    step,
+                    client=client,
+                    session_id=session_id,
+                    cascade_id=cascade_id,
+                    state=state,
+                    on_pending_interaction=on_pending_interaction,
+                )
+
+
+def _frame_steps(frame: dict[str, object]) -> list[dict[str, object]]:
+    """
+    Extract the trajectory steps from one ``StreamAgentStateUpdates`` frame.
+
+    The steps live at ``mainTrajectoryUpdate.stepsUpdate.steps[]`` (design
+    §10.2). A frame without that path (e.g. a non-trajectory update) yields no
+    steps. Only dict entries are returned so a malformed step never crashes the
+    loop.
+
+    :param frame: One parsed DATA-frame ``update`` dict from the stream.
+    :returns: The frame's step dicts (possibly empty).
+    """
+    main = frame.get("mainTrajectoryUpdate")
+    if not isinstance(main, dict):
+        return []
+    steps_update = main.get("stepsUpdate")
+    if not isinstance(steps_update, dict):
+        return []
+    steps = steps_update.get("steps")
+    if not isinstance(steps, list):
+        return []
+    return [step for step in steps if isinstance(step, dict)]
+
+
+async def _process_committed_step(
+    step: dict[str, object],
+    *,
+    client: httpx.AsyncClient,
+    session_id: str,
+    cascade_id: str,
+    state: _ReaderState,
+    on_pending_interaction: OnPendingInteraction,
+) -> None:
+    """
+    Emit one step's committed items + status edges + interaction (poll path).
+
+    De-dups by ``(trajectory_id, step_index)`` against ``state.seen`` so a
+    re-read posts nothing, then emits via :func:`_emit_step` and hands a WAITING
+    step to the bridge once. This is the committed-only path (no deltas).
+
+    De-dup is only RECORDED once the step is *settled* (:func:`_is_settled`): a
+    tool-result step is observed non-contiguously through PENDING/RUNNING/WAITING
+    before DONE (verified in the live fixtures), and the mapper emits its output
+    only at DONE. Marking it ``seen`` on a pre-DONE sighting (where the mapper
+    returns ``[]``) would dedup the later DONE and silently DROP the output —
+    likelier on the stream path, which observes every intermediate status frame
+    than on the coarse poll. So a not-yet-settled step is re-emitted (a safe
+    no-op: it maps to ``[]`` and fires no status edge) until it settles, and the
+    interaction is still handed off via its own ``interacted`` dedup meanwhile.
+
+    :param step: One RPC step dict.
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id to mirror into.
+    :param cascade_id: agy cascade id (namespaces ids).
+    :param state: Per-run shared trackers.
+    :param on_pending_interaction: Async callback for a distinct interaction.
+    :returns: None.
+    """
+    key = _step_key(step)
+    if key not in state.seen:
+        if _is_settled(step):
+            state.seen.add(key)
+        state.turn_active = await _emit_step(
+            step,
+            client=client,
+            session_id=session_id,
+            cascade_id=cascade_id,
+            allocator=state.allocator,
+            turn_active=state.turn_active,
+        )
+    await _maybe_handle_interaction(
+        step,
+        key=key,
+        interacted=state.interacted,
+        on_pending_interaction=on_pending_interaction,
+    )
+
+
+def _is_settled(step: dict[str, object]) -> bool:
+    """
+    Return whether a step has reached a state safe to record as de-duped.
+
+    A step is settled when re-emitting it can produce nothing new, so recording
+    its identity in ``seen`` will not drop later content:
+
+    * a USER_INPUT step (always terminal; maps to ``[]`` permanently — the user
+      turn is persisted by the direct ``POST /events``);
+    * any step whose ``status`` is terminal — DONE (the mapper emits its content)
+      or ERROR (the command failed before producing output, so none is coming).
+
+    A PENDING/RUNNING/WAITING/GENERATING step is NOT settled: its content (if
+    any) only appears at DONE, so it must stay re-evaluable until then.
+
+    :param step: One RPC step dict.
+    :returns: ``True`` when the step is terminal or a USER_INPUT.
+    """
+    if step.get("type") == _TYPE_USER_INPUT:
+        return True
+    return step.get("status") in _TERMINAL_STATUSES
+
+
+async def _process_stream_step(
+    step: dict[str, object],
+    *,
+    client: httpx.AsyncClient,
+    session_id: str,
+    cascade_id: str,
+    state: _ReaderState,
+    on_pending_interaction: OnPendingInteraction,
+) -> None:
+    """
+    Emit one streamed step: incremental deltas, then committed items on DONE.
+
+    Dispatch by step ``status`` (design §10.2 discriminator):
+
+    * A GENERATING PLANNER_RESPONSE emits only the NEW ``modifiedResponse``
+      suffix as an ``output_text_delta`` (no committed item yet); the step is NOT
+      added to ``state.seen`` so its eventual DONE frame still commits.
+    * Any other step is routed through the committed path
+      (:func:`_process_committed_step`): DONE planner → the committed ``message``
+      (deltas already preceded it); tool-result DONE → ``function_call_output``;
+      WAITING → the bridge. Committing a planner step clears its delta prefix
+      tracker.
+
+    :param step: One RPC step dict from a stream frame.
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id to mirror into.
+    :param cascade_id: agy cascade id (namespaces ids + message ids).
+    :param state: Per-run shared trackers (incl. the per-step prefix tracker).
+    :param on_pending_interaction: Async callback for a distinct interaction.
+    :returns: None.
+    """
+    if _is_generating_planner(step):
+        await _emit_partial_delta(
+            step,
+            client=client,
+            session_id=session_id,
+            cascade_id=cascade_id,
+            prefixes=state.prefixes,
+        )
+        return
+
+    await _process_committed_step(
+        step,
+        client=client,
+        session_id=session_id,
+        cascade_id=cascade_id,
+        state=state,
+        on_pending_interaction=on_pending_interaction,
+    )
+    # Once committed, the live block is retired by the committed message; drop the
+    # prefix tracker so a later same-index step (e.g. an agy timeout-retry reusing
+    # the slot) starts a fresh delta stream rather than diffing against stale text.
+    idx = _step_index(step)
+    if idx is not None:
+        state.prefixes.pop(idx, None)
+
+
+def _is_generating_planner(step: dict[str, object]) -> bool:
+    """
+    Return whether a step is a PLANNER_RESPONSE still generating its text.
+
+    Only such a step contributes incremental ``output_text_delta`` events; every
+    other status/type is handled by the committed path.
+
+    :param step: One RPC step dict.
+    :returns: ``True`` for a ``CORTEX_STEP_TYPE_PLANNER_RESPONSE`` whose
+        ``status`` is ``CORTEX_STEP_STATUS_GENERATING``.
+    """
+    return step.get("type") == _TYPE_PLANNER_RESPONSE and step.get("status") == _STATUS_GENERATING
+
+
+def _partial_planner_text(step: dict[str, object]) -> str | None:
+    """
+    Extract the growing partial assistant text from a GENERATING planner step.
+
+    The partial lives at ``plannerResponse.modifiedResponse`` (design §10.2);
+    ``response`` is absent during generation. Returns ``None`` when the planner
+    block or the partial field is missing.
+
+    :param step: A GENERATING PLANNER_RESPONSE step dict.
+    :returns: The current cumulative ``modifiedResponse`` text, or ``None``.
+    """
+    planner = step.get("plannerResponse")
+    if not isinstance(planner, dict):
+        return None
+    modified = planner.get("modifiedResponse")
+    return modified if isinstance(modified, str) else None
+
+
+async def _emit_partial_delta(
+    step: dict[str, object],
+    *,
+    client: httpx.AsyncClient,
+    session_id: str,
+    cascade_id: str,
+    prefixes: dict[int, str],
+) -> None:
+    """
+    Emit the NEW suffix of a GENERATING planner step's partial text as a delta.
+
+    Frames are cumulative snapshots, so the reader prefix-diffs: the delta is
+    ``modifiedResponse`` minus the prefix already forwarded for this step's
+    ``step_index``. When the new cumulative text does not extend the forwarded
+    prefix (a no-growth re-send, or a non-extending rewrite), nothing is emitted.
+    The tracker then advances to the full cumulative text so subsequent frames
+    emit only further growth — deltas never overlap or duplicate, and they
+    concatenate to the full text.
+
+    :param step: A GENERATING PLANNER_RESPONSE step dict.
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id to mirror into.
+    :param cascade_id: agy cascade id (namespaces the stable message id).
+    :param prefixes: Per-``step_index`` forwarded-prefix tracker (mutated here).
+    :returns: None.
+    """
+    idx = _step_index(step)
+    if idx is None:
+        return
+    text = _partial_planner_text(step)
+    if text is None:
+        return
+    forwarded = prefixes.get(idx, "")
+    # Only forward growth that extends what we already sent. A frame that does not
+    # start with the forwarded prefix (an unexpected non-monotonic rewrite) or
+    # that has not grown yields no delta; we still re-anchor the tracker to the
+    # latest cumulative text so we never re-emit the overlap.
+    if text.startswith(forwarded) and len(text) > len(forwarded):
+        suffix = text[len(forwarded) :]
+        await _post_event(
+            client,
+            session_id,
+            output_text_delta_event(
+                conversation_id=cascade_id,
+                step_idx=idx,
+                delta=suffix,
+                final=False,
+            ),
+        )
+    prefixes[idx] = text
 
 
 async def _emit_step(

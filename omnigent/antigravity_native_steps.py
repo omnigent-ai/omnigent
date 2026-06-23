@@ -328,6 +328,64 @@ def _result_call_id(step: dict[str, object]) -> str | None:
     return cid if isinstance(cid, str) and cid else None
 
 
+def planner_message_id(conversation_id: str, step_idx: int) -> str:
+    """
+    Build the stable streaming ``message_id`` for a PLANNER_RESPONSE step.
+
+    The streaming read driver (Task T-D) tags every ``external_output_text_delta``
+    for one assistant step with this id so the SPA coalesces the deltas into a
+    single live block and then retires that block when the committed ``message``
+    arrives — the reconciliation contract that prevents the double-render. One id
+    per ``(conversation_id, step_idx)``; identical across all of the step's
+    deltas.
+
+    :param conversation_id: agy conversation id (equal to the cascade id).
+    :param step_idx: The PLANNER_RESPONSE step's trajectory step index.
+    :returns: Stable message id, e.g. ``"antigravity:8ca97c49:2:planner"``.
+    """
+    return f"antigravity:{conversation_id}:{step_idx}:planner"
+
+
+def output_text_delta_event(
+    *,
+    conversation_id: str,
+    step_idx: int,
+    delta: str,
+    final: bool,
+) -> OutboundEvent:
+    """
+    Build an incremental assistant ``output_text_delta`` for a planner step.
+
+    Relocated here from the retired transcript forwarder (Task 12 makes this
+    module the home of :class:`OutboundEvent` and the event builders). Unlike the
+    forwarder's one-shot delta (which carried the whole DONE message at once with
+    ``final=True``), the streaming reader emits a *suffix* delta per frame while
+    the step is GENERATING (``final=False``); the committed ``message`` then
+    arrives separately via :func:`map_step_to_events` on DONE. The stable
+    :func:`planner_message_id` lets the SPA coalesce the deltas into one live
+    block and reconcile it against that committed item (no double-render).
+
+    :param conversation_id: agy conversation id.
+    :param step_idx: Owning step index (the planner step's trajectory index).
+    :param delta: The NEW suffix of ``modifiedResponse`` since the last forwarded
+        prefix for this step — NOT the cumulative text.
+    :param final: ``True`` only on a terminal delta for the message; the
+        streaming reader emits incremental deltas with ``False`` and relies on
+        the committed ``message`` (not a ``final`` delta) to close the block.
+    :returns: One ``external_output_text_delta`` event.
+    """
+    return OutboundEvent(
+        event_type="external_output_text_delta",
+        data={
+            "delta": delta,
+            "message_id": planner_message_id(conversation_id, step_idx),
+            "index": 0,
+            "final": final,
+        },
+        step_index=step_idx,
+    )
+
+
 def _message_event(
     *,
     conversation_id: str,
