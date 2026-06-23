@@ -200,6 +200,108 @@ _SPINNER_FRAMES: tuple[str, ...] = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 # calls don't dominate the event loop.
 _SPINNER_TICK_SECONDS: float = 0.1
 
+# ── Running sub-agents toolbar segment ────────────────
+# Surfaces background sub-agents an orchestrator dispatched (via
+# ``sys_session_send``) so the user is aware work is happening — even after
+# the parent's turn goes idle while children keep running. Driven entirely by
+# the live ``session.child_session.updated`` deltas the runner fans out onto
+# the parent stream. The pure helpers below keep the formatting and the event
+# reduction unit-testable without constructing a host.
+
+# How many child names to show before collapsing the rest into ``+K``.
+_SUBAGENT_NAMES_SHOWN: int = 2
+
+
+def _format_elapsed_short(seconds: float) -> str:
+    """Compact elapsed string: ``8s`` / ``2m`` / ``1h`` (floored, never < 0)."""
+    secs = max(0, int(seconds))
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m"
+    return f"{secs // 3600}h"
+
+
+def _format_subagent_segment(
+    subagents: dict[str, tuple[str, float, bool]],
+    *,
+    budget: int,
+    now: float,
+) -> str:
+    """Format the running-sub-agents toolbar segment within ``budget`` columns.
+
+    :param subagents: Active children, ``child_id -> (label, started_monotonic,
+        awaiting_input)``.
+    :param budget: Maximum columns the segment may occupy.
+    :param now: Current ``time.monotonic()`` (passed in for testability).
+    :returns: e.g. ``" ⇡2 sub-agents · researcher 12s · coder 8s "`` —
+        degrading to ``" ⇡2 sub-agents "`` then ``""`` as ``budget`` shrinks,
+        and ``""`` when there are no active children.
+    """
+    if not subagents:
+        return ""
+    count = len(subagents)
+    noun = "sub-agent" if count == 1 else "sub-agents"
+    warn = "⚠ " if any(awaiting for _, _, awaiting in subagents.values()) else ""
+    # Oldest-first, so the longest-running children lead.
+    ordered = sorted(subagents.values(), key=lambda entry: entry[1])
+    shown = ordered[:_SUBAGENT_NAMES_SHOWN]
+    tails = [f"{label} {_format_elapsed_short(now - started)}" for label, started, _ in shown]
+    tail = " · ".join(tails)
+    extra = count - len(shown)
+    if extra > 0:
+        tail = f"{tail} +{extra}"
+    full = f" {warn}⇡{count} {noun} · {tail} "
+    if len(full) <= budget:
+        return full
+    compact = f" {warn}⇡{count} {noun} "
+    if len(compact) <= budget:
+        return compact
+    return ""
+
+
+def _reduce_subagent_event(
+    state: dict[str, dict[str, object]],
+    active: dict[str, tuple[str, float, bool]],
+    *,
+    child_id: str,
+    child: dict[str, object],
+    now: float,
+) -> None:
+    """Fold one ``session.child_session.updated`` delta into the registry.
+
+    Mutates ``state`` (the per-child merge cache, since the runner sends
+    PARTIAL deltas) and ``active`` (``child_id -> (label, started, awaiting)``
+    for currently-running children). A child is active while ``busy`` or its
+    task is ``launching`` / ``queued`` / ``in_progress``; it is dropped once
+    terminal (``completed`` / ``failed`` / ``cancelled``). The start time is
+    captured the first time a child is seen active and preserved across later
+    deltas, so its elapsed counter is stable (and clock-skew-free — it uses
+    the client monotonic clock, not the server ``created_at`` epoch).
+
+    :param state: Per-child merge cache, carried across deltas.
+    :param active: The active-children registry, updated in place.
+    :param child_id: The child session id from the event.
+    :param child: The PARTIAL child summary (only changed fields present).
+    :param now: Current ``time.monotonic()`` for a newly-seen child's start.
+    """
+    merged = state.setdefault(child_id, {})
+    merged.update({key: value for key, value in child.items() if value is not None})
+    busy = bool(merged.get("busy"))
+    task_status = merged.get("current_task_status")
+    is_active = busy or task_status in ("launching", "queued", "in_progress")
+    is_terminal = not busy and task_status in ("completed", "failed", "cancelled")
+    if is_terminal or not is_active:
+        active.pop(child_id, None)
+        if is_terminal:
+            state.pop(child_id, None)
+        return
+    label = merged.get("tool") or merged.get("session_name") or merged.get("title") or "sub-agent"
+    awaiting = bool(merged.get("pending_elicitations_count"))
+    started = active[child_id][1] if child_id in active else now
+    active[child_id] = (str(label), started, awaiting)
+
+
 # Window for the two-press Ctrl+C exit: first Ctrl+C with an
 # empty input arms the exit hint; a second Ctrl+C within this
 # many seconds actually exits. Longer than "immediate" so a
@@ -883,6 +985,14 @@ class TerminalHost:
         self._tokens_used: int | None = None
         self._context_window: int | None = None
 
+        # Running sub-agents shown in the bottom toolbar. ``_subagents`` maps
+        # child_id -> (label, started_monotonic, awaiting_input) for children
+        # currently running; ``_subagent_state`` is the per-child merge cache
+        # for the PARTIAL ``session.child_session.updated`` deltas the runner
+        # fans out. Both stay empty until the first such delta arrives.
+        self._subagents: dict[str, tuple[str, float, bool]] = {}
+        self._subagent_state: dict[str, dict[str, object]] = {}
+
         # Overlays registered via :meth:`add_overlay`. Populated
         # before :meth:`run` is invoked; the host wires each
         # overlay's trigger into the prompt's keybindings below,
@@ -1211,6 +1321,36 @@ class TerminalHost:
         with contextlib.suppress(RuntimeError):
             get_app().invalidate()
 
+    def apply_child_session_update(self, child_id: str, child: dict[str, object]) -> None:
+        """Fold a ``session.child_session.updated`` delta into the toolbar's
+        running-sub-agents segment, then repaint.
+
+        Called by the REPL for each child delta the runner fans out onto the
+        parent stream. Children are added while running and dropped once
+        terminal; see :func:`_reduce_subagent_event`.
+
+        :param child_id: The child session id from the event.
+        :param child: The PARTIAL child summary (only changed fields present).
+        """
+        import time as _time
+
+        _reduce_subagent_event(
+            self._subagent_state,
+            self._subagents,
+            child_id=child_id,
+            child=child,
+            now=_time.monotonic(),
+        )
+        with contextlib.suppress(RuntimeError):
+            get_app().invalidate()
+
+    def clear_subagents(self) -> None:
+        """Drop all tracked sub-agents (e.g. on a session reset) and repaint."""
+        self._subagents.clear()
+        self._subagent_state.clear()
+        with contextlib.suppress(RuntimeError):
+            get_app().invalidate()
+
     def set_theme(self, theme: TerminalTheme | str) -> None:
         """Switch prompt/status-bar colors for future TUI renders."""
         self.theme = get_theme(theme) if isinstance(theme, str) else theme
@@ -1516,7 +1656,7 @@ class TerminalHost:
               the toolbar responsive to late ``is_busy`` flips.
             """
             while True:
-                if self._stream_start is not None or self.is_busy:
+                if self._stream_start is not None or self.is_busy or self._subagents:
                     if self._prompt.app:
                         self._prompt.app.invalidate()
                     await asyncio.sleep(_SPINNER_TICK_SECONDS)
@@ -3064,16 +3204,23 @@ class TerminalHost:
             ring_segment = f" {ring_char} {pct:.0%} "
         state_segment = f" {state_badge} "
         width = _term_width()
-        bar_right = max(
-            0,
-            width
-            - 2
-            - len(parts)
-            - len(hints)
-            - len(counter_segment)
-            - len(ring_segment)
-            - len(state_segment),
+        # Running sub-agents segment, fitted into the space left after the
+        # fixed segments. It degrades (drops per-child names) then disappears
+        # rather than wrapping or displacing the core toolbar elements.
+        fixed = (
+            2
+            + len(parts)
+            + len(hints)
+            + len(counter_segment)
+            + len(ring_segment)
+            + len(state_segment)
         )
+        subagent_segment = _format_subagent_segment(
+            self._subagents,
+            budget=max(0, width - fixed),
+            now=_time.monotonic(),
+        )
+        bar_right = max(0, width - fixed - len(subagent_segment))
         segments: list[tuple[str, str]] = [
             ("class:bar", "──"),
             ("class:model-name", parts),
@@ -3083,6 +3230,8 @@ class TerminalHost:
             segments.append(("class:model-name", counter_segment))
         if ring_segment:
             segments.append(("class:model-name", ring_segment))
+        if subagent_segment:
+            segments.append(("class:bottom-toolbar.key", subagent_segment))
         segments.append(("class:bar", "─" * bar_right))
         segments.append(("class:model-name", state_segment))
         return FormattedText(segments)
