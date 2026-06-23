@@ -31,6 +31,7 @@ Environment (Databricks):
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import hmac
 import json
@@ -701,7 +702,12 @@ def _build_models_json(
             # Declare image input: Pi's transformMessages drops every image
             # block ("model does not support images") unless the model entry
             # advertises it, so a dynamically-registered vision model would
-            # silently lose its images (#515).
+            # silently lose its images (#515). We assert capability for ALL
+            # dynamically-routed ids (no per-model vision metadata here): for a
+            # genuinely text-only model this turns a silent image drop into a
+            # provider-side 400 on image turns — a deliberate trade (loud error
+            # over silent loss), since most current gateway models are
+            # multimodal and text-only turns are unaffected.
             provider["models"] = [
                 *provider["models"],
                 {"id": model, "input": ["text", "image"]},
@@ -1048,16 +1054,19 @@ def _split_pi_prompt(blocks: list[dict[str, Any]]) -> tuple[str, list[dict[str, 
     makes Pi forward the image data URI as literal text, so the model never
     sees the image (#515).
 
-    :param blocks: Responses-API content block dicts (``input_text`` /
-        ``input_image``). An unsupported block type (e.g. ``input_file``,
-        which carries a resolved attachment data URI) raises ``ValueError``
-        rather than being silently dropped: Pi's prompt RPC has no channel
-        for it, and the previous ``json.dumps(prompt)`` path at least
-        surfaced its content as text, so a silent skip would be a data-loss
-        regression. ``run_turn`` turns the error into an ``ExecutorError``.
+    :param blocks: Responses-API content block dicts. ``input_text`` →
+        message text; ``input_image`` → Pi ``images``; ``input_file`` (a
+        resolved attachment data URI) → its text payload is decoded into the
+        message for text-like MIME types and skipped (with a warning) for
+        binary ones, mirroring the Codex harness — Pi has no native file
+        channel, but a text file's content is still useful inline, and the
+        old ``json.dumps(prompt)`` path surfaced it as text, so neither a
+        silent drop nor a hard failure is the right default here. A genuinely
+        unknown block type raises ``ValueError`` (→ ``ExecutorError`` in
+        ``run_turn``) so a new shape fails loudly rather than vanishing.
     :returns: ``(message, images)`` — joined text and a list of Pi
         ``ImageContent`` dicts.
-    :raises ValueError: On a malformed ``input_image`` or an unsupported
+    :raises ValueError: On a malformed ``input_image`` or an unhandled
         block type.
     """
     text_parts: list[str] = []
@@ -1079,12 +1088,36 @@ def _split_pi_prompt(blocks: list[dict[str, Any]]) -> tuple[str, list[dict[str, 
             images.append(
                 {"type": "image", "data": parsed.base64_payload, "mimeType": parsed.mime_type}
             )
+        elif block_type == "input_file":
+            # Pi has no file channel, so inline text-like files into the
+            # message (the model can still reason about them) and skip binary
+            # ones. Matches codex_executor's input_file fallback.
+            file_data = block.get("file_data") or ""
+            if isinstance(file_data, str) and file_data.startswith("data:"):
+                parsed = parse_data_uri(file_data)
+                if not parsed.mime_type.startswith("text/"):
+                    logger.warning(
+                        "Pi harness: skipping non-text input_file (%s) — Pi "
+                        "cannot consume binary attachments inline.",
+                        parsed.mime_type,
+                    )
+                    continue
+                try:
+                    decoded = base64.b64decode(parsed.base64_payload).decode("utf-8", "replace")
+                except ValueError as exc:  # binascii.Error subclasses ValueError
+                    raise ValueError(
+                        f"input_file has an undecodable base64 payload: {exc}"
+                    ) from exc
+                text_parts.append(decoded)
+            elif isinstance(file_data, str) and file_data:
+                # Already-inline text (no data: wrapper).
+                text_parts.append(file_data)
         else:
             raise ValueError(
                 f"Unsupported content block type {block_type!r} for the Pi "
-                "harness: only 'input_text' and 'input_image' (inline data "
-                "URI) blocks can be forwarded. Dropping it silently would lose "
-                "the attachment, so the turn fails loudly instead."
+                "harness: only 'input_text', 'input_image', and 'input_file' "
+                "blocks can be forwarded. Dropping it silently would lose the "
+                "attachment, so the turn fails loudly instead."
             )
     return "\n".join(text_parts), images
 

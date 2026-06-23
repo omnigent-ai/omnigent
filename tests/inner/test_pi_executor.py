@@ -374,12 +374,40 @@ def test_split_pi_prompt_rejects_non_data_uri_image():
         _split_pi_prompt([{"type": "input_image", "image_url": "file-abc123"}])
 
 
-def test_split_pi_prompt_rejects_unsupported_block_type():
-    # #516 review: an input_file (or any non-text/non-image) block has no Pi
-    # channel. Dropping it silently would lose the attachment (a regression vs
-    # the old json.dumps path), so it must raise -> ExecutorError, not vanish.
+def test_split_pi_prompt_inlines_text_input_file():
+    # #516 review: a text-like input_file is decoded into the message (so the
+    # model can read it) rather than dropped or hard-failed — mirroring codex.
+    import base64 as _b64
+
+    payload = _b64.b64encode(b"hello from a file").decode()
+    message, images = _split_pi_prompt(
+        [
+            {"type": "input_text", "text": "summarize:"},
+            {"type": "input_file", "file_data": f"data:text/markdown;base64,{payload}"},
+        ]
+    )
+    assert message == "summarize:\nhello from a file"
+    assert images == []
+
+
+def test_split_pi_prompt_skips_binary_input_file():
+    # A binary input_file (e.g. PDF) can't be inlined as text; it's skipped
+    # (with a logged warning), not raised — the turn still runs.
+    message, images = _split_pi_prompt(
+        [
+            {"type": "input_text", "text": "hi"},
+            {"type": "input_file", "file_data": "data:application/pdf;base64,JVBERi0x"},
+        ]
+    )
+    assert message == "hi"
+    assert images == []
+
+
+def test_split_pi_prompt_rejects_genuinely_unknown_block_type():
+    # A block type Pi can't handle at all still fails loudly rather than
+    # silently vanishing -> run_turn surfaces it as an ExecutorError.
     with pytest.raises(ValueError, match="Unsupported content block type"):
-        _split_pi_prompt([{"type": "input_file", "file_data": "data:application/pdf;base64,AAAA"}])
+        _split_pi_prompt([{"type": "input_audio", "audio": "..."}])
 
 
 # _build_models_json tests
