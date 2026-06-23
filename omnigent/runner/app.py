@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     # Type-only import: the runner keeps codex deps out of its runtime import
     # graph (they are imported lazily inside the codex-native helpers).
+    from omnigent.antigravity_native_steps import PendingInteraction
     from omnigent.codex_native_app_server import CodexAppServerClient
     from omnigent.runner.cost_advisor import AdvisorTurnResult
     from omnigent.terminals.registry import TerminalListEntry
@@ -35,6 +36,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from omnigent.claude_native_bridge import url_component
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     SessionResourceView,
@@ -65,6 +67,7 @@ from omnigent.runner.resource_registry import (
     TerminalLifecycle,
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 from omnigent.spec.parser import discover_host_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
 from omnigent.terminals.ws_bridge import (
@@ -227,6 +230,20 @@ _AUTO_FORWARDER_TASKS: dict[str, asyncio.Task[Any]] = {}
 # Bound how long terminal (re)creation waits for a cancelled forwarder.
 _AUTO_FORWARDER_CANCEL_TIMEOUT_S = 10.0
 
+# Antigravity (agy) elicitation long-poll budget for the RPC reader's
+# interaction bridge (mirrors the codex forwarder's elicitation re-POST policy).
+# The per-attempt client read budget sits slightly ABOVE the server-side wait
+# (``_ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S`` = 86400.0) so the server's
+# own timeout (empty-body → None verdict) wins over a client cut; it doubles as
+# the total re-POST budget across severed long-polls. Connects fail fast into
+# the backoff loop instead of inheriting the day-long read budget. The first
+# retry lands inside the server's re-park grace (proxies sever idle long-polls);
+# later retries back off.
+_AGY_ELICITATION_REQUEST_TIMEOUT_SECONDS = 86405.0
+_AGY_ELICITATION_CONNECT_TIMEOUT_SECONDS = 30.0
+_AGY_ELICITATION_RETRY_INITIAL_BACKOFF_SECONDS = 1.0
+_AGY_ELICITATION_RETRY_MAX_BACKOFF_SECONDS = 30.0
+
 
 class _CodexNativeModelOptionsNotReady(RuntimeError):
     """Raised when Codex model options are requested before bridge startup."""
@@ -284,6 +301,153 @@ def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[Any]) -> N
             del _AUTO_FORWARDER_TASKS[session_id]
 
     task.add_done_callback(_evict)
+
+
+async def _agy_elicitation_retry_sleep(seconds: float) -> None:
+    """
+    Indirection over :func:`asyncio.sleep` for the agy elicitation re-POST
+    backoff, so tests can stub it without clobbering the process-global
+    ``asyncio.sleep``. Mirrors
+    :func:`omnigent.codex_native_forwarder._elicitation_retry_sleep`.
+
+    :param seconds: Seconds to sleep, e.g. ``1.0``.
+    :returns: None.
+    """
+    await asyncio.sleep(seconds)
+
+
+async def _post_agy_elicitation_request(
+    client: httpx.AsyncClient,
+    session_id: str,
+    *,
+    elicitation_id: str,
+    params: ElicitationRequestParams,
+) -> httpx.Response | None:
+    """
+    POST one agy elicitation to the Omnigent hook, re-POSTing across severed
+    long-polls.
+
+    Mirrors :func:`omnigent.codex_native_forwarder._post_codex_elicitation_request`:
+    the hook is a long-poll request/reply that blocks on a human, so a single
+    failed POST must not abandon the prompt. The elicitation id is deterministic
+    per ``(cascade_id, trajectory_id, step_index)`` (built by
+    :func:`omnigent.antigravity_native_interactions.agy_elicitation_id`), so a
+    re-POST of the same body re-parks the SAME elicitation server-side (keeping
+    the approval card alive) and can collect a verdict that landed between
+    attempts. Transport errors and 5xx responses are retried within the
+    ``_AGY_ELICITATION_REQUEST_TIMEOUT_SECONDS`` budget; 2xx and 4xx are final.
+
+    :param client: HTTP client for Omnigent hook posts (the reader's client).
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param elicitation_id: Deterministic agy elicitation id, e.g.
+        ``"elicit_agy_<digest>"``.
+    :param params: The web-renderable elicitation params.
+    :returns: The final hook response, or ``None`` when the retry budget ran
+        out — the caller surfaces no verdict (agy's own WAITING timeout reclaims
+        the step).
+    """
+    url = f"/v1/sessions/{url_component(session_id)}/hooks/antigravity-elicitation-request"
+    body: dict[str, object] = {
+        "elicitation_id": elicitation_id,
+        "params": params.model_dump(),
+    }
+    timeout = httpx.Timeout(
+        _AGY_ELICITATION_REQUEST_TIMEOUT_SECONDS,
+        connect=_AGY_ELICITATION_CONNECT_TIMEOUT_SECONDS,
+    )
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _AGY_ELICITATION_REQUEST_TIMEOUT_SECONDS
+    backoff_s = _AGY_ELICITATION_RETRY_INITIAL_BACKOFF_SECONDS
+    while True:
+        response: httpx.Response | None = None
+        try:
+            response = await client.post(url, json=body, timeout=timeout)
+        except httpx.HTTPError:
+            _logger.warning(
+                "Antigravity elicitation hook POST failed; retrying: elicitation_id=%s",
+                elicitation_id,
+                exc_info=True,
+            )
+        if response is not None and response.status_code < 500:
+            return response
+        if response is not None:
+            # 5xx = proxy gateway error on a severed long-poll, or a restarting
+            # server — the verdict may still be pending, so re-POST.
+            _logger.warning(
+                "Antigravity elicitation hook returned %s; retrying: elicitation_id=%s",
+                response.status_code,
+                elicitation_id,
+            )
+        if loop.time() + backoff_s >= deadline:
+            _logger.warning(
+                "Antigravity elicitation hook retry budget exhausted: elicitation_id=%s",
+                elicitation_id,
+            )
+            return None
+        await _agy_elicitation_retry_sleep(backoff_s)
+        backoff_s = min(backoff_s * 2, _AGY_ELICITATION_RETRY_MAX_BACKOFF_SECONDS)
+
+
+async def _request_agy_elicitation(
+    client: httpx.AsyncClient,
+    session_id: str,
+    *,
+    elicitation_id: str,
+    params: ElicitationRequestParams,
+) -> ElicitationResult | None:
+    """
+    Production ``request_elicitation`` for the agy interaction bridge.
+
+    Publishes the elicitation under ``elicitation_id`` via the Task 9 hook
+    (``POST /v1/sessions/{id}/hooks/antigravity-elicitation-request``) and
+    long-poll-awaits the human verdict. Mirrors codex's
+    ``_codex_elicitation_hook_result`` body handling:
+
+    * a 2xx with a body → parse it as :class:`ElicitationResult`;
+    * a 2xx with an EMPTY body → ``None`` (the server timed out / saw the
+      upstream disconnect — agy's own WAITING timeout reclaims the step);
+    * a 4xx, an exhausted-retry ``None`` response, or a non-JSON / non-object
+      body → ``None`` (logged; no verdict delivered).
+
+    :param client: HTTP client for Omnigent hook posts (the reader's client).
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param elicitation_id: Deterministic agy elicitation id.
+    :param params: The web-renderable elicitation params.
+    :returns: The parsed :class:`ElicitationResult`, or ``None`` on
+        timeout / rejection / malformed body.
+    """
+    response = await _post_agy_elicitation_request(
+        client,
+        session_id,
+        elicitation_id=elicitation_id,
+        params=params,
+    )
+    if response is None:
+        return None
+    if response.status_code >= 400:
+        _logger.warning(
+            "Antigravity elicitation hook rejected request: status=%s elicitation_id=%s body=%s",
+            response.status_code,
+            elicitation_id,
+            response.text[:512],
+        )
+        return None
+    if not response.content:
+        _logger.info(
+            "Antigravity elicitation hook returned empty body; no verdict: elicitation_id=%s",
+            elicitation_id,
+        )
+        return None
+    try:
+        return ElicitationResult.model_validate(response.json())
+    except ValueError:
+        _logger.warning(
+            "Antigravity elicitation hook returned a non-ElicitationResult body: "
+            "elicitation_id=%s body=%s",
+            elicitation_id,
+            response.text[:512],
+        )
+        return None
 
 
 # Background tasks that re-pop a still-pending cost-budget approval on a
@@ -1635,6 +1799,85 @@ async def _codex_forward_known_thread(
                 await leftover_app_server.close()
 
 
+async def _run_antigravity_reader(
+    *,
+    base_url: str,
+    headers: dict[str, str],
+    auth: httpx.Auth | None,
+    session_id: str,
+    bridge_dir: Path,
+) -> None:
+    """
+    Run the agy RPC streaming reader + interaction bridge for one session.
+
+    Owns the long-lived Omnigent HTTP client (the reader takes a client but does
+    NOT own its lifecycle) and runs :func:`supervise_reader`, wiring its
+    ``on_pending_interaction`` callback to the Task 8 interaction bridge:
+
+    * ``request_elicitation`` → :func:`_request_agy_elicitation` (POSTs the Task 9
+      ``antigravity-elicitation-request`` hook and long-poll-awaits the human),
+      mirroring codex's ``_handle_codex_elicitation_request``;
+    * ``get_steps`` → ``get_trajectory_steps(port, cascade_id)`` offloaded to a
+      worker thread (the RPC is synchronous);
+    * ``deliver`` → the bridge default (``handle_user_interaction`` in a thread).
+
+    The reader discovers the cascade id + connect-RPC port and hands BOTH to the
+    callback, so the bridge targets agy's live conversation without
+    re-discovering (which could bind a recycled/foreign port).
+
+    This is the host-spawned (web-UI) read path that replaces the transcript
+    forwarder: the runner-owned tmux terminal IS the agy agent process, and this
+    reader is the single writer mirroring agy's conversation into the session.
+
+    :param base_url: Omnigent server base URL, e.g. ``"http://127.0.0.1:6767"``.
+    :param headers: Auth headers for the Omnigent client (best-effort static
+        bearer; ``auth`` carries the refresh-capable flow).
+    :param auth: Refresh-capable httpx auth flow, or ``None`` when unauthenticated.
+    :param session_id: Omnigent conversation id to mirror into, e.g.
+        ``"conv_abc123"``.
+    :param bridge_dir: Native Antigravity bridge directory for this session.
+    :returns: None. Runs until cancelled.
+    """
+    from omnigent.antigravity_native_interactions import bridge_interaction
+    from omnigent.antigravity_native_reader import supervise_reader
+    from omnigent.antigravity_native_rpc import get_trajectory_steps
+
+    async with httpx.AsyncClient(
+        base_url=base_url,
+        headers=headers,
+        auth=auth,
+        timeout=httpx.Timeout(30.0),
+    ) as client:
+
+        async def _on_pending(cascade_id: str, port: int, pending: PendingInteraction) -> None:
+            """Drive the interaction bridge for one WAITING interaction."""
+
+            async def _request_elicitation(
+                eid: str, params: ElicitationRequestParams
+            ) -> ElicitationResult | None:
+                return await _request_agy_elicitation(
+                    client, session_id, elicitation_id=eid, params=params
+                )
+
+            async def _get_steps() -> list[dict[str, object]]:
+                return await asyncio.to_thread(get_trajectory_steps, port, cascade_id)
+
+            await bridge_interaction(
+                cascade_id,
+                pending,
+                port=port,
+                get_steps=_get_steps,
+                request_elicitation=_request_elicitation,
+            )
+
+        await supervise_reader(
+            bridge_dir,
+            session_id,
+            client=client,
+            on_pending_interaction=_on_pending,
+        )
+
+
 async def _auto_create_antigravity_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -1652,10 +1895,10 @@ async def _auto_create_antigravity_terminal(
 
     Unlike codex-native there is **no app-server**: agy self-hosts its
     control surface, so this boots agy directly in a runner-owned tmux
-    terminal and runs the native transcript forwarder server-side so the
+    terminal and runs the native RPC streaming reader server-side so the
     web chat view mirrors agy's conversation. It is structurally closer to
     :func:`_auto_create_claude_terminal` (the terminal IS the agent
-    process and the forwarder is the single transcript writer) than to the
+    process and the reader is the single conversation writer) than to the
     codex path. The terminal starts agy immediately
     (``tmux_start_on_attach=False``) — UNLIKE the CLI launch in
     :func:`omnigent.antigravity_native._launch_antigravity_terminal`, which
@@ -1675,10 +1918,10 @@ async def _auto_create_antigravity_terminal(
     which would silently disable the per-tool prompt for a watching web
     user.
 
-    Fresh sessions launch with no ``--conversation`` so agy mints and the
-    forwarder discovers its real id; resume sessions launch
-    ``--conversation <external_session_id>`` (agy's real id, persisted by a
-    prior run's forwarder).
+    Fresh sessions launch with no ``--conversation``: the runner cold-starts
+    the conversation over connect-RPC (11a) so the reader binds agy's real id
+    directly. Resume sessions launch ``--conversation <external_session_id>``
+    (agy's real id, persisted by a prior run).
 
     :param session_id: Session/conversation identifier, e.g.
         ``"conv_abc123"``.
@@ -1704,7 +1947,6 @@ async def _auto_create_antigravity_terminal(
         write_bridge_state,
         write_tmux_target,
     )
-    from omnigent.antigravity_native_forwarder import supervise_forwarder
     from omnigent.antigravity_native_launch import build_agy_launch
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 
@@ -1899,48 +2141,47 @@ async def _auto_create_antigravity_terminal(
             bridge_dir, session_id, timeout_s=_AGY_COLD_START_PORT_TIMEOUT_S
         )
 
-    # Bind the forwarder's discovery to THIS session's own agy process via its
-    # tmux pane (pane pid → agy child → connect-RPC port), instead of guessing
-    # by newest brain dir — the brain root is shared by every agy on the host.
-    # ``_terminal_tmux_pane`` is fully defensive (never raises for a valid or
-    # absent terminal), so NOTHING fallible runs between the terminal
-    # registration above and the forwarder below — a partial failure can never
-    # leave a registered terminal without a forwarder (which a later ensure
-    # would see and return 200 for, never self-healing).
+    # Resolve THIS session's own agy tmux pane (pane pid → agy child) for the
+    # first-turn TUI bootstrap advertised below. The RPC reader discovers its own
+    # connect-RPC port from bridge state (cascade id → port), so it needs no pane;
+    # the pane is still required so the executor can type the FIRST web turn into
+    # agy's TUI before any conversation exists. ``_terminal_tmux_pane`` is fully
+    # defensive (never raises for a valid or absent terminal), so NOTHING fallible
+    # runs between the terminal registration above and the reader below — a
+    # partial failure can never leave a registered terminal without a reader
+    # (which a later ensure would see and return 200 for, never self-healing).
     tmux_socket, tmux_target = _terminal_tmux_pane(
         resource_registry, session_id, "antigravity", "main"
     )
 
-    # Start the transcript forwarder server-side. The CLI client runs this on
-    # the wrapper path; on this host-spawned path the runner uses the server URL
-    # + refresh-capable auth resolved above. ``audit_policies=True`` enables the
-    # post-hoc tool-call policy audit (agy exposes no firing PreToolUse hook,
-    # so enforcement here is audit-only).
-    _forwarder_task = asyncio.create_task(
-        supervise_forwarder(
+    # Start the RPC streaming reader + interaction bridge server-side (replacing
+    # the transcript forwarder). It mirrors agy's conversation over connect-RPC
+    # and surfaces WAITING interactions as web elicitations via the Task 9 hook.
+    # The reader owns its own Omnigent client (built in ``_run_antigravity_reader``)
+    # from the server URL + refresh-capable auth resolved above. Reuses the same
+    # per-session background-task registry the forwarder used, so a session never
+    # runs two readers at once and a terminal re-create cancels the prior reader.
+    _reader_task = asyncio.create_task(
+        _run_antigravity_reader(
             base_url=server_url,
             headers=runner_headers,
+            auth=_RunnerDatabricksAuth(auth_factory),
             session_id=session_id,
             bridge_dir=bridge_dir,
-            tmux_socket=tmux_socket,
-            tmux_target=tmux_target,
-            model=model,
-            audit_policies=True,
-            auth=_RunnerDatabricksAuth(auth_factory),
         ),
-        name=f"antigravity-forwarder-{session_id}",
+        name=f"antigravity-reader-{session_id}",
     )
-    _register_auto_forwarder_task(session_id, _forwarder_task)
+    _register_auto_forwarder_task(session_id, _reader_task)
 
     # Advertise the tmux pane so the executor can deliver the FIRST web turn into
     # the agy TUI (agy mints its conversation only after it processes input; the
     # connect-RPC fast path cannot address a conversation that does not exist
-    # yet). Done AFTER the forwarder is registered and made best-effort/off-loop:
+    # yet). Done AFTER the reader is registered and made best-effort/off-loop:
     # this is a fallible filesystem write, and the "a registered runner-owned
-    # terminal implies a running forwarder" invariant requires nothing fallible
-    # to abort the launch between terminal registration and forwarder start. A
+    # terminal implies a running reader" invariant requires nothing fallible
+    # to abort the launch between terminal registration and reader start. A
     # write failure (or a truly remote runner with no local pane) leaves the
-    # forwarder running; the executor's first-turn bootstrap then surfaces a clear
+    # reader running; the executor's first-turn bootstrap then surfaces a clear
     # "tmux target was not advertised" error and a later ensure can re-advertise.
     if tmux_socket is not None and tmux_target is not None:
         try:
@@ -1971,7 +2212,7 @@ async def _auto_create_antigravity_terminal(
         },
     )
     _logger.info(
-        "Auto-created antigravity terminal + forwarder for session %s",
+        "Auto-created antigravity terminal + RPC reader for session %s",
         session_id,
     )
     return terminal_view

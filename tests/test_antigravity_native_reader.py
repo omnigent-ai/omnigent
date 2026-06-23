@@ -285,7 +285,7 @@ async def _run_stream(
 
     monkeypatch.setattr(reader, "_sleep", _noop_sleep)
 
-    async def _default_pending(_pending: PendingInteraction) -> None:
+    async def _default_pending(_cascade_id: str, _port: int, _pending: PendingInteraction) -> None:
         return None
 
     callback = on_pending if on_pending is not None else _default_pending
@@ -363,7 +363,7 @@ async def _run(
 
     monkeypatch.setattr(reader, "_sleep", _noop_sleep)
 
-    async def _default_pending(_pending: PendingInteraction) -> None:
+    async def _default_pending(_cascade_id: str, _port: int, _pending: PendingInteraction) -> None:
         return None
 
     callback = on_pending if on_pending is not None else _default_pending
@@ -522,14 +522,19 @@ async def test_waiting_step_invokes_callback_once(
     monkeypatch: pytest.MonkeyPatch,
     patched_discovery: None,
 ) -> None:
-    """A WAITING step hands its pending interaction to the callback exactly once."""
+    """A WAITING step hands its pending interaction to the callback exactly once.
+
+    The callback also receives the SAME cascade id + port the reader discovered,
+    so the interaction bridge it drives targets agy's live conversation without
+    re-discovering (and risking a recycled/foreign port).
+    """
     waiting = _load("ask_question_waiting")
     script = _StepScript([[waiting], [waiting], [waiting]])
     sink = _PostSink()
-    captured: list[PendingInteraction] = []
+    captured: list[tuple[str, int, PendingInteraction]] = []
 
-    async def _on_pending(pending: PendingInteraction) -> None:
-        captured.append(pending)
+    async def _on_pending(cascade_id: str, port: int, pending: PendingInteraction) -> None:
+        captured.append((cascade_id, port, pending))
 
     await _run(
         bridge_dir=_bridge_dir(tmp_path),
@@ -542,8 +547,12 @@ async def test_waiting_step_invokes_callback_once(
 
     # Despite three reads of the same WAITING step, the bridge is called once.
     assert len(captured) == 1
-    assert captured[0]["kind"] == "ask_question"
-    assert captured[0]["trajectory_id"] == _CASCADE_ID
+    cascade_id, port, pending = captured[0]
+    # The callback is handed the SAME cascade id + port the reader bound to.
+    assert cascade_id == _CASCADE_ID
+    assert port == _PORT
+    assert pending["kind"] == "ask_question"
+    assert pending["trajectory_id"] == _CASCADE_ID
 
 
 # ---------------------------------------------------------------------------
@@ -721,7 +730,7 @@ async def test_placeholder_conversation_id_waits_for_real_id(
 
     monkeypatch.setattr(reader, "_sleep", _noop_sleep)
 
-    async def _on_pending(_pending: PendingInteraction) -> None:
+    async def _on_pending(_cascade_id: str, _port: int, _pending: PendingInteraction) -> None:
         return None
 
     await reader.supervise_reader(
@@ -939,14 +948,19 @@ async def test_stream_waiting_frame_invokes_callback_once(
     monkeypatch: pytest.MonkeyPatch,
     patched_discovery: None,
 ) -> None:
-    """A WAITING step delivered over the stream hands its interaction once."""
+    """A WAITING step delivered over the stream hands its interaction once.
+
+    The stream path threads the SAME cascade id + port to the callback as the
+    poll path does, so the bridge targets agy's live conversation regardless of
+    which read path surfaced the interaction.
+    """
     waiting = _load("ask_question_waiting")
     frames = [_frame([waiting]), _frame([waiting]), _frame([waiting])]
     sink = _PostSink()
-    captured: list[PendingInteraction] = []
+    captured: list[tuple[str, int, PendingInteraction]] = []
 
-    async def _on_pending(pending: PendingInteraction) -> None:
-        captured.append(pending)
+    async def _on_pending(cascade_id: str, port: int, pending: PendingInteraction) -> None:
+        captured.append((cascade_id, port, pending))
 
     await _run_stream(
         bridge_dir=_bridge_dir(tmp_path),
@@ -959,8 +973,11 @@ async def test_stream_waiting_frame_invokes_callback_once(
     )
 
     assert len(captured) == 1
-    assert captured[0]["kind"] == "ask_question"
-    assert captured[0]["trajectory_id"] == _CASCADE_ID
+    cascade_id, port, pending = captured[0]
+    assert cascade_id == _CASCADE_ID
+    assert port == _PORT
+    assert pending["kind"] == "ask_question"
+    assert pending["trajectory_id"] == _CASCADE_ID
 
 
 # ---------------------------------------------------------------------------
@@ -1212,7 +1229,7 @@ async def _run_with_telemetry(
 
     monkeypatch.setattr(reader, "_sleep", _noop_sleep)
 
-    async def _on_pending(_pending: PendingInteraction) -> None:
+    async def _on_pending(_cascade_id: str, _port: int, _pending: PendingInteraction) -> None:
         return None
 
     await reader.supervise_reader(

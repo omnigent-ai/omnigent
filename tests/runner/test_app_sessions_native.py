@@ -2571,10 +2571,11 @@ async def _run_antigravity_auto_create(
     :param snapshot: The Omnigent session snapshot the helper should read.
     :param candidate_ports: Ports ``_candidate_agy_rpc_ports`` yields (``[]`` →
         the bootstrap never finds a port).
-    :returns: ``(bridge_state_after, start_cascade_calls, forwarder_calls)``.
+    :returns: ``(bridge_state_after, start_cascade_calls, reader_calls)``.
     """
     import omnigent.antigravity_native_bridge as bridge_mod
     import omnigent.antigravity_native_launch as launch_mod
+    import omnigent.antigravity_native_reader as reader_mod
     import omnigent.antigravity_native_rpc as rpc_mod
     import omnigent.runner.app as runner_app_mod
 
@@ -2590,23 +2591,24 @@ async def _run_antigravity_auto_create(
         launch_mod, "build_agy_launch", lambda **_kwargs: (("agy",), {"AGY_ENV": "1"})
     )
     monkeypatch.setattr(bridge_mod, "ensure_agy_onboarding_complete", lambda: None)
-    # The forwarder still spawns (Task 11a keeps it as a functional intermediate);
-    # stub it so the test does not start a real one.
-    forwarder_calls: list[dict[str, Any]] = []
+    # Auto-create now spawns the RPC reader (NOT the transcript forwarder); stub
+    # ``supervise_reader`` at its definition module (the helper imports it lazily)
+    # so the test does not start a real one. The reader is wrapped in
+    # ``_run_antigravity_reader``, which still opens (and, on teardown, closes) a
+    # real Omnigent client around this stub — fine, since nothing posts here.
+    reader_calls: list[dict[str, Any]] = []
 
-    def _counting_forwarder(**kwargs: Any) -> Any:
-        forwarder_calls.append(kwargs)
+    def _counting_reader(*args: Any, **kwargs: Any) -> Any:
+        reader_calls.append(kwargs)
 
         async def _runner() -> None:
             await asyncio.Event().wait()
 
         return _runner()
 
-    monkeypatch.setattr(
-        "omnigent.antigravity_native_forwarder.supervise_forwarder", _counting_forwarder
-    )
-    # No live pane in unit tests → the forwarder uses its ambiguity fallback and
-    # the tmux advertise is skipped. Keep the bootstrap independent of tmux.
+    monkeypatch.setattr(reader_mod, "supervise_reader", _counting_reader)
+    # No live pane in unit tests → the tmux advertise is skipped. Keep the
+    # bootstrap independent of tmux (the reader discovers its own RPC port).
     monkeypatch.setattr(runner_app_mod, "_terminal_tmux_pane", lambda *_a, **_k: (None, None))
 
     # Mock the connect-RPC cold-start surface. Collapse the port-poll budget +
@@ -2670,7 +2672,7 @@ async def _run_antigravity_auto_create(
         await runner_app_mod._cancel_auto_forwarder_task(session_id)
 
     bridge_dir = bridge_mod.bridge_dir_for_bridge_id(session_id)
-    return bridge_mod.read_bridge_state(bridge_dir), start_cascade_calls, forwarder_calls
+    return bridge_mod.read_bridge_state(bridge_dir), start_cascade_calls, reader_calls
 
 
 @pytest.mark.asyncio
@@ -2689,7 +2691,7 @@ async def test_auto_create_antigravity_cold_starts_real_conversation(
     ``agy_conv_*`` placeholder ``read_bridge_state`` would otherwise return.
     """
     session_id = "conv_agy_coldstart"
-    state, start_cascade_calls, forwarder_calls = await _run_antigravity_auto_create(
+    state, start_cascade_calls, reader_calls = await _run_antigravity_auto_create(
         tmp_path,
         monkeypatch,
         session_id=session_id,
@@ -2705,8 +2707,8 @@ async def test_auto_create_antigravity_cold_starts_real_conversation(
     assert state is not None
     assert state.conversation_id == called_id
     assert not bridge_mod_is_placeholder(state.conversation_id)
-    # The forwarder still spawns (functional intermediate for Task 11a).
-    assert len(forwarder_calls) == 1
+    # The RPC reader spawns (it replaced the transcript forwarder).
+    assert len(reader_calls) == 1
 
 
 @pytest.mark.asyncio
@@ -2724,7 +2726,7 @@ async def test_auto_create_antigravity_resume_skips_cold_start(
     """
     session_id = "conv_agy_resume"
     resume_id = "68caaeac-2eaf-4e2c-9b95-721b022f4903"
-    state, start_cascade_calls, _forwarder_calls = await _run_antigravity_auto_create(
+    state, start_cascade_calls, _reader_calls = await _run_antigravity_auto_create(
         tmp_path,
         monkeypatch,
         session_id=session_id,
@@ -2750,7 +2752,7 @@ async def test_auto_create_antigravity_cold_start_port_timeout_keeps_placeholder
     is never called and bridge state retains the ``agy_conv_*`` placeholder.
     """
     session_id = "conv_agy_noport"
-    state, start_cascade_calls, forwarder_calls = await _run_antigravity_auto_create(
+    state, start_cascade_calls, reader_calls = await _run_antigravity_auto_create(
         tmp_path,
         monkeypatch,
         session_id=session_id,
@@ -2760,8 +2762,189 @@ async def test_auto_create_antigravity_cold_start_port_timeout_keeps_placeholder
     assert start_cascade_calls == []
     assert state is not None
     assert bridge_mod_is_placeholder(state.conversation_id)
-    # Forwarder still spawns regardless of the cold-start outcome.
-    assert len(forwarder_calls) == 1
+    # The RPC reader still spawns regardless of the cold-start outcome.
+    assert len(reader_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_create_antigravity_wires_reader_task_and_interaction_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Auto-create spawns the RPC reader task and wires its interaction bridge.
+
+    Asserts the Task 11b integration linchpin end-to-end against fakes:
+
+    * the background task is the ``antigravity-reader-{session_id}`` reader (NOT
+      the transcript forwarder), registered in the single-instance task slot;
+    * the reader is wired with an ``on_pending_interaction`` that, when a WAITING
+      interaction is handed to it, POSTs the Task 9 antigravity-elicitation hook
+      with ``{elicitation_id, params}``, then — on the human verdict — delivers
+      the answer to agy via ``handle_user_interaction`` (the bridge default).
+    """
+    import omnigent.antigravity_native_bridge as bridge_mod
+    import omnigent.antigravity_native_interactions as interactions_mod
+    import omnigent.antigravity_native_launch as launch_mod
+    import omnigent.antigravity_native_reader as reader_mod
+    import omnigent.antigravity_native_rpc as rpc_mod
+    import omnigent.runner.app as runner_app_mod
+    from omnigent.antigravity_native_interactions import agy_elicitation_id
+    from omnigent.antigravity_native_steps import pending_interaction
+
+    session_id = "conv_agy_wiring"
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    (tmp_path / "workspace").mkdir(parents=True, exist_ok=True)
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(
+        launch_mod, "build_agy_launch", lambda **_kwargs: (("agy",), {"AGY_ENV": "1"})
+    )
+    monkeypatch.setattr(bridge_mod, "ensure_agy_onboarding_complete", lambda: None)
+    monkeypatch.setattr(runner_app_mod, "_terminal_tmux_pane", lambda *_a, **_k: (None, None))
+    # Skip the 11a cold-start network work (resume launch → no StartCascade).
+    resume_id = "efb134b2-d69f-43de-bb54-c9ece346d8a3"
+    monkeypatch.setattr(rpc_mod, "_candidate_agy_rpc_ports", list)
+
+    # Capture the reader's wiring (client + on_pending_interaction) and park so the
+    # owning ``_run_antigravity_reader`` keeps its client open while we drive the
+    # callback. ``supervise_reader`` is patched at its definition module (the
+    # helper imports it lazily).
+    captured: dict[str, Any] = {}
+    wired = asyncio.Event()
+
+    def _capturing_reader(*_args: Any, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        wired.set()
+
+        async def _runner() -> None:
+            await asyncio.Event().wait()
+
+        return _runner()
+
+    monkeypatch.setattr(reader_mod, "supervise_reader", _capturing_reader)
+
+    # Control the reader's Omnigent client transport: record the elicitation hook
+    # POST and return the human's ACCEPT verdict as an ElicitationResult body.
+    hook_posts: list[tuple[str, dict[str, Any]]] = []
+
+    def _handle(request: httpx.Request) -> httpx.Response:
+        hook_posts.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={"action": "accept", "content": {}})
+
+    real_async_client = httpx.AsyncClient
+
+    def _mock_client(**kwargs: Any) -> httpx.AsyncClient:
+        kwargs.pop("transport", None)
+        return real_async_client(transport=httpx.MockTransport(_handle), **kwargs)
+
+    # ``_run_antigravity_reader`` builds its client via ``httpx.AsyncClient``; patch
+    # the httpx module itself (the reader is the only AsyncClient built on this
+    # auto-create path — the snapshot client is a hand-rolled fake) so its POSTs hit
+    # the MockTransport above instead of the network.
+    monkeypatch.setattr(httpx, "AsyncClient", _mock_client)
+
+    # The WAITING (permission) step the bridge re-reads at delivery time, and the
+    # ``handle_user_interaction`` delivery sink (the bridge's default ``deliver``).
+    waiting_step = json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "fixtures"
+            / "antigravity"
+            / "steps"
+            / "run_command_waiting.json"
+        ).read_text()
+    )
+    # ``_run_antigravity_reader``'s ``_get_steps`` closure binds
+    # ``get_trajectory_steps`` from the RPC module (a lazy function-local import),
+    # so patch it there (not the reader's re-export).
+    monkeypatch.setattr(rpc_mod, "get_trajectory_steps", lambda _port, _cid: [waiting_step])
+    delivered: list[dict[str, Any]] = []
+
+    def _fake_deliver(
+        port: int, cascade_id: str, *, trajectory_id: str, step_index: int, payload: Any
+    ) -> None:
+        delivered.append(
+            {
+                "port": port,
+                "cascade_id": cascade_id,
+                "trajectory_id": trajectory_id,
+                "step_index": step_index,
+                "payload": payload,
+            }
+        )
+
+    monkeypatch.setattr(interactions_mod, "handle_user_interaction", _fake_deliver)
+
+    class _SnapshotServerClient:
+        async def get(self, url: str, **_kwargs: Any) -> httpx.Response:
+            assert url == f"/v1/sessions/{session_id}"
+            return httpx.Response(
+                200,
+                json={"external_session_id": resume_id},
+                request=httpx.Request("GET", url),
+            )
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            *,
+            resource_role: str | None = None,
+            **_kwargs: Any,
+        ) -> SessionResourceView:
+            return SessionResourceView(
+                id="terminal_antigravity_main",
+                type="terminal",
+                session_id=session_id,
+                name="Antigravity",
+            )
+
+    try:
+        await _auto_create_antigravity_terminal(
+            session_id,
+            cast(SessionResourceRegistry, _FakeResourceRegistry()),
+            lambda _sid, _event: None,
+            server_client=cast(httpx.AsyncClient, _SnapshotServerClient()),
+        )
+        await asyncio.wait_for(wired.wait(), timeout=5.0)
+
+        # The single-instance task slot holds the reader task, named for the reader.
+        task = runner_app_mod._AUTO_FORWARDER_TASKS[session_id]
+        assert task.get_name() == f"antigravity-reader-{session_id}"
+
+        # Drive the captured wiring with a WAITING (permission) interaction, as the
+        # reader would when it observes one. Use the SAME cascade id + port the
+        # callback contract threads through.
+        port = 52548
+        pending = pending_interaction(waiting_step)
+        assert pending is not None
+        await captured["on_pending_interaction"](resume_id, port, pending)
+
+        # 1) It POSTed the antigravity-elicitation hook with {elicitation_id, params}.
+        assert len(hook_posts) == 1
+        path, body = hook_posts[0]
+        assert path == f"/v1/sessions/{session_id}/hooks/antigravity-elicitation-request"
+        assert body["elicitation_id"] == agy_elicitation_id(
+            resume_id, pending["trajectory_id"], pending["step_index"]
+        )
+        assert isinstance(body["params"], dict)
+
+        # 2) On the ACCEPT verdict it delivered the answer to agy via the bridge.
+        assert len(delivered) == 1
+        assert delivered[0]["cascade_id"] == resume_id
+        assert delivered[0]["port"] == port
+        assert delivered[0]["trajectory_id"] == pending["trajectory_id"]
+        assert delivered[0]["step_index"] == pending["step_index"]
+        assert delivered[0]["payload"] == {"permission": {"allow": True}}
+    finally:
+        await runner_app_mod._cancel_auto_forwarder_task(session_id)
 
 
 @pytest.mark.parametrize("parent_host_id", ["host_parent", None])

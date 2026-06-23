@@ -149,7 +149,12 @@ _StepKey = tuple[str | None, int | None]
 _EXTERNAL_SESSION_USAGE = "external_session_usage"
 _EXTERNAL_MODEL_CHANGE = "external_model_change"
 
-OnPendingInteraction = Callable[[PendingInteraction], Awaitable[None]]
+# Async callback handed each distinct WAITING interaction. It receives the SAME
+# ``cascade_id`` + connect-RPC ``port`` the reader discovered and is using, so the
+# Task 8 interaction bridge it drives targets agy's live conversation WITHOUT
+# re-discovering them (re-discovery could bind a recycled/foreign port). Args:
+# ``(cascade_id, port, pending)``.
+OnPendingInteraction = Callable[[str, int, PendingInteraction], Awaitable[None]]
 StopPredicate = Callable[[], bool]
 
 
@@ -514,7 +519,10 @@ async def supervise_reader(
         ``"conv_abc123"``.
     :param client: HTTP client for Omnigent event posts.
     :param on_pending_interaction: Async callback handed each distinct WAITING
-        interaction (the Task 8 interaction bridge). Invoked at most once per
+        interaction (the Task 8 interaction bridge), as
+        ``(cascade_id, port, pending)`` — the SAME cascade id + connect-RPC port
+        the reader discovered, so the bridge targets agy's live conversation
+        without re-discovering. Invoked at most once per
         ``(trajectory_id, step_index)``.
     :param poll_interval_s: Seconds between RPC polls (and discovery polls).
     :param stop: Optional predicate consulted once per loop iteration; when it
@@ -853,6 +861,8 @@ async def _process_committed_step(
     await _maybe_handle_interaction(
         step,
         key=key,
+        cascade_id=cascade_id,
+        port=state.port,
         interacted=state.interacted,
         on_pending_interaction=on_pending_interaction,
     )
@@ -1065,6 +1075,8 @@ async def _maybe_handle_interaction(
     step: dict[str, object],
     *,
     key: _StepKey,
+    cascade_id: str,
+    port: int,
     interacted: set[_StepKey],
     on_pending_interaction: OnPendingInteraction,
 ) -> None:
@@ -1074,10 +1086,15 @@ async def _maybe_handle_interaction(
     A non-WAITING step yields no interaction. A WAITING step is handed to the
     callback only the first time its ``(trajectory_id, step_index)`` is seen as
     pending, so a re-read of the same WAITING snapshot does not re-fire the
-    bridge.
+    bridge. The callback is handed the SAME ``cascade_id`` + ``port`` the reader
+    discovered, so the bridge it drives delivers against agy's live conversation
+    without re-discovering (which could bind a recycled/foreign port).
 
     :param step: One new RPC step dict.
     :param key: The step's identity key (already computed by the caller).
+    :param cascade_id: agy cascade id (equal to the conversation id) the reader
+        is bound to.
+    :param port: Validated connect-RPC port the reader is bound to.
     :param interacted: Set of interaction keys already handed to the bridge
         (mutated here).
     :param on_pending_interaction: Async callback for a distinct interaction.
@@ -1089,7 +1106,7 @@ async def _maybe_handle_interaction(
     if key in interacted:
         return
     interacted.add(key)
-    await on_pending_interaction(pending)
+    await on_pending_interaction(cascade_id, port, pending)
 
 
 async def _maybe_emit_session_usage(
