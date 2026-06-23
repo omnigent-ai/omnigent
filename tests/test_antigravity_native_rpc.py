@@ -899,3 +899,169 @@ def test_handle_user_interaction_raises_rpc_error_on_transport_error(
             step_index=0,
             payload={"permission": {"allow": True}},
         )
+
+
+# ---------------------------------------------------------------------------
+# send_user_cascade_message (unary RPC, Task T-A)
+# ---------------------------------------------------------------------------
+
+
+def test_send_user_cascade_message_posts_exact_nested_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``send_user_cascade_message`` POSTs a body with ``items[].text`` and
+    ``cascadeConfig.plannerConfig.planModel`` to ``SendUserCascadeMessage``.
+
+    The design specifies EXACT shapes: text MUST be in ``items[0].text`` (a list
+    of objects, NOT a flat "message"), and the model MUST be at
+    ``cascadeConfig.plannerConfig.planModel`` (omitting it causes agy to error
+    "neither PlanModel nor RequestedModel specified"). Asserts the full wire body
+    so a refactor cannot silently break either constraint.
+    """
+    seen: dict[str, object] = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["url"] = str(req.url)
+        seen["body"] = json.loads(req.content)
+        seen["content_type"] = req.headers.get("content-type")
+        return httpx.Response(200, json={})
+
+    monkeypatch.setattr(rpc, "_HTTP_TRANSPORT", httpx.MockTransport(handler))
+    rpc.send_user_cascade_message(
+        52548,
+        "conv-uuid",
+        "hello from omnigent",
+        plan_model="gemini-2.5-pro",
+    )
+    assert seen["url"] == (
+        "https://127.0.0.1:52548/exa.language_server_pb.LanguageServerService/"
+        "SendUserCascadeMessage"
+    )
+    assert seen["content_type"] == "application/json"
+    assert seen["body"] == {
+        "cascadeId": "conv-uuid",
+        "items": [{"text": "hello from omnigent"}],
+        "cascadeConfig": {"plannerConfig": {"planModel": "gemini-2.5-pro"}},
+    }
+
+
+def test_send_user_cascade_message_returns_none_on_200(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A 200 response causes ``send_user_cascade_message`` to return without raising.
+
+    The turn-send is fire-and-forget from the caller's perspective; the only
+    signal needed is "agy accepted" (200) vs "error" (raise). No exception on
+    200 mirrors ``handle_user_interaction``'s contract.
+    """
+    monkeypatch.setattr(
+        rpc,
+        "_HTTP_TRANSPORT",
+        httpx.MockTransport(lambda r: httpx.Response(200, json={})),
+    )
+    rpc.send_user_cascade_message(52548, "c", "hi", plan_model="m")  # must not raise
+
+
+def test_send_user_cascade_message_raises_rpc_error_on_500(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A non-2xx response raises ``AntigravityRpcError`` carrying the raw body text.
+
+    Mirrors ``handle_user_interaction``: the body is load-bearing so the executor
+    can surface model/validation error messages (e.g. "neither PlanModel nor
+    RequestedModel specified") without wrapping them in a generic string.
+    """
+    monkeypatch.setattr(
+        rpc,
+        "_HTTP_TRANSPORT",
+        httpx.MockTransport(
+            lambda r: httpx.Response(
+                500, json={"message": "neither PlanModel nor RequestedModel specified"}
+            )
+        ),
+    )
+    with pytest.raises(rpc.AntigravityRpcError) as exc_info:
+        rpc.send_user_cascade_message(52548, "c", "hi", plan_model="")
+    assert "PlanModel" in str(exc_info.value)
+
+
+def test_send_user_cascade_message_raises_rpc_error_on_transport_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A transport failure raises ``AntigravityRpcError``, NOT raw ``httpx.HTTPError``.
+
+    The executor catches ``AntigravityRpcError`` as the single failure surface;
+    a raw transport error bypassing that type would crash the executor. Mirrors
+    ``handle_user_interaction``'s transport-error contract.
+    """
+
+    def raise_transport(req: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    monkeypatch.setattr(rpc, "_HTTP_TRANSPORT", httpx.MockTransport(raise_transport))
+    with pytest.raises(rpc.AntigravityRpcError, match="transport error"):
+        rpc.send_user_cascade_message(52548, "c", "hi", plan_model="m")
+
+
+# ---------------------------------------------------------------------------
+# get_available_models (unary RPC, Task T-A)
+# ---------------------------------------------------------------------------
+
+
+def test_get_available_models_posts_empty_body_and_returns_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``get_available_models`` POSTs ``{}`` to ``GetAvailableModels`` and returns
+    the parsed response body (the full catalog dict).
+
+    The catalog shape is ``{"models": {<key>: {"model", "displayName", ...}}}``.
+    Asserts the URL and wire body so a refactor cannot silently change the method
+    or add unexpected request fields.
+    """
+    seen: dict[str, object] = {}
+    catalog = {
+        "models": {
+            "gemini-2.5-pro": {
+                "model": "gemini-2.5-pro",
+                "displayName": "Gemini 2.5 Pro",
+                "recommended": True,
+                "supportsThinking": True,
+                "thinkingBudget": 8192,
+            }
+        }
+    }
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["url"] = str(req.url)
+        seen["body"] = json.loads(req.content)
+        return httpx.Response(200, json=catalog)
+
+    monkeypatch.setattr(rpc, "_HTTP_TRANSPORT", httpx.MockTransport(handler))
+    result = rpc.get_available_models(52548)
+    assert seen["url"] == (
+        "https://127.0.0.1:52548/exa.language_server_pb.LanguageServerService/GetAvailableModels"
+    )
+    assert seen["body"] == {}
+    assert result == catalog
+
+
+def test_get_available_models_raises_on_500(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A non-2xx response from ``GetAvailableModels`` raises ``httpx.HTTPStatusError``.
+
+    Mirrors ``get_trajectory_steps``' error contract: a hard read failure raises
+    rather than silently returning ``{}``, so the executor gets a clear signal
+    that model resolution failed.
+    """
+    monkeypatch.setattr(
+        rpc,
+        "_HTTP_TRANSPORT",
+        httpx.MockTransport(lambda r: httpx.Response(500, json={"code": "unknown"})),
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        rpc.get_available_models(52548)

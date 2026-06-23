@@ -78,6 +78,8 @@ _METHOD_FORCE_STOP_CASCADE_TREE = "ForceStopCascadeTree"
 _METHOD_GET_CASCADE_TRAJECTORY_STEPS = "GetCascadeTrajectorySteps"
 _METHOD_CANCEL_CASCADE_STEPS = "CancelCascadeSteps"
 _METHOD_HANDLE_CASCADE_USER_INTERACTION = "HandleCascadeUserInteraction"
+_METHOD_SEND_USER_CASCADE_MESSAGE = "SendUserCascadeMessage"
+_METHOD_GET_AVAILABLE_MODELS = "GetAvailableModels"
 
 _LOOPBACK = "127.0.0.1"
 
@@ -504,6 +506,124 @@ def handle_user_interaction(
         raise AntigravityRpcError(f"transport error contacting agy: {e}") from e
     if response.status_code >= 400:
         raise AntigravityRpcError(response.text)
+
+
+def send_user_cascade_message(
+    port: int,
+    cascade_id: str,
+    text: str,
+    *,
+    plan_model: str,
+) -> None:
+    """
+    Send a user turn to agy via connect-RPC (replaces tmux send-keys).
+
+    POSTs ``{"cascadeId": cascade_id, "items": [{"text": text}],
+    "cascadeConfig": {"plannerConfig": {"planModel": plan_model}}}`` to
+    ``SendUserCascadeMessage``. This records the turn as
+    ``CORTEX_STEP_TYPE_USER_INPUT`` with
+    ``metadata.source==CORTEX_STEP_SOURCE_USER_EXPLICIT``, which the read
+    driver keys on — in contrast to ``SendAgentMessage`` which records as a
+    ``SYSTEM_MESSAGE`` and is therefore unsuitable.
+
+    Two shape constraints (live-verified against agy 1.0.10, see §10.1 of the
+    design doc):
+
+    * The turn text MUST be in ``items[].text`` (a list of objects) — a flat
+      ``"message"`` field is not the correct schema.
+    * The ``plan_model`` MUST be present at
+      ``cascadeConfig.plannerConfig.planModel``; omitting it causes agy to
+      error "neither PlanModel nor RequestedModel specified".
+
+    :param port: Validated connect-RPC port, e.g. ``52548``.
+    :param cascade_id: agy cascade id (equal to the conversation id) to send
+        the turn to.
+    :param text: The turn text to send (the user's message).
+    :param plan_model: agy model enum string, resolved at runtime via
+        :func:`get_available_models` or echoed from the read-side
+        ``userInput.userConfig.plannerConfig.requestedModel.model``. Must not
+        be empty or omitted.
+    :returns: ``None`` on success (HTTP 200).
+    :raises AntigravityRpcError: On transport errors (e.g. connection refused)
+        or any HTTP status >= 400. Transport errors are wrapped so the executor
+        has one exception type to catch. On non-2xx, the raw response body text
+        is the message (NOT ``raise_for_status()``) so callers can surface agy
+        model/validation errors (e.g. "neither PlanModel nor RequestedModel
+        specified") directly. Mirrors :func:`handle_user_interaction`.
+    """
+    url = _rpc_url(port, _METHOD_SEND_USER_CASCADE_MESSAGE)
+    _assert_loopback_url(url)
+    body: dict[str, object] = {
+        "cascadeId": cascade_id,
+        "items": [{"text": text}],
+        "cascadeConfig": {"plannerConfig": {"planModel": plan_model}},
+    }
+    try:
+        with _sync_client(_PROBE_TIMEOUT_S) as client:
+            response = client.post(
+                url,
+                headers={"Content-Type": "application/json"},
+                content=json.dumps(body).encode("utf-8"),
+            )
+    except httpx.HTTPError as e:
+        raise AntigravityRpcError(f"transport error contacting agy: {e}") from e
+    if response.status_code >= 400:
+        raise AntigravityRpcError(response.text)
+
+
+def get_available_models(port: int) -> dict[str, object]:
+    """
+    Return the agy model catalog from ``GetAvailableModels``.
+
+    POSTs ``{}`` to ``GetAvailableModels`` and returns the full parsed response
+    body. Used to resolve a model enum string at runtime for
+    :func:`send_user_cascade_message` (the model is required per-turn and must
+    not be hardcoded — ``planModel`` values are version-volatile enums).
+
+    The response shape (live-verified, agy 1.0.10) is::
+
+        {"models": {
+            "<key>": {
+                "model": "<enum-string>",
+                "displayName": "<human label>",
+                "recommended": <bool>,
+                "supportsThinking": <bool>,
+                "thinkingBudget": <int>
+            },
+            ...
+        }}
+
+    Callers should key on ``response["models"]`` and pick the desired entry by
+    ``recommended == True`` or by matching the ``displayName`` / ``model``
+    string the user selected. The echo-from-read-side shortcut
+    (``userInput.userConfig.plannerConfig.requestedModel.model``) is preferred
+    when the current model is already known from a prior turn's step data —
+    call this only when no prior model is available.
+
+    :param port: Validated connect-RPC port, e.g. ``52548``.
+    :returns: The full parsed response body (a dict, at minimum
+        ``{"models": {...}}``). Returns ``{}`` if the 200 body is not a dict
+        (guards against a future agy returning a non-object 200).
+    :raises httpx.HTTPError: On transport errors or non-2xx responses; the
+        executor is responsible for retry/backoff. Intentionally NOT fail-open
+        (mirrors :func:`get_trajectory_steps`): a non-2xx is a hard read
+        failure, not a "not found" signal.
+    :raises ValueError: When the 2xx response body is not valid JSON (body is
+        decoded; the caller catches broadly).
+    """
+    url = _rpc_url(port, _METHOD_GET_AVAILABLE_MODELS)
+    _assert_loopback_url(url)
+    with _sync_client(_PROBE_TIMEOUT_S) as client:
+        response = client.post(
+            url,
+            headers={"Content-Type": "application/json"},
+            content=b"{}",
+        )
+    # Raises httpx.HTTPStatusError (subclass of httpx.HTTPError) on non-2xx so
+    # the body is never decoded on error paths (which may not be JSON).
+    response.raise_for_status()
+    body = response.json()  # ValueError on non-JSON 200 propagates (documented)
+    return body if isinstance(body, dict) else {}
 
 
 def _list_agy_pids() -> list[int]:
