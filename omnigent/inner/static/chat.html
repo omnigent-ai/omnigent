@@ -4,11 +4,15 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Omnigent Chat</title>
-<!-- Markdown + syntax highlighting + HTML sanitization from CDN -->
-<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/github-dark.min.css">
-<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"></script>
+<!-- Markdown + syntax highlighting + HTML sanitization from CDN.
+     Versions are pinned and protected with Subresource Integrity (SRI):
+     the browser refuses to run a file whose hash doesn't match, so a
+     compromised/swapped CDN asset can't inject code. Bumping a version
+     requires regenerating the matching integrity hash. -->
+<script src="https://cdn.jsdelivr.net/npm/marked@18.0.5/lib/marked.umd.min.js" integrity="sha512-7W46WS6vPCNlOKFEEO1KksrE1R2BfdQoBF9vUTz+mlGqaYrNNDDBqIe+Ckd1alkxeVr0A8M3ISkA34kc+hFGjQ==" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.4.11/dist/purify.min.js" integrity="sha512-lBPWWUhZJjVB3av+jFeCwgle3o8VaQIQu867R9fZh4HlNdPl/9/jeGVayR4BEV635JFXnVecK52KIBEu7UH9Ug==" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.11.1/build/styles/github-dark.min.css" integrity="sha512-rO+olRTkcf304DQBxSWxln8JXCzTHlKnIdnMUwYvQa9/Jd4cQaNkItIUj6Z4nvW1dqK0SKXLbn9h4KwZTNtAyw==" crossorigin="anonymous">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.11.1/build/highlight.min.js" integrity="sha512-EBLzUL8XLl+va/zAsmXwS7Z2B1F9HUHkZwyS/VKwh3S7T/U0nF4BaU29EP/ZSf6zgiIxYAnKLu6bJ8dqpmX5uw==" crossorigin="anonymous"></script>
 <style>
 :root {
   --bg: #f8f9fa; --fg: #1a1a2e; --muted: #f0f0f0; --muted-fg: #6b7280;
