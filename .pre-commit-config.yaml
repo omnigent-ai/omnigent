@@ -75,6 +75,19 @@ repos:
         files: ^uv\.lock$
         pass_filenames: true
 
+      # Same hazard for npm: a local `npm install` against the Databricks npm
+      # proxy bakes that host into package-lock.json `resolved` URLs, and
+      # `npm ci` fetches from those URLs regardless of NPM_CONFIG_REGISTRY —
+      # breaking every frontend CI job (the proxy is unreachable from public
+      # runners). Normalize tarball hosts back to registry.npmjs.org before they
+      # land. Fixer: re-stage if it changes.
+      - id: normalize-npm-lock-registry
+        name: normalize ap-web/package-lock.json registry to npmjs.org
+        language: system
+        entry: .venv/bin/python scripts/normalize_npm_lock_registry.py
+        files: ^ap-web/package-lock\.json$
+        pass_filenames: true
+
   # ── File hygiene ────────────────────────────────────────────────
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0
