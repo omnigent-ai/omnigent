@@ -2083,7 +2083,7 @@ describe("Files scope default and persistence", () => {
     fireEvent.click(screen.getByRole("button", { name: /files: switch to changed/i }));
     expect(screen.getByTestId("files-panel")).toHaveAttribute("data-flat-view", "true");
     // The choice was written to localStorage — that's what makes it sticky.
-    expect(localStorage.getItem(PREF_KEY)).toBe(JSON.stringify({ changedOnly: true }));
+    expect(localStorage.getItem(PREF_KEY)).toBe(JSON.stringify({ changedOnly: true, sort: "recent" }));
 
     // Re-enter a *different* session fresh: it must open on the remembered
     // "Changed" scope. cleanup() unmounts the shell but does NOT touch
@@ -2186,7 +2186,7 @@ describe("Files scope default and persistence", () => {
     // The deep-link override is transient: it must NOT rewrite the stored
     // preference. If this flips to changedOnly:false, a shared ?view=explore
     // link would silently clobber the recipient's remembered choice.
-    expect(localStorage.getItem(PREF_KEY)).toBe(JSON.stringify({ changedOnly: true }));
+    expect(localStorage.getItem(PREF_KEY)).toBe(JSON.stringify({ changedOnly: true, sort: "recent" }));
   });
 });
 
