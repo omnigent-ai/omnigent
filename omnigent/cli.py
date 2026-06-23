@@ -4797,7 +4797,7 @@ def resume(
 _HARNESS_CHOICES_HELP = (
     "'claude' (alias for 'claude-sdk'), 'claude-sdk', 'codex', "
     "'cursor', "
-    "'openai-agents', 'open-responses', 'pi', 'antigravity', or 'qwen'"
+    "'openai-agents', 'open-responses', 'pi', 'antigravity', 'qwen', or 'goose'"
 )
 _HARNESS_HELP = f"Harness to use for a local agent: {_HARNESS_CHOICES_HELP}."
 _RUN_HARNESS_HELP = (
@@ -4833,6 +4833,9 @@ _DEFAULT_HARNESS_PROMPTS = {
         "You are Qwen Code, running through Omnigent. "
         "Help the user with software engineering tasks."
     ),
+    "goose": (
+        "You are Goose, running through Omnigent. Help the user with software engineering tasks."
+    ),
 }
 _DEFAULT_HARNESS_PROMPT = "You are a helpful coding agent running through Omnigent."
 
@@ -4842,7 +4845,7 @@ _DEFAULT_HARNESS_PROMPT = "You are a helpful coding agent running through Omnige
 # operations route through the Omnigent dispatch path (runner
 # visibility, timeouts, error recovery) instead of the harness's
 # internal built-in tools.
-_OS_ENV_HARNESSES: frozenset[str] = frozenset({"claude-sdk", "codex", "pi", "qwen"})
+_OS_ENV_HARNESSES: frozenset[str] = frozenset({"claude-sdk", "codex", "pi", "qwen", "goose"})
 
 
 def _validate_harness(harness: str) -> None:

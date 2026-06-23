@@ -178,6 +178,9 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "native-cursor": CURSOR_KEY,
     "goose-native": GOOSE_KEY,
     "native-goose": GOOSE_KEY,
+    # Headless Goose (``harness: goose``, drives ``goose acp``) wraps the same
+    # ``goose`` CLI as the native TUI, so it gates on the same binary.
+    GOOSE_KEY: GOOSE_KEY,
     QWEN_KEY: QWEN_KEY,
     "qwen-code": QWEN_KEY,
 }

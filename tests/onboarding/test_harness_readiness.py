@@ -140,7 +140,9 @@ def test_configured_harness_map_covers_all_spellings(
         # Native Cursor (``omni cursor``) — gates on the cursor-agent CLI.
         "cursor-native",
         "native-cursor",
-        # Native Goose (``omni goose``) — gates on the goose CLI.
+        # Goose — native TUI (``omni goose``) + headless ACP harness; both gate
+        # on the goose CLI.
+        "goose",
         "goose-native",
         "native-goose",
         # Antigravity SDK harness + its user-facing aliases.

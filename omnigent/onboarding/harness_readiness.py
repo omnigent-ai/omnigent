@@ -135,10 +135,12 @@ def harness_is_configured(harness: str) -> bool:
         # state surfaces at run time; the daemon gates only on binary presence,
         # mirroring the other native harnesses.)
         return harness_cli_installed(CURSOR_KEY)
-    if canonical in _GOOSE_NATIVE_HARNESSES:
-        # Native Goose (``omni goose``) wraps the ``goose`` CLI — gate on that
-        # binary. Auth/provider state surfaces at run time via Goose's own
-        # config; the daemon gates only on binary presence.
+    if canonical in _GOOSE_NATIVE_HARNESSES or canonical == GOOSE_KEY:
+        # Goose — both the native TUI (``goose-native`` / ``native-goose``, via
+        # ``omni goose``) and the headless ACP harness (``goose``, drives
+        # ``goose acp``) — wraps the ``goose`` CLI, so gate on that binary.
+        # Auth/provider state surfaces at run time via Goose's own config; the
+        # daemon gates only on binary presence.
         return harness_cli_installed(GOOSE_KEY)
     if canonical == CURSOR_KEY:
         # Cursor runs in-process via ``cursor-sdk`` and authenticates with a
@@ -190,4 +192,5 @@ def configured_harness_map() -> dict[str, bool]:
     spellings.update(_GOOSE_NATIVE_HARNESSES)
     spellings.update(_QWEN_HARNESSES)
     spellings.add(CURSOR_KEY)
+    spellings.add(GOOSE_KEY)  # headless Goose (``goose acp``) gates on the goose binary
     return {spelling: harness_is_configured(spelling) for spelling in spellings}

@@ -83,6 +83,11 @@ _HARNESS_MODULES: dict[str, str] = {
     # Qwen Code harness wrap. See omnigent/inner/qwen_harness.py.
     # Drives the ``qwen`` CLI in ACP mode (``qwen --acp``) for agent execution.
     "qwen": "omnigent.inner.qwen_harness",
+    # Headless Goose harness wrap. See omnigent/inner/goose_harness.py.
+    # Drives Block's ``goose`` CLI in ACP mode (``goose acp``) — the chat-first
+    # counterpart to the terminal-first ``goose-native`` TUI harness. Tool
+    # approvals surface as web elicitation cards via session/request_permission.
+    "goose": "omnigent.inner.goose_harness",
 }
 
 __all__ = ["_HARNESS_MODULES"]
