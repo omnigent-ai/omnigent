@@ -106,4 +106,16 @@ describe("fetchLastAssistantText", () => {
     fetchMock.mockRejectedValue(new Error("network"));
     expect(await fetchLastAssistantText("conv_a")).toBeUndefined();
   });
+
+  it("prefixes the items endpoint with the configured base path", async () => {
+    window.__OMNIGENT_BASE_PATH__ = "/proxy/6767";
+    try {
+      fetchMock.mockResolvedValue(okResponse([]));
+      await fetchLastAssistantText("conv_a");
+      const url = fetchMock.mock.calls[0][0] as string;
+      expect(url).toContain("/proxy/6767/v1/sessions/conv_a/items");
+    } finally {
+      delete window.__OMNIGENT_BASE_PATH__;
+    }
+  });
 });

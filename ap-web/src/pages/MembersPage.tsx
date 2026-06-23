@@ -24,6 +24,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "@/lib/routing";
+import { withBasePath } from "@/lib/basePath";
 import { CopyIcon, KeyRoundIcon, RefreshCwIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -434,7 +435,11 @@ function CopyableValue({ value }: { value: string }) {
 function rebaseUrl(serverUrl: string): string {
   try {
     const parsed = new URL(serverUrl);
-    return `${window.location.origin}${parsed.pathname}${parsed.search}${parsed.hash}`;
+    // Apply the deployment base path (e.g. `/proxy/6767`) so the invite link
+    // resolves under a subpath proxy. `withBasePath` is idempotent, so a server
+    // that already emits a prefixed path (via OMNIGENT_ACCOUNTS_BASE_URL) is
+    // left unchanged.
+    return `${window.location.origin}${withBasePath(parsed.pathname)}${parsed.search}${parsed.hash}`;
   } catch {
     return serverUrl;
   }

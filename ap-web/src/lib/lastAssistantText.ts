@@ -13,6 +13,8 @@
 // unexpected wire shape all resolve to `undefined`, and the caller falls back
 // to the generic body. This module never takes down the notification path.
 
+import { hostFetch } from "./host";
+
 /**
  * How many trailing items to scan for the last assistant message. A turn
  * usually ends on the assistant's final message, but it may be followed by a
@@ -104,7 +106,9 @@ export async function fetchLastAssistantText(
 ): Promise<string | undefined> {
   try {
     const params = new URLSearchParams({ limit: String(SCAN_ITEMS), order: "desc" });
-    const res = await fetch(`/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`);
+    // `hostFetch` applies the deployment base path (e.g. `/proxy/6767`) in
+    // standalone and routes through the embed host transport when embedded.
+    const res = await hostFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`);
     if (!res.ok) return undefined;
     const json = (await res.json()) as { data?: unknown };
     const items = Array.isArray(json.data) ? json.data : [];

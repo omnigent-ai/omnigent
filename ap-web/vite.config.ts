@@ -123,7 +123,14 @@ if (useAuth) {
 
 const proxyConfig = createProxyConfig(OMNIGENT_URL, useAuth);
 
-export default defineConfig({
+export default defineConfig(({ command }) => ({
+  // Relative asset base for production builds so the SPA can be served under
+  // any path prefix (e.g. code-server's `/proxy/6767/`): dynamic code-split
+  // chunks and the Monaco worker then resolve relative to `import.meta.url`
+  // instead of a hardcoded `/assets/...`. The server rewrites the entry/preload
+  // refs in `index.html` to absolute `{base}/assets/...` at serve time (see
+  // `_rewrite_web_ui_index`). Dev (`vite serve`) stays at root.
+  base: command === "build" ? "./" : "/",
   plugins: [react(), tailwindcss()],
   resolve: {
     alias: {
@@ -160,4 +167,4 @@ export default defineConfig({
     outDir: path.resolve(__dirname, "../omnigent/server/static/web-ui"),
     emptyOutDir: true,
   },
-});
+}));
