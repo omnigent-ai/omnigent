@@ -607,6 +607,15 @@ class _ReaderState:
         reader run (fetched once on first model-change detection; ``None``
         until needed).
     :param port: Validated connect-RPC port used for lazy catalog fetch.
+    :param cumulative_input_tokens: Running session total of input tokens
+        accumulated across all PLANNER_RESPONSE DONE steps this run. The server
+        treats ``external_session_usage.cumulative_input_tokens`` as a SET
+        (new value = current total), so we must sum, not emit per-call values.
+        Reset to 0 at the start of each reader run; T-G /clear rotation must
+        also zero this when it rotates to a fresh conversation.
+    :param cumulative_output_tokens: Running session total of output tokens.
+    :param cumulative_cache_read_input_tokens: Running session total of
+        cache-read input tokens.
     """
 
     allocator: _ToolCallIdAllocator
@@ -617,6 +626,9 @@ class _ReaderState:
     posted_model_enum: str | None = None
     model_catalog: dict[str, object] | None = None
     port: int = 0
+    cumulative_input_tokens: int = 0
+    cumulative_output_tokens: int = 0
+    cumulative_cache_read_input_tokens: int = 0
 
 
 async def _poll_loop(
@@ -1090,10 +1102,18 @@ async def _maybe_emit_session_usage(
     """
     Emit ``external_session_usage`` when a PLANNER_RESPONSE DONE carries usage.
 
-    Maps agy's string-int ``modelUsage`` fields onto the Omnigent event shape
-    (design §10.3). The model enum is resolved to a displayName via the cached
-    catalog (the catalog was already fetched for model-change detection; if
-    it has not been fetched yet it is fetched here and cached).
+    The server treats ``cumulative_input_tokens`` / ``cumulative_output_tokens``
+    / ``cumulative_cache_read_input_tokens`` as SET semantics — the posted value
+    IS the new session total, and the server prices the per-turn delta as
+    (new − old). agy's ``step.metadata.modelUsage`` fields are PER-MODEL-CALL
+    (not cumulative), so we accumulate them in ``state`` and emit the running
+    totals. This matches codex's behaviour (``tokenUsage.total`` is a cumulative
+    thread-wide counter, forwarded as SET values by
+    :class:`~omnigent.codex_native_forwarder._SessionUsageCoalescer`).
+
+    NOTE: ``state.cumulative_*`` accumulators are zeroed at reader-run start;
+    T-G /clear rotation must also zero them when rotating to a fresh conversation
+    so the new session's cost badge starts from 0.
 
     De-dup is via ``state.seen``: this function is only called inside the
     ``key not in state.seen`` branch of :func:`_process_committed_step`, so
@@ -1102,24 +1122,50 @@ async def _maybe_emit_session_usage(
     :param step: One RPC step dict (must be a PLANNER_RESPONSE DONE).
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id.
-    :param state: Per-run trackers (port + model_catalog cache).
+    :param state: Per-run trackers (accumulators + port + model_catalog).
     :returns: None.
     """
-    usage = _model_usage_from_step(step)
-    if not usage:
+    per_call = _model_usage_from_step(step)
+    if not per_call:
         return
+
+    def _int_field(d: dict[str, object], key: str) -> int:
+        """Return ``d[key]`` as an int, or 0 when absent / not an int."""
+        val = d.get(key, 0)
+        return val if isinstance(val, int) else 0
+
+    # Accumulate per-call values into running session totals (SET semantics).
+    state.cumulative_input_tokens += _int_field(per_call, "cumulative_input_tokens")
+    state.cumulative_output_tokens += _int_field(per_call, "cumulative_output_tokens")
+    state.cumulative_cache_read_input_tokens += _int_field(
+        per_call, "cumulative_cache_read_input_tokens"
+    )
     # Resolve the raw model enum to a displayName if the catalog is available.
-    model_enum = usage.get("model")
+    model_enum = per_call.get("model")
+    display_name: str | None = None
     if isinstance(model_enum, str) and model_enum:
         catalog = await _ensure_catalog(state)
-        usage["model"] = _resolve_display_name(model_enum, catalog)
+        display_name = _resolve_display_name(model_enum, catalog)
+    # Build the cumulative payload (SET-semantics running totals).
+    payload: dict[str, object] = {}
+    if state.cumulative_input_tokens > 0:
+        payload["cumulative_input_tokens"] = state.cumulative_input_tokens
+    if state.cumulative_output_tokens > 0:
+        payload["cumulative_output_tokens"] = state.cumulative_output_tokens
+    if state.cumulative_cache_read_input_tokens > 0:
+        payload["cumulative_cache_read_input_tokens"] = state.cumulative_cache_read_input_tokens
+    if display_name is not None:
+        payload["model"] = display_name
+    if not payload:
+        return
+    step_idx = _step_index(step) or 0
     await _post_event(
         client,
         session_id,
         OutboundEvent(
             event_type=_EXTERNAL_SESSION_USAGE,
-            data=usage,
-            step_index=0,
+            data=payload,
+            step_index=step_idx,
         ),
     )
 
@@ -1156,13 +1202,14 @@ async def _maybe_emit_model_change(
         return
     catalog = await _ensure_catalog(state)
     display_name = _resolve_display_name(model_enum, catalog)
+    step_idx = _step_index(step) or 0
     await _post_event(
         client,
         session_id,
         OutboundEvent(
             event_type=_EXTERNAL_MODEL_CHANGE,
             data={"model": display_name},
-            step_index=0,
+            step_index=step_idx,
         ),
     )
     state.posted_model_enum = model_enum

@@ -1466,3 +1466,57 @@ async def test_unknown_model_enum_posts_raw_enum(
     assert len(model_change_events) == 1
     # Falls back to the raw enum when the catalog does not contain it.
     assert model_change_events[0][1]["model"] == unknown_enum
+
+
+@pytest.mark.asyncio
+async def test_two_turn_usage_is_cumulative(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """Two turns each with 1000 input tokens → turn 1 posts 1000, turn 2 posts 2000.
+
+    Regression guard for the SET-semantics bug: if the reader emitted per-call
+    values, turn 2 would also post 1000, causing the server to compute a zero
+    delta for that turn and the cost badge to freeze after turn 1.
+    """
+    planner_turn1 = _planner_with_model_usage(
+        step_index=2,
+        input_tokens="1000",
+        output_tokens="50",
+        cache_read_tokens="100",
+    )
+    planner_turn2 = _planner_with_model_usage(
+        step_index=6,
+        input_tokens="1000",
+        output_tokens="50",
+        cache_read_tokens="100",
+    )
+    # Two separate DONE planner steps (different step indices = different turns).
+    frames = [
+        _frame([planner_turn1]),
+        _frame([planner_turn1, planner_turn2]),
+    ]
+    sink = _PostSink()
+
+    await _run_with_telemetry(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    usage_events = [(et, d) for et, d in sink.posts if et == "external_session_usage"]
+    assert len(usage_events) == 2, (
+        f"expected 2 usage events (one per turn), got {len(usage_events)}"
+    )
+    # Turn 1: per-call values (first turn, cumulative == per-call).
+    assert usage_events[0][1]["cumulative_input_tokens"] == 1000
+    assert usage_events[0][1]["cumulative_output_tokens"] == 50
+    assert usage_events[0][1]["cumulative_cache_read_input_tokens"] == 100
+    # Turn 2: RUNNING total (2000 input, not 1000 again).
+    assert usage_events[1][1]["cumulative_input_tokens"] == 2000
+    assert usage_events[1][1]["cumulative_output_tokens"] == 100
+    assert usage_events[1][1]["cumulative_cache_read_input_tokens"] == 200
