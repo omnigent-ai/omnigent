@@ -78,6 +78,62 @@ from omnigent.tools.builtins.load_skill import (
 _logger = logging.getLogger(__name__)
 
 
+# ── session.status "waiting" backwards-compat (new runner ↔ old server) ──
+# The runner emits ``session.status: "waiting"`` when a turn ends with sub-agents
+# still running (PR #930, for the headless ``-p`` fast-exit). Servers older than
+# 0.3.0 don't model "waiting" — their ``SessionResponse.status`` is
+# ``Literal["idle","running","failed"]`` — and 500 on ``GET /v1/sessions`` when
+# they try to serialize the cached value. So we resolve the server version once
+# (``_get_server_version``) and, when publishing status, downgrade
+# "waiting"→"running" unless that version supports it
+# (``_version_supports_waiting_status``). An unknown version — unprobed or a
+# probe failure — downgrades too, so an old server is never 500'd.
+_WAITING_STATUS_MIN_SERVER_VERSION = "0.3.0"
+# Cached server version from the /api/version probe; ``None`` until a probe
+# succeeds. A failed probe stays ``None`` and is retried on the next
+# session-create — the GET is cheap and self-heals a transient failure.
+_server_version: str | None = None
+
+
+def _version_supports_waiting_status(server_version: str) -> bool:
+    """
+    Whether *server_version* can serialize ``session.status: "waiting"``.
+
+    :param server_version: The server's reported version, e.g. ``"0.2.0"`` or
+        ``"0.3.0.dev0"``.
+    :returns: ``True`` iff the server's PEP 440 release tuple is ``>= 0.3.0``
+        (the release that added "waiting" to the session-status model).
+    """
+    from packaging.version import Version
+
+    return Version(server_version).release >= Version(_WAITING_STATUS_MIN_SERVER_VERSION).release
+
+
+async def _get_server_version(server_client: httpx.AsyncClient) -> str | None:
+    """
+    Resolve the server's version via a one-time ``GET /api/version`` probe.
+
+    Memoized once it succeeds: later calls return the cached version. A failed
+    probe returns ``None`` and is retried on the next call, so callers fail safe
+    (treat an unknown version as not supporting newer behavior).
+
+    :param server_client: The runner's httpx client pointed at the server.
+    :returns: The server's reported version (e.g. ``"0.2.0"``), or ``None`` when
+        the probe has not yet succeeded.
+    """
+    global _server_version
+    if _server_version is not None:
+        return _server_version
+    try:
+        resp = await server_client.get("/api/version")
+        resp.raise_for_status()
+        _server_version = resp.json()["version"]
+        _logger.info("resolved server version: %s", _server_version)
+    except Exception as exc:  # noqa: BLE001 — degrade gracefully; never 500 an old server
+        _logger.warning("could not probe server /api/version (%s); treating as unknown", exc)
+    return _server_version
+
+
 def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
     """
     Log *exc* in full and return a generic detail string safe for clients.
@@ -5354,6 +5410,12 @@ def create_runner_app(
                 },
             )
 
+        # Resolve the server version once so _publish_turn_status can downgrade
+        # session.status "waiting"->"running" for servers too old to accept it
+        # (< 0.3.0) — they'd otherwise 500 on GET /v1/sessions. Memoized; only
+        # the first session-create on this runner pays the cheap GET.
+        await _get_server_version(server_client)
+
         # Resolve the spec once — derive harness config from it and
         # cache it for resource endpoints (filesystem, terminals)
         # that may fire before the first turn dispatches.
@@ -6804,6 +6866,14 @@ def create_runner_app(
             ``None`` for ``running`` / ``idle``.
         :returns: None.
         """
+        # Backwards-compat: servers older than 0.3.0 can't serialize "waiting"
+        # and 500 on GET /v1/sessions. Downgrade it to "running" unless the
+        # resolved server version supports it; an unknown version (unprobed or
+        # probe failure) downgrades too (safe default). See _get_server_version.
+        if status == "waiting" and not (
+            _server_version is not None and _version_supports_waiting_status(_server_version)
+        ):
+            status = "running"
         # An unresolved spec (``_session_harness_name`` → ``None``) means the
         # session hasn't resolved a terminal-backed harness yet, so no native
         # observer is known and the turn lifecycle is still the only status
