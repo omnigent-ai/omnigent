@@ -114,3 +114,33 @@ describe("LoginPage sanitizeReturnTo open-redirect defense", () => {
     expect(hrefWrites[0]).not.toContain("evil.com");
   });
 });
+
+describe("LoginPage return_to under a base path", () => {
+  beforeEach(() => {
+    window.__OMNIGENT_BASE_PATH__ = "/proxy/6767";
+  });
+  afterEach(() => {
+    delete window.__OMNIGENT_BASE_PATH__;
+  });
+
+  it("defaults to the base root (not origin root) when no return_to is given", async () => {
+    renderLoginAt("");
+    await waitFor(() => expect(hrefWrites.length).toBeGreaterThan(0));
+    expect(hrefWrites[0]).toBe("/proxy/6767/");
+  });
+
+  it("falls back to the base root for an off-origin return_to", async () => {
+    renderLoginAt("https://evil.com");
+    await waitFor(() => expect(hrefWrites.length).toBeGreaterThan(0));
+    expect(hrefWrites[0]).toBe("/proxy/6767/");
+    expect(hrefWrites[0]).not.toContain("evil.com");
+  });
+
+  it("preserves a legitimate base-prefixed return_to unchanged", async () => {
+    // The captured return_to already carries the base prefix; it must be used
+    // as-is so the post-reload BrowserRouter (basename) matches the route.
+    renderLoginAt("%2Fproxy%2F6767%2Fsessions%2Fabc");
+    await waitFor(() => expect(hrefWrites.length).toBeGreaterThan(0));
+    expect(hrefWrites[0]).toBe("/proxy/6767/sessions/abc");
+  });
+});

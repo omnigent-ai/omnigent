@@ -40,6 +40,28 @@ def test_normalize_base_path(raw: str | None, expected: str) -> None:
     assert app_module._normalize_base_path(raw) == expected
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '"/><img src=x onerror=alert(1)>',  # HTML-attribute breakout
+        '/proxy" onload="alert(1)',  # quote breakout
+        "/proxy/6767</script><script>",  # script breakout
+        "/a b",  # space
+        "/a\\b",  # backslash
+    ],
+)
+def test_normalize_base_path_rejects_unsafe_chars(raw: str) -> None:
+    """A base path with non-URL-path characters is rejected loudly, not served."""
+    with pytest.raises(ValueError, match="base path"):
+        app_module._normalize_base_path(raw)
+
+
+@pytest.mark.parametrize("raw", ["/proxy/6767", "/a-b_c.d~e/f%20g", "/v1/app"])
+def test_normalize_base_path_allows_safe_url_chars(raw: str) -> None:
+    """Ordinary URL path characters (incl. percent-encoding) are accepted."""
+    assert app_module._normalize_base_path(raw) == raw
+
+
 def test_rewrite_web_ui_index_absolute_when_no_base() -> None:
     """With no base, relative Vite asset refs become root-absolute and no global is injected."""
     html = (

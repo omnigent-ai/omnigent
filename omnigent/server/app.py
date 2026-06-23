@@ -2025,6 +2025,16 @@ def _apply_web_ui_cache_headers(response: Response, path: str) -> Response:
     return response
 
 
+# URL-path characters safe to splice into both an HTML attribute and a routing
+# prefix without escaping: RFC 3986 unreserved + the path separator + percent
+# (for encoded segments). Anything else — quotes, angle brackets, spaces,
+# backslashes — is rejected so a misconfigured base path can't break out of the
+# index.html it is rewritten into.
+_BASE_PATH_ALLOWED = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/%"
+)
+
+
 def _normalize_base_path(value: str | None) -> str:
     """
     Normalize a public base path to a leading-slash, no-trailing-slash string.
@@ -2035,6 +2045,8 @@ def _normalize_base_path(value: str | None) -> str:
 
     :param value: Raw base path, e.g. ``"/proxy/6767/"`` or ``"proxy/6767"``.
     :returns: Normalized path (``"/proxy/6767"``) or ``""``.
+    :raises ValueError: If the path contains characters outside the safe
+        URL-path set (it is spliced into ``index.html`` unescaped).
     """
     if not value:
         return ""
@@ -2043,7 +2055,14 @@ def _normalize_base_path(value: str | None) -> str:
         return ""
     if not trimmed.startswith("/"):
         trimmed = f"/{trimmed}"
-    return trimmed.rstrip("/")
+    trimmed = trimmed.rstrip("/")
+    invalid = set(trimmed) - _BASE_PATH_ALLOWED
+    if invalid:
+        raise ValueError(
+            f"Invalid base path {value!r}: only URL path characters "
+            f"(letters, digits, '-._~/%') are allowed, got {sorted(invalid)!r}."
+        )
+    return trimmed
 
 
 def _rewrite_web_ui_index(html: str, base_path: str) -> str:
