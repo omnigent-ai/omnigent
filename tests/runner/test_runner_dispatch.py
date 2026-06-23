@@ -56,7 +56,7 @@ from omnigent.runner.app import (
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
-from omnigent.spec.types import AgentSpec, ExecutorSpec
+from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy
 from tests.runner.helpers import NullServerClient
 
 _TEST_HARNESS_NAME = "runner-test-default"
@@ -6246,6 +6246,8 @@ async def test_sys_session_share_defaults_to_caller_and_puts_grant() -> None:
             arguments=json.dumps({"user_id": "alice@example.com", "level": "edit"}),
             server_client=server_client,
             conversation_id="conv_caller",
+            # Sharing a named user only needs the non-public tier enabled.
+            agent_spec=AgentSpec(spec_version=1, share=SharePolicy.NON_PUBLIC),
         )
 
     # Exactly one PUT to the caller's own permissions sub-resource, with
@@ -6302,6 +6304,7 @@ async def test_sys_session_share_maps_error_statuses(
             arguments=json.dumps({"user_id": "alice@example.com", "session_id": "conv_x"}),
             server_client=server_client,
             conversation_id="conv_caller",
+            agent_spec=AgentSpec(spec_version=1, share=SharePolicy.NON_PUBLIC),
         )
 
     result = json.loads(output)
@@ -6335,6 +6338,8 @@ async def test_sys_session_share_rejects_bad_level_without_calling_server() -> N
             arguments=json.dumps({"user_id": "alice@example.com", "level": "admin"}),
             server_client=server_client,
             conversation_id="conv_caller",
+            # Share enabled (non-public) so the call reaches level validation.
+            agent_spec=AgentSpec(spec_version=1, share=SharePolicy.NON_PUBLIC),
         )
 
     assert called is False  # validation must short-circuit before the PUT
@@ -6373,6 +6378,9 @@ async def test_sys_session_share_surfaces_server_message_on_4xx() -> None:
             ),
             server_client=server_client,
             conversation_id="conv_caller",
+            # share: public lets __public__ pass the runner gate and reach
+            # the server, which is what rejects level>read for public.
+            agent_spec=AgentSpec(spec_version=1, share=SharePolicy.PUBLIC),
         )
 
     result = json.loads(output)
@@ -6380,6 +6388,131 @@ async def test_sys_session_share_surfaces_server_message_on_4xx() -> None:
     assert result["error"] == server_message
     assert result["status_code"] == 400
     assert result["session_id"] == "conv_x"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "share_policy",
+    [
+        pytest.param(None, id="no-spec"),
+        pytest.param(SharePolicy.NONE, id="share-none"),
+    ],
+)
+async def test_sys_session_share_disabled_without_share_flag(
+    share_policy: SharePolicy | None,
+) -> None:
+    """
+    With no spec (``None``) or ``share: none``, the runner refuses the
+    grant client-side and never PUTs — the share flag is the real gate,
+    not just tool advertisement, so a prompt-injected call naming the
+    tool can't escalate. A PUT reaching the handler would mean the
+    runner-side policy gate regressed.
+
+    :param share_policy: The spec's ``share`` policy under test (or
+        ``None`` for a missing spec).
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    called = False
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200, json={})
+
+    spec = None if share_policy is None else AgentSpec(spec_version=1, share=share_policy)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_share",
+            arguments=json.dumps({"user_id": "alice@example.com", "session_id": "conv_x"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            agent_spec=spec,
+        )
+
+    assert called is False  # the gate must short-circuit before the PUT
+    assert "not enabled" in json.loads(output)["error"]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_share_non_public_rejects_public_grant() -> None:
+    """
+    Under ``share: non-public`` a grant to a named user is allowed, but
+    a ``__public__`` grant is refused client-side before any PUT — the
+    non-public tier must not be able to expose the transcript anonymously
+    even if the model (or an injection) asks for it. A PUT here would
+    mean the public sub-gate regressed.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    called = False
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_share",
+            arguments=json.dumps({"user_id": "__public__", "session_id": "conv_x"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            agent_spec=AgentSpec(spec_version=1, share=SharePolicy.NON_PUBLIC),
+        )
+
+    assert called is False  # public sub-gate must short-circuit before the PUT
+    assert "public" in json.loads(output)["error"]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_share_public_allows_public_grant() -> None:
+    """
+    Under ``share: public`` a ``__public__`` read grant passes the runner
+    gate and PUTs to the permissions endpoint — the positive case the
+    non-public/none gates exclude. If the gate wrongly blocked it, public
+    sharing would be impossible even when the spec explicitly opts in.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    requests: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path, json.loads(request.content)))
+        return httpx.Response(
+            200,
+            json={"user_id": "__public__", "conversation_id": "conv_caller", "level": 1},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_share",
+            arguments=json.dumps({"user_id": "__public__"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            agent_spec=AgentSpec(spec_version=1, share=SharePolicy.PUBLIC),
+        )
+
+    # __public__ reached the server as a level-1 (read) grant on the caller.
+    assert requests == [
+        ("PUT", "/v1/sessions/conv_caller/permissions", {"user_id": "__public__", "level": 1})
+    ]
+    result = json.loads(output)
+    assert result == {
+        "shared": True,
+        "session_id": "conv_caller",
+        "user_id": "__public__",
+        "level": "read",
+    }
 
 
 @pytest.mark.asyncio

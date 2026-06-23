@@ -14,7 +14,7 @@ from typing import Any
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.os_env import OSEnvironment
 from omnigent.spec import AgentSpec
-from omnigent.spec.types import ToolRuntime
+from omnigent.spec.types import SharePolicy, ToolRuntime
 from omnigent.tools._srt import is_srt_available
 from omnigent.tools.base import Tool, ToolContext, is_valid_tool_name
 from omnigent.tools.builtins import (
@@ -387,8 +387,22 @@ class ToolManager:
         ``sys_session_list`` or a prior ``sys_session_send`` handle),
         so they need no ``sub_specs`` map.
 
-        The mutating tools are opt-in, gated behind ``tools.agents``
-        (declared sub-agents) or the top-level ``spawn: true`` flag:
+        ``sys_session_share`` is gated by its OWN dedicated ``share:``
+        flag (:class:`SharePolicy`), independent of the spawn grants.
+        Sharing MUTATES access control — it can expose a session to a
+        third party or, via ``__public__``, to anonymous read of the
+        full transcript — and the server can confirm the caller holds
+        manage-level access but cannot distinguish "the owner intended
+        this" from "the agent was prompt-injected into sharing". So it
+        is off unless the spec opts in: ``none`` (default) leaves it
+        unregistered; ``non-public`` registers it for granting named
+        users; ``public`` additionally lets it grant ``__public__``
+        (the tool advertises and enforces that extra tier via
+        ``allow_public``).
+
+        The spawn-lifecycle tools are a SEPARATE opt-in, gated behind
+        ``tools.agents`` (declared sub-agents) or the top-level
+        ``spawn: true`` flag:
 
         - ``tools.agents`` registers ``sys_session_send`` (named
           ``(agent, title)`` mode limited to the declared-type enum,
@@ -403,16 +417,6 @@ class ToolManager:
           tombstone the children it creates); without declared
           sub-agents, send's schema omits the named-mode parameters.
 
-        ``sys_session_share`` is gated behind the SAME opt-in (either
-        grant). Unlike the read-only discovery tools it MUTATES access
-        control — it can expose a session to a third party or, via
-        ``__public__``, to anonymous read of the full transcript. The
-        server can confirm the caller holds manage-level access but
-        cannot distinguish "the owner intended this" from "the agent
-        was prompt-injected into sharing", so it is not advertised to
-        every agent by default — only to specs that have already opted
-        into the multi-agent / spawn surface, matching send/close.
-
         The spawn writes are child-only and ``sys_session_share`` is
         owner-authority-bounded, both enforced at dispatch/server level;
         the opt-ins control advertisement, not authority.
@@ -424,7 +428,20 @@ class ToolManager:
         self._tools[SysSessionGetHistoryTool.name()] = SysSessionGetHistoryTool()
         self._tools[SysSessionGetInfoTool.name()] = SysSessionGetInfoTool()
 
-        # send + close + share: opt-in via declared sub-agents or spawn: true.
+        # Session sharing: opt-in via the dedicated ``share`` flag,
+        # independent of spawn / declared sub-agents. ``none`` leaves it
+        # unregistered; ``public`` additionally permits __public__ grants
+        # (the tool reflects that in its schema and the runner enforces
+        # it). It is its own flag — not folded into the spawn grant —
+        # because exposing a session is a distinct authority from
+        # spawning children, and the public tier warrants an explicit
+        # extra opt-in given the prompt-injection exposure.
+        if self._spec.share is not SharePolicy.NONE:
+            self._tools[SysSessionShareTool.name()] = SysSessionShareTool(
+                allow_public=self._spec.share is SharePolicy.PUBLIC,
+            )
+
+        # send + close: opt-in via declared sub-agents or spawn: true.
         if not (self._spec.tools.agents or self._spec.spawn):
             return
 
@@ -433,14 +450,6 @@ class ToolManager:
             sub_specs=sub_specs,
         )
         self._tools[SysSessionCloseTool.name()] = SysSessionCloseTool()
-        # Session sharing MUTATES access control (it can expose the
-        # session to a third party or, via __public__, to anonymous read
-        # of the full transcript), so it is opt-in behind the same grant
-        # as send/close rather than always-on like the read-only
-        # discovery tools: the server can confirm the caller has
-        # manage-level access but not that the owner — versus a
-        # prompt-injected agent — intended the share.
-        self._tools[SysSessionShareTool.name()] = SysSessionShareTool()
         # Model awareness pairs with the dispatch grant: the per-worker
         # listing exists to pick a valid ``args.model`` for send.
         self._tools[SysListModelsTool.name()] = SysListModelsTool(spec=self._spec)

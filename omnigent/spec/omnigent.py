@@ -58,6 +58,7 @@ from omnigent.spec.types import (
     LLMConfig,
     LocalToolInfo,
     MCPServerConfig,
+    SharePolicy,
     ToolRuntime,
     ToolsConfig,
 )
@@ -1176,6 +1177,9 @@ def agent_def_to_agent_spec(
         terminals=terminals,
         timers=agent_def.timers,
         spawn=agent_def.spawn,
+        # AgentDef.share is the raw YAML string ("none"/"non-public"/
+        # "public"); map it to the SharePolicy enum AgentSpec expects.
+        share=SharePolicy(agent_def.share),
         skills_filter=skills_filter,
     )
 

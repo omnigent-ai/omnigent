@@ -223,6 +223,18 @@ _SESSION_QUERY_TOOLS = frozenset(
     }
 )
 
+# Grantee sentinel for an anonymous, public read-only share. Mirrors the
+# server's RESERVED_USER_PUBLIC; only specs with ``share: public`` may
+# grant it (enforced in _session_share_via_rest — the server can't see
+# the agent's share policy, so the runner is the gate).
+_PUBLIC_USER_SENTINEL = "__public__"
+
+# Spec ``share:`` policy values (omnigent.spec.types.SharePolicy) that
+# enable the sys_session_share tool. Compared as plain strings since
+# SharePolicy is a str-enum; anything else (incl. "none"/absent) is off.
+_SHARE_ENABLED_POLICIES = frozenset({"non-public", "public"})
+_SHARE_PUBLIC_POLICY = "public"
+
 # Priority 5f.1: web_fetch — translates the LLM-facing query/url
 # arguments into a sys_session_send call against the built-in
 # ``__web_researcher`` sub-agent, then reuses
@@ -2455,6 +2467,7 @@ async def _execute_session_query_tool(
     *,
     conversation_id: str | None,
     server_client: httpx.AsyncClient | None,
+    agent_spec: Any | None = None,
 ) -> str:
     """
     Runner-local handler for ``sys_session_get_history`` / ``sys_session_list`` /
@@ -2490,6 +2503,10 @@ async def _execute_session_query_tool(
         used as the parent for ``sys_session_list``.
     :param server_client: HTTP client pointed at the Omnigent server; ``None``
         if unavailable (returns an error string).
+    :param agent_spec: The session's :class:`AgentSpec`. Used only by
+        ``sys_session_share`` to read the spec's ``share:`` policy (the
+        server can't see it, so the runner is the gate). ``None`` when no
+        spec is available — sharing then fails closed.
     :returns: Tool output JSON string matching the in-process tool shape.
     """
     if server_client is None:
@@ -2508,7 +2525,7 @@ async def _execute_session_query_tool(
     if tool_name == "sys_session_get_info":
         return await _session_get_info_via_rest(args, conversation_id, server_client)
     if tool_name == "sys_session_share":
-        return await _session_share_via_rest(args, conversation_id, server_client)
+        return await _session_share_via_rest(args, conversation_id, server_client, agent_spec)
     return await _session_close_via_rest(args, conversation_id, server_client)
 
 
@@ -2649,6 +2666,7 @@ async def _session_share_via_rest(
     args: dict[str, Any],
     conversation_id: str,
     server_client: httpx.AsyncClient,
+    agent_spec: Any | None,
 ) -> str:
     """
     Grant a user access to a session via ``PUT /v1/sessions/{id}/permissions``.
@@ -2661,6 +2679,13 @@ async def _session_share_via_rest(
     manage-level access on the target (the session owner does), and caps
     public (``__public__``) grants at read.
 
+    The spec's ``share:`` policy is enforced HERE, in the runner, because
+    the server cannot see it: a ``share: none`` (or unknown) spec refuses
+    every grant, and a ``share: non-public`` spec refuses ``__public__``.
+    This is the real gate — tool *advertisement* is gated in the
+    ToolManager, but an unadvertised-yet-named call must still be denied
+    so a prompt-injected agent can't escalate by emitting the tool name.
+
     Maps 404 to ``session_not_found`` and 401/403 to ``access_denied``;
     other 4xx/5xx surface the server's own error message when present
     (e.g. the "public is read-only" rejection of a ``__public__`` grant
@@ -2672,6 +2697,9 @@ async def _session_share_via_rest(
     :param conversation_id: The caller's own session id, used as the
         default target when ``session_id`` is omitted.
     :param server_client: HTTP client pointed at the Omnigent server.
+    :param agent_spec: The session's :class:`AgentSpec`; its ``share``
+        policy gates this call. ``None`` (or ``share: none``) fails
+        closed — no grant is attempted.
     :returns: JSON ``{"shared": true, ...}`` on success, or a JSON
         error object.
     """
@@ -2681,6 +2709,31 @@ async def _session_share_via_rest(
     user_id = args.get("user_id")
     if not isinstance(user_id, str) or not user_id:
         return json.dumps({"error": "sys_session_share requires a non-empty 'user_id'"})
+    # Enforce the spec's ``share:`` policy (SharePolicy is a str-enum, so
+    # compare its value directly). ``none``/absent disables the feature;
+    # ``__public__`` requires the ``public`` tier specifically.
+    share_policy = getattr(agent_spec, "share", None)
+    if share_policy not in _SHARE_ENABLED_POLICIES:
+        return json.dumps(
+            {
+                "error": (
+                    "sys_session_share: session sharing is not enabled for this "
+                    "agent (set share: non-public or share: public in the spec)"
+                ),
+                "session_id": target,
+            }
+        )
+    if user_id == _PUBLIC_USER_SENTINEL and share_policy != _SHARE_PUBLIC_POLICY:
+        return json.dumps(
+            {
+                "error": (
+                    "sys_session_share: public ('__public__') sharing is not "
+                    "enabled for this agent (requires share: public); grant a "
+                    "specific user instead"
+                ),
+                "session_id": target,
+            }
+        )
     # Friendly level name -> the server's numeric permission level
     # (GrantPermissionRequest accepts 1=read, 2=edit, 3=manage).
     level_by_name = {"read": 1, "edit": 2, "manage": 3}
@@ -3713,6 +3766,7 @@ async def execute_tool(
                 arguments,
                 conversation_id=conversation_id,
                 server_client=server_client,
+                agent_spec=agent_spec,
             )
         elif tool_name in _WEB_FETCH_TOOLS:
             output = await _execute_web_fetch_tool(
