@@ -148,15 +148,12 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Install bubblewrap
+      - name: Install tmux
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
-        # bubblewrap: the linux_bwrap sandbox backend needs bwrap on PATH.
-        # apparmor sysctl: Ubuntu 24.04 blocks unprivileged user namespaces
-        # that bwrap's unshare(CLONE_NEWUSER) needs; scope is the ephemeral runner.
+        # tmux: Polly uses it for its shell terminal.
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap tmux
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo apt-get install -y tmux
 
       - name: Cache virtualenv
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
@@ -348,74 +345,37 @@ jobs:
           permission-pull-requests: read
           permission-contents: read
 
-      - name: Write CI polly config with egress allowlist
-        # Write a CI-specific Polly config that restricts outbound HTTP to the
-        # gateway and GitHub API only, blocking exfiltration to arbitrary hosts.
-        # The gateway hostname is resolved from GATEWAY_BASE_URL at runtime so
-        # the allowlist is tight (no wildcards on the gateway side).
-        # Uses uv run python (PyYAML available in the venv) to read+rewrite the
-        # YAML config rather than shelling heredocs with untrusted values.
+      - name: Restrict egress to gateway and GitHub API
+        # Use iptables to enforce egress at the kernel level — simpler and
+        # more reliable than bwrap egress_rules, which requires a sandbox
+        # that breaks Polly's shell tool visibility. Resolves gateway host
+        # from GATEWAY_BASE_URL at runtime for a tight allowlist.
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
         env:
           GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
         run: |
-          uv run python3 -c "
-          import pathlib, os, shutil, urllib.parse
-          import yaml
+          set -euo pipefail
 
+          GW_HOST=$(python3 -c "
+          import urllib.parse, os
           gw = os.environ.get('GATEWAY_BASE_URL', '')
-          gw_host = urllib.parse.urlparse(gw).netloc if gw else ''
+          print(urllib.parse.urlparse(gw).netloc if gw else '')
+          ")
 
-          # Copy polly source tree so the source is not mutated.
-          src = pathlib.Path('examples/polly')
-          dst = pathlib.Path('/tmp/polly-ci')
-          shutil.copytree(src, dst, dirs_exist_ok=True)
+          # Allow established connections and loopback (needed for the
+          # local Omnigent server Polly starts).
+          sudo iptables -I OUTPUT 1 -m state --state ESTABLISHED,RELATED -j ACCEPT
+          sudo iptables -I OUTPUT 2 -o lo -j ACCEPT
+          # Allow GitHub API (gh CLI for PR diff / context).
+          sudo iptables -A OUTPUT -d api.github.com -j ACCEPT
+          # Allow gateway (LLM calls).
+          if [ -n "$GW_HOST" ]; then
+            sudo iptables -A OUTPUT -d "$GW_HOST" -j ACCEPT
+          fi
+          # Drop all other outbound traffic.
+          sudo iptables -A OUTPUT -j DROP
 
-          cfg_path = dst / 'config.yaml'
-          cfg = yaml.safe_load(cfg_path.read_text())
-
-          # Allowlist: GitHub API (gh CLI reads) + gateway (LLM calls).
-          # CONNECT is not a valid egress_rules method — only HTTP verbs.
-          rules = [
-              'GET api.github.com/**',
-              'POST api.github.com/**',
-          ]
-          if gw_host:
-              rules += [
-                  f'GET {gw_host}/**',
-                  f'POST {gw_host}/**',
-              ]
-
-          import os as _os
-          workspace = _os.environ.get('GITHUB_WORKSPACE', '')
-          home = str(pathlib.Path.home())
-
-          # Specific home dotpaths Polly needs — avoid adding the entire HOME
-          # as a read_path because the dotfile masker would walk it, find
-          # dirs like ~/.ghcup, and try to --tmpfs-mask them, which fails
-          # when bwrap can't create the mount point in the new root.
-          home_paths = [
-              f'{home}/.omnigent',        # omnigent provider config
-              f'{home}/.databrickscfg',   # gateway auth token
-              f'{home}/.config/gh',       # gh CLI auth
-          ]
-
-          read_paths = ([workspace] if workspace else []) + home_paths
-
-          sandbox = {
-              'type': 'linux_bwrap',
-              'egress_rules': rules,
-              'read_paths': read_paths,
-              # Allow dotdirs under workspace that Polly needs (CLIs, venv).
-              'cwd_allow_hidden': ['.venv', '.cc-cli', '.codex-cli', '.omnigent'],
-              'write_paths': ['/tmp'],
-          }
-          cfg['os_env']['sandbox'] = sandbox
-          cfg['terminals']['shell']['os_env']['sandbox'] = dict(sandbox)
-
-          cfg_path.write_text(yaml.dump(cfg, default_flow_style=False, sort_keys=False))
-          print(f'CI polly config written (gateway: {gw_host or \"(none)\"}, {len(rules)} egress rules)')
-          "
+          echo "Egress restricted to: api.github.com${GW_HOST:+, $GW_HOST} + loopback"
 
       - name: Run Polly review
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
@@ -436,9 +396,8 @@ jobs:
           # Run Polly headlessly with -p; it starts a local server, sends
           # one turn, prints the assistant response, and exits.
           # --no-session: ephemeral run, no persistent session state.
-          # Uses the CI config (/tmp/polly-ci/) which has egress_rules that
-          # restrict outbound HTTP to the gateway + GitHub API only.
-          uv run omnigent run /tmp/polly-ci/ \
+          # Egress is restricted by the iptables rules set in the previous step.
+          uv run omnigent run examples/polly/ \
             -p "$prompt" \
             --no-session \
             2>polly-stderr.log \
