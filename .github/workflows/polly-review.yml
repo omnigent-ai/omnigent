@@ -300,7 +300,7 @@ jobs:
           skip these — they are a supply chain attack surface. Do NOT read the
           full hunk (it is noise). Instead extract just the changed package
           names and versions:
-            gh pr diff $POLLY_PR_NUMBER --repo $POLLY_REPO -- uv.lock | grep '^[+-]name\|^[+-]version' | grep -v '^---\|^+++' | head -200
+            gh pr diff $POLLY_PR_NUMBER --repo $POLLY_REPO -- uv.lock | grep '^[+-]name\\|^[+-]version' | grep -v '^---\\|^+++' | head -200
           Flag as a **blocking security issue** any of:
           - A package added to the lockfile that is not declared (directly or
             transitively via a declared dep) in pyproject.toml.
@@ -386,7 +386,21 @@ jobs:
                   f'POST {gw_host}/**',
               ]
 
-          sandbox = {'type': 'linux_bwrap', 'egress_rules': rules}
+          import os as _os
+          workspace = _os.environ.get('GITHUB_WORKSPACE', '')
+          home = str(pathlib.Path.home())
+
+          # read_paths: grant the workspace (CLIs, venv, repo) and home
+          # (gh config, omnigent config, .databrickscfg) so bwrap's
+          # restricted filesystem view doesn't break Polly's shell tools.
+          read_paths = [workspace, home] if workspace else [home]
+
+          sandbox = {
+              'type': 'linux_bwrap',
+              'egress_rules': rules,
+              'read_paths': read_paths,
+              'write_paths': ['/tmp'],
+          }
           cfg['os_env']['sandbox'] = sandbox
           cfg['terminals']['shell']['os_env']['sandbox'] = dict(sandbox)
 
