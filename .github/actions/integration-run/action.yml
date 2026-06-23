@@ -33,6 +33,13 @@ inputs:
       (Config 2 backwards-compat run). Orthogonal to server_version.
     required: false
     default: ""
+  artifact_suffix:
+    description: >
+      Appended to uploaded-artifact names so they stay unique across matrix
+      cells (e.g. "-sv0.2.0-rmain"). Default empty — the normal gate runs one
+      cell, so its harness-scoped names are already unique.
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -163,7 +170,7 @@ runs:
       if: ${{ failure() || cancelled() }}
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
       with:
-        name: integration-server-logs-${{ inputs.harness }}-${{ github.run_id }}
+        name: integration-server-logs-${{ inputs.harness }}-${{ github.run_id }}${{ inputs.artifact_suffix }}
         path: |
           /tmp/omnigent-integration-${{ github.run_id }}-${{ inputs.harness }}/**/server.log
           /tmp/omnigent-integration-${{ github.run_id }}-${{ inputs.harness }}/**/runner.log
@@ -174,7 +181,7 @@ runs:
       if: ${{ always() }}
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
       with:
-        name: integration-${{ inputs.harness }}-${{ github.run_id }}
+        name: integration-${{ inputs.harness }}-${{ github.run_id }}${{ inputs.artifact_suffix }}
         path: artifacts/
         retention-days: 14
         if-no-files-found: ignore

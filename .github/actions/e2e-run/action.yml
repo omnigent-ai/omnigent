@@ -39,6 +39,13 @@ inputs:
       to server_version.
     required: false
     default: ""
+  artifact_suffix:
+    description: >
+      Appended to uploaded-artifact names so they stay unique across matrix
+      cells (e.g. "-sv0.2.0-rmain"). Default empty — the normal gate has one
+      cell per shard, so its names are already unique.
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -198,7 +205,7 @@ runs:
       if: ${{ failure() || cancelled() }}
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
       with:
-        name: e2e-server-logs-${{ github.run_id }}-shard${{ inputs.shard_id }}
+        name: e2e-server-logs-${{ github.run_id }}-shard${{ inputs.shard_id }}${{ inputs.artifact_suffix }}
         path: |
           /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ inputs.shard_id }}/**/server.log
           /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ inputs.shard_id }}/**/runner.log
@@ -213,7 +220,7 @@ runs:
       if: ${{ always() }}
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
       with:
-        name: e2e-tokens-${{ github.run_id }}-shard${{ inputs.shard_id }}
+        name: e2e-tokens-${{ github.run_id }}-shard${{ inputs.shard_id }}${{ inputs.artifact_suffix }}
         path: /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ inputs.shard_id }}/tokens*.json
         retention-days: 14
         if-no-files-found: warn
