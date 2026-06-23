@@ -20,13 +20,16 @@ import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
 from fastapi import FastAPI
 
 from omnigent import claude_native_bridge, codex_native_bridge, cursor_native_bridge
+from omnigent.antigravity_native_bridge import (
+    is_placeholder_conversation_id as bridge_mod_is_placeholder,
+)
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
     bridge_dir_for_bridge_id,
@@ -43,6 +46,7 @@ from omnigent.runner.app import (
     _WAKE_POST_MAX_ATTEMPTS,
     ResolvedSpec,
     _agent_os_env_from_spec,
+    _auto_create_antigravity_terminal,
     _auto_create_claude_terminal,
     _auto_create_codex_terminal,
     _auto_create_pi_terminal,
@@ -59,6 +63,7 @@ from omnigent.runner.app import (
 )
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.runner.resource_registry import (
+    ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
     OMNIGENT_REPL_TERMINAL_ROLE,
@@ -2541,6 +2546,222 @@ async def test_claude_native_first_turn_not_blocked_by_cold_bridge_notify(
             async with _runner_client(app) as cleanup_client:
                 await cleanup_client.delete(f"/v1/sessions/{session_id}")
         shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+async def _run_antigravity_auto_create(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    session_id: str,
+    snapshot: dict[str, Any],
+    candidate_ports: list[int],
+) -> tuple[Any, list[tuple[int, str]], list[dict[str, Any]]]:
+    """
+    Drive ``_auto_create_antigravity_terminal`` with every live collaborator faked.
+
+    No real agy is launched: ``build_agy_launch`` is stubbed to a no-op argv, the
+    onboarding seed is a no-op, the resource registry records the launched spec,
+    the forwarder is a counting stub, and the connect-RPC layer
+    (``_candidate_agy_rpc_ports`` / ``start_cascade``) is mocked so the cold-start
+    bootstrap runs without a socket.
+
+    :param tmp_path: Temporary directory for isolated bridge state.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param session_id: Session/conversation id under test.
+    :param snapshot: The Omnigent session snapshot the helper should read.
+    :param candidate_ports: Ports ``_candidate_agy_rpc_ports`` yields (``[]`` →
+        the bootstrap never finds a port).
+    :returns: ``(bridge_state_after, start_cascade_calls, forwarder_calls)``.
+    """
+    import omnigent.antigravity_native_bridge as bridge_mod
+    import omnigent.antigravity_native_launch as launch_mod
+    import omnigent.antigravity_native_rpc as rpc_mod
+    import omnigent.runner.app as runner_app_mod
+
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    (tmp_path / "workspace").mkdir(parents=True, exist_ok=True)
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+
+    # No-op the launch builder + onboarding seed so nothing tries to find agy.
+    monkeypatch.setattr(
+        launch_mod, "build_agy_launch", lambda **_kwargs: (("agy",), {"AGY_ENV": "1"})
+    )
+    monkeypatch.setattr(bridge_mod, "ensure_agy_onboarding_complete", lambda: None)
+    # The forwarder still spawns (Task 11a keeps it as a functional intermediate);
+    # stub it so the test does not start a real one.
+    forwarder_calls: list[dict[str, Any]] = []
+
+    def _counting_forwarder(**kwargs: Any) -> Any:
+        forwarder_calls.append(kwargs)
+
+        async def _runner() -> None:
+            await asyncio.Event().wait()
+
+        return _runner()
+
+    monkeypatch.setattr(
+        "omnigent.antigravity_native_forwarder.supervise_forwarder", _counting_forwarder
+    )
+    # No live pane in unit tests → the forwarder uses its ambiguity fallback and
+    # the tmux advertise is skipped. Keep the bootstrap independent of tmux.
+    monkeypatch.setattr(runner_app_mod, "_terminal_tmux_pane", lambda *_a, **_k: (None, None))
+
+    # Mock the connect-RPC cold-start surface. Collapse the port-poll budget +
+    # backoff so the no-port case bails immediately instead of waiting the real
+    # 20s (and the success case still finds its port on the first probe).
+    monkeypatch.setattr(runner_app_mod, "_AGY_COLD_START_PORT_TIMEOUT_S", 0.0)
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(runner_app_mod, "_agy_cold_start_poll_sleep", _no_sleep)
+    monkeypatch.setattr(rpc_mod, "_candidate_agy_rpc_ports", lambda: list(candidate_ports))
+    start_cascade_calls: list[tuple[int, str]] = []
+
+    def _fake_start_cascade(port: int, cascade_id: str, **_kwargs: Any) -> None:
+        start_cascade_calls.append((port, cascade_id))
+
+    monkeypatch.setattr(rpc_mod, "start_cascade", _fake_start_cascade)
+
+    class _SnapshotServerClient:
+        """Server client returning the configured Antigravity launch snapshot."""
+
+        async def get(self, url: str, **_kwargs: Any) -> httpx.Response:
+            assert url == f"/v1/sessions/{session_id}"
+            return httpx.Response(200, json=snapshot, request=httpx.Request("GET", url))
+
+    class _FakeResourceRegistry:
+        """Resource registry that records the required-terminal launch."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            *,
+            resource_role: str | None = None,
+            **_kwargs: Any,
+        ) -> SessionResourceView:
+            assert terminal_name == "antigravity"
+            assert session_key == "main"
+            assert resource_role == ANTIGRAVITY_NATIVE_TERMINAL_ROLE
+            return SessionResourceView(
+                id="terminal_antigravity_main",
+                type="terminal",
+                session_id=session_id,
+                name="Antigravity",
+            )
+
+    try:
+        await _auto_create_antigravity_terminal(
+            session_id,
+            cast(SessionResourceRegistry, _FakeResourceRegistry()),
+            lambda _sid, _event: None,
+            server_client=cast(httpx.AsyncClient, _SnapshotServerClient()),
+        )
+        await asyncio.sleep(0)
+    finally:
+        await runner_app_mod._cancel_auto_forwarder_task(session_id)
+
+    bridge_dir = bridge_mod.bridge_dir_for_bridge_id(session_id)
+    return bridge_mod.read_bridge_state(bridge_dir), start_cascade_calls, forwarder_calls
+
+
+@pytest.mark.asyncio
+async def test_auto_create_antigravity_cold_starts_real_conversation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A fresh runner launch cold-starts the agy conversation over RPC.
+
+    The runner mints the cascade over ``StartCascade`` (no send-keys / no waiting
+    for the TUI to lazily create it) so the executor's turn-1 has a real cascade
+    id. This asserts the load-bearing integration: after the agy terminal launches
+    and the connect-RPC port answers, the runner calls ``start_cascade`` with a
+    runner-generated id and writes THAT real id into bridge state — NOT the
+    ``agy_conv_*`` placeholder ``read_bridge_state`` would otherwise return.
+    """
+    session_id = "conv_agy_coldstart"
+    state, start_cascade_calls, forwarder_calls = await _run_antigravity_auto_create(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+        snapshot={},  # fresh: no external_session_id
+        candidate_ports=[52548],
+    )
+    # start_cascade was called once, on the discovered port, with a real id.
+    assert len(start_cascade_calls) == 1
+    called_port, called_id = start_cascade_calls[0]
+    assert called_port == 52548
+    assert not bridge_mod_is_placeholder(called_id)
+    # The real cold-started id is what reaches bridge state (no placeholder).
+    assert state is not None
+    assert state.conversation_id == called_id
+    assert not bridge_mod_is_placeholder(state.conversation_id)
+    # The forwarder still spawns (functional intermediate for Task 11a).
+    assert len(forwarder_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_create_antigravity_resume_skips_cold_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A resume launch does NOT cold-start — the conversation already exists.
+
+    On resume the snapshot carries agy's real ``external_session_id`` (persisted
+    by a prior run), so the conversation already exists and ``StartCascade`` must
+    not be issued (it would create a second, empty one). Bridge state keeps the
+    resume id verbatim.
+    """
+    session_id = "conv_agy_resume"
+    resume_id = "68caaeac-2eaf-4e2c-9b95-721b022f4903"
+    state, start_cascade_calls, _forwarder_calls = await _run_antigravity_auto_create(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+        snapshot={"external_session_id": resume_id},
+        candidate_ports=[52548],
+    )
+    assert start_cascade_calls == []
+    assert state is not None
+    assert state.conversation_id == resume_id
+
+
+@pytest.mark.asyncio
+async def test_auto_create_antigravity_cold_start_port_timeout_keeps_placeholder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When no connect-RPC port answers, the cold-start is best-effort: the launch
+    still completes and leaves the placeholder id for the forwarder to overwrite.
+
+    The cold-start must NOT abort the launch (which would leave a registered
+    terminal with no forwarder, never self-healing). With no port, ``start_cascade``
+    is never called and bridge state retains the ``agy_conv_*`` placeholder.
+    """
+    session_id = "conv_agy_noport"
+    state, start_cascade_calls, forwarder_calls = await _run_antigravity_auto_create(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+        snapshot={},
+        candidate_ports=[],  # port never comes up within the bounded poll
+    )
+    assert start_cascade_calls == []
+    assert state is not None
+    assert bridge_mod_is_placeholder(state.conversation_id)
+    # Forwarder still spawns regardless of the cold-start outcome.
+    assert len(forwarder_calls) == 1
 
 
 @pytest.mark.parametrize("parent_host_id", ["host_parent", None])

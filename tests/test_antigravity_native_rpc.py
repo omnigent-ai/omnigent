@@ -1010,6 +1010,120 @@ def test_send_user_cascade_message_raises_rpc_error_on_transport_error(
 
 
 # ---------------------------------------------------------------------------
+# start_cascade (unary RPC, Task 11a cold-start bootstrap)
+# ---------------------------------------------------------------------------
+
+
+def test_start_cascade_posts_cascade_id_and_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``start_cascade`` POSTs ``{"cascadeId": ..., "source": ...}`` to ``StartCascade``.
+
+    The runner cold-starts the conversation so its turn-1 has a real cascade id
+    instead of waiting for the TUI to lazily mint one. ``source`` is the only
+    required field; the runner PROVIDES the cascadeId so it owns the id. Asserts
+    the full wire body so a refactor cannot drop either field or change the
+    default source enum.
+    """
+    seen: dict[str, object] = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["url"] = str(req.url)
+        seen["body"] = json.loads(req.content)
+        seen["content_type"] = req.headers.get("content-type")
+        return httpx.Response(200, json={"cascadeId": "runner-uuid"})
+
+    monkeypatch.setattr(rpc, "_HTTP_TRANSPORT", httpx.MockTransport(handler))
+    rpc.start_cascade(52548, "runner-uuid")
+    assert seen["url"] == (
+        "https://127.0.0.1:52548/exa.language_server_pb.LanguageServerService/StartCascade"
+    )
+    assert seen["content_type"] == "application/json"
+    assert seen["body"] == {
+        "cascadeId": "runner-uuid",
+        "source": "CORTEX_TRAJECTORY_SOURCE_CLI",
+    }
+
+
+def test_start_cascade_returns_none_on_200(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A 200 response causes ``start_cascade`` to return without raising.
+
+    The bootstrap only needs "agy created the cascade" (200) vs "error" (raise);
+    no return value is consumed (the runner already holds the id it sent). Mirrors
+    ``send_user_cascade_message``'s 200 contract.
+    """
+    monkeypatch.setattr(
+        rpc,
+        "_HTTP_TRANSPORT",
+        httpx.MockTransport(lambda r: httpx.Response(200, json={"cascadeId": "c"})),
+    )
+    rpc.start_cascade(52548, "c")  # must not raise
+
+
+def test_start_cascade_raises_rpc_error_on_500(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A non-2xx response raises ``AntigravityRpcError`` carrying the raw body text.
+
+    Mirrors ``send_user_cascade_message``: the body is the message (NOT
+    ``raise_for_status()``) so the runner can surface agy's error verbatim rather
+    than a generic status string.
+    """
+    monkeypatch.setattr(
+        rpc,
+        "_HTTP_TRANSPORT",
+        httpx.MockTransport(lambda r: httpx.Response(500, json={"message": "cascade boom"})),
+    )
+    with pytest.raises(rpc.AntigravityRpcError) as exc_info:
+        rpc.start_cascade(52548, "c")
+    assert "cascade boom" in str(exc_info.value)
+
+
+def test_start_cascade_raises_rpc_error_on_transport_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A transport failure raises ``AntigravityRpcError``, NOT a raw ``httpx.HTTPError``.
+
+    The runner bootstrap catches ``AntigravityRpcError`` as the single failure
+    surface; a raw transport error bypassing that type would crash the launch.
+    Mirrors ``send_user_cascade_message``'s transport-error contract.
+    """
+
+    def raise_transport(req: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    monkeypatch.setattr(rpc, "_HTTP_TRANSPORT", httpx.MockTransport(raise_transport))
+    with pytest.raises(rpc.AntigravityRpcError, match="transport error"):
+        rpc.start_cascade(52548, "c")
+
+
+def test_start_cascade_custom_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A caller-provided ``source`` overrides the default enum in the POST body.
+
+    Keeps the source a parameter (not a hardcoded constant) so a future agy enum
+    rename is a one-line caller change, not an edit to the RPC helper.
+    """
+    seen: dict[str, object] = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(req.content)
+        return httpx.Response(200, json={})
+
+    monkeypatch.setattr(rpc, "_HTTP_TRANSPORT", httpx.MockTransport(handler))
+    rpc.start_cascade(52548, "c", source="CORTEX_TRAJECTORY_SOURCE_OTHER")
+    assert seen["body"] == {"cascadeId": "c", "source": "CORTEX_TRAJECTORY_SOURCE_OTHER"}
+
+
+# ---------------------------------------------------------------------------
 # get_available_models (unary RPC, Task T-A)
 # ---------------------------------------------------------------------------
 

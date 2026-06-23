@@ -1883,6 +1883,22 @@ async def _auto_create_antigravity_terminal(
         ),
     )
 
+    # Cold-start the conversation over connect-RPC on a FRESH launch so the
+    # executor's turn-1 has a real cascade id (no send-keys, no waiting for the
+    # TUI to lazily mint one): the runner mints the cascade via ``StartCascade``
+    # and writes that real id into bridge state, replacing the ``agy_conv_*``
+    # placeholder seeded above. Resume launches already hold agy's real id
+    # (``external_session_id``), so cold-starting would create a second empty
+    # conversation — skip it. Best-effort and NON-RAISING (see
+    # ``_cold_start_agy_conversation``): a failure leaves the placeholder for the
+    # forwarder to overwrite the legacy way, so this stays inside the "nothing
+    # fallible between terminal registration and forwarder start" window. Done
+    # BEFORE the forwarder spawns so the forwarder binds the real id directly.
+    if not resume:
+        await _cold_start_agy_conversation(
+            bridge_dir, session_id, timeout_s=_AGY_COLD_START_PORT_TIMEOUT_S
+        )
+
     # Bind the forwarder's discovery to THIS session's own agy process via its
     # tmux pane (pane pid → agy child → connect-RPC port), instead of guessing
     # by newest brain dir — the brain root is shared by every agy on the host.
@@ -1972,6 +1988,119 @@ def _mint_runner_agy_conversation_id() -> str:
     :returns: An ``"agy_conv_<hex>"`` placeholder id.
     """
     return f"agy_conv_{uuid.uuid4().hex}"
+
+
+# Cold-start port-discovery budget. agy's connect-RPC server binds its loopback
+# port a moment AFTER the process starts (per-process, BEFORE any conversation
+# exists), so the bootstrap polls rather than probing once. The total wait is
+# bounded so a never-binding agy cannot hang the launch; the forwarder still
+# spawns afterward as a functional fallback.
+_AGY_COLD_START_PORT_TIMEOUT_S = 20.0
+_AGY_COLD_START_PORT_POLL_INTERVAL_S = 0.25
+
+
+async def _agy_cold_start_poll_sleep(seconds: float) -> None:
+    """
+    Sleep between agy cold-start port-discovery polls.
+
+    Indirection point so tests can stub the poll backoff without patching the
+    process-wide ``asyncio.sleep`` (the ``no-global-asyncio-patch`` lint hook
+    bans patching the module singleton). Mirrors :func:`_wake_retry_sleep`.
+
+    :param seconds: Seconds to wait before the next port probe, e.g. ``0.25``.
+    :returns: None.
+    """
+    await asyncio.sleep(seconds)
+
+
+async def _cold_start_agy_conversation(
+    bridge_dir: Path,
+    session_id: str,
+    *,
+    timeout_s: float = _AGY_COLD_START_PORT_TIMEOUT_S,
+) -> str | None:
+    """
+    Cold-start agy's conversation over connect-RPC and own its id (best-effort).
+
+    The fresh-launch bootstrap: the runner mints the conversation over
+    ``StartCascade`` so the executor's turn-1 has a real cascade id, instead of
+    waiting for the agy TUI to lazily create one on its first typed turn. With a
+    single runner-launched agy on the host, its connect-RPC port is the lone
+    ``Heartbeat``-answering candidate (the conversation-ownership check that
+    disambiguates multiple agys is not usable yet — no conversation exists), so
+    this polls :func:`omnigent.antigravity_native_rpc._candidate_agy_rpc_ports`
+    until a port binds, then ``StartCascade``s a runner-generated ``uuid4`` and
+    writes THAT real id into bridge state (replacing the ``agy_conv_*``
+    placeholder) so :func:`read_bridge_state` returns the real id and the
+    forwarder/executor address the cold-started conversation directly.
+
+    **Best-effort, never raises.** A bootstrap failure (no port within
+    *timeout_s*, or ``StartCascade`` erroring) must NOT abort the auto-create:
+    that would leave a registered terminal with no forwarder (which a later
+    ensure sees and returns 200 for, never self-healing). On failure this logs
+    and returns ``None`` (the placeholder stays; the forwarder then discovers
+    agy's real id the legacy way once a turn creates the conversation). The sync
+    RPC/poll work runs in :func:`asyncio.to_thread` so the event loop is never
+    blocked.
+
+    :param bridge_dir: Native Antigravity bridge directory whose ``state.json``
+        the real cold-started id is written into.
+    :param session_id: Owning session/conversation id (for log correlation).
+    :param timeout_s: Total seconds to wait for agy's connect-RPC port to bind.
+    :returns: The real (cold-started) cascade/conversation id on success, or
+        ``None`` when no port answered in time or ``StartCascade`` failed.
+    """
+    from omnigent.antigravity_native_bridge import update_conversation_id
+    from omnigent.antigravity_native_rpc import (
+        AntigravityRpcError,
+        _candidate_agy_rpc_ports,
+        start_cascade,
+    )
+
+    deadline = time.monotonic() + timeout_s
+    port: int | None = None
+    while True:
+        candidates = await asyncio.to_thread(_candidate_agy_rpc_ports)
+        if candidates:
+            # The lone runner-launched agy is the only Heartbeat-answering
+            # candidate at this point (no conversation exists to disambiguate
+            # several, so take the lowest validated port).
+            port = candidates[0]
+            break
+        if time.monotonic() >= deadline:
+            _logger.warning(
+                "Antigravity cold-start: no agy connect-RPC port bound within %.0fs for "
+                "session %s; leaving the placeholder conversation id for the forwarder to "
+                "discover once a turn creates the conversation.",
+                timeout_s,
+                session_id,
+            )
+            return None
+        await _agy_cold_start_poll_sleep(_AGY_COLD_START_PORT_POLL_INTERVAL_S)
+
+    cascade_id = str(uuid.uuid4())
+    try:
+        await asyncio.to_thread(start_cascade, port, cascade_id)
+    except AntigravityRpcError:
+        _logger.warning(
+            "Antigravity cold-start: StartCascade failed on port %s for session %s; leaving "
+            "the placeholder conversation id for the forwarder to discover.",
+            port,
+            session_id,
+            exc_info=True,
+        )
+        return None
+    # Persist the real id (replacing the placeholder). ``update_conversation_id``
+    # resets the resume cursor when the id changes — correct here: a fresh
+    # cold-started conversation has no prior mirrored steps. Offloaded (file I/O).
+    await asyncio.to_thread(update_conversation_id, bridge_dir, cascade_id)
+    _logger.info(
+        "Antigravity cold-start: created conversation %s on port %s for session %s",
+        cascade_id,
+        port,
+        session_id,
+    )
+    return cascade_id
 
 
 def _terminal_tmux_pane(

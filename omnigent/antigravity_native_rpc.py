@@ -80,6 +80,7 @@ _METHOD_GET_CASCADE_TRAJECTORY_STEPS = "GetCascadeTrajectorySteps"
 _METHOD_CANCEL_CASCADE_STEPS = "CancelCascadeSteps"
 _METHOD_HANDLE_CASCADE_USER_INTERACTION = "HandleCascadeUserInteraction"
 _METHOD_SEND_USER_CASCADE_MESSAGE = "SendUserCascadeMessage"
+_METHOD_START_CASCADE = "StartCascade"
 _METHOD_GET_AVAILABLE_MODELS = "GetAvailableModels"
 _METHOD_STREAM_AGENT_STATE_UPDATES = "StreamAgentStateUpdates"
 
@@ -583,6 +584,60 @@ def send_user_cascade_message(
         "items": [{"text": text}],
         "cascadeConfig": {"plannerConfig": {"planModel": plan_model}},
     }
+    try:
+        with _sync_client(_PROBE_TIMEOUT_S) as client:
+            response = client.post(
+                url,
+                headers={"Content-Type": "application/json"},
+                content=json.dumps(body).encode("utf-8"),
+            )
+    except httpx.HTTPError as e:
+        raise AntigravityRpcError(f"transport error contacting agy: {e}") from e
+    if response.status_code >= 400:
+        raise AntigravityRpcError(response.text)
+
+
+def start_cascade(
+    port: int,
+    cascade_id: str,
+    *,
+    source: str = "CORTEX_TRAJECTORY_SOURCE_CLI",
+) -> None:
+    """
+    Cold-start (create) an agy conversation over connect-RPC.
+
+    POSTs ``{"cascadeId": cascade_id, "source": source}`` to ``StartCascade``,
+    creating agy's brain dir (named after *cascade_id*) so the runner owns the
+    conversation id from turn-1 instead of waiting for the TUI to lazily mint one
+    on its first typed turn (live-verified against agy 1.0.10; see
+    ``agy-rpc-interaction-bridge`` / ``/tmp/agy-coldstart-spike.md``).
+
+    Two contract facts (live-verified):
+
+    * ``source`` is the ONLY required field. ``cascadeId`` is optional — when
+      omitted agy mints and returns one — but the runner PROVIDES it so it owns
+      the id (the response echoes the same id back). No model is needed here; the
+      model is selected per-turn by :func:`send_user_cascade_message`.
+    * An RPC-created conversation does NOT surface in the agy TUI (it stays on the
+      empty ``>`` banner); the brain dir / backend is the source of truth, which
+      is correct for the headless RPC runner.
+
+    :param port: Validated connect-RPC port, e.g. ``52548``.
+    :param cascade_id: Runner-generated conversation/cascade id (a ``uuid4``) the
+        new conversation will own.
+    :param source: agy trajectory-source enum string. Defaults to
+        ``"CORTEX_TRAJECTORY_SOURCE_CLI"`` (the headless-CLI source); kept a
+        parameter so a future enum rename is a one-line caller change.
+    :returns: ``None`` on success (HTTP 200).
+    :raises AntigravityRpcError: On transport errors (e.g. connection refused) or
+        any HTTP status >= 400. Transport errors are wrapped so the runner has one
+        exception type to catch. On non-2xx, the raw response body text is the
+        message (NOT ``raise_for_status()``) so the runner can surface agy's
+        error verbatim. Mirrors :func:`send_user_cascade_message`.
+    """
+    url = _rpc_url(port, _METHOD_START_CASCADE)
+    _assert_loopback_url(url)
+    body: dict[str, object] = {"cascadeId": cascade_id, "source": source}
     try:
         with _sync_client(_PROBE_TIMEOUT_S) as client:
             response = client.post(
