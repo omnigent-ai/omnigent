@@ -820,18 +820,33 @@ async def _stream_loop(
     """
     while not stop():
         async for frame in stream_agent_state_updates(port, cascade_id):
-            # /clear-rotation guard (design §10.5): a TUI ``/clear`` mints a NEW
-            # cascade id and retires the bound one; each frame's
-            # ``update.conversationId`` names the now-active conversation. If it
-            # ever names a DIFFERENT conversation than the one this reader bound,
-            # the bound conversation is dead — continuing would mirror a stale,
-            # frozen conversation while the live one's turns are lost silently. We
-            # stop mirroring (the failure is now logged, not silent). Full
-            # automatic rotation — rebinding to the new conversation and rotating
-            # the Omnigent session, like the codex forwarder does — is a larger
-            # change tracked as a follow-up (T-G); for the headless runner path it
-            # is OBVIATED by the 1:1 design, and for the CLI-fallback TUI edge this
-            # detect+stop keeps the failure visible rather than silent.
+            # /clear-rotation guard (best-effort, secondary signal): a TUI
+            # ``/clear`` mints a NEW cascade id and retires the bound one. If a
+            # frame ever names a DIFFERENT conversation than the one this reader
+            # bound, the bound conversation is dead — continuing would mirror a
+            # stale, frozen conversation while the live one's turns are lost
+            # silently. We stop mirroring (the failure is now logged, not silent).
+            #
+            # CAVEAT (unverified field path — gated on Task 13 live capture): this
+            # reads ``conversationId`` at the frame top level per design §10.5, but
+            # §10.5 is planning intent, NOT a capture, and the only live-verified
+            # id echo is NESTED (``metadata.rootConversationId`` from
+            # GetConversationMetadata). No captured frame in the repo pairs a
+            # top-level ``conversationId`` with ``mainTrajectoryUpdate``. So this
+            # guard may be a harmless no-op until a live ``/clear`` capture
+            # confirms where the active id actually lives (Task 13: do a TUI
+            # ``/clear``, dump the raw post-rotation frame, fix the field path +
+            # swap the hand-built test helper for a real fixture if it is nested).
+            # Two-axis uncertainty: (1) field location above, and (2) whether a
+            # foreign frame ever reaches THIS stream at all — §10.5 names
+            # GetAllCascadeTrajectories as the PRIMARY rotation signal; this
+            # per-frame check is only the secondary one.
+            #
+            # Full automatic rotation — rebinding to the new conversation and
+            # rotating the Omnigent session, like the codex forwarder does — is a
+            # larger change tracked as a follow-up (T-G); for the headless runner
+            # path it is OBVIATED by the 1:1 design, and for the CLI-fallback TUI
+            # edge this detect+stop keeps the failure visible rather than silent.
             if _frame_names_other_conversation(frame, cascade_id):
                 _logger.warning(
                     "agy RPC reader: bound conversation %s was rotated away (a "
@@ -884,11 +899,16 @@ def _frame_steps(frame: dict[str, object]) -> list[dict[str, object]]:
 
 def _frame_conversation_id(frame: dict[str, object]) -> str | None:
     """
-    Extract ``update.conversationId`` from one ``StreamAgentStateUpdates`` frame.
+    Extract a top-level ``conversationId`` from one ``StreamAgentStateUpdates``
+    frame.
 
-    Each stream frame names the active conversation (design §10.5); the field is
-    the rotation signal for a TUI ``/clear`` (which mints a new conversation id).
-    A frame without a string ``conversationId`` yields ``None``.
+    Design §10.5 ASSUMES each stream frame names the active conversation at the
+    frame top level (the rotation signal for a TUI ``/clear``, which mints a new
+    conversation id). That field path is UNVERIFIED — §10.5 is planning intent,
+    and the only live-verified id echo is nested (``metadata.rootConversationId``)
+    — so this may return ``None`` for every real frame until a Task 13 live
+    ``/clear`` capture confirms where the active id lives. A frame without a
+    string top-level ``conversationId`` yields ``None``.
 
     :param frame: One parsed DATA-frame ``update`` dict from the stream.
     :returns: The frame's conversation id string, or ``None`` when absent.
@@ -904,8 +924,11 @@ def _frame_names_other_conversation(frame: dict[str, object], cascade_id: str) -
     A frame that omits ``conversationId`` (or carries an empty/non-string one)
     is NOT treated as a rotation — only an explicit, different id is. This keeps
     the guard false-positive-free on the normal same-conversation path (where the
-    field either matches or is absent) and fires only on a real rotation (design
-    §10.5: a TUI ``/clear`` mints a new id, so frames begin naming it).
+    field either matches or is absent). It is INTENDED to fire on a real rotation
+    (design §10.5: a TUI ``/clear`` mints a new id, so frames would begin naming
+    it) — but see :func:`_frame_conversation_id`: the top-level field path is
+    unverified, so on the real wire this may never fire until confirmed by a
+    Task 13 live ``/clear`` capture.
 
     :param frame: One parsed DATA-frame ``update`` dict from the stream.
     :param cascade_id: The conversation id this reader bound at discovery.

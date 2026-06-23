@@ -186,11 +186,15 @@ def _frame(steps: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _frame_with_conversation(steps: list[dict[str, Any]], conversation_id: str) -> dict[str, Any]:
-    """A stream frame that names its active conversation (design §10.5).
+    """A stream frame with a top-level ``conversationId`` (design §10.5 ASSUMPTION).
 
-    Each live frame carries ``update.conversationId``; a TUI ``/clear`` mints a
-    NEW id, so post-rotation frames begin naming it. The reader keys its
-    /clear-rotation guard off this field.
+    Design §10.5 assumes each live frame carries ``update.conversationId`` and
+    that a TUI ``/clear`` mints a NEW id so post-rotation frames begin naming it;
+    the reader keys its /clear-rotation guard off this field. NOTE: that top-level
+    field path is unverified (the only live-verified id echo is nested,
+    ``metadata.rootConversationId``). This helper hand-sets the field to exercise
+    the guard's logic; it does NOT prove the real frame shape — replace it with a
+    captured post-``/clear`` fixture once Task 13 confirms the path.
     """
     frame = _frame(steps)
     frame["conversationId"] = conversation_id
