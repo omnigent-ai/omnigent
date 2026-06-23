@@ -28,10 +28,11 @@ import json
 import logging
 import os
 import secrets
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
+from pathlib import Path
 from typing import Any
 
-from omnigent.inner.datamodel import OSEnvSpec
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     Executor,
     ExecutorConfig,
@@ -138,8 +139,12 @@ class QwenExecutor(Executor):
 
         :param cwd: Working directory for the qwen subprocess.  When
             ``None``, the subprocess inherits the caller's cwd.
-        :param os_env: Environment spec for sandboxing (currently unused
-            by this executor but accepted for API parity).
+        :param os_env: Environment / sandbox spec. When its ``sandbox`` is not
+            ``"none"``, the whole ``qwen`` process tree is wrapped in the
+            platform sandbox (bwrap/seatbelt) at spawn — see
+            :meth:`_sandbox_launch_path` — so qwen's own file/shell tools are
+            confined to the spec's read/write roots, not just gated by the
+            permission policy.
         :param model: Model identifier to pass in ``session/new``.
         :param qwen_path: Absolute path to qwen CLI binary.
             Defaults to ``"qwen"`` (PATH lookup).
@@ -220,15 +225,25 @@ class QwenExecutor(Executor):
         models) don't hit the default 64 KiB per-line cap and raise
         "Separator is not found, and chunk exceed the limit".
         """
+        # Reset handshake state: this may be a restart after the previous
+        # subprocess died. ``_initialized`` is a one-way latch, so without
+        # this the new process would skip ``initialize`` and qwen would
+        # reject the subsequent ``session/new``. ``_image_supported`` is
+        # derived from the initialize response, so it's stale too.
+        self._initialized = False
+        self._image_supported = False
         env = os.environ.copy()
         # Translate Omnigent's provider/gateway routing into the OpenAI-compatible
         # env vars qwen reads (overriding any ambient values). No-op when no
         # gateway is wired (the CLI's own ambient auth is used).
         env.update(await self._resolve_gateway_env())
+        # Resolve the path to spawn: the bare qwen binary, or a sandbox launcher
+        # that confines the whole process tree when os_env requests it.
+        launch_path = self._sandbox_launch_path(tuple(env.keys()))
         # 16 MiB per-line limit for the stdout StreamReader.
         _STREAM_LIMIT = 16 * 1024 * 1024
         self._proc = await asyncio.create_subprocess_exec(
-            self._qwen_path,
+            launch_path,
             "--acp",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
@@ -239,6 +254,57 @@ class QwenExecutor(Executor):
         )
         self._reader_task = asyncio.create_task(self._read_stdout())
         self._stderr_task = asyncio.create_task(self._read_stderr())
+
+    def _sandbox_launch_path(self, spawn_env_names: Sequence[str]) -> str:
+        """Return the path to spawn for qwen — sandbox launcher or bare binary.
+
+        Mirrors :func:`omnigent.inner.pi_executor._try_sandbox_pi`. When
+        ``os_env.sandbox`` requests confinement, wraps the qwen binary in the
+        platform sandbox (``linux_bwrap`` / ``darwin_seatbelt``) so the *entire*
+        qwen process tree — its built-in file tools and any shell child
+        processes — runs confined to the spec's read/write roots. This is the
+        OS-level guarantee the per-tool permission gate can't give: even an
+        *allowed* tool call can't touch paths outside the sandbox.
+
+        Falls back to the bare binary (never blocks startup) when no sandbox is
+        requested, the resolved policy is inactive, or the backend is
+        unavailable on this platform.
+
+        :param spawn_env_names: Env-var names we deliberately set on the
+            subprocess ``env=``; baked into the policy so ``run_launcher``
+            prunes anything else the launcher inherits (host-env leak defense).
+        :returns: The path to pass as argv[0] to ``create_subprocess_exec``.
+        """
+        os_env = self._os_env
+        if os_env is None:
+            return self._qwen_path
+        sandbox_spec = os_env.sandbox or OSEnvSandboxSpec()
+        if sandbox_spec.type == "none":
+            return self._qwen_path
+        try:
+            from .sandbox import (
+                create_exec_launcher,
+                resolve_sandbox,
+                with_additional_read_roots,
+                with_additional_write_roots,
+                with_spawn_env_allowlist,
+            )
+
+            cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
+            sandbox = resolve_sandbox(os_env, cwd)
+            if not sandbox.active:
+                return self._qwen_path
+            # qwen is an npm CLI: it must read its own install + node_modules
+            # and write its config dir (~/.qwen) and /tmp, or it can't start
+            # inside the jail.
+            qwen_dir = Path(self._qwen_path).resolve().parent.parent
+            sandbox = with_additional_read_roots(sandbox, [qwen_dir])
+            sandbox = with_additional_write_roots(sandbox, [Path.home() / ".qwen", Path("/tmp")])
+            sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
+            return create_exec_launcher(self._qwen_path, sandbox)
+        except (OSError, ImportError, NotImplementedError) as exc:
+            logger.warning("Could not apply sandbox for qwen; running unsandboxed: %s", exc)
+            return self._qwen_path
 
     async def _resolve_gateway_env(self) -> dict[str, str]:
         """Build the OpenAI-compatible env qwen reads from the gateway config.
@@ -325,7 +391,14 @@ class QwenExecutor(Executor):
             while True:
                 raw_line = await self._proc.stdout.readline()
                 if not raw_line:
-                    break  # EOF — process exited
+                    # EOF — the qwen subprocess exited (a crash mid-turn
+                    # surfaces here, not in the except branch). Wake any
+                    # in-flight futures so run_turn fails fast instead of
+                    # blocking until the idle timeout.
+                    for fut in self._pending.values():
+                        if not fut.done():
+                            fut.set_exception(EOFError("qwen subprocess closed stdout"))
+                    break
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line:
                     continue

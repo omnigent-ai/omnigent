@@ -23,6 +23,11 @@ Tracks pending work and known limitations for the Qwen Code harness
   Verified end-to-end against an OpenAI-compatible endpoint. **Caveat:** this is
   authoritative only when qwen has no conflicting ambient `~/.qwen/settings.json`
   — see Pending work for the precedence limitation.
+- **OS sandbox.** When the spec's `os_env.sandbox` is not `none`, the whole
+  `qwen` process tree is wrapped in the platform sandbox (bwrap / seatbelt) at
+  spawn (`_sandbox_launch_path`), confining qwen's own file/shell tools to the
+  spec's read/write roots — an OS-level guarantee independent of the per-tool
+  permission gate.
 
 ## Pending work
 
@@ -74,8 +79,15 @@ comments; this is the *what*, not the *how*.)
 - [ ] **Omnigent tools.** Qwen can only call its own built-in tools; tools
   defined by Omnigent aren't exposed to it (so they can't be invoked or
   recorded). Permission gating on qwen's *own* tool calls already works.
-- [ ] **File I/O through Omnigent.** Qwen reads and writes files with its own
-  tools, so file operations bypass Omnigent's policy and sandboxing.
+- [ ] **File I/O execution / content recording.** Qwen performs file reads and
+  writes with its own tools (we don't advertise `clientCapabilities.fs`), so
+  Omnigent never executes the I/O and can't record the file content or run
+  TOOL_RESULT-phase content policy on it. Note the gaps that are *already*
+  closed: the TOOL_CALL request is gated (permission + policy) when qwen asks,
+  and the ops are confined when `os_env.sandbox` is set (see What works today).
+  What's missing is Omnigent-side execution/recording of the I/O itself —
+  advertise `clientCapabilities.fs` + re-add `fs/read_text_file` /
+  `fs/write_text_file` handlers to route it through Omnigent.
 
 > LLM-phase policy (`PHASE_LLM_REQUEST` / `PHASE_LLM_RESPONSE`) is intentionally
 > out of scope: qwen's model calls happen internally over ACP and are opaque to

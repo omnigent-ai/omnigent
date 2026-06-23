@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -232,10 +233,168 @@ async def test_read_stdout_does_not_resolve_future_for_colliding_request() -> No
 
     await executor._read_stdout()
 
-    assert not fut.done()  # our prompt future was NOT mis-resolved
+    # The colliding request must NOT resolve our future with a result; it
+    # routes to the queue instead. (The trailing EOF wakes the still-pending
+    # future with EOFError so callers fail fast — see the EOF path — so the
+    # future may be done, but never with a result.)
+    assert fut.exception() is not None and not fut.cancelled()
+    assert isinstance(fut.exception(), EOFError)
     assert 2 in executor._pending
     queued = executor._queue.get_nowait()
     assert queued["method"] == "session/request_permission"
+
+
+@pytest.mark.asyncio
+async def test_read_stdout_wakes_pending_futures_on_eof() -> None:
+    """A clean EOF (subprocess crash) wakes in-flight futures with EOFError.
+
+    Without this, a qwen process that dies mid-turn closes stdout (an EOF, not
+    an exception), the reader exits normally, and the pending session/prompt
+    future never resolves — run_turn blocks until the idle timeout instead of
+    failing fast.
+    """
+    executor = QwenExecutor()
+
+    loop = asyncio.get_event_loop()
+    fut: asyncio.Future = loop.create_future()
+    executor._pending[7] = fut  # in-flight session/prompt
+
+    # stdout closes immediately (process died) — first readline is EOF.
+    mock_stdout = AsyncMock()
+    mock_stdout.readline = AsyncMock(side_effect=[b""])
+    mock_proc = MagicMock()
+    mock_proc.stdout = mock_stdout
+    executor._proc = mock_proc
+
+    await executor._read_stdout()
+
+    assert fut.done()
+    assert isinstance(fut.exception(), EOFError)
+
+
+# ---------------------------------------------------------------------------
+# _sandbox_launch_path — confine the qwen process tree per os_env.sandbox
+# ---------------------------------------------------------------------------
+
+
+def test_sandbox_launch_path_bare_when_no_sandbox() -> None:
+    """No os_env, or sandbox type 'none', spawns the bare qwen binary."""
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    # os_env not provided at all.
+    bare = QwenExecutor(qwen_path="/usr/bin/qwen")
+    assert bare._sandbox_launch_path(["PATH"]) == "/usr/bin/qwen"
+    # os_env present but sandbox explicitly disabled.
+    executor = QwenExecutor(
+        qwen_path="/usr/bin/qwen",
+        os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none")),
+    )
+    assert executor._sandbox_launch_path(["PATH"]) == "/usr/bin/qwen"
+
+
+def test_sandbox_launch_path_wraps_active_policy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """An active sandbox wraps qwen in a launcher with its roots + env baked in.
+
+    Mirrors pi: the whole qwen process tree is confined, so even an allowed
+    tool call can't escape the spec's read/write roots. Asserts the launcher is
+    returned and the policy carries qwen's own paths and our spawn env names.
+    """
+    from omnigent.inner import sandbox as sandbox_mod
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.sandbox import SandboxPolicy
+
+    captured: dict = {}
+
+    def _fake_resolve(_os_env, cwd: Path) -> SandboxPolicy:
+        return SandboxPolicy(
+            backend_type="linux_bwrap",
+            active=True,
+            read_roots=[cwd.resolve(strict=False)],
+            write_roots=[cwd.resolve(strict=False)],
+            write_files=[],
+            allow_network=True,
+        )
+
+    def _fake_launcher(target: str, sandbox: SandboxPolicy) -> str:
+        captured["target"] = target
+        captured["policy"] = sandbox
+        return "/fake/launcher"
+
+    monkeypatch.setattr(sandbox_mod, "resolve_sandbox", _fake_resolve)
+    monkeypatch.setattr(sandbox_mod, "create_exec_launcher", _fake_launcher)
+
+    executor = QwenExecutor(
+        cwd=str(tmp_path),
+        qwen_path="/usr/bin/qwen",
+        os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+    )
+    path = executor._sandbox_launch_path(("PATH", "OPENAI_BASE_URL"))
+
+    assert path == "/fake/launcher"
+    assert captured["target"] == "/usr/bin/qwen"
+    policy = captured["policy"]
+    # qwen's config dir is a write root so it can start inside the jail.
+    assert any(str(p).endswith(".qwen") for p in policy.write_roots)
+    # Our deliberate spawn env names are pruneproof in the launcher.
+    assert policy.spawn_env_allowlist is not None
+    assert "PATH" in policy.spawn_env_allowlist
+    assert "OPENAI_BASE_URL" in policy.spawn_env_allowlist
+
+
+def test_sandbox_launch_path_falls_back_when_backend_unavailable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A backend failure degrades to the bare binary, never blocks startup."""
+    from omnigent.inner import sandbox as sandbox_mod
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    def _boom(_os_env, _cwd) -> None:
+        raise NotImplementedError("no bwrap on this platform")
+
+    monkeypatch.setattr(sandbox_mod, "resolve_sandbox", _boom)
+
+    executor = QwenExecutor(
+        cwd=str(tmp_path),
+        qwen_path="/usr/bin/qwen",
+        os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+    )
+    assert executor._sandbox_launch_path(["PATH"]) == "/usr/bin/qwen"
+
+
+@pytest.mark.asyncio
+async def test_start_process_resets_handshake_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A (re)start clears the one-way init latch so the fresh process re-handshakes.
+
+    After a crash the error paths reset session state but ``_initialized`` is a
+    one-way latch — without resetting it on restart, ``_ensure_initialized``
+    would skip ``initialize`` against the new subprocess and qwen would reject
+    the subsequent ``session/new``. ``_image_supported`` (derived from the init
+    response) is stale for the same reason.
+    """
+    executor = QwenExecutor(qwen_path="/usr/bin/qwen")
+    # Simulate the post-crash state: handshake flags left latched from the
+    # previous (now-dead) subprocess.
+    executor._initialized = True
+    executor._image_supported = True
+
+    async def _fake_subprocess_exec(*_args, **_kwargs):
+        proc = MagicMock()
+        proc.stdout = AsyncMock()
+        proc.stdout.readline = AsyncMock(return_value=b"")
+        proc.stderr = AsyncMock()
+        proc.stderr.readline = AsyncMock(return_value=b"")
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_subprocess_exec)
+
+    await executor._start_process()
+
+    assert executor._initialized is False
+    assert executor._image_supported is False
 
 
 # ---------------------------------------------------------------------------
