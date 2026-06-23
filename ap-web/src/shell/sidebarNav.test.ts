@@ -8,6 +8,7 @@ import {
   getConversationIconKind,
   getConversationAgentType,
   normalizePinnedConversationIds,
+  orderByPinnedSequence,
   togglePinnedConversationId,
 } from "./sidebarNav";
 
@@ -113,6 +114,46 @@ describe("pin helpers", () => {
     expect(
       normalizePinnedConversationIds(["conv_a", "missing", "conv_a", "conv_b"], conversations),
     ).toEqual(["conv_a", "conv_b"]);
+  });
+});
+
+describe("orderByPinnedSequence", () => {
+  it("puts the newest pin last, ignoring updated_at", () => {
+    // conv_a leads the ids list (the most recent pin) AND has the newest
+    // updated_at, yet it must render LAST: pinned order is oldest-pin-first
+    // (newest pin at the bottom) and never follows updated_at.
+    const convA = conversation("conv_a", "A", new Date(2026, 4, 14, 9), {
+      updatedAt: new Date(2026, 4, 14, 23),
+    });
+    const convB = conversation("conv_b", "B", new Date(2026, 4, 14, 8), {
+      updatedAt: new Date(2026, 4, 14, 9),
+    });
+
+    // ids are most-recently-pinned-first: conv_a pinned last, conv_b earlier.
+    expect(orderByPinnedSequence([convA, convB], ["conv_a", "conv_b"]).map((c) => c.id)).toEqual([
+      "conv_b",
+      "conv_a",
+    ]);
+  });
+
+  it("holds a pinned row's slot when its updated_at is bumped", () => {
+    const convA = conversation("conv_a", "A", new Date(2026, 4, 14, 9));
+    const convB = conversation("conv_b", "B", new Date(2026, 4, 14, 8));
+    const ids = ["conv_a", "conv_b"];
+
+    const before = orderByPinnedSequence([convA, convB], ids).map((c) => c.id);
+    // conv_b gets a new message (latest updated_at) — its slot must not move.
+    const bumped = { ...convB, updated_at: Math.floor(new Date(2026, 4, 14, 23).getTime() / 1000) };
+    const after = orderByPinnedSequence([convA, bumped], ids).map((c) => c.id);
+    expect(after).toEqual(before);
+  });
+
+  it("does not mutate the input array", () => {
+    const convA = conversation("conv_a", "A", new Date(2026, 4, 14, 9));
+    const convB = conversation("conv_b", "B", new Date(2026, 4, 14, 8));
+    const input = [convB, convA];
+    orderByPinnedSequence(input, ["conv_a", "conv_b"]);
+    expect(input.map((c) => c.id)).toEqual(["conv_b", "conv_a"]);
   });
 });
 
