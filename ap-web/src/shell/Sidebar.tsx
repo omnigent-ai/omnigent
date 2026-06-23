@@ -71,9 +71,7 @@ import { sumPendingApprovals } from "@/lib/inbox";
 import { cn } from "@/lib/utils";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
-import { PINNED_HOTKEY_DIGITS, usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
-import { MOD_KEY } from "@/components/KeyboardShortcutsDialog";
-import { isNativeShell } from "@/lib/nativeBridge";
+import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import { ThemeModeMenu } from "@/components/theme/ThemeModeMenu";
 import { AccountMenu } from "./AccountMenu";
@@ -528,8 +526,8 @@ function ConversationList({
   }, [sections, collapsedSections]);
   useSessionSwitchHotkey(orderedConversationIds, activeId);
 
-  // Cmd/Ctrl+1..9/0 jumps to the first ten pinned sessions. Empty when the
-  // Pinned section is collapsed, matching the per-row chips below.
+  // Cmd/Ctrl+1..9/0 jumps to the first ten pinned sessions (desktop only;
+  // see the hook). Empty when the Pinned section is collapsed.
   const pinnedSessionIds = useMemo(
     () => (collapsedSections.includes("Pinned") ? [] : sections.pinned.map((c) => c.id)),
     [sections.pinned, collapsedSections],
@@ -596,7 +594,6 @@ function ConversationList({
               selectionMode={selectionMode}
               selectedIds={selectedIds}
               onToggleSelected={onToggleSelected}
-              showPinnedShortcuts={isNativeShell()}
             />
           )}
           {sections.sessions.length > 0 && (
@@ -679,7 +676,6 @@ function ConversationSection({
   selectionMode,
   selectedIds,
   onToggleSelected,
-  showPinnedShortcuts = false,
 }: {
   title?: string;
   conversations: Conversation[];
@@ -691,8 +687,6 @@ function ConversationSection({
   selectionMode: boolean;
   selectedIds: Set<string>;
   onToggleSelected: (conversationId: string) => void;
-  /** Pinned section only: render the Cmd/Ctrl+digit chip on the first ten rows. */
-  showPinnedShortcuts?: boolean;
 }) {
   const collapsed = title != null && collapsedSections.includes(title);
   return (
@@ -717,7 +711,7 @@ function ConversationSection({
       )}
       {!collapsed && (
         <ul className="flex flex-col gap-0.5">
-          {conversations.map((conv, idx) => (
+          {conversations.map((conv) => (
             <ConversationRow
               key={conv.id}
               conversation={conv}
@@ -727,11 +721,6 @@ function ConversationSection({
               selectionMode={selectionMode}
               isSelected={selectedIds.has(conv.id)}
               onToggleSelected={onToggleSelected}
-              shortcutDigit={
-                showPinnedShortcuts && idx < PINNED_HOTKEY_DIGITS.length
-                  ? PINNED_HOTKEY_DIGITS[idx]
-                  : undefined
-              }
             />
           ))}
         </ul>
@@ -748,7 +737,6 @@ function ConversationRow({
   selectionMode,
   isSelected,
   onToggleSelected,
-  shortcutDigit,
 }: {
   conversation: Conversation;
   isPinned: boolean;
@@ -757,8 +745,6 @@ function ConversationRow({
   selectionMode: boolean;
   isSelected: boolean;
   onToggleSelected: (conversationId: string) => void;
-  /** When set, the digit selected by Cmd/Ctrl+<digit> for this pinned row. */
-  shortcutDigit?: string;
 }) {
   // `useParams` reads from the active matched route. On `/`, the param is
   // undefined; on `/c/:conversationId`, it carries the active id.
@@ -962,16 +948,6 @@ function ConversationRow({
             shared) were removed to keep rows text-clean; pinned rows still
             group under "Pinned". */}
         <div className="flex w-full items-center gap-1.5">
-          {shortcutDigit && !selectionMode && (
-            <kbd
-              data-testid="pinned-shortcut-hint"
-              aria-hidden
-              className="hidden h-5 shrink-0 items-center justify-center rounded border border-border bg-muted px-1 font-sans text-[10px] font-medium text-muted-foreground md:inline-flex"
-            >
-              {MOD_KEY}
-              {shortcutDigit}
-            </kbd>
-          )}
           <span className={cn("relative min-w-0 truncate", hasUnseenMessages && "font-semibold")}>
             {label}
             {hasUnseenMessages && <span className="sr-only"> (unread)</span>}

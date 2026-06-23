@@ -1,13 +1,12 @@
 """Desktop-only pinned-session hotkeys: Cmd/Ctrl+digit jumps to a pinned row.
 
 The sidebar binds ``Cmd+1..9/0`` (``Ctrl`` on Win/Linux) to the first ten
-pinned sessions in render order — 1–9 to the first nine, 0 to the tenth —
-and paints a matching ``⌘N`` chip on each of those rows
-(``usePinnedSessionHotkeys`` + ``Sidebar.tsx``). Both are **desktop-only**:
-a browser tab reserves ``Cmd/Ctrl+digit`` for native tab-switching, so the
-hook is inert and the chips are suppressed outside the Electron shell
-(gated on ``isNativeShell()`` -> ``window.omnigentDesktop.kind ===
-"electron"`` — see ``ap-web/src/lib/nativeBridge.ts``).
+pinned sessions in render order — 1–9 to the first nine, 0 to the tenth
+(``usePinnedSessionHotkeys``). It is **desktop-only**: a browser tab
+reserves ``Cmd/Ctrl+digit`` for native tab-switching, so the hook is inert
+outside the Electron shell (gated on ``isNativeShell()`` ->
+``window.omnigentDesktop.kind === "electron"`` — see
+``ap-web/src/lib/nativeBridge.ts``).
 
 The e2e_ui harness runs the SPA in a plain Chromium browser, not Electron,
 so by default ``isNativeShell()`` is false and this behavior can't fire. To
@@ -15,12 +14,11 @@ exercise it end-to-end we inject a minimal ``window.omnigentDesktop`` stub
 via ``add_init_script`` *before any app script runs* — the same
 feature-detection-stubbing pattern ``test_idle_notifications.py`` uses for
 the OS-notification path. With the stub in place the SPA believes it is
-under the desktop shell, so the chips render and the keydown handler routes.
+under the desktop shell, so the keydown handler routes.
 
-These drive the real chain the ``usePinnedSessionHotkeys`` /
-``Sidebar.pinnedHotkeys`` unit tests mock out: the live
-``GET /v1/sessions`` list -> ``useConversations`` -> the Pinned section
-peel -> the per-row chip and the window keydown handler -> a client-side
+These drive the real chain the ``usePinnedSessionHotkeys`` unit tests mock
+out: the live ``GET /v1/sessions`` list -> ``useConversations`` -> the
+Pinned section peel -> the window keydown handler -> a client-side
 navigation to ``/c/{id}``. A regression in the shell gate, the digit->slot
 mapping, or the list shape would surface here.
 """
@@ -112,10 +110,10 @@ def _pin(page: Page, session_id: str) -> None:
 def _pinned_slot_ids(page: Page) -> list[str]:
     """Return the pinned conversation ids in sidebar render order.
 
-    The Nth entry (0-based) is the row the chip labels — and the hotkey
-    jumps to — with digit ``PINNED_HOTKEY_DIGITS[N]`` (1..9 then 0). Reading
-    the live DOM order rather than assuming an insertion order keeps the
-    digit->slot assertions honest to what the user actually sees.
+    The Nth entry (0-based) is the row the hotkey jumps to with digit
+    ``PINNED_HOTKEY_DIGITS[N]`` (1..9 then 0). Reading the live DOM order
+    rather than assuming an insertion order keeps the digit->slot assertions
+    honest to what the user actually sees.
 
     :param page: Playwright page with the Pinned section rendered.
     :returns: Ordered ``/c/{id}`` -> ``id`` for each pinned row.
@@ -137,13 +135,11 @@ def test_pinned_hotkey_navigates_under_native_shell(
     Pins two sessions, leaves the open conversation for the new-session
     screen ("/") so a jump is observable, then presses the platform modifier
     + the digit for each pinned slot and asserts the route lands on that
-    slot's session. Also asserts the per-row ``⌘N`` chips render (one per
-    pinned row) — the visible affordance the hotkey mirrors.
+    slot's session.
 
     Catches regressions the mocked unit tests can't: the live list shape
-    drifting so a pinned row never reaches the Pinned section, the digit->id
-    mapping breaking, or the chip/handler silently decoupling from render
-    order.
+    drifting so a pinned row never reaches the Pinned section, or the
+    digit->id mapping breaking against real render order.
 
     :param page: Playwright page fixture (fresh context per test).
     :param seeded_session_pair: ``(base_url, session_a, session_b)`` — two
@@ -163,14 +159,6 @@ def test_pinned_hotkey_navigates_under_native_shell(
     slots = _pinned_slot_ids(page)
     assert session_a in slots and session_b in slots, slots
     assert len(slots) == 2, f"expected exactly two pinned rows, got {slots}"
-
-    # The chip is gated on the native shell and only shows on the first ten
-    # pinned rows — both pinned rows must carry one.
-    chips = _section(page, "Pinned").get_by_test_id("pinned-shortcut-hint")
-    expect(chips).to_have_count(2)
-    # Digit labels track render order: slot 0 -> "1", slot 1 -> "2".
-    expect(chips.nth(0)).to_contain_text("1")
-    expect(chips.nth(1)).to_contain_text("2")
 
     # Leave the open session so a hotkey jump is an observable navigation.
     page.get_by_test_id("new-chat-button").click()
@@ -193,13 +181,12 @@ def test_pinned_hotkey_inert_in_plain_browser(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """In a plain browser tab the chip is hidden and the hotkey does nothing.
+    """In a plain browser tab the hotkey does nothing.
 
     No native-shell stub: ``isNativeShell()`` is false, so the SPA must not
-    paint the ``⌘N`` chip and must not hijack ``Cmd/Ctrl+digit`` (which the
-    browser reserves for tab-switching). Pins a session, asserts no chip
-    renders, navigates to the new-session screen, presses the modifier+1,
-    and asserts the route did NOT jump to the pinned session.
+    hijack ``Cmd/Ctrl+digit`` (which the browser reserves for tab-switching).
+    Pins a session, navigates to the new-session screen, presses the
+    modifier+1, and asserts the route did NOT jump to the pinned session.
 
     This is the half of the contract that only an end-to-end browser run can
     prove — the gate that keeps the feature desktop-only.
@@ -213,9 +200,6 @@ def test_pinned_hotkey_inert_in_plain_browser(
 
     page.goto(f"{base_url}/c/{session_id}")
     _pin(page, session_id)
-
-    # No native shell -> no shortcut chip anywhere in the sidebar.
-    expect(page.get_by_test_id("pinned-shortcut-hint")).to_have_count(0)
 
     # Leave the session; if the hotkey fired it would jump straight back.
     page.get_by_test_id("new-chat-button").click()
