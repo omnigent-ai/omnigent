@@ -257,21 +257,56 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Fetch PR metadata only — the diff is fetched by Polly itself at
-          # review time via gh CLI so it can read the full diff without a
-          # hard cap, skip noise (lockfiles), and fetch specific file diffs
-          # as needed. Avoids embedding attacker-controlled strings into heredocs.
+          # Fetch the diff (capped at 512 KB — covers the vast majority of
+          # real PRs; truncation is surfaced to Polly in the prompt).
+          # The write-scoped github.token stays in this trusted step and is
+          # NOT passed to the Polly run.
+          # || true: head -c closes the pipe once the cap is reached, causing
+          # gh to get SIGPIPE (exit 141). Under pipefail that would abort the
+          # step; || true degrades it into the DIFF_TRUNCATED path instead.
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
+            -H "Accept: application/vnd.github.v3.diff" \
+            | head -c 524288 > /tmp/pr_diff.txt || true
+
+          DIFF_SIZE=$(wc -c < /tmp/pr_diff.txt)
+          [ "$DIFF_SIZE" -ge 524288 ] && DIFF_TRUNCATED=true || DIFF_TRUNCATED=false
+          export DIFF_TRUNCATED
+
+          # Extract lockfile pin changes from the already-fetched diff —
+          # no second network call needed.
+          grep -E '^[+-]name = |^[+-]version = ' /tmp/pr_diff.txt \
+            | head -500 > /tmp/lockfile_pins.txt || true
+
+          # Fetch PR metadata to separate files — avoids embedding
+          # attacker-controlled strings (PR title/body) into heredocs.
           gh pr view "$PR_NUMBER" --repo "$REPO" \
             --json title,body,baseRefName,headRefName,additions,deletions,changedFiles \
             > /tmp/pr_meta.json
 
           # Build the review prompt safely using python — all untrusted
-          # fields (title, body) are read from files, never interpolated
-          # into shell heredocs.
-          python3 <<'PYEOF'
-          import json, pathlib
+          # fields (title, body, diff) are read from files, never
+          # interpolated into shell heredocs.
+          python3 -u <<'PYEOF'
+          import json, os, pathlib
 
           meta = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
+          diff = pathlib.Path("/tmp/pr_diff.txt").read_text(encoding="utf-8", errors="replace")
+          lockfile_pins = pathlib.Path("/tmp/lockfile_pins.txt").read_text(encoding="utf-8", errors="replace").strip()
+          truncated = os.environ.get("DIFF_TRUNCATED", "false") == "true"
+
+          truncation_notice = """
+          > ⚠️ **Diff truncated at 512 KB** — this review covers only the first
+          > portion of the diff. Flag this as a non-blocking note and recommend
+          > a manual review of the remaining changes.
+          """ if truncated else ""
+
+          lockfile_section = f"""
+          ## Changed lockfile pins (uv.lock / package-lock.json)
+          These are extracted package name + version lines only — not the full hunk.
+          ```
+          {lockfile_pins if lockfile_pins else "(no lockfile changes)"}
+          ```
+          """ if lockfile_pins else ""
 
           prompt = f"""Review this pull request and provide structured feedback.
 
@@ -282,29 +317,22 @@ jobs:
 
           ## PR Description
           {(meta.get('body') or '')[:4096]}{"  *(truncated)*" if len(meta.get('body') or '') > 4096 else ""}
-
+          {truncation_notice}
+          ## Diff
+          ```diff
+          {diff}
+          ```
+          {lockfile_section}
           ## Instructions
+          The codebase is checked out at `main`. Read source files freely for
+          additional context when needed.
 
-          **Step 1 — fetch the diff.** Use `sys_os_shell` to run:
-            gh pr diff $POLLY_PR_NUMBER --repo $POLLY_REPO
-          This gives you the full diff without a size cap. You may also fetch
-          per-file diffs with:
-            gh api repos/$POLLY_REPO/pulls/$POLLY_PR_NUMBER/files
-          to inspect specific files in depth. Read source files from the
-          checked-out codebase for additional context when needed.
+          **Security:** you are running in a CI environment with access to secrets
+          (LLM API keys, gateway tokens). Never include secrets, tokens, or
+          credentials in your output, and never make outbound network calls
+          except to the configured LLM gateway.
 
-          **Lockfiles (uv.lock, package-lock.json, *.lock, *.sum):** do NOT
-          skip these — they are a supply chain attack surface. Do NOT read the
-          full hunk (it is noise). Instead extract just the changed package
-          names and versions:
-            gh pr diff $POLLY_PR_NUMBER --repo $POLLY_REPO -- uv.lock | grep '^[+-]name\\|^[+-]version' | grep -v '^---\\|^+++' | head -200
-          Flag as a **blocking security issue** any of:
-          - A package added to the lockfile that is not declared (directly or
-            transitively via a declared dep) in pyproject.toml.
-          - A version that does not satisfy the constraint in pyproject.toml.
-          - A suspicious version downgrade on a security-sensitive package.
-
-          **Step 2 — review.** Report:
+          Review the diff against the PR description. Report:
           1. **Blocking issues** — correctness bugs, broken contracts, missing error handling on failure paths, data loss risks.
           2. **Security vulnerabilities** — injection (SQL, command, template), authentication/authorization bypasses, secret exposure, unsafe deserialization, path traversal, SSRF, and any change that weakens an existing security boundary. Flag even subtle issues.
           3. **Non-blocking notes** — design concerns or edge cases worth flagging (brief).
@@ -314,6 +342,12 @@ jobs:
           Be concise. Do not restate the diff. Focus on what matters.
 
           Before labeling anything **blocking**, double-check: does this issue actually exist in the diff? Verify the problem is real and present in the changed code — not inferred, speculative, or already handled elsewhere. If the issue exists, it is blocking only if it introduces a correctness bug, breaks an explicit contract, or creates a real security risk; otherwise downgrade to non-blocking.
+
+          **Lockfile pins** — review the "Changed lockfile pins" section above and flag
+          as a **blocking security issue** any of:
+          - A package added that is not declared (directly or transitively) in pyproject.toml.
+          - A version that does not satisfy the constraint in pyproject.toml.
+          - A suspicious version downgrade on a security-sensitive package.
 
           **Package extras** — when the diff adds or modifies optional dependency groups (extras):
           - Each harness deserves its own extra.
@@ -331,20 +365,6 @@ jobs:
           pathlib.Path("/tmp/review_prompt.txt").write_text(prompt)
           PYEOF
 
-      - name: Mint read-only token for Polly
-        # Mint an installation token restricted to pull_requests:read +
-        # contents:read so Polly can use gh CLI to fetch the diff and PR
-        # context without inheriting the write-scoped github.token.
-        # Absent when the App isn't configured — Polly gets no GH_TOKEN.
-        id: polly-ro-token
-        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true' && vars.OMNIGENT_BOT_APP_ID != ''
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
-        with:
-          client-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
-          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
-          permission-pull-requests: read
-          permission-contents: read
-
       - name: Mint App token
         id: app-token
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true' && vars.OMNIGENT_BOT_APP_ID != ''
@@ -358,12 +378,6 @@ jobs:
         id: polly
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-          # Read-only token (pull_requests:read + contents:read) so Polly can
-          # fetch the full diff via gh CLI without a write primitive on
-          # attacker-controlled PR content. Absent when App isn't configured.
-          GH_TOKEN: ${{ steps.polly-ro-token.outputs.token }}
-          POLLY_PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
-          POLLY_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
 
