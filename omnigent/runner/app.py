@@ -5245,6 +5245,18 @@ def create_runner_app(
             _session_workspace_cache[session_id] = snapshot.workspace
         return _session_workspace_cache.get(session_id)
 
+    async def _session_runtime_cwd(session_id: str) -> Path | None:
+        """Return the cwd the harness should use for *session_id*.
+
+        The server-stored session workspace wins because it carries
+        worktree-specific paths. Fall back to the runner's global workspace
+        only when the snapshot has no workspace.
+        """
+        workspace = await _session_workspace_value(session_id)
+        if workspace and workspace.strip():
+            return Path(workspace.strip()).expanduser().resolve()
+        return runner_workspace.resolve() if runner_workspace is not None else None
+
     async def _resolve_session_fs_registry(
         session_id: str,
     ) -> FilesystemRegistry | None:
@@ -5489,6 +5501,7 @@ def create_runner_app(
                 spec,
                 harness_name,
                 workdir=_resolved_spec_workdir(spec_entry),
+                cwd=await _session_runtime_cwd(session_id),
             )
             if harness_name == "claude-native" and spawn_env is None:
                 from omnigent.claude_native_bridge import (
@@ -9187,6 +9200,7 @@ def create_runner_app(
                 cached_spec,
                 harness_name,
                 workdir=cached_spec_workdir,
+                cwd=await _session_runtime_cwd(conv),
                 # Apply the per-session /model override so it actually
                 # changes the model on the SDK harnesses (not just the
                 # readout). Forwarded by the Omnigent server in the message body.
@@ -9581,6 +9595,7 @@ def create_runner_app(
                     model_override=body.get("model_override"),
                     harness_override=body.get("harness_override"),
                     sub_agent_name=_sub_agent_name,
+                    cwd=await _session_runtime_cwd(conv_id),
                 )
             except (httpx.HTTPError, RuntimeError) as exc:
                 return JSONResponse(
@@ -13473,6 +13488,7 @@ async def _resolve_harness_config(
     model_override: str | None = None,
     harness_override: str | None = None,
     sub_agent_name: str | None = None,
+    cwd: Path | None = None,
 ) -> tuple[str, dict[str, str] | None]:
     """Resolve harness type + spawn-env from the agent spec.
 
@@ -13493,6 +13509,7 @@ async def _resolve_harness_config(
         the parent spec is swapped to the matching sub-spec via
         :func:`_find_spec_by_name` before harness derivation. ``None`` for
         top-level sessions.
+    :param cwd: Runtime working directory for harnesses that need it.
     :returns: ``(harness, spawn_env)``; a default for unresolved specs.
     """
     if agent_id and spec_resolver:
@@ -13514,7 +13531,7 @@ async def _resolve_harness_config(
             harness = harness_override or spec.executor.config.get("harness") or spec.executor.type
             harness = canonicalize_harness(harness) or harness
             spawn_env = _build_spawn_env_from_spec(
-                spec, harness, workdir=workdir, model_override=model_override
+                spec, harness, cwd=cwd, workdir=workdir, model_override=model_override
             )
             return harness, spawn_env
 
@@ -13544,6 +13561,7 @@ def _build_spawn_env_from_spec(
     spec: Any,
     harness: str,
     *,
+    cwd: Path | None = None,
     workdir: Path | None = None,
     model_override: str | None = None,
 ) -> dict[str, str] | None:
@@ -13551,6 +13569,7 @@ def _build_spawn_env_from_spec(
 
     :param spec: The resolved agent spec.
     :param harness: Canonical harness name, e.g. ``"claude-sdk"``.
+    :param cwd: Runtime working directory for harnesses that need it.
     :param workdir: Bundle workdir, threaded to the builders.
     :param model_override: The per-session ``/model`` override, e.g.
         ``"claude-sonnet-4-6"``, or ``None``. When set, it overrides the
@@ -13578,7 +13597,7 @@ def _build_spawn_env_from_spec(
         elif harness == "codex":
             env = _build_codex_spawn_env(spec, workdir=workdir)
         elif harness == "pi":
-            env = _build_pi_spawn_env(spec, workdir=workdir)
+            env = _build_pi_spawn_env(spec, cwd=cwd, workdir=workdir)
         elif harness == "openai-agents":
             env = _build_openai_agents_sdk_spawn_env(spec)
         elif harness == "cursor":
