@@ -1,8 +1,10 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
+import { I18nextProvider } from "react-i18next";
 import { BrowserRouter } from "react-router-dom";
 import App from "./App.tsx";
+import i18n from "./i18n";
 import { ThemeProvider } from "./components/theme/ThemeProvider";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { RunnerHealthProvider } from "./hooks/RunnerHealthProvider";
@@ -63,19 +65,21 @@ void _bootProbe.then((info) => {
   createRoot(document.getElementById("root")!).render(
     <StrictMode>
       <CapabilitiesProvider info={info}>
-        <QueryClientProvider client={queryClient}>
-          <ThemeProvider>
-            <TooltipProvider>
-              <BrowserRouter>
-                <SessionUpdatesProvider>
-                  <RunnerHealthProvider>
-                    <App />
-                  </RunnerHealthProvider>
-                </SessionUpdatesProvider>
-              </BrowserRouter>
-            </TooltipProvider>
-          </ThemeProvider>
-        </QueryClientProvider>
+        <I18nextProvider i18n={i18n}>
+          <QueryClientProvider client={queryClient}>
+            <ThemeProvider>
+              <TooltipProvider>
+                <BrowserRouter>
+                  <SessionUpdatesProvider>
+                    <RunnerHealthProvider>
+                      <App />
+                    </RunnerHealthProvider>
+                  </SessionUpdatesProvider>
+                </BrowserRouter>
+              </TooltipProvider>
+            </ThemeProvider>
+          </QueryClientProvider>
+        </I18nextProvider>
       </CapabilitiesProvider>
     </StrictMode>,
   );

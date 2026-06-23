@@ -1,6 +1,12 @@
 import "@testing-library/jest-dom/vitest";
 import { vi } from "vitest";
 
+// Initialize the i18next singleton (side-effect import) so components
+// using `useTranslation` resolve real strings in tests instead of bare
+// keys. jsdom's navigator defaults to en-US, so the detector lands on
+// the English resources — matching the labels existing tests assert on.
+import "@/i18n";
+
 // The @lobehub icon packages have broken nested-module resolution
 // under vitest; stub presentational glyphs so component modules that
 // import them can still load in tests.
