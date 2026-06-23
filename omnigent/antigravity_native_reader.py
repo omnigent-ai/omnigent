@@ -247,9 +247,11 @@ def _requested_model_enum_from_step(step: dict[str, object]) -> str | None:
     """
     Extract the model enum from a USER_INPUT step's plannerConfig.
 
-    Reads ``step.userInput.userConfig.plannerConfig.requestedModel.model``
-    (design §10.4). Returns ``None`` when the field is absent or the step is not
-    a USER_INPUT.
+    The live wire (agy 1.0.10) carries the enum as a STRING at
+    ``step.userInput.userConfig.plannerConfig.planModel`` (design §10.4) — the
+    same field :func:`send_user_cascade_message` sends. A TUI-origin step using
+    the older ``requestedModel.model`` (dict) shape is supported as a fallback.
+    Returns ``None`` when the field is absent or the step is not a USER_INPUT.
 
     :param step: One RPC step dict.
     :returns: The model enum string, e.g. ``"MODEL_PLACEHOLDER_M20"``, or
@@ -266,6 +268,9 @@ def _requested_model_enum_from_step(step: dict[str, object]) -> str | None:
     planner_config = user_config.get("plannerConfig")
     if not isinstance(planner_config, dict):
         return None
+    plan_model = planner_config.get("planModel")
+    if isinstance(plan_model, str) and plan_model:
+        return plan_model
     requested_model = planner_config.get("requestedModel")
     if not isinstance(requested_model, dict):
         return None

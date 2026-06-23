@@ -1133,11 +1133,12 @@ def test_get_available_models_posts_empty_body_and_returns_catalog(
 ) -> None:
     """
     ``get_available_models`` POSTs ``{}`` to ``GetAvailableModels`` and returns
-    the parsed response body (the full catalog dict).
+    the catalog unwrapped from the live ``{"response": {...}}`` envelope.
 
-    The catalog shape is ``{"models": {<key>: {"model", "displayName", ...}}}``.
-    Asserts the URL and wire body so a refactor cannot silently change the method
-    or add unexpected request fields.
+    The live 200 body wraps the catalog under ``"response"``; the function unwraps
+    it so callers see ``{"models": {<key>: {"model", "displayName", ...}}}`` at the
+    top level. Asserts the URL and wire body so a refactor cannot silently change
+    the method or add unexpected request fields.
     """
     seen: dict[str, object] = {}
     catalog = {
@@ -1149,13 +1150,15 @@ def test_get_available_models_posts_empty_body_and_returns_catalog(
                 "supportsThinking": True,
                 "thinkingBudget": 8192,
             }
-        }
+        },
+        "defaultAgentModelId": "gemini-2.5-pro",
     }
 
     def handler(req: httpx.Request) -> httpx.Response:
         seen["url"] = str(req.url)
         seen["body"] = json.loads(req.content)
-        return httpx.Response(200, json=catalog)
+        # Live agy wraps the catalog under a top-level "response" key.
+        return httpx.Response(200, json={"response": catalog})
 
     monkeypatch.setattr(rpc, "_HTTP_TRANSPORT", httpx.MockTransport(handler))
     result = rpc.get_available_models(52548)
@@ -1163,6 +1166,7 @@ def test_get_available_models_posts_empty_body_and_returns_catalog(
         "https://127.0.0.1:52548/exa.language_server_pb.LanguageServerService/GetAvailableModels"
     )
     assert seen["body"] == {}
+    # The "response" envelope is unwrapped: callers read "models" at the top level.
     assert result == catalog
 
 
@@ -1211,8 +1215,14 @@ def _frame(flag: int, payload: bytes) -> bytes:
 
 
 def _data_frame(obj: dict[str, object]) -> bytes:
-    """Build a ``flag==0x00`` data frame whose payload is ``obj`` as JSON."""
-    return _frame(0x00, json.dumps(obj).encode("utf-8"))
+    """Build a ``flag==0x00`` data frame for the logical update ``obj``.
+
+    The live wire wraps every DATA frame's update in a connect envelope
+    ``{"update": {...}}`` (agy 1.0.10), and the generator unwraps it before
+    yielding. This helper wraps ``obj`` in that envelope so the test exercises the
+    unwrap, while ``obj`` itself is what the generator is expected to yield back.
+    """
+    return _frame(0x00, json.dumps({"update": obj}).encode("utf-8"))
 
 
 class _ByteChunks(httpx.AsyncByteStream):
@@ -1294,10 +1304,12 @@ async def test_stream_agent_state_updates_yields_data_frames_in_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    A stream of several data frames + a trailer yields the parsed dicts in order.
+    A stream of several data frames + a trailer yields the unwrapped updates in order.
 
-    The happy path: each ``flag==0x00`` frame's JSON payload is yielded as a
-    dict, in arrival order, and the trailer ends iteration cleanly.
+    The happy path: each ``flag==0x00`` frame's JSON payload is the connect
+    envelope ``{"update": {...}}`` (see :func:`_data_frame`); the generator
+    unwraps it and yields the inner ``update`` object, in arrival order, and the
+    trailer ends iteration cleanly.
     """
     updates: list[dict[str, object]] = [
         {"mainTrajectoryUpdate": {"stepsUpdate": {"steps": [{"stepIndex": 0}]}}},
@@ -1307,6 +1319,26 @@ async def test_stream_agent_state_updates_yields_data_frames_in_order(
     chunks = [_data_frame(u) for u in updates] + [_frame(0x02, b"")]
     monkeypatch.setattr(rpc, "_ASYNC_HTTP_TRANSPORT", _stream_transport(chunks, {}))
     assert await _collect(52548, _CONVERSATION_ID) == updates
+
+
+async def test_stream_agent_state_updates_yields_frame_without_envelope_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A DATA frame lacking the ``{"update": ...}`` envelope is yielded verbatim.
+
+    Defensive fallback: live agy wraps every update under ``"update"``, but if a
+    future agy ever drops the envelope, the generator must yield the parsed dict
+    as-is rather than ``None`` — so the reader keeps receiving frames. Built with
+    raw ``_frame`` (NOT ``_data_frame``, which would re-wrap).
+    """
+    no_envelope = {"mainTrajectoryUpdate": {"stepsUpdate": {"steps": [{"stepIndex": 0}]}}}
+    chunks = [
+        _frame(0x00, json.dumps(no_envelope).encode("utf-8")),
+        _frame(0x02, b""),
+    ]
+    monkeypatch.setattr(rpc, "_ASYNC_HTTP_TRANSPORT", _stream_transport(chunks, {}))
+    assert await _collect(52548, _CONVERSATION_ID) == [no_envelope]
 
 
 async def test_stream_agent_state_updates_reassembles_split_and_packed_frames(

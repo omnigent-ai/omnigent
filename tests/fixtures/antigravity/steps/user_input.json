@@ -65,9 +65,7 @@
             "effectiveGrants": {}
           }
         },
-        "requestedModel": {
-          "model": "MODEL_PLACEHOLDER_M20"
-        },
+        "planModel": "MODEL_PLACEHOLDER_M20",
         "useAiCredits": false
       }
     }

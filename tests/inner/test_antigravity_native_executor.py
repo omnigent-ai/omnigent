@@ -12,9 +12,9 @@ resolves the cascade id / port, and how it maps success/failure to events.
 
 Model resolution (two-tier, see design §10.1/§10.4): the executor echoes agy's
 CURRENT model from the latest ``USER_INPUT`` step's
-``userInput.userConfig.plannerConfig.requestedModel.model`` (via
-``get_trajectory_steps``); on the first turn / when not yet observable it falls
-back to the ``recommended`` entry from ``get_available_models``.
+``userInput.userConfig.plannerConfig.planModel`` (via ``get_trajectory_steps``);
+on the first turn / when not yet observable it falls back to the ``recommended``
+entry from ``get_available_models``.
 """
 
 from __future__ import annotations
@@ -69,8 +69,8 @@ def _steps_with_model(model: str) -> list[dict[str, object]]:
     """
     Build a trajectory-step list whose latest USER_INPUT step carries ``model``.
 
-    Mirrors the shape the executor reads to echo agy's current model:
-    ``step.userInput.userConfig.plannerConfig.requestedModel.model`` on a
+    Mirrors the live wire shape the executor reads to echo agy's current model:
+    ``step.userInput.userConfig.plannerConfig.planModel`` (a string) on a
     ``CORTEX_STEP_TYPE_USER_INPUT`` step. Includes a trailing non-USER_INPUT
     step so the test exercises "find the latest USER_INPUT", not "take the last".
 
@@ -81,16 +81,12 @@ def _steps_with_model(model: str) -> list[dict[str, object]]:
         {
             "stepIndex": 0,
             "type": "CORTEX_STEP_TYPE_USER_INPUT",
-            "userInput": {
-                "userConfig": {
-                    "plannerConfig": {"requestedModel": {"model": "MODEL_PLACEHOLDER_OLD"}}
-                }
-            },
+            "userInput": {"userConfig": {"plannerConfig": {"planModel": "MODEL_PLACEHOLDER_OLD"}}},
         },
         {
             "stepIndex": 1,
             "type": "CORTEX_STEP_TYPE_USER_INPUT",
-            "userInput": {"userConfig": {"plannerConfig": {"requestedModel": {"model": model}}}},
+            "userInput": {"userConfig": {"plannerConfig": {"planModel": model}}},
         },
         {"stepIndex": 2, "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE", "plannerResponse": {}},
     ]
@@ -255,9 +251,8 @@ def test_run_turn_echoes_current_model_from_trajectory(
     The plan model is echoed from the latest USER_INPUT step (tier-1 resolution).
 
     The executor must reflect the user's current TUI/session model without new
-    plumbing, so it reads the most recent USER_INPUT step's
-    ``requestedModel.model`` and does NOT consult the catalog when that is
-    available.
+    plumbing, so it reads the most recent USER_INPUT step's ``planModel`` and
+    does NOT consult the catalog when that is available.
     """
     _seed_state(tmp_path)
     asyncio.run(_run(_executor(tmp_path), "hi"))
@@ -697,8 +692,8 @@ def test_latest_requested_model_none_when_absent() -> None:
     """
     ``_latest_requested_model`` returns ``None`` when no USER_INPUT model is present.
 
-    An empty step list (first turn) or steps without a ``requestedModel`` must
-    signal "nothing to echo" so the caller falls back to the recommended model.
+    An empty step list (first turn) or steps without a ``planModel`` must signal
+    "nothing to echo" so the caller falls back to the recommended model.
     """
     from omnigent.inner.antigravity_native_executor import _latest_requested_model
 
@@ -707,6 +702,30 @@ def test_latest_requested_model_none_when_absent() -> None:
         _latest_requested_model([{"stepIndex": 0, "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE"}])
         is None
     )
+
+
+def test_latest_requested_model_falls_back_to_requested_model() -> None:
+    """
+    ``_latest_requested_model`` reads the legacy ``requestedModel.model`` shape.
+
+    The live wire carries ``plannerConfig.planModel`` (a string), but a
+    TUI-origin step may still use the older ``requestedModel.model`` dict shape.
+    The executor must honor that fallback so such a turn's model still echoes.
+    """
+    from omnigent.inner.antigravity_native_executor import _latest_requested_model
+
+    legacy_steps: list[dict[str, object]] = [
+        {
+            "stepIndex": 0,
+            "type": "CORTEX_STEP_TYPE_USER_INPUT",
+            "userInput": {
+                "userConfig": {
+                    "plannerConfig": {"requestedModel": {"model": "MODEL_PLACEHOLDER_M20"}}
+                }
+            },
+        },
+    ]
+    assert _latest_requested_model(legacy_steps) == "MODEL_PLACEHOLDER_M20"
 
 
 def test_recommended_model_picks_recommended_entry() -> None:

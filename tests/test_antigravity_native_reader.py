@@ -1681,9 +1681,10 @@ def _user_input_with_model(
     *,
     step_index: int | None = None,
 ) -> dict[str, Any]:
-    """A USER_INPUT step with a specific requestedModel enum.
+    """A USER_INPUT step with a specific ``planModel`` enum (live wire shape).
 
-    :param model_enum: agy model enum string.
+    :param model_enum: agy model enum string, written as the live
+        ``plannerConfig.planModel`` string.
     :param step_index: Optional step index override; when provided it is written
         into ``metadata.sourceTrajectoryStepInfo.stepIndex`` so two consecutive
         turns can be assigned distinct dedup keys (the base fixture has no
@@ -1693,7 +1694,7 @@ def _user_input_with_model(
     step = copy.deepcopy(_load("user_input"))
     user_input = cast(dict[str, Any], step["userInput"])
     planner_cfg = cast(dict[str, Any], user_input["userConfig"]["plannerConfig"])
-    planner_cfg["requestedModel"] = {"model": model_enum}
+    planner_cfg["planModel"] = model_enum
     if step_index is not None:
         traj_info = cast(dict[str, Any], step["metadata"])["sourceTrajectoryStepInfo"]
         traj_info["stepIndex"] = step_index
@@ -1722,7 +1723,7 @@ def _user_input_real_wire(
     metadata["sourceTrajectoryStepInfo"].pop("stepIndex", None)
     user_input = cast(dict[str, Any], step["userInput"])
     planner_cfg = cast(dict[str, Any], user_input["userConfig"]["plannerConfig"])
-    planner_cfg["requestedModel"] = {"model": model_enum}
+    planner_cfg["planModel"] = model_enum
     return step
 
 
@@ -2008,6 +2009,23 @@ async def test_unknown_model_enum_posts_raw_enum(
     assert len(model_change_events) == 1
     # Falls back to the raw enum when the catalog does not contain it.
     assert model_change_events[0][1]["model"] == unknown_enum
+
+
+def test_requested_model_enum_from_step_falls_back_to_requested_model() -> None:
+    """A legacy ``requestedModel.model`` (dict) shape is read when ``planModel`` is absent.
+
+    The live wire carries ``plannerConfig.planModel`` (a string), but a TUI-origin
+    step may still use the older ``requestedModel.model`` dict shape. The reader
+    must read that fallback so a model switch from such a step is not silently
+    dropped.
+    """
+    legacy_step: dict[str, Any] = {
+        "type": reader._TYPE_USER_INPUT,
+        "userInput": {
+            "userConfig": {"plannerConfig": {"requestedModel": {"model": "MODEL_PLACEHOLDER_M20"}}}
+        },
+    }
+    assert reader._requested_model_enum_from_step(legacy_step) == "MODEL_PLACEHOLDER_M20"
 
 
 @pytest.mark.asyncio

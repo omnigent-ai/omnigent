@@ -38,8 +38,9 @@ a ``planModel`` enum per turn (omitting it errors "neither PlanModel nor
 RequestedModel specified"), and the enum names are version-volatile so they are
 NEVER hardcoded. The executor resolves the model at runtime in two tiers
 (design §10.4): (1) echo agy's CURRENT model from the latest ``USER_INPUT`` step's
-``userInput.userConfig.plannerConfig.requestedModel.model`` (reflecting the
-user's TUI ``/model`` choice without new plumbing); (2) on a first turn / when no
+``userInput.userConfig.plannerConfig.planModel`` (a string on the live wire, with
+the older ``requestedModel.model`` shape as a fallback) reflecting the user's TUI
+``/model`` choice without new plumbing; (2) on a first turn / when no
 prior model is observable, fall back to the ``recommended`` entry from
 ``GetAvailableModels``. The Omnigent ``ExecutorConfig.model``/``reasoning_effort``
 stay informational on this write path — agy's own model selection determines the
@@ -356,7 +357,8 @@ class AntigravityNativeExecutor(Executor):
         names are version-volatile, so the model is resolved at runtime:
 
         1. **Echo agy's current model** — read the latest ``USER_INPUT`` step's
-           ``userInput.userConfig.plannerConfig.requestedModel.model`` from
+           ``userInput.userConfig.plannerConfig.planModel`` (a string on the live
+           wire, with the older ``requestedModel.model`` shape as a fallback) from
            :func:`omnigent.antigravity_native_rpc.get_trajectory_steps`. This
            reflects the user's TUI ``/model`` choice without new plumbing.
         2. **Recommended fallback** — when no prior model is observable (a first
@@ -465,11 +467,14 @@ def _latest_requested_model(steps: list[dict[str, object]]) -> str | None:
 
     Tier-1 of the per-turn model resolution (design §10.4): scans the trajectory
     steps from newest to oldest for the most recent ``CORTEX_STEP_TYPE_USER_INPUT``
-    step and returns its
-    ``userInput.userConfig.plannerConfig.requestedModel.model``. Newest-first
-    because a later ``/model`` switch must win over an earlier turn's model.
-    Fails closed (``None``) on any missing/unexpected shape, so the caller falls
-    back to the recommended catalog entry.
+    step and returns its model enum. The live wire (agy 1.0.10) carries the enum
+    as a STRING at ``userInput.userConfig.plannerConfig.planModel`` — the same
+    field :func:`omnigent.antigravity_native_rpc.send_user_cascade_message` sends
+    as ``cascadeConfig.plannerConfig.planModel``. A TUI-origin step using the
+    older ``requestedModel.model`` (dict) shape is supported as a fallback.
+    Newest-first because a later ``/model`` switch must win over an earlier turn's
+    model. Fails closed (``None``) on any missing/unexpected shape, so the caller
+    falls back to the recommended catalog entry.
 
     :param steps: Trajectory steps as returned by
         :func:`omnigent.antigravity_native_rpc.get_trajectory_steps`.
@@ -479,9 +484,12 @@ def _latest_requested_model(steps: list[dict[str, object]]) -> str | None:
     for step in reversed(steps):
         if not isinstance(step, dict) or step.get("type") != _USER_INPUT_STEP_TYPE:
             continue
-        model = _dig(step, "userInput", "userConfig", "plannerConfig", "requestedModel", "model")
-        if isinstance(model, str) and model:
-            return model
+        plan_model = _dig(step, "userInput", "userConfig", "plannerConfig", "planModel")
+        if isinstance(plan_model, str) and plan_model:
+            return plan_model
+        legacy = _dig(step, "userInput", "userConfig", "plannerConfig", "requestedModel", "model")
+        if isinstance(legacy, str) and legacy:
+            return legacy
     return None
 
 

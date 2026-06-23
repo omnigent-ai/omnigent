@@ -673,34 +673,45 @@ def get_available_models(port: int) -> dict[str, object]:
     """
     Return the agy model catalog from ``GetAvailableModels``.
 
-    POSTs ``{}`` to ``GetAvailableModels`` and returns the full parsed response
-    body. Used to resolve a model enum string at runtime for
-    :func:`send_user_cascade_message` (the model is required per-turn and must
-    not be hardcoded — ``planModel`` values are version-volatile enums).
+    POSTs ``{}`` to ``GetAvailableModels`` and returns the catalog object
+    (unwrapped from the response envelope — see below). Used to resolve a model
+    enum string at runtime for :func:`send_user_cascade_message` (the model is
+    required per-turn and must not be hardcoded — ``planModel`` values are
+    version-volatile enums).
 
-    The response shape (live-verified, agy 1.0.10) is::
+    The response shape (live-verified, agy 1.0.10) wraps the catalog under a
+    top-level ``"response"`` key::
 
-        {"models": {
-            "<key>": {
-                "model": "<enum-string>",
-                "displayName": "<human label>",
-                "recommended": <bool>,
-                "supportsThinking": <bool>,
-                "thinkingBudget": <int>
+        {"response": {
+            "models": {
+                "<key>": {
+                    "model": "<enum-string>",
+                    "displayName": "<human label>",
+                    "recommended": <bool>,
+                    "supportsThinking": <bool>,
+                    "thinkingBudget": <int>
+                },
+                ...
             },
+            "defaultAgentModelId": "<enum-string>",
+            "tieredModelIds": {...},
             ...
         }}
 
-    Callers should key on ``response["models"]`` and pick the desired entry by
-    ``recommended == True`` or by matching the ``displayName`` / ``model``
-    string the user selected. The echo-from-read-side shortcut
-    (``userInput.userConfig.plannerConfig.requestedModel.model``) is preferred
-    when the current model is already known from a prior turn's step data —
-    call this only when no prior model is available.
+    This function unwraps that envelope and returns the inner object, so callers
+    see ``{"models": ..., "defaultAgentModelId": ...}`` at the top level and can
+    key on ``catalog["models"]``. Pick the desired entry by ``recommended ==
+    True`` or by matching the ``displayName`` / ``model`` string the user
+    selected. The echo-from-read-side shortcut
+    (``userInput.userConfig.plannerConfig.planModel``) is preferred when the
+    current model is already known from a prior turn's step data — call this only
+    when no prior model is available.
 
     :param port: Validated connect-RPC port, e.g. ``52548``.
-    :returns: The full parsed response body (a dict, at minimum
-        ``{"models": {...}}``). Returns ``{}`` if the 200 body is not a dict
+    :returns: The unwrapped catalog (a dict, at minimum ``{"models": {...}}``):
+        ``body["response"]`` when the 200 body is a dict carrying a dict under
+        ``"response"``; otherwise the body itself (defensive, for a future agy
+        that drops the envelope). Returns ``{}`` if the 200 body is not a dict
         (guards against a future agy returning a non-object 200).
     :raises httpx.HTTPError: On transport errors or non-2xx responses; the
         executor is responsible for retry/backoff. Intentionally NOT fail-open
@@ -721,7 +732,13 @@ def get_available_models(port: int) -> dict[str, object]:
     # the body is never decoded on error paths (which may not be JSON).
     response.raise_for_status()
     body = response.json()  # ValueError on non-JSON 200 propagates (documented)
-    return body if isinstance(body, dict) else {}
+    if not isinstance(body, dict):
+        return {}
+    # Live agy wraps the catalog under "response"; unwrap so callers read
+    # ``catalog["models"]`` at the top level. Fall back to the body itself if a
+    # future agy ever drops the envelope (defensive — keeps callers working).
+    inner = body.get("response")
+    return inner if isinstance(inner, dict) else body
 
 
 def _encode_connect_envelope(payload: dict[str, object]) -> bytes:
@@ -779,8 +796,12 @@ async def stream_agent_state_updates(
 
     Opens a persistent ``StreamAgentStateUpdates`` POST (connect protocol,
     ``Content-Type: application/connect+json``) and yields each DATA frame's
-    parsed JSON ``update`` object as it arrives, stopping cleanly on the
-    end-of-stream trailer. The first frame carries a snapshot
+    logical update payload as it arrives, stopping cleanly on the end-of-stream
+    trailer. Each DATA frame is a connect envelope ``{"update": {...}}`` (live-
+    verified, agy 1.0.10); this generator unwraps it and yields the inner
+    ``update`` object, so the reader receives
+    ``{"conversationId", "trajectoryId", "status", "mainTrajectoryUpdate", ...}``
+    at the top level. The first frame carries a snapshot
     (``update.mainTrajectoryUpdate.stepsUpdate.steps[]``); subsequent frames are
     cumulative snapshots that grow while a step is generating (the Task T-D
     reader owns prefix-diffing for ``output_text_delta`` parity).
@@ -790,7 +811,8 @@ async def stream_agent_state_updates(
     response is a byte stream of frames, each ``[flag: 1B][length: 4B BE][payload:
     length B]``:
 
-    * ``flag == 0x00`` — DATA: ``payload`` is the JSON ``update`` object (yielded).
+    * ``flag == 0x00`` — DATA: ``payload`` is the JSON envelope ``{"update":
+      {...}}``; the unwrapped ``update`` object is yielded.
     * ``flag & 0x02`` (:data:`_FRAME_FLAG_TRAILER`) — end-of-stream trailer:
       iteration stops; the payload is NOT yielded. A trailer carrying a connect
       ``{"error": {...}}`` (how a mid-stream failure is reported once the 200 +
@@ -878,7 +900,13 @@ async def stream_agent_state_updates(
                         f"malformed JSON in agy connect-stream DATA frame: {e}"
                     ) from e
                 if isinstance(parsed, dict):
-                    yield parsed
+                    # Each DATA frame is a connect envelope ``{"update": {...}}``;
+                    # unwrap it so the reader's _frame_steps / _frame_conversation_id
+                    # see ``mainTrajectoryUpdate`` / ``conversationId`` at the top
+                    # level. Fall back to the parsed dict if a future agy ever
+                    # drops the envelope (defensive — keeps the reader working).
+                    inner = parsed.get("update")
+                    yield inner if isinstance(inner, dict) else parsed
 
 
 def _list_agy_pids() -> list[int]:
