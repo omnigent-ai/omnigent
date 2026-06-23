@@ -2135,9 +2135,9 @@ async def _cold_start_agy_conversation(
             exc_info=True,
         )
         return None
-    # Persist the real id (replacing the placeholder). ``update_conversation_id``
-    # resets the resume cursor when the id changes — correct here: a fresh
-    # cold-started conversation has no prior mirrored steps. Offloaded (file I/O).
+    # Persist the real id (replacing the ``agy_conv_*`` placeholder) so
+    # ``read_bridge_state`` returns it and the reader/executor address the
+    # cold-started conversation. Offloaded (file I/O).
     await asyncio.to_thread(update_conversation_id, bridge_dir, cascade_id)
     # PATCH the real id onto the session so a later ``--resume`` continues this
     # conversation (best-effort; mirrors codex/pi). A failure leaves the chat
@@ -2163,9 +2163,10 @@ async def _patch_agy_external_session_id(
     Records ``external_session_id`` so a later ``omnigent antigravity --resume``
     reads agy's real id back and passes ``--conversation <id>``. Read-path
     replacement for the retired forwarder's ``_patch_external_session_id``;
-    mirrors the codex/pi fork PATCH (best-effort — an ``httpx.HTTPError`` is
-    logged, not raised, since the chat mirror does not depend on it). A ``None``
-    client (no server client available) is a no-op.
+    mirrors the codex/pi recorder PATCH (best-effort — a transport
+    ``httpx.HTTPError`` or a ``>= 400`` rejection is logged, not raised, since the
+    chat mirror does not depend on it). A ``None`` client (no server client
+    available) is a no-op.
 
     :param server_client: Runner Omnigent server client, or ``None`` to skip.
     :param session_id: Omnigent conversation id to PATCH.
@@ -2175,7 +2176,7 @@ async def _patch_agy_external_session_id(
     if server_client is None:
         return
     try:
-        await server_client.patch(
+        resp = await server_client.patch(
             f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
             json={"external_session_id": cascade_id},
             timeout=10.0,
@@ -2187,6 +2188,15 @@ async def _patch_agy_external_session_id(
             cascade_id,
             session_id,
             exc_info=True,
+        )
+        return
+    if resp.status_code >= 400:
+        _logger.warning(
+            "Antigravity cold-start: AP rejected external_session_id PATCH (%s); session=%s "
+            "cascade=%s — the conversation is mirrored but `--resume` will cold-start fresh.",
+            resp.status_code,
+            session_id,
+            cascade_id,
         )
 
 

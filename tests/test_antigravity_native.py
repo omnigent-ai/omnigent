@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
@@ -26,7 +28,7 @@ from omnigent.antigravity_native_bridge import (
 )
 
 
-def _mock_client(handler: object) -> httpx.AsyncClient:
+def _mock_client(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.AsyncClient:
     """
     Build an async client whose requests are served by ``handler``.
 
@@ -35,7 +37,7 @@ def _mock_client(handler: object) -> httpx.AsyncClient:
     """
     return httpx.AsyncClient(
         base_url="http://127.0.0.1:0",
-        transport=httpx.MockTransport(handler),  # type: ignore[arg-type]
+        transport=httpx.MockTransport(handler),
     )
 
 
@@ -942,3 +944,50 @@ async def test_cli_cold_start_skips_when_conversation_already_real(
     after = read_bridge_state(bridge_dir)
     assert after is not None
     assert after.conversation_id == real_id
+
+
+async def test_cli_cold_start_logs_when_patch_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    A ``>= 400`` PATCH response is logged (best-effort) but never raised.
+
+    ``httpx`` does not raise on a 4xx/5xx response unless asked, so the cold-start
+    inspects ``status_code`` and warns when the server rejects the
+    ``external_session_id`` write — but the cascade id still reaches bridge state
+    (the chat mirror does not depend on the resume-fidelity PATCH).
+    """
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_cs_reject")
+    _seed_bridge_state(bridge_dir, "agy_conv_placeholder")
+
+    monkeypatch.setattr(_mod, "_candidate_agy_rpc_ports", lambda: [52548])
+    started: list[tuple[int, str]] = []
+    monkeypatch.setattr(_mod, "start_cascade", lambda port, cid: started.append((port, cid)))
+
+    real_async_client = httpx.AsyncClient
+
+    def _reject_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={})
+
+    def _mock_async_client(**kwargs: object) -> httpx.AsyncClient:
+        kwargs.pop("transport", None)
+        return real_async_client(transport=httpx.MockTransport(_reject_handler), **kwargs)
+
+    monkeypatch.setattr(_mod.httpx, "AsyncClient", _mock_async_client)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.antigravity_native"):
+        await _mod._cold_start_agy_conversation(
+            bridge_dir,
+            "conv_cs",
+            base_url="http://test",
+            headers={},
+            timeout_s=1.0,
+        )
+
+    # The cascade was still minted + persisted; only the resume-fidelity PATCH failed.
+    assert len(started) == 1
+    after = read_bridge_state(bridge_dir)
+    assert after is not None
+    assert after.conversation_id == started[0][1]
+    assert "rejected external_session_id PATCH (404)" in caplog.text

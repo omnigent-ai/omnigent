@@ -1239,7 +1239,7 @@ async def _cold_start_agy_conversation(
     # short-lived client suffices for this one call.
     try:
         async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=10.0) as client:
-            await client.patch(
+            resp = await client.patch(
                 f"/v1/sessions/{url_component(session_id)}",
                 json={"external_session_id": cascade_id},
             )
@@ -1251,6 +1251,16 @@ async def _cold_start_agy_conversation(
             session_id,
             exc_info=True,
         )
+    else:
+        if resp.status_code >= 400:
+            _logger.warning(
+                "Antigravity cold-start: server rejected external_session_id PATCH (%s); "
+                "session=%s cascade=%s — the conversation is mirrored but `--resume` will "
+                "cold-start fresh.",
+                resp.status_code,
+                session_id,
+                cascade_id,
+            )
     _logger.info(
         "Antigravity cold-start: created conversation %s on port %s for session %s",
         cascade_id,

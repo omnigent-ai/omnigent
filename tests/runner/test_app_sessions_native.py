@@ -2789,6 +2789,67 @@ async def test_auto_create_antigravity_cold_start_port_timeout_keeps_placeholder
 
 
 @pytest.mark.asyncio
+async def test_patch_agy_external_session_id_noop_without_client() -> None:
+    """A ``None`` server client makes the external_session_id PATCH a no-op.
+
+    The cold-start helper threads its (optional) runner server client through;
+    when absent there is nothing to PATCH against, so the call must simply return
+    without raising — the cascade id still lives in bridge state.
+    """
+    import omnigent.runner.app as runner_app_mod
+
+    # No client, no exception, no work — just returns.
+    await runner_app_mod._patch_agy_external_session_id(None, "conv_x", "cascade_x")
+
+
+@pytest.mark.asyncio
+async def test_patch_agy_external_session_id_swallows_transport_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A transport ``httpx.HTTPError`` is logged, never raised (best-effort).
+
+    The PATCH is the read-path resume-fidelity write; a transport failure must
+    not crash the cold-start (which would strand a terminal with no reader), so
+    it is caught and surfaced as a warning only.
+    """
+    import omnigent.runner.app as runner_app_mod
+
+    class _BoomClient:
+        async def patch(self, _url: str, **_kwargs: Any) -> httpx.Response:
+            raise httpx.ConnectError("boom")
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        await runner_app_mod._patch_agy_external_session_id(
+            cast(httpx.AsyncClient, _BoomClient()), "conv_x", "cascade_x"
+        )
+    assert "failed to PATCH external_session_id" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_patch_agy_external_session_id_logs_on_rejection(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A ``>= 400`` response is logged (not silently swallowed), never raised.
+
+    Mirrors the codex recorder PATCH: ``httpx`` does not raise on a 4xx/5xx
+    response unless asked, so the helper inspects ``status_code`` and warns when
+    the server rejects the write — otherwise the lost resume continuity would be
+    invisible.
+    """
+    import omnigent.runner.app as runner_app_mod
+
+    class _RejectClient:
+        async def patch(self, url: str, **_kwargs: Any) -> httpx.Response:
+            return httpx.Response(404, json={}, request=httpx.Request("PATCH", url))
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        await runner_app_mod._patch_agy_external_session_id(
+            cast(httpx.AsyncClient, _RejectClient()), "conv_x", "cascade_x"
+        )
+    assert "rejected external_session_id PATCH (404)" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_auto_create_antigravity_wires_reader_task_and_interaction_bridge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
