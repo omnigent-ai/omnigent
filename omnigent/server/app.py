@@ -759,14 +759,26 @@ _API_ONLY_LANDING_HTML = """<!doctype html>
     nothing to render in the browser here.
   </p>
   <h2>How to fix</h2>
+  <p>The web UI bundle isn't present. The fix depends on how you installed Omnigent:</p>
   <p>
-    Reinstall Omnigent with the web UI built. Make sure
-    <code>Node.js 22+</code> and <code>npm</code> are available and that
-    <code>OMNIGENT_SKIP_WEB_UI</code> is <em>not</em> set, then for example:
+    <strong>Installed</strong> (uv / pip / pipx / brew) — make sure
+    <code>OMNIGENT_SKIP_WEB_UI</code> is <em>not</em> set in your shell profile,
+    then clear the cache and reinstall (<code>--reinstall</code> alone can
+    re-serve a cached UI-less build, so the cache-clean matters):
   </p>
-  <pre>uv tool install --force --reinstall omnigent</pre>
+  <pre>uv cache clean omnigent
+uv tool install --force --reinstall omnigent</pre>
+  <p>
+    <strong>Running from source</strong> — build the UI in place (needs
+    <code>Node.js</code> and <code>npm</code>), then restart:
+  </p>
+  <pre>cd ap-web
+npm install
+npm run build</pre>
   <p class="muted">
-    The CLI works regardless, and the JSON API is at <a href="/docs">/docs</a>.
+    <code>npm run dev</code> is for live UI development — it runs a separate dev
+    server and won't fix this page. The CLI works regardless, and the JSON API
+    is at <a href="/docs">/docs</a>.
     Details: <a href="https://github.com/omnigent-ai/omnigent#readme">omnigent-ai/omnigent</a>
   </p>
 </body>
