@@ -26,6 +26,13 @@ inputs:
       to it (backwards-compat run).
     required: false
     default: ""
+  runner_version:
+    description: >
+      Empty = run the checked-out runner (normal gate). Set to a release tag =
+      build that old runner into a venv and redirect the runner subprocess to it
+      (Config 2 backwards-compat run). Orthogonal to server_version.
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -96,6 +103,29 @@ runs:
         "$venv/bin/omnigent" --version
         echo "OMNIGENT_COMPAT_SERVER_PYTHON=$venv/bin/python" >> "$GITHUB_ENV"
         echo "OMNIGENT_COMPAT_SERVER_VERSION=${tag#v}" >> "$GITHUB_ENV"
+
+    - name: Build pinned old runner (backwards-compat only)
+      # Config 2: redirect the runner subprocess to the pinned old build via
+      # OMNIGENT_COMPAT_RUNNER_PYTHON. See e2e-run for the full rationale.
+      # Distinct paths from the server build. Requires fetch-depth 0 in the caller.
+      if: ${{ inputs.runner_version != '' }}
+      shell: bash
+      env:
+        RUNNER_VERSION_INPUT: ${{ inputs.runner_version }}
+      run: |
+        tag="$RUNNER_VERSION_INPUT"
+        if ! [[ "$tag" =~ ^v?[0-9]+\.[0-9]+(\.[0-9]+)?([a-z0-9.]*)?$ ]]; then
+          echo "Invalid runner_version: '$tag'" >&2; exit 1
+        fi
+        src="$RUNNER_TEMP/runner-src"
+        venv="$RUNNER_TEMP/runner-env"
+        git worktree add --detach "$src" "$tag"
+        uv venv --python 3.12 "$venv"
+        uv pip install --python "$venv/bin/python" \
+          -e "$src" -e "$src/sdks/python-client" -e "$src/sdks/ui"
+        "$venv/bin/omnigent" --version
+        echo "OMNIGENT_COMPAT_RUNNER_PYTHON=$venv/bin/python" >> "$GITHUB_ENV"
+        echo "OMNIGENT_COMPAT_RUNNER_VERSION=${tag#v}" >> "$GITHUB_ENV"
 
     - name: Run integration tests
       shell: bash

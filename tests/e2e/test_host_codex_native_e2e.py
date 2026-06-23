@@ -22,7 +22,6 @@ import os
 import shutil
 import signal
 import subprocess
-import sys
 import threading
 import time
 import uuid
@@ -32,6 +31,7 @@ import httpx
 import pytest
 
 from omnigent.entities.session_resources import terminal_resource_id
+from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e.helpers import POLL_INTERVAL_S
 
 _CODEX_NATIVE_AGENT_NAME = "codex-native-ui"
@@ -66,14 +66,18 @@ def _spawn_host_daemon(
     daemon_log = tmp_path / "host-daemon.log"
     with open(daemon_log, "w") as log_fh:
         return subprocess.Popen(
+            # Compat-aware: pinned OLD host venv in runner compat mode (Config 2).
+            # apply_runner_env drops this test's repo_root PYTHONPATH in that mode
+            # so the old host build resolves; no-op in normal runs.
             [
-                sys.executable,
+                runner_executable(),
                 "-m",
                 "omnigent.host._daemon_entry",
                 "--server",
                 live_server,
             ],
-            env=env,
+            env=apply_runner_env(env),
+            cwd=compat_runner_cwd(),
             stdout=subprocess.DEVNULL,
             stderr=log_fh,
         )

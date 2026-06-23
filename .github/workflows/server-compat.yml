@@ -1,25 +1,32 @@
-name: Server Backwards-Compat
+name: Backwards-Compat
 
-# Runs main's e2e + integration suites against a PINNED OLDER server, to catch
-# backwards-incompatible server changes before release. Only the server
-# subprocess is the old build; the client, runner, and tests are all the
-# checked-out ref. See docs/SERVER_VERSION_COMPAT_CI.md.
+# Cross-version backwards-compatibility sweep, both directions, against main's
+# e2e + integration suites. The test runs are the SAME composite actions the
+# normal gates use (.github/actions/e2e-run, integration-run), invoked with one
+# component pinned to an older release — so they run byte-for-byte the way
+# e2e.yml / integration.yml do (mock LLM), differing only in which subprocess is
+# the old build. See docs/SERVER_VERSION_COMPAT_CI.md.
 #
-# The actual test runs are the SAME composite actions the normal gates use
-# (.github/actions/e2e-run, .github/actions/integration-run) — invoked here
-# with `server_version` set. So these backcompat jobs run the suites byte-for-
-# byte the way e2e.yml / integration.yml do (mock LLM), differing only in that
-# the server subprocess is redirected to the old build. No drift.
+#   Config 1 (backcompat-{e2e,integration}):        OLD server, new runner/host/client/tests.
+#   Config 2 (backcompat-runner-{e2e,integration}): OLD runner+host, new server/client/tests.
+#
+# Runner and host are colocated (one install), so a single knob pins both. The
+# server and runner knobs are orthogonal (tests/_helpers/compat.py): each job
+# pins exactly one component and leaves the rest on main.
 #
 # Triggers:
-#   workflow_dispatch   manual; `server_version` input picks the old tag.
-#   schedule            nightly; pins the latest non-rc release tag.
+#   workflow_dispatch   manual; server_version / runner_version pick the old tags.
+#   schedule            every 4h; both default to the latest non-rc release tag.
 
 on:
   workflow_dispatch:
     inputs:
       server_version:
-        description: "Old server tag to test against, e.g. v0.1.1. Empty = latest non-rc tag."
+        description: "Old SERVER tag for Config 1, e.g. v0.1.1. Empty = latest non-rc tag."
+        required: false
+        default: ""
+      runner_version:
+        description: "Old RUNNER/HOST tag for Config 2, e.g. v0.1.1. Empty = latest non-rc tag."
         required: false
         default: ""
   schedule:
@@ -27,7 +34,7 @@ on:
     - cron: "0 */4 * * *"
 
 concurrency:
-  group: server-compat-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.inputs.server_version || github.sha }}
+  group: backcompat-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
 permissions:
@@ -68,13 +75,13 @@ jobs:
           IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
         run: bash .github/scripts/ci/integration-matrix.sh
 
-  # tests/e2e against the pinned old server — same shards as e2e.yml.
+  # ── Config 1: OLD server, new runner/host/client/tests ────────────────
   backcompat-e2e:
-    name: Backcompat e2e (server ${{ github.event.inputs.server_version || 'latest' }}, shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
+    name: Backcompat e2e (server ${{ github.event.inputs.server_version || 'latest-release' }}, shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
     needs: setup
     runs-on: ubuntu-latest
     # Job-level cap (composite run steps can't set timeout-minutes); mirrors
-    # e2e.yml's ~30-min test budget + setup + old-server build.
+    # e2e.yml's ~30-min test budget + setup + old-build install.
     timeout-minutes: 40
     strategy:
       fail-fast: false
@@ -90,16 +97,16 @@ jobs:
           ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.event.inputs.branch || github.ref }}
           fetch-depth: 0
 
-      - name: Resolve old server version
+      - name: Resolve old version
         id: resolve
         env:
-          SERVER_VERSION_INPUT: ${{ github.event.inputs.server_version }}
+          VERSION_INPUT: ${{ github.event.inputs.server_version }}
         run: |
-          tag="$SERVER_VERSION_INPUT"
+          tag="$VERSION_INPUT"
           if [ -z "$tag" ]; then
             tag="$(git tag --sort=-v:refname | grep -vi rc | head -1)"
           fi
-          echo "Resolved old server tag: $tag"
+          echo "Resolved old tag: $tag"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Run e2e suite against old server
@@ -111,14 +118,10 @@ jobs:
           parallelism: "2"
           nightly_full: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
 
-  # tests/integration against the pinned old server — same harness matrix as
-  # integration.yml.
   backcompat-integration:
-    name: Backcompat integration (server ${{ github.event.inputs.server_version || 'latest' }}, ${{ matrix.harness }})
+    name: Backcompat integration (server ${{ github.event.inputs.server_version || 'latest-release' }}, ${{ matrix.harness }})
     needs: setup
     runs-on: ubuntu-latest
-    # Job-level cap (composite run steps can't set timeout-minutes); mirrors
-    # integration.yml's 30-min budget + the old-server build.
     timeout-minutes: 35
     strategy:
       fail-fast: false
@@ -131,22 +134,95 @@ jobs:
           ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.event.inputs.branch || github.ref }}
           fetch-depth: 0
 
-      - name: Resolve old server version
+      - name: Resolve old version
         id: resolve
         env:
-          SERVER_VERSION_INPUT: ${{ github.event.inputs.server_version }}
+          VERSION_INPUT: ${{ github.event.inputs.server_version }}
         run: |
-          tag="$SERVER_VERSION_INPUT"
+          tag="$VERSION_INPUT"
           if [ -z "$tag" ]; then
             tag="$(git tag --sort=-v:refname | grep -vi rc | head -1)"
           fi
-          echo "Resolved old server tag: $tag"
+          echo "Resolved old tag: $tag"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Run integration suite against old server
         uses: ./.github/actions/integration-run
         with:
           server_version: ${{ steps.resolve.outputs.tag }}
+          harness: ${{ matrix.harness }}
+          model: ${{ matrix.model }}
+          workers: ${{ matrix.workers }}
+
+  # ── Config 2: OLD runner/host, new server/client/tests ────────────────
+  backcompat-runner-e2e:
+    name: Backcompat e2e (runner ${{ github.event.inputs.runner_version || 'latest-release' }}, shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.setup.outputs.e2e_matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.event.inputs.branch || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve old version
+        id: resolve
+        env:
+          VERSION_INPUT: ${{ github.event.inputs.runner_version }}
+        run: |
+          tag="$VERSION_INPUT"
+          if [ -z "$tag" ]; then
+            tag="$(git tag --sort=-v:refname | grep -vi rc | head -1)"
+          fi
+          echo "Resolved old tag: $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Run e2e suite against old runner/host
+        uses: ./.github/actions/e2e-run
+        with:
+          runner_version: ${{ steps.resolve.outputs.tag }}
+          shard_id: ${{ matrix.shard_id }}
+          num_shards: ${{ matrix.num_shards }}
+          parallelism: "2"
+          nightly_full: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+
+  backcompat-runner-integration:
+    name: Backcompat integration (runner ${{ github.event.inputs.runner_version || 'latest-release' }}, ${{ matrix.harness }})
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.integration_matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.event.inputs.branch || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve old version
+        id: resolve
+        env:
+          VERSION_INPUT: ${{ github.event.inputs.runner_version }}
+        run: |
+          tag="$VERSION_INPUT"
+          if [ -z "$tag" ]; then
+            tag="$(git tag --sort=-v:refname | grep -vi rc | head -1)"
+          fi
+          echo "Resolved old tag: $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Run integration suite against old runner
+        uses: ./.github/actions/integration-run
+        with:
+          runner_version: ${{ steps.resolve.outputs.tag }}
           harness: ${{ matrix.harness }}
           model: ${{ matrix.model }}
           workers: ${{ matrix.workers }}
